@@ -1,0 +1,35 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.mls.createConvo",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Create a new private conversation (MLS group).",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "didList": {
+              "type": "array",
+              "items": { "type": "string", "format": "did" },
+              "description": "Optional initial invitee DIDs"
+            },
+            "title": { 
+              "type": "string", 
+              "maxLength": 100,
+              "description": "Optional conversation title"
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "ref",
+          "ref": "blue.catbird.mls.defs#convoView"
+        }
+      }
+    }
+  }
+}
