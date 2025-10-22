@@ -28,10 +28,10 @@
               "type": "string",
               "description": "Base64-encoded MLS Commit message for remaining members"
             },
-            "epoch": {
-              "type": "ref",
-              "ref": "blue.catbird.mls.defs#epochInfo",
-              "description": "New epoch information"
+            "newEpoch": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "New epoch number after member removal"
             }
           }
         }

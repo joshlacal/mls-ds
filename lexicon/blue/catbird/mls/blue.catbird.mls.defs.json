@@ -1,11 +1,12 @@
 {
   "lexicon": 1,
   "id": "blue.catbird.mls.defs",
+  "description": "Shared type definitions for MLS (Message Layer Security) protocol",
   "defs": {
     "convoView": {
       "type": "object",
-      "description": "View of an MLS conversation",
-      "required": ["id", "groupId", "creator", "members", "epoch", "createdAt"],
+      "description": "View of an MLS conversation with member and epoch information",
+      "required": ["id", "groupId", "creator", "members", "epoch", "cipherSuite", "createdAt"],
       "properties": {
         "id": {
           "type": "string",
@@ -36,8 +37,8 @@
         },
         "cipherSuite": {
           "type": "string",
-          "description": "MLS cipher suite used",
-          "enum": [
+          "description": "MLS cipher suite used for this conversation",
+          "knownValues": [
             "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519",
             "MLS_128_DHKEMP256_AES128GCM_SHA256_P256",
             "MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519",
@@ -57,28 +58,62 @@
           "description": "Timestamp of last message"
         },
         "metadata": {
-          "type": "object",
-          "description": "Optional conversation metadata",
-          "properties": {
-            "name": {
-              "type": "string",
-              "maxLength": 128
-            },
-            "description": {
-              "type": "string",
-              "maxLength": 512
-            },
-            "avatar": {
-              "type": "ref",
-              "ref": "#blobRef"
-            }
-          }
+          "type": "ref",
+          "ref": "#convoMetadata",
+          "description": "Optional conversation metadata"
+        }
+      }
+    },
+    "convoMetadata": {
+      "type": "object",
+      "description": "Metadata for a conversation (name, description, avatar)",
+      "properties": {
+        "name": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Conversation display name"
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 512,
+          "description": "Conversation description"
+        },
+        "avatar": {
+          "type": "ref",
+          "ref": "#blobRef",
+          "description": "Conversation avatar image"
+        }
+      }
+    },
+    "memberView": {
+      "type": "object",
+      "description": "View of a conversation member with MLS credentials",
+      "required": ["did", "joinedAt"],
+      "properties": {
+        "did": {
+          "type": "string",
+          "format": "did",
+          "description": "Member DID"
+        },
+        "joinedAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "When member joined the conversation"
+        },
+        "leafIndex": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "MLS leaf index in tree structure"
+        },
+        "credential": {
+          "type": "string",
+          "description": "Base64-encoded MLS credential"
         }
       }
     },
     "messageView": {
       "type": "object",
-      "description": "View of an MLS message",
+      "description": "View of an encrypted MLS message",
       "required": ["id", "convoId", "sender", "ciphertext", "epoch", "createdAt"],
       "properties": {
         "id": {
@@ -124,35 +159,9 @@
         }
       }
     },
-    "memberView": {
-      "type": "object",
-      "description": "View of a conversation member",
-      "required": ["did", "joinedAt"],
-      "properties": {
-        "did": {
-          "type": "string",
-          "format": "did",
-          "description": "Member DID"
-        },
-        "joinedAt": {
-          "type": "string",
-          "format": "datetime",
-          "description": "When member joined"
-        },
-        "leafIndex": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "MLS leaf index in tree"
-        },
-        "credential": {
-          "type": "string",
-          "description": "Base64-encoded MLS credential"
-        }
-      }
-    },
     "keyPackageRef": {
       "type": "object",
-      "description": "Reference to an MLS key package",
+      "description": "Reference to an MLS key package for adding members",
       "required": ["id", "did", "keyPackage", "cipherSuite", "createdAt"],
       "properties": {
         "id": {
@@ -169,9 +178,16 @@
           "description": "Base64-encoded MLS key package"
         },
         "cipherSuite": {
-          "type": "ref",
-          "ref": "#cipherSuiteEnum",
-          "description": "Supported cipher suite"
+          "type": "string",
+          "description": "Supported cipher suite for this key package",
+          "knownValues": [
+            "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519",
+            "MLS_128_DHKEMP256_AES128GCM_SHA256_P256",
+            "MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519",
+            "MLS_256_DHKEMX448_AES256GCM_SHA512_Ed448",
+            "MLS_256_DHKEMP521_AES256GCM_SHA512_P521",
+            "MLS_256_DHKEMX448_CHACHA20POLY1305_SHA512_Ed448"
+          ]
         },
         "createdAt": {
           "type": "string",
@@ -211,44 +227,6 @@
           "description": "AT URI reference to blob"
         }
       }
-    },
-    "epochInfo": {
-      "type": "object",
-      "description": "Information about an MLS epoch",
-      "required": ["epoch", "groupId"],
-      "properties": {
-        "epoch": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "Epoch number"
-        },
-        "groupId": {
-          "type": "string",
-          "description": "MLS group identifier"
-        },
-        "memberCount": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "Number of members in this epoch"
-        },
-        "updatedAt": {
-          "type": "string",
-          "format": "datetime",
-          "description": "When epoch was created"
-        }
-      }
-    },
-    "cipherSuiteEnum": {
-      "type": "string",
-      "description": "MLS cipher suite enumeration",
-      "knownValues": [
-        "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519",
-        "MLS_128_DHKEMP256_AES128GCM_SHA256_P256",
-        "MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519",
-        "MLS_256_DHKEMX448_AES256GCM_SHA512_Ed448",
-        "MLS_256_DHKEMP521_AES256GCM_SHA512_P521",
-        "MLS_256_DHKEMX448_CHACHA20POLY1305_SHA512_Ed448"
-      ]
     }
   }
 }

@@ -1,10 +1,11 @@
 {
   "lexicon": 1,
   "id": "blue.catbird.mls.getConvos",
+  "description": "Retrieve MLS conversations for the authenticated user with pagination support",
   "defs": {
     "main": {
       "type": "query",
-      "description": "Retrieve MLS conversations for the authenticated user",
+      "description": "Query to fetch user's MLS conversations",
       "parameters": {
         "type": "params",
         "properties": {
@@ -18,18 +19,6 @@
           "cursor": {
             "type": "string",
             "description": "Pagination cursor from previous response"
-          },
-          "sortBy": {
-            "type": "string",
-            "enum": ["createdAt", "lastMessageAt"],
-            "default": "lastMessageAt",
-            "description": "Sort conversations by field"
-          },
-          "sortOrder": {
-            "type": "string",
-            "enum": ["asc", "desc"],
-            "default": "desc",
-            "description": "Sort order"
           }
         }
       },
@@ -57,7 +46,7 @@
       "errors": [
         {
           "name": "InvalidCursor",
-          "description": "Pagination cursor is invalid"
+          "description": "The provided pagination cursor is invalid"
         }
       ]
     }

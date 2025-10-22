@@ -1,6 +1,7 @@
 {
   "lexicon": 1,
   "id": "blue.catbird.mls.addMembers",
+  "description": "Add new members to an existing MLS conversation",
   "defs": {
     "main": {
       "type": "procedure",
@@ -46,18 +47,8 @@
             "welcomeMessages": {
               "type": "array",
               "items": {
-                "type": "object",
-                "required": ["did", "welcome"],
-                "properties": {
-                  "did": {
-                    "type": "string",
-                    "format": "did"
-                  },
-                  "welcome": {
-                    "type": "string",
-                    "description": "Base64-encoded MLS Welcome message"
-                  }
-                }
+                "type": "ref",
+                "ref": "#welcomeMessage"
               },
               "description": "Welcome messages for new members"
             }
@@ -86,6 +77,21 @@
           "description": "Would exceed maximum member count"
         }
       ]
+    },
+    "welcomeMessage": {
+      "type": "object",
+      "required": ["did", "welcome"],
+      "properties": {
+        "did": {
+          "type": "string",
+          "format": "did",
+          "description": "DID of the new member"
+        },
+        "welcome": {
+          "type": "string",
+          "description": "Base64-encoded MLS Welcome message for this member"
+        }
+      }
     }
   }
 }
