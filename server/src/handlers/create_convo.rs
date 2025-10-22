@@ -19,15 +19,24 @@ pub async fn create_convo(
         return Err(StatusCode::UNAUTHORIZED);
     }
     let did = &auth_user.did;
-    // Validate input
-    if let Some(ref did_list) = input.did_list {
-        if did_list.is_empty() {
-            warn!("Empty did_list provided");
+    
+    // Validate cipher suite
+    let valid_suites = ["MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519", 
+                        "MLS_128_DHKEMP256_AES128GCM_SHA256_P256"];
+    if !valid_suites.contains(&input.cipher_suite.as_str()) {
+        warn!("Invalid cipher suite: {}", input.cipher_suite);
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    
+    // Validate initial members
+    if let Some(ref members) = input.initial_members {
+        if members.len() > 100 {
+            warn!("Too many initial members: {}", members.len());
             return Err(StatusCode::BAD_REQUEST);
         }
         
         // Validate DIDs format
-        for d in did_list {
+        for d in members {
             if !d.starts_with("did:") {
                 warn!("Invalid DID format: {}", d);
                 return Err(StatusCode::BAD_REQUEST);
@@ -37,17 +46,26 @@ pub async fn create_convo(
 
     let convo_id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now();
+    
+    let (name, description, avatar) = if let Some(ref meta) = input.metadata {
+        (meta.name.clone(), meta.description.clone(), meta.avatar.clone())
+    } else {
+        (None, None, None)
+    };
 
-    info!("Creating conversation {}", convo_id);
+    info!("Creating conversation {} with cipher suite {}", convo_id, input.cipher_suite);
 
     // Create conversation
     sqlx::query(
-        "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at, title) VALUES ($1, $2, 0, $3, $3, $4)"
+        "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at, cipher_suite, name, description, avatar_blob) VALUES ($1, $2, 0, $3, $3, $4, $5, $6, $7)"
     )
     .bind(&convo_id)
     .bind(did)
     .bind(&now)
-    .bind(&input.title)
+    .bind(&input.cipher_suite)
+    .bind(&name)
+    .bind(&description)
+    .bind(&avatar)
     .execute(&pool)
     .await
     .map_err(|e| {
@@ -72,8 +90,8 @@ pub async fn create_convo(
     let mut members = vec![MemberInfo { did: did.clone() }];
 
     // Add initial members if specified
-    if let Some(did_list) = input.did_list {
-        for member_did in did_list {
+    if let Some(initial_members) = input.initial_members {
+        for member_did in initial_members {
             sqlx::query(
                 "INSERT INTO members (convo_id, member_did, joined_at) VALUES ($1, $2, $3)"
             )

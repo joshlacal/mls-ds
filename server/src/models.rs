@@ -8,17 +8,29 @@ pub struct Conversation {
     pub creator_did: String,
     pub current_epoch: i32,
     pub created_at: DateTime<Utc>,
-    pub title: Option<String>,
+    pub cipher_suite: String,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub avatar_blob: Option<String>,
 }
 
 impl Conversation {
-    pub fn new(creator_did: String, title: Option<String>) -> Self {
+    pub fn new(creator_did: String, cipher_suite: String, metadata: Option<ConvoMetadata>) -> Self {
+        let (name, description, avatar_blob) = if let Some(m) = metadata {
+            (m.name, m.description, m.avatar)
+        } else {
+            (None, None, None)
+        };
+        
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             creator_did,
             current_epoch: 0,
             created_at: Utc::now(),
-            title,
+            cipher_suite,
+            name,
+            description,
+            avatar_blob,
         }
     }
 }
@@ -99,9 +111,18 @@ pub struct Blob {
 
 #[derive(Debug, Deserialize)]
 pub struct CreateConvoInput {
-    #[serde(rename = "didList")]
-    pub did_list: Option<Vec<String>>,
-    pub title: Option<String>,
+    #[serde(rename = "cipherSuite")]
+    pub cipher_suite: String,
+    #[serde(rename = "initialMembers")]
+    pub initial_members: Option<Vec<String>>,
+    pub metadata: Option<ConvoMetadata>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConvoMetadata {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub avatar: Option<String>, // blob reference or base64
 }
 
 #[derive(Debug, Serialize)]
