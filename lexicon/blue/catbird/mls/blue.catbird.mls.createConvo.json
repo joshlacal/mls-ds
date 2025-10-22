@@ -54,34 +54,8 @@
       "output": {
         "encoding": "application/json",
         "schema": {
-          "type": "object",
-          "required": ["convo", "welcomeMessages"],
-          "properties": {
-            "convo": {
-              "type": "ref",
-              "ref": "blue.catbird.mls.defs#convoView",
-              "description": "Created conversation view"
-            },
-            "welcomeMessages": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "required": ["did", "welcome"],
-                "properties": {
-                  "did": {
-                    "type": "string",
-                    "format": "did",
-                    "description": "Member DID"
-                  },
-                  "welcome": {
-                    "type": "string",
-                    "description": "Base64-encoded MLS Welcome message"
-                  }
-                }
-              },
-              "description": "Welcome messages for initial members"
-            }
-          }
+          "type": "ref",
+          "ref": "blue.catbird.mls.defs#convoView"
         }
       },
       "errors": [
