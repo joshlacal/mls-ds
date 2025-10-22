@@ -37,9 +37,9 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["convos"],
+          "required": ["conversations"],
           "properties": {
-            "convos": {
+            "conversations": {
               "type": "array",
               "items": {
                 "type": "ref",
