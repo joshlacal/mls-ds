@@ -87,11 +87,15 @@ pub async fn create_convo(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let mut members = vec![MemberInfo { did: did.clone() }];
+    let mut members = vec![crate::models::MemberView { 
+        did: did.clone(), 
+        joined_at: now,
+        leaf_index: Some(0),
+    }];
 
     // Add initial members if specified
     if let Some(initial_members) = input.initial_members {
-        for member_did in initial_members {
+        for (idx, member_did) in initial_members.iter().enumerate() {
             sqlx::query(
                 "INSERT INTO members (convo_id, member_did, joined_at) VALUES ($1, $2, $3)"
             )
@@ -105,19 +109,40 @@ pub async fn create_convo(
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
             
-            members.push(MemberInfo { did: member_did });
+            members.push(crate::models::MemberView { 
+                did: member_did.clone(),
+                joined_at: now,
+                leaf_index: Some((idx + 1) as i32),
+            });
         }
     }
 
     info!("Conversation {} created successfully with {} members", convo_id, members.len());
 
+    // Generate MLS group ID (for now, derive from conversation ID)
+    let group_id = format!("group_{}", convo_id);
+    
+    // Build metadata view if metadata exists
+    let metadata_view = if name.is_some() || description.is_some() || avatar.is_some() {
+        Some(crate::models::ConvoMetadataView {
+            name: name.clone(),
+            description: description.clone(),
+            avatar: None, // TODO: Convert blob reference to BlobRef
+        })
+    } else {
+        None
+    };
+
     Ok(Json(ConvoView {
         id: convo_id,
+        group_id,
+        creator: did.clone(),
         members,
-        created_at: now,
-        created_by: did.clone(),
-        unread_count: 0,
         epoch: 0,
+        cipher_suite: input.cipher_suite.clone(),
+        created_at: now,
+        last_message_at: None,
+        metadata: metadata_view,
     }))
 }
 

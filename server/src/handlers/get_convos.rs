@@ -57,18 +57,40 @@ pub async fn get_convos(
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
-            let members: Vec<MemberInfo> = member_rows
+            let members: Vec<crate::models::MemberView> = member_rows
                 .into_iter()
-                .map(|m| MemberInfo { did: m.member_did })
+                .enumerate()
+                .map(|(idx, m)| crate::models::MemberView { 
+                    did: m.member_did,
+                    joined_at: m.joined_at,
+                    leaf_index: Some(idx as i32),
+                })
                 .collect();
+
+            // Generate group ID
+            let group_id = format!("group_{}", c.id);
+            
+            // Build metadata view
+            let metadata_view = if c.name.is_some() || c.description.is_some() || c.avatar_blob.is_some() {
+                Some(crate::models::ConvoMetadataView {
+                    name: c.name.clone(),
+                    description: c.description.clone(),
+                    avatar: None, // TODO: Convert blob reference
+                })
+            } else {
+                None
+            };
 
             convos.push(ConvoView {
                 id: c.id,
+                group_id,
+                creator: c.creator_did,
                 members,
-                created_at: c.created_at,
-                created_by: c.creator_did,
-                unread_count: membership.unread_count,
                 epoch: c.current_epoch,
+                cipher_suite: c.cipher_suite,
+                created_at: c.created_at,
+                last_message_at: None, // TODO: Get from last message
+                metadata: metadata_view,
             });
         }
     }

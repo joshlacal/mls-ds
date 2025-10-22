@@ -128,19 +128,45 @@ pub struct ConvoMetadata {
 #[derive(Debug, Serialize)]
 pub struct ConvoView {
     pub id: String,
-    pub members: Vec<MemberInfo>,
+    #[serde(rename = "groupId")]
+    pub group_id: String,
+    pub creator: String,
+    pub members: Vec<MemberView>,
+    pub epoch: i32,
+    #[serde(rename = "cipherSuite")]
+    pub cipher_suite: String,
     #[serde(rename = "createdAt")]
     pub created_at: DateTime<Utc>,
-    #[serde(rename = "createdBy")]
-    pub created_by: String,
-    #[serde(rename = "unreadCount")]
-    pub unread_count: i32,
-    pub epoch: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "lastMessageAt")]
+    pub last_message_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<ConvoMetadataView>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MemberInfo {
     pub did: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MemberView {
+    pub did: String,
+    #[serde(rename = "joinedAt")]
+    pub joined_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "leafIndex")]
+    pub leaf_index: Option<i32>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConvoMetadataView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<BlobRef>,
 }
 
 #[derive(Debug, Deserialize)]
