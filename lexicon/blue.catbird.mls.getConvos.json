@@ -1,0 +1,65 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.mls.getConvos",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Retrieve MLS conversations for the authenticated user",
+      "parameters": {
+        "type": "params",
+        "properties": {
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 50,
+            "description": "Maximum number of conversations to return"
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Pagination cursor from previous response"
+          },
+          "sortBy": {
+            "type": "string",
+            "enum": ["createdAt", "lastMessageAt"],
+            "default": "lastMessageAt",
+            "description": "Sort conversations by field"
+          },
+          "sortOrder": {
+            "type": "string",
+            "enum": ["asc", "desc"],
+            "default": "desc",
+            "description": "Sort order"
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["convos"],
+          "properties": {
+            "convos": {
+              "type": "array",
+              "items": {
+                "type": "ref",
+                "ref": "blue.catbird.mls.defs#convoView"
+              },
+              "description": "List of conversations"
+            },
+            "cursor": {
+              "type": "string",
+              "description": "Pagination cursor for next page"
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "InvalidCursor",
+          "description": "Pagination cursor is invalid"
+        }
+      ]
+    }
+  }
+}

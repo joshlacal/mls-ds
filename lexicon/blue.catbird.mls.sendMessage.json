@@ -1,0 +1,80 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.mls.sendMessage",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Send an encrypted message to an MLS conversation",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["convoId", "ciphertext"],
+          "properties": {
+            "convoId": {
+              "type": "string",
+              "description": "Conversation identifier"
+            },
+            "ciphertext": {
+              "type": "string",
+              "description": "Base64-encoded MLS application message ciphertext",
+              "maxLength": 1048576
+            },
+            "contentType": {
+              "type": "string",
+              "description": "MIME type of the plaintext content",
+              "default": "text/plain",
+              "maxLength": 256
+            },
+            "attachments": {
+              "type": "array",
+              "items": {
+                "type": "blob",
+                "accept": ["*/*"],
+                "maxSize": 52428800
+              },
+              "description": "Message attachments (max 50MB each)",
+              "maxLength": 10
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["message"],
+          "properties": {
+            "message": {
+              "type": "ref",
+              "ref": "blue.catbird.mls.defs#messageView",
+              "description": "Created message view"
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "ConvoNotFound",
+          "description": "Conversation not found"
+        },
+        {
+          "name": "NotMember",
+          "description": "Caller is not a member of the conversation"
+        },
+        {
+          "name": "InvalidCiphertext",
+          "description": "Ciphertext is malformed or invalid"
+        },
+        {
+          "name": "EpochMismatch",
+          "description": "Message epoch does not match current conversation epoch"
+        },
+        {
+          "name": "MessageTooLarge",
+          "description": "Message exceeds maximum size"
+        }
+      ]
+    }
+  }
+}

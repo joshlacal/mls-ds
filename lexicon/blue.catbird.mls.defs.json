@@ -4,63 +4,244 @@
   "defs": {
     "convoView": {
       "type": "object",
-      "required": ["id", "members", "createdAt", "createdBy", "unreadCount", "epoch"],
+      "description": "View of an MLS conversation",
+      "required": ["id", "groupId", "creator", "members", "epoch", "createdAt"],
       "properties": {
-        "id": { "type": "string" },
+        "id": {
+          "type": "string",
+          "description": "Conversation identifier (TID)"
+        },
+        "groupId": {
+          "type": "string",
+          "description": "MLS group identifier (hex-encoded)",
+          "maxLength": 128
+        },
+        "creator": {
+          "type": "string",
+          "format": "did",
+          "description": "DID of the conversation creator"
+        },
         "members": {
           "type": "array",
-          "items": { "type": "ref", "ref": "#memberInfo" }
+          "items": {
+            "type": "ref",
+            "ref": "#memberView"
+          },
+          "description": "Current conversation members"
         },
-        "createdAt": { "type": "string", "format": "datetime" },
-        "createdBy": { "type": "string", "format": "did" },
-        "unreadCount": { "type": "integer" },
-        "epoch": { "type": "integer" },
-        "title": { "type": "string", "maxLength": 100 }
-      }
-    },
-    "memberInfo": {
-      "type": "object",
-      "required": ["did"],
-      "properties": {
-        "did": { "type": "string", "format": "did" }
+        "epoch": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Current MLS epoch number"
+        },
+        "cipherSuite": {
+          "type": "ref",
+          "ref": "#cipherSuiteEnum",
+          "description": "MLS cipher suite used"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "Conversation creation timestamp"
+        },
+        "lastMessageAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "Timestamp of last message"
+        },
+        "metadata": {
+          "type": "object",
+          "description": "Optional conversation metadata",
+          "properties": {
+            "name": {
+              "type": "string",
+              "maxLength": 128
+            },
+            "description": {
+              "type": "string",
+              "maxLength": 512
+            },
+            "avatar": {
+              "type": "ref",
+              "ref": "#blobRef"
+            }
+          }
+        }
       }
     },
     "messageView": {
       "type": "object",
-      "required": ["id", "ciphertext", "epoch", "sender", "sentAt"],
+      "description": "View of an MLS message",
+      "required": ["id", "convoId", "sender", "ciphertext", "epoch", "createdAt"],
       "properties": {
-        "id": { "type": "string" },
-        "ciphertext": { 
+        "id": {
           "type": "string",
-          "description": "Base64url encoded MLS PrivateMessage"
+          "description": "Message identifier (TID)"
         },
-        "epoch": { "type": "integer" },
-        "sender": { "type": "ref", "ref": "#memberInfo" },
-        "sentAt": { "type": "string", "format": "datetime" }
+        "convoId": {
+          "type": "string",
+          "description": "Conversation identifier"
+        },
+        "sender": {
+          "type": "string",
+          "format": "did",
+          "description": "DID of message sender"
+        },
+        "ciphertext": {
+          "type": "string",
+          "description": "Base64-encoded MLS ciphertext"
+        },
+        "epoch": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "MLS epoch when message was sent"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "Message creation timestamp"
+        },
+        "contentType": {
+          "type": "string",
+          "description": "MIME type of decrypted content",
+          "default": "text/plain"
+        },
+        "attachments": {
+          "type": "array",
+          "items": {
+            "type": "ref",
+            "ref": "#blobRef"
+          },
+          "description": "Message attachments",
+          "maxLength": 10
+        }
       }
     },
-    "keyPackageInfo": {
+    "memberView": {
       "type": "object",
-      "required": ["did", "keyPackage", "cipherSuite"],
+      "description": "View of a conversation member",
+      "required": ["did", "joinedAt"],
       "properties": {
-        "did": { "type": "string", "format": "did" },
+        "did": {
+          "type": "string",
+          "format": "did",
+          "description": "Member DID"
+        },
+        "joinedAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "When member joined"
+        },
+        "leafIndex": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "MLS leaf index in tree"
+        },
+        "credential": {
+          "type": "string",
+          "description": "Base64-encoded MLS credential"
+        }
+      }
+    },
+    "keyPackageRef": {
+      "type": "object",
+      "description": "Reference to an MLS key package",
+      "required": ["id", "did", "keyPackage", "cipherSuite", "createdAt"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Key package identifier"
+        },
+        "did": {
+          "type": "string",
+          "format": "did",
+          "description": "Owner DID"
+        },
         "keyPackage": {
           "type": "string",
-          "description": "Base64url encoded MLS KeyPackage"
+          "description": "Base64-encoded MLS key package"
         },
-        "cipherSuite": { "type": "string" }
+        "cipherSuite": {
+          "type": "ref",
+          "ref": "#cipherSuiteEnum",
+          "description": "Supported cipher suite"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "Key package creation time"
+        },
+        "expiresAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "Key package expiration time"
+        }
       }
     },
     "blobRef": {
       "type": "object",
-      "required": ["cid", "size"],
+      "description": "Reference to a blob (file attachment)",
+      "required": ["cid", "mimeType", "size"],
       "properties": {
-        "cid": { 
+        "cid": {
           "type": "string",
-          "description": "Content identifier (SHA256 hash)" 
+          "description": "Content identifier (CID)"
         },
-        "size": { "type": "integer" }
+        "mimeType": {
+          "type": "string",
+          "description": "MIME type of the blob",
+          "maxLength": 256
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 52428800,
+          "description": "Blob size in bytes (max 50MB)"
+        },
+        "ref": {
+          "type": "string",
+          "format": "at-uri",
+          "description": "AT URI reference to blob"
+        }
       }
+    },
+    "epochInfo": {
+      "type": "object",
+      "description": "Information about an MLS epoch",
+      "required": ["epoch", "groupId"],
+      "properties": {
+        "epoch": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Epoch number"
+        },
+        "groupId": {
+          "type": "string",
+          "description": "MLS group identifier"
+        },
+        "memberCount": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of members in this epoch"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "When epoch was created"
+        }
+      }
+    },
+    "cipherSuiteEnum": {
+      "type": "string",
+      "description": "MLS cipher suite enumeration",
+      "knownValues": [
+        "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519",
+        "MLS_128_DHKEMP256_AES128GCM_SHA256_P256",
+        "MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519",
+        "MLS_256_DHKEMX448_AES256GCM_SHA512_Ed448",
+        "MLS_256_DHKEMP521_AES256GCM_SHA512_P521",
+        "MLS_256_DHKEMX448_CHACHA20POLY1305_SHA512_Ed448"
+      ]
     }
   }
 }

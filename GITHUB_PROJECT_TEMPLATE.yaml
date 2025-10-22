@@ -1,0 +1,525 @@
+# GitHub Project Board Template - MLS Chat Integration
+# Import this to create a complete project board with all tasks
+
+project_name: "Catbird MLS Chat Integration"
+description: "14-day project to integrate MLS E2EE group chat into Catbird iOS app"
+
+columns:
+  - name: "📋 Backlog"
+  - name: "🔜 Ready"
+  - name: "🏗️ In Progress"
+  - name: "👀 Review"
+  - name: "✅ Done"
+
+milestones:
+  - title: "Milestone 1: Lexicons Complete"
+    due_date: "Day 2"
+    description: "All lexicons validated, architecture documented, branch ready"
+    
+  - title: "Milestone 2: Code Generation Complete"
+    due_date: "Day 4"
+    description: "Swift models generated, MLSClient implemented, FFI compiling"
+    
+  - title: "Milestone 3: Server Production Ready"
+    due_date: "Day 7"
+    description: "All endpoints working, database deployed, Docker built"
+    
+  - title: "Milestone 4: iOS App Complete"
+    due_date: "Day 12"
+    description: "All views implemented, integrated into Catbird, regression passing"
+    
+  - title: "Milestone 5: Production Deployment"
+    due_date: "Day 14"
+    description: "E2E tests passing, security audit complete, beta deployed"
+
+labels:
+  - name: "phase-1-prep"
+    color: "0366d6"
+  - name: "phase-2-codegen"
+    color: "5319e7"
+  - name: "phase-3-server"
+    color: "d73a4a"
+  - name: "phase-4-ios"
+    color: "fbca04"
+  - name: "phase-5-testing"
+    color: "0e8a16"
+  - name: "critical-path"
+    color: "b60205"
+  - name: "parallelizable"
+    color: "c5def5"
+  - name: "blocked"
+    color: "e99695"
+  - name: "security"
+    color: "d93f0b"
+  - name: "documentation"
+    color: "c2e0c6"
+
+issues:
+  # Phase 1: Preparation
+  - title: "P1.1: Git & Repository Setup"
+    milestone: "Milestone 1: Lexicons Complete"
+    labels: ["phase-1-prep", "critical-path"]
+    assignee: "git-coordinator"
+    estimate: "1 hour"
+    body: |
+      **Task**: Create mls-chat branch and set up project board
+      
+      Checklist:
+      - [ ] Create mls-chat branch from main
+      - [ ] Set up branch protection rules
+      - [ ] Create GitHub Project board
+      - [ ] Tag initial commit
+      - [ ] Configure CI/CD for branch
+      
+      **Deliverable**: Branch ready for development
+      **Blockers**: None
+      
+      See: MLS_TASK_LIST.md#p11
+      
+  - title: "P1.2: Complete Lexicon Definitions"
+    milestone: "Milestone 1: Lexicons Complete"
+    labels: ["phase-1-prep", "critical-path", "documentation"]
+    assignee: "lexicon-architect"
+    estimate: "6 hours"
+    body: |
+      **Task**: Create all 10 AT Protocol lexicon files
+      
+      Lexicons to create:
+      - [ ] blue.catbird.mls.defs.json (common types)
+      - [ ] blue.catbird.mls.createConvo.json
+      - [ ] blue.catbird.mls.addMembers.json
+      - [ ] blue.catbird.mls.sendMessage.json
+      - [ ] blue.catbird.mls.getMessages.json (query)
+      - [ ] blue.catbird.mls.leaveConvo.json
+      - [ ] blue.catbird.mls.publishKeyPackage.json
+      - [ ] blue.catbird.mls.getKeyPackages.json (query)
+      - [ ] blue.catbird.mls.uploadBlob.json
+      - [ ] blue.catbird.mls.getConvos.json (query)
+      
+      Validation:
+      - [ ] All pass AT Protocol schema validation
+      - [ ] Field documentation complete
+      - [ ] Examples provided
+      
+      **Deliverable**: 10 validated lexicon JSON files
+      **Blockers**: None
+      
+      See: MLS_TASK_LIST.md#p12, MLS_INTEGRATION_MASTER_PLAN.md#task-12
+      
+  - title: "P1.3: Catbird Architecture Audit"
+    milestone: "Milestone 1: Lexicons Complete"
+    labels: ["phase-1-prep", "parallelizable", "documentation"]
+    assignee: "code-archaeologist"
+    estimate: "6 hours"
+    body: |
+      **Task**: Analyze existing Catbird codebase for integration points
+      
+      Analysis areas:
+      - [ ] Map Bluesky chat implementation
+      - [ ] Analyze Petrel integration
+      - [ ] Document view architecture
+      - [ ] Analyze networking layer
+      - [ ] Document security implementations
+      - [ ] Analyze persistence layer
+      - [ ] Create architecture diagram (Mermaid)
+      - [ ] Create dependency map
+      - [ ] Identify integration points
+      - [ ] List reusable components
+      - [ ] Risk assessment for conflicts
+      
+      **Deliverable**: CATBIRD_ARCHITECTURE.md with diagrams
+      **Blockers**: P1.1 (need branch access)
+      
+      See: MLS_TASK_LIST.md#p13
+      
+  # Phase 2: Code Generation
+  - title: "P2.1: Generate Swift Models via Petrel"
+    milestone: "Milestone 2: Code Generation Complete"
+    labels: ["phase-2-codegen", "critical-path"]
+    assignee: "petrel-operator"
+    estimate: "3 hours"
+    body: |
+      **Task**: Generate Swift models from lexicons
+      
+      Steps:
+      - [ ] Install/update Petrel
+      - [ ] Create generation script
+      - [ ] Generate models (20+ files expected)
+      - [ ] Add to Xcode project
+      - [ ] Verify compilation
+      - [ ] Add Codable tests
+      - [ ] Document generation process
+      
+      **Deliverable**: 20+ compiled Swift model files
+      **Blockers**: P1.2 (need lexicons)
+      
+      See: MLS_TASK_LIST.md#p21
+      
+  - title: "P2.2: Implement MLS API Client (Swift)"
+    milestone: "Milestone 2: Code Generation Complete"
+    labels: ["phase-2-codegen", "critical-path"]
+    assignee: "network-engineer"
+    estimate: "8 hours"
+    body: |
+      **Task**: Implement MLSClient actor with all XRPC calls
+      
+      Methods to implement:
+      - [ ] authenticate(did:jwt:)
+      - [ ] createConvo(title:invites:)
+      - [ ] addMembers(convoId:dids:commit:welcome:)
+      - [ ] sendMessage(convoId:ciphertext:epoch:)
+      - [ ] getMessages(convoId:since:sinceEpoch:)
+      - [ ] leaveConvo(_:target:commit:)
+      - [ ] publishKeyPackage(_:cipherSuite:expires:)
+      - [ ] getKeyPackages(dids:)
+      - [ ] uploadBlob(_:mimeType:)
+      - [ ] downloadBlob(cid:)
+      - [ ] Error handling with retry logic
+      - [ ] Request logging (redacted)
+      
+      Testing:
+      - [ ] Unit tests with mocked responses (90%+ coverage)
+      - [ ] Integration tests against local server
+      
+      **Deliverable**: Complete MLSClient.swift
+      **Blockers**: P2.1 (need models)
+      
+      See: MLS_TASK_LIST.md#p22
+      
+  - title: "P2.3: Complete OpenMLS FFI Implementation"
+    milestone: "Milestone 2: Code Generation Complete"
+    labels: ["phase-2-codegen", "parallelizable", "security"]
+    assignee: "cryptography-specialist"
+    estimate: "12 hours"
+    body: |
+      **Task**: Implement all MLS operations in Rust FFI
+      
+      Functions to implement:
+      - [ ] mls_create_group
+      - [ ] mls_join_group
+      - [ ] mls_add_member (Add + Commit + Welcome)
+      - [ ] mls_remove_member
+      - [ ] mls_encrypt_message
+      - [ ] mls_decrypt_message
+      - [ ] mls_process_commit
+      - [ ] mls_generate_key_package
+      - [ ] Memory management (free functions)
+      - [ ] Error handling
+      
+      Additional:
+      - [ ] Generate C header with cbindgen
+      - [ ] Rust unit tests
+      - [ ] Integration test (multi-party)
+      - [ ] Build for iOS targets (aarch64, x86_64)
+      - [ ] Memory leak testing with Instruments
+      
+      **Deliverable**: Production-ready mls-ffi
+      **Blockers**: None (parallel work)
+      
+      See: MLS_TASK_LIST.md#p23
+      
+  # Phase 3: Server Enhancement
+  - title: "P3.1-3.7: Complete Server Implementation"
+    milestone: "Milestone 3: Server Production Ready"
+    labels: ["phase-3-server", "critical-path", "security"]
+    assignee: "backend-engineer"
+    estimate: "22 hours"
+    body: |
+      **Task**: Complete Rust server with all features
+      
+      Sub-tasks:
+      - [ ] P3.1: Authentication enhancement (JWT, DID, rate limiting)
+      - [ ] P3.2: Database schema & migrations
+      - [ ] P3.3: Storage layer (all CRUD operations)
+      - [ ] P3.4: Complete all 9 API handlers
+      - [ ] P3.5: KeyPackage management
+      - [ ] P3.6: Blob storage (content-addressed)
+      - [ ] P3.7: Production hardening (TLS, metrics, Docker)
+      
+      Testing:
+      - [ ] Unit tests (80%+ coverage)
+      - [ ] Integration tests
+      - [ ] All endpoints working
+      
+      **Deliverable**: Production-ready server
+      **Blockers**: P1.2 (need lexicons)
+      
+      See: MLS_TASK_LIST.md#phase-3
+      
+  - title: "P3.8: Server Testing & Multi-party Harness"
+    milestone: "Milestone 3: Server Production Ready"
+    labels: ["phase-3-server", "phase-5-testing"]
+    assignee: "qa-engineer"
+    estimate: "8 hours"
+    body: |
+      **Task**: Comprehensive server testing
+      
+      Test types:
+      - [ ] Unit tests for all modules
+      - [ ] Integration tests for endpoints
+      - [ ] Multi-party MLS harness (2, 3, 10 members)
+      - [ ] Concurrent message sends
+      - [ ] Add/remove during conversation
+      - [ ] Out-of-order commit handling
+      - [ ] Load testing (1000 msg/sec target)
+      - [ ] Security testing
+      
+      **Deliverable**: Test suite with passing results
+      **Blockers**: P3.7 (need complete server)
+      
+      See: MLS_TASK_LIST.md#p38
+      
+  # Phase 4: iOS Integration
+  - title: "P4.1: Swift FFI Bridge to Rust"
+    milestone: "Milestone 4: iOS App Complete"
+    labels: ["phase-4-ios", "critical-path", "security"]
+    assignee: "ffi-specialist"
+    estimate: "8 hours"
+    body: |
+      **Task**: Wrap Rust FFI in safe Swift API
+      
+      Implementation:
+      - [ ] Create MLSManager actor
+      - [ ] Implement group lifecycle (create, join, destroy)
+      - [ ] Implement member operations (add, remove, process commit)
+      - [ ] Implement message operations (encrypt, decrypt)
+      - [ ] Error handling (parse Rust errors)
+      - [ ] Memory management (track pointers, free in deinit)
+      - [ ] Thread safety
+      
+      Testing:
+      - [ ] Unit tests with mock FFI
+      - [ ] Integration tests with real FFI
+      - [ ] Memory leak tests (Instruments)
+      
+      **Deliverable**: Complete MLSManager.swift
+      **Blockers**: P2.3 (need Rust FFI)
+      
+      See: MLS_TASK_LIST.md#p41
+      
+  - title: "P4.2: Keychain & SwiftData Storage"
+    milestone: "Milestone 4: iOS App Complete"
+    labels: ["phase-4-ios", "parallelizable", "security"]
+    assignee: "security-engineer"
+    estimate: "6 hours"
+    body: |
+      **Task**: Implement secure storage for keys and data
+      
+      KeychainManager:
+      - [ ] storeCredential(_:for:)
+      - [ ] retrieveCredential(for:)
+      - [ ] storeGroupState(_:for:)
+      - [ ] retrieveGroupState(for:)
+      - [ ] deleteGroupState(for:)
+      - [ ] Configure security attributes
+      - [ ] Tests
+      
+      MLSStorage (SwiftData):
+      - [ ] Define MLSConversation model
+      - [ ] Define MLSMessage model
+      - [ ] Implement storage operations
+      - [ ] Tests
+      
+      **Deliverable**: KeychainManager.swift, MLSStorage.swift
+      **Blockers**: None (parallel to P4.1)
+      
+      See: MLS_TASK_LIST.md#p42
+      
+  - title: "P4.3: View Models & Business Logic"
+    milestone: "Milestone 4: iOS App Complete"
+    labels: ["phase-4-ios", "critical-path"]
+    assignee: "ios-developer"
+    estimate: "8 hours"
+    body: |
+      **Task**: Implement view models for conversations and messages
+      
+      MLSConversationListViewModel:
+      - [ ] loadConversations()
+      - [ ] createConversation(title:invites:)
+      - [ ] deleteConversation(_:)
+      - [ ] Merge remote and local state
+      - [ ] Published properties
+      
+      MLSConversationViewModel:
+      - [ ] loadMessages()
+      - [ ] send(text:)
+      - [ ] send(attachment:)
+      - [ ] invite(did:)
+      - [ ] removeMember(did:)
+      - [ ] Handle group state (track epoch, process commits)
+      - [ ] Real-time sync
+      - [ ] Error handling and retry
+      - [ ] Offline support
+      
+      Testing:
+      - [ ] Unit tests (80%+ coverage, mocked dependencies)
+      
+      **Deliverable**: Complete view models
+      **Blockers**: P2.2 (MLSClient), P4.1 (MLSManager), P4.2 (Storage)
+      
+      See: MLS_TASK_LIST.md#p43
+      
+  - title: "P4.4: SwiftUI Views"
+    milestone: "Milestone 4: iOS App Complete"
+    labels: ["phase-4-ios", "critical-path"]
+    assignee: "ui-developer"
+    estimate: "10 hours"
+    body: |
+      **Task**: Create all MLS chat UI views
+      
+      Views to create:
+      - [ ] MLSConversationListView
+      - [ ] NewMLSConversationView
+      - [ ] MLSConversationView (chat UI)
+      - [ ] MLSMessageRow
+      - [ ] MLSMemberListView
+      - [ ] MLSMemberPickerView
+      
+      Polish:
+      - [ ] Accessibility (VoiceOver, Dynamic Type)
+      - [ ] Dark mode support
+      - [ ] Localization (English)
+      - [ ] Empty/loading/error states
+      - [ ] SwiftUI previews
+      
+      **Deliverable**: Complete MLS chat UI
+      **Blockers**: P4.3 (need view models)
+      
+      See: MLS_TASK_LIST.md#p44
+      
+  - title: "P4.5: Integration into Catbird"
+    milestone: "Milestone 4: iOS App Complete"
+    labels: ["phase-4-ios", "critical-path"]
+    assignee: "integration-specialist"
+    estimate: "6 hours"
+    body: |
+      **Task**: Integrate MLS into existing Catbird app
+      
+      Integration points:
+      - [ ] Add MLS tab to main navigation
+      - [ ] Integrate with settings
+      - [ ] Onboarding flow for MLS
+      - [ ] Notification handling (routing, badge)
+      - [ ] Coexistence with Bluesky chat
+      - [ ] Deep linking (catbird://mls/convo/{id})
+      - [ ] Feature flag (MLS_ENABLED)
+      - [ ] Migration/upgrade path
+      
+      Testing:
+      - [ ] Regression tests (Bluesky chat still works)
+      - [ ] No memory leaks
+      - [ ] No performance degradation
+      
+      **Deliverable**: Fully integrated app
+      **Blockers**: P4.4 (need views), P1.3 (architecture doc)
+      
+      See: MLS_TASK_LIST.md#p45
+      
+  # Phase 5: Testing & Deployment
+  - title: "P5.1: End-to-End Testing"
+    milestone: "Milestone 5: Production Deployment"
+    labels: ["phase-5-testing", "critical-path"]
+    assignee: "qa-engineer"
+    estimate: "10 hours"
+    body: |
+      **Task**: Comprehensive E2E testing
+      
+      Test scenarios:
+      - [ ] 2-person chat (create, invite, exchange messages)
+      - [ ] 3-person chat
+      - [ ] Member removal (verify PCS)
+      - [ ] Voluntary leave
+      - [ ] Offline sync
+      - [ ] Attachments
+      - [ ] Concurrent sends
+      - [ ] Key rotation
+      - [ ] Server restart
+      - [ ] Network failure
+      - [ ] Stale epoch handling
+      
+      Performance testing:
+      - [ ] Message send latency
+      - [ ] Message decrypt time
+      - [ ] Memory usage
+      - [ ] UI performance (60fps)
+      - [ ] Battery impact
+      
+      **Deliverable**: Passing E2E tests and performance report
+      **Blockers**: P4.5 (need complete app)
+      
+      See: MLS_TASK_LIST.md#p51
+      
+  - title: "P5.2: Security Audit"
+    milestone: "Milestone 5: Production Deployment"
+    labels: ["phase-5-testing", "security", "critical-path"]
+    assignee: "security-auditor"
+    estimate: "8 hours"
+    body: |
+      **Task**: Security review and penetration testing
+      
+      Audit areas:
+      - [ ] Static code analysis (SwiftLint, Semgrep, cargo audit)
+      - [ ] Cryptographic review
+      - [ ] Key storage audit
+      - [ ] Network security (TLS, pinning)
+      - [ ] Input validation
+      - [ ] Log sanitization
+      - [ ] Privacy compliance (GDPR, CCPA)
+      - [ ] Dynamic testing (Frida)
+      - [ ] Penetration testing
+      - [ ] Threat model validation
+      
+      Report:
+      - [ ] Security audit report complete
+      - [ ] All critical issues fixed
+      - [ ] All high issues fixed
+      - [ ] Medium/low documented
+      
+      **Deliverable**: Security audit report with fixes
+      **Blockers**: P5.1 (need E2E tests complete)
+      
+      See: MLS_TASK_LIST.md#p52
+      
+  - title: "P5.3: Documentation & Deployment"
+    milestone: "Milestone 5: Production Deployment"
+    labels: ["phase-5-testing", "documentation"]
+    assignees: ["tech-writer", "devops-engineer"]
+    estimate: "8 hours"
+    body: |
+      **Task**: Complete documentation and deploy to production
+      
+      Documentation (Tech Writer):
+      - [ ] User guides (getting started, tutorials, FAQ)
+      - [ ] Developer docs (architecture, API reference, extending)
+      - [ ] Deployment docs (server setup, Docker, monitoring)
+      - [ ] Security docs (whitepaper, threat model, key mgmt)
+      - [ ] Create documentation site (MkDocs, deploy to GitHub Pages)
+      
+      Deployment (DevOps):
+      - [ ] Docker image (multi-stage, health checks)
+      - [ ] docker-compose.yml
+      - [ ] Kubernetes manifests (optional)
+      - [ ] CI/CD pipeline (GitHub Actions)
+      - [ ] Monitoring setup (Prometheus, Grafana)
+      - [ ] Log aggregation (Loki)
+      - [ ] Production deployment
+      - [ ] Smoke test
+      
+      **Deliverable**: Documentation site and production system
+      **Blockers**: P5.2 (need security sign-off)
+      
+      See: MLS_TASK_LIST.md#p53
+
+# How to import:
+# 1. Create new GitHub Project
+# 2. Manually create columns
+# 3. Create milestones via gh CLI or web UI
+# 4. Create labels
+# 5. Create issues (can use gh CLI with --body-file)
+#    gh issue create --title "P1.1: Git Setup" --label "phase-1-prep" --body-file issue_body.txt
+
+# Automation tips:
+# - Use GitHub Actions to move cards between columns
+# - Link PRs to issues automatically
+# - Update issue status based on CI results
+# - Send Slack notifications for blockers

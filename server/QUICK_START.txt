@@ -1,0 +1,69 @@
+===========================================
+MLS SERVER QUICK START
+===========================================
+
+SERVER STATUS: ✅ RUNNING ON PORT 8080
+
+QUICK COMMANDS:
+--------------
+
+Start Server:
+  cd /Users/joshlacalamito/Developer/Catbird+Petrel/mls/server
+  cargo run --release
+
+Stop Server:
+  Ctrl+C (if foreground)
+  OR
+  lsof -ti:8080 | xargs kill
+
+Test Health:
+  curl http://localhost:8080/health
+
+View Logs:
+  tail -f server.log  (if running in background)
+
+SERVICES:
+--------
+✅ PostgreSQL: localhost:5432 (database: mls_dev)
+✅ Redis: localhost:6379
+✅ Server: http://localhost:8080
+
+ENDPOINTS:
+---------
+• GET  /health              - Health check
+• GET  /health/ready        - Readiness probe  
+• GET  /health/live         - Liveness probe
+• GET  /metrics             - Prometheus metrics
+• POST /xrpc/blue.catbird.mls.createConvo
+• POST /xrpc/blue.catbird.mls.addMembers
+• POST /xrpc/blue.catbird.mls.sendMessage
+• GET  /xrpc/blue.catbird.mls.getMessages
+• POST /xrpc/blue.catbird.mls.publishKeyPackage
+• GET  /xrpc/blue.catbird.mls.getKeyPackages
+• POST /xrpc/blue.catbird.mls.uploadBlob
+
+DATABASE TABLES:
+---------------
+• conversations   - MLS groups
+• members         - Group membership
+• messages        - Encrypted messages
+• key_packages    - Pre-published keys
+• blobs          - Binary data
+
+TROUBLESHOOTING:
+---------------
+Database error?
+  → Check PostgreSQL: pg_isready
+  → Verify .env file: cat .env
+  → Run migrations: sqlx migrate run --database-url postgresql://localhost/mls_dev
+
+Port in use?
+  → Kill process: lsof -ti:8080 | xargs kill
+  → Or change port in .env
+
+Build errors?
+  → Clean: cargo clean
+  → Rebuild: cargo build --release
+
+SEE SERVER_SETUP.md FOR COMPLETE DOCUMENTATION
+===========================================

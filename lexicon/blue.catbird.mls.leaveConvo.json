@@ -1,0 +1,55 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.mls.leaveConvo",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Leave an MLS conversation",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["convoId"],
+          "properties": {
+            "convoId": {
+              "type": "string",
+              "description": "Conversation identifier"
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["commit"],
+          "properties": {
+            "commit": {
+              "type": "string",
+              "description": "Base64-encoded MLS Commit message for remaining members"
+            },
+            "epoch": {
+              "type": "ref",
+              "ref": "blue.catbird.mls.defs#epochInfo",
+              "description": "New epoch information"
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "ConvoNotFound",
+          "description": "Conversation not found"
+        },
+        {
+          "name": "NotMember",
+          "description": "Caller is not a member of the conversation"
+        },
+        {
+          "name": "LastMember",
+          "description": "Cannot leave as the last member (delete the conversation instead)"
+        }
+      ]
+    }
+  }
+}

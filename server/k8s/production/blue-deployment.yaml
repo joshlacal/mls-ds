@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mls-server-blue
+  labels:
+    app: mls-server
+    version: blue
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: mls-server
+      version: blue
+  template:
+    metadata:
+      labels:
+        app: mls-server
+        version: blue
+    spec:
+      serviceAccountName: mls-server
+      containers:
+        - name: mls-server
+          image: ghcr.io/catbird/mls-server:latest
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            - name: RUST_LOG
+              value: "info,catbird_server=info"
+            - name: VERSION
+              value: "blue"
+          envFrom:
+            - secretRef:
+                name: mls-secrets
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi

@@ -1,5 +1,5 @@
 use axum::{
-    routing::{get, post},
+    routing::{any, get, post},
     Router,
 };
 use std::net::SocketAddr;
@@ -8,12 +8,19 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod auth;
 mod crypto;
+mod db;
 mod handlers;
+mod health;
+mod metrics;
 mod models;
 mod storage;
+mod xrpc_proxy;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Load environment variables from .env file
+    dotenvy::dotenv().ok();
+    
     // Initialize tracing
     tracing_subscriber::registry()
         .with(
@@ -25,37 +32,59 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Starting Catbird MLS Server");
 
+    // Initialize metrics
+    let metrics_recorder = metrics::MetricsRecorder::new();
+    let metrics_handle = metrics_recorder.handle().clone();
+    tracing::info!("Metrics initialized");
+
     // Initialize database
-    let db_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "sqlite::memory:".to_string());
-    let db_pool = storage::init_db(&db_url).await?;
+    let db_pool = db::init_db_default().await?;
     
     tracing::info!("Database initialized");
 
     // Build application router
-    let app = Router::new()
-        .route("/health", get(health_check))
+    let metrics_router = Router::new()
+        .route("/metrics", get(metrics::metrics_handler))
+        .with_state(metrics_handle);
+    
+    let mut base_router = Router::new()
+        // Health check endpoints
+        .route("/health", get(health::health))
+        .route("/health/live", get(health::liveness))
+        .route("/health/ready", get(health::readiness))
         // XRPC routes under /xrpc namespace
         .route("/xrpc/blue.catbird.mls.createConvo", post(handlers::create_convo))
         .route("/xrpc/blue.catbird.mls.addMembers", post(handlers::add_members))
         .route("/xrpc/blue.catbird.mls.sendMessage", post(handlers::send_message))
         .route("/xrpc/blue.catbird.mls.leaveConvo", post(handlers::leave_convo))
         .route("/xrpc/blue.catbird.mls.getMessages", get(handlers::get_messages))
-        .route("/xrpc/blue.catbird.mls.publishKeyPackage", post(handlers::publish_keypackage))
-        .route("/xrpc/blue.catbird.mls.getKeyPackages", get(handlers::get_keypackages))
+        .route("/xrpc/blue.catbird.mls.publishKeyPackage", post(handlers::publish_key_package))
+        .route("/xrpc/blue.catbird.mls.getKeyPackages", get(handlers::get_key_packages))
         .route("/xrpc/blue.catbird.mls.uploadBlob", post(handlers::upload_blob))
-        .layer(TraceLayer::new_for_http())
-        .with_state(db_pool);
+        .merge(metrics_router)
+        .layer(TraceLayer::new_for_http());
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
+    // Optional: developer-only direct XRPC proxy (off by default).
+    if matches!(std::env::var("ENABLE_DIRECT_XRPC_PROXY").as_deref(), Ok("1") | Ok("true") | Ok("TRUE")) {
+        let upstream = std::env::var("UPSTREAM_XRPC_BASE").unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
+        let proxy_state = xrpc_proxy::ProxyState { client: reqwest::Client::new(), base: upstream };
+        let proxy_router = Router::new()
+            .route("/xrpc/*rest", any(xrpc_proxy::proxy))
+            .with_state(proxy_state);
+        base_router = base_router.merge(proxy_router);
+        tracing::warn!("ENABLE_DIRECT_XRPC_PROXY is enabled; forward-all /xrpc/* is active");
+    }
+    let app = base_router.with_state(db_pool);
+
+    let port = std::env::var("SERVER_PORT")
+        .unwrap_or_else(|_| "8080".to_string())
+        .parse::<u16>()
+        .unwrap_or(8080);
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     tracing::info!("Server listening on {}", addr);
     
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
 
     Ok(())
-}
-
-async fn health_check() -> &'static str {
-    "OK"
 }

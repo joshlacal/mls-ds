@@ -1,0 +1,14 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: catbird-mls-config
+  namespace: catbird
+data:
+  RUST_LOG: "info"
+  SERVER_PORT: "3000"
+  DATABASE_HOST: "postgres-service"
+  DATABASE_PORT: "5432"
+  DATABASE_NAME: "catbird"
+  REDIS_HOST: "redis-service"
+  REDIS_PORT: "6379"

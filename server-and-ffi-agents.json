@@ -1,0 +1,14 @@
+{
+  "agents": [
+    {
+      "name": "rust-ffi-linker",
+      "task": "Build the Rust FFI library and link it to catbird-mls Xcode project. Steps: 1) Navigate to /Users/joshlacalamito/Developer/Catbird+Petrel/mls/mls-ffi and build the iOS static library using 'cargo build --release --target aarch64-apple-ios' and 'cargo build --release --target x86_64-apple-ios-sim'. 2) Create universal library using lipo for both simulator and device architectures. 3) Copy the generated libmls_ffi.a and mls_ffi.h to catbird-mls/Libs/ directory. 4) Update catbird-mls Xcode project to link the static library: add to 'Link Binary With Libraries' build phase, set library search paths, and create/update bridging header to import mls_ffi.h. 5) Remove MLSFFIStubs.swift from Xcode project (no longer needed). 6) Verify the project builds successfully with real FFI. Document all steps and any issues encountered.",
+      "approval": "--allow-all-tools"
+    },
+    {
+      "name": "server-builder",
+      "task": "Build and run the MLS Rust server on localhost for testing. Steps: 1) Navigate to /Users/joshlacalamito/Developer/Catbird+Petrel/mls/server. 2) Check Cargo.toml dependencies and ensure all are compatible. 3) Run 'cargo build' to compile the server (fix any compilation errors). 4) Set up local PostgreSQL database: create database 'mls_dev', run migrations from migrations/ directory using 'sqlx migrate run'. 5) Create .env file with DATABASE_URL=postgresql://localhost/mls_dev, REDIS_URL=redis://localhost:6379, SERVER_PORT=8080, JWT_SECRET=test_secret. 6) Start Redis if not running: 'redis-server &' (or check if already running). 7) Run the server: 'cargo run --release'. 8) Test health endpoint: 'curl http://localhost:8080/health'. 9) Document the server status, any errors encountered, and how to start/stop the server. Create a SERVER_SETUP.md guide.",
+      "approval": "--allow-all-tools"
+    }
+  ]
+}

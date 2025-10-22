@@ -11,6 +11,18 @@ pub struct Conversation {
     pub title: Option<String>,
 }
 
+impl Conversation {
+    pub fn new(creator_did: String, title: Option<String>) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            creator_did,
+            current_epoch: 0,
+            created_at: Utc::now(),
+            title,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Membership {
     pub convo_id: String,
@@ -18,6 +30,12 @@ pub struct Membership {
     pub joined_at: DateTime<Utc>,
     pub left_at: Option<DateTime<Utc>>,
     pub unread_count: i32,
+}
+
+impl Membership {
+    pub fn is_active(&self) -> bool {
+        self.left_at.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -31,6 +49,26 @@ pub struct Message {
     pub sent_at: DateTime<Utc>,
 }
 
+impl Message {
+    pub fn new(
+        convo_id: String,
+        sender_did: String,
+        message_type: String,
+        epoch: i32,
+        ciphertext: Vec<u8>,
+    ) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            convo_id,
+            sender_did,
+            message_type,
+            epoch,
+            ciphertext,
+            sent_at: Utc::now(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct KeyPackage {
     pub did: String,
@@ -39,6 +77,12 @@ pub struct KeyPackage {
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub consumed: bool,
+}
+
+impl KeyPackage {
+    pub fn is_valid(&self) -> bool {
+        !self.consumed && self.expires_at > Utc::now()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]

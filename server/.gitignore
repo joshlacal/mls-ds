@@ -1,1 +1,29 @@
 /target
+
+# Environment files with secrets
+.env
+.env.local
+.env.production
+.env.*.local
+
+# Database
+*.db
+*.sqlite
+
+# Backups
+backups/
+*.sql
+*.sql.gz
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

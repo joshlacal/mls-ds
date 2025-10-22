@@ -1,0 +1,81 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: catbird-postgres
+    environment:
+      POSTGRES_DB: catbird
+      POSTGRES_USER: catbird
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sh:/docker-entrypoint-initdb.d/init-db.sh
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U catbird"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - catbird-network
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: catbird-redis
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-changeme}
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - catbird-network
+    restart: unless-stopped
+
+  mls-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: catbird-mls-server
+    environment:
+      DATABASE_URL: postgresql://catbird:${POSTGRES_PASSWORD:-changeme}@postgres:5432/catbird
+      REDIS_URL: redis://:${REDIS_PASSWORD:-changeme}@redis:6379
+      RUST_LOG: ${RUST_LOG:-info}
+      JWT_SECRET: ${JWT_SECRET:-your-secret-key-change-in-production}
+      SERVER_PORT: 3000
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - catbird-network
+    restart: unless-stopped
+    volumes:
+      - ./migrations:/app/migrations:ro
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  catbird-network:
+    driver: bridge

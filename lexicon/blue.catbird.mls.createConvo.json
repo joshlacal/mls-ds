@@ -4,21 +4,49 @@
   "defs": {
     "main": {
       "type": "procedure",
-      "description": "Create a new private conversation (MLS group).",
+      "description": "Create a new MLS conversation",
       "input": {
         "encoding": "application/json",
         "schema": {
           "type": "object",
+          "required": ["cipherSuite"],
           "properties": {
-            "didList": {
-              "type": "array",
-              "items": { "type": "string", "format": "did" },
-              "description": "Optional initial invitee DIDs"
+            "cipherSuite": {
+              "type": "ref",
+              "ref": "blue.catbird.mls.defs#cipherSuiteEnum",
+              "description": "MLS cipher suite to use"
             },
-            "title": { 
-              "type": "string", 
+            "initialMembers": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "format": "did"
+              },
+              "description": "DIDs of initial members to add",
               "maxLength": 100,
-              "description": "Optional conversation title"
+              "minLength": 0
+            },
+            "metadata": {
+              "type": "object",
+              "description": "Optional conversation metadata",
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "maxLength": 128,
+                  "description": "Conversation name"
+                },
+                "description": {
+                  "type": "string",
+                  "maxLength": 512,
+                  "description": "Conversation description"
+                },
+                "avatar": {
+                  "type": "blob",
+                  "accept": ["image/png", "image/jpeg", "image/webp"],
+                  "maxSize": 1000000,
+                  "description": "Conversation avatar (max 1MB)"
+                }
+              }
             }
           }
         }
@@ -26,10 +54,50 @@
       "output": {
         "encoding": "application/json",
         "schema": {
-          "type": "ref",
-          "ref": "blue.catbird.mls.defs#convoView"
+          "type": "object",
+          "required": ["convo", "welcomeMessages"],
+          "properties": {
+            "convo": {
+              "type": "ref",
+              "ref": "blue.catbird.mls.defs#convoView",
+              "description": "Created conversation view"
+            },
+            "welcomeMessages": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["did", "welcome"],
+                "properties": {
+                  "did": {
+                    "type": "string",
+                    "format": "did",
+                    "description": "Member DID"
+                  },
+                  "welcome": {
+                    "type": "string",
+                    "description": "Base64-encoded MLS Welcome message"
+                  }
+                }
+              },
+              "description": "Welcome messages for initial members"
+            }
+          }
         }
-      }
+      },
+      "errors": [
+        {
+          "name": "InvalidCipherSuite",
+          "description": "Unsupported cipher suite"
+        },
+        {
+          "name": "KeyPackageNotFound",
+          "description": "Key package not found for one or more members"
+        },
+        {
+          "name": "TooManyMembers",
+          "description": "Too many initial members specified"
+        }
+      ]
     }
   }
 }

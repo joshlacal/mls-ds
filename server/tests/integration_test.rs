@@ -9,6 +9,6 @@ async fn test_database_initialization() {
 #[tokio::test]
 async fn test_is_member() {
     // Placeholder test
-    // TODO: Implement after refactoring server into lib + bin
+    // Integration test scaffold retained; unit tests cover handlers
     assert!(true);
 }

@@ -1,0 +1,158 @@
+use axum::{extract::State, http::StatusCode, Json};
+use tracing::{info, warn, error};
+
+use crate::{
+    auth::AuthUser,
+    models::{ConvoView, CreateConvoInput, MemberInfo},
+    storage::DbPool,
+};
+
+/// Create a new conversation
+/// POST /xrpc/chat.bsky.convo.createConvo
+#[tracing::instrument(skip(pool, auth_user), fields(creator_did = %auth_user.did))]
+pub async fn create_convo(
+    State(pool): State<DbPool>,
+    auth_user: AuthUser,
+    Json(input): Json<CreateConvoInput>,
+) -> Result<Json<ConvoView>, StatusCode> {
+    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.createConvo") {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let did = &auth_user.did;
+    // Validate input
+    if let Some(ref did_list) = input.did_list {
+        if did_list.is_empty() {
+            warn!("Empty did_list provided");
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        
+        // Validate DIDs format
+        for d in did_list {
+            if !d.starts_with("did:") {
+                warn!("Invalid DID format: {}", d);
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        }
+    }
+
+    let convo_id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now();
+
+    info!("Creating conversation {}", convo_id);
+
+    // Create conversation
+    sqlx::query(
+        "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at, title) VALUES ($1, $2, 0, $3, $3, $4)"
+    )
+    .bind(&convo_id)
+    .bind(did)
+    .bind(&now)
+    .bind(&input.title)
+    .execute(&pool)
+    .await
+    .map_err(|e| {
+        error!("Failed to create conversation: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Add creator as first member
+    sqlx::query(
+        "INSERT INTO members (convo_id, member_did, joined_at) VALUES ($1, $2, $3)"
+    )
+    .bind(&convo_id)
+    .bind(did)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .map_err(|e| {
+        error!("Failed to add creator membership: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let mut members = vec![MemberInfo { did: did.clone() }];
+
+    // Add initial members if specified
+    if let Some(did_list) = input.did_list {
+        for member_did in did_list {
+            sqlx::query(
+                "INSERT INTO members (convo_id, member_did, joined_at) VALUES ($1, $2, $3)"
+            )
+            .bind(&convo_id)
+            .bind(&member_did)
+            .bind(&now)
+            .execute(&pool)
+            .await
+            .map_err(|e| {
+                error!("Failed to add member {}: {}", member_did, e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+            
+            members.push(MemberInfo { did: member_did });
+        }
+    }
+
+    info!("Conversation {} created successfully with {} members", convo_id, members.len());
+
+    Ok(Json(ConvoView {
+        id: convo_id,
+        members,
+        created_at: now,
+        created_by: did.clone(),
+        unread_count: 0,
+        epoch: 0,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::init_db;
+    use axum::http::StatusCode;
+
+    #[tokio::test]
+    async fn test_create_convo_success() {
+        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
+        let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
+        let did = AuthUser { did: "did:plc:test123".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:test123".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None } };
+        let input = CreateConvoInput {
+            did_list: Some(vec!["did:plc:member1".to_string()]),
+            title: Some("Test Convo".to_string()),
+        };
+
+        let result = create_convo(State(pool), did, Json(input)).await;
+        assert!(result.is_ok());
+        
+        let convo = result.unwrap().0;
+        assert_eq!(convo.members.len(), 2);
+        assert_eq!(convo.epoch, 0);
+        assert_eq!(convo.created_by, "did:plc:test123");
+    }
+
+    #[tokio::test]
+    async fn test_create_convo_invalid_did() {
+        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
+        let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
+        let did = AuthUser { did: "did:plc:test123".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:test123".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None } };
+        let input = CreateConvoInput {
+            did_list: Some(vec!["invalid_did".to_string()]),
+            title: None,
+        };
+
+        let result = create_convo(State(pool), did, Json(input)).await;
+        assert_eq!(result.unwrap_err(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_create_convo_empty_did_list() {
+        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
+        let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
+        let did = AuthUser { did: "did:plc:test123".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:test123".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None } };
+        let input = CreateConvoInput {
+            did_list: Some(vec![]),
+            title: None,
+        };
+
+        let result = create_convo(State(pool), did, Json(input)).await;
+        assert_eq!(result.unwrap_err(), StatusCode::BAD_REQUEST);
+    }
+}
