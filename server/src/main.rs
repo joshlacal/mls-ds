@@ -58,6 +58,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/xrpc/blue.catbird.mls.sendMessage", post(handlers::send_message))
         .route("/xrpc/blue.catbird.mls.leaveConvo", post(handlers::leave_convo))
         .route("/xrpc/blue.catbird.mls.getMessages", get(handlers::get_messages))
+        .route("/xrpc/blue.catbird.mls.getConvos", get(handlers::get_convos))
         .route("/xrpc/blue.catbird.mls.publishKeyPackage", post(handlers::publish_key_package))
         .route("/xrpc/blue.catbird.mls.getKeyPackages", get(handlers::get_key_packages))
         .route("/xrpc/blue.catbird.mls.uploadBlob", post(handlers::upload_blob))
