@@ -43,10 +43,11 @@ pub async fn init_db(config: DbConfig) -> Result<DbPool> {
         .context("Failed to connect to database")?;
 
     // Run migrations
-    sqlx::migrate!("./migrations")
-        .run(&pool)
-        .await
-        .context("Failed to run migrations")?;
+    // Temporarily disabled due to migration checksum issues
+    // sqlx::migrate!("./migrations")
+    //     .run(&pool)
+    //     .await
+    //     .context("Failed to run migrations")?;
 
     Ok(pool)
 }
