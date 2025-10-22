@@ -267,26 +267,89 @@ async fn verify_jwt(&self, token: &str) -> Result<AtProtoClaims, AuthError> {
         // ES256K: secp256k1 ECDSA (R||S)
         "ES256K" => {
             use k256::ecdsa::{signature::Verifier, VerifyingKey, Signature};
-            use k256::EncodedPoint;
             let did_doc = self.resolve_did(&claims.iss).await?;
             let vm = did_doc.verification_method.first().ok_or(AuthError::MissingVerificationMethod)?;
-            let jwk = vm.public_key_jwk.as_ref().ok_or(AuthError::MissingVerificationMethod)?;
-            if jwk.kty != "EC" { return Err(AuthError::UnsupportedKeyType(format!("Expected EC, got {}", jwk.kty))); }
-            let crv = jwk.crv.to_ascii_lowercase();
-            if crv != "secp256k1" && crv != "k-256" && crv != "p-256k" { return Err(AuthError::UnsupportedKeyType(format!("Expected secp256k1, got {}", jwk.crv))); }
-            let x = URL_SAFE_NO_PAD.decode(&jwk.x).map_err(|e| AuthError::InvalidToken(format!("bad jwk.x: {}", e)))?;
-            let y = URL_SAFE_NO_PAD.decode(jwk.y.as_ref().ok_or_else(|| AuthError::MissingVerificationMethod)?)
-                .map_err(|e| AuthError::InvalidToken(format!("bad jwk.y: {}", e)))?;
-            let ep = EncodedPoint::from_affine_coordinates(p256::FieldBytes::from_slice(&x), p256::FieldBytes::from_slice(&y), false);
-            let vk = VerifyingKey::from_encoded_point(&ep).map_err(|_| AuthError::InvalidToken("invalid secp256k1 point".into()))?;
-            let sig_bytes = URL_SAFE_NO_PAD.decode(parts[2]).map_err(|e| AuthError::InvalidToken(format!("Invalid b64 sig: {}", e)))?;
-            let sig = Signature::from_slice(&sig_bytes).map_err(|_| AuthError::InvalidToken("invalid ES256K signature".into()))?;
-            vk.verify(signing_input.as_bytes(), &sig).map_err(|_| AuthError::InvalidSignature)?;
+            
+            // Extract public key from either Multikey or JWK format
+            let key_bytes = Self::extract_secp256k1_key(vm)?;
+            
+            // Create verifying key from the public key bytes
+            let vk = VerifyingKey::from_sec1_bytes(&key_bytes)
+                .map_err(|e| AuthError::InvalidToken(format!("invalid secp256k1 key: {}", e)))?;
+            
+            // Decode and verify signature
+            let sig_bytes = URL_SAFE_NO_PAD.decode(parts[2])
+                .map_err(|e| AuthError::InvalidToken(format!("Invalid b64 sig: {}", e)))?;
+            let sig = Signature::from_slice(&sig_bytes)
+                .map_err(|_| AuthError::InvalidToken("invalid ES256K signature".into()))?;
+            
+            vk.verify(signing_input.as_bytes(), &sig)
+                .map_err(|_| AuthError::InvalidSignature)?;
+            
             Ok(claims)
         }
         other => Err(AuthError::UnsupportedKeyType(format!("Unsupported alg: {}", other))),
     }
 }
+
+    /// Extract secp256k1 public key bytes from DID verification method
+    /// Supports both JWK and Multikey formats
+    fn extract_secp256k1_key(vm: &VerificationMethod) -> Result<Vec<u8>, AuthError> {
+        // Try Multikey format first (newer AT Protocol standard)
+        if let Some(multibase) = &vm.public_key_multibase {
+            return Self::decode_multikey_secp256k1(multibase);
+        }
+        
+        // Fall back to JWK format (older)
+        if let Some(jwk) = &vm.public_key_jwk {
+            if jwk.kty != "EC" {
+                return Err(AuthError::UnsupportedKeyType(format!("Expected EC, got {}", jwk.kty)));
+            }
+            let crv = jwk.crv.to_ascii_lowercase();
+            if crv != "secp256k1" && crv != "k-256" && crv != "p-256k" {
+                return Err(AuthError::UnsupportedKeyType(format!("Expected secp256k1, got {}", jwk.crv)));
+            }
+            
+            let x = URL_SAFE_NO_PAD.decode(&jwk.x)
+                .map_err(|e| AuthError::InvalidToken(format!("bad jwk.x: {}", e)))?;
+            let y = URL_SAFE_NO_PAD.decode(jwk.y.as_ref().ok_or_else(|| AuthError::MissingVerificationMethod)?)
+                .map_err(|e| AuthError::InvalidToken(format!("bad jwk.y: {}", e)))?;
+            
+            // Uncompressed point: 0x04 || x || y
+            let mut key_bytes = Vec::with_capacity(65);
+            key_bytes.push(0x04);
+            key_bytes.extend_from_slice(&x);
+            key_bytes.extend_from_slice(&y);
+            return Ok(key_bytes);
+        }
+        
+        Err(AuthError::MissingVerificationMethod)
+    }
+
+    /// Decode a Multikey format public key for secp256k1
+    /// Format: multibase(multicodec || public_key_bytes)
+    /// For secp256k1: multicodec = 0xe7 0x01 (varint encoded 0xe7 = secp256k1-pub)
+    fn decode_multikey_secp256k1(multibase_str: &str) -> Result<Vec<u8>, AuthError> {
+        // Decode multibase (z prefix = base58btc)
+        let (_base, bytes) = multibase::decode(multibase_str)
+            .map_err(|e| AuthError::InvalidToken(format!("multibase decode failed: {}", e)))?;
+        
+        // Check multicodec prefix for secp256k1-pub (0xe7, varint encoded as 0xe7 0x01)
+        if bytes.len() < 2 {
+            return Err(AuthError::InvalidToken("multikey too short".into()));
+        }
+        
+        // secp256k1-pub multicodec: 0xe7 0x01
+        if bytes[0] == 0xe7 && bytes[1] == 0x01 {
+            // Compressed or uncompressed public key follows
+            Ok(bytes[2..].to_vec())
+        } else {
+            Err(AuthError::UnsupportedKeyType(format!(
+                "Expected secp256k1-pub multicodec (0xe7 0x01), got {:02x} {:02x}",
+                bytes[0], bytes.get(1).unwrap_or(&0)
+            )))
+        }
+    }
 
 /// Resolve DID document with caching
     async fn resolve_did(&self, did: &str) -> Result<DidDocument, AuthError> {
@@ -456,17 +519,28 @@ where
     type Rejection = AuthError;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        // Log all headers for debugging
+        tracing::debug!("Incoming headers: {:?}", parts.headers);
+        
         // Extract authorization header
         let auth_header = parts
             .headers
             .get("authorization")
             .and_then(|v| v.to_str().ok())
-            .ok_or(AuthError::MissingAuthHeader)?;
+            .ok_or_else(|| {
+                tracing::error!("Missing authorization header");
+                AuthError::MissingAuthHeader
+            })?;
+
+        tracing::debug!("Authorization header found: {}", auth_header);
 
         // Parse bearer token
         let token = auth_header
             .strip_prefix("Bearer ")
-            .ok_or(AuthError::InvalidAuthFormat)?;
+            .ok_or_else(|| {
+                tracing::error!("Invalid auth format - expected 'Bearer <token>'");
+                AuthError::InvalidAuthFormat
+            })?;
 
         // Get or create auth middleware (in production, this should be passed via state)
         let middleware = AuthMiddleware::new();
