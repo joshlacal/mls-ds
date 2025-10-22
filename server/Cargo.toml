@@ -36,6 +36,11 @@ multibase = "0.9"
 # Auth/JWT
 jsonwebtoken = "9"
 
+# ATProto/Atrium
+atrium-api = "0.25"
+atrium-xrpc = "0.12"
+atrium-xrpc-client = "0.5"
+
 # HTTP client (for DID resolution)
 reqwest = { version = "0.11", features = ["json"] }
 
