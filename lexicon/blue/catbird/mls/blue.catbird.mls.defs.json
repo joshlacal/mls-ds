@@ -35,9 +35,16 @@
           "description": "Current MLS epoch number"
         },
         "cipherSuite": {
-          "type": "ref",
-          "ref": "#cipherSuiteEnum",
-          "description": "MLS cipher suite used"
+          "type": "string",
+          "description": "MLS cipher suite used",
+          "enum": [
+            "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519",
+            "MLS_128_DHKEMP256_AES128GCM_SHA256_P256",
+            "MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519",
+            "MLS_256_DHKEMX448_AES256GCM_SHA512_Ed448",
+            "MLS_256_DHKEMP521_AES256GCM_SHA512_P521",
+            "MLS_256_DHKEMX448_CHACHA20POLY1305_SHA512_Ed448"
+          ]
         },
         "createdAt": {
           "type": "string",
