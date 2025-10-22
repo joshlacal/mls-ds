@@ -1,6 +1,7 @@
 {
   "lexicon": 1,
   "id": "blue.catbird.mls.createConvo",
+  "description": "Create a new MLS conversation with optional initial members and metadata",
   "defs": {
     "main": {
       "type": "procedure",
@@ -13,8 +14,8 @@
           "properties": {
             "cipherSuite": {
               "type": "string",
-              "description": "MLS cipher suite to use",
-              "enum": [
+              "description": "MLS cipher suite to use for this conversation",
+              "knownValues": [
                 "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519",
                 "MLS_128_DHKEMP256_AES128GCM_SHA256_P256",
                 "MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519",
@@ -29,31 +30,14 @@
                 "type": "string",
                 "format": "did"
               },
-              "description": "DIDs of initial members to add",
+              "description": "DIDs of initial members to add to the conversation",
               "maxLength": 100,
               "minLength": 0
             },
             "metadata": {
-              "type": "object",
-              "description": "Optional conversation metadata",
-              "properties": {
-                "name": {
-                  "type": "string",
-                  "maxLength": 128,
-                  "description": "Conversation name"
-                },
-                "description": {
-                  "type": "string",
-                  "maxLength": 512,
-                  "description": "Conversation description"
-                },
-                "avatar": {
-                  "type": "blob",
-                  "accept": ["image/png", "image/jpeg", "image/webp"],
-                  "maxSize": 1000000,
-                  "description": "Conversation avatar (max 1MB)"
-                }
-              }
+              "type": "ref",
+              "ref": "#metadataInput",
+              "description": "Optional conversation metadata (name, description, avatar)"
             }
           }
         }
@@ -68,17 +52,38 @@
       "errors": [
         {
           "name": "InvalidCipherSuite",
-          "description": "Unsupported cipher suite"
+          "description": "The specified cipher suite is not supported"
         },
         {
           "name": "KeyPackageNotFound",
-          "description": "Key package not found for one or more members"
+          "description": "Key package not found for one or more initial members"
         },
         {
           "name": "TooManyMembers",
-          "description": "Too many initial members specified"
+          "description": "Too many initial members specified (max 100)"
         }
       ]
+    },
+    "metadataInput": {
+      "type": "object",
+      "description": "Input metadata for conversation creation",
+      "properties": {
+        "name": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Conversation display name"
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 512,
+          "description": "Conversation description"
+        },
+        "avatar": {
+          "type": "ref",
+          "ref": "blue.catbird.mls.defs#blobRef",
+          "description": "Conversation avatar image reference (upload via uploadBlob first)"
+        }
+      }
     }
   }
 }
