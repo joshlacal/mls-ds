@@ -1,0 +1,144 @@
+================================================================================
+          MLS AT PROTOCOL SERVICE - DEPLOYMENT COMPLETE! 🎉
+================================================================================
+
+✅ Your MLS server is configured as an AT Protocol service!
+
+SERVICE INFORMATION
+-------------------
+URL:        https://mls.catbird.blue
+DID:        did:web:mls.catbird.blue
+Type:       AtprotoMlsService
+Service ID: #atproto_mls
+
+ENDPOINTS
+---------
+DID Document:   https://mls.catbird.blue/.well-known/did.json
+Health Check:   https://mls.catbird.blue/health
+XRPC Prefix:    https://mls.catbird.blue/xrpc/blue.catbird.mls.*
+
+ATPROTO SERVICE PROXY
+---------------------
+Clients can access this service through their PDS using the proxy header:
+
+  atproto-proxy: did:web:mls.catbird.blue#atproto_mls
+
+The PDS will:
+  1. Authenticate the user
+  2. Resolve your service DID
+  3. Create inter-service JWT (signed with user's key)
+  4. Forward request to your service
+
+EXAMPLE USAGE
+-------------
+# Via PDS proxy
+curl -X POST https://user-pds.example.com/xrpc/blue.catbird.mls.createConvo \
+  -H "Authorization: Bearer <user-token>" \
+  -H "atproto-proxy: did:web:mls.catbird.blue#atproto_mls" \
+  -H "Content-Type: application/json" \
+  -d '{"title":"Secure Chat","members":["did:plc:user1"]}'
+
+AVAILABLE XRPC METHODS
+----------------------
+  blue.catbird.mls.createConvo       - Create conversation
+  blue.catbird.mls.addMembers        - Add members
+  blue.catbird.mls.sendMessage       - Send encrypted message
+  blue.catbird.mls.getMessages       - Get messages
+  blue.catbird.mls.publishKeyPackage - Upload key package
+  blue.catbird.mls.getKeyPackages    - Fetch key packages
+  blue.catbird.mls.leaveConvo        - Leave conversation
+  blue.catbird.mls.uploadBlob        - Upload attachment
+
+AUTHENTICATION
+--------------
+Your server accepts:
+  ✓ Inter-service JWTs (from PDS proxies)
+  ✓ Direct access JWTs (for testing)
+
+Inter-service JWT validated by:
+  - User's DID signing key (from their DID document)
+  - aud field must be: did:web:mls.catbird.blue
+  - Short expiration (60s recommended)
+  - Optional lxm field for method-specific auth
+
+QUICK TESTS
+-----------
+# Test health
+curl https://mls.catbird.blue/health
+
+# Test DID document
+curl https://mls.catbird.blue/.well-known/did.json
+
+# View logs
+tail -f /home/ubuntu/mls/server.log
+
+DNS SETUP NEEDED
+----------------
+Add this A record at your DNS provider:
+
+  Type:  A
+  Name:  mls
+  Value: 51.81.33.144
+  TTL:   300
+
+Then install SSL:
+  sudo certbot --nginx -d mls.catbird.blue
+
+CONFIGURATION FILES
+-------------------
+Nginx Config:    /etc/nginx/sites-available/mls.catbird.blue
+Server Env:      /home/ubuntu/mls/server/.env
+DID Document:    /home/ubuntu/mls/.well-known/did.json
+Server Binary:   /home/ubuntu/mls/target/release/catbird-server
+Server Logs:     /home/ubuntu/mls/server.log
+
+SERVER MANAGEMENT
+-----------------
+# Stop
+pkill -f catbird-server
+
+# Start
+cd /home/ubuntu/mls/server && \
+/home/ubuntu/mls/target/release/catbird-server > /home/ubuntu/mls/server.log 2>&1 &
+
+# Status
+ps aux | grep catbird-server
+
+DOCUMENTATION
+-------------
+ATPROTO_SERVICE_SETUP.md  - Complete AT Protocol integration guide
+SETUP_COMPLETE.md         - General setup documentation
+TESTING_GUIDE.md          - API testing examples
+EXTERNAL_ACCESS.md        - DNS and SSL setup
+
+CRYPTOGRAPHIC KEYS
+------------------
+Private Key:    /home/ubuntu/mls/did_key.pem (ED25519)
+Public Key:     zWo9ufkfcQw8iA4yO-6XCwv0XhfGN1AmV01jJ0K5rmpc
+DID:            did:web:mls.catbird.blue
+
+SECURITY NOTES
+--------------
+⚠️  Current setup is for TESTING/DEVELOPMENT
+
+Before production:
+  ✓ Set up DNS (mls.catbird.blue -> 51.81.33.144)
+  ✓ Install SSL certificate with certbot
+  ✓ Change JWT_SECRET in .env
+  ✓ Enable rate limiting
+  ✓ Set up monitoring
+  ✓ Implement proper JWT validation
+  ✓ Test inter-service auth flow
+
+NEXT STEPS
+----------
+1. Configure DNS at your provider
+2. Install SSL certificate
+3. Test from external network
+4. Configure PDS to proxy to this service
+5. Test end-to-end flow with real clients
+
+================================================================================
+Setup completed: $(date)
+Service Status: ✅ OPERATIONAL (local testing)
+================================================================================

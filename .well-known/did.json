@@ -1,0 +1,22 @@
+{
+  "@context": [
+    "https://www.w3.org/ns/did/v1",
+    "https://w3id.org/security/multikey/v1"
+  ],
+  "id": "did:web:mls.catbird.blue",
+  "verificationMethod": [
+    {
+      "id": "did:web:mls.catbird.blue#atproto",
+      "type": "Multikey",
+      "controller": "did:web:mls.catbird.blue",
+      "publicKeyMultibase": "zWo9ufkfcQw8iA4yO-6XCwv0XhfGN1AmV01jJ0K5rmpc"
+    }
+  ],
+  "service": [
+    {
+      "id": "#atproto_mls",
+      "type": "AtprotoMlsService",
+      "serviceEndpoint": "https://mls.catbird.blue"
+    }
+  ]
+}
