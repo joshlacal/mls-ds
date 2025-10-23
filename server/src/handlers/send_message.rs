@@ -29,18 +29,17 @@ pub async fn send_message(
     let did = &auth_user.did;
 
     // Validate ExternalAsset payload
-    if let Err(e) = crate::util::asset_validate::validate_external_asset(&input.payload) {
+    let config = crate::util::asset_validate::AssetValidationConfig::default();
+    if let Err(e) = crate::util::asset_validate::validate_asset(&input.payload, &config) {
         warn!("Invalid ExternalAsset: {}", e);
         return Err(StatusCode::BAD_REQUEST);
     }
 
     // Validate attachments if present
     if let Some(ref attachments) = input.attachments {
-        for (idx, attachment) in attachments.iter().enumerate() {
-            if let Err(e) = crate::util::asset_validate::validate_external_asset(attachment) {
-                warn!("Invalid attachment at index {}: {}", idx, e);
-                return Err(StatusCode::BAD_REQUEST);
-            }
+        if let Err(e) = crate::util::asset_validate::validate_assets(attachments, &config, 10) {
+            warn!("Invalid attachments: {}", e);
+            return Err(StatusCode::BAD_REQUEST);
         }
     }
 

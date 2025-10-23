@@ -1,0 +1,37 @@
+# Simple Dockerfile using pre-built binary
+FROM debian:bookworm-slim
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    libpq5 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN useradd -m -u 1000 -s /bin/bash catbird
+
+WORKDIR /app
+
+# Copy pre-built binary
+COPY catbird-server /app/catbird-server
+
+# Copy migrations
+COPY migrations /app/migrations
+
+# Set ownership and make binary executable
+RUN chown -R catbird:catbird /app && \
+    chmod +x /app/catbird-server
+
+USER catbird
+
+# Expose port
+EXPOSE 3000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:3000/health || exit 1
+
+# Run the application
+CMD ["/app/catbird-server"]

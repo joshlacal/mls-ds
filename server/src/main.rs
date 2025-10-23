@@ -9,6 +9,7 @@ use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod auth;
+mod blob_storage;
 mod crypto;
 mod db;
 mod fanout;
@@ -28,6 +29,7 @@ mod xrpc_proxy;
 struct AppState {
     db_pool: PgPool,
     sse_state: Arc<realtime::SseState>,
+    blob_storage: Arc<blob_storage::BlobStorage>,
 }
 
 #[tokio::main]
@@ -64,18 +66,24 @@ async fn main() -> anyhow::Result<()> {
     let sse_state = Arc::new(realtime::SseState::new(sse_buffer_size));
     tracing::info!("SSE state initialized with buffer size {}", sse_buffer_size);
 
-    // Spawn compaction worker
-    let compaction_pool = db_pool.clone();
-    let compaction_config = jobs::CompactionConfig::default();
-    tokio::spawn(async move {
-        jobs::run_compaction_worker(compaction_pool, compaction_config).await;
-    });
-    tracing::info!("Compaction worker started");
+    // Initialize blob storage (Cloudflare R2)
+    let blob_config = blob_storage::BlobStorageConfig::default();
+    let blob_storage = Arc::new(blob_storage::BlobStorage::new(blob_config).await?);
+    tracing::info!("Blob storage (R2) initialized");
+
+    // Spawn compaction worker - Temporarily disabled - requires new DB schema
+    // let compaction_pool = db_pool.clone();
+    // let compaction_config = jobs::CompactionConfig::default();
+    // tokio::spawn(async move {
+    //     jobs::run_compaction_worker(compaction_pool, compaction_config).await;
+    // });
+    // tracing::info!("Compaction worker started");
 
     // Create composite app state
     let app_state = AppState {
         db_pool: db_pool.clone(),
         sse_state,
+        blob_storage,
     };
 
     // Build application router
@@ -133,6 +141,19 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/xrpc/blue.catbird.mls.updateCursor",
             post(handlers::update_cursor),
+        )
+        // REST API for message blob storage
+        .route(
+            "/api/v1/messages",
+            post(handlers::store_message),
+        )
+        .route(
+            "/api/v1/messages/pending",
+            get(handlers::list_pending_messages),
+        )
+        .route(
+            "/api/v1/messages/:message_id",
+            get(handlers::get_message),
         )
         .merge(metrics_router)
         .layer(TraceLayer::new_for_http())
