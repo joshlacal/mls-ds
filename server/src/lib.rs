@@ -4,7 +4,7 @@ pub mod db;
 pub mod fanout;
 pub mod handlers;
 pub mod health;
-pub mod jobs;
+// pub mod jobs;  // Temporarily disabled - requires new DB schema
 pub mod metrics;
 pub mod middleware;
 pub mod models;

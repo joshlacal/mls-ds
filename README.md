@@ -276,3 +276,38 @@ MIT
 # This service validates inter-service JWTs (at+jwt) from the PDS when proxying.
 - Set `SERVICE_DID` to this service's DID.
 - Optionally set `PDS_XRPC_BASE` to enable fallback proxying for non-MLS endpoints (disabled by default).
+
+## 🐳 Docker Deployment (Current)
+
+**As of October 23, 2025**, the MLS server now runs using Docker Compose for improved isolation, portability, and management.
+
+### Quick Start
+```bash
+cd /home/ubuntu/mls/server
+sudo docker compose --env-file .env.docker up -d
+```
+
+### Access
+- **Health Check**: http://localhost:3000/health
+- **API Endpoints**: http://localhost:3000/xrpc/*
+
+### Management
+```bash
+# View status
+sudo docker compose ps
+
+# View logs
+sudo docker logs -f catbird-mls-server
+
+# Restart
+sudo docker compose restart
+
+# Stop
+sudo docker compose down
+```
+
+### Documentation
+- 📚 **Full Migration Guide**: [DOCKER_MIGRATION_SUMMARY.md](DOCKER_MIGRATION_SUMMARY.md)
+- ⚡ **Quick Reference**: [DOCKER_QUICKSTART.md](DOCKER_QUICKSTART.md)
+- 📖 **Original Setup Guide**: [SERVER_SETUP.md](SERVER_SETUP.md) (legacy systemd approach)
+

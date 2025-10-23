@@ -28,6 +28,11 @@ serde_bytes = "0.11"
 # Database
 sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "sqlite", "macros", "uuid", "chrono", "migrate"] }
 
+# Object storage (Cloudflare R2)
+aws-sdk-s3 = "1.52"
+aws-config = "1.5"
+aws-credential-types = "1.2"
+
 # MLS
 openmls = "0.5"
 openmls_traits = "0.2"

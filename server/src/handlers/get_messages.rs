@@ -6,7 +6,7 @@ use tracing::{info, warn, error};
 
 use crate::{
     auth::AuthUser,
-    models::{Message, MessageView, MemberInfo},
+    models::{Message, MessageView},
     storage::{is_member, DbPool},
 };
 
@@ -104,12 +104,15 @@ pub async fn get_messages(
         .into_iter()
         .map(|m| MessageView {
             id: m.id,
-            ciphertext: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(m.ciphertext),
+            convo_id: m.convo_id,
+            sender: m.sender_did,
+            payload: None,
+            ciphertext: Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(m.ciphertext)),
             epoch: m.epoch,
-            sender: MemberInfo {
-                did: m.sender_did,
-            },
-            sent_at: m.sent_at,
+            created_at: m.sent_at,
+            content_type: None,
+            attachments: None,
+            reply_uri: None,
         })
         .collect();
 

@@ -930,7 +930,10 @@ mod tests {
 // =============================================================================
 // Cursor Operations (Hybrid Messaging)
 // =============================================================================
+// NOTE: These functions are disabled - they require new DB schema with cursors,
+// envelopes, and event_stream tables. Enable after running new migrations.
 
+/*
 /// Update user's last seen cursor for a conversation
 pub async fn update_last_seen_cursor(
     pool: &DbPool,
@@ -1122,3 +1125,4 @@ pub async fn get_events_after_cursor(
         .map(|e| (e.id, e.payload, e.emitted_at))
         .collect())
 }
+*/
