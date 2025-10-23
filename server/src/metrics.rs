@@ -13,10 +13,7 @@ impl MetricsRecorder {
             .expect("failed to install Prometheus recorder");
 
         // Initialize metrics
-        metrics::describe_counter!(
-            "http_requests_total",
-            "Total number of HTTP requests"
-        );
+        metrics::describe_counter!("http_requests_total", "Total number of HTTP requests");
         metrics::describe_histogram!(
             "http_request_duration_seconds",
             "HTTP request duration in seconds"
@@ -25,10 +22,7 @@ impl MetricsRecorder {
             "database_connections_active",
             "Number of active database connections"
         );
-        metrics::describe_counter!(
-            "database_queries_total",
-            "Total number of database queries"
-        );
+        metrics::describe_counter!("database_queries_total", "Total number of database queries");
         metrics::describe_counter!(
             "mls_messages_sent_total",
             "Total number of MLS messages sent"
@@ -100,6 +94,44 @@ pub fn record_mls_group_created() {
 #[allow(dead_code)]
 pub fn record_mls_member_added() {
     metrics::counter!("mls_members_added_total", 1);
+}
+
+/// Record realtime metrics
+#[allow(dead_code)]
+pub fn record_realtime_queue_depth(convo_id: &str, depth: i64) {
+    metrics::gauge!("realtime_queue_depth", depth as f64, "convo_id" => convo_id.to_string());
+}
+
+#[allow(dead_code)]
+pub fn record_fanout_operation(provider: &str, success: bool) {
+    let status = if success { "success" } else { "error" };
+    metrics::counter!("fanout_operations_total", 1, "provider" => provider.to_string(), "status" => status.to_string());
+}
+
+#[allow(dead_code)]
+pub fn record_envelope_write_duration(convo_id: &str, duration: Duration) {
+    metrics::histogram!("envelope_write_duration_seconds", duration.as_secs_f64(), "convo_id" => convo_id.to_string());
+}
+
+#[allow(dead_code)]
+pub fn record_cursor_operation(operation: &str, success: bool) {
+    let status = if success { "success" } else { "error" };
+    metrics::counter!("cursor_operations_total", 1, "operation" => operation.to_string(), "status" => status.to_string());
+}
+
+#[allow(dead_code)]
+pub fn record_rate_limit_drop(endpoint: &str) {
+    metrics::counter!("rate_limit_drops_total", 1, "endpoint" => endpoint.to_string());
+}
+
+#[allow(dead_code)]
+pub fn record_event_stream_size(size_bytes: i64) {
+    metrics::gauge!("event_stream_size_bytes", size_bytes as f64);
+}
+
+#[allow(dead_code)]
+pub fn record_active_sse_connections(convo_id: &str, count: i64) {
+    metrics::gauge!("active_sse_connections", count as f64, "convo_id" => convo_id.to_string());
 }
 
 /// Update system resource metrics

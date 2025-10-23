@@ -2,7 +2,7 @@ use anyhow::Result;
 use sqlx::PgPool;
 
 // Re-export from db module
-pub use crate::db::{init_db, init_db_default, DbConfig, DbPool};
+pub use crate::db::{init_db, DbConfig, DbPool};
 
 // Legacy compatibility function
 pub async fn init_db_legacy(database_url: &str) -> Result<PgPool> {
