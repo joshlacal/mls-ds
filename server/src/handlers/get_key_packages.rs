@@ -6,7 +6,7 @@ use tracing::{info, warn, error};
 
 use crate::{
     auth::AuthUser,
-    models::{KeyPackage, KeyPackageInfo},
+    models::KeyPackageInfo,
     storage::DbPool,
 };
 

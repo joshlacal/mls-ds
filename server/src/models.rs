@@ -1,6 +1,5 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Conversation {
@@ -186,14 +185,32 @@ pub struct AddMembersOutput {
     pub new_epoch: i32,
 }
 
+// ExternalAsset types for CloudKit architecture
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalAsset {
+    pub provider: String,
+    pub uri: String,
+    #[serde(rename = "mimeType")]
+    pub mime_type: String,
+    pub size: i64,
+    pub sha256: Vec<u8>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SendMessageInput {
     #[serde(rename = "convoId")]
     pub convo_id: String,
-    pub ciphertext: String, // base64url encoded
+    /// ExternalAsset pointer to message payload in CloudKit/external storage
+    pub payload: ExternalAsset,
     pub epoch: i32,
     #[serde(rename = "senderDid")]
     pub sender_did: String,
+    #[serde(rename = "contentType", skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachments: Option<Vec<ExternalAsset>>,
+    #[serde(rename = "replyTo", skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -223,11 +240,26 @@ pub struct LeaveConvoOutput {
 #[derive(Debug, Serialize)]
 pub struct MessageView {
     pub id: String,
-    pub ciphertext: String, // base64url
+    #[serde(rename = "convoId")]
+    pub convo_id: String,
+    pub sender: String, // DID
+    // New: ExternalAsset payload
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Option<ExternalAsset>,
+    // Legacy: direct ciphertext
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ciphertext: Option<String>, // base64url
     pub epoch: i32,
-    pub sender: MemberInfo,
-    #[serde(rename = "sentAt")]
-    pub sent_at: DateTime<Utc>,
+    #[serde(rename = "createdAt")]
+    pub created_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "contentType")]
+    pub content_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachments: Option<Vec<ExternalAsset>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "replyUri")]
+    pub reply_uri: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

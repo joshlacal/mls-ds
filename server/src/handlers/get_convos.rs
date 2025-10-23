@@ -3,7 +3,7 @@ use tracing::{info, error};
 
 use crate::{
     auth::AuthUser,
-    models::{ConvoView, MemberInfo, Membership},
+    models::{ConvoView, Membership},
     storage::DbPool,
 };
 

@@ -4,7 +4,7 @@ use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Transaction};
 use std::time::Duration;
 use uuid::Uuid;
 
-use crate::models::{Blob, Conversation, KeyPackage, Message, Membership};
+use crate::models::{Blob, Conversation, KeyPackage, Membership, Message};
 
 pub type DbPool = PgPool;
 
@@ -158,13 +158,12 @@ pub async fn update_conversation_epoch(
 
 /// Get current epoch for a conversation
 pub async fn get_current_epoch(pool: &DbPool, convo_id: &str) -> Result<i32> {
-    let epoch = sqlx::query_scalar::<_, i32>(
-        "SELECT current_epoch FROM conversations WHERE id = $1",
-    )
-    .bind(convo_id)
-    .fetch_one(pool)
-    .await
-    .context("Failed to get current epoch")?;
+    let epoch =
+        sqlx::query_scalar::<_, i32>("SELECT current_epoch FROM conversations WHERE id = $1")
+            .bind(convo_id)
+            .fetch_one(pool)
+            .await
+            .context("Failed to get current epoch")?;
 
     Ok(epoch)
 }
@@ -185,11 +184,7 @@ pub async fn delete_conversation(pool: &DbPool, convo_id: &str) -> Result<()> {
 // =============================================================================
 
 /// Add a member to a conversation
-pub async fn add_member(
-    pool: &DbPool,
-    convo_id: &str,
-    member_did: &str,
-) -> Result<Membership> {
+pub async fn add_member(pool: &DbPool, convo_id: &str, member_did: &str) -> Result<Membership> {
     let now = Utc::now();
 
     let membership = sqlx::query_as::<_, Membership>(
@@ -452,13 +447,11 @@ pub async fn list_messages_since(
 
 /// Get message count for a conversation
 pub async fn get_message_count(pool: &DbPool, convo_id: &str) -> Result<i64> {
-    let count = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM messages WHERE convo_id = $1",
-    )
-    .bind(convo_id)
-    .fetch_one(pool)
-    .await
-    .context("Failed to get message count")?;
+    let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages WHERE convo_id = $1")
+        .bind(convo_id)
+        .fetch_one(pool)
+        .await
+        .context("Failed to get message count")?;
 
     Ok(count)
 }
@@ -565,13 +558,11 @@ pub async fn consume_key_package(
 
 /// Delete expired key packages
 pub async fn delete_expired_key_packages(pool: &DbPool) -> Result<u64> {
-    let result = sqlx::query(
-        "DELETE FROM key_packages WHERE expires_at < $1",
-    )
-    .bind(Utc::now())
-    .execute(pool)
-    .await
-    .context("Failed to delete expired key packages")?;
+    let result = sqlx::query("DELETE FROM key_packages WHERE expires_at < $1")
+        .bind(Utc::now())
+        .execute(pool)
+        .await
+        .context("Failed to delete expired key packages")?;
 
     Ok(result.rows_affected())
 }
@@ -789,16 +780,19 @@ mod tests {
             idle_timeout: Duration::from_secs(60),
         };
 
-        init_db(config).await.expect("Failed to initialize test database")
+        init_db(config)
+            .await
+            .expect("Failed to initialize test database")
     }
 
     #[tokio::test]
     async fn test_create_and_get_conversation() {
         let pool = setup_test_db().await;
 
-        let conversation = create_conversation(&pool, "did:plc:test123", Some("Test Convo".to_string()))
-            .await
-            .expect("Failed to create conversation");
+        let conversation =
+            create_conversation(&pool, "did:plc:test123", Some("Test Convo".to_string()))
+                .await
+                .expect("Failed to create conversation");
 
         assert_eq!(conversation.creator_did, "did:plc:test123");
         assert_eq!(conversation.title, Some("Test Convo".to_string()));
@@ -881,20 +875,33 @@ mod tests {
         .await
         .expect("Failed to store key package");
 
-        let fetched = get_key_package(&pool, "did:plc:user", "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519")
-            .await
-            .expect("Failed to get key package")
-            .expect("Key package not found");
+        let fetched = get_key_package(
+            &pool,
+            "did:plc:user",
+            "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519",
+        )
+        .await
+        .expect("Failed to get key package")
+        .expect("Key package not found");
 
         assert_eq!(fetched.key_data, key_data);
 
-        consume_key_package(&pool, "did:plc:user", "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519", &key_data)
-            .await
-            .expect("Failed to consume key package");
+        consume_key_package(
+            &pool,
+            "did:plc:user",
+            "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519",
+            &key_data,
+        )
+        .await
+        .expect("Failed to consume key package");
 
-        let consumed = get_key_package(&pool, "did:plc:user", "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519")
-            .await
-            .expect("Failed to get key package");
+        let consumed = get_key_package(
+            &pool,
+            "did:plc:user",
+            "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519",
+        )
+        .await
+        .expect("Failed to get key package");
 
         assert!(consumed.is_none());
     }
@@ -918,4 +925,200 @@ mod tests {
 
         assert_eq!(members.len(), 2);
     }
+}
+
+// =============================================================================
+// Cursor Operations (Hybrid Messaging)
+// =============================================================================
+
+/// Update user's last seen cursor for a conversation
+pub async fn update_last_seen_cursor(
+    pool: &DbPool,
+    user_did: &str,
+    convo_id: &str,
+    cursor: &str,
+) -> Result<()> {
+    sqlx::query!(
+        r#"
+        INSERT INTO cursors (user_did, convo_id, last_seen_cursor, updated_at)
+        VALUES ($1, $2, $3, NOW())
+        ON CONFLICT (user_did, convo_id)
+        DO UPDATE SET 
+            last_seen_cursor = $3,
+            updated_at = NOW()
+        "#,
+        user_did,
+        convo_id,
+        cursor,
+    )
+    .execute(pool)
+    .await
+    .context("Failed to update cursor")?;
+
+    Ok(())
+}
+
+/// Get user's last seen cursor for a conversation
+pub async fn get_last_seen_cursor(
+    pool: &DbPool,
+    user_did: &str,
+    convo_id: &str,
+) -> Result<Option<String>> {
+    let result = sqlx::query!(
+        r#"
+        SELECT last_seen_cursor
+        FROM cursors
+        WHERE user_did = $1 AND convo_id = $2
+        "#,
+        user_did,
+        convo_id,
+    )
+    .fetch_optional(pool)
+    .await
+    .context("Failed to get cursor")?;
+
+    Ok(result.map(|r| r.last_seen_cursor))
+}
+
+// =============================================================================
+// Envelope Operations (Mailbox Fan-out)
+// =============================================================================
+
+/// Create envelope for message delivery
+pub async fn create_envelope(
+    pool: &DbPool,
+    convo_id: &str,
+    recipient_did: &str,
+    message_id: &str,
+    mailbox_provider: &str,
+    cloudkit_zone: Option<&str>,
+) -> Result<String> {
+    let id = Uuid::new_v4().to_string();
+
+    sqlx::query!(
+        r#"
+        INSERT INTO envelopes (id, convo_id, recipient_did, message_id, mailbox_provider, cloudkit_zone, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, NOW())
+        ON CONFLICT (recipient_did, message_id) DO NOTHING
+        RETURNING id
+        "#,
+        &id,
+        convo_id,
+        recipient_did,
+        message_id,
+        mailbox_provider,
+        cloudkit_zone,
+    )
+    .fetch_optional(pool)
+    .await
+    .context("Failed to create envelope")?;
+
+    Ok(id)
+}
+
+/// Get member mailbox configuration
+pub async fn get_member_mailbox_config(
+    pool: &DbPool,
+    convo_id: &str,
+    member_did: &str,
+) -> Result<Option<(String, Option<String>)>> {
+    let result = sqlx::query!(
+        r#"
+        SELECT mailbox_provider, mailbox_zone
+        FROM members
+        WHERE convo_id = $1 AND member_did = $2 AND left_at IS NULL
+        "#,
+        convo_id,
+        member_did,
+    )
+    .fetch_optional(pool)
+    .await
+    .context("Failed to get mailbox config")?;
+
+    Ok(result.map(|r| (r.mailbox_provider, r.mailbox_zone)))
+}
+
+// =============================================================================
+// Event Stream Operations (Realtime Events)
+// =============================================================================
+
+/// Store event in event stream
+pub async fn store_event(
+    pool: &DbPool,
+    cursor: &str,
+    convo_id: &str,
+    event_type: &str,
+    payload: serde_json::Value,
+) -> Result<()> {
+    sqlx::query!(
+        r#"
+        INSERT INTO event_stream (id, convo_id, event_type, payload, emitted_at)
+        VALUES ($1, $2, $3, $4, NOW())
+        "#,
+        cursor,
+        convo_id,
+        event_type,
+        payload,
+    )
+    .execute(pool)
+    .await
+    .context("Failed to store event")?;
+
+    Ok(())
+}
+
+/// Get events after cursor for backfill
+pub async fn get_events_after_cursor(
+    pool: &DbPool,
+    convo_id: &str,
+    event_type: Option<&str>,
+    after_cursor: &str,
+    limit: i64,
+) -> Result<Vec<(String, serde_json::Value, DateTime<Utc>)>> {
+    #[derive(sqlx::FromRow)]
+    struct EventRow {
+        id: String,
+        payload: serde_json::Value,
+        emitted_at: DateTime<Utc>,
+    }
+
+    let events: Vec<EventRow> = if let Some(et) = event_type {
+        sqlx::query_as(
+            r#"
+            SELECT id, payload, emitted_at
+            FROM event_stream
+            WHERE convo_id = $1 AND event_type = $2 AND id > $3
+            ORDER BY id ASC
+            LIMIT $4
+            "#,
+        )
+        .bind(convo_id)
+        .bind(et)
+        .bind(after_cursor)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .context("Failed to get events")?
+    } else {
+        sqlx::query_as(
+            r#"
+            SELECT id, payload, emitted_at
+            FROM event_stream
+            WHERE convo_id = $1 AND id > $2
+            ORDER BY id ASC
+            LIMIT $3
+            "#,
+        )
+        .bind(convo_id)
+        .bind(after_cursor)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .context("Failed to get events")?
+    };
+
+    Ok(events
+        .into_iter()
+        .map(|e| (e.id, e.payload, e.emitted_at))
+        .collect())
 }

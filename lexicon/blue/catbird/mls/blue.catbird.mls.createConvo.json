@@ -79,9 +79,8 @@
           "description": "Conversation description"
         },
         "avatar": {
-          "type": "ref",
-          "ref": "blue.catbird.mls.defs#blobRef",
-          "description": "Conversation avatar image reference (upload via uploadBlob first)"
+          "type": "blob",
+          "maxSize": 52428800
         }
       }
     }

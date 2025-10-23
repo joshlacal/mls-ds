@@ -3,38 +3,51 @@
   "id": "blue.catbird.mls.defs",
   "description": "Shared type definitions for MLS (Message Layer Security) protocol",
   "defs": {
+    "externalAsset": {
+      "type": "object",
+      "description": "Pointer to ciphertext stored in an external provider",
+      "required": ["provider", "uri", "mimeType", "size", "sha256"],
+      "properties": {
+        "provider": {
+          "type": "string",
+          "description": "Storage provider identifier",
+          "knownValues": ["cloudkit", "firestore", "gdrive", "s3", "custom"]
+        },
+        "uri": {
+          "type": "string",
+          "format": "uri",
+          "description": "Provider-specific URI (e.g., cloudkit://..., firestore://..., gdrive://...)"
+        },
+        "mimeType": {
+          "type": "string",
+          "description": "MIME type of the ciphertext payload"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Size in bytes of the ciphertext payload"
+        },
+        "sha256": {
+          "type": "bytes",
+          "description": "SHA-256 of ciphertext payload bytes"
+        }
+      }
+    },
+
     "convoView": {
       "type": "object",
       "description": "View of an MLS conversation with member and epoch information",
       "required": ["id", "groupId", "creator", "members", "epoch", "cipherSuite", "createdAt"],
       "properties": {
-        "id": {
-          "type": "string",
-          "description": "Conversation identifier (TID)"
-        },
+        "id": { "type": "string", "description": "Conversation identifier (TID)" },
         "groupId": {
           "type": "string",
           "description": "MLS group identifier (hex-encoded)",
           "maxLength": 128
         },
-        "creator": {
-          "type": "string",
-          "format": "did",
-          "description": "DID of the conversation creator"
-        },
-        "members": {
-          "type": "array",
-          "items": {
-            "type": "ref",
-            "ref": "#memberView"
-          },
-          "description": "Current conversation members"
-        },
-        "epoch": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "Current MLS epoch number"
-        },
+        "creator": { "type": "string", "format": "did", "description": "DID of the conversation creator" },
+        "members": { "type": "array", "items": { "type": "ref", "ref": "#memberView" }, "description": "Current conversation members" },
+        "epoch": { "type": "integer", "minimum": 0, "description": "Current MLS epoch number" },
         "cipherSuite": {
           "type": "string",
           "description": "MLS cipher suite used for this conversation",
@@ -47,136 +60,64 @@
             "MLS_256_DHKEMX448_CHACHA20POLY1305_SHA512_Ed448"
           ]
         },
-        "createdAt": {
-          "type": "string",
-          "format": "datetime",
-          "description": "Conversation creation timestamp"
-        },
-        "lastMessageAt": {
-          "type": "string",
-          "format": "datetime",
-          "description": "Timestamp of last message"
-        },
-        "metadata": {
-          "type": "ref",
-          "ref": "#convoMetadata",
-          "description": "Optional conversation metadata"
-        }
+        "createdAt": { "type": "string", "format": "datetime", "description": "Conversation creation timestamp" },
+        "lastMessageAt": { "type": "string", "format": "datetime", "description": "Timestamp of last message" },
+        "metadata": { "type": "ref", "ref": "#convoMetadata", "description": "Optional conversation metadata" }
       }
     },
+
     "convoMetadata": {
       "type": "object",
       "description": "Metadata for a conversation (name, description, avatar)",
       "properties": {
-        "name": {
-          "type": "string",
-          "maxLength": 128,
-          "description": "Conversation display name"
-        },
-        "description": {
-          "type": "string",
-          "maxLength": 512,
-          "description": "Conversation description"
-        },
-        "avatar": {
-          "type": "ref",
-          "ref": "#blobRef",
-          "description": "Conversation avatar image"
-        }
+        "name": { "type": "string", "maxLength": 128, "description": "Conversation display name" },
+        "description": { "type": "string", "maxLength": 512, "description": "Conversation description" },
+        "avatar": { "type": "blob", "description": "Conversation avatar image" }
       }
     },
+
     "memberView": {
       "type": "object",
       "description": "View of a conversation member with MLS credentials",
       "required": ["did", "joinedAt"],
       "properties": {
-        "did": {
-          "type": "string",
-          "format": "did",
-          "description": "Member DID"
-        },
-        "joinedAt": {
-          "type": "string",
-          "format": "datetime",
-          "description": "When member joined the conversation"
-        },
-        "leafIndex": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "MLS leaf index in tree structure"
-        },
-        "credential": {
-          "type": "string",
-          "description": "Base64-encoded MLS credential"
-        }
+        "did": { "type": "string", "format": "did", "description": "Member DID" },
+        "joinedAt": { "type": "string", "format": "datetime", "description": "When member joined the conversation" },
+        "leafIndex": { "type": "integer", "minimum": 0, "description": "MLS leaf index in tree structure" },
+        "credential": { "type": "bytes", "description": "MLS credential bytes" }
       }
     },
+
     "messageView": {
       "type": "object",
       "description": "View of an encrypted MLS message",
-      "required": ["id", "convoId", "sender", "ciphertext", "epoch", "createdAt"],
+      "required": ["id", "convoId", "sender", "payload", "epoch", "createdAt"],
       "properties": {
-        "id": {
-          "type": "string",
-          "description": "Message identifier (TID)"
-        },
-        "convoId": {
-          "type": "string",
-          "description": "Conversation identifier"
-        },
-        "sender": {
-          "type": "string",
-          "format": "did",
-          "description": "DID of message sender"
-        },
-        "ciphertext": {
-          "type": "string",
-          "description": "Base64-encoded MLS ciphertext"
-        },
-        "epoch": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "MLS epoch when message was sent"
-        },
-        "createdAt": {
-          "type": "string",
-          "format": "datetime",
-          "description": "Message creation timestamp"
-        },
-        "contentType": {
-          "type": "string",
-          "description": "MIME type of decrypted content",
-          "default": "text/plain"
-        },
+        "id": { "type": "string", "description": "Message identifier (TID)" },
+        "convoId": { "type": "string", "description": "Conversation identifier" },
+        "sender": { "type": "string", "format": "did", "description": "DID of message sender" },
+        "payload": { "type": "ref", "ref": "#externalAsset", "description": "Pointer to the message ciphertext payload" },
+        "epoch": { "type": "integer", "minimum": 0, "description": "MLS epoch when message was sent" },
+        "createdAt": { "type": "string", "format": "datetime", "description": "Message creation timestamp" },
+        "contentType": { "type": "string", "description": "MIME type of decrypted content", "default": "text/plain" },
         "attachments": {
           "type": "array",
-          "items": {
-            "type": "ref",
-            "ref": "#blobRef"
-          },
-          "description": "Message attachments",
+          "items": { "type": "ref", "ref": "#externalAsset" },
+          "description": "Attachment ciphertext payload pointers",
           "maxLength": 10
-        }
+        },
+        "replyUri": { "type": "string", "format": "at-uri", "description": "If this message is a reply, AT-URI of the message being replied to" }
       }
     },
+
     "keyPackageRef": {
       "type": "object",
       "description": "Reference to an MLS key package for adding members",
       "required": ["id", "did", "keyPackage", "cipherSuite", "createdAt"],
       "properties": {
-        "id": {
-          "type": "string",
-          "description": "Key package identifier"
-        },
-        "did": {
-          "type": "string",
-          "format": "did",
-          "description": "Owner DID"
-        },
-        "keyPackage": {
-          "type": "string",
-          "description": "Base64-encoded MLS key package"
-        },
+        "id": { "type": "string", "description": "Key package identifier" },
+        "did": { "type": "string", "format": "did", "description": "Owner DID" },
+        "keyPackage": { "type": "bytes", "description": "MLS key package bytes" },
         "cipherSuite": {
           "type": "string",
           "description": "Supported cipher suite for this key package",
@@ -189,43 +130,20 @@
             "MLS_256_DHKEMX448_CHACHA20POLY1305_SHA512_Ed448"
           ]
         },
-        "createdAt": {
-          "type": "string",
-          "format": "datetime",
-          "description": "Key package creation time"
-        },
-        "expiresAt": {
-          "type": "string",
-          "format": "datetime",
-          "description": "Key package expiration time"
-        }
+        "createdAt": { "type": "string", "format": "datetime", "description": "Key package creation time" },
+        "expiresAt": { "type": "string", "format": "datetime", "description": "Key package expiration time" }
       }
     },
+
     "blobRef": {
       "type": "object",
       "description": "Reference to a blob (file attachment)",
       "required": ["cid", "mimeType", "size"],
       "properties": {
-        "cid": {
-          "type": "string",
-          "description": "Content identifier (CID)"
-        },
-        "mimeType": {
-          "type": "string",
-          "description": "MIME type of the blob",
-          "maxLength": 256
-        },
-        "size": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 52428800,
-          "description": "Blob size in bytes (max 50MB)"
-        },
-        "ref": {
-          "type": "string",
-          "format": "at-uri",
-          "description": "AT URI reference to blob"
-        }
+        "cid": { "type": "string", "description": "Content identifier (CID)" },
+        "mimeType": { "type": "string", "description": "MIME type of the blob", "maxLength": 256 },
+        "size": { "type": "integer", "minimum": 0, "maximum": 52428800, "description": "Blob size in bytes (max 50MB)" },
+        "ref": { "type": "string", "format": "at-uri", "description": "AT URI reference to blob" }
       }
     }
   }
