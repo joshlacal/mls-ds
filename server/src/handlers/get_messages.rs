@@ -1,12 +1,11 @@
-use base64::Engine;
-
 use axum::{extract::{Query, State}, http::StatusCode, Json};
 use serde::Deserialize;
 use tracing::{info, warn, error};
 
 use crate::{
     auth::AuthUser,
-    models::{Message, MessageView},
+    db,
+    models::MessageView,
     storage::{is_member, DbPool},
 };
 
@@ -53,11 +52,11 @@ pub async fn get_messages(
 
     info!("Fetching messages for conversation {}", params.convo_id);
 
-    // Fetch messages
+    // Fetch messages using cursor pagination if sinceMessage is provided
     let messages = if let Some(since_id) = params.since_message {
-        // Get messages after a specific message ID
+        // Get messages after a specific cursor
         let since_timestamp: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
-            "SELECT sent_at FROM messages WHERE id = $1"
+            "SELECT created_at FROM messages WHERE id = $1"
         )
         .bind(&since_id)
         .fetch_optional(&pool)
@@ -68,51 +67,39 @@ pub async fn get_messages(
         })?;
 
         if let Some(ts) = since_timestamp {
-            sqlx::query_as::<_, Message>(
-                "SELECT id, convo_id, sender_did, message_type, epoch, ciphertext, sent_at FROM messages WHERE convo_id = $1 AND sent_at > $2 ORDER BY sent_at ASC LIMIT $3"
-            )
-            .bind(&params.convo_id)
-            .bind(&ts)
-            .bind(limit)
-            .fetch_all(&pool)
-            .await
-            .map_err(|e| {
-                error!("Failed to fetch messages: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?
+            db::list_messages_since(&pool, &params.convo_id, ts)
+                .await
+                .map_err(|e| {
+                    error!("Failed to fetch messages since: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?
         } else {
             warn!("Since message not found: {}", since_id);
             vec![]
         }
     } else {
-        // Get latest messages
-        sqlx::query_as::<_, Message>(
-            "SELECT id, convo_id, sender_did, message_type, epoch, ciphertext, sent_at FROM messages WHERE convo_id = $1 ORDER BY sent_at DESC LIMIT $2"
-        )
-        .bind(&params.convo_id)
-        .bind(limit)
-        .fetch_all(&pool)
-        .await
-        .map_err(|e| {
-            error!("Failed to fetch messages: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?
+        // Get latest messages (most recent first)
+        db::list_messages(&pool, &params.convo_id, None, limit as i64)
+            .await
+            .map_err(|e| {
+                error!("Failed to list messages: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
     };
 
-    // Convert to view models
+    // Convert to view models with ciphertext
     let message_views: Vec<MessageView> = messages
         .into_iter()
         .map(|m| MessageView {
             id: m.id,
             convo_id: m.convo_id,
             sender: m.sender_did,
-            payload: None,
-            ciphertext: Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(m.ciphertext)),
+            ciphertext: m.ciphertext,
             epoch: m.epoch,
-            created_at: m.sent_at,
-            content_type: None,
-            attachments: None,
-            reply_uri: None,
+            seq: m.seq,
+            created_at: m.created_at,
+            embed_type: m.embed_type,
+            embed_uri: m.embed_uri,
         })
         .collect();
 
@@ -161,7 +148,7 @@ mod tests {
         for i in 0..3 {
             let msg_id = format!("msg-{}", i);
             sqlx::query(
-                "INSERT INTO messages (id, convo_id, sender_did, message_type, epoch, ciphertext, sent_at) VALUES ($1, $2, $3, 'app', 0, $4, $5)"
+                "INSERT INTO messages (id, convo_id, sender_did, message_type, epoch, ciphertext, created_at) VALUES ($1, $2, $3, 'app', 0, $4, $5)"
             )
             .bind(&msg_id)
             .bind(convo_id)
@@ -183,7 +170,7 @@ mod tests {
         
         setup_test_convo_with_messages(&pool, user, convo_id).await;
 
-        let did = AuthUser { did: user.to_string(), claims: crate::auth::AtProtoClaims { iss: user.to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None } };
+        let did = AuthUser { did: user.to_string(), claims: crate::auth::AtProtoClaims { iss: user.to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
         let params = GetMessagesParams {
             convo_id: convo_id.to_string(),
             since_message: None,
@@ -207,7 +194,7 @@ mod tests {
         
         setup_test_convo_with_messages(&pool, creator, convo_id).await;
 
-        let did = AuthUser { did: "did:plc:outsider".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:outsider".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None } };
+        let did = AuthUser { did: "did:plc:outsider".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:outsider".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
         let params = GetMessagesParams {
             convo_id: convo_id.to_string(),
             since_message: None,
@@ -227,7 +214,7 @@ mod tests {
         
         setup_test_convo_with_messages(&pool, user, convo_id).await;
 
-        let did = AuthUser { did: user.to_string(), claims: crate::auth::AtProtoClaims { iss: user.to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None } };
+        let did = AuthUser { did: user.to_string(), claims: crate::auth::AtProtoClaims { iss: user.to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
         let params = GetMessagesParams {
             convo_id: convo_id.to_string(),
             since_message: None,
