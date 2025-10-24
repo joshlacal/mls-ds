@@ -105,7 +105,7 @@ mod tests {
         publish_key_package(&pool, did1, cipher_suite).await;
         publish_key_package(&pool, did2, cipher_suite).await;
 
-        let auth_user = AuthUser { did: "did:plc:requester".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:requester".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None } };
+        let auth_user = AuthUser { did: "did:plc:requester".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:requester".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
         let params = GetKeyPackagesParams {
             dids: format!("{},{}", did1, did2),
         };
@@ -123,7 +123,7 @@ mod tests {
         let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
         let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
         
-        let auth_user = AuthUser { did: "did:plc:requester".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:requester".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None } };
+        let auth_user = AuthUser { did: "did:plc:requester".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:requester".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
         let params = GetKeyPackagesParams {
             dids: "did:plc:nonexistent".to_string(),
         };
@@ -141,7 +141,7 @@ mod tests {
         let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
         let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
         
-        let auth_user = AuthUser { did: "did:plc:requester".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:requester".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None } };
+        let auth_user = AuthUser { did: "did:plc:requester".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:requester".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
         let params = GetKeyPackagesParams {
             dids: String::new(),
         };
@@ -154,7 +154,7 @@ mod tests {
     async fn test_get_key_packages_invalid_did() {
         let pool = crate::db::init_db(crate::db::DbConfig { database_url: ":memory:".to_string(), max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
         
-        let auth_user = AuthUser { did: "did:plc:requester".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:requester".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None } };
+        let auth_user = AuthUser { did: "did:plc:requester".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:requester".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
         let params = GetKeyPackagesParams {
             dids: "invalid_did".to_string(),
         };
@@ -176,7 +176,7 @@ mod tests {
 
         let _ = crate::db::store_key_package(&pool, did, cipher_suite, key_data, expires).await;
 
-        let auth_user = AuthUser { did: "did:plc:requester".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:requester".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None } };
+        let auth_user = AuthUser { did: "did:plc:requester".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:requester".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
         let params = GetKeyPackagesParams {
             dids: did.to_string(),
         };
@@ -204,7 +204,7 @@ mod tests {
         let _ = crate::db::store_key_package(&pool, did, cipher_suite, key_data.clone(), expires).await;
         let _ = crate::db::consume_key_package(&pool, did, cipher_suite, &key_data).await;
 
-        let auth_user = AuthUser { did: "did:plc:requester".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:requester".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None } };
+        let auth_user = AuthUser { did: "did:plc:requester".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:requester".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
         let params = GetKeyPackagesParams {
             dids: did.to_string(),
         };

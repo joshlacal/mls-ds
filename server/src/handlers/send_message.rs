@@ -1,5 +1,3 @@
-use base64::Engine;
-
 use axum::{extract::State, http::StatusCode, Json};
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -9,6 +7,7 @@ use crate::{
     fanout::{Envelope, MailboxConfig, MailboxFactory},
     models::{SendMessageInput, SendMessageOutput},
     realtime::{SseState, StreamEvent},
+    db,
     storage::{is_member, DbPool},
 };
 
@@ -28,21 +27,6 @@ pub async fn send_message(
     }
     let did = &auth_user.did;
 
-    // Validate ExternalAsset payload
-    let config = crate::util::asset_validate::AssetValidationConfig::default();
-    if let Err(e) = crate::util::asset_validate::validate_asset(&input.payload, &config) {
-        warn!("Invalid ExternalAsset: {}", e);
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
-    // Validate attachments if present
-    if let Some(ref attachments) = input.attachments {
-        if let Err(e) = crate::util::asset_validate::validate_assets(attachments, &config, 10) {
-            warn!("Invalid attachments: {}", e);
-            return Err(StatusCode::BAD_REQUEST);
-        }
-    }
-
     if &input.sender_did != did {
         warn!(
             "Sender DID mismatch: expected {}, got {}",
@@ -53,6 +37,16 @@ pub async fn send_message(
 
     if input.epoch < 0 {
         warn!("Invalid epoch: {}", input.epoch);
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Validate ciphertext is present and not too large (10MB limit)
+    if input.ciphertext.is_empty() {
+        warn!("Empty ciphertext provided");
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if input.ciphertext.len() > 10 * 1024 * 1024 {
+        warn!("Ciphertext too large: {} bytes", input.ciphertext.len());
         return Err(StatusCode::BAD_REQUEST);
     }
 
@@ -68,71 +62,29 @@ pub async fn send_message(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    let msg_id = uuid::Uuid::new_v4().to_string();
-    let now = chrono::Utc::now();
-
     info!(
-        "Sending message {} to conversation {} (payload provider: {})",
-        msg_id, input.convo_id, input.payload.provider
+        "Sending message to conversation {} ({} bytes)",
+        input.convo_id, input.ciphertext.len()
     );
 
-    // Insert message with ExternalAsset payload
-    sqlx::query(
-        r#"
-        INSERT INTO messages (
-            id, convo_id, sender_did, message_type, epoch,
-            payload_provider, payload_uri, payload_mime_type, payload_size, payload_sha256,
-            content_type, reply_to, sent_at
-        ) VALUES ($1, $2, $3, 'app', $4, $5, $6, $7, $8, $9, $10, $11, $12)
-        "#
+    // Create message with direct ciphertext storage
+    let message = db::create_message(
+        &pool,
+        &input.convo_id,
+        did,
+        input.ciphertext,
+        input.epoch,
+        input.embed_type.as_deref(),
+        input.embed_uri.as_deref(),
     )
-    .bind(&msg_id)
-    .bind(&input.convo_id)
-    .bind(did)
-    .bind(input.epoch)
-    .bind(&input.payload.provider)
-    .bind(&input.payload.uri)
-    .bind(&input.payload.mime_type)
-    .bind(input.payload.size)
-    .bind(&input.payload.sha256)
-    .bind(&input.content_type)
-    .bind(&input.reply_to)
-    .bind(&now)
-    .execute(&pool)
     .await
     .map_err(|e| {
-        error!("Failed to insert message: {}", e);
+        error!("Failed to create message: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    // Insert attachments if present
-    if let Some(attachments) = &input.attachments {
-        for (idx, attachment) in attachments.iter().enumerate() {
-            let attachment_id = uuid::Uuid::new_v4().to_string();
-            sqlx::query(
-                r#"
-                INSERT INTO message_attachments (
-                    id, message_id, attachment_index,
-                    provider, uri, mime_type, size, sha256
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                "#
-            )
-            .bind(&attachment_id)
-            .bind(&msg_id)
-            .bind(idx as i32)
-            .bind(&attachment.provider)
-            .bind(&attachment.uri)
-            .bind(&attachment.mime_type)
-            .bind(attachment.size)
-            .bind(&attachment.sha256)
-            .execute(&pool)
-            .await
-            .map_err(|e| {
-                error!("Failed to insert attachment {}: {}", idx, e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-        }
-    }
+    let msg_id = message.id.clone();
+    let now = message.created_at;
 
     // Update unread counts for other members
     sqlx::query(
@@ -264,7 +216,7 @@ pub async fn send_message(
             payload: crate::realtime::sse::MessageEventPayload {
                 message_id: msg_id_clone.clone(),
                 sender_did: sender_did.clone(),
-                epoch,
+                epoch: epoch as i32,
             },
         };
 
@@ -272,7 +224,7 @@ pub async fn send_message(
         let event_payload = serde_json::json!({
             "messageId": msg_id_clone,
             "senderDid": sender_did,
-            "epoch": epoch,
+            "epoch": epoch as i32,
         });
 
         if let Err(e) = crate::db::store_event(
@@ -346,7 +298,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let sse_state = Arc::new(SseState::new());
+        let sse_state = Arc::new(SseState::new(1000));
         let convo_id = "test-convo-1";
         let sender = "did:plc:sender";
 
@@ -358,25 +310,18 @@ mod tests {
                 iss: sender.to_string(),
                 aud: "test".to_string(),
                 exp: 9999999999,
-                iat: None,
+                iat: None, jti: Some("test-jti".to_string()), lxm: None,
                 sub: None,
             },
         };
         
         let input = SendMessageInput {
             convo_id: convo_id.to_string(),
-            payload: ExternalAsset {
-                provider: "cloudkit".to_string(),
-                uri: "cloudkit://iCloud.com.example.app/Messages/msg-123".to_string(),
-                mime_type: "application/octet-stream".to_string(),
-                size: 1024,
-                sha256: vec![0u8; 32],
-            },
+            ciphertext: b"encrypted message data".to_vec(),
             epoch: 0,
             sender_did: sender.to_string(),
-            content_type: Some("text/plain".to_string()),
-            attachments: None,
-            reply_to: None,
+            embed_type: None,
+            embed_uri: None,
         };
 
         let result = send_message(
@@ -405,7 +350,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let sse_state = Arc::new(SseState::new());
+        let sse_state = Arc::new(SseState::new(1000));
         let convo_id = "test-convo-2";
         let creator = "did:plc:creator";
 
@@ -417,25 +362,18 @@ mod tests {
                 iss: "did:plc:outsider".to_string(),
                 aud: "test".to_string(),
                 exp: 9999999999,
-                iat: None,
+                iat: None, jti: Some("test-jti".to_string()), lxm: None,
                 sub: None,
             },
         };
         
         let input = SendMessageInput {
             convo_id: convo_id.to_string(),
-            payload: ExternalAsset {
-                provider: "cloudkit".to_string(),
-                uri: "cloudkit://iCloud.com.example.app/Messages/msg-123".to_string(),
-                mime_type: "application/octet-stream".to_string(),
-                size: 1024,
-                sha256: vec![0u8; 32],
-            },
+            ciphertext: b"encrypted message data".to_vec(),
             epoch: 0,
             sender_did: "did:plc:outsider".to_string(),
-            content_type: None,
-            attachments: None,
-            reply_to: None,
+            embed_type: None,
+            embed_uri: None,
         };
 
         let result = send_message(
@@ -461,7 +399,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let sse_state = Arc::new(SseState::new());
+        let sse_state = Arc::new(SseState::new(1000));
         let convo_id = "test-convo-3";
         let sender = "did:plc:sender";
 
@@ -473,25 +411,18 @@ mod tests {
                 iss: sender.to_string(),
                 aud: "test".to_string(),
                 exp: 9999999999,
-                iat: None,
+                iat: None, jti: Some("test-jti".to_string()), lxm: None,
                 sub: None,
             },
         };
         
         let input = SendMessageInput {
             convo_id: convo_id.to_string(),
-            payload: ExternalAsset {
-                provider: "invalid-provider".to_string(),
-                uri: "invalid://uri".to_string(),
-                mime_type: "application/octet-stream".to_string(),
-                size: 1024,
-                sha256: vec![0u8; 32],
-            },
+            ciphertext: b"".to_vec(), // Empty ciphertext should fail
             epoch: 0,
             sender_did: sender.to_string(),
-            content_type: None,
-            attachments: None,
-            reply_to: None,
+            embed_type: None,
+            embed_uri: None,
         };
 
         let result = send_message(
@@ -517,7 +448,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let sse_state = Arc::new(SseState::new());
+        let sse_state = Arc::new(SseState::new(1000));
         let convo_id = "test-convo-4";
         let sender = "did:plc:sender";
 
@@ -529,25 +460,18 @@ mod tests {
                 iss: sender.to_string(),
                 aud: "test".to_string(),
                 exp: 9999999999,
-                iat: None,
+                iat: None, jti: Some("test-jti".to_string()), lxm: None,
                 sub: None,
             },
         };
         
         let input = SendMessageInput {
             convo_id: convo_id.to_string(),
-            payload: ExternalAsset {
-                provider: "cloudkit".to_string(),
-                uri: "cloudkit://iCloud.com.example.app/Messages/msg-123".to_string(),
-                mime_type: "application/octet-stream".to_string(),
-                size: 1024,
-                sha256: vec![0u8; 32],
-            },
+            ciphertext: b"encrypted message data".to_vec(),
             epoch: 0,
             sender_did: "did:plc:impostor".to_string(),
-            content_type: None,
-            attachments: None,
-            reply_to: None,
+            embed_type: None,
+            embed_uri: None,
         };
 
         let result = send_message(

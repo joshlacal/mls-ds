@@ -76,7 +76,7 @@ mod tests {
     async fn test_upload_blob_success() {
         let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
         let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
-        let did = AuthUser { did: "did:plc:uploader".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:uploader".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None } };
+        let did = AuthUser { did: "did:plc:uploader".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:uploader".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
         let data = b"test blob data content";
         let body = Bytes::from(data.to_vec());
 
@@ -93,7 +93,7 @@ mod tests {
     async fn test_upload_blob_empty() {
         let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
         let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
-        let did = AuthUser { did: "did:plc:uploader".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:uploader".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None } };
+        let did = AuthUser { did: "did:plc:uploader".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:uploader".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
         let body = Bytes::new();
 
         let result = upload_blob(State(pool), did, body).await;
@@ -104,7 +104,7 @@ mod tests {
     async fn test_upload_blob_too_large() {
         let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
         let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
-        let did = AuthUser { did: "did:plc:uploader".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:uploader".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None } };
+        let did = AuthUser { did: "did:plc:uploader".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:uploader".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
         
         // Create a blob larger than 10MB
         let data = vec![0u8; 11 * 1024 * 1024];
@@ -118,7 +118,7 @@ mod tests {
     async fn test_upload_blob_duplicate() {
         let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
         let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
-        let did = AuthUser { did: "did:plc:uploader".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:uploader".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None } };
+        let did = AuthUser { did: "did:plc:uploader".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:uploader".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
         let data = b"duplicate content";
         
         // Upload first time
@@ -152,7 +152,7 @@ mod tests {
     async fn test_upload_blob_different_content() {
         let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
         let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
-        let did = AuthUser { did: "did:plc:uploader".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:uploader".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None } };
+        let did = AuthUser { did: "did:plc:uploader".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:uploader".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
         
         let data1 = b"content one";
         let data2 = b"content two";

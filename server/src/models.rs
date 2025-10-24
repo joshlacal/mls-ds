@@ -7,29 +7,30 @@ pub struct Conversation {
     pub creator_did: String,
     pub current_epoch: i32,
     pub created_at: DateTime<Utc>,
-    pub cipher_suite: String,
-    pub name: Option<String>,
-    pub description: Option<String>,
-    pub avatar_blob: Option<String>,
+    pub updated_at: DateTime<Utc>,
+    pub title: Option<String>,
+    pub cloudkit_zone_id: Option<String>,
+    pub storage_model: Option<String>,
 }
 
 impl Conversation {
-    pub fn new(creator_did: String, cipher_suite: String, metadata: Option<ConvoMetadata>) -> Self {
-        let (name, description, avatar_blob) = if let Some(m) = metadata {
+    pub fn new(creator_did: String, metadata: Option<ConvoMetadata>) -> Self {
+        let (title, _description, _avatar_blob) = if let Some(m) = metadata {
             (m.name, m.description, m.avatar)
         } else {
             (None, None, None)
         };
         
+        let now = Utc::now();
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             creator_did,
             current_epoch: 0,
-            created_at: Utc::now(),
-            cipher_suite,
-            name,
-            description,
-            avatar_blob,
+            created_at: now,
+            updated_at: now,
+            title,
+            cloudkit_zone_id: None,
+            storage_model: Some("shared-zone".to_string()),
         }
     }
 }
@@ -55,9 +56,13 @@ pub struct Message {
     pub convo_id: String,
     pub sender_did: String,
     pub message_type: String, // "app" or "commit"
-    pub epoch: i32,
+    pub epoch: i64,
+    pub seq: i64,
     pub ciphertext: Vec<u8>,
-    pub sent_at: DateTime<Utc>,
+    pub embed_type: Option<String>,
+    pub embed_uri: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 impl Message {
@@ -65,17 +70,24 @@ impl Message {
         convo_id: String,
         sender_did: String,
         message_type: String,
-        epoch: i32,
+        epoch: i64,
+        seq: i64,
         ciphertext: Vec<u8>,
     ) -> Self {
+        let now = Utc::now();
+        let expires_at = now + chrono::Duration::days(30);
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             convo_id,
             sender_did,
             message_type,
             epoch,
+            seq,
             ciphertext,
-            sent_at: Utc::now(),
+            embed_type: None,
+            embed_uri: None,
+            created_at: now,
+            expires_at: Some(expires_at),
         }
     }
 }
@@ -185,32 +197,43 @@ pub struct AddMembersOutput {
     pub new_epoch: i32,
 }
 
-// ExternalAsset types for CloudKit architecture
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExternalAsset {
-    pub provider: String,
-    pub uri: String,
-    #[serde(rename = "mimeType")]
-    pub mime_type: String,
-    pub size: i64,
-    pub sha256: Vec<u8>,
-}
-
 #[derive(Debug, Deserialize)]
 pub struct SendMessageInput {
     #[serde(rename = "convoId")]
     pub convo_id: String,
-    /// ExternalAsset pointer to message payload in CloudKit/external storage
-    pub payload: ExternalAsset,
-    pub epoch: i32,
+    /// Direct ciphertext payload stored in PostgreSQL
+    #[serde(with = "base64_bytes")]
+    pub ciphertext: Vec<u8>,
+    pub epoch: i64,
     #[serde(rename = "senderDid")]
     pub sender_did: String,
-    #[serde(rename = "contentType", skip_serializing_if = "Option::is_none")]
-    pub content_type: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub attachments: Option<Vec<ExternalAsset>>,
-    #[serde(rename = "replyTo", skip_serializing_if = "Option::is_none")]
-    pub reply_to: Option<String>,
+    #[serde(rename = "embedType", skip_serializing_if = "Option::is_none")]
+    pub embed_type: Option<String>,
+    #[serde(rename = "embedUri", skip_serializing_if = "Option::is_none")]
+    pub embed_uri: Option<String>,
+}
+
+mod base64_bytes {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use base64::Engine;
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&s)
+            .map_err(serde::de::Error::custom)
+    }
+
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        serializer.serialize_str(&encoded)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -243,23 +266,18 @@ pub struct MessageView {
     #[serde(rename = "convoId")]
     pub convo_id: String,
     pub sender: String, // DID
-    // New: ExternalAsset payload
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub payload: Option<ExternalAsset>,
-    // Legacy: direct ciphertext
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ciphertext: Option<String>, // base64url
-    pub epoch: i32,
+    #[serde(with = "base64_bytes")]
+    pub ciphertext: Vec<u8>,
+    pub epoch: i64,
+    pub seq: i64,
     #[serde(rename = "createdAt")]
     pub created_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "contentType")]
-    pub content_type: Option<String>,
+    #[serde(rename = "embedType")]
+    pub embed_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub attachments: Option<Vec<ExternalAsset>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "replyUri")]
-    pub reply_uri: Option<String>,
+    #[serde(rename = "embedUri")]
+    pub embed_uri: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
