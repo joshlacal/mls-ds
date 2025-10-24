@@ -132,7 +132,7 @@ pub async fn send_message(
                 // Write envelopes and notify mailboxes
                 for member in &members {
                     let envelope_id = uuid::Uuid::new_v4().to_string();
-                    let provider = &member.mailbox_provider;
+                    let provider = member.mailbox_provider.as_deref().unwrap_or("cloudkit");
                     let zone = member.mailbox_zone.as_deref();
 
                     // Insert envelope
@@ -169,7 +169,7 @@ pub async fn send_message(
                         convo_id: convo_id.clone(),
                         recipient_did: member.member_did.clone(),
                         message_id: msg_id_clone.clone(),
-                        mailbox_provider: provider.clone(),
+                        mailbox_provider: provider.to_string(),
                         cloudkit_zone: zone.map(String::from),
                     };
 

@@ -20,24 +20,9 @@
             "default": 50,
             "description": "Maximum number of messages to return"
           },
-          "cursor": {
+          "sinceMessage": {
             "type": "string",
-            "description": "Pagination cursor from previous response"
-          },
-          "since": {
-            "type": "string",
-            "format": "datetime",
-            "description": "Only return messages after this timestamp"
-          },
-          "until": {
-            "type": "string",
-            "format": "datetime",
-            "description": "Only return messages before this timestamp"
-          },
-          "epoch": {
-            "type": "integer",
-            "minimum": 0,
-            "description": "Filter messages by specific epoch"
+            "description": "Message ID to fetch messages after (pagination cursor)"
           }
         }
       },
@@ -57,7 +42,7 @@
             },
             "cursor": {
               "type": "string",
-              "description": "Pagination cursor for next page"
+              "description": "Cursor for next page of messages (if more available)"
             }
           }
         }

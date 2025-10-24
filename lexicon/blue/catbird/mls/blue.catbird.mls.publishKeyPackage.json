@@ -28,10 +28,10 @@
                 "MLS_256_DHKEMX448_CHACHA20POLY1305_SHA512_Ed448"
               ]
             },
-            "expiresAt": {
+            "expires": {
               "type": "string",
               "format": "datetime",
-              "description": "Optional expiration timestamp (defaults to 30 days)"
+              "description": "Expiration timestamp (required, max 90 days from now)"
             }
           }
         }
@@ -40,14 +40,7 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["keyPackage"],
-          "properties": {
-            "keyPackage": {
-              "type": "ref",
-              "ref": "blue.catbird.mls.defs#keyPackageRef",
-              "description": "Published key package reference"
-            }
-          }
+          "properties": {}
         }
       },
       "errors": [
