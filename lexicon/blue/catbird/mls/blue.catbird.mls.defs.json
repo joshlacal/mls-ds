@@ -91,33 +91,27 @@
     "messageView": {
       "type": "object",
       "description": "View of an encrypted MLS message",
-      "required": ["id", "convoId", "sender", "payload", "epoch", "createdAt"],
+      "required": ["id", "convoId", "sender", "ciphertext", "epoch", "seq", "createdAt"],
       "properties": {
-        "id": { "type": "string", "description": "Message identifier (TID)" },
+        "id": { "type": "string", "description": "Message identifier" },
         "convoId": { "type": "string", "description": "Conversation identifier" },
         "sender": { "type": "string", "format": "did", "description": "DID of message sender" },
-        "payload": { "type": "ref", "ref": "#externalAsset", "description": "Pointer to the message ciphertext payload" },
+        "ciphertext": { "type": "bytes", "description": "MLS encrypted message ciphertext bytes", "maxLength": 10485760 },
         "epoch": { "type": "integer", "minimum": 0, "description": "MLS epoch when message was sent" },
+        "seq": { "type": "integer", "minimum": 0, "description": "Sequence number within conversation" },
         "createdAt": { "type": "string", "format": "datetime", "description": "Message creation timestamp" },
-        "contentType": { "type": "string", "description": "MIME type of decrypted content", "default": "text/plain" },
-        "attachments": {
-          "type": "array",
-          "items": { "type": "ref", "ref": "#externalAsset" },
-          "description": "Attachment ciphertext payload pointers",
-          "maxLength": 10
-        },
-        "replyUri": { "type": "string", "format": "at-uri", "description": "If this message is a reply, AT-URI of the message being replied to" }
+        "embedType": { "type": "string", "description": "Optional embed type", "maxLength": 256 },
+        "embedUri": { "type": "string", "format": "uri", "description": "Optional embed URI reference" }
       }
     },
 
     "keyPackageRef": {
       "type": "object",
       "description": "Reference to an MLS key package for adding members",
-      "required": ["id", "did", "keyPackage", "cipherSuite", "createdAt"],
+      "required": ["did", "keyPackage", "cipherSuite"],
       "properties": {
-        "id": { "type": "string", "description": "Key package identifier" },
         "did": { "type": "string", "format": "did", "description": "Owner DID" },
-        "keyPackage": { "type": "bytes", "description": "MLS key package bytes" },
+        "keyPackage": { "type": "string", "description": "Base64url-encoded MLS key package bytes" },
         "cipherSuite": {
           "type": "string",
           "description": "Supported cipher suite for this key package",
@@ -129,9 +123,7 @@
             "MLS_256_DHKEMP521_AES256GCM_SHA512_P521",
             "MLS_256_DHKEMX448_CHACHA20POLY1305_SHA512_Ed448"
           ]
-        },
-        "createdAt": { "type": "string", "format": "datetime", "description": "Key package creation time" },
-        "expiresAt": { "type": "string", "format": "datetime", "description": "Key package expiration time" }
+        }
       }
     },
 

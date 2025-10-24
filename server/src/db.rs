@@ -1056,7 +1056,7 @@ pub async fn get_member_mailbox_config(
     .await
     .context("Failed to get mailbox config")?;
 
-    Ok(result.map(|r| (r.mailbox_provider, r.mailbox_zone)))
+    Ok(result.map(|r| (r.mailbox_provider.unwrap_or_else(|| "cloudkit".to_string()), r.mailbox_zone)))
 }
 
 // =============================================================================

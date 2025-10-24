@@ -10,13 +10,13 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["convoId", "members"],
+          "required": ["convoId", "didList"],
           "properties": {
             "convoId": {
               "type": "string",
               "description": "Conversation identifier"
             },
-            "members": {
+            "didList": {
               "type": "array",
               "items": {
                 "type": "string",
@@ -25,6 +25,14 @@
               "description": "DIDs of members to add",
               "minLength": 1,
               "maxLength": 50
+            },
+            "commit": {
+              "type": "string",
+              "description": "Optional base64url-encoded MLS Commit message"
+            },
+            "welcome": {
+              "type": "string",
+              "description": "Optional base64url-encoded MLS Welcome message"
             }
           }
         }
@@ -33,24 +41,16 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["convo", "commit", "welcomeMessages"],
+          "required": ["success", "newEpoch"],
           "properties": {
-            "convo": {
-              "type": "ref",
-              "ref": "blue.catbird.mls.defs#convoView",
-              "description": "Updated conversation view"
+            "success": {
+              "type": "boolean",
+              "description": "Whether the operation succeeded"
             },
-            "commit": {
-              "type": "string",
-              "description": "Base64-encoded MLS Commit message for existing members"
-            },
-            "welcomeMessages": {
-              "type": "array",
-              "items": {
-                "type": "ref",
-                "ref": "#welcomeMessage"
-              },
-              "description": "Welcome messages for new members"
+            "newEpoch": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "New epoch number after adding members"
             }
           }
         }
@@ -77,21 +77,6 @@
           "description": "Would exceed maximum member count"
         }
       ]
-    },
-    "welcomeMessage": {
-      "type": "object",
-      "required": ["did", "welcome"],
-      "properties": {
-        "did": {
-          "type": "string",
-          "format": "did",
-          "description": "DID of the new member"
-        },
-        "welcome": {
-          "type": "string",
-          "description": "Base64-encoded MLS Welcome message for this member"
-        }
-      }
     }
   }
 }
