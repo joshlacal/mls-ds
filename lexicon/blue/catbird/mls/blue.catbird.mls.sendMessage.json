@@ -9,27 +9,34 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["convoId", "payload"],
+          "required": ["convoId", "ciphertext", "epoch", "senderDid"],
           "properties": {
             "convoId": { "type": "string", "description": "Conversation identifier" },
-            "payload": {
-              "type": "ref",
-              "ref": "blue.catbird.mls.defs#externalAsset",
-              "description": "Pointer to the message ciphertext payload"
+            "ciphertext": {
+              "type": "bytes",
+              "description": "MLS encrypted message ciphertext bytes",
+              "maxLength": 10485760
             },
-            "contentType": {
+            "epoch": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "MLS epoch number when message was encrypted"
+            },
+            "senderDid": {
               "type": "string",
-              "description": "MIME type of the plaintext content",
-              "default": "text/plain",
+              "format": "did",
+              "description": "DID of the message sender"
+            },
+            "embedType": {
+              "type": "string",
+              "description": "Optional embed type",
               "maxLength": 256
             },
-            "attachments": {
-              "type": "array",
-              "items": { "type": "ref", "ref": "blue.catbird.mls.defs#externalAsset" },
-              "description": "Attachment ciphertext payload pointers",
-              "maxLength": 10
-            },
-            "replyUri": { "type": "string", "format": "at-uri", "description": "If reply, AT-URI of the message being replied to" }
+            "embedUri": {
+              "type": "string",
+              "format": "uri",
+              "description": "Optional embed URI reference"
+            }
           }
         }
       },
@@ -37,9 +44,10 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["message"],
+          "required": ["messageId", "receivedAt"],
           "properties": {
-            "message": { "type": "ref", "ref": "blue.catbird.mls.defs#messageView", "description": "Created message view" }
+            "messageId": { "type": "string", "description": "Created message identifier" },
+            "receivedAt": { "type": "string", "format": "datetime", "description": "Server timestamp when message was received" }
           }
         }
       },

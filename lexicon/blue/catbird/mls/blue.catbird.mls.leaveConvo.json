@@ -14,6 +14,15 @@
             "convoId": {
               "type": "string",
               "description": "Conversation identifier"
+            },
+            "targetDid": {
+              "type": "string",
+              "format": "did",
+              "description": "DID of member to remove (defaults to caller's DID)"
+            },
+            "commit": {
+              "type": "string",
+              "description": "Optional base64url-encoded MLS Commit message"
             }
           }
         }
@@ -22,11 +31,11 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["commit"],
+          "required": ["success", "newEpoch"],
           "properties": {
-            "commit": {
-              "type": "string",
-              "description": "Base64-encoded MLS Commit message for remaining members"
+            "success": {
+              "type": "boolean",
+              "description": "Whether the operation succeeded"
             },
             "newEpoch": {
               "type": "integer",
