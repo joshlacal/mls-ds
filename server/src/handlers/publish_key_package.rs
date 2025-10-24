@@ -76,7 +76,7 @@ mod tests {
     async fn test_publish_key_package_success() {
         let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
         let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
-        let did = AuthUser { did: "did:plc:user".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:user".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None } };
+        let did = AuthUser { did: "did:plc:user".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:user".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
         
         let key_data = b"sample_key_package_data";
         let key_package = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key_data);
@@ -99,7 +99,7 @@ mod tests {
     async fn test_publish_key_package_empty() {
         let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
         let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
-        let did = AuthUser { did: "did:plc:user".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:user".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None } };
+        let did = AuthUser { did: "did:plc:user".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:user".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
         
         let expires = chrono::Utc::now() + Duration::days(30);
         let input = PublishKeyPackageInput {
@@ -116,7 +116,7 @@ mod tests {
     async fn test_publish_key_package_expired() {
         let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
         let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
-        let did = AuthUser { did: "did:plc:user".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:user".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None } };
+        let did = AuthUser { did: "did:plc:user".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:user".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
         
         let key_data = b"sample_key_package_data";
         let key_package = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key_data);

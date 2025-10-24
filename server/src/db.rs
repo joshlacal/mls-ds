@@ -93,7 +93,7 @@ pub async fn create_conversation(
 pub async fn get_conversation(pool: &DbPool, convo_id: &str) -> Result<Option<Conversation>> {
     let conversation = sqlx::query_as::<_, Conversation>(
         r#"
-        SELECT id, creator_did, current_epoch, created_at, title
+        SELECT id, creator_did, current_epoch, created_at, updated_at, title, cloudkit_zone_id, storage_model
         FROM conversations
         WHERE id = $1
         "#,
@@ -330,35 +330,55 @@ pub async fn reset_unread_count(pool: &DbPool, convo_id: &str, member_did: &str)
 // Message Operations
 // =============================================================================
 
-/// Create a new message
+/// Create a new message with direct ciphertext storage (v1 simplified)
 pub async fn create_message(
     pool: &DbPool,
     convo_id: &str,
     sender_did: &str,
-    message_type: &str,
-    epoch: i32,
     ciphertext: Vec<u8>,
+    epoch: i64,
+    embed_type: Option<&str>,
+    embed_uri: Option<&str>,
 ) -> Result<Message> {
-    let id = Uuid::new_v4().to_string();
+    let msg_id = uuid::Uuid::new_v4().to_string();
     let now = Utc::now();
+    let expires_at = now + chrono::Duration::days(30);
+
+    // Calculate sequence number within transaction
+    let mut tx = pool.begin().await.context("Failed to begin transaction")?;
+
+    let seq: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE convo_id = $1"
+    )
+    .bind(convo_id)
+    .fetch_one(&mut *tx)
+    .await
+    .context("Failed to calculate sequence number")?;
 
     let message = sqlx::query_as::<_, Message>(
         r#"
-        INSERT INTO messages (id, convo_id, sender_did, message_type, epoch, ciphertext, sent_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        RETURNING id, convo_id, sender_did, message_type, epoch, ciphertext, sent_at
+        INSERT INTO messages (
+            id, convo_id, sender_did, message_type, epoch, seq,
+            ciphertext, embed_type, embed_uri, created_at, expires_at
+        ) VALUES ($1, $2, $3, 'app', $4, $5, $6, $7, $8, $9, $10)
+        RETURNING id, convo_id, sender_did, message_type, epoch, seq, ciphertext, embed_type, embed_uri, created_at, expires_at
         "#,
     )
-    .bind(&id)
+    .bind(&msg_id)
     .bind(convo_id)
     .bind(sender_did)
-    .bind(message_type)
     .bind(epoch)
-    .bind(ciphertext)
-    .bind(now)
-    .fetch_one(pool)
+    .bind(seq)
+    .bind(&ciphertext)
+    .bind(embed_type)
+    .bind(embed_uri)
+    .bind(&now)
+    .bind(&expires_at)
+    .fetch_one(&mut *tx)
     .await
-    .context("Failed to create message")?;
+    .context("Failed to insert message")?;
+
+    tx.commit().await.context("Failed to commit transaction")?;
 
     Ok(message)
 }
@@ -367,7 +387,7 @@ pub async fn create_message(
 pub async fn get_message(pool: &DbPool, message_id: &str) -> Result<Option<Message>> {
     let message = sqlx::query_as::<_, Message>(
         r#"
-        SELECT id, convo_id, sender_did, message_type, epoch, ciphertext, sent_at
+        SELECT id, convo_id, sender_did, message_type, epoch, seq, ciphertext, embed_type, embed_uri, created_at, expires_at
         FROM messages
         WHERE id = $1
         "#,
@@ -384,16 +404,16 @@ pub async fn get_message(pool: &DbPool, message_id: &str) -> Result<Option<Messa
 pub async fn list_messages(
     pool: &DbPool,
     convo_id: &str,
-    limit: i64,
     before: Option<DateTime<Utc>>,
+    limit: i64,
 ) -> Result<Vec<Message>> {
     let messages = if let Some(before_time) = before {
         sqlx::query_as::<_, Message>(
             r#"
-            SELECT id, convo_id, sender_did, message_type, epoch, ciphertext, sent_at
+            SELECT id, convo_id, sender_did, message_type, epoch, seq, ciphertext, embed_type, embed_uri, created_at, expires_at
             FROM messages
-            WHERE convo_id = $1 AND sent_at < $2
-            ORDER BY sent_at DESC
+            WHERE convo_id = $1 AND created_at < $2 AND (expires_at IS NULL OR expires_at > NOW())
+            ORDER BY created_at DESC
             LIMIT $3
             "#,
         )
@@ -405,10 +425,10 @@ pub async fn list_messages(
     } else {
         sqlx::query_as::<_, Message>(
             r#"
-            SELECT id, convo_id, sender_did, message_type, epoch, ciphertext, sent_at
+            SELECT id, convo_id, sender_did, message_type, epoch, seq, ciphertext, embed_type, embed_uri, created_at, expires_at
             FROM messages
-            WHERE convo_id = $1
-            ORDER BY sent_at DESC
+            WHERE convo_id = $1 AND (expires_at IS NULL OR expires_at > NOW())
+            ORDER BY created_at DESC
             LIMIT $2
             "#,
         )
@@ -430,10 +450,10 @@ pub async fn list_messages_since(
 ) -> Result<Vec<Message>> {
     let messages = sqlx::query_as::<_, Message>(
         r#"
-        SELECT id, convo_id, sender_did, message_type, epoch, ciphertext, sent_at
+        SELECT id, convo_id, sender_did, message_type, epoch, seq, ciphertext, embed_type, embed_uri, created_at, expires_at
         FROM messages
-        WHERE convo_id = $1 AND sent_at > $2
-        ORDER BY sent_at ASC
+        WHERE convo_id = $1 AND created_at > $2 AND (expires_at IS NULL OR expires_at > NOW())
+        ORDER BY created_at ASC
         "#,
     )
     .bind(convo_id)
@@ -842,9 +862,10 @@ mod tests {
             &pool,
             &conversation.id,
             "did:plc:sender",
-            "app",
-            0,
             vec![1, 2, 3, 4],
+            0,
+            None,
+            None,
         )
         .await
         .expect("Failed to create message");
@@ -930,10 +951,7 @@ mod tests {
 // =============================================================================
 // Cursor Operations (Hybrid Messaging)
 // =============================================================================
-// NOTE: These functions are disabled - they require new DB schema with cursors,
-// envelopes, and event_stream tables. Enable after running new migrations.
 
-/*
 /// Update user's last seen cursor for a conversation
 pub async fn update_last_seen_cursor(
     pool: &DbPool,
@@ -1125,4 +1143,4 @@ pub async fn get_events_after_cursor(
         .map(|e| (e.id, e.payload, e.emitted_at))
         .collect())
 }
-*/
+

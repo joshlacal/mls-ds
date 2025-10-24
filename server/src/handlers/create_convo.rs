@@ -156,7 +156,7 @@ mod tests {
     async fn test_create_convo_success() {
         let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
         let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
-        let did = AuthUser { did: "did:plc:test123".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:test123".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None } };
+        let did = AuthUser { did: "did:plc:test123".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:test123".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
         let input = CreateConvoInput {
             did_list: Some(vec!["did:plc:member1".to_string()]),
             title: Some("Test Convo".to_string()),
@@ -175,7 +175,7 @@ mod tests {
     async fn test_create_convo_invalid_did() {
         let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
         let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
-        let did = AuthUser { did: "did:plc:test123".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:test123".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None } };
+        let did = AuthUser { did: "did:plc:test123".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:test123".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
         let input = CreateConvoInput {
             did_list: Some(vec!["invalid_did".to_string()]),
             title: None,
@@ -189,7 +189,7 @@ mod tests {
     async fn test_create_convo_empty_did_list() {
         let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
         let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
-        let did = AuthUser { did: "did:plc:test123".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:test123".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None } };
+        let did = AuthUser { did: "did:plc:test123".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:test123".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
         let input = CreateConvoInput {
             did_list: Some(vec![]),
             title: None,

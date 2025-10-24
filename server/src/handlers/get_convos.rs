@@ -71,10 +71,10 @@ pub async fn get_convos(
             let group_id = format!("group_{}", c.id);
             
             // Build metadata view
-            let metadata_view = if c.name.is_some() || c.description.is_some() || c.avatar_blob.is_some() {
+            let metadata_view = if c.title.is_some() {
                 Some(crate::models::ConvoMetadataView {
-                    name: c.name.clone(),
-                    description: c.description.clone(),
+                    name: c.title.clone(),
+                    description: None,
                     avatar: None, // TODO: Convert blob reference
                 })
             } else {
@@ -87,7 +87,7 @@ pub async fn get_convos(
                 creator: c.creator_did,
                 members,
                 epoch: c.current_epoch,
-                cipher_suite: c.cipher_suite,
+                cipher_suite: "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519".to_string(), // Default cipher suite
                 created_at: c.created_at,
                 last_message_at: None, // TODO: Get from last message
                 metadata: metadata_view,
@@ -136,7 +136,7 @@ mod tests {
         setup_test_convo(&pool, "convo-1", user, vec![user, "did:plc:member1"]).await;
         setup_test_convo(&pool, "convo-2", "did:plc:other", vec!["did:plc:other", user]).await;
 
-        let did = AuthUser { did: user.to_string(), claims: crate::auth::AtProtoClaims { iss: user.to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None } };
+        let did = AuthUser { did: user.to_string(), claims: crate::auth::AtProtoClaims { iss: user.to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
         let result = get_convos(State(pool), did).await;
         assert!(result.is_ok());
         
@@ -150,7 +150,7 @@ mod tests {
         let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
         let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
         
-        let did = AuthUser { did: "did:plc:lonely".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:lonely".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None } };
+        let did = AuthUser { did: "did:plc:lonely".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:lonely".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
         let result = get_convos(State(pool), did).await;
         assert!(result.is_ok());
         
@@ -178,7 +178,7 @@ mod tests {
             .await
             .unwrap();
 
-        let did = AuthUser { did: user.to_string(), claims: crate::auth::AtProtoClaims { iss: user.to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None } };
+        let did = AuthUser { did: user.to_string(), claims: crate::auth::AtProtoClaims { iss: user.to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
         let result = get_convos(State(pool), did).await;
         assert!(result.is_ok());
         
@@ -203,7 +203,7 @@ mod tests {
             .await
             .unwrap();
 
-        let did = AuthUser { did: user.to_string(), claims: crate::auth::AtProtoClaims { iss: user.to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None } };
+        let did = AuthUser { did: user.to_string(), claims: crate::auth::AtProtoClaims { iss: user.to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
         let result = get_convos(State(pool), did).await;
         assert!(result.is_ok());
         
@@ -225,7 +225,7 @@ mod tests {
         
         setup_test_convo(&pool, "convo-1", user, vec![user, member1, member2]).await;
 
-        let did = AuthUser { did: user.to_string(), claims: crate::auth::AtProtoClaims { iss: user.to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None } };
+        let did = AuthUser { did: user.to_string(), claims: crate::auth::AtProtoClaims { iss: user.to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
         let result = get_convos(State(pool), did).await;
         assert!(result.is_ok());
         

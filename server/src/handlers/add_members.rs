@@ -69,7 +69,7 @@ pub async fn add_members(
         let msg_id = uuid::Uuid::new_v4().to_string();
 
         sqlx::query(
-            "INSERT INTO messages (id, convo_id, sender_did, message_type, epoch, ciphertext, sent_at) VALUES ($1, $2, $3, 'commit', $4, $5, $6)"
+            "INSERT INTO messages (id, convo_id, sender_did, message_type, epoch, ciphertext, created_at) VALUES ($1, $2, $3, 'commit', $4, $5, $6)"
         )
         .bind(&msg_id)
         .bind(&input.convo_id)
@@ -171,7 +171,7 @@ mod tests {
         
         setup_test_convo(&pool, creator, convo_id).await;
 
-        let did = AuthUser { did: creator.to_string(), claims: crate::auth::AtProtoClaims { iss: creator.to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None } };
+        let did = AuthUser { did: creator.to_string(), claims: crate::auth::AtProtoClaims { iss: creator.to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
         let input = AddMembersInput {
             convo_id: convo_id.to_string(),
             did_list: vec!["did:plc:member1".to_string()],
@@ -196,7 +196,7 @@ mod tests {
         
         setup_test_convo(&pool, creator, convo_id).await;
 
-        let did = AuthUser { did: "did:plc:outsider".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:outsider".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None } };
+        let did = AuthUser { did: "did:plc:outsider".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:outsider".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
         let input = AddMembersInput {
             convo_id: convo_id.to_string(),
             did_list: vec!["did:plc:member1".to_string()],
@@ -217,7 +217,7 @@ mod tests {
         
         setup_test_convo(&pool, creator, convo_id).await;
 
-        let did = AuthUser { did: creator.to_string(), claims: crate::auth::AtProtoClaims { iss: creator.to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None } };
+        let did = AuthUser { did: creator.to_string(), claims: crate::auth::AtProtoClaims { iss: creator.to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
         let input = AddMembersInput {
             convo_id: convo_id.to_string(),
             did_list: vec![],
