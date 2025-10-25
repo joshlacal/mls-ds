@@ -1,4 +1,6 @@
 pub mod cursor;
 pub mod sse;
+pub mod websocket;
 
-pub use sse::{subscribe_convo_events, SseState, StreamEvent};
+pub use sse::{SseState, StreamEvent};
+pub use websocket::subscribe_convo_events;
