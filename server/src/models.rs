@@ -9,16 +9,14 @@ pub struct Conversation {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub title: Option<String>,
-    pub cloudkit_zone_id: Option<String>,
-    pub storage_model: Option<String>,
 }
 
 impl Conversation {
     pub fn new(creator_did: String, metadata: Option<ConvoMetadata>) -> Self {
-        let (title, _description, _avatar_blob) = if let Some(m) = metadata {
-            (m.name, m.description, m.avatar)
+        let (title, _description) = if let Some(m) = metadata {
+            (m.name, m.description)
         } else {
-            (None, None, None)
+            (None, None)
         };
         
         let now = Utc::now();
@@ -29,8 +27,6 @@ impl Conversation {
             created_at: now,
             updated_at: now,
             title,
-            cloudkit_zone_id: None,
-            storage_model: Some("shared-zone".to_string()),
         }
     }
 }
@@ -108,16 +104,6 @@ impl KeyPackage {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
-pub struct Blob {
-    pub cid: String,
-    pub data: Vec<u8>,
-    pub size: i64,
-    pub uploaded_by_did: String,
-    pub convo_id: Option<String>,
-    pub uploaded_at: DateTime<Utc>,
-}
-
 // API Request/Response types
 
 #[derive(Debug, Deserialize)]
@@ -133,7 +119,6 @@ pub struct CreateConvoInput {
 pub struct ConvoMetadata {
     pub name: Option<String>,
     pub description: Option<String>,
-    pub avatar: Option<String>, // blob reference or base64
 }
 
 #[derive(Debug, Serialize)]
@@ -176,8 +161,6 @@ pub struct ConvoMetadataView {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub avatar: Option<BlobRef>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -296,10 +279,4 @@ pub struct KeyPackageInfo {
     pub key_package: String, // base64url
     #[serde(rename = "cipherSuite")]
     pub cipher_suite: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct BlobRef {
-    pub cid: String,
-    pub size: i64,
 }

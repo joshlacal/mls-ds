@@ -34,7 +34,7 @@ pub async fn get_convos(
     for membership in memberships {
         // Get conversation details
         let convo: Option<crate::models::Conversation> = sqlx::query_as(
-            "SELECT id, creator_did, current_epoch, created_at, cipher_suite, name, description, avatar_blob FROM conversations WHERE id = $1"
+            "SELECT id, creator_did, current_epoch, created_at, updated_at, title FROM conversations WHERE id = $1"
         )
         .bind(&membership.convo_id)
         .fetch_optional(&pool)
@@ -75,7 +75,6 @@ pub async fn get_convos(
                 Some(crate::models::ConvoMetadataView {
                     name: c.title.clone(),
                     description: None,
-                    avatar: None, // TODO: Convert blob reference
                 })
             } else {
                 None

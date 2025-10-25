@@ -121,10 +121,6 @@ async fn main() -> anyhow::Result<()> {
             "/xrpc/blue.catbird.mls.getKeyPackages",
             get(handlers::get_key_packages),
         )
-        .route(
-            "/xrpc/blue.catbird.mls.uploadBlob",
-            post(handlers::upload_blob),
-        )
         // Hybrid messaging endpoints
         .route(
             "/xrpc/blue.catbird.mls.subscribeConvoEvents",

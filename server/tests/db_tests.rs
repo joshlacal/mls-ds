@@ -22,7 +22,7 @@ async fn setup_test_db() -> PgPool {
 }
 
 async fn cleanup_test_data(pool: &PgPool) {
-    sqlx::query("TRUNCATE TABLE messages, members, conversations, key_packages, blobs CASCADE")
+    sqlx::query("TRUNCATE TABLE messages, members, conversations, key_packages CASCADE")
         .execute(pool)
         .await
         .expect("Failed to cleanup test data");
@@ -175,9 +175,10 @@ async fn test_message_operations() {
         &pool,
         &convo.id,
         "did:plc:alice",
-        "app",
-        0,
         vec![1, 2, 3, 4],
+        0,
+        None,
+        None,
     )
     .await
     .expect("Failed to create message 1");
@@ -188,9 +189,10 @@ async fn test_message_operations() {
         &pool,
         &convo.id,
         "did:plc:bob",
-        "app",
-        0,
         vec![5, 6, 7, 8],
+        0,
+        None,
+        None,
     )
     .await
     .expect("Failed to create message 2");
@@ -220,7 +222,7 @@ async fn test_message_operations() {
     assert_eq!(page1.len(), 1);
     assert_eq!(page1[0].id, msg2.id);
 
-    let page2 = list_messages(&pool, &convo.id, 1, Some(msg2.sent_at))
+    let page2 = list_messages(&pool, &convo.id, 1, Some(msg2.created_at))
         .await
         .expect("Failed to list messages");
 
@@ -228,7 +230,7 @@ async fn test_message_operations() {
     assert_eq!(page2[0].id, msg1.id);
 
     // List since time
-    let since = msg1.sent_at;
+    let since = msg1.created_at;
     let recent = list_messages_since(&pool, &convo.id, since)
         .await
         .expect("Failed to list messages since");
@@ -345,77 +347,7 @@ async fn test_expired_key_package_cleanup() {
     assert!(deleted >= 1);
 }
 
-#[tokio::test]
-async fn test_blob_operations() {
-    let pool = setup_test_db().await;
-    cleanup_test_data(&pool).await;
-
-    let convo = create_conversation(&pool, "did:plc:creator", None)
-        .await
-        .expect("Failed to create conversation");
-
-    // Store blob
-    let blob_data = vec![1, 2, 3, 4, 5, 6, 7, 8];
-    let blob = store_blob(
-        &pool,
-        "bafytest123",
-        blob_data.clone(),
-        "did:plc:alice",
-        Some(&convo.id),
-        Some("image/png"),
-    )
-    .await
-    .expect("Failed to store blob");
-
-    assert_eq!(blob.cid, "bafytest123");
-    assert_eq!(blob.size, 8);
-
-    // Get blob
-    let fetched = get_blob(&pool, "bafytest123")
-        .await
-        .expect("Failed to get blob")
-        .expect("Blob not found");
-
-    assert_eq!(fetched.data, blob_data);
-    assert_eq!(fetched.uploaded_by_did, "did:plc:alice");
-
-    // Store another blob
-    store_blob(
-        &pool,
-        "bafytest456",
-        vec![9, 10],
-        "did:plc:alice",
-        Some(&convo.id),
-        None,
-    )
-    .await
-    .expect("Failed to store blob 2");
-
-    // List blobs by conversation
-    let blobs = list_blobs_by_conversation(&pool, &convo.id, 10)
-        .await
-        .expect("Failed to list blobs");
-
-    assert_eq!(blobs.len(), 2);
-
-    // Get user storage size
-    let storage = get_user_storage_size(&pool, "did:plc:alice")
-        .await
-        .expect("Failed to get storage size");
-
-    assert_eq!(storage, 10); // 8 + 2
-
-    // Delete blob
-    delete_blob(&pool, "bafytest123")
-        .await
-        .expect("Failed to delete blob");
-
-    let deleted = get_blob(&pool, "bafytest123")
-        .await
-        .expect("Failed to get blob");
-
-    assert!(deleted.is_none());
-}
+// Blob operations have been removed - system is now text-only with PostgreSQL storage
 
 #[tokio::test]
 async fn test_transaction_conversation_with_members() {
@@ -522,9 +454,10 @@ async fn test_concurrent_operations() {
                 &pool_clone,
                 &convo_id,
                 &format!("did:plc:user{}", i),
-                "app",
-                0,
                 vec![i as u8],
+                0,
+                None,
+                None,
             )
             .await
         });
