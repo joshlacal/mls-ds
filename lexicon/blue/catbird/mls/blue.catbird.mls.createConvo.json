@@ -66,7 +66,7 @@
     },
     "metadataInput": {
       "type": "object",
-      "description": "Input metadata for conversation creation",
+      "description": "Input metadata for conversation creation (text-only, no avatar)",
       "properties": {
         "name": {
           "type": "string",
@@ -77,10 +77,6 @@
           "type": "string",
           "maxLength": 512,
           "description": "Conversation description"
-        },
-        "avatar": {
-          "type": "blob",
-          "maxSize": 52428800
         }
       }
     }
