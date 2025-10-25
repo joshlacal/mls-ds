@@ -4,7 +4,6 @@ use tracing::{error, info, warn};
 
 use crate::{
     auth::AuthUser,
-    fanout::{Envelope, MailboxConfig, MailboxFactory},
     models::{SendMessageInput, SendMessageOutput},
     realtime::{SseState, StreamEvent},
     db,
@@ -114,7 +113,7 @@ pub async fn send_message(
         // Get all active members
         let members_result = sqlx::query!(
             r#"
-            SELECT member_did, mailbox_provider, mailbox_zone
+            SELECT member_did
             FROM members
             WHERE convo_id = $1 AND left_at IS NULL
             "#,
@@ -127,27 +126,21 @@ pub async fn send_message(
             Ok(members) => {
                 info!(convo_id = %convo_id, member_count = members.len(), "Fan-out to members");
 
-                let mailbox_config = MailboxConfig::default();
-
-                // Write envelopes and notify mailboxes
+                // Write envelopes for message tracking
                 for member in &members {
                     let envelope_id = uuid::Uuid::new_v4().to_string();
-                    let provider = member.mailbox_provider.as_deref().unwrap_or("cloudkit");
-                    let zone = member.mailbox_zone.as_deref();
 
-                    // Insert envelope
+                    // Insert envelope (simplified - no provider/zone)
                     let envelope_result = sqlx::query!(
                         r#"
-                        INSERT INTO envelopes (id, convo_id, recipient_did, message_id, mailbox_provider, cloudkit_zone, created_at)
-                        VALUES ($1, $2, $3, $4, $5, $6, NOW())
+                        INSERT INTO envelopes (id, convo_id, recipient_did, message_id, created_at)
+                        VALUES ($1, $2, $3, $4, NOW())
                         ON CONFLICT (recipient_did, message_id) DO NOTHING
                         "#,
                         &envelope_id,
                         &convo_id,
                         &member.member_did,
                         &msg_id_clone,
-                        provider,
-                        zone,
                     )
                     .execute(&pool_clone)
                     .await;
@@ -159,30 +152,6 @@ pub async fn send_message(
                             error = ?e,
                             "Failed to insert envelope"
                         );
-                        continue;
-                    }
-
-                    // Notify mailbox backend
-                    let backend = MailboxFactory::create(provider, &mailbox_config);
-                    let envelope = Envelope {
-                        id: envelope_id,
-                        convo_id: convo_id.clone(),
-                        recipient_did: member.member_did.clone(),
-                        message_id: msg_id_clone.clone(),
-                        mailbox_provider: provider.to_string(),
-                        cloudkit_zone: zone.map(String::from),
-                    };
-
-                    if let Err(e) = backend.notify(&envelope).await {
-                        error!(
-                            recipient = %member.member_did,
-                            provider = provider,
-                            error = ?e,
-                            "Mailbox notification failed"
-                        );
-                        crate::metrics::record_fanout_operation(provider, false);
-                    } else {
-                        crate::metrics::record_fanout_operation(provider, true);
                     }
                 }
 

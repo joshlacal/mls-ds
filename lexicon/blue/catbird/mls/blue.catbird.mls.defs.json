@@ -3,37 +3,6 @@
   "id": "blue.catbird.mls.defs",
   "description": "Shared type definitions for MLS (Message Layer Security) protocol",
   "defs": {
-    "externalAsset": {
-      "type": "object",
-      "description": "Pointer to ciphertext stored in an external provider",
-      "required": ["provider", "uri", "mimeType", "size", "sha256"],
-      "properties": {
-        "provider": {
-          "type": "string",
-          "description": "Storage provider identifier",
-          "knownValues": ["cloudkit", "firestore", "gdrive", "s3", "custom"]
-        },
-        "uri": {
-          "type": "string",
-          "format": "uri",
-          "description": "Provider-specific URI (e.g., cloudkit://..., firestore://..., gdrive://...)"
-        },
-        "mimeType": {
-          "type": "string",
-          "description": "MIME type of the ciphertext payload"
-        },
-        "size": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "Size in bytes of the ciphertext payload"
-        },
-        "sha256": {
-          "type": "bytes",
-          "description": "SHA-256 of ciphertext payload bytes"
-        }
-      }
-    },
-
     "convoView": {
       "type": "object",
       "description": "View of an MLS conversation with member and epoch information",
@@ -68,11 +37,10 @@
 
     "convoMetadata": {
       "type": "object",
-      "description": "Metadata for a conversation (name, description, avatar)",
+      "description": "Metadata for a conversation (name, description)",
       "properties": {
         "name": { "type": "string", "maxLength": 128, "description": "Conversation display name" },
-        "description": { "type": "string", "maxLength": 512, "description": "Conversation description" },
-        "avatar": { "type": "blob", "description": "Conversation avatar image" }
+        "description": { "type": "string", "maxLength": 512, "description": "Conversation description" }
       }
     },
 
@@ -100,8 +68,8 @@
         "epoch": { "type": "integer", "minimum": 0, "description": "MLS epoch when message was sent" },
         "seq": { "type": "integer", "minimum": 0, "description": "Sequence number within conversation" },
         "createdAt": { "type": "string", "format": "datetime", "description": "Message creation timestamp" },
-        "embedType": { "type": "string", "description": "Optional embed type", "maxLength": 256 },
-        "embedUri": { "type": "string", "format": "uri", "description": "Optional embed URI reference" }
+        "embedType": { "type": "string", "description": "Optional embed type (e.g., 'tenor', 'bsky_post', 'link')", "maxLength": 256 },
+        "embedUri": { "type": "string", "format": "uri", "description": "Optional embed URI reference (Tenor URL, AT-URI for Bluesky posts, etc.)" }
       }
     },
 
@@ -124,18 +92,6 @@
             "MLS_256_DHKEMX448_CHACHA20POLY1305_SHA512_Ed448"
           ]
         }
-      }
-    },
-
-    "blobRef": {
-      "type": "object",
-      "description": "Reference to a blob (file attachment)",
-      "required": ["cid", "mimeType", "size"],
-      "properties": {
-        "cid": { "type": "string", "description": "Content identifier (CID)" },
-        "mimeType": { "type": "string", "description": "MIME type of the blob", "maxLength": 256 },
-        "size": { "type": "integer", "minimum": 0, "maximum": 52428800, "description": "Blob size in bytes (max 50MB)" },
-        "ref": { "type": "string", "format": "at-uri", "description": "AT URI reference to blob" }
       }
     }
   }

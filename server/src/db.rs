@@ -4,7 +4,7 @@ use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Transaction};
 use std::time::Duration;
 use uuid::Uuid;
 
-use crate::models::{Blob, Conversation, KeyPackage, Membership, Message};
+use crate::models::{Conversation, KeyPackage, Membership, Message};
 
 pub type DbPool = PgPool;
 
@@ -93,7 +93,7 @@ pub async fn create_conversation(
 pub async fn get_conversation(pool: &DbPool, convo_id: &str) -> Result<Option<Conversation>> {
     let conversation = sqlx::query_as::<_, Conversation>(
         r#"
-        SELECT id, creator_did, current_epoch, created_at, updated_at, title, cloudkit_zone_id, storage_model
+        SELECT id, creator_did, current_epoch, created_at, updated_at, title
         FROM conversations
         WHERE id = $1
         "#,
@@ -612,107 +612,6 @@ pub async fn count_key_packages(pool: &DbPool, did: &str, cipher_suite: &str) ->
 }
 
 // =============================================================================
-// Blob Operations
-// =============================================================================
-
-/// Store a blob
-pub async fn store_blob(
-    pool: &DbPool,
-    cid: &str,
-    data: Vec<u8>,
-    uploaded_by_did: &str,
-    convo_id: Option<&str>,
-    _mime_type: Option<&str>,
-) -> Result<Blob> {
-    let size = data.len() as i64;
-    let now = Utc::now();
-
-    let blob = sqlx::query_as::<_, Blob>(
-        r#"
-        INSERT INTO blobs (cid, data, size, uploaded_by_did, convo_id, uploaded_at)
-        VALUES ($1, $2, $3, $4, $5, $6)
-        RETURNING cid, data, size, uploaded_by_did, convo_id, uploaded_at
-        "#,
-    )
-    .bind(cid)
-    .bind(data)
-    .bind(size)
-    .bind(uploaded_by_did)
-    .bind(convo_id)
-    .bind(now)
-    .fetch_one(pool)
-    .await
-    .context("Failed to store blob")?;
-
-    Ok(blob)
-}
-
-/// Get a blob by CID
-pub async fn get_blob(pool: &DbPool, cid: &str) -> Result<Option<Blob>> {
-    let blob = sqlx::query_as::<_, Blob>(
-        r#"
-        SELECT cid, data, size, uploaded_by_did, convo_id, uploaded_at
-        FROM blobs
-        WHERE cid = $1
-        "#,
-    )
-    .bind(cid)
-    .fetch_optional(pool)
-    .await
-    .context("Failed to fetch blob")?;
-
-    Ok(blob)
-}
-
-/// List blobs for a conversation
-pub async fn list_blobs_by_conversation(
-    pool: &DbPool,
-    convo_id: &str,
-    limit: i64,
-) -> Result<Vec<Blob>> {
-    let blobs = sqlx::query_as::<_, Blob>(
-        r#"
-        SELECT cid, data, size, uploaded_by_did, convo_id, uploaded_at
-        FROM blobs
-        WHERE convo_id = $1
-        ORDER BY uploaded_at DESC
-        LIMIT $2
-        "#,
-    )
-    .bind(convo_id)
-    .bind(limit)
-    .fetch_all(pool)
-    .await
-    .context("Failed to list blobs")?;
-
-    Ok(blobs)
-}
-
-/// Delete a blob
-pub async fn delete_blob(pool: &DbPool, cid: &str) -> Result<()> {
-    sqlx::query("DELETE FROM blobs WHERE cid = $1")
-        .bind(cid)
-        .execute(pool)
-        .await
-        .context("Failed to delete blob")?;
-
-    Ok(())
-}
-
-/// Get total blob storage for a user
-pub async fn get_user_storage_size(pool: &DbPool, did: &str) -> Result<i64> {
-    let size = sqlx::query_scalar::<_, Option<i64>>(
-        "SELECT SUM(size) FROM blobs WHERE uploaded_by_did = $1",
-    )
-    .bind(did)
-    .fetch_one(pool)
-    .await
-    .context("Failed to get user storage size")?;
-
-    Ok(size.unwrap_or(0))
-}
-
-// =============================================================================
 // Transaction Support
 // =============================================================================
 
@@ -1005,21 +904,19 @@ pub async fn get_last_seen_cursor(
 // Envelope Operations (Mailbox Fan-out)
 // =============================================================================
 
-/// Create envelope for message delivery
+/// Create envelope for message delivery (simplified - no provider/zone)
 pub async fn create_envelope(
     pool: &DbPool,
     convo_id: &str,
     recipient_did: &str,
     message_id: &str,
-    mailbox_provider: &str,
-    cloudkit_zone: Option<&str>,
 ) -> Result<String> {
     let id = Uuid::new_v4().to_string();
 
     sqlx::query!(
         r#"
-        INSERT INTO envelopes (id, convo_id, recipient_did, message_id, mailbox_provider, cloudkit_zone, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, NOW())
+        INSERT INTO envelopes (id, convo_id, recipient_did, message_id, created_at)
+        VALUES ($1, $2, $3, $4, NOW())
         ON CONFLICT (recipient_did, message_id) DO NOTHING
         RETURNING id
         "#,
@@ -1027,36 +924,12 @@ pub async fn create_envelope(
         convo_id,
         recipient_did,
         message_id,
-        mailbox_provider,
-        cloudkit_zone,
     )
     .fetch_optional(pool)
     .await
     .context("Failed to create envelope")?;
 
     Ok(id)
-}
-
-/// Get member mailbox configuration
-pub async fn get_member_mailbox_config(
-    pool: &DbPool,
-    convo_id: &str,
-    member_did: &str,
-) -> Result<Option<(String, Option<String>)>> {
-    let result = sqlx::query!(
-        r#"
-        SELECT mailbox_provider, mailbox_zone
-        FROM members
-        WHERE convo_id = $1 AND member_did = $2 AND left_at IS NULL
-        "#,
-        convo_id,
-        member_did,
-    )
-    .fetch_optional(pool)
-    .await
-    .context("Failed to get mailbox config")?;
-
-    Ok(result.map(|r| (r.mailbox_provider.unwrap_or_else(|| "cloudkit".to_string()), r.mailbox_zone)))
 }
 
 // =============================================================================
@@ -1143,4 +1016,3 @@ pub async fn get_events_after_cursor(
         .map(|e| (e.id, e.payload, e.emitted_at))
         .collect())
 }
-
