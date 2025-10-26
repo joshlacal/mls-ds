@@ -55,14 +55,16 @@ pub async fn create_convo(
 
     info!("Creating conversation {} with cipher suite {}", convo_id, input.cipher_suite);
 
-    // Create conversation
+    // Create conversation with group_id from client
     sqlx::query(
-        "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at, title) VALUES ($1, $2, 0, $3, $3, $4)"
+        "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at, title, group_id, cipher_suite) VALUES ($1, $2, 0, $3, $3, $4, $5, $6)"
     )
     .bind(&convo_id)
     .bind(did)
     .bind(&now)
     .bind(&name)
+    .bind(&input.group_id)
+    .bind(&input.cipher_suite)
     .execute(&pool)
     .await
     .map_err(|e| {
@@ -116,8 +118,8 @@ pub async fn create_convo(
 
     info!("Conversation {} created successfully with {} members", convo_id, members.len());
 
-    // Generate MLS group ID (for now, derive from conversation ID)
-    let group_id = format!("group_{}", convo_id);
+    // Use the actual MLS group ID from client input
+    let group_id = input.group_id.clone();
     
     // Build metadata view if metadata exists
     let metadata_view = if name.is_some() || description.is_some() {
@@ -154,6 +156,7 @@ mod tests {
         let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
         let did = AuthUser { did: "did:plc:test123".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:test123".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
         let input = CreateConvoInput {
+            group_id: "abcdef0123456789".to_string(),
             cipher_suite: "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519".to_string(),
             initial_members: Some(vec!["did:plc:member1".to_string()]),
             metadata: Some(crate::models::ConvoMetadata {
@@ -177,6 +180,7 @@ mod tests {
         let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
         let did = AuthUser { did: "did:plc:test123".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:test123".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
         let input = CreateConvoInput {
+            group_id: "abcdef0123456789".to_string(),
             cipher_suite: "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519".to_string(),
             initial_members: Some(vec!["invalid_did".to_string()]),
             metadata: None,
@@ -192,6 +196,7 @@ mod tests {
         let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
         let did = AuthUser { did: "did:plc:test123".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:test123".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
         let input = CreateConvoInput {
+            group_id: "abcdef0123456789".to_string(),
             cipher_suite: "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519".to_string(),
             initial_members: Some(vec![]),
             metadata: None,
