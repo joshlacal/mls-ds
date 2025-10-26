@@ -29,6 +29,8 @@ impl Conversation {
             created_at: now,
             updated_at: now,
             title,
+            group_id: None,
+            cipher_suite: None,
         }
     }
 }

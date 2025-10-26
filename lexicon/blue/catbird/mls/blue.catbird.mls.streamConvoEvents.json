@@ -1,11 +1,11 @@
 {
   "lexicon": 1,
-  "id": "blue.catbird.mls.subscribeConvoEvents",
-  "description": "Real-time event stream for conversation updates (messages, reactions, typing indicators)",
+  "id": "blue.catbird.mls.streamConvoEvents",
+  "description": "Server-Sent Events stream for conversation updates (messages, reactions, typing indicators)",
   "defs": {
     "main": {
-      "type": "subscription",
-      "description": "Subscribe to live events (new messages, reactions, etc.) in conversations involving the authenticated user",
+      "type": "query",
+      "description": "Subscribe to live events (new messages, reactions, etc.) via Server-Sent Events in conversations involving the authenticated user",
       "parameters": {
         "type": "params",
         "properties": {
@@ -19,7 +19,9 @@
           }
         }
       },
-      "message": {
+      "output": {
+        "encoding": "text/event-stream",
+        "description": "Server-Sent Events stream",
         "schema": {
           "type": "union",
           "refs": ["#messageEvent", "#reactionEvent", "#typingEvent", "#infoEvent"]
