@@ -123,7 +123,7 @@ async fn main() -> anyhow::Result<()> {
         )
         // Hybrid messaging endpoints
         .route(
-            "/xrpc/blue.catbird.mls.subscribeConvoEvents",
+            "/xrpc/blue.catbird.mls.streamConvoEvents",
             get(realtime::subscribe_convo_events),
         )
         .route(
