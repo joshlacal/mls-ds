@@ -9,6 +9,8 @@ pub struct Conversation {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub title: Option<String>,
+    pub group_id: Option<String>,
+    pub cipher_suite: Option<String>,
 }
 
 impl Conversation {
@@ -108,6 +110,8 @@ impl KeyPackage {
 
 #[derive(Debug, Deserialize)]
 pub struct CreateConvoInput {
+    #[serde(rename = "groupId")]
+    pub group_id: String,
     #[serde(rename = "cipherSuite")]
     pub cipher_suite: String,
     #[serde(rename = "initialMembers")]

@@ -34,7 +34,7 @@ pub async fn get_convos(
     for membership in memberships {
         // Get conversation details
         let convo: Option<crate::models::Conversation> = sqlx::query_as(
-            "SELECT id, creator_did, current_epoch, created_at, updated_at, name as title, cipher_suite FROM conversations WHERE id = $1"
+            "SELECT id, creator_did, current_epoch, created_at, updated_at, name as title, cipher_suite, group_id FROM conversations WHERE id = $1"
         )
         .bind(&membership.convo_id)
         .fetch_optional(&pool)
@@ -67,8 +67,8 @@ pub async fn get_convos(
                 })
                 .collect();
 
-            // Generate group ID
-            let group_id = format!("group_{}", c.id);
+            // Use stored group_id or fallback to generated one for backward compatibility
+            let group_id = c.group_id.clone().unwrap_or_else(|| format!("group_{}", c.id));
             
             // Build metadata view
             let metadata_view = if c.title.is_some() {
@@ -86,7 +86,7 @@ pub async fn get_convos(
                 creator: c.creator_did,
                 members,
                 epoch: c.current_epoch,
-                cipher_suite: "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519".to_string(), // Default cipher suite
+                cipher_suite: c.cipher_suite.clone().unwrap_or_else(|| "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519".to_string()),
                 created_at: c.created_at,
                 last_message_at: None, // TODO: Get from last message
                 metadata: metadata_view,

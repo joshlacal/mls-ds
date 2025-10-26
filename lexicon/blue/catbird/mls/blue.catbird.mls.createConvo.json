@@ -10,8 +10,13 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["cipherSuite"],
+          "required": ["groupId", "cipherSuite"],
           "properties": {
+            "groupId": {
+              "type": "string",
+              "description": "Hex-encoded MLS group identifier",
+              "maxLength": 128
+            },
             "cipherSuite": {
               "type": "string",
               "description": "MLS cipher suite to use for this conversation",
