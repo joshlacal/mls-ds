@@ -67,8 +67,14 @@ pub async fn get_convos(
                 })
                 .collect();
 
-            // Use stored group_id or fallback to generated one for backward compatibility
-            let group_id = c.group_id.clone().unwrap_or_else(|| format!("group_{}", c.id));
+            // Skip conversations without a valid MLS groupId
+            let group_id = match c.group_id.clone() {
+                Some(gid) if !gid.is_empty() => gid,
+                _ => {
+                    error!("Conversation {} has no MLS group_id, skipping", c.id);
+                    continue;
+                }
+            };
             
             // Build metadata view
             let metadata_view = if c.title.is_some() {
