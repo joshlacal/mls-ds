@@ -10,6 +10,8 @@ NC='\033[0m' # No Color
 
 # Configuration
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKSPACE_DIR="$(cd "$PROJECT_DIR/.." && pwd)"
+TARGET_DIR="$WORKSPACE_DIR/target"
 BUILD_DIR="$PROJECT_DIR/build"
 INCLUDE_DIR="$PROJECT_DIR/include"
 
@@ -81,7 +83,7 @@ for target in "${TARGETS[@]}"; do
     
     # Copy to build directory
     LIB_NAME="libmls_ffi.a"
-    SRC_PATH="$PROJECT_DIR/target/$target/$BUILD_TYPE/$LIB_NAME"
+    SRC_PATH="$TARGET_DIR/$target/$BUILD_TYPE/$LIB_NAME"
     DEST_PATH="$BUILD_DIR/$LIB_NAME.$target"
     
     cp "$SRC_PATH" "$DEST_PATH"
