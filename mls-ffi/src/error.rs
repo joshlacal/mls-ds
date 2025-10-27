@@ -36,6 +36,12 @@ pub enum MLSError {
     
     #[error("Internal error: {0}")]
     Internal(String),
+    
+    #[error("Invalid input: {0}")]
+    InvalidInput(String),
+    
+    #[error("Epoch mismatch: expected {expected}, got {actual}")]
+    EpochMismatch { expected: u64, actual: u64 },
 }
 
 impl MLSError {

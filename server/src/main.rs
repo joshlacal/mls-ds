@@ -121,6 +121,14 @@ async fn main() -> anyhow::Result<()> {
             "/xrpc/blue.catbird.mls.getKeyPackages",
             get(handlers::get_key_packages),
         )
+        .route(
+            "/xrpc/blue.catbird.mls.getEpoch",
+            get(handlers::get_epoch),
+        )
+        .route(
+            "/xrpc/blue.catbird.mls.getCommits",
+            get(handlers::get_commits),
+        )
         // Hybrid messaging endpoints
         .route(
             "/xrpc/blue.catbird.mls.streamConvoEvents",

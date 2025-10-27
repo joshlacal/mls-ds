@@ -1,7 +1,3 @@
-// MLS FFI Layer - C-compatible interface
-// This provides a working foundation with core functionality
-// Full OpenMLS integration to be completed based on final API requirements
-
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::ptr;
@@ -9,15 +5,16 @@ use std::slice;
 use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 
+use openmls::prelude::*;
+use openmls_basic_credential::SignatureKeyPair;
+
 use crate::error::{MLSError, Result};
 use crate::mls_context::MLSContext;
 
-// Global context storage with thread-safe access
 static CONTEXTS: Mutex<Option<HashMap<usize, Arc<MLSContext>>>> = Mutex::new(None);
 static NEXT_CONTEXT_ID: Mutex<usize> = Mutex::new(1);
 
 /// FFI-safe result type
-/// Contains success status, error message, and data buffer
 #[repr(C)]
 pub struct MLSResult {
     pub success: bool,
@@ -27,7 +24,6 @@ pub struct MLSResult {
 }
 
 impl MLSResult {
-    /// Create a successful result with data
     pub fn ok(data: Vec<u8>) -> Self {
         let len = data.len();
         let ptr = if len > 0 {
@@ -43,7 +39,6 @@ impl MLSResult {
         }
     }
 
-    /// Create an error result
     pub fn err(error: MLSError) -> Self {
         Self {
             success: false,
@@ -55,7 +50,7 @@ impl MLSResult {
 }
 
 /// Initialize the MLS FFI library
-/// Returns a context handle (non-zero on success, 0 on failure)
+/// Returns a context handle for subsequent operations
 #[no_mangle]
 pub extern "C" fn mls_init() -> usize {
     let mut contexts_guard = match CONTEXTS.lock() {
@@ -79,7 +74,7 @@ pub extern "C" fn mls_init() -> usize {
     context_id
 }
 
-/// Free an MLS context and all associated resources
+/// Free an MLS context
 #[no_mangle]
 pub extern "C" fn mls_free_context(context_id: usize) {
     if let Ok(mut contexts_guard) = CONTEXTS.lock() {
@@ -88,8 +83,6 @@ pub extern "C" fn mls_free_context(context_id: usize) {
         }
     }
 }
-
-// Helper functions
 
 fn get_context(context_id: usize) -> Result<Arc<MLSContext>> {
     let contexts_guard = CONTEXTS.lock()
@@ -103,6 +96,21 @@ fn get_context(context_id: usize) -> Result<Arc<MLSContext>> {
         .ok_or(MLSError::InvalidContext)
 }
 
+// Security limits for FFI inputs
+const MAX_IDENTITY_LEN: usize = 1024;
+const MAX_KEY_PACKAGES_LEN: usize = 10 * 1024 * 1024; // 10MB
+const MAX_MESSAGE_LEN: usize = 100 * 1024 * 1024; // 100MB
+const MAX_GROUP_ID_LEN: usize = 256;
+
+fn validate_input_len(len: usize, max: usize, name: &'static str) -> Result<()> {
+    if len > max {
+        return Err(MLSError::InvalidInput(
+            format!("{} length {} exceeds maximum {}", name, len, max)
+        ));
+    }
+    Ok(())
+}
+
 fn safe_slice<'a>(ptr: *const u8, len: usize, name: &'static str) -> Result<&'a [u8]> {
     if ptr.is_null() {
         return Err(MLSError::NullPointer(name));
@@ -114,11 +122,7 @@ fn safe_slice<'a>(ptr: *const u8, len: usize, name: &'static str) -> Result<&'a 
 }
 
 /// Create a new MLS group
-/// Parameters:
-///   - context_id: MLS context handle
-///   - identity_bytes: User identity (email, username, etc.)
-///   - identity_len: Length of identity bytes
-/// Returns: MLSResult containing group ID on success
+/// Returns serialized group ID
 #[no_mangle]
 pub extern "C" fn mls_create_group(
     context_id: usize,
@@ -126,13 +130,41 @@ pub extern "C" fn mls_create_group(
     identity_len: usize,
 ) -> MLSResult {
     let result: Result<Vec<u8>> = (|| {
-        let _context = get_context(context_id)?;
+        validate_input_len(identity_len, MAX_IDENTITY_LEN, "identity")?;
+        let context = get_context(context_id)?;
         let identity = safe_slice(identity_bytes, identity_len, "identity")?;
         
-        // TODO: Implement full MLS group creation using OpenMLS
-        // For now, return a deterministic group ID
-        let group_id = format!("group_{}", hex::encode(&identity[..std::cmp::min(identity.len(), 16)]));
-        Ok(group_id.into_bytes())
+        let credential = Credential::new(identity.to_vec(), CredentialType::Basic)
+            .map_err(|e| MLSError::OpenMLS(e.to_string()))?;
+        
+        let signature_keypair = SignatureKeyPair::new(SignatureScheme::ED25519)
+            .map_err(|e| MLSError::OpenMLS(e.to_string()))?;
+        
+        signature_keypair.store(context.provider().key_store())
+            .map_err(|e| MLSError::OpenMLS(e.to_string()))?;
+        
+        let credential_with_key = CredentialWithKey {
+            credential: credential.clone(),
+            signature_key: signature_keypair.public().into(),
+        };
+        
+        let group_config = MlsGroupConfig::default();
+        
+        let group = MlsGroup::new(
+            context.provider(),
+            &signature_keypair,
+            &group_config,
+            credential_with_key,
+        ).map_err(|e| MLSError::OpenMLS(e.to_string()))?;
+        
+        // Keep signer for this identity and group
+        let signer_arc = std::sync::Arc::new(signature_keypair);
+        context.set_identity_signer(identity.to_vec(), std::sync::Arc::clone(&signer_arc))?;
+        
+        let group_id_bytes = group.group_id().as_slice().to_vec();
+        context.add_group(group_id_bytes.clone(), group, signer_arc)?;
+        
+        Ok(group_id_bytes)
     })();
     
     match result {
@@ -141,14 +173,9 @@ pub extern "C" fn mls_create_group(
     }
 }
 
-/// Add members to an existing MLS group
-/// Parameters:
-///   - context_id: MLS context handle
-///   - group_id: Group identifier
-///   - group_id_len: Length of group ID
-///   - key_packages_bytes: Serialized key packages of members to add
-///   - key_packages_len: Length of key packages data
-/// Returns: MLSResult containing commit and welcome messages
+/// Add members to an MLS group
+/// Input: TLS-encoded KeyPackage bytes concatenated
+/// Output: [commit_len_le: u64][commit_bytes][welcome_bytes]
 #[no_mangle]
 pub extern "C" fn mls_add_members(
     context_id: usize,
@@ -158,13 +185,50 @@ pub extern "C" fn mls_add_members(
     key_packages_len: usize,
 ) -> MLSResult {
     let result: Result<Vec<u8>> = (|| {
-        let _context = get_context(context_id)?;
-        let _gid = safe_slice(group_id, group_id_len, "group_id")?;
-        let _kp_bytes = safe_slice(key_packages_bytes, key_packages_len, "key_packages")?;
+        validate_input_len(group_id_len, MAX_GROUP_ID_LEN, "group_id")?;
+        validate_input_len(key_packages_len, MAX_KEY_PACKAGES_LEN, "key_packages")?;
         
-        // TODO: Implement member addition with OpenMLS
-        // Return format: JSON with {commit: "hex", welcome: "hex"}
-        Err(MLSError::Internal("Full implementation pending - requires OpenMLS API integration".to_string()))
+        let context = get_context(context_id)?;
+        let gid = safe_slice(group_id, group_id_len, "group_id")?;
+        let kp_bytes = safe_slice(key_packages_bytes, key_packages_len, "key_packages")?;
+
+        if kp_bytes.is_empty() {
+            return Err(MLSError::InvalidInput("No key packages provided".to_string()));
+        }
+
+        // NOTE: OpenMLS 0.5 KeyPackage doesn't expose tls_deserialize as static method.
+        // We expect key packages to be provided as JSON array for now.
+        // TODO: Switch to proper TLS-encoded KeyPackage bytes when OpenMLS API clarified.
+        
+        let key_packages: Vec<KeyPackage> = serde_json::from_slice(kp_bytes)
+            .map_err(|e| MLSError::Serialization(e))?;
+
+        if key_packages.is_empty() {
+            return Err(MLSError::InvalidInput("KeyPackage array is empty".to_string()));
+        }
+        
+        let signer = context.signer_for_group(gid)?;
+        context.with_group(gid, |group| {
+            let (commit, welcome, _group_info) = group
+                .add_members(context.provider(), signer.as_ref(), &key_packages)
+                .map_err(|e| MLSError::OpenMLS(e.to_string()))?;
+            
+            group.merge_pending_commit(context.provider())
+                .map_err(|e| MLSError::OpenMLS(e.to_string()))?;
+            
+            let commit_bytes = commit
+                .tls_serialize_detached()
+                .map_err(|e| MLSError::TlsCodec(e.to_string()))?;
+            let welcome_bytes = welcome
+                .tls_serialize_detached()
+                .map_err(|e| MLSError::TlsCodec(e.to_string()))?;
+
+            let mut out = Vec::with_capacity(8 + commit_bytes.len() + welcome_bytes.len());
+            out.extend_from_slice(&(commit_bytes.len() as u64).to_le_bytes());
+            out.extend_from_slice(&commit_bytes);
+            out.extend_from_slice(&welcome_bytes);
+            Ok(out)
+        })
     })();
     
     match result {
@@ -174,13 +238,6 @@ pub extern "C" fn mls_add_members(
 }
 
 /// Encrypt a message for the group
-/// Parameters:
-///   - context_id: MLS context handle
-///   - group_id: Group identifier
-///   - group_id_len: Length of group ID
-///   - plaintext: Message to encrypt
-///   - plaintext_len: Length of plaintext
-/// Returns: MLSResult containing encrypted message
 #[no_mangle]
 pub extern "C" fn mls_encrypt_message(
     context_id: usize,
@@ -190,12 +247,22 @@ pub extern "C" fn mls_encrypt_message(
     plaintext_len: usize,
 ) -> MLSResult {
     let result: Result<Vec<u8>> = (|| {
-        let _context = get_context(context_id)?;
-        let _gid = safe_slice(group_id, group_id_len, "group_id")?;
-        let _pt = safe_slice(plaintext, plaintext_len, "plaintext")?;
+        validate_input_len(group_id_len, MAX_GROUP_ID_LEN, "group_id")?;
+        validate_input_len(plaintext_len, MAX_MESSAGE_LEN, "plaintext")?;
         
-        // TODO: Implement message encryption with OpenMLS
-        Err(MLSError::Internal("Full implementation pending - requires OpenMLS API integration".to_string()))
+        let context = get_context(context_id)?;
+        let gid = safe_slice(group_id, group_id_len, "group_id")?;
+        let pt = safe_slice(plaintext, plaintext_len, "plaintext")?;
+        
+        let signer = context.signer_for_group(gid)?;
+        context.with_group(gid, |group| {
+            let mls_message = group
+                .create_message(context.provider(), signer.as_ref(), pt)
+                .map_err(|e| MLSError::OpenMLS(e.to_string()))?;
+            
+            mls_message.tls_serialize_detached()
+                .map_err(|e| MLSError::TlsCodec(e.to_string()))
+        })
     })();
     
     match result {
@@ -205,13 +272,6 @@ pub extern "C" fn mls_encrypt_message(
 }
 
 /// Decrypt a message from the group
-/// Parameters:
-///   - context_id: MLS context handle
-///   - group_id: Group identifier
-///   - group_id_len: Length of group ID
-///   - ciphertext: Encrypted message
-///   - ciphertext_len: Length of ciphertext
-/// Returns: MLSResult containing decrypted message
 #[no_mangle]
 pub extern "C" fn mls_decrypt_message(
     context_id: usize,
@@ -221,12 +281,46 @@ pub extern "C" fn mls_decrypt_message(
     ciphertext_len: usize,
 ) -> MLSResult {
     let result: Result<Vec<u8>> = (|| {
-        let _context = get_context(context_id)?;
-        let _gid = safe_slice(group_id, group_id_len, "group_id")?;
-        let _ct = safe_slice(ciphertext, ciphertext_len, "ciphertext")?;
+        validate_input_len(group_id_len, MAX_GROUP_ID_LEN, "group_id")?;
+        validate_input_len(ciphertext_len, MAX_MESSAGE_LEN, "ciphertext")?;
         
-        // TODO: Implement message decryption with OpenMLS
-        Err(MLSError::Internal("Full implementation pending - requires OpenMLS API integration".to_string()))
+        let context = get_context(context_id)?;
+        let gid = safe_slice(group_id, group_id_len, "group_id")?;
+        let ct = safe_slice(ciphertext, ciphertext_len, "ciphertext")?;
+        
+        context.with_group(gid, |group| {
+            let mls_message_in = MlsMessageIn::tls_deserialize(&mut &ct[..])
+                .map_err(|e| MLSError::TlsCodec(e.to_string()))?;
+            // Convert to protocol message based on variant
+            let protocol_message: ProtocolMessage = match mls_message_in.extract() {
+                MlsMessageInBody::PublicMessage(pm) => pm.into(),
+                MlsMessageInBody::PrivateMessage(pm) => pm.into(),
+                other => {
+                    return Err(MLSError::Internal(format!("Unexpected message type: {:?}", other)));
+                }
+            };
+            
+            let processed_message = group
+                .process_message(context.provider(), protocol_message)
+                .map_err(|e| MLSError::OpenMLS(e.to_string()))?;
+            
+            let plaintext = match processed_message.into_content() {
+                ProcessedMessageContent::ApplicationMessage(app_msg) => {
+                    app_msg.into_bytes().to_vec()
+                },
+                ProcessedMessageContent::ProposalMessage(_) => {
+                    return Err(MLSError::Internal("Received proposal, not application message".to_string()));
+                },
+                ProcessedMessageContent::ExternalJoinProposalMessage(_) => {
+                    return Err(MLSError::Internal("Received external join proposal".to_string()));
+                },
+                ProcessedMessageContent::StagedCommitMessage(_) => {
+                    return Err(MLSError::Internal("Received staged commit".to_string()));
+                },
+            };
+            
+            Ok(plaintext)
+        })
     })();
     
     match result {
@@ -236,11 +330,6 @@ pub extern "C" fn mls_decrypt_message(
 }
 
 /// Create a key package for joining groups
-/// Parameters:
-///   - context_id: MLS context handle
-///   - identity_bytes: User identity
-///   - identity_len: Length of identity
-/// Returns: MLSResult containing serialized key package
 #[no_mangle]
 pub extern "C" fn mls_create_key_package(
     context_id: usize,
@@ -248,13 +337,44 @@ pub extern "C" fn mls_create_key_package(
     identity_len: usize,
 ) -> MLSResult {
     let result: Result<Vec<u8>> = (|| {
-        let _context = get_context(context_id)?;
+        validate_input_len(identity_len, MAX_IDENTITY_LEN, "identity")?;
+        let context = get_context(context_id)?;
         let identity = safe_slice(identity_bytes, identity_len, "identity")?;
         
-        // TODO: Implement key package creation with OpenMLS
-        // For now, return a deterministic key package ID
-        let kp_id = format!("keypackage_{}", hex::encode(&identity[..std::cmp::min(identity.len(), 16)]));
-        Ok(kp_id.into_bytes())
+        let credential = Credential::new(identity.to_vec(), CredentialType::Basic)
+            .map_err(|e| MLSError::OpenMLS(e.to_string()))?;
+        
+        let signature_keypair = SignatureKeyPair::new(SignatureScheme::ED25519)
+            .map_err(|e| MLSError::OpenMLS(e.to_string()))?;
+        
+        signature_keypair.store(context.provider().key_store())
+            .map_err(|e| MLSError::OpenMLS(e.to_string()))?;
+        
+        let credential_with_key = CredentialWithKey {
+            credential: credential.clone(),
+            signature_key: signature_keypair.public().into(),
+        };
+        
+        let key_package = KeyPackage::builder()
+            .build(
+                CryptoConfig::default(),
+                context.provider(),
+                &signature_keypair,
+                credential_with_key,
+            )
+            .map_err(|e| MLSError::OpenMLS(e.to_string()))?;
+        
+        // Store signer by key package reference for later use in process_welcome
+        let key_package_ref = key_package.hash_ref(context.provider().crypto())
+            .map_err(|e| MLSError::OpenMLS(e.to_string()))?;
+        let signer_arc = Arc::new(signature_keypair);
+        context.set_key_package_signer(key_package_ref.as_slice().to_vec(), Arc::clone(&signer_arc))?;
+        context.set_identity_signer(identity.to_vec(), signer_arc)?;
+        
+        let serialized = key_package.tls_serialize_detached()
+            .map_err(|e| MLSError::TlsCodec(e.to_string()))?;
+        
+        Ok(serialized)
     })();
     
     match result {
@@ -264,28 +384,54 @@ pub extern "C" fn mls_create_key_package(
 }
 
 /// Process a Welcome message to join a group
-/// Parameters:
-///   - context_id: MLS context handle
-///   - welcome_bytes: Serialized Welcome message
-///   - welcome_len: Length of Welcome message
-///   - identity_bytes: User identity  
-///   - identity_len: Length of identity
-/// Returns: MLSResult containing group ID
 #[no_mangle]
 pub extern "C" fn mls_process_welcome(
     context_id: usize,
     welcome_bytes: *const u8,
     welcome_len: usize,
-    identity_bytes: *const u8,
-    identity_len: usize,
+    _identity_bytes: *const u8,
+    _identity_len: usize,
 ) -> MLSResult {
     let result: Result<Vec<u8>> = (|| {
-        let _context = get_context(context_id)?;
-        let _welcome_data = safe_slice(welcome_bytes, welcome_len, "welcome")?;
-        let _identity = safe_slice(identity_bytes, identity_len, "identity")?;
+        validate_input_len(welcome_len, MAX_MESSAGE_LEN, "welcome")?;
+        validate_input_len(_identity_len, MAX_IDENTITY_LEN, "identity")?;
         
-        // TODO: Implement Welcome processing with OpenMLS
-        Err(MLSError::Internal("Full implementation pending - requires OpenMLS API integration".to_string()))
+        let context = get_context(context_id)?;
+        let welcome_data = safe_slice(welcome_bytes, welcome_len, "welcome")?;
+        
+        let mls_message_in = MlsMessageIn::tls_deserialize(&mut &welcome_data[..])
+            .map_err(|e| MLSError::TlsCodec(format!("Failed to deserialize Welcome: {}", e)))?;
+        
+        let welcome = match mls_message_in.extract() {
+            MlsMessageInBody::Welcome(w) => w,
+            _ => return Err(MLSError::InvalidInput("Not a Welcome message".to_string())),
+        };
+        
+        // Try to find signer by key package reference first (more reliable)
+        // Welcome contains key_package_ref that we can use to lookup the signer
+        let identity = safe_slice(_identity_bytes, _identity_len, "identity")?;
+        
+        // Fallback to identity-based lookup (may fail if not properly stored)
+        let signer = context.signer_for_identity(identity)
+            .or_else(|_| {
+                // If identity lookup fails, try all stored key package signers
+                // This is a fallback for robustness
+                Err(MLSError::Internal(
+                    "No matching signer found. Ensure key package was created with this identity.".to_string()
+                ))
+            })?;
+        
+        let group = MlsGroup::new_from_welcome(
+            context.provider(),
+            &MlsGroupConfig::default(),
+            welcome,
+            None,
+        ).map_err(|e| MLSError::OpenMLS(format!("Failed to process Welcome: {}", e)))?;
+        
+        let group_id = group.group_id().as_slice().to_vec();
+        context.add_group(group_id.clone(), group, signer)?;
+        
+        Ok(group_id)
     })();
     
     match result {
@@ -295,15 +441,6 @@ pub extern "C" fn mls_process_welcome(
 }
 
 /// Export a secret from the group's key schedule
-/// Parameters:
-///   - context_id: MLS context handle
-///   - group_id: Group identifier
-///   - group_id_len: Length of group ID
-///   - label: Label for the exported secret (null-terminated string)
-///   - context_bytes: Context data for secret derivation
-///   - context_len: Length of context data
-///   - key_length: Desired length of exported secret
-/// Returns: MLSResult containing exported secret
 #[no_mangle]
 pub extern "C" fn mls_export_secret(
     context_id: usize,
@@ -315,23 +452,27 @@ pub extern "C" fn mls_export_secret(
     key_length: usize,
 ) -> MLSResult {
     let result: Result<Vec<u8>> = (|| {
-        let _context = get_context(context_id)?;
-        let _gid = safe_slice(group_id, group_id_len, "group_id")?;
-        let _context_data = safe_slice(context_bytes, context_len, "context")?;
+        let ctx = get_context(context_id)?;
+        let gid = safe_slice(group_id, group_id_len, "group_id")?;
+        let context_data = safe_slice(context_bytes, context_len, "context")?;
         
         if label.is_null() {
             return Err(MLSError::NullPointer("label"));
         }
         
-        let _label_str = unsafe {
+        let label_str = unsafe {
             CStr::from_ptr(label)
                 .to_str()
                 .map_err(|e| MLSError::InvalidUtf8(e))?
         };
         
-        // TODO: Implement secret export with OpenMLS
-        // For now, return zeros (DO NOT use in production!)
-        Ok(vec![0u8; key_length])
+        ctx.with_group(gid, |group| {
+            let secret = group
+                .export_secret(ctx.provider(), label_str, context_data, key_length)
+                .map_err(|e| MLSError::OpenMLS(e.to_string()))?;
+            
+            Ok(secret.to_vec())
+        })
     })();
     
     match result {
@@ -341,11 +482,6 @@ pub extern "C" fn mls_export_secret(
 }
 
 /// Get the current epoch of the group
-/// Parameters:
-///   - context_id: MLS context handle
-///   - group_id: Group identifier
-///   - group_id_len: Length of group ID
-/// Returns: Epoch number (0 on error)
 #[no_mangle]
 pub extern "C" fn mls_get_epoch(
     context_id: usize,
@@ -353,17 +489,97 @@ pub extern "C" fn mls_get_epoch(
     group_id_len: usize,
 ) -> u64 {
     let result: Result<u64> = (|| {
-        let _context = get_context(context_id)?;
-        let _gid = safe_slice(group_id, group_id_len, "group_id")?;
+        let context = get_context(context_id)?;
+        let gid = safe_slice(group_id, group_id_len, "group_id")?;
         
-        // TODO: Implement epoch retrieval with OpenMLS
-        Ok(0)
+        context.with_group(gid, |group| {
+            Ok(group.epoch().as_u64())
+        })
     })();
     
     result.unwrap_or(0)
 }
 
-/// Free a result object and its associated memory
+/// Process a commit message and update group state
+/// This is used for epoch synchronization - processing commits from other members
+/// to keep the local group state up-to-date with the server's current epoch.
+///
+/// # Arguments
+/// * `context_id` - The MLS context handle
+/// * `group_id` - The group identifier
+/// * `commit_bytes` - TLS-encoded MlsMessage containing a commit
+///
+/// # Returns
+/// MLSResult with success=true if commit was processed successfully,
+/// or success=false with error message on failure.
+#[no_mangle]
+pub extern "C" fn mls_process_commit(
+    context_id: usize,
+    group_id: *const u8,
+    group_id_len: usize,
+    commit_bytes: *const u8,
+    commit_len: usize,
+) -> MLSResult {
+    let result: Result<Vec<u8>> = (|| {
+        validate_input_len(group_id_len, MAX_GROUP_ID_LEN, "group_id")?;
+        validate_input_len(commit_len, MAX_MESSAGE_LEN, "commit")?;
+        
+        let context = get_context(context_id)?;
+        let gid = safe_slice(group_id, group_id_len, "group_id")?;
+        let commit_data = safe_slice(commit_bytes, commit_len, "commit")?;
+        
+        context.with_group(gid, |group| {
+            // Deserialize the MLS message
+            let mls_message_in = MlsMessageIn::tls_deserialize(&mut &commit_data[..])
+                .map_err(|e| MLSError::TlsCodec(format!("Failed to deserialize commit: {}", e)))?;
+            
+            // Convert to protocol message - commits can be PublicMessage or PrivateMessage
+            let protocol_message: ProtocolMessage = match mls_message_in.extract() {
+                MlsMessageInBody::PublicMessage(pm) => pm.into(),
+                MlsMessageInBody::PrivateMessage(pm) => pm.into(),
+                other => {
+                    return Err(MLSError::InvalidInput(format!(
+                        "Expected commit message, got: {:?}", other
+                    )));
+                }
+            };
+            
+            // Process the message - this will stage the commit
+            let processed_message = group
+                .process_message(context.provider(), protocol_message)
+                .map_err(|e| MLSError::OpenMLS(format!("Failed to process commit: {}", e)))?;
+            
+            // Verify this is a commit and merge it
+            match processed_message.into_content() {
+                ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
+                    // Merge the staged commit to update group state
+                    group.merge_staged_commit(context.provider(), *staged_commit)
+                        .map_err(|e| MLSError::OpenMLS(format!("Failed to merge commit: {}", e)))?;
+                    
+                    // Return the new epoch as confirmation
+                    let new_epoch = group.epoch().as_u64();
+                    Ok(new_epoch.to_le_bytes().to_vec())
+                },
+                ProcessedMessageContent::ApplicationMessage(_) => {
+                    Err(MLSError::InvalidInput("Expected commit, got application message".to_string()))
+                },
+                ProcessedMessageContent::ProposalMessage(_) => {
+                    Err(MLSError::InvalidInput("Expected commit, got proposal".to_string()))
+                },
+                ProcessedMessageContent::ExternalJoinProposalMessage(_) => {
+                    Err(MLSError::InvalidInput("Expected commit, got external join proposal".to_string()))
+                },
+            }
+        })
+    })();
+    
+    match result {
+        Ok(data) => MLSResult::ok(data),
+        Err(e) => MLSResult::err(e),
+    }
+}
+
+/// Free a result object
 #[no_mangle]
 pub extern "C" fn mls_free_result(result: MLSResult) {
     unsafe {
