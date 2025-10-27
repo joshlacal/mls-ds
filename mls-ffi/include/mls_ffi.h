@@ -12,7 +12,6 @@
 
 /**
  * FFI-safe result type
- * Contains success status, error message, and data buffer
  */
 typedef struct MLSResult {
   bool success;
@@ -23,36 +22,27 @@ typedef struct MLSResult {
 
 /**
  * Initialize the MLS FFI library
- * Returns a context handle (non-zero on success, 0 on failure)
+ * Returns a context handle for subsequent operations
  */
 uintptr_t mls_init(void);
 
 /**
- * Free an MLS context and all associated resources
+ * Free an MLS context
  */
 void mls_free_context(uintptr_t context_id);
 
 /**
  * Create a new MLS group
- * Parameters:
- *   - context_id: MLS context handle
- *   - identity_bytes: User identity (email, username, etc.)
- *   - identity_len: Length of identity bytes
- * Returns: MLSResult containing group ID on success
+ * Returns serialized group ID
  */
 struct MLSResult mls_create_group(uintptr_t context_id,
                                   const uint8_t *identity_bytes,
                                   uintptr_t identity_len);
 
 /**
- * Add members to an existing MLS group
- * Parameters:
- *   - context_id: MLS context handle
- *   - group_id: Group identifier
- *   - group_id_len: Length of group ID
- *   - key_packages_bytes: Serialized key packages of members to add
- *   - key_packages_len: Length of key packages data
- * Returns: MLSResult containing commit and welcome messages
+ * Add members to an MLS group
+ * Input: TLS-encoded KeyPackage bytes concatenated
+ * Output: [commit_len_le: u64][commit_bytes][welcome_bytes]
  */
 struct MLSResult mls_add_members(uintptr_t context_id,
                                  const uint8_t *group_id,
@@ -62,13 +52,6 @@ struct MLSResult mls_add_members(uintptr_t context_id,
 
 /**
  * Encrypt a message for the group
- * Parameters:
- *   - context_id: MLS context handle
- *   - group_id: Group identifier
- *   - group_id_len: Length of group ID
- *   - plaintext: Message to encrypt
- *   - plaintext_len: Length of plaintext
- * Returns: MLSResult containing encrypted message
  */
 struct MLSResult mls_encrypt_message(uintptr_t context_id,
                                      const uint8_t *group_id,
@@ -78,13 +61,6 @@ struct MLSResult mls_encrypt_message(uintptr_t context_id,
 
 /**
  * Decrypt a message from the group
- * Parameters:
- *   - context_id: MLS context handle
- *   - group_id: Group identifier
- *   - group_id_len: Length of group ID
- *   - ciphertext: Encrypted message
- *   - ciphertext_len: Length of ciphertext
- * Returns: MLSResult containing decrypted message
  */
 struct MLSResult mls_decrypt_message(uintptr_t context_id,
                                      const uint8_t *group_id,
@@ -94,11 +70,6 @@ struct MLSResult mls_decrypt_message(uintptr_t context_id,
 
 /**
  * Create a key package for joining groups
- * Parameters:
- *   - context_id: MLS context handle
- *   - identity_bytes: User identity
- *   - identity_len: Length of identity
- * Returns: MLSResult containing serialized key package
  */
 struct MLSResult mls_create_key_package(uintptr_t context_id,
                                         const uint8_t *identity_bytes,
@@ -106,31 +77,15 @@ struct MLSResult mls_create_key_package(uintptr_t context_id,
 
 /**
  * Process a Welcome message to join a group
- * Parameters:
- *   - context_id: MLS context handle
- *   - welcome_bytes: Serialized Welcome message
- *   - welcome_len: Length of Welcome message
- *   - identity_bytes: User identity
- *   - identity_len: Length of identity
- * Returns: MLSResult containing group ID
  */
 struct MLSResult mls_process_welcome(uintptr_t context_id,
                                      const uint8_t *welcome_bytes,
                                      uintptr_t welcome_len,
-                                     const uint8_t *identity_bytes,
-                                     uintptr_t identity_len);
+                                     const uint8_t *_identity_bytes,
+                                     uintptr_t _identity_len);
 
 /**
  * Export a secret from the group's key schedule
- * Parameters:
- *   - context_id: MLS context handle
- *   - group_id: Group identifier
- *   - group_id_len: Length of group ID
- *   - label: Label for the exported secret (null-terminated string)
- *   - context_bytes: Context data for secret derivation
- *   - context_len: Length of context data
- *   - key_length: Desired length of exported secret
- * Returns: MLSResult containing exported secret
  */
 struct MLSResult mls_export_secret(uintptr_t context_id,
                                    const uint8_t *group_id,
@@ -142,16 +97,31 @@ struct MLSResult mls_export_secret(uintptr_t context_id,
 
 /**
  * Get the current epoch of the group
- * Parameters:
- *   - context_id: MLS context handle
- *   - group_id: Group identifier
- *   - group_id_len: Length of group ID
- * Returns: Epoch number (0 on error)
  */
 uint64_t mls_get_epoch(uintptr_t context_id, const uint8_t *group_id, uintptr_t group_id_len);
 
 /**
- * Free a result object and its associated memory
+ * Process a commit message and update group state
+ * This is used for epoch synchronization - processing commits from other members
+ * to keep the local group state up-to-date with the server's current epoch.
+ *
+ * # Arguments
+ * * `context_id` - The MLS context handle
+ * * `group_id` - The group identifier
+ * * `commit_bytes` - TLS-encoded MlsMessage containing a commit
+ *
+ * # Returns
+ * MLSResult with success=true if commit was processed successfully,
+ * or success=false with error message on failure.
+ */
+struct MLSResult mls_process_commit(uintptr_t context_id,
+                                    const uint8_t *group_id,
+                                    uintptr_t group_id_len,
+                                    const uint8_t *commit_bytes,
+                                    uintptr_t commit_len);
+
+/**
+ * Free a result object
  */
 void mls_free_result(struct MLSResult result);
 
