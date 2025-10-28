@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
+use tls_codec::{Deserialize as TlsDeserialize};
 
 use crate::error::{MLSError, Result};
 use crate::mls_context::MLSContext;
@@ -196,12 +197,46 @@ pub extern "C" fn mls_add_members(
             return Err(MLSError::InvalidInput("No key packages provided".to_string()));
         }
 
-        // NOTE: OpenMLS 0.5 KeyPackage doesn't expose tls_deserialize as static method.
-        // We expect key packages to be provided as JSON array for now.
-        // TODO: Switch to proper TLS-encoded KeyPackage bytes when OpenMLS API clarified.
+        // Parse KeyPackages from JSON
+        // Two supported formats:
+        // 1. Array of KeyPackage objects (direct serde): [{"payload": {...}, "signature": "..."}, ...]
+        // 2. Array with tls_serialized field: [{"tls_serialized": "base64..."}, ...]
         
-        let key_packages: Vec<KeyPackage> = serde_json::from_slice(kp_bytes)
-            .map_err(|e| MLSError::Serialization(e))?;
+        let key_packages: Vec<KeyPackage> = if let Ok(kps) = serde_json::from_slice::<Vec<KeyPackage>>(kp_bytes) {
+            // Direct serde format (full KeyPackage JSON)
+            kps
+        } else {
+            // Try tls_serialized format
+            let json_packages: Vec<serde_json::Value> = serde_json::from_slice(kp_bytes)
+                .map_err(|e| MLSError::Serialization(e))?;
+            
+            // Convert TLS bytes to KeyPackages via MlsMessageIn wrapper
+            json_packages.iter()
+                .map(|pkg| {
+                    let tls_b64 = pkg.get("tls_serialized")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| MLSError::InvalidInput("Missing tls_serialized field".to_string()))?;
+                    
+                    let tls_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, tls_b64)
+                        .map_err(|e| MLSError::InvalidInput(format!("Invalid base64: {}", e)))?;
+                    
+                    // Wrap in MlsMessageIn to deserialize
+                    let mls_msg = MlsMessageIn::tls_deserialize(&mut &tls_bytes[..])
+                        .map_err(|e| MLSError::TlsCodec(format!("Failed to deserialize: {}", e)))?;
+                    
+                    // Extract KeyPackage from message and validate
+                    match mls_msg.extract() {
+                        MlsMessageInBody::KeyPackage(kp_in) => {
+                            // Validate KeyPackageIn to get KeyPackage
+                            let kp = kp_in.validate(context.provider().crypto(), ProtocolVersion::default())
+                                .map_err(|e| MLSError::OpenMLS(format!("KeyPackage validation failed: {}", e)))?;
+                            Ok(kp)
+                        },
+                        _ => Err(MLSError::InvalidInput("Message is not a KeyPackage".to_string())),
+                    }
+                })
+                .collect::<Result<Vec<KeyPackage>>>()?
+        };
 
         if key_packages.is_empty() {
             return Err(MLSError::InvalidInput("KeyPackage array is empty".to_string()));
