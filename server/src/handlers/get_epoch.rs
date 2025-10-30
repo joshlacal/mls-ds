@@ -18,7 +18,7 @@ pub struct EpochResponse {
     #[serde(rename = "convoId")]
     pub convo_id: String,
     #[serde(rename = "currentEpoch")]
-    pub current_epoch: i64,
+    pub current_epoch: i32,
 }
 
 /// Get the current epoch for a conversation
@@ -54,7 +54,7 @@ pub async fn get_epoch(
     }
     
     // Get current epoch from conversations table
-    let current_epoch: i64 = sqlx::query_scalar(
+    let current_epoch: i32 = sqlx::query_scalar(
         "SELECT current_epoch FROM conversations WHERE id = $1"
     )
     .bind(&params.convo_id)
