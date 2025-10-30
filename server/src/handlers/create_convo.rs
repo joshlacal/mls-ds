@@ -57,7 +57,7 @@ pub async fn create_convo(
 
     // Create conversation with group_id from client
     sqlx::query(
-        "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at, title, group_id, cipher_suite) VALUES ($1, $2, 0, $3, $3, $4, $5, $6)"
+        "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at, name, group_id, cipher_suite) VALUES ($1, $2, 0, $3, $3, $4, $5, $6)"
     )
     .bind(&convo_id)
     .bind(did)
