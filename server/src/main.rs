@@ -126,6 +126,10 @@ async fn main() -> anyhow::Result<()> {
             get(handlers::get_epoch),
         )
         .route(
+            "/xrpc/blue.catbird.mls.getWelcome",
+            get(handlers::get_welcome),
+        )
+        .route(
             "/xrpc/blue.catbird.mls.getCommits",
             get(handlers::get_commits),
         )
