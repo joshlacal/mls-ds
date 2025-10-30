@@ -1,60 +1,67 @@
-use std::ffi::CString;
-use std::os::raw::c_char;
 use thiserror::Error;
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, uniffi::Error)]
+#[uniffi(flat_error)]
 pub enum MLSError {
-    #[error("Null pointer provided: {0}")]
-    NullPointer(&'static str),
+    #[error("Invalid input: {message}")]
+    InvalidInput { message: String },
     
-    #[error("Invalid UTF-8 string: {0}")]
-    InvalidUtf8(#[from] std::str::Utf8Error),
+    #[error("Group not found: {message}")]
+    GroupNotFound { message: String },
     
-    #[error("Invalid data length: expected {expected}, got {actual}")]
-    InvalidLength { expected: usize, actual: usize },
+    #[error("Invalid key package")]
+    InvalidKeyPackage,
     
-    #[error("OpenMLS error: {0}")]
-    OpenMLS(String),
+    #[error("Failed to add members")]
+    AddMembersFailed,
     
-    #[error("Serialization error: {0}")]
-    Serialization(#[from] serde_json::Error),
+    #[error("Encryption failed")]
+    EncryptionFailed,
     
-    #[error("TLS codec error: {0}")]
-    TlsCodec(String),
+    #[error("Decryption failed")]
+    DecryptionFailed,
     
-    #[error("Invalid context handle")]
-    InvalidContext,
+    #[error("Serialization error")]
+    SerializationError,
     
-    #[error("Group not found: {0}")]
-    GroupNotFound(String),
+    #[error("OpenMLS error")]
+    OpenMLSError,
     
-    #[error("Thread safety error: {0}")]
-    ThreadSafety(String),
+    #[error("Invalid group ID")]
+    InvalidGroupId,
     
-    #[error("Memory allocation failed")]
-    MemoryAllocation,
+    #[error("Secret export failed")]
+    SecretExportFailed,
     
-    #[error("Internal error: {0}")]
-    Internal(String),
+    #[error("Commit processing failed")]
+    CommitProcessingFailed,
     
-    #[error("Invalid input: {0}")]
-    InvalidInput(String),
+    #[error("Invalid commit")]
+    InvalidCommit,
     
-    #[error("Epoch mismatch: expected {expected}, got {actual}")]
-    EpochMismatch { expected: u64, actual: u64 },
+    #[error("Invalid data")]
+    InvalidData,
+    
+    #[error("Context not initialized")]
+    ContextNotInitialized,
+
+    #[error("Wire format policy violation: {message}")]
+    WireFormatPolicyViolation { message: String },
+
+    #[error("Merge failed")]
+    MergeFailed,
 }
 
 impl MLSError {
-    pub fn to_c_string(&self) -> *mut c_char {
-        let error_msg = self.to_string();
-        match CString::new(error_msg) {
-            Ok(c_str) => c_str.into_raw(),
-            Err(_) => {
-                let fallback = CString::new("Failed to create error message").unwrap();
-                fallback.into_raw()
-            }
-        }
+    pub fn invalid_input(msg: impl Into<String>) -> Self {
+        Self::InvalidInput { message: msg.into() }
+    }
+
+    pub fn group_not_found(msg: impl Into<String>) -> Self {
+        Self::GroupNotFound { message: msg.into() }
+    }
+
+    pub fn wire_format_policy_violation(msg: impl Into<String>) -> Self {
+        Self::WireFormatPolicyViolation { message: msg.into() }
     }
 }
-
-pub type Result<T> = std::result::Result<T, MLSError>;

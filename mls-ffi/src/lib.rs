@@ -1,6 +1,11 @@
 mod error;
-mod ffi;
 mod mls_context;
-mod tests;
+mod types;
+mod api;
 
-pub use ffi::*;
+pub use api::*;
+pub use error::*;
+pub use types::*;
+
+// UniFFI setup
+uniffi::setup_scaffolding!();

@@ -584,16 +584,68 @@ pub extern "C" fn mls_process_commit(
                 .process_message(context.provider(), protocol_message)
                 .map_err(|e| MLSError::OpenMLS(format!("Failed to process commit: {}", e)))?;
             
-            // Verify this is a commit and merge it
+            // Verify this is a commit and extract Update proposals before merging
             match processed_message.into_content() {
                 ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
+                    // Extract Update proposals with credentials before merging
+                    let update_proposals: Vec<(u32, Vec<u8>, Vec<u8>)> = staged_commit
+                        .add_proposals()
+                        .iter()
+                        .chain(staged_commit.update_proposals().iter())
+                        .filter_map(|queued_proposal| {
+                            // Check if this is an Update proposal
+                            match queued_proposal.proposal() {
+                                Proposal::Update(update_proposal) => {
+                                    // Get the leaf node with new credential
+                                    let leaf_node = update_proposal.leaf_node();
+                                    let new_credential = leaf_node.credential();
+
+                                    // Get leaf index from queued proposal
+                                    let leaf_index = queued_proposal.sender().as_u32();
+
+                                    // Get old credential from current group state
+                                    if let Some(old_member) = group.members().find(|m| m.index.as_u32() == leaf_index) {
+                                        let old_cred_bytes = match old_member.credential.credential_type() {
+                                            CredentialType::Basic => old_member.credential.serialized_content().to_vec(),
+                                            _ => vec![],
+                                        };
+
+                                        let new_cred_bytes = match new_credential.credential_type() {
+                                            CredentialType::Basic => new_credential.serialized_content().to_vec(),
+                                            _ => vec![],
+                                        };
+
+                                        Some((leaf_index, old_cred_bytes, new_cred_bytes))
+                                    } else {
+                                        None
+                                    }
+                                },
+                                _ => None,
+                            }
+                        })
+                        .collect();
+
                     // Merge the staged commit to update group state
                     group.merge_staged_commit(context.provider(), *staged_commit)
                         .map_err(|e| MLSError::OpenMLS(format!("Failed to merge commit: {}", e)))?;
-                    
-                    // Return the new epoch as confirmation
+
+                    // Return the new epoch and update proposals
                     let new_epoch = group.epoch().as_u64();
-                    Ok(new_epoch.to_le_bytes().to_vec())
+
+                    // Serialize update proposals as: [epoch: u64][num_updates: u32]([index: u32][old_len: u32][old_cred][new_len: u32][new_cred])*
+                    let mut result = Vec::new();
+                    result.extend_from_slice(&new_epoch.to_le_bytes());
+                    result.extend_from_slice(&(update_proposals.len() as u32).to_le_bytes());
+
+                    for (index, old_cred, new_cred) in update_proposals {
+                        result.extend_from_slice(&index.to_le_bytes());
+                        result.extend_from_slice(&(old_cred.len() as u32).to_le_bytes());
+                        result.extend_from_slice(&old_cred);
+                        result.extend_from_slice(&(new_cred.len() as u32).to_le_bytes());
+                        result.extend_from_slice(&new_cred);
+                    }
+
+                    Ok(result)
                 },
                 ProcessedMessageContent::ApplicationMessage(_) => {
                     Err(MLSError::InvalidInput("Expected commit, got application message".to_string()))
