@@ -211,14 +211,29 @@ pub struct SendMessageInput {
 mod base64_bytes {
     use serde::{Deserialize, Deserializer, Serializer};
     use base64::Engine;
+    use serde_json::Value;
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
     where
         D: Deserializer<'de>,
     {
-        let s = String::deserialize(deserializer)?;
+        // Handle both formats:
+        // 1. Plain base64 string: "base64data"
+        // 2. AT Protocol $bytes format: {"$bytes": "base64data"}
+        let value = Value::deserialize(deserializer)?;
+
+        let base64_str = match value {
+            Value::String(s) => s,
+            Value::Object(mut map) => {
+                map.remove("$bytes")
+                    .and_then(|v| v.as_str().map(String::from))
+                    .ok_or_else(|| serde::de::Error::custom("Expected $bytes field in object"))?
+            }
+            _ => return Err(serde::de::Error::custom("Expected string or $bytes object")),
+        };
+
         base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(&s)
+            .decode(&base64_str)
             .map_err(serde::de::Error::custom)
     }
 
