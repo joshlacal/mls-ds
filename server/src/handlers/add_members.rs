@@ -129,6 +129,38 @@ pub async fn add_members(
         })?;
     }
 
+    // Store Welcome messages for new members
+    if let Some(welcome_messages) = input.welcome_messages {
+        for welcome_msg in welcome_messages {
+            // Decode base64url Welcome message
+            let welcome_data = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(&welcome_msg.welcome)
+                .map_err(|e| {
+                    warn!("Invalid base64 welcome message: {}", e);
+                    StatusCode::BAD_REQUEST
+                })?;
+
+            let welcome_id = uuid::Uuid::new_v4().to_string();
+
+            sqlx::query(
+                "INSERT INTO welcome_messages (id, convo_id, recipient_did, welcome_data, created_at) VALUES ($1, $2, $3, $4, $5)"
+            )
+            .bind(&welcome_id)
+            .bind(&input.convo_id)
+            .bind(&welcome_msg.recipient_did)
+            .bind(&welcome_data)
+            .bind(&now)
+            .execute(&pool)
+            .await
+            .map_err(|e| {
+                error!("Failed to store welcome message for {}: {}", welcome_msg.recipient_did, e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+            info!("Stored welcome message for {} in conversation {}", welcome_msg.recipient_did, input.convo_id);
+        }
+    }
+
     info!("Successfully added members to conversation {}, new epoch: {}", input.convo_id, new_epoch);
 
     Ok(Json(AddMembersOutput {
