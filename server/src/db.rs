@@ -72,9 +72,9 @@ pub async fn create_conversation(
 
     let conversation = sqlx::query_as::<_, Conversation>(
         r#"
-        INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at, title)
+        INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at, name)
         VALUES ($1, $2, 0, $3, $4, $5)
-        RETURNING id, creator_did, current_epoch, created_at, title
+        RETURNING id, creator_did, current_epoch, created_at, name as title
         "#,
     )
     .bind(&id)
@@ -93,7 +93,7 @@ pub async fn create_conversation(
 pub async fn get_conversation(pool: &DbPool, convo_id: &str) -> Result<Option<Conversation>> {
     let conversation = sqlx::query_as::<_, Conversation>(
         r#"
-        SELECT id, creator_did, current_epoch, created_at, updated_at, title
+        SELECT id, creator_did, current_epoch, created_at, updated_at, name as title
         FROM conversations
         WHERE id = $1
         "#,
@@ -115,7 +115,7 @@ pub async fn list_conversations(
 ) -> Result<Vec<Conversation>> {
     let conversations = sqlx::query_as::<_, Conversation>(
         r#"
-        SELECT c.id, c.creator_did, c.current_epoch, c.created_at, c.title
+        SELECT c.id, c.creator_did, c.current_epoch, c.created_at, c.updated_at, c.name as title
         FROM conversations c
         INNER JOIN members m ON c.id = m.convo_id
         WHERE m.member_did = $1 AND m.left_at IS NULL
@@ -636,9 +636,9 @@ pub async fn create_conversation_with_members(
 
     let conversation = sqlx::query_as::<_, Conversation>(
         r#"
-        INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at, title)
+        INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at, name)
         VALUES ($1, $2, 0, $3, $4, $5)
-        RETURNING id, creator_did, current_epoch, created_at, title
+        RETURNING id, creator_did, current_epoch, created_at, name as title
         "#,
     )
     .bind(&id)

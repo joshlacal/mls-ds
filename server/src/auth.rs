@@ -239,8 +239,9 @@ async fn verify_jwt(&self, token: &str) -> Result<AtProtoClaims, AuthError> {
             let secret = std::env::var("JWT_SECRET")
                 .map_err(|_| AuthError::InvalidToken("HS256 requires JWT_SECRET".into()))?;
             let mut val = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
-            val.set_audience(&[&claims.aud]);
-            val.set_issuer(&[&claims.iss]);
+            if let Ok(service_did) = std::env::var("SERVICE_DID") {
+                val.set_audience(&[service_did.as_str()]);
+            }
             jsonwebtoken::decode::<AtProtoClaims>(token, &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()), &val)
                 .map_err(|e| AuthError::InvalidToken(format!("HS256 verify failed: {}", e)))
                 .map(|d| d.claims)
@@ -415,6 +416,10 @@ async fn verify_jwt(&self, token: &str) -> Result<AtProtoClaims, AuthError> {
     async fn resolve_web_did(&self, did: &str) -> Result<DidDocument, AuthError> {
         let web_path = did.strip_prefix("did:web:").ok_or_else(|| AuthError::InvalidDid(format!("Invalid WEB DID: {}", did)))?;
         let domain = web_path.replace(':', "/");
+        let host = domain.split('/').next().unwrap_or("");
+        if is_disallowed_host(host) {
+            return Err(AuthError::DidResolutionFailed("disallowed did:web host".into()));
+        }
         let url = format!("https://{}/.well-known/did.json", domain);
 
         let response = self
@@ -482,11 +487,27 @@ static JTI_CACHE: Lazy<moka::sync::Cache<String, ()>> = Lazy::new(|| {
         .build()
 });
 
+static AUTH_MIDDLEWARE: Lazy<AuthMiddleware> = Lazy::new(|| AuthMiddleware::new());
+
 fn truthy(var: &str) -> bool {
     matches!(var, "1" | "true" | "TRUE" | "yes" | "YES")
 }
 
 /// Enforce optional lxm (endpoint) and jti (replay) constraints.
+fn is_disallowed_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost") {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        match ip {
+            std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_multicast(),
+            std::net::IpAddr::V6(v6) => v6.is_unique_local() || v6.is_loopback() || v6.is_unspecified() || v6.is_multicast(),
+        }
+    } else {
+        false
+    }
+}
+
 pub fn enforce_standard(claims: &AtProtoClaims, endpoint_nsid: &str) -> Result<(), AuthError> {
     // Enforce lxm if requested
     if truthy(&std::env::var("ENFORCE_LXM").unwrap_or_default()) {
@@ -518,10 +539,7 @@ where
     type Rejection = AuthError;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        // Log all headers for debugging
-        tracing::debug!("Incoming headers: {:?}", parts.headers);
-        
-        // Extract authorization header
+        // Extract authorization header (do not log token)
         let auth_header = parts
             .headers
             .get("authorization")
@@ -531,9 +549,7 @@ where
                 AuthError::MissingAuthHeader
             })?;
 
-        tracing::debug!("Authorization header found: {}", auth_header);
-
-        // Parse bearer token
+        // Parse bearer token (redacted in logs)
         let token = auth_header
             .strip_prefix("Bearer ")
             .ok_or_else(|| {
@@ -541,8 +557,8 @@ where
                 AuthError::InvalidAuthFormat
             })?;
 
-        // Get or create auth middleware (in production, this should be passed via state)
-        let middleware = AuthMiddleware::new();
+        // Use shared auth middleware (cached DID docs, rate limiting)
+        let middleware: &AuthMiddleware = &AUTH_MIDDLEWARE;
 
         // Verify JWT and extract claims
         let claims = middleware.verify_jwt(token).await?;

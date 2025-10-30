@@ -307,7 +307,9 @@ pub extern "C" fn mls_create_key_package(
             )
             .map_err(|e| MLSError::OpenMLS(e.to_string()))?;
         
-        let serialized = key_package.tls_serialize_detached()
+        // Wrap the key package in an MlsMessageOut for wire format compatibility
+        let mls_message = MlsMessageOut::from(key_package);
+        let serialized = mls_message.tls_serialize_detached()
             .map_err(|e| MLSError::TlsCodec(e.to_string()))?;
         
         Ok(serialized)
