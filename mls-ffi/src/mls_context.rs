@@ -1,28 +1,32 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-
-use openmls::prelude::MlsGroup;
+use openmls::prelude::*;
+use openmls::group::PURE_CIPHERTEXT_WIRE_FORMAT_POLICY;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 
-use crate::error::{MLSError, Result};
+use crate::error::MLSError;
 
-pub struct MLSContext {
-    provider: OpenMlsRustCrypto,
-    groups: Mutex<HashMap<Vec<u8>, MlsGroup>>,                        // group_id -> group state
-    signers_by_group: Mutex<HashMap<Vec<u8>, Arc<SignatureKeyPair>>>, // group_id -> signer
-    signers_by_identity: Mutex<HashMap<Vec<u8>, Arc<SignatureKeyPair>>>, // identity -> signer
-    signers_by_key_package_ref: Mutex<HashMap<Vec<u8>, Arc<SignatureKeyPair>>>, // key_package_ref -> signer
+pub struct GroupState {
+    pub group: MlsGroup,
+    pub signer_public_key: Vec<u8>,
 }
 
-impl MLSContext {
+pub struct MLSContextInner {
+    provider: OpenMlsRustCrypto,
+    groups: HashMap<Vec<u8>, GroupState>,
+    signers_by_identity: HashMap<Vec<u8>, Vec<u8>>, // identity -> public key bytes
+    staged_welcomes: HashMap<String, StagedWelcome>,
+    staged_commits: HashMap<String, Box<StagedCommit>>,
+}
+
+impl MLSContextInner {
     pub fn new() -> Self {
         Self {
             provider: OpenMlsRustCrypto::default(),
-            groups: Mutex::new(HashMap::new()),
-            signers_by_group: Mutex::new(HashMap::new()),
-            signers_by_identity: Mutex::new(HashMap::new()),
-            signers_by_key_package_ref: Mutex::new(HashMap::new()),
+            groups: HashMap::new(),
+            signers_by_identity: HashMap::new(),
+            staged_welcomes: HashMap::new(),
+            staged_commits: HashMap::new(),
         }
     }
 
@@ -30,132 +34,124 @@ impl MLSContext {
         &self.provider
     }
 
-    pub fn add_group(&self, group_id: Vec<u8>, group: MlsGroup, signer: Arc<SignatureKeyPair>) -> Result<()> {
-        let mut groups = self.groups.lock()
-            .map_err(|e| MLSError::ThreadSafety(e.to_string()))?;
-        let mut signers = self.signers_by_group.lock()
-            .map_err(|e| MLSError::ThreadSafety(e.to_string()))?;
-        groups.insert(group_id.clone(), group);
-        signers.insert(group_id, signer);
-        Ok(())
+    pub fn create_group(&mut self, identity: &str, config: crate::types::GroupConfig) -> Result<Vec<u8>, MLSError> {
+        let credential = Credential::new(
+            CredentialType::Basic,
+            identity.as_bytes().to_vec()
+        );
+        let signature_keys = SignatureKeyPair::new(SignatureScheme::ED25519)
+            .map_err(|_| MLSError::OpenMLSError)?;
+
+        signature_keys.store(self.provider.storage())
+            .map_err(|_| MLSError::OpenMLSError)?;
+
+        // Build group config with forward secrecy settings
+        let group_config = MlsGroupCreateConfig::builder()
+            .max_past_epochs(config.max_past_epochs as usize)
+            .sender_ratchet_configuration(SenderRatchetConfiguration::new(
+                config.out_of_order_tolerance,
+                config.maximum_forward_distance,
+            ))
+            .wire_format_policy(PURE_CIPHERTEXT_WIRE_FORMAT_POLICY)
+            .build();
+
+        let group = MlsGroup::new(
+            &self.provider,
+            &signature_keys,
+            &group_config,
+            CredentialWithKey {
+                credential,
+                signature_key: signature_keys.public().into(),
+            },
+        )
+        .map_err(|_| MLSError::OpenMLSError)?;
+
+        let group_id = group.group_id().as_slice().to_vec();
+
+        self.groups.insert(group_id.clone(), GroupState {
+            group,
+            signer_public_key: signature_keys.public().to_vec(),
+        });
+
+        self.signers_by_identity.insert(identity.as_bytes().to_vec(), signature_keys.public().to_vec());
+
+        Ok(group_id)
     }
 
-    pub fn set_identity_signer(&self, identity: Vec<u8>, signer: Arc<SignatureKeyPair>) -> Result<()> {
-        let mut map = self.signers_by_identity.lock()
-            .map_err(|e| MLSError::ThreadSafety(e.to_string()))?;
-        map.insert(identity, signer);
-        Ok(())
-    }
-
-    pub fn signer_for_group(&self, group_id: &[u8]) -> Result<Arc<SignatureKeyPair>> {
-        let map = self.signers_by_group.lock()
-            .map_err(|e| MLSError::ThreadSafety(e.to_string()))?;
-        map.get(group_id)
-            .cloned()
-            .ok_or_else(|| MLSError::GroupNotFound(hex::encode(group_id)))
-    }
-
-    pub fn signer_for_identity(&self, identity: &[u8]) -> Result<Arc<SignatureKeyPair>> {
-        let map = self.signers_by_identity.lock()
-            .map_err(|e| MLSError::ThreadSafety(e.to_string()))?;
-        map.get(identity)
-            .cloned()
-            .ok_or_else(|| MLSError::GroupNotFound(format!("identity:{}", hex::encode(identity))))
-    }
-
-    pub fn set_key_package_signer(&self, key_package_ref: Vec<u8>, signer: Arc<SignatureKeyPair>) -> Result<()> {
-        let mut map = self.signers_by_key_package_ref.lock()
-            .map_err(|e| MLSError::ThreadSafety(e.to_string()))?;
-        map.insert(key_package_ref, signer);
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub fn signer_for_key_package(&self, key_package_ref: &[u8]) -> Result<Arc<SignatureKeyPair>> {
-        let map = self.signers_by_key_package_ref.lock()
-            .map_err(|e| MLSError::ThreadSafety(e.to_string()))?;
-        map.get(key_package_ref)
-            .cloned()
-            .ok_or_else(|| MLSError::GroupNotFound(format!("key_package_ref:{}", hex::encode(key_package_ref))))
-    }
-
-    pub fn with_group<T, F: FnOnce(&mut MlsGroup) -> Result<T>>(&self, group_id: &[u8], f: F) -> Result<T> {
-        let mut groups = self.groups.lock()
-            .map_err(|e| MLSError::ThreadSafety(e.to_string()))?;
-        let group = groups.get_mut(group_id)
-            .ok_or_else(|| MLSError::GroupNotFound(hex::encode(group_id)))?;
-        f(group)
-    }
-
-    #[allow(dead_code)]
-    pub fn remove_group(&self, group_id: &[u8]) -> Result<()> {
-        let mut groups = self.groups.lock()
-            .map_err(|e| MLSError::ThreadSafety(e.to_string()))?;
-        groups.remove(group_id);
-        let mut signers = self.signers_by_group.lock()
-            .map_err(|e| MLSError::ThreadSafety(e.to_string()))?;
-        signers.remove(group_id);
-        Ok(())
-    }
-
-    /// Validate that the group's current epoch matches the expected epoch.
-    /// This prevents replay attacks and ensures epoch synchronization.
-    #[allow(dead_code)]
-    pub fn validate_epoch(&self, group_id: &[u8], expected_epoch: u64) -> Result<()> {
-        let groups = self.groups.lock()
-            .map_err(|e| MLSError::ThreadSafety(e.to_string()))?;
-        let group = groups.get(group_id)
-            .ok_or_else(|| MLSError::GroupNotFound(hex::encode(group_id)))?;
+    pub fn add_group(&mut self, group: MlsGroup, identity: &str) -> Result<(), MLSError> {
+        let signer_pk = self.signers_by_identity
+            .get(identity.as_bytes())
+            .ok_or_else(|| MLSError::group_not_found(format!("No signer for identity: {}", identity)))?
+            .clone();
         
-        let actual_epoch = group.epoch().as_u64();
-        if actual_epoch != expected_epoch {
-            return Err(MLSError::EpochMismatch {
-                expected: expected_epoch,
-                actual: actual_epoch,
-            });
-        }
+        let group_id = group.group_id().as_slice().to_vec();
+        self.groups.insert(group_id, GroupState { 
+            group, 
+            signer_public_key: signer_pk 
+        });
         Ok(())
     }
 
-    /// Get the current epoch for a group.
-    #[allow(dead_code)]
-    pub fn get_epoch(&self, group_id: &[u8]) -> Result<u64> {
-        let groups = self.groups.lock()
-            .map_err(|e| MLSError::ThreadSafety(e.to_string()))?;
-        let group = groups.get(group_id)
-            .ok_or_else(|| MLSError::GroupNotFound(hex::encode(group_id)))?;
-        Ok(group.epoch().as_u64())
-    }
-}
-
-impl Drop for MLSContext {
-    fn drop(&mut self) {
-        // Note: SignatureKeyPair doesn't implement Zeroize in openmls 0.5
-        // This is a limitation of the current OpenMLS version.
-        // Future: When OpenMLS adds zeroize support, uncomment below:
+    pub fn signer_for_group(&self, group_id: &GroupId) -> Result<SignatureKeyPair, MLSError> {
+        let state = self.groups
+            .get(group_id.as_slice())
+            .ok_or_else(|| MLSError::group_not_found(hex::encode(group_id.as_slice())))?;
         
-        // Clear all key material from memory
-        // if let Ok(mut signers) = self.signers_by_group.lock() {
-        //     for (_, signer) in signers.drain() {
-        //         // Zeroize signature keys
-        //         drop(signer);
-        //     }
-        // }
-        // if let Ok(mut signers) = self.signers_by_identity.lock() {
-        //     for (_, signer) in signers.drain() {
-        //         drop(signer);
-        //     }
-        // }
-        // if let Ok(mut signers) = self.signers_by_key_package_ref.lock() {
-        //     for (_, signer) in signers.drain() {
-        //         drop(signer);
-        //     }
-        // }
+        // Load signer from storage using public key
+        SignatureKeyPair::read(
+            self.provider.storage(), 
+            &state.signer_public_key,
+            SignatureScheme::ED25519
+        )
+            .ok_or_else(|| MLSError::OpenMLSError)
     }
-}
 
-impl Default for MLSContext {
-    fn default() -> Self {
-        Self::new()
+    pub fn with_group<T, F: FnOnce(&mut MlsGroup, &OpenMlsRustCrypto, &SignatureKeyPair) -> Result<T, MLSError>>(
+        &mut self,
+        group_id: &GroupId,
+        f: F,
+    ) -> Result<T, MLSError> {
+        let state = self.groups
+            .get_mut(group_id.as_slice())
+            .ok_or_else(|| MLSError::group_not_found(hex::encode(group_id.as_slice())))?;
+        
+        // Load signer from storage
+        let signer = SignatureKeyPair::read(
+            self.provider.storage(), 
+            &state.signer_public_key,
+            SignatureScheme::ED25519
+        )
+            .ok_or_else(|| MLSError::OpenMLSError)?;
+        
+        f(&mut state.group, &self.provider, &signer)
+    }
+
+    pub fn with_group_ref<T, F: FnOnce(&MlsGroup, &OpenMlsRustCrypto) -> Result<T, MLSError>>(
+        &self,
+        group_id: &GroupId,
+        f: F,
+    ) -> Result<T, MLSError> {
+        let state = self.groups
+            .get(group_id.as_slice())
+            .ok_or_else(|| MLSError::group_not_found(hex::encode(group_id.as_slice())))?;
+        f(&state.group, &self.provider)
+    }
+
+    pub fn store_staged_welcome(&mut self, id: String, staged: StagedWelcome) {
+        self.staged_welcomes.insert(id, staged);
+    }
+
+    pub fn take_staged_welcome(&mut self, id: &str) -> Result<StagedWelcome, MLSError> {
+        self.staged_welcomes.remove(id)
+            .ok_or_else(|| MLSError::invalid_input("Staged welcome not found"))
+    }
+
+    pub fn store_staged_commit(&mut self, id: String, staged: Box<StagedCommit>) {
+        self.staged_commits.insert(id, staged);
+    }
+
+    pub fn take_staged_commit(&mut self, id: &str) -> Result<Box<StagedCommit>, MLSError> {
+        self.staged_commits.remove(id)
+            .ok_or_else(|| MLSError::invalid_input("Staged commit not found"))
     }
 }
