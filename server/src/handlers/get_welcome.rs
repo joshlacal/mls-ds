@@ -65,28 +65,13 @@ pub async fn get_welcome(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let (welcome_id, welcome_data) = result.ok_or_else(|| {
-        // Check if user is the conversation creator (they don't get Welcome messages)
-        let is_creator_query = sqlx::query_scalar::<_, String>(
-            "SELECT creator_did FROM conversations WHERE id = $1"
-        )
-        .bind(&params.convo_id)
-        .fetch_optional(&pool);
-        
-        if let Ok(Some(creator_did)) = futures::executor::block_on(is_creator_query) {
-            if creator_did == *did {
-                warn!("User {} is the creator of conversation {} - no Welcome message needed", 
-                      did, params.convo_id);
-            } else {
-                warn!("No Welcome message found for user {} in conversation {} (creator: {})", 
-                      did, params.convo_id, creator_did);
-            }
-        } else {
-            warn!("No Welcome message found for user {} in conversation {} (checked: convo_id={}, recipient_did={}, consumed=false)", 
-                  did, params.convo_id, params.convo_id, did);
+    let (welcome_id, welcome_data) = match result {
+        Some(data) => data,
+        None => {
+            warn!("No Welcome message found for user {} in conversation {}", did, params.convo_id);
+            return Err(StatusCode::NOT_FOUND);
         }
-        StatusCode::NOT_FOUND
-    })?;
+    };
 
     // Mark as consumed
     let now = chrono::Utc::now();

@@ -501,24 +501,24 @@ pub async fn store_key_package(
 ) -> Result<KeyPackage> {
     let now = Utc::now();
 
-    let key_package = sqlx::query_as::<_, KeyPackage>(
+    let result = sqlx::query_as::<_, KeyPackage>(
         r#"
         INSERT INTO key_packages (did, cipher_suite, key_data, created_at, expires_at, consumed)
         VALUES ($1, $2, $3, $4, $5, false)
-        ON CONFLICT (did, cipher_suite, key_data) DO NOTHING
+        ON CONFLICT (did, cipher_suite, key_data) DO UPDATE SET expires_at = EXCLUDED.expires_at
         RETURNING did, cipher_suite, key_data, created_at, expires_at, consumed
         "#,
     )
     .bind(did)
     .bind(cipher_suite)
-    .bind(key_data)
+    .bind(&key_data)
     .bind(now)
     .bind(expires_at)
     .fetch_one(pool)
     .await
     .context("Failed to store key package")?;
 
-    Ok(key_package)
+    Ok(result)
 }
 
 /// Get an available key package for a user
