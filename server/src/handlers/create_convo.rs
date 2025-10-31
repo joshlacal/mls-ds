@@ -16,11 +16,11 @@ pub async fn create_convo(
     auth_user: AuthUser,
     Json(input): Json<CreateConvoInput>,
 ) -> Result<Json<ConvoView>, StatusCode> {
-    info!("🔷 [create_convo] START - creator: {}, groupId: {}, initialMembers: {}, welcomeMessages: {}", 
+    info!("🔷 [create_convo] START - creator: {}, groupId: {}, initialMembers: {}, has_welcome: {}", 
           auth_user.did, 
           input.group_id,
           input.initial_members.as_ref().map(|m| m.len()).unwrap_or(0),
-          input.welcome_messages.as_ref().map(|w| w.len()).unwrap_or(0));
+          input.welcome_message.is_some());
     
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.createConvo") {
         error!("❌ [create_convo] Unauthorized");
@@ -134,121 +134,56 @@ pub async fn create_convo(
         }
     }
 
-    // Store Welcome messages for initial members
+    // Store Welcome message for initial members
     // MLS generates ONE Welcome message containing encrypted secrets for ALL members
     // Each member can decrypt only their portion from the same Welcome
-    // 
-    // MULTI-DEVICE SUPPORT:
-    // If a member has multiple KeyPackages (multiple devices), we need to:
-    // 1. Fetch ALL KeyPackages for the member
-    // 2. Generate a separate Welcome for EACH KeyPackage
-    // 3. Store each Welcome with its corresponding key_package_hash
-    if let Some(ref welcome_messages) = input.welcome_messages {
-        info!("📍 [create_convo] Processing {} welcome message entries...", welcome_messages.len());
+    if let Some(ref welcome_b64) = input.welcome_message {
+        info!("📍 [create_convo] Processing Welcome message...");
         
-        if welcome_messages.is_empty() {
-            info!("📍 [create_convo] No welcome messages provided");
-        } else if welcome_messages.len() == 1 {
-            // New format: ONE Welcome for ALL members (single-device scenario)
-            // The single Welcome contains secrets for all members' KeyPackages
-            let welcome_msg = &welcome_messages[0];
+        // Decode base64url Welcome message
+        let welcome_data = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(welcome_b64)
+            .map_err(|e| {
+                warn!("❌ [create_convo] Invalid base64 welcome message: {}", e);
+                StatusCode::BAD_REQUEST
+            })?;
+        
+        info!("📍 [create_convo] Single Welcome message ({} bytes) for all members/devices", welcome_data.len());
+        
+        // Store the SAME Welcome for each initial member (excluding creator)
+        if let Some(ref member_list) = input.initial_members {
+            let non_creator_members: Vec<_> = member_list.iter().filter(|d| *d != did).collect();
             
-            // Decode base64url Welcome message once
-            let welcome_data = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(&welcome_msg.welcome)
-                .map_err(|e| {
-                    warn!("❌ [create_convo] Invalid base64 welcome message: {}", e);
-                    StatusCode::BAD_REQUEST
-                })?;
-            
-            info!("📍 [create_convo] Single Welcome message ({} bytes) for all members/devices", welcome_data.len());
-            
-            // Store the SAME Welcome for each initial member
-            // IMPORTANT: Do NOT store Welcome for the creator (they don't need it)
-            if let Some(ref member_list) = input.initial_members {
-                let non_creator_members: Vec<_> = member_list.iter().filter(|d| *d != did).collect();
-                
-                // For multi-device support, fetch all KeyPackages and store Welcome per device
-                // For now, store one Welcome per member (single-device)
-                // TODO: When client sends multiple Welcomes, parse and match to KeyPackages
-                for member_did in &non_creator_members {
-                    let welcome_id = uuid::Uuid::new_v4().to_string();
-                    
-                    // Store with NULL key_package_hash for backward compatibility
-                    // Future: Parse Welcome to extract key_package_ref and hash it
-                    sqlx::query(
-                        "INSERT INTO welcome_messages (id, convo_id, recipient_did, welcome_data, key_package_hash, created_at) 
-                         VALUES ($1, $2, $3, $4, $5, $6)
-                         ON CONFLICT (convo_id, recipient_did) WHERE consumed = false
-                         DO NOTHING"
-                    )
-                    .bind(&welcome_id)
-                    .bind(&convo_id)
-                    .bind(member_did)
-                    .bind(&welcome_data)
-                    .bind::<Option<Vec<u8>>>(None) // key_package_hash (NULL for now)
-                    .bind(&now)
-                    .execute(&pool)
-                    .await
-                    .map_err(|e| {
-                        error!("❌ [create_convo] Failed to store welcome message for {}: {}", member_did, e);
-                        StatusCode::INTERNAL_SERVER_ERROR
-                    })?;
-                    
-                    info!("✅ [create_convo] Welcome stored for member {}", member_did);
-                }
-                info!("📍 [create_convo] Stored Welcome for {} members (excluding creator)", non_creator_members.len());
-            } else {
-                info!("📍 [create_convo] No initial_members list - skipping Welcome storage");
-            }
-        } else {
-            // Legacy format OR multi-device format: Multiple entries
-            // Store each one as-is for backward compatibility
-            info!("📍 [create_convo] Multi-entry format: {} welcome entries", welcome_messages.len());
-            
-            for (idx, welcome_msg) in welcome_messages.iter().enumerate() {
-                // Skip creator
-                if welcome_msg.recipient_did == *did {
-                    info!("📍 [create_convo] Skipping Welcome for creator");
-                    continue;
-                }
-                
-                info!("📍 [create_convo] Processing welcome message {}/{} for: {}", 
-                      idx + 1, welcome_messages.len(), welcome_msg.recipient_did);
-                
-                let welcome_data = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                    .decode(&welcome_msg.welcome)
-                    .map_err(|e| {
-                        warn!("❌ [create_convo] Invalid base64 welcome message: {}", e);
-                        StatusCode::BAD_REQUEST
-                    })?;
-
+            for member_did in &non_creator_members {
                 let welcome_id = uuid::Uuid::new_v4().to_string();
-
+                
                 sqlx::query(
-                    "INSERT INTO welcome_messages (id, convo_id, recipient_did, welcome_data, key_package_hash, created_at)
+                    "INSERT INTO welcome_messages (id, convo_id, recipient_did, welcome_data, key_package_hash, created_at) 
                      VALUES ($1, $2, $3, $4, $5, $6)
-                     ON CONFLICT (convo_id, recipient_did) WHERE consumed = false
+                     ON CONFLICT (convo_id, recipient_did, COALESCE(key_package_hash, '\\x00'::bytea)) WHERE consumed = false
                      DO NOTHING"
                 )
                 .bind(&welcome_id)
                 .bind(&convo_id)
-                .bind(&welcome_msg.recipient_did)
+                .bind(member_did)
                 .bind(&welcome_data)
-                .bind::<Option<Vec<u8>>>(None)
+                .bind::<Option<Vec<u8>>>(None) // key_package_hash
                 .bind(&now)
                 .execute(&pool)
                 .await
                 .map_err(|e| {
-                    error!("❌ [create_convo] Failed to store welcome message for {}: {}", welcome_msg.recipient_did, e);
+                    error!("❌ [create_convo] Failed to store welcome message for {}: {}", member_did, e);
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
-
-                info!("✅ [create_convo] Welcome message stored for {}", welcome_msg.recipient_did);
+                
+                info!("✅ [create_convo] Welcome stored for member {}", member_did);
             }
+            info!("📍 [create_convo] Stored Welcome for {} members (excluding creator)", non_creator_members.len());
+        } else {
+            info!("📍 [create_convo] No initial_members list - skipping Welcome storage");
         }
     } else {
-        info!("📍 [create_convo] No welcome messages to store");
+        info!("📍 [create_convo] No welcome message provided");
     }
 
     info!("✅ [create_convo] COMPLETE - convoId: {}, members: {}, epoch: 0", 

@@ -39,15 +39,9 @@
               "maxLength": 100,
               "minLength": 0
             },
-            "welcomeMessages": {
-              "type": "array",
-              "items": {
-                "type": "ref",
-                "ref": "#welcomeMessageInput"
-              },
-              "description": "Welcome messages for initial members (one per member)",
-              "maxLength": 100,
-              "minLength": 0
+            "welcomeMessage": {
+              "type": "string",
+              "description": "Base64url-encoded MLS Welcome message containing encrypted secrets for ALL initial members"
             },
             "metadata": {
               "type": "ref",
@@ -92,22 +86,6 @@
           "type": "string",
           "maxLength": 512,
           "description": "Conversation description"
-        }
-      }
-    },
-    "welcomeMessageInput": {
-      "type": "object",
-      "description": "Welcome message for a specific recipient",
-      "required": ["recipientDid", "welcome"],
-      "properties": {
-        "recipientDid": {
-          "type": "string",
-          "format": "did",
-          "description": "DID of the recipient for this Welcome message"
-        },
-        "welcome": {
-          "type": "string",
-          "description": "Base64url-encoded MLS Welcome message data"
         }
       }
     }
