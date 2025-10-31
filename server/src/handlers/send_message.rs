@@ -20,52 +20,54 @@ pub async fn send_message(
     auth_user: AuthUser,
     LoggedJson(input): LoggedJson<SendMessageInput>,
 ) -> Result<Json<SendMessageOutput>, StatusCode> {
+    info!("🔷 [send_message] START - did: {}, convo: {}, epoch: {}, ciphertext: {} bytes", 
+          auth_user.did, input.convo_id, input.epoch, input.ciphertext.len());
+    
     if let Err(_e) =
         crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.sendMessage")
     {
+        error!("❌ [send_message] Unauthorized - failed auth check");
         return Err(StatusCode::UNAUTHORIZED);
     }
     let did = &auth_user.did;
 
     if &input.sender_did != did {
         warn!(
-            "Sender DID mismatch: expected {}, got {}",
+            "❌ [send_message] Sender DID mismatch: expected {}, got {}",
             did, input.sender_did
         );
         return Err(StatusCode::FORBIDDEN);
     }
 
     if input.epoch < 0 {
-        warn!("Invalid epoch: {}", input.epoch);
+        warn!("❌ [send_message] Invalid epoch: {}", input.epoch);
         return Err(StatusCode::BAD_REQUEST);
     }
 
     // Validate ciphertext is present and not too large (10MB limit)
     if input.ciphertext.is_empty() {
-        warn!("Empty ciphertext provided");
+        warn!("❌ [send_message] Empty ciphertext provided");
         return Err(StatusCode::BAD_REQUEST);
     }
     if input.ciphertext.len() > 10 * 1024 * 1024 {
-        warn!("Ciphertext too large: {} bytes", input.ciphertext.len());
+        warn!("❌ [send_message] Ciphertext too large: {} bytes", input.ciphertext.len());
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    info!("📍 [send_message] Checking membership...");
     // Check if sender is a member
     if !is_member(&pool, did, &input.convo_id).await.map_err(|e| {
-        error!("Failed to check membership: {}", e);
+        error!("❌ [send_message] Failed to check membership: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })? {
         warn!(
-            "User {} is not a member of conversation {}",
+            "❌ [send_message] User {} is not a member of conversation {}",
             did, input.convo_id
         );
         return Err(StatusCode::FORBIDDEN);
     }
 
-    info!(
-        "Sending message to conversation {} ({} bytes)",
-        input.convo_id, input.ciphertext.len()
-    );
+    info!("📍 [send_message] Creating message in database...");
 
     // Create message with direct ciphertext storage
     let message = db::create_message(
@@ -79,13 +81,16 @@ pub async fn send_message(
     )
     .await
     .map_err(|e| {
-        error!("Failed to create message: {}", e);
+        error!("❌ [send_message] Failed to create message: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
     let msg_id = message.id.clone();
     let now = message.created_at;
+    
+    info!("✅ [send_message] Message created - id: {}", msg_id);
 
+    info!("📍 [send_message] Updating unread counts...");
     // Update unread counts for other members
     sqlx::query(
         "UPDATE members SET unread_count = unread_count + 1 WHERE convo_id = $1 AND member_did != $2 AND left_at IS NULL"
@@ -95,12 +100,12 @@ pub async fn send_message(
     .execute(&pool)
     .await
     .map_err(|e| {
-        error!("Failed to update unread counts: {}", e);
+        error!("❌ [send_message] Failed to update unread counts: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
+    info!("📍 [send_message] Spawning fan-out task...");
     // Spawn async task for fan-out and realtime emission
-    // Clone variables needed for async task
     let pool_clone = pool.clone();
     let convo_id = input.convo_id.clone();
     let msg_id_clone = msg_id.clone();
@@ -110,6 +115,7 @@ pub async fn send_message(
 
     tokio::spawn(async move {
         let fanout_start = std::time::Instant::now();
+        info!("📍 [send_message:fanout] Starting fan-out for convo: {}", convo_id);
 
         // Get all active members
         let members_result = sqlx::query!(
@@ -125,13 +131,13 @@ pub async fn send_message(
 
         match members_result {
             Ok(members) => {
-                info!(convo_id = %convo_id, member_count = members.len(), "Fan-out to members");
+                info!("📍 [send_message:fanout] Fan-out to {} members", members.len());
 
                 // Write envelopes for message tracking
                 for member in &members {
                     let envelope_id = uuid::Uuid::new_v4().to_string();
 
-                    // Insert envelope (simplified - no provider/zone)
+                    // Insert envelope
                     let envelope_result = sqlx::query!(
                         r#"
                         INSERT INTO envelopes (id, convo_id, recipient_did, message_id, created_at)
@@ -148,10 +154,8 @@ pub async fn send_message(
 
                     if let Err(e) = envelope_result {
                         error!(
-                            convo_id = %convo_id,
-                            recipient = %member.member_did,
-                            error = ?e,
-                            "Failed to insert envelope"
+                            "❌ [send_message:fanout] Failed to insert envelope for {}: {:?}",
+                            member.member_did, e
                         );
                     }
                 }
@@ -160,20 +164,19 @@ pub async fn send_message(
                 crate::metrics::record_envelope_write_duration(&convo_id, fanout_duration);
 
                 info!(
-                    convo_id = %convo_id,
-                    duration_ms = fanout_duration.as_millis(),
-                    "Fan-out completed"
+                    "✅ [send_message:fanout] Completed in {}ms",
+                    fanout_duration.as_millis()
                 );
             }
             Err(e) => {
                 error!(
-                    convo_id = %convo_id,
-                    error = ?e,
-                    "Failed to get members for fan-out"
+                    "❌ [send_message:fanout] Failed to get members: {:?}",
+                    e
                 );
             }
         }
 
+        info!("📍 [send_message:fanout] Emitting SSE event...");
         // Emit realtime event
         let cursor = sse_state_clone
             .cursor_gen
@@ -206,23 +209,21 @@ pub async fn send_message(
         )
         .await
         {
-            error!(error = ?e, "Failed to store event for backfill");
+            error!("❌ [send_message:fanout] Failed to store event: {:?}", e);
         }
 
         // Emit to SSE subscribers
         if let Err(e) = sse_state_clone.emit(&convo_id, event).await {
             error!(
-                convo_id = %convo_id,
-                error = %e,
-                "Failed to emit realtime event"
+                "❌ [send_message:fanout] Failed to emit SSE event: {}",
+                e
             );
+        } else {
+            info!("✅ [send_message:fanout] SSE event emitted");
         }
     });
 
-    info!(
-        "Message {} sent successfully (async fan-out initiated)",
-        msg_id
-    );
+    info!("✅ [send_message] COMPLETE - msgId: {} (async fan-out initiated)", msg_id);
 
     Ok(Json(SendMessageOutput {
         message_id: msg_id,
