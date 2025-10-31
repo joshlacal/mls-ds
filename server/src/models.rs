@@ -119,10 +119,10 @@ pub struct CreateConvoInput {
     #[serde(rename = "initialMembers")]
     pub initial_members: Option<Vec<String>>,
     pub metadata: Option<ConvoMetadata>,
-    /// Welcome messages for initial members (base64url encoded)
-    /// Array with one entry per initial member
-    #[serde(rename = "welcomeMessages", skip_serializing_if = "Option::is_none")]
-    pub welcome_messages: Option<Vec<WelcomeMessageInput>>,
+    /// Single Welcome message for ALL initial members (base64url encoded)
+    /// Contains encrypted secrets that each member can decrypt
+    #[serde(rename = "welcomeMessage", skip_serializing_if = "Option::is_none")]
+    pub welcome_message: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -180,9 +180,10 @@ pub struct AddMembersInput {
     #[serde(rename = "didList")]
     pub did_list: Vec<String>,
     pub commit: Option<String>, // base64url encoded
-    /// Welcome messages for new members (one per member in didList)
-    #[serde(rename = "welcomeMessages", skip_serializing_if = "Option::is_none")]
-    pub welcome_messages: Option<Vec<WelcomeMessageInput>>,
+    /// Single Welcome message for ALL new members (base64url encoded)
+    /// Contains encrypted secrets that each member can decrypt
+    #[serde(rename = "welcomeMessage", skip_serializing_if = "Option::is_none")]
+    pub welcome_message: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -310,13 +311,6 @@ pub struct KeyPackageInfo {
 
 // Welcome message models
 
-#[derive(Debug, Deserialize)]
-pub struct WelcomeMessageInput {
-    #[serde(rename = "recipientDid")]
-    pub recipient_did: String,
-    /// Base64url-encoded Welcome message data
-    pub welcome: String,
-}
 
 #[derive(Debug, Serialize)]
 pub struct GetWelcomeOutput {

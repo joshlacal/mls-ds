@@ -129,93 +129,50 @@ pub async fn add_members(
         })?;
     }
 
-    // Store Welcome messages for new members
+    // Store Welcome message for new members
     // MLS generates ONE Welcome message containing encrypted secrets for ALL members
-    // Each member can decrypt only their portion from the same Welcome
-    if let Some(welcome_messages) = input.welcome_messages {
-        info!("📍 [add_members] Processing {} welcome message entries...", welcome_messages.len());
+    if let Some(ref welcome_b64) = input.welcome_message {
+        info!("📍 [add_members] Processing Welcome message...");
         
-        if welcome_messages.is_empty() {
-            info!("📍 [add_members] No welcome messages provided");
-        } else if welcome_messages.len() == 1 {
-            // New format: ONE Welcome for ALL new members (correct MLS protocol)
-            let welcome_msg = &welcome_messages[0];
-            
-            // Decode base64url Welcome message once
-            let welcome_data = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(&welcome_msg.welcome)
-                .map_err(|e| {
-                    warn!("❌ [add_members] Invalid base64 welcome message: {}", e);
-                    StatusCode::BAD_REQUEST
-                })?;
-            
-            info!("📍 [add_members] Single Welcome message ({} bytes) for {} new members", 
-                  welcome_data.len(), input.did_list.len());
-            
-            // Store the SAME Welcome for each new member
-            // Each member will extract their encrypted secret from it
-            for target_did in &input.did_list {
-                let welcome_id = uuid::Uuid::new_v4().to_string();
+        // Decode base64url Welcome message
+        let welcome_data = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(welcome_b64)
+            .map_err(|e| {
+                warn!("❌ [add_members] Invalid base64 welcome message: {}", e);
+                StatusCode::BAD_REQUEST
+            })?;
+        
+        info!("📍 [add_members] Single Welcome message ({} bytes) for {} new members", 
+              welcome_data.len(), input.did_list.len());
+        
+        // Store the SAME Welcome for each new member
+        for target_did in &input.did_list {
+            let welcome_id = uuid::Uuid::new_v4().to_string();
 
-                sqlx::query(
-                    "INSERT INTO welcome_messages (id, convo_id, recipient_did, welcome_data, key_package_hash, created_at)
-                     VALUES ($1, $2, $3, $4, $5, $6)
-                     ON CONFLICT (convo_id, recipient_did, COALESCE(key_package_hash, '\\x00'::bytea)) WHERE consumed = false
-                     DO NOTHING"
-                )
-                .bind(&welcome_id)
-                .bind(&input.convo_id)
-                .bind(target_did)
-                .bind(&welcome_data)
-                .bind::<Option<Vec<u8>>>(None) // key_package_hash
-                .bind(&now)
-                .execute(&pool)
-                .await
-                .map_err(|e| {
-                    error!("❌ [add_members] Failed to store welcome message for {}: {}", target_did, e);
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?;
+            sqlx::query(
+                "INSERT INTO welcome_messages (id, convo_id, recipient_did, welcome_data, key_package_hash, created_at)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT (convo_id, recipient_did, COALESCE(key_package_hash, '\\x00'::bytea)) WHERE consumed = false
+                 DO NOTHING"
+            )
+            .bind(&welcome_id)
+            .bind(&input.convo_id)
+            .bind(target_did)
+            .bind(&welcome_data)
+            .bind::<Option<Vec<u8>>>(None) // key_package_hash
+            .bind(&now)
+            .execute(&pool)
+            .await
+            .map_err(|e| {
+                error!("❌ [add_members] Failed to store welcome message for {}: {}", target_did, e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
-                info!("✅ [add_members] Welcome stored for member {}", target_did);
-            }
-            info!("📍 [add_members] Stored Welcome for {} members", input.did_list.len());
-        } else {
-            // Legacy format: Multiple entries (client sends same Welcome multiple times)
-            // Store each one as-is for backward compatibility
-            info!("📍 [add_members] Multi-entry format: {} welcome entries", welcome_messages.len());
-            
-            for welcome_msg in welcome_messages {
-                let welcome_data = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                    .decode(&welcome_msg.welcome)
-                    .map_err(|e| {
-                        warn!("❌ [add_members] Invalid base64 welcome message: {}", e);
-                        StatusCode::BAD_REQUEST
-                    })?;
-
-                let welcome_id = uuid::Uuid::new_v4().to_string();
-
-                sqlx::query(
-                    "INSERT INTO welcome_messages (id, convo_id, recipient_did, welcome_data, key_package_hash, created_at)
-                     VALUES ($1, $2, $3, $4, $5, $6)
-                     ON CONFLICT (convo_id, recipient_did, COALESCE(key_package_hash, '\\x00'::bytea)) WHERE consumed = false
-                     DO NOTHING"
-                )
-                .bind(&welcome_id)
-                .bind(&input.convo_id)
-                .bind(&welcome_msg.recipient_did)
-                .bind(&welcome_data)
-                .bind::<Option<Vec<u8>>>(None)
-                .bind(&now)
-                .execute(&pool)
-                .await
-                .map_err(|e| {
-                    error!("❌ [add_members] Failed to store welcome message for {}: {}", welcome_msg.recipient_did, e);
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?;
-
-                info!("✅ [add_members] Welcome message stored for {}", welcome_msg.recipient_did);
-            }
+            info!("✅ [add_members] Welcome stored for member {}", target_did);
         }
+        info!("📍 [add_members] Stored Welcome for {} members", input.did_list.len());
+    } else {
+        info!("📍 [add_members] No welcome message provided");
     }
 
     info!("Successfully added members to conversation {}, new epoch: {}", input.convo_id, new_epoch);
