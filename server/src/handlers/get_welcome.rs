@@ -68,7 +68,19 @@ pub async fn get_welcome(
     let (welcome_id, welcome_data) = match result {
         Some(data) => data,
         None => {
-            warn!("No Welcome message found for user {} in conversation {}", did, params.convo_id);
+            // Debug: Query all welcome messages for this conversation
+            let all_messages: Vec<(String, bool)> = sqlx::query_as(
+                "SELECT recipient_did, consumed FROM welcome_messages WHERE convo_id = $1"
+            )
+            .bind(&params.convo_id)
+            .fetch_all(&pool)
+            .await
+            .unwrap_or_default();
+            
+            warn!(
+                "No Welcome message found for user {} in conversation {}. All welcome messages in this convo: {:?}",
+                did, params.convo_id, all_messages
+            );
             return Err(StatusCode::NOT_FOUND);
         }
     };
