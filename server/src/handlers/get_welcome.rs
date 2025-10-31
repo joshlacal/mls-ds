@@ -48,6 +48,8 @@ pub async fn get_welcome(
     }
 
     // Fetch unconsumed Welcome message for this user
+    info!("Querying welcome message: convo_id={}, recipient_did={}", params.convo_id, did);
+    
     let result: Option<(String, Vec<u8>)> = sqlx::query_as(
         "SELECT id, welcome_data FROM welcome_messages
          WHERE convo_id = $1 AND recipient_did = $2 AND consumed = false
@@ -64,7 +66,8 @@ pub async fn get_welcome(
     })?;
 
     let (welcome_id, welcome_data) = result.ok_or_else(|| {
-        warn!("No welcome message found for user {} in conversation {}", did, params.convo_id);
+        warn!("No welcome message found for user {} in conversation {} (checked: convo_id={}, recipient_did={}, consumed=false)", 
+              did, params.convo_id, params.convo_id, did);
         StatusCode::NOT_FOUND
     })?;
 

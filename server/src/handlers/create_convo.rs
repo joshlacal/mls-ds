@@ -124,7 +124,10 @@ pub async fn create_convo(
 
     // Store Welcome messages for initial members
     if let Some(welcome_messages) = input.welcome_messages {
+        info!("Storing {} welcome messages for conversation {}", welcome_messages.len(), convo_id);
         for welcome_msg in welcome_messages {
+            info!("Processing welcome message for recipient: {}", welcome_msg.recipient_did);
+            
             // Decode base64url Welcome message
             let welcome_data = base64::engine::general_purpose::URL_SAFE_NO_PAD
                 .decode(&welcome_msg.welcome)
@@ -134,6 +137,9 @@ pub async fn create_convo(
                 })?;
 
             let welcome_id = uuid::Uuid::new_v4().to_string();
+            
+            info!("Storing welcome message: id={}, convo={}, recipient={}, data_size={}", 
+                  welcome_id, convo_id, welcome_msg.recipient_did, welcome_data.len());
 
             sqlx::query(
                 "INSERT INTO welcome_messages (id, convo_id, recipient_did, welcome_data, created_at) VALUES ($1, $2, $3, $4, $5)"
@@ -150,8 +156,10 @@ pub async fn create_convo(
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
-            info!("Stored welcome message for {} in conversation {}", welcome_msg.recipient_did, convo_id);
+            info!("Successfully stored welcome message for {} in conversation {}", welcome_msg.recipient_did, convo_id);
         }
+    } else {
+        info!("No welcome messages to store for conversation {}", convo_id);
     }
 
     info!("Conversation {} created successfully with {} members", convo_id, members.len());
