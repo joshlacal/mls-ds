@@ -8,6 +8,7 @@ use crate::{
     realtime::{SseState, StreamEvent},
     db,
     storage::{is_member, DbPool},
+    util::json_extractor::LoggedJson,
 };
 
 /// Send a message to a conversation
@@ -17,7 +18,7 @@ pub async fn send_message(
     State(pool): State<DbPool>,
     State(sse_state): State<Arc<SseState>>,
     auth_user: AuthUser,
-    Json(input): Json<SendMessageInput>,
+    LoggedJson(input): LoggedJson<SendMessageInput>,
 ) -> Result<Json<SendMessageOutput>, StatusCode> {
     if let Err(_e) =
         crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.sendMessage")
