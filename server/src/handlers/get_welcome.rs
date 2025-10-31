@@ -47,18 +47,25 @@ pub async fn get_welcome(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    // Fetch unconsumed Welcome message for this user
+    // Fetch and consume Welcome message for this user (atomic operation)
     info!("Querying welcome message: convo_id={}, recipient_did={}", params.convo_id, did);
+    
+    // Use a transaction to atomically fetch and mark as consumed
+    let mut tx = pool.begin().await.map_err(|e| {
+        error!("Failed to begin transaction: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     
     let result: Option<(String, Vec<u8>)> = sqlx::query_as(
         "SELECT id, welcome_data FROM welcome_messages
          WHERE convo_id = $1 AND recipient_did = $2 AND consumed = false
          ORDER BY created_at ASC
-         LIMIT 1"
+         LIMIT 1
+         FOR UPDATE"  // Lock row for update
     )
     .bind(&params.convo_id)
     .bind(did)
-    .fetch_optional(&pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|e| {
         error!("Failed to fetch welcome message: {}", e);
@@ -68,12 +75,28 @@ pub async fn get_welcome(
     let (welcome_id, welcome_data) = match result {
         Some(data) => data,
         None => {
+            // Check if already consumed (return 410 Gone) vs never existed (return 404)
+            let consumed_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM welcome_messages 
+                 WHERE convo_id = $1 AND recipient_did = $2 AND consumed = true"
+            )
+            .bind(&params.convo_id)
+            .bind(did)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap_or(0);
+            
+            if consumed_count > 0 {
+                warn!("Welcome already consumed for user {} in conversation {}", did, params.convo_id);
+                return Err(StatusCode::GONE);  // 410 Gone - already fetched
+            }
+            
             // Debug: Query all welcome messages for this conversation
             let all_messages: Vec<(String, bool)> = sqlx::query_as(
                 "SELECT recipient_did, consumed FROM welcome_messages WHERE convo_id = $1"
             )
             .bind(&params.convo_id)
-            .fetch_all(&pool)
+            .fetch_all(&mut *tx)
             .await
             .unwrap_or_default();
             
@@ -85,17 +108,33 @@ pub async fn get_welcome(
         }
     };
 
-    // Mark as consumed
+    // Mark as consumed atomically
     let now = chrono::Utc::now();
-    sqlx::query(
-        "UPDATE welcome_messages SET consumed = true, consumed_at = $1 WHERE id = $2"
+    let rows_updated = sqlx::query(
+        "UPDATE welcome_messages 
+         SET consumed = true, consumed_at = $1 
+         WHERE id = $2 AND consumed = false
+         RETURNING 1"
     )
     .bind(&now)
     .bind(&welcome_id)
-    .execute(&pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| {
         error!("Failed to mark welcome message as consumed: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .rows_affected();
+    
+    if rows_updated == 0 {
+        // Race condition: someone else consumed it between SELECT and UPDATE
+        warn!("Welcome message {} was consumed by another request", welcome_id);
+        return Err(StatusCode::GONE);
+    }
+    
+    // Commit transaction
+    tx.commit().await.map_err(|e| {
+        error!("Failed to commit transaction: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 

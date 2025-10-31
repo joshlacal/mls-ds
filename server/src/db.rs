@@ -551,6 +551,36 @@ pub async fn get_key_package(
     Ok(key_package)
 }
 
+/// Get ALL unconsumed key packages for a user (for multi-device support)
+/// Returns all valid key packages, one per device
+pub async fn get_all_key_packages(
+    pool: &DbPool,
+    did: &str,
+    cipher_suite: &str,
+) -> Result<Vec<KeyPackage>> {
+    let now = Utc::now();
+
+    let key_packages = sqlx::query_as::<_, KeyPackage>(
+        r#"
+        SELECT did, cipher_suite, key_data, created_at, expires_at, consumed
+        FROM key_packages
+        WHERE did = $1 
+          AND cipher_suite = $2 
+          AND consumed = false 
+          AND expires_at > $3
+        ORDER BY created_at ASC
+        "#,
+    )
+    .bind(did)
+    .bind(cipher_suite)
+    .bind(now)
+    .fetch_all(pool)
+    .await
+    .context("Failed to get all key packages")?;
+
+    Ok(key_packages)
+}
+
 /// Mark a key package as consumed
 pub async fn consume_key_package(
     pool: &DbPool,
