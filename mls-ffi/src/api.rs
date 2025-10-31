@@ -23,14 +23,28 @@ impl MLSContext {
     }
 
     pub fn create_group(&self, identity_bytes: Vec<u8>, config: Option<GroupConfig>) -> Result<GroupCreationResult, MLSError> {
+        eprintln!("[MLS-FFI] create_group: Starting");
+        eprintln!("[MLS-FFI] Identity bytes: {} bytes", identity_bytes.len());
+        
         let mut inner = self.inner.write()
-            .map_err(|_| MLSError::ContextNotInitialized)?;
+            .map_err(|e| {
+                eprintln!("[MLS-FFI] ERROR: Failed to acquire write lock: {:?}", e);
+                MLSError::ContextNotInitialized
+            })?;
 
         let identity = String::from_utf8(identity_bytes)
-            .map_err(|_| MLSError::invalid_input("Invalid UTF-8"))?;
+            .map_err(|e| {
+                eprintln!("[MLS-FFI] ERROR: Invalid UTF-8 in identity: {:?}", e);
+                MLSError::invalid_input("Invalid UTF-8")
+            })?;
+        eprintln!("[MLS-FFI] Identity: {}", identity);
 
         let group_config = config.unwrap_or_default();
+        eprintln!("[MLS-FFI] Group config - max_past_epochs: {}, out_of_order_tolerance: {}, maximum_forward_distance: {}", 
+            group_config.max_past_epochs, group_config.out_of_order_tolerance, group_config.maximum_forward_distance);
+        
         let group_id = inner.create_group(&identity, group_config)?;
+        eprintln!("[MLS-FFI] Group created successfully, ID: {}", hex::encode(&group_id));
 
         Ok(GroupCreationResult {
             group_id: group_id.to_vec(),
@@ -133,20 +147,41 @@ impl MLSContext {
         group_id: Vec<u8>,
         plaintext: Vec<u8>,
     ) -> Result<EncryptResult, MLSError> {
+        eprintln!("[MLS-FFI] encrypt_message: Starting");
+        eprintln!("[MLS-FFI] Group ID: {} ({} bytes)", hex::encode(&group_id), group_id.len());
+        eprintln!("[MLS-FFI] Plaintext size: {} bytes", plaintext.len());
+        
         let mut inner = self.inner.write()
-            .map_err(|_| MLSError::ContextNotInitialized)?;
+            .map_err(|e| {
+                eprintln!("[MLS-FFI] ERROR: Failed to acquire write lock: {:?}", e);
+                MLSError::ContextNotInitialized
+            })?;
         
         let gid = GroupId::from_slice(&group_id);
+        eprintln!("[MLS-FFI] GroupId created");
         
         let ciphertext = inner.with_group(&gid, |group, provider, signer| {
+            eprintln!("[MLS-FFI] Inside with_group for encryption");
+            eprintln!("[MLS-FFI] Current epoch: {:?}", group.epoch());
+            
+            eprintln!("[MLS-FFI] Creating encrypted message...");
             let msg = group
                 .create_message(provider, signer, &plaintext)
-                .map_err(|_| MLSError::EncryptionFailed)?;
+                .map_err(|e| {
+                    eprintln!("[MLS-FFI] ERROR: Failed to create message: {:?}", e);
+                    MLSError::EncryptionFailed
+                })?;
+            eprintln!("[MLS-FFI] Message created successfully");
             
+            eprintln!("[MLS-FFI] Serializing message...");
             msg.tls_serialize_detached()
-                .map_err(|_| MLSError::SerializationError)
+                .map_err(|e| {
+                    eprintln!("[MLS-FFI] ERROR: Failed to serialize message: {:?}", e);
+                    MLSError::SerializationError
+                })
         })?;
 
+        eprintln!("[MLS-FFI] encrypt_message: Completed successfully, ciphertext size: {} bytes", ciphertext.len());
         Ok(EncryptResult { ciphertext })
     }
 
@@ -155,33 +190,69 @@ impl MLSContext {
         group_id: Vec<u8>,
         ciphertext: Vec<u8>,
     ) -> Result<DecryptResult, MLSError> {
+        eprintln!("[MLS-FFI] decrypt_message: Starting decryption");
+        eprintln!("[MLS-FFI] Group ID: {} ({} bytes)", hex::encode(&group_id), group_id.len());
+        eprintln!("[MLS-FFI] Ciphertext size: {} bytes", ciphertext.len());
+        eprintln!("[MLS-FFI] Ciphertext first 32 bytes: {:02x?}", &ciphertext[..ciphertext.len().min(32)]);
+        
         let mut inner = self.inner.write()
-            .map_err(|_| MLSError::ContextNotInitialized)?;
+            .map_err(|e| {
+                eprintln!("[MLS-FFI] ERROR: Failed to acquire write lock: {:?}", e);
+                MLSError::ContextNotInitialized
+            })?;
         
         let gid = GroupId::from_slice(&group_id);
+        eprintln!("[MLS-FFI] GroupId created from slice");
         
         let plaintext = inner.with_group(&gid, |group, provider, _signer| {
-            let (mls_msg, _) = MlsMessageIn::tls_deserialize_bytes(&ciphertext)
-                .map_err(|_| MLSError::SerializationError)?;
+            eprintln!("[MLS-FFI] Inside with_group closure");
+            eprintln!("[MLS-FFI] Current group epoch: {:?}", group.epoch());
+            eprintln!("[MLS-FFI] Group ciphersuite: {:?}", group.ciphersuite());
             
+            eprintln!("[MLS-FFI] Attempting to deserialize MlsMessage...");
+            let (mls_msg, remaining) = MlsMessageIn::tls_deserialize_bytes(&ciphertext)
+                .map_err(|e| {
+                    eprintln!("[MLS-FFI] ERROR: Failed to deserialize MlsMessage: {:?}", e);
+                    MLSError::SerializationError
+                })?;
+            eprintln!("[MLS-FFI] MlsMessage deserialized successfully ({} bytes remaining)", remaining.len());
+            
+            eprintln!("[MLS-FFI] Converting MlsMessage to ProtocolMessage...");
             let protocol_msg: ProtocolMessage = mls_msg.try_into()
-                .map_err(|_| MLSError::DecryptionFailed)?;
+                .map_err(|e| {
+                    eprintln!("[MLS-FFI] ERROR: Failed to convert to ProtocolMessage: {:?}", e);
+                    MLSError::DecryptionFailed
+                })?;
+            eprintln!("[MLS-FFI] ProtocolMessage created successfully");
+            eprintln!("[MLS-FFI] Protocol message epoch: {:?}", protocol_msg.epoch());
             
+            eprintln!("[MLS-FFI] Calling OpenMLS process_message...");
             let processed = group
                 .process_message(provider, protocol_msg)
-                .map_err(|_| MLSError::DecryptionFailed)?;
+                .map_err(|e| {
+                    eprintln!("[MLS-FFI] ERROR: OpenMLS process_message failed: {:?}", e);
+                    eprintln!("[MLS-FFI] ERROR: Error type: {}", std::any::type_name_of_val(&e));
+                    MLSError::DecryptionFailed
+                })?;
+            eprintln!("[MLS-FFI] OpenMLS process_message succeeded");
             
+            eprintln!("[MLS-FFI] Processing message content...");
             match processed.into_content() {
                 ProcessedMessageContent::ApplicationMessage(app_msg) => {
-                    Ok(app_msg.into_bytes())
+                    let bytes = app_msg.into_bytes();
+                    eprintln!("[MLS-FFI] ApplicationMessage processed: {} bytes", bytes.len());
+                    Ok(bytes)
                 },
-                ProcessedMessageContent::ProposalMessage(_) => {
+                ProcessedMessageContent::ProposalMessage(prop) => {
+                    eprintln!("[MLS-FFI] ProposalMessage received: {:?}", std::any::type_name_of_val(&prop));
                     Ok(vec![]) // Proposals don't have plaintext
                 },
-                ProcessedMessageContent::ExternalJoinProposalMessage(_) => {
+                ProcessedMessageContent::ExternalJoinProposalMessage(ext) => {
+                    eprintln!("[MLS-FFI] ExternalJoinProposalMessage received: {:?}", std::any::type_name_of_val(&ext));
                     Ok(vec![])
                 },
-                ProcessedMessageContent::StagedCommitMessage(_staged) => {
+                ProcessedMessageContent::StagedCommitMessage(staged) => {
+                    eprintln!("[MLS-FFI] StagedCommitMessage received: {:?}", std::any::type_name_of_val(&staged));
                     // Don't auto-merge - let Swift validate first
                     // Return empty vec to indicate staged commit (Swift will use process_message instead)
                     Ok(vec![])
@@ -189,6 +260,7 @@ impl MLSContext {
             }
         })?;
 
+        eprintln!("[MLS-FFI] decrypt_message: Completed successfully, plaintext size: {} bytes", plaintext.len());
         Ok(DecryptResult { plaintext })
     }
 
@@ -197,43 +269,90 @@ impl MLSContext {
         group_id: Vec<u8>,
         message_data: Vec<u8>,
     ) -> Result<ProcessedContent, MLSError> {
+        eprintln!("[MLS-FFI] process_message: Starting");
+        eprintln!("[MLS-FFI] Group ID: {} ({} bytes)", hex::encode(&group_id), group_id.len());
+        eprintln!("[MLS-FFI] Message data size: {} bytes", message_data.len());
+        eprintln!("[MLS-FFI] Message data first 32 bytes: {:02x?}", &message_data[..message_data.len().min(32)]);
+        
         let mut inner = self.inner.write()
-            .map_err(|_| MLSError::ContextNotInitialized)?;
+            .map_err(|e| {
+                eprintln!("[MLS-FFI] ERROR: Failed to acquire write lock: {:?}", e);
+                MLSError::ContextNotInitialized
+            })?;
 
         let gid = GroupId::from_slice(&group_id);
+        eprintln!("[MLS-FFI] GroupId created: {}", hex::encode(gid.as_slice()));
 
         inner.with_group(&gid, |group, provider, _signer| {
-            let (mls_msg, _) = MlsMessageIn::tls_deserialize_bytes(&message_data)
-                .map_err(|_| MLSError::SerializationError)?;
+            eprintln!("[MLS-FFI] Inside with_group closure for process_message");
+            eprintln!("[MLS-FFI] Current group epoch: {:?}", group.epoch());
+            eprintln!("[MLS-FFI] Group ciphersuite: {:?}", group.ciphersuite());
+            eprintln!("[MLS-FFI] Group members count: {}", group.members().count());
+            
+            eprintln!("[MLS-FFI] Deserializing MlsMessage...");
+            let (mls_msg, remaining) = MlsMessageIn::tls_deserialize_bytes(&message_data)
+                .map_err(|e| {
+                    eprintln!("[MLS-FFI] ERROR: Failed to deserialize MlsMessage: {:?}", e);
+                    MLSError::SerializationError
+                })?;
+            eprintln!("[MLS-FFI] MlsMessage deserialized ({} bytes remaining)", remaining.len());
 
+            eprintln!("[MLS-FFI] Converting to ProtocolMessage...");
             let protocol_msg: ProtocolMessage = mls_msg.try_into()
-                .map_err(|_| MLSError::DecryptionFailed)?;
+                .map_err(|e| {
+                    eprintln!("[MLS-FFI] ERROR: Failed to convert to ProtocolMessage: {:?}", e);
+                    MLSError::DecryptionFailed
+                })?;
+            eprintln!("[MLS-FFI] ProtocolMessage created");
+            eprintln!("[MLS-FFI] Protocol message epoch: {:?}", protocol_msg.epoch());
+            eprintln!("[MLS-FFI] Protocol message content type: {:?}", std::any::type_name_of_val(&protocol_msg));
 
+            eprintln!("[MLS-FFI] Calling OpenMLS process_message...");
             let processed = group
                 .process_message(provider, protocol_msg)
-                .map_err(|_| MLSError::DecryptionFailed)?;
+                .map_err(|e| {
+                    eprintln!("[MLS-FFI] ERROR: OpenMLS process_message failed!");
+                    eprintln!("[MLS-FFI] ERROR: Error details: {:?}", e);
+                    eprintln!("[MLS-FFI] ERROR: Error type: {}", std::any::type_name_of_val(&e));
+                    eprintln!("[MLS-FFI] ERROR: Current epoch: {:?}", group.epoch());
+                    MLSError::DecryptionFailed
+                })?;
+            eprintln!("[MLS-FFI] OpenMLS process_message succeeded!");
 
+            eprintln!("[MLS-FFI] Processing message content type...");
             match processed.into_content() {
                 ProcessedMessageContent::ApplicationMessage(app_msg) => {
+                    let plaintext = app_msg.into_bytes();
+                    eprintln!("[MLS-FFI] ApplicationMessage processed: {} bytes", plaintext.len());
                     Ok(ProcessedContent::ApplicationMessage {
-                        plaintext: app_msg.into_bytes(),
+                        plaintext,
                     })
                 },
                 ProcessedMessageContent::ProposalMessage(proposal_msg) => {
+                    eprintln!("[MLS-FFI] ProposalMessage received, processing...");
                     let proposal = proposal_msg.proposal();
 
                     // Compute proposal reference by hashing the proposal
                     // Since proposal_reference() is pub(crate), we compute our own identifier
                     let proposal_bytes = proposal
                         .tls_serialize_detached()
-                        .map_err(|_| MLSError::SerializationError)?;
+                        .map_err(|e| {
+                            eprintln!("[MLS-FFI] ERROR: Failed to serialize proposal: {:?}", e);
+                            MLSError::SerializationError
+                        })?;
 
                     let proposal_ref_bytes = provider.crypto()
                         .hash(group.ciphersuite().hash_algorithm(), &proposal_bytes)
-                        .map_err(|_| MLSError::OpenMLSError)?;
+                        .map_err(|e| {
+                            eprintln!("[MLS-FFI] ERROR: Failed to hash proposal: {:?}", e);
+                            MLSError::OpenMLSError
+                        })?;
 
+                    eprintln!("[MLS-FFI] Proposal ref computed: {}", hex::encode(&proposal_ref_bytes));
+                    
                     let proposal_info = match proposal {
                         Proposal::Add(add_proposal) => {
+                            eprintln!("[MLS-FFI] Add proposal detected");
                             let key_package = add_proposal.key_package();
                             let credential = key_package.leaf_node().credential();
 
@@ -253,6 +372,7 @@ impl MLSContext {
                             }
                         },
                         Proposal::Remove(remove_proposal) => {
+                            eprintln!("[MLS-FFI] Remove proposal detected, index: {}", remove_proposal.removed().u32());
                             ProposalInfo::Remove {
                                 info: RemoveProposalInfo {
                                     removed_index: remove_proposal.removed().u32(),
@@ -260,6 +380,7 @@ impl MLSContext {
                             }
                         },
                         Proposal::Update(update_proposal) => {
+                            eprintln!("[MLS-FFI] Update proposal detected");
                             let leaf_node = update_proposal.leaf_node();
                             let credential = leaf_node.credential();
 
@@ -269,6 +390,7 @@ impl MLSContext {
                             };
 
                             let leaf_index = group.own_leaf_index().u32();
+                            eprintln!("[MLS-FFI] Update proposal leaf index: {}", leaf_index);
 
                             ProposalInfo::Update {
                                 info: UpdateProposalInfo {
@@ -279,10 +401,12 @@ impl MLSContext {
                             }
                         },
                         _ => {
+                            eprintln!("[MLS-FFI] ERROR: Unsupported proposal type");
                             return Err(MLSError::invalid_input("Unsupported proposal type"));
                         }
                     };
 
+                    eprintln!("[MLS-FFI] Proposal processed successfully");
                     Ok(ProcessedContent::Proposal {
                         proposal: proposal_info,
                         proposal_ref: ProposalRef {
@@ -291,9 +415,11 @@ impl MLSContext {
                     })
                 },
                 ProcessedMessageContent::ExternalJoinProposalMessage(_) => {
+                    eprintln!("[MLS-FFI] ERROR: External join proposals not supported");
                     Err(MLSError::invalid_input("External join proposals not supported"))
                 },
                 ProcessedMessageContent::StagedCommitMessage(staged) => {
+                    eprintln!("[MLS-FFI] StagedCommitMessage received, processing...");
                     let new_epoch = staged.group_context().epoch().as_u64();
 
                     // Don't auto-merge - return staged commit info for validation
@@ -424,13 +550,21 @@ impl MLSContext {
     }
 
     pub fn get_epoch(&self, group_id: Vec<u8>) -> Result<u64, MLSError> {
+        eprintln!("[MLS-FFI] get_epoch: Starting");
+        eprintln!("[MLS-FFI] Group ID: {}", hex::encode(&group_id));
+        
         let inner = self.inner.read()
-            .map_err(|_| MLSError::ContextNotInitialized)?;
+            .map_err(|e| {
+                eprintln!("[MLS-FFI] ERROR: Failed to acquire read lock: {:?}", e);
+                MLSError::ContextNotInitialized
+            })?;
         
         let gid = GroupId::from_slice(&group_id);
         
         inner.with_group_ref(&gid, |group, _provider| {
-            Ok(group.epoch().as_u64())
+            let epoch = group.epoch().as_u64();
+            eprintln!("[MLS-FFI] Current epoch: {}", epoch);
+            Ok(epoch)
         })
     }
 
@@ -658,5 +792,17 @@ impl MLSContext {
     pub fn merge_staged_commit(&self, group_id: Vec<u8>) -> Result<u64, MLSError> {
         // OpenMLS uses the same internal method for both pending and staged commits
         self.merge_pending_commit(group_id)
+    }
+
+    /// Check if a group exists in local storage
+    /// - Parameters:
+    ///   - group_id: Group identifier to check
+    /// - Returns: true if group exists, false otherwise
+    pub fn group_exists(&self, group_id: Vec<u8>) -> bool {
+        let inner = match self.inner.read() {
+            Ok(guard) => guard,
+            Err(_) => return false,
+        };
+        inner.has_group(&group_id)
     }
 }
