@@ -1,12 +1,13 @@
 # Simple Dockerfile using pre-built binary
 FROM debian:bookworm-slim
 
-# Install runtime dependencies
+# Install runtime dependencies including postgresql-client for migrations
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl3 \
     libpq5 \
     curl \
+    postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
@@ -20,9 +21,13 @@ COPY catbird-server /app/catbird-server
 # Copy migrations
 COPY migrations /app/migrations
 
-# Set ownership and make binary executable
+# Copy entrypoint script
+COPY entrypoint.sh /app/entrypoint.sh
+
+# Set ownership and make files executable
 RUN chown -R catbird:catbird /app && \
-    chmod +x /app/catbird-server
+    chmod +x /app/catbird-server && \
+    chmod +x /app/entrypoint.sh
 
 USER catbird
 
@@ -33,5 +38,5 @@ EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:3000/health || exit 1
 
-# Run the application
-CMD ["/app/catbird-server"]
+# Run via entrypoint script
+ENTRYPOINT ["/app/entrypoint.sh"]

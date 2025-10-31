@@ -12,8 +12,10 @@
 
 # Backups
 backups/
-*.sql
 *.sql.gz
+
+# But keep migrations
+!migrations/*.sql
 
 # Logs
 *.log
