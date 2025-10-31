@@ -96,6 +96,11 @@ pub async fn create_convo(
     // Add initial members if specified
     if let Some(initial_members) = input.initial_members {
         for (idx, member_did) in initial_members.iter().enumerate() {
+            // Skip if member is the creator (already added above)
+            if member_did == did {
+                continue;
+            }
+            
             sqlx::query(
                 "INSERT INTO members (convo_id, member_did, joined_at) VALUES ($1, $2, $3)"
             )
