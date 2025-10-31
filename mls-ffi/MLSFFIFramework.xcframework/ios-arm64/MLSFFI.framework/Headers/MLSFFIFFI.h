@@ -297,9 +297,19 @@ RustBuffer uniffi_mls_ffi_fn_method_mlscontext_create_key_package(void*_Nonnull 
 RustBuffer uniffi_mls_ffi_fn_method_mlscontext_decrypt_message(void*_Nonnull ptr, RustBuffer group_id, RustBuffer ciphertext, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_MLS_FFI_FN_METHOD_MLSCONTEXT_DESERIALIZE_STORAGE
+#define UNIFFI_FFIDEF_UNIFFI_MLS_FFI_FN_METHOD_MLSCONTEXT_DESERIALIZE_STORAGE
+void uniffi_mls_ffi_fn_method_mlscontext_deserialize_storage(void*_Nonnull ptr, RustBuffer storage_bytes, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_MLS_FFI_FN_METHOD_MLSCONTEXT_ENCRYPT_MESSAGE
 #define UNIFFI_FFIDEF_UNIFFI_MLS_FFI_FN_METHOD_MLSCONTEXT_ENCRYPT_MESSAGE
 RustBuffer uniffi_mls_ffi_fn_method_mlscontext_encrypt_message(void*_Nonnull ptr, RustBuffer group_id, RustBuffer plaintext, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_MLS_FFI_FN_METHOD_MLSCONTEXT_EXPORT_GROUP_STATE
+#define UNIFFI_FFIDEF_UNIFFI_MLS_FFI_FN_METHOD_MLSCONTEXT_EXPORT_GROUP_STATE
+RustBuffer uniffi_mls_ffi_fn_method_mlscontext_export_group_state(void*_Nonnull ptr, RustBuffer group_id, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_MLS_FFI_FN_METHOD_MLSCONTEXT_EXPORT_SECRET
@@ -315,6 +325,11 @@ uint64_t uniffi_mls_ffi_fn_method_mlscontext_get_epoch(void*_Nonnull ptr, RustBu
 #ifndef UNIFFI_FFIDEF_UNIFFI_MLS_FFI_FN_METHOD_MLSCONTEXT_GROUP_EXISTS
 #define UNIFFI_FFIDEF_UNIFFI_MLS_FFI_FN_METHOD_MLSCONTEXT_GROUP_EXISTS
 int8_t uniffi_mls_ffi_fn_method_mlscontext_group_exists(void*_Nonnull ptr, RustBuffer group_id, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_MLS_FFI_FN_METHOD_MLSCONTEXT_IMPORT_GROUP_STATE
+#define UNIFFI_FFIDEF_UNIFFI_MLS_FFI_FN_METHOD_MLSCONTEXT_IMPORT_GROUP_STATE
+RustBuffer uniffi_mls_ffi_fn_method_mlscontext_import_group_state(void*_Nonnull ptr, RustBuffer state_bytes, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_MLS_FFI_FN_METHOD_MLSCONTEXT_LIST_PENDING_PROPOSALS
@@ -350,6 +365,11 @@ RustBuffer uniffi_mls_ffi_fn_method_mlscontext_process_welcome(void*_Nonnull ptr
 #ifndef UNIFFI_FFIDEF_UNIFFI_MLS_FFI_FN_METHOD_MLSCONTEXT_REMOVE_PROPOSAL
 #define UNIFFI_FFIDEF_UNIFFI_MLS_FFI_FN_METHOD_MLSCONTEXT_REMOVE_PROPOSAL
 void uniffi_mls_ffi_fn_method_mlscontext_remove_proposal(void*_Nonnull ptr, RustBuffer group_id, RustBuffer proposal_ref, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_MLS_FFI_FN_METHOD_MLSCONTEXT_SERIALIZE_STORAGE
+#define UNIFFI_FFIDEF_UNIFFI_MLS_FFI_FN_METHOD_MLSCONTEXT_SERIALIZE_STORAGE
+RustBuffer uniffi_mls_ffi_fn_method_mlscontext_serialize_storage(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_MLS_FFI_FN_METHOD_MLSCONTEXT_STORE_PROPOSAL
@@ -673,9 +693,21 @@ uint16_t uniffi_mls_ffi_checksum_method_mlscontext_decrypt_message(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_MLS_FFI_CHECKSUM_METHOD_MLSCONTEXT_DESERIALIZE_STORAGE
+#define UNIFFI_FFIDEF_UNIFFI_MLS_FFI_CHECKSUM_METHOD_MLSCONTEXT_DESERIALIZE_STORAGE
+uint16_t uniffi_mls_ffi_checksum_method_mlscontext_deserialize_storage(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_MLS_FFI_CHECKSUM_METHOD_MLSCONTEXT_ENCRYPT_MESSAGE
 #define UNIFFI_FFIDEF_UNIFFI_MLS_FFI_CHECKSUM_METHOD_MLSCONTEXT_ENCRYPT_MESSAGE
 uint16_t uniffi_mls_ffi_checksum_method_mlscontext_encrypt_message(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_MLS_FFI_CHECKSUM_METHOD_MLSCONTEXT_EXPORT_GROUP_STATE
+#define UNIFFI_FFIDEF_UNIFFI_MLS_FFI_CHECKSUM_METHOD_MLSCONTEXT_EXPORT_GROUP_STATE
+uint16_t uniffi_mls_ffi_checksum_method_mlscontext_export_group_state(void
     
 );
 #endif
@@ -694,6 +726,12 @@ uint16_t uniffi_mls_ffi_checksum_method_mlscontext_get_epoch(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_MLS_FFI_CHECKSUM_METHOD_MLSCONTEXT_GROUP_EXISTS
 #define UNIFFI_FFIDEF_UNIFFI_MLS_FFI_CHECKSUM_METHOD_MLSCONTEXT_GROUP_EXISTS
 uint16_t uniffi_mls_ffi_checksum_method_mlscontext_group_exists(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_MLS_FFI_CHECKSUM_METHOD_MLSCONTEXT_IMPORT_GROUP_STATE
+#define UNIFFI_FFIDEF_UNIFFI_MLS_FFI_CHECKSUM_METHOD_MLSCONTEXT_IMPORT_GROUP_STATE
+uint16_t uniffi_mls_ffi_checksum_method_mlscontext_import_group_state(void
     
 );
 #endif
@@ -736,6 +774,12 @@ uint16_t uniffi_mls_ffi_checksum_method_mlscontext_process_welcome(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_MLS_FFI_CHECKSUM_METHOD_MLSCONTEXT_REMOVE_PROPOSAL
 #define UNIFFI_FFIDEF_UNIFFI_MLS_FFI_CHECKSUM_METHOD_MLSCONTEXT_REMOVE_PROPOSAL
 uint16_t uniffi_mls_ffi_checksum_method_mlscontext_remove_proposal(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_MLS_FFI_CHECKSUM_METHOD_MLSCONTEXT_SERIALIZE_STORAGE
+#define UNIFFI_FFIDEF_UNIFFI_MLS_FFI_CHECKSUM_METHOD_MLSCONTEXT_SERIALIZE_STORAGE
+uint16_t uniffi_mls_ffi_checksum_method_mlscontext_serialize_storage(void
     
 );
 #endif

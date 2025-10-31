@@ -805,4 +805,89 @@ impl MLSContext {
         };
         inner.has_group(&group_id)
     }
+
+    /// Export a group's state for persistent storage
+    ///
+    /// Returns serialized bytes that can be stored in the keychain
+    /// and later restored with import_group_state.
+    ///
+    /// - Parameters:
+    ///   - group_id: Group identifier to export
+    /// - Returns: Serialized group state bytes
+    /// - Throws: MLSError if group not found or serialization fails
+    pub fn export_group_state(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
+        eprintln!("[MLS-FFI] export_group_state: Starting");
+
+        let inner = self.inner.read()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+
+        let state_bytes = inner.export_group_state(&group_id)?;
+
+        eprintln!("[MLS-FFI] export_group_state: Complete, {} bytes", state_bytes.len());
+        Ok(state_bytes)
+    }
+
+    /// Import a group's state from persistent storage
+    ///
+    /// Restores a previously exported group state. The group will be
+    /// available for all MLS operations after import.
+    ///
+    /// - Parameters:
+    ///   - state_bytes: Serialized group state from export_group_state
+    /// - Returns: Group ID of the imported group
+    /// - Throws: MLSError if deserialization fails
+    pub fn import_group_state(&self, state_bytes: Vec<u8>) -> Result<Vec<u8>, MLSError> {
+        eprintln!("[MLS-FFI] import_group_state: Starting with {} bytes", state_bytes.len());
+
+        let mut inner = self.inner.write()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+
+        let group_id = inner.import_group_state(&state_bytes)?;
+
+        eprintln!("[MLS-FFI] import_group_state: Complete, group ID: {}", hex::encode(&group_id));
+        Ok(group_id)
+    }
+
+    /// Serialize the entire MLS storage for persistence
+    ///
+    /// Exports all groups, keys, and cryptographic state to a byte blob
+    /// that can be stored in Core Data or Keychain. This should be called
+    /// when the app backgrounds or before termination.
+    ///
+    /// - Returns: Serialized storage bytes
+    /// - Throws: MLSError if serialization fails
+    pub fn serialize_storage(&self) -> Result<Vec<u8>, MLSError> {
+        eprintln!("[MLS-FFI] serialize_storage: Starting");
+
+        let inner = self.inner.read()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+
+        let storage_bytes = inner.serialize_storage()?;
+
+        eprintln!("[MLS-FFI] serialize_storage: Complete, {} bytes", storage_bytes.len());
+        Ok(storage_bytes)
+    }
+
+    /// Deserialize and restore MLS storage from persistent bytes
+    ///
+    /// Restores all groups, keys, and cryptographic state from a previously
+    /// serialized storage blob. This should be called during app initialization
+    /// BEFORE any other MLS operations.
+    ///
+    /// WARNING: This replaces the entire storage. Only call during initialization.
+    ///
+    /// - Parameters:
+    ///   - storage_bytes: Serialized storage from serialize_storage
+    /// - Throws: MLSError if deserialization fails
+    pub fn deserialize_storage(&self, storage_bytes: Vec<u8>) -> Result<(), MLSError> {
+        eprintln!("[MLS-FFI] deserialize_storage: Starting with {} bytes", storage_bytes.len());
+
+        let mut inner = self.inner.write()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+
+        inner.deserialize_storage(&storage_bytes)?;
+
+        eprintln!("[MLS-FFI] deserialize_storage: Complete");
+        Ok(())
+    }
 }
