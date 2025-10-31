@@ -20,7 +20,7 @@ struct GroupMetadata {
 struct SerializedState {
     storage_bytes: Vec<u8>,
     group_metadata: Vec<GroupMetadata>,
-    signers_by_identity: HashMap<String, String>, // hex-encoded keys and values
+    signers_by_identity: Vec<(String, String)>, // hex-encoded key-value pairs
 }
 
 pub struct GroupState {
@@ -324,9 +324,18 @@ impl MLSContextInner {
         eprintln!("[MLS-CONTEXT] Collected metadata for {} groups", group_metadata.len());
 
         // Convert signers_by_identity to hex-encoded strings for JSON serialization
-        let signers_by_identity_hex: HashMap<String, String> = self.signers_by_identity.iter()
-            .map(|(k, v)| (hex::encode(k), hex::encode(v)))
+        eprintln!("[MLS-CONTEXT] Converting {} signers_by_identity entries to hex...", self.signers_by_identity.len());
+        let signers_by_identity_hex: Vec<(String, String)> = self.signers_by_identity.iter()
+            .enumerate()
+            .map(|(i, (k, v))| {
+                let k_hex = hex::encode(k);
+                let v_hex = hex::encode(v);
+                eprintln!("[MLS-CONTEXT]   Entry {}: key={} ({} bytes), value={} ({} bytes)", 
+                    i, k_hex, k.len(), v_hex, v.len());
+                (k_hex, v_hex)
+            })
             .collect();
+        eprintln!("[MLS-CONTEXT] Hex conversion complete: {} entries", signers_by_identity_hex.len());
 
         // Create complete serialized state
         let serialized_state = SerializedState {
