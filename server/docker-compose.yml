@@ -51,6 +51,7 @@ services:
       RUST_LOG: ${RUST_LOG:-info}
       JWT_SECRET: ${JWT_SECRET:-your-secret-key-change-in-production}
       SERVER_PORT: 3000
+      SERVICE_DID: did:web:mls.catbird.blue
     ports:
       - "3000:3000"  # Back to standard port since old service is disabled
     depends_on:

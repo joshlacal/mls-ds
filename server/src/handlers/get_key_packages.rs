@@ -1,6 +1,6 @@
 use base64::Engine;
 
-use axum::{extract::{Query, State}, http::StatusCode, Json};
+use axum::{extract::{RawQuery, State}, http::StatusCode, Json};
 use serde::Deserialize;
 use tracing::{info, warn, error};
 
@@ -10,50 +10,66 @@ use crate::{
     storage::DbPool,
 };
 
-#[derive(Debug, Deserialize)]
-pub struct GetKeyPackagesParams {
-    #[serde(default)]
-    pub dids: Vec<String>, // Array of DIDs
-}
-
 /// Get key packages for specified users
 /// GET /xrpc/chat.bsky.convo.getKeyPackages
 #[tracing::instrument(skip(pool), fields(did = %auth_user.did))]
 pub async fn get_key_packages(
     State(pool): State<DbPool>,
     auth_user: AuthUser,
-    Query(params): Query<GetKeyPackagesParams>,
+    RawQuery(query): RawQuery,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.getKeyPackages") {
+        warn!("Unauthorized access attempt");
         return Err(StatusCode::UNAUTHORIZED);
     }
+    
+    // Parse query string manually to handle ATProto array format (?dids=X&dids=Y)
+    let query_str = query.unwrap_or_default();
+    info!("getKeyPackages called with query: {}", query_str);
+    
+    let mut dids = Vec::new();
+    let mut cipher_suite = None;
+    
+    for pair in query_str.split('&') {
+        if let Some((key, value)) = pair.split_once('=') {
+            let decoded_value = urlencoding::decode(value).unwrap_or_default().to_string();
+            match key {
+                "dids" => dids.push(decoded_value),
+                "cipherSuite" => cipher_suite = Some(decoded_value),
+                _ => {}
+            }
+        }
+    }
+    
     // Validate input
-    if params.dids.is_empty() {
+    if dids.is_empty() {
         warn!("Empty dids parameter provided");
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let dids: Vec<&str> = params.dids.iter().map(|s| s.as_str()).collect();
+    let dids_refs: Vec<&str> = dids.iter().map(|s| s.as_str()).collect();
 
-    if dids.len() > 100 {
-        warn!("Too many DIDs requested: {}", dids.len());
+    if dids_refs.len() > 100 {
+        warn!("Too many DIDs requested: {}", dids_refs.len());
         return Err(StatusCode::BAD_REQUEST);
     }
 
     // Validate DID format
-    for did in &dids {
+    for did in &dids_refs {
         if !did.starts_with("did:") {
             warn!("Invalid DID format: {}", did);
             return Err(StatusCode::BAD_REQUEST);
         }
     }
 
-    info!("Fetching key packages for {} DIDs", dids.len());
+    info!("Fetching key packages for {} DIDs", dids_refs.len());
 
     let mut results = Vec::new();
+    let default_cipher_suite = "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519";
+    let suite = cipher_suite.as_deref().unwrap_or(default_cipher_suite);
 
-    for did in dids {
-        match crate::db::get_key_package(&pool, did, "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519").await {
+    for did in dids_refs {
+        match crate::db::get_key_package(&pool, did, suite).await {
             Ok(Some(kp)) => {
                 results.push(KeyPackageInfo {
                     did: kp.did,
