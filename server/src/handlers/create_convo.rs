@@ -16,30 +16,39 @@ pub async fn create_convo(
     auth_user: AuthUser,
     Json(input): Json<CreateConvoInput>,
 ) -> Result<Json<ConvoView>, StatusCode> {
+    info!("🔷 [create_convo] START - creator: {}, groupId: {}, initialMembers: {}, welcomeMessages: {}", 
+          auth_user.did, 
+          input.group_id,
+          input.initial_members.as_ref().map(|m| m.len()).unwrap_or(0),
+          input.welcome_messages.as_ref().map(|w| w.len()).unwrap_or(0));
+    
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.createConvo") {
+        error!("❌ [create_convo] Unauthorized");
         return Err(StatusCode::UNAUTHORIZED);
     }
     let did = &auth_user.did;
     
+    info!("📍 [create_convo] Validating cipher suite: {}", input.cipher_suite);
     // Validate cipher suite
     let valid_suites = ["MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519", 
                         "MLS_128_DHKEMP256_AES128GCM_SHA256_P256"];
     if !valid_suites.contains(&input.cipher_suite.as_str()) {
-        warn!("Invalid cipher suite: {}", input.cipher_suite);
+        warn!("❌ [create_convo] Invalid cipher suite: {}", input.cipher_suite);
         return Err(StatusCode::BAD_REQUEST);
     }
     
     // Validate initial members
     if let Some(ref members) = input.initial_members {
+        info!("📍 [create_convo] Validating {} initial members", members.len());
         if members.len() > 100 {
-            warn!("Too many initial members: {}", members.len());
+            warn!("❌ [create_convo] Too many initial members: {}", members.len());
             return Err(StatusCode::BAD_REQUEST);
         }
         
         // Validate DIDs format
         for d in members {
             if !d.starts_with("did:") {
-                warn!("Invalid DID format: {}", d);
+                warn!("❌ [create_convo] Invalid DID format: {}", d);
                 return Err(StatusCode::BAD_REQUEST);
             }
         }
@@ -54,7 +63,7 @@ pub async fn create_convo(
         (None, None)
     };
 
-    info!("Creating conversation {} with cipher suite {}", convo_id, input.cipher_suite);
+    info!("📍 [create_convo] Creating conversation {} in database...", convo_id);
 
     // Create conversation with group_id from client
     sqlx::query(
@@ -69,10 +78,11 @@ pub async fn create_convo(
     .execute(&pool)
     .await
     .map_err(|e| {
-        error!("Failed to create conversation: {}", e);
+        error!("❌ [create_convo] Failed to create conversation: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
+    info!("📍 [create_convo] Adding creator as member...");
     // Add creator as first member
     sqlx::query(
         "INSERT INTO members (convo_id, member_did, joined_at) VALUES ($1, $2, $3)"
@@ -83,7 +93,7 @@ pub async fn create_convo(
     .execute(&pool)
     .await
     .map_err(|e| {
-        error!("Failed to add creator membership: {}", e);
+        error!("❌ [create_convo] Failed to add creator membership: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
@@ -95,12 +105,14 @@ pub async fn create_convo(
 
     // Add initial members if specified
     if let Some(initial_members) = input.initial_members {
+        info!("📍 [create_convo] Adding {} initial members...", initial_members.len());
         for (idx, member_did) in initial_members.iter().enumerate() {
             // Skip if member is the creator (already added above)
             if member_did == did {
                 continue;
             }
             
+            info!("📍 [create_convo] Adding member {}: {}", idx + 1, member_did);
             sqlx::query(
                 "INSERT INTO members (convo_id, member_did, joined_at) VALUES ($1, $2, $3)"
             )
@@ -110,7 +122,7 @@ pub async fn create_convo(
             .execute(&pool)
             .await
             .map_err(|e| {
-                error!("Failed to add member {}: {}", member_did, e);
+                error!("❌ [create_convo] Failed to add member {}: {}", member_did, e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
@@ -123,23 +135,24 @@ pub async fn create_convo(
     }
 
     // Store Welcome messages for initial members
-    if let Some(welcome_messages) = input.welcome_messages {
-        info!("Storing {} welcome messages for conversation {}", welcome_messages.len(), convo_id);
-        for welcome_msg in welcome_messages {
-            info!("Processing welcome message for recipient: {}", welcome_msg.recipient_did);
+    if let Some(ref welcome_messages) = input.welcome_messages {
+        info!("📍 [create_convo] Storing {} welcome messages...", welcome_messages.len());
+        for (idx, welcome_msg) in welcome_messages.iter().enumerate() {
+            info!("📍 [create_convo] Processing welcome message {}/{} for: {}", 
+                  idx + 1, welcome_messages.len(), welcome_msg.recipient_did);
             
             // Decode base64url Welcome message
             let welcome_data = base64::engine::general_purpose::URL_SAFE_NO_PAD
                 .decode(&welcome_msg.welcome)
                 .map_err(|e| {
-                    warn!("Invalid base64 welcome message: {}", e);
+                    warn!("❌ [create_convo] Invalid base64 welcome message: {}", e);
                     StatusCode::BAD_REQUEST
                 })?;
 
             let welcome_id = uuid::Uuid::new_v4().to_string();
             
-            info!("Storing welcome message: id={}, convo={}, recipient={}, data_size={}", 
-                  welcome_id, convo_id, welcome_msg.recipient_did, welcome_data.len());
+            info!("📍 [create_convo] Storing welcome: id={}, recipient={}, size={} bytes", 
+                  welcome_id, welcome_msg.recipient_did, welcome_data.len());
 
             sqlx::query(
                 "INSERT INTO welcome_messages (id, convo_id, recipient_did, welcome_data, created_at) VALUES ($1, $2, $3, $4, $5)"
@@ -152,17 +165,18 @@ pub async fn create_convo(
             .execute(&pool)
             .await
             .map_err(|e| {
-                error!("Failed to store welcome message for {}: {}", welcome_msg.recipient_did, e);
+                error!("❌ [create_convo] Failed to store welcome message for {}: {}", welcome_msg.recipient_did, e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
-            info!("Successfully stored welcome message for {} in conversation {}", welcome_msg.recipient_did, convo_id);
+            info!("✅ [create_convo] Welcome message stored for {}", welcome_msg.recipient_did);
         }
     } else {
-        info!("No welcome messages to store for conversation {}", convo_id);
+        info!("📍 [create_convo] No welcome messages to store");
     }
 
-    info!("Conversation {} created successfully with {} members", convo_id, members.len());
+    info!("✅ [create_convo] COMPLETE - convoId: {}, members: {}, epoch: 0", 
+          convo_id, members.len());
 
     // Use the actual MLS group ID from client input
     let group_id = input.group_id.clone();
