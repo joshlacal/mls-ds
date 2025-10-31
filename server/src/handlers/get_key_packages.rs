@@ -12,7 +12,8 @@ use crate::{
 
 #[derive(Debug, Deserialize)]
 pub struct GetKeyPackagesParams {
-    pub dids: String, // comma-separated DIDs
+    #[serde(default)]
+    pub dids: Vec<String>, // Array of DIDs
 }
 
 /// Get key packages for specified users
@@ -32,12 +33,7 @@ pub async fn get_key_packages(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let dids: Vec<&str> = params.dids.split(',').filter(|s| !s.is_empty()).collect();
-
-    if dids.is_empty() {
-        warn!("No valid DIDs provided after parsing");
-        return Err(StatusCode::BAD_REQUEST);
-    }
+    let dids: Vec<&str> = params.dids.iter().map(|s| s.as_str()).collect();
 
     if dids.len() > 100 {
         warn!("Too many DIDs requested: {}", dids.len());
@@ -107,7 +103,7 @@ mod tests {
 
         let auth_user = AuthUser { did: "did:plc:requester".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:requester".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
         let params = GetKeyPackagesParams {
-            dids: format!("{},{}", did1, did2),
+            dids: vec![did1.to_string(), did2.to_string()],
         };
 
         let result = get_key_packages(State(pool), auth_user, Query(params)).await;
@@ -125,7 +121,7 @@ mod tests {
         
         let auth_user = AuthUser { did: "did:plc:requester".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:requester".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
         let params = GetKeyPackagesParams {
-            dids: "did:plc:nonexistent".to_string(),
+            dids: vec!["did:plc:nonexistent".to_string()],
         };
 
         let result = get_key_packages(State(pool), auth_user, Query(params)).await;
@@ -143,7 +139,7 @@ mod tests {
         
         let auth_user = AuthUser { did: "did:plc:requester".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:requester".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
         let params = GetKeyPackagesParams {
-            dids: String::new(),
+            dids: vec![],
         };
 
         let result = get_key_packages(State(pool), auth_user, Query(params)).await;
@@ -156,7 +152,7 @@ mod tests {
         
         let auth_user = AuthUser { did: "did:plc:requester".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:requester".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
         let params = GetKeyPackagesParams {
-            dids: "invalid_did".to_string(),
+            dids: vec!["invalid_did".to_string()],
         };
 
         let result = get_key_packages(State(pool), auth_user, Query(params)).await;
@@ -178,12 +174,12 @@ mod tests {
 
         let auth_user = AuthUser { did: "did:plc:requester".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:requester".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
         let params = GetKeyPackagesParams {
-            dids: did.to_string(),
+            dids: vec![did.to_string()],
         };
 
         let result = get_key_packages(State(pool), auth_user, Query(params)).await;
         assert!(result.is_ok());
-        
+
         let json = result.unwrap().0;
         let key_packages = json.get("keyPackages").unwrap().as_array().unwrap();
         assert_eq!(key_packages.len(), 0); // Expired key package should not be returned
@@ -206,12 +202,12 @@ mod tests {
 
         let auth_user = AuthUser { did: "did:plc:requester".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:requester".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
         let params = GetKeyPackagesParams {
-            dids: did.to_string(),
+            dids: vec![did.to_string()],
         };
 
         let result = get_key_packages(State(pool), auth_user, Query(params)).await;
         assert!(result.is_ok());
-        
+
         let json = result.unwrap().0;
         let key_packages = json.get("keyPackages").unwrap().as_array().unwrap();
         assert_eq!(key_packages.len(), 0); // Consumed key package should not be returned
