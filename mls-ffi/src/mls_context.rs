@@ -3,8 +3,25 @@ use openmls::prelude::*;
 use openmls::group::PURE_CIPHERTEXT_WIRE_FORMAT_POLICY;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
+use tls_codec::{Serialize as TlsSerialize, Deserialize as TlsDeserialize};
+use serde::{Serialize, Deserialize};
 
 use crate::error::MLSError;
+
+/// Serializable metadata for persisting group state
+#[derive(Serialize, Deserialize)]
+struct GroupMetadata {
+    group_id: Vec<u8>,
+    signer_public_key: Vec<u8>,
+}
+
+/// Complete serialized state including storage and group metadata
+#[derive(Serialize, Deserialize)]
+struct SerializedState {
+    storage_bytes: Vec<u8>,
+    group_metadata: Vec<GroupMetadata>,
+    signers_by_identity: HashMap<String, String>, // hex-encoded keys and values
+}
 
 pub struct GroupState {
     pub group: MlsGroup,
@@ -201,5 +218,221 @@ impl MLSContextInner {
     /// Check if a group exists in the context
     pub fn has_group(&self, group_id: &[u8]) -> bool {
         self.groups.contains_key(group_id)
+    }
+
+    /// Export a group's state for persistent storage
+    ///
+    /// Uses OpenMLS's built-in load/save mechanism.
+    /// Returns just the group ID and signer key - the group state
+    /// is persisted in OpenMLS's internal storage which is memory-based.
+    ///
+    /// NOTE: This is a simplified implementation. For true persistence,
+    /// we'd need to implement a custom StorageProvider that writes to disk.
+    pub fn export_group_state(&self, group_id: &[u8]) -> Result<Vec<u8>, MLSError> {
+        eprintln!("[MLS-CONTEXT] export_group_state: Starting for group {}", hex::encode(group_id));
+
+        let state = self.groups
+            .get(group_id)
+            .ok_or_else(|| {
+                eprintln!("[MLS-CONTEXT] ERROR: Group not found for export");
+                MLSError::group_not_found(hex::encode(group_id))
+            })?;
+
+        // For now, just return the signer public key and group ID
+        // The actual group state is in OpenMLS's provider storage (memory)
+        // This is sufficient for the singleton approach
+
+        // Format: [group_id_len: u32][group_id][signer_key_len: u32][signer_key]
+        let mut result = Vec::new();
+        let gid_len = group_id.len() as u32;
+        let key_len = state.signer_public_key.len() as u32;
+
+        result.extend_from_slice(&gid_len.to_le_bytes());
+        result.extend_from_slice(group_id);
+        result.extend_from_slice(&key_len.to_le_bytes());
+        result.extend_from_slice(&state.signer_public_key);
+
+        eprintln!("[MLS-CONTEXT] export_group_state: Complete, total {} bytes", result.len());
+        Ok(result)
+    }
+
+    /// Import a group's state from persistent storage
+    ///
+    /// NOTE: This is a placeholder for the singleton approach.
+    /// Groups are already in memory, so this just validates the group exists.
+    pub fn import_group_state(&mut self, state_bytes: &[u8]) -> Result<Vec<u8>, MLSError> {
+        eprintln!("[MLS-CONTEXT] import_group_state: Starting with {} bytes", state_bytes.len());
+
+        if state_bytes.len() < 8 {
+            eprintln!("[MLS-CONTEXT] ERROR: State bytes too short");
+            return Err(MLSError::invalid_input("State bytes too short"));
+        }
+
+        // Parse: [group_id_len: u32][group_id][signer_key_len: u32][signer_key]
+        let gid_len = u32::from_le_bytes([
+            state_bytes[0], state_bytes[1], state_bytes[2], state_bytes[3]
+        ]) as usize;
+
+        if state_bytes.len() < 4 + gid_len + 4 {
+            eprintln!("[MLS-CONTEXT] ERROR: Invalid state format");
+            return Err(MLSError::invalid_input("Invalid state format"));
+        }
+
+        let group_id = state_bytes[4..4+gid_len].to_vec();
+        eprintln!("[MLS-CONTEXT] Group ID from state: {}", hex::encode(&group_id));
+
+        // Check if group exists (singleton keeps it in memory)
+        if self.has_group(&group_id) {
+            eprintln!("[MLS-CONTEXT] Group already loaded in memory");
+            Ok(group_id)
+        } else {
+            eprintln!("[MLS-CONTEXT] Group not found - needs reconstruction from Welcome");
+            Err(MLSError::group_not_found(hex::encode(&group_id)))
+        }
+    }
+
+    /// Serialize the entire OpenMLS storage and group metadata to bytes for persistence
+    ///
+    /// This serializes:
+    /// 1. All groups, keys, and secrets stored in the provider's MemoryStorage
+    /// 2. Group metadata (group IDs and their associated signer public keys)
+    /// 3. Identity-to-signer mappings
+    ///
+    /// The resulting bytes can be saved to Core Data/Keychain and restored on app restart.
+    pub fn serialize_storage(&self) -> Result<Vec<u8>, MLSError> {
+        eprintln!("[MLS-CONTEXT] serialize_storage: Starting");
+
+        // Serialize the raw storage
+        let mut storage_buffer = Vec::new();
+        self.provider.storage()
+            .serialize(&mut storage_buffer)
+            .map_err(|e| {
+                eprintln!("[MLS-CONTEXT] ERROR: Failed to serialize storage: {:?}", e);
+                MLSError::invalid_input(format!("Serialization failed: {}", e))
+            })?;
+
+        eprintln!("[MLS-CONTEXT] Serialized storage: {} bytes", storage_buffer.len());
+
+        // Collect group metadata
+        let group_metadata: Vec<GroupMetadata> = self.groups.iter()
+            .map(|(group_id, state)| GroupMetadata {
+                group_id: group_id.clone(),
+                signer_public_key: state.signer_public_key.clone(),
+            })
+            .collect();
+
+        eprintln!("[MLS-CONTEXT] Collected metadata for {} groups", group_metadata.len());
+
+        // Convert signers_by_identity to hex-encoded strings for JSON serialization
+        let signers_by_identity_hex: HashMap<String, String> = self.signers_by_identity.iter()
+            .map(|(k, v)| (hex::encode(k), hex::encode(v)))
+            .collect();
+
+        // Create complete serialized state
+        let serialized_state = SerializedState {
+            storage_bytes: storage_buffer,
+            group_metadata,
+            signers_by_identity: signers_by_identity_hex,
+        };
+
+        // Serialize to JSON
+        let json_bytes = serde_json::to_vec(&serialized_state)
+            .map_err(|e| {
+                eprintln!("[MLS-CONTEXT] ERROR: Failed to serialize state to JSON: {:?}", e);
+                MLSError::invalid_input(format!("JSON serialization failed: {}", e))
+            })?;
+
+        eprintln!("[MLS-CONTEXT] serialize_storage: Complete, {} bytes total", json_bytes.len());
+        Ok(json_bytes)
+    }
+
+    /// Deserialize and restore OpenMLS storage and group metadata from bytes
+    ///
+    /// This restores:
+    /// 1. All groups, keys, and secrets from the storage
+    /// 2. Group metadata (group IDs and their associated signer public keys)
+    /// 3. Identity-to-signer mappings
+    ///
+    /// Must be called before any other operations if restoring from persistent storage.
+    ///
+    /// NOTE: This replaces the entire storage, so it should only be called
+    /// during initialization, not after groups are already created.
+    pub fn deserialize_storage(&mut self, json_bytes: &[u8]) -> Result<(), MLSError> {
+        eprintln!("[MLS-CONTEXT] deserialize_storage: Starting with {} bytes", json_bytes.len());
+
+        // Deserialize the JSON state
+        let serialized_state: SerializedState = serde_json::from_slice(json_bytes)
+            .map_err(|e| {
+                eprintln!("[MLS-CONTEXT] ERROR: Failed to deserialize JSON: {:?}", e);
+                MLSError::invalid_input(format!("JSON deserialization failed: {}", e))
+            })?;
+
+        eprintln!("[MLS-CONTEXT] Deserialized {} groups metadata", serialized_state.group_metadata.len());
+
+        // Deserialize the raw storage
+        use std::io::Cursor;
+        let mut cursor = Cursor::new(&serialized_state.storage_bytes);
+
+        let loaded_storage = openmls_rust_crypto::MemoryStorage::deserialize(&mut cursor)
+            .map_err(|e| {
+                eprintln!("[MLS-CONTEXT] ERROR: Failed to deserialize storage: {:?}", e);
+                MLSError::invalid_input(format!("Storage deserialization failed: {}", e))
+            })?;
+
+        // Replace the HashMap in the existing storage
+        let mut current_values = self.provider.storage().values.write().unwrap();
+        let loaded_values = loaded_storage.values.read().unwrap();
+
+        current_values.clear();
+        current_values.extend(loaded_values.clone());
+        drop(current_values); // Release write lock
+
+        eprintln!("[MLS-CONTEXT] Restored {} storage entries", loaded_values.len());
+
+        // Restore groups HashMap by loading each group from storage
+        self.groups.clear();
+        for metadata in serialized_state.group_metadata {
+            let group_id_bytes = metadata.group_id;
+            let group_id = GroupId::from_slice(&group_id_bytes);
+
+            // Load the MlsGroup from storage
+            match MlsGroup::load(self.provider.storage(), &group_id) {
+                Ok(Some(group)) => {
+                    eprintln!("[MLS-CONTEXT] Loaded group: {}", hex::encode(&group_id_bytes));
+                    self.groups.insert(group_id_bytes, GroupState {
+                        group,
+                        signer_public_key: metadata.signer_public_key,
+                    });
+                }
+                Ok(None) => {
+                    eprintln!("[MLS-CONTEXT] WARNING: Group {} in metadata but not in storage", hex::encode(&group_id_bytes));
+                }
+                Err(e) => {
+                    eprintln!("[MLS-CONTEXT] ERROR: Failed to load group {}: {:?}", hex::encode(&group_id_bytes), e);
+                }
+            }
+        }
+
+        eprintln!("[MLS-CONTEXT] Restored {} groups", self.groups.len());
+
+        // Restore identity-to-signer mappings by decoding hex strings
+        self.signers_by_identity.clear();
+        for (key_hex, value_hex) in serialized_state.signers_by_identity {
+            let key = hex::decode(&key_hex)
+                .map_err(|e| {
+                    eprintln!("[MLS-CONTEXT] ERROR: Failed to decode hex key: {:?}", e);
+                    MLSError::invalid_input(format!("Failed to decode identity key: {}", e))
+                })?;
+            let value = hex::decode(&value_hex)
+                .map_err(|e| {
+                    eprintln!("[MLS-CONTEXT] ERROR: Failed to decode hex value: {:?}", e);
+                    MLSError::invalid_input(format!("Failed to decode signer public key: {}", e))
+                })?;
+            self.signers_by_identity.insert(key, value);
+        }
+        eprintln!("[MLS-CONTEXT] Restored {} identity mappings", self.signers_by_identity.len());
+
+        eprintln!("[MLS-CONTEXT] deserialize_storage: Complete");
+        Ok(())
     }
 }
