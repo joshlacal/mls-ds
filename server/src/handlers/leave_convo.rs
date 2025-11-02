@@ -1,9 +1,12 @@
 use base64::Engine;
 
 use axum::{extract::State, http::StatusCode, Json};
+use std::sync::Arc;
+use tokio::sync::oneshot;
 use tracing::{info, warn, error};
 
 use crate::{
+    actors::{ActorRegistry, ConvoMessage},
     auth::AuthUser,
     models::{LeaveConvoInput, LeaveConvoOutput},
     storage::{get_current_epoch, is_member, DbPool},
@@ -11,9 +14,10 @@ use crate::{
 
 /// Leave a conversation
 /// POST /xrpc/chat.bsky.convo.leaveConvo
-#[tracing::instrument(skip(pool), fields(did = %auth_user.did, convo_id = %input.convo_id))]
+#[tracing::instrument(skip(pool, actor_registry), fields(did = %auth_user.did, convo_id = %input.convo_id))]
 pub async fn leave_convo(
     State(pool): State<DbPool>,
+    State(actor_registry): State<Arc<ActorRegistry>>,
     auth_user: AuthUser,
     Json(input): Json<LeaveConvoInput>,
 ) -> Result<Json<LeaveConvoOutput>, StatusCode> {
@@ -66,72 +70,133 @@ pub async fn leave_convo(
         }
     }
 
-    let current_epoch = get_current_epoch(&pool, &input.convo_id)
-        .await
-        .map_err(|e| {
-            error!("Failed to get current epoch: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-    
-    let new_epoch = current_epoch + 1;
-    let now = chrono::Utc::now();
-
     info!("User {} leaving conversation {}", target_did, input.convo_id);
 
-    // Process commit if provided
-    if let Some(commit) = input.commit {
-        let commit_bytes = base64::engine::general_purpose::STANDARD.decode(commit)
-            .map_err(|e| {
-                warn!("Invalid base64 commit: {}", e);
-                StatusCode::BAD_REQUEST
-            })?;
-        
-        let msg_id = uuid::Uuid::new_v4().to_string();
+    // Check if actor system is enabled
+    let use_actors = std::env::var("ENABLE_ACTOR_SYSTEM")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
 
-        sqlx::query(
-            "INSERT INTO messages (id, convo_id, sender_did, message_type, epoch, ciphertext, created_at) VALUES ($1, $2, $3, 'commit', $4, $5, $6)"
-        )
-        .bind(&msg_id)
-        .bind(&input.convo_id)
-        .bind(did)
-        .bind(new_epoch)
-        .bind(&commit_bytes)
-        .bind(&now)
-        .execute(&pool)
-        .await
-        .map_err(|e| {
-            error!("Failed to insert commit message: {}", e);
+    let new_epoch = if use_actors {
+        info!("Using actor system for leave_convo");
+
+        // Decode commit if provided
+        let commit_bytes = if let Some(ref commit) = input.commit {
+            Some(base64::engine::general_purpose::STANDARD.decode(commit)
+                .map_err(|e| {
+                    warn!("Invalid base64 commit: {}", e);
+                    StatusCode::BAD_REQUEST
+                })?)
+        } else {
+            None
+        };
+
+        // Get or spawn conversation actor
+        let actor_ref = actor_registry.get_or_spawn(&input.convo_id).await
+            .map_err(|e| {
+                error!("Failed to get conversation actor: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        // Send RemoveMember message
+        let (tx, rx) = oneshot::channel();
+        actor_ref.send_message(ConvoMessage::RemoveMember {
+            member_did: target_did.clone(),
+            commit: commit_bytes,
+            reply: tx,
+        }).map_err(|_| {
+            error!("Failed to send message to actor");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-        sqlx::query("UPDATE conversations SET current_epoch = $1 WHERE id = $2")
-            .bind(new_epoch)
+        // Await response
+        rx.await
+            .map_err(|_| {
+                error!("Actor channel closed unexpectedly");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .map_err(|e| {
+                error!("Actor failed to remove member: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+    } else {
+        info!("Using legacy database approach for leave_convo");
+
+        let current_epoch = get_current_epoch(&pool, &input.convo_id)
+            .await
+            .map_err(|e| {
+                error!("Failed to get current epoch: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        let new_epoch = current_epoch + 1;
+        let now = chrono::Utc::now();
+
+        // Process commit if provided
+        if let Some(commit) = input.commit {
+            let commit_bytes = base64::engine::general_purpose::STANDARD.decode(commit)
+                .map_err(|e| {
+                    warn!("Invalid base64 commit: {}", e);
+                    StatusCode::BAD_REQUEST
+                })?;
+
+            let msg_id = uuid::Uuid::new_v4().to_string();
+
+            sqlx::query(
+                "INSERT INTO messages (id, convo_id, sender_did, message_type, epoch, ciphertext, created_at) VALUES ($1, $2, $3, 'commit', $4, $5, $6)"
+            )
+            .bind(&msg_id)
             .bind(&input.convo_id)
+            .bind(did)
+            .bind(new_epoch)
+            .bind(&commit_bytes)
+            .bind(&now)
             .execute(&pool)
             .await
             .map_err(|e| {
-                error!("Failed to update conversation epoch: {}", e);
+                error!("Failed to insert commit message: {}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
-    }
 
-    // Mark member as left
-    sqlx::query("UPDATE members SET left_at = $1 WHERE convo_id = $2 AND member_did = $3")
-        .bind(&now)
-        .bind(&input.convo_id)
-        .bind(&target_did)
-        .execute(&pool)
-        .await
-        .map_err(|e| {
-            error!("Failed to mark member as left: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+            sqlx::query("UPDATE conversations SET current_epoch = $1 WHERE id = $2")
+                .bind(new_epoch)
+                .bind(&input.convo_id)
+                .execute(&pool)
+                .await
+                .map_err(|e| {
+                    error!("Failed to update conversation epoch: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+        }
+
+        // Mark member as left (natural idempotency: only update if not already left)
+        let rows_affected = sqlx::query(
+            "UPDATE members SET left_at = $1 WHERE convo_id = $2 AND member_did = $3 AND left_at IS NULL"
+        )
+            .bind(&now)
+            .bind(&input.convo_id)
+            .bind(&target_did)
+            .execute(&pool)
+            .await
+            .map_err(|e| {
+                error!("Failed to mark member as left: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .rows_affected();
+
+        if rows_affected == 0 {
+            // Member was already marked as left - this is idempotent
+            info!("Member {} already left conversation {}, treating as idempotent success", target_did, input.convo_id);
+        }
+
+        new_epoch as u32
+    };
 
     info!("User {} successfully left conversation {}, new epoch: {}", target_did, input.convo_id, new_epoch);
 
     Ok(Json(LeaveConvoOutput {
         success: true,
-        new_epoch,
+        new_epoch: new_epoch as i32,
     }))
 }
 

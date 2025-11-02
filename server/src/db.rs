@@ -338,12 +338,40 @@ pub async fn create_message(
     ciphertext: Vec<u8>,
     epoch: i64,
 ) -> Result<Message> {
+    create_message_with_idempotency(pool, convo_id, sender_did, ciphertext, epoch, None).await
+}
+
+/// Create a new message with optional idempotency key
+pub async fn create_message_with_idempotency(
+    pool: &DbPool,
+    convo_id: &str,
+    sender_did: &str,
+    ciphertext: Vec<u8>,
+    epoch: i64,
+    idempotency_key: Option<String>,
+) -> Result<Message> {
     let msg_id = uuid::Uuid::new_v4().to_string();
     let now = Utc::now();
     let expires_at = now + chrono::Duration::days(30);
 
     // Calculate sequence number within transaction
     let mut tx = pool.begin().await.context("Failed to begin transaction")?;
+
+    // If idempotency key is provided, check for existing message
+    if let Some(ref idem_key) = idempotency_key {
+        if let Some(existing) = sqlx::query_as::<_, Message>(
+            "SELECT id, convo_id, sender_did, message_type, CAST(epoch AS BIGINT), CAST(seq AS BIGINT), ciphertext, created_at, expires_at
+             FROM messages WHERE idempotency_key = $1"
+        )
+        .bind(idem_key)
+        .fetch_optional(&mut *tx)
+        .await
+        .context("Failed to check idempotency key")? {
+            // Return existing message without creating a duplicate
+            tx.rollback().await.ok();
+            return Ok(existing);
+        }
+    }
 
     let seq: i64 = sqlx::query_scalar(
         "SELECT CAST(COALESCE(MAX(seq), 0) + 1 AS BIGINT) FROM messages WHERE convo_id = $1"
@@ -357,8 +385,8 @@ pub async fn create_message(
         r#"
         INSERT INTO messages (
             id, convo_id, sender_did, message_type, epoch, seq,
-            ciphertext, created_at, expires_at
-        ) VALUES ($1, $2, $3, 'app', $4, $5, $6, $7, $8)
+            ciphertext, created_at, expires_at, idempotency_key
+        ) VALUES ($1, $2, $3, 'app', $4, $5, $6, $7, $8, $9)
         RETURNING id, convo_id, sender_did, message_type, CAST(epoch AS BIGINT), CAST(seq AS BIGINT), ciphertext, created_at, expires_at
         "#,
     )
@@ -370,6 +398,7 @@ pub async fn create_message(
     .bind(&ciphertext)
     .bind(&now)
     .bind(&expires_at)
+    .bind(&idempotency_key)
     .fetch_one(&mut *tx)
     .await
     .context("Failed to insert message")?;

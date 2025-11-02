@@ -1,5 +1,6 @@
 use axum::{extract::State, http::StatusCode, Json};
 use base64::Engine;
+use chrono::{DateTime, Utc};
 use tracing::{info, warn, error};
 
 use crate::{
@@ -72,9 +73,65 @@ pub async fn create_convo(
 
     info!("📍 [create_convo] Creating conversation {} in database...", convo_id);
 
+    // If idempotency key is provided, check for existing conversation
+    if let Some(ref idem_key) = input.idempotency_key {
+        if let Ok(Some(existing_convo_id)) = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM conversations WHERE idempotency_key = $1"
+        )
+        .bind(idem_key)
+        .fetch_optional(&pool)
+        .await
+        {
+            info!("📍 [create_convo] Idempotency: Returning existing conversation {}", existing_convo_id);
+
+            // Fetch existing conversation details
+            let existing_members: Vec<(String, DateTime<Utc>)> = sqlx::query_as(
+                "SELECT member_did, joined_at FROM members WHERE convo_id = $1 AND left_at IS NULL ORDER BY joined_at"
+            )
+            .bind(&existing_convo_id)
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| {
+                error!("❌ [create_convo] Failed to fetch existing members: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+            let members: Vec<crate::models::MemberView> = existing_members
+                .into_iter()
+                .enumerate()
+                .map(|(idx, (did, joined_at))| crate::models::MemberView {
+                    did,
+                    joined_at,
+                    leaf_index: Some(idx as i32),
+                })
+                .collect();
+
+            let metadata_view = if name.is_some() || description.is_some() {
+                Some(crate::models::ConvoMetadataView {
+                    name: name.clone(),
+                    description: description.clone(),
+                })
+            } else {
+                None
+            };
+
+            return Ok(Json(ConvoView {
+                id: existing_convo_id,
+                group_id: input.group_id.clone(),
+                creator: did.clone(),
+                members,
+                epoch: 0,
+                cipher_suite: input.cipher_suite.clone(),
+                created_at: now,
+                last_message_at: None,
+                metadata: metadata_view,
+            }));
+        }
+    }
+
     // Create conversation with group_id from client
     sqlx::query(
-        "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at, name, group_id, cipher_suite) VALUES ($1, $2, 0, $3, $3, $4, $5, $6)"
+        "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at, name, group_id, cipher_suite, idempotency_key) VALUES ($1, $2, 0, $3, $3, $4, $5, $6, $7)"
     )
     .bind(&convo_id)
     .bind(did)
@@ -82,6 +139,7 @@ pub async fn create_convo(
     .bind(&name)
     .bind(&input.group_id)
     .bind(&input.cipher_suite)
+    .bind(&input.idempotency_key)
     .execute(&pool)
     .await
     .map_err(|e| {

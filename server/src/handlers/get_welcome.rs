@@ -50,18 +50,23 @@ pub async fn get_welcome(
     // Fetch and consume Welcome message for this user (atomic operation)
     info!("Querying welcome message: convo_id={}, recipient_did={}", params.convo_id, did);
     
-    // Use a transaction to atomically fetch and mark as consumed
+    // Use a transaction to atomically fetch and mark as in_flight
     let mut tx = pool.begin().await.map_err(|e| {
         error!("Failed to begin transaction: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    
+
     // First, try to find a Welcome that matches one of the user's available key packages
     // This prevents the NoMatchingKeyPackage error when users publish new key packages
+    // Grace period: allow re-fetch within 5 minutes if state='in_flight' OR (state='consumed' AND consumed_at > NOW() - INTERVAL '5 minutes')
     let result: Option<(String, Vec<u8>, Option<Vec<u8>>)> = sqlx::query_as(
-        "SELECT wm.id, wm.welcome_data, wm.key_package_hash 
+        "SELECT wm.id, wm.welcome_data, wm.key_package_hash
          FROM welcome_messages wm
-         WHERE wm.convo_id = $1 AND wm.recipient_did = $2 AND wm.consumed = false
+         WHERE wm.convo_id = $1 AND wm.recipient_did = $2
+         AND (
+           wm.consumed = false
+           OR (wm.consumed = true AND wm.consumed_at > NOW() - INTERVAL '5 minutes')
+         )
          AND (
            wm.key_package_hash IS NULL
            OR EXISTS (
@@ -121,12 +126,14 @@ pub async fn get_welcome(
         }
     };
 
-    // Mark as consumed atomically
+    // Mark as consumed (in_flight) atomically
+    // For now we use consumed=true for backward compatibility
+    // In the future, this should transition to state='in_flight'
     let now = chrono::Utc::now();
     let rows_updated = sqlx::query(
-        "UPDATE welcome_messages 
-         SET consumed = true, consumed_at = $1 
-         WHERE id = $2 AND consumed = false
+        "UPDATE welcome_messages
+         SET consumed = true, consumed_at = $1
+         WHERE id = $2
          RETURNING 1"
     )
     .bind(&now)
@@ -134,15 +141,15 @@ pub async fn get_welcome(
     .execute(&mut *tx)
     .await
     .map_err(|e| {
-        error!("Failed to mark welcome message as consumed: {}", e);
+        error!("Failed to mark welcome message as in_flight: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?
     .rows_affected();
-    
+
     if rows_updated == 0 {
-        // Race condition: someone else consumed it between SELECT and UPDATE
-        warn!("Welcome message {} was consumed by another request", welcome_id);
-        return Err(StatusCode::GONE);
+        // This shouldn't happen since we have FOR UPDATE lock
+        warn!("Welcome message {} could not be updated", welcome_id);
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
     
     // Mark the corresponding key package as consumed (if hash is present)

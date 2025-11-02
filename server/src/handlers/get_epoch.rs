@@ -1,8 +1,11 @@
 use axum::{extract::{Query, State}, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tokio::sync::oneshot;
 use tracing::{info, warn, error};
 
 use crate::{
+    actors::{ActorRegistry, ConvoMessage},
     auth::AuthUser,
     storage::{is_member, DbPool},
 };
@@ -23,9 +26,10 @@ pub struct EpochResponse {
 
 /// Get the current epoch for a conversation
 /// GET /xrpc/blue.catbird.mls.getEpoch
-#[tracing::instrument(skip(pool), fields(did = %auth_user.did, convo_id = %params.convo_id))]
+#[tracing::instrument(skip(pool, actor_registry), fields(did = %auth_user.did, convo_id = %params.convo_id))]
 pub async fn get_epoch(
     State(pool): State<DbPool>,
+    State(actor_registry): State<Arc<ActorRegistry>>,
     auth_user: AuthUser,
     Query(params): Query<GetEpochParams>,
 ) -> Result<Json<EpochResponse>, StatusCode> {
@@ -52,22 +56,58 @@ pub async fn get_epoch(
         warn!("User {} is not a member of conversation {}", did, params.convo_id);
         return Err(StatusCode::FORBIDDEN);
     }
-    
-    // Get current epoch from conversations table
-    let current_epoch: i32 = sqlx::query_scalar(
-        "SELECT current_epoch FROM conversations WHERE id = $1"
-    )
-    .bind(&params.convo_id)
-    .fetch_one(&pool)
-    .await
-    .map_err(|e| {
-        error!("Failed to fetch current epoch: {}", e);
-        match e {
-            sqlx::Error::RowNotFound => StatusCode::NOT_FOUND,
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
-        }
-    })?;
-    
+
+    // Check if actor system is enabled
+    let use_actors = std::env::var("ENABLE_ACTOR_SYSTEM")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+
+    let current_epoch = if use_actors {
+        info!("Using actor system for get_epoch");
+
+        // Get or spawn conversation actor
+        let actor_ref = actor_registry.get_or_spawn(&params.convo_id).await
+            .map_err(|e| {
+                error!("Failed to get conversation actor: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        // Get epoch from actor (fast in-memory read)
+        let (tx, rx) = oneshot::channel();
+        actor_ref.send_message(ConvoMessage::GetEpoch {
+            reply: tx,
+        }).map_err(|_| {
+            error!("Failed to send message to actor");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        // Await response
+        let epoch = rx.await
+            .map_err(|_| {
+                error!("Actor channel closed unexpectedly");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        epoch as i32
+    } else {
+        info!("Using legacy database approach for get_epoch");
+
+        // Get current epoch from conversations table
+        sqlx::query_scalar(
+            "SELECT current_epoch FROM conversations WHERE id = $1"
+        )
+        .bind(&params.convo_id)
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| {
+            error!("Failed to fetch current epoch: {}", e);
+            match e {
+                sqlx::Error::RowNotFound => StatusCode::NOT_FOUND,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            }
+        })?
+    };
+
     info!("Fetched epoch {} for conversation {}", current_epoch, params.convo_id);
     
     Ok(Json(EpochResponse {

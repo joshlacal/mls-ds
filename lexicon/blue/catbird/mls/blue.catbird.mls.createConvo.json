@@ -17,6 +17,10 @@
               "description": "Hex-encoded MLS group identifier",
               "maxLength": 128
             },
+            "idempotencyKey": {
+              "type": "string",
+              "description": "Client-generated UUID for idempotent request retries. Optional but recommended."
+            },
             "cipherSuite": {
               "type": "string",
               "description": "MLS cipher suite to use for this conversation",

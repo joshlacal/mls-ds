@@ -1,5 +1,6 @@
 // Handler modules for API endpoints
 mod add_members;
+mod confirm_welcome;
 mod create_convo;
 mod get_commits;
 mod get_convos;
@@ -14,6 +15,7 @@ mod update_cursor;
 
 // Re-export handlers
 pub use add_members::add_members;
+pub use confirm_welcome::confirm_welcome;
 pub use create_convo::create_convo;
 pub use get_commits::get_commits;
 pub use get_convos::get_convos;

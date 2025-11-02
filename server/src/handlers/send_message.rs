@@ -1,8 +1,10 @@
 use axum::{extract::State, http::StatusCode, Json};
 use std::sync::Arc;
+use tokio::sync::oneshot;
 use tracing::{error, info, warn};
 
 use crate::{
+    actors::{ActorRegistry, ConvoMessage},
     auth::AuthUser,
     models::{SendMessageInput, SendMessageOutput},
     realtime::{SseState, StreamEvent},
@@ -13,10 +15,11 @@ use crate::{
 
 /// Send a message to a conversation
 /// POST /xrpc/chat.bsky.convo.sendMessage
-#[tracing::instrument(skip(pool, sse_state, input), fields(did = %auth_user.did, convo_id = %input.convo_id))]
+#[tracing::instrument(skip(pool, sse_state, actor_registry, input), fields(did = %auth_user.did, convo_id = %input.convo_id))]
 pub async fn send_message(
     State(pool): State<DbPool>,
     State(sse_state): State<Arc<SseState>>,
+    State(actor_registry): State<Arc<ActorRegistry>>,
     auth_user: AuthUser,
     LoggedJson(input): LoggedJson<SendMessageInput>,
 ) -> Result<Json<SendMessageOutput>, StatusCode> {
@@ -67,40 +70,109 @@ pub async fn send_message(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    info!("📍 [send_message] Creating message in database...");
+    // Check if actor system is enabled
+    let use_actors = std::env::var("ENABLE_ACTOR_SYSTEM")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
 
-    // Create message with direct ciphertext storage
-    let message = db::create_message(
-        &pool,
-        &input.convo_id,
-        did,
-        input.ciphertext,
-        input.epoch,
-    )
-    .await
-    .map_err(|e| {
-        error!("❌ [send_message] Failed to create message: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let (msg_id, now) = if use_actors {
+        info!("Using actor system for send_message");
 
-    let msg_id = message.id.clone();
-    let now = message.created_at;
-    
+        // Get or spawn conversation actor
+        let actor_ref = actor_registry.get_or_spawn(&input.convo_id).await
+            .map_err(|e| {
+                error!("Failed to get conversation actor: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        // Send message via actor
+        let (tx, rx) = oneshot::channel();
+        actor_ref.send_message(ConvoMessage::SendMessage {
+            sender_did: did.clone(),
+            ciphertext: input.ciphertext.clone(),
+            reply: tx,
+        }).map_err(|_| {
+            error!("Failed to send message to actor");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        // Await response
+        rx.await
+            .map_err(|_| {
+                error!("Actor channel closed unexpectedly");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .map_err(|e| {
+                error!("Actor failed to send message: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        // Increment unread counts via actor (fire-and-forget)
+        let _ = actor_ref.cast(ConvoMessage::IncrementUnread {
+            sender_did: did.clone(),
+        });
+
+        // For now, still create the message in DB directly for compatibility
+        // TODO: Move this into the actor's SendMessage handler
+        info!("📍 [send_message] Creating message in database...");
+        let message = db::create_message_with_idempotency(
+            &pool,
+            &input.convo_id,
+            did,
+            input.ciphertext.clone(),
+            input.epoch,
+            input.idempotency_key.clone(),
+        )
+        .await
+        .map_err(|e| {
+            error!("❌ [send_message] Failed to create message: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        (message.id.clone(), message.created_at)
+    } else {
+        info!("Using legacy database approach for send_message");
+
+        info!("📍 [send_message] Creating message in database...");
+
+        // Create message with direct ciphertext storage and optional idempotency key
+        let message = db::create_message_with_idempotency(
+            &pool,
+            &input.convo_id,
+            did,
+            input.ciphertext,
+            input.epoch,
+            input.idempotency_key.clone(),
+        )
+        .await
+        .map_err(|e| {
+            error!("❌ [send_message] Failed to create message: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        let msg_id = message.id.clone();
+        let now = message.created_at;
+
+        info!("✅ [send_message] Message created - id: {}", msg_id);
+
+        info!("📍 [send_message] Updating unread counts...");
+        // Update unread counts for other members
+        sqlx::query(
+            "UPDATE members SET unread_count = unread_count + 1 WHERE convo_id = $1 AND member_did != $2 AND left_at IS NULL"
+        )
+        .bind(&input.convo_id)
+        .bind(did)
+        .execute(&pool)
+        .await
+        .map_err(|e| {
+            error!("❌ [send_message] Failed to update unread counts: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        (msg_id, now)
+    };
+
     info!("✅ [send_message] Message created - id: {}", msg_id);
-
-    info!("📍 [send_message] Updating unread counts...");
-    // Update unread counts for other members
-    sqlx::query(
-        "UPDATE members SET unread_count = unread_count + 1 WHERE convo_id = $1 AND member_did != $2 AND left_at IS NULL"
-    )
-    .bind(&input.convo_id)
-    .bind(did)
-    .execute(&pool)
-    .await
-    .map_err(|e| {
-        error!("❌ [send_message] Failed to update unread counts: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
 
     info!("📍 [send_message] Spawning fan-out task...");
     // Spawn async task for fan-out and realtime emission
