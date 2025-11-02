@@ -40,7 +40,7 @@ pub async fn publish_key_package(
     }
 
     // Decode key package
-    let key_data = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(input.key_package)
+    let key_data = base64::engine::general_purpose::STANDARD.decode(input.key_package)
         .map_err(|e| {
             warn!("Invalid base64 key_package: {}", e);
             StatusCode::BAD_REQUEST

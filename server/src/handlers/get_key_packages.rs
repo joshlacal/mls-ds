@@ -69,19 +69,24 @@ pub async fn get_key_packages(
     let suite = cipher_suite.as_deref().unwrap_or(default_cipher_suite);
 
     for did in dids_refs {
-        match crate::db::get_key_package(&pool, did, suite).await {
-            Ok(Some(kp)) => {
-                results.push(KeyPackageInfo {
-                    did: kp.did,
-                    key_package: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(kp.key_data),
-                    cipher_suite: kp.cipher_suite,
-                });
+        // Get ALL available key packages for this DID (multi-device support)
+        match crate::db::get_all_key_packages(&pool, did, suite).await {
+            Ok(kps) if !kps.is_empty() => {
+                info!("Found {} key package(s) for DID: {}", kps.len(), did);
+                for kp in kps {
+                    results.push(KeyPackageInfo {
+                        did: kp.did,
+                        key_package: base64::engine::general_purpose::STANDARD.encode(kp.key_data),
+                        cipher_suite: kp.cipher_suite,
+                        key_package_hash: kp.key_package_hash,
+                    });
+                }
             }
-            Ok(None) => {
+            Ok(_) => {
                 info!("No valid key package found for DID: {}", did);
             }
             Err(e) => {
-                error!("Failed to get key package for {}: {}", did, e);
+                error!("Failed to get key packages for {}: {}", did, e);
             }
         }
     }

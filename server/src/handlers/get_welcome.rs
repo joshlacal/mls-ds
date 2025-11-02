@@ -56,10 +56,23 @@ pub async fn get_welcome(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
     
-    let result: Option<(String, Vec<u8>)> = sqlx::query_as(
-        "SELECT id, welcome_data FROM welcome_messages
-         WHERE convo_id = $1 AND recipient_did = $2 AND consumed = false
-         ORDER BY created_at ASC
+    // First, try to find a Welcome that matches one of the user's available key packages
+    // This prevents the NoMatchingKeyPackage error when users publish new key packages
+    let result: Option<(String, Vec<u8>, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT wm.id, wm.welcome_data, wm.key_package_hash 
+         FROM welcome_messages wm
+         WHERE wm.convo_id = $1 AND wm.recipient_did = $2 AND wm.consumed = false
+         AND (
+           wm.key_package_hash IS NULL
+           OR EXISTS (
+             SELECT 1 FROM key_packages kp
+             WHERE kp.did = $2
+             AND kp.key_package_hash = encode(wm.key_package_hash, 'hex')
+             AND kp.consumed = false
+             AND kp.expires_at > NOW()
+           )
+         )
+         ORDER BY wm.created_at ASC
          LIMIT 1
          FOR UPDATE"  // Lock row for update
     )
@@ -72,7 +85,7 @@ pub async fn get_welcome(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let (welcome_id, welcome_data) = match result {
+    let (welcome_id, welcome_data, key_package_hash_opt) = match result {
         Some(data) => data,
         None => {
             // Check if already consumed (return 410 Gone) vs never existed (return 404)
@@ -132,14 +145,42 @@ pub async fn get_welcome(
         return Err(StatusCode::GONE);
     }
     
+    // Mark the corresponding key package as consumed (if hash is present)
+    if let Some(ref hash_bytes) = key_package_hash_opt {
+        let hash_hex = hex::encode(hash_bytes);
+        info!("Marking key package as consumed: hash={}", hash_hex);
+        
+        let kp_rows = sqlx::query(
+            "UPDATE key_packages
+             SET consumed = true, consumed_at = $1
+             WHERE did = $2 AND key_package_hash = $3 AND consumed = false"
+        )
+        .bind(&now)
+        .bind(did)
+        .bind(&hash_hex)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            error!("Failed to mark key package as consumed: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .rows_affected();
+        
+        if kp_rows > 0 {
+            info!("Marked {} key package(s) as consumed", kp_rows);
+        } else {
+            warn!("Key package with hash {} not found or already consumed", hash_hex);
+        }
+    }
+    
     // Commit transaction
     tx.commit().await.map_err(|e| {
         error!("Failed to commit transaction: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    // Encode welcome data as base64url
-    let welcome_base64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&welcome_data);
+    // Encode welcome data as standard base64 (for Swift compatibility)
+    let welcome_base64 = base64::engine::general_purpose::STANDARD.encode(&welcome_data);
 
     info!("Successfully fetched and consumed welcome message for {} in conversation {}", did, params.convo_id);
 
