@@ -28,6 +28,9 @@ COPY migrations ./migrations
 RUN touch src/main.rs && \
     cargo build --release
 
+# Install sqlx-cli for migrations
+RUN cargo install sqlx-cli --no-default-features --features postgres
+
 # Stage 2: Runtime
 FROM debian:bookworm-slim
 
@@ -46,6 +49,9 @@ WORKDIR /app
 
 # Copy binary from builder
 COPY --from=builder /app/target/release/catbird-server /app/catbird-server
+
+# Copy sqlx-cli from builder
+COPY --from=builder /usr/local/cargo/bin/sqlx /usr/local/bin/sqlx
 
 # Copy migrations
 COPY --from=builder /app/migrations /app/migrations

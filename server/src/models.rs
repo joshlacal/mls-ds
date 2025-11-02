@@ -59,8 +59,6 @@ pub struct Message {
     pub epoch: i64,
     pub seq: i64,
     pub ciphertext: Vec<u8>,
-    pub embed_type: Option<String>,
-    pub embed_uri: Option<String>,
     pub created_at: DateTime<Utc>,
     pub expires_at: Option<DateTime<Utc>>,
 }
@@ -84,8 +82,6 @@ impl Message {
             epoch,
             seq,
             ciphertext,
-            embed_type: None,
-            embed_uri: None,
             created_at: now,
             expires_at: Some(expires_at),
         }
@@ -97,6 +93,7 @@ pub struct KeyPackage {
     pub did: String,
     pub cipher_suite: String,
     pub key_data: Vec<u8>,
+    pub key_package_hash: String,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub consumed: bool,
@@ -111,6 +108,14 @@ impl KeyPackage {
 // API Request/Response types
 
 #[derive(Debug, Deserialize)]
+pub struct KeyPackageHashEntry {
+    #[serde(rename = "$type")]
+    pub type_field: Option<String>,
+    pub did: String,
+    pub hash: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct CreateConvoInput {
     #[serde(rename = "groupId")]
     pub group_id: String,
@@ -123,6 +128,10 @@ pub struct CreateConvoInput {
     /// Contains encrypted secrets that each member can decrypt
     #[serde(rename = "welcomeMessage", skip_serializing_if = "Option::is_none")]
     pub welcome_message: Option<String>,
+    /// Array of {did, hash} objects for each initial member
+    /// This tells the server which key package was used for each member's Welcome
+    #[serde(rename = "keyPackageHashes", skip_serializing_if = "Option::is_none")]
+    pub key_package_hashes: Option<Vec<KeyPackageHashEntry>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -184,6 +193,10 @@ pub struct AddMembersInput {
     /// Contains encrypted secrets that each member can decrypt
     #[serde(rename = "welcomeMessage", skip_serializing_if = "Option::is_none")]
     pub welcome_message: Option<String>,
+    /// Array of {did, hash} objects for each new member
+    /// This tells the server which key package was used for each member's Welcome
+    #[serde(rename = "keyPackageHashes", skip_serializing_if = "Option::is_none")]
+    pub key_package_hashes: Option<Vec<KeyPackageHashEntry>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -198,15 +211,12 @@ pub struct SendMessageInput {
     #[serde(rename = "convoId")]
     pub convo_id: String,
     /// Direct ciphertext payload stored in PostgreSQL
+    /// Contains encrypted JSON with version, text, and optional embed
     #[serde(with = "base64_bytes")]
     pub ciphertext: Vec<u8>,
     pub epoch: i64,
     #[serde(rename = "senderDid")]
     pub sender_did: String,
-    #[serde(rename = "embedType", skip_serializing_if = "Option::is_none")]
-    pub embed_type: Option<String>,
-    #[serde(rename = "embedUri", skip_serializing_if = "Option::is_none")]
-    pub embed_uri: Option<String>,
 }
 
 mod base64_bytes {
@@ -233,8 +243,12 @@ mod base64_bytes {
             _ => return Err(serde::de::Error::custom("Expected string or $bytes object")),
         };
 
-        base64::engine::general_purpose::URL_SAFE_NO_PAD
+        // Try STANDARD base64 first (with +/), then fall back to URL_SAFE_NO_PAD
+        base64::engine::general_purpose::STANDARD
             .decode(&base64_str)
+            .or_else(|_| {
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&base64_str)
+            })
             .map_err(serde::de::Error::custom)
     }
 
@@ -242,8 +256,14 @@ mod base64_bytes {
     where
         S: Serializer,
     {
-        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
-        serializer.serialize_str(&encoded)
+        // Use STANDARD base64 for Swift compatibility
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+
+        // Serialize as AT Protocol $bytes format: {"$bytes": "base64data"}
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry("$bytes", &encoded)?;
+        map.end()
     }
 }
 
@@ -283,12 +303,6 @@ pub struct MessageView {
     pub seq: i64,
     #[serde(rename = "createdAt")]
     pub created_at: DateTime<Utc>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "embedType")]
-    pub embed_type: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "embedUri")]
-    pub embed_uri: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -307,6 +321,8 @@ pub struct KeyPackageInfo {
     pub key_package: String, // base64url
     #[serde(rename = "cipherSuite")]
     pub cipher_suite: String,
+    #[serde(rename = "keyPackageHash")]
+    pub key_package_hash: String,
 }
 
 // Welcome message models

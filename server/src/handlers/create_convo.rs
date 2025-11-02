@@ -14,8 +14,15 @@ use crate::{
 pub async fn create_convo(
     State(pool): State<DbPool>,
     auth_user: AuthUser,
-    Json(input): Json<CreateConvoInput>,
+    Json(raw_json): Json<serde_json::Value>,
 ) -> Result<Json<ConvoView>, StatusCode> {
+    error!("🔍 [create_convo] RAW JSON: {}", serde_json::to_string_pretty(&raw_json).unwrap_or_else(|_| "failed to serialize".to_string()));
+    
+    let input: CreateConvoInput = serde_json::from_value(raw_json).map_err(|e| {
+        error!("❌ [create_convo] Deserialization error: {}", e);
+        StatusCode::BAD_REQUEST
+    })?;
+    
     info!("🔷 [create_convo] START - creator: {}, groupId: {}, initialMembers: {}, has_welcome: {}", 
           auth_user.did, 
           input.group_id,
@@ -140,8 +147,8 @@ pub async fn create_convo(
     if let Some(ref welcome_b64) = input.welcome_message {
         info!("📍 [create_convo] Processing Welcome message...");
         
-        // Decode base64url Welcome message
-        let welcome_data = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        // Decode base64 Welcome message
+        let welcome_data = base64::engine::general_purpose::STANDARD
             .decode(welcome_b64)
             .map_err(|e| {
                 warn!("❌ [create_convo] Invalid base64 welcome message: {}", e);
@@ -153,12 +160,21 @@ pub async fn create_convo(
         // Store the SAME Welcome for each initial member (excluding creator)
         if let Some(ref member_list) = input.initial_members {
             let non_creator_members: Vec<_> = member_list.iter().filter(|d| *d != did).collect();
-            
+
             for member_did in &non_creator_members {
                 let welcome_id = uuid::Uuid::new_v4().to_string();
-                
+
+                // Get the key_package_hash for this member from the input
+                let key_package_hash = input.key_package_hashes.as_ref()
+                    .and_then(|hashes| {
+                        hashes.iter()
+                            .find(|entry| entry.did == **member_did)
+                            .map(|entry| hex::decode(&entry.hash).ok())
+                            .flatten()
+                    });
+
                 sqlx::query(
-                    "INSERT INTO welcome_messages (id, convo_id, recipient_did, welcome_data, key_package_hash, created_at) 
+                    "INSERT INTO welcome_messages (id, convo_id, recipient_did, welcome_data, key_package_hash, created_at)
                      VALUES ($1, $2, $3, $4, $5, $6)
                      ON CONFLICT (convo_id, recipient_did, COALESCE(key_package_hash, '\\x00'::bytea)) WHERE consumed = false
                      DO NOTHING"
@@ -167,7 +183,7 @@ pub async fn create_convo(
                 .bind(&convo_id)
                 .bind(member_did)
                 .bind(&welcome_data)
-                .bind::<Option<Vec<u8>>>(None) // key_package_hash
+                .bind::<Option<Vec<u8>>>(key_package_hash) // key_package_hash from client
                 .bind(&now)
                 .execute(&pool)
                 .await
@@ -175,7 +191,7 @@ pub async fn create_convo(
                     error!("❌ [create_convo] Failed to store welcome message for {}: {}", member_did, e);
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
-                
+
                 info!("✅ [create_convo] Welcome stored for member {}", member_did);
             }
             info!("📍 [create_convo] Stored Welcome for {} members (excluding creator)", non_creator_members.len());

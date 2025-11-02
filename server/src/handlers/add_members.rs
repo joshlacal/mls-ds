@@ -60,7 +60,7 @@ pub async fn add_members(
 
     // Process commit if provided
     if let Some(commit) = input.commit {
-        let commit_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(commit)
+        let commit_bytes = base64::engine::general_purpose::STANDARD.decode(commit)
             .map_err(|e| {
                 warn!("Invalid base64 commit: {}", e);
                 StatusCode::BAD_REQUEST
@@ -133,9 +133,9 @@ pub async fn add_members(
     // MLS generates ONE Welcome message containing encrypted secrets for ALL members
     if let Some(ref welcome_b64) = input.welcome_message {
         info!("📍 [add_members] Processing Welcome message...");
-        
-        // Decode base64url Welcome message
-        let welcome_data = base64::engine::general_purpose::URL_SAFE_NO_PAD
+
+        // Decode base64 Welcome message
+        let welcome_data = base64::engine::general_purpose::STANDARD
             .decode(welcome_b64)
             .map_err(|e| {
                 warn!("❌ [add_members] Invalid base64 welcome message: {}", e);
@@ -149,6 +149,15 @@ pub async fn add_members(
         for target_did in &input.did_list {
             let welcome_id = uuid::Uuid::new_v4().to_string();
 
+            // Get the key_package_hash for this member from the input
+            let key_package_hash = input.key_package_hashes.as_ref()
+                .and_then(|hashes| {
+                    hashes.iter()
+                        .find(|entry| entry.did == *target_did)
+                        .map(|entry| hex::decode(&entry.hash).ok())
+                        .flatten()
+                });
+
             sqlx::query(
                 "INSERT INTO welcome_messages (id, convo_id, recipient_did, welcome_data, key_package_hash, created_at)
                  VALUES ($1, $2, $3, $4, $5, $6)
@@ -159,7 +168,7 @@ pub async fn add_members(
             .bind(&input.convo_id)
             .bind(target_did)
             .bind(&welcome_data)
-            .bind::<Option<Vec<u8>>>(None) // key_package_hash
+            .bind::<Option<Vec<u8>>>(key_package_hash) // key_package_hash from client
             .bind(&now)
             .execute(&pool)
             .await
