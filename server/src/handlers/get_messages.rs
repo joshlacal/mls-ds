@@ -1,8 +1,11 @@
 use axum::{extract::{Query, State}, http::StatusCode, Json};
 use serde::Deserialize;
+use std::sync::Arc;
+use tokio::sync::oneshot;
 use tracing::{info, warn, error};
 
 use crate::{
+    actors::{ActorRegistry, ConvoMessage},
     auth::AuthUser,
     db,
     models::MessageView,
@@ -20,9 +23,10 @@ pub struct GetMessagesParams {
 
 /// Get messages from a conversation
 /// GET /xrpc/chat.bsky.convo.getMessages
-#[tracing::instrument(skip(pool), fields(did = %auth_user.did, convo_id = %params.convo_id))]
+#[tracing::instrument(skip(pool, actor_registry), fields(did = %auth_user.did, convo_id = %params.convo_id))]
 pub async fn get_messages(
     State(pool): State<DbPool>,
+    State(actor_registry): State<Arc<ActorRegistry>>,
     auth_user: AuthUser,
     Query(params): Query<GetMessagesParams>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -102,17 +106,52 @@ pub async fn get_messages(
         .collect();
 
     // Reset unread count for this user
-    sqlx::query(
-        "UPDATE members SET unread_count = 0 WHERE convo_id = $1 AND member_did = $2"
-    )
-    .bind(&params.convo_id)
-    .bind(did)
-    .execute(&pool)
-    .await
-    .map_err(|e| {
-        error!("Failed to reset unread count: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let use_actors = std::env::var("ENABLE_ACTOR_SYSTEM")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+
+    if use_actors {
+        info!("Using actor system for reset unread count");
+
+        let actor_ref = actor_registry.get_or_spawn(&params.convo_id).await
+            .map_err(|e| {
+                error!("Failed to get conversation actor: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        let (tx, rx) = oneshot::channel();
+        actor_ref.send_message(ConvoMessage::ResetUnread {
+            member_did: did.clone(),
+            reply: tx,
+        }).map_err(|_| {
+            error!("Failed to send message to actor");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        rx.await
+            .map_err(|_| {
+                error!("Actor channel closed unexpectedly");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .map_err(|e| {
+                error!("Actor failed to reset unread count: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    } else {
+        info!("Using legacy database approach for reset unread count");
+
+        sqlx::query(
+            "UPDATE members SET unread_count = 0 WHERE convo_id = $1 AND member_did = $2"
+        )
+        .bind(&params.convo_id)
+        .bind(did)
+        .execute(&pool)
+        .await
+        .map_err(|e| {
+            error!("Failed to reset unread count: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    }
 
     info!("Fetched {} messages", message_views.len());
 
@@ -163,9 +202,10 @@ mod tests {
     async fn test_get_messages_success() {
         let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
         let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
+        let actor_registry = Arc::new(crate::actors::ActorRegistry::new(pool.clone()));
         let convo_id = "test-convo-1";
         let user = "did:plc:user";
-        
+
         setup_test_convo_with_messages(&pool, user, convo_id).await;
 
         let did = AuthUser { did: user.to_string(), claims: crate::auth::AtProtoClaims { iss: user.to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
@@ -175,9 +215,9 @@ mod tests {
             limit: None,
         };
 
-        let result = get_messages(State(pool), did, Query(params)).await;
+        let result = get_messages(State(pool), State(actor_registry), did, Query(params)).await;
         assert!(result.is_ok());
-        
+
         let json = result.unwrap().0;
         let messages = json.get("messages").unwrap().as_array().unwrap();
         assert_eq!(messages.len(), 3);
@@ -187,9 +227,10 @@ mod tests {
     async fn test_get_messages_not_member() {
         let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
         let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
+        let actor_registry = Arc::new(crate::actors::ActorRegistry::new(pool.clone()));
         let convo_id = "test-convo-2";
         let creator = "did:plc:creator";
-        
+
         setup_test_convo_with_messages(&pool, creator, convo_id).await;
 
         let did = AuthUser { did: "did:plc:outsider".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:outsider".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
@@ -199,7 +240,7 @@ mod tests {
             limit: None,
         };
 
-        let result = get_messages(State(pool), did, Query(params)).await;
+        let result = get_messages(State(pool), State(actor_registry), did, Query(params)).await;
         assert_eq!(result.unwrap_err(), StatusCode::FORBIDDEN);
     }
 
@@ -207,9 +248,10 @@ mod tests {
     async fn test_get_messages_with_limit() {
         let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
         let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
+        let actor_registry = Arc::new(crate::actors::ActorRegistry::new(pool.clone()));
         let convo_id = "test-convo-3";
         let user = "did:plc:user";
-        
+
         setup_test_convo_with_messages(&pool, user, convo_id).await;
 
         let did = AuthUser { did: user.to_string(), claims: crate::auth::AtProtoClaims { iss: user.to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
@@ -219,9 +261,9 @@ mod tests {
             limit: Some(2),
         };
 
-        let result = get_messages(State(pool), did, Query(params)).await;
+        let result = get_messages(State(pool), State(actor_registry), did, Query(params)).await;
         assert!(result.is_ok());
-        
+
         let json = result.unwrap().0;
         let messages = json.get("messages").unwrap().as_array().unwrap();
         assert_eq!(messages.len(), 2);

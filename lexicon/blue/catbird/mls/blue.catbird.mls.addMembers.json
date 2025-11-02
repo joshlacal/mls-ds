@@ -16,6 +16,10 @@
               "type": "string",
               "description": "Conversation identifier"
             },
+            "idempotencyKey": {
+              "type": "string",
+              "description": "Client-generated UUID for idempotent request retries. Optional but recommended."
+            },
             "didList": {
               "type": "array",
               "items": {
