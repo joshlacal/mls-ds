@@ -12,6 +12,10 @@
           "required": ["convoId", "ciphertext", "epoch", "senderDid"],
           "properties": {
             "convoId": { "type": "string", "description": "Conversation identifier" },
+            "idempotencyKey": {
+              "type": "string",
+              "description": "Client-generated UUID for idempotent request retries. Optional but recommended."
+            },
             "ciphertext": {
               "type": "bytes",
               "description": "MLS encrypted message ciphertext bytes",

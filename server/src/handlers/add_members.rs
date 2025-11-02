@@ -1,9 +1,12 @@
 use base64::Engine;
 
 use axum::{extract::State, http::StatusCode, Json};
+use std::sync::Arc;
+use tokio::sync::oneshot;
 use tracing::{info, warn, error};
 
 use crate::{
+    actors::{ActorRegistry, ConvoMessage, KeyPackageHashEntry},
     auth::AuthUser,
     models::{AddMembersInput, AddMembersOutput},
     storage::{get_current_epoch, is_member, DbPool},
@@ -11,9 +14,10 @@ use crate::{
 
 /// Add members to an existing conversation
 /// POST /xrpc/chat.bsky.convo.addMembers
-#[tracing::instrument(skip(pool), fields(did = %auth_user.did, convo_id = %input.convo_id))]
+#[tracing::instrument(skip(pool, actor_registry), fields(did = %auth_user.did, convo_id = %input.convo_id))]
 pub async fn add_members(
     State(pool): State<DbPool>,
+    State(actor_registry): State<Arc<ActorRegistry>>,
     auth_user: AuthUser,
     Json(input): Json<AddMembersInput>,
 ) -> Result<Json<AddMembersOutput>, StatusCode> {
@@ -46,149 +50,248 @@ pub async fn add_members(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    let current_epoch = get_current_epoch(&pool, &input.convo_id)
-        .await
-        .map_err(|e| {
-            error!("Failed to get current epoch: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-    
-    let new_epoch = current_epoch + 1;
-    let now = chrono::Utc::now();
-
     info!("Adding {} members to conversation {}", input.did_list.len(), input.convo_id);
 
-    // Process commit if provided
-    if let Some(commit) = input.commit {
-        let commit_bytes = base64::engine::general_purpose::STANDARD.decode(commit)
-            .map_err(|e| {
-                warn!("Invalid base64 commit: {}", e);
-                StatusCode::BAD_REQUEST
-            })?;
-        
-        let msg_id = uuid::Uuid::new_v4().to_string();
-
-        sqlx::query(
-            "INSERT INTO messages (id, convo_id, sender_did, message_type, epoch, ciphertext, created_at) VALUES ($1, $2, $3, 'commit', $4, $5, $6)"
-        )
-        .bind(&msg_id)
-        .bind(&input.convo_id)
-        .bind(did)
-        .bind(new_epoch)
-        .bind(&commit_bytes)
-        .bind(&now)
-        .execute(&pool)
-        .await
-        .map_err(|e| {
-            error!("Failed to insert commit message: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-        sqlx::query("UPDATE conversations SET current_epoch = $1 WHERE id = $2")
-            .bind(new_epoch)
-            .bind(&input.convo_id)
-            .execute(&pool)
-            .await
-            .map_err(|e| {
-                error!("Failed to update conversation epoch: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-    }
-
-    // Add new members
-    for target_did in &input.did_list {
-        // Check if already a member
-        let is_existing = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM members WHERE convo_id = $1 AND member_did = $2"
-        )
-        .bind(&input.convo_id)
-        .bind(target_did)
-        .fetch_one(&pool)
-        .await
-        .map_err(|e| {
-            error!("Failed to check existing membership: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-        if is_existing > 0 {
-            info!("Member {} already exists, skipping", target_did);
-            continue;
-        }
-
-        sqlx::query(
-            "INSERT INTO members (convo_id, member_did, joined_at) VALUES ($1, $2, $3)"
-        )
-        .bind(&input.convo_id)
-        .bind(target_did)
-        .bind(&now)
-        .execute(&pool)
-        .await
-        .map_err(|e| {
-            error!("Failed to add member {}: {}", target_did, e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-    }
-
-    // Store Welcome message for new members
-    // MLS generates ONE Welcome message containing encrypted secrets for ALL members
-    if let Some(ref welcome_b64) = input.welcome_message {
-        info!("📍 [add_members] Processing Welcome message...");
-
-        // Decode base64 Welcome message
-        let welcome_data = base64::engine::general_purpose::STANDARD
-            .decode(welcome_b64)
-            .map_err(|e| {
-                warn!("❌ [add_members] Invalid base64 welcome message: {}", e);
-                StatusCode::BAD_REQUEST
-            })?;
-        
-        info!("📍 [add_members] Single Welcome message ({} bytes) for {} new members", 
-              welcome_data.len(), input.did_list.len());
-        
-        // Store the SAME Welcome for each new member
+    // If idempotency key is provided, check if this operation was already completed
+    if let Some(ref _idem_key) = input.idempotency_key {
+        // Check if all members are already added - if so, this is a duplicate request
+        let mut all_exist = true;
         for target_did in &input.did_list {
-            let welcome_id = uuid::Uuid::new_v4().to_string();
-
-            // Get the key_package_hash for this member from the input
-            let key_package_hash = input.key_package_hashes.as_ref()
-                .and_then(|hashes| {
-                    hashes.iter()
-                        .find(|entry| entry.did == *target_did)
-                        .map(|entry| hex::decode(&entry.hash).ok())
-                        .flatten()
-                });
-
-            sqlx::query(
-                "INSERT INTO welcome_messages (id, convo_id, recipient_did, welcome_data, key_package_hash, created_at)
-                 VALUES ($1, $2, $3, $4, $5, $6)
-                 ON CONFLICT (convo_id, recipient_did, COALESCE(key_package_hash, '\\x00'::bytea)) WHERE consumed = false
-                 DO NOTHING"
+            let exists = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM members WHERE convo_id = $1 AND member_did = $2 AND left_at IS NULL)"
             )
-            .bind(&welcome_id)
             .bind(&input.convo_id)
             .bind(target_did)
-            .bind(&welcome_data)
-            .bind::<Option<Vec<u8>>>(key_package_hash) // key_package_hash from client
+            .fetch_one(&pool)
+            .await
+            .unwrap_or(false);
+
+            if !exists {
+                all_exist = false;
+                break;
+            }
+        }
+
+        if all_exist {
+            info!("📍 [add_members] Idempotency: All members already exist, returning success");
+            let current_epoch = get_current_epoch(&pool, &input.convo_id)
+                .await
+                .map_err(|e| {
+                    error!("Failed to get current epoch: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+
+            return Ok(Json(AddMembersOutput {
+                success: true,
+                new_epoch: current_epoch,
+            }));
+        }
+    }
+
+    // Check if actor system is enabled
+    let use_actors = std::env::var("ENABLE_ACTOR_SYSTEM")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+
+    let new_epoch = if use_actors {
+        info!("Using actor system for add_members");
+
+        // Decode commit if provided
+        let commit_bytes = if let Some(ref commit) = input.commit {
+            Some(base64::engine::general_purpose::STANDARD.decode(commit)
+                .map_err(|e| {
+                    warn!("Invalid base64 commit: {}", e);
+                    StatusCode::BAD_REQUEST
+                })?)
+        } else {
+            None
+        };
+
+        // Convert key_package_hashes to actor message format
+        let key_package_hashes = input.key_package_hashes.as_ref().map(|hashes| {
+            hashes.iter().map(|entry| KeyPackageHashEntry {
+                did: entry.did.clone(),
+                hash: entry.hash.clone(),
+            }).collect()
+        });
+
+        // Get or spawn conversation actor
+        let actor_ref = actor_registry.get_or_spawn(&input.convo_id).await
+            .map_err(|e| {
+                error!("Failed to get conversation actor: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        // Send AddMembers message
+        let (tx, rx) = oneshot::channel();
+        actor_ref.send_message(ConvoMessage::AddMembers {
+            did_list: input.did_list.clone(),
+            commit: commit_bytes,
+            welcome_message: input.welcome_message.clone(),
+            key_package_hashes,
+            reply: tx,
+        }).map_err(|_| {
+            error!("Failed to send message to actor");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        // Await response
+        rx.await
+            .map_err(|_| {
+                error!("Actor channel closed unexpectedly");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .map_err(|e| {
+                error!("Actor failed to add members: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+    } else {
+        info!("Using legacy database approach for add_members");
+
+        let current_epoch = get_current_epoch(&pool, &input.convo_id)
+            .await
+            .map_err(|e| {
+                error!("Failed to get current epoch: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        let new_epoch = current_epoch + 1;
+        let now = chrono::Utc::now();
+
+        // Process commit if provided
+        if let Some(commit) = input.commit {
+            let commit_bytes = base64::engine::general_purpose::STANDARD.decode(commit)
+                .map_err(|e| {
+                    warn!("Invalid base64 commit: {}", e);
+                    StatusCode::BAD_REQUEST
+                })?;
+
+            let msg_id = uuid::Uuid::new_v4().to_string();
+
+            sqlx::query(
+                "INSERT INTO messages (id, convo_id, sender_did, message_type, epoch, ciphertext, created_at) VALUES ($1, $2, $3, 'commit', $4, $5, $6)"
+            )
+            .bind(&msg_id)
+            .bind(&input.convo_id)
+            .bind(did)
+            .bind(new_epoch)
+            .bind(&commit_bytes)
             .bind(&now)
             .execute(&pool)
             .await
             .map_err(|e| {
-                error!("❌ [add_members] Failed to store welcome message for {}: {}", target_did, e);
+                error!("Failed to insert commit message: {}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
-            info!("✅ [add_members] Welcome stored for member {}", target_did);
+            sqlx::query("UPDATE conversations SET current_epoch = $1 WHERE id = $2")
+                .bind(new_epoch)
+                .bind(&input.convo_id)
+                .execute(&pool)
+                .await
+                .map_err(|e| {
+                    error!("Failed to update conversation epoch: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
         }
-        info!("📍 [add_members] Stored Welcome for {} members", input.did_list.len());
-    } else {
-        info!("📍 [add_members] No welcome message provided");
-    }
+
+        // Add new members
+        for target_did in &input.did_list {
+            // Check if already a member
+            let is_existing = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM members WHERE convo_id = $1 AND member_did = $2"
+            )
+            .bind(&input.convo_id)
+            .bind(target_did)
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| {
+                error!("Failed to check existing membership: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+            if is_existing > 0 {
+                info!("Member {} already exists, skipping", target_did);
+                continue;
+            }
+
+            sqlx::query(
+                "INSERT INTO members (convo_id, member_did, joined_at) VALUES ($1, $2, $3)"
+            )
+            .bind(&input.convo_id)
+            .bind(target_did)
+            .bind(&now)
+            .execute(&pool)
+            .await
+            .map_err(|e| {
+                error!("Failed to add member {}: {}", target_did, e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        }
+
+        // Store Welcome message for new members
+        // MLS generates ONE Welcome message containing encrypted secrets for ALL members
+        if let Some(ref welcome_b64) = input.welcome_message {
+            info!("📍 [add_members] Processing Welcome message...");
+
+            // Decode base64 Welcome message
+            let welcome_data = base64::engine::general_purpose::STANDARD
+                .decode(welcome_b64)
+                .map_err(|e| {
+                    warn!("❌ [add_members] Invalid base64 welcome message: {}", e);
+                    StatusCode::BAD_REQUEST
+                })?;
+
+            info!("📍 [add_members] Single Welcome message ({} bytes) for {} new members",
+                  welcome_data.len(), input.did_list.len());
+
+            // Store the SAME Welcome for each new member
+            for target_did in &input.did_list {
+                let welcome_id = uuid::Uuid::new_v4().to_string();
+
+                // Get the key_package_hash for this member from the input
+                let key_package_hash = input.key_package_hashes.as_ref()
+                    .and_then(|hashes| {
+                        hashes.iter()
+                            .find(|entry| entry.did == *target_did)
+                            .map(|entry| hex::decode(&entry.hash).ok())
+                            .flatten()
+                    });
+
+                sqlx::query(
+                    "INSERT INTO welcome_messages (id, convo_id, recipient_did, welcome_data, key_package_hash, created_at)
+                     VALUES ($1, $2, $3, $4, $5, $6)
+                     ON CONFLICT (convo_id, recipient_did, COALESCE(key_package_hash, '\\x00'::bytea)) WHERE consumed = false
+                     DO NOTHING"
+                )
+                .bind(&welcome_id)
+                .bind(&input.convo_id)
+                .bind(target_did)
+                .bind(&welcome_data)
+                .bind::<Option<Vec<u8>>>(key_package_hash) // key_package_hash from client
+                .bind(&now)
+                .execute(&pool)
+                .await
+                .map_err(|e| {
+                    error!("❌ [add_members] Failed to store welcome message for {}: {}", target_did, e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+
+                info!("✅ [add_members] Welcome stored for member {}", target_did);
+            }
+            info!("📍 [add_members] Stored Welcome for {} members", input.did_list.len());
+        } else {
+            info!("📍 [add_members] No welcome message provided");
+        }
+
+        new_epoch as u32
+    };
 
     info!("Successfully added members to conversation {}, new epoch: {}", input.convo_id, new_epoch);
 
     Ok(Json(AddMembersOutput {
         success: true,
-        new_epoch,
+        new_epoch: new_epoch as i32,
     }))
 }
 

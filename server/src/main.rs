@@ -5,9 +5,11 @@ use axum::{
 };
 use sqlx::PgPool;
 use std::{net::SocketAddr, sync::Arc};
+use tokio::time::{interval, Duration};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+mod actors;
 mod auth;
 mod crypto;
 mod db;
@@ -28,6 +30,7 @@ mod xrpc_proxy;
 struct AppState {
     db_pool: PgPool,
     sse_state: Arc<realtime::SseState>,
+    actor_registry: Arc<actors::ActorRegistry>,
 }
 
 #[tokio::main]
@@ -72,10 +75,30 @@ async fn main() -> anyhow::Result<()> {
     // });
     // tracing::info!("Compaction worker started");
 
+    // Initialize actor registry
+    let actor_registry = Arc::new(actors::ActorRegistry::new(db_pool.clone()));
+    tracing::info!("Actor registry initialized");
+
+    // Spawn idempotency cache cleanup worker
+    let cleanup_pool = db_pool.clone();
+    tokio::spawn(async move {
+        let mut interval_timer = interval(Duration::from_secs(3600)); // Every hour
+        loop {
+            interval_timer.tick().await;
+            if let Err(e) = middleware::idempotency::cleanup_expired_entries(&cleanup_pool).await {
+                tracing::error!("Failed to cleanup idempotency cache: {}", e);
+            } else {
+                tracing::debug!("Idempotency cache cleanup completed");
+            }
+        }
+    });
+    tracing::info!("Idempotency cache cleanup worker started");
+
     // Create composite app state
     let app_state = AppState {
         db_pool: db_pool.clone(),
         sse_state,
+        actor_registry,
     };
 
     // Build application router
@@ -130,6 +153,10 @@ async fn main() -> anyhow::Result<()> {
             get(handlers::get_welcome),
         )
         .route(
+            "/xrpc/blue.catbird.mls.confirmWelcome",
+            post(handlers::confirm_welcome),
+        )
+        .route(
             "/xrpc/blue.catbird.mls.getCommits",
             get(handlers::get_commits),
         )
@@ -144,6 +171,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .merge(metrics_router)
         .layer(TraceLayer::new_for_http())
+        .layer(axum::middleware::from_fn_with_state(
+            middleware::idempotency::IdempotencyLayer::new(db_pool.clone()),
+            middleware::idempotency::idempotency_middleware,
+        ))
         .with_state(app_state);
 
     // Optional: developer-only direct XRPC proxy (off by default).

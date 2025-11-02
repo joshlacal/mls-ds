@@ -132,6 +132,9 @@ pub struct CreateConvoInput {
     /// This tells the server which key package was used for each member's Welcome
     #[serde(rename = "keyPackageHashes", skip_serializing_if = "Option::is_none")]
     pub key_package_hashes: Option<Vec<KeyPackageHashEntry>>,
+    /// Optional idempotency key for preventing duplicate conversations
+    #[serde(rename = "idempotencyKey", skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -197,6 +200,9 @@ pub struct AddMembersInput {
     /// This tells the server which key package was used for each member's Welcome
     #[serde(rename = "keyPackageHashes", skip_serializing_if = "Option::is_none")]
     pub key_package_hashes: Option<Vec<KeyPackageHashEntry>>,
+    /// Optional idempotency key for preventing duplicate member additions
+    #[serde(rename = "idempotencyKey", skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -217,6 +223,9 @@ pub struct SendMessageInput {
     pub epoch: i64,
     #[serde(rename = "senderDid")]
     pub sender_did: String,
+    /// Optional idempotency key for preventing duplicate messages
+    #[serde(rename = "idempotencyKey", skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 mod base64_bytes {
@@ -334,4 +343,9 @@ pub struct GetWelcomeOutput {
     pub convo_id: String,
     /// Base64url-encoded Welcome message data
     pub welcome: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConfirmWelcomeOutput {
+    pub confirmed: bool,
 }
