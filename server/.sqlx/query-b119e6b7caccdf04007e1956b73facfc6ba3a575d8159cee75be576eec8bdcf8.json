@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        DELETE FROM event_stream\n        WHERE event_type = 'typingEvent'\n          AND emitted_at < $1\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b119e6b7caccdf04007e1956b73facfc6ba3a575d8159cee75be576eec8bdcf8"
+}

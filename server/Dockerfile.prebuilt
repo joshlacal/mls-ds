@@ -1,5 +1,24 @@
-# Simple Dockerfile using pre-built binary
-FROM debian:bookworm-slim
+# Stage 1: Build sqlx-cli with matching GLIBC
+FROM ubuntu:24.04 as sqlx-builder
+
+# Install Rust and build dependencies
+RUN apt-get update && apt-get install -y \
+    curl \
+    build-essential \
+    libpq-dev \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Build sqlx-cli with postgres support only (faster build)
+RUN cargo install sqlx-cli --version 0.7.3 --no-default-features --features postgres,rustls
+
+# Stage 2: Runtime
+FROM ubuntu:24.04
 
 # Install runtime dependencies including postgresql-client for migrations
 RUN apt-get update && apt-get install -y \
@@ -10,8 +29,11 @@ RUN apt-get update && apt-get install -y \
     postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
-# Create non-root user
-RUN useradd -m -u 1000 -s /bin/bash catbird
+# Copy sqlx-cli from builder
+COPY --from=sqlx-builder /root/.cargo/bin/sqlx /usr/local/bin/sqlx
+
+# Create non-root user (allow non-unique UID in case 1000 exists)
+RUN useradd -m -u 1000 -o -s /bin/bash catbird || true
 
 WORKDIR /app
 

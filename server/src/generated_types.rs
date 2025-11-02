@@ -327,7 +327,8 @@ mod base64_bytes {
     where
         S: Serializer,
     {
-        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        // Use STANDARD base64 for Swift compatibility
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
         serializer.serialize_str(&encoded)
     }
 
@@ -336,8 +337,12 @@ mod base64_bytes {
         D: Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
-        base64::engine::general_purpose::URL_SAFE_NO_PAD
+        // Try STANDARD base64 first (with +/), then fall back to URL_SAFE_NO_PAD
+        base64::engine::general_purpose::STANDARD
             .decode(&s)
+            .or_else(|_| {
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&s)
+            })
             .map_err(serde::de::Error::custom)
     }
 }

@@ -337,8 +337,6 @@ pub async fn create_message(
     sender_did: &str,
     ciphertext: Vec<u8>,
     epoch: i64,
-    embed_type: Option<&str>,
-    embed_uri: Option<&str>,
 ) -> Result<Message> {
     let msg_id = uuid::Uuid::new_v4().to_string();
     let now = Utc::now();
@@ -348,7 +346,7 @@ pub async fn create_message(
     let mut tx = pool.begin().await.context("Failed to begin transaction")?;
 
     let seq: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE convo_id = $1"
+        "SELECT CAST(COALESCE(MAX(seq), 0) + 1 AS BIGINT) FROM messages WHERE convo_id = $1"
     )
     .bind(convo_id)
     .fetch_one(&mut *tx)
@@ -359,9 +357,9 @@ pub async fn create_message(
         r#"
         INSERT INTO messages (
             id, convo_id, sender_did, message_type, epoch, seq,
-            ciphertext, embed_type, embed_uri, created_at, expires_at
-        ) VALUES ($1, $2, $3, 'app', $4, $5, $6, $7, $8, $9, $10)
-        RETURNING id, convo_id, sender_did, message_type, epoch, seq, ciphertext, embed_type, embed_uri, created_at, expires_at
+            ciphertext, created_at, expires_at
+        ) VALUES ($1, $2, $3, 'app', $4, $5, $6, $7, $8)
+        RETURNING id, convo_id, sender_did, message_type, CAST(epoch AS BIGINT), CAST(seq AS BIGINT), ciphertext, created_at, expires_at
         "#,
     )
     .bind(&msg_id)
@@ -370,8 +368,6 @@ pub async fn create_message(
     .bind(epoch)
     .bind(seq)
     .bind(&ciphertext)
-    .bind(embed_type)
-    .bind(embed_uri)
     .bind(&now)
     .bind(&expires_at)
     .fetch_one(&mut *tx)
@@ -387,7 +383,7 @@ pub async fn create_message(
 pub async fn get_message(pool: &DbPool, message_id: &str) -> Result<Option<Message>> {
     let message = sqlx::query_as::<_, Message>(
         r#"
-        SELECT id, convo_id, sender_did, message_type, epoch, seq, ciphertext, embed_type, embed_uri, created_at, expires_at
+        SELECT id, convo_id, sender_did, message_type, CAST(epoch AS BIGINT), CAST(seq AS BIGINT), ciphertext, created_at, expires_at
         FROM messages
         WHERE id = $1
         "#,
@@ -410,7 +406,7 @@ pub async fn list_messages(
     let messages = if let Some(before_time) = before {
         sqlx::query_as::<_, Message>(
             r#"
-            SELECT id, convo_id, sender_did, message_type, epoch, seq, ciphertext, embed_type, embed_uri, created_at, expires_at
+            SELECT id, convo_id, sender_did, message_type, CAST(epoch AS BIGINT), CAST(seq AS BIGINT), ciphertext, created_at, expires_at
             FROM messages
             WHERE convo_id = $1 AND created_at < $2 AND (expires_at IS NULL OR expires_at > NOW())
             ORDER BY created_at DESC
@@ -425,7 +421,7 @@ pub async fn list_messages(
     } else {
         sqlx::query_as::<_, Message>(
             r#"
-            SELECT id, convo_id, sender_did, message_type, epoch, seq, ciphertext, embed_type, embed_uri, created_at, expires_at
+            SELECT id, convo_id, sender_did, message_type, CAST(epoch AS BIGINT), CAST(seq AS BIGINT), ciphertext, created_at, expires_at
             FROM messages
             WHERE convo_id = $1 AND (expires_at IS NULL OR expires_at > NOW())
             ORDER BY created_at DESC
@@ -450,7 +446,7 @@ pub async fn list_messages_since(
 ) -> Result<Vec<Message>> {
     let messages = sqlx::query_as::<_, Message>(
         r#"
-        SELECT id, convo_id, sender_did, message_type, epoch, seq, ciphertext, embed_type, embed_uri, created_at, expires_at
+        SELECT id, convo_id, sender_did, message_type, CAST(epoch AS BIGINT), CAST(seq AS BIGINT), ciphertext, created_at, expires_at
         FROM messages
         WHERE convo_id = $1 AND created_at > $2 AND (expires_at IS NULL OR expires_at > NOW())
         ORDER BY created_at ASC
@@ -501,17 +497,21 @@ pub async fn store_key_package(
 ) -> Result<KeyPackage> {
     let now = Utc::now();
 
+    // Compute SHA256 hash of the key package data
+    let key_package_hash = crate::crypto::sha256_hex(&key_data);
+
     let result = sqlx::query_as::<_, KeyPackage>(
         r#"
-        INSERT INTO key_packages (did, cipher_suite, key_data, created_at, expires_at, consumed)
-        VALUES ($1, $2, $3, $4, $5, false)
-        ON CONFLICT (did, cipher_suite, key_data) DO UPDATE SET expires_at = EXCLUDED.expires_at
-        RETURNING did, cipher_suite, key_data, created_at, expires_at, consumed
+        INSERT INTO key_packages (did, cipher_suite, key_data, key_package_hash, created_at, expires_at, consumed)
+        VALUES ($1, $2, $3, $4, $5, $6, false)
+        ON CONFLICT (did, cipher_suite, key_data) DO UPDATE SET expires_at = EXCLUDED.expires_at, key_package_hash = EXCLUDED.key_package_hash
+        RETURNING did, cipher_suite, key_data, key_package_hash, created_at, expires_at, consumed
         "#,
     )
     .bind(did)
     .bind(cipher_suite)
     .bind(&key_data)
+    .bind(&key_package_hash)
     .bind(now)
     .bind(expires_at)
     .fetch_one(pool)
@@ -531,11 +531,11 @@ pub async fn get_key_package(
 
     let key_package = sqlx::query_as::<_, KeyPackage>(
         r#"
-        SELECT did, cipher_suite, key_data, created_at, expires_at, consumed
+        SELECT did, cipher_suite, key_data, key_package_hash, created_at, expires_at, consumed
         FROM key_packages
-        WHERE did = $1 
-          AND cipher_suite = $2 
-          AND consumed = false 
+        WHERE did = $1
+          AND cipher_suite = $2
+          AND consumed = false
           AND expires_at > $3
         ORDER BY created_at ASC
         LIMIT 1
@@ -562,11 +562,11 @@ pub async fn get_all_key_packages(
 
     let key_packages = sqlx::query_as::<_, KeyPackage>(
         r#"
-        SELECT did, cipher_suite, key_data, created_at, expires_at, consumed
+        SELECT did, cipher_suite, key_data, key_package_hash, created_at, expires_at, consumed
         FROM key_packages
-        WHERE did = $1 
-          AND cipher_suite = $2 
-          AND consumed = false 
+        WHERE did = $1
+          AND cipher_suite = $2
+          AND consumed = false
           AND expires_at > $3
         ORDER BY created_at ASC
         "#,

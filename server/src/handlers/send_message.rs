@@ -76,8 +76,6 @@ pub async fn send_message(
         did,
         input.ciphertext,
         input.epoch,
-        input.embed_type.as_deref(),
-        input.embed_uri.as_deref(),
     )
     .await
     .map_err(|e| {

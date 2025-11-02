@@ -11,27 +11,33 @@ done
 
 echo "✅ PostgreSQL is ready"
 
-# Parse DATABASE_URL to get connection details
+# Run migrations using sqlx-cli (properly tracks migration state)
 if [ -n "$DATABASE_URL" ]; then
-  # Extract database name from URL
-  DB_NAME=$(echo "$DATABASE_URL" | sed -n 's/.*\/\([^?]*\).*/\1/p')
-  DB_HOST=$(echo "$DATABASE_URL" | sed -n 's/.*@\([^:]*\):.*/\1/p')
-  DB_USER=$(echo "$DATABASE_URL" | sed -n 's/.*:\/\/\([^:]*\):.*/\1/p')
+  echo "📂 Running database migrations with sqlx..."
   
-  echo "📂 Running migrations for database: $DB_NAME"
-  
-  # Run each migration file in order
-  for migration in /app/migrations/*.sql; do
-    if [ -f "$migration" ]; then
-      migration_name=$(basename "$migration")
-      echo "  ▶ Applying: $migration_name"
+  # Check if sqlx binary exists, if not install it
+  if ! command -v sqlx &> /dev/null; then
+    echo "⚠️  sqlx not found, running migrations manually (one-time only)..."
+    # Fallback: run the idempotent schema-ensure migration
+    DB_NAME=$(echo "$DATABASE_URL" | sed -n 's/.*\/\([^?]*\).*/\1/p')
+    DB_HOST=$(echo "$DATABASE_URL" | sed -n 's/.*@\([^:]*\):.*/\1/p')
+    DB_USER=$(echo "$DATABASE_URL" | sed -n 's/.*:\/\/\([^:]*\):.*/\1/p')
+    
+    PGPASSWORD="${POSTGRES_PASSWORD:-changeme}" psql -h "$DB_HOST" -U "$DB_USER" -d "$DB_NAME" \
+      -f /app/migrations/20251101_000_ensure_schema_complete.sql 2>&1 || true
+  else
+    # Use sqlx to run migrations (tracks state in _sqlx_migrations table)
+    sqlx migrate run --source /app/migrations || {
+      echo "⚠️  Some migrations may have failed, running schema validation..."
+      # Run idempotent schema fix as fallback
+      DB_NAME=$(echo "$DATABASE_URL" | sed -n 's/.*\/\([^?]*\).*/\1/p')
+      DB_HOST=$(echo "$DATABASE_URL" | sed -n 's/.*@\([^:]*\):.*/\1/p')
+      DB_USER=$(echo "$DATABASE_URL" | sed -n 's/.*:\/\/\([^:]*\):.*/\1/p')
       
-      # Use psql to run migration (requires PASSWORD env var or .pgpass)
-      PGPASSWORD="${POSTGRES_PASSWORD:-changeme}" psql -h "$DB_HOST" -U "$DB_USER" -d "$DB_NAME" -f "$migration" || {
-        echo "  ⚠️  Warning: Migration $migration_name may have already been applied or failed"
-      }
-    fi
-  done
+      PGPASSWORD="${POSTGRES_PASSWORD:-changeme}" psql -h "$DB_HOST" -U "$DB_USER" -d "$DB_NAME" \
+        -f /app/migrations/20251101_000_ensure_schema_complete.sql 2>&1 || true
+    }
+  fi
   
   echo "✅ Migrations complete"
 else

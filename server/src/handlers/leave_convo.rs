@@ -80,7 +80,7 @@ pub async fn leave_convo(
 
     // Process commit if provided
     if let Some(commit) = input.commit {
-        let commit_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(commit)
+        let commit_bytes = base64::engine::general_purpose::STANDARD.decode(commit)
             .map_err(|e| {
                 warn!("Invalid base64 commit: {}", e);
                 StatusCode::BAD_REQUEST

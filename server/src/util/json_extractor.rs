@@ -1,5 +1,6 @@
 use axum::{
     async_trait,
+    body::Bytes,
     extract::{FromRequest, Request},
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -18,31 +19,26 @@ where
     type Rejection = Response;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        use axum::extract::rejection::JsonRejection;
-        use axum::Json;
-        
-        match Json::<T>::from_request(req, state).await {
-            Ok(Json(value)) => Ok(LoggedJson(value)),
-            Err(rejection) => {
-                let error_msg = match &rejection {
-                    JsonRejection::JsonDataError(e) => {
-                        error!("JSON deserialization error: {}", e);
-                        format!("Invalid JSON data: {}", e)
-                    }
-                    JsonRejection::JsonSyntaxError(e) => {
-                        error!("JSON syntax error: {}", e);
-                        format!("Invalid JSON syntax: {}", e)
-                    }
-                    JsonRejection::MissingJsonContentType(e) => {
-                        error!("Missing Content-Type header: {}", e);
-                        format!("Missing Content-Type: {}", e)
-                    }
-                    _ => {
-                        error!("JSON extraction failed: {}", rejection);
-                        format!("Request validation failed: {}", rejection)
-                    }
-                };
-                
+        // First extract raw bytes
+        let bytes = match Bytes::from_request(req, state).await {
+            Ok(b) => b,
+            Err(e) => {
+                error!("Failed to read request body: {}", e);
+                return Err((StatusCode::BAD_REQUEST, "Failed to read request body").into_response());
+            }
+        };
+
+        // Log the raw body for debugging
+        if let Ok(body_str) = std::str::from_utf8(&bytes) {
+            error!("📥 [LoggedJson] Received request body: {}", body_str);
+        }
+
+        // Try to deserialize
+        match serde_json::from_slice::<T>(&bytes) {
+            Ok(value) => Ok(LoggedJson(value)),
+            Err(e) => {
+                error!("❌ [LoggedJson] JSON deserialization error: {}", e);
+                let error_msg = format!("Invalid JSON data: {}", e);
                 Err((StatusCode::UNPROCESSABLE_ENTITY, error_msg).into_response())
             }
         }
