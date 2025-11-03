@@ -220,13 +220,34 @@ async fn verify_jwt(&self, token: &str) -> Result<AtProtoClaims, AuthError> {
     let claims: AtProtoClaims = serde_json::from_slice(&payload_json)
         .map_err(|e| AuthError::InvalidToken(format!("Invalid claims JSON: {}", e)))?;
 
+    tracing::info!(
+        iss = %claims.iss,
+        aud = %claims.aud,
+        exp = claims.exp,
+        has_lxm = claims.lxm.is_some(),
+        lxm = claims.lxm.as_deref().unwrap_or("none"),
+        has_jti = claims.jti.is_some(),
+        jti = claims.jti.as_deref().unwrap_or("none"),
+        "Parsed JWT claims successfully"
+    );
+
     // Expiration
     let now = Utc::now().timestamp();
     if claims.exp < now { return Err(AuthError::TokenExpired); }
 
     // Audience enforcement when configured
     if let Ok(service_did) = std::env::var("SERVICE_DID") {
+        tracing::debug!(
+            service_did = %service_did,
+            jwt_aud = %claims.aud,
+            "Validating JWT audience against SERVICE_DID"
+        );
         if claims.aud != service_did {
+            tracing::error!(
+                service_did = %service_did,
+                jwt_aud = %claims.aud,
+                "JWT audience mismatch with SERVICE_DID"
+            );
             return Err(AuthError::InvalidToken("aud does not match SERVICE_DID".into()));
         }
     }
@@ -390,6 +411,12 @@ async fn verify_jwt(&self, token: &str) -> Result<AtProtoClaims, AuthError> {
         let _plc_id = did.strip_prefix("did:plc:").ok_or_else(|| AuthError::InvalidDid(format!("Invalid PLC DID: {}", did)))?;
         let url = format!("https://plc.directory/{}", did);
 
+        tracing::info!(
+            did = did,
+            url = %url,
+            "Resolving DID document via PLC directory"
+        );
+
         let response = self
             .http_client
             .get(&url)
@@ -398,6 +425,12 @@ async fn verify_jwt(&self, token: &str) -> Result<AtProtoClaims, AuthError> {
             .map_err(|e| AuthError::DidResolutionFailed(format!("HTTP error: {}", e)))?;
 
         if !response.status().is_success() {
+            tracing::error!(
+                did = did,
+                status = response.status().as_u16(),
+                url = %url,
+                "Failed to resolve DID from PLC directory"
+            );
             return Err(AuthError::DidResolutionFailed(format!(
                 "PLC directory returned status {}",
                 response.status()
@@ -509,23 +542,62 @@ fn is_disallowed_host(host: &str) -> bool {
 }
 
 pub fn enforce_standard(claims: &AtProtoClaims, endpoint_nsid: &str) -> Result<(), AuthError> {
+    tracing::debug!(
+        iss = %claims.iss,
+        endpoint = endpoint_nsid,
+        lxm = claims.lxm.as_deref().unwrap_or("none"),
+        jti = claims.jti.as_deref().unwrap_or("none"),
+        "Enforcing authorization constraints"
+    );
+
     // Enforce lxm if requested
-    if truthy(&std::env::var("ENFORCE_LXM").unwrap_or_default()) {
-        let lxm = claims.lxm.as_deref().ok_or(AuthError::MissingLxm)?;
-        if lxm != endpoint_nsid {
-            return Err(AuthError::LxmMismatch);
+    if let Ok(val) = std::env::var("ENFORCE_LXM") {
+        if val == "1" || val.eq_ignore_ascii_case("true") || val.eq_ignore_ascii_case("yes") {
+            if let Some(lxm) = &claims.lxm {
+                if lxm != endpoint_nsid {
+                    tracing::warn!(
+                        endpoint = endpoint_nsid,
+                        jwt_lxm = lxm,
+                        iss = %claims.iss,
+                        "LXM mismatch: JWT lxm does not match endpoint NSID"
+                    );
+                    return Err(AuthError::LxmMismatch);
+                }
+            } else {
+                return Err(AuthError::MissingLxm);
+            }
         }
     }
 
     // Enforce jti replay-prevention unless disabled
-    let enforce_jti = std::env::var("ENFORCE_JTI").map(|s| truthy(&s)).unwrap_or(true);
+    let enforce_jti = std::env::var("ENFORCE_JTI")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
+        .unwrap_or(true);
+
     if enforce_jti {
-        let jti = claims.jti.as_deref().ok_or(AuthError::MissingJti)?;
-        let key = format!("{}|{}", claims.iss, jti);
-        if JTI_CACHE.get(&key).is_some() {
-            return Err(AuthError::ReplayDetected);
+        match &claims.jti {
+            None => {
+                tracing::warn!(
+                    iss = %claims.iss,
+                    endpoint = endpoint_nsid,
+                    "Missing jti claim when ENFORCE_JTI is enabled"
+                );
+                return Err(AuthError::MissingJti);
+            }
+            Some(jti) => {
+                let key = format!("{}|{}", claims.iss, jti);
+                if JTI_CACHE.get(&key).is_some() {
+                    tracing::warn!(
+                        jti = jti,
+                        iss = %claims.iss,
+                        endpoint = endpoint_nsid,
+                        "Duplicate jti detected - possible replay attack"
+                    );
+                    return Err(AuthError::ReplayDetected);
+                }
+                JTI_CACHE.insert(key, ());
+            }
         }
-        JTI_CACHE.insert(key, ());
     }
     Ok(())
 }
@@ -539,13 +611,34 @@ where
     type Rejection = AuthError;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let has_authorization = parts.headers.contains_key("authorization");
+        let has_atproto_proxy = parts.headers.contains_key("atproto-proxy");
+        let auth_scheme = parts.headers.get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split_whitespace().next())
+            .map(|s| s.to_string());
+
+        tracing::info!(
+            method = %parts.method,
+            uri = %parts.uri,
+            has_authorization = has_authorization,
+            has_atproto_proxy = has_atproto_proxy,
+            auth_scheme = ?auth_scheme,
+            "Processing authentication for request"
+        );
+
         // Extract authorization header (do not log token)
         let auth_header = parts
             .headers
             .get("authorization")
             .and_then(|v| v.to_str().ok())
             .ok_or_else(|| {
-                tracing::error!("Missing authorization header");
+                tracing::error!(
+                    method = %parts.method,
+                    uri = %parts.uri,
+                    headers = ?parts.headers.keys().map(|k| k.as_str()).collect::<Vec<_>>(),
+                    "Missing authorization header"
+                );
                 AuthError::MissingAuthHeader
             })?;
 
