@@ -49,6 +49,16 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Starting Catbird MLS Server");
 
+    // Log authentication configuration at startup
+    tracing::info!(
+        service_did = std::env::var("SERVICE_DID").ok(),
+        enforce_lxm = std::env::var("ENFORCE_LXM").ok(),
+        enforce_jti = std::env::var("ENFORCE_JTI").unwrap_or_else(|_| "true".to_string()),
+        jti_ttl_seconds = std::env::var("JTI_TTL_SECONDS").unwrap_or_else(|_| "120".to_string()),
+        jwt_secret_configured = std::env::var("JWT_SECRET").is_ok(),
+        "Authentication configuration loaded"
+    );
+
     // Initialize metrics
     let metrics_recorder = metrics::MetricsRecorder::new();
     let metrics_handle = metrics_recorder.handle().clone();
@@ -171,6 +181,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .merge(metrics_router)
         .layer(TraceLayer::new_for_http())
+        .layer(axum::middleware::from_fn(middleware::logging::log_headers_middleware))
         .layer(axum::middleware::from_fn_with_state(
             middleware::idempotency::IdempotencyLayer::new(db_pool.clone()),
             middleware::idempotency::idempotency_middleware,

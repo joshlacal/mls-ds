@@ -152,10 +152,10 @@ pub async fn idempotency_middleware(
     }
 
     // Read the request body using Axum's Bytes extractor
-    let (parts, body) = request.into_parts();
+    let (mut parts, body) = request.into_parts();
 
     // Reconstruct request temporarily to use Bytes extractor
-    let temp_request = Request::from_parts(parts, body);
+    let temp_request = Request::from_parts(parts.clone(), body);
     let body_bytes = match Bytes::from_request(temp_request, &()).await {
         Ok(bytes) => bytes,
         Err(_) => {
@@ -163,9 +163,6 @@ pub async fn idempotency_middleware(
             return Err(StatusCode::BAD_REQUEST);
         }
     };
-
-    // Split request again for later use
-    let (parts, _) = Request::new(Body::empty()).into_parts();
 
     // Extract idempotency key from body
     let idempotency_key = match extract_idempotency_key(&body_bytes) {
@@ -175,7 +172,11 @@ pub async fn idempotency_middleware(
         }
         None => {
             // No idempotency key provided - skip caching
-            debug!("No idempotency key in request body, skipping cache");
+            tracing::debug!(
+                method = ?method,
+                uri = %endpoint,
+                "No idempotency key found in request body - skipping idempotency check"
+            );
             let request = Request::from_parts(parts, Body::from(body_bytes));
             return Ok(next.run(request).await);
         }
@@ -184,9 +185,12 @@ pub async fn idempotency_middleware(
     // Check cache for existing response
     match check_cache(&layer.pool, &idempotency_key, &endpoint).await {
         Ok(Some(cached)) => {
-            info!(
-                "Idempotency cache HIT for key={} endpoint={} status={}",
-                idempotency_key, endpoint, cached.status_code
+            tracing::info!(
+                idempotency_key = ?idempotency_key,
+                method = ?method,
+                uri = %endpoint,
+                cached_status = cached.status_code,
+                "Idempotency cache HIT - returning cached response"
             );
 
             // Return cached response
@@ -204,9 +208,11 @@ pub async fn idempotency_middleware(
                 .into_response());
         }
         Ok(None) => {
-            debug!(
-                "Idempotency cache MISS for key={} endpoint={}",
-                idempotency_key, endpoint
+            tracing::info!(
+                idempotency_key = ?idempotency_key,
+                method = ?method,
+                uri = %endpoint,
+                "Idempotency cache MISS - processing request"
             );
         }
         Err(e) => {
@@ -264,9 +270,12 @@ pub async fn idempotency_middleware(
                     );
                     // Continue anyway - caching is best-effort
                 } else {
-                    info!(
-                        "Stored idempotency cache for key={} endpoint={} status={} ttl={}s",
-                        idempotency_key, endpoint, status_code, layer.ttl_seconds
+                    tracing::info!(
+                        idempotency_key = ?idempotency_key,
+                        status = status_code as u16,
+                        method = ?method,
+                        uri = %endpoint,
+                        "Storing response in idempotency cache"
                     );
                 }
             }
