@@ -56,26 +56,17 @@ pub async fn get_welcome(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    // First, try to find a Welcome that matches one of the user's available key packages
-    // This prevents the NoMatchingKeyPackage error when users publish new key packages
-    // Grace period: allow re-fetch within 5 minutes if state='in_flight' OR (state='consumed' AND consumed_at > NOW() - INTERVAL '5 minutes')
+    // Fetch the Welcome message for this user
+    // Grace period: allow re-fetch within 5 minutes if state='in_flight' AND fetched_at > NOW() - INTERVAL '5 minutes'
+    // NOTE: We do NOT check if key_package is consumed, because key packages are consumed
+    // when the group is created (adding members), not when fetching the Welcome.
     let result: Option<(String, Vec<u8>, Option<Vec<u8>>)> = sqlx::query_as(
         "SELECT wm.id, wm.welcome_data, wm.key_package_hash
          FROM welcome_messages wm
          WHERE wm.convo_id = $1 AND wm.recipient_did = $2
          AND (
-           wm.consumed = false
-           OR (wm.consumed = true AND wm.consumed_at > NOW() - INTERVAL '5 minutes')
-         )
-         AND (
-           wm.key_package_hash IS NULL
-           OR EXISTS (
-             SELECT 1 FROM key_packages kp
-             WHERE kp.did = $2
-             AND kp.key_package_hash = encode(wm.key_package_hash, 'hex')
-             AND kp.consumed = false
-             AND kp.expires_at > NOW()
-           )
+           wm.state = 'available'
+           OR (wm.state = 'in_flight' AND wm.fetched_at > NOW() - INTERVAL '5 minutes')
          )
          ORDER BY wm.created_at ASC
          LIMIT 1
@@ -95,29 +86,29 @@ pub async fn get_welcome(
         None => {
             // Check if already consumed (return 410 Gone) vs never existed (return 404)
             let consumed_count: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM welcome_messages 
-                 WHERE convo_id = $1 AND recipient_did = $2 AND consumed = true"
+                "SELECT COUNT(*) FROM welcome_messages
+                 WHERE convo_id = $1 AND recipient_did = $2 AND state = 'consumed'"
             )
             .bind(&params.convo_id)
             .bind(did)
             .fetch_one(&mut *tx)
             .await
             .unwrap_or(0);
-            
+
             if consumed_count > 0 {
                 warn!("Welcome already consumed for user {} in conversation {}", did, params.convo_id);
                 return Err(StatusCode::GONE);  // 410 Gone - already fetched
             }
             
             // Debug: Query all welcome messages for this conversation
-            let all_messages: Vec<(String, bool)> = sqlx::query_as(
-                "SELECT recipient_did, consumed FROM welcome_messages WHERE convo_id = $1"
+            let all_messages: Vec<(String, String)> = sqlx::query_as(
+                "SELECT recipient_did, state FROM welcome_messages WHERE convo_id = $1"
             )
             .bind(&params.convo_id)
             .fetch_all(&mut *tx)
             .await
             .unwrap_or_default();
-            
+
             warn!(
                 "No Welcome message found for user {} in conversation {}. All welcome messages in this convo: {:?}",
                 did, params.convo_id, all_messages
@@ -126,13 +117,11 @@ pub async fn get_welcome(
         }
     };
 
-    // Mark as consumed (in_flight) atomically
-    // For now we use consumed=true for backward compatibility
-    // In the future, this should transition to state='in_flight'
+    // Mark as in_flight atomically with fetched_at timestamp
     let now = chrono::Utc::now();
     let rows_updated = sqlx::query(
         "UPDATE welcome_messages
-         SET consumed = true, consumed_at = $1
+         SET state = 'in_flight', fetched_at = $1
          WHERE id = $2
          RETURNING 1"
     )
@@ -152,11 +141,13 @@ pub async fn get_welcome(
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
     
-    // Mark the corresponding key package as consumed (if hash is present)
+    // Mark the corresponding key package as consumed (if hash is present and not already consumed)
+    // NOTE: Key packages may already be consumed during group creation (when adding members),
+    // so this may affect 0 rows, which is expected and not an error.
     if let Some(ref hash_bytes) = key_package_hash_opt {
         let hash_hex = hex::encode(hash_bytes);
-        info!("Marking key package as consumed: hash={}", hash_hex);
-        
+        info!("Attempting to mark key package as consumed: hash={}", hash_hex);
+
         let kp_rows = sqlx::query(
             "UPDATE key_packages
              SET consumed = true, consumed_at = $1
@@ -172,11 +163,11 @@ pub async fn get_welcome(
             StatusCode::INTERNAL_SERVER_ERROR
         })?
         .rows_affected();
-        
+
         if kp_rows > 0 {
             info!("Marked {} key package(s) as consumed", kp_rows);
         } else {
-            warn!("Key package with hash {} not found or already consumed", hash_hex);
+            info!("Key package with hash {} was already consumed (expected if consumed during group creation)", hash_hex);
         }
     }
     
@@ -242,11 +233,11 @@ mod tests {
         .await
         .unwrap();
 
-        // Add welcome message
+        // Add welcome message with state='available'
         let welcome_data = vec![1, 2, 3, 4, 5]; // Mock welcome data
         sqlx::query(
-            "INSERT INTO welcome_messages (id, convo_id, recipient_did, welcome_data, created_at)
-             VALUES ($1, $2, $3, $4, $5)"
+            "INSERT INTO welcome_messages (id, convo_id, recipient_did, welcome_data, state, created_at)
+             VALUES ($1, $2, $3, $4, 'available', $5)"
         )
         .bind(uuid::Uuid::new_v4().to_string())
         .bind(convo_id)
@@ -301,9 +292,9 @@ mod tests {
         assert_eq!(response.convo_id, convo_id);
         assert!(!response.welcome.is_empty());
 
-        // Verify welcome was marked as consumed
-        let consumed: bool = sqlx::query_scalar(
-            "SELECT consumed FROM welcome_messages WHERE convo_id = $1 AND recipient_did = $2"
+        // Verify welcome was marked as in_flight
+        let state: String = sqlx::query_scalar(
+            "SELECT state FROM welcome_messages WHERE convo_id = $1 AND recipient_did = $2"
         )
         .bind(convo_id)
         .bind(member)
@@ -311,7 +302,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(consumed);
+        assert_eq!(state, "in_flight");
     }
 
     #[tokio::test]
