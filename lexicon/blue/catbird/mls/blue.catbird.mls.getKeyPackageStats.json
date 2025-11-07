@@ -1,0 +1,81 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.mls.getKeyPackageStats",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Get key package inventory statistics for the authenticated user to determine when replenishment is needed",
+      "parameters": {
+        "type": "params",
+        "properties": {
+          "did": {
+            "type": "string",
+            "format": "did",
+            "description": "DID to fetch stats for (defaults to authenticated user)"
+          },
+          "cipherSuite": {
+            "type": "string",
+            "description": "Filter by specific cipher suite"
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["available", "threshold", "needsReplenish"],
+          "properties": {
+            "available": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Number of unconsumed key packages available"
+            },
+            "threshold": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Recommended minimum inventory threshold"
+            },
+            "needsReplenish": {
+              "type": "boolean",
+              "description": "True if available < threshold"
+            },
+            "oldestExpiresIn": {
+              "type": "string",
+              "description": "Human-readable time until oldest key package expires (e.g., '23d 4h')"
+            },
+            "byCipherSuite": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["cipherSuite", "available"],
+                "properties": {
+                  "cipherSuite": {
+                    "type": "string",
+                    "description": "Cipher suite name"
+                  },
+                  "available": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Available key packages for this suite"
+                  },
+                  "consumed": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Total consumed key packages for this suite"
+                  }
+                }
+              },
+              "description": "Breakdown by cipher suite"
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "InvalidDid",
+          "description": "The provided DID is invalid"
+        }
+      ]
+    }
+  }
+}

@@ -117,10 +117,17 @@ pub struct MessageView {
 pub struct SendMessageInput {
     #[serde(rename = "convoId")]
     pub convo_id: String,
+    #[serde(rename = "msgId")]
+    pub msg_id: String,
     pub ciphertext: String,
     pub epoch: i32,
-    #[serde(rename = "senderDid")]
-    pub sender_did: String,
+    #[serde(rename = "declaredSize")]
+    pub declared_size: i32,
+    #[serde(rename = "paddedSize")]
+    pub padded_size: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "idempotencyKey")]
+    pub idempotency_key: Option<String>,
 }
 
 // blue.catbird.mls.sendMessage output
@@ -218,4 +225,29 @@ pub struct GetKeyPackagesOutput {
 #[derive(Debug, Clone, Serialize)]
 pub struct UploadBlobOutput {
     pub blob: BlobRef,
+}
+
+// blue.catbird.mls.getKeyPackageStats output
+#[derive(Debug, Clone, Serialize)]
+pub struct GetKeyPackageStatsOutput {
+    pub available: i32,
+    pub threshold: i32,
+    #[serde(rename = "needsReplenish")]
+    pub needs_replenish: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "oldestExpiresIn")]
+    pub oldest_expires_in: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "byCipherSuite")]
+    pub by_cipher_suite: Option<Vec<KeyPackageStatsByCipherSuite>>,
+}
+
+// blue.catbird.mls.getKeyPackageStats cipher suite breakdown
+#[derive(Debug, Clone, Serialize)]
+pub struct KeyPackageStatsByCipherSuite {
+    #[serde(rename = "cipherSuite")]
+    pub cipher_suite: String,
+    pub available: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consumed: Option<i32>,
 }

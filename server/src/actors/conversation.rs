@@ -1,0 +1,695 @@
+use async_trait::async_trait;
+use ractor::{Actor, ActorProcessingErr, ActorRef};
+use sqlx::PgPool;
+use std::collections::HashMap;
+use tracing::info;
+
+use super::messages::{ConvoMessage, KeyPackageHashEntry};
+
+/// Manages state for a single conversation, ensuring sequential processing
+/// of all epoch-modifying operations to prevent race conditions.
+///
+/// Each `ConversationActor` owns:
+/// - Current epoch counter (synchronized with database)
+/// - Unread counts for all members (with periodic database sync)
+/// - Database connection pool for persistence
+///
+/// # Concurrency Safety
+///
+/// All messages are processed sequentially through the actor's mailbox,
+/// preventing race conditions that could occur with direct database access.
+/// This ensures that operations like adding/removing members, sending messages,
+/// and incrementing the epoch are atomic and ordered.
+///
+/// # Actor Lifecycle
+///
+/// - **Spawn**: Actors are spawned on-demand via [`ActorRegistry::get_or_spawn`]
+/// - **Pre-start**: Loads initial epoch from database
+/// - **Message Processing**: Handles [`ConvoMessage`] variants sequentially
+/// - **Shutdown**: Gracefully stops on [`ConvoMessage::Shutdown`]
+///
+/// # Examples
+///
+/// ```no_run
+/// use tokio::sync::oneshot;
+///
+/// # async fn example(registry: &ActorRegistry) -> anyhow::Result<()> {
+/// let actor_ref = registry.get_or_spawn("conv_123").await?;
+/// let (tx, rx) = oneshot::channel();
+/// actor_ref.send_message(ConvoMessage::GetEpoch { reply: tx })?;
+/// let epoch = rx.await?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// [`ActorRegistry::get_or_spawn`]: super::registry::ActorRegistry::get_or_spawn
+pub struct ConversationActor;
+
+/// Arguments for spawning a new [`ConversationActor`].
+///
+/// These arguments are passed to the actor during initialization in the
+/// [`Actor::pre_start`] method, where they are used to construct the
+/// initial [`ConversationActorState`].
+///
+/// # Fields
+///
+/// - `convo_id`: Unique identifier for the conversation
+/// - `db_pool`: Database connection pool for persistent operations
+pub struct ConvoActorArgs {
+    pub convo_id: String,
+    pub db_pool: PgPool,
+}
+
+#[async_trait]
+impl Actor for ConversationActor {
+    type Msg = ConvoMessage;
+    type State = ConversationActorState;
+    type Arguments = ConvoActorArgs;
+
+    async fn pre_start(
+        &self,
+        _myself: ActorRef<Self::Msg>,
+        args: Self::Arguments,
+    ) -> Result<Self::State, ActorProcessingErr> {
+        // Load initial state from database
+        let current_epoch = crate::storage::get_current_epoch(&args.db_pool, &args.convo_id)
+            .await
+            .map_err(|e| format!("Failed to get current epoch: {}", e))?;
+
+        info!(
+            "ConversationActor {} starting at epoch {}",
+            args.convo_id, current_epoch
+        );
+
+        Ok(ConversationActorState {
+            convo_id: args.convo_id,
+            current_epoch: current_epoch as u32,
+            unread_counts: HashMap::new(),
+            db_pool: args.db_pool,
+        })
+    }
+
+    async fn handle(
+        &self,
+        _myself: ActorRef<Self::Msg>,
+        message: Self::Msg,
+        state: &mut Self::State,
+    ) -> Result<(), ActorProcessingErr> {
+        match message {
+            ConvoMessage::AddMembers {
+                did_list,
+                commit,
+                welcome_message,
+                key_package_hashes,
+                reply,
+            } => {
+                let result = state
+                    .handle_add_members(did_list, commit, welcome_message, key_package_hashes)
+                    .await;
+                let _ = reply.send(result);
+            }
+            ConvoMessage::RemoveMember {
+                member_did,
+                commit,
+                reply,
+            } => {
+                let result = state.handle_remove_member(member_did, commit).await;
+                let _ = reply.send(result);
+            }
+            ConvoMessage::SendMessage {
+                sender_did,
+                ciphertext,
+                reply,
+            } => {
+                let result = state.handle_send_message(sender_did, ciphertext).await;
+                let _ = reply.send(result);
+            }
+            ConvoMessage::IncrementUnread { sender_did } => {
+                state.handle_increment_unread(sender_did).await;
+            }
+            ConvoMessage::ResetUnread { member_did, reply } => {
+                let result = state.handle_reset_unread(member_did).await;
+                let _ = reply.send(result);
+            }
+            ConvoMessage::GetEpoch { reply } => {
+                let _ = reply.send(state.current_epoch);
+            }
+            ConvoMessage::Shutdown => {
+                info!("ConversationActor {} shutting down", state.convo_id);
+                // Could persist state here if needed
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Mutable state maintained by a [`ConversationActor`].
+///
+/// This structure holds the runtime state for a single conversation,
+/// including the current MLS epoch, unread message counts, and database
+/// connection for persistence operations.
+///
+/// # Fields
+///
+/// - `convo_id`: Unique identifier for this conversation
+/// - `current_epoch`: Current MLS epoch counter (increments on roster changes)
+/// - `unread_counts`: In-memory cache of unread counts per member (periodically synced to DB)
+/// - `db_pool`: PostgreSQL connection pool for database operations
+///
+/// # Concurrency Model
+///
+/// This state is only accessed by a single actor thread, eliminating the need
+/// for locks. All modifications happen sequentially in response to messages.
+pub struct ConversationActorState {
+    convo_id: String,
+    current_epoch: u32,
+    unread_counts: HashMap<String, u32>, // member_did -> count
+    db_pool: PgPool,
+}
+
+impl ConversationActorState {
+    /// Handles adding new members to the conversation.
+    ///
+    /// This operation atomically:
+    /// 1. Increments the conversation epoch
+    /// 2. Stores the MLS commit message (if provided)
+    /// 3. Adds new member records to the database
+    /// 4. Stores Welcome messages for new members
+    ///
+    /// # Arguments
+    ///
+    /// - `did_list`: List of DIDs (decentralized identifiers) for new members
+    /// - `commit`: Optional MLS Commit message bytes
+    /// - `welcome_message`: Optional base64-encoded MLS Welcome message
+    /// - `key_package_hashes`: Optional mapping of DIDs to their key package hashes
+    ///
+    /// # Returns
+    ///
+    /// The new epoch number after adding members.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Database transaction fails
+    /// - Welcome message is invalid base64
+    /// - Member insertion fails
+    async fn handle_add_members(
+        &mut self,
+        did_list: Vec<String>,
+        commit: Option<Vec<u8>>,
+        welcome_message: Option<String>,
+        key_package_hashes: Option<Vec<KeyPackageHashEntry>>,
+    ) -> anyhow::Result<u32> {
+        use anyhow::Context;
+
+        info!(
+            "Adding {} members to conversation {}",
+            did_list.len(),
+            self.convo_id
+        );
+
+        let new_epoch = self.current_epoch + 1;
+        let now = chrono::Utc::now();
+
+        // Begin transaction for atomicity
+        let mut tx = self.db_pool.begin().await.context("Failed to begin transaction")?;
+
+        // Process commit if provided
+        if let Some(commit_bytes) = commit {
+            let msg_id = uuid::Uuid::new_v4().to_string();
+
+            sqlx::query(
+                "INSERT INTO messages (id, convo_id, sender_did, message_type, epoch, ciphertext, created_at) VALUES ($1, $2, $3, 'commit', $4, $5, $6)"
+            )
+            .bind(&msg_id)
+            .bind(&self.convo_id)
+            .bind("system") // Commit messages are system-generated
+            .bind(new_epoch as i32)
+            .bind(&commit_bytes)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await
+            .context("Failed to insert commit message")?;
+
+            info!("Commit message stored for epoch {}", new_epoch);
+        }
+
+        // Update conversation epoch
+        sqlx::query("UPDATE conversations SET current_epoch = $1 WHERE id = $2")
+            .bind(new_epoch as i32)
+            .bind(&self.convo_id)
+            .execute(&mut *tx)
+            .await
+            .context("Failed to update conversation epoch")?;
+
+        // Add new members
+        for target_did in &did_list {
+            // Check if already a member
+            let is_existing = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM members WHERE convo_id = $1 AND member_did = $2"
+            )
+            .bind(&self.convo_id)
+            .bind(target_did)
+            .fetch_one(&mut *tx)
+            .await
+            .context("Failed to check existing membership")?;
+
+            if is_existing > 0 {
+                info!("Member {} already exists, skipping", target_did);
+                continue;
+            }
+
+            sqlx::query(
+                "INSERT INTO members (convo_id, member_did, joined_at) VALUES ($1, $2, $3)"
+            )
+            .bind(&self.convo_id)
+            .bind(target_did)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await
+            .context(format!("Failed to add member {}", target_did))?;
+
+            info!("Added member {} to conversation {}", target_did, self.convo_id);
+        }
+
+        // Store Welcome message for new members
+        if let Some(ref welcome_b64) = welcome_message {
+            info!("Processing Welcome message for {} new members", did_list.len());
+
+            // Decode base64 Welcome message
+            let welcome_data = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, welcome_b64)
+                .context("Invalid base64 welcome message")?;
+
+            info!("Single Welcome message ({} bytes) for {} new members",
+                  welcome_data.len(), did_list.len());
+
+            // Store the SAME Welcome for each new member
+            for target_did in &did_list {
+                let welcome_id = uuid::Uuid::new_v4().to_string();
+
+                // Get the key_package_hash for this member from the input
+                let key_package_hash = key_package_hashes.as_ref()
+                    .and_then(|hashes| {
+                        hashes.iter()
+                            .find(|entry| entry.did == *target_did)
+                            .and_then(|entry| hex::decode(&entry.hash).ok())
+                    });
+
+                sqlx::query(
+                    "INSERT INTO welcome_messages (id, convo_id, recipient_did, welcome_data, key_package_hash, created_at)
+                     VALUES ($1, $2, $3, $4, $5, $6)
+                     ON CONFLICT (convo_id, recipient_did, COALESCE(key_package_hash, '\\x00'::bytea)) WHERE consumed = false
+                     DO NOTHING"
+                )
+                .bind(&welcome_id)
+                .bind(&self.convo_id)
+                .bind(target_did)
+                .bind(&welcome_data)
+                .bind::<Option<Vec<u8>>>(key_package_hash)
+                .bind(&now)
+                .execute(&mut *tx)
+                .await
+                .context(format!("Failed to store welcome message for {}", target_did))?;
+
+                info!("Welcome stored for member {}", target_did);
+            }
+        }
+
+        // Commit transaction
+        tx.commit().await.context("Failed to commit transaction")?;
+
+        // Update local epoch state
+        self.current_epoch = new_epoch;
+
+        info!(
+            "Members added, new epoch: {} for conversation {}",
+            self.current_epoch, self.convo_id
+        );
+
+        Ok(self.current_epoch)
+    }
+
+    /// Handles removing a member from the conversation.
+    ///
+    /// This operation atomically:
+    /// 1. Increments the conversation epoch
+    /// 2. Stores the MLS commit message (if provided)
+    /// 3. Soft-deletes the member by setting their `left_at` timestamp
+    /// 4. Removes the member from in-memory unread counts
+    ///
+    /// # Arguments
+    ///
+    /// - `member_did`: DID of the member to remove
+    /// - `commit`: Optional MLS Commit message bytes
+    ///
+    /// # Returns
+    ///
+    /// The new epoch number after removing the member.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database transaction fails.
+    async fn handle_remove_member(
+        &mut self,
+        member_did: String,
+        commit: Option<Vec<u8>>,
+    ) -> anyhow::Result<u32> {
+        use anyhow::Context;
+
+        info!(
+            "Removing member {} from conversation {}",
+            member_did, self.convo_id
+        );
+
+        let new_epoch = self.current_epoch + 1;
+        let now = chrono::Utc::now();
+
+        // Begin transaction for atomicity
+        let mut tx = self.db_pool.begin().await.context("Failed to begin transaction")?;
+
+        // Process commit if provided
+        if let Some(commit_bytes) = commit {
+            let msg_id = uuid::Uuid::new_v4().to_string();
+
+            sqlx::query(
+                "INSERT INTO messages (id, convo_id, sender_did, message_type, epoch, ciphertext, created_at) VALUES ($1, $2, $3, 'commit', $4, $5, $6)"
+            )
+            .bind(&msg_id)
+            .bind(&self.convo_id)
+            .bind(&member_did)
+            .bind(new_epoch as i32)
+            .bind(&commit_bytes)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await
+            .context("Failed to insert commit message")?;
+
+            info!("Commit message stored for epoch {}", new_epoch);
+        }
+
+        // Update conversation epoch
+        sqlx::query("UPDATE conversations SET current_epoch = $1 WHERE id = $2")
+            .bind(new_epoch as i32)
+            .bind(&self.convo_id)
+            .execute(&mut *tx)
+            .await
+            .context("Failed to update conversation epoch")?;
+
+        // Mark member as left (soft delete with left_at timestamp)
+        sqlx::query("UPDATE members SET left_at = $1 WHERE convo_id = $2 AND member_did = $3")
+            .bind(&now)
+            .bind(&self.convo_id)
+            .bind(&member_did)
+            .execute(&mut *tx)
+            .await
+            .context("Failed to mark member as left")?;
+
+        // Commit transaction
+        tx.commit().await.context("Failed to commit transaction")?;
+
+        // Update local epoch state
+        self.current_epoch = new_epoch;
+        self.unread_counts.remove(&member_did);
+
+        info!(
+            "Member removed, new epoch: {} for conversation {}",
+            self.current_epoch, self.convo_id
+        );
+
+        Ok(self.current_epoch)
+    }
+
+    /// Handles sending an application message in the conversation.
+    ///
+    /// This operation:
+    /// 1. Stores the encrypted message with a sequence number
+    /// 2. Updates unread counts for all members except the sender
+    /// 3. Spawns an async task to fan out message envelopes to all members
+    ///
+    /// # Arguments
+    ///
+    /// - `sender_did`: DID of the message sender
+    /// - `ciphertext`: Encrypted message bytes
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if the message is successfully stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if message insertion or unread count update fails.
+    ///
+    /// # Notes
+    ///
+    /// The fan-out operation (creating envelopes for each member) runs
+    /// asynchronously to avoid blocking the actor. Errors in fan-out are
+    /// logged but don't affect the message send result.
+    async fn handle_send_message(
+        &mut self,
+        sender_did: String,
+        ciphertext: Vec<u8>,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        info!(
+            "Storing message from {} in conversation {} ({} bytes)",
+            sender_did,
+            self.convo_id,
+            ciphertext.len()
+        );
+
+        let msg_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now();
+        let expires_at = now + chrono::Duration::days(30);
+
+        // Calculate sequence number within transaction
+        let mut tx = self.db_pool.begin().await.context("Failed to begin transaction")?;
+
+        let seq: i64 = sqlx::query_scalar(
+            "SELECT CAST(COALESCE(MAX(seq), 0) + 1 AS BIGINT) FROM messages WHERE convo_id = $1"
+        )
+        .bind(&self.convo_id)
+        .fetch_one(&mut *tx)
+        .await
+        .context("Failed to calculate sequence number")?;
+
+        // Insert message into messages table
+        sqlx::query(
+            r#"
+            INSERT INTO messages (
+                id, convo_id, sender_did, message_type, epoch, seq,
+                ciphertext, created_at, expires_at
+            ) VALUES ($1, $2, $3, 'app', $4, $5, $6, $7, $8)
+            "#,
+        )
+        .bind(&msg_id)
+        .bind(&self.convo_id)
+        .bind(&sender_did)
+        .bind(self.current_epoch as i64)
+        .bind(seq)
+        .bind(&ciphertext)
+        .bind(&now)
+        .bind(&expires_at)
+        .execute(&mut *tx)
+        .await
+        .context("Failed to insert message")?;
+
+        tx.commit().await.context("Failed to commit transaction")?;
+
+        info!("Message {} stored with sequence number {}", msg_id, seq);
+
+        // Update unread counts for all members except sender in database
+        sqlx::query(
+            "UPDATE members SET unread_count = unread_count + 1 WHERE convo_id = $1 AND member_did != $2 AND left_at IS NULL"
+        )
+        .bind(&self.convo_id)
+        .bind(&sender_did)
+        .execute(&self.db_pool)
+        .await
+        .context("Failed to update unread counts")?;
+
+        // Spawn async task for fan-out (envelopes)
+        let pool_clone = self.db_pool.clone();
+        let convo_id = self.convo_id.clone();
+        let msg_id_clone = msg_id.clone();
+
+        tokio::spawn(async move {
+            let fanout_start = std::time::Instant::now();
+            info!("Starting fan-out for convo: {}", convo_id);
+
+            // Get all active members
+            let members_result = sqlx::query!(
+                r#"
+                SELECT member_did
+                FROM members
+                WHERE convo_id = $1 AND left_at IS NULL
+                "#,
+                &convo_id
+            )
+            .fetch_all(&pool_clone)
+            .await;
+
+            match members_result {
+                Ok(members) => {
+                    info!("Fan-out to {} members", members.len());
+
+                    // Write envelopes for message tracking
+                    for member in &members {
+                        let envelope_id = uuid::Uuid::new_v4().to_string();
+
+                        // Insert envelope
+                        let envelope_result = sqlx::query!(
+                            r#"
+                            INSERT INTO envelopes (id, convo_id, recipient_did, message_id, created_at)
+                            VALUES ($1, $2, $3, $4, NOW())
+                            ON CONFLICT (recipient_did, message_id) DO NOTHING
+                            "#,
+                            &envelope_id,
+                            &convo_id,
+                            &member.member_did,
+                            &msg_id_clone,
+                        )
+                        .execute(&pool_clone)
+                        .await;
+
+                        if let Err(e) = envelope_result {
+                            tracing::error!(
+                                "Failed to insert envelope for {}: {:?}",
+                                member.member_did, e
+                            );
+                        }
+                    }
+
+                    info!(
+                        "Fan-out completed in {}ms",
+                        fanout_start.elapsed().as_millis()
+                    );
+                }
+                Err(e) => {
+                    tracing::error!("Failed to get members for fan-out: {:?}", e);
+                }
+            }
+        });
+
+        Ok(())
+    }
+
+    /// Handles incrementing unread counts for all members except the sender.
+    ///
+    /// This operation:
+    /// 1. Queries all active members in the conversation
+    /// 2. Increments in-memory unread count for each member (except sender)
+    /// 3. Periodically flushes counts to database (every 10 messages per member)
+    ///
+    /// # Arguments
+    ///
+    /// - `sender_did`: DID of the message sender (excluded from unread increment)
+    ///
+    /// # Notes
+    ///
+    /// This method uses batched writes to reduce database load. Counts are
+    /// flushed to the database every 10 increments per member. In case of
+    /// actor restart, some increments may be lost, which is acceptable for
+    /// unread counts.
+    async fn handle_increment_unread(&mut self, sender_did: String) {
+        info!(
+            "Incrementing unread counts for conversation {} (sender: {})",
+            self.convo_id, sender_did
+        );
+
+        // Get all active members
+        let members_result = sqlx::query!(
+            r#"
+            SELECT member_did
+            FROM members
+            WHERE convo_id = $1 AND left_at IS NULL
+            "#,
+            &self.convo_id
+        )
+        .fetch_all(&self.db_pool)
+        .await;
+
+        match members_result {
+            Ok(members) => {
+                let member_count = members.len();
+                // Increment in-memory counter for all members except sender
+                for member in members {
+                    if member.member_did != sender_did {
+                        let count = self.unread_counts.entry(member.member_did.clone()).or_insert(0);
+                        *count += 1;
+
+                        // Optional: flush to database every N increments (e.g., every 10 messages)
+                        if *count % 10 == 0 {
+                            if let Err(e) = sqlx::query(
+                                "UPDATE members SET unread_count = unread_count + 10 WHERE convo_id = $1 AND member_did = $2"
+                            )
+                            .bind(&self.convo_id)
+                            .bind(&member.member_did)
+                            .execute(&self.db_pool)
+                            .await {
+                                tracing::warn!("Failed to sync unread count to database for {}: {}", member.member_did, e);
+                            } else {
+                                // Reset in-memory counter after successful sync
+                                *count = 0;
+                            }
+                        }
+                    }
+                }
+                info!("Incremented unread counts for {} members", member_count.saturating_sub(1));
+            }
+            Err(e) => {
+                tracing::error!("Failed to get members for unread increment: {}", e);
+            }
+        }
+    }
+
+    /// Handles resetting the unread count for a specific member.
+    ///
+    /// This operation:
+    /// 1. Immediately resets the unread count to 0 in the database
+    /// 2. Clears the in-memory unread count for the member
+    ///
+    /// # Arguments
+    ///
+    /// - `member_did`: DID of the member whose unread count should be reset
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if the reset is successful.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database update fails.
+    ///
+    /// # Notes
+    ///
+    /// This is typically called when a member reads messages in the conversation.
+    async fn handle_reset_unread(&mut self, member_did: String) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        info!(
+            "Resetting unread count for member {} in conversation {}",
+            member_did, self.convo_id
+        );
+
+        // Reset in database immediately
+        sqlx::query(
+            "UPDATE members SET unread_count = 0 WHERE convo_id = $1 AND member_did = $2"
+        )
+        .bind(&self.convo_id)
+        .bind(&member_did)
+        .execute(&self.db_pool)
+        .await
+        .context("Failed to reset unread count in database")?;
+
+        // Reset in-memory counter
+        self.unread_counts.insert(member_did.clone(), 0);
+
+        info!(
+            "Unread count reset for member {} in conversation {}",
+            member_did, self.convo_id
+        );
+
+        Ok(())
+    }
+}

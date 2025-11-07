@@ -216,13 +216,24 @@ pub struct AddMembersOutput {
 pub struct SendMessageInput {
     #[serde(rename = "convoId")]
     pub convo_id: String,
+    /// Client-generated ULID for message deduplication
+    /// MUST be included in MLS message AAD
+    #[serde(rename = "msgId")]
+    pub msg_id: String,
     /// Direct ciphertext payload stored in PostgreSQL
     /// Contains encrypted JSON with version, text, and optional embed
+    /// MUST be padded to paddedSize for metadata privacy
     #[serde(with = "base64_bytes")]
     pub ciphertext: Vec<u8>,
     pub epoch: i64,
-    #[serde(rename = "senderDid")]
-    pub sender_did: String,
+    /// Original plaintext size before padding (for metadata privacy)
+    #[serde(rename = "declaredSize")]
+    pub declared_size: i64,
+    /// Padded ciphertext size in bytes
+    /// Must be 512, 1024, 2048, 4096, 8192, or multiples of 8192 up to 10MB
+    #[serde(rename = "paddedSize")]
+    pub padded_size: i64,
+    /// Deprecated: Use msgId instead
     /// Optional idempotency key for preventing duplicate messages
     #[serde(rename = "idempotencyKey", skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
@@ -300,7 +311,7 @@ pub struct LeaveConvoOutput {
     pub new_epoch: i32,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct MessageView {
     pub id: String,
     #[serde(rename = "convoId")]
@@ -312,6 +323,12 @@ pub struct MessageView {
     pub seq: i64,
     #[serde(rename = "createdAt")]
     pub created_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "embedType")]
+    pub embed_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "embedUri")]
+    pub embed_uri: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

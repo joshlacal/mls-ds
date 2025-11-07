@@ -34,12 +34,10 @@ pub async fn send_message(
     }
     let did = &auth_user.did;
 
-    if &input.sender_did != did {
-        warn!(
-            "❌ [send_message] Sender DID mismatch: expected {}, got {}",
-            did, input.sender_did
-        );
-        return Err(StatusCode::FORBIDDEN);
+    // Validate msg_id format (ULID is 26 characters)
+    if input.msg_id.len() != 26 || !input.msg_id.chars().all(|c| c.is_ascii_alphanumeric()) {
+        warn!("❌ [send_message] Invalid msg_id format: {}", input.msg_id);
+        return Err(StatusCode::BAD_REQUEST);
     }
 
     if input.epoch < 0 {
@@ -54,6 +52,40 @@ pub async fn send_message(
     }
     if input.ciphertext.len() > 10 * 1024 * 1024 {
         warn!("❌ [send_message] Ciphertext too large: {} bytes", input.ciphertext.len());
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Validate padding: ciphertext length must match padded_size
+    if input.ciphertext.len() as i64 != input.padded_size {
+        warn!(
+            "❌ [send_message] Ciphertext length ({}) does not match paddedSize ({})",
+            input.ciphertext.len(),
+            input.padded_size
+        );
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Validate declared_size is not larger than padded_size
+    if input.declared_size > input.padded_size {
+        warn!(
+            "❌ [send_message] declaredSize ({}) > paddedSize ({})",
+            input.declared_size, input.padded_size
+        );
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Validate padded_size is a valid bucket size
+    let valid_buckets = [512, 1024, 2048, 4096, 8192];
+    let is_valid_bucket = valid_buckets.contains(&input.padded_size)
+        || (input.padded_size > 8192
+            && input.padded_size <= 10 * 1024 * 1024
+            && input.padded_size % 8192 == 0);
+
+    if !is_valid_bucket {
+        warn!(
+            "❌ [send_message] Invalid paddedSize: {} (must be 512, 1024, 2048, 4096, 8192, or multiples of 8192 up to 10MB)",
+            input.padded_size
+        );
         return Err(StatusCode::BAD_REQUEST);
     }
 
@@ -115,12 +147,14 @@ pub async fn send_message(
         // For now, still create the message in DB directly for compatibility
         // TODO: Move this into the actor's SendMessage handler
         info!("📍 [send_message] Creating message in database...");
-        let message = db::create_message_with_idempotency(
+        let message = db::create_message_v2(
             &pool,
             &input.convo_id,
-            did,
+            &input.msg_id,
             input.ciphertext.clone(),
             input.epoch,
+            input.declared_size,
+            input.padded_size,
             input.idempotency_key.clone(),
         )
         .await
@@ -135,13 +169,15 @@ pub async fn send_message(
 
         info!("📍 [send_message] Creating message in database...");
 
-        // Create message with direct ciphertext storage and optional idempotency key
-        let message = db::create_message_with_idempotency(
+        // Create message with privacy-enhancing fields
+        let message = db::create_message_v2(
             &pool,
             &input.convo_id,
-            did,
+            &input.msg_id,
             input.ciphertext,
             input.epoch,
+            input.declared_size,
+            input.padded_size,
             input.idempotency_key.clone(),
         )
         .await
@@ -247,49 +283,75 @@ pub async fn send_message(
         }
 
         info!("📍 [send_message:fanout] Emitting SSE event...");
-        // Emit realtime event
+        // Emit realtime event with full message view including ciphertext
         let cursor = sse_state_clone
             .cursor_gen
             .next(&convo_id, "messageEvent")
             .await;
-        let event = StreamEvent::MessageEvent {
-            cursor: cursor.clone(),
-            convo_id: convo_id.clone(),
-            emitted_at: chrono::Utc::now().to_rfc3339(),
-            payload: crate::realtime::sse::MessageEventPayload {
-                message_id: msg_id_clone.clone(),
-                sender_did: sender_did.clone(),
-                epoch: epoch as i32,
-            },
-        };
 
-        // Store event for backfill
-        let event_payload = serde_json::json!({
-            "messageId": msg_id_clone,
-            "senderDid": sender_did,
-            "epoch": epoch as i32,
-        });
-
-        if let Err(e) = crate::db::store_event(
-            &pool_clone,
-            &cursor,
-            &convo_id,
-            "messageEvent",
-            event_payload,
+        // Fetch the full message from database to get seq and created_at
+        let message_result = sqlx::query!(
+            r#"
+            SELECT id, sender_did, ciphertext, epoch, seq, created_at
+            FROM messages
+            WHERE id = $1
+            "#,
+            &msg_id_clone
         )
-        .await
-        {
-            error!("❌ [send_message:fanout] Failed to store event: {:?}", e);
-        }
+        .fetch_one(&pool_clone)
+        .await;
 
-        // Emit to SSE subscribers
-        if let Err(e) = sse_state_clone.emit(&convo_id, event).await {
-            error!(
-                "❌ [send_message:fanout] Failed to emit SSE event: {}",
-                e
-            );
-        } else {
-            info!("✅ [send_message:fanout] SSE event emitted");
+        match message_result {
+            Ok(msg) => {
+                let message_view = crate::models::MessageView {
+                    id: msg.id,
+                    convo_id: convo_id.clone(),
+                    sender: msg.sender_did,
+                    ciphertext: msg.ciphertext.unwrap_or_default(),
+                    epoch: msg.epoch,
+                    seq: msg.seq,
+                    created_at: msg.created_at,
+                    embed_type: None,
+                    embed_uri: None,
+                };
+
+                let event = StreamEvent::MessageEvent {
+                    cursor: cursor.clone(),
+                    message: message_view.clone(),
+                };
+
+                // Store event for backfill with full message data
+                let event_payload = serde_json::to_value(&message_view)
+                    .unwrap_or_else(|_| serde_json::json!({}));
+
+                if let Err(e) = crate::db::store_event(
+                    &pool_clone,
+                    &cursor,
+                    &convo_id,
+                    "messageEvent",
+                    event_payload,
+                )
+                .await
+                {
+                    error!("❌ [send_message:fanout] Failed to store event: {:?}", e);
+                }
+
+                // Emit to SSE subscribers
+                if let Err(e) = sse_state_clone.emit(&convo_id, event).await {
+                    error!(
+                        "❌ [send_message:fanout] Failed to emit SSE event: {}",
+                        e
+                    );
+                } else {
+                    info!("✅ [send_message:fanout] SSE event emitted");
+                }
+            }
+            Err(e) => {
+                error!(
+                    "❌ [send_message:fanout] Failed to fetch message for SSE event: {:?}",
+                    e
+                );
+            }
         }
     });
 
