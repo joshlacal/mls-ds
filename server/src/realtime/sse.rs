@@ -1,18 +1,18 @@
 use axum::{
     extract::{Query, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     response::{
         sse::{Event, KeepAlive},
-        Sse,
+        IntoResponse, Sse,
     },
 };
-use futures::stream::{self, Stream};
+use futures::stream;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, convert::Infallible, sync::Arc, time::Duration};
 use tokio::sync::{broadcast, RwLock};
 use tracing::{error, info, warn};
 
-use crate::{auth::AuthUser, db::DbPool, realtime::cursor::CursorGenerator};
+use crate::{auth::AuthUser, db::DbPool, models::MessageView, realtime::cursor::CursorGenerator};
 
 /// SSE query parameters for subscribeConvoEvents
 #[derive(Debug, Deserialize)]
@@ -28,9 +28,7 @@ pub struct SubscribeQuery {
 pub enum StreamEvent {
     MessageEvent {
         cursor: String,
-        convo_id: String,
-        emitted_at: String,
-        payload: MessageEventPayload,
+        message: MessageView,
     },
     ReactionEvent {
         cursor: String,
@@ -51,13 +49,6 @@ pub enum StreamEvent {
         reason: String,
         detail: Option<serde_json::Value>,
     },
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct MessageEventPayload {
-    pub message_id: String,
-    pub sender_did: String,
-    pub epoch: i32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -120,7 +111,7 @@ pub async fn subscribe_convo_events(
     State(sse_state): State<Arc<SseState>>,
     auth_user: AuthUser,
     Query(query): Query<SubscribeQuery>,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+) -> Result<impl IntoResponse, StatusCode> {
     let convo_id = query.convo_id.clone();
     let user_did = auth_user.did.clone();
 
@@ -180,7 +171,7 @@ pub async fn subscribe_convo_events(
                         match result {
                             Ok(event) => {
                                 // Filter based on resume cursor
-                                if let Some(ref cursor) = resume_cursor {
+                                if let Some(ref resume_cur) = resume_cursor {
                                     let event_cursor = match &event {
                                         StreamEvent::MessageEvent { cursor, .. } => cursor,
                                         StreamEvent::ReactionEvent { cursor, .. } => cursor,
@@ -189,7 +180,7 @@ pub async fn subscribe_convo_events(
                                     };
 
                                     // Only send events after resume cursor
-                                    if !CursorGenerator::is_greater(event_cursor, cursor) {
+                                    if !CursorGenerator::is_greater(event_cursor, resume_cur) {
                                         continue;
                                     }
                                 }
@@ -204,7 +195,7 @@ pub async fn subscribe_convo_events(
                                 };
 
                                 let sse_event = Event::default().data(json);
-                                return Some((Ok(sse_event), (rx, None, convo_id.clone())));
+                                return Some((Ok::<Event, Infallible>(sse_event), (rx, None, convo_id.clone())));
                             }
                             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                                 warn!(
@@ -224,7 +215,7 @@ pub async fn subscribe_convo_events(
 
                                 let json = serde_json::to_string(&info).unwrap();
                                 let sse_event = Event::default().data(json);
-                                return Some((Ok(sse_event), (rx, None, convo_id.clone())));
+                                return Some((Ok::<Event, Infallible>(sse_event), (rx, None, convo_id.clone())));
                             }
                             Err(broadcast::error::RecvError::Closed) => {
                                 info!(convo_id = %convo_id, "Broadcast channel closed");
@@ -244,7 +235,16 @@ pub async fn subscribe_convo_events(
         },
     );
 
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+    // Return SSE with explicit headers to ensure proper content-type
+    // and disable nginx buffering
+    Ok((
+        [
+            (header::CONTENT_TYPE, "text/event-stream"),
+            (header::CACHE_CONTROL, "no-cache"),
+            (header::HeaderName::from_static("x-accel-buffering"), "no"),
+        ],
+        Sse::new(stream).keep_alive(KeepAlive::default()),
+    ))
 }
 
 #[cfg(test)]

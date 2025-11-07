@@ -102,6 +102,8 @@ pub async fn get_messages(
             epoch: m.epoch,
             seq: m.seq,
             created_at: m.created_at,
+            embed_type: None,
+            embed_uri: None,
         })
         .collect();
 

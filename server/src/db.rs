@@ -350,6 +350,8 @@ pub async fn create_message_with_idempotency(
     epoch: i64,
     idempotency_key: Option<String>,
 ) -> Result<Message> {
+    // Generate msg_id for backward compatibility
+    // New clients should call create_message_v2 with client-generated msg_id
     let msg_id = uuid::Uuid::new_v4().to_string();
     let now = Utc::now();
     let expires_at = now + chrono::Duration::days(30);
@@ -406,6 +408,138 @@ pub async fn create_message_with_idempotency(
     tx.commit().await.context("Failed to commit transaction")?;
 
     Ok(message)
+}
+
+/// Create a message with privacy-enhancing fields (v2)
+/// Supports msg_id, padding, and timestamp quantization
+pub async fn create_message_v2(
+    pool: &DbPool,
+    convo_id: &str,
+    msg_id: &str,
+    ciphertext: Vec<u8>,
+    epoch: i64,
+    declared_size: i64,
+    padded_size: i64,
+    idempotency_key: Option<String>,
+) -> Result<Message> {
+    let now = Utc::now();
+    let expires_at = now + chrono::Duration::days(30);
+
+    // Quantize timestamp to 2-second buckets for traffic analysis resistance
+    let received_bucket_ts = (now.timestamp() / 2) * 2;
+
+    // Calculate sequence number within transaction
+    let mut tx = pool.begin().await.context("Failed to begin transaction")?;
+
+    // Check for duplicate msg_id (protocol-layer deduplication)
+    if let Some(existing) = sqlx::query_as::<_, Message>(
+        "SELECT id, convo_id, sender_did, message_type, CAST(epoch AS BIGINT), CAST(seq AS BIGINT), ciphertext, created_at, expires_at
+         FROM messages WHERE convo_id = $1 AND msg_id = $2"
+    )
+    .bind(convo_id)
+    .bind(msg_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .context("Failed to check msg_id")? {
+        // Return existing message without creating a duplicate
+        tx.rollback().await.ok();
+        return Ok(existing);
+    }
+
+    // If idempotency key is provided, check for existing message
+    if let Some(ref idem_key) = idempotency_key {
+        if let Some(existing) = sqlx::query_as::<_, Message>(
+            "SELECT id, convo_id, sender_did, message_type, CAST(epoch AS BIGINT), CAST(seq AS BIGINT), ciphertext, created_at, expires_at
+             FROM messages WHERE idempotency_key = $1"
+        )
+        .bind(idem_key)
+        .fetch_optional(&mut *tx)
+        .await
+        .context("Failed to check idempotency key")? {
+            // Return existing message without creating a duplicate
+            tx.rollback().await.ok();
+            return Ok(existing);
+        }
+    }
+
+    let seq: i64 = sqlx::query_scalar(
+        "SELECT CAST(COALESCE(MAX(seq), 0) + 1 AS BIGINT) FROM messages WHERE convo_id = $1"
+    )
+    .bind(convo_id)
+    .fetch_one(&mut *tx)
+    .await
+    .context("Failed to calculate sequence number")?;
+
+    // Generate unique row ID (internal database ID)
+    let row_id = uuid::Uuid::new_v4().to_string();
+
+    // Try to insert the message
+    let insert_result = sqlx::query_as::<_, Message>(
+        r#"
+        INSERT INTO messages (
+            id, convo_id, sender_did, message_type, epoch, seq,
+            ciphertext, created_at, expires_at,
+            msg_id, declared_size, padded_size, received_bucket_ts,
+            idempotency_key
+        ) VALUES ($1, $2, NULL, 'app', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        RETURNING id, convo_id, sender_did, message_type, CAST(epoch AS BIGINT), CAST(seq AS BIGINT), ciphertext, created_at, expires_at
+        "#,
+    )
+    .bind(&row_id)
+    .bind(convo_id)
+    .bind(epoch)
+    .bind(seq)
+    .bind(&ciphertext)
+    .bind(&now)
+    .bind(&expires_at)
+    .bind(msg_id)
+    .bind(declared_size)
+    .bind(padded_size)
+    .bind(received_bucket_ts)
+    .bind(&idempotency_key)
+    .fetch_one(&mut *tx)
+    .await;
+
+    match insert_result {
+        Ok(message) => {
+            // Insert succeeded, commit transaction
+            tx.commit().await.context("Failed to commit transaction")?;
+            Ok(message)
+        }
+        Err(e) => {
+            // Rollback the transaction immediately (consumes tx)
+            tx.rollback().await.ok();
+
+            // Check if this is a unique constraint violation on idempotency_key
+            if let Some(db_err) = e.as_database_error() {
+                if db_err.code() == Some(std::borrow::Cow::Borrowed("23505")) {
+                    // SQLSTATE 23505 = unique_violation
+                    // Check if it's the idempotency_key constraint
+                    if let Some(constraint) = db_err.constraint() {
+                        if constraint == "messages_idempotency_key_unique" {
+                            // Query for the existing message with this idempotency key
+                            if let Some(ref idem_key) = idempotency_key {
+                                if let Some(existing) = sqlx::query_as::<_, Message>(
+                                    "SELECT id, convo_id, sender_did, message_type, CAST(epoch AS BIGINT), CAST(seq AS BIGINT), ciphertext, created_at, expires_at
+                                     FROM messages WHERE idempotency_key = $1"
+                                )
+                                .bind(idem_key)
+                                .fetch_optional(pool)
+                                .await
+                                .context("Failed to fetch existing message after unique violation")? {
+                                    tracing::info!("Idempotency key collision detected, returning existing message: {}", existing.id);
+                                    return Ok(existing);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // If we get here, it's not a handled unique violation, so propagate the error
+            Err(e).context("Failed to insert message")
+        }
+    }
 }
 
 /// Get a message by ID

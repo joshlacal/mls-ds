@@ -155,6 +155,10 @@ async fn main() -> anyhow::Result<()> {
             get(handlers::get_key_packages),
         )
         .route(
+            "/xrpc/blue.catbird.mls.getKeyPackageStats",
+            get(handlers::get_key_package_stats),
+        )
+        .route(
             "/xrpc/blue.catbird.mls.getEpoch",
             get(handlers::get_epoch),
         )
