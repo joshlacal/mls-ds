@@ -801,7 +801,7 @@ pub async fn count_consumed_key_packages(
         r#"
         SELECT COUNT(*)
         FROM key_packages
-        WHERE did = $1 AND consumed = true AND consumed_at >= $2
+        WHERE owner_did = $1 AND consumed_at IS NOT NULL AND consumed_at >= $2
         "#,
     )
     .bind(did)
@@ -823,7 +823,7 @@ pub async fn get_consumption_rate(pool: &DbPool, did: &str) -> Result<f64> {
             COUNT(*) as count,
             EXTRACT(EPOCH FROM (MAX(consumed_at) - MIN(consumed_at)))::bigint as duration_seconds
         FROM key_packages
-        WHERE did = $1 AND consumed = true AND consumed_at >= $2
+        WHERE owner_did = $1 AND consumed_at IS NOT NULL AND consumed_at >= $2
         "#,
     )
     .bind(did)
@@ -857,7 +857,7 @@ pub async fn count_all_key_packages(
             r#"
             SELECT COUNT(*)
             FROM key_packages
-            WHERE did = $1 AND cipher_suite = $2
+            WHERE owner_did = $1 AND cipher_suite = $2
             "#,
         )
         .bind(did)
@@ -869,7 +869,7 @@ pub async fn count_all_key_packages(
             r#"
             SELECT COUNT(*)
             FROM key_packages
-            WHERE did = $1
+            WHERE owner_did = $1
             "#,
         )
         .bind(did)
