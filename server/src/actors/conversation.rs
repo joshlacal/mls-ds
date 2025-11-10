@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use ractor::{Actor, ActorProcessingErr, ActorRef};
 use sqlx::PgPool;
 use std::collections::HashMap;
-use tracing::info;
+use tracing::{debug, info};
 
 use super::messages::{ConvoMessage, KeyPackageHashEntry};
 
@@ -135,7 +135,7 @@ impl Actor for ConversationActor {
                 let _ = reply.send(state.current_epoch);
             }
             ConvoMessage::Shutdown => {
-                info!("ConversationActor {} shutting down", state.convo_id);
+                info!("ConversationActor shutting down");
                 // Could persist state here if needed
             }
         }
@@ -255,7 +255,7 @@ impl ConversationActorState {
             .context("Failed to check existing membership")?;
 
             if is_existing > 0 {
-                info!("Member {} already exists, skipping", target_did);
+                info!("Member already exists, skipping");
                 continue;
             }
 
@@ -269,7 +269,7 @@ impl ConversationActorState {
             .await
             .context(format!("Failed to add member {}", target_did))?;
 
-            info!("Added member {} to conversation {}", target_did, self.convo_id);
+            info!("Added member to conversation");
         }
 
         // Store Welcome message for new members
@@ -311,7 +311,7 @@ impl ConversationActorState {
                 .await
                 .context(format!("Failed to store welcome message for {}", target_did))?;
 
-                info!("Welcome stored for member {}", target_did);
+                info!("Welcome stored for member");
             }
         }
 
@@ -496,7 +496,7 @@ impl ConversationActorState {
 
         tx.commit().await.context("Failed to commit transaction")?;
 
-        info!("Message {} stored with sequence number {}", msg_id, seq);
+        debug!("Message stored with sequence number {}", seq);
 
         // Update unread counts for all members except sender in database
         sqlx::query(
@@ -515,7 +515,7 @@ impl ConversationActorState {
 
         tokio::spawn(async move {
             let fanout_start = std::time::Instant::now();
-            info!("Starting fan-out for convo: {}", convo_id);
+            debug!("Starting fan-out for conversation");
 
             // Get all active members
             let members_result = sqlx::query!(
@@ -627,7 +627,7 @@ impl ConversationActorState {
                             .bind(&member.member_did)
                             .execute(&self.db_pool)
                             .await {
-                                tracing::warn!("Failed to sync unread count to database for {}: {}", member.member_did, e);
+                                tracing::warn!("Failed to sync unread count to database: {}", e);
                             } else {
                                 // Reset in-memory counter after successful sync
                                 *count = 0;

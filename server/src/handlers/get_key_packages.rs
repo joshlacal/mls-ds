@@ -1,18 +1,25 @@
 use base64::Engine;
 
 use axum::{extract::{RawQuery, State}, http::StatusCode, Json};
-use serde::Deserialize;
-use tracing::{info, warn, error};
+use serde::{Deserialize, Serialize};
+use tracing::{debug, info, warn, error};
 
 use crate::{
     auth::AuthUser,
-    models::KeyPackageInfo,
     storage::DbPool,
 };
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct KeyPackageInfo {
+    did: String,
+    key_package: String,
+    cipher_suite: String,
+    key_package_hash: String,
+}
+
 /// Get key packages for specified users
 /// GET /xrpc/chat.bsky.convo.getKeyPackages
-#[tracing::instrument(skip(pool), fields(did = %auth_user.did))]
+#[tracing::instrument(skip(pool))]
 pub async fn get_key_packages(
     State(pool): State<DbPool>,
     auth_user: AuthUser,
@@ -83,10 +90,10 @@ pub async fn get_key_packages(
                 }
             }
             Ok(_) => {
-                info!("No valid key package found for DID: {}", did);
+                debug!("No valid key package found for DID: {}", crate::crypto::hash_for_log(&did));
             }
             Err(e) => {
-                error!("Failed to get key packages for {}: {}", did, e);
+                error!("Failed to get key packages: {}", e);
             }
         }
     }

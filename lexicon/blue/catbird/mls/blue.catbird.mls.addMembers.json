@@ -87,6 +87,10 @@
         {
           "name": "TooManyMembers",
           "description": "Would exceed maximum member count"
+        },
+        {
+          "name": "BlockedByMember",
+          "description": "Cannot add user who has blocked or been blocked by an existing member (Bluesky social graph enforcement)"
         }
       ]
     },

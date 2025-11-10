@@ -1,0 +1,35 @@
+{
+  "task": "Redact identity-bearing fields from production logs",
+  "context": "Production MLS server must not leak user identities, conversation IDs, or behavioral metadata in logs. Use hash_for_log() for debugging, move sensitive data to debug level only.",
+  "requirements": [
+    "Replace info!() logs containing DIDs with debug!() + hash_for_log() in server/src/auth.rs",
+    "Replace info!() logs containing convo IDs with debug!() + hash_for_log() in all handlers",
+    "Move JWT claim logging (iss/aud/lxm/jti) to debug level in server/src/auth.rs",
+    "Remove 'RAW INPUT' and user behavior counter logs from handlers at info level",
+    "Update server/src/middleware/logging.rs to redact headers in production",
+    "Ensure hash_for_log() is available in server/src/crypto.rs",
+    "Keep error logs with minimal redacted context",
+    "Document RUST_LOG=warn requirement for production in comments"
+  ],
+  "files": [
+    "server/src/auth.rs",
+    "server/src/middleware/logging.rs",
+    "server/src/handlers/create_convo.rs",
+    "server/src/handlers/send_message.rs",
+    "server/src/handlers/get_messages.rs",
+    "server/src/handlers/update_cursor.rs",
+    "server/src/realtime/mod.rs",
+    "server/src/crypto.rs"
+  ],
+  "examples": [
+    "// Before: info!(\"User {} created convo {}\", did, convo_id);",
+    "// After: debug!(\"User {} created convo {}\", hash_for_log(&did), hash_for_log(&convo_id));"
+  ],
+  "success_criteria": [
+    "No DIDs or convo IDs in info-level logs",
+    "JWT claims only at debug level",
+    "Headers redacted in production middleware",
+    "hash_for_log() used consistently",
+    "Code compiles without warnings"
+  ]
+}

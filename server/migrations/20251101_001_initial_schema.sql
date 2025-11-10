@@ -30,6 +30,9 @@ CREATE TABLE members (
     left_at TIMESTAMPTZ,
     unread_count INTEGER NOT NULL DEFAULT 0,
     last_read_at TIMESTAMPTZ,
+    needs_rejoin BOOLEAN NOT NULL DEFAULT false,
+    rejoin_requested_at TIMESTAMPTZ,
+    rejoin_key_package_hash TEXT,
     PRIMARY KEY (convo_id, member_did),
     FOREIGN KEY (convo_id) REFERENCES conversations(id) ON DELETE CASCADE
 );
@@ -38,6 +41,7 @@ CREATE INDEX idx_members_member_did ON members(member_did);
 CREATE INDEX idx_members_active ON members(member_did, convo_id) WHERE left_at IS NULL;
 CREATE INDEX idx_members_unread ON members(member_did, unread_count) WHERE unread_count > 0;
 CREATE INDEX idx_members_left_at ON members(left_at) WHERE left_at IS NULL;
+CREATE INDEX idx_members_rejoin_pending ON members(convo_id, member_did) WHERE needs_rejoin = true;
 
 -- Messages (encrypted MLS messages)
 CREATE TABLE messages (

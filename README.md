@@ -45,6 +45,40 @@ Fork Catbird into `mls-chat` branch and integrate production-ready MLS E2EE grou
    - Quality gates
    - Conflict resolution
 
+### 🚀 Greenfield Implementation (Ready to Build)
+
+**[GREENFIELD_IMPLEMENTATION_SUMMARY.md](GREENFIELD_IMPLEMENTATION_SUMMARY.md)** ⭐ **START HERE FOR IMPLEMENTATION**
+- Complete greenfield implementation (no legacy code, no migrations)
+- Ready-to-use deliverables:
+  - ✅ Database schema (`server/schema_greenfield.sql`) - 650 lines
+  - ✅ Swift client code (`Catbird/Services/MLS/MLSIdentityBackup.swift`) - 450 lines
+  - ✅ Server automatic rejoin (`server/src/automatic_rejoin.rs`) - 400 lines
+  - ✅ Server admin system (`server/src/admin_system.rs`) - 500 lines
+  - ✅ All 22 lexicons defined
+- 5-week implementation roadmap with week-by-week tasks
+- Open questions and recommendations
+- Complete testing checklist
+
+### ⭐ Security & Admin System (Architecture)
+
+**[MLS_COMPLETE_IMPLEMENTATION_GUIDE.md](MLS_COMPLETE_IMPLEMENTATION_GUIDE.md)** ⭐ **COMPREHENSIVE ARCHITECTURE GUIDE**
+- Complete architecture for E2EE group chat
+- Answers critical questions:
+  - ❌ Can admins delete messages? → NO (E2EE impossible)
+  - ✅ iCloud Keychain backup? → YES (identity only, ~500 bytes)
+  - ✅ Automatic rejoin? → YES (no admin approval needed)
+- Architectural decisions and security analysis
+- Full database design documentation
+- All lexicon specifications
+- **Reference guide - see GREENFIELD_IMPLEMENTATION_SUMMARY.md for implementation**
+
+**Supporting Security Documents:**
+- [SECURITY_ADMIN_COMPLETE_PLAN.md](SECURITY_ADMIN_COMPLETE_PLAN.md) - Original admin system plan
+- [ADMIN_SECURITY_PLAN.md](ADMIN_SECURITY_PLAN.md) - Admin architecture deep-dive
+- [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) - Sender identity security analysis
+- [QUICK_SECURITY_SUMMARY.md](QUICK_SECURITY_SUMMARY.md) - Quick reference
+- [BLUESKY_BLOCKS_INTEGRATION.md](BLUESKY_BLOCKS_INTEGRATION.md) - Blocks enforcement
+
 ### Existing Technical Docs
 - **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** - System design and data flow
 - **[docs/SECURITY.md](docs/SECURITY.md)** - Threat model and mitigations

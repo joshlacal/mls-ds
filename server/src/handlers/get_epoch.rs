@@ -26,7 +26,7 @@ pub struct EpochResponse {
 
 /// Get the current epoch for a conversation
 /// GET /xrpc/blue.catbird.mls.getEpoch
-#[tracing::instrument(skip(pool, actor_registry), fields(did = %auth_user.did, convo_id = %params.convo_id))]
+#[tracing::instrument(skip(pool, actor_registry))]
 pub async fn get_epoch(
     State(pool): State<DbPool>,
     State(actor_registry): State<Arc<ActorRegistry>>,
@@ -53,7 +53,7 @@ pub async fn get_epoch(
             StatusCode::INTERNAL_SERVER_ERROR
         })?
     {
-        warn!("User {} is not a member of conversation {}", did, params.convo_id);
+        warn!("User is not a member of conversation");
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -108,7 +108,7 @@ pub async fn get_epoch(
         })?
     };
 
-    info!("Fetched epoch {} for conversation {}", current_epoch, params.convo_id);
+    info!("Fetched epoch: {}", current_epoch);
     
     Ok(Json(EpochResponse {
         convo_id: params.convo_id,

@@ -5,13 +5,13 @@ use tracing::{info, warn, error};
 
 use crate::{
     auth::AuthUser,
-    models::PublishKeyPackageInput,
+    generated_types::PublishKeyPackageInput,
     storage::DbPool,
 };
 
 /// Publish a key package for the authenticated user
 /// POST /xrpc/chat.bsky.convo.publishKeyPackage
-#[tracing::instrument(skip(pool, input), fields(did = %auth_user.did))]
+#[tracing::instrument(skip(pool, input))]
 pub async fn publish_key_package(
     State(pool): State<DbPool>,
     auth_user: AuthUser,
@@ -51,7 +51,7 @@ pub async fn publish_key_package(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    info!("Publishing key package for user {}, cipher_suite: {}", did, input.cipher_suite);
+    info!("Publishing key package, cipher_suite: {}", input.cipher_suite);
 
     // Store key package (dedup by did+cipher_suite+key_data)
     crate::db::store_key_package(&pool, did, &input.cipher_suite, key_data, input.expires)
@@ -61,7 +61,7 @@ pub async fn publish_key_package(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    info!("Key package published successfully for user {}", did);
+    info!("Key package published successfully");
 
     Ok(Json(serde_json::json!({ "success": true })))
 }

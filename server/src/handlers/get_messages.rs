@@ -8,7 +8,7 @@ use crate::{
     actors::{ActorRegistry, ConvoMessage},
     auth::AuthUser,
     db,
-    models::MessageView,
+    generated_types::MessageView,
     storage::{is_member, DbPool},
 };
 
@@ -23,7 +23,7 @@ pub struct GetMessagesParams {
 
 /// Get messages from a conversation
 /// GET /xrpc/chat.bsky.convo.getMessages
-#[tracing::instrument(skip(pool, actor_registry), fields(did = %auth_user.did, convo_id = %params.convo_id))]
+#[tracing::instrument(skip(pool, actor_registry))]
 pub async fn get_messages(
     State(pool): State<DbPool>,
     State(actor_registry): State<Arc<ActorRegistry>>,
@@ -50,11 +50,12 @@ pub async fn get_messages(
             StatusCode::INTERNAL_SERVER_ERROR
         })?
     {
-        warn!("User {} is not a member of conversation {}", did, params.convo_id);
+        warn!("User is not a member of conversation");
         return Err(StatusCode::FORBIDDEN);
     }
 
-    info!("Fetching messages for conversation {}", params.convo_id);
+    // Note: Reduced logging per security hardening - no convo IDs at info level
+    tracing::debug!("Fetching messages from convo {}", crate::crypto::redact_for_log(&params.convo_id));
 
     // Fetch messages using cursor pagination if sinceMessage is provided
     let messages = if let Some(since_id) = params.since_message {
@@ -92,18 +93,16 @@ pub async fn get_messages(
     };
 
     // Convert to view models with ciphertext
+    // Note: sender field removed per security hardening - clients derive sender from decrypted MLS content
     let message_views: Vec<MessageView> = messages
         .into_iter()
         .map(|m| MessageView {
             id: m.id,
             convo_id: m.convo_id,
-            sender: m.sender_did,
             ciphertext: m.ciphertext,
             epoch: m.epoch,
             seq: m.seq,
             created_at: m.created_at,
-            embed_type: None,
-            embed_uri: None,
         })
         .collect();
 
@@ -113,7 +112,7 @@ pub async fn get_messages(
         .unwrap_or(false);
 
     if use_actors {
-        info!("Using actor system for reset unread count");
+    tracing::debug!("Using actor system for reset unread count");
 
         let actor_ref = actor_registry.get_or_spawn(&params.convo_id).await
             .map_err(|e| {
@@ -140,7 +139,7 @@ pub async fn get_messages(
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
     } else {
-        info!("Using legacy database approach for reset unread count");
+        tracing::debug!("Using legacy database approach for reset unread count");
 
         sqlx::query(
             "UPDATE members SET unread_count = 0 WHERE convo_id = $1 AND member_did = $2"

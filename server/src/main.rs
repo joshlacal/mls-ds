@@ -9,20 +9,16 @@ use tokio::time::{interval, Duration};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-mod actors;
-mod auth;
-mod crypto;
-mod db;
-mod fanout;
-mod handlers;
-mod health;
+// Import from library crate instead of re-declaring modules
+use catbird_server::{
+    actors, auth, crypto, db, fanout, handlers, health, metrics, middleware, models, realtime,
+    storage, util,
+};
+
+// These modules are only in main.rs (not in lib.rs)
+mod device_utils;
 mod jobs;
-mod metrics;
-mod middleware;
-mod models;
-mod realtime;
-mod storage;
-mod util;
+mod admin_system;
 mod xrpc_proxy;
 
 // Composite state for Axum 0.7
@@ -38,12 +34,22 @@ async fn main() -> anyhow::Result<()> {
     // Load environment variables from .env file
     dotenvy::dotenv().ok();
 
-    // Initialize tracing
+    // Initialize tracing with production-safe defaults
+    // Default to warn in production, debug in development
+    let log_level = std::env::var("RUST_LOG").unwrap_or_else(|_| {
+        #[cfg(debug_assertions)]
+        {
+            "debug".to_string()
+        }
+
+        #[cfg(not(debug_assertions))]
+        {
+            "warn".to_string()
+        }
+    });
+
     tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "catbird_server=debug,tower_http=debug".into()),
-        )
+        .with(tracing_subscriber::EnvFilter::new(&log_level))
         .with(tracing_subscriber::fmt::layer().json())
         .init();
 
@@ -51,10 +57,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Log authentication configuration at startup
     tracing::info!(
-        service_did = std::env::var("SERVICE_DID").ok(),
-        enforce_lxm = std::env::var("ENFORCE_LXM").ok(),
-        enforce_jti = std::env::var("ENFORCE_JTI").unwrap_or_else(|_| "true".to_string()),
-        jti_ttl_seconds = std::env::var("JTI_TTL_SECONDS").unwrap_or_else(|_| "120".to_string()),
+        enforce_lxm = %std::env::var("ENFORCE_LXM").unwrap_or_else(|_| "true".to_string()),
+        enforce_jti = %std::env::var("ENFORCE_JTI").unwrap_or_else(|_| "true".to_string()),
+        jti_ttl_seconds = %std::env::var("JTI_TTL_SECONDS").unwrap_or_else(|_| "120".to_string()),
         jwt_secret_configured = std::env::var("JWT_SECRET").is_ok(),
         "Authentication configuration loaded"
     );
@@ -104,6 +109,33 @@ async fn main() -> anyhow::Result<()> {
     });
     tracing::info!("Idempotency cache cleanup worker started");
 
+    // Spawn data compaction worker (messages, events, welcome messages)
+    let compaction_pool = db_pool.clone();
+    tokio::spawn(async move {
+        jobs::run_data_compaction_worker(compaction_pool).await;
+    });
+    tracing::info!("Data compaction worker started");
+
+    // Spawn key package cleanup worker
+    let key_package_pool = db_pool.clone();
+    tokio::spawn(async move {
+        jobs::run_key_package_cleanup_worker(key_package_pool).await;
+    });
+    tracing::info!("Key package cleanup worker started");
+
+    // Spawn rate limiter cleanup worker (clean up stale buckets every 5 minutes)
+    tokio::spawn(async move {
+        let mut interval_timer = interval(Duration::from_secs(300)); // Every 5 minutes
+        loop {
+            interval_timer.tick().await;
+            // Cleanup buckets not accessed in the last 10 minutes
+            let max_age = Duration::from_secs(600);
+            middleware::rate_limit::DID_RATE_LIMITER.cleanup_old_buckets(max_age).await;
+            tracing::debug!("Rate limiter cleanup completed");
+        }
+    });
+    tracing::info!("Rate limiter cleanup worker started");
+
     // Create composite app state
     let app_state = AppState {
         db_pool: db_pool.clone(),
@@ -112,9 +144,17 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Build application router
-    let metrics_router = Router::new()
-        .route("/metrics", get(metrics::metrics_handler))
-        .with_state(metrics_handle);
+    // Only expose metrics when explicitly enabled
+    let metrics_router = if matches!(
+        std::env::var("ENABLE_METRICS").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    ) {
+        Router::new()
+            .route("/metrics", get(metrics::metrics_handler))
+            .with_state(metrics_handle)
+    } else {
+        Router::new()
+    };
 
     let mut base_router = Router::new()
         // Health check endpoints
@@ -159,6 +199,10 @@ async fn main() -> anyhow::Result<()> {
             get(handlers::get_key_package_stats),
         )
         .route(
+            "/xrpc/blue.catbird.mls.registerDevice",
+            post(handlers::register_device),
+        )
+        .route(
             "/xrpc/blue.catbird.mls.getEpoch",
             get(handlers::get_epoch),
         )
@@ -171,8 +215,55 @@ async fn main() -> anyhow::Result<()> {
             post(handlers::confirm_welcome),
         )
         .route(
+            "/xrpc/blue.catbird.mls.requestRejoin",
+            post(handlers::request_rejoin),
+        )
+        .route(
             "/xrpc/blue.catbird.mls.getCommits",
             get(handlers::get_commits),
+        )
+        // Admin endpoints
+        .route(
+            "/xrpc/blue.catbird.mls.promoteAdmin",
+            post(handlers::promote_admin),
+        )
+        .route(
+            "/xrpc/blue.catbird.mls.demoteAdmin",
+            post(handlers::demote_admin),
+        )
+        // Moderation endpoints
+        .route(
+            "/xrpc/blue.catbird.mls.removeMember",
+            post(handlers::remove_member),
+        )
+        .route(
+            "/xrpc/blue.catbird.mls.reportMember",
+            post(handlers::report_member),
+        )
+        .route(
+            "/xrpc/blue.catbird.mls.getReports",
+            get(handlers::get_reports),
+        )
+        .route(
+            "/xrpc/blue.catbird.mls.resolveReport",
+            post(handlers::resolve_report),
+        )
+        .route(
+            "/xrpc/blue.catbird.mls.getAdminStats",
+            get(handlers::get_admin_stats),
+        )
+        // Bluesky blocks integration endpoints
+        .route(
+            "/xrpc/blue.catbird.mls.checkBlocks",
+            get(handlers::check_blocks),
+        )
+        .route(
+            "/xrpc/blue.catbird.mls.getBlockStatus",
+            get(handlers::get_block_status),
+        )
+        .route(
+            "/xrpc/blue.catbird.mls.handleBlockChange",
+            post(handlers::handle_block_change),
         )
         // Hybrid messaging endpoints
         .route(
@@ -186,13 +277,45 @@ async fn main() -> anyhow::Result<()> {
         .merge(metrics_router)
         .layer(TraceLayer::new_for_http())
         .layer(axum::middleware::from_fn(middleware::logging::log_headers_middleware))
+        // Lightweight per-IP backstop rate limiter (per-DID limits live in auth extractor)
+        .layer(axum::middleware::from_fn(middleware::rate_limit::rate_limit_middleware))
         .layer(axum::middleware::from_fn_with_state(
             middleware::idempotency::IdempotencyLayer::new(db_pool.clone()),
             middleware::idempotency::idempotency_middleware,
         ))
-        .with_state(app_state);
+        .with_state(app_state.clone());
 
-    // Optional: developer-only direct XRPC proxy (off by default).
+    // Admin & moderation endpoints (server-side authorization; content stays E2EE)
+    let admin_router = Router::new()
+        .route(
+            "/xrpc/blue.catbird.mls.promoteAdmin",
+            post(admin_system::promote_admin),
+        )
+        .route(
+            "/xrpc/blue.catbird.mls.demoteAdmin",
+            post(admin_system::demote_admin),
+        )
+        .route(
+            "/xrpc/blue.catbird.mls.removeMember",
+            post(admin_system::remove_member),
+        )
+        .route(
+            "/xrpc/blue.catbird.mls.reportMember",
+            post(admin_system::report_member),
+        )
+        .route(
+            "/xrpc/blue.catbird.mls.getReports",
+            get(admin_system::get_reports),
+        )
+        .route(
+            "/xrpc/blue.catbird.mls.resolveReport",
+            post(admin_system::resolve_report),
+        )
+        .with_state(app_state.clone());
+
+    // ⚠️ SECURITY: Developer-only direct XRPC proxy - NEVER enable in production
+    // This is gated with #[cfg(debug_assertions)] to prevent accidental production use
+    #[cfg(debug_assertions)]
     if matches!(
         std::env::var("ENABLE_DIRECT_XRPC_PROXY").as_deref(),
         Ok("1") | Ok("true") | Ok("TRUE")
@@ -207,10 +330,20 @@ async fn main() -> anyhow::Result<()> {
             .route("/xrpc/*rest", any(xrpc_proxy::proxy))
             .with_state(proxy_state);
         base_router = base_router.merge(proxy_router);
-        tracing::warn!("ENABLE_DIRECT_XRPC_PROXY is enabled; forward-all /xrpc/* is active");
+        tracing::warn!("⚠️  ENABLE_DIRECT_XRPC_PROXY is enabled (DEBUG BUILD ONLY); forward-all /xrpc/* is active");
     }
 
-    let app = base_router;
+    // Refuse to start if proxy is requested in release mode
+    #[cfg(not(debug_assertions))]
+    if std::env::var("ENABLE_DIRECT_XRPC_PROXY").is_ok() {
+        panic!(
+            "SECURITY ERROR: ENABLE_DIRECT_XRPC_PROXY is set in a RELEASE build. \
+             This debug-only feature exposes all XRPC traffic and must never be enabled in production. \
+             Remove the environment variable to proceed."
+        );
+    }
+
+    let app = base_router.merge(admin_router);
 
     let port = std::env::var("SERVER_PORT")
         .unwrap_or_else(|_| "8080".to_string())

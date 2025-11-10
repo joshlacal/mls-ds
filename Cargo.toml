@@ -1,5 +1,5 @@
 [workspace]
-members = ["server", "mls-ffi"]
+members = ["server", "codegen"]
 resolver = "2"
 
 [workspace.package]

@@ -187,8 +187,15 @@ impl AuthMiddleware {
             .time_to_live(std::time::Duration::from_secs(cache_ttl_seconds))
             .build();
 
-        let quota = Quota::per_second(NonZeroU32::new(rate_limit_requests.max(1)).unwrap())
-            .allow_burst(NonZeroU32::new((rate_limit_requests.max(1) / 10).max(1)).unwrap());
+        // SAFETY: rate_limit_requests.max(1) is always >= 1, so NonZeroU32::new() cannot fail
+        let quota = Quota::per_second(
+            NonZeroU32::new(rate_limit_requests.max(1))
+                .expect("BUG: rate_limit_requests.max(1) should always be >= 1"),
+        )
+        .allow_burst(
+            NonZeroU32::new((rate_limit_requests.max(1) / 10).max(1))
+                .expect("BUG: burst calculation should always be >= 1"),
+        );
 
         Self {
             did_cache,
@@ -220,15 +227,14 @@ async fn verify_jwt(&self, token: &str) -> Result<AtProtoClaims, AuthError> {
     let claims: AtProtoClaims = serde_json::from_slice(&payload_json)
         .map_err(|e| AuthError::InvalidToken(format!("Invalid claims JSON: {}", e)))?;
 
-    tracing::info!(
-        iss = %claims.iss,
-        aud = %claims.aud,
+    // Do not log full identities or tokens at info level
+    tracing::debug!(
+        iss = %crate::crypto::redact_for_log(&claims.iss),
+        aud = %crate::crypto::redact_for_log(&claims.aud),
         exp = claims.exp,
         has_lxm = claims.lxm.is_some(),
-        lxm = claims.lxm.as_deref().unwrap_or("none"),
         has_jti = claims.jti.is_some(),
-        jti = claims.jti.as_deref().unwrap_or("none"),
-        "Parsed JWT claims successfully"
+        "Parsed JWT claims"
     );
 
     // Expiration
@@ -237,17 +243,9 @@ async fn verify_jwt(&self, token: &str) -> Result<AtProtoClaims, AuthError> {
 
     // Audience enforcement when configured
     if let Ok(service_did) = std::env::var("SERVICE_DID") {
-        tracing::debug!(
-            service_did = %service_did,
-            jwt_aud = %claims.aud,
-            "Validating JWT audience against SERVICE_DID"
-        );
+        tracing::debug!("Validating JWT audience against configured SERVICE_DID");
         if claims.aud != service_did {
-            tracing::error!(
-                service_did = %service_did,
-                jwt_aud = %claims.aud,
-                "JWT audience mismatch with SERVICE_DID"
-            );
+            tracing::warn!("JWT audience mismatch with SERVICE_DID");
             return Err(AuthError::InvalidToken("aud does not match SERVICE_DID".into()));
         }
     }
@@ -411,9 +409,8 @@ async fn verify_jwt(&self, token: &str) -> Result<AtProtoClaims, AuthError> {
         let _plc_id = did.strip_prefix("did:plc:").ok_or_else(|| AuthError::InvalidDid(format!("Invalid PLC DID: {}", did)))?;
         let url = format!("https://plc.directory/{}", did);
 
-        tracing::info!(
-            did = did,
-            url = %url,
+        tracing::debug!(
+            did = %crate::crypto::redact_for_log(did),
             "Resolving DID document via PLC directory"
         );
 
@@ -426,9 +423,7 @@ async fn verify_jwt(&self, token: &str) -> Result<AtProtoClaims, AuthError> {
 
         if !response.status().is_success() {
             tracing::error!(
-                did = did,
                 status = response.status().as_u16(),
-                url = %url,
                 "Failed to resolve DID from PLC directory"
             );
             return Err(AuthError::DidResolutionFailed(format!(
@@ -551,21 +546,20 @@ pub fn enforce_standard(claims: &AtProtoClaims, endpoint_nsid: &str) -> Result<(
     );
 
     // Enforce lxm if requested
-    if let Ok(val) = std::env::var("ENFORCE_LXM") {
-        if val == "1" || val.eq_ignore_ascii_case("true") || val.eq_ignore_ascii_case("yes") {
-            if let Some(lxm) = &claims.lxm {
-                if lxm != endpoint_nsid {
-                    tracing::warn!(
-                        endpoint = endpoint_nsid,
-                        jwt_lxm = lxm,
-                        iss = %claims.iss,
-                        "LXM mismatch: JWT lxm does not match endpoint NSID"
-                    );
-                    return Err(AuthError::LxmMismatch);
-                }
-            } else {
-                return Err(AuthError::MissingLxm);
+    // Default to enforcing LXM unless explicitly disabled
+    let enforce_lxm = std::env::var("ENFORCE_LXM")
+        .map(|v| truthy(&v))
+        .unwrap_or(true);
+    if enforce_lxm {
+        if let Some(lxm) = &claims.lxm {
+            if lxm != endpoint_nsid {
+                tracing::warn!(
+                    "LXM mismatch: JWT lxm does not match endpoint NSID"
+                );
+                return Err(AuthError::LxmMismatch);
             }
+        } else {
+            return Err(AuthError::MissingLxm);
         }
     }
 
@@ -613,17 +607,11 @@ where
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         let has_authorization = parts.headers.contains_key("authorization");
         let has_atproto_proxy = parts.headers.contains_key("atproto-proxy");
-        let auth_scheme = parts.headers.get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.split_whitespace().next())
-            .map(|s| s.to_string());
-
-        tracing::info!(
+        tracing::debug!(
             method = %parts.method,
             uri = %parts.uri,
             has_authorization = has_authorization,
             has_atproto_proxy = has_atproto_proxy,
-            auth_scheme = ?auth_scheme,
             "Processing authentication for request"
         );
 
@@ -633,12 +621,7 @@ where
             .get("authorization")
             .and_then(|v| v.to_str().ok())
             .ok_or_else(|| {
-                tracing::error!(
-                    method = %parts.method,
-                    uri = %parts.uri,
-                    headers = ?parts.headers.keys().map(|k| k.as_str()).collect::<Vec<_>>(),
-                    "Missing authorization header"
-                );
+                tracing::error!("Missing authorization header");
                 AuthError::MissingAuthHeader
             })?;
 
@@ -659,13 +642,125 @@ where
         // Check rate limit
         middleware.check_rate_limit(&claims.iss)?;
 
-        debug!("Authenticated request from DID: {}", claims.iss);
+        // Check per-DID endpoint-specific rate limit
+        let endpoint = parts.uri.path();
+        if let Err(retry_after) = crate::middleware::rate_limit::DID_RATE_LIMITER
+            .check_did_limit(&claims.iss, endpoint)
+            .await
+        {
+            tracing::warn!(
+                did = %crate::crypto::redact_for_log(&claims.iss),
+                endpoint = endpoint,
+                retry_after = retry_after,
+                "DID rate limit exceeded for endpoint"
+            );
+            return Err(AuthError::RateLimitExceeded);
+        }
+
+        debug!("Authenticated request from DID: {}", crate::crypto::redact_for_log(&claims.iss));
 
         Ok(AuthUser {
             did: claims.iss.clone(),
             claims,
         })
     }
+}
+
+// =============================================================================
+// Admin Authorization Helpers
+// =============================================================================
+
+/// Check if a user is an admin of a conversation
+///
+/// # Errors
+/// Returns an error if:
+/// - Database query fails
+/// - User is not a member of the conversation
+/// - User is not an admin
+pub async fn verify_is_admin(
+    pool: &crate::storage::DbPool,
+    convo_id: &str,
+    user_did: &str,
+) -> Result<(), StatusCode> {
+    let is_admin: Option<bool> = sqlx::query_scalar(
+        "SELECT is_admin FROM members
+         WHERE convo_id = $1 AND member_did = $2 AND left_at IS NULL"
+    )
+    .bind(convo_id)
+    .bind(user_did)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to check admin status: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    match is_admin {
+        Some(true) => Ok(()),
+        Some(false) => {
+            tracing::warn!("User is not an admin of conversation");
+            Err(StatusCode::FORBIDDEN)
+        }
+        None => {
+            tracing::warn!("User is not a member of conversation");
+            Err(StatusCode::NOT_FOUND)
+        }
+    }
+}
+
+/// Check if a user is a member of a conversation
+///
+/// # Errors
+/// Returns an error if:
+/// - Database query fails
+/// - User is not a member of the conversation
+pub async fn verify_is_member(
+    pool: &crate::storage::DbPool,
+    convo_id: &str,
+    user_did: &str,
+) -> Result<(), StatusCode> {
+    let is_member: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM members
+            WHERE convo_id = $1 AND member_did = $2 AND left_at IS NULL
+        )"
+    )
+    .bind(convo_id)
+    .bind(user_did)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to check membership: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    if is_member {
+        Ok(())
+    } else {
+        tracing::warn!("User is not a member of conversation");
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+/// Count admins in a conversation
+///
+/// # Errors
+/// Returns an error if database query fails
+pub async fn count_admins(
+    pool: &crate::storage::DbPool,
+    convo_id: &str,
+) -> Result<i64, StatusCode> {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM members
+         WHERE convo_id = $1 AND is_admin = true AND left_at IS NULL"
+    )
+    .bind(convo_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to count admins: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 #[cfg(test)]

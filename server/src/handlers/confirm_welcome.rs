@@ -23,7 +23,7 @@ pub struct ConfirmWelcomeOutput {
 
 /// Confirm successful or failed processing of Welcome message
 /// POST /xrpc/blue.catbird.mls.confirmWelcome
-#[tracing::instrument(skip(pool, input), fields(did = %auth_user.did, convo_id = %input.convo_id, success = %input.success))]
+#[tracing::instrument(skip(pool, input))]
 pub async fn confirm_welcome(
     State(pool): State<DbPool>,
     auth_user: AuthUser,
@@ -50,13 +50,13 @@ pub async fn confirm_welcome(
             StatusCode::INTERNAL_SERVER_ERROR
         })?
     {
-        warn!("User {} is not a member of conversation {}", did, input.convo_id);
+        warn!("User is not a member of conversation");
         return Err(StatusCode::FORBIDDEN);
     }
 
     if input.success {
         // Mark Welcome as consumed on successful processing
-        info!("Confirming successful Welcome processing for {} in conversation {}", did, input.convo_id);
+        info!("Confirming successful Welcome processing");
 
         let rows_updated = sqlx::query(
             "UPDATE welcome_messages
@@ -74,7 +74,7 @@ pub async fn confirm_welcome(
         .rows_affected();
 
         if rows_updated == 0 {
-            warn!("No in-flight Welcome message found for {} in conversation {}", did, input.convo_id);
+            warn!("No in-flight Welcome message found");
             // This could be:
             // 1. Already consumed (duplicate confirmation)
             // 2. Never fetched (invalid flow)

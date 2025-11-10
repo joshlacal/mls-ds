@@ -89,9 +89,47 @@ impl MetricsRecorder {
 }
 
 /// Handler for Prometheus metrics endpoint
-pub async fn metrics_handler(handle: axum::extract::State<PrometheusHandle>) -> impl IntoResponse {
+///
+/// # Security
+/// This endpoint is protected by:
+/// 1. ENABLE_METRICS environment variable (must be explicitly enabled)
+/// 2. Optional METRICS_TOKEN bearer token authentication
+/// 3. Should be served on internal-only network or behind auth proxy
+///
+/// If METRICS_TOKEN is set, requests must include: `Authorization: Bearer <token>`
+pub async fn metrics_handler(
+    handle: axum::extract::State<PrometheusHandle>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    // Check if metrics token authentication is required
+    if let Ok(expected_token) = std::env::var("METRICS_TOKEN") {
+        if expected_token.is_empty() {
+            tracing::warn!("METRICS_TOKEN is set but empty - treating as no auth required");
+        } else {
+            // Extract bearer token from Authorization header
+            let auth_header = headers.get(axum::http::header::AUTHORIZATION);
+            let provided_token = auth_header
+                .and_then(|h| h.to_str().ok())
+                .and_then(|s| s.strip_prefix("Bearer "));
+
+            match provided_token {
+                Some(token) if token == expected_token => {
+                    // Token matches - proceed
+                }
+                Some(_) => {
+                    tracing::warn!("Metrics endpoint accessed with invalid token");
+                    return (StatusCode::UNAUTHORIZED, "Invalid metrics token".to_string()).into_response();
+                }
+                None => {
+                    tracing::warn!("Metrics endpoint accessed without authentication");
+                    return (StatusCode::UNAUTHORIZED, "Missing or malformed Authorization header".to_string()).into_response();
+                }
+            }
+        }
+    }
+
     let metrics = handle.render();
-    (StatusCode::OK, metrics)
+    (StatusCode::OK, metrics).into_response()
 }
 
 /// Middleware to track HTTP request metrics
@@ -138,19 +176,26 @@ pub fn record_mls_member_added() {
 
 /// Record realtime metrics
 #[allow(dead_code)]
-pub fn record_realtime_queue_depth(convo_id: &str, depth: i64) {
-    metrics::gauge!("realtime_queue_depth", depth as f64, "convo_id" => convo_id.to_string());
+pub fn record_realtime_queue_depth(_convo_id: &str, depth: i64) {
+    // Avoid high-cardinality labels; record aggregate only
+    metrics::gauge!("realtime_queue_depth", depth as f64);
 }
 
 #[allow(dead_code)]
 pub fn record_fanout_operation(provider: &str, success: bool) {
     let status = if success { "success" } else { "error" };
-    metrics::counter!("fanout_operations_total", 1, "provider" => provider.to_string(), "status" => status.to_string());
+    metrics::counter!(
+        "fanout_operations_total",
+        1,
+        "provider" => provider.to_string(),
+        "status" => status.to_string()
+    );
 }
 
 #[allow(dead_code)]
-pub fn record_envelope_write_duration(convo_id: &str, duration: Duration) {
-    metrics::histogram!("envelope_write_duration_seconds", duration.as_secs_f64(), "convo_id" => convo_id.to_string());
+pub fn record_envelope_write_duration(_convo_id: &str, duration: Duration) {
+    // Avoid high-cardinality labels; record aggregate only
+    metrics::histogram!("envelope_write_duration_seconds", duration.as_secs_f64());
 }
 
 #[allow(dead_code)]
@@ -170,8 +215,8 @@ pub fn record_event_stream_size(size_bytes: i64) {
 }
 
 #[allow(dead_code)]
-pub fn record_active_sse_connections(convo_id: &str, count: i64) {
-    metrics::gauge!("active_sse_connections", count as f64, "convo_id" => convo_id.to_string());
+pub fn record_active_sse_connections(_convo_id: &str, count: i64) {
+    metrics::gauge!("active_sse_connections", count as f64);
 }
 
 /// Update system resource metrics
@@ -209,11 +254,11 @@ pub fn record_actor_restart(actor_type: &str, reason: &str) {
 }
 
 /// Record actor mailbox depth
+/// Note: convo_id removed from labels per security hardening (high cardinality)
 #[allow(dead_code)]
-pub fn record_actor_mailbox_depth(actor_type: &str, convo_id: &str, depth: i64) {
+pub fn record_actor_mailbox_depth(actor_type: &str, _convo_id: &str, depth: i64) {
     metrics::gauge!("actor_mailbox_depth", depth as f64,
-        "actor_type" => actor_type.to_string(),
-        "convo_id" => convo_id.to_string()
+        "actor_type" => actor_type.to_string()
     );
 }
 
@@ -236,11 +281,10 @@ pub fn record_actor_message_drop(actor_type: &str, reason: &str) {
 }
 
 /// Record actor mailbox full event
+/// Note: convo_id removed from labels per security hardening (high cardinality)
 #[allow(dead_code)]
-pub fn record_actor_mailbox_full(convo_id: &str) {
-    metrics::counter!("actor_mailbox_full_events_total", 1,
-        "convo_id" => convo_id.to_string()
-    );
+pub fn record_actor_mailbox_full(_convo_id: &str) {
+    metrics::counter!("actor_mailbox_full_events_total", 1);
 }
 
 // ============================================================================
@@ -248,17 +292,15 @@ pub fn record_actor_mailbox_full(convo_id: &str) {
 // ============================================================================
 
 /// Record epoch increment operation duration
+/// Note: convo_id removed from labels per security hardening (high cardinality)
 #[allow(dead_code)]
-pub fn record_epoch_increment(convo_id: &str, duration: Duration) {
-    metrics::histogram!("epoch_increment_duration_seconds", duration.as_secs_f64(),
-        "convo_id" => convo_id.to_string()
-    );
+pub fn record_epoch_increment(_convo_id: &str, duration: Duration) {
+    metrics::histogram!("epoch_increment_duration_seconds", duration.as_secs_f64());
 }
 
 /// Record epoch conflict detection
+/// Note: convo_id removed from labels per security hardening (high cardinality)
 #[allow(dead_code)]
-pub fn record_epoch_conflict(convo_id: &str) {
-    metrics::counter!("epoch_conflicts_total", 1,
-        "convo_id" => convo_id.to_string()
-    );
+pub fn record_epoch_conflict(_convo_id: &str) {
+    metrics::counter!("epoch_conflicts_total", 1);
 }

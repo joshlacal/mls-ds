@@ -90,7 +90,10 @@ impl SseState {
             .entry(convo_id.to_string())
             .or_insert_with(|| {
                 let (tx, _rx) = broadcast::channel(self.buffer_size);
-                info!(convo_id = convo_id, "Created new broadcast channel");
+                info!(
+                    convo = %crate::crypto::redact_for_log(convo_id),
+                    "Created new broadcast channel"
+                );
                 tx
             })
             .clone()
@@ -116,9 +119,9 @@ pub async fn subscribe_convo_events(
     let user_did = auth_user.did.clone();
 
     info!(
-        convo_id = %convo_id,
-        user_did = %user_did,
-        cursor = ?query.cursor,
+        convo = %crate::crypto::redact_for_log(&convo_id),
+        user = %crate::crypto::redact_for_log(&user_did),
+        has_cursor = query.cursor.is_some(),
         "SSE subscription request"
     );
 
@@ -132,8 +135,8 @@ pub async fn subscribe_convo_events(
 
     if !is_member {
         warn!(
-            convo_id = %convo_id,
-            user_did = %user_did,
+            convo = %crate::crypto::redact_for_log(&convo_id),
+            user = %crate::crypto::redact_for_log(&user_did),
             "User not a member of conversation"
         );
         return Err(StatusCode::FORBIDDEN);
@@ -148,7 +151,11 @@ pub async fn subscribe_convo_events(
                 Some(cursor_str.clone())
             }
             Err(e) => {
-                warn!(cursor = cursor_str, error = %e, "Invalid cursor format");
+                warn!(
+                    cursor = %crate::crypto::redact_for_log(cursor_str),
+                    error = %e,
+                    "Invalid cursor format"
+                );
                 return Err(StatusCode::BAD_REQUEST);
             }
         }
@@ -199,7 +206,7 @@ pub async fn subscribe_convo_events(
                             }
                             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                                 warn!(
-                                    convo_id = %convo_id,
+                                    convo = %crate::crypto::redact_for_log(&convo_id),
                                     skipped = skipped,
                                     "Slow consumer, events skipped"
                                 );
@@ -213,12 +220,18 @@ pub async fn subscribe_convo_events(
                                     detail: Some(serde_json::json!({ "skipped": skipped })),
                                 };
 
-                                let json = serde_json::to_string(&info).unwrap();
+                                // SAFETY: StreamEvent is a simple enum with no complex types,
+                                // so serialization can only fail if there's a bug in serde_json.
+                                let json = serde_json::to_string(&info)
+                                    .expect("BUG: Failed to serialize StreamEvent");
                                 let sse_event = Event::default().data(json);
                                 return Some((Ok::<Event, Infallible>(sse_event), (rx, None, convo_id.clone())));
                             }
                             Err(broadcast::error::RecvError::Closed) => {
-                                info!(convo_id = %convo_id, "Broadcast channel closed");
+                                info!(
+                                    convo = %crate::crypto::redact_for_log(&convo_id),
+                                    "Broadcast channel closed"
+                                );
                                 return None;
                             }
                         }

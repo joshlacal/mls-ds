@@ -5,7 +5,7 @@ use tracing::{info, warn, error};
 
 use crate::{
     auth::AuthUser,
-    models::GetWelcomeOutput,
+    generated_types::GetWelcomeOutput,
     storage::{is_member, DbPool},
 };
 
@@ -17,7 +17,7 @@ pub struct GetWelcomeParams {
 
 /// Get Welcome message for joining a conversation
 /// GET /xrpc/blue.catbird.mls.getWelcome
-#[tracing::instrument(skip(pool), fields(did = %auth_user.did, convo_id = %params.convo_id))]
+#[tracing::instrument(skip(pool))]
 pub async fn get_welcome(
     State(pool): State<DbPool>,
     auth_user: AuthUser,
@@ -43,12 +43,12 @@ pub async fn get_welcome(
             StatusCode::INTERNAL_SERVER_ERROR
         })?
     {
-        warn!("User {} is not a member of conversation {}", did, params.convo_id);
+        warn!("User is not a member of conversation");
         return Err(StatusCode::FORBIDDEN);
     }
 
     // Fetch and consume Welcome message for this user (atomic operation)
-    info!("Querying welcome message: convo_id={}, recipient_did={}", params.convo_id, did);
+    info!("Querying welcome message");
     
     // Use a transaction to atomically fetch and mark as in_flight
     let mut tx = pool.begin().await.map_err(|e| {
@@ -96,7 +96,7 @@ pub async fn get_welcome(
             .unwrap_or(0);
 
             if consumed_count > 0 {
-                warn!("Welcome already consumed for user {} in conversation {}", did, params.convo_id);
+                warn!("Welcome already consumed for user");
                 return Err(StatusCode::GONE);  // 410 Gone - already fetched
             }
             
@@ -180,7 +180,7 @@ pub async fn get_welcome(
     // Encode welcome data as standard base64 (for Swift compatibility)
     let welcome_base64 = base64::engine::general_purpose::STANDARD.encode(&welcome_data);
 
-    info!("Successfully fetched and consumed welcome message for {} in conversation {}", did, params.convo_id);
+    info!("Successfully fetched and consumed welcome message");
 
     Ok(Json(GetWelcomeOutput {
         convo_id: params.convo_id,

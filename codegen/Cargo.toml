@@ -1,0 +1,13 @@
+[package]
+name = "mls-codegen"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "gen-lexicons"
+path = "src/main.rs"
+
+[dependencies]
+# ATrium codegen from git (not published to crates.io)
+atrium-codegen = { git = "https://github.com/atrium-rs/atrium.git", branch = "main" }
+clap = { version = "4", features = ["derive"] }

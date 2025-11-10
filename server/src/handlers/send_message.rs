@@ -1,103 +1,116 @@
 use axum::{extract::State, http::StatusCode, Json};
 use std::sync::Arc;
 use tokio::sync::oneshot;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use crate::{
     actors::{ActorRegistry, ConvoMessage},
     auth::AuthUser,
-    models::{SendMessageInput, SendMessageOutput},
+    generated::blue::catbird::mls::send_message::{Input, Output, OutputData, NSID},
     realtime::{SseState, StreamEvent},
+    sqlx_atrium::chrono_to_datetime,
     db,
     storage::{is_member, DbPool},
-    util::json_extractor::LoggedJson,
 };
 
 /// Send a message to a conversation
-/// POST /xrpc/chat.bsky.convo.sendMessage
-#[tracing::instrument(skip(pool, sse_state, actor_registry, input), fields(did = %auth_user.did, convo_id = %input.convo_id))]
+/// POST /xrpc/blue.catbird.mls.sendMessage
+#[tracing::instrument(skip(pool, sse_state, actor_registry, auth_user))]
 pub async fn send_message(
     State(pool): State<DbPool>,
     State(sse_state): State<Arc<SseState>>,
     State(actor_registry): State<Arc<ActorRegistry>>,
     auth_user: AuthUser,
-    LoggedJson(input): LoggedJson<SendMessageInput>,
-) -> Result<Json<SendMessageOutput>, StatusCode> {
-    info!("🔷 [send_message] START - did: {}, convo: {}, epoch: {}, ciphertext: {} bytes", 
-          auth_user.did, input.convo_id, input.epoch, input.ciphertext.len());
-    
-    if let Err(_e) =
-        crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.sendMessage")
-    {
+    Json(input): Json<Input>,
+) -> Result<Json<Output>, StatusCode> {
+    let input = input.data; // Unwrap Object<InputData>
+
+    // Extract privacy metadata values from bounded/limited types
+    let declared_size: u32 = input.declared_size.into();
+    let padded_size: u32 = input.padded_size.into();
+
+    // Note: Reduced logging per security hardening - no identity-bearing fields at info level
+    tracing::debug!(
+        "send_message start: msgId={}, convoId={}, epoch={}",
+        crate::crypto::redact_for_log(&input.msg_id),
+        crate::crypto::redact_for_log(&input.convo_id),
+        input.epoch
+    );
+
+    // Enforce authorization
+    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
         error!("❌ [send_message] Unauthorized - failed auth check");
         return Err(StatusCode::UNAUTHORIZED);
     }
-    let did = &auth_user.did;
 
-    // Validate msg_id format (ULID is 26 characters)
+    // Note: Sender verification from JWT - server no longer exposes sender in responses per security hardening
+    // Clients derive sender from decrypted MLS content
+
+    // Validate msgId format (ULID is 26 characters, alphanumeric)
     if input.msg_id.len() != 26 || !input.msg_id.chars().all(|c| c.is_ascii_alphanumeric()) {
-        warn!("❌ [send_message] Invalid msg_id format: {}", input.msg_id);
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
-    if input.epoch < 0 {
-        warn!("❌ [send_message] Invalid epoch: {}", input.epoch);
+        error!("❌ [send_message] Invalid msgId format");
         return Err(StatusCode::BAD_REQUEST);
     }
 
     // Validate ciphertext is present and not too large (10MB limit)
     if input.ciphertext.is_empty() {
-        warn!("❌ [send_message] Empty ciphertext provided");
+        error!("❌ [send_message] Empty ciphertext provided");
         return Err(StatusCode::BAD_REQUEST);
     }
     if input.ciphertext.len() > 10 * 1024 * 1024 {
-        warn!("❌ [send_message] Ciphertext too large: {} bytes", input.ciphertext.len());
+        error!("❌ [send_message] Ciphertext too large: {} bytes", input.ciphertext.len());
         return Err(StatusCode::BAD_REQUEST);
     }
 
     // Validate padding: ciphertext length must match padded_size
-    if input.ciphertext.len() as i64 != input.padded_size {
-        warn!(
+    if input.ciphertext.len() as u32 != padded_size {
+        error!(
             "❌ [send_message] Ciphertext length ({}) does not match paddedSize ({})",
             input.ciphertext.len(),
-            input.padded_size
+            padded_size
         );
         return Err(StatusCode::BAD_REQUEST);
     }
 
     // Validate declared_size is not larger than padded_size
-    if input.declared_size > input.padded_size {
-        warn!(
+    if declared_size > padded_size {
+        error!(
             "❌ [send_message] declaredSize ({}) > paddedSize ({})",
-            input.declared_size, input.padded_size
+            declared_size, padded_size
         );
         return Err(StatusCode::BAD_REQUEST);
     }
 
     // Validate padded_size is a valid bucket size
     let valid_buckets = [512, 1024, 2048, 4096, 8192];
-    let is_valid_bucket = valid_buckets.contains(&input.padded_size)
-        || (input.padded_size > 8192
-            && input.padded_size <= 10 * 1024 * 1024
-            && input.padded_size % 8192 == 0);
+    let is_valid_bucket = valid_buckets.contains(&padded_size)
+        || (padded_size > 8192
+            && padded_size <= 10 * 1024 * 1024
+            && padded_size % 8192 == 0);
 
     if !is_valid_bucket {
-        warn!(
+        error!(
             "❌ [send_message] Invalid paddedSize: {} (must be 512, 1024, 2048, 4096, 8192, or multiples of 8192 up to 10MB)",
-            input.padded_size
+            padded_size
         );
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    info!("📍 [send_message] Checking membership...");
+    // Log privacy metadata when present
+    if declared_size > 0 && padded_size > 0 {
+        info!("📍 [send_message] Privacy metadata - declared: {}, padded: {}, overhead: {}",
+              declared_size, padded_size, padded_size - declared_size);
+    }
+
+    tracing::debug!("📍 [send_message] checking membership");
     // Check if sender is a member
-    if !is_member(&pool, did, &input.convo_id).await.map_err(|e| {
+    if !is_member(&pool, &auth_user.did, &input.convo_id).await.map_err(|e| {
         error!("❌ [send_message] Failed to check membership: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })? {
-        warn!(
+        error!(
             "❌ [send_message] User {} is not a member of conversation {}",
-            did, input.convo_id
+            auth_user.did, input.convo_id
         );
         return Err(StatusCode::FORBIDDEN);
     }
@@ -108,7 +121,7 @@ pub async fn send_message(
         .unwrap_or(false);
 
     let (msg_id, now) = if use_actors {
-        info!("Using actor system for send_message");
+        tracing::debug!("Using actor system for send_message");
 
         // Get or spawn conversation actor
         let actor_ref = actor_registry.get_or_spawn(&input.convo_id).await
@@ -120,7 +133,7 @@ pub async fn send_message(
         // Send message via actor
         let (tx, rx) = oneshot::channel();
         actor_ref.send_message(ConvoMessage::SendMessage {
-            sender_did: did.clone(),
+            sender_did: auth_user.did.clone(),
             ciphertext: input.ciphertext.clone(),
             reply: tx,
         }).map_err(|_| {
@@ -141,20 +154,20 @@ pub async fn send_message(
 
         // Increment unread counts via actor (fire-and-forget)
         let _ = actor_ref.cast(ConvoMessage::IncrementUnread {
-            sender_did: did.clone(),
+            sender_did: auth_user.did.clone(),
         });
 
         // For now, still create the message in DB directly for compatibility
         // TODO: Move this into the actor's SendMessage handler
         info!("📍 [send_message] Creating message in database...");
-        let message = db::create_message_v2(
+        let message = db::create_message(
             &pool,
             &input.convo_id,
             &input.msg_id,
             input.ciphertext.clone(),
-            input.epoch,
-            input.declared_size,
-            input.padded_size,
+            input.epoch as i64,
+            declared_size as i64,
+            padded_size as i64,
             input.idempotency_key.clone(),
         )
         .await
@@ -165,19 +178,19 @@ pub async fn send_message(
 
         (message.id.clone(), message.created_at)
     } else {
-        info!("Using legacy database approach for send_message");
+        tracing::debug!("Using legacy database approach for send_message");
 
         info!("📍 [send_message] Creating message in database...");
 
         // Create message with privacy-enhancing fields
-        let message = db::create_message_v2(
+        let message = db::create_message(
             &pool,
             &input.convo_id,
             &input.msg_id,
             input.ciphertext,
-            input.epoch,
-            input.declared_size,
-            input.padded_size,
+            input.epoch as i64,
+            declared_size as i64,
+            padded_size as i64,
             input.idempotency_key.clone(),
         )
         .await
@@ -189,15 +202,15 @@ pub async fn send_message(
         let msg_id = message.id.clone();
         let now = message.created_at;
 
-        info!("✅ [send_message] Message created - id: {}", msg_id);
+        tracing::debug!("send_message message created: msgId={}", crate::crypto::redact_for_log(&msg_id));
 
-        info!("📍 [send_message] Updating unread counts...");
+        tracing::debug!("📍 [send_message] updating unread counts");
         // Update unread counts for other members
         sqlx::query(
             "UPDATE members SET unread_count = unread_count + 1 WHERE convo_id = $1 AND member_did != $2 AND left_at IS NULL"
         )
         .bind(&input.convo_id)
-        .bind(did)
+        .bind(&auth_user.did)
         .execute(&pool)
         .await
         .map_err(|e| {
@@ -208,20 +221,18 @@ pub async fn send_message(
         (msg_id, now)
     };
 
-    info!("✅ [send_message] Message created - id: {}", msg_id);
+    tracing::debug!("send_message message created: msgId={}", crate::crypto::redact_for_log(&msg_id));
 
-    info!("📍 [send_message] Spawning fan-out task...");
+    tracing::debug!("📍 [send_message] spawning fan-out task");
     // Spawn async task for fan-out and realtime emission
     let pool_clone = pool.clone();
     let convo_id = input.convo_id.clone();
     let msg_id_clone = msg_id.clone();
-    let sender_did = did.clone();
-    let epoch = input.epoch;
     let sse_state_clone = sse_state.clone();
 
     tokio::spawn(async move {
         let fanout_start = std::time::Instant::now();
-        info!("📍 [send_message:fanout] Starting fan-out for convo: {}", convo_id);
+        tracing::debug!("📍 [send_message:fanout] starting fan-out");
 
         // Get all active members
         let members_result = sqlx::query!(
@@ -237,7 +248,7 @@ pub async fn send_message(
 
         match members_result {
             Ok(members) => {
-                info!("📍 [send_message:fanout] Fan-out to {} members", members.len());
+                tracing::debug!("📍 [send_message:fanout] fan-out to members");
 
                 // Write envelopes for message tracking
                 for member in &members {
@@ -269,10 +280,7 @@ pub async fn send_message(
                 let fanout_duration = fanout_start.elapsed();
                 crate::metrics::record_envelope_write_duration(&convo_id, fanout_duration);
 
-                info!(
-                    "✅ [send_message:fanout] Completed in {}ms",
-                    fanout_duration.as_millis()
-                );
+                tracing::debug!("send_message:fanout completed in {}ms", fanout_duration.as_millis());
             }
             Err(e) => {
                 error!(
@@ -282,7 +290,7 @@ pub async fn send_message(
             }
         }
 
-        info!("📍 [send_message:fanout] Emitting SSE event...");
+        tracing::debug!("📍 [send_message:fanout] emitting SSE event");
         // Emit realtime event with full message view including ciphertext
         let cursor = sse_state_clone
             .cursor_gen
@@ -303,33 +311,29 @@ pub async fn send_message(
 
         match message_result {
             Ok(msg) => {
-                let message_view = crate::models::MessageView {
+                // Note: sender field removed per security hardening - clients derive sender from decrypted MLS content
+                let message_view = crate::models::MessageView::from(crate::models::MessageViewData {
                     id: msg.id,
                     convo_id: convo_id.clone(),
-                    sender: msg.sender_did,
-                    ciphertext: msg.ciphertext.unwrap_or_default(),
-                    epoch: msg.epoch,
-                    seq: msg.seq,
-                    created_at: msg.created_at,
-                    embed_type: None,
-                    embed_uri: None,
-                };
+                    ciphertext: msg.ciphertext,
+                    epoch: msg.epoch as usize,
+                    seq: msg.seq as usize,
+                    created_at: crate::sqlx_atrium::chrono_to_datetime(msg.created_at),
+                });
 
                 let event = StreamEvent::MessageEvent {
                     cursor: cursor.clone(),
                     message: message_view.clone(),
                 };
 
-                // Store event for backfill with full message data
-                let event_payload = serde_json::to_value(&message_view)
-                    .unwrap_or_else(|_| serde_json::json!({}));
-
+                // Store minimal event envelope (no ciphertext)
+                // Clients will fetch full message via getMessages
                 if let Err(e) = crate::db::store_event(
                     &pool_clone,
                     &cursor,
                     &convo_id,
                     "messageEvent",
-                    event_payload,
+                    Some(&msg_id_clone),
                 )
                 .await
                 {
@@ -343,7 +347,7 @@ pub async fn send_message(
                         e
                     );
                 } else {
-                    info!("✅ [send_message:fanout] SSE event emitted");
+                    tracing::debug!("✅ [send_message:fanout] SSE event emitted");
                 }
             }
             Err(e) => {
@@ -355,12 +359,13 @@ pub async fn send_message(
         }
     });
 
-    info!("✅ [send_message] COMPLETE - msgId: {} (async fan-out initiated)", msg_id);
+    info!("✅ [send_message] COMPLETE - async fan-out initiated");
 
-    Ok(Json(SendMessageOutput {
+    // Note: sender field removed from output per security hardening - client already knows sender from JWT
+    Ok(Json(Output::from(OutputData {
         message_id: msg_id,
-        received_at: now,
-    }))
+        received_at: chrono_to_datetime(now),
+    })))
 }
 
 #[cfg(test)]

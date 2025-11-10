@@ -5,7 +5,9 @@ metadata:
   name: catbird-mls-config
   namespace: catbird
 data:
-  RUST_LOG: "info"
+  # Production log level: warn (errors and warnings only)
+  # CRITICAL: Do not use info/debug/trace in production - they leak metadata
+  RUST_LOG: "warn"
   SERVER_PORT: "3000"
   DATABASE_HOST: "postgres-service"
   DATABASE_PORT: "5432"
