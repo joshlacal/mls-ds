@@ -9,17 +9,20 @@ use crate::{
 
 /// Get all conversations for the authenticated user
 /// GET /xrpc/chat.bsky.convo.getConvos
-#[tracing::instrument(skip(pool), fields(did = %auth_user.did))]
+#[tracing::instrument(skip(pool))]
 pub async fn get_convos(
     State(pool): State<DbPool>,
     auth_user: AuthUser,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let did = &auth_user.did;
-    info!("Fetching conversations for user {}", did);
+    info!("Fetching conversations for user");
 
     // Get all active memberships for the user
     let memberships = sqlx::query_as::<_, Membership>(
-        "SELECT convo_id, member_did, joined_at, left_at, unread_count FROM members WHERE member_did = $1 AND left_at IS NULL ORDER BY joined_at DESC"
+        "SELECT convo_id, member_did, user_did, device_id, device_name, joined_at, left_at, unread_count, last_read_at,
+                is_admin, promoted_at, promoted_by_did, leaf_index,
+                needs_rejoin, rejoin_requested_at, rejoin_key_package_hash
+         FROM members WHERE member_did = $1 AND left_at IS NULL ORDER BY joined_at DESC"
     )
     .bind(did)
     .fetch_all(&pool)
@@ -40,67 +43,53 @@ pub async fn get_convos(
         .fetch_optional(&pool)
         .await
         .map_err(|e| {
-            error!("Failed to fetch conversation {}: {}", membership.convo_id, e);
+            error!("Failed to fetch conversation: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
         if let Some(c) = convo {
             // Get all active members
             let member_rows: Vec<Membership> = sqlx::query_as(
-                "SELECT convo_id, member_did, joined_at, left_at, unread_count FROM members WHERE convo_id = $1 AND left_at IS NULL"
+                "SELECT convo_id, member_did, user_did, device_id, device_name, joined_at, left_at, unread_count, last_read_at,
+                        is_admin, promoted_at, promoted_by_did, leaf_index,
+                        needs_rejoin, rejoin_requested_at, rejoin_key_package_hash
+                 FROM members WHERE convo_id = $1 AND left_at IS NULL ORDER BY user_did, joined_at"
             )
             .bind(&membership.convo_id)
             .fetch_all(&pool)
             .await
             .map_err(|e| {
-                error!("Failed to fetch members for conversation {}: {}", membership.convo_id, e);
+                error!("Failed to fetch members for conversation: {}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
             let members: Vec<crate::models::MemberView> = member_rows
                 .into_iter()
-                .enumerate()
-                .map(|(idx, m)| crate::models::MemberView { 
-                    did: m.member_did,
-                    joined_at: m.joined_at,
-                    leaf_index: Some(idx as i32),
+                .map(|m| {
+                    m.to_member_view().map_err(|e| {
+                        error!("Failed to convert membership to member view: {}", e);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })
                 })
-                .collect();
+                .collect::<Result<Vec<_>, StatusCode>>()?;
 
             // Skip conversations without a valid MLS groupId
-            let group_id = match c.group_id.clone() {
-                Some(gid) if !gid.is_empty() => gid,
-                _ => {
-                    error!("Conversation {} has no MLS group_id, skipping", c.id);
-                    continue;
-                }
-            };
-            
-            // Build metadata view
-            let metadata_view = if c.title.is_some() {
-                Some(crate::models::ConvoMetadataView {
-                    name: c.title.clone(),
-                    description: None,
-                })
-            } else {
-                None
-            };
+            if c.group_id.is_none() || c.group_id.as_ref().map_or(true, |gid| gid.is_empty()) {
+                error!("Conversation {} has no MLS group_id, skipping", c.id);
+                continue;
+            }
 
-            convos.push(ConvoView {
-                id: c.id,
-                group_id,
-                creator: c.creator_did,
-                members,
-                epoch: c.current_epoch,
-                cipher_suite: c.cipher_suite.clone().unwrap_or_else(|| "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519".to_string()),
-                created_at: c.created_at,
-                last_message_at: None, // TODO: Get from last message
-                metadata: metadata_view,
-            });
+            // Convert conversation to ConvoView using the existing method
+            let convo_view = c.to_convo_view(members).map_err(|e| {
+                error!("Failed to convert conversation to view: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+            convos.push(convo_view);
         }
     }
 
-    info!("Found {} conversations for user {}", convos.len(), did);
+    info!("Found {} conversations for user", convos.len());
 
     Ok(Json(serde_json::json!({ "conversations": convos })))
 }

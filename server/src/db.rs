@@ -330,89 +330,19 @@ pub async fn reset_unread_count(pool: &DbPool, convo_id: &str, member_did: &str)
 // Message Operations
 // =============================================================================
 
-/// Create a new message with direct ciphertext storage (v1 simplified)
+/// Create a message with privacy-enhancing fields
+///
+/// This is the ONLY message creation function. It implements metadata privacy by:
+/// - Setting sender_did to NULL (sender derived from decrypted MLS message by clients)
+/// - Using client-provided msg_id (ULID) for deduplication
+/// - Supporting declared_size/padded_size for traffic analysis resistance
+/// - Quantizing timestamps to 2-second buckets
+///
+/// # Security
+/// - Never stores sender identity in plaintext
+/// - Idempotent via msg_id and optional idempotency_key
+/// - Provides minimal metadata surface for network observers
 pub async fn create_message(
-    pool: &DbPool,
-    convo_id: &str,
-    sender_did: &str,
-    ciphertext: Vec<u8>,
-    epoch: i64,
-) -> Result<Message> {
-    create_message_with_idempotency(pool, convo_id, sender_did, ciphertext, epoch, None).await
-}
-
-/// Create a new message with optional idempotency key
-pub async fn create_message_with_idempotency(
-    pool: &DbPool,
-    convo_id: &str,
-    sender_did: &str,
-    ciphertext: Vec<u8>,
-    epoch: i64,
-    idempotency_key: Option<String>,
-) -> Result<Message> {
-    // Generate msg_id for backward compatibility
-    // New clients should call create_message_v2 with client-generated msg_id
-    let msg_id = uuid::Uuid::new_v4().to_string();
-    let now = Utc::now();
-    let expires_at = now + chrono::Duration::days(30);
-
-    // Calculate sequence number within transaction
-    let mut tx = pool.begin().await.context("Failed to begin transaction")?;
-
-    // If idempotency key is provided, check for existing message
-    if let Some(ref idem_key) = idempotency_key {
-        if let Some(existing) = sqlx::query_as::<_, Message>(
-            "SELECT id, convo_id, sender_did, message_type, CAST(epoch AS BIGINT), CAST(seq AS BIGINT), ciphertext, created_at, expires_at
-             FROM messages WHERE idempotency_key = $1"
-        )
-        .bind(idem_key)
-        .fetch_optional(&mut *tx)
-        .await
-        .context("Failed to check idempotency key")? {
-            // Return existing message without creating a duplicate
-            tx.rollback().await.ok();
-            return Ok(existing);
-        }
-    }
-
-    let seq: i64 = sqlx::query_scalar(
-        "SELECT CAST(COALESCE(MAX(seq), 0) + 1 AS BIGINT) FROM messages WHERE convo_id = $1"
-    )
-    .bind(convo_id)
-    .fetch_one(&mut *tx)
-    .await
-    .context("Failed to calculate sequence number")?;
-
-    let message = sqlx::query_as::<_, Message>(
-        r#"
-        INSERT INTO messages (
-            id, convo_id, sender_did, message_type, epoch, seq,
-            ciphertext, created_at, expires_at, idempotency_key
-        ) VALUES ($1, $2, $3, 'app', $4, $5, $6, $7, $8, $9)
-        RETURNING id, convo_id, sender_did, message_type, CAST(epoch AS BIGINT), CAST(seq AS BIGINT), ciphertext, created_at, expires_at
-        "#,
-    )
-    .bind(&msg_id)
-    .bind(convo_id)
-    .bind(sender_did)
-    .bind(epoch)
-    .bind(seq)
-    .bind(&ciphertext)
-    .bind(&now)
-    .bind(&expires_at)
-    .bind(&idempotency_key)
-    .fetch_one(&mut *tx)
-    .await
-    .context("Failed to insert message")?;
-
-    tx.commit().await.context("Failed to commit transaction")?;
-
-    Ok(message)
-}
-
-/// Create a message with privacy-enhancing fields (v2)
-/// Supports msg_id, padding, and timestamp quantization
-pub async fn create_message_v2(
     pool: &DbPool,
     convo_id: &str,
     msg_id: &str,
@@ -635,6 +565,73 @@ pub async fn get_message_count(pool: &DbPool, convo_id: &str) -> Result<i64> {
     Ok(count)
 }
 
+/// Delete expired messages based on expires_at
+pub async fn delete_expired_messages(pool: &DbPool) -> Result<u64> {
+    let result = sqlx::query("DELETE FROM messages WHERE expires_at IS NOT NULL AND expires_at < NOW()")
+        .execute(pool)
+        .await
+        .context("Failed to delete expired messages")?;
+    Ok(result.rows_affected())
+}
+
+/// Delete old events older than the provided retention window (seconds)
+pub async fn delete_old_events(pool: &DbPool, older_than_seconds: i64) -> Result<u64> {
+    let result = sqlx::query(
+        r#"DELETE FROM event_stream WHERE emitted_at < NOW() - ($1::text || ' seconds')::interval"#,
+    )
+    .bind(older_than_seconds.to_string())
+    .execute(pool)
+    .await
+    .context("Failed to delete old events")?;
+    Ok(result.rows_affected())
+}
+
+/// Delete messages older than TTL (in days)
+pub async fn compact_messages(pool: &DbPool, ttl_days: i64) -> Result<u64> {
+    let cutoff = Utc::now() - chrono::Duration::days(ttl_days);
+
+    let result = sqlx::query(
+        "DELETE FROM messages WHERE created_at < $1"
+    )
+    .bind(cutoff)
+    .execute(pool)
+    .await
+    .context("Failed to compact messages")?;
+
+    Ok(result.rows_affected())
+}
+
+/// Delete event_stream entries older than TTL (in days)
+pub async fn compact_event_stream(pool: &DbPool, ttl_days: i64) -> Result<u64> {
+    let cutoff = Utc::now() - chrono::Duration::days(ttl_days);
+
+    let result = sqlx::query(
+        "DELETE FROM event_stream WHERE emitted_at < $1"
+    )
+    .bind(cutoff)
+    .execute(pool)
+    .await
+    .context("Failed to compact event stream")?;
+
+    Ok(result.rows_affected())
+}
+
+/// Delete consumed welcome messages older than 7 days
+pub async fn compact_welcome_messages(pool: &DbPool) -> Result<u64> {
+    let cutoff = Utc::now() - chrono::Duration::days(7);
+
+    let result = sqlx::query(
+        "DELETE FROM welcome_messages
+         WHERE consumed = true AND consumed_at < $1"
+    )
+    .bind(cutoff)
+    .execute(pool)
+    .await
+    .context("Failed to compact welcome messages")?;
+
+    Ok(result.rows_affected())
+}
+
 /// Delete a message
 pub async fn delete_message(pool: &DbPool, message_id: &str) -> Result<()> {
     sqlx::query("DELETE FROM messages WHERE id = $1")
@@ -776,6 +773,52 @@ pub async fn delete_expired_key_packages(pool: &DbPool) -> Result<u64> {
         .execute(pool)
         .await
         .context("Failed to delete expired key packages")?;
+
+    Ok(result.rows_affected())
+}
+
+/// Delete consumed key packages older than specified hours
+pub async fn delete_consumed_key_packages(pool: &DbPool, hours_old: i64) -> Result<u64> {
+    let cutoff = Utc::now() - chrono::Duration::hours(hours_old);
+
+    let result = sqlx::query(
+        "DELETE FROM key_packages WHERE consumed = true AND consumed_at < $1"
+    )
+    .bind(cutoff)
+    .execute(pool)
+    .await
+    .context("Failed to delete consumed key packages")?;
+
+    Ok(result.rows_affected())
+}
+
+/// Enforce maximum key packages per device
+pub async fn enforce_key_package_limit(
+    pool: &DbPool,
+    max_per_device: i64,
+) -> Result<u64> {
+    // For each DID, keep only the newest max_per_device packages
+    let result = sqlx::query(
+        r#"
+        DELETE FROM key_packages
+        WHERE id IN (
+            SELECT id FROM (
+                SELECT id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY did
+                           ORDER BY created_at DESC
+                       ) as rn
+                FROM key_packages
+                WHERE consumed = false
+            ) ranked
+            WHERE rn > $1
+        )
+        "#
+    )
+    .bind(max_per_device)
+    .execute(pool)
+    .await
+    .context("Failed to enforce key package limit")?;
 
     Ok(result.rows_affected())
 }
@@ -1129,14 +1172,31 @@ pub async fn create_envelope(
 // Event Stream Operations (Realtime Events)
 // =============================================================================
 
-/// Store event in event stream
+/// Store minimal event envelope (no full message content)
+///
+/// Security: Only stores routing metadata. Clients fetch full message
+/// via getMessages and decrypt locally. This prevents metadata leakage
+/// from event stream storage.
+///
+/// # Arguments
+/// * `cursor` - Event cursor (ULID) for ordering
+/// * `convo_id` - Conversation identifier
+/// * `event_type` - Type of event (messageEvent, reactionEvent, etc.)
+/// * `message_id` - Optional message ID for message events only
 pub async fn store_event(
     pool: &DbPool,
     cursor: &str,
     convo_id: &str,
     event_type: &str,
-    payload: serde_json::Value,
+    message_id: Option<&str>,
 ) -> Result<()> {
+    // Store minimal envelope only - no ciphertext or metadata
+    let envelope = serde_json::json!({
+        "cursor": cursor,
+        "convoId": convo_id,
+        "messageId": message_id,
+    });
+
     sqlx::query!(
         r#"
         INSERT INTO event_stream (id, convo_id, event_type, payload, emitted_at)
@@ -1145,7 +1205,7 @@ pub async fn store_event(
         cursor,
         convo_id,
         event_type,
-        payload,
+        envelope,
     )
     .execute(pool)
     .await

@@ -1,368 +1,314 @@
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+//! Database models using generated Atrium types
+//!
+//! These models use the generated lexicon types directly with sqlx extensions
+//! for Atrium types (Did, Datetime, etc.)
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+use sqlx::FromRow;
+
+// Re-export generated types for convenience
+pub use crate::generated::blue::catbird::mls::defs::{
+    ConvoMetadata, ConvoMetadataData, ConvoView, ConvoViewData, KeyPackageRef, KeyPackageRefData,
+    MemberView, MemberViewData, MessageView, MessageViewData,
+};
+
+// Re-export endpoint types that handlers need
+pub use crate::generated::endpoints::{
+    add_members::{Input as AddMembersInput, Output as AddMembersOutput},
+    get_welcome::Output as GetWelcomeOutput,
+    leave_convo::{Input as LeaveConvoInput, Output as LeaveConvoOutput},
+    publish_key_package::Input as PublishKeyPackageInput,
+    send_message::{Input as SendMessageInput, Output as SendMessageOutput},
+};
+
+// =============================================================================
+// Database-specific models (not in lexicon)
+// =============================================================================
+
+/// Database representation of a conversation
+/// Maps to `conversations` table (current schema)
+#[derive(Debug, Clone, FromRow)]
 pub struct Conversation {
     pub id: String,
-    pub creator_did: String,
+    pub group_id: Option<String>, // Optional in current schema
+    pub creator_did: String,      // Stored as TEXT, convert to Did when needed
     pub current_epoch: i32,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-    pub title: Option<String>,
-    pub group_id: Option<String>,
-    pub cipher_suite: Option<String>,
+    pub cipher_suite: Option<String>, // Optional in current schema
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub name: Option<String>, // From metadata
 }
 
 impl Conversation {
-    pub fn new(creator_did: String, metadata: Option<ConvoMetadata>) -> Self {
-        let (title, _description) = if let Some(m) = metadata {
-            (m.name, m.description)
+    /// Convert to API ConvoView with members
+    ///
+    /// # Errors
+    /// Returns an error if the creator_did is not a valid DID string.
+    pub fn to_convo_view(&self, members: Vec<MemberView>) -> Result<ConvoView, String> {
+        let metadata = if self.name.is_some() {
+            Some(ConvoMetadata::from(ConvoMetadataData {
+                name: self.name.clone(),
+                description: None, // TODO: Add description column to conversations table
+            }))
         } else {
-            (None, None)
+            None
         };
-        
-        let now = Utc::now();
-        Self {
-            id: uuid::Uuid::new_v4().to_string(),
-            creator_did,
-            current_epoch: 0,
-            created_at: now,
-            updated_at: now,
-            title,
-            group_id: None,
-            cipher_suite: None,
-        }
+
+        let creator = self.creator_did.parse().map_err(|e| {
+            format!("Invalid creator DID '{}': {}", self.creator_did, e)
+        })?;
+
+        Ok(ConvoView::from(ConvoViewData {
+            id: self.id.clone(),
+            group_id: self.group_id.clone().unwrap_or_default(),
+            creator,
+            members,
+            epoch: self.current_epoch as usize,
+            cipher_suite: self
+                .cipher_suite
+                .clone()
+                .unwrap_or_else(|| "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519".to_string()),
+            created_at: crate::sqlx_atrium::chrono_to_datetime(self.created_at),
+            last_message_at: None,
+            metadata,
+        }))
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+/// Database representation of a membership
+/// Maps to `members` table (current schema)
+#[derive(Debug, Clone, FromRow)]
 pub struct Membership {
     pub convo_id: String,
-    pub member_did: String,
-    pub joined_at: DateTime<Utc>,
-    pub left_at: Option<DateTime<Utc>>,
+    pub member_did: String, // Stored as TEXT (device-specific MLS DID)
+    pub user_did: Option<String>, // User DID without device suffix
+    pub device_id: Option<String>, // Device UUID
+    pub device_name: Option<String>, // Human-readable device name
+    pub joined_at: chrono::DateTime<chrono::Utc>,
+    pub left_at: Option<chrono::DateTime<chrono::Utc>>,
     pub unread_count: i32,
+    pub last_read_at: Option<chrono::DateTime<chrono::Utc>>,
+    // Admin fields
+    pub is_admin: bool,
+    pub promoted_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub promoted_by_did: Option<String>,
+    pub leaf_index: Option<i32>,
+    // Rejoin support fields
+    pub needs_rejoin: bool,
+    pub rejoin_requested_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub rejoin_key_package_hash: Option<String>,
 }
 
 impl Membership {
     pub fn is_active(&self) -> bool {
         self.left_at.is_none()
     }
-}
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
-pub struct Message {
-    pub id: String,
-    pub convo_id: String,
-    pub sender_did: String,
-    pub message_type: String, // "app" or "commit"
-    pub epoch: i64,
-    pub seq: i64,
-    pub ciphertext: Vec<u8>,
-    pub created_at: DateTime<Utc>,
-    pub expires_at: Option<DateTime<Utc>>,
-}
+    /// Convert to API MemberView
+    ///
+    /// # Errors
+    /// Returns an error if member_did is not a valid DID string or promoted_by_did is invalid.
+    pub fn to_member_view(&self) -> Result<MemberView, String> {
+        let did: atrium_api::types::string::Did = self.member_did.parse().map_err(|e| {
+            format!("Invalid member DID '{}': {}", self.member_did, e)
+        })?;
 
-impl Message {
-    pub fn new(
-        convo_id: String,
-        sender_did: String,
-        message_type: String,
-        epoch: i64,
-        seq: i64,
-        ciphertext: Vec<u8>,
-    ) -> Self {
-        let now = Utc::now();
-        let expires_at = now + chrono::Duration::days(30);
-        Self {
-            id: uuid::Uuid::new_v4().to_string(),
-            convo_id,
-            sender_did,
-            message_type,
-            epoch,
-            seq,
-            ciphertext,
-            created_at: now,
-            expires_at: Some(expires_at),
-        }
+        // Use user_did if available, otherwise fall back to member_did (for backward compatibility)
+        let user_did = if let Some(ref user_did_str) = self.user_did {
+            user_did_str.parse().map_err(|e| {
+                format!("Invalid user DID '{}': {}", user_did_str, e)
+            })?
+        } else {
+            did.clone()
+        };
+
+        let promoted_by = if let Some(ref promoted_by_did) = self.promoted_by_did {
+            Some(promoted_by_did.parse().map_err(|e| {
+                format!("Invalid promoted_by DID '{}': {}", promoted_by_did, e)
+            })?)
+        } else {
+            None
+        };
+
+        Ok(MemberView::from(MemberViewData {
+            did,
+            user_did,
+            device_id: self.device_id.clone(),
+            device_name: self.device_name.clone(),
+            joined_at: crate::sqlx_atrium::chrono_to_datetime(self.joined_at),
+            is_admin: self.is_admin,
+            leaf_index: self.leaf_index.map(|i| i as usize),
+            credential: None,
+            promoted_at: self.promoted_at.map(crate::sqlx_atrium::chrono_to_datetime),
+            promoted_by,
+        }))
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+/// Database representation of a message
+/// Maps to `messages` table
+#[derive(Debug, Clone, FromRow)]
+pub struct Message {
+    pub id: String,
+    pub convo_id: String,
+    pub sender_did: String, // Stored as TEXT
+    pub message_type: String,
+    pub epoch: i64,
+    pub seq: i64,
+    pub ciphertext: Vec<u8>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl Message {
+        /// Convert to API MessageView
+    ///
+    /// Note: sender field removed per security hardening - clients derive sender from decrypted MLS content
+    pub fn to_message_view(&self) -> Result<MessageView, String> {
+        Ok(MessageView::from(MessageViewData {
+            id: self.id.clone(),
+            convo_id: self.convo_id.clone(),
+            ciphertext: self.ciphertext.clone(),
+            epoch: self.epoch as usize,
+            seq: self.seq as usize,
+            created_at: crate::sqlx_atrium::chrono_to_datetime(self.created_at),
+        }))
+    }
+}
+
+/// Database representation of a key package
+/// Maps to `key_packages` table
+#[derive(Debug, Clone, FromRow)]
 pub struct KeyPackage {
-    pub did: String,
+    pub did: String, // Stored as TEXT
     pub cipher_suite: String,
     pub key_data: Vec<u8>,
     pub key_package_hash: String,
-    pub created_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
     pub consumed: bool,
 }
 
 impl KeyPackage {
     pub fn is_valid(&self) -> bool {
-        !self.consumed && self.expires_at > Utc::now()
+        !self.consumed && self.expires_at > chrono::Utc::now()
+    }
+
+    /// Convert to API KeyPackageRef
+    ///
+    /// # Errors
+    /// Returns an error if the DID is not a valid DID string.
+    pub fn to_key_package_ref(&self) -> Result<KeyPackageRef, String> {
+        use base64::Engine;
+        let key_package_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(&self.key_data);
+
+        let did = self.did.parse().map_err(|e| {
+            format!("Invalid key package DID '{}': {}", self.did, e)
+        })?;
+
+        Ok(KeyPackageRef::from(KeyPackageRefData {
+            did,
+            key_package: key_package_b64,
+            cipher_suite: self.cipher_suite.clone(),
+        }))
     }
 }
 
-// API Request/Response types
-
-#[derive(Debug, Deserialize)]
-pub struct KeyPackageHashEntry {
-    #[serde(rename = "$type")]
-    pub type_field: Option<String>,
-    pub did: String,
-    pub hash: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct CreateConvoInput {
-    #[serde(rename = "groupId")]
-    pub group_id: String,
-    #[serde(rename = "cipherSuite")]
-    pub cipher_suite: String,
-    #[serde(rename = "initialMembers")]
-    pub initial_members: Option<Vec<String>>,
-    pub metadata: Option<ConvoMetadata>,
-    /// Single Welcome message for ALL initial members (base64url encoded)
-    /// Contains encrypted secrets that each member can decrypt
-    #[serde(rename = "welcomeMessage", skip_serializing_if = "Option::is_none")]
-    pub welcome_message: Option<String>,
-    /// Array of {did, hash} objects for each initial member
-    /// This tells the server which key package was used for each member's Welcome
-    #[serde(rename = "keyPackageHashes", skip_serializing_if = "Option::is_none")]
-    pub key_package_hashes: Option<Vec<KeyPackageHashEntry>>,
-    /// Optional idempotency key for preventing duplicate conversations
-    #[serde(rename = "idempotencyKey", skip_serializing_if = "Option::is_none")]
-    pub idempotency_key: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ConvoMetadata {
-    pub name: Option<String>,
-    pub description: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ConvoView {
+/// Welcome message storage (database-specific)
+#[derive(Debug, Clone, FromRow)]
+pub struct WelcomeMessage {
     pub id: String,
-    #[serde(rename = "groupId")]
-    pub group_id: String,
-    pub creator: String,
-    pub members: Vec<MemberView>,
+    pub convo_id: String,
+    pub recipient_did: String,
+    pub welcome_data: Vec<u8>, // Base64url decoded
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub consumed: bool,
+}
+
+/// Commit message storage (database-specific)
+#[derive(Debug, Clone, FromRow)]
+pub struct CommitMessage {
+    pub id: String,
+    pub convo_id: String,
+    pub sender_did: String,
     pub epoch: i32,
-    #[serde(rename = "cipherSuite")]
-    pub cipher_suite: String,
-    #[serde(rename = "createdAt")]
-    pub created_at: DateTime<Utc>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "lastMessageAt")]
-    pub last_message_at: Option<DateTime<Utc>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<ConvoMetadataView>,
+    pub commit_data: Vec<u8>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MemberInfo {
-    pub did: String,
+// =============================================================================
+// NEW: Models for Admin System, Blocks, and Multi-Device Support
+// =============================================================================
+// NOTE: These models are defined but their database tables need to be created
+// in a future migration. See Phase 2 of the implementation plan.
+
+/// User device registration for multi-device support
+/// Will map to future `user_devices` table
+#[derive(Debug, Clone, FromRow)]
+pub struct UserDevice {
+    pub device_id: String, // UUID
+    pub user_did: String,  // Base user DID (without #device suffix)
+    pub mls_did: String,   // Device-specific MLS DID (user_did#device_id)
+    pub device_name: String,
+    pub signature_public_key: Vec<u8>, // Ed25519 public key
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub last_seen_at: chrono::DateTime<chrono::Utc>,
+    pub is_active: bool,
 }
 
-#[derive(Debug, Serialize)]
-pub struct MemberView {
-    pub did: String,
-    #[serde(rename = "joinedAt")]
-    pub joined_at: DateTime<Utc>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "leafIndex")]
-    pub leaf_index: Option<i32>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ConvoMetadataView {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct AddMembersInput {
-    #[serde(rename = "convoId")]
+/// Admin action audit log
+/// Will map to future `admin_actions` table
+#[derive(Debug, Clone, FromRow)]
+pub struct AdminAction {
+    pub id: String, // ULID
     pub convo_id: String,
-    #[serde(rename = "didList")]
-    pub did_list: Vec<String>,
-    pub commit: Option<String>, // base64url encoded
-    /// Single Welcome message for ALL new members (base64url encoded)
-    /// Contains encrypted secrets that each member can decrypt
-    #[serde(rename = "welcomeMessage", skip_serializing_if = "Option::is_none")]
-    pub welcome_message: Option<String>,
-    /// Array of {did, hash} objects for each new member
-    /// This tells the server which key package was used for each member's Welcome
-    #[serde(rename = "keyPackageHashes", skip_serializing_if = "Option::is_none")]
-    pub key_package_hashes: Option<Vec<KeyPackageHashEntry>>,
-    /// Optional idempotency key for preventing duplicate member additions
-    #[serde(rename = "idempotencyKey", skip_serializing_if = "Option::is_none")]
-    pub idempotency_key: Option<String>,
+    pub actor_did: String,  // Admin who performed the action
+    pub target_did: String, // Member who was acted upon
+    pub action_type: String, // "promote", "demote", "remove"
+    pub reason: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct AddMembersOutput {
-    pub success: bool,
-    #[serde(rename = "newEpoch")]
-    pub new_epoch: i32,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct SendMessageInput {
-    #[serde(rename = "convoId")]
+/// E2EE moderation report
+/// Will map to future `reports` table
+#[derive(Debug, Clone, FromRow)]
+pub struct Report {
+    pub id: String, // ULID
     pub convo_id: String,
-    /// Client-generated ULID for message deduplication
-    /// MUST be included in MLS message AAD
-    #[serde(rename = "msgId")]
-    pub msg_id: String,
-    /// Direct ciphertext payload stored in PostgreSQL
-    /// Contains encrypted JSON with version, text, and optional embed
-    /// MUST be padded to paddedSize for metadata privacy
-    #[serde(with = "base64_bytes")]
-    pub ciphertext: Vec<u8>,
-    pub epoch: i64,
-    /// Original plaintext size before padding (for metadata privacy)
-    #[serde(rename = "declaredSize")]
-    pub declared_size: i64,
-    /// Padded ciphertext size in bytes
-    /// Must be 512, 1024, 2048, 4096, 8192, or multiples of 8192 up to 10MB
-    #[serde(rename = "paddedSize")]
-    pub padded_size: i64,
-    /// Deprecated: Use msgId instead
-    /// Optional idempotency key for preventing duplicate messages
-    #[serde(rename = "idempotencyKey", skip_serializing_if = "Option::is_none")]
-    pub idempotency_key: Option<String>,
+    pub reporter_did: String,
+    pub reported_did: String,
+    pub category: String, // "spam", "harassment", "illegal", etc.
+    pub encrypted_content: Vec<u8>, // Encrypted report details
+    pub message_ids: Option<Vec<String>>, // JSON array of related message IDs
+    pub status: String,   // "pending", "resolved", "dismissed"
+    pub resolved_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub resolved_by: Option<String>, // Admin DID
+    pub resolution_notes: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
-mod base64_bytes {
-    use serde::{Deserialize, Deserializer, Serializer};
-    use base64::Engine;
-    use serde_json::Value;
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        // Handle both formats:
-        // 1. Plain base64 string: "base64data"
-        // 2. AT Protocol $bytes format: {"$bytes": "base64data"}
-        let value = Value::deserialize(deserializer)?;
-
-        let base64_str = match value {
-            Value::String(s) => s,
-            Value::Object(mut map) => {
-                map.remove("$bytes")
-                    .and_then(|v| v.as_str().map(String::from))
-                    .ok_or_else(|| serde::de::Error::custom("Expected $bytes field in object"))?
-            }
-            _ => return Err(serde::de::Error::custom("Expected string or $bytes object")),
-        };
-
-        // Try STANDARD base64 first (with +/), then fall back to URL_SAFE_NO_PAD
-        base64::engine::general_purpose::STANDARD
-            .decode(&base64_str)
-            .or_else(|_| {
-                base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&base64_str)
-            })
-            .map_err(serde::de::Error::custom)
-    }
-
-    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        // Use STANDARD base64 for Swift compatibility
-        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-
-        // Serialize as AT Protocol $bytes format: {"$bytes": "base64data"}
-        use serde::ser::SerializeMap;
-        let mut map = serializer.serialize_map(Some(1))?;
-        map.serialize_entry("$bytes", &encoded)?;
-        map.end()
-    }
+/// Cached Bluesky block relationships
+/// Will map to future `bsky_blocks` table
+#[derive(Debug, Clone, FromRow)]
+pub struct BskyBlock {
+    pub id: i64, // Auto-increment
+    pub blocker_did: String,
+    pub blocked_did: String,
+    pub block_uri: Option<String>, // AT-URI of block record
+    pub created_at: chrono::DateTime<chrono::Utc>, // When block was created on Bluesky
+    pub cached_at: chrono::DateTime<chrono::Utc>,  // When we cached it
+    pub checked_at: chrono::DateTime<chrono::Utc>, // Last verification
 }
 
-#[derive(Debug, Serialize)]
-pub struct SendMessageOutput {
-    #[serde(rename = "messageId")]
-    pub message_id: String,
-    #[serde(rename = "receivedAt")]
-    pub received_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct LeaveConvoInput {
-    #[serde(rename = "convoId")]
+/// Pending welcome message for rejoin orchestration
+/// Will map to future `pending_welcomes` table
+#[derive(Debug, Clone, FromRow)]
+pub struct PendingWelcome {
+    pub id: String, // ULID
     pub convo_id: String,
-    #[serde(rename = "targetDid")]
-    pub target_did: Option<String>,
-    pub commit: Option<String>, // base64url encoded
-}
-
-#[derive(Debug, Serialize)]
-pub struct LeaveConvoOutput {
-    pub success: bool,
-    #[serde(rename = "newEpoch")]
-    pub new_epoch: i32,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct MessageView {
-    pub id: String,
-    #[serde(rename = "convoId")]
-    pub convo_id: String,
-    pub sender: String, // DID
-    #[serde(with = "base64_bytes")]
-    pub ciphertext: Vec<u8>,
-    pub epoch: i64,
-    pub seq: i64,
-    #[serde(rename = "createdAt")]
-    pub created_at: DateTime<Utc>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "embedType")]
-    pub embed_type: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "embedUri")]
-    pub embed_uri: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct PublishKeyPackageInput {
-    #[serde(rename = "keyPackage")]
-    pub key_package: String, // base64url
-    #[serde(rename = "cipherSuite")]
-    pub cipher_suite: String,
-    pub expires: DateTime<Utc>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct KeyPackageInfo {
-    pub did: String,
-    #[serde(rename = "keyPackage")]
-    pub key_package: String, // base64url
-    #[serde(rename = "cipherSuite")]
-    pub cipher_suite: String,
-    #[serde(rename = "keyPackageHash")]
-    pub key_package_hash: String,
-}
-
-// Welcome message models
-
-
-#[derive(Debug, Serialize)]
-pub struct GetWelcomeOutput {
-    #[serde(rename = "convoId")]
-    pub convo_id: String,
-    /// Base64url-encoded Welcome message data
-    pub welcome: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ConfirmWelcomeOutput {
-    pub confirmed: bool,
+    pub recipient_did: String,
+    pub welcome_data: Vec<u8>, // Base64url decoded MLS Welcome
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+    pub delivered: bool,
 }

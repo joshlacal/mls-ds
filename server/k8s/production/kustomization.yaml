@@ -32,7 +32,7 @@ patchesStrategicMerge:
             - name: mls-server
               env:
                 - name: RUST_LOG
-                  value: "info,catbird_server=info"
+                  value: "warn"  # Production: warn only (errors and warnings)
               resources:
                 requests:
                   cpu: 250m

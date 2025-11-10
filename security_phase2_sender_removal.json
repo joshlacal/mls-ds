@@ -1,0 +1,28 @@
+{
+  "task": "Remove all sender metadata from responses and events",
+  "context": "Following 'dumb delivery service' model - server must not expose sender identity. Clients derive sender from decrypted MLS content.",
+  "requirements": [
+    "Remove sender from MessageEvent SSE payload in server/src/realtime/mod.rs",
+    "Remove sender_did from get_messages response in server/src/handlers/get_messages.rs",
+    "Return only: msg_id, ciphertext, seq, epoch, created_at (bucketed) from get_messages",
+    "Update event_stream to store minimal envelope: {cursor, convo_id, message_id} in server/src/db.rs",
+    "Ensure sender_did column is nullable in messages table",
+    "Remove any remaining references to server-side sender tracking",
+    "Use safe error handling - no .unwrap() calls",
+    "Preserve existing functionality for encryption/decryption flows"
+  ],
+  "files": [
+    "server/src/realtime/mod.rs",
+    "server/src/handlers/get_messages.rs",
+    "server/src/handlers/send_message.rs",
+    "server/src/db.rs",
+    "server/migrations/20251103_001_message_privacy_columns.sql"
+  ],
+  "success_criteria": [
+    "No sender/sender_did in any API response",
+    "Clients must decrypt to determine sender",
+    "Event stream stores minimal data",
+    "All code compiles",
+    "Zero .unwrap() calls"
+  ]
+}

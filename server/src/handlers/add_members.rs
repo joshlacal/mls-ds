@@ -8,13 +8,13 @@ use tracing::{info, warn, error};
 use crate::{
     actors::{ActorRegistry, ConvoMessage, KeyPackageHashEntry},
     auth::AuthUser,
-    models::{AddMembersInput, AddMembersOutput},
+    generated::blue::catbird::mls::add_members::{Input as AddMembersInput, Output as AddMembersOutput, OutputData},
     storage::{get_current_epoch, is_member, DbPool},
 };
 
 /// Add members to an existing conversation
 /// POST /xrpc/chat.bsky.convo.addMembers
-#[tracing::instrument(skip(pool, actor_registry), fields(did = %auth_user.did, convo_id = %input.convo_id))]
+#[tracing::instrument(skip(pool, actor_registry))]
 pub async fn add_members(
     State(pool): State<DbPool>,
     State(actor_registry): State<Arc<ActorRegistry>>,
@@ -32,8 +32,9 @@ pub async fn add_members(
     }
 
     for d in &input.did_list {
-        if !d.starts_with("did:") {
-            warn!("Invalid DID format: {}", d);
+        let did_str = d.as_str();
+        if !did_str.starts_with("did:") {
+            warn!("Invalid DID format: {}", did_str);
             return Err(StatusCode::BAD_REQUEST);
         }
     }
@@ -46,22 +47,33 @@ pub async fn add_members(
             StatusCode::INTERNAL_SERVER_ERROR
         })?
     {
-        warn!("User {} is not a member of conversation {}", did, input.convo_id);
+        warn!("User is not a member of conversation");
         return Err(StatusCode::FORBIDDEN);
     }
 
-    info!("Adding {} members to conversation {}", input.did_list.len(), input.convo_id);
+    // Note: Reduced logging per security hardening - no convo IDs at info level
+    tracing::debug!("Adding {} members to convo {}", input.did_list.len(), crate::crypto::redact_for_log(&input.convo_id));
+
+    // Enforce idempotency key for write endpoints unless explicitly disabled
+    let require_idem = std::env::var("REQUIRE_IDEMPOTENCY")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
+        .unwrap_or(true);
+    if require_idem && input.idempotency_key.is_none() {
+        warn!("❌ [add_members] Missing idempotencyKey");
+        return Err(StatusCode::BAD_REQUEST);
+    }
 
     // If idempotency key is provided, check if this operation was already completed
     if let Some(ref _idem_key) = input.idempotency_key {
         // Check if all members are already added - if so, this is a duplicate request
         let mut all_exist = true;
         for target_did in &input.did_list {
+            let target_did_str = target_did.as_str();
             let exists = sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS(SELECT 1 FROM members WHERE convo_id = $1 AND member_did = $2 AND left_at IS NULL)"
             )
             .bind(&input.convo_id)
-            .bind(target_did)
+            .bind(target_did_str)
             .fetch_one(&pool)
             .await
             .unwrap_or(false);
@@ -81,10 +93,10 @@ pub async fn add_members(
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
 
-            return Ok(Json(AddMembersOutput {
+            return Ok(Json(AddMembersOutput::from(OutputData {
                 success: true,
-                new_epoch: current_epoch,
-            }));
+                new_epoch: current_epoch as usize,
+            })));
         }
     }
 
@@ -94,7 +106,7 @@ pub async fn add_members(
         .unwrap_or(false);
 
     let new_epoch = if use_actors {
-        info!("Using actor system for add_members");
+        tracing::debug!("Using actor system for add_members");
 
         // Decode commit if provided
         let commit_bytes = if let Some(ref commit) = input.commit {
@@ -110,8 +122,8 @@ pub async fn add_members(
         // Convert key_package_hashes to actor message format
         let key_package_hashes = input.key_package_hashes.as_ref().map(|hashes| {
             hashes.iter().map(|entry| KeyPackageHashEntry {
-                did: entry.did.clone(),
-                hash: entry.hash.clone(),
+                did: entry.data.did.to_string(),
+                hash: entry.data.hash.clone(),
             }).collect()
         });
 
@@ -125,7 +137,7 @@ pub async fn add_members(
         // Send AddMembers message
         let (tx, rx) = oneshot::channel();
         actor_ref.send_message(ConvoMessage::AddMembers {
-            did_list: input.did_list.clone(),
+            did_list: input.did_list.iter().map(|d| d.to_string()).collect(),
             commit: commit_bytes,
             welcome_message: input.welcome_message.clone(),
             key_package_hashes,
@@ -146,7 +158,7 @@ pub async fn add_members(
                 StatusCode::INTERNAL_SERVER_ERROR
             })?
     } else {
-        info!("Using legacy database approach for add_members");
+        tracing::debug!("Using legacy database approach for add_members");
 
         let current_epoch = get_current_epoch(&pool, &input.convo_id)
             .await
@@ -159,7 +171,7 @@ pub async fn add_members(
         let now = chrono::Utc::now();
 
         // Process commit if provided
-        if let Some(commit) = input.commit {
+        if let Some(ref commit) = input.commit {
             let commit_bytes = base64::engine::general_purpose::STANDARD.decode(commit)
                 .map_err(|e| {
                     warn!("Invalid base64 commit: {}", e);
@@ -195,44 +207,113 @@ pub async fn add_members(
                 })?;
         }
 
-        // Add new members
+        // Add new members (multi-device: add ALL devices for each user)
         for target_did in &input.did_list {
-            // Check if already a member
-            let is_existing = sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM members WHERE convo_id = $1 AND member_did = $2"
+            let target_did_str = target_did.as_str();
+            tracing::debug!("📍 [add_members] processing member");
+
+            // Query user's devices from user_devices table
+            let devices: Vec<(String, String, Option<String>)> = sqlx::query_as(
+                "SELECT device_id, device_mls_did, device_name
+                 FROM user_devices
+                 WHERE user_did = $1
+                 ORDER BY registered_at"
             )
-            .bind(&input.convo_id)
-            .bind(target_did)
-            .fetch_one(&pool)
+            .bind(target_did_str)
+            .fetch_all(&pool)
             .await
             .map_err(|e| {
-                error!("Failed to check existing membership: {}", e);
+                error!("Failed to query devices for {}: {}", target_did_str, e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
-            if is_existing > 0 {
-                info!("Member {} already exists, skipping", target_did);
-                continue;
+            if devices.is_empty() {
+                // Fallback to single-device mode (backward compatibility)
+                tracing::debug!("📍 [add_members] no devices found, using single-device mode");
+
+                // Check if already a member
+                let is_existing = sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM members WHERE convo_id = $1 AND member_did = $2"
+                )
+                .bind(&input.convo_id)
+                .bind(target_did_str)
+                .fetch_one(&pool)
+                .await
+                .map_err(|e| {
+                    error!("Failed to check existing membership: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+
+                if is_existing > 0 {
+                    tracing::debug!("Member already exists, skipping");
+                    continue;
+                }
+
+                sqlx::query(
+                    "INSERT INTO members (convo_id, member_did, user_did, joined_at, is_admin)
+                     VALUES ($1, $2, $3, $4, false)"
+                )
+                .bind(&input.convo_id)
+                .bind(target_did_str)
+                .bind(target_did_str)
+                .bind(&now)
+                .execute(&pool)
+                .await
+                .map_err(|e| {
+                    error!("Failed to add member: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+
+                tracing::debug!("✅ [add_members] added single-device member");
+            } else {
+                // Multi-device mode: add each device
+                tracing::debug!("📍 [add_members] found devices for user");
+
+                for (device_id, device_mls_did, device_name) in devices {
+                    // Check if device already a member
+                    let is_existing = sqlx::query_scalar::<_, i64>(
+                        "SELECT COUNT(*) FROM members WHERE convo_id = $1 AND member_did = $2"
+                    )
+                    .bind(&input.convo_id)
+                    .bind(&device_mls_did)
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(|e| {
+                        error!("Failed to check existing device membership: {}", e);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?;
+
+                    if is_existing > 0 {
+                        tracing::debug!("Device already exists, skipping");
+                        continue;
+                    }
+
+                    sqlx::query(
+                        "INSERT INTO members (convo_id, member_did, user_did, device_id, device_name, joined_at, is_admin)
+                         VALUES ($1, $2, $3, $4, $5, $6, false)"
+                    )
+                    .bind(&input.convo_id)
+                    .bind(&device_mls_did)
+                    .bind(target_did_str)
+                    .bind(&device_id)
+                    .bind(&device_name)
+                    .bind(&now)
+                    .execute(&pool)
+                    .await
+                    .map_err(|e| {
+                        error!("Failed to add device for user: {}", e);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?;
+
+                    tracing::debug!("✅ [add_members] added device for user");
+                }
             }
-
-            sqlx::query(
-                "INSERT INTO members (convo_id, member_did, joined_at) VALUES ($1, $2, $3)"
-            )
-            .bind(&input.convo_id)
-            .bind(target_did)
-            .bind(&now)
-            .execute(&pool)
-            .await
-            .map_err(|e| {
-                error!("Failed to add member {}: {}", target_did, e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
         }
 
         // Store Welcome message for new members
         // MLS generates ONE Welcome message containing encrypted secrets for ALL members
         if let Some(ref welcome_b64) = input.welcome_message {
-            info!("📍 [add_members] Processing Welcome message...");
+            tracing::debug!("📍 [add_members] processing welcome message");
 
             // Decode base64 Welcome message
             let welcome_data = base64::engine::general_purpose::STANDARD
@@ -247,13 +328,14 @@ pub async fn add_members(
 
             // Store the SAME Welcome for each new member
             for target_did in &input.did_list {
+                let target_did_str = target_did.as_str();
                 let welcome_id = uuid::Uuid::new_v4().to_string();
 
                 // Get the key_package_hash for this member from the input
                 let key_package_hash = input.key_package_hashes.as_ref()
                     .and_then(|hashes| {
                         hashes.iter()
-                            .find(|entry| entry.did == *target_did)
+                            .find(|entry| entry.did.as_str() == target_did_str)
                             .map(|entry| hex::decode(&entry.hash).ok())
                             .flatten()
                     });
@@ -266,18 +348,18 @@ pub async fn add_members(
                 )
                 .bind(&welcome_id)
                 .bind(&input.convo_id)
-                .bind(target_did)
+                .bind(target_did_str)
                 .bind(&welcome_data)
                 .bind::<Option<Vec<u8>>>(key_package_hash) // key_package_hash from client
                 .bind(&now)
                 .execute(&pool)
                 .await
                 .map_err(|e| {
-                    error!("❌ [add_members] Failed to store welcome message for {}: {}", target_did, e);
+                    error!("❌ [add_members] Failed to store welcome message for {}: {}", target_did_str, e);
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
 
-                info!("✅ [add_members] Welcome stored for member {}", target_did);
+                info!("✅ [add_members] Welcome stored for member");
             }
             info!("📍 [add_members] Stored Welcome for {} members", input.did_list.len());
         } else {
@@ -287,12 +369,12 @@ pub async fn add_members(
         new_epoch as u32
     };
 
-    info!("Successfully added members to conversation {}, new epoch: {}", input.convo_id, new_epoch);
+    info!("Successfully added members to conversation, new epoch: {}", new_epoch);
 
-    Ok(Json(AddMembersOutput {
+    Ok(Json(AddMembersOutput::from(OutputData {
         success: true,
-        new_epoch: new_epoch as i32,
-    }))
+        new_epoch: new_epoch as usize,
+    })))
 }
 
 #[cfg(test)]

@@ -35,7 +35,7 @@ pub struct KeyPackageStatsResponse {
 
 /// Get key package inventory statistics
 /// GET /xrpc/blue.catbird.mls.getKeyPackageStats
-#[tracing::instrument(skip(pool), fields(did = %auth_user.did))]
+#[tracing::instrument(skip(pool))]
 pub async fn get_key_package_stats(
     State(pool): State<DbPool>,
     auth_user: AuthUser,
@@ -65,7 +65,7 @@ pub async fn get_key_package_stats(
     // Use target DID if provided, otherwise use authenticated user's DID
     let did = target_did.as_deref().unwrap_or(&auth_user.did);
 
-    info!("Fetching key package stats for DID: {}", did);
+    info!("Fetching key package stats");
 
     // Get available key packages count
     let available = get_available_count(&pool, did, cipher_suite_filter.as_deref()).await

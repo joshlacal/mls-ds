@@ -16,6 +16,12 @@ pub fn sha256_hex(data: &[u8]) -> String {
     hex::encode(result)
 }
 
+/// Redact a sensitive value for logs by returning a short, non-reversible tag
+/// Example: "h:3fae91b2c4d5e677"
+pub fn redact_for_log(value: &str) -> String {
+    format!("h:{}", hash_for_log(value))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

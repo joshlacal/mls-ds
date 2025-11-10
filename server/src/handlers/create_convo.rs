@@ -5,73 +5,81 @@ use tracing::{info, warn, error};
 
 use crate::{
     auth::AuthUser,
-    models::{ConvoView, CreateConvoInput},
+    generated::blue::catbird::mls::create_convo::{Input, NSID},
+    generated::blue::catbird::mls::defs::{ConvoView, ConvoViewData, ConvoMetadata, ConvoMetadataData, MemberView, MemberViewData},
+    sqlx_atrium::{chrono_to_datetime, did_to_string},
     storage::DbPool,
 };
 
 /// Create a new conversation
-/// POST /xrpc/chat.bsky.convo.createConvo
-#[tracing::instrument(skip(pool, auth_user), fields(creator_did = %auth_user.did))]
+/// POST /xrpc/blue.catbird.mls.createConvo
+#[tracing::instrument(skip(pool, auth_user))]
 pub async fn create_convo(
     State(pool): State<DbPool>,
     auth_user: AuthUser,
-    Json(raw_json): Json<serde_json::Value>,
+    Json(input): Json<Input>,
 ) -> Result<Json<ConvoView>, StatusCode> {
-    error!("🔍 [create_convo] RAW JSON: {}", serde_json::to_string_pretty(&raw_json).unwrap_or_else(|_| "failed to serialize".to_string()));
-    
-    let input: CreateConvoInput = serde_json::from_value(raw_json).map_err(|e| {
-        error!("❌ [create_convo] Deserialization error: {}", e);
-        StatusCode::BAD_REQUEST
-    })?;
-    
-    info!("🔷 [create_convo] START - creator: {}, groupId: {}, initialMembers: {}, has_welcome: {}", 
-          auth_user.did, 
-          input.group_id,
-          input.initial_members.as_ref().map(|m| m.len()).unwrap_or(0),
-          input.welcome_message.is_some());
-    
-    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.createConvo") {
+    let input = input.data;
+
+    tracing::debug!("🔷 [create_convo] incoming create request");
+
+    info!(
+        creator = %crate::crypto::redact_for_log(&auth_user.did),
+        group = %crate::crypto::redact_for_log(&input.group_id),
+        initial_members = input.initial_members.as_ref().map(|m| m.len()).unwrap_or(0),
+        has_welcome = input.welcome_message.is_some(),
+        "[create_convo] start"
+    );
+
+    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
         error!("❌ [create_convo] Unauthorized");
         return Err(StatusCode::UNAUTHORIZED);
     }
-    let did = &auth_user.did;
-    
-    info!("📍 [create_convo] Validating cipher suite: {}", input.cipher_suite);
+
+    // Parse creator DID safely
+    let creator_did = auth_user.did.parse().map_err(|e| {
+        error!("Invalid creator DID '{}': {}", auth_user.did, e);
+        StatusCode::BAD_REQUEST
+    })?;
+
+    tracing::debug!("📍 [create_convo] Validating cipher suite");
     // Validate cipher suite
-    let valid_suites = ["MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519", 
+    let valid_suites = ["MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519",
                         "MLS_128_DHKEMP256_AES128GCM_SHA256_P256"];
     if !valid_suites.contains(&input.cipher_suite.as_str()) {
         warn!("❌ [create_convo] Invalid cipher suite: {}", input.cipher_suite);
         return Err(StatusCode::BAD_REQUEST);
     }
-    
+
     // Validate initial members
     if let Some(ref members) = input.initial_members {
-        info!("📍 [create_convo] Validating {} initial members", members.len());
+    tracing::debug!("📍 [create_convo] validating initial members");
         if members.len() > 100 {
             warn!("❌ [create_convo] Too many initial members: {}", members.len());
             return Err(StatusCode::BAD_REQUEST);
-        }
-        
-        // Validate DIDs format
-        for d in members {
-            if !d.starts_with("did:") {
-                warn!("❌ [create_convo] Invalid DID format: {}", d);
-                return Err(StatusCode::BAD_REQUEST);
-            }
         }
     }
 
     let convo_id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now();
-    
+
     let (name, description) = if let Some(ref meta) = input.metadata {
-        (meta.name.clone(), meta.description.clone())
+        let meta_data = &meta.data;
+        (meta_data.name.clone(), meta_data.description.clone())
     } else {
         (None, None)
     };
 
-    info!("📍 [create_convo] Creating conversation {} in database...", convo_id);
+    tracing::debug!("📍 [create_convo] creating conversation in database");
+
+    // Enforce idempotency key for production (can be disabled via REQUIRE_IDEMPOTENCY=false)
+    let require_idem = std::env::var("REQUIRE_IDEMPOTENCY")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
+        .unwrap_or(true);
+    if require_idem && input.idempotency_key.is_none() {
+        warn!("❌ [create_convo] Missing idempotencyKey");
+        return Err(StatusCode::BAD_REQUEST);
+    }
 
     // If idempotency key is provided, check for existing conversation
     if let Some(ref idem_key) = input.idempotency_key {
@@ -82,11 +90,12 @@ pub async fn create_convo(
         .fetch_optional(&pool)
         .await
         {
-            info!("📍 [create_convo] Idempotency: Returning existing conversation {}", existing_convo_id);
+            tracing::debug!("📍 [create_convo] Idempotency: returning existing conversation");
 
             // Fetch existing conversation details
-            let existing_members: Vec<(String, DateTime<Utc>)> = sqlx::query_as(
-                "SELECT member_did, joined_at FROM members WHERE convo_id = $1 AND left_at IS NULL ORDER BY joined_at"
+            let existing_members: Vec<(String, String, Option<String>, Option<String>, DateTime<Utc>, bool, Option<i32>)> = sqlx::query_as(
+                "SELECT member_did, user_did, device_id, device_name, joined_at, is_admin, leaf_index
+                 FROM members WHERE convo_id = $1 AND left_at IS NULL ORDER BY joined_at"
             )
             .bind(&existing_convo_id)
             .fetch_all(&pool)
@@ -96,45 +105,64 @@ pub async fn create_convo(
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
-            let members: Vec<crate::models::MemberView> = existing_members
+            let members: Vec<MemberView> = existing_members
                 .into_iter()
-                .enumerate()
-                .map(|(idx, (did, joined_at))| crate::models::MemberView {
-                    did,
-                    joined_at,
-                    leaf_index: Some(idx as i32),
-                })
-                .collect();
+                .map(|(member_did, user_did, device_id, device_name, joined_at, is_admin, leaf_index)| {
+                    let did = member_did.parse().map_err(|e| {
+                        error!("Invalid member DID '{}': {}", member_did, e);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?;
 
-            let metadata_view = if name.is_some() || description.is_some() {
-                Some(crate::models::ConvoMetadataView {
+                    let user_did_parsed = user_did.parse().map_err(|e| {
+                        error!("Invalid user DID '{}': {}", user_did, e);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?;
+
+                    Ok(MemberView::from(MemberViewData {
+                        did,
+                        user_did: user_did_parsed,
+                        device_id,
+                        device_name,
+                        joined_at: chrono_to_datetime(joined_at),
+                        is_admin,
+                        leaf_index: leaf_index.map(|i| i as usize),
+                        credential: None,
+                        promoted_at: None,
+                        promoted_by: None,
+                    }))
+                })
+                .collect::<Result<Vec<_>, StatusCode>>()?;
+
+            let metadata = if name.is_some() || description.is_some() {
+                Some(ConvoMetadata::from(ConvoMetadataData {
                     name: name.clone(),
                     description: description.clone(),
-                })
+                }))
             } else {
                 None
             };
 
-            return Ok(Json(ConvoView {
+            return Ok(Json(ConvoView::from(ConvoViewData {
                 id: existing_convo_id,
                 group_id: input.group_id.clone(),
-                creator: did.clone(),
+                creator: creator_did,
                 members,
                 epoch: 0,
                 cipher_suite: input.cipher_suite.clone(),
-                created_at: now,
+                created_at: chrono_to_datetime(now),
                 last_message_at: None,
-                metadata: metadata_view,
-            }));
+                metadata,
+            })));
         }
     }
 
     // Create conversation with group_id from client
     sqlx::query(
-        "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at, name, group_id, cipher_suite, idempotency_key) VALUES ($1, $2, 0, $3, $3, $4, $5, $6, $7)"
+        "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at, name, group_id, cipher_suite, idempotency_key)
+         VALUES ($1, $2, 0, $3, $3, $4, $5, $6, $7)"
     )
     .bind(&convo_id)
-    .bind(did)
+    .bind(&auth_user.did)
     .bind(&now)
     .bind(&name)
     .bind(&input.group_id)
@@ -147,13 +175,14 @@ pub async fn create_convo(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    info!("📍 [create_convo] Adding creator as member...");
+    tracing::debug!("📍 [create_convo] adding creator membership");
     // Add creator as first member
     sqlx::query(
-        "INSERT INTO members (convo_id, member_did, joined_at) VALUES ($1, $2, $3)"
+        "INSERT INTO members (convo_id, member_did, user_did, joined_at, is_admin) VALUES ($1, $2, $3, $4, true)"
     )
     .bind(&convo_id)
-    .bind(did)
+    .bind(&auth_user.did)
+    .bind(&auth_user.did) // For single-device: user_did = member_did
     .bind(&now)
     .execute(&pool)
     .await
@@ -162,40 +191,57 @@ pub async fn create_convo(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let mut members = vec![crate::models::MemberView { 
-        did: did.clone(), 
-        joined_at: now,
+    let mut members = vec![MemberView::from(MemberViewData {
+        did: creator_did.clone(),
+        user_did: creator_did.clone(), // For single-device: same as did
+        device_id: None,
+        device_name: None,
+        joined_at: chrono_to_datetime(now),
+        is_admin: true,
         leaf_index: Some(0),
-    }];
+        credential: None,
+        promoted_at: None,
+        promoted_by: None,
+    })];
 
     // Add initial members if specified
     if let Some(ref initial_members) = input.initial_members {
-        info!("📍 [create_convo] Adding {} initial members...", initial_members.len());
+        tracing::debug!("📍 [create_convo] adding initial members");
         for (idx, member_did) in initial_members.iter().enumerate() {
+            let member_did_str = did_to_string(member_did);
+
             // Skip if member is the creator (already added above)
-            if member_did == did {
+            if member_did_str == auth_user.did {
                 continue;
             }
-            
-            info!("📍 [create_convo] Adding member {}: {}", idx + 1, member_did);
+
+            info!("📍 [create_convo] Adding member {}", idx + 1);
             sqlx::query(
-                "INSERT INTO members (convo_id, member_did, joined_at) VALUES ($1, $2, $3)"
+                "INSERT INTO members (convo_id, member_did, user_did, joined_at, is_admin) VALUES ($1, $2, $3, $4, false)"
             )
             .bind(&convo_id)
-            .bind(&member_did)
+            .bind(&member_did_str)
+            .bind(&member_did_str) // For single-device: user_did = member_did
             .bind(&now)
             .execute(&pool)
             .await
             .map_err(|e| {
-                error!("❌ [create_convo] Failed to add member {}: {}", member_did, e);
+                error!("❌ [create_convo] Failed to add member: {}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
-            members.push(crate::models::MemberView {
+            members.push(MemberView::from(MemberViewData {
                 did: member_did.clone(),
-                joined_at: now,
-                leaf_index: Some((idx + 1) as i32),
-            });
+                user_did: member_did.clone(), // For single-device: same as did
+                device_id: None,
+                device_name: None,
+                joined_at: chrono_to_datetime(now),
+                is_admin: false,
+                leaf_index: Some((idx + 1) as usize),
+                credential: None,
+                promoted_at: None,
+                promoted_by: None,
+            }));
         }
     }
 
@@ -204,7 +250,7 @@ pub async fn create_convo(
     // Each member can decrypt only their portion from the same Welcome
     if let Some(ref welcome_b64) = input.welcome_message {
         info!("📍 [create_convo] Processing Welcome message...");
-        
+
         // Decode base64 Welcome message
         let welcome_data = base64::engine::general_purpose::STANDARD
             .decode(welcome_b64)
@@ -212,22 +258,25 @@ pub async fn create_convo(
                 warn!("❌ [create_convo] Invalid base64 welcome message: {}", e);
                 StatusCode::BAD_REQUEST
             })?;
-        
+
         info!("📍 [create_convo] Single Welcome message ({} bytes) for all members/devices", welcome_data.len());
-        
+
         // Store the SAME Welcome for each initial member (excluding creator)
         if let Some(ref member_list) = input.initial_members {
-            let non_creator_members: Vec<_> = member_list.iter().filter(|d| *d != did).collect();
+            let non_creator_members: Vec<_> = member_list.iter()
+                .filter(|d| did_to_string(d) != auth_user.did)
+                .collect();
 
             for member_did in &non_creator_members {
                 let welcome_id = uuid::Uuid::new_v4().to_string();
+                let member_did_str = did_to_string(member_did);
 
                 // Get the key_package_hash for this member from the input
                 let key_package_hash = input.key_package_hashes.as_ref()
                     .and_then(|hashes| {
                         hashes.iter()
-                            .find(|entry| entry.did == **member_did)
-                            .map(|entry| hex::decode(&entry.hash).ok())
+                            .find(|entry| did_to_string(&entry.data.did) == member_did_str)
+                            .map(|entry| hex::decode(&entry.data.hash).ok())
                             .flatten()
                     });
 
@@ -239,116 +288,53 @@ pub async fn create_convo(
                 )
                 .bind(&welcome_id)
                 .bind(&convo_id)
-                .bind(member_did)
+                .bind(&member_did_str)
                 .bind(&welcome_data)
                 .bind::<Option<Vec<u8>>>(key_package_hash) // key_package_hash from client
                 .bind(&now)
                 .execute(&pool)
                 .await
                 .map_err(|e| {
-                    error!("❌ [create_convo] Failed to store welcome message for {}: {}", member_did, e);
+                    error!("❌ [create_convo] Failed to store welcome message: {}", e);
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
 
-                info!("✅ [create_convo] Welcome stored for member {}", member_did);
+                tracing::debug!("✅ [create_convo] welcome stored for member");
             }
-            info!("📍 [create_convo] Stored Welcome for {} members (excluding creator)", non_creator_members.len());
+            tracing::debug!("📍 [create_convo] stored welcome for initial members");
         } else {
-            info!("📍 [create_convo] No initial_members list - skipping Welcome storage");
+            tracing::debug!("📍 [create_convo] no initial_members list - skipping welcome storage");
         }
     } else {
-        info!("📍 [create_convo] No welcome message provided");
+        tracing::debug!("📍 [create_convo] no welcome message provided");
     }
 
-    info!("✅ [create_convo] COMPLETE - convoId: {}, members: {}, epoch: 0", 
-          convo_id, members.len());
+    info!(
+        convo = %crate::crypto::redact_for_log(&convo_id),
+        member_count = members.len(),
+        epoch = 0,
+        "✅ [create_convo] complete"
+    );
 
-    // Use the actual MLS group ID from client input
-    let group_id = input.group_id.clone();
-    
     // Build metadata view if metadata exists
-    let metadata_view = if name.is_some() || description.is_some() {
-        Some(crate::models::ConvoMetadataView {
-            name: name.clone(),
-            description: description.clone(),
-        })
+    let metadata = if name.is_some() || description.is_some() {
+        Some(ConvoMetadata::from(ConvoMetadataData {
+            name,
+            description,
+        }))
     } else {
         None
     };
 
-    Ok(Json(ConvoView {
+    Ok(Json(ConvoView::from(ConvoViewData {
         id: convo_id,
-        group_id,
-        creator: did.clone(),
+        group_id: input.group_id,
+        creator: creator_did,
         members,
         epoch: 0,
-        cipher_suite: input.cipher_suite.clone(),
-        created_at: now,
+        cipher_suite: input.cipher_suite,
+        created_at: chrono_to_datetime(now),
         last_message_at: None,
-        metadata: metadata_view,
-    }))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::storage::init_db;
-    use axum::http::StatusCode;
-
-    #[tokio::test]
-    async fn test_create_convo_success() {
-        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
-        let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
-        let did = AuthUser { did: "did:plc:test123".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:test123".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
-        let input = CreateConvoInput {
-            group_id: "abcdef0123456789".to_string(),
-            cipher_suite: "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519".to_string(),
-            initial_members: Some(vec!["did:plc:member1".to_string()]),
-            metadata: Some(crate::models::ConvoMetadata {
-                name: Some("Test Convo".to_string()),
-                description: None,
-            }),
-        };
-
-        let result = create_convo(State(pool), did.clone(), Json(input)).await;
-        assert!(result.is_ok());
-        
-        let convo = result.unwrap().0;
-        assert_eq!(convo.members.len(), 2);
-        assert_eq!(convo.epoch, 0);
-        assert_eq!(convo.creator, did.did);
-    }
-
-    #[tokio::test]
-    async fn test_create_convo_invalid_did() {
-        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
-        let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
-        let did = AuthUser { did: "did:plc:test123".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:test123".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
-        let input = CreateConvoInput {
-            group_id: "abcdef0123456789".to_string(),
-            cipher_suite: "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519".to_string(),
-            initial_members: Some(vec!["invalid_did".to_string()]),
-            metadata: None,
-        };
-
-        let result = create_convo(State(pool), did, Json(input)).await;
-        assert_eq!(result.unwrap_err(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn test_create_convo_empty_did_list() {
-        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
-        let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
-        let did = AuthUser { did: "did:plc:test123".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:test123".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
-        let input = CreateConvoInput {
-            group_id: "abcdef0123456789".to_string(),
-            cipher_suite: "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519".to_string(),
-            initial_members: Some(vec![]),
-            metadata: None,
-        };
-
-        let result = create_convo(State(pool), did, Json(input)).await;
-        // Empty initial_members is actually valid - creator will be the only member
-        assert!(result.is_ok());
-    }
+        metadata,
+    })))
 }

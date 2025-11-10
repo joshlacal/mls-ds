@@ -37,7 +37,7 @@ pub struct CommitsResponse {
 
 /// Get commit messages within an epoch range
 /// GET /xrpc/blue.catbird.mls.getCommits
-#[tracing::instrument(skip(pool), fields(did = %auth_user.did, convo_id = %params.convo_id))]
+#[tracing::instrument(skip(pool))]
 pub async fn get_commits(
     State(pool): State<DbPool>,
     auth_user: AuthUser,
@@ -68,7 +68,7 @@ pub async fn get_commits(
             StatusCode::INTERNAL_SERVER_ERROR
         })?
     {
-        warn!("User {} is not a member of conversation {}", did, params.convo_id);
+        warn!("User is not a member of conversation");
         return Err(StatusCode::FORBIDDEN);
     }
     

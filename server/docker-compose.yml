@@ -48,7 +48,7 @@ services:
     environment:
       DATABASE_URL: postgresql://catbird:${POSTGRES_PASSWORD:-changeme}@postgres:5432/catbird
       REDIS_URL: redis://:${REDIS_PASSWORD:-changeme}@redis:6379
-      RUST_LOG: ${RUST_LOG:-info}
+      RUST_LOG: ${RUST_LOG:-warn}  # Production default: warn (errors and warnings only)
       JWT_SECRET: ${JWT_SECRET:-your-secret-key-change-in-production}
       SERVER_PORT: 3000
       SERVICE_DID: did:web:mls.catbird.blue

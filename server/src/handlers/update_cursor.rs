@@ -23,9 +23,9 @@ pub async fn update_cursor(
     Json(input): Json<UpdateCursorInput>,
 ) -> Result<Json<UpdateCursorOutput>, StatusCode> {
     info!(
-        user_did = %auth_user.did,
-        convo_id = %input.convo_id,
-        cursor = %input.cursor,
+        user = %crate::crypto::redact_for_log(&auth_user.did),
+        convo = %crate::crypto::redact_for_log(&input.convo_id),
+        has_cursor = true,
         "Updating cursor"
     );
 

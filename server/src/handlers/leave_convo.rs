@@ -8,13 +8,13 @@ use tracing::{info, warn, error};
 use crate::{
     actors::{ActorRegistry, ConvoMessage},
     auth::AuthUser,
-    models::{LeaveConvoInput, LeaveConvoOutput},
+    generated_types::{LeaveConvoInput, LeaveConvoOutput},
     storage::{get_current_epoch, is_member, DbPool},
 };
 
 /// Leave a conversation
 /// POST /xrpc/chat.bsky.convo.leaveConvo
-#[tracing::instrument(skip(pool, actor_registry), fields(did = %auth_user.did, convo_id = %input.convo_id))]
+#[tracing::instrument(skip(pool, actor_registry))]
 pub async fn leave_convo(
     State(pool): State<DbPool>,
     State(actor_registry): State<Arc<ActorRegistry>>,
@@ -47,7 +47,7 @@ pub async fn leave_convo(
             StatusCode::INTERNAL_SERVER_ERROR
         })?
     {
-        warn!("User {} is not a member of conversation {}", did, input.convo_id);
+        warn!("User is not a member of conversation");
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -65,12 +65,12 @@ pub async fn leave_convo(
         })?;
 
         if creator_did != *did {
-            warn!("User {} is not the creator, cannot remove other members", did);
+            warn!("User is not the creator, cannot remove other members");
             return Err(StatusCode::FORBIDDEN);
         }
     }
 
-    info!("User {} leaving conversation {}", target_did, input.convo_id);
+    info!("User leaving conversation");
 
     // Check if actor system is enabled
     let use_actors = std::env::var("ENABLE_ACTOR_SYSTEM")
@@ -186,13 +186,13 @@ pub async fn leave_convo(
 
         if rows_affected == 0 {
             // Member was already marked as left - this is idempotent
-            info!("Member {} already left conversation {}, treating as idempotent success", target_did, input.convo_id);
+            info!("Member already left conversation, treating as idempotent success");
         }
 
         new_epoch as u32
     };
 
-    info!("User {} successfully left conversation {}, new epoch: {}", target_did, input.convo_id, new_epoch);
+    info!("User successfully left conversation, new epoch: {}", new_epoch);
 
     Ok(Json(LeaveConvoOutput {
         success: true,

@@ -2,7 +2,7 @@ use dashmap::DashMap;
 use ractor::ActorRef;
 use sqlx::PgPool;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::conversation::{ConversationActor, ConvoActorArgs};
 use super::messages::ConvoMessage;
@@ -113,11 +113,11 @@ impl ActorRegistry {
     pub async fn get_or_spawn(&self, convo_id: &str) -> anyhow::Result<ActorRef<ConvoMessage>> {
         // Check if actor already exists
         if let Some(actor_ref) = self.actors.get(convo_id) {
-            info!("Using existing actor for conversation {}", convo_id);
+            debug!("Using existing actor for conversation");
             return Ok(actor_ref.clone());
         }
 
-        info!("Spawning new actor for conversation {}", convo_id);
+        debug!("Spawning new actor for conversation");
 
         // Spawn new actor
         let args = ConvoActorArgs {
@@ -218,7 +218,7 @@ impl ActorRegistry {
             let convo_id = entry.key();
             let actor_ref = entry.value();
 
-            info!("Sending shutdown to actor {}", convo_id);
+            debug!("Sending shutdown to actor");
             let _ = actor_ref.cast(ConvoMessage::Shutdown);
         }
 

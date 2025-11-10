@@ -82,6 +82,10 @@
         {
           "name": "TooManyMembers",
           "description": "Too many initial members specified (max 100)"
+        },
+        {
+          "name": "MutualBlockDetected",
+          "description": "Cannot create conversation with users who have blocked each other on Bluesky"
         }
       ]
     },

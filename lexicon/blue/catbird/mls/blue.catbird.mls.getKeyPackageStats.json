@@ -46,24 +46,8 @@
             "byCipherSuite": {
               "type": "array",
               "items": {
-                "type": "object",
-                "required": ["cipherSuite", "available"],
-                "properties": {
-                  "cipherSuite": {
-                    "type": "string",
-                    "description": "Cipher suite name"
-                  },
-                  "available": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "description": "Available key packages for this suite"
-                  },
-                  "consumed": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "description": "Total consumed key packages for this suite"
-                  }
-                }
+                "type": "ref",
+                "ref": "#cipherSuiteStats"
               },
               "description": "Breakdown by cipher suite"
             }
@@ -76,6 +60,27 @@
           "description": "The provided DID is invalid"
         }
       ]
+    },
+    "cipherSuiteStats": {
+      "type": "object",
+      "description": "Key package statistics for a specific cipher suite",
+      "required": ["cipherSuite", "available"],
+      "properties": {
+        "cipherSuite": {
+          "type": "string",
+          "description": "Cipher suite name"
+        },
+        "available": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Available key packages for this suite"
+        },
+        "consumed": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total consumed key packages for this suite"
+        }
+      }
     }
   }
 }
