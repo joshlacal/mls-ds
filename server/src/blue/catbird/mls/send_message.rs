@@ -25,12 +25,10 @@ pub type Input = crate::types::Object<InputData>;
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct OutputData {
-    ///Created message identifier
+    ///Created message identifier (echoed from input msgId)
     pub message_id: String,
-    ///Server timestamp when message was received
+    ///Server timestamp when message was received (bucketed to 2-second intervals)
     pub received_at: crate::types::string::Datetime,
-    ///Verified sender DID from JWT (server-provided, never trust client)
-    pub sender: crate::types::string::Did,
 }
 pub type Output = crate::types::Object<OutputData>;
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]

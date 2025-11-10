@@ -362,6 +362,28 @@ pub async fn add_members(
                 info!("✅ [add_members] Welcome stored for member");
             }
             info!("📍 [add_members] Stored Welcome for {} members", input.did_list.len());
+
+            // Mark key packages as consumed
+            if let Some(ref kp_hashes) = input.key_package_hashes {
+                for entry in kp_hashes {
+                    let member_did_str = entry.did.as_str();
+                    let hash_hex = &entry.hash;
+
+                    match crate::db::mark_key_package_consumed(&pool, member_did_str, hash_hex).await {
+                        Ok(consumed) => {
+                            if consumed {
+                                tracing::debug!("✅ [add_members] marked key package as consumed for {}", member_did_str);
+                            } else {
+                                tracing::warn!("⚠️ [add_members] key package not found or already consumed for {}", member_did_str);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("⚠️ [add_members] failed to mark key package as consumed: {}", e);
+                        }
+                    }
+                }
+                tracing::debug!("📍 [add_members] marked {} key packages as consumed", kp_hashes.len());
+            }
         } else {
             info!("📍 [add_members] No welcome message provided");
         }

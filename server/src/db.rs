@@ -766,6 +766,120 @@ pub async fn consume_key_package(
     Ok(())
 }
 
+/// Mark a key package as consumed by hash (used in group operations)
+pub async fn mark_key_package_consumed(
+    pool: &DbPool,
+    did: &str,
+    key_package_hash: &str,
+) -> Result<bool> {
+    let result = sqlx::query(
+        r#"
+        UPDATE key_packages
+        SET consumed = true, consumed_at = $1
+        WHERE did = $2 AND key_package_hash = $3 AND consumed = false
+        "#,
+    )
+    .bind(Utc::now())
+    .bind(did)
+    .bind(key_package_hash)
+    .execute(pool)
+    .await
+    .context("Failed to mark key package as consumed")?;
+
+    Ok(result.rows_affected() > 0)
+}
+
+/// Count key packages consumed in last N hours
+pub async fn count_consumed_key_packages(
+    pool: &DbPool,
+    did: &str,
+    hours: i64,
+) -> Result<i64> {
+    let cutoff = Utc::now() - chrono::Duration::hours(hours);
+
+    let result = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM key_packages
+        WHERE did = $1 AND consumed = true AND consumed_at >= $2
+        "#,
+    )
+    .bind(did)
+    .bind(cutoff)
+    .fetch_one(pool)
+    .await
+    .context("Failed to count consumed key packages")?;
+
+    Ok(result)
+}
+
+/// Get consumption rate (packages per day) based on last 7 days
+pub async fn get_consumption_rate(pool: &DbPool, did: &str) -> Result<f64> {
+    let cutoff = Utc::now() - chrono::Duration::days(7);
+
+    let result = sqlx::query_as::<_, (Option<i64>, Option<i64>)>(
+        r#"
+        SELECT
+            COUNT(*) as count,
+            EXTRACT(EPOCH FROM (MAX(consumed_at) - MIN(consumed_at)))::bigint as duration_seconds
+        FROM key_packages
+        WHERE did = $1 AND consumed = true AND consumed_at >= $2
+        "#,
+    )
+    .bind(did)
+    .bind(cutoff)
+    .fetch_one(pool)
+    .await
+    .context("Failed to calculate consumption rate")?;
+
+    let (count, duration_seconds) = result;
+
+    // If we have less than 2 data points or duration is 0, return 0
+    if count.unwrap_or(0) < 2 || duration_seconds.unwrap_or(0) == 0 {
+        return Ok(0.0);
+    }
+
+    // Calculate packages per day
+    let count = count.unwrap() as f64;
+    let duration_days = duration_seconds.unwrap() as f64 / 86400.0;
+
+    Ok(count / duration_days)
+}
+
+/// Get total count of key packages (all states)
+pub async fn count_all_key_packages(
+    pool: &DbPool,
+    did: &str,
+    cipher_suite: Option<&str>,
+) -> Result<i64> {
+    let result = if let Some(suite) = cipher_suite {
+        sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM key_packages
+            WHERE did = $1 AND cipher_suite = $2
+            "#,
+        )
+        .bind(did)
+        .bind(suite)
+        .fetch_one(pool)
+        .await
+    } else {
+        sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM key_packages
+            WHERE did = $1
+            "#,
+        )
+        .bind(did)
+        .fetch_one(pool)
+        .await
+    };
+
+    result.context("Failed to count all key packages")
+}
+
 /// Delete expired key packages
 pub async fn delete_expired_key_packages(pool: &DbPool) -> Result<u64> {
     let result = sqlx::query("DELETE FROM key_packages WHERE expires_at < $1")

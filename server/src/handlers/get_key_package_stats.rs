@@ -31,6 +31,19 @@ pub struct KeyPackageStatsResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "byCipherSuite")]
     by_cipher_suite: Option<Vec<CipherSuiteStats>>,
+
+    // New consumption tracking fields
+    total: i32,
+    consumed: i32,
+    #[serde(rename = "consumedLast24h")]
+    consumed_last_24h: i32,
+    #[serde(rename = "consumedLast7d")]
+    consumed_last_7d: i32,
+    #[serde(rename = "averageDailyConsumption")]
+    average_daily_consumption: i32,  // Multiplied by 100 (e.g., 250 = 2.5/day)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "predictedDepletionDays")]
+    predicted_depletion_days: Option<i32>,  // Multiplied by 100 (e.g., 350 = 3.5 days)
 }
 
 /// Get key package inventory statistics
@@ -96,11 +109,52 @@ pub async fn get_key_package_stats(
         None
     };
 
-    let needs_replenish = available < RECOMMENDED_THRESHOLD;
+    // Get consumption statistics
+    let total = crate::db::count_all_key_packages(&pool, did, cipher_suite_filter.as_deref()).await
+        .map_err(|e| {
+            error!("Failed to count all key packages: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })? as i32;
+
+    let consumed = total - available;
+
+    let consumed_last_24h = crate::db::count_consumed_key_packages(&pool, did, 24).await
+        .map_err(|e| {
+            error!("Failed to count consumed packages (24h): {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })? as i32;
+
+    let consumed_last_7d = crate::db::count_consumed_key_packages(&pool, did, 24 * 7).await
+        .map_err(|e| {
+            error!("Failed to count consumed packages (7d): {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })? as i32;
+
+    let average_daily_consumption_f64 = crate::db::get_consumption_rate(&pool, did).await
+        .map_err(|e| {
+            error!("Failed to get consumption rate: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // Convert to integer (multiply by 100)
+    let average_daily_consumption = (average_daily_consumption_f64 * 100.0) as i32;
+
+    // Calculate predicted depletion days
+    let predicted_depletion_days = if average_daily_consumption_f64 > 0.1 && available > 0 {
+        let days = (available as f64) / average_daily_consumption_f64;
+        Some((days * 100.0) as i32)  // Multiply by 100
+    } else {
+        None
+    };
+
+    // Enhanced needs_replenish logic: replenish if below threshold OR predicted to deplete in < 3 days
+    // Note: predicted_depletion_days is multiplied by 100, so < 300 means < 3.0 days
+    let needs_replenish = available < RECOMMENDED_THRESHOLD ||
+        predicted_depletion_days.map_or(false, |days| days < 300);
 
     info!(
-        "Key package stats for {}: available={}, threshold={}, needs_replenish={}",
-        did, available, RECOMMENDED_THRESHOLD, needs_replenish
+        "Key package stats for {}: available={}, threshold={}, needs_replenish={}, consumption_rate={:.2}/day",
+        did, available, RECOMMENDED_THRESHOLD, needs_replenish, average_daily_consumption_f64
     );
 
     Ok(Json(KeyPackageStatsResponse {
@@ -109,6 +163,12 @@ pub async fn get_key_package_stats(
         needs_replenish,
         oldest_expires_in,
         by_cipher_suite,
+        total,
+        consumed,
+        consumed_last_24h,
+        consumed_last_7d,
+        average_daily_consumption,
+        predicted_depletion_days,
     }))
 }
 

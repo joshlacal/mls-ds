@@ -191,6 +191,10 @@ async fn main() -> anyhow::Result<()> {
             post(handlers::publish_key_package),
         )
         .route(
+            "/xrpc/blue.catbird.mls.publishKeyPackages",
+            post(handlers::publish_key_packages),
+        )
+        .route(
             "/xrpc/blue.catbird.mls.getKeyPackages",
             get(handlers::get_key_packages),
         )
