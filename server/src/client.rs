@@ -668,6 +668,36 @@ where
             _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
         }
     }
+    ///Publish multiple MLS key packages in a single batch request (up to 100 packages). More efficient than individual uploads for replenishing key package pools.
+    pub async fn publish_key_packages(
+        &self,
+        input: crate::blue::catbird::mls::publish_key_packages::Input,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::publish_key_packages::Output,
+        crate::blue::catbird::mls::publish_key_packages::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                (),
+                _,
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::POST,
+                    nsid: crate::blue::catbird::mls::publish_key_packages::NSID.into(),
+                    parameters: None,
+                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                    encoding: Some(String::from("application/json")),
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
     ///Register a new device with the MLS server. Each device gets a unique MLS identity (did:plc:user#device-uuid). Server automatically adds device to user's existing conversations. Returns device credentials for local storage.
     pub async fn register_device(
         &self,

@@ -128,6 +128,21 @@ COMMENT ON COLUMN messages.padded_size IS 'Padded ciphertext size. Must be 512, 
 COMMENT ON COLUMN messages.received_bucket_ts IS 'Unix timestamp quantized to 2-second buckets for traffic analysis resistance';
 
 -- =============================================================================
+-- Users Table (minimal - AT Protocol identity)
+-- =============================================================================
+
+-- Users table (just for FK constraints - full profile data lives in ATProto)
+CREATE TABLE users (
+    did TEXT PRIMARY KEY,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at TIMESTAMPTZ
+);
+
+CREATE INDEX idx_users_last_seen ON users(last_seen_at DESC);
+
+COMMENT ON TABLE users IS 'Minimal user table - full identity/profile data lives in AT Protocol';
+
+-- =============================================================================
 -- KeyPackage Management (for adding members and automatic rejoin)
 -- =============================================================================
 
@@ -386,21 +401,6 @@ CREATE TRIGGER trigger_promote_creator
     AFTER INSERT ON conversations
     FOR EACH ROW
     EXECUTE FUNCTION promote_creator_to_admin();
-
--- =============================================================================
--- Users Table (minimal - AT Protocol identity)
--- =============================================================================
-
--- Users table (just for FK constraints - full profile data lives in ATProto)
-CREATE TABLE users (
-    did TEXT PRIMARY KEY,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    last_seen_at TIMESTAMPTZ
-);
-
-CREATE INDEX idx_users_last_seen ON users(last_seen_at DESC);
-
-COMMENT ON TABLE users IS 'Minimal user table - full identity/profile data lives in AT Protocol';
 
 -- =============================================================================
 -- Schema Version & Metadata

@@ -23,7 +23,7 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["available", "threshold", "needsReplenish"],
+          "required": ["available", "threshold", "needsReplenish", "total", "consumed", "consumedLast24h", "consumedLast7d", "averageDailyConsumption"],
           "properties": {
             "available": {
               "type": "integer",
@@ -37,7 +37,37 @@
             },
             "needsReplenish": {
               "type": "boolean",
-              "description": "True if available < threshold"
+              "description": "True if available < threshold OR predicted to deplete in < 3 days"
+            },
+            "total": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Total number of key packages (all states: available + consumed)"
+            },
+            "consumed": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Total number of consumed key packages"
+            },
+            "consumedLast24h": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Number of key packages consumed in the last 24 hours"
+            },
+            "consumedLast7d": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Number of key packages consumed in the last 7 days"
+            },
+            "averageDailyConsumption": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Average key packages consumed per day, multiplied by 100 (e.g., 250 = 2.5 packages/day). Calculated from 7-day window."
+            },
+            "predictedDepletionDays": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Predicted days until key package pool depletes, multiplied by 100 (e.g., 350 = 3.5 days). Null if insufficient data or rate is too low."
             },
             "oldestExpiresIn": {
               "type": "string",

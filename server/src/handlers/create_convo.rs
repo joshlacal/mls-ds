@@ -302,6 +302,28 @@ pub async fn create_convo(
                 tracing::debug!("✅ [create_convo] welcome stored for member");
             }
             tracing::debug!("📍 [create_convo] stored welcome for initial members");
+
+            // Mark key packages as consumed
+            if let Some(ref kp_hashes) = input.key_package_hashes {
+                for entry in kp_hashes {
+                    let member_did_str = did_to_string(&entry.data.did);
+                    let hash_hex = &entry.data.hash;
+
+                    match crate::db::mark_key_package_consumed(&pool, &member_did_str, hash_hex).await {
+                        Ok(consumed) => {
+                            if consumed {
+                                tracing::debug!("✅ [create_convo] marked key package as consumed for {}", member_did_str);
+                            } else {
+                                tracing::warn!("⚠️ [create_convo] key package not found or already consumed for {}", member_did_str);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("⚠️ [create_convo] failed to mark key package as consumed: {}", e);
+                        }
+                    }
+                }
+                tracing::debug!("📍 [create_convo] marked {} key packages as consumed", kp_hashes.len());
+            }
         } else {
             tracing::debug!("📍 [create_convo] no initial_members list - skipping welcome storage");
         }
