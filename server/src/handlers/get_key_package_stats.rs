@@ -182,9 +182,9 @@ async fn get_available_count(
             r#"
             SELECT COUNT(*)
             FROM key_packages
-            WHERE did = $1
+            WHERE owner_did = $1
               AND cipher_suite = $2
-              AND consumed = false
+              AND consumed_at IS NULL
               AND expires_at > NOW()
             "#
         )
@@ -197,8 +197,8 @@ async fn get_available_count(
             r#"
             SELECT COUNT(*)
             FROM key_packages
-            WHERE did = $1
-              AND consumed = false
+            WHERE owner_did = $1
+              AND consumed_at IS NULL
               AND expires_at > NOW()
             "#
         )
@@ -220,9 +220,9 @@ async fn get_oldest_expiration(
             r#"
             SELECT MIN(expires_at)
             FROM key_packages
-            WHERE did = $1
+            WHERE owner_did = $1
               AND cipher_suite = $2
-              AND consumed = false
+              AND consumed_at IS NULL
               AND expires_at > NOW()
             "#
         )
@@ -235,8 +235,8 @@ async fn get_oldest_expiration(
             r#"
             SELECT MIN(expires_at)
             FROM key_packages
-            WHERE did = $1
-              AND consumed = false
+            WHERE owner_did = $1
+              AND consumed_at IS NULL
               AND expires_at > NOW()
             "#
         )
@@ -263,10 +263,10 @@ async fn get_stats_by_cipher_suite(
         r#"
         SELECT
             cipher_suite,
-            COUNT(*) FILTER (WHERE consumed = false AND expires_at > NOW()) as "available!",
-            COUNT(*) FILTER (WHERE consumed = true) as "consumed!"
+            COUNT(*) FILTER (WHERE consumed_at IS NULL AND expires_at > NOW()) as "available!",
+            COUNT(*) FILTER (WHERE consumed_at IS NOT NULL) as "consumed!"
         FROM key_packages
-        WHERE did = $1
+        WHERE owner_did = $1
         GROUP BY cipher_suite
         ORDER BY cipher_suite
         "#,

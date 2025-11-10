@@ -1,4 +1,6 @@
-version: '3.8'
+# Catbird MLS Server - Production Configuration
+# Greenfield deployment with no migrations required
+# All schema changes are in scripts/init-db.sh
 
 services:
   postgres:
@@ -11,7 +13,7 @@ services:
       PGDATA: /var/lib/postgresql/data/pgdata
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./scripts/init-db.sh:/docker-entrypoint-initdb.d/init-db.sh
+      - ./scripts/init-db.sh:/docker-entrypoint-initdb.d/init-db.sh:ro
     ports:
       - "5433:5432"  # Changed to avoid conflict with host PostgreSQL
     healthcheck:
@@ -54,7 +56,7 @@ services:
       SERVICE_DID: did:web:mls.catbird.blue
       ENABLE_ACTOR_SYSTEM: true
     ports:
-      - "3000:3000"  # Back to standard port since old service is disabled
+      - "3000:3000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -69,8 +71,6 @@ services:
     networks:
       - catbird-network
     restart: unless-stopped
-    volumes:
-      - ./migrations:/app/migrations:ro
 
 volumes:
   postgres_data:
