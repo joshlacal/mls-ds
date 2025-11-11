@@ -80,22 +80,23 @@ impl Conversation {
 pub struct Membership {
     pub convo_id: String,
     pub member_did: String, // Stored as TEXT (device-specific MLS DID)
-    pub user_did: Option<String>, // User DID without device suffix
-    pub device_id: Option<String>, // Device UUID
-    pub device_name: Option<String>, // Human-readable device name
     pub joined_at: chrono::DateTime<chrono::Utc>,
     pub left_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub unread_count: i32,
-    pub last_read_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub leaf_index: Option<i32>,
     // Admin fields
     pub is_admin: bool,
     pub promoted_at: Option<chrono::DateTime<chrono::Utc>>,
     pub promoted_by_did: Option<String>,
-    pub leaf_index: Option<i32>,
     // Rejoin support fields
     pub needs_rejoin: bool,
     pub rejoin_requested_at: Option<chrono::DateTime<chrono::Utc>>,
     pub rejoin_key_package_hash: Option<String>,
+    pub unread_count: i32,
+    pub last_read_at: Option<chrono::DateTime<chrono::Utc>>,
+    // Multi-device support fields
+    pub user_did: Option<String>,    // Base user DID (without device suffix)
+    pub device_id: Option<String>,   // Device identifier (UUID)
+    pub device_name: Option<String>, // Human-readable device name
 }
 
 impl Membership {
@@ -112,15 +113,6 @@ impl Membership {
             format!("Invalid member DID '{}': {}", self.member_did, e)
         })?;
 
-        // Use user_did if available, otherwise fall back to member_did (for backward compatibility)
-        let user_did = if let Some(ref user_did_str) = self.user_did {
-            user_did_str.parse().map_err(|e| {
-                format!("Invalid user DID '{}': {}", user_did_str, e)
-            })?
-        } else {
-            did.clone()
-        };
-
         let promoted_by = if let Some(ref promoted_by_did) = self.promoted_by_did {
             Some(promoted_by_did.parse().map_err(|e| {
                 format!("Invalid promoted_by DID '{}': {}", promoted_by_did, e)
@@ -129,8 +121,18 @@ impl Membership {
             None
         };
 
+        // Parse user_did if present, otherwise fall back to member_did for backward compatibility
+        let user_did: atrium_api::types::string::Did = if let Some(ref user_did_str) = self.user_did {
+            user_did_str.parse().map_err(|e| {
+                format!("Invalid user DID '{}': {}", user_did_str, e)
+            })?
+        } else {
+            // Backward compatibility: use member_did as user_did
+            did.clone()
+        };
+
         Ok(MemberView::from(MemberViewData {
-            did,
+            did: did.clone(),
             user_did,
             device_id: self.device_id.clone(),
             device_name: self.device_name.clone(),
@@ -150,7 +152,7 @@ impl Membership {
 pub struct Message {
     pub id: String,
     pub convo_id: String,
-    pub sender_did: String, // Stored as TEXT
+    pub sender_did: Option<String>, // Made nullable per privacy hardening migration
     pub message_type: String,
     pub epoch: i64,
     pub seq: i64,

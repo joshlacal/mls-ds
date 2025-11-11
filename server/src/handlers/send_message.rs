@@ -1,4 +1,4 @@
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{extract::{rejection::JsonRejection, State}, http::StatusCode, Json};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use tracing::{error, info};
@@ -6,7 +6,7 @@ use tracing::{error, info};
 use crate::{
     actors::{ActorRegistry, ConvoMessage},
     auth::AuthUser,
-    generated::blue::catbird::mls::send_message::{Input, Output, OutputData, NSID},
+    generated::blue::catbird::mls::send_message::{Input, NSID},
     realtime::{SseState, StreamEvent},
     sqlx_atrium::chrono_to_datetime,
     db,
@@ -21,12 +21,15 @@ pub async fn send_message(
     State(sse_state): State<Arc<SseState>>,
     State(actor_registry): State<Arc<ActorRegistry>>,
     auth_user: AuthUser,
-    Json(input): Json<Input>,
-) -> Result<Json<Output>, StatusCode> {
+    input: Result<Json<Input>, JsonRejection>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let Json(input) = input.map_err(|rejection| {
+        error!("❌ [send_message] Failed to deserialize request body: {}", rejection);
+        StatusCode::BAD_REQUEST
+    })?;
     let input = input.data; // Unwrap Object<InputData>
 
-    // Extract privacy metadata values from bounded/limited types
-    let declared_size: u32 = input.declared_size.into();
+    // Extract padded_size from bounded type
     let padded_size: u32 = input.padded_size.into();
 
     // Note: Reduced logging per security hardening - no identity-bearing fields at info level
@@ -46,9 +49,11 @@ pub async fn send_message(
     // Note: Sender verification from JWT - server no longer exposes sender in responses per security hardening
     // Clients derive sender from decrypted MLS content
 
-    // Validate msgId format (ULID is 26 characters, alphanumeric)
-    if input.msg_id.len() != 26 || !input.msg_id.chars().all(|c| c.is_ascii_alphanumeric()) {
-        error!("❌ [send_message] Invalid msgId format");
+    // Validate msgId format (accept ULID 26 chars or UUID 36 chars with hyphens)
+    let is_ulid = input.msg_id.len() == 26 && input.msg_id.chars().all(|c| c.is_ascii_alphanumeric());
+    let is_uuid = input.msg_id.len() == 36 && input.msg_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    if !is_ulid && !is_uuid {
+        error!("❌ [send_message] Invalid msgId format (expected ULID or UUID)");
         return Err(StatusCode::BAD_REQUEST);
     }
 
@@ -72,15 +77,6 @@ pub async fn send_message(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    // Validate declared_size is not larger than padded_size
-    if declared_size > padded_size {
-        error!(
-            "❌ [send_message] declaredSize ({}) > paddedSize ({})",
-            declared_size, padded_size
-        );
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
     // Validate padded_size is a valid bucket size
     let valid_buckets = [512, 1024, 2048, 4096, 8192];
     let is_valid_bucket = valid_buckets.contains(&padded_size)
@@ -94,12 +90,6 @@ pub async fn send_message(
             padded_size
         );
         return Err(StatusCode::BAD_REQUEST);
-    }
-
-    // Log privacy metadata when present
-    if declared_size > 0 && padded_size > 0 {
-        info!("📍 [send_message] Privacy metadata - declared: {}, padded: {}, overhead: {}",
-              declared_size, padded_size, padded_size - declared_size);
     }
 
     tracing::debug!("📍 [send_message] checking membership");
@@ -120,7 +110,7 @@ pub async fn send_message(
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
 
-    let (msg_id, now) = if use_actors {
+    let (msg_id, now, seq, epoch) = if use_actors {
         tracing::debug!("Using actor system for send_message");
 
         // Get or spawn conversation actor
@@ -130,19 +120,23 @@ pub async fn send_message(
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
-        // Send message via actor
+        // Send message via actor with all privacy fields
         let (tx, rx) = oneshot::channel();
         actor_ref.send_message(ConvoMessage::SendMessage {
             sender_did: auth_user.did.clone(),
             ciphertext: input.ciphertext.clone(),
+            msg_id: input.msg_id.clone(),
+            epoch: input.epoch as i64,
+            padded_size: padded_size as i64,
+            idempotency_key: input.idempotency_key.clone(),
             reply: tx,
         }).map_err(|_| {
             error!("Failed to send message to actor");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-        // Await response
-        rx.await
+        // Await response - actor already stored message and returns (msg_id, timestamp)
+        let (msg_id, created_at) = rx.await
             .map_err(|_| {
                 error!("Actor channel closed unexpectedly");
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -152,31 +146,24 @@ pub async fn send_message(
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
+        // Fetch seq and epoch from the created message
+        let message = sqlx::query_as::<_, crate::models::Message>(
+            "SELECT id, convo_id, sender_did, message_type, CAST(epoch AS BIGINT), CAST(seq AS BIGINT), ciphertext, created_at, expires_at FROM messages WHERE id = $1"
+        )
+        .bind(&msg_id)
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| {
+            error!("Failed to fetch message for seq/epoch: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
         // Increment unread counts via actor (fire-and-forget)
         let _ = actor_ref.cast(ConvoMessage::IncrementUnread {
             sender_did: auth_user.did.clone(),
         });
 
-        // For now, still create the message in DB directly for compatibility
-        // TODO: Move this into the actor's SendMessage handler
-        info!("📍 [send_message] Creating message in database...");
-        let message = db::create_message(
-            &pool,
-            &input.convo_id,
-            &input.msg_id,
-            input.ciphertext.clone(),
-            input.epoch as i64,
-            declared_size as i64,
-            padded_size as i64,
-            input.idempotency_key.clone(),
-        )
-        .await
-        .map_err(|e| {
-            error!("❌ [send_message] Failed to create message: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-        (message.id.clone(), message.created_at)
+        (msg_id, created_at, message.seq, message.epoch)
     } else {
         tracing::debug!("Using legacy database approach for send_message");
 
@@ -189,7 +176,6 @@ pub async fn send_message(
             &input.msg_id,
             input.ciphertext,
             input.epoch as i64,
-            declared_size as i64,
             padded_size as i64,
             input.idempotency_key.clone(),
         )
@@ -201,8 +187,10 @@ pub async fn send_message(
 
         let msg_id = message.id.clone();
         let now = message.created_at;
+        let seq = message.seq;
+        let epoch = message.epoch;
 
-        tracing::debug!("send_message message created: msgId={}", crate::crypto::redact_for_log(&msg_id));
+        tracing::debug!("send_message message created: msgId={}, seq={}, epoch={}", crate::crypto::redact_for_log(&msg_id), seq, epoch);
 
         tracing::debug!("📍 [send_message] updating unread counts");
         // Update unread counts for other members
@@ -218,7 +206,7 @@ pub async fn send_message(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-        (msg_id, now)
+        (msg_id, now, seq, epoch)
     };
 
     tracing::debug!("send_message message created: msgId={}", crate::crypto::redact_for_log(&msg_id));
@@ -362,9 +350,12 @@ pub async fn send_message(
     info!("✅ [send_message] COMPLETE - async fan-out initiated");
 
     // Note: sender field removed from output per security hardening - client already knows sender from JWT
-    Ok(Json(Output::from(OutputData {
-        message_id: msg_id,
-        received_at: chrono_to_datetime(now),
+    // Manually construct response with new seq and epoch fields (lexicon has been updated)
+    Ok(Json(serde_json::json!({
+        "messageId": msg_id,
+        "receivedAt": chrono_to_datetime(now),
+        "seq": seq,
+        "epoch": epoch,
     })))
 }
 
