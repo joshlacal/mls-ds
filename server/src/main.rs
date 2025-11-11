@@ -226,36 +226,6 @@ async fn main() -> anyhow::Result<()> {
             "/xrpc/blue.catbird.mls.getCommits",
             get(handlers::get_commits),
         )
-        // Admin endpoints
-        .route(
-            "/xrpc/blue.catbird.mls.promoteAdmin",
-            post(handlers::promote_admin),
-        )
-        .route(
-            "/xrpc/blue.catbird.mls.demoteAdmin",
-            post(handlers::demote_admin),
-        )
-        // Moderation endpoints
-        .route(
-            "/xrpc/blue.catbird.mls.removeMember",
-            post(handlers::remove_member),
-        )
-        .route(
-            "/xrpc/blue.catbird.mls.reportMember",
-            post(handlers::report_member),
-        )
-        .route(
-            "/xrpc/blue.catbird.mls.getReports",
-            get(handlers::get_reports),
-        )
-        .route(
-            "/xrpc/blue.catbird.mls.resolveReport",
-            post(handlers::resolve_report),
-        )
-        .route(
-            "/xrpc/blue.catbird.mls.getAdminStats",
-            get(handlers::get_admin_stats),
-        )
         // Bluesky blocks integration endpoints
         .route(
             "/xrpc/blue.catbird.mls.checkBlocks",
