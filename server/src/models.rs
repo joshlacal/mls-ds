@@ -179,18 +179,18 @@ impl Message {
 /// Maps to `key_packages` table
 #[derive(Debug, Clone, FromRow)]
 pub struct KeyPackage {
-    pub did: String, // Stored as TEXT
+    pub owner_did: String, // Stored as TEXT
     pub cipher_suite: String,
     pub key_data: Vec<u8>,
     pub key_package_hash: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub expires_at: chrono::DateTime<chrono::Utc>,
-    pub consumed: bool,
+    pub consumed_at: Option<chrono::DateTime<chrono::Utc>>, // NULL = available, NOT NULL = consumed
 }
 
 impl KeyPackage {
     pub fn is_valid(&self) -> bool {
-        !self.consumed && self.expires_at > chrono::Utc::now()
+        self.consumed_at.is_none() && self.expires_at > chrono::Utc::now()
     }
 
     /// Convert to API KeyPackageRef
@@ -202,8 +202,8 @@ impl KeyPackage {
         let key_package_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(&self.key_data);
 
-        let did = self.did.parse().map_err(|e| {
-            format!("Invalid key package DID '{}': {}", self.did, e)
+        let did = self.owner_did.parse().map_err(|e| {
+            format!("Invalid key package DID '{}': {}", self.owner_did, e)
         })?;
 
         Ok(KeyPackageRef::from(KeyPackageRefData {

@@ -82,7 +82,7 @@ pub async fn get_key_packages(
                 info!("Found {} key package(s) for DID: {}", kps.len(), did);
                 for kp in kps {
                     results.push(KeyPackageInfo {
-                        did: kp.did,
+                        did: kp.owner_did,
                         key_package: base64::engine::general_purpose::STANDARD.encode(kp.key_data),
                         cipher_suite: kp.cipher_suite,
                         key_package_hash: kp.key_package_hash,

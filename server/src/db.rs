@@ -656,18 +656,19 @@ pub async fn store_key_package(
     expires_at: DateTime<Utc>,
 ) -> Result<KeyPackage> {
     let now = Utc::now();
+    let id = Uuid::new_v4().to_string();
 
     // Compute SHA256 hash of the key package data
     let key_package_hash = crate::crypto::sha256_hex(&key_data);
 
     let result = sqlx::query_as::<_, KeyPackage>(
         r#"
-        INSERT INTO key_packages (did, cipher_suite, key_data, key_package_hash, created_at, expires_at, consumed)
-        VALUES ($1, $2, $3, $4, $5, $6, false)
-        ON CONFLICT (did, cipher_suite, key_data) DO UPDATE SET expires_at = EXCLUDED.expires_at, key_package_hash = EXCLUDED.key_package_hash
-        RETURNING did, cipher_suite, key_data, key_package_hash, created_at, expires_at, consumed
+        INSERT INTO key_packages (id, owner_did, cipher_suite, key_package, key_package_hash, created_at, expires_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        RETURNING owner_did, cipher_suite, key_package as key_data, key_package_hash, created_at, expires_at, consumed_at
         "#,
     )
+    .bind(&id)
     .bind(did)
     .bind(cipher_suite)
     .bind(&key_data)
@@ -691,11 +692,11 @@ pub async fn get_key_package(
 
     let key_package = sqlx::query_as::<_, KeyPackage>(
         r#"
-        SELECT did, cipher_suite, key_data, key_package_hash, created_at, expires_at, consumed
+        SELECT owner_did, cipher_suite, key_package as key_data, key_package_hash, created_at, expires_at, consumed_at
         FROM key_packages
-        WHERE did = $1
+        WHERE owner_did = $1
           AND cipher_suite = $2
-          AND consumed = false
+          AND consumed_at IS NULL
           AND expires_at > $3
         ORDER BY created_at ASC
         LIMIT 1
@@ -722,11 +723,11 @@ pub async fn get_all_key_packages(
 
     let key_packages = sqlx::query_as::<_, KeyPackage>(
         r#"
-        SELECT did, cipher_suite, key_data, key_package_hash, created_at, expires_at, consumed
+        SELECT owner_did, cipher_suite, key_package as key_data, key_package_hash, created_at, expires_at, consumed_at
         FROM key_packages
-        WHERE did = $1
+        WHERE owner_did = $1
           AND cipher_suite = $2
-          AND consumed = false
+          AND consumed_at IS NULL
           AND expires_at > $3
         ORDER BY created_at ASC
         "#,
@@ -751,8 +752,8 @@ pub async fn consume_key_package(
     sqlx::query(
         r#"
         UPDATE key_packages
-        SET consumed = true, consumed_at = $1
-        WHERE did = $2 AND cipher_suite = $3 AND key_data = $4
+        SET consumed_at = $1
+        WHERE owner_did = $2 AND cipher_suite = $3 AND key_package = $4 AND consumed_at IS NULL
         "#,
     )
     .bind(Utc::now())
@@ -775,8 +776,8 @@ pub async fn mark_key_package_consumed(
     let result = sqlx::query(
         r#"
         UPDATE key_packages
-        SET consumed = true, consumed_at = $1
-        WHERE did = $2 AND key_package_hash = $3 AND consumed = false
+        SET consumed_at = $1
+        WHERE owner_did = $2 AND key_package_hash = $3 AND consumed_at IS NULL
         "#,
     )
     .bind(Utc::now())
