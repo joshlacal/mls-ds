@@ -9,7 +9,7 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["convoId", "ciphertext", "epoch", "msgId", "declaredSize", "paddedSize"],
+          "required": ["convoId", "ciphertext", "epoch", "msgId", "paddedSize"],
           "properties": {
             "convoId": { "type": "string", "description": "Conversation identifier" },
             "msgId": {
@@ -24,7 +24,7 @@
             },
             "ciphertext": {
               "type": "bytes",
-              "description": "MLS encrypted message ciphertext bytes (MUST be padded to paddedSize)",
+              "description": "MLS encrypted message ciphertext bytes (MUST be padded to paddedSize). The actual message length MUST be encrypted inside the MLS ciphertext for recipients to strip padding.",
               "maxLength": 10485760
             },
             "epoch": {
@@ -32,17 +32,11 @@
               "minimum": 0,
               "description": "MLS epoch number when message was encrypted"
             },
-            "declaredSize": {
-              "type": "integer",
-              "minimum": 0,
-              "maximum": 10485760,
-              "description": "Original plaintext size before padding (for metadata privacy)"
-            },
             "paddedSize": {
               "type": "integer",
               "minimum": 512,
               "maximum": 10485760,
-              "description": "Padded ciphertext size in bytes. Must be 512, 1024, 2048, 4096, 8192, or multiples of 8192 up to 10MB."
+              "description": "Padded ciphertext size in bytes. Must be 512, 1024, 2048, 4096, 8192, or multiples of 8192 up to 10MB. For metadata privacy, only this bucket size is revealed; the actual message size is encrypted inside the ciphertext."
             }
           }
         }
@@ -51,10 +45,20 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["messageId", "receivedAt"],
+          "required": ["messageId", "receivedAt", "seq", "epoch"],
           "properties": {
             "messageId": { "type": "string", "description": "Created message identifier (echoed from input msgId)" },
-            "receivedAt": { "type": "string", "format": "datetime", "description": "Server timestamp when message was received (bucketed to 2-second intervals)" }
+            "receivedAt": { "type": "string", "format": "datetime", "description": "Server timestamp when message was received (bucketed to 2-second intervals)" },
+            "seq": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Server-assigned sequence number for this message. Monotonically increasing within the conversation."
+            },
+            "epoch": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "MLS epoch number (echoed from input for client confirmation)"
+            }
           }
         }
       },

@@ -16,9 +16,19 @@ use crate::{
 pub struct GetMessagesParams {
     #[serde(rename = "convoId")]
     pub convo_id: String,
-    #[serde(rename = "sinceMessage")]
-    pub since_message: Option<String>,
+    #[serde(rename = "sinceSeq")]
+    pub since_seq: Option<i64>,
     pub limit: Option<i32>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct GapInfoResponse {
+    #[serde(rename = "hasGaps")]
+    pub has_gaps: bool,
+    #[serde(rename = "missingSeqs")]
+    pub missing_seqs: Vec<i64>,
+    #[serde(rename = "totalMessages")]
+    pub total_messages: i64,
 }
 
 /// Get messages from a conversation
@@ -57,33 +67,17 @@ pub async fn get_messages(
     // Note: Reduced logging per security hardening - no convo IDs at info level
     tracing::debug!("Fetching messages from convo {}", crate::crypto::redact_for_log(&params.convo_id));
 
-    // Fetch messages using cursor pagination if sinceMessage is provided
-    let messages = if let Some(since_id) = params.since_message {
-        // Get messages after a specific cursor
-        let since_timestamp: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
-            "SELECT created_at FROM messages WHERE id = $1"
-        )
-        .bind(&since_id)
-        .fetch_optional(&pool)
-        .await
-        .map_err(|e| {
-            error!("Failed to fetch since timestamp: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-        if let Some(ts) = since_timestamp {
-            db::list_messages_since(&pool, &params.convo_id, ts)
-                .await
-                .map_err(|e| {
-                    error!("Failed to fetch messages since: {}", e);
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?
-        } else {
-            warn!("Since message not found: {}", since_id);
-            vec![]
-        }
+    // Fetch messages using seq-based pagination if sinceSeq is provided
+    let messages = if let Some(since_seq) = params.since_seq {
+        // Get messages after a specific sequence number
+        db::list_messages_since_seq(&pool, &params.convo_id, since_seq, limit as i64)
+            .await
+            .map_err(|e| {
+                error!("Failed to fetch messages since seq {}: {}", since_seq, e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
     } else {
-        // Get latest messages (most recent first)
+        // Get latest messages (ordered by epoch, seq)
         db::list_messages(&pool, &params.convo_id, None, limit as i64)
             .await
             .map_err(|e| {
@@ -91,6 +85,14 @@ pub async fn get_messages(
                 StatusCode::INTERNAL_SERVER_ERROR
             })?
     };
+
+    // Detect gaps in message sequence
+    let gap_info = db::detect_message_gaps(&pool, &params.convo_id)
+        .await
+        .map_err(|e| {
+            error!("Failed to detect message gaps: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     // Convert to view models with ciphertext
     // Note: sender field removed per security hardening - clients derive sender from decrypted MLS content
@@ -156,7 +158,29 @@ pub async fn get_messages(
 
     info!("Fetched {} messages", message_views.len());
 
-    Ok(Json(serde_json::json!({ "messages": message_views })))
+    // Calculate lastSeq from the last message in the result
+    let last_seq = message_views.last().map(|m| m.seq);
+
+    // Build response with messages, lastSeq, and gapInfo
+    let mut response = serde_json::json!({
+        "messages": message_views,
+    });
+
+    // Add lastSeq if we have messages
+    if let Some(seq) = last_seq {
+        response["lastSeq"] = serde_json::json!(seq);
+    }
+
+    // Add gapInfo if there are gaps
+    if gap_info.has_gaps {
+        response["gapInfo"] = serde_json::json!(GapInfoResponse {
+            has_gaps: gap_info.has_gaps,
+            missing_seqs: gap_info.missing_seqs,
+            total_messages: gap_info.total_messages,
+        });
+    }
+
+    Ok(Json(response))
 }
 
 #[cfg(test)]

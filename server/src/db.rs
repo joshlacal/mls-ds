@@ -348,7 +348,6 @@ pub async fn create_message(
     msg_id: &str,
     ciphertext: Vec<u8>,
     epoch: i64,
-    declared_size: i64,
     padded_size: i64,
     idempotency_key: Option<String>,
 ) -> Result<Message> {
@@ -409,9 +408,9 @@ pub async fn create_message(
         INSERT INTO messages (
             id, convo_id, sender_did, message_type, epoch, seq,
             ciphertext, created_at, expires_at,
-            msg_id, declared_size, padded_size, received_bucket_ts,
+            msg_id, padded_size, received_bucket_ts,
             idempotency_key
-        ) VALUES ($1, $2, NULL, 'app', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        ) VALUES ($1, $2, NULL, 'app', $3, $4, $5, $6, $7, $8, $9, $10, $11)
         RETURNING id, convo_id, sender_did, message_type, CAST(epoch AS BIGINT), CAST(seq AS BIGINT), ciphertext, created_at, expires_at
         "#,
     )
@@ -423,7 +422,6 @@ pub async fn create_message(
     .bind(&now)
     .bind(&expires_at)
     .bind(msg_id)
-    .bind(declared_size)
     .bind(padded_size)
     .bind(received_bucket_ts)
     .bind(&idempotency_key)
@@ -502,7 +500,7 @@ pub async fn list_messages(
             SELECT id, convo_id, sender_did, message_type, CAST(epoch AS BIGINT), CAST(seq AS BIGINT), ciphertext, created_at, expires_at
             FROM messages
             WHERE convo_id = $1 AND created_at < $2 AND (expires_at IS NULL OR expires_at > NOW())
-            ORDER BY created_at DESC
+            ORDER BY epoch ASC, seq ASC
             LIMIT $3
             "#,
         )
@@ -517,7 +515,7 @@ pub async fn list_messages(
             SELECT id, convo_id, sender_did, message_type, CAST(epoch AS BIGINT), CAST(seq AS BIGINT), ciphertext, created_at, expires_at
             FROM messages
             WHERE convo_id = $1 AND (expires_at IS NULL OR expires_at > NOW())
-            ORDER BY created_at DESC
+            ORDER BY epoch ASC, seq ASC
             LIMIT $2
             "#,
         )
@@ -531,27 +529,114 @@ pub async fn list_messages(
     Ok(messages)
 }
 
-/// List messages since a specific time
-pub async fn list_messages_since(
+/// List messages since a specific sequence number (for seq-based pagination)
+pub async fn list_messages_since_seq(
     pool: &DbPool,
     convo_id: &str,
-    since: DateTime<Utc>,
+    since_seq: i64,
+    limit: i64,
 ) -> Result<Vec<Message>> {
     let messages = sqlx::query_as::<_, Message>(
         r#"
         SELECT id, convo_id, sender_did, message_type, CAST(epoch AS BIGINT), CAST(seq AS BIGINT), ciphertext, created_at, expires_at
         FROM messages
-        WHERE convo_id = $1 AND created_at > $2 AND (expires_at IS NULL OR expires_at > NOW())
-        ORDER BY created_at ASC
+        WHERE convo_id = $1 AND seq > $2 AND (expires_at IS NULL OR expires_at > NOW())
+        ORDER BY epoch ASC, seq ASC
+        LIMIT $3
         "#,
     )
     .bind(convo_id)
-    .bind(since)
+    .bind(since_seq)
+    .bind(limit)
     .fetch_all(pool)
     .await
-    .context("Failed to list messages since time")?;
+    .context("Failed to list messages since sequence number")?;
 
     Ok(messages)
+}
+
+/// Gap detection information
+#[derive(Debug, Clone)]
+pub struct GapInfo {
+    pub has_gaps: bool,
+    pub missing_seqs: Vec<i64>,
+    pub total_messages: i64,
+}
+
+/// Detect gaps in message sequence numbers for a conversation
+/// Returns GapInfo with missing sequence numbers within the min-max range
+pub async fn detect_message_gaps(
+    pool: &DbPool,
+    convo_id: &str,
+) -> Result<GapInfo> {
+    // Get min, max seq and total count
+    let stats: Option<(Option<i64>, Option<i64>, i64)> = sqlx::query_as(
+        r#"
+        SELECT
+            MIN(seq) as min_seq,
+            MAX(seq) as max_seq,
+            COUNT(*) as total
+        FROM messages
+        WHERE convo_id = $1 AND (expires_at IS NULL OR expires_at > NOW())
+        "#,
+    )
+    .bind(convo_id)
+    .fetch_optional(pool)
+    .await
+    .context("Failed to get message sequence stats")?;
+
+    let (min_seq, max_seq, total_messages) = match stats {
+        Some((Some(min), Some(max), total)) => (min, max, total),
+        _ => {
+            // No messages or all expired
+            return Ok(GapInfo {
+                has_gaps: false,
+                missing_seqs: vec![],
+                total_messages: 0,
+            });
+        }
+    };
+
+    // Check if there are gaps by comparing expected range with actual count
+    let expected_count = (max_seq - min_seq + 1) as i64;
+    if expected_count == total_messages {
+        // No gaps
+        return Ok(GapInfo {
+            has_gaps: false,
+            missing_seqs: vec![],
+            total_messages,
+        });
+    }
+
+    // Find specific missing sequence numbers
+    let missing_seqs: Vec<i64> = sqlx::query_scalar(
+        r#"
+        WITH RECURSIVE seq_range AS (
+            SELECT $2::BIGINT AS seq
+            UNION ALL
+            SELECT seq + 1
+            FROM seq_range
+            WHERE seq < $3
+        )
+        SELECT sr.seq
+        FROM seq_range sr
+        LEFT JOIN messages m ON sr.seq = m.seq AND m.convo_id = $1 AND (m.expires_at IS NULL OR m.expires_at > NOW())
+        WHERE m.seq IS NULL
+        ORDER BY sr.seq
+        "#,
+    )
+    .bind(convo_id)
+    .bind(min_seq)
+    .bind(max_seq)
+    .fetch_all(pool)
+    .await
+    .context("Failed to detect gaps in message sequence")?;
+
+    Ok(GapInfo {
+        has_gaps: !missing_seqs.is_empty(),
+        missing_seqs,
+        total_messages,
+    })
 }
 
 /// Get message count for a conversation
@@ -657,6 +742,21 @@ pub async fn store_key_package(
 ) -> Result<KeyPackage> {
     let now = Utc::now();
     let id = Uuid::new_v4().to_string();
+
+    // Ensure user exists (upsert)
+    sqlx::query(
+        r#"
+        INSERT INTO users (did, created_at, last_seen_at)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (did) DO UPDATE SET last_seen_at = $3
+        "#,
+    )
+    .bind(did)
+    .bind(now)
+    .bind(now)
+    .execute(pool)
+    .await
+    .context("Failed to ensure user exists")?;
 
     // Compute SHA256 hash of the key package data
     let key_package_hash = crate::crypto::sha256_hex(&key_data);
@@ -897,7 +997,7 @@ pub async fn delete_consumed_key_packages(pool: &DbPool, hours_old: i64) -> Resu
     let cutoff = Utc::now() - chrono::Duration::hours(hours_old);
 
     let result = sqlx::query(
-        "DELETE FROM key_packages WHERE consumed = true AND consumed_at < $1"
+        "DELETE FROM key_packages WHERE consumed_at IS NOT NULL AND consumed_at < $1"
     )
     .bind(cutoff)
     .execute(pool)
@@ -920,11 +1020,11 @@ pub async fn enforce_key_package_limit(
             SELECT id FROM (
                 SELECT id,
                        ROW_NUMBER() OVER (
-                           PARTITION BY did
+                           PARTITION BY owner_did
                            ORDER BY created_at DESC
                        ) as rn
                 FROM key_packages
-                WHERE consumed = false
+                WHERE consumed_at IS NULL
             ) ranked
             WHERE rn > $1
         )
