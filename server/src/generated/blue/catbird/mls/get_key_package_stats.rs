@@ -17,16 +17,29 @@ pub type Parameters = crate::types::Object<ParametersData>;
 pub struct OutputData {
     ///Number of unconsumed key packages available
     pub available: usize,
+    ///Average key packages consumed per day, multiplied by 100 (e.g., 250 = 2.5 packages/day). Calculated from 7-day window.
+    pub average_daily_consumption: usize,
     ///Breakdown by cipher suite
     #[serde(skip_serializing_if = "core::option::Option::is_none")]
     pub by_cipher_suite: core::option::Option<Vec<CipherSuiteStats>>,
-    ///True if available < threshold
+    ///Total number of consumed key packages
+    pub consumed: usize,
+    ///Number of key packages consumed in the last 24 hours
+    pub consumed_last24h: usize,
+    ///Number of key packages consumed in the last 7 days
+    pub consumed_last7d: usize,
+    ///True if available < threshold OR predicted to deplete in < 3 days
     pub needs_replenish: bool,
     ///Human-readable time until oldest key package expires (e.g., '23d 4h')
     #[serde(skip_serializing_if = "core::option::Option::is_none")]
     pub oldest_expires_in: core::option::Option<String>,
+    ///Predicted days until key package pool depletes, multiplied by 100 (e.g., 350 = 3.5 days). Null if insufficient data or rate is too low.
+    #[serde(skip_serializing_if = "core::option::Option::is_none")]
+    pub predicted_depletion_days: core::option::Option<usize>,
     ///Recommended minimum inventory threshold
     pub threshold: core::num::NonZeroU64,
+    ///Total number of key packages (all states: available + consumed)
+    pub total: usize,
 }
 pub type Output = crate::types::Object<OutputData>;
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
