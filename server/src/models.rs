@@ -12,7 +12,7 @@ pub use crate::generated::blue::catbird::mls::defs::{
 };
 
 // Re-export endpoint types that handlers need
-pub use crate::generated::endpoints::{
+pub use crate::generated::blue::catbird::mls::{
     add_members::{Input as AddMembersInput, Output as AddMembersOutput},
     get_welcome::Output as GetWelcomeOutput,
     leave_convo::{Input as LeaveConvoInput, Output as LeaveConvoOutput},
@@ -25,11 +25,10 @@ pub use crate::generated::endpoints::{
 // =============================================================================
 
 /// Database representation of a conversation
-/// Maps to `conversations` table (current schema)
+/// Maps to `conversations` table (updated schema - id is the group_id)
 #[derive(Debug, Clone, FromRow)]
 pub struct Conversation {
-    pub id: String,
-    pub group_id: Option<String>, // Optional in current schema
+    pub id: String,               // MLS group identifier (hex-encoded) - canonical ID
     pub creator_did: String,      // Stored as TEXT, convert to Did when needed
     pub current_epoch: i32,
     pub cipher_suite: Option<String>, // Optional in current schema
@@ -58,8 +57,7 @@ impl Conversation {
         })?;
 
         Ok(ConvoView::from(ConvoViewData {
-            id: self.id.clone(),
-            group_id: self.group_id.clone().unwrap_or_default(),
+            group_id: self.id.clone(),  // id is the group_id (canonical ID)
             creator,
             members,
             epoch: self.current_epoch as usize,

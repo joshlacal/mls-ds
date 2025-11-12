@@ -6,12 +6,11 @@
     "convoView": {
       "type": "object",
       "description": "View of an MLS conversation with member and epoch information",
-      "required": ["id", "groupId", "creator", "members", "epoch", "cipherSuite", "createdAt"],
+      "required": ["groupId", "creator", "members", "epoch", "cipherSuite", "createdAt"],
       "properties": {
-        "id": { "type": "string", "description": "Conversation identifier (TID)" },
         "groupId": {
           "type": "string",
-          "description": "MLS group identifier (hex-encoded)",
+          "description": "MLS group identifier (hex-encoded) - canonical conversation ID",
           "maxLength": 128
         },
         "creator": { "type": "string", "format": "did", "description": "DID of the conversation creator" },

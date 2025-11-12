@@ -9,18 +9,21 @@ pub struct ParametersData {
     ///Maximum number of messages to return
     #[serde(skip_serializing_if = "core::option::Option::is_none")]
     pub limit: core::option::Option<crate::types::LimitedNonZeroU8<100u8>>,
-    ///Message ID to fetch messages after (pagination cursor)
+    ///Fetch messages with seq > sinceSeq (pagination cursor). Use lastSeq from previous response.
     #[serde(skip_serializing_if = "core::option::Option::is_none")]
-    pub since_message: core::option::Option<String>,
+    pub since_seq: core::option::Option<usize>,
 }
 pub type Parameters = crate::types::Object<ParametersData>;
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct OutputData {
-    ///Cursor for next page of messages (if more available)
+    ///Gap detection metadata for missing messages. Omitted if no gaps detected or conversation is empty.
     #[serde(skip_serializing_if = "core::option::Option::is_none")]
-    pub cursor: core::option::Option<String>,
-    ///List of messages
+    pub gap_info: core::option::Option<GapInfo>,
+    ///Sequence number of the last message in this response. Use as sinceSeq for next page. Omitted if no messages returned.
+    #[serde(skip_serializing_if = "core::option::Option::is_none")]
+    pub last_seq: core::option::Option<i64>,
+    ///Messages in MLS sequential order (epoch ASC, seq ASC). Clients MUST process in this order.
     pub messages: Vec<crate::blue::catbird::mls::defs::MessageView>,
 }
 pub type Output = crate::types::Object<OutputData>;
@@ -31,7 +34,7 @@ pub enum Error {
     ConvoNotFound(Option<String>),
     ///Caller is not a member of the conversation
     NotMember(Option<String>),
-    ///Pagination cursor is invalid
+    ///sinceSeq parameter is invalid or exceeds available messages
     InvalidCursor(Option<String>),
 }
 impl std::fmt::Display for Error {
@@ -59,3 +62,15 @@ impl std::fmt::Display for Error {
         Ok(())
     }
 }
+///Metadata about missing sequence numbers in a conversation. Gaps can occur when members are removed from the conversation.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GapInfoData {
+    ///Whether there are gaps in the sequence number range
+    pub has_gaps: bool,
+    ///Array of missing sequence numbers within the conversation's min-max seq range. Empty if hasGaps is false.
+    pub missing_seqs: Vec<i64>,
+    ///Total number of messages in the conversation (including gaps)
+    pub total_messages: usize,
+}
+pub type GapInfo = crate::types::Object<GapInfoData>;

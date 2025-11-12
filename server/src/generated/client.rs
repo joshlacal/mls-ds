@@ -458,7 +458,7 @@ where
             _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
         }
     }
-    ///Retrieve messages from an MLS conversation
+    ///Retrieve messages from an MLS conversation. Messages are GUARANTEED to be returned in MLS sequential order (epoch ASC, seq ASC). Clients MUST process messages in this order for proper MLS decryption.
     pub async fn get_messages(
         &self,
         params: crate::blue::catbird::mls::get_messages::Parameters,
@@ -657,6 +657,36 @@ where
                 &atrium_xrpc::XrpcRequest {
                     method: http::Method::POST,
                     nsid: crate::blue::catbird::mls::publish_key_package::NSID.into(),
+                    parameters: None,
+                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                    encoding: Some(String::from("application/json")),
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
+    ///Publish multiple MLS key packages in a single batch request (up to 100 packages). More efficient than individual uploads for replenishing key package pools.
+    pub async fn publish_key_packages(
+        &self,
+        input: crate::blue::catbird::mls::publish_key_packages::Input,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::publish_key_packages::Output,
+        crate::blue::catbird::mls::publish_key_packages::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                (),
+                _,
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::POST,
+                    nsid: crate::blue::catbird::mls::publish_key_packages::NSID.into(),
                     parameters: None,
                     input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
                     encoding: Some(String::from("application/json")),

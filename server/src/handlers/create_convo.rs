@@ -60,7 +60,8 @@ pub async fn create_convo(
         }
     }
 
-    let convo_id = uuid::Uuid::new_v4().to_string();
+    // Use client-provided group_id as the canonical conversation ID
+    let convo_id = input.group_id.clone();
     let now = chrono::Utc::now();
 
     let (name, description) = if let Some(ref meta) = input.metadata {
@@ -143,8 +144,7 @@ pub async fn create_convo(
             };
 
             return Ok(Json(ConvoView::from(ConvoViewData {
-                id: existing_convo_id,
-                group_id: input.group_id.clone(),
+                group_id: existing_convo_id,  // existing_convo_id is the group_id
                 creator: creator_did,
                 members,
                 epoch: 0,
@@ -156,16 +156,15 @@ pub async fn create_convo(
         }
     }
 
-    // Create conversation with group_id from client
+    // Create conversation - id is the client-provided group_id
     sqlx::query(
-        "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at, name, group_id, cipher_suite, idempotency_key)
-         VALUES ($1, $2, 0, $3, $3, $4, $5, $6, $7)"
+        "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at, name, cipher_suite, idempotency_key)
+         VALUES ($1, $2, 0, $3, $3, $4, $5, $6)"
     )
-    .bind(&convo_id)
+    .bind(&convo_id)  // convo_id is now input.group_id
     .bind(&auth_user.did)
     .bind(&now)
     .bind(&name)
-    .bind(&input.group_id)
     .bind(&input.cipher_suite)
     .bind(&input.idempotency_key)
     .execute(&pool)
@@ -349,8 +348,7 @@ pub async fn create_convo(
     };
 
     Ok(Json(ConvoView::from(ConvoViewData {
-        id: convo_id,
-        group_id: input.group_id,
+        group_id: convo_id,  // convo_id is the group_id
         creator: creator_did,
         members,
         epoch: 0,

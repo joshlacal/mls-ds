@@ -21,6 +21,7 @@ pub mod leave_convo;
 pub mod message;
 pub mod promote_admin;
 pub mod publish_key_package;
+pub mod publish_key_packages;
 pub mod register_device;
 pub mod remove_member;
 pub mod report_member;

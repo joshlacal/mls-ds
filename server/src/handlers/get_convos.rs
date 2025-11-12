@@ -37,7 +37,7 @@ pub async fn get_convos(
     for membership in memberships {
         // Get conversation details
         let convo: Option<crate::models::Conversation> = sqlx::query_as(
-            "SELECT id, creator_did, current_epoch, created_at, updated_at, name as title, cipher_suite, group_id FROM conversations WHERE id = $1"
+            "SELECT id, creator_did, current_epoch, created_at, updated_at, name, cipher_suite, group_id FROM conversations WHERE id = $1"
         )
         .bind(&membership.convo_id)
         .fetch_optional(&pool)
@@ -73,9 +73,9 @@ pub async fn get_convos(
                 })
                 .collect::<Result<Vec<_>, StatusCode>>()?;
 
-            // Skip conversations without a valid MLS groupId
-            if c.group_id.is_none() || c.group_id.as_ref().map_or(true, |gid| gid.is_empty()) {
-                error!("Conversation {} has no MLS group_id, skipping", c.id);
+            // Skip conversations without a valid MLS groupId (id is the group_id)
+            if c.id.is_empty() {
+                error!("Conversation has empty ID, skipping");
                 continue;
             }
 
