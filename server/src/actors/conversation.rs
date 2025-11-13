@@ -119,9 +119,13 @@ impl Actor for ConversationActor {
             ConvoMessage::SendMessage {
                 sender_did,
                 ciphertext,
+                msg_id,
+                epoch,
+                padded_size,
+                idempotency_key,
                 reply,
             } => {
-                let result = state.handle_send_message(sender_did, ciphertext).await;
+                let result = state.handle_send_message(sender_did, ciphertext, msg_id, epoch, padded_size, idempotency_key).await;
                 let _ = reply.send(result);
             }
             ConvoMessage::IncrementUnread { sender_did } => {
@@ -422,18 +426,23 @@ impl ConversationActorState {
     /// Handles sending an application message in the conversation.
     ///
     /// This operation:
-    /// 1. Stores the encrypted message with a sequence number
-    /// 2. Updates unread counts for all members except the sender
-    /// 3. Spawns an async task to fan out message envelopes to all members
+    /// 1. Checks for duplicate messages via msg_id and idempotency_key
+    /// 2. Stores the encrypted message with a sequence number and privacy fields
+    /// 3. Updates unread counts for all members except the sender
+    /// 4. Spawns an async task to fan out message envelopes to all members
     ///
     /// # Arguments
     ///
     /// - `sender_did`: DID of the message sender
     /// - `ciphertext`: Encrypted message bytes
+    /// - `msg_id`: Client-provided ULID/UUID for message deduplication
+    /// - `epoch`: Client's epoch number when message was encrypted
+    /// - `padded_size`: Padded ciphertext size for metadata privacy
+    /// - `idempotency_key`: Optional key for backward-compatible deduplication
     ///
     /// # Returns
     ///
-    /// `Ok(())` if the message is successfully stored.
+    /// `Ok((msg_id, created_at))` tuple if the message is successfully stored or found as duplicate.
     ///
     /// # Errors
     ///
@@ -448,22 +457,66 @@ impl ConversationActorState {
         &mut self,
         sender_did: String,
         ciphertext: Vec<u8>,
-    ) -> anyhow::Result<()> {
+        msg_id: String,
+        epoch: i64,
+        padded_size: i64,
+        idempotency_key: Option<String>,
+    ) -> anyhow::Result<(String, chrono::DateTime<chrono::Utc>)> {
         use anyhow::Context;
 
         info!(
-            "Storing message from {} in conversation {} ({} bytes)",
+            "Storing message from {} in conversation {} ({} bytes, msg_id={}, epoch={}, padded_size={})",
             sender_did,
             self.convo_id,
-            ciphertext.len()
+            ciphertext.len(),
+            msg_id,
+            epoch,
+            padded_size
         );
 
-        let msg_id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now();
         let expires_at = now + chrono::Duration::days(30);
 
+        // Quantize timestamp to 2-second buckets for traffic analysis resistance
+        let received_bucket_ts = (now.timestamp() / 2) * 2;
+
         // Calculate sequence number within transaction
         let mut tx = self.db_pool.begin().await.context("Failed to begin transaction")?;
+
+        // Check for duplicate msg_id (protocol-layer deduplication)
+        let existing_msg: Option<(String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+            "SELECT id, created_at FROM messages WHERE convo_id = $1 AND msg_id = $2"
+        )
+        .bind(&self.convo_id)
+        .bind(&msg_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .context("Failed to check msg_id")?;
+
+        if let Some((existing_id, existing_created_at)) = existing_msg {
+            // Return existing message without creating a duplicate
+            tx.rollback().await.ok();
+            info!("Duplicate msg_id detected, returning existing message: {}", existing_id);
+            return Ok((existing_id, existing_created_at));
+        }
+
+        // If idempotency key is provided, check for existing message
+        if let Some(ref idem_key) = idempotency_key {
+            let existing_by_idem: Option<(String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+                "SELECT id, created_at FROM messages WHERE idempotency_key = $1"
+            )
+            .bind(idem_key)
+            .fetch_optional(&mut *tx)
+            .await
+            .context("Failed to check idempotency key")?;
+
+            if let Some((existing_id, existing_created_at)) = existing_by_idem {
+                // Return existing message without creating a duplicate
+                tx.rollback().await.ok();
+                info!("Duplicate idempotency_key detected, returning existing message: {}", existing_id);
+                return Ok((existing_id, existing_created_at));
+            }
+        }
 
         let seq: i64 = sqlx::query_scalar(
             "SELECT CAST(COALESCE(MAX(seq), 0) + 1 AS BIGINT) FROM messages WHERE convo_id = $1"
@@ -473,23 +526,32 @@ impl ConversationActorState {
         .await
         .context("Failed to calculate sequence number")?;
 
-        // Insert message into messages table
+        // Generate unique internal row ID
+        let row_id = uuid::Uuid::new_v4().to_string();
+
+        // Insert message into messages table with all privacy fields
         sqlx::query(
             r#"
             INSERT INTO messages (
                 id, convo_id, sender_did, message_type, epoch, seq,
-                ciphertext, created_at, expires_at
-            ) VALUES ($1, $2, $3, 'app', $4, $5, $6, $7, $8)
+                ciphertext, created_at, expires_at,
+                msg_id, padded_size, received_bucket_ts,
+                idempotency_key
+            ) VALUES ($1, $2, $3, 'app', $4, $5, $6, $7, $8, $9, $10, $11, $12)
             "#,
         )
-        .bind(&msg_id)
+        .bind(&row_id)
         .bind(&self.convo_id)
         .bind(&sender_did)
-        .bind(self.current_epoch as i64)
+        .bind(epoch)
         .bind(seq)
         .bind(&ciphertext)
         .bind(&now)
         .bind(&expires_at)
+        .bind(&msg_id)
+        .bind(padded_size)
+        .bind(received_bucket_ts)
+        .bind(&idempotency_key)
         .execute(&mut *tx)
         .await
         .context("Failed to insert message")?;
@@ -571,7 +633,7 @@ impl ConversationActorState {
             }
         });
 
-        Ok(())
+        Ok((row_id, now))
     }
 
     /// Handles incrementing unread counts for all members except the sender.

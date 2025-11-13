@@ -25,10 +25,8 @@ pub struct ConvoViewData {
     pub creator: crate::types::string::Did,
     ///Current MLS epoch number
     pub epoch: usize,
-    ///MLS group identifier (hex-encoded)
+    ///MLS group identifier (hex-encoded) - canonical conversation ID
     pub group_id: String,
-    ///Conversation identifier (TID)
-    pub id: String,
     ///Timestamp of last message
     #[serde(skip_serializing_if = "core::option::Option::is_none")]
     pub last_message_at: core::option::Option<crate::types::string::Datetime>,
@@ -85,7 +83,7 @@ pub struct MemberViewData {
     pub user_did: crate::types::string::Did,
 }
 pub type MemberView = crate::types::Object<MemberViewData>;
-///View of an encrypted MLS message. Server follows 'dumb delivery service' model - sender identity must be derived by clients from decrypted MLS content for metadata privacy.
+///View of an encrypted MLS message. Server follows 'dumb delivery service' model - sender identity must be derived by clients from decrypted MLS content for metadata privacy. Server GUARANTEES: (1) Sequential (epoch, seq) assignment per conversation, (2) Monotonic seq increment, (3) No seq reuse. Clients MUST process messages in (epoch ASC, seq ASC) order for correct MLS decryption.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageViewData {
@@ -100,7 +98,7 @@ pub struct MessageViewData {
     pub epoch: usize,
     ///Message identifier (ULID for deduplication)
     pub id: String,
-    ///Sequence number within conversation
+    ///Monotonically increasing sequence number within conversation. Server assigns sequentially starting from 1. Gaps may occur when members are removed from the conversation, but seq values are never reused.
     pub seq: usize,
 }
 pub type MessageView = crate::types::Object<MessageViewData>;

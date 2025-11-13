@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT key_package_hash, owner_did\n        FROM key_packages\n        WHERE owner_did = $1\n          AND key_package_hash = ANY($2)\n          AND consumed_at IS NULL\n          AND (reserved_at IS NULL OR reserved_at < NOW() - INTERVAL '5 minutes')\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "key_package_hash",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "owner_did",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "88443e69ad7b66d2f3c0c1f024330c61161b9b241c734c380e3380a3a758449d"
+}

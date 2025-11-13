@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT convo_id, key_package_hash\n        FROM welcome_messages\n        WHERE recipient_did = $1\n          AND key_package_hash = decode($2, 'hex')\n          AND consumed = false\n        ORDER BY created_at DESC\n        LIMIT 1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "convo_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "key_package_hash",
+        "type_info": "Bytea"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "6ee3149021b608101c21cb0e265a7264fab577ea35bd9edb1331261429f44296"
+}

@@ -428,6 +428,36 @@ where
             _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
         }
     }
+    ///Get key package statistics and consumption history for the authenticated user. Helps clients detect missing bundles before processing Welcome messages.
+    pub async fn get_key_package_status(
+        &self,
+        params: crate::blue::catbird::mls::get_key_package_status::Parameters,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::get_key_package_status::Output,
+        crate::blue::catbird::mls::get_key_package_status::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                _,
+                (),
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::GET,
+                    nsid: crate::blue::catbird::mls::get_key_package_status::NSID.into(),
+                    parameters: Some(params),
+                    input: None,
+                    encoding: None,
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
     ///Retrieve key packages for one or more DIDs to add them to conversations
     pub async fn get_key_packages(
         &self,
@@ -458,7 +488,7 @@ where
             _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
         }
     }
-    ///Retrieve messages from an MLS conversation
+    ///Retrieve messages from an MLS conversation. Messages are GUARANTEED to be returned in MLS sequential order (epoch ASC, seq ASC). Clients MUST process messages in this order for proper MLS decryption.
     pub async fn get_messages(
         &self,
         params: crate::blue::catbird::mls::get_messages::Parameters,
@@ -900,6 +930,36 @@ where
                     parameters: Some(params),
                     input: None,
                     encoding: None,
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
+    ///Validate a Welcome message before processing and reserve the referenced key package. Prevents race conditions and helps clients detect missing bundles early.
+    pub async fn validate_welcome(
+        &self,
+        input: crate::blue::catbird::mls::validate_welcome::Input,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::validate_welcome::Output,
+        crate::blue::catbird::mls::validate_welcome::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                (),
+                _,
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::POST,
+                    nsid: crate::blue::catbird::mls::validate_welcome::NSID.into(),
+                    parameters: None,
+                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                    encoding: Some(String::from("application/json")),
                 },
             )
             .await?;

@@ -95,7 +95,7 @@ pub struct MessageView {
     /// Conversation identifier
     pub convo_id: String,
     /// MLS encrypted message ciphertext bytes
-    #[serde(with = "base64_bytes")]
+    #[serde(with = "crate::atproto_bytes")]
     pub ciphertext: Vec<u8>,
     /// MLS epoch when message was sent
     pub epoch: i64,
@@ -397,7 +397,7 @@ pub struct SendMessageInput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
     /// MLS encrypted message ciphertext bytes
-    #[serde(with = "base64_bytes")]
+    #[serde(with = "crate::atproto_bytes")]
     pub ciphertext: Vec<u8>,
     /// MLS epoch number when message was encrypted
     pub epoch: i64,

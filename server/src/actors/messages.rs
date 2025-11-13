@@ -80,7 +80,8 @@ pub enum ConvoMessage {
     /// Sends an encrypted application message to the conversation.
     ///
     /// This operation:
-    /// - Stores the encrypted message with a sequence number
+    /// - Stores the encrypted message with a sequence number and privacy-enhancing fields
+    /// - Implements deduplication via msg_id and idempotency_key
     /// - Updates unread counts for all members except the sender
     /// - Fans out message envelopes to all active members
     ///
@@ -88,11 +89,19 @@ pub enum ConvoMessage {
     ///
     /// - `sender_did`: DID of the message sender
     /// - `ciphertext`: Encrypted message bytes
-    /// - `reply`: Channel to receive acknowledgment
+    /// - `msg_id`: Client-provided ULID/UUID for message deduplication
+    /// - `epoch`: Client's epoch number when message was encrypted
+    /// - `padded_size`: Padded ciphertext size for metadata privacy
+    /// - `idempotency_key`: Optional key for backward-compatible deduplication
+    /// - `reply`: Channel to receive (message_id, timestamp) tuple
     SendMessage {
         sender_did: String,
         ciphertext: Vec<u8>,
-        reply: oneshot::Sender<Result<()>>,
+        msg_id: String,
+        epoch: i64,
+        padded_size: i64,
+        idempotency_key: Option<String>,
+        reply: oneshot::Sender<Result<(String, chrono::DateTime<chrono::Utc>)>>,
     },
 
     /// Increments unread counts for all members except the sender.

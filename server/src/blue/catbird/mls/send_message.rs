@@ -4,13 +4,11 @@ pub const NSID: &str = "blue.catbird.mls.sendMessage";
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct InputData {
-    ///MLS encrypted message ciphertext bytes (MUST be padded to paddedSize)
+    ///MLS encrypted message ciphertext bytes (MUST be padded to paddedSize). The actual message length MUST be encrypted inside the MLS ciphertext for recipients to strip padding.
     #[serde(with = "serde_bytes")]
     pub ciphertext: Vec<u8>,
     ///Conversation identifier
     pub convo_id: String,
-    ///Original plaintext size before padding (for metadata privacy)
-    pub declared_size: crate::types::LimitedU32<10485760u32>,
     ///MLS epoch number when message was encrypted
     pub epoch: usize,
     ///Deprecated: Use msgId instead. Client-generated UUID for idempotent request retries.
@@ -18,17 +16,21 @@ pub struct InputData {
     pub idempotency_key: core::option::Option<String>,
     ///Client-generated ULID for message deduplication. MUST be included in MLS message AAD.
     pub msg_id: String,
-    ///Padded ciphertext size in bytes. Must be 512, 1024, 2048, 4096, 8192, or multiples of 8192 up to 10MB.
+    ///Padded ciphertext size in bytes. Must be 512, 1024, 2048, 4096, 8192, or multiples of 8192 up to 10MB. For metadata privacy, only this bucket size is revealed; the actual message size is encrypted inside the ciphertext.
     pub padded_size: crate::types::BoundedU32<512u32, 10485760u32>,
 }
 pub type Input = crate::types::Object<InputData>;
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct OutputData {
+    ///MLS epoch number (echoed from input for client confirmation)
+    pub epoch: usize,
     ///Created message identifier (echoed from input msgId)
     pub message_id: String,
     ///Server timestamp when message was received (bucketed to 2-second intervals)
     pub received_at: crate::types::string::Datetime,
+    ///Server-assigned sequence number for this message. Monotonically increasing within the conversation.
+    pub seq: usize,
 }
 pub type Output = crate::types::Object<OutputData>;
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]

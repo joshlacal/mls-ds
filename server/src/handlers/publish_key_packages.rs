@@ -23,6 +23,10 @@ pub struct KeyPackageItem {
     expires: DateTime<Utc>,
     #[serde(rename = "idempotencyKey")]
     idempotency_key: Option<String>,
+    #[serde(rename = "deviceId")]
+    device_id: Option<String>,
+    #[serde(rename = "credentialDid")]
+    credential_did: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -234,8 +238,16 @@ pub async fn publish_key_packages(
             }
         }
 
-        // Store key package
-        match crate::db::store_key_package(&pool, did, &item.cipher_suite, key_data, item.expires).await {
+        // Store key package with device information
+        match crate::db::store_key_package_with_device(
+            &pool,
+            did,
+            &item.cipher_suite,
+            key_data,
+            item.expires,
+            item.device_id.clone(),
+            item.credential_did.clone()
+        ).await {
             Ok(_) => {
                 succeeded += 1;
             }

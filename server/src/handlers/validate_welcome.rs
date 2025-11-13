@@ -1,6 +1,8 @@
 use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
-use tracing::{info, error, warn};
+use tracing::{error, warn};
+use openmls::prelude::*;
+use openmls::messages::Welcome;
 
 use crate::{
     auth::AuthUser,
@@ -10,6 +12,7 @@ use crate::{
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ValidateWelcomeInput {
+    #[serde(with = "crate::atproto_bytes")]
     welcome_message: Vec<u8>,
 }
 
@@ -42,60 +45,129 @@ pub async fn validate_welcome(
 
     let did = &auth_user.did;
 
-    // TODO: Parse MLS Welcome message to extract:
-    // - key_package_hash (from encrypted group secrets)
-    // - group_id (from group context)
-    // - Verify recipient matches authenticated user
-    //
-    // For now, this is a placeholder that demonstrates the flow.
-    // Full MLS parsing requires openmls or custom TLS deserialization.
-
     if input.welcome_message.is_empty() {
         warn!("Empty welcome message");
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    // Placeholder: In production, parse the Welcome message here
-    // For now, return an error indicating parsing is not implemented
-    error!("Welcome message parsing not yet implemented");
-
-    // Example of what the full implementation would look like:
-    // 1. Parse Welcome message to get key_package_hash and group_id
-    // 2. Check if key package exists and is available
-    // 3. Reserve the key package
-    // 4. Return validation result
-
-    // Placeholder response
-    return Err(StatusCode::NOT_IMPLEMENTED);
-
-    // The code below shows the intended logic once parsing is implemented:
-    /*
-    let key_package_hash = "placeholder_hash"; // Extract from Welcome
-    let group_id = "placeholder_group"; // Extract from Welcome
-
-    // Check if key package exists and is available
-    let exists = match crate::db::check_key_package_duplicate(&pool, did, &key_package_hash).await {
-        Ok(exists) => exists,
+    // Parse MLS Welcome message using TLS codec
+    let welcome = match Welcome::tls_deserialize(&mut input.welcome_message.as_slice()) {
+        Ok(w) => w,
         Err(e) => {
-            error!("Failed to check key package: {}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            warn!("Failed to deserialize Welcome message: {:?}", e);
+            return Err(StatusCode::BAD_REQUEST);
         }
     };
 
-    if !exists {
-        warn!("Key package not found: {}", key_package_hash);
+    // Extract ALL candidate key package refs from the Welcome
+    let secrets = welcome.secrets();
+    if secrets.is_empty() {
+        warn!("Welcome message has no secrets");
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Build set of all key package hashes referenced in the Welcome
+    let candidate_hashes: Vec<String> = secrets.iter()
+        .map(|encrypted_secret| {
+            let kp_ref = encrypted_secret.new_member();
+            hex::encode(kp_ref.as_slice())
+        })
+        .collect();
+
+    if candidate_hashes.is_empty() {
+        warn!("No key package refs extracted from Welcome");
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Find intersection: which of these hashes belong to the authenticated DID
+    // and are available (not consumed/reserved)?
+    let matching_rows = sqlx::query!(
+        r#"
+        SELECT key_package_hash, owner_did
+        FROM key_packages
+        WHERE owner_did = $1
+          AND key_package_hash = ANY($2)
+          AND consumed_at IS NULL
+          AND (reserved_at IS NULL OR reserved_at < NOW() - INTERVAL '5 minutes')
+        "#,
+        did,
+        &candidate_hashes
+    )
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| {
+        error!("Failed to query matching key packages: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    if matching_rows.is_empty() {
+        warn!(
+            "No available key packages for {} match Welcome (candidates: {:?})",
+            did, candidate_hashes
+        );
         return Ok(Json(ValidateWelcomeOutput {
             valid: false,
-            key_package_hash: key_package_hash.to_string(),
+            key_package_hash: candidate_hashes.get(0).unwrap_or(&String::new()).to_string(),
             recipient_did: Some(did.clone()),
-            group_id: Some(group_id.to_string()),
+            group_id: None,
             reserved: Some(false),
             reserved_until: None,
         }));
     }
 
+    if matching_rows.len() > 1 {
+        error!(
+            "Multiple key packages match for {}: {:?} (BUG: duplicate issuance or ambiguous Welcome)",
+            did,
+            matching_rows.iter().map(|r| &r.key_package_hash).collect::<Vec<_>>()
+        );
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // Exactly one match - this is the key package to reserve
+    let key_package_hash = &matching_rows[0].key_package_hash;
+
+    // Get the group_id from the welcome_messages table (server created this when adding members)
+    let welcome_row = sqlx::query!(
+        r#"
+        SELECT convo_id, key_package_hash
+        FROM welcome_messages
+        WHERE recipient_did = $1
+          AND key_package_hash = decode($2, 'hex')
+          AND consumed = false
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+        did,
+        key_package_hash
+    )
+    .fetch_optional(&pool)
+    .await
+    .map_err(|e| {
+        error!("Failed to lookup welcome message: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let group_id = match welcome_row {
+        Some(row) => row.convo_id,
+        None => {
+            warn!(
+                "No welcome_messages row found for did={}, key_package_hash={}",
+                did, key_package_hash
+            );
+            return Ok(Json(ValidateWelcomeOutput {
+                valid: false,
+                key_package_hash: key_package_hash.to_string(),
+                recipient_did: Some(did.clone()),
+                group_id: None,
+                reserved: Some(false),
+                reserved_until: None,
+            }));
+        }
+    };
+
     // Reserve the key package
-    let reserved = match crate::db::reserve_key_package(&pool, did, &key_package_hash, &group_id).await {
+    let reserved = match crate::db::reserve_key_package(&pool, did, key_package_hash, &group_id).await {
         Ok(success) => success,
         Err(e) => {
             error!("Failed to reserve key package: {}", e);
@@ -109,18 +181,13 @@ pub async fn validate_welcome(
         None
     };
 
-    info!(
-        "Welcome validation for {}: valid={}, reserved={}",
-        did, exists, reserved
-    );
-
     Ok(Json(ValidateWelcomeOutput {
         valid: true,
         key_package_hash: key_package_hash.to_string(),
         recipient_did: Some(did.clone()),
-        group_id: Some(group_id.to_string()),
+        group_id: Some(group_id.clone()),
         reserved: Some(reserved),
         reserved_until,
     }))
-    */
+
 }

@@ -740,6 +740,19 @@ pub async fn store_key_package(
     key_data: Vec<u8>,
     expires_at: DateTime<Utc>,
 ) -> Result<KeyPackage> {
+    store_key_package_with_device(pool, did, cipher_suite, key_data, expires_at, None, None).await
+}
+
+/// Store a new key package with device information
+pub async fn store_key_package_with_device(
+    pool: &DbPool,
+    did: &str,
+    cipher_suite: &str,
+    key_data: Vec<u8>,
+    expires_at: DateTime<Utc>,
+    device_id: Option<String>,
+    credential_did: Option<String>,
+) -> Result<KeyPackage> {
     let now = Utc::now();
     let id = Uuid::new_v4().to_string();
 
@@ -763,8 +776,8 @@ pub async fn store_key_package(
 
     let result = sqlx::query_as::<_, KeyPackage>(
         r#"
-        INSERT INTO key_packages (id, owner_did, cipher_suite, key_package, key_package_hash, created_at, expires_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        INSERT INTO key_packages (id, owner_did, cipher_suite, key_package, key_package_hash, created_at, expires_at, device_id, credential_did)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         RETURNING owner_did, cipher_suite, key_package as key_data, key_package_hash, created_at, expires_at, consumed_at
         "#,
     )
@@ -775,6 +788,8 @@ pub async fn store_key_package(
     .bind(&key_package_hash)
     .bind(now)
     .bind(expires_at)
+    .bind(device_id)
+    .bind(credential_did)
     .fetch_one(pool)
     .await
     .context("Failed to store key package")?;
@@ -812,30 +827,38 @@ pub async fn get_key_package(
     Ok(key_package)
 }
 
-/// Get ALL unconsumed key packages for a user (for multi-device support)
-/// Returns all valid key packages, one per device
+/// Get ONE key package PER DEVICE for a user (multi-device support)
+/// Returns up to 50 key packages, one per unique device credential.
+/// For proper multi-device support, each package must have a unique credential_did.
+/// Legacy key packages (without device_id) are returned as a single fallback.
 pub async fn get_all_key_packages(
     pool: &DbPool,
     did: &str,
     cipher_suite: &str,
 ) -> Result<Vec<KeyPackage>> {
     let now = Utc::now();
+    let reservation_timeout = now - chrono::Duration::minutes(5);
 
+    // Get ONE key package per unique device
+    // This query uses DISTINCT ON to get the oldest available key package for each device
     let key_packages = sqlx::query_as::<_, KeyPackage>(
         r#"
-        SELECT owner_did, cipher_suite, key_package as key_data, key_package_hash, created_at, expires_at, consumed_at
+        SELECT DISTINCT ON (COALESCE(credential_did, key_package_hash))
+            owner_did, cipher_suite, key_package as key_data, key_package_hash, created_at, expires_at, consumed_at
         FROM key_packages
         WHERE owner_did = $1
           AND cipher_suite = $2
           AND consumed_at IS NULL
           AND expires_at > $3
-        ORDER BY created_at ASC
+          AND (reserved_at IS NULL OR reserved_at < $4)
+        ORDER BY COALESCE(credential_did, key_package_hash), created_at ASC
         LIMIT 50
         "#,
     )
     .bind(did)
     .bind(cipher_suite)
     .bind(now)
+    .bind(reservation_timeout)
     .fetch_all(pool)
     .await
     .context("Failed to get all key packages")?;
