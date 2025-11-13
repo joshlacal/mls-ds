@@ -10,6 +10,7 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct KeyPackageInfo {
     did: String,
     key_package: String,

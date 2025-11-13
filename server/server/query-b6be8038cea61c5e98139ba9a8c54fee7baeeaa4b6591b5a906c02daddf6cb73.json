@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            cipher_suite,\n            COUNT(*) FILTER (WHERE consumed_at IS NULL AND expires_at > NOW()) as \"available!\",\n            COUNT(*) FILTER (WHERE consumed_at IS NOT NULL) as \"consumed!\"\n        FROM key_packages\n        WHERE owner_did = $1\n        GROUP BY cipher_suite\n        ORDER BY cipher_suite\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "cipher_suite",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "available!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "consumed!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      null
+    ]
+  },
+  "hash": "b6be8038cea61c5e98139ba9a8c54fee7baeeaa4b6591b5a906c02daddf6cb73"
+}

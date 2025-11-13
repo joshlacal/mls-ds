@@ -57,7 +57,7 @@ pub async fn get_welcome(
     })?;
 
     // Fetch the Welcome message for this user
-    // Grace period: allow re-fetch within 5 minutes if state='in_flight' AND fetched_at > NOW() - INTERVAL '5 minutes'
+    // Grace period: allow re-fetch within 5 minutes if consumed_at is recent
     // NOTE: We do NOT check if key_package is consumed, because key packages are consumed
     // when the group is created (adding members), not when fetching the Welcome.
     let result: Option<(String, Vec<u8>, Option<Vec<u8>>)> = sqlx::query_as(
@@ -65,8 +65,8 @@ pub async fn get_welcome(
          FROM welcome_messages wm
          WHERE wm.convo_id = $1 AND wm.recipient_did = $2
          AND (
-           wm.state = 'available'
-           OR (wm.state = 'in_flight' AND wm.fetched_at > NOW() - INTERVAL '5 minutes')
+           wm.consumed = false
+           OR (wm.consumed = true AND wm.consumed_at > NOW() - INTERVAL '5 minutes')
          )
          ORDER BY wm.created_at ASC
          LIMIT 1
@@ -87,7 +87,8 @@ pub async fn get_welcome(
             // Check if already consumed (return 410 Gone) vs never existed (return 404)
             let consumed_count: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM welcome_messages
-                 WHERE convo_id = $1 AND recipient_did = $2 AND state = 'consumed'"
+                 WHERE convo_id = $1 AND recipient_did = $2 AND consumed = true
+                 AND consumed_at < NOW() - INTERVAL '5 minutes'"
             )
             .bind(&params.convo_id)
             .bind(did)
@@ -99,10 +100,10 @@ pub async fn get_welcome(
                 warn!("Welcome already consumed for user");
                 return Err(StatusCode::GONE);  // 410 Gone - already fetched
             }
-            
+
             // Debug: Query all welcome messages for this conversation
-            let all_messages: Vec<(String, String)> = sqlx::query_as(
-                "SELECT recipient_did, state FROM welcome_messages WHERE convo_id = $1"
+            let all_messages: Vec<(String, bool)> = sqlx::query_as(
+                "SELECT recipient_did, consumed FROM welcome_messages WHERE convo_id = $1"
             )
             .bind(&params.convo_id)
             .fetch_all(&mut *tx)
@@ -117,11 +118,11 @@ pub async fn get_welcome(
         }
     };
 
-    // Mark as in_flight atomically with fetched_at timestamp
+    // Mark as consumed atomically with consumed_at timestamp
     let now = chrono::Utc::now();
     let rows_updated = sqlx::query(
         "UPDATE welcome_messages
-         SET state = 'in_flight', fetched_at = $1
+         SET consumed = true, consumed_at = $1
          WHERE id = $2
          RETURNING 1"
     )
@@ -130,7 +131,7 @@ pub async fn get_welcome(
     .execute(&mut *tx)
     .await
     .map_err(|e| {
-        error!("Failed to mark welcome message as in_flight: {}", e);
+        error!("Failed to mark welcome message as consumed: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?
     .rows_affected();
@@ -150,8 +151,8 @@ pub async fn get_welcome(
 
         let kp_rows = sqlx::query(
             "UPDATE key_packages
-             SET consumed = true, consumed_at = $1
-             WHERE did = $2 AND key_package_hash = $3 AND consumed = false"
+             SET consumed_at = $1
+             WHERE owner_did = $2 AND key_package_hash = $3 AND consumed_at IS NULL"
         )
         .bind(&now)
         .bind(did)

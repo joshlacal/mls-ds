@@ -135,11 +135,13 @@ pub async fn request_rejoin(
             })?;
 
             // Store the KeyPackage for when admin re-adds the user
+            let kp_id = uuid::Uuid::new_v4().to_string();
             sqlx::query(
-                "INSERT INTO key_packages (did, cipher_suite, key_data, key_package_hash, expires_at)
-                 VALUES ($1, $2, $3, $4, NOW() + INTERVAL '7 days')
-                 ON CONFLICT (did, cipher_suite, key_data) DO NOTHING"
+                "INSERT INTO key_packages (id, owner_did, cipher_suite, key_package, key_package_hash, expires_at)
+                 VALUES ($1, $2, $3, $4, $5, NOW() + INTERVAL '7 days')
+                 ON CONFLICT DO NOTHING"
             )
+            .bind(&kp_id)
             .bind(did)
             .bind("MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519") // Default cipher suite
             .bind(&key_package_bytes)

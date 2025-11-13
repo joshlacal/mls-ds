@@ -1,4 +1,5 @@
 pub mod actors;
+pub mod atproto_bytes;
 pub mod auth;
 pub mod crypto;
 pub mod db;

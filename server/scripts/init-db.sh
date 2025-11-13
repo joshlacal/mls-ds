@@ -67,6 +67,12 @@ COMMENT ON COLUMN conversations.current_epoch IS 'Current MLS epoch number, incr
 CREATE TABLE members (
     convo_id TEXT NOT NULL,
     member_did TEXT NOT NULL,
+
+    -- Multi-device support (device-specific MLS identity)
+    user_did TEXT,
+    device_id TEXT,
+    device_name TEXT,
+
     joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     left_at TIMESTAMPTZ,
     leaf_index INTEGER,
@@ -96,6 +102,10 @@ CREATE INDEX idx_members_unread ON members(member_did, unread_count) WHERE unrea
 CREATE INDEX idx_members_rejoin_pending ON members(convo_id, member_did) WHERE needs_rejoin = true;
 
 COMMENT ON TABLE members IS 'Conversation membership with admin privileges and rejoin support';
+COMMENT ON COLUMN members.member_did IS 'Device-specific MLS DID (e.g., did:plc:abc123#device-xyz) - each device has unique MLS identity';
+COMMENT ON COLUMN members.user_did IS 'Base user DID without device suffix (e.g., did:plc:abc123) - links devices to same user';
+COMMENT ON COLUMN members.device_id IS 'Device identifier extracted from member_did fragment (e.g., "device-xyz")';
+COMMENT ON COLUMN members.device_name IS 'Human-readable device name (e.g., "iPhone 15 Pro", "MacBook Air") for UI display';
 COMMENT ON COLUMN members.is_admin IS 'Whether this member has admin privileges (encrypted roster distributed via MLS)';
 COMMENT ON COLUMN members.promoted_at IS 'When member was promoted to admin (NULL if creator or not admin)';
 COMMENT ON COLUMN members.promoted_by_did IS 'DID of admin who promoted this member (NULL if creator or not admin)';
@@ -114,7 +124,6 @@ CREATE TABLE messages (
 
     -- Privacy-enhancing metadata
     msg_id TEXT,
-    declared_size INTEGER,
     padded_size INTEGER,
     received_bucket_ts BIGINT,
 
@@ -142,8 +151,7 @@ CREATE UNIQUE INDEX idx_messages_idempotency_key ON messages(idempotency_key) WH
 COMMENT ON TABLE messages IS 'Encrypted MLS messages with metadata privacy features';
 COMMENT ON COLUMN messages.sender_did IS 'Verified sender DID from JWT (server-provided, NEVER trust client input)';
 COMMENT ON COLUMN messages.msg_id IS 'Client-generated ULID for deduplication. MUST be included in MLS message AAD.';
-COMMENT ON COLUMN messages.declared_size IS 'Original plaintext size before padding (for metadata privacy)';
-COMMENT ON COLUMN messages.padded_size IS 'Padded ciphertext size. Must be 512, 1024, 2048, 4096, 8192, or multiples of 8192 up to 10MB.';
+COMMENT ON COLUMN messages.padded_size IS 'Padded ciphertext size. Must be 512, 1024, 2048, 4096, 8192, or multiples of 8192 up to 10MB. Original size encrypted inside MLS ciphertext for privacy.';
 COMMENT ON COLUMN messages.received_bucket_ts IS 'Unix timestamp quantized to 2-second buckets for traffic analysis resistance';
 
 -- =============================================================================
