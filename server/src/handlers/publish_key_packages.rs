@@ -10,6 +10,9 @@ use crate::{
 };
 
 const MAX_BATCH_SIZE: usize = 100;
+const MAX_UNCONSUMED_PER_USER: i64 = 100;
+const MAX_UPLOADS_PER_HOUR: i64 = 200;
+const RATE_LIMIT_WINDOW_HOURS: i64 = 1;
 
 #[derive(Debug, Deserialize)]
 pub struct KeyPackageItem {
@@ -38,6 +41,8 @@ pub struct BatchError {
 pub struct PublishKeyPackagesOutput {
     succeeded: usize,
     failed: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skipped: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     errors: Option<Vec<BatchError>>,
 }
@@ -70,8 +75,65 @@ pub async fn publish_key_packages(
     info!("Publishing batch of {} key packages", input.key_packages.len());
 
     let now = Utc::now();
+
+    // Check 1: Total unconsumed key packages limit
+    let unconsumed_count: (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*) as count
+        FROM key_packages
+        WHERE owner_did = $1
+          AND consumed_at IS NULL
+          AND expires_at > $2
+        "#,
+    )
+    .bind(did)
+    .bind(now)
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| {
+        error!("Failed to count unconsumed key packages: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    if unconsumed_count.0 >= MAX_UNCONSUMED_PER_USER {
+        warn!("User {} has {} unconsumed key packages (limit: {})", did, unconsumed_count.0, MAX_UNCONSUMED_PER_USER);
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    // Check 2: Rate limiting - count uploads in the last hour
+    let rate_limit_window = now - chrono::Duration::hours(RATE_LIMIT_WINDOW_HOURS);
+    let recent_uploads: (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*) as count
+        FROM key_packages
+        WHERE owner_did = $1
+          AND created_at > $2
+        "#,
+    )
+    .bind(did)
+    .bind(rate_limit_window)
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| {
+        error!("Failed to check rate limit: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    if recent_uploads.0 >= MAX_UPLOADS_PER_HOUR {
+        warn!("User {} exceeded rate limit: {} uploads in last hour (limit: {})", did, recent_uploads.0, MAX_UPLOADS_PER_HOUR);
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    // Check if this batch would exceed limits
+    if unconsumed_count.0 + input.key_packages.len() as i64 > MAX_UNCONSUMED_PER_USER {
+        warn!("Batch would exceed unconsumed limit for user {}: {} + {} > {}",
+            did, unconsumed_count.0, input.key_packages.len(), MAX_UNCONSUMED_PER_USER);
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+
     let mut succeeded = 0;
     let mut failed = 0;
+    let mut skipped = 0;
     let mut errors = Vec::new();
 
     // Validate all packages first (fail fast)
@@ -119,6 +181,7 @@ pub async fn publish_key_packages(
         return Ok(Json(PublishKeyPackagesOutput {
             succeeded: 0,
             failed: errors.len(),
+            skipped: None,
             errors: Some(errors),
         }));
     }
@@ -147,6 +210,30 @@ pub async fn publish_key_packages(
             continue;
         }
 
+        // Compute hash for deduplication
+        let key_package_hash = crate::crypto::sha256_hex(&key_data);
+
+        // Check for duplicates (idempotent behavior)
+        match crate::db::check_key_package_duplicate(&pool, did, &key_package_hash).await {
+            Ok(true) => {
+                // Duplicate found - skip silently (idempotent)
+                skipped += 1;
+                continue;
+            }
+            Ok(false) => {
+                // Not a duplicate - proceed with storage
+            }
+            Err(e) => {
+                error!("Failed to check key package duplicate {}: {}", idx, e);
+                errors.push(BatchError {
+                    index: idx,
+                    error: format!("Database error: {}", e),
+                });
+                failed += 1;
+                continue;
+            }
+        }
+
         // Store key package
         match crate::db::store_key_package(&pool, did, &item.cipher_suite, key_data, item.expires).await {
             Ok(_) => {
@@ -164,13 +251,14 @@ pub async fn publish_key_packages(
     }
 
     info!(
-        "Batch upload complete: {} succeeded, {} failed",
-        succeeded, failed
+        "Batch upload complete: {} succeeded, {} failed, {} skipped",
+        succeeded, failed, skipped
     );
 
     Ok(Json(PublishKeyPackagesOutput {
         succeeded,
         failed,
+        skipped: if skipped > 0 { Some(skipped) } else { None },
         errors: if errors.is_empty() { None } else { Some(errors) },
     }))
 }
