@@ -1,0 +1,42 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT key_package_hash, consumed_at, consumed_by_convo, cipher_suite\n            FROM key_packages\n            WHERE owner_did = $1\n              AND consumed_at IS NOT NULL\n              AND id < $3\n            ORDER BY consumed_at DESC, id DESC\n            LIMIT $2\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "key_package_hash",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "consumed_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 2,
+        "name": "consumed_by_convo",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "cipher_suite",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "52d34facb28b04c06291f52311bac5279a3ff0e9192d3a3e10123433987a450c"
+}

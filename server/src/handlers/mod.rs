@@ -11,6 +11,7 @@ mod get_convos;
 mod get_epoch;
 mod get_key_packages;
 mod get_key_package_stats;
+mod get_key_package_status;
 mod get_messages;
 mod get_reports;
 mod get_welcome;
@@ -26,6 +27,7 @@ mod request_rejoin;
 mod resolve_report;
 mod send_message;
 mod update_cursor;
+mod validate_welcome;
 
 // Re-export handlers
 pub use add_members::add_members;
@@ -40,6 +42,7 @@ pub use get_convos::get_convos;
 pub use get_epoch::get_epoch;
 pub use get_key_packages::get_key_packages;
 pub use get_key_package_stats::get_key_package_stats;
+pub use get_key_package_status::get_key_package_status;
 pub use get_messages::get_messages;
 pub use get_reports::get_reports;
 pub use get_welcome::get_welcome;
@@ -55,3 +58,4 @@ pub use request_rejoin::request_rejoin;
 pub use resolve_report::resolve_report;
 pub use send_message::send_message;
 pub use update_cursor::update_cursor;
+pub use validate_welcome::validate_welcome;

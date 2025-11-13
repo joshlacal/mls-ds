@@ -62,7 +62,7 @@ impl std::fmt::Display for Error {
 #[serde(rename_all = "camelCase")]
 pub struct CommitMessageData {
     ///MLS commit message bytes
-    #[serde(with = "serde_bytes")]
+    #[serde(with = "crate::atproto_bytes")]
     pub commit_data: Vec<u8>,
     ///Timestamp when commit was created
     pub created_at: crate::types::string::Datetime,

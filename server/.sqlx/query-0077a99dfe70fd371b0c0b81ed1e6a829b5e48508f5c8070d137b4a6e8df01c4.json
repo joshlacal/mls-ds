@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                        INSERT INTO envelopes (id, convo_id, recipient_did, message_id, created_at)\n                        VALUES ($1, $2, $3, $4, NOW())\n                        ON CONFLICT (recipient_did, message_id) DO NOTHING\n                        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0077a99dfe70fd371b0c0b81ed1e6a829b5e48508f5c8070d137b4a6e8df01c4"
+}

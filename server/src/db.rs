@@ -830,6 +830,7 @@ pub async fn get_all_key_packages(
           AND consumed_at IS NULL
           AND expires_at > $3
         ORDER BY created_at ASC
+        LIMIT 50
         "#,
     )
     .bind(did)
@@ -1007,6 +1008,25 @@ pub async fn delete_consumed_key_packages(pool: &DbPool, hours_old: i64) -> Resu
     Ok(result.rows_affected())
 }
 
+/// Delete old unconsumed key packages (prevent accumulation of stale packages)
+pub async fn delete_old_unconsumed_key_packages(pool: &DbPool, days_old: i64) -> Result<u64> {
+    let cutoff = Utc::now() - chrono::Duration::days(days_old);
+
+    let result = sqlx::query(
+        r#"
+        DELETE FROM key_packages
+        WHERE consumed_at IS NULL
+          AND created_at < $1
+        "#
+    )
+    .bind(cutoff)
+    .execute(pool)
+    .await
+    .context("Failed to delete old unconsumed key packages")?;
+
+    Ok(result.rows_affected())
+}
+
 /// Enforce maximum key packages per device
 pub async fn enforce_key_package_limit(
     pool: &DbPool,
@@ -1060,6 +1080,158 @@ pub async fn count_key_packages(pool: &DbPool, did: &str, cipher_suite: &str) ->
     .context("Failed to count key packages")?;
 
     Ok(count)
+}
+
+/// Check if a key package with the given hash already exists for the user
+pub async fn check_key_package_duplicate(
+    pool: &DbPool,
+    owner_did: &str,
+    key_package_hash: &str,
+) -> Result<bool> {
+    let exists = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS(
+            SELECT 1 FROM key_packages
+            WHERE owner_did = $1 AND key_package_hash = $2
+        )
+        "#,
+    )
+    .bind(owner_did)
+    .bind(key_package_hash)
+    .fetch_one(pool)
+    .await
+    .context("Failed to check key package duplicate")?;
+
+    Ok(exists)
+}
+
+/// Get key package statistics for a user
+/// Returns (total_uploaded, available, consumed, reserved)
+pub async fn get_key_package_stats(pool: &DbPool, owner_did: &str) -> Result<(i64, i64, i64, i64)> {
+    let now = Utc::now();
+    let reservation_timeout = now - chrono::Duration::minutes(5);
+
+    let row = sqlx::query!(
+        r#"
+        SELECT
+            COUNT(*) as "total!",
+            COUNT(*) FILTER (
+                WHERE consumed_at IS NULL
+                  AND (reserved_at IS NULL OR reserved_at < $2)
+            ) as "available!",
+            COUNT(*) FILTER (WHERE consumed_at IS NOT NULL) as "consumed!",
+            COUNT(*) FILTER (
+                WHERE consumed_at IS NULL
+                  AND reserved_at IS NOT NULL
+                  AND reserved_at >= $2
+            ) as "reserved!"
+        FROM key_packages
+        WHERE owner_did = $1
+        "#,
+        owner_did,
+        reservation_timeout
+    )
+    .fetch_one(pool)
+    .await
+    .context("Failed to get key package stats")?;
+
+    Ok((row.total, row.available, row.consumed, row.reserved))
+}
+
+/// Get paginated list of consumed key packages for a user
+#[derive(Debug)]
+pub struct ConsumedKeyPackage {
+    pub key_package_hash: String,
+    pub consumed_at: Option<DateTime<Utc>>,
+    pub consumed_by_convo: Option<String>,
+    pub cipher_suite: String,
+}
+
+pub async fn get_consumed_key_packages_paginated(
+    pool: &DbPool,
+    owner_did: &str,
+    limit: i64,
+    cursor: Option<String>,
+) -> Result<(Vec<ConsumedKeyPackage>, Option<String>)> {
+    let rows = if let Some(cursor_id) = cursor {
+        sqlx::query_as!(
+            ConsumedKeyPackage,
+            r#"
+            SELECT key_package_hash, consumed_at, consumed_by_convo, cipher_suite
+            FROM key_packages
+            WHERE owner_did = $1
+              AND consumed_at IS NOT NULL
+              AND id < $3
+            ORDER BY consumed_at DESC, id DESC
+            LIMIT $2
+            "#,
+            owner_did,
+            limit,
+            cursor_id
+        )
+        .fetch_all(pool)
+        .await
+        .context("Failed to fetch consumed key packages")?
+    } else {
+        sqlx::query_as!(
+            ConsumedKeyPackage,
+            r#"
+            SELECT key_package_hash, consumed_at, consumed_by_convo, cipher_suite
+            FROM key_packages
+            WHERE owner_did = $1
+              AND consumed_at IS NOT NULL
+            ORDER BY consumed_at DESC, id DESC
+            LIMIT $2
+            "#,
+            owner_did,
+            limit
+        )
+        .fetch_all(pool)
+        .await
+        .context("Failed to fetch consumed key packages")?
+    };
+
+    // Generate next cursor if we got a full page
+    let next_cursor = if rows.len() as i64 == limit {
+        rows.last().map(|r| r.key_package_hash.clone())
+    } else {
+        None
+    };
+
+    Ok((rows, next_cursor))
+}
+
+/// Reserve a key package for welcome validation (prevents race conditions)
+/// Returns true if reservation successful, false if package not found/already consumed/already reserved
+pub async fn reserve_key_package(
+    pool: &DbPool,
+    owner_did: &str,
+    key_package_hash: &str,
+    convo_id: &str,
+) -> Result<bool> {
+    let now = Utc::now();
+    let reservation_timeout = now - chrono::Duration::minutes(5);
+
+    let result = sqlx::query!(
+        r#"
+        UPDATE key_packages
+        SET reserved_at = $4, reserved_by_convo = $5
+        WHERE owner_did = $1
+          AND key_package_hash = $2
+          AND consumed_at IS NULL
+          AND (reserved_at IS NULL OR reserved_at < $3)
+        "#,
+        owner_did,
+        key_package_hash,
+        reservation_timeout,
+        now,
+        convo_id
+    )
+    .execute(pool)
+    .await
+    .context("Failed to reserve key package")?;
+
+    Ok(result.rows_affected() > 0)
 }
 
 // =============================================================================

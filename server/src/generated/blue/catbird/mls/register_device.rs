@@ -10,7 +10,7 @@ pub struct InputData {
     ///Initial key packages for this device (100+ recommended for optimal performance)
     pub key_packages: Vec<crate::blue::catbird::mls::defs::KeyPackageRef>,
     ///Ed25519 public key (32 bytes) derived from device's signature private key
-    #[serde(with = "serde_bytes")]
+    #[serde(with = "crate::atproto_bytes")]
     pub signature_public_key: Vec<u8>,
 }
 pub type Input = crate::types::Object<InputData>;

@@ -55,7 +55,6 @@ pub type KeyPackageRef = crate::types::Object<KeyPackageRefData>;
 pub struct MemberViewData {
     ///MLS credential bytes
     #[serde(default)]
-    #[serde(with = "serde_bytes")]
     #[serde(skip_serializing_if = "core::option::Option::is_none")]
     pub credential: core::option::Option<Vec<u8>>,
     ///Device identifier (UUID). Unique per device.
@@ -88,7 +87,7 @@ pub type MemberView = crate::types::Object<MemberViewData>;
 #[serde(rename_all = "camelCase")]
 pub struct MessageViewData {
     ///MLS encrypted message ciphertext bytes
-    #[serde(with = "serde_bytes")]
+    #[serde(with = "crate::atproto_bytes")]
     pub ciphertext: Vec<u8>,
     ///Conversation identifier
     pub convo_id: String,
