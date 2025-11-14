@@ -47,6 +47,9 @@ pub struct KeyPackageRefData {
     pub did: crate::types::string::Did,
     ///Base64url-encoded MLS key package bytes
     pub key_package: String,
+    ///Hex-encoded SHA-256 hash of the key package bytes. Clients should use this server-computed hash when creating conversations to ensure hash consistency.
+    #[serde(skip_serializing_if = "core::option::Option::is_none")]
+    pub key_package_hash: core::option::Option<String>,
 }
 pub type KeyPackageRef = crate::types::Object<KeyPackageRefData>;
 ///View of a conversation member representing a single device. Multiple devices per user appear as separate members in MLS layer, but UI should group by userDid.

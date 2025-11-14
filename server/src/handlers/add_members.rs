@@ -8,7 +8,8 @@ use tracing::{info, warn, error};
 use crate::{
     actors::{ActorRegistry, ConvoMessage, KeyPackageHashEntry},
     auth::AuthUser,
-    generated::blue::catbird::mls::add_members::{Input as AddMembersInput, Output as AddMembersOutput, OutputData},
+    error_responses::AddMembersError,
+    generated::blue::catbird::mls::add_members::{Input as AddMembersInput, Output as AddMembersOutput, OutputData, Error},
     storage::{get_current_epoch, is_member, DbPool},
 };
 
@@ -20,22 +21,22 @@ pub async fn add_members(
     State(actor_registry): State<Arc<ActorRegistry>>,
     auth_user: AuthUser,
     Json(input): Json<AddMembersInput>,
-) -> Result<Json<AddMembersOutput>, StatusCode> {
+) -> Result<Json<AddMembersOutput>, AddMembersError> {
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.addMembers") {
-        return Err(StatusCode::UNAUTHORIZED);
+        return Err(StatusCode::UNAUTHORIZED.into());
     }
     let did = &auth_user.did;
     // Validate input
     if input.did_list.is_empty() {
         warn!("Empty did_list provided");
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(StatusCode::BAD_REQUEST.into());
     }
 
     for d in &input.did_list {
         let did_str = d.as_str();
         if !did_str.starts_with("did:") {
             warn!("Invalid DID format: {}", did_str);
-            return Err(StatusCode::BAD_REQUEST);
+            return Err(StatusCode::BAD_REQUEST.into());
         }
     }
 
@@ -48,7 +49,7 @@ pub async fn add_members(
         })?
     {
         warn!("User is not a member of conversation");
-        return Err(StatusCode::FORBIDDEN);
+        return Err(StatusCode::FORBIDDEN.into());
     }
 
     // Note: Reduced logging per security hardening - no convo IDs at info level
@@ -60,7 +61,7 @@ pub async fn add_members(
         .unwrap_or(true);
     if require_idem && input.idempotency_key.is_none() {
         warn!("❌ [add_members] Missing idempotencyKey");
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(StatusCode::BAD_REQUEST.into());
     }
 
     // If idempotency key is provided, check if this operation was already completed
@@ -325,6 +326,49 @@ pub async fn add_members(
 
             info!("📍 [add_members] Single Welcome message ({} bytes) for {} new members",
                   welcome_data.len(), input.did_list.len());
+
+            // Validate all key packages are available BEFORE storing anything
+            if let Some(ref kp_hashes) = input.key_package_hashes {
+                info!("📍 [add_members] Validating {} key packages are available...", kp_hashes.len());
+
+                for entry in kp_hashes {
+                    let member_did_str = entry.did.as_str();
+                    let hash_hex = &entry.hash;
+
+                    // Check if key package exists and is available (not consumed/reserved)
+                    let available = sqlx::query_scalar::<_, bool>(
+                        r#"
+                        SELECT EXISTS(
+                            SELECT 1 FROM key_packages
+                            WHERE owner_did = $1
+                              AND key_package_hash = $2
+                              AND consumed_at IS NULL
+                              AND (reserved_at IS NULL OR reserved_at < NOW() - INTERVAL '5 minutes')
+                        )
+                        "#
+                    )
+                    .bind(member_did_str)
+                    .bind(hash_hex)
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(|e| {
+                        error!("❌ [add_members] Failed to check key package availability: {}", e);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?;
+
+                    if !available {
+                        warn!(
+                            "❌ [add_members] Key package not available for {}: hash={}",
+                            member_did_str, hash_hex
+                        );
+                        return Err(Error::KeyPackageNotFound(Some(format!(
+                            "Key package not available for {}: hash={}",
+                            member_did_str, hash_hex
+                        ))).into());
+                    }
+                }
+                info!("✅ [add_members] All {} key packages are available", kp_hashes.len());
+            }
 
             // Store the SAME Welcome for each new member
             for target_did in &input.did_list {

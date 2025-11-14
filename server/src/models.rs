@@ -210,6 +210,7 @@ impl KeyPackage {
             did,
             key_package: key_package_b64,
             cipher_suite: self.cipher_suite.clone(),
+            key_package_hash: Some(self.key_package_hash.clone()),
         }))
     }
 }

@@ -112,6 +112,11 @@
       "properties": {
         "did": { "type": "string", "format": "did", "description": "Owner DID" },
         "keyPackage": { "type": "string", "description": "Base64url-encoded MLS key package bytes" },
+        "keyPackageHash": {
+          "type": "string",
+          "description": "Hex-encoded SHA-256 hash of the key package bytes. Clients should use this server-computed hash when creating conversations to ensure hash consistency.",
+          "maxLength": 64
+        },
         "cipherSuite": {
           "type": "string",
           "description": "Supported cipher suite for this key package",
