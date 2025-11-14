@@ -57,6 +57,7 @@ pub type KeyPackageRef = crate::types::Object<KeyPackageRefData>;
 #[serde(rename_all = "camelCase")]
 pub struct MemberViewData {
     ///MLS credential bytes
+    #[serde(with = "crate::atproto_bytes::option")]
     #[serde(default)]
     #[serde(skip_serializing_if = "core::option::Option::is_none")]
     pub credential: core::option::Option<Vec<u8>>,
