@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo test:*)",
+      "Bash(cargo tree:*)",
+      "Bash(find:*)",
+      "Bash(cargo run:*)",
+      "Bash(rustc:*)",
+      "Bash(./test_atproto_bytes:*)",
+      "Bash(cargo check:*)",
+      "WebSearch",
+      "Bash(cat:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
