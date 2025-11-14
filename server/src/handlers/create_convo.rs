@@ -5,7 +5,8 @@ use tracing::{info, warn, error};
 
 use crate::{
     auth::AuthUser,
-    generated::blue::catbird::mls::create_convo::{Input, NSID},
+    error_responses::CreateConvoError,
+    generated::blue::catbird::mls::create_convo::{Input, NSID, Error},
     generated::blue::catbird::mls::defs::{ConvoView, ConvoViewData, ConvoMetadata, ConvoMetadataData, MemberView, MemberViewData},
     sqlx_atrium::{chrono_to_datetime, did_to_string},
     storage::DbPool,
@@ -18,7 +19,7 @@ pub async fn create_convo(
     State(pool): State<DbPool>,
     auth_user: AuthUser,
     Json(input): Json<Input>,
-) -> Result<Json<ConvoView>, StatusCode> {
+) -> Result<Json<ConvoView>, CreateConvoError> {
     let input = input.data;
 
     tracing::debug!("🔷 [create_convo] incoming create request");
@@ -33,7 +34,7 @@ pub async fn create_convo(
 
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
         error!("❌ [create_convo] Unauthorized");
-        return Err(StatusCode::UNAUTHORIZED);
+        return Err(StatusCode::UNAUTHORIZED.into());
     }
 
     // Parse creator DID safely
@@ -48,7 +49,10 @@ pub async fn create_convo(
                         "MLS_128_DHKEMP256_AES128GCM_SHA256_P256"];
     if !valid_suites.contains(&input.cipher_suite.as_str()) {
         warn!("❌ [create_convo] Invalid cipher suite: {}", input.cipher_suite);
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(Error::InvalidCipherSuite(Some(format!(
+            "Cipher suite '{}' is not supported",
+            input.cipher_suite
+        ))).into());
     }
 
     // Validate initial members
@@ -56,7 +60,10 @@ pub async fn create_convo(
     tracing::debug!("📍 [create_convo] validating initial members");
         if members.len() > 100 {
             warn!("❌ [create_convo] Too many initial members: {}", members.len());
-            return Err(StatusCode::BAD_REQUEST);
+            return Err(Error::TooManyMembers(Some(format!(
+                "Cannot add more than 100 initial members (got {})",
+                members.len()
+            ))).into());
         }
     }
 
@@ -79,7 +86,7 @@ pub async fn create_convo(
         .unwrap_or(true);
     if require_idem && input.idempotency_key.is_none() {
         warn!("❌ [create_convo] Missing idempotencyKey");
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(StatusCode::BAD_REQUEST.into());
     }
 
     // If idempotency key is provided, check for existing conversation
@@ -259,6 +266,65 @@ pub async fn create_convo(
             })?;
 
         info!("📍 [create_convo] Single Welcome message ({} bytes) for all members/devices", welcome_data.len());
+
+        // Validate all key packages are available BEFORE storing anything
+        if let Some(ref kp_hashes) = input.key_package_hashes {
+            info!("📍 [create_convo] Validating {} key packages are available...", kp_hashes.len());
+
+            for entry in kp_hashes {
+                let member_did_str = did_to_string(&entry.data.did);
+                let hash_hex = &entry.data.hash;
+
+                // Check if key package exists and is available (not consumed/reserved)
+                let available = sqlx::query_scalar::<_, bool>(
+                    r#"
+                    SELECT EXISTS(
+                        SELECT 1 FROM key_packages
+                        WHERE owner_did = $1
+                          AND key_package_hash = $2
+                          AND consumed_at IS NULL
+                          AND (reserved_at IS NULL OR reserved_at < NOW() - INTERVAL '5 minutes')
+                    )
+                    "#
+                )
+                .bind(&member_did_str)
+                .bind(hash_hex)
+                .fetch_one(&pool)
+                .await
+                .map_err(|e| {
+                    error!("❌ [create_convo] Failed to check key package availability: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+
+                if !available {
+                    // Enhanced logging: show what hashes ARE available for this user
+                    let available_hashes: Vec<String> = sqlx::query_scalar(
+                        r#"
+                        SELECT key_package_hash FROM key_packages
+                        WHERE owner_did = $1
+                          AND consumed_at IS NULL
+                          AND (reserved_at IS NULL OR reserved_at < NOW() - INTERVAL '5 minutes')
+                        ORDER BY created_at DESC
+                        LIMIT 10
+                        "#
+                    )
+                    .bind(&member_did_str)
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap_or_default();
+
+                    warn!(
+                        "❌ [create_convo] Key package not available for {}: requested_hash={}, available_hashes_count={}, available_hashes={:?}",
+                        member_did_str, hash_hex, available_hashes.len(), available_hashes
+                    );
+                    return Err(Error::KeyPackageNotFound(Some(format!(
+                        "Key package not available for {}: hash={}. Server has {} available key packages.",
+                        member_did_str, hash_hex, available_hashes.len()
+                    ))).into());
+                }
+            }
+            info!("✅ [create_convo] All {} key packages are available", kp_hashes.len());
+        }
 
         // Store the SAME Welcome for each initial member (excluding creator)
         if let Some(ref member_list) = input.initial_members {
