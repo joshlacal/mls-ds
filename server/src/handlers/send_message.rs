@@ -105,6 +105,29 @@ pub async fn send_message(
         return Err(StatusCode::FORBIDDEN);
     }
 
+    tracing::debug!("📍 [send_message] validating epoch");
+    // Validate epoch matches server's expectation (defense-in-depth)
+    let convo = sqlx::query_as::<_, crate::models::Conversation>(
+        "SELECT id, creator_did, current_epoch, created_at, updated_at, name, cipher_suite FROM conversations WHERE id = $1"
+    )
+    .bind(&input.convo_id)
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| {
+        error!("❌ [send_message] Failed to fetch conversation: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    if input.epoch as i32 != convo.current_epoch {
+        error!(
+            "❌ [send_message] Epoch mismatch: conversation {} is at epoch {}, but client sent epoch {}. This indicates client state desynchronization.",
+            crate::crypto::redact_for_log(&input.convo_id),
+            convo.current_epoch,
+            input.epoch
+        );
+        return Err(StatusCode::CONFLICT); // 409 Conflict
+    }
+
     // Check if actor system is enabled
     let use_actors = std::env::var("ENABLE_ACTOR_SYSTEM")
         .map(|v| v == "true" || v == "1")
