@@ -27,7 +27,6 @@ mod request_rejoin;
 mod resolve_report;
 mod send_message;
 mod update_cursor;
-mod validate_welcome;
 
 // Re-export handlers
 pub use add_members::add_members;
@@ -58,4 +57,3 @@ pub use request_rejoin::request_rejoin;
 pub use resolve_report::resolve_report;
 pub use send_message::send_message;
 pub use update_cursor::update_cursor;
-pub use validate_welcome::validate_welcome;

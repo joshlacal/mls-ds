@@ -8,12 +8,14 @@ CREATE TABLE IF NOT EXISTS devices (
     device_id TEXT NOT NULL, -- UUID for this device
     device_name TEXT, -- Human-readable name like "Josh's iPhone"
     credential_did TEXT NOT NULL, -- Full credential: did:plc:user#device-uuid
+    signature_public_key TEXT, -- Ed25519 public key (hex-encoded)
     registered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     platform TEXT, -- ios, android, web, desktop
     app_version TEXT,
     UNIQUE(user_did, device_id),
-    UNIQUE(credential_did)
+    UNIQUE(credential_did),
+    UNIQUE(user_did, signature_public_key)
 );
 
 -- Index for looking up devices by user

@@ -207,10 +207,6 @@ async fn main() -> anyhow::Result<()> {
             get(handlers::get_key_package_status),
         )
         .route(
-            "/xrpc/blue.catbird.mls.validateWelcome",
-            post(handlers::validate_welcome),
-        )
-        .route(
             "/xrpc/blue.catbird.mls.registerDevice",
             post(handlers::register_device),
         )
