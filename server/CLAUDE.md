@@ -52,17 +52,49 @@ make clean
 
 ### Docker Image Management
 
-```bash
-# Build Docker image
-make build
-# or: docker build -t catbird-mls-server:latest .
+**IMPORTANT**: The project uses a Cargo workspace, so the build output is in `/home/ubuntu/mls/target` (parent directory), NOT in `server/target`.
 
-# Rebuild and restart container
-cargo build --release
-cp target/release/catbird-server server/catbird-server
-docker build -f Dockerfile.prebuilt -t server-mls-server .
-docker restart catbird-mls-server
+```bash
+# Quick deploy (RECOMMENDED - handles all steps correctly)
+cd /home/ubuntu/mls
+./deploy.sh
+
+# Manual deployment (if you need more control)
+cd /home/ubuntu/mls/server
+
+# 1. Build release binary with offline sqlx mode
+SQLX_OFFLINE=true cargo build --release
+
+# 2. Copy binary from workspace target dir to Docker build location
+cp ../target/release/catbird-server server/catbird-server
+
+# 3. Stop and remove old container
+docker stop catbird-mls-server && docker rm catbird-mls-server
+
+# 4. Rebuild Docker image without cache (important!)
+docker build --no-cache -f Dockerfile.prebuilt -t server-mls-server .
+
+# 5. Start new container with correct network and environment
+docker run -d \
+  --name catbird-mls-server \
+  --network server_catbird-network \
+  -p 3000:3000 \
+  -e DATABASE_URL="postgresql://catbird:changeme@catbird-postgres:5432/catbird" \
+  -e REDIS_URL="redis://catbird-redis:6379" \
+  -e RUST_LOG="info" \
+  -e SERVICE_DID="did:web:mls.catbird.blue" \
+  server-mls-server
+
+# 6. Verify the binary was updated
+docker exec catbird-mls-server ls -lh /app/catbird-server
 ```
+
+**Why these steps are necessary:**
+
+1. **Cargo Workspace**: The project root has a workspace Cargo.toml, so builds output to `/home/ubuntu/mls/target`, not `server/target`
+2. **Binary Location**: Docker copies from `server/catbird-server`, so you must copy from the workspace target directory
+3. **Docker Cache**: Docker's layer caching can prevent the new binary from being copied even if the file changed. Use `--no-cache` to force a fresh build
+4. **Container Recreation**: `docker restart` doesn't reload the image. You must stop, remove, and recreate the container to use the new image
 
 ### Production Deployment
 
@@ -147,13 +179,26 @@ make restore BACKUP=/path/to/backup.sql.gz
 - Blob storage for encrypted message payloads (moving to R2)
 
 **Docker Container Binary Updates:**
-The server runs in Docker, and binary updates require rebuilding the image:
-1. Build: `cargo build --release`
-2. Copy binary: `cp target/release/catbird-server server/catbird-server`
-3. Rebuild image: `docker build -f Dockerfile.prebuilt -t server-mls-server .`
-4. Restart container: `docker restart catbird-mls-server`
 
-Note: Simple `docker restart` does NOT pick up code changes - the image must be rebuilt.
+The server runs in Docker. To deploy code changes, use the automated script:
+
+```bash
+cd /home/ubuntu/mls
+./deploy.sh
+```
+
+This script handles all the steps correctly:
+1. Build: `SQLX_OFFLINE=true cargo build --release`
+2. Copy binary from workspace: `cp ../target/release/catbird-server server/catbird-server`
+3. Stop & remove container: `docker stop catbird-mls-server && docker rm catbird-mls-server`
+4. Rebuild image (no cache): `docker build --no-cache -f Dockerfile.prebuilt -t server-mls-server .`
+5. Recreate container with proper network and env vars
+6. Verify the deployment
+
+**CRITICAL**:
+- `docker restart` does NOT pick up code changes - you must rebuild the image and recreate the container
+- Use `--no-cache` when rebuilding to ensure the new binary is copied
+- The binary is in `/home/ubuntu/mls/target/release/` (workspace root), NOT `server/target/release/`
 
 ## Database Operations
 

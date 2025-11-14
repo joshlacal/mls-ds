@@ -728,7 +728,7 @@ where
             _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
         }
     }
-    ///Register a new device with the MLS server. Each device gets a unique MLS identity (did:plc:user#device-uuid). Server automatically adds device to user's existing conversations. Returns device credentials for local storage.
+    ///Register a device for multi-device MLS support. Each device gets a unique device ID and credential (did:plc:user#device-uuid). Required for proper multi-device group conversations.
     pub async fn register_device(
         &self,
         input: crate::blue::catbird::mls::register_device::Input,
