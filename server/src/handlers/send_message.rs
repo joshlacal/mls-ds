@@ -105,8 +105,9 @@ pub async fn send_message(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    tracing::debug!("📍 [send_message] validating epoch");
-    // Validate epoch matches server's expectation (defense-in-depth)
+    tracing::debug!("📍 [send_message] checking epoch telemetry");
+    // Fetch conversation for epoch telemetry (non-blocking)
+    // Note: Server does NOT enforce epoch - clients are authoritative for MLS state
     let convo = sqlx::query_as::<_, crate::models::Conversation>(
         "SELECT id, creator_did, current_epoch, created_at, updated_at, name, cipher_suite FROM conversations WHERE id = $1"
     )
@@ -118,14 +119,50 @@ pub async fn send_message(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    if input.epoch as i32 != convo.current_epoch {
-        error!(
-            "❌ [send_message] Epoch mismatch: conversation {} is at epoch {}, but client sent epoch {}. This indicates client state desynchronization.",
-            crate::crypto::redact_for_log(&input.convo_id),
-            convo.current_epoch,
-            input.epoch
-        );
-        return Err(StatusCode::CONFLICT); // 409 Conflict
+    // Epoch telemetry (mailbox-only, not authoritative)
+    let client_epoch = input.epoch as i64;
+    let server_epoch = convo.current_epoch as i64;
+
+    if client_epoch != server_epoch {
+        // Log suspicious patterns
+        if client_epoch < server_epoch {
+            tracing::warn!(
+                target: "mls_epoch",
+                convo_id = %crate::crypto::redact_for_log(&input.convo_id),
+                server_last_seen = server_epoch,
+                client_reports = client_epoch,
+                "client reported epoch behind last_reported_epoch; device may be out-of-date or restored"
+            );
+        } else if client_epoch > server_epoch + 50 {
+            tracing::warn!(
+                target: "mls_epoch",
+                convo_id = %crate::crypto::redact_for_log(&input.convo_id),
+                server_last_seen = server_epoch,
+                client_reports = client_epoch,
+                jump = client_epoch - server_epoch,
+                "client reported large epoch jump; investigate MLS client state"
+            );
+        } else {
+            // Normal mismatch (client ahead by small amount)
+            tracing::info!(
+                target: "mls_epoch",
+                convo_id = %crate::crypto::redact_for_log(&input.convo_id),
+                server_last_seen = server_epoch,
+                client_reports = client_epoch,
+                "send_message epoch telemetry mismatch (server is mailbox-only, not authoritative)"
+            );
+        }
+    }
+
+    // Update server's last-seen epoch for telemetry (best-effort, non-blocking)
+    if client_epoch as i32 > convo.current_epoch {
+        let _ = sqlx::query(
+            "UPDATE conversations SET current_epoch = GREATEST(current_epoch, $1) WHERE id = $2"
+        )
+        .bind(client_epoch as i32)
+        .bind(&input.convo_id)
+        .execute(&pool)
+        .await; // Ignore errors - this is telemetry only
     }
 
     // Check if actor system is enabled
