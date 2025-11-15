@@ -17,6 +17,11 @@
               "minLength": 1,
               "maxLength": 100
             },
+            "deviceUUID": {
+              "type": "string",
+              "description": "Persistent device UUID (stored in iCloud Keychain). Allows server to detect device re-registration and cleanup old key packages. Optional for backward compatibility.",
+              "format": "uuid"
+            },
             "keyPackages": {
               "type": "array",
               "description": "MLS key packages for this device (1-200 packages)",

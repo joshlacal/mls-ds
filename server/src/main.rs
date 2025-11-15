@@ -209,12 +209,24 @@ async fn main() -> anyhow::Result<()> {
             get(handlers::get_key_package_stats),
         )
         .route(
+            "/xrpc/blue.catbird.mls.getKeyPackageHistory",
+            get(handlers::get_key_package_history),
+        )
+        .route(
             "/xrpc/blue.catbird.mls.getKeyPackageStatus",
             get(handlers::get_key_package_status),
         )
         .route(
             "/xrpc/blue.catbird.mls.registerDevice",
             post(handlers::register_device),
+        )
+        .route(
+            "/xrpc/blue.catbird.mls.deleteDevice",
+            post(handlers::delete_device),
+        )
+        .route(
+            "/xrpc/blue.catbird.mls.listDevices",
+            get(handlers::list_devices),
         )
         .route(
             "/xrpc/blue.catbird.mls.getEpoch",
@@ -231,6 +243,14 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/xrpc/blue.catbird.mls.requestRejoin",
             post(handlers::request_rejoin),
+        )
+        .route(
+            "/xrpc/blue.catbird.mls.getExpectedConversations",
+            get(handlers::get_expected_conversations),
+        )
+        .route(
+            "/xrpc/blue.catbird.mls.validateDeviceState",
+            get(handlers::validate_device_state),
         )
         .route(
             "/xrpc/blue.catbird.mls.getCommits",

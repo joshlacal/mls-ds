@@ -1,0 +1,157 @@
+use axum::{extract::{RawQuery, State}, http::StatusCode, Json};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use tracing::{info, warn};
+
+use crate::{
+    auth::AuthUser,
+    storage::DbPool,
+};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KeyPackageHistoryEntry {
+    package_id: String,
+    created_at: DateTime<Utc>,
+    consumed_at: Option<DateTime<Utc>>,
+    consumed_for_convo: Option<String>,
+    consumed_for_convo_name: Option<String>,
+    consumed_by_device: Option<String>,
+    device_id: Option<String>,
+    cipher_suite: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GetKeyPackageHistoryResponse {
+    history: Vec<KeyPackageHistoryEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cursor: Option<String>,
+}
+
+/// Get key package consumption history for authenticated user
+/// GET /xrpc/blue.catbird.mls.getKeyPackageHistory
+#[tracing::instrument(skip(pool))]
+pub async fn get_key_package_history(
+    State(pool): State<DbPool>,
+    auth_user: AuthUser,
+    RawQuery(query): RawQuery,
+) -> Result<Json<GetKeyPackageHistoryResponse>, StatusCode> {
+    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.getKeyPackageHistory") {
+        warn!("Unauthorized access attempt");
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    // Parse query parameters
+    let query_str = query.unwrap_or_default();
+    let mut limit = 20i64;
+    let mut cursor: Option<String> = None;
+
+    for pair in query_str.split('&') {
+        if let Some((key, value)) = pair.split_once('=') {
+            let decoded_value = urlencoding::decode(value).unwrap_or_default().to_string();
+            match key {
+                "limit" => {
+                    if let Ok(l) = decoded_value.parse::<i64>() {
+                        limit = l.clamp(1, 100);
+                    }
+                }
+                "cursor" => cursor = Some(decoded_value),
+                _ => {}
+            }
+        }
+    }
+
+    let user_did = &auth_user.claims.iss;
+    info!("Fetching key package history for user: {} (limit: {})", user_did, limit);
+
+    // Fetch history from database
+    let rows = if let Some(cursor_id) = cursor {
+        sqlx::query!(
+            r#"
+            SELECT
+                kp.key_package_hash,
+                kp.created_at,
+                kp.consumed_at,
+                kp.consumed_for_convo_id,
+                kp.consumed_by_device_id,
+                kp.device_id,
+                kp.cipher_suite,
+                c.name as convo_name
+            FROM key_packages kp
+            LEFT JOIN conversations c ON kp.consumed_for_convo_id = c.id
+            WHERE kp.owner_did = $1
+              AND kp.consumed_at IS NOT NULL
+              AND kp.key_package_hash < $3
+            ORDER BY kp.consumed_at DESC, kp.key_package_hash DESC
+            LIMIT $2
+            "#,
+            user_did,
+            limit,
+            cursor_id
+        )
+        .fetch_all(&pool)
+        .await
+        .map_err(|e| {
+            warn!("Failed to fetch key package history: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+    } else {
+        sqlx::query!(
+            r#"
+            SELECT
+                kp.key_package_hash,
+                kp.created_at,
+                kp.consumed_at,
+                kp.consumed_for_convo_id,
+                kp.consumed_by_device_id,
+                kp.device_id,
+                kp.cipher_suite,
+                c.name as convo_name
+            FROM key_packages kp
+            LEFT JOIN conversations c ON kp.consumed_for_convo_id = c.id
+            WHERE kp.owner_did = $1
+              AND kp.consumed_at IS NOT NULL
+            ORDER BY kp.consumed_at DESC, kp.key_package_hash DESC
+            LIMIT $2
+            "#,
+            user_did,
+            limit
+        )
+        .fetch_all(&pool)
+        .await
+        .map_err(|e| {
+            warn!("Failed to fetch key package history: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+    };
+
+    // Build response
+    let history: Vec<KeyPackageHistoryEntry> = rows
+        .iter()
+        .map(|row| KeyPackageHistoryEntry {
+            package_id: row.key_package_hash.clone(),
+            created_at: row.created_at,
+            consumed_at: row.consumed_at,
+            consumed_for_convo: row.consumed_for_convo_id.clone(),
+            consumed_for_convo_name: row.convo_name.clone(),
+            consumed_by_device: row.consumed_by_device_id.clone(),
+            device_id: row.device_id.clone(),
+            cipher_suite: row.cipher_suite.clone(),
+        })
+        .collect();
+
+    // Generate next cursor if we got a full page
+    let next_cursor = if history.len() as i64 == limit {
+        history.last().map(|h| h.package_id.clone())
+    } else {
+        None
+    };
+
+    info!("Returning {} history entries", history.len());
+
+    Ok(Json(GetKeyPackageHistoryResponse {
+        history,
+        cursor: next_cursor,
+    }))
+}

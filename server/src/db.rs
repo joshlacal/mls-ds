@@ -701,9 +701,10 @@ pub async fn compact_event_stream(pool: &DbPool, ttl_days: i64) -> Result<u64> {
     Ok(result.rows_affected())
 }
 
-/// Delete consumed welcome messages older than 7 days
+/// Delete consumed welcome messages older than 24 hours
+/// Unconsumed messages are kept indefinitely (until consumed + 24h grace period)
 pub async fn compact_welcome_messages(pool: &DbPool) -> Result<u64> {
-    let cutoff = Utc::now() - chrono::Duration::days(7);
+    let cutoff = Utc::now() - chrono::Duration::hours(24);
 
     let result = sqlx::query(
         "DELETE FROM welcome_messages
@@ -847,6 +848,7 @@ pub async fn get_key_package(
 /// Returns up to 50 key packages, one per unique device credential.
 /// For proper multi-device support, each package must have a unique credential_did.
 /// Legacy key packages (without device_id) are returned as a single fallback.
+/// Prioritizes active devices over inactive ones.
 pub async fn get_all_key_packages(
     pool: &DbPool,
     did: &str,
@@ -855,19 +857,24 @@ pub async fn get_all_key_packages(
     let now = Utc::now();
     let reservation_timeout = now - chrono::Duration::minutes(5);
 
-    // Get ONE key package per unique device
+    // Get ONE key package per unique device, prioritizing active devices
     // This query uses DISTINCT ON to get the oldest available key package for each device
+    // and sorts by device active status first (active devices first)
     let key_packages = sqlx::query_as::<_, KeyPackage>(
         r#"
-        SELECT DISTINCT ON (COALESCE(credential_did, key_package_hash))
-            owner_did, cipher_suite, key_package as key_data, key_package_hash, created_at, expires_at, consumed_at
-        FROM key_packages
-        WHERE owner_did = $1
-          AND cipher_suite = $2
-          AND consumed_at IS NULL
-          AND expires_at > $3
-          AND (reserved_at IS NULL OR reserved_at < $4)
-        ORDER BY COALESCE(credential_did, key_package_hash), created_at ASC
+        SELECT DISTINCT ON (COALESCE(kp.credential_did, kp.key_package_hash))
+            kp.owner_did, kp.cipher_suite, kp.key_package as key_data, kp.key_package_hash, kp.created_at, kp.expires_at, kp.consumed_at
+        FROM key_packages kp
+        LEFT JOIN devices d ON kp.device_id = d.id
+        WHERE kp.owner_did = $1
+          AND kp.cipher_suite = $2
+          AND kp.consumed_at IS NULL
+          AND kp.expires_at > $3
+          AND (kp.reserved_at IS NULL OR kp.reserved_at < $4)
+        ORDER BY
+            COALESCE(kp.credential_did, kp.key_package_hash),
+            COALESCE(d.is_active, true) DESC,
+            kp.created_at ASC
         LIMIT 50
         "#,
     )
@@ -889,10 +896,22 @@ pub async fn consume_key_package(
     cipher_suite: &str,
     key_data: &[u8],
 ) -> Result<()> {
+    consume_key_package_with_metadata(pool, did, cipher_suite, key_data, None, None).await
+}
+
+/// Mark a key package as consumed with consumption metadata
+pub async fn consume_key_package_with_metadata(
+    pool: &DbPool,
+    did: &str,
+    cipher_suite: &str,
+    key_data: &[u8],
+    consumed_for_convo_id: Option<&str>,
+    consumed_by_device_id: Option<&str>,
+) -> Result<()> {
     sqlx::query(
         r#"
         UPDATE key_packages
-        SET consumed_at = $1
+        SET consumed_at = $1, consumed_for_convo_id = $5, consumed_by_device_id = $6
         WHERE owner_did = $2 AND cipher_suite = $3 AND key_package = $4 AND consumed_at IS NULL
         "#,
     )
@@ -900,6 +919,8 @@ pub async fn consume_key_package(
     .bind(did)
     .bind(cipher_suite)
     .bind(key_data)
+    .bind(consumed_for_convo_id)
+    .bind(consumed_by_device_id)
     .execute(pool)
     .await
     .context("Failed to consume key package")?;
@@ -913,16 +934,29 @@ pub async fn mark_key_package_consumed(
     did: &str,
     key_package_hash: &str,
 ) -> Result<bool> {
+    mark_key_package_consumed_with_metadata(pool, did, key_package_hash, None, None).await
+}
+
+/// Mark a key package as consumed by hash with consumption metadata
+pub async fn mark_key_package_consumed_with_metadata(
+    pool: &DbPool,
+    did: &str,
+    key_package_hash: &str,
+    consumed_for_convo_id: Option<&str>,
+    consumed_by_device_id: Option<&str>,
+) -> Result<bool> {
     let result = sqlx::query(
         r#"
         UPDATE key_packages
-        SET consumed_at = $1
+        SET consumed_at = $1, consumed_for_convo_id = $4, consumed_by_device_id = $5
         WHERE owner_did = $2 AND key_package_hash = $3 AND consumed_at IS NULL
         "#,
     )
     .bind(Utc::now())
     .bind(did)
     .bind(key_package_hash)
+    .bind(consumed_for_convo_id)
+    .bind(consumed_by_device_id)
     .execute(pool)
     .await
     .context("Failed to mark key package as consumed")?;

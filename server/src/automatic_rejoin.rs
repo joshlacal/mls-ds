@@ -93,6 +93,7 @@ pub struct GetWelcomeOutput {
 /// Client calls this after detecting identity in iCloud but no local MLS state
 ///
 /// Authorization: User must be a member (based on server DB, not MLS state)
+/// Auto-approval: Automatically approves if user was active member within 30 days
 pub async fn mark_needs_rejoin(
     State(pool): State<PgPool>,
     auth_user: AuthUser,
@@ -106,47 +107,92 @@ pub async fn mark_needs_rejoin(
         "Member requesting rejoin"
     );
 
-    // 1. Verify user is a member (server DB is source of truth)
-    let is_member = sqlx::query_scalar::<_, bool>(
+    // 1. Verify user is a member and check eligibility for auto-rejoin
+    let member_info = sqlx::query_as::<_, (bool, Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>)>(
         r#"
-        SELECT EXISTS(
-            SELECT 1 FROM members
-            WHERE convo_id = $1 AND member_did = $2 AND left_at IS NULL
-        )
-        "#,
-    )
-    .bind(&input.convo_id)
-    .bind(did)
-    .fetch_one(&pool)
-    .await?;
-
-    if !is_member {
-        return Err(Error::NotMember);
-    }
-
-    // 2. Mark member as needing rejoin
-    sqlx::query(
-        r#"
-        UPDATE members
-        SET needs_rejoin = true,
-            rejoin_requested_at = NOW()
+        SELECT
+            (left_at IS NULL) as is_active_member,
+            last_seen_at,
+            left_at
+        FROM members
         WHERE convo_id = $1 AND member_did = $2
         "#,
     )
     .bind(&input.convo_id)
     .bind(did)
+    .fetch_optional(&pool)
+    .await?;
+
+    let (is_active_member, last_seen_at, left_at) = match member_info {
+        Some(info) => info,
+        None => return Err(Error::NotMember),
+    };
+
+    // Check if member left voluntarily
+    if !is_active_member && left_at.is_some() {
+        error!(
+            convo_id = %input.convo_id,
+            did = %did,
+            "User voluntarily left conversation - rejoin not allowed"
+        );
+        return Err(Error::BadRequest("Cannot rejoin a conversation you left".to_string()));
+    }
+
+    // Check if device was last seen within 30 days (for auto-approval)
+    let auto_approve = if let Some(last_seen) = last_seen_at {
+        let days_since_seen = (chrono::Utc::now() - last_seen).num_days();
+        days_since_seen <= 30
+    } else {
+        // No last_seen_at means this is a new rejoin request - approve it
+        true
+    };
+
+    // TODO: Check security flags on account
+    // let security_flags = check_security_flags(&pool, did).await?;
+    // auto_approve = auto_approve && !security_flags.has_violations;
+
+    // 2. Mark member as needing rejoin with auto-approval status
+    sqlx::query(
+        r#"
+        UPDATE members
+        SET needs_rejoin = true,
+            rejoin_requested_at = NOW(),
+            rejoin_auto_approved = $3
+        WHERE convo_id = $1 AND member_did = $2
+        "#,
+    )
+    .bind(&input.convo_id)
+    .bind(did)
+    .bind(auto_approve)
     .execute(&pool)
     .await?;
 
-    // 3. Notify online members via SSE to generate Welcome
+    // 3. Log audit entry for rejoin request
+    log_rejoin_audit(
+        &pool,
+        &input.convo_id,
+        did,
+        auto_approve,
+        if auto_approve {
+            "Auto-approved: Active member within 30 days"
+        } else {
+            "Pending manual approval: Device inactive > 30 days"
+        }
+    ).await?;
+
+    // 4. Notify online members via SSE to generate Welcome
     // (In production, this would broadcast to SSE connections)
     broadcast_rejoin_request(&pool, &input.convo_id, did).await?;
 
+    let message = if auto_approve {
+        "Rejoin approved automatically. An online member will deliver your Welcome message shortly."
+    } else {
+        "Rejoin request pending approval (device inactive > 30 days). Please contact an admin."
+    };
+
     Ok(Json(MarkNeedsRejoinOutput {
         success: true,
-        message: format!(
-            "Rejoin requested. An online member will deliver your Welcome message shortly."
-        ),
+        message: message.to_string(),
     }))
 }
 
@@ -190,10 +236,10 @@ pub async fn deliver_welcome(
         return Err(Error::NotMember);
     }
 
-    // 2. Verify target actually needs rejoin
-    let needs_rejoin = sqlx::query_scalar::<_, bool>(
+    // 2. Verify target actually needs rejoin and is auto-approved
+    let rejoin_status = sqlx::query_as::<_, (bool, Option<bool>)>(
         r#"
-        SELECT needs_rejoin
+        SELECT needs_rejoin, rejoin_auto_approved
         FROM members
         WHERE convo_id = $1 AND member_did = $2
         "#,
@@ -201,12 +247,25 @@ pub async fn deliver_welcome(
     .bind(&input.convo_id)
     .bind(&input.target_did)
     .fetch_optional(&pool)
-    .await?
-    .unwrap_or(false);
+    .await?;
+
+    let (needs_rejoin, auto_approved) = match rejoin_status {
+        Some((needs, approved)) => (needs, approved),
+        None => return Err(Error::BadRequest(
+            "Target member not found in conversation".to_string(),
+        )),
+    };
 
     if !needs_rejoin {
         return Err(Error::BadRequest(
             "Target member does not need rejoin".to_string(),
+        ));
+    }
+
+    // Only allow Welcome delivery for auto-approved rejoins
+    if auto_approved != Some(true) {
+        return Err(Error::BadRequest(
+            "Target member rejoin is not auto-approved - requires manual admin approval".to_string(),
         ));
     }
 
@@ -353,6 +412,72 @@ async fn broadcast_rejoin_request(
 fn generate_id() -> String {
     use uuid::Uuid;
     Uuid::new_v4().to_string()
+}
+
+/// Log rejoin request to audit table for tracking and debugging
+async fn log_rejoin_audit(
+    pool: &PgPool,
+    convo_id: &str,
+    member_did: &str,
+    auto_approved: bool,
+    reason: &str,
+) -> Result<()> {
+    // Create rejoin_requests table if it doesn't exist (idempotent)
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS rejoin_requests (
+            id TEXT PRIMARY KEY,
+            convo_id TEXT NOT NULL,
+            member_did TEXT NOT NULL,
+            auto_approved BOOLEAN NOT NULL,
+            reason TEXT NOT NULL,
+            requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            FOREIGN KEY (convo_id) REFERENCES conversations(id) ON DELETE CASCADE
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // Create index for audit queries
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_rejoin_requests_convo ON rejoin_requests(convo_id, requested_at DESC)"
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_rejoin_requests_member ON rejoin_requests(member_did, requested_at DESC)"
+    )
+    .execute(pool)
+    .await?;
+
+    // Insert audit log entry
+    let request_id = generate_id();
+    sqlx::query(
+        r#"
+        INSERT INTO rejoin_requests (id, convo_id, member_did, auto_approved, reason)
+        VALUES ($1, $2, $3, $4, $5)
+        "#,
+    )
+    .bind(&request_id)
+    .bind(convo_id)
+    .bind(member_did)
+    .bind(auto_approved)
+    .bind(reason)
+    .execute(pool)
+    .await?;
+
+    info!(
+        request_id = %request_id,
+        convo_id = %convo_id,
+        member_did = %member_did,
+        auto_approved = auto_approved,
+        reason = %reason,
+        "Logged rejoin request to audit table"
+    );
+
+    Ok(())
 }
 
 // =============================================================================

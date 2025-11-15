@@ -57,7 +57,8 @@ pub async fn get_welcome(
     })?;
 
     // Fetch the Welcome message for this user
-    // Grace period: allow re-fetch within 5 minutes if consumed_at is recent
+    // Grace period: allow re-fetch within 24 hours if consumed_at is recent
+    // This extended retention supports automatic rejoin after app reinstall
     // NOTE: We do NOT check if key_package is consumed, because key packages are consumed
     // when the group is created (adding members), not when fetching the Welcome.
     let result: Option<(String, Vec<u8>, Option<Vec<u8>>)> = sqlx::query_as(
@@ -66,7 +67,7 @@ pub async fn get_welcome(
          WHERE wm.convo_id = $1 AND wm.recipient_did = $2
          AND (
            wm.consumed = false
-           OR (wm.consumed = true AND wm.consumed_at > NOW() - INTERVAL '5 minutes')
+           OR (wm.consumed = true AND wm.consumed_at > NOW() - INTERVAL '24 hours')
          )
          ORDER BY wm.created_at ASC
          LIMIT 1
@@ -88,7 +89,7 @@ pub async fn get_welcome(
             let consumed_count: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM welcome_messages
                  WHERE convo_id = $1 AND recipient_did = $2 AND consumed = true
-                 AND consumed_at < NOW() - INTERVAL '5 minutes'"
+                 AND consumed_at < NOW() - INTERVAL '24 hours'"
             )
             .bind(&params.convo_id)
             .bind(did)
