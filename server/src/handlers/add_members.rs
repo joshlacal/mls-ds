@@ -427,6 +427,71 @@ pub async fn add_members(
                     }
                 }
                 tracing::debug!("📍 [add_members] marked {} key packages as consumed", kp_hashes.len());
+
+                // Check inventory and send notification if low
+                for entry in kp_hashes {
+                    let member_did_str = entry.did.as_str();
+
+                    // Count remaining available packages for this user
+                    match crate::db::count_available_key_packages(&pool, member_did_str).await {
+                        Ok(available) => {
+                            tracing::debug!(
+                                "User {} has {} available key packages remaining",
+                                member_did_str,
+                                available
+                            );
+
+                            // Notify if below threshold (5 packages)
+                            if available < 5 {
+                                // Check if we should send notification (throttling)
+                                match crate::db::should_send_low_inventory_notification(&pool, member_did_str).await {
+                                    Ok(should_send) => {
+                                        if should_send {
+                                            tracing::info!(
+                                                "⚠️ User {} has low key package inventory: {} available",
+                                                member_did_str,
+                                                available
+                                            );
+
+                                            // TODO: Send notification via notification service
+                                            // When NotificationService is integrated into AppState:
+                                            // if let Some(notification_service) = state.notification_service.as_ref() {
+                                            //     notification_service
+                                            //         .notify_low_key_packages(member_did_str, available, 10)
+                                            //         .await
+                                            //         .ok(); // Don't fail the request if notification fails
+                                            // }
+
+                                            // Record that we sent the notification
+                                            crate::db::record_low_inventory_notification(&pool, member_did_str)
+                                                .await
+                                                .ok(); // Log but don't fail
+                                        } else {
+                                            tracing::debug!(
+                                                "Skipping notification for {} (already notified within 24h)",
+                                                member_did_str
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "Failed to check notification throttling for {}: {}",
+                                            member_did_str,
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to count available key packages for {}: {}",
+                                member_did_str,
+                                e
+                            );
+                        }
+                    }
+                }
             }
         } else {
             info!("📍 [add_members] No welcome message provided");

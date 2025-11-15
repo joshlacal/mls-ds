@@ -1,7 +1,6 @@
 use axum::{extract::State, http::StatusCode, Json};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tracing::{error, info, warn};
 
 use crate::{
@@ -65,10 +64,33 @@ pub async fn request_rejoin(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    // Compute KeyPackage hash for tracking
-    let mut hasher = Sha256::new();
-    hasher.update(&key_package_bytes);
-    let key_package_hash = hex::encode(hasher.finalize());
+    // Compute MLS-compliant hash_ref using OpenMLS
+    use openmls::prelude::{KeyPackageIn, ProtocolVersion, TlsDeserializeTrait};
+
+    // Create crypto provider (RustCrypto implements OpenMlsCrypto)
+    let provider = openmls_rust_crypto::RustCrypto::default();
+
+    // Deserialize and validate the key package
+    let kp_in = KeyPackageIn::tls_deserialize(&mut key_package_bytes.as_slice())
+        .map_err(|e| {
+            warn!("Failed to deserialize key package: {:?}", e);
+            StatusCode::BAD_REQUEST
+        })?;
+    let kp = kp_in
+        .validate(&provider, ProtocolVersion::default())
+        .map_err(|e| {
+            warn!("Failed to validate key package: {:?}", e);
+            StatusCode::BAD_REQUEST
+        })?;
+
+    // Compute the MLS-defined hash reference
+    let hash_ref = kp
+        .hash_ref(&provider)
+        .map_err(|e| {
+            error!("Failed to compute hash_ref: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let key_package_hash = hex::encode(hash_ref.as_slice());
 
     info!("Processing rejoin request");
 

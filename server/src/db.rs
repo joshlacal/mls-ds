@@ -771,8 +771,24 @@ pub async fn store_key_package_with_device(
     .await
     .context("Failed to ensure user exists")?;
 
-    // Compute SHA256 hash of the key package data
-    let key_package_hash = crate::crypto::sha256_hex(&key_data);
+    // Compute MLS-compliant hash_ref using OpenMLS
+    use openmls::prelude::{KeyPackageIn, ProtocolVersion, TlsDeserializeTrait};
+
+    // Create crypto provider (RustCrypto implements OpenMlsCrypto)
+    let provider = openmls_rust_crypto::RustCrypto::default();
+
+    // Deserialize and validate the key package
+    let kp_in = KeyPackageIn::tls_deserialize(&mut key_data.as_slice())
+        .context("Failed to deserialize key package")?;
+    let kp = kp_in
+        .validate(&provider, ProtocolVersion::default())
+        .context("Failed to validate key package")?;
+
+    // Compute the MLS-defined hash reference
+    let hash_ref = kp
+        .hash_ref(&provider)
+        .context("Failed to compute hash_ref")?;
+    let key_package_hash = hex::encode(hash_ref.as_slice());
 
     let result = sqlx::query_as::<_, KeyPackage>(
         r#"
@@ -1678,4 +1694,88 @@ pub async fn get_events_after_cursor(
         .into_iter()
         .map(|e| (e.id, e.payload, e.emitted_at))
         .collect())
+}
+
+// =============================================================================
+// Key Package Notification Tracking
+// =============================================================================
+
+/// Record that a low inventory notification was sent to a user
+/// Updates the timestamp if a record already exists
+pub async fn record_low_inventory_notification(
+    pool: &DbPool,
+    user_did: &str,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO key_package_notifications (user_did, notified_at, notification_type)
+        VALUES ($1, $2, 'low_inventory')
+        ON CONFLICT (user_did, notification_type)
+        DO UPDATE SET notified_at = $2
+        "#,
+    )
+    .bind(user_did)
+    .bind(Utc::now())
+    .execute(pool)
+    .await
+    .context("Failed to record low inventory notification")?;
+
+    Ok(())
+}
+
+/// Check if a low inventory notification should be sent to a user
+/// Returns true if:
+/// - Never sent before, OR
+/// - Last sent > 24 hours ago
+pub async fn should_send_low_inventory_notification(
+    pool: &DbPool,
+    user_did: &str,
+) -> Result<bool> {
+    let last_sent: Option<DateTime<Utc>> = sqlx::query_scalar(
+        r#"
+        SELECT notified_at FROM key_package_notifications
+        WHERE user_did = $1 AND notification_type = 'low_inventory'
+        ORDER BY notified_at DESC LIMIT 1
+        "#,
+    )
+    .bind(user_did)
+    .fetch_optional(pool)
+    .await
+    .context("Failed to check last notification time")?;
+
+    match last_sent {
+        None => Ok(true), // Never sent before
+        Some(sent_at) => {
+            let elapsed = Utc::now().signed_duration_since(sent_at);
+            Ok(elapsed.num_hours() >= 24) // Only send if 24+ hours have passed
+        }
+    }
+}
+
+/// Count available (unconsumed, non-reserved) key packages for a user
+pub async fn count_available_key_packages(
+    pool: &DbPool,
+    user_did: &str,
+) -> Result<i64> {
+    let now = Utc::now();
+    let reservation_timeout = now - chrono::Duration::minutes(5);
+
+    let count = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM key_packages
+        WHERE owner_did = $1
+          AND consumed_at IS NULL
+          AND expires_at > $2
+          AND (reserved_at IS NULL OR reserved_at < $3)
+        "#,
+    )
+    .bind(user_did)
+    .bind(now)
+    .bind(reservation_timeout)
+    .fetch_one(pool)
+    .await
+    .context("Failed to count available key packages")?;
+
+    Ok(count)
 }
