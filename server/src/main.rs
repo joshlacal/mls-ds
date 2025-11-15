@@ -27,6 +27,7 @@ struct AppState {
     db_pool: PgPool,
     sse_state: Arc<realtime::SseState>,
     actor_registry: Arc<actors::ActorRegistry>,
+    notification_service: Option<Arc<catbird_server::notifications::NotificationService>>,
 }
 
 #[tokio::main]
@@ -94,6 +95,10 @@ async fn main() -> anyhow::Result<()> {
     let actor_registry = Arc::new(actors::ActorRegistry::new(db_pool.clone()));
     tracing::info!("Actor registry initialized");
 
+    // Initialize notification service
+    let notification_service = Some(Arc::new(catbird_server::notifications::NotificationService::new()));
+    tracing::info!("Notification service initialized");
+
     // Spawn idempotency cache cleanup worker
     let cleanup_pool = db_pool.clone();
     tokio::spawn(async move {
@@ -141,6 +146,7 @@ async fn main() -> anyhow::Result<()> {
         db_pool: db_pool.clone(),
         sse_state,
         actor_registry,
+        notification_service,
     };
 
     // Build application router

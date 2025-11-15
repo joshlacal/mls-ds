@@ -11,6 +11,7 @@ pub mod health;
 pub mod metrics;
 pub mod middleware;
 pub mod models;
+pub mod notifications;
 pub mod realtime;
 pub mod storage;
 pub mod util;
