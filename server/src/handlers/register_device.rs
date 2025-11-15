@@ -24,6 +24,8 @@ pub struct KeyPackageItem {
 #[serde(rename_all = "camelCase")]
 pub struct RegisterDeviceInput {
     device_name: String,
+    #[serde(default)]
+    device_uuid: Option<String>,
     key_packages: Vec<KeyPackageItem>,
     #[serde(with = "crate::atproto_bytes")]
     signature_public_key: Vec<u8>,
@@ -94,78 +96,165 @@ pub async fn register_device(
     // Construct MLS DID: did:plc:user#device-uuid
     let mls_did = format!("{}#{}", user_did, device_id);
 
-    info!("Registering new device for user {}: {} ({})", user_did, device_id, input.device_name);
-
     let now = Utc::now();
-
-    // Check if a device with this signature key already exists
     let sig_key_hex = hex::encode(&input.signature_public_key);
-    let existing_device: Option<(String,)> = sqlx::query_as(
-        r#"
-        SELECT device_id
-        FROM devices
-        WHERE user_did = $1 AND signature_public_key = $2
-        "#,
-    )
-    .bind(user_did)
-    .bind(&sig_key_hex)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|e| {
-        error!("Failed to check existing device by signature key: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
 
-    if let Some((existing_id,)) = existing_device {
-        warn!("Device with this signature key already exists: {}", existing_id);
-        return Err(StatusCode::CONFLICT);
+    // Check for device re-registration by device_uuid
+    let is_reregistration = if let Some(ref device_uuid) = input.device_uuid {
+        let existing_by_uuid: Option<(String, String, String)> = sqlx::query_as(
+            r#"
+            SELECT id, device_id, credential_did
+            FROM devices
+            WHERE user_did = $1 AND device_uuid = $2
+            "#,
+        )
+        .bind(user_did)
+        .bind(device_uuid)
+        .fetch_optional(&pool)
+        .await
+        .map_err(|e| {
+            error!("Failed to check existing device by UUID: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        if let Some((db_id, old_device_id, old_credential_did)) = existing_by_uuid {
+            info!("Device re-registration detected for user {}: device_uuid={}, old_device_id={}",
+                user_did, device_uuid, old_device_id);
+
+            // Delete all old key packages for this device
+            let deleted_count = sqlx::query!(
+                r#"
+                DELETE FROM key_packages
+                WHERE owner_did = $1 AND device_id = $2
+                "#,
+                user_did,
+                old_device_id
+            )
+            .execute(&pool)
+            .await
+            .map_err(|e| {
+                error!("Failed to delete old key packages: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .rows_affected();
+
+            info!("Deleted {} old key packages for re-registered device {}", deleted_count, old_device_id);
+
+            // Update existing device record with new signature key and timestamps
+            // Note: We keep device_uuid the same (it's the persistent identifier)
+            sqlx::query!(
+                r#"
+                UPDATE devices
+                SET device_id = $1,
+                    device_name = $2,
+                    credential_did = $3,
+                    signature_public_key = $4,
+                    registered_at = $5,
+                    last_seen_at = $6
+                WHERE id = $7
+                "#,
+                device_id,
+                input.device_name,
+                mls_did,
+                sig_key_hex,
+                now,
+                now,
+                db_id
+            )
+            .execute(&pool)
+            .await
+            .map_err(|e| {
+                error!("Failed to update re-registered device: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+            info!("Updated device record for re-registration: {}", device_id);
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    // If not a re-registration, check if a device with this signature key already exists
+    if !is_reregistration {
+        let existing_device: Option<(String,)> = sqlx::query_as(
+            r#"
+            SELECT device_id
+            FROM devices
+            WHERE user_did = $1 AND signature_public_key = $2
+            "#,
+        )
+        .bind(user_did)
+        .bind(&sig_key_hex)
+        .fetch_optional(&pool)
+        .await
+        .map_err(|e| {
+            error!("Failed to check existing device by signature key: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        if let Some((existing_id,)) = existing_device {
+            warn!("Device with this signature key already exists: {}", existing_id);
+            return Err(StatusCode::CONFLICT);
+        }
     }
 
-    // Check device limit (max 10 devices per user)
-    let device_count: (i64,) = sqlx::query_as(
-        r#"
-        SELECT COUNT(*)
-        FROM devices
-        WHERE user_did = $1
-        "#,
-    )
-    .bind(user_did)
-    .fetch_one(&pool)
-    .await
-    .map_err(|e| {
-        error!("Failed to count user devices: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    info!("Registering device for user {}: {} ({}) [re-registration: {}]",
+        user_did, device_id, input.device_name, is_reregistration);
 
-    if device_count.0 >= 10 {
-        warn!("User {} has reached device limit: {}", user_did, device_count.0);
-        return Err(StatusCode::TOO_MANY_REQUESTS);
+    // Only insert new device if this is NOT a re-registration
+    if !is_reregistration {
+        // Check device limit (max 10 devices per user)
+        let device_count: (i64,) = sqlx::query_as(
+            r#"
+            SELECT COUNT(*)
+            FROM devices
+            WHERE user_did = $1
+            "#,
+        )
+        .bind(user_did)
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| {
+            error!("Failed to count user devices: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        if device_count.0 >= 10 {
+            warn!("User {} has reached device limit: {}", user_did, device_count.0);
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
+
+        // Insert new device
+        let db_device_id = Uuid::new_v4().to_string();
+        sqlx::query!(
+            r#"
+            INSERT INTO devices (id, user_did, device_id, device_name, credential_did, signature_public_key, device_uuid, registered_at, last_seen_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            "#,
+            db_device_id,
+            user_did,
+            device_id,
+            input.device_name,
+            mls_did,
+            sig_key_hex,
+            input.device_uuid.as_deref(),
+            now,
+            now
+        )
+        .execute(&pool)
+        .await
+        .map_err(|e| {
+            error!("Failed to insert device: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        info!("Device {} registered successfully", device_id);
+    } else {
+        info!("Device {} re-registered successfully", device_id);
     }
-
-    // Insert new device
-    let db_device_id = Uuid::new_v4().to_string();
-    sqlx::query!(
-        r#"
-        INSERT INTO devices (id, user_did, device_id, device_name, credential_did, signature_public_key, registered_at, last_seen_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        "#,
-        db_device_id,
-        user_did,
-        device_id,
-        input.device_name,
-        mls_did,
-        sig_key_hex,
-        now,
-        now
-    )
-    .execute(&pool)
-    .await
-    .map_err(|e| {
-        error!("Failed to insert device: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    info!("Device {} registered successfully", device_id);
 
     // Store key packages for this device
     let mut stored_count = 0;

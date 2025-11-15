@@ -56,7 +56,7 @@ pub async fn run_compaction_worker(pool: PgPool) {
         // Compact welcome messages
         match crate::db::compact_welcome_messages(&pool).await {
             Ok(count) if count > 0 => {
-                info!("Compacted {} old consumed welcome messages (older than 7 days)", count);
+                info!("Compacted {} old consumed welcome messages (older than 24 hours)", count);
             }
             Ok(_) => {
                 info!("No welcome messages to compact");
