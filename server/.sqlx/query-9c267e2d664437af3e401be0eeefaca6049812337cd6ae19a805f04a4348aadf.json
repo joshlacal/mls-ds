@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT convo_id\n        FROM rejoin_requests\n        WHERE member_did = $1\n        ORDER BY requested_at DESC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "convo_id",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "9c267e2d664437af3e401be0eeefaca6049812337cd6ae19a805f04a4348aadf"
+}

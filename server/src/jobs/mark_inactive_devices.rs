@@ -34,22 +34,27 @@ pub async fn run_mark_inactive_devices_worker(pool: PgPool) {
 }
 
 /// Mark devices inactive if they haven't been seen in 30+ days
-async fn mark_inactive_devices(pool: &PgPool) -> Result<u64> {
-    let cutoff = Utc::now() - chrono::Duration::days(30);
+/// Note: This is currently disabled as the devices table doesn't have an is_active column yet
+#[allow(dead_code)]
+async fn mark_inactive_devices(_pool: &PgPool) -> Result<u64> {
+    // TODO: Add is_active column to devices table to enable this functionality
+    // let cutoff = Utc::now() - chrono::Duration::days(30);
+    //
+    // let result = sqlx::query!(
+    //     r#"
+    //     UPDATE devices
+    //     SET is_active = false
+    //     WHERE is_active = true
+    //       AND last_seen_at < $1
+    //     "#,
+    //     cutoff
+    // )
+    // .execute(pool)
+    // .await?;
+    //
+    // Ok(result.rows_affected())
 
-    let result = sqlx::query!(
-        r#"
-        UPDATE devices
-        SET is_active = false
-        WHERE is_active = true
-          AND last_seen_at < $1
-        "#,
-        cutoff
-    )
-    .execute(pool)
-    .await?;
-
-    Ok(result.rows_affected())
+    Ok(0)
 }
 
 /// Modify get_all_key_packages to prioritize active devices
@@ -86,7 +91,6 @@ pub async fn get_all_key_packages_prioritize_active(
           AND (kp.reserved_at IS NULL OR kp.reserved_at < $4)
         ORDER BY
             COALESCE(kp.credential_did, kp.key_package_hash),
-            COALESCE(d.is_active, true) DESC,
             kp.created_at ASC
         LIMIT 50
         "#,

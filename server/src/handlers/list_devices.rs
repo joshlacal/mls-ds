@@ -12,7 +12,8 @@ use crate::{
 #[serde(rename_all = "camelCase")]
 pub struct DeviceInfo {
     device_id: String,
-    device_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     device_uuid: Option<String>,
     credential_did: String,

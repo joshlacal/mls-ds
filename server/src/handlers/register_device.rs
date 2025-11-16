@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::{
     auth::AuthUser,
+    device_utils::parse_device_did,
     storage::DbPool,
 };
 
@@ -60,7 +61,14 @@ pub async fn register_device(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    let user_did = &auth_user.did;
+    // Extract user DID from device DID (handles both single and multi-device mode)
+    // During initial registration, auth_user.did is the user DID
+    // During re-registration, it might be a device DID
+    let (user_did, _device_id_from_auth) = parse_device_did(&auth_user.did)
+        .map_err(|e| {
+            error!("Invalid device DID format: {}", e);
+            StatusCode::BAD_REQUEST
+        })?;
 
     // Validate device name
     if input.device_name.trim().is_empty() {
@@ -94,13 +102,13 @@ pub async fn register_device(
     let device_id = Uuid::new_v4().to_string();
 
     // Construct MLS DID: did:plc:user#device-uuid
-    let mls_did = format!("{}#{}", user_did, device_id);
+    let mls_did = format!("{}#{}", &user_did, device_id);
 
     let now = Utc::now();
     let sig_key_hex = hex::encode(&input.signature_public_key);
 
     // Check for device re-registration by device_uuid
-    let is_reregistration = if let Some(ref device_uuid) = input.device_uuid {
+    let mut is_reregistration = if let Some(ref device_uuid) = input.device_uuid {
         let existing_by_uuid: Option<(String, String, String)> = sqlx::query_as(
             r#"
             SELECT id, device_id, credential_did
@@ -108,7 +116,7 @@ pub async fn register_device(
             WHERE user_did = $1 AND device_uuid = $2
             "#,
         )
-        .bind(user_did)
+        .bind(&user_did)
         .bind(device_uuid)
         .fetch_optional(&pool)
         .await
@@ -177,16 +185,16 @@ pub async fn register_device(
         false
     };
 
-    // If not a re-registration, check if a device with this signature key already exists
+    // If not a re-registration by device_uuid, check if we can re-register by signature key
     if !is_reregistration {
-        let existing_device: Option<(String,)> = sqlx::query_as(
+        let existing_device: Option<(String, String, String)> = sqlx::query_as(
             r#"
-            SELECT device_id
+            SELECT id, device_id, credential_did
             FROM devices
             WHERE user_did = $1 AND signature_public_key = $2
             "#,
         )
-        .bind(user_did)
+        .bind(&user_did)
         .bind(&sig_key_hex)
         .fetch_optional(&pool)
         .await
@@ -195,9 +203,58 @@ pub async fn register_device(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-        if let Some((existing_id,)) = existing_device {
-            warn!("Device with this signature key already exists: {}", existing_id);
-            return Err(StatusCode::CONFLICT);
+        if let Some((db_id, old_device_id, _old_credential_did)) = existing_device {
+            info!("Device re-registration detected by signature key for user {}: old_device_id={}",
+                user_did, old_device_id);
+
+            // Delete all old key packages for this device
+            let deleted_count = sqlx::query!(
+                r#"
+                DELETE FROM key_packages
+                WHERE owner_did = $1 AND device_id = $2
+                "#,
+                user_did,
+                old_device_id
+            )
+            .execute(&pool)
+            .await
+            .map_err(|e| {
+                error!("Failed to delete old key packages: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .rows_affected();
+
+            info!("Deleted {} old key packages for re-registered device {} (signature key match)", deleted_count, old_device_id);
+
+            // Update existing device record with new device_id and timestamps
+            sqlx::query!(
+                r#"
+                UPDATE devices
+                SET device_id = $1,
+                    device_name = $2,
+                    credential_did = $3,
+                    device_uuid = $4,
+                    registered_at = $5,
+                    last_seen_at = $6
+                WHERE id = $7
+                "#,
+                device_id,
+                input.device_name,
+                mls_did,
+                input.device_uuid.as_deref(),
+                now,
+                now,
+                db_id
+            )
+            .execute(&pool)
+            .await
+            .map_err(|e| {
+                error!("Failed to update re-registered device: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+            info!("Updated device record for re-registration by signature key: {}", device_id);
+            is_reregistration = true;
         }
     }
 
@@ -214,7 +271,7 @@ pub async fn register_device(
             WHERE user_did = $1
             "#,
         )
-        .bind(user_did)
+        .bind(&user_did)
         .fetch_one(&pool)
         .await
         .map_err(|e| {
@@ -279,15 +336,17 @@ pub async fn register_device(
             continue;
         }
 
-        // Store key package
+        // Store key package with user DID as owner (not device DID)
+        // The server will parse the KeyPackage and extract the verified credential identity
+        // NOTE: We pass device_id for tracking, but credential_did is now extracted from the KeyPackage
         match crate::db::store_key_package_with_device(
             &pool,
-            user_did,
+            &user_did,
             &kp.cipher_suite,
             key_data,
             kp.expires,
             Some(device_id.clone()),
-            Some(mls_did.clone()),
+            None,  // credential_did is now extracted from KeyPackage and validated
         ).await {
             Ok(_) => {
                 stored_count += 1;

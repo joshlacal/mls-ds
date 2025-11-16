@@ -4,6 +4,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     auth::AuthUser,
+    device_utils::parse_device_did,
     storage::{is_member, DbPool},
 };
 
@@ -36,13 +37,20 @@ pub async fn confirm_welcome(
 
     let did = &auth_user.did;
 
+    // Extract user DID from device DID (handles both single and multi-device mode)
+    let (user_did, _device_id) = parse_device_did(did)
+        .map_err(|e| {
+            error!("Invalid device DID format: {}", e);
+            StatusCode::BAD_REQUEST
+        })?;
+
     // Validate input
     if input.convo_id.is_empty() {
         warn!("Empty convo_id provided");
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    // Check if user is a member of the conversation
+    // Check if user is a member of the conversation (use device DID for membership check)
     if !is_member(&pool, did, &input.convo_id)
         .await
         .map_err(|e| {
@@ -58,13 +66,14 @@ pub async fn confirm_welcome(
         // Mark Welcome as consumed on successful processing
         info!("Confirming successful Welcome processing");
 
+        // NOTE: We use user_did (not device_did) because welcome messages are stored per user
         let rows_updated = sqlx::query(
             "UPDATE welcome_messages
              SET state = 'consumed', confirmed_at = NOW()
              WHERE convo_id = $1 AND recipient_did = $2 AND state = 'in_flight'"
         )
         .bind(&input.convo_id)
-        .bind(did)
+        .bind(&user_did)
         .execute(&pool)
         .await
         .map_err(|e| {

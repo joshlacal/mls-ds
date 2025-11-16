@@ -6,6 +6,7 @@ use tracing::{info, warn, error};
 
 use crate::{
     auth::AuthUser,
+    device_utils::parse_device_did,
     storage::DbPool,
 };
 
@@ -65,6 +66,13 @@ pub async fn publish_key_packages(
 
     let did = &auth_user.did;
 
+    // Extract user DID from device DID (handles both single and multi-device mode)
+    let (user_did, _device_id) = parse_device_did(did)
+        .map_err(|e| {
+            error!("Invalid device DID format: {}", e);
+            StatusCode::BAD_REQUEST
+        })?;
+
     // Validate batch size
     if input.key_packages.is_empty() {
         warn!("Empty key packages array");
@@ -90,7 +98,7 @@ pub async fn publish_key_packages(
           AND expires_at > $2
         "#,
     )
-    .bind(did)
+    .bind(&user_did)
     .bind(now)
     .fetch_one(&pool)
     .await
@@ -114,7 +122,7 @@ pub async fn publish_key_packages(
           AND created_at > $2
         "#,
     )
-    .bind(did)
+    .bind(&user_did)
     .bind(rate_limit_window)
     .fetch_one(&pool)
     .await
@@ -218,7 +226,7 @@ pub async fn publish_key_packages(
         let key_package_hash = crate::crypto::sha256_hex(&key_data);
 
         // Check for duplicates (idempotent behavior)
-        match crate::db::check_key_package_duplicate(&pool, did, &key_package_hash).await {
+        match crate::db::check_key_package_duplicate(&pool, &user_did, &key_package_hash).await {
             Ok(true) => {
                 // Duplicate found - skip silently (idempotent)
                 skipped += 1;
@@ -239,14 +247,17 @@ pub async fn publish_key_packages(
         }
 
         // Store key package with device information
+        // NOTE: Use user_did (not device_did) as owner_did so getKeyPackages can find
+        // all key packages for a user regardless of which device published them
+        // The server will parse the KeyPackage and extract + validate the credential identity
         match crate::db::store_key_package_with_device(
             &pool,
-            did,
+            &user_did,
             &item.cipher_suite,
             key_data,
             item.expires,
             item.device_id.clone(),
-            item.credential_did.clone()
+            None,  // credential_did is now extracted from KeyPackage and validated
         ).await {
             Ok(_) => {
                 succeeded += 1;

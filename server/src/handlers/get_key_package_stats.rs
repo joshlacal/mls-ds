@@ -5,6 +5,7 @@ use tracing::{info, warn, error};
 
 use crate::{
     auth::AuthUser,
+    device_utils::parse_device_did,
     storage::DbPool,
 };
 
@@ -76,19 +77,26 @@ pub async fn get_key_package_stats(
     }
 
     // Use target DID if provided, otherwise use authenticated user's DID
-    let did = target_did.as_deref().unwrap_or(&auth_user.did);
+    let did_raw = target_did.as_deref().unwrap_or(&auth_user.did);
+
+    // Extract user DID from device DID (handles both single and multi-device mode)
+    let (did, _device_id) = parse_device_did(did_raw)
+        .map_err(|e| {
+            error!("Invalid device DID format: {}", e);
+            StatusCode::BAD_REQUEST
+        })?;
 
     info!("Fetching key package stats");
 
     // Get available key packages count
-    let available = get_available_count(&pool, did, cipher_suite_filter.as_deref()).await
+    let available = get_available_count(&pool, &did, cipher_suite_filter.as_deref()).await
         .map_err(|e| {
             error!("Failed to count available key packages: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
     // Get oldest expiration timestamp
-    let oldest_expires_at = get_oldest_expiration(&pool, did, cipher_suite_filter.as_deref()).await
+    let oldest_expires_at = get_oldest_expiration(&pool, &did, cipher_suite_filter.as_deref()).await
         .map_err(|e| {
             error!("Failed to get oldest expiration: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
@@ -100,7 +108,7 @@ pub async fn get_key_package_stats(
 
     // Get breakdown by cipher suite if no filter is provided
     let by_cipher_suite = if cipher_suite_filter.is_none() {
-        Some(get_stats_by_cipher_suite(&pool, did).await
+        Some(get_stats_by_cipher_suite(&pool, &did).await
             .map_err(|e| {
                 error!("Failed to get stats by cipher suite: {}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -110,7 +118,7 @@ pub async fn get_key_package_stats(
     };
 
     // Get consumption statistics
-    let total = crate::db::count_all_key_packages(&pool, did, cipher_suite_filter.as_deref()).await
+    let total = crate::db::count_all_key_packages(&pool, &did, cipher_suite_filter.as_deref()).await
         .map_err(|e| {
             error!("Failed to count all key packages: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
@@ -118,19 +126,19 @@ pub async fn get_key_package_stats(
 
     let consumed = total - available;
 
-    let consumed_last_24h = crate::db::count_consumed_key_packages(&pool, did, 24).await
+    let consumed_last_24h = crate::db::count_consumed_key_packages(&pool, &did, 24).await
         .map_err(|e| {
             error!("Failed to count consumed packages (24h): {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })? as i32;
 
-    let consumed_last_7d = crate::db::count_consumed_key_packages(&pool, did, 24 * 7).await
+    let consumed_last_7d = crate::db::count_consumed_key_packages(&pool, &did, 24 * 7).await
         .map_err(|e| {
             error!("Failed to count consumed packages (7d): {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })? as i32;
 
-    let average_daily_consumption_f64 = crate::db::get_consumption_rate(&pool, did).await
+    let average_daily_consumption_f64 = crate::db::get_consumption_rate(&pool, &did).await
         .map_err(|e| {
             error!("Failed to get consumption rate: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
@@ -154,7 +162,7 @@ pub async fn get_key_package_stats(
 
     info!(
         "Key package stats for {}: available={}, threshold={}, needs_replenish={}, consumption_rate={:.2}/day",
-        did, available, RECOMMENDED_THRESHOLD, needs_replenish, average_daily_consumption_f64
+        &did, available, RECOMMENDED_THRESHOLD, needs_replenish, average_daily_consumption_f64
     );
 
     Ok(Json(KeyPackageStatsResponse {

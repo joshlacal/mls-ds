@@ -1,5 +1,5 @@
 use axum::{extract::State, http::StatusCode, Json};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
@@ -53,9 +53,9 @@ pub async fn request_rejoin(
     }
 
     // Decode and validate KeyPackage
-    let key_package_bytes = URL_SAFE_NO_PAD.decode(&input.key_package)
+    let key_package_bytes = base64::engine::general_purpose::STANDARD.decode(&input.key_package)
         .map_err(|e| {
-            warn!("Invalid base64url KeyPackage: {}", e);
+            warn!("Invalid base64 KeyPackage: {}", e);
             StatusCode::BAD_REQUEST
         })?;
 
@@ -65,7 +65,8 @@ pub async fn request_rejoin(
     }
 
     // Compute MLS-compliant hash_ref using OpenMLS
-    use openmls::prelude::{KeyPackageIn, ProtocolVersion, TlsDeserializeTrait};
+    use openmls::prelude::{KeyPackageIn, ProtocolVersion};
+    use openmls::prelude::tls_codec::Deserialize;
 
     // Create crypto provider (RustCrypto implements OpenMlsCrypto)
     let provider = openmls_rust_crypto::RustCrypto::default();

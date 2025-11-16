@@ -4,6 +4,7 @@ use axum::{
     middleware::Next,
     response::Response,
 };
+use base64::Engine;
 use std::{
     collections::HashMap,
     sync::Arc,
@@ -233,19 +234,52 @@ pub async fn rate_limit_middleware(request: Request, next: Next) -> Result<Respo
     // Per-IP global limiter to protect unauthenticated paths and act as backstop
     static IP_LIMITER: Lazy<RateLimiter> = Lazy::new(RateLimiter::default);
 
-    let client_ip = extract_client_ip(request.headers());
-    match IP_LIMITER.check(&client_ip).await {
-        Ok(()) => Ok(next.run(request).await),
-        Err(retry_after) => {
-            // Return 429 Too Many Requests (no body to avoid leaks)
-            let mut resp = Response::new(axum::body::Body::empty());
-            let headers = resp.headers_mut();
-            headers.insert(
-                axum::http::header::RETRY_AFTER,
-                axum::http::HeaderValue::from_str(&retry_after.to_string()).unwrap_or(axum::http::HeaderValue::from_static("1")),
-            );
-            *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
-            Ok(resp)
+    let headers = request.headers();
+    let uri = request.uri().to_string();
+
+    // Try to extract DID from Authorization header for authenticated requests
+    let did_opt = extract_did_from_auth_header(headers);
+
+    // Use DID-based rate limiting for authenticated requests
+    if let Some(did) = did_opt {
+        match DID_RATE_LIMITER.check_did_limit(&did, &uri).await {
+            Ok(()) => {
+                tracing::debug!("DID rate limit passed for {}: {}", did, uri);
+                Ok(next.run(request).await)
+            }
+            Err(retry_after) => {
+                tracing::warn!("DID rate limit exceeded for {}: {} (retry after {} seconds)", did, uri, retry_after);
+                let mut resp = Response::new(axum::body::Body::empty());
+                let headers = resp.headers_mut();
+                headers.insert(
+                    axum::http::header::RETRY_AFTER,
+                    axum::http::HeaderValue::from_str(&retry_after.to_string())
+                        .unwrap_or(axum::http::HeaderValue::from_static("1")),
+                );
+                *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+                Ok(resp)
+            }
+        }
+    } else {
+        // Fall back to IP-based rate limiting for unauthenticated requests
+        let client_ip = extract_client_ip(headers);
+        match IP_LIMITER.check(&client_ip).await {
+            Ok(()) => {
+                tracing::debug!("IP rate limit passed for {}: {}", client_ip, uri);
+                Ok(next.run(request).await)
+            }
+            Err(retry_after) => {
+                tracing::warn!("IP rate limit exceeded for {}: {} (retry after {} seconds)", client_ip, uri, retry_after);
+                let mut resp = Response::new(axum::body::Body::empty());
+                let headers = resp.headers_mut();
+                headers.insert(
+                    axum::http::header::RETRY_AFTER,
+                    axum::http::HeaderValue::from_str(&retry_after.to_string())
+                        .unwrap_or(axum::http::HeaderValue::from_static("1")),
+                );
+                *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+                Ok(resp)
+            }
         }
     }
 }
@@ -319,4 +353,32 @@ fn extract_client_ip(headers: &HeaderMap) -> String {
     }
     // Fall back to opaque key
     "unknown".to_string()
+}
+
+/// Extract DID from Authorization header (lightweight parsing, no validation)
+fn extract_did_from_auth_header(headers: &HeaderMap) -> Option<String> {
+    let auth_header = headers.get(axum::http::header::AUTHORIZATION)?;
+    let auth_str = auth_header.to_str().ok()?;
+
+    // Extract Bearer token
+    let token = auth_str.strip_prefix("Bearer ")?.trim();
+
+    // Parse JWT without validation (we only need the DID for rate limiting)
+    // JWT format: header.payload.signature
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+
+    // Decode payload (base64url)
+    let payload = parts[1];
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+
+    // Parse JSON to extract issuer (DID)
+    let json: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    let iss = json.get("iss")?.as_str()?;
+
+    Some(iss.to_string())
 }
