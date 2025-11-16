@@ -8,25 +8,38 @@ use crate::{
     storage::DbPool,
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct KeyPackageHistoryEntry {
-    package_id: String,
+// Database row struct for query results
+#[derive(Debug, Clone)]
+struct KeyPackageHistoryRow {
+    key_package_hash: String,
     created_at: DateTime<Utc>,
     consumed_at: Option<DateTime<Utc>>,
-    consumed_for_convo: Option<String>,
-    consumed_for_convo_name: Option<String>,
-    consumed_by_device: Option<String>,
+    consumed_for_convo_id: Option<String>,
+    consumed_by_device_id: Option<String>,
     device_id: Option<String>,
     cipher_suite: String,
+    convo_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct GetKeyPackageHistoryResponse {
-    history: Vec<KeyPackageHistoryEntry>,
+pub struct KeyPackageHistoryEntry {
+    pub package_id: String,
+    pub created_at: DateTime<Utc>,
+    pub consumed_at: Option<DateTime<Utc>>,
+    pub consumed_for_convo: Option<String>,
+    pub consumed_for_convo_name: Option<String>,
+    pub consumed_by_device: Option<String>,
+    pub device_id: Option<String>,
+    pub cipher_suite: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetKeyPackageHistoryResponse {
+    pub history: Vec<KeyPackageHistoryEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    cursor: Option<String>,
+    pub cursor: Option<String>,
 }
 
 /// Get key package consumption history for authenticated user
@@ -66,8 +79,9 @@ pub async fn get_key_package_history(
     info!("Fetching key package history for user: {} (limit: {})", user_did, limit);
 
     // Fetch history from database
-    let rows = if let Some(cursor_id) = cursor {
-        sqlx::query!(
+    let rows: Vec<KeyPackageHistoryRow> = if let Some(cursor_id) = cursor {
+        sqlx::query_as!(
+            KeyPackageHistoryRow,
             r#"
             SELECT
                 kp.key_package_hash,
@@ -82,13 +96,13 @@ pub async fn get_key_package_history(
             LEFT JOIN conversations c ON kp.consumed_for_convo_id = c.id
             WHERE kp.owner_did = $1
               AND kp.consumed_at IS NOT NULL
-              AND kp.key_package_hash < $3
+              AND kp.key_package_hash < $2
             ORDER BY kp.consumed_at DESC, kp.key_package_hash DESC
-            LIMIT $2
+            LIMIT $3
             "#,
             user_did,
-            limit,
-            cursor_id
+            cursor_id,
+            limit
         )
         .fetch_all(&pool)
         .await
@@ -97,7 +111,8 @@ pub async fn get_key_package_history(
             StatusCode::INTERNAL_SERVER_ERROR
         })?
     } else {
-        sqlx::query!(
+        sqlx::query_as!(
+            KeyPackageHistoryRow,
             r#"
             SELECT
                 kp.key_package_hash,

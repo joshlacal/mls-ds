@@ -51,10 +51,10 @@ pub async fn get_expected_conversations(
     let user_did = &auth_user.did;
 
     // Extract device_id from auth token or use provided parameter
-    let device_id = params.device_id.as_ref().or_else(|| {
+    let device_id = params.device_id.clone().or_else(|| {
         // Try to extract device_id from user_did if it has format did:plc:user#device-uuid
         if user_did.contains('#') {
-            user_did.split('#').nth(1)
+            user_did.split('#').nth(1).map(|s| s.to_string())
         } else {
             None
         }
@@ -110,7 +110,7 @@ pub async fn get_expected_conversations(
     let mut result = Vec::new();
     for (convo_id, name, member_count, last_activity, needs_rejoin, member_device_id) in conversations {
         // Determine if this device should be in the group
-        let device_in_group = if let Some(ref target_device) = device_id {
+        let device_in_group = if let Some(target_device) = &device_id {
             // Check if the specific device is in the members table
             member_device_id.as_ref() == Some(target_device)
         } else {

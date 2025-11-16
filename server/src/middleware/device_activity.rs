@@ -61,92 +61,59 @@ pub async fn track_device_activity(
     next.run(request).await
 }
 
-/// Extract device_id from AuthUser claims
-/// Device ID could be in custom claims or derived from credential_did
+/// Extract device_id from AuthUser DID
+/// Device ID is extracted from DID if it's in format did:plc:user#device-uuid
 fn extract_device_id(auth_user: &AuthUser) -> Option<String> {
-    // Check for device_id in custom claims
-    if let Some(device_id) = auth_user.claims.extra.get("device_id") {
-        if let Some(id_str) = device_id.as_str() {
-            return Some(id_str.to_string());
-        }
+    // Try to extract device_id from DID if it has format did:plc:user#device-uuid
+    if auth_user.did.contains('#') {
+        auth_user.did.split('#').nth(1).map(|s| s.to_string())
+    } else {
+        None
     }
-
-    // Check for device_id in other possible claim locations
-    if let Some(device_id) = auth_user.claims.extra.get("deviceId") {
-        if let Some(id_str) = device_id.as_str() {
-            return Some(id_str.to_string());
-        }
-    }
-
-    // Could also derive from credential DID if available
-    // For now, return None if not found
-    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::Claims;
-    use serde_json::json;
+    use crate::auth::AtProtoClaims;
 
     #[test]
-    fn test_extract_device_id_from_custom_claim() {
-        let mut extra = serde_json::Map::new();
-        extra.insert("device_id".to_string(), json!("device-123"));
-
-        let claims = Claims {
+    fn test_extract_device_id_from_did() {
+        let claims = AtProtoClaims {
             iss: "did:plc:test".to_string(),
             aud: "test".to_string(),
             exp: 0,
             iat: None,
-            nbf: None,
-            jti: None,
+            sub: None,
             lxm: None,
-            extra,
+            jti: None,
         };
 
-        let auth_user = AuthUser { claims };
-        let device_id = extract_device_id(&auth_user);
-
-        assert_eq!(device_id, Some("device-123".to_string()));
-    }
-
-    #[test]
-    fn test_extract_device_id_camel_case() {
-        let mut extra = serde_json::Map::new();
-        extra.insert("deviceId".to_string(), json!("device-456"));
-
-        let claims = Claims {
-            iss: "did:plc:test".to_string(),
-            aud: "test".to_string(),
-            exp: 0,
-            iat: None,
-            nbf: None,
-            jti: None,
-            lxm: None,
-            extra,
+        let auth_user = AuthUser {
+            did: "did:plc:user123#device-456".to_string(),
+            claims,
         };
-
-        let auth_user = AuthUser { claims };
         let device_id = extract_device_id(&auth_user);
 
         assert_eq!(device_id, Some("device-456".to_string()));
     }
 
     #[test]
-    fn test_extract_device_id_none() {
-        let claims = Claims {
+    fn test_extract_device_id_no_fragment() {
+        let claims = AtProtoClaims {
             iss: "did:plc:test".to_string(),
             aud: "test".to_string(),
             exp: 0,
             iat: None,
-            nbf: None,
-            jti: None,
+            sub: None,
             lxm: None,
-            extra: serde_json::Map::new(),
+            jti: None,
         };
 
-        let auth_user = AuthUser { claims };
+        let auth_user = AuthUser {
+            did: "did:plc:user123".to_string(),
+            claims,
+        };
         let device_id = extract_device_id(&auth_user);
 
         assert_eq!(device_id, None);

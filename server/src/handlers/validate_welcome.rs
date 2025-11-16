@@ -6,6 +6,7 @@ use openmls::messages::Welcome;
 
 use crate::{
     auth::AuthUser,
+    device_utils::parse_device_did,
     storage::DbPool,
 };
 
@@ -44,6 +45,13 @@ pub async fn validate_welcome(
     }
 
     let did = &auth_user.did;
+
+    // Extract user DID from device DID (handles both single and multi-device mode)
+    let (user_did, _device_id) = parse_device_did(did)
+        .map_err(|e| {
+            error!("Invalid device DID format: {}", e);
+            StatusCode::BAD_REQUEST
+        })?;
 
     if input.welcome_message.is_empty() {
         warn!("Empty welcome message");
@@ -128,6 +136,7 @@ pub async fn validate_welcome(
     let key_package_hash = &matching_rows[0].key_package_hash;
 
     // Get the group_id from the welcome_messages table (server created this when adding members)
+    // NOTE: We use user_did (not device_did) because welcome messages are stored per user
     let welcome_row = sqlx::query!(
         r#"
         SELECT convo_id, key_package_hash
@@ -138,7 +147,7 @@ pub async fn validate_welcome(
         ORDER BY created_at DESC
         LIMIT 1
         "#,
-        did,
+        user_did,
         key_package_hash
     )
     .fetch_optional(&pool)
@@ -152,8 +161,8 @@ pub async fn validate_welcome(
         Some(row) => row.convo_id,
         None => {
             warn!(
-                "No welcome_messages row found for did={}, key_package_hash={}",
-                did, key_package_hash
+                "No welcome_messages row found for user_did={}, key_package_hash={}",
+                user_did, key_package_hash
             );
             return Ok(Json(ValidateWelcomeOutput {
                 valid: false,

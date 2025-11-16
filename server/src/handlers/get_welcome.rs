@@ -5,6 +5,7 @@ use tracing::{info, warn, error};
 
 use crate::{
     auth::AuthUser,
+    device_utils::parse_device_did,
     generated_types::GetWelcomeOutput,
     storage::{is_member, DbPool},
 };
@@ -29,13 +30,22 @@ pub async fn get_welcome(
 
     let did = &auth_user.did;
 
+    // Extract user DID from device DID (handles both single and multi-device mode)
+    // In multi-device mode: "did:plc:user#device-uuid" -> "did:plc:user"
+    // In single-device mode: "did:plc:user" -> "did:plc:user"
+    let (user_did, _device_id) = parse_device_did(did)
+        .map_err(|e| {
+            error!("Invalid device DID format: {}", e);
+            StatusCode::BAD_REQUEST
+        })?;
+
     // Validate input
     if params.convo_id.is_empty() {
         warn!("Empty convo_id provided");
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    // Check if user is a member
+    // Check if user is a member (use device DID for membership check)
     if !is_member(&pool, did, &params.convo_id)
         .await
         .map_err(|e| {
@@ -61,6 +71,7 @@ pub async fn get_welcome(
     // This extended retention supports automatic rejoin after app reinstall
     // NOTE: We do NOT check if key_package is consumed, because key packages are consumed
     // when the group is created (adding members), not when fetching the Welcome.
+    // NOTE: We use user_did (not device_did) because welcome messages are stored per user
     let result: Option<(String, Vec<u8>, Option<Vec<u8>>)> = sqlx::query_as(
         "SELECT wm.id, wm.welcome_data, wm.key_package_hash
          FROM welcome_messages wm
@@ -74,7 +85,7 @@ pub async fn get_welcome(
          FOR UPDATE"  // Lock row for update
     )
     .bind(&params.convo_id)
-    .bind(did)
+    .bind(&user_did)  // Use user_did, not device_did
     .fetch_optional(&mut *tx)
     .await
     .map_err(|e| {
@@ -92,7 +103,7 @@ pub async fn get_welcome(
                  AND consumed_at < NOW() - INTERVAL '24 hours'"
             )
             .bind(&params.convo_id)
-            .bind(did)
+            .bind(&user_did)  // Use user_did, not device_did
             .fetch_one(&mut *tx)
             .await
             .unwrap_or(0);
@@ -113,7 +124,7 @@ pub async fn get_welcome(
 
             warn!(
                 "No Welcome message found for user {} in conversation {}. All welcome messages in this convo: {:?}",
-                did, params.convo_id, all_messages
+                user_did, params.convo_id, all_messages
             );
             return Err(StatusCode::NOT_FOUND);
         }
@@ -156,7 +167,7 @@ pub async fn get_welcome(
              WHERE owner_did = $2 AND key_package_hash = $3 AND consumed_at IS NULL"
         )
         .bind(&now)
-        .bind(did)
+        .bind(did)  // Use device_did for key packages (they're owned by devices)
         .bind(&hash_hex)
         .execute(&mut *tx)
         .await

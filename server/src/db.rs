@@ -752,7 +752,7 @@ pub async fn store_key_package_with_device(
     key_data: Vec<u8>,
     expires_at: DateTime<Utc>,
     device_id: Option<String>,
-    credential_did: Option<String>,
+    _credential_did: Option<String>,  // Ignored - extracted from KeyPackage
 ) -> Result<KeyPackage> {
     let now = Utc::now();
     let id = Uuid::new_v4().to_string();
@@ -773,7 +773,8 @@ pub async fn store_key_package_with_device(
     .context("Failed to ensure user exists")?;
 
     // Compute MLS-compliant hash_ref using OpenMLS
-    use openmls::prelude::{KeyPackageIn, ProtocolVersion, TlsDeserializeTrait};
+    use openmls::prelude::{KeyPackageIn, ProtocolVersion};
+    use openmls::prelude::tls_codec::Deserialize;
 
     // Create crypto provider (RustCrypto implements OpenMlsCrypto)
     let provider = openmls_rust_crypto::RustCrypto::default();
@@ -785,12 +786,38 @@ pub async fn store_key_package_with_device(
         .validate(&provider, ProtocolVersion::default())
         .context("Failed to validate key package")?;
 
+    // Extract and validate credential identity
+    let credential = kp.leaf_node().credential();
+    let credential_identity = match credential.credential_type() {
+        openmls::credentials::CredentialType::Basic => {
+            // Extract identity bytes from BasicCredential
+            let identity_bytes = credential.serialized_content();
+            String::from_utf8(identity_bytes.to_vec())
+                .context("Credential identity is not valid UTF-8")?
+        }
+        _ => {
+            anyhow::bail!("Only BasicCredential is supported");
+        }
+    };
+
+    // Validate that credential identity is the bare DID (owner_did)
+    // This enforces the "bare DID only" policy - no device DIDs allowed in MLS credentials
+    if credential_identity != did {
+        anyhow::bail!(
+            "KeyPackage credential identity must be the bare user DID ({}), got {} instead. \
+             Device DIDs (with #device-id) are not allowed in MLS credentials.",
+            did,
+            credential_identity
+        );
+    }
+
     // Compute the MLS-defined hash reference
     let hash_ref = kp
         .hash_ref(&provider)
         .context("Failed to compute hash_ref")?;
     let key_package_hash = hex::encode(hash_ref.as_slice());
 
+    // Store with the verified credential identity (not the client-provided one)
     let result = sqlx::query_as::<_, KeyPackage>(
         r#"
         INSERT INTO key_packages (id, owner_did, cipher_suite, key_package, key_package_hash, created_at, expires_at, device_id, credential_did)
@@ -806,7 +833,7 @@ pub async fn store_key_package_with_device(
     .bind(now)
     .bind(expires_at)
     .bind(device_id)
-    .bind(credential_did)
+    .bind(&credential_identity)  // Use verified identity from KeyPackage, not client param
     .fetch_one(pool)
     .await
     .context("Failed to store key package")?;
@@ -857,15 +884,15 @@ pub async fn get_all_key_packages(
     let now = Utc::now();
     let reservation_timeout = now - chrono::Duration::minutes(5);
 
-    // Get ONE key package per unique device, prioritizing active devices
+    // Get ONE key package per unique device, prioritizing recently active devices
     // This query uses DISTINCT ON to get the oldest available key package for each device
-    // and sorts by device active status first (active devices first)
+    // and sorts by device last_seen_at first (recently active devices first)
     let key_packages = sqlx::query_as::<_, KeyPackage>(
         r#"
         SELECT DISTINCT ON (COALESCE(kp.credential_did, kp.key_package_hash))
             kp.owner_did, kp.cipher_suite, kp.key_package as key_data, kp.key_package_hash, kp.created_at, kp.expires_at, kp.consumed_at
         FROM key_packages kp
-        LEFT JOIN devices d ON kp.device_id = d.id
+        LEFT JOIN devices d ON kp.device_id = d.device_id
         WHERE kp.owner_did = $1
           AND kp.cipher_suite = $2
           AND kp.consumed_at IS NULL
@@ -873,7 +900,7 @@ pub async fn get_all_key_packages(
           AND (kp.reserved_at IS NULL OR kp.reserved_at < $4)
         ORDER BY
             COALESCE(kp.credential_did, kp.key_package_hash),
-            COALESCE(d.is_active, true) DESC,
+            d.last_seen_at DESC NULLS LAST,
             kp.created_at ASC
         LIMIT 50
         "#,

@@ -1,0 +1,58 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            d.device_id,\n            d.device_name,\n            d.device_uuid,\n            d.credential_did,\n            d.last_seen_at,\n            d.registered_at,\n            COUNT(kp.id) FILTER (WHERE kp.consumed_at IS NULL AND kp.expires_at > NOW()) as \"key_package_count!\"\n        FROM devices d\n        LEFT JOIN key_packages kp ON d.device_id = kp.device_id\n        WHERE d.user_did = $1\n        GROUP BY d.id, d.device_id, d.device_name, d.device_uuid, d.credential_did, d.last_seen_at, d.registered_at\n        ORDER BY d.last_seen_at DESC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "device_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "device_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "device_uuid",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "credential_did",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "last_seen_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "registered_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 6,
+        "name": "key_package_count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      false,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "05abde93061cc1b83a57cc22a158bb6ab1562823d8d3f9340149b885eaa73125"
+}

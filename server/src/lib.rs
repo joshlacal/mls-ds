@@ -3,6 +3,7 @@ pub mod atproto_bytes;
 pub mod auth;
 pub mod crypto;
 pub mod db;
+pub mod device_utils;
 pub mod error_responses;
 pub mod fanout;
 pub mod handlers;

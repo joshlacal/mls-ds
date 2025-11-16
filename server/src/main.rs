@@ -281,7 +281,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(metrics_router)
         .layer(TraceLayer::new_for_http())
         .layer(axum::middleware::from_fn(middleware::logging::log_headers_middleware))
-        // Lightweight per-IP backstop rate limiter (per-DID limits live in auth extractor)
+        // DID-based rate limiter for authenticated requests, IP-based backstop for unauthenticated
         .layer(axum::middleware::from_fn(middleware::rate_limit::rate_limit_middleware))
         .layer(axum::middleware::from_fn_with_state(
             middleware::idempotency::IdempotencyLayer::new(db_pool.clone()),

@@ -9,23 +9,23 @@ use crate::{
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct KeyPackageInventory {
-    available: i64,
-    target: i64,
-    needs_replenishment: bool,
-    per_device_count: i64,
+pub struct KeyPackageInventory {
+    pub available: i64,
+    pub target: i64,
+    pub needs_replenishment: bool,
+    pub per_device_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ValidateDeviceStateResponse {
-    is_valid: bool,
-    issues: Vec<String>,
-    recommendations: Vec<String>,
-    expected_convos: i64,
-    actual_convos: i64,
-    key_package_inventory: KeyPackageInventory,
-    pending_rejoin_requests: Vec<String>,
+pub struct ValidateDeviceStateResponse {
+    pub is_valid: bool,
+    pub issues: Vec<String>,
+    pub recommendations: Vec<String>,
+    pub expected_convos: i64,
+    pub actual_convos: i64,
+    pub key_package_inventory: KeyPackageInventory,
+    pub pending_rejoin_requests: Vec<String>,
 }
 
 /// Validate device state and sync status
@@ -207,7 +207,7 @@ async fn count_active_devices(pool: &DbPool, user_did: &str) -> anyhow::Result<i
         r#"
         SELECT COUNT(*) as "count!"
         FROM devices
-        WHERE owner_did = $1 AND is_active = true
+        WHERE user_did = $1
         "#,
         user_did
     )
@@ -223,7 +223,7 @@ async fn get_pending_rejoin_requests(pool: &DbPool, user_did: &str) -> anyhow::R
         r#"
         SELECT convo_id
         FROM rejoin_requests
-        WHERE requester_did = $1 AND status = 'pending'
+        WHERE member_did = $1
         ORDER BY requested_at DESC
         "#,
         user_did
