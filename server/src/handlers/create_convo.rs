@@ -1,6 +1,7 @@
 use axum::{extract::State, http::StatusCode, Json};
 use base64::Engine;
 use chrono::{DateTime, Utc};
+use sha2::{Sha256, Digest};
 use tracing::{info, warn, error};
 
 use crate::{
@@ -267,6 +268,24 @@ pub async fn create_convo(
 
         info!("📍 [create_convo] Single Welcome message ({} bytes) for all members/devices", welcome_data.len());
 
+        // 📨 [CREATE_CONVO] Log Welcome message BEFORE storing for corruption detection
+        let mut hasher = Sha256::new();
+        hasher.update(&welcome_data);
+        let checksum = hasher.finalize();
+        info!("📨 [CREATE_CONVO] Storing Welcome message for convo {}:", input.group_id);
+        info!("   Size: {} bytes", welcome_data.len());
+        if welcome_data.len() >= 100 {
+            info!("   First 100 bytes (hex): {}", hex::encode(&welcome_data[..100]));
+        } else {
+            info!("   First {} bytes (hex): {}", welcome_data.len(), hex::encode(&welcome_data));
+        }
+        if welcome_data.len() > 100 {
+            let start = welcome_data.len().saturating_sub(100);
+            info!("   Last 100 bytes (hex): {}", hex::encode(&welcome_data[start..]));
+        }
+        info!("   SHA256 checksum: {}", hex::encode(checksum));
+        info!("   ✅ Welcome message stored for group: {}", input.group_id);
+
         // Validate all key packages are available BEFORE storing anything
         if let Some(ref kp_hashes) = input.key_package_hashes {
             info!("📍 [create_convo] Validating {} key packages are available...", kp_hashes.len());
@@ -326,71 +345,79 @@ pub async fn create_convo(
             info!("✅ [create_convo] All {} key packages are available", kp_hashes.len());
         }
 
-        // Store the SAME Welcome for each initial member (excluding creator)
+        // Store the SAME Welcome for ALL members (creator + initial members)
+        // In MLS, the Welcome message contains encrypted secrets for all members,
+        // and each member (including the creator) must process it to initialize their group state
+
+        // Collect all member DIDs (creator + initial_members)
+        let mut all_member_dids = vec![auth_user.did.clone()];
         if let Some(ref member_list) = input.initial_members {
-            let non_creator_members: Vec<_> = member_list.iter()
-                .filter(|d| did_to_string(d) != auth_user.did)
-                .collect();
-
-            for member_did in &non_creator_members {
-                let welcome_id = uuid::Uuid::new_v4().to_string();
+            for member_did in member_list.iter() {
                 let member_did_str = did_to_string(member_did);
-
-                // Get the key_package_hash for this member from the input
-                let key_package_hash = input.key_package_hashes.as_ref()
-                    .and_then(|hashes| {
-                        hashes.iter()
-                            .find(|entry| did_to_string(&entry.data.did) == member_did_str)
-                            .map(|entry| hex::decode(&entry.data.hash).ok())
-                            .flatten()
-                    });
-
-                sqlx::query(
-                    "INSERT INTO welcome_messages (id, convo_id, recipient_did, welcome_data, key_package_hash, created_at)
-                     VALUES ($1, $2, $3, $4, $5, $6)
-                     ON CONFLICT (convo_id, recipient_did, COALESCE(key_package_hash, '\\x00'::bytea)) WHERE consumed = false
-                     DO NOTHING"
-                )
-                .bind(&welcome_id)
-                .bind(&convo_id)
-                .bind(&member_did_str)
-                .bind(&welcome_data)
-                .bind::<Option<Vec<u8>>>(key_package_hash) // key_package_hash from client
-                .bind(&now)
-                .execute(&pool)
-                .await
-                .map_err(|e| {
-                    error!("❌ [create_convo] Failed to store welcome message: {}", e);
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?;
-
-                tracing::debug!("✅ [create_convo] welcome stored for member");
+                // Avoid duplicates (in case creator is also in initial_members)
+                if member_did_str != auth_user.did {
+                    all_member_dids.push(member_did_str);
+                }
             }
-            tracing::debug!("📍 [create_convo] stored welcome for initial members");
+        }
 
-            // Mark key packages as consumed
-            if let Some(ref kp_hashes) = input.key_package_hashes {
-                for entry in kp_hashes {
-                    let member_did_str = did_to_string(&entry.data.did);
-                    let hash_hex = &entry.data.hash;
+        info!("📍 [create_convo] Storing Welcome message for {} total members (including creator)", all_member_dids.len());
 
-                    match crate::db::mark_key_package_consumed(&pool, &member_did_str, hash_hex).await {
-                        Ok(consumed) => {
-                            if consumed {
-                                tracing::debug!("✅ [create_convo] marked key package as consumed for {}", member_did_str);
-                            } else {
-                                tracing::warn!("⚠️ [create_convo] key package not found or already consumed for {}", member_did_str);
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("⚠️ [create_convo] failed to mark key package as consumed: {}", e);
+        for member_did_str in all_member_dids.iter() {
+            let welcome_id = uuid::Uuid::new_v4().to_string();
+
+            // Get the key_package_hash for this member from the input
+            let key_package_hash = input.key_package_hashes.as_ref()
+                .and_then(|hashes| {
+                    hashes.iter()
+                        .find(|entry| did_to_string(&entry.data.did) == *member_did_str)
+                        .map(|entry| hex::decode(&entry.data.hash).ok())
+                        .flatten()
+                });
+
+            sqlx::query(
+                "INSERT INTO welcome_messages (id, convo_id, recipient_did, welcome_data, key_package_hash, created_at)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT (convo_id, recipient_did, COALESCE(key_package_hash, '\\x00'::bytea)) WHERE consumed = false
+                 DO NOTHING"
+            )
+            .bind(&welcome_id)
+            .bind(&convo_id)
+            .bind(member_did_str)
+            .bind(&welcome_data)
+            .bind::<Option<Vec<u8>>>(key_package_hash) // key_package_hash from client
+            .bind(&now)
+            .execute(&pool)
+            .await
+            .map_err(|e| {
+                error!("❌ [create_convo] Failed to store welcome message for {}: {}", member_did_str, e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+            tracing::debug!("✅ [create_convo] welcome stored for member: {}", member_did_str);
+        }
+        tracing::debug!("📍 [create_convo] stored welcome for {} members", all_member_dids.len());
+
+        // Mark key packages as consumed
+        if let Some(ref kp_hashes) = input.key_package_hashes {
+            for entry in kp_hashes {
+                let member_did_str = did_to_string(&entry.data.did);
+                let hash_hex = &entry.data.hash;
+
+                match crate::db::mark_key_package_consumed(&pool, &member_did_str, hash_hex).await {
+                    Ok(consumed) => {
+                        if consumed {
+                            tracing::debug!("✅ [create_convo] marked key package as consumed for {}", member_did_str);
+                        } else {
+                            tracing::warn!("⚠️ [create_convo] key package not found or already consumed for {}", member_did_str);
                         }
                     }
+                    Err(e) => {
+                        tracing::warn!("⚠️ [create_convo] failed to mark key package as consumed: {}", e);
+                    }
                 }
-                tracing::debug!("📍 [create_convo] marked {} key packages as consumed", kp_hashes.len());
             }
-        } else {
-            tracing::debug!("📍 [create_convo] no initial_members list - skipping welcome storage");
+            tracing::debug!("📍 [create_convo] marked {} key packages as consumed", kp_hashes.len());
         }
     } else {
         tracing::debug!("📍 [create_convo] no welcome message provided");

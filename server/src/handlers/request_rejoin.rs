@@ -113,8 +113,8 @@ pub async fn request_rejoin(
     }
 
     // Check member status
-    let member = sqlx::query_as::<_, (Option<chrono::DateTime<chrono::Utc>>, bool)>(
-        "SELECT left_at, needs_rejoin FROM members WHERE convo_id = $1 AND member_did = $2"
+    let member = sqlx::query_as::<_, (Option<chrono::DateTime<chrono::Utc>>, bool, Option<chrono::DateTime<chrono::Utc>>)>(
+        "SELECT left_at, needs_rejoin, rejoin_requested_at FROM members WHERE convo_id = $1 AND member_did = $2"
     )
     .bind(&input.convo_id)
     .bind(&did)
@@ -131,68 +131,84 @@ pub async fn request_rejoin(
             warn!("User was never a member of conversation");
             return Err(StatusCode::FORBIDDEN);
         }
-        Some((left_at, needs_rejoin)) if left_at.is_none() && !needs_rejoin => {
-            // User is still an active member with valid state
-            warn!("User is already an active member of conversation");
-            return Err(StatusCode::CONFLICT);
+        Some((Some(_left_at), _, _)) => {
+            // User has left the conversation - they should use standard join flow
+            warn!("User has left the conversation, cannot rejoin");
+            return Err(StatusCode::FORBIDDEN);
+        }
+        Some((_, needs_rejoin, Some(rejoin_requested_at))) if needs_rejoin => {
+            // Check if rejoin was requested recently (within 5 minutes) - return existing request
+            let five_minutes_ago = chrono::Utc::now() - chrono::Duration::minutes(5);
+            if rejoin_requested_at > five_minutes_ago {
+                info!("Rejoin already requested recently, returning idempotent success");
+                let request_id = format!("{}-{}-rejoin", input.convo_id, did);
+                return Ok(Json(RequestRejoinOutput {
+                    request_id,
+                    pending: true,
+                    approved_at: None,
+                }));
+            }
+            // Otherwise fall through to update the request
         }
         Some(_) => {
-            // User needs rejoin - mark the request
+            // User is a member (active or needing rejoin) - allow the request
+            // When a client calls requestRejoin, it's explicitly signaling invalid state
+            // even if the server thinks the member is still active
             info!("Marking rejoin request for user");
-
-            sqlx::query(
-                "UPDATE members
-                 SET needs_rejoin = true,
-                     rejoin_requested_at = NOW(),
-                     rejoin_key_package_hash = $3
-                 WHERE convo_id = $1 AND member_did = $2"
-            )
-            .bind(&input.convo_id)
-            .bind(did)
-            .bind(&key_package_hash)
-            .execute(&pool)
-            .await
-            .map_err(|e| {
-                error!("Failed to mark rejoin request: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-
-            // Store the KeyPackage for when admin re-adds the user
-            let kp_id = uuid::Uuid::new_v4().to_string();
-            sqlx::query(
-                "INSERT INTO key_packages (id, owner_did, cipher_suite, key_package, key_package_hash, expires_at)
-                 VALUES ($1, $2, $3, $4, $5, NOW() + INTERVAL '7 days')
-                 ON CONFLICT DO NOTHING"
-            )
-            .bind(&kp_id)
-            .bind(did)
-            .bind("MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519") // Default cipher suite
-            .bind(&key_package_bytes)
-            .bind(&key_package_hash)
-            .execute(&pool)
-            .await
-            .map_err(|e| {
-                error!("Failed to store rejoin KeyPackage: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-
-            // Generate request ID from conversation + member + timestamp
-            let request_id = format!("{}-{}-rejoin", input.convo_id, did);
-
-            // TODO: In a full implementation, this would:
-            // 1. Notify other conversation members of rejoin request
-            // 2. Create a pending approval workflow
-            // 3. Auto-approve for single-member convos or based on policy
-            // 4. Generate Welcome message when approved and admin re-adds member
-
-            // For now, mark as pending - requires manual admin action to re-add
-            info!("✅ Rejoin request created: {}", request_id);
-
-            Ok(Json(RequestRejoinOutput {
-                request_id,
-                pending: true,
-                approved_at: None,
-            }))
         }
     }
+
+    sqlx::query(
+        "UPDATE members
+         SET needs_rejoin = true,
+             rejoin_requested_at = NOW(),
+             rejoin_key_package_hash = $3
+         WHERE convo_id = $1 AND member_did = $2"
+    )
+    .bind(&input.convo_id)
+    .bind(did)
+    .bind(&key_package_hash)
+    .execute(&pool)
+    .await
+    .map_err(|e| {
+        error!("Failed to mark rejoin request: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Store the KeyPackage for when admin re-adds the user
+    let kp_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO key_packages (id, owner_did, cipher_suite, key_package, key_package_hash, expires_at)
+         VALUES ($1, $2, $3, $4, $5, NOW() + INTERVAL '7 days')
+         ON CONFLICT DO NOTHING"
+    )
+    .bind(&kp_id)
+    .bind(did)
+    .bind("MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519") // Default cipher suite
+    .bind(&key_package_bytes)
+    .bind(&key_package_hash)
+    .execute(&pool)
+    .await
+    .map_err(|e| {
+        error!("Failed to store rejoin KeyPackage: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Generate request ID from conversation + member + timestamp
+    let request_id = format!("{}-{}-rejoin", input.convo_id, did);
+
+    // TODO: In a full implementation, this would:
+    // 1. Notify other conversation members of rejoin request
+    // 2. Create a pending approval workflow
+    // 3. Auto-approve for single-member convos or based on policy
+    // 4. Generate Welcome message when approved and admin re-adds member
+
+    // For now, mark as pending - requires manual admin action to re-add
+    info!("✅ Rejoin request created: {}", request_id);
+
+    Ok(Json(RequestRejoinOutput {
+        request_id,
+        pending: true,
+        approved_at: None,
+    }))
 }

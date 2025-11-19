@@ -74,6 +74,9 @@ thiserror = "1"
 dotenvy = "0.15"
 once_cell = "1.19"
 
+# Push notifications
+a2 = "0.10"
+
 # Metrics
 metrics = "0.21"
 metrics-exporter-prometheus = "0.13"

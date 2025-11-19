@@ -169,9 +169,9 @@ pub async fn leave_convo(
                 })?;
         }
 
-        // Mark member as left (natural idempotency: only update if not already left)
+        // Mark member as left and clear rejoin flags (natural idempotency: only update if not already left)
         let rows_affected = sqlx::query(
-            "UPDATE members SET left_at = $1 WHERE convo_id = $2 AND member_did = $3 AND left_at IS NULL"
+            "UPDATE members SET left_at = $1, needs_rejoin = false, rejoin_requested_at = NULL WHERE convo_id = $2 AND member_did = $3 AND left_at IS NULL"
         )
             .bind(&now)
             .bind(&input.convo_id)

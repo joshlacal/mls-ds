@@ -11,15 +11,17 @@ use crate::{
     sqlx_atrium::chrono_to_datetime,
     db,
     storage::{is_member, DbPool},
+    notifications::NotificationService,
 };
 
 /// Send a message to a conversation
 /// POST /xrpc/blue.catbird.mls.sendMessage
-#[tracing::instrument(skip(pool, sse_state, actor_registry, auth_user))]
+#[tracing::instrument(skip(pool, sse_state, actor_registry, notification_service, auth_user))]
 pub async fn send_message(
     State(pool): State<DbPool>,
     State(sse_state): State<Arc<SseState>>,
     State(actor_registry): State<Arc<ActorRegistry>>,
+    State(notification_service): State<Option<Arc<NotificationService>>>,
     auth_user: AuthUser,
     input: Result<Json<Input>, JsonRejection>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -170,6 +172,9 @@ pub async fn send_message(
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
 
+    // Clone ciphertext early for push notifications
+    let ciphertext_clone = input.ciphertext.clone();
+
     let (msg_id, now, seq, epoch) = if use_actors {
         tracing::debug!("Using actor system for send_message");
 
@@ -229,12 +234,15 @@ pub async fn send_message(
 
         info!("📍 [send_message] Creating message in database...");
 
+        // Clone ciphertext before moving it
+        let ciphertext_for_db = input.ciphertext.clone();
+
         // Create message with privacy-enhancing fields
         let message = db::create_message(
             &pool,
             &input.convo_id,
             &input.msg_id,
-            input.ciphertext,
+            ciphertext_for_db,
             input.epoch as i64,
             padded_size as i64,
             input.idempotency_key.clone(),
@@ -272,11 +280,13 @@ pub async fn send_message(
     tracing::debug!("send_message message created: msgId={}", crate::crypto::redact_for_log(&msg_id));
 
     tracing::debug!("📍 [send_message] spawning fan-out task");
-    // Spawn async task for fan-out and realtime emission
+    // Spawn async task for fan-out, push notifications, and realtime emission
     let pool_clone = pool.clone();
     let convo_id = input.convo_id.clone();
     let msg_id_clone = msg_id.clone();
     let sse_state_clone = sse_state.clone();
+    let sender_did_clone = auth_user.did.clone();
+    let notification_service_clone = notification_service.clone();
 
     tokio::spawn(async move {
         let fanout_start = std::time::Instant::now();
@@ -403,6 +413,23 @@ pub async fn send_message(
                     "❌ [send_message:fanout] Failed to fetch message for SSE event: {:?}",
                     e
                 );
+            }
+        }
+
+        // Send push notifications with ciphertext
+        if let Some(notification_service) = notification_service_clone.as_ref() {
+            tracing::debug!("📍 [send_message:fanout] sending push notifications");
+            if let Err(e) = notification_service
+                .notify_new_message(
+                    &pool_clone,
+                    &convo_id,
+                    &msg_id_clone,
+                    &ciphertext_clone,
+                    &sender_did_clone,
+                )
+                .await
+            {
+                error!("❌ [send_message:fanout] Failed to send push notifications: {}", e);
             }
         }
     });

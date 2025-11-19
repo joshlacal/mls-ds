@@ -77,7 +77,7 @@ pub async fn get_commits(
         to
     } else {
         // Get current epoch
-        let current_epoch: i64 = sqlx::query_scalar(
+        let current_epoch: i32 = sqlx::query_scalar(
             "SELECT current_epoch FROM conversations WHERE id = $1"
         )
         .bind(&params.convo_id)
@@ -90,7 +90,7 @@ pub async fn get_commits(
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             }
         })?;
-        current_epoch
+        current_epoch as i64
     };
     
     // Validate epoch range

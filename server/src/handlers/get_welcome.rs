@@ -1,6 +1,7 @@
 use axum::{extract::{Query, State}, http::StatusCode, Json};
 use base64::Engine;
 use serde::Deserialize;
+use sha2::{Sha256, Digest};
 use tracing::{info, warn, error};
 
 use crate::{
@@ -129,6 +130,27 @@ pub async fn get_welcome(
             return Err(StatusCode::NOT_FOUND);
         }
     };
+
+    // 📨 [GET_WELCOME] Log retrieved Welcome message for corruption detection
+    let mut hasher = Sha256::new();
+    hasher.update(&welcome_data);
+    let checksum = hasher.finalize();
+    info!(
+        "📨 [GET_WELCOME] Retrieved Welcome message for user {} in convo {}:",
+        user_did, params.convo_id
+    );
+    info!("   Size: {} bytes", welcome_data.len());
+    if welcome_data.len() >= 100 {
+        info!("   First 100 bytes (hex): {}", hex::encode(&welcome_data[..100]));
+    } else {
+        info!("   First {} bytes (hex): {}", welcome_data.len(), hex::encode(&welcome_data));
+    }
+    if welcome_data.len() > 100 {
+        let start = welcome_data.len().saturating_sub(100);
+        info!("   Last 100 bytes (hex): {}", hex::encode(&welcome_data[start..]));
+    }
+    info!("   SHA256 checksum: {}", hex::encode(checksum));
+    info!("   ⚠️  Compare this checksum with the CREATE_CONVO checksum above!");
 
     // Mark as consumed atomically with consumed_at timestamp
     let now = chrono::Utc::now();
