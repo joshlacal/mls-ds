@@ -229,6 +229,14 @@ async fn main() -> anyhow::Result<()> {
             get(handlers::list_devices),
         )
         .route(
+            "/xrpc/blue.catbird.mls.registerDeviceToken",
+            post(handlers::register_device_token),
+        )
+        .route(
+            "/xrpc/blue.catbird.mls.unregisterDeviceToken",
+            post(handlers::unregister_device_token),
+        )
+        .route(
             "/xrpc/blue.catbird.mls.getEpoch",
             get(handlers::get_epoch),
         )

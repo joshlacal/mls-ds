@@ -107,7 +107,11 @@ impl Membership {
     /// # Errors
     /// Returns an error if member_did is not a valid DID string or promoted_by_did is invalid.
     pub fn to_member_view(&self) -> Result<MemberView, String> {
-        let did: atrium_api::types::string::Did = self.member_did.parse().map_err(|e| {
+        // Strip fragment (#...) from DID if present (e.g., did:plc:abc#device-uuid -> did:plc:abc)
+        // Fragments are used for credential DIDs but not valid in AT Protocol DID strings
+        let did_without_fragment = self.member_did.split('#').next().unwrap_or(&self.member_did);
+
+        let did: atrium_api::types::string::Did = did_without_fragment.parse().map_err(|e| {
             format!("Invalid member DID '{}': {}", self.member_did, e)
         })?;
 

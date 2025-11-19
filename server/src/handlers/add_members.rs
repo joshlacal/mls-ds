@@ -67,39 +67,47 @@ pub async fn add_members(
     }
 
     // If idempotency key is provided, check if this operation was already completed
+    // IMPORTANT: Only skip if members exist AND no commit is provided
+    // If a commit is provided, we must process it even if members exist,
+    // because the commit might contain epoch advancement or other updates
     if let Some(ref _idem_key) = input.idempotency_key {
-        // Check if all members are already added - if so, this is a duplicate request
-        let mut all_exist = true;
-        for target_did in &input.did_list {
-            let target_did_str = target_did.as_str();
-            let exists = sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS(SELECT 1 FROM members WHERE convo_id = $1 AND member_did = $2 AND left_at IS NULL)"
-            )
-            .bind(&input.convo_id)
-            .bind(target_did_str)
-            .fetch_one(&pool)
-            .await
-            .unwrap_or(false);
-
-            if !exists {
-                all_exist = false;
-                break;
-            }
-        }
-
-        if all_exist {
-            info!("📍 [add_members] Idempotency: All members already exist, returning success");
-            let current_epoch = get_current_epoch(&pool, &input.convo_id)
+        // Only apply idempotency check if NO commit is provided
+        if input.commit.is_none() {
+            // Check if all members are already added - if so, this is a duplicate request
+            let mut all_exist = true;
+            for target_did in &input.did_list {
+                let target_did_str = target_did.as_str();
+                let exists = sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM members WHERE convo_id = $1 AND member_did = $2 AND left_at IS NULL)"
+                )
+                .bind(&input.convo_id)
+                .bind(target_did_str)
+                .fetch_one(&pool)
                 .await
-                .map_err(|e| {
-                    error!("Failed to get current epoch: {}", e);
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?;
+                .unwrap_or(false);
 
-            return Ok(Json(AddMembersOutput::from(OutputData {
-                success: true,
-                new_epoch: current_epoch as usize,
-            })));
+                if !exists {
+                    all_exist = false;
+                    break;
+                }
+            }
+
+            if all_exist {
+                info!("📍 [add_members] Idempotency: All members already exist (no commit), returning success");
+                let current_epoch = get_current_epoch(&pool, &input.convo_id)
+                    .await
+                    .map_err(|e| {
+                        error!("Failed to get current epoch: {}", e);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?;
+
+                return Ok(Json(AddMembersOutput::from(OutputData {
+                    success: true,
+                    new_epoch: current_epoch as usize,
+                })));
+            }
+        } else {
+            info!("📍 [add_members] Commit provided - processing even if members exist (may advance epoch)");
         }
     }
 
@@ -304,7 +312,7 @@ pub async fn add_members(
                     .await;
 
                 // Fetch the commit message from database
-                let message_result = sqlx::query_as::<_, (String, Option<String>, Option<Vec<u8>>, i32, i64, chrono::DateTime<chrono::Utc>)>(
+                let message_result = sqlx::query_as::<_, (String, Option<String>, Option<Vec<u8>>, i64, i64, chrono::DateTime<chrono::Utc>)>(
                     r#"
                     SELECT id, sender_did, ciphertext, epoch, seq, created_at
                     FROM messages
@@ -367,10 +375,10 @@ pub async fn add_members(
             let target_did_str = target_did.as_str();
             tracing::debug!("📍 [add_members] processing member");
 
-            // Query user's devices from user_devices table
+            // Query user's devices from devices table
             let devices: Vec<(String, String, Option<String>)> = sqlx::query_as(
-                "SELECT device_id, device_mls_did, device_name
-                 FROM user_devices
+                "SELECT device_id, credential_did, device_name
+                 FROM devices
                  WHERE user_did = $1
                  ORDER BY registered_at"
             )
