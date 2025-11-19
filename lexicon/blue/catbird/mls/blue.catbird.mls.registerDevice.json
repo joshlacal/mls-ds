@@ -19,8 +19,7 @@
             },
             "deviceUUID": {
               "type": "string",
-              "description": "Persistent device UUID (stored in iCloud Keychain). Allows server to detect device re-registration and cleanup old key packages. Optional for backward compatibility.",
-              "format": "uuid"
+              "description": "Persistent device UUID (stored in iCloud Keychain). Allows server to detect device re-registration and cleanup old key packages. Optional for backward compatibility."
             },
             "keyPackages": {
               "type": "array",

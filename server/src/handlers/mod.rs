@@ -10,6 +10,7 @@ mod get_block_status;
 mod get_commits;
 mod get_convos;
 mod get_epoch;
+mod get_group_info;
 mod get_expected_conversations;
 mod get_key_packages;
 mod get_key_package_history;
@@ -32,6 +33,7 @@ mod request_rejoin;
 mod resolve_report;
 mod send_message;
 mod update_cursor;
+mod update_group_info;
 mod validate_device_state;
 
 // Re-export handlers
@@ -46,6 +48,8 @@ pub use get_block_status::get_block_status;
 pub use get_commits::get_commits;
 pub use get_convos::get_convos;
 pub use get_epoch::get_epoch;
+pub use get_group_info::handle as get_group_info;
+pub use update_group_info::handle as update_group_info;
 pub use get_expected_conversations::get_expected_conversations;
 pub use get_key_packages::get_key_packages;
 pub use get_key_package_history::get_key_package_history;
