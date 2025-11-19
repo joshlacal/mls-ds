@@ -7,6 +7,9 @@ pub const NSID: &str = "blue.catbird.mls.createConvo";
 pub struct InputData {
     ///MLS cipher suite to use for this conversation
     pub cipher_suite: String,
+    ///Client's current MLS epoch after group creation and adding initial members. Used for server telemetry only (server is not authoritative for MLS state). Defaults to 0 if not provided.
+    #[serde(skip_serializing_if = "core::option::Option::is_none")]
+    pub current_epoch: core::option::Option<usize>,
     ///Hex-encoded MLS group identifier
     pub group_id: String,
     ///Client-generated UUID for idempotent request retries. Optional but recommended.

@@ -11,6 +11,8 @@ pub mod get_block_status;
 pub mod get_commits;
 pub mod get_convos;
 pub mod get_epoch;
+pub mod get_group_info;
+pub mod update_group_info;
 pub mod get_key_package_stats;
 pub mod get_key_package_status;
 pub mod get_key_packages;

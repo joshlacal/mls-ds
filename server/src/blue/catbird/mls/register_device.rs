@@ -4,52 +4,58 @@ pub const NSID: &str = "blue.catbird.mls.registerDevice";
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct InputData {
-    ///App version string
-    #[serde(skip_serializing_if = "core::option::Option::is_none")]
-    pub app_version: core::option::Option<String>,
-    ///Unique device identifier (UUID). Client-generated and persisted across app launches.
-    pub device_id: String,
     ///Human-readable device name (e.g., 'Josh's iPhone', 'MacBook Pro')
     pub device_name: String,
-    ///Device platform
+    ///Persistent device UUID (stored in iCloud Keychain). Allows server to detect device re-registration and cleanup old key packages. Optional for backward compatibility.
     #[serde(skip_serializing_if = "core::option::Option::is_none")]
-    pub platform: core::option::Option<String>,
+    pub device_uuid: core::option::Option<String>,
+    ///MLS key packages for this device (1-200 packages)
+    pub key_packages: Vec<KeyPackageItem>,
+    ///Device Ed25519 signature public key (32 bytes)
+    #[serde(with = "serde_bytes")]
+    pub signature_public_key: Vec<u8>,
 }
 pub type Input = crate::types::Object<InputData>;
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct OutputData {
-    ///Full device credential DID (did:plc:user#device-uuid). Use this as the MLS credential identity.
-    pub credential_did: String,
-    ///Confirmed device ID
+    ///Conversation IDs that this device can auto-join
+    pub auto_joined_convos: Vec<String>,
+    ///Server-generated device ID (UUID)
     pub device_id: String,
-    ///True if this is a new registration, false if updating existing device
+    ///Full device credential DID (did:plc:user#device-uuid). Use this as the MLS credential identity.
+    pub mls_did: String,
+    ///Welcome messages for auto-joining conversations (may be null)
     #[serde(skip_serializing_if = "core::option::Option::is_none")]
-    pub is_new_device: core::option::Option<bool>,
-    ///When the device was registered
-    pub registered_at: crate::types::string::Datetime,
-    ///Base user DID without device suffix
-    pub user_did: String,
+    pub welcome_messages: core::option::Option<Vec<WelcomeMessage>>,
 }
 pub type Output = crate::types::Object<OutputData>;
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "error", content = "message")]
 pub enum Error {
-    InvalidDeviceId(Option<String>),
     InvalidDeviceName(Option<String>),
+    InvalidKeyPackages(Option<String>),
+    InvalidSignatureKey(Option<String>),
     DeviceAlreadyRegistered(Option<String>),
+    TooManyDevices(Option<String>),
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, _f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            Error::InvalidDeviceId(msg) => {
-                write!(_f, "InvalidDeviceId")?;
+            Error::InvalidDeviceName(msg) => {
+                write!(_f, "InvalidDeviceName")?;
                 if let Some(msg) = msg {
                     write!(_f, ": {msg}")?;
                 }
             }
-            Error::InvalidDeviceName(msg) => {
-                write!(_f, "InvalidDeviceName")?;
+            Error::InvalidKeyPackages(msg) => {
+                write!(_f, "InvalidKeyPackages")?;
+                if let Some(msg) = msg {
+                    write!(_f, ": {msg}")?;
+                }
+            }
+            Error::InvalidSignatureKey(msg) => {
+                write!(_f, "InvalidSignatureKey")?;
                 if let Some(msg) = msg {
                     write!(_f, ": {msg}")?;
                 }
@@ -60,7 +66,33 @@ impl std::fmt::Display for Error {
                     write!(_f, ": {msg}")?;
                 }
             }
+            Error::TooManyDevices(msg) => {
+                write!(_f, "TooManyDevices")?;
+                if let Some(msg) = msg {
+                    write!(_f, ": {msg}")?;
+                }
+            }
         }
         Ok(())
     }
 }
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyPackageItemData {
+    ///MLS cipher suite (e.g., 'MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519')
+    pub cipher_suite: String,
+    ///Key package expiration time
+    pub expires: crate::types::string::Datetime,
+    ///Base64-encoded MLS key package
+    pub key_package: String,
+}
+pub type KeyPackageItem = crate::types::Object<KeyPackageItemData>;
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WelcomeMessageData {
+    ///Conversation ID
+    pub convo_id: String,
+    ///Base64-encoded MLS Welcome message
+    pub welcome: String,
+}
+pub type WelcomeMessage = crate::types::Object<WelcomeMessageData>;

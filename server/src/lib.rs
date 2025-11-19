@@ -6,6 +6,7 @@ pub mod db;
 pub mod device_utils;
 pub mod error_responses;
 pub mod fanout;
+pub mod group_info;
 pub mod handlers;
 pub mod health;
 // pub mod jobs;  // Temporarily disabled - requires new DB schema
