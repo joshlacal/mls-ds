@@ -373,7 +373,7 @@ pub async fn send_message(
                 let message_view = crate::models::MessageView::from(crate::models::MessageViewData {
                     id: msg.id,
                     convo_id: convo_id.clone(),
-                    ciphertext: msg.ciphertext,
+                    ciphertext: msg.ciphertext.unwrap_or_default(),
                     epoch: msg.epoch as usize,
                     seq: msg.seq as usize,
                     created_at: crate::sqlx_atrium::chrono_to_datetime(msg.created_at),

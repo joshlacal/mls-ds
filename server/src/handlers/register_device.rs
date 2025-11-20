@@ -107,6 +107,24 @@ pub async fn register_device(
     let now = Utc::now();
     let sig_key_hex = hex::encode(&input.signature_public_key);
 
+    // Ensure user exists in database (upsert)
+    sqlx::query!(
+        r#"
+        INSERT INTO users (did, created_at, last_seen_at)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (did) DO UPDATE SET last_seen_at = $3
+        "#,
+        user_did,
+        now,
+        now
+    )
+    .execute(&pool)
+    .await
+    .map_err(|e| {
+        error!("Failed to ensure user exists: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
     // Check for device re-registration by device_uuid
     let mut is_reregistration = if let Some(ref device_uuid) = input.device_uuid {
         let existing_by_uuid: Option<(String, String, String)> = sqlx::query_as(
