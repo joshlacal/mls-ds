@@ -1,23 +1,24 @@
-use base64::Engine;
-
 use axum::{extract::State, http::StatusCode, Json};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use tracing::{info, warn, error};
+use base64::Engine;
 
 use crate::{
     actors::{ActorRegistry, ConvoMessage},
     auth::AuthUser,
     generated_types::{LeaveConvoInput, LeaveConvoOutput},
+    realtime::SseState,
     storage::{get_current_epoch, is_member, DbPool},
 };
 
 /// Leave a conversation
 /// POST /xrpc/chat.bsky.convo.leaveConvo
-#[tracing::instrument(skip(pool, actor_registry))]
+#[tracing::instrument(skip(pool, actor_registry, sse_state))]
 pub async fn leave_convo(
     State(pool): State<DbPool>,
     State(actor_registry): State<Arc<ActorRegistry>>,
+    State(sse_state): State<Arc<SseState>>,
     auth_user: AuthUser,
     Json(input): Json<LeaveConvoInput>,
 ) -> Result<Json<LeaveConvoOutput>, StatusCode> {
@@ -134,6 +135,7 @@ pub async fn leave_convo(
 
         // Process commit if provided
         if let Some(commit) = input.commit {
+            use base64::Engine;
             let commit_bytes = base64::engine::general_purpose::STANDARD.decode(commit)
                 .map_err(|e| {
                     warn!("Invalid base64 commit: {}", e);
@@ -142,31 +144,165 @@ pub async fn leave_convo(
 
             let msg_id = uuid::Uuid::new_v4().to_string();
 
+            // Start transaction
+            let mut tx = pool.begin().await.map_err(|e| {
+                error!("Failed to begin transaction: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+            // Calculate sequence number
+            let seq: i64 = sqlx::query_scalar(
+                "SELECT CAST(COALESCE(MAX(seq), 0) + 1 AS BIGINT) FROM messages WHERE convo_id = $1"
+            )
+            .bind(&input.convo_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| {
+                error!("Failed to calculate sequence number: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+            // Insert commit message with sequence number
             sqlx::query(
-                "INSERT INTO messages (id, convo_id, sender_did, message_type, epoch, ciphertext, created_at) VALUES ($1, $2, $3, 'commit', $4, $5, $6)"
+                "INSERT INTO messages (id, convo_id, sender_did, message_type, epoch, seq, ciphertext, created_at) VALUES ($1, $2, $3, 'commit', $4, $5, $6, $7)"
             )
             .bind(&msg_id)
             .bind(&input.convo_id)
             .bind(did)
             .bind(new_epoch)
+            .bind(seq)
             .bind(&commit_bytes)
             .bind(&now)
-            .execute(&pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| {
                 error!("Failed to insert commit message: {}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
+            // Update epoch in same transaction
             sqlx::query("UPDATE conversations SET current_epoch = $1 WHERE id = $2")
                 .bind(new_epoch)
                 .bind(&input.convo_id)
-                .execute(&pool)
+                .execute(&mut *tx)
                 .await
                 .map_err(|e| {
                     error!("Failed to update conversation epoch: {}", e);
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
+
+            // Commit transaction
+            tx.commit().await.map_err(|e| {
+                error!("Failed to commit transaction: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+            info!("✅ [leave_convo] Commit message stored with seq={}, epoch={}", seq, new_epoch);
+
+            // Fan out commit message to all members (async)
+            let pool_clone = pool.clone();
+            let convo_id_clone = input.convo_id.clone();
+            let msg_id_clone = msg_id.clone();
+            let sse_state_clone = sse_state.clone();
+
+            tokio::spawn(async move {
+                tracing::debug!("📍 [leave_convo:fanout] starting commit fan-out");
+
+                // Get all active members (including the one leaving, so they get the commit)
+                let members_result = sqlx::query_as::<_, (String,)>(
+                    r#"
+                    SELECT member_did
+                    FROM members
+                    WHERE convo_id = $1 AND left_at IS NULL
+                    "#,
+                )
+                .bind(&convo_id_clone)
+                .fetch_all(&pool_clone)
+                .await;
+
+                match members_result {
+                    Ok(members) => {
+                        tracing::debug!("📍 [leave_convo:fanout] fan-out commit to {} members", members.len());
+
+                        // Create envelopes for each member
+                        for (member_did,) in &members {
+                            let envelope_id = uuid::Uuid::new_v4().to_string();
+
+                            let envelope_result = sqlx::query(
+                                r#"
+                                INSERT INTO envelopes (id, convo_id, recipient_did, message_id, created_at)
+                                VALUES ($1, $2, $3, $4, NOW())
+                                ON CONFLICT (recipient_did, message_id) DO NOTHING
+                                "#,
+                            )
+                            .bind(&envelope_id)
+                            .bind(&convo_id_clone)
+                            .bind(member_did)
+                            .bind(&msg_id_clone)
+                            .execute(&pool_clone)
+                            .await;
+
+                            if let Err(e) = envelope_result {
+                                error!(
+                                    "❌ [leave_convo:fanout] Failed to insert envelope for {}: {:?}",
+                                    member_did, e
+                                );
+                            }
+                        }
+
+                        tracing::debug!("✅ [leave_convo:fanout] envelopes created");
+                    }
+                    Err(e) => {
+                        error!("❌ [leave_convo:fanout] Failed to get members: {:?}", e);
+                    }
+                }
+
+                tracing::debug!("📍 [leave_convo:fanout] emitting SSE event for commit");
+                // Emit SSE event for commit message
+                let cursor = sse_state_clone
+                    .cursor_gen
+                    .next(&convo_id_clone, "messageEvent")
+                    .await;
+
+                // Fetch the full message from database to get all fields
+                let message_result = sqlx::query!(
+                    r#"
+                    SELECT id, sender_did, ciphertext, epoch, seq, created_at
+                    FROM messages
+                    WHERE id = $1
+                    "#,
+                    &msg_id_clone
+                )
+                .fetch_one(&pool_clone)
+                .await;
+
+                match message_result {
+                    Ok(msg) => {
+                        let message_view = crate::models::MessageView::from(crate::models::MessageViewData {
+                            id: msg.id,
+                            convo_id: convo_id_clone.clone(),
+                            ciphertext: msg.ciphertext.unwrap_or_default(),
+                            epoch: msg.epoch as usize,
+                            seq: msg.seq as usize,
+                            created_at: crate::sqlx_atrium::chrono_to_datetime(msg.created_at),
+                        });
+
+                        let event = crate::realtime::StreamEvent::MessageEvent {
+                            cursor: cursor.clone(),
+                            message: message_view.clone(),
+                        };
+
+                        if let Err(e) = sse_state_clone.emit(&convo_id_clone, event).await {
+                            error!("❌ [leave_convo:fanout] Failed to emit SSE event: {}", e);
+                        } else {
+                            tracing::debug!("✅ [leave_convo:fanout] SSE event emitted");
+                        }
+                    }
+                    Err(e) => {
+                        error!("❌ [leave_convo:fanout] Failed to fetch message for SSE: {:?}", e);
+                    }
+                }
+            });
         }
 
         // Mark member as left and clear rejoin flags (natural idempotency: only update if not already left)

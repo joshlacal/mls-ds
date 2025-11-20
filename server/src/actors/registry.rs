@@ -6,6 +6,7 @@ use tracing::{debug, info, warn};
 
 use super::conversation::{ConversationActor, ConvoActorArgs};
 use super::messages::ConvoMessage;
+use crate::realtime::SseState;
 
 /// Central registry for managing conversation actor lifecycle.
 ///
@@ -55,23 +56,26 @@ use super::messages::ConvoMessage;
 pub struct ActorRegistry {
     actors: Arc<DashMap<String, ActorRef<ConvoMessage>>>,
     db_pool: PgPool,
+    sse_state: Arc<SseState>,
 }
 
 impl ActorRegistry {
-    /// Creates a new actor registry with the given database connection pool.
+    /// Creates a new actor registry with the given database connection pool and SSE state.
     ///
     /// # Arguments
     ///
     /// - `db_pool`: PostgreSQL connection pool used by spawned actors
+    /// - `sse_state`: SSE state for real-time event broadcasting
     ///
     /// # Returns
     ///
     /// A new `ActorRegistry` instance ready to spawn actors.
-    pub fn new(db_pool: PgPool) -> Self {
+    pub fn new(db_pool: PgPool, sse_state: Arc<SseState>) -> Self {
         info!("Initializing ActorRegistry");
         Self {
             actors: Arc::new(DashMap::new()),
             db_pool,
+            sse_state,
         }
     }
 
@@ -123,6 +127,7 @@ impl ActorRegistry {
         let args = ConvoActorArgs {
             convo_id: convo_id.to_string(),
             db_pool: self.db_pool.clone(),
+            sse_state: self.sse_state.clone(),
         };
 
         let (actor_ref, _handle) = ractor::Actor::spawn(None, ConversationActor, args)
@@ -233,6 +238,7 @@ impl Clone for ActorRegistry {
         Self {
             actors: Arc::clone(&self.actors),
             db_pool: self.db_pool.clone(),
+            sse_state: self.sse_state.clone(),
         }
     }
 }

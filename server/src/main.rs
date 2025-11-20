@@ -92,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
     // tracing::info!("Compaction worker started");
 
     // Initialize actor registry
-    let actor_registry = Arc::new(actors::ActorRegistry::new(db_pool.clone()));
+    let actor_registry = Arc::new(actors::ActorRegistry::new(db_pool.clone(), sse_state.clone()));
     tracing::info!("Actor registry initialized");
 
     // Initialize notification service
@@ -249,16 +249,8 @@ async fn main() -> anyhow::Result<()> {
             post(handlers::update_group_info),
         )
         .route(
-            "/xrpc/blue.catbird.mls.getWelcome",
-            get(handlers::get_welcome),
-        )
-        .route(
-            "/xrpc/blue.catbird.mls.confirmWelcome",
-            post(handlers::confirm_welcome),
-        )
-        .route(
-            "/xrpc/blue.catbird.mls.requestRejoin",
-            post(handlers::request_rejoin),
+            "/xrpc/blue.catbird.mls.processExternalCommit",
+            post(handlers::process_external_commit),
         )
         .route(
             "/xrpc/blue.catbird.mls.getExpectedConversations",
