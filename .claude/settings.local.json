@@ -48,7 +48,18 @@
       "Bash(timeout 10 docker logs:*)",
       "Bash(docker port:*)",
       "Bash(docker inspect:*)",
-      "Bash(docker ps:*)"
+      "Bash(docker ps:*)",
+      "Bash(DATABASE_URL=\"postgresql://catbird:catbird_secure_password_change_in_production@localhost:5433/catbird\" cargo sqlx prepare:*)",
+      "Bash(sudo systemctl status:*)",
+      "Bash(sudo nginx:*)",
+      "Bash(sudo tail:*)",
+      "Bash(sudo systemctl:*)",
+      "Bash(sudo journalctl:*)",
+      "Bash(docker network:*)",
+      "Bash(docker build:*)",
+      "Bash(DATABASE_URL=\"postgresql://catbird:changeme@localhost:5433/catbird\" cargo sqlx:*)",
+      "Bash(docker-compose ps:*)",
+      "Bash(docker restart:*)"
     ],
     "deny": [],
     "ask": []
