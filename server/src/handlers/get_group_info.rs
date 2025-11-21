@@ -25,10 +25,11 @@ pub async fn handle(
 ) -> Result<Json<Output>, GetGroupInfoError> {
     let did = &auth.did;
     
-    // 1. Check authorization: must be current OR past member
+    // 1. Check authorization: must be current member (not removed/left)
+    // GroupInfo is for cryptographic resync, not for re-adding removed members
     let member_check: Option<MemberCheckRow> = sqlx::query_as(
-        "SELECT member_did, left_at 
-         FROM members 
+        "SELECT member_did, left_at
+         FROM members
          WHERE convo_id = $1 AND user_did = $2
          LIMIT 1"
     )
@@ -37,19 +38,16 @@ pub async fn handle(
     .fetch_optional(&pool)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    
+
     let member = member_check.ok_or(Error::Unauthorized(
         Some("Not a member of this conversation".into())
     ))?;
-    
-    // 2. Allow if currently in group OR left recently (within 30 days)
-    if let Some(left_at) = member.left_at {
-        let days_since_left = (chrono::Utc::now() - left_at).num_days();
-        if days_since_left > 30 {
-            return Err(Error::Unauthorized(
-                Some("Membership expired (left more than 30 days ago)".into())
-            ).into());
-        }
+
+    // 2. Only current members can fetch GroupInfo (for external commits/resync)
+    if member.left_at.is_some() {
+        return Err(Error::Unauthorized(
+            Some("Member was removed or left. Request re-add from admin.".into())
+        ).into());
     }
     
     // 3. Fetch cached GroupInfo

@@ -42,16 +42,24 @@ CREATE TABLE conversations (
     cipher_suite TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    idempotency_key TEXT UNIQUE
+    idempotency_key TEXT UNIQUE,
+    -- GroupInfo caching for external commit joins
+    group_info BYTEA,
+    group_info_updated_at TIMESTAMPTZ,
+    group_info_epoch INTEGER
 );
 
 CREATE INDEX idx_conversations_creator ON conversations(creator_did);
 CREATE INDEX idx_conversations_group_id ON conversations(group_id) WHERE group_id IS NOT NULL;
 CREATE INDEX idx_conversations_updated ON conversations(updated_at DESC);
+CREATE INDEX idx_conversations_group_info_updated ON conversations(id, group_info_updated_at DESC) WHERE group_info IS NOT NULL;
 
 COMMENT ON TABLE conversations IS 'MLS group conversations with E2EE support';
 COMMENT ON COLUMN conversations.cipher_suite IS 'MLS cipher suite (e.g., MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519)';
 COMMENT ON COLUMN conversations.current_epoch IS 'Current MLS epoch number, increments with each group state change';
+COMMENT ON COLUMN conversations.group_info IS 'Cached MLS GroupInfo object for external commit joins. Updated after each epoch change.';
+COMMENT ON COLUMN conversations.group_info_updated_at IS 'Timestamp when the GroupInfo was last updated. Used to determine freshness (5 minute TTL).';
+COMMENT ON COLUMN conversations.group_info_epoch IS 'The epoch number corresponding to the cached GroupInfo object.';
 
 -- Members (conversation participants with admin support)
 CREATE TABLE members (

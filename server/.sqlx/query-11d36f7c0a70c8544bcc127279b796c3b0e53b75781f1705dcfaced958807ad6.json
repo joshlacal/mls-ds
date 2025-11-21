@@ -1,0 +1,35 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT left_at, needs_rejoin, member_did\n         FROM members\n         WHERE convo_id = $1 AND user_did = $2\n         ORDER BY joined_at DESC\n         LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "left_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 1,
+        "name": "needs_rejoin",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 2,
+        "name": "member_did",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "11d36f7c0a70c8544bcc127279b796c3b0e53b75781f1705dcfaced958807ad6"
+}

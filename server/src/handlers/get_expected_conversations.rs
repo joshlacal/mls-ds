@@ -74,7 +74,8 @@ pub async fn get_expected_conversations(
     };
 
     // Query all conversations where user is a member (not left)
-    // For each conversation, check if the specific device is in the members table
+    // For multi-device support, we query by user_did and return the device-specific record
+    // Use DISTINCT ON to get one record per conversation, prioritizing the target device if specified
     let conversations = sqlx::query_as::<_, (
         String,                                      // convo_id
         String,                                      // name
@@ -84,7 +85,7 @@ pub async fn get_expected_conversations(
         Option<String>,                              // device_id from members
     )>(
         r#"
-        SELECT
+        SELECT DISTINCT ON (c.id)
             c.id as convo_id,
             COALESCE(c.name, 'Unnamed Conversation') as name,
             (SELECT COUNT(*) FROM members m2 WHERE m2.convo_id = c.id AND m2.left_at IS NULL) as member_count,
@@ -93,12 +94,16 @@ pub async fn get_expected_conversations(
             m.device_id
         FROM conversations c
         INNER JOIN members m ON c.id = m.convo_id
-        WHERE m.member_did = $1
+        WHERE m.user_did = $1
           AND m.left_at IS NULL
-        ORDER BY c.updated_at DESC
+        ORDER BY c.id,
+                 CASE WHEN $2::text IS NOT NULL AND m.device_id = $2 THEN 0 ELSE 1 END,
+                 m.device_id NULLS LAST,
+                 c.updated_at DESC
         "#,
     )
     .bind(base_user_did)
+    .bind(&device_id)
     .fetch_all(&pool)
     .await
     .map_err(|e| {

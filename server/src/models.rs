@@ -203,7 +203,7 @@ impl KeyPackage {
     /// Returns an error if the DID is not a valid DID string.
     pub fn to_key_package_ref(&self) -> Result<KeyPackageRef, String> {
         use base64::Engine;
-        let key_package_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        let key_package_b64 = base64::engine::general_purpose::STANDARD
             .encode(&self.key_data);
 
         let did = self.owner_did.parse().map_err(|e| {

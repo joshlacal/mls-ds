@@ -108,10 +108,12 @@ pub async fn handle(
         return Err(StatusCode::BAD_REQUEST.into());
     }
     
-    // 1. Verify authorization (must be past member or current member)
-    // Reuse logic from get_group_info or similar
+    // 1. Verify authorization
+    // External commits are for members who are still in the group socially,
+    // but whose devices are cryptographically out of sync (lost state, app reinstall, etc.)
+    // This is different from members who left/were removed (social decision).
     let member_check = sqlx::query!(
-        "SELECT left_at
+        "SELECT left_at, needs_rejoin, member_did
          FROM members
          WHERE convo_id = $1 AND user_did = $2
          ORDER BY joined_at DESC
@@ -125,19 +127,33 @@ pub async fn handle(
         error!("Database error checking membership: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    
+
     let member = member_check.ok_or(Error::Unauthorized(
         Some("Not a member of this conversation".into())
     ))?;
-    
-    // Allow if left recently (within 30 days) or currently in
-    if let Some(left_at) = member.left_at {
-        let days_since = (chrono::Utc::now() - left_at).num_days();
-        if days_since > 30 {
-            return Err(Error::Unauthorized(
-                Some("Membership expired (>30 days since leaving)".into())
-            ).into());
-        }
+
+    // Distinguish between social removal and cryptographic desync:
+    // - left_at NOT NULL: Removed/left voluntarily (social decision) → REJECT
+    // - left_at IS NULL, needs_rejoin = true: Out of sync (crypto issue) → ALLOW
+    // - left_at IS NULL, needs_rejoin = false: In sync → ALLOW (idempotent rejoin)
+
+    if member.left_at.is_some() {
+        return Err(Error::Unauthorized(
+            Some("Member was removed or left. External commits are only for cryptographic resync. Request re-add from admin.".into())
+        ).into());
+    }
+
+    // Log rejoin attempt for monitoring
+    if member.needs_rejoin {
+        info!(
+            "Processing external commit for out-of-sync member {} in {}",
+            did, convo_id
+        );
+    } else {
+        info!(
+            "Processing external commit for member {} in {} (idempotent rejoin or proactive resync)",
+            did, convo_id
+        );
     }
     
     // 2. Decode commit message
@@ -145,13 +161,12 @@ pub async fn handle(
         .decode(&input.external_commit)
         .map_err(|e| Error::InvalidCommit(Some(format!("Invalid base64: {}", e))))?;
     
-    // 3. Validate it's a commit (lightweight validation)
-    // We can't fully verify without state, but we can check structure
+    // 3. Validate commit structure (server validates format, clients validate cryptography)
     let _mls_message = MlsMessageIn::tls_deserialize(&mut commit_bytes.as_slice())
         .map_err(|e| Error::InvalidCommit(Some(format!("Invalid MLS message: {}", e))))?;
-        
-    // 4. Update DB (Blind Trust Mode for now)
-    // We trust the client provided a valid commit that adds them back
+
+    // 4. Store commit and update state
+    // Server role: authorization + delivery; Client role: cryptographic validation
     
     let current_epoch = get_current_epoch(&pool, convo_id)
         .await
@@ -240,20 +255,15 @@ pub async fn handle(
         })?;
     }
         
-    // Re-add member (update left_at to NULL)
-    // We assume the commit adds THIS user. 
-    // In a real implementation with state, we would verify the commit adds this user.
-    
-    // Check if we need to find the device_id. 
-    // For now, we'll just update the existing member record if it exists, or insert new.
-    // Since we checked membership earlier, we know a record exists (maybe with left_at).
-    
+    // Clear needs_rejoin flag - device is now cryptographically resynced
+    // Cryptographic validation happens client-side when members process this commit
     sqlx::query(
-        "UPDATE members 
-         SET left_at = NULL, joined_at = $1
-         WHERE convo_id = $2 AND user_did = $3"
+        "UPDATE members
+         SET needs_rejoin = false,
+             rejoin_requested_at = NULL,
+             rejoin_key_package_hash = NULL
+         WHERE convo_id = $1 AND user_did = $2"
     )
-    .bind(now)
     .bind(convo_id)
     .bind(did)
     .execute(&mut *tx)
