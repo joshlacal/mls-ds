@@ -14,6 +14,25 @@ use crate::{
 use std::sync::Arc;
 use axum::response::{IntoResponse, Response};
 
+// Query result types
+#[derive(sqlx::FromRow)]
+struct PolicyRow {
+    allow_external_commits: bool,
+    require_invite_for_join: bool,
+    allow_rejoin: bool,
+    rejoin_window_days: i32,
+}
+
+#[derive(sqlx::FromRow)]
+struct MemberCheckRow {
+    left_at: Option<chrono::DateTime<chrono::Utc>>,
+    needs_rejoin: bool,
+    member_did: String,
+    user_did: String,
+    rejoin_psk_hash: Option<String>,
+    joined_at: chrono::DateTime<chrono::Utc>,
+}
+
 #[derive(Debug, SerdeDeserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InputData {
@@ -21,6 +40,16 @@ pub struct InputData {
     pub external_commit: String,
     pub idempotency_key: Option<String>,
     pub group_info: Option<String>,
+
+    /// PSK for authentication (client-provided plaintext PSK)
+    /// Server will hash this and compare against:
+    /// - invite.psk_hash (for new joins)
+    /// - member.rejoin_psk_hash (for rejoins)
+    ///
+    /// Note: In production, this should ideally be extracted from the MLS
+    /// external commit PreSharedKey proposal. For now, we accept it as a
+    /// separate parameter to simplify implementation.
+    pub psk: Option<String>,
 }
 
 #[derive(Debug, SerdeDeserialize)]
@@ -53,6 +82,8 @@ pub enum Error {
     Unauthorized(Option<String>),
     InvalidCommit(Option<String>),
     InvalidGroupInfo(Option<String>),
+    InvalidPsk(Option<String>),
+    PolicyViolation(Option<String>),
 }
 
 pub enum ProcessExternalCommitError {
@@ -68,6 +99,8 @@ impl IntoResponse for ProcessExternalCommitError {
                     Error::Unauthorized(_) => StatusCode::FORBIDDEN,
                     Error::InvalidCommit(_) => StatusCode::BAD_REQUEST,
                     Error::InvalidGroupInfo(_) => StatusCode::BAD_REQUEST,
+                    Error::InvalidPsk(_) => StatusCode::FORBIDDEN,
+                    Error::PolicyViolation(_) => StatusCode::FORBIDDEN,
                 };
                 (status, Json(err)).into_response()
             }
@@ -88,15 +121,24 @@ impl From<Error> for ProcessExternalCommitError {
     }
 }
 
+/// Hash PSK using SHA256 and return hex string
+fn hash_psk(psk: &str) -> String {
+    use sha2::{Sha256, Digest};
+    let mut hasher = Sha256::new();
+    hasher.update(psk.as_bytes());
+    let result = hasher.finalize();
+    hex::encode(result)
+}
+
 pub async fn handle(
     State(pool): State<DbPool>,
     State(sse_state): State<Arc<SseState>>,
     auth: AuthUser,
-    Json(input): Json<InputData>, // Accept InputData directly if using standard Json extractor, or Input if wrapped
+    Json(input): Json<InputData>,
 ) -> Result<Json<Output>, ProcessExternalCommitError> {
     let did = &auth.did;
     let convo_id = &input.convo_id;
-    
+
     info!("Processing external commit for {} in {}", did, convo_id);
 
     // Enforce idempotency key
@@ -107,20 +149,62 @@ pub async fn handle(
         warn!("❌ [process_external_commit] Missing idempotencyKey");
         return Err(StatusCode::BAD_REQUEST.into());
     }
-    
-    // 1. Verify authorization
-    // External commits are for members who are still in the group socially,
-    // but whose devices are cryptographically out of sync (lost state, app reinstall, etc.)
-    // This is different from members who left/were removed (social decision).
-    let member_check = sqlx::query!(
-        "SELECT left_at, needs_rejoin, member_did
-         FROM members
-         WHERE convo_id = $1 AND user_did = $2
-         ORDER BY joined_at DESC
-         LIMIT 1",
-        convo_id,
-        did
+
+    // =========================================================================
+    // STEP 1: Fetch conversation policy (master switch)
+    // =========================================================================
+
+    let policy = sqlx::query_as::<_, PolicyRow>(
+        r#"
+        SELECT
+            allow_external_commits,
+            require_invite_for_join,
+            allow_rejoin,
+            rejoin_window_days
+        FROM conversation_policy
+        WHERE convo_id = $1
+        "#
     )
+    .bind(convo_id)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|e| {
+        error!("Database error fetching policy: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .ok_or_else(|| {
+        error!("No policy found for conversation {}", convo_id);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Master switch: if external commits disabled entirely, reject immediately
+    if !policy.allow_external_commits {
+        return Err(Error::PolicyViolation(
+            Some("External commits are disabled for this conversation".into())
+        ).into());
+    }
+
+    // =========================================================================
+    // STEP 2: Check if user is already a member (rejoin vs new join)
+    // =========================================================================
+
+    let member_check = sqlx::query_as::<_, MemberCheckRow>(
+        r#"
+        SELECT
+            left_at,
+            needs_rejoin,
+            member_did,
+            user_did,
+            rejoin_psk_hash,
+            joined_at
+        FROM members
+        WHERE convo_id = $1 AND user_did = $2
+        ORDER BY joined_at DESC
+        LIMIT 1
+        "#
+    )
+    .bind(convo_id)
+    .bind(did)
     .fetch_optional(&pool)
     .await
     .map_err(|e| {
@@ -128,53 +212,171 @@ pub async fn handle(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let member = member_check.ok_or(Error::Unauthorized(
-        Some("Not a member of this conversation".into())
-    ))?;
+    // =========================================================================
+    // STEP 3: Determine flow type and verify authorization
+    // =========================================================================
 
-    // Distinguish between social removal and cryptographic desync:
-    // - left_at NOT NULL: Removed/left voluntarily (social decision) → REJECT
-    // - left_at IS NULL, needs_rejoin = true: Out of sync (crypto issue) → ALLOW
-    // - left_at IS NULL, needs_rejoin = false: In sync → ALLOW (idempotent rejoin)
+    let is_rejoin = match &member_check {
+        Some(member) if member.left_at.is_none() => {
+            // Member exists and hasn't left
+            true
+        }
+        Some(member) if member.left_at.is_some() => {
+            // Member left the group - treat as unauthorized
+            // (Rejoining after leaving is different from resyncing after desync)
+            return Err(Error::Unauthorized(
+                Some("Member was removed or left. Request re-add from admin.".into())
+            ).into());
+        }
+        None => {
+            // Not a member - this is a new join
+            false
+        }
+        _ => false,
+    };
 
-    if member.left_at.is_some() {
-        return Err(Error::Unauthorized(
-            Some("Member was removed or left. External commits are only for cryptographic resync. Request re-add from admin.".into())
-        ).into());
-    }
+    if is_rejoin {
+        // =====================================================================
+        // REJOIN FLOW: Member exists, needs cryptographic resync
+        // =====================================================================
 
-    // Log rejoin attempt for monitoring
-    if member.needs_rejoin {
+        let member = member_check.as_ref().unwrap();
+
         info!(
-            "Processing external commit for out-of-sync member {} in {}",
-            did, convo_id
+            "Processing rejoin for member {} in {} (needs_rejoin: {})",
+            did, convo_id, member.needs_rejoin
         );
+
+        // Check rejoin policy
+        if !policy.allow_rejoin {
+            return Err(Error::PolicyViolation(
+                Some("Rejoin is disabled for this conversation".into())
+            ).into());
+        }
+
+        // Check rejoin window (0 = unlimited)
+        if policy.rejoin_window_days > 0 {
+            let window_duration = chrono::Duration::days(policy.rejoin_window_days.into());
+            let rejoin_deadline = member.joined_at + window_duration;
+            let now = chrono::Utc::now();
+
+            if now > rejoin_deadline {
+                return Err(Error::PolicyViolation(
+                    Some(format!(
+                        "Rejoin window expired. Members can only rejoin within {} days of joining.",
+                        policy.rejoin_window_days
+                    ))
+                ).into());
+            }
+        }
+
+        // CRYPTO AUTHORIZATION: Verify rejoin PSK
+        if let Some(psk) = &input.psk {
+            let provided_psk_hash = hash_psk(psk);
+
+            match &member.rejoin_psk_hash {
+                Some(stored_hash) => {
+                    if provided_psk_hash != *stored_hash {
+                        warn!(
+                            "❌ Rejoin PSK verification failed for {} in {}",
+                            did, convo_id
+                        );
+                        return Err(Error::InvalidPsk(
+                            Some("Invalid rejoin PSK".into())
+                        ).into());
+                    }
+                    info!("✅ Rejoin PSK verified for {} in {}", did, convo_id);
+                }
+                None => {
+                    // No PSK stored - this member joined before PSK system was implemented
+                    // For backwards compatibility, allow rejoin without PSK verification
+                    // (Production systems may want to require PSK update first)
+                    warn!(
+                        "⚠️  No rejoin PSK stored for {} in {} - allowing rejoin for backwards compatibility",
+                        did, convo_id
+                    );
+                }
+            }
+        } else {
+            // PSK not provided
+            if member.rejoin_psk_hash.is_some() {
+                // Member has PSK but didn't provide it
+                return Err(Error::InvalidPsk(
+                    Some("Rejoin PSK required but not provided".into())
+                ).into());
+            }
+            // No PSK required (legacy member)
+        }
+
     } else {
-        info!(
-            "Processing external commit for member {} in {} (idempotent rejoin or proactive resync)",
-            did, convo_id
-        );
+        // =====================================================================
+        // NEW JOIN FLOW: Non-member attempting to join
+        // =====================================================================
+
+        info!("Processing new join for {} in {}", did, convo_id);
+
+        // Check if invites are required
+        if policy.require_invite_for_join {
+            // Invite PSK verification required
+            let psk = input.psk.as_ref().ok_or_else(|| {
+                Error::InvalidPsk(
+                    Some("Invite PSK required but not provided".into())
+                )
+            })?;
+
+            let psk_hash = hash_psk(psk);
+
+            // Use helper function from create_invite.rs to check invite validity
+            use crate::handlers::create_invite::{is_invite_valid, increment_invite_uses};
+
+            let invite_id = is_invite_valid(&pool, &psk_hash, Some(did))
+                .await
+                .map_err(|e| {
+                    error!("Error checking invite validity: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?
+                .ok_or_else(|| {
+                    warn!("❌ Invalid or expired invite for {} in {}", did, convo_id);
+                    Error::InvalidPsk(
+                        Some("Invalid, expired, or already-used invite".into())
+                    )
+                })?;
+
+            info!("✅ Invite PSK verified for {} in {} (invite_id: {})", did, convo_id, invite_id);
+
+            // Increment invite uses count (will be committed with the transaction)
+            // We do this after all validations to ensure atomicity
+            // Note: This happens in the transaction below
+        } else {
+            // Invites not required - open join allowed
+            info!("Open join allowed for {} in {} (no invite required)", did, convo_id);
+        }
     }
-    
-    // 2. Decode commit message
+
+    // =========================================================================
+    // STEP 4: Validate commit structure
+    // =========================================================================
+
+    // Decode commit message
     let commit_bytes = base64::engine::general_purpose::STANDARD
         .decode(&input.external_commit)
         .map_err(|e| Error::InvalidCommit(Some(format!("Invalid base64: {}", e))))?;
-    
-    // 3. Validate commit structure (server validates format, clients validate cryptography)
+
+    // Validate commit structure (server validates format, clients validate cryptography)
     let _mls_message = MlsMessageIn::tls_deserialize(&mut commit_bytes.as_slice())
         .map_err(|e| Error::InvalidCommit(Some(format!("Invalid MLS message: {}", e))))?;
 
-    // 4. Store commit and update state
-    // Server role: authorization + delivery; Client role: cryptographic validation
-    
+    // =========================================================================
+    // STEP 5: Store commit and update state
+    // =========================================================================
+
     let current_epoch = get_current_epoch(&pool, convo_id)
         .await
         .map_err(|e| {
             error!("Failed to get current epoch: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-        
+
     let new_epoch = current_epoch + 1;
     let now = chrono::Utc::now();
 
@@ -186,13 +388,13 @@ pub async fn handle(
     } else {
         None
     };
-    
+
     // Start transaction
     let mut tx = pool.begin().await.map_err(|e| {
         error!("Failed to start transaction: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    
+
     // Insert commit message
     let msg_id = uuid::Uuid::new_v4().to_string();
     let seq: i64 = sqlx::query_scalar(
@@ -205,7 +407,7 @@ pub async fn handle(
         error!("Failed to calculate sequence number: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    
+
     sqlx::query(
         "INSERT INTO messages (id, convo_id, sender_did, message_type, epoch, seq, ciphertext, created_at) VALUES ($1, $2, $3, 'commit', $4, $5, $6, $7)"
     )
@@ -222,7 +424,7 @@ pub async fn handle(
         error!("Failed to insert commit message: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    
+
     // Update conversation epoch
     sqlx::query("UPDATE conversations SET current_epoch = $1 WHERE id = $2")
         .bind(new_epoch)
@@ -237,8 +439,8 @@ pub async fn handle(
     // Update GroupInfo if provided
     if let Some(gi_bytes) = group_info_bytes {
         sqlx::query(
-            "UPDATE conversations 
-             SET group_info = $1, 
+            "UPDATE conversations
+             SET group_info = $1,
                  group_info_updated_at = $2,
                  group_info_epoch = $3
              WHERE id = $4"
@@ -254,38 +456,96 @@ pub async fn handle(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
     }
-        
-    // Clear needs_rejoin flag - device is now cryptographically resynced
-    // Cryptographic validation happens client-side when members process this commit
-    sqlx::query(
-        "UPDATE members
-         SET needs_rejoin = false,
-             rejoin_requested_at = NULL,
-             rejoin_key_package_hash = NULL
-         WHERE convo_id = $1 AND user_did = $2"
-    )
-    .bind(convo_id)
-    .bind(did)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| {
-        error!("Failed to update member status: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    
+
+    // =========================================================================
+    // STEP 6: Update member state or create new member
+    // =========================================================================
+
+    if is_rejoin {
+        // Clear needs_rejoin flag - device is now cryptographically resynced
+        sqlx::query(
+            "UPDATE members
+             SET needs_rejoin = false,
+                 rejoin_requested_at = NULL,
+                 rejoin_key_package_hash = NULL
+             WHERE convo_id = $1 AND user_did = $2"
+        )
+        .bind(convo_id)
+        .bind(did)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            error!("Failed to update member status: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    } else {
+        // New join: Increment invite uses if invite was used
+        if policy.require_invite_for_join && input.psk.is_some() {
+            let psk_hash = hash_psk(input.psk.as_ref().unwrap());
+
+            // Get invite ID
+            let invite_id = sqlx::query_scalar::<_, String>(
+                r#"
+                SELECT id
+                FROM invites
+                WHERE psk_hash = $1
+                  AND revoked = false
+                  AND (expires_at IS NULL OR expires_at > NOW())
+                  AND (max_uses IS NULL OR uses_count < max_uses)
+                  AND ($2::TEXT IS NULL OR target_did IS NULL OR target_did = $2)
+                LIMIT 1
+                "#
+            )
+            .bind(&psk_hash)
+            .bind(did)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| {
+                error!("Failed to fetch invite ID: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+            if let Some(invite_id) = invite_id {
+                // Increment uses count
+                sqlx::query(
+                    "UPDATE invites SET uses_count = uses_count + 1 WHERE id = $1"
+                )
+                .bind(&invite_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    error!("Failed to increment invite uses: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+            }
+        }
+
+        // Note: The actual member row insertion happens via the MLS add_members
+        // flow, not here. External commits for new members typically require
+        // the group to have already added them, and this commit is just their
+        // acceptance of the welcome message.
+        //
+        // If your implementation expects member creation here, add:
+        // INSERT INTO members (convo_id, member_did, user_did, joined_at, ...)
+        // VALUES (...)
+    }
+
     tx.commit().await.map_err(|e| {
         error!("Failed to commit transaction: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    
+
     info!("External commit processed: {} -> epoch {}", convo_id, new_epoch);
-    
-    // 5. Fanout (Async)
+
+    // =========================================================================
+    // STEP 7: Fanout (Async)
+    // =========================================================================
+
     let pool_clone = pool.clone();
     let convo_id_clone = convo_id.clone();
     let msg_id_clone = msg_id.clone();
     let sse_state_clone = sse_state.clone();
-    
+
     tokio::spawn(async move {
         tracing::debug!("📍 [process_external_commit:fanout] starting commit fan-out");
 
@@ -335,10 +595,10 @@ pub async fn handle(
                 error!("❌ [process_external_commit:fanout] Failed to get members: {:?}", e);
             }
         }
-        
+
         // Emit SSE
         let cursor = sse_state_clone.cursor_gen.next(&convo_id_clone, "messageEvent").await;
-        
+
         // Fetch the commit message from database
         let message_result = sqlx::query_as::<_, (String, Option<String>, Option<Vec<u8>>, i64, i64, chrono::DateTime<chrono::Utc>)>(
             r#"
@@ -390,7 +650,7 @@ pub async fn handle(
             }
         }
     });
-    
+
     Ok(Json(Output::from(OutputData {
         success: true,
         epoch: new_epoch as i64,

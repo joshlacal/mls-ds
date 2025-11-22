@@ -108,8 +108,9 @@ impl ApnsClient {
             }
         }
 
+        let body = payload.to_string();
         let notification = DefaultNotificationBuilder::new()
-            .set_body(&payload.to_string())
+            .set_body(&body)
             .build(
                 device_token,
                 NotificationOptions {
