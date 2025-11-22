@@ -653,7 +653,7 @@ pub async fn resolve_report(
 // =============================================================================
 
 /// Verify user is an admin in the conversation
-async fn verify_is_admin(
+pub async fn verify_is_admin(
     pool: &PgPool,
     convo_id: &str,
     did: &str,

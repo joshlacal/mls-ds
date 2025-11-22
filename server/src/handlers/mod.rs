@@ -2,6 +2,7 @@
 mod add_members;
 mod check_blocks;
 mod create_convo;
+mod create_invite;
 mod delete_device;
 mod demote_admin;
 mod get_admin_stats;
@@ -33,12 +34,14 @@ mod resolve_report;
 mod send_message;
 mod update_cursor;
 mod update_group_info;
+mod update_policy;
 mod validate_device_state;
 
 // Re-export handlers
 pub use add_members::add_members;
 pub use check_blocks::check_blocks;
 pub use create_convo::create_convo;
+pub use create_invite::{create_invite, list_invites, revoke_invite};
 pub use delete_device::delete_device;
 pub use demote_admin::demote_admin;
 pub use get_admin_stats::get_admin_stats;
@@ -70,4 +73,5 @@ pub use report_member::report_member;
 pub use resolve_report::resolve_report;
 pub use send_message::send_message;
 pub use update_cursor::update_cursor;
+pub use update_policy::{get_policy, update_policy};
 pub use validate_device_state::validate_device_state;

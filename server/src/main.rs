@@ -327,6 +327,28 @@ async fn main() -> anyhow::Result<()> {
             "/xrpc/blue.catbird.mls.resolveReport",
             post(admin_system::resolve_report),
         )
+        // Invite management endpoints (admin only)
+        .route(
+            "/xrpc/blue.catbird.mls.createInvite",
+            post(handlers::create_invite),
+        )
+        .route(
+            "/xrpc/blue.catbird.mls.revokeInvite",
+            post(handlers::revoke_invite),
+        )
+        .route(
+            "/xrpc/blue.catbird.mls.listInvites",
+            get(handlers::list_invites),
+        )
+        // Policy management endpoints (admin only)
+        .route(
+            "/xrpc/blue.catbird.mls.updatePolicy",
+            post(handlers::update_policy),
+        )
+        .route(
+            "/xrpc/blue.catbird.mls.getPolicy",
+            get(handlers::get_policy),
+        )
         .with_state(app_state.clone());
 
     // ⚠️ SECURITY: Developer-only direct XRPC proxy - NEVER enable in production
