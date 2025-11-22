@@ -68,6 +68,7 @@ impl ApnsClient {
         ciphertext: &[u8],
         convo_id: &str,
         message_id: &str,
+        recipient_did: &str,
     ) -> Result<()> {
         // Encode ciphertext as base64 for JSON payload
         let ciphertext_b64 = base64::encode(ciphertext);
@@ -75,15 +76,40 @@ impl ApnsClient {
         debug!(
             device_token = %device_token,
             convo_id = %convo_id,
+            recipient_did = %recipient_did,
             ciphertext_size = ciphertext.len(),
             "Sending MLS message notification"
         );
 
+        // Build custom payload with all required fields for client decryption
+        let custom_data = json!({
+            "type": "mls_message",
+            "ciphertext": ciphertext_b64,
+            "convo_id": convo_id,
+            "message_id": message_id,
+            "recipient_did": recipient_did,
+        });
+
         // Build notification with custom payload
+        let mut payload = json!({
+            "aps": {
+                "content-available": 1,
+                "mutable-content": 1,
+                "sound": "default",
+            }
+        });
+
+        // Merge custom data into payload
+        if let Some(obj) = payload.as_object_mut() {
+            if let Some(custom_obj) = custom_data.as_object() {
+                for (key, value) in custom_obj {
+                    obj.insert(key.clone(), value.clone());
+                }
+            }
+        }
+
         let notification = DefaultNotificationBuilder::new()
-            .set_content_available()
-            .set_mutable_content()
-            .set_sound("default")
+            .set_body(&payload.to_string())
             .build(
                 device_token,
                 NotificationOptions {
@@ -255,15 +281,16 @@ impl NotificationService {
 
         // Send to all devices in parallel
         let mut tasks = Vec::new();
-        for (device_token, _user_did) in devices {
+        for (device_token, user_did) in devices {
             let client = Arc::clone(client);
             let convo_id = convo_id.to_string();
             let message_id = message_id.to_string();
             let ciphertext = ciphertext.to_vec();
+            let recipient_did = user_did.clone();
 
             let task = tokio::spawn(async move {
                 client
-                    .send_message_notification(&device_token, &ciphertext, &convo_id, &message_id)
+                    .send_message_notification(&device_token, &ciphertext, &convo_id, &message_id, &recipient_did)
                     .await
             });
             tasks.push(task);

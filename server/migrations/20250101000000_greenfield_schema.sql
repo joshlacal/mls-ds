@@ -489,6 +489,8 @@ CREATE TABLE devices (
     last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     platform TEXT,
     app_version TEXT,
+    push_token TEXT,
+    push_token_updated_at TIMESTAMPTZ,
     UNIQUE(user_did, device_id),
     UNIQUE(credential_did),
     UNIQUE(user_did, signature_public_key),
@@ -507,3 +509,5 @@ COMMENT ON COLUMN devices.credential_did IS 'Device-specific MLS DID (did:plc:us
 COMMENT ON COLUMN devices.device_name IS 'Human-readable device name (e.g., "Josh''s iPhone")';
 COMMENT ON COLUMN devices.signature_public_key IS 'Device signature public key for identity verification';
 COMMENT ON COLUMN devices.device_uuid IS 'Optional vendor device UUID (e.g., iOS identifierForVendor)';
+COMMENT ON COLUMN devices.push_token IS 'APNs device token (hex-encoded) for push notifications';
+COMMENT ON COLUMN devices.push_token_updated_at IS 'Timestamp when push_token was last updated';
