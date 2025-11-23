@@ -422,7 +422,7 @@ COMMENT ON TABLE schema_version IS 'Database schema version tracking';
 -- =============================================================================
 
 -- Conversation Policy (per-group settings for external commits, invites, rejoin)
-CREATE TABLE conversation_policy (
+CREATE TABLE IF NOT EXISTS conversation_policy (
     convo_id TEXT PRIMARY KEY,
 
     -- External commit controls
@@ -447,10 +447,10 @@ CREATE TABLE conversation_policy (
     CHECK (rejoin_window_days >= 0)
 );
 
-CREATE INDEX idx_conversation_policy_external_commits
+CREATE INDEX IF NOT EXISTS idx_conversation_policy_external_commits
     ON conversation_policy(allow_external_commits);
 
-CREATE INDEX idx_conversation_policy_updated
+CREATE INDEX IF NOT EXISTS idx_conversation_policy_updated
     ON conversation_policy(updated_at DESC);
 
 COMMENT ON TABLE conversation_policy IS 'Per-conversation policies for external commits, invites, and rejoin';
@@ -460,7 +460,7 @@ COMMENT ON COLUMN conversation_policy.allow_rejoin IS 'If true, former members c
 COMMENT ON COLUMN conversation_policy.rejoin_window_days IS 'Days after leaving that rejoin is allowed (0 = unlimited)';
 
 -- Invites Table (invite links with PSK authentication)
-CREATE TABLE invites (
+CREATE TABLE IF NOT EXISTS invites (
     id TEXT PRIMARY KEY,
     convo_id TEXT NOT NULL,
 
@@ -492,11 +492,11 @@ CREATE TABLE invites (
     CHECK (NOT revoked OR (revoked AND revoked_at IS NOT NULL AND revoked_by_did IS NOT NULL))
 );
 
-CREATE INDEX idx_invites_convo ON invites(convo_id);
-CREATE INDEX idx_invites_target ON invites(target_did) WHERE target_did IS NOT NULL;
-CREATE INDEX idx_invites_psk_hash ON invites(psk_hash);
+CREATE INDEX IF NOT EXISTS idx_invites_convo ON invites(convo_id);
+CREATE INDEX IF NOT EXISTS idx_invites_target ON invites(target_did) WHERE target_did IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_invites_psk_hash ON invites(psk_hash);
 
-CREATE INDEX idx_invites_active ON invites(convo_id, expires_at)
+CREATE INDEX IF NOT EXISTS idx_invites_active ON invites(convo_id, expires_at)
     WHERE revoked = false
       AND (max_uses IS NULL OR uses_count < max_uses);
 
@@ -513,13 +513,13 @@ ALTER TABLE members ADD CONSTRAINT check_rejoin_psk_hash_format
         rejoin_psk_hash ~ '^[0-9a-f]+$'
     ));
 
-CREATE INDEX idx_members_rejoin_psk ON members(rejoin_psk_hash)
+CREATE INDEX IF NOT EXISTS idx_members_rejoin_psk ON members(rejoin_psk_hash)
     WHERE rejoin_psk_hash IS NOT NULL;
 
 COMMENT ON COLUMN members.rejoin_psk_hash IS 'SHA256 hash of rejoin PSK - proves "I was a member" for database compromise protection';
 
 -- Rejoin Requests Audit Table
-CREATE TABLE rejoin_requests (
+CREATE TABLE IF NOT EXISTS rejoin_requests (
     id TEXT PRIMARY KEY,
     convo_id TEXT NOT NULL,
     member_did TEXT NOT NULL,
@@ -529,9 +529,9 @@ CREATE TABLE rejoin_requests (
     FOREIGN KEY (convo_id) REFERENCES conversations(id) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_rejoin_requests_convo ON rejoin_requests(convo_id, requested_at DESC);
-CREATE INDEX idx_rejoin_requests_member ON rejoin_requests(member_did, requested_at DESC);
-CREATE INDEX idx_rejoin_requests_auto_approved ON rejoin_requests(auto_approved, requested_at DESC);
+CREATE INDEX IF NOT EXISTS idx_rejoin_requests_convo ON rejoin_requests(convo_id, requested_at DESC);
+CREATE INDEX IF NOT EXISTS idx_rejoin_requests_member ON rejoin_requests(member_did, requested_at DESC);
+CREATE INDEX IF NOT EXISTS idx_rejoin_requests_auto_approved ON rejoin_requests(auto_approved, requested_at DESC);
 
 COMMENT ON TABLE rejoin_requests IS 'Audit trail for automatic rejoin approvals';
 
