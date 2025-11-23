@@ -100,10 +100,11 @@ CREATE INDEX idx_invites_target ON invites(target_did) WHERE target_did IS NOT N
 CREATE INDEX idx_invites_psk_hash ON invites(psk_hash);
 
 -- Active invites (commonly queried)
+-- Note: expires_at > NOW() check cannot be in index (NOW() is not IMMUTABLE)
+-- Time-based filtering must happen at query time
 CREATE INDEX idx_invites_active ON invites(convo_id, expires_at)
     WHERE revoked = false
-      AND (max_uses IS NULL OR uses_count < max_uses)
-      AND (expires_at IS NULL OR expires_at > NOW());
+      AND (max_uses IS NULL OR uses_count < max_uses);
 
 COMMENT ON TABLE invites IS 'Invite links for joining groups via external commit + PSK proof';
 COMMENT ON COLUMN invites.psk_hash IS 'SHA256 hash of invite PSK - server stores hash only, client provides plaintext PSK in external commit';
