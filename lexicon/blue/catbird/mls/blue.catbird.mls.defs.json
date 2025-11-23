@@ -90,7 +90,7 @@
     "messageView": {
       "type": "object",
       "description": "View of an encrypted MLS message. Server follows 'dumb delivery service' model - sender identity must be derived by clients from decrypted MLS content for metadata privacy. Server GUARANTEES: (1) Sequential (epoch, seq) assignment per conversation, (2) Monotonic seq increment, (3) No seq reuse. Clients MUST process messages in (epoch ASC, seq ASC) order for correct MLS decryption.",
-      "required": ["id", "convoId", "ciphertext", "epoch", "seq", "createdAt"],
+      "required": ["id", "convoId", "ciphertext", "epoch", "seq", "createdAt", "messageType"],
       "properties": {
         "id": { "type": "string", "description": "Message identifier (ULID for deduplication)" },
         "convoId": { "type": "string", "description": "Conversation identifier" },
@@ -101,7 +101,12 @@
           "minimum": 0,
           "description": "Monotonically increasing sequence number within conversation. Server assigns sequentially starting from 1. Gaps may occur when members are removed from the conversation, but seq values are never reused."
         },
-        "createdAt": { "type": "string", "format": "datetime", "description": "Message creation timestamp (bucketed to 2-second intervals for traffic analysis protection)" }
+        "createdAt": { "type": "string", "format": "datetime", "description": "Message creation timestamp (bucketed to 2-second intervals for traffic analysis protection)" },
+        "messageType": {
+          "type": "string",
+          "enum": ["app", "commit"],
+          "description": "Message type discriminator: 'app' for application messages (user content), 'commit' for MLS protocol control messages (epoch changes, membership updates). Clients should process both types for MLS state tracking but only display 'app' messages in the UI."
+        }
       }
     },
 

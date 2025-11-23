@@ -103,6 +103,9 @@ pub struct MessageView {
     pub seq: i64,
     /// Message creation timestamp (bucketed to 2-second intervals for traffic analysis protection)
     pub created_at: DateTime<Utc>,
+    /// Message type: 'app' for application messages, 'commit' for MLS protocol control messages
+    #[serde(rename = "messageType")]
+    pub message_type: String,
 }
 
 /// Reference to an MLS key package for adding members
