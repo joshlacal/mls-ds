@@ -8,6 +8,7 @@ use crate::{
 };
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RegisterDeviceTokenInput {
     pub device_id: String,
     pub push_token: String,
@@ -78,6 +79,7 @@ pub async fn register_device_token(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UnregisterDeviceTokenInput {
     pub device_id: String,
 }
