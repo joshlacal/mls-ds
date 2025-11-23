@@ -94,8 +94,9 @@ pub async fn get_messages(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    // Convert to view models with ciphertext
+    // Convert to view models with ciphertext and message_type
     // Note: sender field removed per security hardening - clients derive sender from decrypted MLS content
+    // message_type is included so clients can distinguish 'app' messages from 'commit' messages
     let message_views: Vec<MessageView> = messages
         .into_iter()
         .map(|m| MessageView {
@@ -105,6 +106,7 @@ pub async fn get_messages(
             epoch: m.epoch,
             seq: m.seq,
             created_at: m.created_at,
+            message_type: m.message_type,
         })
         .collect();
 
