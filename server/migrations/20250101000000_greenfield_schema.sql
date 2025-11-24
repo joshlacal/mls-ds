@@ -270,13 +270,26 @@ CREATE TABLE reports (
     convo_id TEXT NOT NULL,
     reporter_did TEXT NOT NULL,
     reported_did TEXT NOT NULL,
+    category TEXT NOT NULL CHECK (category IN (
+        'harassment',
+        'spam',
+        'hate_speech',
+        'violence',
+        'sexual_content',
+        'impersonation',
+        'privacy_violation',
+        'other'
+    )),
     encrypted_content BYTEA NOT NULL,
+    message_ids TEXT[],
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     status TEXT NOT NULL DEFAULT 'pending'
         CHECK (status IN ('pending', 'resolved', 'dismissed')),
     resolved_by_did TEXT,
     resolved_at TIMESTAMPTZ,
-    resolution_action TEXT,
+    resolution_action TEXT
+        CHECK (resolution_action IN ('removed_member', 'dismissed', 'no_action')),
+    resolution_notes TEXT,
     FOREIGN KEY (convo_id) REFERENCES conversations(id) ON DELETE CASCADE
 );
 
@@ -284,10 +297,54 @@ CREATE INDEX idx_reports_convo ON reports(convo_id);
 CREATE INDEX idx_reports_reporter ON reports(reporter_did);
 CREATE INDEX idx_reports_reported ON reports(reported_did);
 CREATE INDEX idx_reports_status ON reports(status, created_at DESC);
+CREATE INDEX idx_reports_category ON reports(category);
 
 COMMENT ON TABLE reports IS 'E2EE member reports - content encrypted with MLS group key, only admins decrypt';
-COMMENT ON COLUMN reports.encrypted_content IS 'Encrypted report details (reason, evidence) - uses MLS group key';
-COMMENT ON COLUMN reports.resolution_action IS 'What action was taken (removed, warned, dismissed)';
+COMMENT ON COLUMN reports.category IS 'Report category: harassment, spam, hate_speech, violence, sexual_content, impersonation, privacy_violation, other';
+COMMENT ON COLUMN reports.encrypted_content IS 'Encrypted report details (reason, evidence) - uses MLS group key (max 50KB)';
+COMMENT ON COLUMN reports.message_ids IS 'Array of message IDs referenced in report (max 20)';
+COMMENT ON COLUMN reports.resolution_action IS 'Action taken: removed_member, dismissed, or no_action';
+COMMENT ON COLUMN reports.resolution_notes IS 'Admin notes on resolution (max 1000 chars enforced by application)';
+
+-- Admin Actions Audit Log (immutable record of admin operations)
+CREATE TABLE admin_actions (
+    id TEXT PRIMARY KEY,
+    convo_id TEXT NOT NULL,
+    actor_did TEXT NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('promote', 'demote', 'remove')),
+    target_did TEXT,
+    reason TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    FOREIGN KEY (convo_id) REFERENCES conversations(id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_admin_actions_convo ON admin_actions(convo_id, created_at DESC);
+CREATE INDEX idx_admin_actions_actor ON admin_actions(actor_did, created_at DESC);
+CREATE INDEX idx_admin_actions_target ON admin_actions(target_did) WHERE target_did IS NOT NULL;
+
+COMMENT ON TABLE admin_actions IS 'Immutable audit log of all admin actions';
+COMMENT ON COLUMN admin_actions.actor_did IS 'DID of admin who performed the action';
+COMMENT ON COLUMN admin_actions.action IS 'Type of action: promote, demote, or remove';
+COMMENT ON COLUMN admin_actions.target_did IS 'DID of member affected by the action';
+COMMENT ON COLUMN admin_actions.reason IS 'Optional justification for the action';
+
+-- Bluesky Blocks (synced from AT Protocol)
+CREATE TABLE bsky_blocks (
+    user_did TEXT NOT NULL,
+    target_did TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'bsky',
+    synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (user_did, target_did)
+);
+
+CREATE INDEX idx_bsky_blocks_user ON bsky_blocks(user_did);
+CREATE INDEX idx_bsky_blocks_target ON bsky_blocks(target_did);
+
+COMMENT ON TABLE bsky_blocks IS 'Bluesky block relationships synced from AT Protocol';
+COMMENT ON COLUMN bsky_blocks.user_did IS 'DID of user who blocked (blocker)';
+COMMENT ON COLUMN bsky_blocks.target_did IS 'DID of user who was blocked';
+COMMENT ON COLUMN bsky_blocks.source IS 'Source of block: bsky (synced from Bluesky) or manual';
+COMMENT ON COLUMN bsky_blocks.synced_at IS 'When this block was last synced from Bluesky';
 
 -- =============================================================================
 -- Message Delivery & Events

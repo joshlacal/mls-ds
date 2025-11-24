@@ -1,6 +1,10 @@
 // =============================================================================
 // Admin System for MLS E2EE Group Chat
 // =============================================================================
+// ⚠️ DEPRECATED: Most handler functions have been moved to handlers/ directory
+// ⚠️ This module is kept only for the verify_is_admin() utility function
+// ⚠️ All route handlers now use handlers/promote_admin.rs, handlers/demote_admin.rs, etc.
+// =============================================================================
 // Server enforces admin permissions but does NOT see admin roster
 // Admin roster is distributed encrypted via MLS control messages
 //
