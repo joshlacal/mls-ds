@@ -305,27 +305,31 @@ async fn main() -> anyhow::Result<()> {
     let admin_router = Router::new()
         .route(
             "/xrpc/blue.catbird.mls.promoteAdmin",
-            post(admin_system::promote_admin),
+            post(handlers::promote_admin),
         )
         .route(
             "/xrpc/blue.catbird.mls.demoteAdmin",
-            post(admin_system::demote_admin),
+            post(handlers::demote_admin),
         )
         .route(
             "/xrpc/blue.catbird.mls.removeMember",
-            post(admin_system::remove_member),
+            post(handlers::remove_member),
+        )
+        .route(
+            "/xrpc/blue.catbird.mls.getAdminStats",
+            get(handlers::get_admin_stats),
         )
         .route(
             "/xrpc/blue.catbird.mls.reportMember",
-            post(admin_system::report_member),
+            post(handlers::report_member),
         )
         .route(
             "/xrpc/blue.catbird.mls.getReports",
-            get(admin_system::get_reports),
+            get(handlers::get_reports),
         )
         .route(
             "/xrpc/blue.catbird.mls.resolveReport",
-            post(admin_system::resolve_report),
+            post(handlers::resolve_report),
         )
         // Invite management endpoints (admin only)
         .route(
