@@ -90,7 +90,7 @@
     "messageView": {
       "type": "object",
       "description": "View of an encrypted MLS message. Server follows 'dumb delivery service' model - sender identity must be derived by clients from decrypted MLS content for metadata privacy. Server GUARANTEES: (1) Sequential (epoch, seq) assignment per conversation, (2) Monotonic seq increment, (3) No seq reuse. Clients MUST process messages in (epoch ASC, seq ASC) order for correct MLS decryption.",
-      "required": ["id", "convoId", "ciphertext", "epoch", "seq", "createdAt", "messageType"],
+      "required": ["id", "convoId", "ciphertext", "epoch", "seq", "createdAt"],
       "properties": {
         "id": { "type": "string", "description": "Message identifier (ULID for deduplication)" },
         "convoId": { "type": "string", "description": "Conversation identifier" },

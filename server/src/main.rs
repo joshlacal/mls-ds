@@ -285,6 +285,19 @@ async fn main() -> anyhow::Result<()> {
             "/xrpc/blue.catbird.mls.handleBlockChange",
             post(handlers::handle_block_change),
         )
+        // Opt-in endpoints
+        .route(
+            "/xrpc/blue.catbird.mls.optIn",
+            post(handlers::opt_in),
+        )
+        .route(
+            "/xrpc/blue.catbird.mls.optOut",
+            post(handlers::opt_out),
+        )
+        .route(
+            "/xrpc/blue.catbird.mls.getOptInStatus",
+            get(handlers::get_opt_in_status),
+        )
         // Hybrid messaging endpoints
         .route(
             "/xrpc/blue.catbird.mls.streamConvoEvents",
@@ -293,6 +306,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/xrpc/blue.catbird.mls.updateCursor",
             post(handlers::update_cursor),
+        )
+        .route(
+            "/xrpc/blue.catbird.mls.updateRead",
+            post(handlers::update_read),
         )
         .merge(metrics_router)
         .layer(TraceLayer::new_for_http())
@@ -334,6 +351,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/xrpc/blue.catbird.mls.resolveReport",
             post(handlers::resolve_report),
+        )
+        .route(
+            "/xrpc/blue.catbird.mls.warnMember",
+            post(handlers::warn_member),
         )
         // Invite management endpoints (admin only)
         .route(

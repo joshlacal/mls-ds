@@ -56,14 +56,24 @@ pub async fn create_convo(
         ))).into());
     }
 
-    // Validate initial members
+    // Validate initial members count
+    // Default max_members is 1000, but can be configured per-conversation policy
+    // Note: Policy doesn't exist yet at creation time, so we use a default limit here
+    // The actual policy.max_members will be set when the policy is created (via trigger)
     if let Some(ref members) = input.initial_members {
-    tracing::debug!("📍 [create_convo] validating initial members");
-        if members.len() > 100 {
-            warn!("❌ [create_convo] Too many initial members: {}", members.len());
+        tracing::debug!("📍 [create_convo] validating initial members");
+        // Total count includes creator + initial members
+        let total_member_count = members.len() + 1;
+
+        // Use default max of 1000 for creation (policy doesn't exist yet)
+        // This can be lowered later via updatePolicy, but not during creation
+        let max_members = 1000;
+
+        if total_member_count > max_members {
+            warn!("❌ [create_convo] Too many initial members: {} (max {})", total_member_count, max_members);
             return Err(Error::TooManyMembers(Some(format!(
-                "Cannot add more than 100 initial members (got {})",
-                members.len()
+                "Cannot add more than {} initial members (got {} including creator)",
+                max_members, total_member_count
             ))).into());
         }
     }

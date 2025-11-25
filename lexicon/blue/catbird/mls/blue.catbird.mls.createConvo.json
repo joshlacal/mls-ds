@@ -39,8 +39,8 @@
                 "type": "string",
                 "format": "did"
               },
-              "description": "DIDs of initial members to add to the conversation",
-              "maxLength": 100,
+              "description": "DIDs of initial members to add to the conversation (max 999 excluding creator, default policy allows up to 1000 total)",
+              "maxLength": 999,
               "minLength": 0
             },
             "welcomeMessage": {
@@ -87,7 +87,7 @@
         },
         {
           "name": "TooManyMembers",
-          "description": "Too many initial members specified (max 100)"
+          "description": "Too many initial members specified (default max 1000 total including creator, configurable per-conversation via policy)"
         },
         {
           "name": "MutualBlockDetected",

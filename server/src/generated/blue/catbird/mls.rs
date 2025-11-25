@@ -33,3 +33,4 @@ pub mod resolve_report;
 pub mod send_message;
 pub mod stream_convo_events;
 pub mod validate_welcome;
+pub mod warn_member;

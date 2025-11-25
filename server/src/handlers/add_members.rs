@@ -57,6 +57,42 @@ pub async fn add_members(
     // Note: Reduced logging per security hardening - no convo IDs at info level
     tracing::debug!("Adding {} members to convo {}", input.did_list.len(), crate::crypto::redact_for_log(&input.convo_id));
 
+    // Check max_members limit before adding members
+    // Query current member count and max_members from policy
+    let (current_count, max_members): (i64, i32) = sqlx::query_as(
+        r#"
+        SELECT
+            CAST(COUNT(DISTINCT m.member_did) AS BIGINT) as current_count,
+            COALESCE(p.max_members, 1000) as max_members
+        FROM members m
+        LEFT JOIN conversation_policy p ON m.convo_id = p.convo_id
+        WHERE m.convo_id = $1 AND m.left_at IS NULL
+        GROUP BY p.max_members
+        "#
+    )
+    .bind(&input.convo_id)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|e| {
+        error!("Failed to check member count and max_members: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .unwrap_or((0, 1000)); // Default to 0 current members and 1000 max if conversation not found
+
+    tracing::debug!("Current members: {}, max allowed: {}, attempting to add: {}",
+                    current_count, max_members, input.did_list.len());
+
+    // Check if adding new members would exceed max_members
+    let new_total = current_count as usize + input.did_list.len();
+    if new_total > max_members as usize {
+        warn!("❌ [add_members] Would exceed max_members: current={}, adding={}, max={}",
+              current_count, input.did_list.len(), max_members);
+        return Err(Error::TooManyMembers(Some(format!(
+            "Adding {} members would exceed maximum of {} members (current: {})",
+            input.did_list.len(), max_members, current_count
+        ))).into());
+    }
+
     // Enforce idempotency key for write endpoints unless explicitly disabled
     let require_idem = std::env::var("REQUIRE_IDEMPOTENCY")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))

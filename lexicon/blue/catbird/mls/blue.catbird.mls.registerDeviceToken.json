@@ -9,7 +9,7 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["deviceId", "pushToken", "platform"],
+          "required": ["deviceId", "pushToken"],
           "properties": {
             "deviceId": {
               "type": "string",
