@@ -72,6 +72,10 @@
           "type": "boolean",
           "description": "Whether this member (device) has admin privileges. Admin status is synced across all devices of the same user."
         },
+        "isModerator": {
+          "type": "boolean",
+          "description": "Whether this member has moderator privileges. Moderators can warn members and view reports but cannot promote/demote others."
+        },
         "promotedAt": {
           "type": "string",
           "format": "datetime",

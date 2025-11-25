@@ -770,6 +770,47 @@ pub async fn count_admins(
     })
 }
 
+/// Check if a user is a moderator (or admin) of a conversation
+///
+/// Admins have moderator privileges, so this returns true for both admins and moderators.
+///
+/// # Errors
+/// Returns an error if:
+/// - Database query fails
+/// - User is not a member or doesn't have moderator/admin privileges
+pub async fn verify_is_moderator_or_admin(
+    pool: &crate::storage::DbPool,
+    convo_id: &str,
+    user_did: &str,
+) -> Result<(), StatusCode> {
+    let result: Option<(bool, bool)> = sqlx::query_as(
+        "SELECT is_admin, COALESCE(is_moderator, false)
+         FROM members
+         WHERE convo_id = $1 AND (member_did = $2 OR user_did = $2) AND left_at IS NULL
+         LIMIT 1"
+    )
+    .bind(convo_id)
+    .bind(user_did)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to check moderator status: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    match result {
+        Some((is_admin, is_moderator)) if is_admin || is_moderator => Ok(()),
+        Some(_) => {
+            tracing::warn!("User is not a moderator or admin of conversation");
+            Err(StatusCode::FORBIDDEN)
+        }
+        None => {
+            tracing::warn!("User is not a member of conversation");
+            Err(StatusCode::NOT_FOUND)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

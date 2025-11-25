@@ -85,6 +85,8 @@ pub struct Membership {
     pub is_admin: bool,
     pub promoted_at: Option<chrono::DateTime<chrono::Utc>>,
     pub promoted_by_did: Option<String>,
+    // Moderator fields
+    pub is_moderator: bool,
     // Rejoin support fields
     pub needs_rejoin: bool,
     pub rejoin_requested_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -140,6 +142,7 @@ impl Membership {
             device_name: self.device_name.clone(),
             joined_at: crate::sqlx_atrium::chrono_to_datetime(self.joined_at),
             is_admin: self.is_admin,
+            is_moderator: self.is_moderator,
             leaf_index: self.leaf_index.map(|i| i as usize),
             credential: None,
             promoted_at: self.promoted_at.map(crate::sqlx_atrium::chrono_to_datetime),
