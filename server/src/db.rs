@@ -107,6 +107,10 @@ pub async fn get_conversation(pool: &DbPool, convo_id: &str) -> Result<Option<Co
 }
 
 /// List conversations for a user (active memberships only)
+///
+/// Handles both single-device (legacy) and multi-device modes:
+/// - Accepts base user DID or device MLS DID in `member_did` parameter
+/// - Matches against either `member_did` OR `user_did` columns
 pub async fn list_conversations(
     pool: &DbPool,
     member_did: &str,
@@ -118,7 +122,7 @@ pub async fn list_conversations(
         SELECT c.id, c.creator_did, c.current_epoch, c.created_at, c.updated_at, c.name as title
         FROM conversations c
         INNER JOIN members m ON c.id = m.convo_id
-        WHERE m.member_did = $1 AND m.left_at IS NULL
+        WHERE (m.member_did = $1 OR m.user_did = $1) AND m.left_at IS NULL
         ORDER BY c.created_at DESC
         LIMIT $2 OFFSET $3
         "#,
@@ -226,12 +230,18 @@ pub async fn remove_member(pool: &DbPool, convo_id: &str, member_did: &str) -> R
 }
 
 /// Check if a user is an active member of a conversation
+///
+/// Handles both single-device (legacy) and multi-device modes:
+/// - Accepts base user DID (e.g., `did:plc:abc123`) or device MLS DID (e.g., `did:plc:abc123#device-xyz`)
+/// - In multi-device mode, members are stored with device MLS DIDs in `member_did` column
+/// - The `user_did` column stores the base DID (without device fragment) for all devices
+/// - Returns true if the DID matches either `member_did` OR `user_did`
 pub async fn is_member(pool: &DbPool, did: &str, convo_id: &str) -> Result<bool> {
     let count = sqlx::query_scalar::<_, i64>(
         r#"
-        SELECT COUNT(*) 
-        FROM members 
-        WHERE member_did = $1 AND convo_id = $2 AND left_at IS NULL
+        SELECT COUNT(*)
+        FROM members
+        WHERE (member_did = $1 OR user_did = $1) AND convo_id = $2 AND left_at IS NULL
         "#,
     )
     .bind(did)

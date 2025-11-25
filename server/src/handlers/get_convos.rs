@@ -18,11 +18,13 @@ pub async fn get_convos(
     info!("Fetching conversations for user");
 
     // Get all active memberships for the user
+    // In multi-device mode, members are stored with device MLS DIDs (e.g., did:plc:abc123#device-xyz)
+    // but auth DID is the base user DID (e.g., did:plc:abc123), so we check user_did OR member_did
     let memberships = sqlx::query_as::<_, Membership>(
         "SELECT convo_id, member_did, user_did, device_id, device_name, joined_at, left_at, unread_count, last_read_at,
                 is_admin, promoted_at, promoted_by_did, leaf_index,
                 needs_rejoin, rejoin_requested_at, rejoin_key_package_hash
-         FROM members WHERE member_did = $1 AND left_at IS NULL ORDER BY joined_at DESC"
+         FROM members WHERE (member_did = $1 OR user_did = $1) AND left_at IS NULL ORDER BY joined_at DESC"
     )
     .bind(did)
     .fetch_all(&pool)

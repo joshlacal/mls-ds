@@ -268,6 +268,10 @@ async fn main() -> anyhow::Result<()> {
             "/xrpc/blue.catbird.mls.getWelcome",
             get(handlers::get_welcome),
         )
+        .route(
+            "/xrpc/blue.catbird.mls.requestRejoin",
+            post(handlers::request_rejoin),
+        )
         // Bluesky blocks integration endpoints
         .route(
             "/xrpc/blue.catbird.mls.checkBlocks",

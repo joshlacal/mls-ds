@@ -261,9 +261,10 @@ pub async fn send_message(
         tracing::debug!("send_message message created: msgId={}, seq={}, epoch={}", crate::crypto::redact_for_log(&msg_id), seq, epoch);
 
         tracing::debug!("📍 [send_message] updating unread counts");
-        // Update unread counts for other members
+        // Update unread counts for all members except sender's devices
+        // In multi-device mode, user_did is the base DID, so this excludes all sender's devices
         sqlx::query(
-            "UPDATE members SET unread_count = unread_count + 1 WHERE convo_id = $1 AND member_did != $2 AND left_at IS NULL"
+            "UPDATE members SET unread_count = unread_count + 1 WHERE convo_id = $1 AND user_did != $2 AND left_at IS NULL"
         )
         .bind(&input.convo_id)
         .bind(&auth_user.did)

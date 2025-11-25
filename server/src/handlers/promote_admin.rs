@@ -33,10 +33,12 @@ pub async fn promote_admin(
     // Verify target is a member
     verify_is_member(&pool, &input.convo_id, input.target_did.as_str()).await?;
 
-    // Check if target is already an admin
+    // Check if target is already an admin (check any of their devices)
+    // In multi-device mode, all devices of a user share the same admin status
     let is_already_admin: bool = sqlx::query_scalar(
         "SELECT is_admin FROM members
-         WHERE convo_id = $1 AND member_did = $2 AND left_at IS NULL"
+         WHERE convo_id = $1 AND user_did = $2 AND left_at IS NULL
+         LIMIT 1"
     )
     .bind(&input.convo_id)
     .bind(input.target_did.as_str())
@@ -54,11 +56,12 @@ pub async fn promote_admin(
 
     let now = chrono::Utc::now();
 
-    // Promote member to admin
+    // Promote member to admin (updates ALL devices of this user)
+    // In multi-device mode, admin status applies to the user, not individual devices
     sqlx::query(
         "UPDATE members
          SET is_admin = true, promoted_at = $3, promoted_by_did = $4
-         WHERE convo_id = $1 AND member_did = $2 AND left_at IS NULL"
+         WHERE convo_id = $1 AND user_did = $2 AND left_at IS NULL"
     )
     .bind(&input.convo_id)
     .bind(input.target_did.as_str())

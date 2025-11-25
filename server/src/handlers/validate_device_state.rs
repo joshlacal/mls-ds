@@ -179,14 +179,14 @@ pub async fn validate_device_state(
 
 /// Count expected conversations (all conversations the user is a member of)
 async fn count_expected_conversations(pool: &DbPool, user_did: &str) -> anyhow::Result<i64> {
-    let count = sqlx::query_scalar!(
+    let count = sqlx::query_scalar::<_, i64>(
         r#"
-        SELECT COUNT(DISTINCT convo_id) as "count!"
+        SELECT COUNT(DISTINCT convo_id)
         FROM members
-        WHERE member_did = $1 AND left_at IS NULL
-        "#,
-        user_did
+        WHERE (member_did = $1 OR user_did = $1) AND left_at IS NULL
+        "#
     )
+    .bind(user_did)
     .fetch_one(pool)
     .await?;
 
@@ -203,14 +203,14 @@ async fn count_actual_conversations(pool: &DbPool, user_did: &str) -> anyhow::Re
 
 /// Count active devices for a user
 async fn count_active_devices(pool: &DbPool, user_did: &str) -> anyhow::Result<i64> {
-    let count = sqlx::query_scalar!(
+    let count = sqlx::query_scalar::<_, i64>(
         r#"
-        SELECT COUNT(*) as "count!"
+        SELECT COUNT(*)
         FROM devices
         WHERE user_did = $1
-        "#,
-        user_did
+        "#
     )
+    .bind(user_did)
     .fetch_one(pool)
     .await?;
 
@@ -219,15 +219,18 @@ async fn count_active_devices(pool: &DbPool, user_did: &str) -> anyhow::Result<i
 
 /// Get pending rejoin requests for a user
 async fn get_pending_rejoin_requests(pool: &DbPool, user_did: &str) -> anyhow::Result<Vec<String>> {
-    let convo_ids = sqlx::query_scalar!(
+    // Note: rejoin_requests.member_did is the device-specific DID, but we want to match by base user DID
+    // since the rejoin request is for the user, not a specific device
+    let convo_ids = sqlx::query_scalar::<_, String>(
         r#"
-        SELECT convo_id
-        FROM rejoin_requests
-        WHERE member_did = $1
-        ORDER BY requested_at DESC
-        "#,
-        user_did
+        SELECT DISTINCT rr.convo_id
+        FROM rejoin_requests rr
+        LEFT JOIN members m ON rr.convo_id = m.convo_id AND rr.member_did = m.member_did
+        WHERE rr.member_did = $1 OR m.user_did = $1
+        ORDER BY rr.convo_id DESC
+        "#
     )
+    .bind(user_did)
     .fetch_all(pool)
     .await?;
 
@@ -237,15 +240,15 @@ async fn get_pending_rejoin_requests(pool: &DbPool, user_did: &str) -> anyhow::R
 /// Count expired key packages for a user
 async fn count_expired_key_packages(pool: &DbPool, user_did: &str) -> anyhow::Result<i64> {
     let now = chrono::Utc::now();
-    let count = sqlx::query_scalar!(
+    let count = sqlx::query_scalar::<_, i64>(
         r#"
-        SELECT COUNT(*) as "count!"
+        SELECT COUNT(*)
         FROM key_packages
         WHERE owner_did = $1 AND expires_at < $2 AND consumed_at IS NULL
-        "#,
-        user_did,
-        now
+        "#
     )
+    .bind(user_did)
+    .bind(now)
     .fetch_one(pool)
     .await?;
 

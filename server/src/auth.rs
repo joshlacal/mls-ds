@@ -682,9 +682,12 @@ pub async fn verify_is_admin(
     convo_id: &str,
     user_did: &str,
 ) -> Result<(), StatusCode> {
+    // In multi-device mode, user_did from JWT is base DID but members.member_did is device DID
+    // Check both member_did and user_did columns to support both modes
     let is_admin: Option<bool> = sqlx::query_scalar(
         "SELECT is_admin FROM members
-         WHERE convo_id = $1 AND member_did = $2 AND left_at IS NULL"
+         WHERE convo_id = $1 AND (member_did = $2 OR user_did = $2) AND left_at IS NULL
+         LIMIT 1"
     )
     .bind(convo_id)
     .bind(user_did)
@@ -710,6 +713,10 @@ pub async fn verify_is_admin(
 
 /// Check if a user is a member of a conversation
 ///
+/// Handles both single-device (legacy) and multi-device modes:
+/// - In multi-device mode, user_did from JWT is base DID but members.member_did is device DID
+/// - Checks both member_did and user_did columns to support both modes
+///
 /// # Errors
 /// Returns an error if:
 /// - Database query fails
@@ -722,7 +729,7 @@ pub async fn verify_is_member(
     let is_member: bool = sqlx::query_scalar(
         "SELECT EXISTS(
             SELECT 1 FROM members
-            WHERE convo_id = $1 AND member_did = $2 AND left_at IS NULL
+            WHERE convo_id = $1 AND (member_did = $2 OR user_did = $2) AND left_at IS NULL
         )"
     )
     .bind(convo_id)

@@ -804,9 +804,10 @@ impl ConversationActorState {
 
         debug!("Message stored with sequence number {}", seq);
 
-        // Update unread counts for all members except sender in database
+        // Update unread counts for all members except sender's devices in database
+        // In multi-device mode, user_did is the base DID, so this excludes all sender's devices
         sqlx::query(
-            "UPDATE members SET unread_count = unread_count + 1 WHERE convo_id = $1 AND member_did != $2 AND left_at IS NULL"
+            "UPDATE members SET unread_count = unread_count + 1 WHERE convo_id = $1 AND user_did != $2 AND left_at IS NULL"
         )
         .bind(&self.convo_id)
         .bind(&sender_did)
@@ -903,25 +904,27 @@ impl ConversationActorState {
             self.convo_id, sender_did
         );
 
-        // Get all active members
-        let members_result = sqlx::query!(
+        // Get all active members with their user_did to properly exclude sender's devices
+        let members_result = sqlx::query_as::<_, (String, Option<String>)>(
             r#"
-            SELECT member_did
+            SELECT member_did, user_did
             FROM members
             WHERE convo_id = $1 AND left_at IS NULL
-            "#,
-            &self.convo_id
+            "#
         )
+        .bind(&self.convo_id)
         .fetch_all(&self.db_pool)
         .await;
 
         match members_result {
             Ok(members) => {
                 let member_count = members.len();
-                // Increment in-memory counter for all members except sender
-                for member in members {
-                    if member.member_did != sender_did {
-                        let count = self.unread_counts.entry(member.member_did.clone()).or_insert(0);
+                // Increment in-memory counter for all members except sender's devices
+                // In multi-device mode, we exclude all devices where user_did matches sender_did
+                for (member_did, user_did) in members {
+                    let is_sender_device = user_did.as_ref().map_or(false, |uid| uid == &sender_did);
+                    if !is_sender_device {
+                        let count = self.unread_counts.entry(member_did.clone()).or_insert(0);
                         *count += 1;
 
                         // Optional: flush to database every N increments (e.g., every 10 messages)
@@ -930,7 +933,7 @@ impl ConversationActorState {
                                 "UPDATE members SET unread_count = unread_count + 10 WHERE convo_id = $1 AND member_did = $2"
                             )
                             .bind(&self.convo_id)
-                            .bind(&member.member_did)
+                            .bind(&member_did)
                             .execute(&self.db_pool)
                             .await {
                                 tracing::warn!("Failed to sync unread count to database: {}", e);
@@ -974,13 +977,13 @@ impl ConversationActorState {
         use anyhow::Context;
 
         info!(
-            "Resetting unread count for member {} in conversation {}",
+            "Resetting unread count for user {} in conversation {}",
             member_did, self.convo_id
         );
 
-        // Reset in database immediately
+        // Reset in database immediately for all devices of this user
         sqlx::query(
-            "UPDATE members SET unread_count = 0 WHERE convo_id = $1 AND member_did = $2"
+            "UPDATE members SET unread_count = 0 WHERE convo_id = $1 AND user_did = $2 AND left_at IS NULL"
         )
         .bind(&self.convo_id)
         .bind(&member_did)
@@ -988,11 +991,24 @@ impl ConversationActorState {
         .await
         .context("Failed to reset unread count in database")?;
 
-        // Reset in-memory counter
-        self.unread_counts.insert(member_did.clone(), 0);
+        // Reset in-memory counter for all devices of this user
+        // Note: member_did here is the user DID, so we need to reset all device DIDs
+        // Get all device DIDs for this user in this conversation
+        let device_dids = sqlx::query_scalar::<_, String>(
+            "SELECT member_did FROM members WHERE convo_id = $1 AND user_did = $2 AND left_at IS NULL"
+        )
+        .bind(&self.convo_id)
+        .bind(&member_did)
+        .fetch_all(&self.db_pool)
+        .await
+        .context("Failed to fetch device DIDs")?;
+
+        for device_did in device_dids {
+            self.unread_counts.insert(device_did, 0);
+        }
 
         info!(
-            "Unread count reset for member {} in conversation {}",
+            "Unread count reset for user {} in conversation {}",
             member_did, self.convo_id
         );
 
