@@ -40,10 +40,11 @@ pub async fn remove_member(
 
     let now = chrono::Utc::now();
 
-    // Soft delete member (set left_at)
+    // Soft delete member (set left_at for ALL devices of this user)
+    // In multi-device mode, this removes all devices belonging to the target user
     let affected_rows = sqlx::query(
         "UPDATE members SET left_at = $3
-         WHERE convo_id = $1 AND member_did = $2 AND left_at IS NULL"
+         WHERE convo_id = $1 AND user_did = $2 AND left_at IS NULL"
     )
     .bind(&input.convo_id)
     .bind(input.target_did.as_str())

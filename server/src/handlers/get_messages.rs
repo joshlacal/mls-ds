@@ -146,7 +146,7 @@ pub async fn get_messages(
         tracing::debug!("Using legacy database approach for reset unread count");
 
         sqlx::query(
-            "UPDATE members SET unread_count = 0 WHERE convo_id = $1 AND member_did = $2"
+            "UPDATE members SET unread_count = 0 WHERE convo_id = $1 AND user_did = $2 AND left_at IS NULL"
         )
         .bind(&params.convo_id)
         .bind(did)
