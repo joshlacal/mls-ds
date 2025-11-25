@@ -34,6 +34,7 @@ pub struct UpdatePolicyInput {
     pub allow_rejoin: Option<bool>,
     pub rejoin_window_days: Option<i32>,
     pub prevent_removing_last_admin: Option<bool>,
+    pub max_members: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -51,6 +52,7 @@ pub struct PolicyView {
     pub allow_rejoin: bool,
     pub rejoin_window_days: i32,
     pub prevent_removing_last_admin: bool,
+    pub max_members: i32,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -117,6 +119,38 @@ pub async fn update_policy(
         }
     }
 
+    // Validate max_members if provided
+    if let Some(max_members) = input.max_members {
+        if max_members < 2 || max_members > 10000 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "max_members must be between 2 and 10000".to_string(),
+            ));
+        }
+
+        // Check current member count - cannot set max_members below current count
+        let current_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM members WHERE convo_id = $1 AND left_at IS NULL"
+        )
+        .bind(&input.convo_id)
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| {
+            error!("Failed to get current member count: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Database error".to_string())
+        })?;
+
+        if (current_count as i32) > max_members {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Cannot set max_members to {} when conversation has {} members. Remove members first.",
+                    max_members, current_count
+                ),
+            ));
+        }
+    }
+
     // Step 3: Build dynamic UPDATE query
     let mut updates = Vec::new();
     let mut param_count = 2; // $1 = caller_did, $2 = convo_id
@@ -144,6 +178,10 @@ pub async fn update_policy(
         updates.push(format!("prevent_removing_last_admin = ${}", param_count));
         param_count += 1;
     }
+    if input.max_members.is_some() {
+        updates.push(format!("max_members = ${}", param_count));
+        param_count += 1;
+    }
 
     if updates.is_empty() {
         return Err((
@@ -161,7 +199,7 @@ pub async fn update_policy(
             {}
         WHERE convo_id = $2
         RETURNING convo_id, allow_external_commits, require_invite_for_join,
-                  allow_rejoin, rejoin_window_days, prevent_removing_last_admin, updated_at
+                  allow_rejoin, rejoin_window_days, prevent_removing_last_admin, max_members, updated_at
         "#,
         updates.join(", ")
     );
@@ -185,6 +223,9 @@ pub async fn update_policy(
         query_builder = query_builder.bind(val);
     }
     if let Some(val) = input.prevent_removing_last_admin {
+        query_builder = query_builder.bind(val);
+    }
+    if let Some(val) = input.max_members {
         query_builder = query_builder.bind(val);
     }
 
@@ -263,7 +304,7 @@ pub async fn get_policy(
         r#"
         SELECT
             convo_id, allow_external_commits, require_invite_for_join,
-            allow_rejoin, rejoin_window_days, prevent_removing_last_admin, updated_at
+            allow_rejoin, rejoin_window_days, prevent_removing_last_admin, max_members, updated_at
         FROM conversation_policy
         WHERE convo_id = $1
         "#,

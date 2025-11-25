@@ -1,0 +1,56 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.mls.updateRead",
+  "description": "Mark MLS messages as read",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Mark messages as read in an MLS conversation. If messageId is omitted, marks all messages in the conversation as read.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["convoId"],
+          "properties": {
+            "convoId": {
+              "type": "string",
+              "description": "Conversation identifier"
+            },
+            "messageId": {
+              "type": "string",
+              "description": "Optional message ID to mark as read. If omitted, marks all messages as read."
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["readAt"],
+          "properties": {
+            "readAt": {
+              "type": "string",
+              "format": "datetime",
+              "description": "When messages were marked as read"
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "ConvoNotFound",
+          "description": "Conversation not found"
+        },
+        {
+          "name": "NotMember",
+          "description": "Caller is not a member of this conversation"
+        },
+        {
+          "name": "MessageNotFound",
+          "description": "Specified message not found"
+        }
+      ]
+    }
+  }
+}
