@@ -78,6 +78,44 @@ pub async fn create_convo(
         }
     }
 
+    // Check for blocks between creator and initial members
+    tracing::debug!("📍 [create_convo] checking for blocks between members");
+    let mut all_member_dids_for_block_check = vec![auth_user.did.clone()];
+    if let Some(ref members) = input.initial_members {
+        for member_did in members.iter() {
+            let member_did_str = did_to_string(member_did);
+            if member_did_str != auth_user.did {
+                all_member_dids_for_block_check.push(member_did_str);
+            }
+        }
+    }
+
+    // Only check if there are multiple members (more than just the creator)
+    if all_member_dids_for_block_check.len() > 1 {
+        let blocks: Vec<(String, String)> = sqlx::query_as(
+            "SELECT user_did, target_did FROM bsky_blocks
+             WHERE user_did = ANY($1) AND target_did = ANY($1)"
+        )
+        .bind(&all_member_dids_for_block_check)
+        .fetch_all(&pool)
+        .await
+        .map_err(|e| {
+            error!("❌ [create_convo] Failed to check blocks: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        if !blocks.is_empty() {
+            warn!(
+                "❌ [create_convo] Block detected between members: {} blocks found",
+                blocks.len()
+            );
+            return Err(Error::MutualBlockDetected(Some(format!(
+                "Cannot create conversation: one or more members have blocked each other"
+            ))).into());
+        }
+        tracing::debug!("✅ [create_convo] No blocks detected between members");
+    }
+
     // Use client-provided group_id as the canonical conversation ID
     let convo_id = input.group_id.clone();
     let now = chrono::Utc::now();
@@ -148,6 +186,7 @@ pub async fn create_convo(
                         credential: None,
                         promoted_at: None,
                         promoted_by: None,
+                        is_moderator: false,
                     }))
                 })
                 .collect::<Result<Vec<_>, StatusCode>>()?;
@@ -215,6 +254,7 @@ pub async fn create_convo(
         device_name: None,
         joined_at: chrono_to_datetime(now),
         is_admin: true,
+        is_moderator: false,
         leaf_index: Some(0),
         credential: None,
         promoted_at: None,
@@ -254,6 +294,7 @@ pub async fn create_convo(
                 device_name: None,
                 joined_at: chrono_to_datetime(now),
                 is_admin: false,
+                is_moderator: false,
                 leaf_index: Some((idx + 1) as usize),
                 credential: None,
                 promoted_at: None,
