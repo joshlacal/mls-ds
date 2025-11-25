@@ -418,8 +418,14 @@ pub async fn send_message(
 
         // Send push notifications with ciphertext
         if let Some(notification_service) = notification_service_clone.as_ref() {
-            tracing::debug!("📍 [send_message:fanout] sending push notifications");
-            if let Err(e) = notification_service
+            info!(
+                "🔔 [send_message:fanout] Starting push notification delivery for convo={}, message={}, sender={}",
+                convo_id, msg_id_clone, sender_did_clone
+            );
+
+            let push_start = std::time::Instant::now();
+
+            match notification_service
                 .notify_new_message(
                     &pool_clone,
                     &convo_id,
@@ -429,8 +435,24 @@ pub async fn send_message(
                 )
                 .await
             {
-                error!("❌ [send_message:fanout] Failed to send push notifications: {}", e);
+                Ok(_) => {
+                    let push_duration = push_start.elapsed();
+                    info!(
+                        "✅ [send_message:fanout] Push notifications completed successfully in {}ms",
+                        push_duration.as_millis()
+                    );
+                }
+                Err(e) => {
+                    let push_duration = push_start.elapsed();
+                    error!(
+                        "❌ [send_message:fanout] Failed to send push notifications after {}ms: {}",
+                        push_duration.as_millis(),
+                        e
+                    );
+                }
             }
+        } else {
+            info!("🔔 [send_message:fanout] No notification service available, skipping push notifications");
         }
     });
 

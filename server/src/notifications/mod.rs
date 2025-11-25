@@ -70,15 +70,21 @@ impl ApnsClient {
         message_id: &str,
         recipient_did: &str,
     ) -> Result<()> {
+        info!(
+            "🔔 [push_notification] Starting send_message_notification"
+        );
+
         // Encode ciphertext as base64 for JSON payload
         let ciphertext_b64 = base64::encode(ciphertext);
 
-        debug!(
+        info!(
             device_token = %device_token,
             convo_id = %convo_id,
+            message_id = %message_id,
             recipient_did = %recipient_did,
             ciphertext_size = ciphertext.len(),
-            "Sending MLS message notification"
+            ciphertext_b64_length = ciphertext_b64.len(),
+            "🔔 [push_notification] Preparing MLS message notification"
         );
 
         // Build custom payload with all required fields for client decryption
@@ -89,6 +95,11 @@ impl ApnsClient {
             "message_id": message_id,
             "recipient_did": recipient_did,
         });
+
+        info!(
+            "🔔 [push_notification] Custom data payload created with {} fields",
+            custom_data.as_object().map(|o| o.len()).unwrap_or(0)
+        );
 
         // Build notification with custom payload
         let mut payload = json!({
@@ -109,6 +120,12 @@ impl ApnsClient {
         }
 
         let body = payload.to_string();
+        info!(
+            "🔔 [push_notification] Final payload size: {} bytes, topic: {}",
+            body.len(),
+            self.topic
+        );
+
         let notification = DefaultNotificationBuilder::new()
             .set_body(&body)
             .build(
@@ -123,27 +140,48 @@ impl ApnsClient {
                 },
             );
 
+        info!(
+            "🔔 [push_notification] Notification built, starting delivery with retries (max: {})",
+            3
+        );
+
         // Send with retries
         const MAX_RETRIES: u8 = 3;
         let mut retry_count = 0;
         let mut backoff_ms = 100;
 
         loop {
+            info!(
+                "🔔 [push_notification] Attempt {} of {} - sending to APNs",
+                retry_count + 1,
+                MAX_RETRIES + 1
+            );
+
             match self.client.send(notification.clone()).await {
                 Ok(response) => {
+                    info!(
+                        "🔔 [push_notification] Received APNs response: status_code={}",
+                        response.code
+                    );
+
                     if response.code >= 200 && response.code < 300 {
                         info!(
                             device_token = %device_token,
                             status = response.code,
                             convo_id = %convo_id,
-                            "MLS message notification delivered"
+                            message_id = %message_id,
+                            recipient_did = %recipient_did,
+                            attempts = retry_count + 1,
+                            "✅ [push_notification] MLS message notification delivered successfully"
                         );
                         return Ok(());
                     } else {
                         warn!(
                             device_token = %device_token,
                             status = response.code,
-                            "Notification accepted with non-success status"
+                            convo_id = %convo_id,
+                            message_id = %message_id,
+                            "⚠️ [push_notification] Notification accepted with non-success status"
                         );
                         return Ok(());
                     }
@@ -154,18 +192,30 @@ impl ApnsClient {
                         device_token = %device_token,
                         error = %e,
                         attempt = retry_count,
-                        "Failed to send notification, retrying"
+                        max_retries = MAX_RETRIES,
+                        backoff_ms = backoff_ms,
+                        convo_id = %convo_id,
+                        message_id = %message_id,
+                        "⚠️ [push_notification] Failed to send notification, will retry"
                     );
 
                     if retry_count >= MAX_RETRIES {
                         error!(
                             device_token = %device_token,
                             error = %e,
-                            "Failed to send notification after maximum retries"
+                            total_attempts = retry_count,
+                            convo_id = %convo_id,
+                            message_id = %message_id,
+                            recipient_did = %recipient_did,
+                            "❌ [push_notification] Failed to send notification after maximum retries"
                         );
                         return Err(e.into());
                     }
 
+                    info!(
+                        "🔔 [push_notification] Backing off for {}ms before retry",
+                        backoff_ms
+                    );
                     tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
                     backoff_ms *= 2;
                 }
@@ -242,12 +292,25 @@ impl NotificationService {
         ciphertext: &[u8],
         sender_did: &str,
     ) -> Result<()> {
+        info!(
+            "🔔 [push_notification] notify_new_message called for convo={}, message={}, ciphertext_size={}, sender={}",
+            convo_id, message_id, ciphertext.len(), sender_did
+        );
+
         if !self.enabled || self.apns_client.is_none() {
-            debug!("Push notifications disabled, skipping notification");
+            info!(
+                "🔔 [push_notification] Push notifications disabled (enabled={}, client_exists={}), skipping notification",
+                self.enabled,
+                self.apns_client.is_some()
+            );
             return Ok(());
         }
 
+        info!("🔔 [push_notification] Push notifications enabled, proceeding with notification delivery");
+
         let client = self.apns_client.as_ref().unwrap();
+
+        info!("🔔 [push_notification] Querying database for recipient devices");
 
         // Get all devices for members of this conversation (excluding sender)
         let devices = sqlx::query_as::<_, (String, String)>(
@@ -264,62 +327,154 @@ impl NotificationService {
         .bind(convo_id)
         .bind(sender_did)
         .fetch_all(pool)
-        .await?;
+        .await
+        .map_err(|e| {
+            error!(
+                "❌ [push_notification] Database query failed for devices: {}",
+                e
+            );
+            e
+        })?;
+
+        info!(
+            "🔔 [push_notification] Database query returned {} devices",
+            devices.len()
+        );
 
         if devices.is_empty() {
-            debug!(
+            info!(
                 convo_id = %convo_id,
-                "No devices with push tokens found for conversation"
+                sender_did = %sender_did,
+                "🔔 [push_notification] No devices with push tokens found for conversation (all members may have left or sender is only member)"
             );
             return Ok(());
         }
 
-        debug!(
+        info!(
             convo_id = %convo_id,
             device_count = devices.len(),
-            "Sending push notifications to devices"
+            "🔔 [push_notification] Starting parallel notification delivery to {} devices",
+            devices.len()
         );
+
+        // Log each device (for debugging)
+        for (idx, (token, did)) in devices.iter().enumerate() {
+            info!(
+                "🔔 [push_notification] Device {}/{}: token={}, user_did={}",
+                idx + 1,
+                devices.len(),
+                &token[..token.len().min(8)], // Show only first 8 chars for privacy
+                did
+            );
+        }
 
         // Send to all devices in parallel
         let mut tasks = Vec::new();
-        for (device_token, user_did) in devices {
+        let total_devices = devices.len();
+
+        for (idx, (device_token, user_did)) in devices.into_iter().enumerate() {
             let client = Arc::clone(client);
             let convo_id = convo_id.to_string();
             let message_id = message_id.to_string();
             let ciphertext = ciphertext.to_vec();
             let recipient_did = user_did.clone();
+            let task_num = idx + 1;
+
+            info!(
+                "🔔 [push_notification] Spawning task {}/{} for device token={}..., user_did={}",
+                task_num,
+                total_devices,
+                &device_token[..device_token.len().min(8)],
+                recipient_did
+            );
 
             let task = tokio::spawn(async move {
-                client
+                info!(
+                    "🔔 [push_notification] Task {}/{} starting send_message_notification",
+                    task_num,
+                    total_devices
+                );
+                let result = client
                     .send_message_notification(&device_token, &ciphertext, &convo_id, &message_id, &recipient_did)
-                    .await
+                    .await;
+
+                match &result {
+                    Ok(_) => info!(
+                        "🔔 [push_notification] Task {}/{} completed successfully",
+                        task_num,
+                        total_devices
+                    ),
+                    Err(e) => error!(
+                        "🔔 [push_notification] Task {}/{} failed: {}",
+                        task_num,
+                        total_devices,
+                        e
+                    ),
+                }
+
+                result
             });
             tasks.push(task);
         }
+
+        info!(
+            "🔔 [push_notification] All {} tasks spawned, awaiting results",
+            tasks.len()
+        );
 
         // Await all tasks and collect results
         let mut success_count = 0;
         let mut error_count = 0;
 
-        for task in tasks {
+        for (idx, task) in tasks.into_iter().enumerate() {
+            let task_num = idx + 1;
+            info!(
+                "🔔 [push_notification] Awaiting task {}/{}",
+                task_num,
+                total_devices
+            );
+
             match task.await {
-                Ok(Ok(_)) => success_count += 1,
+                Ok(Ok(_)) => {
+                    success_count += 1;
+                    info!(
+                        "🔔 [push_notification] Task {}/{} result: SUCCESS (total success: {})",
+                        task_num,
+                        total_devices,
+                        success_count
+                    );
+                }
                 Ok(Err(e)) => {
                     error_count += 1;
-                    error!("Push notification failed: {}", e);
+                    error!(
+                        "❌ [push_notification] Task {}/{} result: FAILED - {} (total errors: {})",
+                        task_num,
+                        total_devices,
+                        e,
+                        error_count
+                    );
                 }
                 Err(e) => {
                     error_count += 1;
-                    error!("Push notification task panicked: {}", e);
+                    error!(
+                        "❌ [push_notification] Task {}/{} result: PANICKED - {} (total errors: {})",
+                        task_num,
+                        total_devices,
+                        e,
+                        error_count
+                    );
                 }
             }
         }
 
         info!(
             convo_id = %convo_id,
+            message_id = %message_id,
             success = success_count,
             errors = error_count,
-            "Push notifications sent"
+            total = total_devices,
+            "✅ [push_notification] Push notification delivery complete: {}/{} succeeded, {}/{} failed",
+            success_count, total_devices, error_count, total_devices
         );
 
         Ok(())

@@ -1,4 +1,4 @@
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{extract::{rejection::JsonRejection, State}, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
 
@@ -13,7 +13,7 @@ pub struct RegisterDeviceTokenInput {
     pub device_id: String,
     pub push_token: String,
     pub device_name: Option<String>,
-    pub platform: Option<String>,
+    pub platform: String, // Required per lexicon
 }
 
 #[derive(Debug, Serialize)]
@@ -27,38 +27,52 @@ pub struct RegisterDeviceTokenOutput {
 pub async fn register_device_token(
     State(pool): State<DbPool>,
     auth_user: AuthUser,
-    Json(input): Json<RegisterDeviceTokenInput>,
+    input: Result<Json<RegisterDeviceTokenInput>, JsonRejection>,
 ) -> Result<Json<RegisterDeviceTokenOutput>, StatusCode> {
+    let Json(input) = input.map_err(|rejection| {
+        error!("❌ [register_device_token] Failed to deserialize request body: {}", rejection);
+        StatusCode::BAD_REQUEST
+    })?;
+
     info!(
         user_did = %auth_user.did,
         device_id = %input.device_id,
+        platform = %input.platform,
         "Registering device push token"
     );
 
-    // Update or insert device with push token
+    // Update existing device with push token
+    // Note: Device must already exist (created via registerDevice)
     let result = sqlx::query(
         r#"
-        INSERT INTO devices (user_did, device_id, push_token, push_token_updated_at, device_name, platform, last_seen_at)
-        VALUES ($1, $2, $3, NOW(), $4, $5, NOW())
-        ON CONFLICT (user_did, device_id)
-        DO UPDATE SET
-            push_token = EXCLUDED.push_token,
+        UPDATE devices
+        SET push_token = $3,
             push_token_updated_at = NOW(),
-            device_name = COALESCE(EXCLUDED.device_name, devices.device_name),
-            platform = COALESCE(EXCLUDED.platform, devices.platform),
+            device_name = COALESCE($4, device_name),
+            platform = $5,
             last_seen_at = NOW()
+        WHERE user_did = $1 AND device_id = $2
         "#,
     )
     .bind(&auth_user.did)
     .bind(&input.device_id)
     .bind(&input.push_token)
     .bind(input.device_name.as_deref())
-    .bind(input.platform.as_deref())
+    .bind(&input.platform)
     .execute(&pool)
     .await;
 
     match result {
-        Ok(_) => {
+        Ok(result) => {
+            if result.rows_affected() == 0 {
+                error!(
+                    user_did = %auth_user.did,
+                    device_id = %input.device_id,
+                    "Device not found - must register device first via registerDevice"
+                );
+                return Err(StatusCode::NOT_FOUND);
+            }
+
             info!(
                 user_did = %auth_user.did,
                 device_id = %input.device_id,
