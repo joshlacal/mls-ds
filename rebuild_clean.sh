@@ -5,9 +5,9 @@ echo "🧹 Starting complete Docker rebuild with clean database..."
 
 cd /home/ubuntu/mls/server
 
-# Step 1: Stop all containers
+# Step 1: Stop and remove all containers
 echo "🛑 Stopping all containers..."
-sudo docker compose down
+sudo docker compose down -v
 
 # Step 2: Remove all volumes (THIS DELETES ALL DATA!)
 echo "🗑️  Removing all volumes (database will be wiped)..."
