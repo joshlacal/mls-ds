@@ -1,6 +1,7 @@
 use axum::{extract::State, http::StatusCode, Json};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tracing::{info, warn, error};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -8,6 +9,7 @@ use uuid::Uuid;
 use crate::{
     auth::AuthUser,
     device_utils::parse_device_did,
+    realtime::{SseState, StreamEvent},
     storage::DbPool,
 };
 
@@ -51,9 +53,10 @@ pub struct RegisterDeviceOutput {
 
 /// Register a device for multi-device MLS support
 /// POST /xrpc/blue.catbird.mls.registerDevice
-#[tracing::instrument(skip(pool, input))]
+#[tracing::instrument(skip(pool, sse_state, input))]
 pub async fn register_device(
     State(pool): State<DbPool>,
+    State(sse_state): State<Arc<SseState>>,
     auth_user: AuthUser,
     Json(input): Json<RegisterDeviceInput>,
 ) -> Result<Json<RegisterDeviceOutput>, StatusCode> {
@@ -397,8 +400,69 @@ pub async fn register_device(
 
     info!("Device {} can auto-join {} conversations", device_id, auto_joined_convos.len());
 
+    // Create pending device additions for all conversations (for automatic multi-device sync)
+    // This allows other online members to proactively add this device to conversations
+    let device_name_clone = input.device_name.clone();
+    let mls_did_clone = mls_did.clone();
+    let device_id_clone = device_id.clone();
+
+    for convo_id in &auto_joined_convos {
+        let pending_id = Uuid::new_v4().to_string();
+
+        // Insert pending addition (ignore conflicts - device might already have pending additions)
+        let insert_result = sqlx::query!(
+            r#"
+            INSERT INTO pending_device_additions
+                (id, convo_id, user_did, new_device_id, new_device_credential_did, device_name, status, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, 'pending', NOW())
+            ON CONFLICT (convo_id, new_device_credential_did) DO NOTHING
+            RETURNING id
+            "#,
+            pending_id,
+            convo_id,
+            user_did,
+            device_id_clone,
+            mls_did_clone,
+            device_name_clone
+        )
+        .fetch_optional(&pool)
+        .await;
+
+        match insert_result {
+            Ok(Some(_)) => {
+                // Successfully inserted - emit SSE event to conversation members
+                let cursor = sse_state.cursor_gen.next(convo_id, "newDeviceEvent").await;
+                let event = StreamEvent::NewDeviceEvent {
+                    cursor,
+                    convo_id: convo_id.clone(),
+                    user_did: user_did.to_string(),
+                    device_id: device_id_clone.clone(),
+                    device_name: Some(device_name_clone.clone()),
+                    device_credential_did: mls_did_clone.clone(),
+                    pending_addition_id: pending_id.clone(),
+                };
+
+                if let Err(e) = sse_state.emit(convo_id, event).await {
+                    warn!("Failed to emit NewDeviceEvent for convo {}: {}", convo_id, e);
+                } else {
+                    info!("Emitted NewDeviceEvent for device {} in convo {}", device_id_clone, convo_id);
+                }
+            }
+            Ok(None) => {
+                // Conflict - pending addition already exists, skip
+                info!("Pending addition already exists for device {} in convo {}", device_id_clone, convo_id);
+            }
+            Err(e) => {
+                warn!("Failed to create pending addition for convo {}: {}", convo_id, e);
+            }
+        }
+    }
+
+    info!("Created pending device additions for {} conversations", auto_joined_convos.len());
+
     // For now, we don't generate welcome messages during registration
     // The device will need to request rejoin via blue.catbird.mls.requestRejoin
+    // OR other online members will add it via the pending addition flow
     Ok(Json(RegisterDeviceOutput {
         device_id,
         mls_did,
