@@ -10,7 +10,7 @@
 ///! - PSK is generated client-side and included in invite link
 ///! - Only admins can create/revoke invites
 
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{extract::{Query, State}, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tracing::{error, info, warn};
@@ -349,7 +349,7 @@ pub async fn revoke_invite(
 pub async fn list_invites(
     State(pool): State<PgPool>,
     auth_user: AuthUser,
-    Json(input): Json<ListInvitesInput>,
+    Query(input): Query<ListInvitesInput>,
 ) -> Result<Json<ListInvitesOutput>, (StatusCode, String)> {
     let caller_did = &auth_user.did;
 

@@ -11,7 +11,7 @@
 ///! - Rejoin window duration
 ///! - Last admin protection
 
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{extract::{Query, State}, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tracing::{error, info};
@@ -223,7 +223,7 @@ pub async fn update_policy(
 pub async fn get_policy(
     State(pool): State<PgPool>,
     auth_user: AuthUser,
-    Json(input): Json<GetPolicyInput>,
+    Query(input): Query<GetPolicyInput>,
 ) -> Result<Json<GetPolicyOutput>, (StatusCode, String)> {
     let caller_did = &auth_user.did;
 

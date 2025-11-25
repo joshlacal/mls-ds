@@ -59,7 +59,18 @@
       "Bash(docker build:*)",
       "Bash(DATABASE_URL=\"postgresql://catbird:changeme@localhost:5433/catbird\" cargo sqlx:*)",
       "Bash(docker-compose ps:*)",
-      "Bash(docker restart:*)"
+      "Bash(docker restart:*)",
+      "Bash(sudo docker logs:*)",
+      "Bash(sudo docker compose:*)",
+      "Bash(sudo docker exec:*)",
+      "Bash(doppler secrets:*)",
+      "Bash(./scripts/run-migrations.sh:*)",
+      "Bash(DATABASE_URL=\"postgresql://catbird:catbird_secure_password_change_in_production@localhost:5433/catbird\" ./scripts/run-migrations.sh:*)",
+      "Bash(SKIP_CONFIRM=true ./deploy-fresh.sh:*)",
+      "Bash(docker volume:*)",
+      "Bash(xargs:*)",
+      "Bash(md5sum:*)",
+      "Bash(docker builder prune:*)"
     ],
     "deny": [],
     "ask": []
