@@ -22,7 +22,7 @@ pub async fn get_convos(
     // but auth DID is the base user DID (e.g., did:plc:abc123), so we check user_did OR member_did
     let memberships = sqlx::query_as::<_, Membership>(
         "SELECT convo_id, member_did, user_did, device_id, device_name, joined_at, left_at, unread_count, last_read_at,
-                is_admin, promoted_at, promoted_by_did, leaf_index,
+                is_admin, promoted_at, promoted_by_did, COALESCE(is_moderator, false) as is_moderator, leaf_index,
                 needs_rejoin, rejoin_requested_at, rejoin_key_package_hash
          FROM members WHERE (member_did = $1 OR user_did = $1) AND left_at IS NULL ORDER BY joined_at DESC"
     )
@@ -53,7 +53,7 @@ pub async fn get_convos(
             // Get all active members
             let member_rows: Vec<Membership> = sqlx::query_as(
                 "SELECT convo_id, member_did, user_did, device_id, device_name, joined_at, left_at, unread_count, last_read_at,
-                        is_admin, promoted_at, promoted_by_did, leaf_index,
+                        is_admin, promoted_at, promoted_by_did, COALESCE(is_moderator, false) as is_moderator, leaf_index,
                         needs_rejoin, rejoin_requested_at, rejoin_key_package_hash
                  FROM members WHERE convo_id = $1 AND left_at IS NULL ORDER BY user_did, joined_at"
             )

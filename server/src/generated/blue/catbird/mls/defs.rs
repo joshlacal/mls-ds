@@ -71,6 +71,9 @@ pub struct MemberViewData {
     pub did: crate::types::string::Did,
     ///Whether this member (device) has admin privileges. Admin status is synced across all devices of the same user.
     pub is_admin: bool,
+    ///Whether this member has moderator privileges. Moderators can warn members and view reports but cannot promote/demote others.
+    #[serde(default)]
+    pub is_moderator: bool,
     ///When this device joined the conversation
     pub joined_at: crate::types::string::Datetime,
     ///MLS leaf index in ratchet tree structure

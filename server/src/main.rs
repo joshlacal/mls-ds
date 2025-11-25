@@ -346,6 +346,14 @@ async fn main() -> anyhow::Result<()> {
             post(handlers::demote_admin),
         )
         .route(
+            "/xrpc/blue.catbird.mls.promoteModerator",
+            post(handlers::promote_moderator),
+        )
+        .route(
+            "/xrpc/blue.catbird.mls.demoteModerator",
+            post(handlers::demote_moderator),
+        )
+        .route(
             "/xrpc/blue.catbird.mls.removeMember",
             post(handlers::remove_member),
         )
