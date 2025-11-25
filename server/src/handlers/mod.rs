@@ -1,6 +1,8 @@
 // Handler modules for API endpoints
 mod add_members;
 mod check_blocks;
+mod claim_pending_device_addition;
+mod complete_pending_device_addition;
 mod create_convo;
 mod create_invite;
 mod delete_device;
@@ -11,6 +13,7 @@ mod get_commits;
 mod get_convos;
 mod get_epoch;
 mod get_group_info;
+mod get_pending_device_additions;
 mod process_external_commit;
 mod get_expected_conversations;
 mod get_key_packages;
@@ -46,6 +49,9 @@ mod warn_member;
 // Re-export handlers
 pub use add_members::add_members;
 pub use check_blocks::check_blocks;
+pub use claim_pending_device_addition::claim_pending_device_addition;
+pub use complete_pending_device_addition::complete_pending_device_addition;
+pub use get_pending_device_additions::get_pending_device_additions;
 pub use create_convo::create_convo;
 pub use create_invite::{create_invite, list_invites, revoke_invite};
 pub use delete_device::delete_device;

@@ -535,6 +535,44 @@ pub async fn handle(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
+    // Mark any pending device additions for this device as self_joined
+    // This prevents other members from trying to add a device that just joined itself
+    let self_joined_result = sqlx::query!(
+        r#"
+        UPDATE pending_device_additions
+        SET status = 'self_joined',
+            completed_at = $2,
+            completed_by_did = $1,
+            new_epoch = $3,
+            updated_at = $2
+        WHERE convo_id = $4
+          AND new_device_credential_did = $1
+          AND status IN ('pending', 'in_progress')
+        "#,
+        did,
+        now,
+        new_epoch as i32,
+        convo_id
+    )
+    .execute(&pool)
+    .await;
+
+    match self_joined_result {
+        Ok(result) if result.rows_affected() > 0 => {
+            info!(
+                "Marked {} pending addition(s) as self_joined for device {} in {}",
+                result.rows_affected(), did, convo_id
+            );
+        }
+        Ok(_) => {
+            // No pending additions to mark - that's fine
+        }
+        Err(e) => {
+            // Non-fatal error - log and continue
+            warn!("Failed to mark pending additions as self_joined: {}", e);
+        }
+    }
+
     info!("External commit processed: {} -> epoch {}", convo_id, new_epoch);
 
     // =========================================================================

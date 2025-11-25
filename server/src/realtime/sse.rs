@@ -49,6 +49,16 @@ pub enum StreamEvent {
         reason: String,
         detail: Option<serde_json::Value>,
     },
+    /// Event indicating a user has registered a new device that needs to be added to the conversation
+    NewDeviceEvent {
+        cursor: String,
+        convo_id: String,
+        user_did: String,
+        device_id: String,
+        device_name: Option<String>,
+        device_credential_did: String,
+        pending_addition_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -184,6 +194,7 @@ pub async fn subscribe_convo_events(
                                         StreamEvent::ReactionEvent { cursor, .. } => cursor,
                                         StreamEvent::TypingEvent { cursor, .. } => cursor,
                                         StreamEvent::InfoEvent { cursor, .. } => cursor,
+                                        StreamEvent::NewDeviceEvent { cursor, .. } => cursor,
                                     };
 
                                     // Only send events after resume cursor
