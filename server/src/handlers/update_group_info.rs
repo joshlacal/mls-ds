@@ -2,13 +2,15 @@ use axum::{extract::State, Json};
 use axum::http::StatusCode;
 use base64::Engine;
 use sqlx::FromRow;
+use openmls::messages::group_info::VerifiableGroupInfo;
+use tls_codec::Deserialize as TlsDeserialize;
 
 use crate::{
     auth::AuthUser,
     error_responses::UpdateGroupInfoError,
     generated::blue::catbird::mls::update_group_info::{Input, Output, OutputData, Error},
     storage::DbPool,
-    group_info::store_group_info,
+    group_info::{store_group_info, get_group_info, MIN_GROUP_INFO_SIZE, MAX_GROUP_INFO_SIZE},
 };
 
 #[derive(FromRow)]
@@ -43,18 +45,96 @@ pub async fn handle(
         ).into());
     }
     
-    // 2. Decode GroupInfo
+    // 2. Decode GroupInfo from base64
     let group_info_bytes = base64::engine::general_purpose::STANDARD
         .decode(&input.data.group_info)
-        .map_err(|_| Error::InvalidGroupInfo(Some("Invalid base64".into())))?;
-        
-    // 3. Store GroupInfo
+        .map_err(|e| {
+            tracing::error!(
+                convo_id = %input.data.convo_id,
+                error = %e,
+                "Invalid base64 in GroupInfo"
+            );
+            Error::InvalidGroupInfo(Some("Invalid base64 encoding".into()))
+        })?;
+
+    // 3. Validate size bounds
+    if group_info_bytes.len() < MIN_GROUP_INFO_SIZE {
+        tracing::error!(
+            convo_id = %input.data.convo_id,
+            size = group_info_bytes.len(),
+            min_size = MIN_GROUP_INFO_SIZE,
+            "GroupInfo too small - likely truncated"
+        );
+        return Err(Error::InvalidGroupInfo(Some(format!(
+            "GroupInfo too small: {} bytes (minimum {} required)",
+            group_info_bytes.len(), MIN_GROUP_INFO_SIZE
+        ))).into());
+    }
+
+    if group_info_bytes.len() > MAX_GROUP_INFO_SIZE {
+        tracing::error!(
+            convo_id = %input.data.convo_id,
+            size = group_info_bytes.len(),
+            max_size = MAX_GROUP_INFO_SIZE,
+            "GroupInfo too large"
+        );
+        return Err(Error::InvalidGroupInfo(Some(format!(
+            "GroupInfo too large: {} bytes (maximum {} allowed)",
+            group_info_bytes.len(), MAX_GROUP_INFO_SIZE
+        ))).into());
+    }
+
+    // 4. Validate MLS structure - CRITICAL: prevents storing corrupted data
+    let _ = VerifiableGroupInfo::tls_deserialize(&mut group_info_bytes.as_slice())
+        .map_err(|e| {
+            tracing::error!(
+                convo_id = %input.data.convo_id,
+                error = ?e,
+                size = group_info_bytes.len(),
+                "Invalid MLS GroupInfo structure - deserialization failed"
+            );
+            Error::InvalidGroupInfo(Some(format!(
+                "Invalid MLS GroupInfo structure: {:?}", e
+            )))
+        })?;
+
+    // 5. Validate epoch consistency - epoch must increase (no regression)
+    if let Ok(Some((_, existing_epoch, _))) = get_group_info(&pool, &input.data.convo_id).await {
+        if input.data.epoch as i32 <= existing_epoch {
+            tracing::warn!(
+                convo_id = %input.data.convo_id,
+                new_epoch = input.data.epoch,
+                existing_epoch = existing_epoch,
+                "Rejecting GroupInfo with non-increasing epoch"
+            );
+            return Err(Error::InvalidGroupInfo(Some(format!(
+                "Epoch {} must be greater than current epoch {}",
+                input.data.epoch, existing_epoch
+            ))).into());
+        }
+    }
+
+    // 6. Store validated GroupInfo
+    tracing::info!(
+        convo_id = %input.data.convo_id,
+        epoch = input.data.epoch,
+        size = group_info_bytes.len(),
+        "GroupInfo validated successfully, storing"
+    );
+
     store_group_info(
         &pool,
         &input.data.convo_id,
         &group_info_bytes,
         input.data.epoch as i32
-    ).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    ).await.map_err(|e| {
+        tracing::error!(
+            convo_id = %input.data.convo_id,
+            error = %e,
+            "Failed to store GroupInfo"
+        );
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     
     Ok(Json(Output {
         data: OutputData {
