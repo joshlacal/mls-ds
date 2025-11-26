@@ -2,6 +2,15 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, FromRow};
 
+/// Minimum valid GroupInfo size in bytes
+/// A valid MLS GroupInfo with ratchet tree extension must be at least ~100 bytes
+/// for the base structure (protocol version, cipher suite, group ID, epoch, etc.)
+pub const MIN_GROUP_INFO_SIZE: usize = 100;
+
+/// Maximum allowed GroupInfo size in bytes (10 MB)
+/// GroupInfo grows with group size due to ratchet tree, but 10MB is excessive
+pub const MAX_GROUP_INFO_SIZE: usize = 10 * 1024 * 1024;
+
 #[derive(FromRow)]
 struct GroupInfoRow {
     group_info: Option<Vec<u8>>,
