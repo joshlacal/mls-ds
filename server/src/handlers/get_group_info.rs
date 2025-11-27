@@ -55,30 +55,32 @@ pub async fn handle(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         
     if let Some((group_info_bytes, epoch, updated_at)) = cached {
-        // 4. Check freshness (regenerate if > 5 minutes old)
+        // 4. Check freshness (regenerate if > 6 hours old)
+        // Extended TTL to 6 hours to reduce refresh overhead while still providing recovery
         let age = chrono::Utc::now() - updated_at;
-        if age.num_minutes() > 5 {
+        if age.num_hours() > 6 {
             // Regenerate fresh GroupInfo
             // Note: generate_and_cache_group_info is currently a placeholder that might fail
+            // Clients should proactively refresh via publishGroupInfo before expiration
             match generate_and_cache_group_info(&pool, &input.data.convo_id).await {
                 Ok(fresh_info) => {
                     return Ok(Json(Output::from(OutputData {
                         group_info: base64::engine::general_purpose::STANDARD.encode(fresh_info),
                         epoch: epoch as i64,
-                        expires_at: Some((chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339()),
+                        expires_at: Some((chrono::Utc::now() + chrono::Duration::hours(6)).to_rfc3339()),
                     })));
                 },
                 Err(_) => {
                     // If regeneration fails (e.g. not implemented), return cached one if available
-                    // Log warning?
+                    // Clients can request refresh from active members via requestGroupInfoRefresh
                 }
             }
         }
-        
+
         return Ok(Json(Output::from(OutputData {
             group_info: base64::engine::general_purpose::STANDARD.encode(group_info_bytes),
             epoch: epoch as i64,
-            expires_at: Some((updated_at + chrono::Duration::minutes(5)).to_rfc3339()),
+            expires_at: Some((updated_at + chrono::Duration::hours(6)).to_rfc3339()),
         })));
     }
     
@@ -94,7 +96,7 @@ pub async fn handle(
         return Ok(Json(Output::from(OutputData {
             group_info: base64::engine::general_purpose::STANDARD.encode(group_info_bytes),
             epoch: epoch as i64,
-            expires_at: Some((updated_at + chrono::Duration::minutes(5)).to_rfc3339()),
+            expires_at: Some((updated_at + chrono::Duration::hours(6)).to_rfc3339()),
         })));
     }
 

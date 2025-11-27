@@ -28,6 +28,7 @@ pub mod publish_key_packages;
 pub mod register_device;
 pub mod remove_member;
 pub mod report_member;
+pub mod request_group_info_refresh;
 pub mod request_rejoin;
 pub mod resolve_report;
 pub mod send_message;
