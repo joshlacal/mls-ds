@@ -59,6 +59,15 @@ pub enum StreamEvent {
         device_credential_did: String,
         pending_addition_id: String,
     },
+    /// Event requesting active members to publish fresh GroupInfo for external commit joins
+    /// Emitted when a member encounters stale GroupInfo and calls requestGroupInfoRefresh
+    GroupInfoRefreshRequested {
+        cursor: String,
+        convo_id: String,
+        /// DID of the member requesting the refresh (so they don't respond to their own request)
+        requested_by: String,
+        requested_at: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -195,6 +204,7 @@ pub async fn subscribe_convo_events(
                                         StreamEvent::TypingEvent { cursor, .. } => cursor,
                                         StreamEvent::InfoEvent { cursor, .. } => cursor,
                                         StreamEvent::NewDeviceEvent { cursor, .. } => cursor,
+                                        StreamEvent::GroupInfoRefreshRequested { cursor, .. } => cursor,
                                     };
 
                                     // Only send events after resume cursor
