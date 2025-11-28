@@ -68,6 +68,15 @@ pub enum StreamEvent {
         requested_by: String,
         requested_at: String,
     },
+    /// Event indicating a member needs to be re-added to the conversation
+    /// Emitted when both Welcome and External Commit have failed
+    ReadditionRequested {
+        cursor: String,
+        convo_id: String,
+        /// DID of the user requesting re-addition
+        user_did: String,
+        requested_at: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -205,6 +214,7 @@ pub async fn subscribe_convo_events(
                                         StreamEvent::InfoEvent { cursor, .. } => cursor,
                                         StreamEvent::NewDeviceEvent { cursor, .. } => cursor,
                                         StreamEvent::GroupInfoRefreshRequested { cursor, .. } => cursor,
+                                        StreamEvent::ReadditionRequested { cursor, .. } => cursor,
                                     };
 
                                     // Only send events after resume cursor
