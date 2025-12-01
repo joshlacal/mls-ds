@@ -169,6 +169,34 @@ pub async fn register_device(
 
             info!("Deleted {} old key packages for re-registered device {}", deleted_count, old_device_id);
 
+            // CRITICAL FIX: Invalidate all pending Welcome messages for this user
+            // When a device re-registers with fresh key packages, any pending Welcomes
+            // were encrypted to OLD key packages that no longer exist locally.
+            // Without this, clients get NoMatchingKeyPackage errors trying to process old Welcomes.
+            let invalidated_welcomes = sqlx::query!(
+                r#"
+                UPDATE welcome_messages
+                SET consumed = true,
+                    consumed_at = NOW(),
+                    error_reason = 'Device re-registered with fresh key packages'
+                WHERE recipient_did = $1
+                  AND consumed = false
+                "#,
+                user_did
+            )
+            .execute(&pool)
+            .await
+            .map_err(|e| {
+                error!("Failed to invalidate old Welcome messages: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .rows_affected();
+
+            if invalidated_welcomes > 0 {
+                info!("Invalidated {} stale Welcome messages for re-registered user {} (encrypted to old key packages)", 
+                    invalidated_welcomes, user_did);
+            }
+
             // Update existing device record with new signature key and timestamps
             // Note: We keep device_uuid the same (it's the persistent identifier)
             sqlx::query!(
@@ -246,6 +274,34 @@ pub async fn register_device(
             .rows_affected();
 
             info!("Deleted {} old key packages for re-registered device {} (signature key match)", deleted_count, old_device_id);
+
+            // CRITICAL FIX: Invalidate all pending Welcome messages for this user
+            // When a device re-registers with fresh key packages, any pending Welcomes
+            // were encrypted to OLD key packages that no longer exist locally.
+            // Without this, clients get NoMatchingKeyPackage errors trying to process old Welcomes.
+            let invalidated_welcomes = sqlx::query!(
+                r#"
+                UPDATE welcome_messages
+                SET consumed = true,
+                    consumed_at = NOW(),
+                    error_reason = 'Device re-registered with fresh key packages (sig key match)'
+                WHERE recipient_did = $1
+                  AND consumed = false
+                "#,
+                user_did
+            )
+            .execute(&pool)
+            .await
+            .map_err(|e| {
+                error!("Failed to invalidate old Welcome messages: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .rows_affected();
+
+            if invalidated_welcomes > 0 {
+                info!("Invalidated {} stale Welcome messages for re-registered user {} (sig key match)", 
+                    invalidated_welcomes, user_did);
+            }
 
             // Update existing device record with new device_id and timestamps
             sqlx::query!(
