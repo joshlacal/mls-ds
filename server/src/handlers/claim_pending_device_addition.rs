@@ -65,6 +65,33 @@ pub async fn claim_pending_device_addition(
         "Attempting to claim pending device addition"
     );
 
+    // Release any expired claims before attempting to claim
+    // This ensures claims don't stay locked forever if a client crashes
+    let released = sqlx::query!(
+        r#"
+        UPDATE pending_device_additions
+        SET status = 'pending',
+            claimed_by_did = NULL,
+            claimed_at = NULL,
+            claim_expires_at = NULL,
+            updated_at = NOW()
+        WHERE status = 'in_progress'
+          AND claim_expires_at < $1
+        "#,
+        now
+    )
+    .execute(&pool)
+    .await
+    .map_err(|e| {
+        error!("Failed to release expired claims: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .rows_affected();
+
+    if released > 0 {
+        info!("Released {} expired pending addition claims before claim attempt", released);
+    }
+
     // First, get the pending addition to verify membership and status
     let pending: Option<PendingAdditionRow> = sqlx::query_as!(
         PendingAdditionRow,
@@ -135,9 +162,20 @@ pub async fn claim_pending_device_addition(
     }
 
     // Prevent user from claiming their own device addition
+    // Return a clear response rather than an error - this is expected behavior
+    // when the device sync manager hasn't been properly configured with deviceUUID
     if pending.user_did == user_did {
-        warn!("User {} attempted to claim their own device addition", user_did);
-        return Err(StatusCode::BAD_REQUEST);
+        info!(
+            "User {} attempted to claim their own device addition - returning not claimed",
+            crate::crypto::redact_for_log(&user_did)
+        );
+        return Ok(Json(ClaimPendingDeviceAdditionOutput {
+            claimed: false,
+            convo_id: Some(pending.convo_id),
+            device_credential_did: Some(pending.new_device_credential_did),
+            key_package: None,
+            claimed_by: None,  // No claimed_by for self-claim - client detects via claimed=false + no claimedBy
+        }));
     }
 
     // Attempt to atomically claim the pending addition
