@@ -70,10 +70,8 @@ pub async fn warn_member(
 
     // Convert optional expires_at from atrium Datetime to chrono DateTime
     let expires_at = input.expires_at.as_ref().map(|dt| {
-        chrono::DateTime::parse_from_rfc3339(dt.as_ref())
-            .map(|dt| dt.with_timezone(&chrono::Utc))
-            .ok()
-    }).flatten();
+        crate::sqlx_atrium::datetime_to_chrono(dt)
+    });
 
     // Insert warning record into admin_actions table
     // Note: We'll use action='warn' which needs to be added to the CHECK constraint
