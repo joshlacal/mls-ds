@@ -444,7 +444,7 @@ pub async fn register_device(
         WHERE user_did = $1 AND left_at IS NULL
         "#,
     )
-    .bind(user_did)
+    .bind(&user_did)
     .fetch_all(&pool)
     .await
     .map_err(|e| {
@@ -476,7 +476,7 @@ pub async fn register_device(
             "#,
             pending_id,
             convo_id,
-            user_did,
+            &user_did,
             device_id_clone,
             mls_did_clone,
             device_name_clone

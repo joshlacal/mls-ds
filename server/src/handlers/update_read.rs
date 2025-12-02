@@ -117,6 +117,6 @@ pub async fn update_read(
     );
 
     Ok(Json(UpdateReadOutput {
-        read_at: crate::sqlx_atrium::chrono_to_datetime(read_at),
+        read_at: read_at.to_rfc3339(),
     }))
 }
