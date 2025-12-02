@@ -2,10 +2,12 @@ use axum::{extract::State, http::StatusCode, Json};
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use sha2::{Sha256, Digest};
+use std::sync::Arc;
 use tracing::{info, warn, error};
 
 use crate::{
     auth::AuthUser,
+    block_sync::BlockSyncService,
     error_responses::CreateConvoError,
     generated::blue::catbird::mls::create_convo::{Input, NSID, Error},
     generated::blue::catbird::mls::defs::{ConvoView, ConvoViewData, ConvoMetadata, ConvoMetadataData, MemberView, MemberViewData},
@@ -15,9 +17,10 @@ use crate::{
 
 /// Create a new conversation
 /// POST /xrpc/blue.catbird.mls.createConvo
-#[tracing::instrument(skip(pool, auth_user))]
+#[tracing::instrument(skip(pool, block_sync, auth_user))]
 pub async fn create_convo(
     State(pool): State<DbPool>,
+    State(block_sync): State<Arc<BlockSyncService>>,
     auth_user: AuthUser,
     Json(input): Json<Input>,
 ) -> Result<Json<ConvoView>, CreateConvoError> {
@@ -78,8 +81,8 @@ pub async fn create_convo(
         }
     }
 
-    // Check for blocks between creator and initial members
-    tracing::debug!("📍 [create_convo] checking for blocks between members");
+    // Check for blocks between creator and initial members by querying PDSes
+    tracing::debug!("📍 [create_convo] checking for blocks between members via PDS");
     let mut all_member_dids_for_block_check = vec![auth_user.did.clone()];
     if let Some(ref members) = input.initial_members {
         for member_did in members.iter() {
@@ -92,28 +95,55 @@ pub async fn create_convo(
 
     // Only check if there are multiple members (more than just the creator)
     if all_member_dids_for_block_check.len() > 1 {
-        let blocks: Vec<(String, String)> = sqlx::query_as(
-            "SELECT user_did, target_did FROM bsky_blocks
-             WHERE user_did = ANY($1) AND target_did = ANY($1)"
-        )
-        .bind(&all_member_dids_for_block_check)
-        .fetch_all(&pool)
-        .await
-        .map_err(|e| {
-            error!("❌ [create_convo] Failed to check blocks: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        // Query PDSes for authoritative block data
+        match block_sync.check_block_conflicts(&all_member_dids_for_block_check).await {
+            Ok(conflicts) => {
+                if !conflicts.is_empty() {
+                    // Sync blocks to DB for future reference
+                    for (blocker, _blocked) in &conflicts {
+                        if let Err(e) = block_sync.sync_blocks_to_db(&pool, blocker).await {
+                            warn!("Failed to sync blocks to DB: {}", e);
+                        }
+                    }
+                    
+                    warn!(
+                        "❌ [create_convo] Block detected between members: {} blocks found via PDS",
+                        conflicts.len()
+                    );
+                    return Err(Error::MutualBlockDetected(Some(format!(
+                        "Cannot create conversation: one or more members have blocked each other"
+                    ))).into());
+                }
+                tracing::debug!("✅ [create_convo] No blocks detected between members (PDS verified)");
+            }
+            Err(e) => {
+                // Fall back to local DB if PDS queries fail
+                warn!("PDS block check failed, falling back to local DB: {}", e);
+                
+                let blocks: Vec<(String, String)> = sqlx::query_as(
+                    "SELECT user_did, target_did FROM bsky_blocks
+                     WHERE user_did = ANY($1) AND target_did = ANY($1)"
+                )
+                .bind(&all_member_dids_for_block_check)
+                .fetch_all(&pool)
+                .await
+                .map_err(|e| {
+                    error!("❌ [create_convo] Failed to check blocks: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
 
-        if !blocks.is_empty() {
-            warn!(
-                "❌ [create_convo] Block detected between members: {} blocks found",
-                blocks.len()
-            );
-            return Err(Error::MutualBlockDetected(Some(format!(
-                "Cannot create conversation: one or more members have blocked each other"
-            ))).into());
+                if !blocks.is_empty() {
+                    warn!(
+                        "❌ [create_convo] Block detected between members: {} blocks found (from DB cache)",
+                        blocks.len()
+                    );
+                    return Err(Error::MutualBlockDetected(Some(format!(
+                        "Cannot create conversation: one or more members have blocked each other"
+                    ))).into());
+                }
+                tracing::debug!("✅ [create_convo] No blocks detected between members (DB fallback)");
+            }
         }
-        tracing::debug!("✅ [create_convo] No blocks detected between members");
     }
 
     // Use client-provided group_id as the canonical conversation ID

@@ -1,17 +1,20 @@
 use axum::{extract::State, http::StatusCode, Json};
+use std::sync::Arc;
 use tracing::{info, error};
 
 use crate::{
     auth::{AuthUser, verify_is_admin, verify_is_member, enforce_standard},
     generated::blue::catbird::mls::remove_member::{Input, Output, OutputData, NSID},
+    realtime::SseState,
     storage::DbPool,
 };
 
 /// Remove a member from conversation (admin-only)
 /// POST /xrpc/blue.catbird.mls.removeMember
-#[tracing::instrument(skip(pool, auth_user))]
+#[tracing::instrument(skip(pool, sse_state, auth_user))]
 pub async fn remove_member(
     State(pool): State<DbPool>,
+    State(sse_state): State<Arc<SseState>>,
     auth_user: AuthUser,
     Json(input): Json<Input>,
 ) -> Result<Json<Output>, StatusCode> {
@@ -62,6 +65,23 @@ pub async fn remove_member(
         return Err(StatusCode::NOT_FOUND);
     }
 
+    // Prepare membershipChangeEvent metadata for emission after epoch is fetched
+    let event_cursor = sse_state
+        .cursor_gen
+        .next(&input.convo_id, "membershipChangeEvent")
+        .await;
+
+    // Determine action based on reason - use "kicked" if there's a reason suggesting disciplinary action
+    let event_action = if input.reason.as_ref().map(|r|
+        r.to_lowercase().contains("violat") ||
+        r.to_lowercase().contains("abuse") ||
+        r.to_lowercase().contains("spam")
+    ).unwrap_or(false) {
+        "kicked"
+    } else {
+        "removed"
+    };
+
     // Log admin action
     let action_id = uuid::Uuid::new_v4().to_string();
     sqlx::query(
@@ -97,6 +117,24 @@ pub async fn remove_member(
         error!("❌ [remove_member] Conversation not found");
         StatusCode::NOT_FOUND
     })? as usize;
+
+    // Emit the membership event with the correct epoch
+    let membership_event = crate::realtime::StreamEvent::MembershipChangeEvent {
+        cursor: event_cursor,
+        convo_id: input.convo_id.clone(),
+        did: input.target_did.as_str().to_string(),
+        action: event_action.to_string(),
+        actor: Some(auth_user.did.clone()),
+        reason: input.reason.clone(),
+        epoch: epoch_hint,
+    };
+
+    if let Err(e) = sse_state.emit(&input.convo_id, membership_event).await {
+        error!("Failed to emit membershipChangeEvent: {}", e);
+    } else {
+        info!("✅ Emitted membershipChangeEvent for {} being {} by {}",
+              input.target_did.as_str(), event_action, auth_user.did);
+    }
 
     info!("✅ [remove_member] SUCCESS - {} removed by {}, epoch: {}",
           input.target_did.as_str(), auth_user.did, epoch_hint);

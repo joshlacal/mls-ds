@@ -11,7 +11,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 // Import from library crate instead of re-declaring modules
 use catbird_server::{
-    actors, auth, crypto, db, fanout, handlers, health, metrics, middleware, models, realtime,
+    actors, auth, block_sync, crypto, db, fanout, handlers, health, metrics, middleware, models, realtime,
     storage, util,
 };
 
@@ -28,6 +28,7 @@ struct AppState {
     sse_state: Arc<realtime::SseState>,
     actor_registry: Arc<actors::ActorRegistry>,
     notification_service: Option<Arc<catbird_server::notifications::NotificationService>>,
+    block_sync: Arc<block_sync::BlockSyncService>,
 }
 
 #[tokio::main]
@@ -142,11 +143,15 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Rate limiter cleanup worker started");
 
     // Create composite app state
+    let block_sync_service = Arc::new(block_sync::BlockSyncService::new());
+    tracing::info!("Block sync service initialized");
+
     let app_state = AppState {
         db_pool: db_pool.clone(),
         sse_state,
         actor_registry,
         notification_service,
+        block_sync: block_sync_service,
     };
 
     // Build application router
