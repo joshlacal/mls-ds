@@ -2,6 +2,7 @@ pub mod actors;
 pub mod admin_system;
 pub mod atproto_bytes;
 pub mod auth;
+pub mod block_sync;
 pub mod crypto;
 pub mod db;
 pub mod device_utils;

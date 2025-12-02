@@ -1,16 +1,23 @@
 use axum::{extract::State, http::StatusCode, Json};
+use std::sync::Arc;
 use tracing::{info, error};
 
 use crate::{
     auth::{AuthUser, enforce_standard},
+    block_sync::BlockSyncService,
     generated::blue::catbird::mls::handle_block_change::{Input, Output, OutputData, AffectedConvo, AffectedConvoData, NSID},
     sqlx_atrium::chrono_to_datetime,
     storage::DbPool,
 };
 
-#[tracing::instrument(skip(pool, auth_user))]
+/// Handle a block change notification from the client.
+/// 
+/// This is called when a user blocks/unblocks someone on Bluesky.
+/// We update our local cache and find affected conversations.
+#[tracing::instrument(skip(pool, block_sync, auth_user))]
 pub async fn handle_block_change(
     State(pool): State<DbPool>,
+    State(block_sync): State<Arc<BlockSyncService>>,
     auth_user: AuthUser,
     Json(input): Json<Input>,
 ) -> Result<Json<Output>, StatusCode> {
@@ -21,12 +28,15 @@ pub async fn handle_block_change(
     let blocker_str = input.blocker_did.to_string();
     let blocked_str = input.blocked_did.to_string();
 
+    // Invalidate the cache for this user so we fetch fresh data on next check
+    block_sync.invalidate_cache(&blocker_str).await;
+
     if input.action == "created" {
         // Insert block
         let now = chrono::Utc::now();
         sqlx::query(
             "INSERT INTO bsky_blocks (user_did, target_did, source, synced_at)
-             VALUES ($1, $2, 'bsky', $3)
+             VALUES ($1, $2, 'client', $3)
              ON CONFLICT (user_did, target_did) DO UPDATE SET synced_at = $3"
         )
         .bind(&blocker_str)
@@ -39,7 +49,9 @@ pub async fn handle_block_change(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-        info!("Block created: {} blocked {}", blocker_str, blocked_str);
+        info!("Block created: {} blocked {}", 
+              crate::crypto::redact_for_log(&blocker_str), 
+              crate::crypto::redact_for_log(&blocked_str));
     } else {
         // Remove block
         sqlx::query("DELETE FROM bsky_blocks WHERE user_did = $1 AND target_did = $2")
@@ -52,15 +64,17 @@ pub async fn handle_block_change(
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
-        info!("Block removed: {} unblocked {}", blocker_str, blocked_str);
+        info!("Block removed: {} unblocked {}", 
+              crate::crypto::redact_for_log(&blocker_str), 
+              crate::crypto::redact_for_log(&blocked_str));
     }
 
-    // Find affected conversations
+    // Find affected conversations where both users are members
     let affected_convo_ids: Vec<String> = sqlx::query_scalar(
         "SELECT DISTINCT m1.convo_id
          FROM members m1
          JOIN members m2 ON m1.convo_id = m2.convo_id
-         WHERE m1.user_did = $1 AND m2.user_did = $2
+         WHERE m1.member_did = $1 AND m2.member_did = $2
          AND m1.left_at IS NULL AND m2.left_at IS NULL"
     )
     .bind(&blocker_str)

@@ -35,8 +35,8 @@
       "properties": {
         "event": {
           "type": "union",
-          "description": "The actual event (message, reaction, typing, or info)",
-          "refs": ["#messageEvent", "#reactionEvent", "#typingEvent", "#infoEvent"]
+          "description": "The actual event (message, reaction, typing, info, newDevice, groupInfoRefreshRequested, or readditionRequested)",
+          "refs": ["#messageEvent", "#reactionEvent", "#typingEvent", "#infoEvent", "#newDeviceEvent", "#groupInfoRefreshRequestedEvent", "#readditionRequestedEvent", "#membershipChangeEvent"]
         }
       }
     },
@@ -80,6 +80,56 @@
       "properties": {
         "cursor": { "type": "string", "description": "Resume cursor for this event position" },
         "info": { "type": "string", "description": "Human-readable info or keep-alive message" }
+      }
+    },
+    "newDeviceEvent": {
+      "type": "object",
+      "description": "Event indicating a user has registered a new device that needs to be added to the conversation",
+      "required": ["cursor", "convoId", "userDid", "deviceId", "deviceCredentialDid", "pendingAdditionId"],
+      "properties": {
+        "cursor": { "type": "string", "description": "Resume cursor for this event position" },
+        "convoId": { "type": "string", "description": "Conversation identifier" },
+        "userDid": { "type": "string", "format": "did", "description": "Base user DID (without device suffix)" },
+        "deviceId": { "type": "string", "description": "Device identifier" },
+        "deviceName": { "type": "string", "description": "Human-readable device name" },
+        "deviceCredentialDid": { "type": "string", "description": "Full device credential DID (format: did:plc:user#device-uuid)" },
+        "pendingAdditionId": { "type": "string", "description": "ID of the pending addition record for claim/complete flow" }
+      }
+    },
+    "groupInfoRefreshRequestedEvent": {
+      "type": "object",
+      "description": "Event requesting active members to publish fresh GroupInfo for external commit joins",
+      "required": ["cursor", "convoId", "requestedBy", "requestedAt"],
+      "properties": {
+        "cursor": { "type": "string", "description": "Resume cursor for this event position" },
+        "convoId": { "type": "string", "description": "Conversation identifier" },
+        "requestedBy": { "type": "string", "format": "did", "description": "DID of the member requesting the refresh (so they don't respond to their own request)" },
+        "requestedAt": { "type": "string", "format": "datetime", "description": "ISO 8601 timestamp of when the refresh was requested" }
+      }
+    },
+    "readditionRequestedEvent": {
+      "type": "object",
+      "description": "Event indicating a member needs to be re-added to the conversation because both Welcome and External Commit failed",
+      "required": ["cursor", "convoId", "userDid", "requestedAt"],
+      "properties": {
+        "cursor": { "type": "string", "description": "Resume cursor for this event position" },
+        "convoId": { "type": "string", "description": "Conversation identifier" },
+        "userDid": { "type": "string", "format": "did", "description": "DID of the user requesting re-addition" },
+        "requestedAt": { "type": "string", "format": "datetime", "description": "ISO 8601 timestamp of when re-addition was requested" }
+      }
+    },
+    "membershipChangeEvent": {
+      "type": "object",
+      "description": "Event indicating a member joined, left, or was removed from the conversation",
+      "required": ["cursor", "convoId", "did", "action", "epoch"],
+      "properties": {
+        "cursor": { "type": "string", "description": "Resume cursor for this event position" },
+        "convoId": { "type": "string", "description": "Conversation identifier" },
+        "did": { "type": "string", "format": "did", "description": "DID of the affected member" },
+        "action": { "type": "string", "description": "Action performed: 'joined' (Welcome/ExternalCommit), 'left' (self), 'removed' or 'kicked' (by admin)", "knownValues": ["joined", "left", "removed", "kicked"] },
+        "actor": { "type": "string", "format": "did", "description": "DID of the actor who performed the action (for removed/kicked)" },
+        "reason": { "type": "string", "description": "Optional reason for removal" },
+        "epoch": { "type": "integer", "description": "New epoch after this change" }
       }
     }
   }

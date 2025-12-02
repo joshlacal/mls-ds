@@ -324,6 +324,28 @@ pub async fn leave_convo(
         if rows_affected == 0 {
             // Member was already marked as left - this is idempotent
             info!("Member already left conversation, treating as idempotent success");
+        } else {
+            // Emit membershipChangeEvent for the member leaving
+            let cursor = sse_state
+                .cursor_gen
+                .next(&input.convo_id, "membershipChangeEvent")
+                .await;
+
+            let membership_event = crate::realtime::StreamEvent::MembershipChangeEvent {
+                cursor,
+                convo_id: input.convo_id.clone(),
+                did: target_did.clone(),
+                action: "left".to_string(),
+                actor: None, // self-leave has no actor
+                reason: None,
+                epoch: new_epoch as usize,
+            };
+
+            if let Err(e) = sse_state.emit(&input.convo_id, membership_event).await {
+                error!("Failed to emit membershipChangeEvent: {}", e);
+            } else {
+                info!("✅ Emitted membershipChangeEvent for {} leaving", target_did);
+            }
         }
 
         new_epoch as u32

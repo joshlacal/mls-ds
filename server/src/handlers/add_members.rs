@@ -8,6 +8,7 @@ use tracing::{info, warn, error};
 use crate::{
     actors::{ActorRegistry, ConvoMessage, KeyPackageHashEntry},
     auth::AuthUser,
+    block_sync::BlockSyncService,
     error_responses::AddMembersError,
     generated::blue::catbird::mls::add_members::{Input as AddMembersInput, Output as AddMembersOutput, OutputData, Error},
     realtime::{SseState, StreamEvent},
@@ -16,11 +17,12 @@ use crate::{
 
 /// Add members to an existing conversation
 /// POST /xrpc/chat.bsky.convo.addMembers
-#[tracing::instrument(skip(pool, sse_state, actor_registry))]
+#[tracing::instrument(skip(pool, sse_state, actor_registry, block_sync))]
 pub async fn add_members(
     State(pool): State<DbPool>,
     State(sse_state): State<Arc<SseState>>,
     State(actor_registry): State<Arc<ActorRegistry>>,
+    State(block_sync): State<Arc<BlockSyncService>>,
     auth_user: AuthUser,
     Json(input): Json<AddMembersInput>,
 ) -> Result<Json<AddMembersOutput>, AddMembersError> {
@@ -56,6 +58,91 @@ pub async fn add_members(
 
     // Note: Reduced logging per security hardening - no convo IDs at info level
     tracing::debug!("Adding {} members to convo {}", input.did_list.len(), crate::crypto::redact_for_log(&input.convo_id));
+
+    // Check for blocks between existing members and new members
+    tracing::debug!("📍 [add_members] checking for blocks between existing and new members via PDS");
+    
+    // Get existing members
+    let existing_member_dids: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT member_did FROM members WHERE convo_id = $1 AND left_at IS NULL"
+    )
+    .bind(&input.convo_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| {
+        error!("Failed to query existing members: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    
+    // Combine existing + new members for block check
+    let new_member_dids: Vec<String> = input.did_list.iter().map(|d| d.as_str().to_string()).collect();
+    let mut all_dids_for_block_check = existing_member_dids.clone();
+    for new_did in &new_member_dids {
+        if !all_dids_for_block_check.contains(new_did) {
+            all_dids_for_block_check.push(new_did.clone());
+        }
+    }
+    
+    // Check for block conflicts between new members and existing members
+    if all_dids_for_block_check.len() > 1 {
+        match block_sync.check_block_conflicts(&all_dids_for_block_check).await {
+            Ok(conflicts) => {
+                // Filter to only conflicts involving new members
+                let relevant_conflicts: Vec<_> = conflicts.iter()
+                    .filter(|(blocker, blocked)| {
+                        new_member_dids.contains(blocker) || new_member_dids.contains(blocked)
+                    })
+                    .collect();
+                    
+                if !relevant_conflicts.is_empty() {
+                    // Sync blocks to DB for future reference
+                    for (blocker, _blocked) in &relevant_conflicts {
+                        if let Err(e) = block_sync.sync_blocks_to_db(&pool, blocker).await {
+                            warn!("Failed to sync blocks to DB: {}", e);
+                        }
+                    }
+                    
+                    warn!(
+                        "❌ [add_members] Block detected: {} conflicts found via PDS",
+                        relevant_conflicts.len()
+                    );
+                    return Err(Error::BlockedByMember(Some(format!(
+                        "Cannot add members: block exists between new and existing members"
+                    ))).into());
+                }
+                tracing::debug!("✅ [add_members] No blocks detected (PDS verified)");
+            }
+            Err(e) => {
+                // Fall back to local DB if PDS queries fail
+                warn!("PDS block check failed, falling back to local DB: {}", e);
+                
+                let blocks: Vec<(String, String)> = sqlx::query_as(
+                    "SELECT user_did, target_did FROM bsky_blocks
+                     WHERE user_did = ANY($1) AND target_did = ANY($2)
+                        OR user_did = ANY($2) AND target_did = ANY($1)"
+                )
+                .bind(&existing_member_dids)
+                .bind(&new_member_dids)
+                .fetch_all(&pool)
+                .await
+                .map_err(|e| {
+                    error!("❌ [add_members] Failed to check blocks: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+
+                if !blocks.is_empty() {
+                    warn!(
+                        "❌ [add_members] Block detected: {} blocks found (from DB cache)",
+                        blocks.len()
+                    );
+                    return Err(Error::BlockedByMember(Some(format!(
+                        "Cannot add members: block exists between new and existing members"
+                    ))).into());
+                }
+                tracing::debug!("✅ [add_members] No blocks detected (DB fallback)");
+            }
+        }
+    }
 
     // Check max_members limit before adding members
     // Query current member count and max_members from policy

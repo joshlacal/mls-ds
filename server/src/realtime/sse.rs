@@ -23,73 +23,100 @@ pub struct SubscribeQuery {
 }
 
 /// Event types for realtime streaming
+/// Uses AT Protocol format with $type tag for proper client compatibility
 #[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
+#[serde(tag = "$type")]
 pub enum StreamEvent {
+    #[serde(rename = "blue.catbird.mls.streamConvoEvents#messageEvent")]
     MessageEvent {
         cursor: String,
         message: MessageView,
     },
+    #[serde(rename = "blue.catbird.mls.streamConvoEvents#reactionEvent")]
     ReactionEvent {
         cursor: String,
+        #[serde(rename = "convoId")]
         convo_id: String,
-        emitted_at: String,
-        payload: ReactionEventPayload,
+        #[serde(rename = "messageId")]
+        message_id: String,
+        did: String,
+        reaction: String,
+        action: String,
     },
+    #[serde(rename = "blue.catbird.mls.streamConvoEvents#typingEvent")]
     TypingEvent {
         cursor: String,
+        #[serde(rename = "convoId")]
         convo_id: String,
-        emitted_at: String,
-        payload: TypingEventPayload,
+        did: String,
+        #[serde(rename = "isTyping")]
+        is_typing: bool,
     },
+    #[serde(rename = "blue.catbird.mls.streamConvoEvents#infoEvent")]
     InfoEvent {
         cursor: String,
-        convo_id: String,
-        emitted_at: String,
-        reason: String,
-        detail: Option<serde_json::Value>,
+        info: String,
     },
     /// Event indicating a user has registered a new device that needs to be added to the conversation
+    #[serde(rename = "blue.catbird.mls.streamConvoEvents#newDeviceEvent")]
     NewDeviceEvent {
         cursor: String,
+        #[serde(rename = "convoId")]
         convo_id: String,
+        #[serde(rename = "userDid")]
         user_did: String,
+        #[serde(rename = "deviceId")]
         device_id: String,
+        #[serde(rename = "deviceName")]
         device_name: Option<String>,
+        #[serde(rename = "deviceCredentialDid")]
         device_credential_did: String,
+        #[serde(rename = "pendingAdditionId")]
         pending_addition_id: String,
     },
     /// Event requesting active members to publish fresh GroupInfo for external commit joins
     /// Emitted when a member encounters stale GroupInfo and calls requestGroupInfoRefresh
+    #[serde(rename = "blue.catbird.mls.streamConvoEvents#groupInfoRefreshRequestedEvent")]
     GroupInfoRefreshRequested {
         cursor: String,
+        #[serde(rename = "convoId")]
         convo_id: String,
         /// DID of the member requesting the refresh (so they don't respond to their own request)
+        #[serde(rename = "requestedBy")]
         requested_by: String,
+        #[serde(rename = "requestedAt")]
         requested_at: String,
     },
     /// Event indicating a member needs to be re-added to the conversation
     /// Emitted when both Welcome and External Commit have failed
+    #[serde(rename = "blue.catbird.mls.streamConvoEvents#readditionRequestedEvent")]
     ReadditionRequested {
         cursor: String,
+        #[serde(rename = "convoId")]
         convo_id: String,
         /// DID of the user requesting re-addition
+        #[serde(rename = "userDid")]
         user_did: String,
+        #[serde(rename = "requestedAt")]
         requested_at: String,
     },
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ReactionEventPayload {
-    pub message_id: String,
-    pub actor_did: String,
-    pub kind: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct TypingEventPayload {
-    pub actor_did: String,
-    pub is_typing: bool,
+    /// Event indicating a member joined, left, or was removed from the conversation
+    #[serde(rename = "blue.catbird.mls.streamConvoEvents#membershipChangeEvent")]
+    MembershipChangeEvent {
+        cursor: String,
+        #[serde(rename = "convoId")]
+        convo_id: String,
+        /// DID of the affected member
+        did: String,
+        /// Action: joined, left, removed, or kicked
+        action: String,
+        /// DID of the actor who performed the action (for removed/kicked)
+        actor: Option<String>,
+        /// Optional reason for removal
+        reason: Option<String>,
+        /// New epoch after this change
+        epoch: usize,
+    },
 }
 
 /// Shared state for SSE connections
@@ -215,6 +242,7 @@ pub async fn subscribe_convo_events(
                                         StreamEvent::NewDeviceEvent { cursor, .. } => cursor,
                                         StreamEvent::GroupInfoRefreshRequested { cursor, .. } => cursor,
                                         StreamEvent::ReadditionRequested { cursor, .. } => cursor,
+                                        StreamEvent::MembershipChangeEvent { cursor, .. } => cursor,
                                     };
 
                                     // Only send events after resume cursor
@@ -245,10 +273,7 @@ pub async fn subscribe_convo_events(
                                 // Emit infoEvent about slow consumer
                                 let info = StreamEvent::InfoEvent {
                                     cursor: ulid::Ulid::new().to_string(),
-                                    convo_id: convo_id.clone(),
-                                    emitted_at: chrono::Utc::now().to_rfc3339(),
-                                    reason: "slow-consumer".to_string(),
-                                    detail: Some(serde_json::json!({ "skipped": skipped })),
+                                    info: format!("Slow consumer: {} events skipped", skipped),
                                 };
 
                                 // SAFETY: StreamEvent is a simple enum with no complex types,
@@ -319,10 +344,7 @@ mod tests {
 
         let event = StreamEvent::InfoEvent {
             cursor: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
-            convo_id: "convo1".to_string(),
-            emitted_at: chrono::Utc::now().to_rfc3339(),
-            reason: "test".to_string(),
-            detail: None,
+            info: "test".to_string(),
         };
 
         state.emit("convo1", event.clone()).await.unwrap();

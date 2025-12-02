@@ -1,6 +1,5 @@
 use a2::{Client, ClientConfig, DefaultNotificationBuilder, Endpoint, NotificationBuilder, NotificationOptions, Priority};
 use anyhow::{Context, Result};
-use serde_json::json;
 use sqlx::PgPool;
 use std::{path::Path, sync::Arc};
 use tracing::{debug, error, info, warn};
@@ -87,47 +86,17 @@ impl ApnsClient {
             "🔔 [push_notification] Preparing MLS message notification"
         );
 
-        // Build custom payload with all required fields for client decryption
-        let custom_data = json!({
-            "type": "mls_message",
-            "ciphertext": ciphertext_b64,
-            "convo_id": convo_id,
-            "message_id": message_id,
-            "recipient_did": recipient_did,
-        });
-
         info!(
-            "🔔 [push_notification] Custom data payload created with {} fields",
-            custom_data.as_object().map(|o| o.len()).unwrap_or(0)
+            "🔔 [push_notification] Building notification payload with custom MLS data"
         );
 
-        // Build notification with custom payload
-        let mut payload = json!({
-            "aps": {
-                "content-available": 1,
-                "mutable-content": 1,
-                "sound": "default",
-            }
-        });
-
-        // Merge custom data into payload
-        if let Some(obj) = payload.as_object_mut() {
-            if let Some(custom_obj) = custom_data.as_object() {
-                for (key, value) in custom_obj {
-                    obj.insert(key.clone(), value.clone());
-                }
-            }
-        }
-
-        let body = payload.to_string();
-        info!(
-            "🔔 [push_notification] Final payload size: {} bytes, topic: {}",
-            body.len(),
-            self.topic
-        );
-
-        let notification = DefaultNotificationBuilder::new()
-            .set_body(&body)
+        // Build notification with mutable-content for Notification Service Extension
+        // Do NOT use set_body() - that sets the visible alert text, not the payload!
+        // Instead, use set_content_available() + set_mutable_content() + add_custom_data()
+        let mut notification = DefaultNotificationBuilder::new()
+            .set_content_available()  // Enables background processing
+            .set_mutable_content()    // Enables Notification Service Extension to modify
+            .set_sound("default")
             .build(
                 device_token,
                 NotificationOptions {
@@ -140,8 +109,16 @@ impl ApnsClient {
                 },
             );
 
+        // Add custom data fields at the top level of the payload (sibling to "aps")
+        // These are read by the Notification Service Extension to decrypt the message
+        notification.add_custom_data("type", &"mls_message")?;
+        notification.add_custom_data("ciphertext", &ciphertext_b64)?;
+        notification.add_custom_data("convo_id", &convo_id)?;
+        notification.add_custom_data("message_id", &message_id)?;
+        notification.add_custom_data("recipient_did", &recipient_did)?;
+
         info!(
-            "🔔 [push_notification] Notification built, starting delivery with retries (max: {})",
+            "🔔 [push_notification] Notification built with custom MLS data, starting delivery (max retries: {})",
             3
         );
 
