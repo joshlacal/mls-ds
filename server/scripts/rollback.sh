@@ -1,11 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-# Rollback Script for MLS Server
-# Performs blue-green deployment rollback
-
-ENVIRONMENT="${1:-staging}"
-NAMESPACE="${ENVIRONMENT}"
+# Rollback Script for MLS Server (Host-based)
+# Restores a previous binary version
 
 # Colors
 RED='\033[0;31m'
@@ -30,106 +27,94 @@ log_warn() {
     echo -e "${YELLOW}[WARN]${NC} $1"
 }
 
-usage() {
-    echo "Usage: $0 <environment>"
-    echo "  environment: staging or production"
-    exit 1
-}
-
-if [ "$ENVIRONMENT" != "staging" ] && [ "$ENVIRONMENT" != "production" ]; then
-    log_error "Invalid environment: $ENVIRONMENT"
-    usage
-fi
+BACKUP_DIR="/home/ubuntu/mls/backups"
+BINARY_PATH="/home/ubuntu/mls/target/release/catbird-server"
 
 echo "=========================================="
 echo "  MLS Server Rollback"
-echo "  Environment: $ENVIRONMENT"
 echo "=========================================="
 echo ""
 
-log_warn "This will rollback the deployment to the previous version"
+# Check for backup binaries
+if [ ! -d "$BACKUP_DIR" ]; then
+    log_error "No backup directory found at $BACKUP_DIR"
+    echo ""
+    echo "To create a backup before deploying, run:"
+    echo "  mkdir -p $BACKUP_DIR"
+    echo "  cp $BINARY_PATH $BACKUP_DIR/catbird-server.\$(date +%Y%m%d_%H%M%S)"
+    exit 1
+fi
+
+# List available backups
+log_info "Available backups:"
+ls -lt "$BACKUP_DIR"/catbird-server.* 2>/dev/null || {
+    log_error "No backup binaries found in $BACKUP_DIR"
+    exit 1
+}
+
+echo ""
+read -p "Enter backup filename to restore (or 'latest' for most recent): " BACKUP_CHOICE
+
+if [ "$BACKUP_CHOICE" = "latest" ]; then
+    BACKUP_FILE=$(ls -t "$BACKUP_DIR"/catbird-server.* 2>/dev/null | head -1)
+else
+    BACKUP_FILE="$BACKUP_DIR/$BACKUP_CHOICE"
+fi
+
+if [ ! -f "$BACKUP_FILE" ]; then
+    log_error "Backup file not found: $BACKUP_FILE"
+    exit 1
+fi
+
+log_warn "This will rollback to: $BACKUP_FILE"
 read -p "Are you sure you want to continue? (yes/no): " -r
 if [ "$REPLY" != "yes" ]; then
     log_info "Rollback cancelled"
     exit 0
 fi
 
-# Check if kubectl is available
-if ! command -v kubectl &> /dev/null; then
-    log_error "kubectl not found. Please install kubectl."
-    exit 1
-fi
+# Stop the service
+log_info "Stopping server..."
+sudo systemctl stop catbird-mls-server
 
-# Check current deployment status
-log_info "Checking current deployment status..."
-kubectl get deployments -n "$NAMESPACE" -l app=mls-server
+# Backup current binary
+CURRENT_BACKUP="$BACKUP_DIR/catbird-server.$(date +%Y%m%d_%H%M%S).pre-rollback"
+log_info "Backing up current binary to $CURRENT_BACKUP..."
+cp "$BINARY_PATH" "$CURRENT_BACKUP" 2>/dev/null || true
 
-# Get current active version
-CURRENT_VERSION=$(kubectl get service mls-server -n "$NAMESPACE" -o jsonpath='{.spec.selector.version}' || echo "unknown")
-log_info "Current active version: $CURRENT_VERSION"
+# Restore the backup
+log_info "Restoring backup..."
+cp "$BACKUP_FILE" "$BINARY_PATH"
+chmod +x "$BINARY_PATH"
 
-if [ "$CURRENT_VERSION" = "blue" ]; then
-    TARGET_VERSION="green"
-    CURRENT_DEPLOYMENT="mls-server-blue"
-    TARGET_DEPLOYMENT="mls-server-green"
-elif [ "$CURRENT_VERSION" = "green" ]; then
-    TARGET_VERSION="blue"
-    CURRENT_DEPLOYMENT="mls-server-green"
-    TARGET_DEPLOYMENT="mls-server-blue"
-else
-    log_error "Cannot determine current version"
-    exit 1
-fi
+# Start the service
+log_info "Starting server..."
+sudo systemctl start catbird-mls-server
 
-log_info "Rolling back to: $TARGET_VERSION"
-
-# Check if target deployment exists and is ready
-log_info "Verifying target deployment..."
-TARGET_READY=$(kubectl get deployment "$TARGET_DEPLOYMENT" -n "$NAMESPACE" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
-TARGET_DESIRED=$(kubectl get deployment "$TARGET_DEPLOYMENT" -n "$NAMESPACE" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "0")
-
-if [ "$TARGET_READY" -lt "$TARGET_DESIRED" ]; then
-    log_warn "Target deployment is not fully ready (${TARGET_READY}/${TARGET_DESIRED})"
-    log_info "Scaling up target deployment..."
-    kubectl scale deployment "$TARGET_DEPLOYMENT" -n "$NAMESPACE" --replicas=3
-    kubectl rollout status deployment "$TARGET_DEPLOYMENT" -n "$NAMESPACE" --timeout=5m
-fi
-
-# Switch service to target version
-log_info "Switching traffic to $TARGET_VERSION..."
-kubectl patch service mls-server -n "$NAMESPACE" \
-    -p "{\"spec\":{\"selector\":{\"version\":\"$TARGET_VERSION\"}}}"
-
-log_success "Traffic switched to $TARGET_VERSION"
-
-# Wait and monitor
-log_info "Monitoring for 30 seconds..."
-sleep 30
+# Wait and check health
+log_info "Waiting for server to be healthy..."
+sleep 5
 
 # Run health checks
 log_info "Running health checks..."
-SERVICE_IP=$(kubectl get service mls-server -n "$NAMESPACE" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' || echo "localhost")
-if curl -f "http://${SERVICE_IP}/health" -m 10; then
+if curl -sf http://localhost:3000/health > /dev/null 2>&1; then
     log_success "Health check passed"
 else
-    log_error "Health check failed"
+    log_error "Health check failed - consider rolling forward"
+    sudo journalctl -u catbird-mls-server -n 20 --no-pager
     exit 1
 fi
 
-# Scale down current (now old) deployment
-log_info "Scaling down $CURRENT_VERSION deployment..."
-kubectl scale deployment "$CURRENT_DEPLOYMENT" -n "$NAMESPACE" --replicas=1
-
 log_success "Rollback completed successfully!"
-log_info "Current active version: $TARGET_VERSION"
-log_info "Previous version ($CURRENT_VERSION) scaled to 1 replica"
+log_info "Restored from: $BACKUP_FILE"
 
 echo ""
 echo "To verify the rollback:"
-echo "  kubectl get pods -n $NAMESPACE -l app=mls-server"
-echo "  kubectl get service mls-server -n $NAMESPACE"
+echo "  curl http://localhost:3000/health"
+echo "  sudo journalctl -u catbird-mls-server -f"
 echo ""
-echo "To completely remove the old version:"
-echo "  kubectl scale deployment $CURRENT_DEPLOYMENT -n $NAMESPACE --replicas=0"
+echo "To undo this rollback:"
+echo "  cp $CURRENT_BACKUP $BINARY_PATH"
+echo "  sudo systemctl restart catbird-mls-server"
 
 exit 0

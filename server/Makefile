@@ -1,39 +1,44 @@
-.PHONY: help build run test clean deploy deploy-k8s backup restore health-check logs
+.PHONY: help build run test clean deploy backup restore health-check logs
 
 # Default target
 help:
 	@echo "Catbird MLS Server - Make Commands"
 	@echo "===================================="
-	@echo "build              - Build Docker image"
-	@echo "run                - Run with docker-compose"
-	@echo "run-dev            - Run in development mode with hot reload"
-	@echo "stop               - Stop all containers"
+	@echo "build              - Build release binary"
+	@echo "run                - Run the server (foreground)"
+	@echo "start              - Start systemd service"
+	@echo "stop               - Stop systemd service"
+	@echo "restart            - Restart systemd service"
 	@echo "test               - Run tests"
-	@echo "clean              - Clean up containers and volumes"
-	@echo "deploy             - Deploy with docker-compose"
-	@echo "deploy-k8s         - Deploy to Kubernetes"
+	@echo "clean              - Clean build artifacts"
+	@echo "deploy             - Build and deploy (preserve data)"
+	@echo "deploy-fresh       - Deploy with fresh database"
 	@echo "migrate            - Run database migrations"
 	@echo "backup             - Backup database"
 	@echo "restore            - Restore database from backup"
 	@echo "health-check       - Check server health"
 	@echo "logs               - View logs"
-	@echo "shell              - Open shell in container"
+	@echo "clear-db           - Clear all database data"
 
-# Build Docker image
+# Build release binary
 build:
-	docker build -t catbird-mls-server:latest .
+	cargo build --release
 
-# Run with docker-compose
+# Run the server (foreground, for development)
 run:
-	docker-compose up -d
+	cargo run --release
 
-# Run in development mode
-run-dev:
-	docker-compose -f docker-compose.yml -f docker-compose.dev.yml up
+# Start systemd service
+start:
+	sudo systemctl start catbird-mls-server
 
-# Stop all containers
+# Stop systemd service
 stop:
-	docker-compose down
+	sudo systemctl stop catbird-mls-server
+
+# Restart systemd service
+restart:
+	sudo systemctl restart catbird-mls-server
 
 # Run tests
 test:
@@ -41,16 +46,15 @@ test:
 
 # Clean up
 clean:
-	docker-compose down -v
 	cargo clean
 
-# Deploy with docker-compose
+# Deploy (preserve data)
 deploy:
-	./scripts/deploy.sh production
+	./deploy-update.sh
 
-# Deploy to Kubernetes
-deploy-k8s:
-	./scripts/k8s-deploy.sh production
+# Deploy fresh (wipe data)
+deploy-fresh:
+	./deploy-fresh.sh
 
 # Run migrations
 migrate:
@@ -73,27 +77,16 @@ health-check:
 
 # View logs
 logs:
-	docker-compose logs -f mls-server
+	sudo journalctl -u catbird-mls-server -f
 
-# Open shell in container
-shell:
-	docker-compose exec mls-server /bin/bash
+# Clear database
+clear-db:
+	./scripts/clear-db.sh
 
-# Kubernetes specific commands
-k8s-logs:
-	kubectl logs -f deployment/catbird-mls-server -n catbird
+# Clear database (no confirmation)
+clear-db-fast:
+	./scripts/clear-db-fast.sh
 
-k8s-shell:
-	kubectl exec -it deployment/catbird-mls-server -n catbird -- /bin/bash
-
-k8s-health:
-	kubectl port-forward svc/catbird-mls-service 8080:80 -n catbird & \
-	sleep 3 && \
-	./scripts/health-check.sh http://localhost:8080 && \
-	pkill -f "kubectl port-forward"
-
-k8s-scale:
-	@echo "Usage: make k8s-scale REPLICAS=5"
-	@if [ -n "$(REPLICAS)" ]; then \
-		kubectl scale deployment/catbird-mls-server --replicas=$(REPLICAS) -n catbird; \
-	fi
+# Status
+status:
+	sudo systemctl status catbird-mls-server --no-pager

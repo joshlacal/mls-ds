@@ -1,13 +1,12 @@
 #!/bin/bash
 #
-# Catbird MLS Server Deployment Script
+# Catbird MLS Server Deployment Script (Host Deployment)
 # Usage: ./deploy.sh
 #
 # This script:
 # 1. Builds the release binary
-# 2. Copies it to the correct location
-# 3. Rebuilds the Docker image
-# 4. Recreates the container
+# 2. Copies it to /usr/local/bin
+# 3. Restarts the systemd service
 #
 
 set -euo pipefail
@@ -20,99 +19,65 @@ NC='\033[0m' # No Color
 
 # Configuration
 MLS_ROOT="/home/ubuntu/mls"
-SERVER_DIR="$MLS_ROOT/server"
 TARGET_DIR="$MLS_ROOT/target"
 BINARY_NAME="catbird-server"
-IMAGE_NAME="server-mls-server"
-CONTAINER_NAME="catbird-mls-server"
-NETWORK_NAME="server_catbird-network"
+SERVICE_NAME="catbird-mls-server"
 
-echo -e "${GREEN}=== Catbird MLS Server Deployment ===${NC}"
+echo -e "${GREEN}=== Catbird MLS Server Host Deployment ===${NC}"
 echo
 
 # Step 1: Build release binary
-echo -e "${YELLOW}[1/6] Building release binary...${NC}"
+echo -e "${YELLOW}[1/4] Building release binary...${NC}"
 cd "$MLS_ROOT/server"
 SQLX_OFFLINE=true cargo build --release
 echo -e "${GREEN}✓ Build complete${NC}"
 echo
 
-# Step 2: Verify binary exists and copy it
-echo -e "${YELLOW}[2/6] Copying binary to Docker build location...${NC}"
+# Step 2: Verify binary exists
+echo -e "${YELLOW}[2/4] Verifying binary...${NC}"
 if [ ! -f "$TARGET_DIR/release/$BINARY_NAME" ]; then
     echo -e "${RED}ERROR: Binary not found at $TARGET_DIR/release/$BINARY_NAME${NC}"
     exit 1
 fi
-
-cp -f "$TARGET_DIR/release/$BINARY_NAME" "$SERVER_DIR/$BINARY_NAME"
-echo -e "${GREEN}✓ Binary copied${NC}"
-echo "  From: $TARGET_DIR/release/$BINARY_NAME"
-echo "  To:   $SERVER_DIR/$BINARY_NAME"
-echo "  Size: $(du -h "$SERVER_DIR/$BINARY_NAME" | cut -f1)"
-echo "  Date: $(date -r "$SERVER_DIR/$BINARY_NAME" '+%Y-%m-%d %H:%M:%S')"
+echo -e "${GREEN}✓ Binary found${NC}"
+echo "  Path: $TARGET_DIR/release/$BINARY_NAME"
+echo "  Size: $(du -h "$TARGET_DIR/release/$BINARY_NAME" | cut -f1)"
+echo "  Date: $(date -r "$TARGET_DIR/release/$BINARY_NAME" '+%Y-%m-%d %H:%M:%S')"
 echo
 
-# Step 3: Stop and remove old container
-echo -e "${YELLOW}[3/6] Stopping old container...${NC}"
-if docker ps -a | grep -q "$CONTAINER_NAME"; then
-    docker stop "$CONTAINER_NAME" || true
-    docker rm "$CONTAINER_NAME" || true
-    echo -e "${GREEN}✓ Old container removed${NC}"
-else
-    echo "  No existing container found"
-fi
+# Step 3: Copy binary and restart service
+echo -e "${YELLOW}[3/4] Installing binary and restarting service...${NC}"
+sudo cp -f "$TARGET_DIR/release/$BINARY_NAME" /usr/local/bin/$BINARY_NAME
+sudo chmod +x /usr/local/bin/$BINARY_NAME
+sudo systemctl restart $SERVICE_NAME
+echo -e "${GREEN}✓ Service restarted${NC}"
 echo
 
-# Step 4: Rebuild Docker image (no cache)
-echo -e "${YELLOW}[4/6] Rebuilding Docker image...${NC}"
-cd "$SERVER_DIR"
-docker build --no-cache -f Dockerfile.prebuilt -t "$IMAGE_NAME" .
-echo -e "${GREEN}✓ Docker image rebuilt${NC}"
-echo
+# Step 4: Verify deployment
+echo -e "${YELLOW}[4/4] Verifying deployment...${NC}"
+sleep 2
 
-# Step 5: Start new container
-echo -e "${YELLOW}[5/6] Starting new container...${NC}"
-docker run -d \
-  --name "$CONTAINER_NAME" \
-  --network "$NETWORK_NAME" \
-  -p 3000:3000 \
-  -e DATABASE_URL="postgresql://catbird:changeme@catbird-postgres:5432/catbird" \
-  -e REDIS_URL="redis://catbird-redis:6379" \
-  -e RUST_LOG="info" \
-  -e SERVICE_DID="did:web:mls.catbird.blue" \
-  -e SERVER_PORT="3000" \
-  "$IMAGE_NAME"
-echo -e "${GREEN}✓ Container started${NC}"
-echo
-
-# Step 6: Verify deployment
-echo -e "${YELLOW}[6/6] Verifying deployment...${NC}"
-sleep 3
-
-# Check container is running
-if ! docker ps | grep -q "$CONTAINER_NAME"; then
-    echo -e "${RED}ERROR: Container is not running${NC}"
-    echo "Container logs:"
-    docker logs "$CONTAINER_NAME" 2>&1 | tail -20
+# Check service is running
+if ! systemctl is-active --quiet $SERVICE_NAME; then
+    echo -e "${RED}ERROR: Service is not running${NC}"
+    echo "Service status:"
+    sudo systemctl status $SERVICE_NAME --no-pager | tail -20
     exit 1
 fi
 
-# Check binary timestamp in container
-CONTAINER_BINARY_DATE=$(docker exec "$CONTAINER_NAME" date -r "/app/$BINARY_NAME" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown")
-echo -e "${GREEN}✓ Container is running${NC}"
-echo "  Binary date in container: $CONTAINER_BINARY_DATE"
+echo -e "${GREEN}✓ Service is running${NC}"
 echo
 
 # Show recent logs
 echo "Recent logs:"
-docker logs "$CONTAINER_NAME" 2>&1 | grep -E "Starting|Server listening|ERROR" | tail -5
+sudo journalctl -u $SERVICE_NAME --no-pager -n 10 | tail -5
 echo
 
 echo -e "${GREEN}=== Deployment Complete ===${NC}"
-echo "The server is now running with the latest binary."
+echo "The server is now running with the latest binary on host."
 echo
 echo "Useful commands:"
-echo "  View logs:    docker logs -f $CONTAINER_NAME"
-echo "  Stop server:  docker stop $CONTAINER_NAME"
-echo "  Restart:      docker restart $CONTAINER_NAME"
-echo "  Shell access: docker exec -it $CONTAINER_NAME /bin/sh"
+echo "  View logs:    sudo journalctl -u $SERVICE_NAME -f"
+echo "  Stop server:  sudo systemctl stop $SERVICE_NAME"
+echo "  Restart:      sudo systemctl restart $SERVICE_NAME"
+echo "  Status:       sudo systemctl status $SERVICE_NAME"

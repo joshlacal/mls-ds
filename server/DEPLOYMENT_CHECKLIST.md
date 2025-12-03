@@ -7,225 +7,131 @@ Use this checklist when deploying the Catbird MLS Server to production.
 ### Security
 - [ ] Generate strong, random passwords for all services
   - [ ] PostgreSQL password (min 32 characters)
-  - [ ] Redis password (min 32 characters)
-  - [ ] JWT secret (min 64 characters)
-- [ ] Update domain name in `k8s/ingress.yaml`
-- [ ] Review and update resource limits based on expected load
-- [ ] Configure firewall rules
-- [ ] Set up SSL/TLS certificates (automated with cert-manager)
-- [ ] Review Kubernetes security contexts
-- [ ] Configure network policies
+  - [ ] Redis password (min 32 characters, if applicable)
+- [ ] Configure `SERVICE_DID` for JWT validation
+- [ ] Disable `JWT_SECRET` (only use ATProto JWTs in production)
+- [ ] Configure firewall rules (only expose port 3000)
+- [ ] Set up SSL/TLS termination (nginx/caddy)
+- [ ] Review rate limiting configuration
 
 ### Infrastructure
-- [ ] Kubernetes cluster running (v1.28+)
-- [ ] kubectl configured and tested
-- [ ] cert-manager installed
-- [ ] nginx-ingress-controller installed
-- [ ] Storage class available for PVCs
-- [ ] Monitoring stack ready (Prometheus/Grafana)
-- [ ] Log aggregation configured
+- [ ] PostgreSQL 16+ installed and running
+- [ ] Redis 7+ installed and running
+- [ ] Rust toolchain installed
+- [ ] systemd configured
+- [ ] Backup storage configured
 
 ### Configuration
-- [ ] Review `k8s/configmap.yaml` settings
-- [ ] Set appropriate log levels (RUST_LOG)
-- [ ] Configure resource requests/limits
-- [ ] Set up external backup storage (S3/GCS)
+- [ ] Review `.env` settings
+- [ ] Set appropriate log level (`RUST_LOG=info`)
 - [ ] Configure backup retention policies
+- [ ] Set up log rotation
 
 ## Deployment Steps
 
-### 1. Create Namespace and Secrets
+### 1. Database Setup
 ```bash
-# Create namespace
-kubectl apply -f k8s/namespace.yaml
-
-# Create secrets (NEVER commit these!)
-kubectl create secret generic catbird-mls-secrets \
-  --from-literal=POSTGRES_PASSWORD='YOUR_SECURE_PASSWORD' \
-  --from-literal=REDIS_PASSWORD='YOUR_SECURE_REDIS_PASSWORD' \
-  --from-literal=JWT_SECRET='YOUR_SECURE_JWT_SECRET' \
-  --from-literal=DATABASE_URL='postgresql://catbird:PASSWORD@postgres-service:5432/catbird' \
-  --from-literal=REDIS_URL='redis://:PASSWORD@redis-service:6379' \
-  -n catbird
+# Create database and user
+sudo -u postgres createuser catbird
+sudo -u postgres createdb catbird -O catbird
+sudo -u postgres psql -c "ALTER USER catbird WITH PASSWORD 'YOUR_SECURE_PASSWORD';"
 ```
-- [ ] Namespace created
-- [ ] Secrets created and verified
+- [ ] Database created
+- [ ] User created with password
 
-### 2. Deploy Infrastructure
+### 2. Configure Environment
 ```bash
-kubectl apply -f k8s/configmap.yaml
-kubectl apply -f k8s/postgres.yaml
-kubectl apply -f k8s/redis.yaml
+cd /home/ubuntu/mls/server
+cp .env.example .env
+nano .env
 ```
-- [ ] ConfigMap applied
-- [ ] PostgreSQL StatefulSet deployed
-- [ ] Redis StatefulSet deployed
-- [ ] Wait for databases to be ready (5-10 minutes)
 
-### 3. Run Database Migrations
+Update these values:
+- [ ] `DATABASE_URL` with correct password
+- [ ] `REDIS_URL` configured
+- [ ] `SERVICE_DID` set
+- [ ] `RUST_LOG=info`
+
+### 3. Build and Deploy
 ```bash
-kubectl apply -f k8s/job-migrations.yaml
-kubectl wait --for=condition=complete job/catbird-db-migrations -n catbird --timeout=300s
-```
-- [ ] Migration job completed successfully
-- [ ] Database schema created
+# Build release binary
+cargo build --release
 
-### 4. Deploy Application
+# Run migrations
+./scripts/run-migrations.sh
+
+# Install systemd service
+sudo cp catbird-mls-server.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable catbird-mls-server
+sudo systemctl start catbird-mls-server
+```
+- [ ] Binary built
+- [ ] Migrations applied
+- [ ] Service enabled and started
+
+### 4. Verify Deployment
 ```bash
-kubectl apply -f k8s/deployment.yaml
-kubectl apply -f k8s/service.yaml
+# Check service status
+sudo systemctl status catbird-mls-server
+
+# Run health check
+./scripts/health-check.sh
+
+# Run smoke tests
+./scripts/smoke-test.sh
 ```
-- [ ] Deployment created
-- [ ] Services created
-- [ ] Pods running and healthy (check with `kubectl get pods -n catbird`)
+- [ ] Service is running
+- [ ] Health check passes
+- [ ] Smoke tests pass
 
-### 5. Configure Ingress
-```bash
-kubectl apply -f k8s/ingress.yaml
-```
-- [ ] Ingress created
-- [ ] TLS certificate issued (check cert-manager logs)
-- [ ] Domain resolves correctly
-- [ ] HTTPS working
-
-### 6. Enable Auto-scaling
-```bash
-kubectl apply -f k8s/hpa.yaml
-```
-- [ ] HorizontalPodAutoscaler created
-- [ ] Metrics server working
-- [ ] Scaling tested
-
-### 7. Configure Automated Backups
-```bash
-kubectl apply -f k8s/cronjob-backup.yaml
-```
-- [ ] CronJob created
-- [ ] Backup PVC created
-- [ ] Test backup manually
-
-## Post-Deployment Verification
-
-### Health Checks
-```bash
-# Port-forward for testing
-kubectl port-forward svc/catbird-mls-service 8080:80 -n catbird
-
-# Check liveness
-curl http://localhost:8080/health/live
-
-# Check readiness
-curl http://localhost:8080/health/ready
-
-# Check detailed health
-curl http://localhost:8080/health | jq
-```
-- [ ] Liveness probe returns 200 OK
-- [ ] Readiness probe returns 200 OK
-- [ ] Detailed health shows all checks healthy
-- [ ] Database connectivity verified
-
-### Functional Testing
-- [ ] Create conversation works
-- [ ] Add members works
-- [ ] Send message works
-- [ ] Get messages works
-- [ ] Key package operations work
-- [ ] Blob upload works
-
-### Performance Testing
-```bash
-# Install hey for load testing
-go install github.com/rakyll/hey@latest
-
-# Run load test
-hey -n 10000 -c 100 https://mls.yourdomain.com/health
-```
-- [ ] Response times acceptable (<100ms p95)
-- [ ] No errors under load
-- [ ] Auto-scaling triggers correctly
-- [ ] Resource usage within limits
+## Post-Deployment
 
 ### Monitoring
-- [ ] Pods are running (`kubectl get pods -n catbird`)
-- [ ] No error logs (`kubectl logs -l app=catbird-mls-server -n catbird`)
-- [ ] Metrics are being collected
-- [ ] Alerts configured
-- [ ] Dashboard showing metrics
+- [ ] Verify logs are being collected
+- [ ] Set up alerting for health check failures
+- [ ] Monitor resource usage
 
-## Ongoing Operations
+### Backup
+- [ ] Configure automated backups
+```bash
+# Add to crontab
+0 2 * * * /home/ubuntu/mls/server/scripts/backup-db.sh /var/backups/catbird
+```
+- [ ] Test backup and restore procedure
 
-### Daily
-- [ ] Check pod health: `kubectl get pods -n catbird`
-- [ ] Review error logs
-- [ ] Monitor resource usage: `kubectl top pods -n catbird`
-
-### Weekly
-- [ ] Review backup status
-- [ ] Check disk usage
-- [ ] Review scaling events
-- [ ] Security audit logs
-
-### Monthly
-- [ ] Test backup restoration
-- [ ] Review and rotate secrets
-- [ ] Update dependencies
-- [ ] Capacity planning review
+### Security
+- [ ] Verify firewall rules
+- [ ] Test TLS configuration
+- [ ] Review access logs
 
 ## Rollback Procedure
 
-If deployment fails:
+If issues occur after deployment:
 
 ```bash
-# View rollout history
-kubectl rollout history deployment/catbird-mls-server -n catbird
+# Quick rollback
+./scripts/rollback.sh
 
-# Rollback to previous version
-kubectl rollout undo deployment/catbird-mls-server -n catbird
-
-# Rollback to specific revision
-kubectl rollout undo deployment/catbird-mls-server --to-revision=N -n catbird
-
-# Verify rollback
-kubectl rollout status deployment/catbird-mls-server -n catbird
+# Manual rollback
+sudo systemctl stop catbird-mls-server
+# Restore previous binary
+sudo systemctl start catbird-mls-server
 ```
 
-- [ ] Rollback tested in staging
-- [ ] Rollback procedure documented
-- [ ] Team trained on rollback
+## Maintenance
 
-## Emergency Contacts
+### Regular Tasks
+- Weekly: Review logs for errors
+- Monthly: Test backup/restore
+- Quarterly: Update dependencies
+- Annually: Rotate credentials
 
-Document your emergency contacts:
+### Updates
+```bash
+# Pull latest code
+git pull
 
-- **On-call Engineer**: _________________
-- **DevOps Lead**: _________________
-- **Security Team**: _________________
-- **Infrastructure Provider Support**: _________________
-
-## Incident Response
-
-1. **Assess**: Check logs and metrics
-2. **Communicate**: Notify team
-3. **Mitigate**: Scale up or rollback
-4. **Resolve**: Fix root cause
-5. **Document**: Post-mortem
-
-## Sign-off
-
-- [ ] Deployment tested in staging
-- [ ] All checklist items completed
-- [ ] Documentation updated
-- [ ] Team notified
-- [ ] Monitoring confirmed
-
-**Deployed by**: _________________ **Date**: _________________
-**Reviewed by**: _________________ **Date**: _________________
-
----
-
-**Remember**: 
-- Never commit secrets to git
-- Always test in staging first
-- Keep documentation updated
-- Monitor closely after deployment
+# Deploy update
+./deploy-update.sh
+```

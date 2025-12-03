@@ -4,8 +4,10 @@ help:
 	@echo "Catbird MLS - Development Commands"
 	@echo ""
 	@echo "make build          - Build all components"
+	@echo "make build-release  - Build release binaries"
 	@echo "make test           - Run all tests"
 	@echo "make run            - Run backend server"
+	@echo "make deploy         - Deploy to production"
 	@echo "make clean          - Clean build artifacts"
 	@echo "make fmt            - Format code"
 	@echo "make lint           - Run linters"
@@ -30,17 +32,16 @@ test:
 
 run:
 	@echo "Starting server..."
-	cd server && DATABASE_URL=sqlite:catbird.db cargo run
+	./start_server.sh
 
-run-postgres:
-	@echo "Starting server with PostgreSQL..."
-	cd server && DATABASE_URL=postgres://localhost/catbird cargo run
+deploy:
+	@echo "Deploying to production..."
+	./deploy.sh
 
 clean:
 	@echo "Cleaning..."
 	cd server && cargo clean
 	cd mls-ffi && cargo clean
-	rm -f catbird.db catbird.db-shm catbird.db-wal
 
 fmt:
 	@echo "Formatting code..."
@@ -63,10 +64,21 @@ watch:
 	@echo "Watching for changes..."
 	cd server && cargo watch -x run
 
-db-setup:
-	@echo "Setting up database..."
-	createdb catbird || true
-	cd server && DATABASE_URL=postgres://localhost/catbird cargo run
+# Service management
+start:
+	sudo systemctl start catbird-mls-server
+
+stop:
+	sudo systemctl stop catbird-mls-server
+
+restart:
+	sudo systemctl restart catbird-mls-server
+
+status:
+	sudo systemctl status catbird-mls-server --no-pager
+
+logs:
+	sudo journalctl -u catbird-mls-server -f
 
 # iOS targets
 build-ios-sim:
@@ -76,13 +88,5 @@ build-ios-sim:
 build-ios-device:
 	@echo "Building FFI for iOS device..."
 	cd mls-ffi && cargo build --release --target aarch64-apple-ios
-	
-docker-build:
-	@echo "Building Docker image..."
-	docker build -t catbird-server -f server/Dockerfile .
-
-docker-run:
-	@echo "Running Docker container..."
-	docker run -p 3000:3000 -e DATABASE_URL=sqlite::memory: catbird-server
 
 all: build test

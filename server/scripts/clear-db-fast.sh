@@ -3,7 +3,7 @@ set -e
 
 # Fast database clear (no confirmation) - use for automated testing
 
-docker exec -i catbird-postgres psql -U catbird -d catbird > /dev/null 2>&1 <<'EOF'
+psql -h localhost -U catbird -d catbird > /dev/null 2>&1 <<'EOF'
 SET session_replication_role = 'replica';
 TRUNCATE TABLE message_recipients CASCADE;
 TRUNCATE TABLE envelopes CASCADE;

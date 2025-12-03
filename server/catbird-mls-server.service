@@ -1,0 +1,27 @@
+[Unit]
+Description=Catbird MLS Server (Production)
+After=network-online.target postgresql.service redis-server.service
+Wants=network-online.target postgresql.service redis-server.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/mls/server
+ExecStart=/usr/bin/doppler run --project catbird-mls --config prd_server -- /home/ubuntu/mls/target/release/catbird-server
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=catbird-mls-server
+
+# Resource limits
+LimitNOFILE=65536
+MemoryHigh=1G
+MemoryMax=2G
+
+# Environment (Doppler provides the rest)
+Environment=RUST_BACKTRACE=1
+
+[Install]
+WantedBy=multi-user.target

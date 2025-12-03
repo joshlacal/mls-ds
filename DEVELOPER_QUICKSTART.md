@@ -57,7 +57,7 @@ cargo build --release
 ### Week 1: Foundation
 - [ ] Apply `schema_greenfield.sql` to PostgreSQL
 - [ ] Set up JWT authentication with DID verification
-- [ ] Configure Docker Compose for local dev
+- [ ] Configure PostgreSQL and Redis for local dev
 - [ ] Test database schema (creator auto-promotion trigger)
 
 ### Week 2: Server Core

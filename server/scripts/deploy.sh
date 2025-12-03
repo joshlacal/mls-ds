@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# Deploy script for Catbird MLS Server
+# Deploy script for Catbird MLS Server (Host-based)
 # Usage: ./deploy.sh [environment]
 
 ENVIRONMENT="${1:-production}"
@@ -14,14 +14,17 @@ echo "Deploying Catbird MLS Server to $ENVIRONMENT..."
 if [ -f "$PROJECT_DIR/.env.$ENVIRONMENT" ]; then
     echo "Loading environment configuration..."
     source "$PROJECT_DIR/.env.$ENVIRONMENT"
+elif [ -f "$PROJECT_DIR/.env" ]; then
+    echo "Loading .env configuration..."
+    source "$PROJECT_DIR/.env"
 else
-    echo "Warning: No .env.$ENVIRONMENT file found"
+    echo "Warning: No .env file found"
 fi
 
-# Build Docker image
-echo "Building Docker image..."
+# Build binary
+echo "Building release binary..."
 cd "$PROJECT_DIR"
-docker build -t catbird-mls-server:latest -t catbird-mls-server:$ENVIRONMENT .
+cargo build --release
 
 # Run migrations
 echo "Running database migrations..."
@@ -31,14 +34,13 @@ else
     echo "Warning: DATABASE_URL not set, skipping migrations"
 fi
 
-# Deploy with docker-compose
-echo "Deploying with docker-compose..."
-docker-compose -f docker-compose.yml pull postgres redis
-docker-compose -f docker-compose.yml up -d --force-recreate
+# Restart service
+echo "Restarting server..."
+sudo systemctl restart catbird-mls-server
 
-# Wait for services to be healthy
-echo "Waiting for services to be healthy..."
-sleep 10
+# Wait for service to be healthy
+echo "Waiting for server to be healthy..."
+sleep 5
 
 # Health check
 MAX_RETRIES=30
@@ -55,7 +57,7 @@ done
 
 if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
     echo "Error: Server failed to become ready"
-    docker-compose logs mls-server
+    sudo journalctl -u catbird-mls-server -n 50 --no-pager
     exit 1
 fi
 
