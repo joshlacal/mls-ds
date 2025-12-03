@@ -135,7 +135,8 @@ pub async fn claim_pending_device_addition(
     }
 
     // Verify caller is a member of the conversation
-    let is_member: Option<(i64,)> = sqlx::query_as(
+    // Note: SELECT 1 returns PostgreSQL INTEGER (4 bytes), so we use i32 to match
+    let is_member: Option<(i32,)> = sqlx::query_as(
         r#"
         SELECT 1
         FROM members

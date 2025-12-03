@@ -155,11 +155,17 @@ impl SseState {
     }
 
     /// Emit event to all subscribers of a conversation
+    /// Returns Ok if event was sent OR if there were no subscribers (non-fatal)
     pub async fn emit(&self, convo_id: &str, event: StreamEvent) -> Result<(), String> {
         let tx = self.get_channel(convo_id).await;
-        tx.send(event)
-            .map_err(|e| format!("Failed to emit event: {}", e))?;
-        Ok(())
+        match tx.send(event) {
+            Ok(_) => Ok(()),
+            Err(_) => {
+                // No active receivers is not an error - it just means no one is listening
+                // This is expected when members are offline or haven't connected SSE yet
+                Ok(())
+            }
+        }
     }
 }
 
