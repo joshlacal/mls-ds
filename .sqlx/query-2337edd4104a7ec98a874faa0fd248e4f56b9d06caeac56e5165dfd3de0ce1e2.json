@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            wm.welcome_data,\n            wm.key_package_hash,\n            kp.consumed_at as \"kp_consumed_at?\",\n            kp.expires_at as \"kp_expires_at?\"\n        FROM welcome_messages wm\n        LEFT JOIN key_packages kp\n            ON encode(wm.key_package_hash, 'hex') = kp.key_package_hash\n        WHERE wm.recipient_did = $1\n          AND wm.convo_id = $2\n          AND wm.consumed = false\n          AND (\n              wm.key_package_hash IS NULL\n              OR (kp.consumed_at IS NULL AND kp.expires_at > NOW())\n          )\n        ORDER BY wm.created_at DESC\n        LIMIT 1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "welcome_data",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 1,
+        "name": "key_package_hash",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 2,
+        "name": "kp_consumed_at?",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 3,
+        "name": "kp_expires_at?",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "2337edd4104a7ec98a874faa0fd248e4f56b9d06caeac56e5165dfd3de0ce1e2"
+}

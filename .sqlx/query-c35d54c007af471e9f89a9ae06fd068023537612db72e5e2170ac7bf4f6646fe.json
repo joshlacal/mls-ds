@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                UPDATE welcome_messages\n                SET consumed = true,\n                    consumed_at = NOW(),\n                    error_reason = 'Device re-registered with fresh key packages (sig key match)'\n                WHERE recipient_did = $1\n                  AND consumed = false\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c35d54c007af471e9f89a9ae06fd068023537612db72e5e2170ac7bf4f6646fe"
+}

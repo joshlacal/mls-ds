@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            COUNT(*) as \"total!\",\n            COUNT(*) FILTER (\n                WHERE consumed_at IS NULL\n                  AND (reserved_at IS NULL OR reserved_at < $2)\n            ) as \"available!\",\n            COUNT(*) FILTER (WHERE consumed_at IS NOT NULL) as \"consumed!\",\n            COUNT(*) FILTER (\n                WHERE consumed_at IS NULL\n                  AND reserved_at IS NOT NULL\n                  AND reserved_at >= $2\n            ) as \"reserved!\"\n        FROM key_packages\n        WHERE owner_did = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "total!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "available!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "consumed!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "reserved!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "51395c57e7c247466381c0c96a30a42ebdb3468030793f14eaa55e38e62b2b2c"
+}
