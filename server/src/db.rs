@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Transaction};
 use std::time::Duration;
+use tracing::info;
 use uuid::Uuid;
 
 use crate::models::{Conversation, KeyPackage, Membership, Message};

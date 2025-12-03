@@ -1,0 +1,43 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            kp.owner_did as did,\n            encode(kp.key_package, 'base64') as key_package,\n            kp.key_package_hash,\n            kp.cipher_suite\n        FROM key_packages kp\n        WHERE kp.owner_did = $1\n          AND kp.device_id = $2\n          AND kp.consumed_at IS NULL\n          AND kp.expires_at > $3\n          AND (kp.reserved_at IS NULL OR kp.reserved_at < $4)\n        ORDER BY kp.created_at ASC\n        LIMIT 1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "did",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "key_package",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "key_package_hash",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "cipher_suite",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      false,
+      false
+    ]
+  },
+  "hash": "7b9996497bae0116f4b8c5aba7fae372e360c0419b5f479f8123fd39fc5db3cb"
+}

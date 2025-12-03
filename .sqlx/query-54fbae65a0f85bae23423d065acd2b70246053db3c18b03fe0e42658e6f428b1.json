@@ -1,0 +1,72 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                pda.id,\n                pda.convo_id,\n                pda.user_did,\n                pda.new_device_id as device_id,\n                pda.device_name,\n                pda.new_device_credential_did as device_credential_did,\n                pda.status,\n                pda.claimed_by_did as claimed_by,\n                pda.created_at\n            FROM pending_device_additions pda\n            INNER JOIN members m ON pda.convo_id = m.convo_id\n            WHERE m.user_did = $1\n              AND m.left_at IS NULL\n              AND pda.convo_id = ANY($2)\n              AND pda.status IN ('pending', 'in_progress')\n              AND pda.user_did != $1\n            ORDER BY pda.created_at ASC\n            LIMIT $3\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "convo_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "user_did",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "device_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "device_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "device_credential_did",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "claimed_by",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "TextArray",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "54fbae65a0f85bae23423d065acd2b70246053db3c18b03fe0e42658e6f428b1"
+}

@@ -1,0 +1,61 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT DISTINCT ON (COALESCE(kp.device_id, kp.key_package_hash))\n            kp.owner_did,\n            kp.cipher_suite,\n            kp.key_package as key_data,\n            kp.key_package_hash,\n            kp.created_at,\n            kp.expires_at,\n            kp.consumed_at\n        FROM key_packages kp\n        LEFT JOIN devices d ON kp.device_id = d.id\n        WHERE kp.owner_did = $1\n          AND kp.cipher_suite = $2\n          AND kp.consumed_at IS NULL\n          AND kp.expires_at > $3\n          AND (kp.reserved_at IS NULL OR kp.reserved_at < $4)\n        ORDER BY\n            COALESCE(kp.device_id, kp.key_package_hash),\n            kp.created_at ASC\n        LIMIT 50\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "owner_did",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "cipher_suite",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "key_data",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 3,
+        "name": "key_package_hash",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "expires_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 6,
+        "name": "consumed_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "b34f544ef408746dd52d55184fc702f1f8659fdfe6d33feb3185d00c3e06fa1e"
+}
