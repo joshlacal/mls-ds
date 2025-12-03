@@ -894,12 +894,20 @@ pub async fn get_all_key_packages(
     let now = Utc::now();
     let reservation_timeout = now - chrono::Duration::minutes(5);
 
-    // Get ONE key package per unique device, prioritizing recently active devices
-    // This query uses DISTINCT ON to get the oldest available key package for each device
-    // and sorts by device last_seen_at first (recently active devices first)
+    // Get ONE key package per unique DEVICE, prioritizing recently active devices
+    // 
+    // CRITICAL FIX: Use device_id (not credential_did) for DISTINCT ON.
+    // - credential_did is the bare user DID (same for ALL devices of a user)
+    // - device_id is unique per device, ensuring we get one key package per device
+    // 
+    // This enables multi-device support: when inviting a user, we get key packages
+    // for ALL their registered devices, so the Welcome message works on any device.
+    //
+    // For legacy key packages without device_id, we fall back to key_package_hash
+    // to still return one package (though these won't work for multi-device).
     let key_packages = sqlx::query_as::<_, KeyPackage>(
         r#"
-        SELECT DISTINCT ON (COALESCE(kp.credential_did, kp.key_package_hash))
+        SELECT DISTINCT ON (COALESCE(kp.device_id, kp.key_package_hash))
             kp.owner_did, kp.cipher_suite, kp.key_package as key_data, kp.key_package_hash, kp.created_at, kp.expires_at, kp.consumed_at
         FROM key_packages kp
         LEFT JOIN devices d ON kp.device_id = d.device_id
@@ -909,7 +917,7 @@ pub async fn get_all_key_packages(
           AND kp.expires_at > $3
           AND (kp.reserved_at IS NULL OR kp.reserved_at < $4)
         ORDER BY
-            COALESCE(kp.credential_did, kp.key_package_hash),
+            COALESCE(kp.device_id, kp.key_package_hash),
             d.last_seen_at DESC NULLS LAST,
             kp.created_at ASC
         LIMIT 50
