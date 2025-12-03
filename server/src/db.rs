@@ -894,6 +894,32 @@ pub async fn get_all_key_packages(
     let now = Utc::now();
     let reservation_timeout = now - chrono::Duration::minutes(5);
 
+    // 🔍 DIAGNOSTIC: First, log all device_ids for this user's key packages
+    let device_ids: Vec<(Option<String>, i64)> = sqlx::query_as(
+        r#"
+        SELECT device_id, COUNT(*) as count
+        FROM key_packages
+        WHERE owner_did = $1
+          AND cipher_suite = $2
+          AND consumed_at IS NULL
+          AND expires_at > $3
+        GROUP BY device_id
+        ORDER BY device_id NULLS LAST
+        "#,
+    )
+    .bind(did)
+    .bind(cipher_suite)
+    .bind(now)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    info!(
+        "🔍 [get_all_key_packages] Key package device distribution for {}: {:?}",
+        crate::crypto::hash_for_log(did),
+        device_ids
+    );
+
     // Get ONE key package per unique DEVICE, prioritizing recently active devices
     // 
     // CRITICAL FIX: Use device_id (not credential_did) for DISTINCT ON.
@@ -930,6 +956,12 @@ pub async fn get_all_key_packages(
     .fetch_all(pool)
     .await
     .context("Failed to get all key packages")?;
+
+    info!(
+        "🔍 [get_all_key_packages] Returning {} key packages (one per device) for {}",
+        key_packages.len(),
+        crate::crypto::hash_for_log(did)
+    );
 
     Ok(key_packages)
 }
