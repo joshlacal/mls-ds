@@ -307,8 +307,9 @@ pub async fn leave_convo(
 
         // Mark member as left and clear rejoin flags (natural idempotency: only update if not already left)
         // In multi-device mode, this marks ALL devices of the user as having left
+        // FIX: Check both member_did and user_did since user_did may be NULL in single-device mode
         let rows_affected = sqlx::query(
-            "UPDATE members SET left_at = $1, needs_rejoin = false, rejoin_requested_at = NULL WHERE convo_id = $2 AND user_did = $3 AND left_at IS NULL"
+            "UPDATE members SET left_at = $1, needs_rejoin = false, rejoin_requested_at = NULL WHERE convo_id = $2 AND (member_did = $3 OR user_did = $3) AND left_at IS NULL"
         )
             .bind(&now)
             .bind(&input.convo_id)
