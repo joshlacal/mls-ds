@@ -1,62 +1,52 @@
-# Catbird MLS Server - Deployment Quick Reference
+# Catbird MLS Server - Quick Reference
 
 ## 🚀 Quick Start Commands
 
-### Local Development
+### Development
 ```bash
-# Start everything with Docker Compose
-make run
+# Build the project
+cargo build
 
-# Start in development mode (with hot reload)
-make run-dev
+# Run tests
+cargo test
+
+# Run the server locally
+cargo run
+```
+
+### Deployment
+```bash
+# Deploy (preserves data)
+make deploy
+# or: ./deploy-update.sh
+
+# Fresh deploy (wipes data)
+make deploy-fresh
+# or: ./deploy-fresh.sh
+
+# Quick rebuild
+./rebuild.sh
+```
+
+### Service Management
+```bash
+# Start/stop/restart
+make start
+make stop
+make restart
+
+# Check status
+make status
 
 # View logs
 make logs
-
-# Stop services
-make stop
-```
-
-### Production Deployment (Docker)
-```bash
-# Create production environment file
-cp .env.example .env.production
-# Edit .env.production with secure values
-
-# Deploy
-make deploy
-
-# Check health
-make health-check
-```
-
-### Kubernetes Deployment
-```bash
-# Create secrets first
-kubectl create secret generic catbird-mls-secrets \
-  --from-literal=POSTGRES_PASSWORD='your_password' \
-  --from-literal=REDIS_PASSWORD='your_redis_password' \
-  --from-literal=JWT_SECRET='your_jwt_secret' \
-  -n catbird
-
-# Deploy to Kubernetes
-make deploy-k8s
-
-# Check health
-make k8s-health
-
-# View logs
-make k8s-logs
 ```
 
 ## 📁 File Structure
 
 ```
 server/
-├── Dockerfile                      # Multi-stage production build
-├── .dockerignore                   # Docker build exclusions
-├── docker-compose.yml              # Production compose config
-├── docker-compose.dev.yml          # Development overrides
+├── catbird-mls-server.service      # Systemd service file
 ├── Makefile                        # Convenience commands
 ├── DEPLOYMENT.md                   # Complete deployment guide
 │
@@ -65,28 +55,18 @@ server/
 │   └── ...                         # Application code
 │
 ├── scripts/
-│   ├── deploy.sh                   # Docker deployment script
-│   ├── k8s-deploy.sh              # Kubernetes deployment script
-│   ├── init-db.sh                 # Database initialization
-│   ├── run-migrations.sh          # Run database migrations
-│   ├── backup-db.sh               # Database backup
-│   ├── restore-db.sh              # Database restore
-│   └── health-check.sh            # Health check script
+│   ├── deploy.sh                   # Deployment script
+│   ├── init-db.sh                  # Database initialization
+│   ├── run-migrations.sh           # Run database migrations
+│   ├── backup-db.sh                # Database backup
+│   ├── restore-db.sh               # Database restore
+│   ├── clear-db.sh                 # Clear database (with confirmation)
+│   ├── clear-db-fast.sh            # Clear database (no confirmation)
+│   ├── health-check.sh             # Health check script
+│   ├── smoke-test.sh               # Smoke tests
+│   └── rollback.sh                 # Rollback to previous version
 │
-└── k8s/
-    ├── README.md                   # Kubernetes-specific docs
-    ├── kustomization.yaml          # Kustomize config
-    ├── namespace.yaml              # Namespace definition
-    ├── configmap.yaml              # Configuration
-    ├── secrets.yaml                # Secrets template
-    ├── postgres.yaml               # PostgreSQL StatefulSet
-    ├── redis.yaml                  # Redis StatefulSet
-    ├── deployment.yaml             # Application deployment
-    ├── service.yaml                # Service definitions
-    ├── ingress.yaml                # Ingress with TLS
-    ├── hpa.yaml                    # Horizontal auto-scaling
-    ├── cronjob-backup.yaml         # Automated backups
-    └── job-migrations.yaml         # Database migrations job
+└── migrations/                     # Database migrations
 ```
 
 ## 🏥 Health Endpoints
@@ -104,6 +84,12 @@ server/
 # Run migrations
 make migrate
 
+# Clear all data
+make clear-db
+
+# Clear all data (no confirmation)
+make clear-db-fast
+
 # Backup database
 make backup
 
@@ -111,131 +97,122 @@ make backup
 make restore BACKUP=/path/to/backup.sql.gz
 ```
 
-### Scaling (Kubernetes)
-```bash
-# Scale to 5 replicas
-make k8s-scale REPLICAS=5
-
-# Auto-scaling is enabled via HPA (3-10 replicas)
-kubectl get hpa -n catbird
-```
-
 ### Debugging
 ```bash
-# Docker Compose logs
-docker-compose logs -f mls-server
+# View logs
+sudo journalctl -u catbird-mls-server -f
 
-# Kubernetes logs
-kubectl logs -f deployment/catbird-mls-server -n catbird
+# Recent logs
+sudo journalctl -u catbird-mls-server -n 100
 
-# Shell access
-make shell              # Docker
-make k8s-shell         # Kubernetes
+# Logs from specific time
+sudo journalctl -u catbird-mls-server --since "1 hour ago"
+
+# Check service status
+sudo systemctl status catbird-mls-server
+```
+
+### Database Access
+```bash
+# Connect to database
+psql -h localhost -U catbird -d catbird
+
+# List tables
+psql -h localhost -U catbird -d catbird -c "\dt"
+
+# Describe a table
+psql -h localhost -U catbird -d catbird -c "\d conversations"
 ```
 
 ## 🔒 Security Checklist
 
-- [ ] Change all default passwords in `.env.production`
-- [ ] Use strong, randomly generated secrets
-- [ ] Never commit `.env.production` or secrets to git
-- [ ] Enable TLS/SSL for production
+- [ ] Configure strong database password
+- [ ] Set appropriate `SERVICE_DID`
+- [ ] Disable `JWT_SECRET` in production
+- [ ] Enable TLS/SSL via reverse proxy
 - [ ] Configure firewall rules
-- [ ] Update `ingress.yaml` with your domain
-- [ ] Review and adjust resource limits
-- [ ] Enable audit logging
-- [ ] Regular security updates
+- [ ] Enable automated backups
+- [ ] Set up log monitoring
 
 ## 📊 Monitoring
 
-### Docker Compose
+### Health Check
 ```bash
-# Container stats
-docker stats
+# Quick health check
+curl http://localhost:3000/health
 
-# View all logs
-docker-compose logs -f
+# Full health check script
+./scripts/health-check.sh
+
+# Smoke tests
+./scripts/smoke-test.sh
 ```
 
-### Kubernetes
+### Log Monitoring
 ```bash
-# Pod status
-kubectl get pods -n catbird -w
+# Follow logs
+sudo journalctl -u catbird-mls-server -f
 
-# Resource usage
-kubectl top pods -n catbird
+# Search for errors
+sudo journalctl -u catbird-mls-server | grep ERROR
 
-# Events
-kubectl get events -n catbird --sort-by='.lastTimestamp'
-
-# HPA status
-kubectl get hpa -n catbird
+# View logs in JSON format
+sudo journalctl -u catbird-mls-server -o json
 ```
 
 ## 🔄 Updates and Rollbacks
 
-### Docker Compose
+### Update Deployment
 ```bash
-# Pull latest images
-docker-compose pull
+# Build and deploy
+./deploy-update.sh
 
-# Restart with new images
-docker-compose up -d --force-recreate
+# Or manually
+cargo build --release
+sudo systemctl restart catbird-mls-server
 ```
 
-### Kubernetes
+### Rollback
 ```bash
-# Update deployment
-kubectl set image deployment/catbird-mls-server \
-  catbird-mls-server=catbird-mls-server:v1.1.0 -n catbird
-
-# Check rollout
-kubectl rollout status deployment/catbird-mls-server -n catbird
-
-# Rollback
-kubectl rollout undo deployment/catbird-mls-server -n catbird
+# Restore previous binary
+./scripts/rollback.sh
 ```
 
 ## 🆘 Troubleshooting
 
-### Container won't start
+### Server won't start
 ```bash
-# Check logs
-docker-compose logs mls-server
-
-# Check database connectivity
-docker-compose exec mls-server curl http://localhost:3000/health
-```
-
-### Pod fails in Kubernetes
-```bash
-# Describe pod
-kubectl describe pod <pod-name> -n catbird
+# Check service status
+sudo systemctl status catbird-mls-server
 
 # Check logs
-kubectl logs <pod-name> -n catbird
+sudo journalctl -u catbird-mls-server -n 50
 
-# Check events
-kubectl get events -n catbird
+# Check if port is in use
+sudo lsof -i :3000
 ```
 
 ### Database connection issues
 ```bash
 # Test database
-docker-compose exec postgres psql -U catbird -c "SELECT 1"
+psql -h localhost -U catbird -d catbird -c "SELECT 1"
 
-# Kubernetes
-kubectl exec -it postgres-0 -n catbird -- psql -U catbird -c "SELECT 1"
+# Check PostgreSQL status
+sudo systemctl status postgresql
+```
+
+### Health check failing
+```bash
+# Check server response
+curl -v http://localhost:3000/health
+
+# Check database component
+curl http://localhost:3000/health | jq .checks.database
 ```
 
 ## 📚 Documentation
 
 - **[DEPLOYMENT.md](DEPLOYMENT.md)** - Complete deployment guide
-- **[k8s/README.md](k8s/README.md)** - Kubernetes-specific docs
-- **[../README.md](../README.md)** - Project overview
-
-## 🔗 Useful Links
-
-- [Docker Documentation](https://docs.docker.com/)
-- [Kubernetes Documentation](https://kubernetes.io/docs/)
-- [PostgreSQL Documentation](https://www.postgresql.org/docs/)
-- [Redis Documentation](https://redis.io/docs/)
+- **[CLAUDE.md](CLAUDE.md)** - Developer guide
+- **[README.md](README.md)** - Project overview
+- **[scripts/README.md](scripts/README.md)** - Scripts documentation

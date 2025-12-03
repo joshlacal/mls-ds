@@ -235,10 +235,10 @@ Ensure the load balancer forwards client IPs:
 **Logging**:
 ```bash
 # Check rate limit warnings
-docker logs catbird-mls-server 2>&1 | grep "rate limit exceeded"
+sudo journalctl -u catbird-mls-server | grep "rate limit exceeded"
 
 # Check cleanup task
-docker logs catbird-mls-server 2>&1 | grep "Rate limiter cleanup"
+sudo journalctl -u catbird-mls-server | grep "Rate limiter cleanup"
 ```
 
 ## Security Considerations
@@ -291,12 +291,12 @@ This prevents attackers from bypassing limits by forging DIDs.
 
 2. Verify environment variables are loaded:
    ```bash
-   docker exec catbird-mls-server env | grep RATE_LIMIT
+   cat .env | grep RATE_LIMIT
    ```
 
 3. Check logs for rate limit warnings:
    ```bash
-   docker logs catbird-mls-server 2>&1 | grep -i "rate limit"
+   sudo journalctl -u catbird-mls-server | grep -i "rate limit"
    ```
 
 ### False Positives
@@ -313,7 +313,7 @@ If rate limiter memory grows unbounded:
 
 1. Verify cleanup task is running:
    ```bash
-   docker logs catbird-mls-server 2>&1 | grep "Rate limiter cleanup"
+   sudo journalctl -u catbird-mls-server | grep "Rate limiter cleanup"
    ```
 
 2. Check cleanup frequency (default: 5 minutes)

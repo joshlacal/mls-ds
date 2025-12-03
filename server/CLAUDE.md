@@ -14,101 +14,60 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Build the project
 cargo build
 
+# Build release binary
+cargo build --release
+
 # Run tests
 cargo test
 
 # Run specific test
 cargo test --test integration_test
 
-# Run the server locally (requires postgres & redis running)
+# Run the server locally
 cargo run
-
-# Start infrastructure with Docker Compose
-docker-compose up -d postgres redis
 
 # Run database migrations
 make migrate
 # or: ./scripts/run-migrations.sh
 ```
 
-### Docker Compose Development
+### Deployment
 
 ```bash
-# Start all services (postgres, redis, mls-server)
-make run
+# Deploy with data preservation
+make deploy
+# or: ./deploy-update.sh
 
-# Start in development mode with hot reload
-make run-dev
+# Fresh deploy (wipes database)
+make deploy-fresh
+# or: ./deploy-fresh.sh
+
+# Restart the server
+make restart
+# or: sudo systemctl restart catbird-mls-server
 
 # View logs
 make logs
+# or: sudo journalctl -u catbird-mls-server -f
 
-# Stop services
-make stop
-
-# Clean up containers and volumes
-make clean
+# Check status
+make status
+# or: sudo systemctl status catbird-mls-server
 ```
 
-### Docker Image Management
-
-**IMPORTANT**: The project uses a Cargo workspace, so the build output is in `/home/ubuntu/mls/target` (parent directory), NOT in `server/target`.
+### Database Operations
 
 ```bash
-# Quick deploy (RECOMMENDED - handles all steps correctly)
-cd /home/ubuntu/mls
-./deploy.sh
+# Clear all data (with confirmation)
+make clear-db
 
-# Manual deployment (if you need more control)
-cd /home/ubuntu/mls/server
+# Clear all data (no confirmation)
+make clear-db-fast
 
-# 1. Build release binary with offline sqlx mode
-SQLX_OFFLINE=true cargo build --release
-
-# 2. Copy binary from workspace target dir to Docker build location
-cp ../target/release/catbird-server server/catbird-server
-
-# 3. Stop and remove old container
-docker stop catbird-mls-server && docker rm catbird-mls-server
-
-# 4. Rebuild Docker image without cache (important!)
-docker build --no-cache -f Dockerfile.prebuilt -t server-mls-server .
-
-# 5. Start new container with correct network and environment
-docker run -d \
-  --name catbird-mls-server \
-  --network server_catbird-network \
-  -p 3000:3000 \
-  -e DATABASE_URL="postgresql://catbird:changeme@catbird-postgres:5432/catbird" \
-  -e REDIS_URL="redis://catbird-redis:6379" \
-  -e RUST_LOG="info" \
-  -e SERVICE_DID="did:web:mls.catbird.blue" \
-  server-mls-server
-
-# 6. Verify the binary was updated
-docker exec catbird-mls-server ls -lh /app/catbird-server
-```
-
-**Why these steps are necessary:**
-
-1. **Cargo Workspace**: The project root has a workspace Cargo.toml, so builds output to `/home/ubuntu/mls/target`, not `server/target`
-2. **Binary Location**: Docker copies from `server/catbird-server`, so you must copy from the workspace target directory
-3. **Docker Cache**: Docker's layer caching can prevent the new binary from being copied even if the file changed. Use `--no-cache` to force a fresh build
-4. **Container Recreation**: `docker restart` doesn't reload the image. You must stop, remove, and recreate the container to use the new image
-
-### Production Deployment
-
-```bash
-# Deploy with Docker Compose
-make deploy
-
-# Deploy to Kubernetes
-make deploy-k8s
-
-# Database backup
+# Backup database
 make backup
 
-# Database restore
+# Restore database
 make restore BACKUP=/path/to/backup.sql.gz
 ```
 
@@ -155,8 +114,8 @@ make restore BACKUP=/path/to/backup.sql.gz
 
 5. **Health Checks** (`src/health.rs`)
    - `/health`: Detailed health status with database checks
-   - `/health/live`: Liveness probe (Kubernetes)
-   - `/health/ready`: Readiness probe (Kubernetes)
+   - `/health/live`: Liveness probe
+   - `/health/ready`: Readiness probe
 
 ### Key Architectural Patterns
 
@@ -176,29 +135,21 @@ make restore BACKUP=/path/to/backup.sql.gz
 **MLS Integration:**
 - OpenMLS library for protocol implementation
 - Key packages stored in database for async member addition
-- Blob storage for encrypted message payloads (moving to R2)
+- Blob storage for encrypted message payloads
 
-**Docker Container Binary Updates:**
-
-The server runs in Docker. To deploy code changes, use the automated script:
+**Deploying Code Changes:**
 
 ```bash
-cd /home/ubuntu/mls
-./deploy.sh
+# Build and deploy (preserves data)
+./deploy-update.sh
+
+# Or use make
+make deploy
 ```
 
-This script handles all the steps correctly:
-1. Build: `SQLX_OFFLINE=true cargo build --release`
-2. Copy binary from workspace: `cp ../target/release/catbird-server server/catbird-server`
-3. Stop & remove container: `docker stop catbird-mls-server && docker rm catbird-mls-server`
-4. Rebuild image (no cache): `docker build --no-cache -f Dockerfile.prebuilt -t server-mls-server .`
-5. Recreate container with proper network and env vars
-6. Verify the deployment
-
-**CRITICAL**:
-- `docker restart` does NOT pick up code changes - you must rebuild the image and recreate the container
-- Use `--no-cache` when rebuilding to ensure the new binary is copied
-- The binary is in `/home/ubuntu/mls/target/release/` (workspace root), NOT `server/target/release/`
+This script:
+1. Builds the release binary
+2. Restarts the systemd service
 
 ## Database Operations
 
@@ -210,29 +161,26 @@ make migrate
 
 # Direct script
 ./scripts/run-migrations.sh
-
-# Manual (inside postgres container)
-docker exec catbird-postgres psql -U catbird -d catbird -f /path/to/migration.sql
 ```
 
 ### Schema Inspection
 
 ```bash
 # List tables
-docker exec catbird-postgres psql -U catbird -d catbird -c "\dt"
+psql -h localhost -U catbird -d catbird -c "\dt"
 
 # Describe table
-docker exec catbird-postgres psql -U catbird -d catbird -c "\d conversations"
+psql -h localhost -U catbird -d catbird -c "\d conversations"
 
 # Check for column existence
-docker exec catbird-postgres psql -U catbird -d catbird -c "SELECT column_name FROM information_schema.columns WHERE table_name='conversations';"
+psql -h localhost -U catbird -d catbird -c "SELECT column_name FROM information_schema.columns WHERE table_name='conversations';"
 ```
 
 ### Common Database Issues
 
 **Column name mismatches:** The schema evolved from `title` to `name` for conversations. Ensure INSERT/UPDATE statements use `name`, not `title`.
 
-**Missing columns:** If handlers fail with "column does not exist", check if migration was applied and container uses updated code.
+**Missing columns:** If handlers fail with "column does not exist", check if migration was applied and server uses updated code.
 
 ## Important Notes for Code Changes
 
@@ -259,18 +207,17 @@ docker exec catbird-postgres psql -U catbird -d catbird -c "SELECT column_name F
 
 ### When Debugging Production Issues
 
-1. Check Docker logs: `docker logs catbird-mls-server 2>&1 | grep ERROR`
-2. Check specific timeframe: `docker logs catbird-mls-server 2>&1 | grep "21:46"`
-3. Verify database schema: `docker exec catbird-postgres psql -U catbird -d catbird -c "\d table_name"`
+1. Check logs: `sudo journalctl -u catbird-mls-server | grep ERROR`
+2. Check specific timeframe: `sudo journalctl -u catbird-mls-server --since "1 hour ago"`
+3. Verify database schema: `psql -h localhost -U catbird -d catbird -c "\d table_name"`
 4. Check if server is using latest code: Look for log patterns that would only appear in new code
 
 ## Environment Configuration
 
 ### Required Variables
 
-- `DATABASE_URL`: PostgreSQL connection (e.g., `postgresql://catbird:password@postgres:5432/catbird`)
-- `REDIS_URL`: Redis connection (e.g., `redis://:password@redis:6379`)
-- `JWT_SECRET`: Secret for HS256 dev tokens (not used in production)
+- `DATABASE_URL`: PostgreSQL connection (e.g., `postgresql://catbird:password@localhost:5432/catbird`)
+- `REDIS_URL`: Redis connection (e.g., `redis://localhost:6379`)
 
 ### Optional Variables
 
@@ -281,24 +228,28 @@ docker exec catbird-postgres psql -U catbird -d catbird -c "SELECT column_name F
 - `ENFORCE_JTI`: Require jti for replay prevention (default: true)
 - `JTI_TTL_SECONDS`: Replay cache TTL (default: 120)
 - `SSE_BUFFER_SIZE`: Realtime event buffer size (default: 5000)
-- `ENABLE_DIRECT_XRPC_PROXY`: Dev-only catch-all proxy (default: false)
-- `UPSTREAM_XRPC_BASE`: Proxy base URL (default: `http://127.0.0.1:3000`)
 
-## Production Deployment Notes
+## Systemd Service
 
-The server runs in Docker containers with docker-compose (simple deployment) or Kubernetes (production scale). There are three separate Docker Compose environments visible on this system:
+The server runs as a systemd service (`catbird-mls-server`). The service file is located at:
+- `/home/ubuntu/mls/server/catbird-mls-server.service`
 
-1. **docker-compose.yml**: Main production configuration
-2. **docker-compose.dev.yml**: Development overrides (hot reload, debug logging)
-3. **staging/docker-compose.staging.yml**: Staging environment
+Key service commands:
+```bash
+# Start/stop/restart
+sudo systemctl start catbird-mls-server
+sudo systemctl stop catbird-mls-server
+sudo systemctl restart catbird-mls-server
 
-Key deployment considerations:
+# Check status
+sudo systemctl status catbird-mls-server
 
-- Use Dockerfile.prebuilt for faster rebuilds (copies pre-built binary)
-- Container runs as non-root user `catbird` (UID 1000)
-- Health checks required for Kubernetes liveness/readiness probes
-- Migrations should run before starting the server (Job in K8s, script in Docker)
-- Backup strategy: Daily automated backups via CronJob (K8s) or cron script (Docker)
+# View logs
+sudo journalctl -u catbird-mls-server -f
+
+# Enable on boot
+sudo systemctl enable catbird-mls-server
+```
 
 ## Related Documentation
 
@@ -308,4 +259,3 @@ Key deployment considerations:
 - `QUICK_REFERENCE.md`: Command reference
 - `src/auth_README.md`: Authentication implementation details
 - `migrations/README.md`: Migration guidelines
-- `k8s/README.md`: Kubernetes-specific documentation

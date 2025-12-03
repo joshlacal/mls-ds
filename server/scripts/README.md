@@ -1,73 +1,93 @@
-# Database Maintenance Scripts
+# MLS Server Scripts
 
-This directory contains utility scripts for managing the MLS database.
+This directory contains utility scripts for managing the MLS server.
 
-## Clear Database Scripts
+## Deployment Scripts
+
+### `deploy.sh` - Deploy to Production
+Builds and deploys the server with optional environment configuration.
+
+```bash
+./scripts/deploy.sh [environment]
+```
+
+### `rollback.sh` - Rollback Deployment
+Rolls back to a previously saved binary.
+
+```bash
+./scripts/rollback.sh
+```
+
+## Database Scripts
 
 ### `clear-db.sh` - Interactive Clear (Safe)
-
 Clears all data from database tables with a 5-second confirmation prompt.
 
-**Usage:**
 ```bash
-cd /home/ubuntu/mls/server
 ./scripts/clear-db.sh
 ```
 
-**Features:**
-- 5-second warning before clearing
-- Shows table counts after clearing
-- Preserves schema (tables, indexes, constraints)
-- Safe for manual use
-
-**When to use:**
-- Manual testing/development
-- When you want confirmation before clearing
-- When you want to see the results
-
----
-
 ### `clear-db-fast.sh` - Instant Clear (Automated)
-
 Immediately clears all data without confirmation.
 
-**Usage:**
 ```bash
-cd /home/ubuntu/mls/server
 ./scripts/clear-db-fast.sh
 ```
 
-**Features:**
-- No confirmation prompt
-- Silent operation (only shows success message)
-- Fast execution
-- Preserves schema
+### `init-db.sh` - Initialize Database
+Applies the greenfield schema to a fresh database.
 
-**When to use:**
-- Automated testing scripts
-- CI/CD pipelines
-- When you're absolutely sure you want to clear
+```bash
+./scripts/init-db.sh
+```
 
----
+### `run-migrations.sh` - Run Migrations
+Runs SQLx migrations against the database.
 
-## How It Works
+```bash
+./scripts/run-migrations.sh [DATABASE_URL]
+```
 
-Both scripts use PostgreSQL's `TRUNCATE` command which:
+### `backup-db.sh` - Backup Database
+Creates a compressed backup of the database.
+
+```bash
+./scripts/backup-db.sh [BACKUP_DIR]
+```
+
+### `restore-db.sh` - Restore Database
+Restores a database from a backup file.
+
+```bash
+./scripts/restore-db.sh <BACKUP_FILE>
+```
+
+## Monitoring Scripts
+
+### `health-check.sh` - Health Check
+Verifies server health with retries.
+
+```bash
+./scripts/health-check.sh [URL]
+```
+
+### `smoke-test.sh` - Smoke Tests
+Runs comprehensive smoke tests after deployment.
+
+```bash
+./scripts/smoke-test.sh [BASE_URL]
+```
+
+## How Database Clear Works
+
+Both clear scripts use PostgreSQL's `TRUNCATE` command which:
 - Removes all rows from tables
 - Preserves table structure, indexes, and constraints
 - Is faster than `DELETE` for removing all data
 - Handles foreign key constraints with `CASCADE`
 
-**Temporary disables triggers** during truncation to avoid foreign key conflicts:
-```sql
-SET session_replication_role = 'replica';  -- Disable triggers
-TRUNCATE TABLE ... CASCADE;
-SET session_replication_role = 'origin';   -- Re-enable triggers
-```
-
 ## Tables Cleared
 
-The following tables are truncated (in order):
 1. `message_recipients`
 2. `envelopes`
 3. `cursors`
@@ -95,60 +115,39 @@ The following tables are truncated (in order):
 # Clear database
 ./scripts/clear-db-fast.sh
 
-# Restart server to verify
-docker restart catbird-mls-server
+# Restart server
+sudo systemctl restart catbird-mls-server
 
 # Database is now empty and ready for testing
 ```
 
-### Clear in test script
+### View logs
 ```bash
-#!/bin/bash
-# test-workflow.sh
-
-# Clear database before each test run
-./scripts/clear-db-fast.sh
-
-# Run your tests
-npm test
-
-# Clear again for next run
-./scripts/clear-db-fast.sh
+sudo journalctl -u catbird-mls-server -f
 ```
 
-### Verify database is empty
+### Check service status
 ```bash
-./scripts/clear-db.sh
-
-# Output shows:
-#  table_name    | row_count
-# ---------------+-----------
-#  blobs         |         0
-#  conversations |         0
-#  devices       |         0
-#  ...
+sudo systemctl status catbird-mls-server
 ```
 
 ## Safety Notes
 
-⚠️ **WARNING:** These scripts delete ALL data from the database!
+⚠️ **WARNING:** Clear scripts delete ALL data from the database!
 
-- **Production:** DO NOT run these scripts in production
+- **Production:** Use extreme caution in production
 - **Backup:** No backup is created - data is permanently deleted
 - **Schema:** Only data is removed - schema remains intact
 - **Recovery:** There is no way to recover cleared data
 
-## Alternative: Full Database Reset
+## Full Database Reset
 
 If you want to completely recreate the database with fresh schema:
 
 ```bash
-# Stop containers and remove volumes
-cd /home/ubuntu/mls/server
-docker compose down -v
+# Clear the database
+./scripts/clear-db-fast.sh
 
-# Restart (will recreate database with init-db.sh)
-docker compose up -d
+# Re-apply schema
+./scripts/init-db.sh
 ```
-
-This is slower but ensures a completely clean state including schema.

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE pending_device_additions\n        SET status = 'pending',\n            claimed_by_did = NULL,\n            claimed_at = NULL,\n            claim_expires_at = NULL,\n            updated_at = NOW()\n        WHERE status = 'in_progress'\n          AND claim_expires_at < $1\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7dd9865707da4f11a8c7243e4e194bc7c3e50793acd99b5c5d4869a109d9ad76"
+}

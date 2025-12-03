@@ -3,6 +3,7 @@ use axum::http::StatusCode;
 use base64::Engine;
 use sqlx::FromRow;
 use openmls::messages::group_info::VerifiableGroupInfo;
+use openmls::prelude::MlsMessageIn;
 use tls_codec::Deserialize as TlsDeserialize;
 
 use crate::{
@@ -85,18 +86,21 @@ pub async fn handle(
     }
 
     // 4. Validate MLS structure - CRITICAL: prevents storing corrupted data
-    let _ = VerifiableGroupInfo::tls_deserialize(&mut group_info_bytes.as_slice())
-        .map_err(|e| {
-            tracing::error!(
-                convo_id = %input.data.convo_id,
-                error = ?e,
-                size = group_info_bytes.len(),
-                "Invalid MLS GroupInfo structure - deserialization failed"
-            );
-            Error::InvalidGroupInfo(Some(format!(
-                "Invalid MLS GroupInfo structure: {:?}", e
-            )))
-        })?;
+    // The client may send GroupInfo wrapped in an MlsMessage or as raw VerifiableGroupInfo
+    // Try MlsMessage first (newer client format), then fall back to raw GroupInfo
+    let group_info_valid = MlsMessageIn::tls_deserialize(&mut group_info_bytes.as_slice()).is_ok()
+        || VerifiableGroupInfo::tls_deserialize(&mut group_info_bytes.as_slice()).is_ok();
+    
+    if !group_info_valid {
+        tracing::error!(
+            convo_id = %input.data.convo_id,
+            size = group_info_bytes.len(),
+            "Invalid MLS GroupInfo structure - deserialization failed for both wrapped and raw formats"
+        );
+        return Err(Error::InvalidGroupInfo(Some(
+            "Invalid MLS GroupInfo structure: could not deserialize as MlsMessage or raw GroupInfo".into()
+        )).into());
+    }
 
     // 5. Validate epoch consistency - epoch must increase (no regression)
     if let Ok(Some((_, existing_epoch, _))) = get_group_info(&pool, &input.data.convo_id).await {

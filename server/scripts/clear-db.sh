@@ -11,7 +11,7 @@ sleep 5
 echo "🗑️  Clearing all tables..."
 
 # Connect to the database and truncate all tables
-docker exec -i catbird-postgres psql -U catbird -d catbird <<'EOF'
+psql -h localhost -U catbird -d catbird <<'EOF'
 -- Disable triggers to avoid foreign key issues
 SET session_replication_role = 'replica';
 
