@@ -91,11 +91,13 @@ impl ApnsClient {
         );
 
         // Build notification with mutable-content for Notification Service Extension
-        // Do NOT use set_body() - that sets the visible alert text, not the payload!
-        // Instead, use set_content_available() + set_mutable_content() + add_custom_data()
+        // IMPORTANT: We MUST set an initial alert (title/body) for iOS to display a banner.
+        // The Notification Service Extension will then decrypt and REPLACE these with the real content.
+        // Without an alert, iOS only plays a sound but shows no banner.
         let mut notification = DefaultNotificationBuilder::new()
-            .set_content_available()  // Enables background processing
-            .set_mutable_content()    // Enables Notification Service Extension to modify
+            .set_title("New Message")
+            .set_body("Decrypting...")
+            .set_mutable_content()    // Enables Notification Service Extension to modify the alert
             .set_sound("default")
             .build(
                 device_token,
