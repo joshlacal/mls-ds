@@ -1,4 +1,4 @@
-use a2::{Client, ClientConfig, DefaultNotificationBuilder, Endpoint, NotificationBuilder, NotificationOptions, Priority};
+use a2::{Client, ClientConfig, DefaultNotificationBuilder, Endpoint, NotificationBuilder, NotificationOptions, Priority, PushType};
 use anyhow::{Context, Result};
 use sqlx::PgPool;
 use std::{path::Path, sync::Arc};
@@ -106,7 +106,7 @@ impl ApnsClient {
                     apns_priority: Some(Priority::High),
                     apns_collapse_id: None,
                     apns_expiration: None,
-                    apns_push_type: None,
+                    apns_push_type: Some(PushType::Alert),  // Required for Notification Service Extension
                     apns_id: None,
                 },
             );
