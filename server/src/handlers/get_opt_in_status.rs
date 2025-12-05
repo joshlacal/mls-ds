@@ -1,18 +1,12 @@
-use axum::{extract::{Query, State}, http::StatusCode, Json};
+use axum::{extract::{RawQuery, State}, http::StatusCode, Json};
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-use tracing::{warn, error};
+use serde::Serialize;
+use tracing::{info, warn, error};
 
 use crate::{
     auth::AuthUser,
     storage::DbPool,
 };
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GetOptInStatusParams {
-    dids: String, // Comma-separated list of DIDs
-}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -30,24 +24,45 @@ pub struct GetOptInStatusOutput {
 }
 
 /// Get opt-in status for a list of users
-/// GET /xrpc/blue.catbird.mls.getOptInStatus?dids=did1,did2,did3
+/// GET /xrpc/blue.catbird.mls.getOptInStatus?dids=did1&dids=did2 (ATProto array format)
+/// Also supports legacy comma-separated format: ?dids=did1,did2
 #[tracing::instrument(skip(pool))]
 pub async fn get_opt_in_status(
     State(pool): State<DbPool>,
     auth_user: AuthUser,
-    Query(params): Query<GetOptInStatusParams>,
+    RawQuery(query): RawQuery,
 ) -> Result<Json<GetOptInStatusOutput>, StatusCode> {
     // Enforce authentication
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.getOptInStatus") {
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    // Parse DIDs from comma-separated string
-    let dids: Vec<String> = params.dids
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    // Parse query string manually to handle ATProto array format (?dids=X&dids=Y)
+    let query_str = query.unwrap_or_default();
+    info!("getOptInStatus called with query: {}", query_str);
+
+    let mut dids: Vec<String> = Vec::new();
+
+    for pair in query_str.split('&') {
+        if let Some((key, value)) = pair.split_once('=') {
+            if key == "dids" {
+                let decoded_value = urlencoding::decode(value).unwrap_or_default().to_string();
+                // Support both ATProto array format (?dids=X&dids=Y) and comma-separated (?dids=X,Y)
+                if decoded_value.contains(',') {
+                    // Comma-separated legacy format
+                    dids.extend(
+                        decoded_value
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                    );
+                } else if !decoded_value.is_empty() {
+                    // Single DID from ATProto array format
+                    dids.push(decoded_value);
+                }
+            }
+        }
+    }
 
     // Validate DID count (max 100 per request)
     if dids.is_empty() {
@@ -59,6 +74,8 @@ pub async fn get_opt_in_status(
         warn!("Too many DIDs requested: {} (max 100)", dids.len());
         return Err(StatusCode::BAD_REQUEST);
     }
+
+    info!("Checking opt-in status for {} DIDs", dids.len());
 
     // Query opt-in status for all DIDs
     let results = sqlx::query_as::<_, (String, DateTime<Utc>)>(
