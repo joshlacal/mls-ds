@@ -1891,3 +1891,81 @@ pub async fn count_available_key_packages(
 
     Ok(count)
 }
+
+// =============================================================================
+// Key Package Synchronization (NoMatchingKeyPackage Prevention)
+// =============================================================================
+
+/// Get available (unconsumed) key package hashes for a specific device
+/// MULTI-DEVICE SUPPORT: Only returns packages belonging to this device
+/// This prevents one device from seeing/deleting another device's packages
+///
+/// This is the PRIMARY function for key package sync - always use this
+/// to ensure multi-device safety.
+pub async fn get_available_key_package_hashes_for_device(
+    pool: &DbPool,
+    user_did: &str,
+    device_id: &str,
+) -> Result<Vec<String>> {
+    let now = Utc::now();
+    let reservation_timeout = now - chrono::Duration::minutes(5);
+
+    let hashes = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT key_package_hash
+        FROM key_packages
+        WHERE owner_did = $1
+          AND device_id = $2
+          AND consumed_at IS NULL
+          AND expires_at > $3
+          AND (reserved_at IS NULL OR reserved_at < $4)
+        ORDER BY created_at DESC
+        "#,
+    )
+    .bind(user_did)
+    .bind(device_id)
+    .bind(now)
+    .bind(reservation_timeout)
+    .fetch_all(pool)
+    .await
+    .context("Failed to get available key package hashes for device")?;
+
+    Ok(hashes)
+}
+
+/// Delete specific key packages by hash for a specific device
+/// MULTI-DEVICE SUPPORT: Only deletes packages belonging to this device
+/// This prevents one device from deleting another device's packages
+///
+/// This is the PRIMARY function for key package cleanup - always use this
+/// to ensure multi-device safety.
+pub async fn delete_key_packages_by_hashes_for_device(
+    pool: &DbPool,
+    user_did: &str,
+    device_id: &str,
+    hashes: &[String],
+) -> Result<u64> {
+    if hashes.is_empty() {
+        return Ok(0);
+    }
+
+    // Use ANY array comparison for efficient batch deletion
+    // CRITICAL: Also filter by device_id to prevent cross-device deletion
+    let result = sqlx::query(
+        r#"
+        DELETE FROM key_packages
+        WHERE owner_did = $1
+          AND device_id = $2
+          AND key_package_hash = ANY($3)
+          AND consumed_at IS NULL
+        "#,
+    )
+    .bind(user_did)
+    .bind(device_id)
+    .bind(hashes)
+    .execute(pool)
+    .await
+    .context("Failed to delete key packages by hashes for device")?;
+
+    Ok(result.rows_affected())
+}
