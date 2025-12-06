@@ -37,3 +37,7 @@ pub mod send_message;
 pub mod stream_convo_events;
 pub mod validate_welcome;
 pub mod warn_member;
+
+// Manually added for reactions and typing indicators
+pub mod reactions_typing;
+pub use reactions_typing::{add_reaction, remove_reaction, send_typing_indicator};

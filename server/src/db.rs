@@ -1969,3 +1969,102 @@ pub async fn delete_key_packages_by_hashes_for_device(
 
     Ok(result.rows_affected())
 }
+
+// ==================== REACTIONS ====================
+
+/// Check if a message exists in a conversation
+pub async fn message_exists(pool: &DbPool, convo_id: &str, message_id: &str) -> Result<bool> {
+    let result: (bool,) = sqlx::query_as(
+        r#"
+        SELECT EXISTS(
+            SELECT 1 FROM messages
+            WHERE conversation_id = $1 AND id = $2
+        )
+        "#,
+    )
+    .bind(convo_id)
+    .bind(message_id)
+    .fetch_one(pool)
+    .await
+    .context("Failed to check message existence")?;
+
+    Ok(result.0)
+}
+
+/// Add a reaction to a message
+/// Returns true if inserted, false if already exists
+pub async fn add_reaction(
+    pool: &DbPool,
+    convo_id: &str,
+    message_id: &str,
+    user_did: &str,
+    reaction: &str,
+    created_at: DateTime<Utc>,
+) -> Result<bool> {
+    let result = sqlx::query(
+        r#"
+        INSERT INTO message_reactions (conversation_id, message_id, user_did, reaction, created_at)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (conversation_id, message_id, user_did, reaction) DO NOTHING
+        "#,
+    )
+    .bind(convo_id)
+    .bind(message_id)
+    .bind(user_did)
+    .bind(reaction)
+    .bind(created_at)
+    .execute(pool)
+    .await
+    .context("Failed to insert reaction")?;
+
+    Ok(result.rows_affected() > 0)
+}
+
+/// Remove a reaction from a message
+/// Returns true if deleted, false if didn't exist
+pub async fn remove_reaction(
+    pool: &DbPool,
+    convo_id: &str,
+    message_id: &str,
+    user_did: &str,
+    reaction: &str,
+) -> Result<bool> {
+    let result = sqlx::query(
+        r#"
+        DELETE FROM message_reactions
+        WHERE conversation_id = $1 AND message_id = $2 AND user_did = $3 AND reaction = $4
+        "#,
+    )
+    .bind(convo_id)
+    .bind(message_id)
+    .bind(user_did)
+    .bind(reaction)
+    .execute(pool)
+    .await
+    .context("Failed to delete reaction")?;
+
+    Ok(result.rows_affected() > 0)
+}
+
+/// Get all reactions for a message
+pub async fn get_message_reactions(
+    pool: &DbPool,
+    convo_id: &str,
+    message_id: &str,
+) -> Result<Vec<(String, String, DateTime<Utc>)>> {
+    let rows: Vec<(String, String, DateTime<Utc>)> = sqlx::query_as(
+        r#"
+        SELECT user_did, reaction, created_at
+        FROM message_reactions
+        WHERE conversation_id = $1 AND message_id = $2
+        ORDER BY created_at ASC
+        "#,
+    )
+    .bind(convo_id)
+    .bind(message_id)
+    .fetch_all(pool)
+    .await
+    .context("Failed to fetch reactions")?;
+
+    Ok(rows)
+}
