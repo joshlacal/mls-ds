@@ -110,12 +110,13 @@ pub async fn sync_key_packages(
             "✅ [syncKeyPackages] No orphaned key packages found - all synced for device {}",
             device_id
         );
+        let remaining_available = server_hashes.len() as i64;
         return Ok(Json(SyncKeyPackagesOutput {
             server_hashes,
             orphaned_count: 0,
             deleted_count: 0,
             orphaned_hashes: vec![],
-            remaining_available: server_hashes.len() as i64,
+            remaining_available,
             device_id: input.device_id,
         }));
     }
@@ -147,12 +148,13 @@ pub async fn sync_key_packages(
                 "Failed to delete orphaned key packages for device {}: {}",
                 device_id, e
             );
+            let remaining_available = server_hashes.len() as i64;
             return Ok(Json(SyncKeyPackagesOutput {
                 server_hashes,
                 orphaned_count,
                 deleted_count: 0,
                 orphaned_hashes,
-                remaining_available: server_hashes.len() as i64,
+                remaining_available,
                 device_id: input.device_id,
             }));
         }
