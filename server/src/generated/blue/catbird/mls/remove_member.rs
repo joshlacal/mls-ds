@@ -9,6 +9,9 @@ pub struct InputData {
     pub convo_id: String,
     ///Client-generated ULID for idempotent removal operations
     pub idempotency_key: String,
+    ///Base64-encoded MLS commit message for the removal. Required for epoch advancement and distribution to remaining members.
+    #[serde(skip_serializing_if = "core::option::Option::is_none")]
+    pub commit: core::option::Option<String>,
     ///Optional reason for removal (logged in audit trail)
     #[serde(skip_serializing_if = "core::option::Option::is_none")]
     pub reason: core::option::Option<String>,
@@ -19,9 +22,9 @@ pub type Input = crate::types::Object<InputData>;
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct OutputData {
-    ///Server's current observed epoch (hint for client MLS operations)
-    pub epoch_hint: usize,
-    ///Whether removal authorization succeeded
+    ///New epoch after the removal commit was applied
+    pub new_epoch: usize,
+    ///Whether removal succeeded
     pub ok: bool,
 }
 pub type Output = crate::types::Object<OutputData>;

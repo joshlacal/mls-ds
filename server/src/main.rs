@@ -186,6 +186,18 @@ async fn main() -> anyhow::Result<()> {
             post(handlers::send_message),
         )
         .route(
+            "/xrpc/blue.catbird.mls.addReaction",
+            post(handlers::add_reaction),
+        )
+        .route(
+            "/xrpc/blue.catbird.mls.removeReaction",
+            post(handlers::remove_reaction),
+        )
+        .route(
+            "/xrpc/blue.catbird.mls.sendTypingIndicator",
+            post(handlers::send_typing_indicator),
+        )
+        .route(
             "/xrpc/blue.catbird.mls.leaveConvo",
             post(handlers::leave_convo),
         )

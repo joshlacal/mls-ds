@@ -1,5 +1,6 @@
 // Handler modules for API endpoints
 mod add_members;
+mod add_reaction;
 mod check_blocks;
 mod claim_pending_device_addition;
 mod complete_pending_device_addition;
@@ -38,12 +39,14 @@ mod publish_key_packages;
 mod register_device;
 mod register_device_token;
 mod remove_member;
+mod remove_reaction;
 mod report_member;
 mod request_group_info_refresh;
 mod request_readdition;
 mod request_rejoin;
 mod resolve_report;
 mod send_message;
+mod send_typing_indicator;
 mod sync_key_packages;
 mod update_cursor;
 mod update_group_info;
@@ -54,6 +57,7 @@ mod warn_member;
 
 // Re-export handlers
 pub use add_members::add_members;
+pub use add_reaction::add_reaction;
 pub use check_blocks::check_blocks;
 pub use claim_pending_device_addition::claim_pending_device_addition;
 pub use complete_pending_device_addition::complete_pending_device_addition;
@@ -93,12 +97,14 @@ pub use publish_key_packages::publish_key_packages;
 pub use register_device::register_device;
 pub use register_device_token::{register_device_token, unregister_device_token};
 pub use remove_member::remove_member;
+pub use remove_reaction::remove_reaction;
 pub use report_member::report_member;
 pub use request_group_info_refresh::request_group_info_refresh;
 pub use request_readdition::request_readdition;
 pub use request_rejoin::request_rejoin;
 pub use resolve_report::resolve_report;
 pub use send_message::send_message;
+pub use send_typing_indicator::send_typing_indicator;
 pub use sync_key_packages::sync_key_packages;
 pub use update_cursor::update_cursor;
 pub use update_policy::{get_policy, update_policy};
