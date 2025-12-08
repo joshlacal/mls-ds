@@ -371,11 +371,11 @@ pub async fn remove_member(
               input.target_did.as_str(), event_action, auth_user.did);
     }
 
-    info!("✅ [remove_member] SUCCESS - {} removed by {}, new_epoch: {}",
+    info!("✅ [remove_member] SUCCESS - {} removed by {}, epoch_hint: {}",
           input.target_did.as_str(), auth_user.did, new_epoch);
 
     Ok(Json(Output::from(OutputData {
         ok: true,
-        new_epoch: new_epoch as usize,
+        epoch_hint: Some(new_epoch as usize),
     })))
 }

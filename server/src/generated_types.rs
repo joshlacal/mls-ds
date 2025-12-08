@@ -642,7 +642,8 @@ pub struct RemoveMemberOutput {
     /// Whether removal authorization succeeded
     pub ok: bool,
     /// Server's current observed epoch
-    pub epoch_hint: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epoch_hint: Option<i32>,
 }
 
 // =============================================================================
