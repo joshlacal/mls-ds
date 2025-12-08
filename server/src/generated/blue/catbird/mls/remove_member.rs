@@ -22,10 +22,11 @@ pub type Input = crate::types::Object<InputData>;
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct OutputData {
-    ///New epoch after the removal commit was applied
-    pub new_epoch: usize,
     ///Whether removal succeeded
     pub ok: bool,
+    ///Server's current observed epoch (hint for client MLS operations)
+    #[serde(skip_serializing_if = "core::option::Option::is_none")]
+    pub epoch_hint: core::option::Option<usize>,
 }
 pub type Output = crate::types::Object<OutputData>;
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]

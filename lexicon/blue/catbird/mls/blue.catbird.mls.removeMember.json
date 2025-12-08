@@ -5,7 +5,7 @@
   "defs": {
     "main": {
       "type": "procedure",
-      "description": "Remove a member from the conversation. Admin-only operation. Server authorizes, soft-deletes membership (sets left_at), stores the MLS commit for distribution to remaining members, and logs the action.",
+      "description": "Remove a member from the conversation. Admin-only operation. Server authorizes, soft-deletes membership (sets left_at), and logs action. The admin client must issue an MLS Remove commit via the standard MLS flow to cryptographically remove the member and advance the epoch.",
       "input": {
         "encoding": "application/json",
         "schema": {
@@ -26,10 +26,6 @@
               "description": "Client-generated ULID for idempotent removal operations",
               "maxLength": 26
             },
-            "commit": {
-              "type": "string",
-              "description": "Base64-encoded MLS commit message for the removal. Required for epoch advancement and distribution to remaining members."
-            },
             "reason": {
               "type": "string",
               "maxLength": 500,
@@ -42,16 +38,16 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["ok", "newEpoch"],
+          "required": ["ok"],
           "properties": {
             "ok": { 
               "type": "boolean",
-              "description": "Whether removal succeeded"
+              "description": "Whether removal authorization succeeded"
             },
-            "newEpoch": {
+            "epochHint": {
               "type": "integer",
               "minimum": 0,
-              "description": "New epoch after the removal commit was applied"
+              "description": "Server's current observed epoch (hint for client MLS operations)"
             }
           }
         }

@@ -19,10 +19,11 @@ pub type Input = crate::types::Object<InputData>;
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct OutputData {
-    ///Server's current observed epoch (hint for client MLS operations)
-    pub epoch_hint: usize,
     ///Whether removal authorization succeeded
     pub ok: bool,
+    ///Server's current observed epoch (hint for client MLS operations)
+    #[serde(skip_serializing_if = "core::option::Option::is_none")]
+    pub epoch_hint: core::option::Option<usize>,
 }
 pub type Output = crate::types::Object<OutputData>;
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
