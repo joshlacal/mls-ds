@@ -60,7 +60,6 @@ pub struct Input {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OutputData {
-    pub success: bool,
     pub epoch: i64,
     pub rejoined_at: String,
 }
@@ -690,7 +689,6 @@ pub async fn handle(
     });
 
     Ok(Json(Output::from(OutputData {
-        success: true,
         epoch: new_epoch as i64,
         rejoined_at: now.to_rfc3339(),
     })))
