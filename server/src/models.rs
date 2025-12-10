@@ -5,6 +5,14 @@
 
 use sqlx::FromRow;
 
+// Chat request models (submodule)
+pub mod chat_request;
+pub use chat_request::{
+    AcceptRequestInput, AcceptRequestOutput, ChatRequest, ChatRequestBuilder, ChatRequestParams,
+    ChatRequestRateLimit, ChatRequestStatus, HeldMessage, HeldMessageBuilder, HeldMessageParams,
+    ListRequestsInput, ListRequestsOutput, SendRequestInput, SendRequestOutput,
+};
+
 // Re-export generated types for convenience
 pub use crate::generated::blue::catbird::mls::defs::{
     ConvoMetadata, ConvoMetadataData, ConvoView, ConvoViewData, KeyPackageRef, KeyPackageRefData,
