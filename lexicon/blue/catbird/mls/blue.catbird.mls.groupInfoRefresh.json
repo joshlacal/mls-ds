@@ -1,6 +1,6 @@
 {
   "lexicon": 1,
-  "id": "blue.catbird.mls.requestGroupInfoRefresh",
+  "id": "blue.catbird.mls.groupInfoRefresh",
   "defs": {
     "main": {
       "type": "procedure",

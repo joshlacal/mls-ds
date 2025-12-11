@@ -5,12 +5,12 @@ use tracing::{error, info, warn};
 use crate::{
     auth::AuthUser,
     device_utils::parse_device_did,
-    generated::blue::catbird::mls::request_rejoin::{Input, Output, OutputData},
+    generated::blue::catbird::mls::rejoin::{Input, Output, OutputData},
     storage::DbPool,
 };
 
 /// Request to rejoin an MLS conversation after local state loss
-/// POST /xrpc/blue.catbird.mls.requestRejoin
+/// POST /xrpc/blue.catbird.mls.rejoin
 ///
 /// When a device registers and gets `auto_joined_convos`, it needs to request
 /// rejoin to get Welcome messages for those conversations. This handler:
@@ -19,13 +19,13 @@ use crate::{
 /// 3. Creates a pending rejoin request (may be auto-approved based on criteria)
 /// 4. Returns the request status
 #[tracing::instrument(skip(pool))]
-pub async fn request_rejoin(
+pub async fn rejoin(
     State(pool): State<DbPool>,
     auth_user: AuthUser,
     Json(input): Json<Input>,
 ) -> Result<Json<Output>, StatusCode> {
     // Enforce authentication
-    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.requestRejoin") {
+    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.rejoin") {
         return Err(StatusCode::UNAUTHORIZED);
     }
 
@@ -392,7 +392,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_request_rejoin_auto_approved() {
+    async fn test_rejoin_auto_approved() {
         let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
         let pool = crate::db::init_db(crate::db::DbConfig {
             database_url: db_url,
@@ -429,13 +429,13 @@ mod tests {
         let key_package_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(key_package);
 
-        let input = Input::from(crate::generated::blue::catbird::mls::request_rejoin::InputData {
+        let input = Input::from(crate::generated::blue::catbird::mls::rejoin::InputData {
             convo_id: convo_id.to_string(),
             key_package: key_package_b64,
             reason: Some("test_device_state_loss".to_string()),
         });
 
-        let result = request_rejoin(State(pool.clone()), auth_user, Json(input)).await;
+        let result = rejoin(State(pool.clone()), auth_user, Json(input)).await;
         assert!(result.is_ok());
 
         let output = result.unwrap().0;
@@ -444,7 +444,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_request_rejoin_not_member() {
+    async fn test_rejoin_not_member() {
         let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
         let pool = crate::db::init_db(crate::db::DbConfig {
             database_url: db_url,
@@ -492,13 +492,13 @@ mod tests {
         let key_package_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(key_package);
 
-        let input = Input::from(crate::generated::blue::catbird::mls::request_rejoin::InputData {
+        let input = Input::from(crate::generated::blue::catbird::mls::rejoin::InputData {
             convo_id: convo_id.to_string(),
             key_package: key_package_b64,
             reason: Some("test".to_string()),
         });
 
-        let result = request_rejoin(State(pool), auth_user, Json(input)).await;
+        let result = rejoin(State(pool), auth_user, Json(input)).await;
         assert_eq!(result.unwrap_err(), StatusCode::FORBIDDEN);
     }
 }

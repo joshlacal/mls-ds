@@ -917,12 +917,12 @@ pub struct ReportCategoryCounts {
 }
 
 // =============================================================================
-// blue.catbird.mls.requestRejoin
+// blue.catbird.mls.rejoin
 // =============================================================================
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RequestRejoinInput {
+pub struct RejoinInput {
     /// Conversation identifier to rejoin
     pub convo_id: String,
     /// Base64url-encoded fresh MLS KeyPackage
@@ -934,7 +934,7 @@ pub struct RequestRejoinInput {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RequestRejoinOutput {
+pub struct RejoinOutput {
     /// Rejoin request identifier for tracking
     pub request_id: String,
     /// Whether request is pending approval or auto-approved

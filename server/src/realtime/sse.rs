@@ -75,7 +75,7 @@ pub enum StreamEvent {
         pending_addition_id: String,
     },
     /// Event requesting active members to publish fresh GroupInfo for external commit joins
-    /// Emitted when a member encounters stale GroupInfo and calls requestGroupInfoRefresh
+    /// Emitted when a member encounters stale GroupInfo and calls groupInfoRefresh
     #[serde(rename = "blue.catbird.mls.streamConvoEvents#groupInfoRefreshRequestedEvent")]
     GroupInfoRefreshRequested {
         cursor: String,

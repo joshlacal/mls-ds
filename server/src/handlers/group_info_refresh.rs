@@ -5,18 +5,18 @@ use tracing::{error, info, warn};
 use crate::{
     auth::AuthUser,
     device_utils::parse_device_did,
-    generated::blue::catbird::mls::request_group_info_refresh::{Input, Output, OutputData},
+    generated::blue::catbird::mls::group_info_refresh::{Input, Output, OutputData},
     realtime::{SseState, StreamEvent},
     storage::DbPool,
 };
 
 /// Request active members to publish fresh GroupInfo for a conversation.
-/// POST /xrpc/blue.catbird.mls.requestGroupInfoRefresh
+/// POST /xrpc/blue.catbird.mls.groupInfoRefresh
 ///
 /// Used when a member encounters stale GroupInfo during external commit rejoin.
 /// Emits a GroupInfoRefreshRequested SSE event to all active members so one of
 /// them can publish fresh GroupInfo.
-pub async fn request_group_info_refresh(
+pub async fn group_info_refresh(
     State(pool): State<DbPool>,
     State(sse_state): State<Arc<SseState>>,
     auth_user: AuthUser,
@@ -25,7 +25,7 @@ pub async fn request_group_info_refresh(
     // Enforce authentication
     if let Err(_e) = crate::auth::enforce_standard(
         &auth_user.claims,
-        "blue.catbird.mls.requestGroupInfoRefresh",
+        "blue.catbird.mls.groupInfoRefresh",
     ) {
         return Err(StatusCode::UNAUTHORIZED);
     }

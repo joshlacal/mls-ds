@@ -5,18 +5,18 @@ use tracing::{error, info, warn};
 use crate::{
     auth::AuthUser,
     device_utils::parse_device_did,
-    generated::blue::catbird::mls::request_readdition::{Input, Output, OutputData},
+    generated::blue::catbird::mls::readdition::{Input, Output, OutputData},
     realtime::{SseState, StreamEvent},
     storage::DbPool,
 };
 
 /// Request re-addition to a conversation when both Welcome and External Commit have failed.
-/// POST /xrpc/blue.catbird.mls.requestReaddition
+/// POST /xrpc/blue.catbird.mls.readdition
 ///
 /// Used when a member cannot rejoin a conversation through normal means.
 /// This emits a ReadditionRequested SSE event to active members who can then
 /// re-add the user with fresh KeyPackages.
-pub async fn request_readdition(
+pub async fn readdition(
     State(pool): State<DbPool>,
     State(sse_state): State<Arc<SseState>>,
     auth_user: AuthUser,
@@ -25,7 +25,7 @@ pub async fn request_readdition(
     // Enforce authentication
     if let Err(_e) = crate::auth::enforce_standard(
         &auth_user.claims,
-        "blue.catbird.mls.requestReaddition",
+        "blue.catbird.mls.readdition",
     ) {
         return Err(StatusCode::UNAUTHORIZED);
     }

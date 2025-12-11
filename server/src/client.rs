@@ -941,12 +941,12 @@ where
         }
     }
     ///Submit rejoin request with fresh KeyPackage after state loss (e.g., app reinstall, device change)
-    pub async fn request_rejoin(
+    pub async fn rejoin(
         &self,
-        input: crate::blue::catbird::mls::request_rejoin::Input,
+        input: crate::blue::catbird::mls::rejoin::Input,
     ) -> atrium_xrpc::Result<
-        crate::blue::catbird::mls::request_rejoin::Output,
-        crate::blue::catbird::mls::request_rejoin::Error,
+        crate::blue::catbird::mls::rejoin::Output,
+        crate::blue::catbird::mls::rejoin::Error,
     > {
         let response = self
             .xrpc
@@ -958,7 +958,7 @@ where
             >(
                 &atrium_xrpc::XrpcRequest {
                     method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::request_rejoin::NSID.into(),
+                    nsid: crate::blue::catbird::mls::rejoin::NSID.into(),
                     parameters: None,
                     input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
                     encoding: Some(String::from("application/json")),

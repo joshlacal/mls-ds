@@ -517,7 +517,7 @@ pub async fn register_device(
     info!("Created pending device additions for {} conversations", auto_joined_convos.len());
 
     // For now, we don't generate welcome messages during registration
-    // The device will need to request rejoin via blue.catbird.mls.requestRejoin
+    // The device will need to request rejoin via blue.catbird.mls.rejoin
     // OR other online members will add it via the pending addition flow
     Ok(Json(RegisterDeviceOutput {
         device_id,
