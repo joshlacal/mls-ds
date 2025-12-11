@@ -72,7 +72,7 @@ pub async fn handle(
                 },
                 Err(_) => {
                     // If regeneration fails (e.g. not implemented), return cached one if available
-                    // Clients can request refresh from active members via requestGroupInfoRefresh
+                    // Clients can request refresh from active members via groupInfoRefresh
                 }
             }
         }

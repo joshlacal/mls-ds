@@ -11,14 +11,14 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 // Import from library crate instead of re-declaring modules
 use catbird_server::{
-    actors, auth, block_sync, crypto, db, fanout, handlers, health, metrics, middleware, models, realtime,
-    storage, util,
+    actors, auth, block_sync, crypto, db, fanout, handlers, health, metrics, middleware, models,
+    realtime, storage, util,
 };
 
 // These modules are only in main.rs (not in lib.rs)
+mod admin_system;
 mod device_utils;
 mod jobs;
-mod admin_system;
 mod xrpc_proxy;
 
 // Composite state for Axum 0.7
@@ -93,11 +93,16 @@ async fn main() -> anyhow::Result<()> {
     // tracing::info!("Compaction worker started");
 
     // Initialize actor registry
-    let actor_registry = Arc::new(actors::ActorRegistry::new(db_pool.clone(), sse_state.clone()));
+    let actor_registry = Arc::new(actors::ActorRegistry::new(
+        db_pool.clone(),
+        sse_state.clone(),
+    ));
     tracing::info!("Actor registry initialized");
 
     // Initialize notification service
-    let notification_service = Some(Arc::new(catbird_server::notifications::NotificationService::new()));
+    let notification_service = Some(Arc::new(
+        catbird_server::notifications::NotificationService::new(),
+    ));
     tracing::info!("Notification service initialized");
 
     // Spawn idempotency cache cleanup worker
@@ -136,7 +141,9 @@ async fn main() -> anyhow::Result<()> {
             interval_timer.tick().await;
             // Cleanup buckets not accessed in the last 10 minutes
             let max_age = Duration::from_secs(600);
-            middleware::rate_limit::DID_RATE_LIMITER.cleanup_old_buckets(max_age).await;
+            middleware::rate_limit::DID_RATE_LIMITER
+                .cleanup_old_buckets(max_age)
+                .await;
             tracing::debug!("Rate limiter cleanup completed");
         }
     });
@@ -270,10 +277,7 @@ async fn main() -> anyhow::Result<()> {
             "/xrpc/blue.catbird.mls.unregisterDeviceToken",
             post(handlers::unregister_device_token),
         )
-        .route(
-            "/xrpc/blue.catbird.mls.getEpoch",
-            get(handlers::get_epoch),
-        )
+        .route("/xrpc/blue.catbird.mls.getEpoch", get(handlers::get_epoch))
         .route(
             "/xrpc/blue.catbird.mls.getGroupInfo",
             get(handlers::get_group_info),
@@ -302,21 +306,18 @@ async fn main() -> anyhow::Result<()> {
             "/xrpc/blue.catbird.mls.getWelcome",
             get(handlers::get_welcome),
         )
+        .route("/xrpc/blue.catbird.mls.rejoin", post(handlers::rejoin))
         .route(
-            "/xrpc/blue.catbird.mls.requestRejoin",
-            post(handlers::request_rejoin),
-        )
-        .route(
-            "/xrpc/blue.catbird.mls.requestGroupInfoRefresh",
-            post(handlers::request_group_info_refresh),
+            "/xrpc/blue.catbird.mls.groupInfoRefresh",
+            post(handlers::group_info_refresh),
         )
         .route(
             "/xrpc/blue.catbird.mls.invalidateWelcome",
             post(handlers::invalidate_welcome),
         )
         .route(
-            "/xrpc/blue.catbird.mls.requestReaddition",
-            post(handlers::request_readdition),
+            "/xrpc/blue.catbird.mls.readdition",
+            post(handlers::readdition),
         )
         // Bluesky blocks integration endpoints
         .route(
@@ -332,14 +333,8 @@ async fn main() -> anyhow::Result<()> {
             post(handlers::handle_block_change),
         )
         // Opt-in endpoints
-        .route(
-            "/xrpc/blue.catbird.mls.optIn",
-            post(handlers::opt_in),
-        )
-        .route(
-            "/xrpc/blue.catbird.mls.optOut",
-            post(handlers::opt_out),
-        )
+        .route("/xrpc/blue.catbird.mls.optIn", post(handlers::opt_in))
+        .route("/xrpc/blue.catbird.mls.optOut", post(handlers::opt_out))
         .route(
             "/xrpc/blue.catbird.mls.getOptInStatus",
             get(handlers::get_opt_in_status),
@@ -359,9 +354,13 @@ async fn main() -> anyhow::Result<()> {
         )
         .merge(metrics_router)
         .layer(TraceLayer::new_for_http())
-        .layer(axum::middleware::from_fn(middleware::logging::log_headers_middleware))
+        .layer(axum::middleware::from_fn(
+            middleware::logging::log_headers_middleware,
+        ))
         // DID-based rate limiter for authenticated requests, IP-based backstop for unauthenticated
-        .layer(axum::middleware::from_fn(middleware::rate_limit::rate_limit_middleware))
+        .layer(axum::middleware::from_fn(
+            middleware::rate_limit::rate_limit_middleware,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             middleware::idempotency::IdempotencyLayer::new(db_pool.clone()),
             middleware::idempotency::idempotency_middleware,
