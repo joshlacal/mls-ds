@@ -5,10 +5,11 @@ use tracing::{error, info};
 
 use crate::{
     auth::AuthUser,
-    generated::blue::catbird::mls::add_reaction::{Input, Output, NSID},
+    generated::blue::catbird::mls::add_reaction::{Input, Output, OutputData, NSID},
     realtime::{SseState, StreamEvent},
     db,
     storage::DbPool,
+    sqlx_atrium::chrono_to_datetime,
 };
 
 /// Add a reaction to a message
@@ -113,8 +114,8 @@ pub async fn add_reaction(
 
     info!("Reaction added successfully");
 
-    Ok(Json(Output {
+    Ok(Json(Output::from(OutputData {
         success: true,
-        reacted_at: Some(now.to_rfc3339()),
-    }))
+        reacted_at: Some(chrono_to_datetime(now)),
+    })))
 }

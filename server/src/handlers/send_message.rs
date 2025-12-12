@@ -378,6 +378,7 @@ pub async fn send_message(
                     epoch: msg.epoch as usize,
                     seq: msg.seq as usize,
                     created_at: crate::sqlx_atrium::chrono_to_datetime(msg.created_at),
+                    message_type: None,
                 });
 
                 let event = StreamEvent::MessageEvent {

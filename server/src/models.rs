@@ -150,7 +150,7 @@ impl Membership {
             device_name: self.device_name.clone(),
             joined_at: crate::sqlx_atrium::chrono_to_datetime(self.joined_at),
             is_admin: self.is_admin,
-            is_moderator: self.is_moderator,
+            is_moderator: Some(self.is_moderator),
             leaf_index: self.leaf_index.map(|i| i as usize),
             credential: None,
             promoted_at: self.promoted_at.map(crate::sqlx_atrium::chrono_to_datetime),
@@ -186,6 +186,7 @@ impl Message {
             epoch: self.epoch as usize,
             seq: self.seq as usize,
             created_at: crate::sqlx_atrium::chrono_to_datetime(self.created_at),
+            message_type: Some(self.message_type.clone()),
         }))
     }
 }

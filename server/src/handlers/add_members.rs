@@ -455,6 +455,7 @@ pub async fn add_members(
                             epoch: epoch as usize,
                             seq: seq as usize,
                             created_at: crate::sqlx_atrium::chrono_to_datetime(created_at),
+                            message_type: None,
                         });
 
                         let event = StreamEvent::MessageEvent {

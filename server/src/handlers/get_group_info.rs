@@ -6,9 +6,10 @@ use sqlx::FromRow;
 use crate::{
     auth::AuthUser,
     error_responses::GetGroupInfoError,
-    generated::blue::catbird::mls::get_group_info::{Input, Output, OutputData, Error},
+    generated::blue::catbird::mls::get_group_info::{Parameters, Output, OutputData, Error},
     storage::DbPool,
     group_info::{get_group_info, generate_and_cache_group_info},
+    sqlx_atrium::chrono_to_datetime,
 };
 
 #[derive(FromRow)]
@@ -21,7 +22,7 @@ struct MemberCheckRow {
 pub async fn handle(
     State(pool): State<DbPool>,
     auth: AuthUser,
-    Query(input): Query<Input>,
+    Query(params): Query<Parameters>,
 ) -> Result<Json<Output>, GetGroupInfoError> {
     let did = &auth.did;
     
@@ -33,7 +34,7 @@ pub async fn handle(
          WHERE convo_id = $1 AND user_did = $2
          LIMIT 1"
     )
-    .bind(&input.data.convo_id)
+    .bind(&params.data.convo_id)
     .bind(did)
     .fetch_optional(&pool)
     .await
@@ -51,7 +52,7 @@ pub async fn handle(
     }
     
     // 3. Fetch cached GroupInfo
-    let cached = get_group_info(&pool, &input.data.convo_id).await
+    let cached = get_group_info(&pool, &params.data.convo_id).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         
     if let Some((group_info_bytes, epoch, updated_at)) = cached {
@@ -62,12 +63,12 @@ pub async fn handle(
             // Regenerate fresh GroupInfo
             // Note: generate_and_cache_group_info is currently a placeholder that might fail
             // Clients should proactively refresh via publishGroupInfo before expiration
-            match generate_and_cache_group_info(&pool, &input.data.convo_id).await {
+            match generate_and_cache_group_info(&pool, &params.data.convo_id).await {
                 Ok(fresh_info) => {
                     return Ok(Json(Output::from(OutputData {
                         group_info: base64::engine::general_purpose::STANDARD.encode(fresh_info),
                         epoch: epoch as i64,
-                        expires_at: Some((chrono::Utc::now() + chrono::Duration::hours(6)).to_rfc3339()),
+                        expires_at: Some(chrono_to_datetime(chrono::Utc::now() + chrono::Duration::hours(6))),
                     })));
                 },
                 Err(_) => {
@@ -80,23 +81,23 @@ pub async fn handle(
         return Ok(Json(Output::from(OutputData {
             group_info: base64::engine::general_purpose::STANDARD.encode(group_info_bytes),
             epoch: epoch as i64,
-            expires_at: Some((updated_at + chrono::Duration::hours(6)).to_rfc3339()),
+            expires_at: Some(chrono_to_datetime(updated_at + chrono::Duration::hours(6))),
         })));
     }
     
     // If not found, try to generate it
-    let _fresh_info = generate_and_cache_group_info(&pool, &input.data.convo_id).await
+    let _fresh_info = generate_and_cache_group_info(&pool, &params.data.convo_id).await
         .map_err(|_| Error::GroupInfoUnavailable(Some("GroupInfo not available and cannot be generated".into())))?;
         
     // Fetch again to get epoch
-    let cached_again = get_group_info(&pool, &input.data.convo_id).await
+    let cached_again = get_group_info(&pool, &params.data.convo_id).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         
     if let Some((group_info_bytes, epoch, updated_at)) = cached_again {
         return Ok(Json(Output::from(OutputData {
             group_info: base64::engine::general_purpose::STANDARD.encode(group_info_bytes),
             epoch: epoch as i64,
-            expires_at: Some((updated_at + chrono::Duration::hours(6)).to_rfc3339()),
+            expires_at: Some(chrono_to_datetime(updated_at + chrono::Duration::hours(6))),
         })));
     }
 

@@ -216,7 +216,7 @@ pub async fn create_convo(
                         credential: None,
                         promoted_at: None,
                         promoted_by: None,
-                        is_moderator: false,
+                        is_moderator: Some(false),
                     }))
                 })
                 .collect::<Result<Vec<_>, StatusCode>>()?;
@@ -284,7 +284,7 @@ pub async fn create_convo(
         device_name: None,
         joined_at: chrono_to_datetime(now),
         is_admin: true,
-        is_moderator: false,
+        is_moderator: Some(false),
         leaf_index: Some(0),
         credential: None,
         promoted_at: None,
@@ -324,7 +324,7 @@ pub async fn create_convo(
                 device_name: None,
                 joined_at: chrono_to_datetime(now),
                 is_admin: false,
-                is_moderator: false,
+                is_moderator: Some(false),
                 leaf_index: Some((idx + 1) as usize),
                 credential: None,
                 promoted_at: None,

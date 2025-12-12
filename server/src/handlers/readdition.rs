@@ -167,6 +167,6 @@ pub async fn readdition(
 
     Ok(Json(Output::from(OutputData {
         requested: true,
-        active_members: Some(active_members as i32),
+        active_members: Some(active_members as i64),
     })))
 }

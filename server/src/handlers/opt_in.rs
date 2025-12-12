@@ -1,7 +1,7 @@
 use axum::{extract::State, http::StatusCode, Json};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn, error};
+use tracing::{info, error};
 
 use crate::{
     auth::AuthUser,

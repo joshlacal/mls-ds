@@ -326,7 +326,7 @@ pub async fn handle(
             let psk_hash = hash_psk(psk);
 
             // Use helper function from create_invite.rs to check invite validity
-            use crate::handlers::create_invite::{is_invite_valid, increment_invite_uses};
+            use crate::handlers::create_invite::is_invite_valid;
 
             let invite_id = is_invite_valid(&pool, &psk_hash, Some(did))
                 .await
@@ -657,6 +657,7 @@ pub async fn handle(
                     epoch: epoch as usize,
                     seq: seq as usize,
                     created_at: crate::sqlx_atrium::chrono_to_datetime(created_at),
+                    message_type: None,
                 });
 
                 let event = StreamEvent::MessageEvent {

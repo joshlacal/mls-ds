@@ -140,9 +140,7 @@ pub async fn handle(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
     
-    Ok(Json(Output {
-        data: OutputData {
-            updated: true,
-        }
-    }))
+    Ok(Json(Output::from(OutputData {
+        updated: true,
+    })))
 }

@@ -3,7 +3,6 @@
 //! Enforces group membership authorization before allowing MLS operations.
 //! This is CRITICAL for security - prevents unauthorized access to group messages.
 
-use axum::http::StatusCode;
 use sqlx::PgPool;
 use anyhow::{Result, anyhow};
 
