@@ -465,13 +465,23 @@ pub async fn register_device(
     for convo_id in &auto_joined_convos {
         let pending_id = Uuid::new_v4().to_string();
 
-        // Insert pending addition (ignore conflicts - device might already have pending additions)
+        // Insert pending addition, or update device_id if one already exists
+        // CRITICAL: On re-registration, we must update new_device_id so the claim
+        // handler can find key packages (which are stored under the new device_id)
         let insert_result = sqlx::query!(
             r#"
             INSERT INTO pending_device_additions
                 (id, convo_id, user_did, new_device_id, new_device_credential_did, device_name, status, created_at)
             VALUES ($1, $2, $3, $4, $5, $6, 'pending', NOW())
-            ON CONFLICT (convo_id, new_device_credential_did) DO NOTHING
+            ON CONFLICT (convo_id, new_device_credential_did) DO UPDATE
+                SET new_device_id = EXCLUDED.new_device_id,
+                    device_name = EXCLUDED.device_name,
+                    status = 'pending',
+                    claimed_by_did = NULL,
+                    claimed_at = NULL,
+                    claim_expires_at = NULL,
+                    updated_at = NOW()
+                WHERE pending_device_additions.status != 'completed'
             RETURNING id
             "#,
             pending_id,
