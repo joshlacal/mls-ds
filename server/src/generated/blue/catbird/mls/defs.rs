@@ -57,8 +57,8 @@ pub type KeyPackageRef = crate::types::Object<KeyPackageRefData>;
 #[serde(rename_all = "camelCase")]
 pub struct MemberViewData {
     ///MLS credential bytes
-    #[serde(with = "crate::atproto_bytes::option")]
     #[serde(default)]
+    #[serde(with = "serde_bytes")]
     #[serde(skip_serializing_if = "core::option::Option::is_none")]
     pub credential: core::option::Option<Vec<u8>>,
     ///Device identifier (UUID). Unique per device.
@@ -72,8 +72,8 @@ pub struct MemberViewData {
     ///Whether this member (device) has admin privileges. Admin status is synced across all devices of the same user.
     pub is_admin: bool,
     ///Whether this member has moderator privileges. Moderators can warn members and view reports but cannot promote/demote others.
-    #[serde(default)]
-    pub is_moderator: bool,
+    #[serde(skip_serializing_if = "core::option::Option::is_none")]
+    pub is_moderator: core::option::Option<bool>,
     ///When this device joined the conversation
     pub joined_at: crate::types::string::Datetime,
     ///MLS leaf index in ratchet tree structure
@@ -94,7 +94,7 @@ pub type MemberView = crate::types::Object<MemberViewData>;
 #[serde(rename_all = "camelCase")]
 pub struct MessageViewData {
     ///MLS encrypted message ciphertext bytes
-    #[serde(with = "crate::atproto_bytes")]
+    #[serde(with = "serde_bytes")]
     pub ciphertext: Vec<u8>,
     ///Conversation identifier
     pub convo_id: String,
@@ -104,6 +104,9 @@ pub struct MessageViewData {
     pub epoch: usize,
     ///Message identifier (ULID for deduplication)
     pub id: String,
+    ///Message type discriminator: 'app' for application messages (user content), 'commit' for MLS protocol control messages (epoch changes, membership updates). Clients should process both types for MLS state tracking but only display 'app' messages in the UI.
+    #[serde(skip_serializing_if = "core::option::Option::is_none")]
+    pub message_type: core::option::Option<String>,
     ///Monotonically increasing sequence number within conversation. Server assigns sequentially starting from 1. Gaps may occur when members are removed from the conversation, but seq values are never reused.
     pub seq: usize,
 }

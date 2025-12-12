@@ -56,7 +56,7 @@ pub struct ReportViewData {
     ///When report was submitted
     pub created_at: crate::types::string::Datetime,
     ///Encrypted report content (admin must decrypt locally)
-    #[serde(with = "crate::atproto_bytes")]
+    #[serde(with = "serde_bytes")]
     pub encrypted_content: Vec<u8>,
     ///Report identifier
     pub id: String,

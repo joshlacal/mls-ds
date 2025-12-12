@@ -8,45 +8,37 @@
       "input": {
         "encoding": "application/json",
         "schema": {
-          "type": "ref",
-          "ref": "#input"
+          "type": "object",
+          "required": ["convoId", "isTyping"],
+          "properties": {
+            "convoId": {
+              "type": "string",
+              "description": "Conversation identifier (group ID hex)"
+            },
+            "isTyping": {
+              "type": "boolean",
+              "description": "True if user started typing, false if stopped"
+            }
+          }
         }
       },
       "output": {
         "encoding": "application/json",
         "schema": {
-          "type": "ref",
-          "ref": "#output"
+          "type": "object",
+          "required": ["success"],
+          "properties": {
+            "success": {
+              "type": "boolean",
+              "description": "Whether the typing indicator was sent successfully"
+            }
+          }
         }
       },
       "errors": [
         { "name": "NotFound", "description": "Conversation not found" },
         { "name": "NotMember", "description": "User is not a member of the conversation" }
       ]
-    },
-    "input": {
-      "type": "object",
-      "required": ["convoId", "isTyping"],
-      "properties": {
-        "convoId": {
-          "type": "string",
-          "description": "Conversation identifier (group ID hex)"
-        },
-        "isTyping": {
-          "type": "boolean",
-          "description": "True if user started typing, false if stopped"
-        }
-      }
-    },
-    "output": {
-      "type": "object",
-      "required": ["success"],
-      "properties": {
-        "success": {
-          "type": "boolean",
-          "description": "Whether the typing indicator was sent successfully"
-        }
-      }
     }
   }
 }

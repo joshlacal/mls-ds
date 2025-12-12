@@ -8,50 +8,42 @@
       "input": {
         "encoding": "application/json",
         "schema": {
-          "type": "ref",
-          "ref": "#input"
+          "type": "object",
+          "required": ["convoId", "messageId", "reaction"],
+          "properties": {
+            "convoId": {
+              "type": "string",
+              "description": "Conversation identifier (group ID hex)"
+            },
+            "messageId": {
+              "type": "string",
+              "description": "ID of the message to remove reaction from"
+            },
+            "reaction": {
+              "type": "string",
+              "description": "Reaction content (emoji or short code) to remove",
+              "maxLength": 16
+            }
+          }
         }
       },
       "output": {
         "encoding": "application/json",
         "schema": {
-          "type": "ref",
-          "ref": "#output"
+          "type": "object",
+          "required": ["success"],
+          "properties": {
+            "success": {
+              "type": "boolean",
+              "description": "Whether the reaction was removed successfully"
+            }
+          }
         }
       },
       "errors": [
         { "name": "NotFound", "description": "Message, conversation, or reaction not found" },
         { "name": "NotMember", "description": "User is not a member of the conversation" }
       ]
-    },
-    "input": {
-      "type": "object",
-      "required": ["convoId", "messageId", "reaction"],
-      "properties": {
-        "convoId": {
-          "type": "string",
-          "description": "Conversation identifier (group ID hex)"
-        },
-        "messageId": {
-          "type": "string",
-          "description": "ID of the message to remove reaction from"
-        },
-        "reaction": {
-          "type": "string",
-          "description": "Reaction content (emoji or short code) to remove",
-          "maxLength": 16
-        }
-      }
-    },
-    "output": {
-      "type": "object",
-      "required": ["success"],
-      "properties": {
-        "success": {
-          "type": "boolean",
-          "description": "Whether the reaction was removed successfully"
-        }
-      }
     }
   }
 }
