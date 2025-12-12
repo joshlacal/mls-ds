@@ -4,7 +4,7 @@ use tracing::{error, info};
 
 use crate::{
     auth::AuthUser,
-    generated::blue::catbird::mls::remove_reaction::{Input, Output, NSID},
+    generated::blue::catbird::mls::remove_reaction::{Input, Output, OutputData, NSID},
     realtime::{SseState, StreamEvent},
     db,
     storage::DbPool,
@@ -86,5 +86,5 @@ pub async fn remove_reaction(
 
     info!("Reaction removed successfully");
 
-    Ok(Json(Output { success: true }))
+    Ok(Json(Output::from(OutputData { success: true })))
 }

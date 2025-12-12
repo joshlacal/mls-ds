@@ -1,5 +1,6 @@
 use a2::{Client, ClientConfig, DefaultNotificationBuilder, Endpoint, NotificationBuilder, NotificationOptions, Priority, PushType};
 use anyhow::{Context, Result};
+use base64::Engine;
 use sqlx::PgPool;
 use std::{path::Path, sync::Arc};
 use tracing::{debug, error, info, warn};
@@ -74,7 +75,7 @@ impl ApnsClient {
         );
 
         // Encode ciphertext as base64 for JSON payload
-        let ciphertext_b64 = base64::encode(ciphertext);
+        let ciphertext_b64 = base64::engine::general_purpose::STANDARD.encode(ciphertext);
 
         info!(
             device_token = %device_token,

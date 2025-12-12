@@ -4,7 +4,7 @@ use tracing::{error, info};
 
 use crate::{
     auth::AuthUser,
-    generated::blue::catbird::mls::send_typing_indicator::{Input, Output, NSID},
+    generated::blue::catbird::mls::send_typing_indicator::{Input, Output, OutputData, NSID},
     realtime::{SseState, StreamEvent},
     db,
     storage::DbPool,
@@ -64,5 +64,5 @@ pub async fn send_typing_indicator(
 
     info!("Typing indicator sent successfully");
 
-    Ok(Json(Output { success: true }))
+    Ok(Json(Output::from(OutputData { success: true })))
 }
