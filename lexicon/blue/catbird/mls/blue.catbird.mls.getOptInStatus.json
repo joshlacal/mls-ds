@@ -30,27 +30,31 @@
             "statuses": {
               "type": "array",
               "items": {
-                "type": "object",
-                "required": ["did", "optedIn"],
-                "properties": {
-                  "did": {
-                    "type": "string",
-                    "format": "did",
-                    "description": "User DID"
-                  },
-                  "optedIn": {
-                    "type": "boolean",
-                    "description": "Whether user has opted into MLS"
-                  },
-                  "optedInAt": {
-                    "type": "string",
-                    "format": "datetime",
-                    "description": "When user opted in (if applicable)"
-                  }
-                }
+                "type": "ref",
+                "ref": "#optInStatus"
               }
             }
           }
+        }
+      }
+    },
+    "optInStatus": {
+      "type": "object",
+      "required": ["did", "optedIn"],
+      "properties": {
+        "did": {
+          "type": "string",
+          "format": "did",
+          "description": "User DID"
+        },
+        "optedIn": {
+          "type": "boolean",
+          "description": "Whether user has opted into MLS"
+        },
+        "optedInAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "When user opted in (if applicable)"
         }
       }
     }

@@ -7,12 +7,15 @@ pub const NSID: &str = "blue.catbird.mls.createConvo";
 pub struct InputData {
     ///MLS cipher suite to use for this conversation
     pub cipher_suite: String,
+    ///Client's current MLS epoch after group creation and adding initial members. Used for server telemetry only (server is not authoritative for MLS state). Defaults to 0 if not provided.
+    #[serde(skip_serializing_if = "core::option::Option::is_none")]
+    pub current_epoch: core::option::Option<usize>,
     ///Hex-encoded MLS group identifier
     pub group_id: String,
     ///Client-generated UUID for idempotent request retries. Optional but recommended.
     #[serde(skip_serializing_if = "core::option::Option::is_none")]
     pub idempotency_key: core::option::Option<String>,
-    ///DIDs of initial members to add to the conversation
+    ///DIDs of initial members to add to the conversation (max 999 excluding creator, default policy allows up to 1000 total)
     #[serde(skip_serializing_if = "core::option::Option::is_none")]
     pub initial_members: core::option::Option<Vec<crate::types::string::Did>>,
     ///Array of {did, hash} objects mapping each initial member to their key package hash. Required for multi-device support.
@@ -34,7 +37,7 @@ pub enum Error {
     InvalidCipherSuite(Option<String>),
     ///Key package not found for one or more initial members
     KeyPackageNotFound(Option<String>),
-    ///Too many initial members specified (max 100)
+    ///Too many initial members specified (default max 1000 total including creator, configurable per-conversation via policy)
     TooManyMembers(Option<String>),
     ///Cannot create conversation with users who have blocked each other on Bluesky
     MutualBlockDetected(Option<String>),

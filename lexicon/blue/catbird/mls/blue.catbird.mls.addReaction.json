@@ -8,15 +8,41 @@
       "input": {
         "encoding": "application/json",
         "schema": {
-          "type": "ref",
-          "ref": "#input"
+          "type": "object",
+          "required": ["convoId", "messageId", "reaction"],
+          "properties": {
+            "convoId": {
+              "type": "string",
+              "description": "Conversation identifier (group ID hex)"
+            },
+            "messageId": {
+              "type": "string",
+              "description": "ID of the message to react to"
+            },
+            "reaction": {
+              "type": "string",
+              "description": "Reaction content (emoji or short code)",
+              "maxLength": 16
+            }
+          }
         }
       },
       "output": {
         "encoding": "application/json",
         "schema": {
-          "type": "ref",
-          "ref": "#output"
+          "type": "object",
+          "required": ["success"],
+          "properties": {
+            "success": {
+              "type": "boolean",
+              "description": "Whether the reaction was added successfully"
+            },
+            "reactedAt": {
+              "type": "string",
+              "format": "datetime",
+              "description": "When the reaction was recorded"
+            }
+          }
         }
       },
       "errors": [
@@ -24,40 +50,6 @@
         { "name": "NotMember", "description": "User is not a member of the conversation" },
         { "name": "AlreadyReacted", "description": "User has already added this reaction to the message" }
       ]
-    },
-    "input": {
-      "type": "object",
-      "required": ["convoId", "messageId", "reaction"],
-      "properties": {
-        "convoId": {
-          "type": "string",
-          "description": "Conversation identifier (group ID hex)"
-        },
-        "messageId": {
-          "type": "string",
-          "description": "ID of the message to react to"
-        },
-        "reaction": {
-          "type": "string",
-          "description": "Reaction content (emoji or short code)",
-          "maxLength": 16
-        }
-      }
-    },
-    "output": {
-      "type": "object",
-      "required": ["success"],
-      "properties": {
-        "success": {
-          "type": "boolean",
-          "description": "Whether the reaction was added successfully"
-        },
-        "reactedAt": {
-          "type": "string",
-          "format": "datetime",
-          "description": "When the reaction was recorded"
-        }
-      }
     }
   }
 }

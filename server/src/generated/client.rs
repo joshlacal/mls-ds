@@ -98,6 +98,36 @@ where
             _phantom: core::marker::PhantomData,
         }
     }
+    ///Accept a chat request, create MLS group, and deliver held messages
+    pub async fn accept_chat_request(
+        &self,
+        input: crate::blue::catbird::mls::accept_chat_request::Input,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::accept_chat_request::Output,
+        crate::blue::catbird::mls::accept_chat_request::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                (),
+                _,
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::POST,
+                    nsid: crate::blue::catbird::mls::accept_chat_request::NSID.into(),
+                    parameters: None,
+                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                    encoding: Some(String::from("application/json")),
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
     ///Add members to an existing MLS conversation
     pub async fn add_members(
         &self,
@@ -117,6 +147,66 @@ where
                 &atrium_xrpc::XrpcRequest {
                     method: http::Method::POST,
                     nsid: crate::blue::catbird::mls::add_members::NSID.into(),
+                    parameters: None,
+                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                    encoding: Some(String::from("application/json")),
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
+    ///Add a reaction (emoji) to a message in an MLS conversation
+    pub async fn add_reaction(
+        &self,
+        input: crate::blue::catbird::mls::add_reaction::Input,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::add_reaction::Output,
+        crate::blue::catbird::mls::add_reaction::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                (),
+                _,
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::POST,
+                    nsid: crate::blue::catbird::mls::add_reaction::NSID.into(),
+                    parameters: None,
+                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                    encoding: Some(String::from("application/json")),
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
+    ///Block a sender and decline all their pending requests
+    pub async fn block_chat_sender(
+        &self,
+        input: crate::blue::catbird::mls::block_chat_sender::Input,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::block_chat_sender::Output,
+        crate::blue::catbird::mls::block_chat_sender::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                (),
+                _,
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::POST,
+                    nsid: crate::blue::catbird::mls::block_chat_sender::NSID.into(),
                     parameters: None,
                     input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
                     encoding: Some(String::from("application/json")),
@@ -158,13 +248,13 @@ where
             _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
         }
     }
-    ///Confirm successful or failed processing of Welcome message
-    pub async fn confirm_welcome(
+    ///Claims a pending device addition so only one member processes it. Claim expires after 60 seconds if not completed.
+    pub async fn claim_pending_device_addition(
         &self,
-        input: crate::blue::catbird::mls::confirm_welcome::Input,
+        input: crate::blue::catbird::mls::claim_pending_device_addition::Input,
     ) -> atrium_xrpc::Result<
-        crate::blue::catbird::mls::confirm_welcome::Output,
-        crate::blue::catbird::mls::confirm_welcome::Error,
+        crate::blue::catbird::mls::claim_pending_device_addition::Output,
+        crate::blue::catbird::mls::claim_pending_device_addition::Error,
     > {
         let response = self
             .xrpc
@@ -176,7 +266,39 @@ where
             >(
                 &atrium_xrpc::XrpcRequest {
                     method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::confirm_welcome::NSID.into(),
+                    nsid: crate::blue::catbird::mls::claim_pending_device_addition::NSID
+                        .into(),
+                    parameters: None,
+                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                    encoding: Some(String::from("application/json")),
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
+    ///Marks a claimed pending device addition as completed. Call this after successfully adding the device via addMembers.
+    pub async fn complete_pending_device_addition(
+        &self,
+        input: crate::blue::catbird::mls::complete_pending_device_addition::Input,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::complete_pending_device_addition::Output,
+        crate::blue::catbird::mls::complete_pending_device_addition::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                (),
+                _,
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::POST,
+                    nsid: crate::blue::catbird::mls::complete_pending_device_addition::NSID
+                        .into(),
                     parameters: None,
                     input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
                     encoding: Some(String::from("application/json")),
@@ -218,6 +340,96 @@ where
             _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
         }
     }
+    ///Create an invite link with optional PSK hash, expiration, and usage limits. Only admins can create invites.
+    pub async fn create_invite(
+        &self,
+        input: crate::blue::catbird::mls::create_invite::Input,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::create_invite::Output,
+        crate::blue::catbird::mls::create_invite::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                (),
+                _,
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::POST,
+                    nsid: crate::blue::catbird::mls::create_invite::NSID.into(),
+                    parameters: None,
+                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                    encoding: Some(String::from("application/json")),
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
+    ///Decline a chat request
+    pub async fn decline_chat_request(
+        &self,
+        input: crate::blue::catbird::mls::decline_chat_request::Input,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::decline_chat_request::Output,
+        crate::blue::catbird::mls::decline_chat_request::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                (),
+                _,
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::POST,
+                    nsid: crate::blue::catbird::mls::decline_chat_request::NSID.into(),
+                    parameters: None,
+                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                    encoding: Some(String::from("application/json")),
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
+    ///Delete a registered device and all its associated key packages. Users can only delete their own devices.
+    pub async fn delete_device(
+        &self,
+        input: crate::blue::catbird::mls::delete_device::Input,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::delete_device::Output,
+        crate::blue::catbird::mls::delete_device::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                (),
+                _,
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::POST,
+                    nsid: crate::blue::catbird::mls::delete_device::NSID.into(),
+                    parameters: None,
+                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                    encoding: Some(String::from("application/json")),
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
     ///Demote an admin to regular member. Caller must be an admin (unless demoting self). Cannot demote the last admin. Server enforces authorization, updates DB, and logs action.
     pub async fn demote_admin(
         &self,
@@ -237,6 +449,36 @@ where
                 &atrium_xrpc::XrpcRequest {
                     method: http::Method::POST,
                     nsid: crate::blue::catbird::mls::demote_admin::NSID.into(),
+                    parameters: None,
+                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                    encoding: Some(String::from("application/json")),
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
+    ///Demote a moderator to regular member. Caller must be an admin (unless demoting self). Server enforces authorization, updates DB, and logs action.
+    pub async fn demote_moderator(
+        &self,
+        input: crate::blue::catbird::mls::demote_moderator::Input,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::demote_moderator::Output,
+        crate::blue::catbird::mls::demote_moderator::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                (),
+                _,
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::POST,
+                    nsid: crate::blue::catbird::mls::demote_moderator::NSID.into(),
                     parameters: None,
                     input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
                     encoding: Some(String::from("application/json")),
@@ -298,6 +540,36 @@ where
                     method: http::Method::GET,
                     nsid: crate::blue::catbird::mls::get_block_status::NSID.into(),
                     parameters: Some(params),
+                    input: None,
+                    encoding: None,
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
+    ///Get user's chat request settings
+    pub async fn get_chat_request_settings(
+        &self,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::get_chat_request_settings::Output,
+        crate::blue::catbird::mls::get_chat_request_settings::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                (),
+                (),
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::GET,
+                    nsid: crate::blue::catbird::mls::get_chat_request_settings::NSID
+                        .into(),
+                    parameters: None,
                     input: None,
                     encoding: None,
                 },
@@ -398,6 +670,98 @@ where
             _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
         }
     }
+    ///Returns conversations where the user is a member on the server but may not have local MLS state
+    pub async fn get_expected_conversations(
+        &self,
+        params: crate::blue::catbird::mls::get_expected_conversations::Parameters,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::get_expected_conversations::Output,
+        crate::blue::catbird::mls::get_expected_conversations::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                _,
+                (),
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::GET,
+                    nsid: crate::blue::catbird::mls::get_expected_conversations::NSID
+                        .into(),
+                    parameters: Some(params),
+                    input: None,
+                    encoding: None,
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
+    ///Fetch GroupInfo for external commit. Only available to current/past members.
+    pub async fn get_group_info(
+        &self,
+        params: crate::blue::catbird::mls::get_group_info::Parameters,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::get_group_info::Output,
+        crate::blue::catbird::mls::get_group_info::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                _,
+                (),
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::GET,
+                    nsid: crate::blue::catbird::mls::get_group_info::NSID.into(),
+                    parameters: Some(params),
+                    input: None,
+                    encoding: None,
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
+    ///Get key package consumption history for the authenticated user
+    pub async fn get_key_package_history(
+        &self,
+        params: crate::blue::catbird::mls::get_key_package_history::Parameters,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::get_key_package_history::Output,
+        crate::blue::catbird::mls::get_key_package_history::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                _,
+                (),
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::GET,
+                    nsid: crate::blue::catbird::mls::get_key_package_history::NSID
+                        .into(),
+                    parameters: Some(params),
+                    input: None,
+                    encoding: None,
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
     ///Get key package inventory statistics for the authenticated user to determine when replenishment is needed
     pub async fn get_key_package_stats(
         &self,
@@ -417,6 +781,36 @@ where
                 &atrium_xrpc::XrpcRequest {
                     method: http::Method::GET,
                     nsid: crate::blue::catbird::mls::get_key_package_stats::NSID.into(),
+                    parameters: Some(params),
+                    input: None,
+                    encoding: None,
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
+    ///Get key package statistics and consumption history for the authenticated user. Helps clients detect missing bundles before processing Welcome messages.
+    pub async fn get_key_package_status(
+        &self,
+        params: crate::blue::catbird::mls::get_key_package_status::Parameters,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::get_key_package_status::Output,
+        crate::blue::catbird::mls::get_key_package_status::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                _,
+                (),
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::GET,
+                    nsid: crate::blue::catbird::mls::get_key_package_status::NSID.into(),
                     parameters: Some(params),
                     input: None,
                     encoding: None,
@@ -488,6 +882,97 @@ where
             _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
         }
     }
+    ///Query opt-in status for a list of users. Returns array of status objects with DID, opt-in boolean, and optional timestamp.
+    pub async fn get_opt_in_status(
+        &self,
+        params: crate::blue::catbird::mls::get_opt_in_status::Parameters,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::get_opt_in_status::Output,
+        crate::blue::catbird::mls::get_opt_in_status::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                _,
+                (),
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::GET,
+                    nsid: crate::blue::catbird::mls::get_opt_in_status::NSID.into(),
+                    parameters: Some(params),
+                    input: None,
+                    encoding: None,
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
+    ///Returns pending device additions for conversations where caller is a member. Used as fallback when SSE events are missed.
+    pub async fn get_pending_device_additions(
+        &self,
+        params: crate::blue::catbird::mls::get_pending_device_additions::Parameters,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::get_pending_device_additions::Output,
+        crate::blue::catbird::mls::get_pending_device_additions::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                _,
+                (),
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::GET,
+                    nsid: crate::blue::catbird::mls::get_pending_device_additions::NSID
+                        .into(),
+                    parameters: Some(params),
+                    input: None,
+                    encoding: None,
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
+    ///Query to fetch policy settings for a conversation. All members can view policy.
+    pub async fn get_policy(
+        &self,
+        params: crate::blue::catbird::mls::get_policy::Parameters,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::get_policy::Output,
+        crate::blue::catbird::mls::get_policy::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                _,
+                (),
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::GET,
+                    nsid: crate::blue::catbird::mls::get_policy::NSID.into(),
+                    parameters: Some(params),
+                    input: None,
+                    encoding: None,
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
     ///Retrieve reports for a conversation. Admin-only endpoint. Returns encrypted report blobs that admins must decrypt locally using MLS group key.
     pub async fn get_reports(
         &self,
@@ -518,28 +1003,57 @@ where
             _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
         }
     }
-    ///Retrieve the Welcome message for a conversation the user is a member of
-    pub async fn get_welcome(
+    ///Returns the count of pending chat requests. Lightweight endpoint for badge updates.
+    pub async fn get_request_count(
         &self,
-        params: crate::blue::catbird::mls::get_welcome::Parameters,
     ) -> atrium_xrpc::Result<
-        crate::blue::catbird::mls::get_welcome::Output,
-        crate::blue::catbird::mls::get_welcome::Error,
+        crate::blue::catbird::mls::get_request_count::Output,
+        crate::blue::catbird::mls::get_request_count::Error,
     > {
         let response = self
             .xrpc
             .send_xrpc::<
-                _,
+                (),
                 (),
                 _,
                 _,
             >(
                 &atrium_xrpc::XrpcRequest {
                     method: http::Method::GET,
-                    nsid: crate::blue::catbird::mls::get_welcome::NSID.into(),
-                    parameters: Some(params),
+                    nsid: crate::blue::catbird::mls::get_request_count::NSID.into(),
+                    parameters: None,
                     input: None,
                     encoding: None,
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
+    ///Request active members to publish fresh GroupInfo for a conversation. Used when a member encounters stale GroupInfo during external commit rejoin. Emits a GroupInfoRefreshRequested SSE event to all active members.
+    pub async fn group_info_refresh(
+        &self,
+        input: crate::blue::catbird::mls::group_info_refresh::Input,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::group_info_refresh::Output,
+        crate::blue::catbird::mls::group_info_refresh::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                (),
+                _,
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::POST,
+                    nsid: crate::blue::catbird::mls::group_info_refresh::NSID.into(),
+                    parameters: None,
+                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                    encoding: Some(String::from("application/json")),
                 },
             )
             .await?;
@@ -567,6 +1081,36 @@ where
                 &atrium_xrpc::XrpcRequest {
                     method: http::Method::POST,
                     nsid: crate::blue::catbird::mls::handle_block_change::NSID.into(),
+                    parameters: None,
+                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                    encoding: Some(String::from("application/json")),
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
+    ///Invalidate a Welcome message that cannot be processed (e.g., NoMatchingKeyPackage). This allows the client to fall back to External Commit or request re-addition.
+    pub async fn invalidate_welcome(
+        &self,
+        input: crate::blue::catbird::mls::invalidate_welcome::Input,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::invalidate_welcome::Output,
+        crate::blue::catbird::mls::invalidate_welcome::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                (),
+                _,
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::POST,
+                    nsid: crate::blue::catbird::mls::invalidate_welcome::NSID.into(),
                     parameters: None,
                     input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
                     encoding: Some(String::from("application/json")),
@@ -608,6 +1152,186 @@ where
             _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
         }
     }
+    ///List pending chat requests received by the authenticated user
+    pub async fn list_chat_requests(
+        &self,
+        params: crate::blue::catbird::mls::list_chat_requests::Parameters,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::list_chat_requests::Output,
+        crate::blue::catbird::mls::list_chat_requests::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                _,
+                (),
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::GET,
+                    nsid: crate::blue::catbird::mls::list_chat_requests::NSID.into(),
+                    parameters: Some(params),
+                    input: None,
+                    encoding: None,
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
+    ///List all registered devices for the authenticated user with key package counts and last seen timestamps
+    pub async fn list_devices(
+        &self,
+        params: crate::blue::catbird::mls::list_devices::Parameters,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::list_devices::Output,
+        crate::blue::catbird::mls::list_devices::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                _,
+                (),
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::GET,
+                    nsid: crate::blue::catbird::mls::list_devices::NSID.into(),
+                    parameters: Some(params),
+                    input: None,
+                    encoding: None,
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
+    ///Query to fetch all invites for a conversation. Only admins can list invites.
+    pub async fn list_invites(
+        &self,
+        params: crate::blue::catbird::mls::list_invites::Parameters,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::list_invites::Output,
+        crate::blue::catbird::mls::list_invites::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                _,
+                (),
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::GET,
+                    nsid: crate::blue::catbird::mls::list_invites::NSID.into(),
+                    parameters: Some(params),
+                    input: None,
+                    encoding: None,
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
+    ///Opt in to MLS chat. Creates private server-side record.
+    pub async fn opt_in(
+        &self,
+        input: crate::blue::catbird::mls::opt_in::Input,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::opt_in::Output,
+        crate::blue::catbird::mls::opt_in::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                (),
+                _,
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::POST,
+                    nsid: crate::blue::catbird::mls::opt_in::NSID.into(),
+                    parameters: None,
+                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                    encoding: Some(String::from("application/json")),
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
+    ///Opt out of MLS chat. Removes server-side opt-in record.
+    pub async fn opt_out(
+        &self,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::opt_out::Output,
+        crate::blue::catbird::mls::opt_out::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                (),
+                (),
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::POST,
+                    nsid: crate::blue::catbird::mls::opt_out::NSID.into(),
+                    parameters: None,
+                    input: None,
+                    encoding: None,
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
+    ///Process an external commit for a conversation. This allows a client to add itself to a group using a cached GroupInfo.
+    pub async fn process_external_commit(
+        &self,
+        input: crate::blue::catbird::mls::process_external_commit::Input,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::process_external_commit::Output,
+        crate::blue::catbird::mls::process_external_commit::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                (),
+                _,
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::POST,
+                    nsid: crate::blue::catbird::mls::process_external_commit::NSID
+                        .into(),
+                    parameters: None,
+                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                    encoding: Some(String::from("application/json")),
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
     ///Promote a conversation member to admin. Caller must be an existing admin. Server enforces authorization, then updates DB and logs action. Caller should also send an encrypted adminRoster update via sendMessage.
     pub async fn promote_admin(
         &self,
@@ -627,6 +1351,36 @@ where
                 &atrium_xrpc::XrpcRequest {
                     method: http::Method::POST,
                     nsid: crate::blue::catbird::mls::promote_admin::NSID.into(),
+                    parameters: None,
+                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                    encoding: Some(String::from("application/json")),
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
+    ///Promote a conversation member to moderator. Caller must be an existing admin. Moderators can warn members and view reports but cannot promote/demote others.
+    pub async fn promote_moderator(
+        &self,
+        input: crate::blue::catbird::mls::promote_moderator::Input,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::promote_moderator::Output,
+        crate::blue::catbird::mls::promote_moderator::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                (),
+                _,
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::POST,
+                    nsid: crate::blue::catbird::mls::promote_moderator::NSID.into(),
                     parameters: None,
                     input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
                     encoding: Some(String::from("application/json")),
@@ -698,7 +1452,37 @@ where
             _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
         }
     }
-    ///Register a new device with the MLS server. Each device gets a unique MLS identity (did:plc:user#device-uuid). Server automatically adds device to user's existing conversations. Returns device credentials for local storage.
+    ///Request re-addition to a conversation when both Welcome and External Commit have failed. Active members will receive an SSE event and can re-add the user with fresh KeyPackages.
+    pub async fn readdition(
+        &self,
+        input: crate::blue::catbird::mls::readdition::Input,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::readdition::Output,
+        crate::blue::catbird::mls::readdition::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                (),
+                _,
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::POST,
+                    nsid: crate::blue::catbird::mls::readdition::NSID.into(),
+                    parameters: None,
+                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                    encoding: Some(String::from("application/json")),
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
+    ///Register a device for multi-device MLS support. Each device gets a unique device ID and credential (did:plc:user#device-uuid). Required for proper multi-device group conversations.
     pub async fn register_device(
         &self,
         input: crate::blue::catbird::mls::register_device::Input,
@@ -717,6 +1501,66 @@ where
                 &atrium_xrpc::XrpcRequest {
                     method: http::Method::POST,
                     nsid: crate::blue::catbird::mls::register_device::NSID.into(),
+                    parameters: None,
+                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                    encoding: Some(String::from("application/json")),
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
+    ///Register or update a device push token for APNs.
+    pub async fn register_device_token(
+        &self,
+        input: crate::blue::catbird::mls::register_device_token::Input,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::register_device_token::Output,
+        crate::blue::catbird::mls::register_device_token::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                (),
+                _,
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::POST,
+                    nsid: crate::blue::catbird::mls::register_device_token::NSID.into(),
+                    parameters: None,
+                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                    encoding: Some(String::from("application/json")),
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
+    ///Request to rejoin an MLS conversation after local state loss. When a device registers and gets auto_joined_convos, it needs to request rejoin to get Welcome messages for those conversations.
+    pub async fn rejoin(
+        &self,
+        input: crate::blue::catbird::mls::rejoin::Input,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::rejoin::Output,
+        crate::blue::catbird::mls::rejoin::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                (),
+                _,
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::POST,
+                    nsid: crate::blue::catbird::mls::rejoin::NSID.into(),
                     parameters: None,
                     input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
                     encoding: Some(String::from("application/json")),
@@ -758,6 +1602,36 @@ where
             _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
         }
     }
+    ///Remove a reaction (emoji) from a message in an MLS conversation
+    pub async fn remove_reaction(
+        &self,
+        input: crate::blue::catbird::mls::remove_reaction::Input,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::remove_reaction::Output,
+        crate::blue::catbird::mls::remove_reaction::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                (),
+                _,
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::POST,
+                    nsid: crate::blue::catbird::mls::remove_reaction::NSID.into(),
+                    parameters: None,
+                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                    encoding: Some(String::from("application/json")),
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
     ///Submit an encrypted report about a conversation member to admins. Report content is E2EE and only admins can decrypt. Server stores metadata and routes to admins. Any member can report; cannot report self.
     pub async fn report_member(
         &self,
@@ -777,36 +1651,6 @@ where
                 &atrium_xrpc::XrpcRequest {
                     method: http::Method::POST,
                     nsid: crate::blue::catbird::mls::report_member::NSID.into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
-            .await?;
-        match response {
-            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
-            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
-        }
-    }
-    ///Submit rejoin request with fresh KeyPackage after state loss (e.g., app reinstall, device change)
-    pub async fn rejoin(
-        &self,
-        input: crate::blue::catbird::mls::rejoin::Input,
-    ) -> atrium_xrpc::Result<
-        crate::blue::catbird::mls::rejoin::Output,
-        crate::blue::catbird::mls::rejoin::Error,
-    > {
-        let response = self
-            .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::rejoin::NSID.into(),
                     parameters: None,
                     input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
                     encoding: Some(String::from("application/json")),
@@ -848,6 +1692,66 @@ where
             _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
         }
     }
+    ///Revoke an invite link to prevent further use. Only admins can revoke invites.
+    pub async fn revoke_invite(
+        &self,
+        input: crate::blue::catbird::mls::revoke_invite::Input,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::revoke_invite::Output,
+        crate::blue::catbird::mls::revoke_invite::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                (),
+                _,
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::POST,
+                    nsid: crate::blue::catbird::mls::revoke_invite::NSID.into(),
+                    parameters: None,
+                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                    encoding: Some(String::from("application/json")),
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
+    ///Send a chat request to a user not yet in conversation. The request holds encrypted message(s) until accepted.
+    pub async fn send_chat_request(
+        &self,
+        input: crate::blue::catbird::mls::send_chat_request::Input,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::send_chat_request::Output,
+        crate::blue::catbird::mls::send_chat_request::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                (),
+                _,
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::POST,
+                    nsid: crate::blue::catbird::mls::send_chat_request::NSID.into(),
+                    parameters: None,
+                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                    encoding: Some(String::from("application/json")),
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
     ///Send an encrypted message to an MLS conversation
     pub async fn send_message(
         &self,
@@ -867,6 +1771,36 @@ where
                 &atrium_xrpc::XrpcRequest {
                     method: http::Method::POST,
                     nsid: crate::blue::catbird::mls::send_message::NSID.into(),
+                    parameters: None,
+                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                    encoding: Some(String::from("application/json")),
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
+    ///Send a typing indicator to a conversation
+    pub async fn send_typing_indicator(
+        &self,
+        input: crate::blue::catbird::mls::send_typing_indicator::Input,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::send_typing_indicator::Output,
+        crate::blue::catbird::mls::send_typing_indicator::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                (),
+                _,
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::POST,
+                    nsid: crate::blue::catbird::mls::send_typing_indicator::NSID.into(),
                     parameters: None,
                     input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
                     encoding: Some(String::from("application/json")),
@@ -900,6 +1834,278 @@ where
                     parameters: Some(params),
                     input: None,
                     encoding: None,
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
+    ///Synchronize key packages between client and server to prevent NoMatchingKeyPackage errors. Compares server-side available key packages against client-provided local hashes and deletes orphaned server packages that no longer have corresponding private keys on the device. MULTI-DEVICE: deviceId is REQUIRED - only syncs packages for that specific device to prevent cross-device interference.
+    pub async fn sync_key_packages(
+        &self,
+        input: crate::blue::catbird::mls::sync_key_packages::Input,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::sync_key_packages::Output,
+        crate::blue::catbird::mls::sync_key_packages::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                (),
+                _,
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::POST,
+                    nsid: crate::blue::catbird::mls::sync_key_packages::NSID.into(),
+                    parameters: None,
+                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                    encoding: Some(String::from("application/json")),
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
+    ///Remove a device push token.
+    pub async fn unregister_device_token(
+        &self,
+        input: crate::blue::catbird::mls::unregister_device_token::Input,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::unregister_device_token::Output,
+        crate::blue::catbird::mls::unregister_device_token::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                (),
+                _,
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::POST,
+                    nsid: crate::blue::catbird::mls::unregister_device_token::NSID
+                        .into(),
+                    parameters: None,
+                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                    encoding: Some(String::from("application/json")),
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
+    ///Update user's chat request settings
+    pub async fn update_chat_request_settings(
+        &self,
+        input: crate::blue::catbird::mls::update_chat_request_settings::Input,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::update_chat_request_settings::Output,
+        crate::blue::catbird::mls::update_chat_request_settings::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                (),
+                _,
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::POST,
+                    nsid: crate::blue::catbird::mls::update_chat_request_settings::NSID
+                        .into(),
+                    parameters: None,
+                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                    encoding: Some(String::from("application/json")),
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
+    ///Update the cached GroupInfo for a conversation. Should be called by clients after committing a group state change.
+    pub async fn update_group_info(
+        &self,
+        input: crate::blue::catbird::mls::update_group_info::Input,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::update_group_info::Output,
+        crate::blue::catbird::mls::update_group_info::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                (),
+                _,
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::POST,
+                    nsid: crate::blue::catbird::mls::update_group_info::NSID.into(),
+                    parameters: None,
+                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                    encoding: Some(String::from("application/json")),
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
+    ///Update policy settings for a conversation. Only admins can update policies. At least one policy field must be provided.
+    pub async fn update_policy(
+        &self,
+        input: crate::blue::catbird::mls::update_policy::Input,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::update_policy::Output,
+        crate::blue::catbird::mls::update_policy::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                (),
+                _,
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::POST,
+                    nsid: crate::blue::catbird::mls::update_policy::NSID.into(),
+                    parameters: None,
+                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                    encoding: Some(String::from("application/json")),
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
+    ///Mark messages as read in an MLS conversation. If messageId is omitted, marks all messages in the conversation as read.
+    pub async fn update_read(
+        &self,
+        input: crate::blue::catbird::mls::update_read::Input,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::update_read::Output,
+        crate::blue::catbird::mls::update_read::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                (),
+                _,
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::POST,
+                    nsid: crate::blue::catbird::mls::update_read::NSID.into(),
+                    parameters: None,
+                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                    encoding: Some(String::from("application/json")),
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
+    ///Validate device state and sync status for the authenticated user
+    pub async fn validate_device_state(
+        &self,
+        params: crate::blue::catbird::mls::validate_device_state::Parameters,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::validate_device_state::Output,
+        crate::blue::catbird::mls::validate_device_state::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                _,
+                (),
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::GET,
+                    nsid: crate::blue::catbird::mls::validate_device_state::NSID.into(),
+                    parameters: Some(params),
+                    input: None,
+                    encoding: None,
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
+    ///Validate a Welcome message before processing and reserve the referenced key package. Prevents race conditions and helps clients detect missing bundles early.
+    pub async fn validate_welcome(
+        &self,
+        input: crate::blue::catbird::mls::validate_welcome::Input,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::validate_welcome::Output,
+        crate::blue::catbird::mls::validate_welcome::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                (),
+                _,
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::POST,
+                    nsid: crate::blue::catbird::mls::validate_welcome::NSID.into(),
+                    parameters: None,
+                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                    encoding: Some(String::from("application/json")),
+                },
+            )
+            .await?;
+        match response {
+            atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
+            _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
+        }
+    }
+    ///Send a warning to a conversation member. Admin-only action. Warning is delivered as a system message and tracked server-side.
+    pub async fn warn_member(
+        &self,
+        input: crate::blue::catbird::mls::warn_member::Input,
+    ) -> atrium_xrpc::Result<
+        crate::blue::catbird::mls::warn_member::Output,
+        crate::blue::catbird::mls::warn_member::Error,
+    > {
+        let response = self
+            .xrpc
+            .send_xrpc::<
+                (),
+                _,
+                _,
+                _,
+            >(
+                &atrium_xrpc::XrpcRequest {
+                    method: http::Method::POST,
+                    nsid: crate::blue::catbird::mls::warn_member::NSID.into(),
+                    parameters: None,
+                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                    encoding: Some(String::from("application/json")),
                 },
             )
             .await?;

@@ -5,29 +5,29 @@ pub const NSID: &str = "blue.catbird.mls.validateWelcome";
 #[serde(rename_all = "camelCase")]
 pub struct InputData {
     ///MLS Welcome message bytes to validate
-    #[serde(with = "crate::atproto_bytes")]
+    #[serde(with = "serde_bytes")]
     pub welcome_message: Vec<u8>,
 }
 pub type Input = crate::types::Object<InputData>;
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct OutputData {
-    ///Whether the Welcome message is valid and key package is available
-    pub valid: bool,
-    ///SHA256 hex hash of the key package referenced in the Welcome message
-    pub key_package_hash: String,
-    ///DID of the recipient (authenticated user)
-    #[serde(skip_serializing_if = "core::option::Option::is_none")]
-    pub recipient_did: core::option::Option<crate::types::string::Did>,
-    ///MLS group identifier extracted from Welcome message
+    ///MLS group identifier (hex-encoded) extracted from Welcome message
     #[serde(skip_serializing_if = "core::option::Option::is_none")]
     pub group_id: core::option::Option<String>,
-    ///Whether the key package was successfully reserved
+    ///SHA256 hex hash of the key package referenced in the Welcome message
+    pub key_package_hash: String,
+    ///DID of the recipient (authenticated user). Confirms Welcome is for this user.
+    #[serde(skip_serializing_if = "core::option::Option::is_none")]
+    pub recipient_did: core::option::Option<crate::types::string::Did>,
+    ///Whether the key package was successfully reserved. If true, client should process Welcome within 5 minutes.
     #[serde(skip_serializing_if = "core::option::Option::is_none")]
     pub reserved: core::option::Option<bool>,
-    ///Timestamp when reservation expires
+    ///Timestamp when reservation expires (5 minutes from now). Only present if reserved is true.
     #[serde(skip_serializing_if = "core::option::Option::is_none")]
     pub reserved_until: core::option::Option<crate::types::string::Datetime>,
+    ///Whether the Welcome message is valid and key package is available
+    pub valid: bool,
 }
 pub type Output = crate::types::Object<OutputData>;
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]

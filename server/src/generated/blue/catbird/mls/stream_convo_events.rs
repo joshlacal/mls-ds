@@ -27,10 +27,26 @@ impl std::fmt::Display for Error {
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct EventWrapperData {
-    ///The actual event (message, reaction, typing, or info)
+    ///The actual event (message, reaction, typing, info, newDevice, groupInfoRefreshRequested, or readditionRequested)
     pub event: crate::types::Union<EventWrapperEventRefs>,
 }
 pub type EventWrapper = crate::types::Object<EventWrapperData>;
+///Event requesting active members to publish fresh GroupInfo for external commit joins
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupInfoRefreshRequestedEventData {
+    ///Conversation identifier
+    pub convo_id: String,
+    ///Resume cursor for this event position
+    pub cursor: String,
+    ///ISO 8601 timestamp of when the refresh was requested
+    pub requested_at: crate::types::string::Datetime,
+    ///DID of the member requesting the refresh (so they don't respond to their own request)
+    pub requested_by: crate::types::string::Did,
+}
+pub type GroupInfoRefreshRequestedEvent = crate::types::Object<
+    GroupInfoRefreshRequestedEventData,
+>;
 ///Event carrying informational messages (heartbeat or notices)
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -41,6 +57,28 @@ pub struct InfoEventData {
     pub info: String,
 }
 pub type InfoEvent = crate::types::Object<InfoEventData>;
+///Event indicating a member joined, left, or was removed from the conversation
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MembershipChangeEventData {
+    ///Action performed: 'joined' (Welcome/ExternalCommit), 'left' (self), 'removed' or 'kicked' (by admin)
+    pub action: String,
+    ///DID of the actor who performed the action (for removed/kicked)
+    #[serde(skip_serializing_if = "core::option::Option::is_none")]
+    pub actor: core::option::Option<crate::types::string::Did>,
+    ///Conversation identifier
+    pub convo_id: String,
+    ///Resume cursor for this event position
+    pub cursor: String,
+    ///DID of the affected member
+    pub did: crate::types::string::Did,
+    ///New epoch after this change
+    pub epoch: i64,
+    ///Optional reason for removal
+    #[serde(skip_serializing_if = "core::option::Option::is_none")]
+    pub reason: core::option::Option<String>,
+}
+pub type MembershipChangeEvent = crate::types::Object<MembershipChangeEventData>;
 ///Event for a newly sent message
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -50,6 +88,27 @@ pub struct MessageEventData {
     pub message: crate::blue::catbird::mls::defs::MessageView,
 }
 pub type MessageEvent = crate::types::Object<MessageEventData>;
+///Event indicating a user has registered a new device that needs to be added to the conversation
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NewDeviceEventData {
+    ///Conversation identifier
+    pub convo_id: String,
+    ///Resume cursor for this event position
+    pub cursor: String,
+    ///Full device credential DID (format: did:plc:user#device-uuid)
+    pub device_credential_did: String,
+    ///Device identifier
+    pub device_id: String,
+    ///Human-readable device name
+    #[serde(skip_serializing_if = "core::option::Option::is_none")]
+    pub device_name: core::option::Option<String>,
+    ///ID of the pending addition record for claim/complete flow
+    pub pending_addition_id: String,
+    ///Base user DID (without device suffix)
+    pub user_did: crate::types::string::Did,
+}
+pub type NewDeviceEvent = crate::types::Object<NewDeviceEventData>;
 ///Event for a reaction added or removed
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -68,6 +127,37 @@ pub struct ReactionEventData {
     pub reaction: String,
 }
 pub type ReactionEvent = crate::types::Object<ReactionEventData>;
+///Event indicating a member has read messages in the conversation
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadEventData {
+    ///Conversation identifier
+    pub convo_id: String,
+    ///Resume cursor for this event position
+    pub cursor: String,
+    ///DID of the member who read the messages
+    pub did: crate::types::string::Did,
+    ///Optional specific message ID that was marked as read. If omitted, all messages were marked as read.
+    #[serde(skip_serializing_if = "core::option::Option::is_none")]
+    pub message_id: core::option::Option<String>,
+    ///ISO 8601 timestamp of when messages were read
+    pub read_at: crate::types::string::Datetime,
+}
+pub type ReadEvent = crate::types::Object<ReadEventData>;
+///Event indicating a member needs to be re-added to the conversation because both Welcome and External Commit failed
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadditionRequestedEventData {
+    ///Conversation identifier
+    pub convo_id: String,
+    ///Resume cursor for this event position
+    pub cursor: String,
+    ///ISO 8601 timestamp of when re-addition was requested
+    pub requested_at: crate::types::string::Datetime,
+    ///DID of the user requesting re-addition
+    pub user_did: crate::types::string::Did,
+}
+pub type ReadditionRequestedEvent = crate::types::Object<ReadditionRequestedEventData>;
 ///Event indicating a user is typing
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -93,4 +183,16 @@ pub enum EventWrapperEventRefs {
     TypingEvent(Box<TypingEvent>),
     #[serde(rename = "blue.catbird.mls.streamConvoEvents#infoEvent")]
     InfoEvent(Box<InfoEvent>),
+    #[serde(rename = "blue.catbird.mls.streamConvoEvents#newDeviceEvent")]
+    NewDeviceEvent(Box<NewDeviceEvent>),
+    #[serde(
+        rename = "blue.catbird.mls.streamConvoEvents#groupInfoRefreshRequestedEvent"
+    )]
+    GroupInfoRefreshRequestedEvent(Box<GroupInfoRefreshRequestedEvent>),
+    #[serde(rename = "blue.catbird.mls.streamConvoEvents#readditionRequestedEvent")]
+    ReadditionRequestedEvent(Box<ReadditionRequestedEvent>),
+    #[serde(rename = "blue.catbird.mls.streamConvoEvents#membershipChangeEvent")]
+    MembershipChangeEvent(Box<MembershipChangeEvent>),
+    #[serde(rename = "blue.catbird.mls.streamConvoEvents#readEvent")]
+    ReadEvent(Box<ReadEvent>),
 }

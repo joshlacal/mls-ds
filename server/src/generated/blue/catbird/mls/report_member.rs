@@ -10,7 +10,7 @@ pub struct InputData {
     ///Conversation identifier
     pub convo_id: String,
     ///Encrypted report blob containing detailed reason, context, and optional evidence (message IDs, screenshots). Only admins can decrypt using MLS group key or admin-specific encryption.
-    #[serde(with = "crate::atproto_bytes")]
+    #[serde(with = "serde_bytes")]
     pub encrypted_content: Vec<u8>,
     ///Optional list of message IDs being reported (for reference, not encrypted). Max 20 messages.
     #[serde(skip_serializing_if = "core::option::Option::is_none")]

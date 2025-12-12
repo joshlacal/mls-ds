@@ -7,22 +7,22 @@ pub const NSID: &str = "blue.catbird.mls.warnMember";
 pub struct InputData {
     ///Conversation identifier
     pub convo_id: String,
+    ///Optional expiration time for warning
+    #[serde(skip_serializing_if = "core::option::Option::is_none")]
+    pub expires_at: core::option::Option<crate::types::string::Datetime>,
     ///DID of member to warn
     pub member_did: crate::types::string::Did,
     ///Reason for warning
     pub reason: String,
-    ///Optional expiration time for warning
-    #[serde(skip_serializing_if = "core::option::Option::is_none")]
-    pub expires_at: core::option::Option<crate::types::string::Datetime>,
 }
 pub type Input = crate::types::Object<InputData>;
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct OutputData {
-    ///Unique warning identifier
-    pub warning_id: String,
     ///When warning was delivered
     pub delivered_at: crate::types::string::Datetime,
+    ///Unique warning identifier
+    pub warning_id: String,
 }
 pub type Output = crate::types::Object<OutputData>;
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]

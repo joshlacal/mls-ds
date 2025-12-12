@@ -1,8 +1,9 @@
 use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tracing::{error, info};
 
-use crate::{auth::AuthUser, storage::DbPool};
+use crate::{auth::AuthUser, realtime::{SseState, StreamEvent}, storage::DbPool};
 
 #[derive(Debug, Deserialize)]
 pub struct UpdateReadInput {
@@ -20,9 +21,10 @@ pub struct UpdateReadOutput {
 
 /// Mark messages as read in an MLS conversation
 /// POST /xrpc/blue.catbird.mls.updateRead
-#[tracing::instrument(skip(pool, auth_user))]
+#[tracing::instrument(skip(pool, sse_state, auth_user))]
 pub async fn update_read(
     State(pool): State<DbPool>,
+    State(sse_state): State<Arc<SseState>>,
     auth_user: AuthUser,
     Json(input): Json<UpdateReadInput>,
 ) -> Result<Json<UpdateReadOutput>, StatusCode> {
@@ -109,6 +111,21 @@ pub async fn update_read(
             error!("❌ [update_read] Failed to reset unread count: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
+    }
+
+    // Emit SSE read event to notify other conversation members
+    let cursor = sse_state.cursor_gen.next(&input.convo_id, "readEvent").await;
+    let event = StreamEvent::ReadEvent {
+        cursor,
+        convo_id: input.convo_id.clone(),
+        did: auth_user.did.clone(),
+        message_id: input.message_id.clone(),
+        read_at: read_at.to_rfc3339(),
+    };
+
+    if let Err(e) = sse_state.emit(&input.convo_id, event).await {
+        // Don't fail the request - read receipts are best-effort for SSE delivery
+        error!("Failed to emit read event via SSE: {}", e);
     }
 
     info!(
