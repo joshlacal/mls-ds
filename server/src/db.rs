@@ -2093,7 +2093,7 @@ pub async fn get_reactions_for_messages(
         r#"
         SELECT message_id, user_did, reaction, created_at
         FROM message_reactions
-        WHERE conversation_id = $1 AND message_id = ANY($2)
+        WHERE convo_id = $1 AND message_id = ANY($2)
         ORDER BY created_at ASC
         "#,
     )
