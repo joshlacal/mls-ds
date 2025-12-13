@@ -9,6 +9,9 @@ pub struct InputData {
     pub ciphertext: Vec<u8>,
     ///Conversation identifier
     pub convo_id: String,
+    ///Delivery mode: persistent (stored, replayed on sync) or ephemeral (SSE only, not stored). Default is persistent. Both modes skip unread count and push notifications.
+    #[serde(skip_serializing_if = "core::option::Option::is_none")]
+    pub delivery: core::option::Option<String>,
     ///MLS epoch number when message was encrypted
     pub epoch: usize,
     ///Deprecated: Use msgId instead. Client-generated UUID for idempotent request retries.

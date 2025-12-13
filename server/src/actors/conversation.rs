@@ -463,6 +463,22 @@ impl ConversationActorState {
                             message: message_view.clone(),
                         };
 
+                        // Store event for cursor-based SSE replay
+                        if let Err(e) = crate::db::store_event(
+                            &pool,
+                            &cursor,
+                            &convo_id,
+                            "messageEvent",
+                            Some(&msg_id),
+                        )
+                        .await
+                        {
+                            tracing::error!(
+                                "❌ [actor:add_members:fanout] Failed to store event: {:?}",
+                                e
+                            );
+                        }
+
                         if let Err(e) = sse_state.emit(&convo_id, event).await {
                             tracing::error!("Failed to emit SSE event: {}", e);
                         }
@@ -685,6 +701,22 @@ impl ConversationActorState {
                             cursor: cursor.clone(),
                             message: message_view.clone(),
                         };
+
+                        // Store event for cursor-based SSE replay
+                        if let Err(e) = crate::db::store_event(
+                            &pool,
+                            &cursor,
+                            &convo_id,
+                            "messageEvent",
+                            Some(&msg_id),
+                        )
+                        .await
+                        {
+                            tracing::error!(
+                                "❌ [actor:remove_member:fanout] Failed to store event: {:?}",
+                                e
+                            );
+                        }
 
                         if let Err(e) = sse_state.emit(&convo_id, event).await {
                             tracing::error!("Failed to emit SSE event: {}", e);
