@@ -1737,6 +1737,41 @@ pub async fn store_event(
     Ok(())
 }
 
+/// Store reaction event with full payload (needed for cursor-based SSE replay)
+pub async fn store_reaction_event(
+    pool: &DbPool,
+    cursor: &str,
+    convo_id: &str,
+    message_id: &str,
+    did: &str,
+    reaction: &str,
+    action: &str,
+) -> Result<()> {
+    let envelope = serde_json::json!({
+        "cursor": cursor,
+        "convoId": convo_id,
+        "messageId": message_id,
+        "did": did,
+        "reaction": reaction,
+        "action": action,
+    });
+
+    sqlx::query!(
+        r#"
+        INSERT INTO event_stream (id, convo_id, event_type, payload, emitted_at)
+        VALUES ($1, $2, 'reactionEvent', $3, NOW())
+        "#,
+        cursor,
+        convo_id,
+        envelope,
+    )
+    .execute(pool)
+    .await
+    .context("Failed to store reaction event")?;
+
+    Ok(())
+}
+
 /// Get events after cursor for backfill
 pub async fn get_events_after_cursor(
     pool: &DbPool,
@@ -2051,8 +2086,8 @@ pub async fn get_reactions_for_messages(
     convo_id: &str,
     message_ids: &[&str],
 ) -> Result<std::collections::HashMap<String, Vec<crate::generated_types::ReactionView>>> {
-    use std::collections::HashMap;
     use crate::generated_types::ReactionView;
+    use std::collections::HashMap;
 
     let rows: Vec<(String, String, String, DateTime<Utc>)> = sqlx::query_as(
         r#"

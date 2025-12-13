@@ -83,12 +83,14 @@ pub async fn remove_reaction(
     };
 
     // Store event for cursor-based replay
-    if let Err(e) = crate::db::store_event(
+    if let Err(e) = crate::db::store_reaction_event(
         &pool,
         &cursor,
         &input.convo_id,
-        "reactionEvent",
-        Some(&input.message_id),
+        &input.message_id,
+        &user_did,
+        &input.reaction,
+        "remove",
     )
     .await
     {

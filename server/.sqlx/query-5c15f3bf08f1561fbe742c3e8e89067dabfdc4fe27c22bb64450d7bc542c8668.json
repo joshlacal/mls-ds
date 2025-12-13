@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO event_stream (id, convo_id, event_type, payload, emitted_at)\n        VALUES ($1, $2, 'reactionEvent', $3, NOW())\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5c15f3bf08f1561fbe742c3e8e89067dabfdc4fe27c22bb64450d7bc542c8668"
+}

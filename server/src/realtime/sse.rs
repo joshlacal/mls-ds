@@ -6,9 +6,14 @@ use axum::{
         IntoResponse, Sse,
     },
 };
-use futures::stream;
+use futures::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, convert::Infallible, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    convert::Infallible,
+    sync::Arc,
+    time::Duration,
+};
 use tokio::sync::{broadcast, RwLock};
 use tracing::{error, info, warn};
 
@@ -240,34 +245,106 @@ pub async fn subscribe_convo_events(
     let tx = sse_state.get_channel(&convo_id).await;
     let rx = tx.subscribe();
 
-    // Create event stream
-    let stream = stream::unfold(
-        (rx, resume_cursor, convo_id.clone()),
-        move |(mut rx, resume_cursor, convo_id)| async move {
+    // If the client provided a cursor, backfill missed reaction events from the DB first.
+    // (Messages are fetched via getMessages; reactions need full payload for replay.)
+    let mut replayed_cursors: HashSet<String> = HashSet::new();
+    let mut replay_sse_events: Vec<Event> = Vec::new();
+
+    if let Some(ref resume_cur) = resume_cursor {
+        match crate::db::get_events_after_cursor(
+            &pool,
+            &convo_id,
+            Some("reactionEvent"),
+            resume_cur,
+            200,
+        )
+        .await
+        {
+            Ok(events) => {
+                for (id, payload, _emitted_at) in events {
+                    let message_id = payload.get("messageId").and_then(|v| v.as_str());
+                    let did = payload.get("did").and_then(|v| v.as_str());
+                    let reaction = payload.get("reaction").and_then(|v| v.as_str());
+                    let action = payload.get("action").and_then(|v| v.as_str());
+
+                    let (Some(message_id), Some(did), Some(reaction), Some(action)) =
+                        (message_id, did, reaction, action)
+                    else {
+                        // Older reactionEvent rows may have only the minimal envelope.
+                        continue;
+                    };
+
+                    let event = StreamEvent::ReactionEvent {
+                        cursor: id.clone(),
+                        convo_id: convo_id.clone(),
+                        message_id: message_id.to_string(),
+                        did: did.to_string(),
+                        reaction: reaction.to_string(),
+                        action: action.to_string(),
+                    };
+
+                    let json = match serde_json::to_string(&event) {
+                        Ok(j) => j,
+                        Err(e) => {
+                            error!(error = ?e, "Failed to serialize replay event");
+                            continue;
+                        }
+                    };
+
+                    replayed_cursors.insert(id);
+                    replay_sse_events.push(Event::default().data(json));
+                }
+            }
+            Err(e) => {
+                warn!(
+                    convo = %crate::crypto::redact_for_log(&convo_id),
+                    error = ?e,
+                    "Failed to backfill reaction events"
+                );
+            }
+        }
+    }
+
+    let replay_stream = stream::iter(
+        replay_sse_events
+            .into_iter()
+            .map(|evt| Ok::<Event, Infallible>(evt)),
+    );
+
+    // Create live event stream
+    let live_stream = stream::unfold(
+        (rx, resume_cursor, replayed_cursors, convo_id.clone()),
+        move |(mut rx, resume_cursor, replayed_cursors, convo_id)| async move {
+            let mut replayed_cursors = replayed_cursors;
             loop {
                 tokio::select! {
                     // Wait for broadcast event
                     result = rx.recv() => {
                         match result {
                             Ok(event) => {
+                                let event_cursor = match &event {
+                                    StreamEvent::MessageEvent { cursor, .. } => cursor,
+                                    StreamEvent::ReactionEvent { cursor, .. } => cursor,
+                                    StreamEvent::TypingEvent { cursor, .. } => cursor,
+                                    StreamEvent::InfoEvent { cursor, .. } => cursor,
+                                    StreamEvent::NewDeviceEvent { cursor, .. } => cursor,
+                                    StreamEvent::GroupInfoRefreshRequested { cursor, .. } => cursor,
+                                    StreamEvent::ReadditionRequested { cursor, .. } => cursor,
+                                    StreamEvent::MembershipChangeEvent { cursor, .. } => cursor,
+                                    StreamEvent::ReadEvent { cursor, .. } => cursor,
+                                };
+
                                 // Filter based on resume cursor
                                 if let Some(ref resume_cur) = resume_cursor {
-                                    let event_cursor = match &event {
-                                        StreamEvent::MessageEvent { cursor, .. } => cursor,
-                                        StreamEvent::ReactionEvent { cursor, .. } => cursor,
-                                        StreamEvent::TypingEvent { cursor, .. } => cursor,
-                                        StreamEvent::InfoEvent { cursor, .. } => cursor,
-                                        StreamEvent::NewDeviceEvent { cursor, .. } => cursor,
-                                        StreamEvent::GroupInfoRefreshRequested { cursor, .. } => cursor,
-                                        StreamEvent::ReadditionRequested { cursor, .. } => cursor,
-                                        StreamEvent::MembershipChangeEvent { cursor, .. } => cursor,
-                                        StreamEvent::ReadEvent { cursor, .. } => cursor,
-                                    };
-
                                     // Only send events after resume cursor
                                     if !CursorGenerator::is_greater(event_cursor, resume_cur) {
                                         continue;
                                     }
+                                }
+
+                                // Avoid duplicating replayed DB events if they race with live delivery
+                                if replayed_cursors.contains(event_cursor) {
+                                    continue;
                                 }
 
                                 // Serialize event
@@ -280,7 +357,7 @@ pub async fn subscribe_convo_events(
                                 };
 
                                 let sse_event = Event::default().data(json);
-                                return Some((Ok::<Event, Infallible>(sse_event), (rx, None, convo_id.clone())));
+                                return Some((Ok::<Event, Infallible>(sse_event), (rx, None, replayed_cursors, convo_id.clone())));
                             }
                             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                                 warn!(
@@ -300,7 +377,7 @@ pub async fn subscribe_convo_events(
                                 let json = serde_json::to_string(&info)
                                     .expect("BUG: Failed to serialize StreamEvent");
                                 let sse_event = Event::default().data(json);
-                                return Some((Ok::<Event, Infallible>(sse_event), (rx, None, convo_id.clone())));
+                                return Some((Ok::<Event, Infallible>(sse_event), (rx, None, replayed_cursors, convo_id.clone())));
                             }
                             Err(broadcast::error::RecvError::Closed) => {
                                 info!(
@@ -316,12 +393,14 @@ pub async fn subscribe_convo_events(
                     _ = tokio::time::sleep(Duration::from_secs(15)) => {
                         // Send comment line as keepalive
                         let sse_event = Event::default().comment("keepalive");
-                        return Some((Ok(sse_event), (rx, None, convo_id.clone())));
+                        return Some((Ok(sse_event), (rx, None, replayed_cursors, convo_id.clone())));
                     }
                 }
             }
         },
     );
+
+    let stream = replay_stream.chain(live_stream);
 
     // Return SSE with explicit headers to ensure proper content-type
     // and disable nginx buffering
