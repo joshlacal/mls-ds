@@ -1,8 +1,12 @@
-use axum::{extract::{Query, State}, http::StatusCode, Json};
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    Json,
+};
 use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::oneshot;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 use crate::{
     actors::{ActorRegistry, ConvoMessage},
@@ -40,7 +44,9 @@ pub async fn get_messages(
     auth_user: AuthUser,
     Query(params): Query<GetMessagesParams>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.getMessages") {
+    if let Err(_e) =
+        crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.getMessages")
+    {
         return Err(StatusCode::UNAUTHORIZED);
     }
     let did = &auth_user.did;
@@ -53,19 +59,19 @@ pub async fn get_messages(
     let limit = params.limit.unwrap_or(50).min(100).max(1);
 
     // Check if user is a member
-    if !is_member(&pool, did, &params.convo_id)
-        .await
-        .map_err(|e| {
-            error!("Failed to check membership: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?
-    {
+    if !is_member(&pool, did, &params.convo_id).await.map_err(|e| {
+        error!("Failed to check membership: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })? {
         warn!("User is not a member of conversation");
         return Err(StatusCode::FORBIDDEN);
     }
 
     // Note: Reduced logging per security hardening - no convo IDs at info level
-    tracing::debug!("Fetching messages from convo {}", crate::crypto::redact_for_log(&params.convo_id));
+    tracing::debug!(
+        "Fetching messages from convo {}",
+        crate::crypto::redact_for_log(&params.convo_id)
+    );
 
     // Fetch messages using seq-based pagination if sinceSeq is provided
     let messages = if let Some(since_seq) = params.since_seq {
@@ -116,22 +122,26 @@ pub async fn get_messages(
         .unwrap_or(false);
 
     if use_actors {
-    tracing::debug!("Using actor system for reset unread count");
+        tracing::debug!("Using actor system for reset unread count");
 
-        let actor_ref = actor_registry.get_or_spawn(&params.convo_id).await
+        let actor_ref = actor_registry
+            .get_or_spawn(&params.convo_id)
+            .await
             .map_err(|e| {
                 error!("Failed to get conversation actor: {}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
         let (tx, rx) = oneshot::channel();
-        actor_ref.send_message(ConvoMessage::ResetUnread {
-            member_did: did.clone(),
-            reply: tx,
-        }).map_err(|_| {
-            error!("Failed to send message to actor");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        actor_ref
+            .send_message(ConvoMessage::ResetUnread {
+                member_did: did.clone(),
+                reply: tx,
+            })
+            .map_err(|_| {
+                error!("Failed to send message to actor");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
         rx.await
             .map_err(|_| {
@@ -199,7 +209,7 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
-        
+
         sqlx::query("INSERT INTO members (convo_id, member_did, joined_at) VALUES ($1, $2, $3)")
             .bind(convo_id)
             .bind(creator)
@@ -222,20 +232,41 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
-    }
+        }
     }
 
     #[tokio::test]
     async fn test_get_messages_success() {
-        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
-        let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
+        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else {
+            return;
+        };
+        let pool = crate::db::init_db(crate::db::DbConfig {
+            database_url: db_url,
+            max_connections: 5,
+            min_connections: 1,
+            acquire_timeout: std::time::Duration::from_secs(5),
+            idle_timeout: std::time::Duration::from_secs(30),
+        })
+        .await
+        .unwrap();
         let actor_registry = Arc::new(crate::actors::ActorRegistry::new(pool.clone()));
         let convo_id = "test-convo-1";
         let user = "did:plc:user";
 
         setup_test_convo_with_messages(&pool, user, convo_id).await;
 
-        let did = AuthUser { did: user.to_string(), claims: crate::auth::AtProtoClaims { iss: user.to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
+        let did = AuthUser {
+            did: user.to_string(),
+            claims: crate::auth::AtProtoClaims {
+                iss: user.to_string(),
+                aud: "test".to_string(),
+                exp: 9999999999,
+                iat: None,
+                sub: None,
+                jti: Some("test-jti".to_string()),
+                lxm: None,
+            },
+        };
         let params = GetMessagesParams {
             convo_id: convo_id.to_string(),
             since_message: None,
@@ -252,15 +283,36 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_messages_not_member() {
-        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
-        let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
+        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else {
+            return;
+        };
+        let pool = crate::db::init_db(crate::db::DbConfig {
+            database_url: db_url,
+            max_connections: 5,
+            min_connections: 1,
+            acquire_timeout: std::time::Duration::from_secs(5),
+            idle_timeout: std::time::Duration::from_secs(30),
+        })
+        .await
+        .unwrap();
         let actor_registry = Arc::new(crate::actors::ActorRegistry::new(pool.clone()));
         let convo_id = "test-convo-2";
         let creator = "did:plc:creator";
 
         setup_test_convo_with_messages(&pool, creator, convo_id).await;
 
-        let did = AuthUser { did: "did:plc:outsider".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:outsider".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
+        let did = AuthUser {
+            did: "did:plc:outsider".to_string(),
+            claims: crate::auth::AtProtoClaims {
+                iss: "did:plc:outsider".to_string(),
+                aud: "test".to_string(),
+                exp: 9999999999,
+                iat: None,
+                sub: None,
+                jti: Some("test-jti".to_string()),
+                lxm: None,
+            },
+        };
         let params = GetMessagesParams {
             convo_id: convo_id.to_string(),
             since_message: None,
@@ -273,15 +325,36 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_messages_with_limit() {
-        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
-        let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
+        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else {
+            return;
+        };
+        let pool = crate::db::init_db(crate::db::DbConfig {
+            database_url: db_url,
+            max_connections: 5,
+            min_connections: 1,
+            acquire_timeout: std::time::Duration::from_secs(5),
+            idle_timeout: std::time::Duration::from_secs(30),
+        })
+        .await
+        .unwrap();
         let actor_registry = Arc::new(crate::actors::ActorRegistry::new(pool.clone()));
         let convo_id = "test-convo-3";
         let user = "did:plc:user";
 
         setup_test_convo_with_messages(&pool, user, convo_id).await;
 
-        let did = AuthUser { did: user.to_string(), claims: crate::auth::AtProtoClaims { iss: user.to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
+        let did = AuthUser {
+            did: user.to_string(),
+            claims: crate::auth::AtProtoClaims {
+                iss: user.to_string(),
+                aud: "test".to_string(),
+                exp: 9999999999,
+                iat: None,
+                sub: None,
+                jti: Some("test-jti".to_string()),
+                lxm: None,
+            },
+        };
         let params = GetMessagesParams {
             convo_id: convo_id.to_string(),
             since_message: None,

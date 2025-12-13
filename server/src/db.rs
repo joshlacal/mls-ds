@@ -44,11 +44,10 @@ pub async fn init_db(config: DbConfig) -> Result<DbPool> {
         .context("Failed to connect to database")?;
 
     // Run migrations
-    // Temporarily disabled due to migration checksum issues
-    // sqlx::migrate!("./migrations")
-    //     .run(&pool)
-    //     .await
-    //     .context("Failed to run migrations")?;
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .context("Failed to run migrations")?;
 
     Ok(pool)
 }
@@ -403,7 +402,7 @@ pub async fn create_message(
     }
 
     let seq: i64 = sqlx::query_scalar(
-        "SELECT CAST(COALESCE(MAX(seq), 0) + 1 AS BIGINT) FROM messages WHERE convo_id = $1"
+        "SELECT CAST(COALESCE(MAX(seq), 0) + 1 AS BIGINT) FROM messages WHERE convo_id = $1",
     )
     .bind(convo_id)
     .fetch_one(&mut *tx)
@@ -576,10 +575,7 @@ pub struct GapInfo {
 
 /// Detect gaps in message sequence numbers for a conversation
 /// Returns GapInfo with missing sequence numbers within the min-max range
-pub async fn detect_message_gaps(
-    pool: &DbPool,
-    convo_id: &str,
-) -> Result<GapInfo> {
+pub async fn detect_message_gaps(pool: &DbPool, convo_id: &str) -> Result<GapInfo> {
     // Get min, max seq and total count
     let stats: Option<(Option<i64>, Option<i64>, i64)> = sqlx::query_as(
         r#"
@@ -663,10 +659,11 @@ pub async fn get_message_count(pool: &DbPool, convo_id: &str) -> Result<i64> {
 
 /// Delete expired messages based on expires_at
 pub async fn delete_expired_messages(pool: &DbPool) -> Result<u64> {
-    let result = sqlx::query("DELETE FROM messages WHERE expires_at IS NOT NULL AND expires_at < NOW()")
-        .execute(pool)
-        .await
-        .context("Failed to delete expired messages")?;
+    let result =
+        sqlx::query("DELETE FROM messages WHERE expires_at IS NOT NULL AND expires_at < NOW()")
+            .execute(pool)
+            .await
+            .context("Failed to delete expired messages")?;
     Ok(result.rows_affected())
 }
 
@@ -686,13 +683,11 @@ pub async fn delete_old_events(pool: &DbPool, older_than_seconds: i64) -> Result
 pub async fn compact_messages(pool: &DbPool, ttl_days: i64) -> Result<u64> {
     let cutoff = Utc::now() - chrono::Duration::days(ttl_days);
 
-    let result = sqlx::query(
-        "DELETE FROM messages WHERE created_at < $1"
-    )
-    .bind(cutoff)
-    .execute(pool)
-    .await
-    .context("Failed to compact messages")?;
+    let result = sqlx::query("DELETE FROM messages WHERE created_at < $1")
+        .bind(cutoff)
+        .execute(pool)
+        .await
+        .context("Failed to compact messages")?;
 
     Ok(result.rows_affected())
 }
@@ -701,13 +696,11 @@ pub async fn compact_messages(pool: &DbPool, ttl_days: i64) -> Result<u64> {
 pub async fn compact_event_stream(pool: &DbPool, ttl_days: i64) -> Result<u64> {
     let cutoff = Utc::now() - chrono::Duration::days(ttl_days);
 
-    let result = sqlx::query(
-        "DELETE FROM event_stream WHERE emitted_at < $1"
-    )
-    .bind(cutoff)
-    .execute(pool)
-    .await
-    .context("Failed to compact event stream")?;
+    let result = sqlx::query("DELETE FROM event_stream WHERE emitted_at < $1")
+        .bind(cutoff)
+        .execute(pool)
+        .await
+        .context("Failed to compact event stream")?;
 
     Ok(result.rows_affected())
 }
@@ -719,7 +712,7 @@ pub async fn compact_welcome_messages(pool: &DbPool) -> Result<u64> {
 
     let result = sqlx::query(
         "DELETE FROM welcome_messages
-         WHERE consumed = true AND consumed_at < $1"
+         WHERE consumed = true AND consumed_at < $1",
     )
     .bind(cutoff)
     .execute(pool)
@@ -763,7 +756,7 @@ pub async fn store_key_package_with_device(
     key_data: Vec<u8>,
     expires_at: DateTime<Utc>,
     device_id: Option<String>,
-    _credential_did: Option<String>,  // Ignored - extracted from KeyPackage
+    _credential_did: Option<String>, // Ignored - extracted from KeyPackage
 ) -> Result<KeyPackage> {
     let now = Utc::now();
     let id = Uuid::new_v4().to_string();
@@ -784,8 +777,8 @@ pub async fn store_key_package_with_device(
     .context("Failed to ensure user exists")?;
 
     // Compute MLS-compliant hash_ref using OpenMLS
-    use openmls::prelude::{KeyPackageIn, ProtocolVersion};
     use openmls::prelude::tls_codec::Deserialize;
+    use openmls::prelude::{KeyPackageIn, ProtocolVersion};
 
     // Create crypto provider (RustCrypto implements OpenMlsCrypto)
     let provider = openmls_rust_crypto::RustCrypto::default();
@@ -922,11 +915,11 @@ pub async fn get_all_key_packages(
     );
 
     // Get ONE key package per unique DEVICE, prioritizing recently active devices
-    // 
+    //
     // CRITICAL FIX: Use device_id (not credential_did) for DISTINCT ON.
     // - credential_did is the bare user DID (same for ALL devices of a user)
     // - device_id is unique per device, ensuring we get one key package per device
-    // 
+    //
     // This enables multi-device support: when inviting a user, we get key packages
     // for ALL their registered devices, so the Welcome message works on any device.
     //
@@ -1043,11 +1036,7 @@ pub async fn mark_key_package_consumed_with_metadata(
 }
 
 /// Count key packages consumed in last N hours
-pub async fn count_consumed_key_packages(
-    pool: &DbPool,
-    did: &str,
-    hours: i64,
-) -> Result<i64> {
+pub async fn count_consumed_key_packages(pool: &DbPool, did: &str, hours: i64) -> Result<i64> {
     let cutoff = Utc::now() - chrono::Duration::hours(hours);
 
     let result = sqlx::query_scalar::<_, i64>(
@@ -1148,13 +1137,12 @@ pub async fn delete_expired_key_packages(pool: &DbPool) -> Result<u64> {
 pub async fn delete_consumed_key_packages(pool: &DbPool, hours_old: i64) -> Result<u64> {
     let cutoff = Utc::now() - chrono::Duration::hours(hours_old);
 
-    let result = sqlx::query(
-        "DELETE FROM key_packages WHERE consumed_at IS NOT NULL AND consumed_at < $1"
-    )
-    .bind(cutoff)
-    .execute(pool)
-    .await
-    .context("Failed to delete consumed key packages")?;
+    let result =
+        sqlx::query("DELETE FROM key_packages WHERE consumed_at IS NOT NULL AND consumed_at < $1")
+            .bind(cutoff)
+            .execute(pool)
+            .await
+            .context("Failed to delete consumed key packages")?;
 
     Ok(result.rows_affected())
 }
@@ -1168,7 +1156,7 @@ pub async fn delete_old_unconsumed_key_packages(pool: &DbPool, days_old: i64) ->
         DELETE FROM key_packages
         WHERE consumed_at IS NULL
           AND created_at < $1
-        "#
+        "#,
     )
     .bind(cutoff)
     .execute(pool)
@@ -1179,10 +1167,7 @@ pub async fn delete_old_unconsumed_key_packages(pool: &DbPool, days_old: i64) ->
 }
 
 /// Enforce maximum key packages per device
-pub async fn enforce_key_package_limit(
-    pool: &DbPool,
-    max_per_device: i64,
-) -> Result<u64> {
+pub async fn enforce_key_package_limit(pool: &DbPool, max_per_device: i64) -> Result<u64> {
     // For each DID, keep only the newest max_per_device packages
     let result = sqlx::query(
         r#"
@@ -1199,7 +1184,7 @@ pub async fn enforce_key_package_limit(
             ) ranked
             WHERE rn > $1
         )
-        "#
+        "#,
     )
     .bind(max_per_device)
     .execute(pool)
@@ -1814,10 +1799,7 @@ pub async fn get_events_after_cursor(
 
 /// Record that a low inventory notification was sent to a user
 /// Updates the timestamp if a record already exists
-pub async fn record_low_inventory_notification(
-    pool: &DbPool,
-    user_did: &str,
-) -> Result<()> {
+pub async fn record_low_inventory_notification(pool: &DbPool, user_did: &str) -> Result<()> {
     sqlx::query(
         r#"
         INSERT INTO key_package_notifications (user_did, notified_at, notification_type)
@@ -1839,10 +1821,7 @@ pub async fn record_low_inventory_notification(
 /// Returns true if:
 /// - Never sent before, OR
 /// - Last sent > 24 hours ago
-pub async fn should_send_low_inventory_notification(
-    pool: &DbPool,
-    user_did: &str,
-) -> Result<bool> {
+pub async fn should_send_low_inventory_notification(pool: &DbPool, user_did: &str) -> Result<bool> {
     let last_sent: Option<DateTime<Utc>> = sqlx::query_scalar(
         r#"
         SELECT notified_at FROM key_package_notifications
@@ -1865,10 +1844,7 @@ pub async fn should_send_low_inventory_notification(
 }
 
 /// Count available (unconsumed, non-reserved) key packages for a user
-pub async fn count_available_key_packages(
-    pool: &DbPool,
-    user_did: &str,
-) -> Result<i64> {
+pub async fn count_available_key_packages(pool: &DbPool, user_did: &str) -> Result<i64> {
     let now = Utc::now();
     let reservation_timeout = now - chrono::Duration::minutes(5);
 
@@ -1978,7 +1954,7 @@ pub async fn message_exists(pool: &DbPool, convo_id: &str, message_id: &str) -> 
         r#"
         SELECT EXISTS(
             SELECT 1 FROM messages
-            WHERE conversation_id = $1 AND id = $2
+            WHERE convo_id = $1 AND id = $2
         )
         "#,
     )
@@ -2003,9 +1979,9 @@ pub async fn add_reaction(
 ) -> Result<bool> {
     let result = sqlx::query(
         r#"
-        INSERT INTO message_reactions (conversation_id, message_id, user_did, reaction, created_at)
+        INSERT INTO message_reactions (convo_id, message_id, user_did, reaction, created_at)
         VALUES ($1, $2, $3, $4, $5)
-        ON CONFLICT (conversation_id, message_id, user_did, reaction) DO NOTHING
+        ON CONFLICT (convo_id, message_id, user_did, reaction) DO NOTHING
         "#,
     )
     .bind(convo_id)
@@ -2032,7 +2008,7 @@ pub async fn remove_reaction(
     let result = sqlx::query(
         r#"
         DELETE FROM message_reactions
-        WHERE conversation_id = $1 AND message_id = $2 AND user_did = $3 AND reaction = $4
+        WHERE convo_id = $1 AND message_id = $2 AND user_did = $3 AND reaction = $4
         "#,
     )
     .bind(convo_id)
@@ -2056,7 +2032,7 @@ pub async fn get_message_reactions(
         r#"
         SELECT user_did, reaction, created_at
         FROM message_reactions
-        WHERE conversation_id = $1 AND message_id = $2
+        WHERE convo_id = $1 AND message_id = $2
         ORDER BY created_at ASC
         "#,
     )

@@ -1,11 +1,12 @@
-use axum::{extract::{Query, State}, http::StatusCode, Json};
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    Json,
+};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
 
-use crate::{
-    auth::AuthUser,
-    storage::DbPool,
-};
+use crate::{auth::AuthUser, storage::DbPool};
 
 #[derive(Debug, Deserialize)]
 pub struct GetExpectedConversationsParams {
@@ -43,7 +44,10 @@ pub async fn get_expected_conversations(
     auth_user: AuthUser,
     Query(params): Query<GetExpectedConversationsParams>,
 ) -> Result<Json<GetExpectedConversationsOutput>, StatusCode> {
-    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.getExpectedConversations") {
+    if let Err(_e) = crate::auth::enforce_standard(
+        &auth_user.claims,
+        "blue.catbird.mls.getExpectedConversations",
+    ) {
         error!("Unauthorized - failed auth check");
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -113,7 +117,9 @@ pub async fn get_expected_conversations(
 
     // Build response
     let mut result = Vec::new();
-    for (convo_id, name, member_count, last_activity, needs_rejoin, member_device_id) in conversations {
+    for (convo_id, name, member_count, last_activity, needs_rejoin, member_device_id) in
+        conversations
+    {
         // Determine if this device should be in the group
         let device_in_group = if let Some(target_device) = &device_id {
             // Check if the specific device is in the members table

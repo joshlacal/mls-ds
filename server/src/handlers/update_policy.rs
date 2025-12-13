@@ -10,14 +10,17 @@
 ///! - Whether members can rejoin after desync
 ///! - Rejoin window duration
 ///! - Last admin protection
-
-use axum::{extract::{Query, State}, http::StatusCode, Json};
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    Json,
+};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tracing::{error, info};
 
-use crate::auth::AuthUser;
 use crate::admin_system::verify_is_admin;
+use crate::auth::AuthUser;
 
 // =============================================================================
 // REQUEST/RESPONSE TYPES
@@ -130,14 +133,17 @@ pub async fn update_policy(
 
         // Check current member count - cannot set max_members below current count
         let current_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM members WHERE convo_id = $1 AND left_at IS NULL"
+            "SELECT COUNT(*) FROM members WHERE convo_id = $1 AND left_at IS NULL",
         )
         .bind(&input.convo_id)
         .fetch_one(&pool)
         .await
         .map_err(|e| {
             error!("Failed to get current member count: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, "Database error".to_string())
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Database error".to_string(),
+            )
         })?;
 
         if (current_count as i32) > max_members {
@@ -229,16 +235,13 @@ pub async fn update_policy(
         query_builder = query_builder.bind(val);
     }
 
-    let policy = query_builder
-        .fetch_one(&pool)
-        .await
-        .map_err(|e| {
-            error!("Database error updating policy: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to update policy".to_string(),
-            )
-        })?;
+    let policy = query_builder.fetch_one(&pool).await.map_err(|e| {
+        error!("Database error updating policy: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to update policy".to_string(),
+        )
+    })?;
 
     info!(
         convo_id = %input.convo_id,
@@ -330,9 +333,9 @@ mod tests {
     #[test]
     fn test_rejoin_window_validation() {
         // Valid values
-        assert!(0 >= 0);  // 0 = unlimited
-        assert!(30 >= 0);  // 30 days
-        assert!(365 >= 0);  // 1 year
+        assert!(0 >= 0); // 0 = unlimited
+        assert!(30 >= 0); // 30 days
+        assert!(365 >= 0); // 1 year
 
         // Invalid
         assert!(-1 < 0);

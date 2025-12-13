@@ -1,8 +1,8 @@
 use axum::{extract::State, http::StatusCode, Json};
-use tracing::{info, error};
+use tracing::{error, info};
 
 use crate::{
-    auth::{AuthUser, verify_is_admin, enforce_standard},
+    auth::{enforce_standard, verify_is_admin, AuthUser},
     generated::blue::catbird::mls::resolve_report::{Input, Output, OutputData, NSID},
     storage::DbPool,
 };
@@ -17,8 +17,10 @@ pub async fn resolve_report(
 ) -> Result<Json<Output>, StatusCode> {
     let input = input.data;
 
-    info!("📍 [resolve_report] START - actor: {}, report: {}, action: {}",
-          auth_user.did, input.report_id, input.action);
+    info!(
+        "📍 [resolve_report] START - actor: {}, report: {}, action: {}",
+        auth_user.did, input.report_id, input.action
+    );
 
     // Enforce standard auth
     if let Err(_) = enforce_standard(&auth_user.claims, NSID) {
@@ -42,27 +44,29 @@ pub async fn resolve_report(
     }
 
     // Fetch report to get convo_id and verify it exists
-    let (convo_id, current_status): (String, String) = sqlx::query_as(
-        "SELECT convo_id, status FROM reports WHERE id = $1"
-    )
-    .bind(&input.report_id)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|e| {
-        error!("❌ [resolve_report] Database query failed: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?
-    .ok_or_else(|| {
-        error!("❌ [resolve_report] Report not found");
-        StatusCode::NOT_FOUND
-    })?;
+    let (convo_id, current_status): (String, String) =
+        sqlx::query_as("SELECT convo_id, status FROM reports WHERE id = $1")
+            .bind(&input.report_id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| {
+                error!("❌ [resolve_report] Database query failed: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .ok_or_else(|| {
+                error!("❌ [resolve_report] Report not found");
+                StatusCode::NOT_FOUND
+            })?;
 
     // Verify admin status for this conversation
     verify_is_admin(&pool, &convo_id, &auth_user.did).await?;
 
     // Check if already resolved
     if current_status != "pending" {
-        error!("❌ [resolve_report] Report already resolved (status: {})", current_status);
+        error!(
+            "❌ [resolve_report] Report already resolved (status: {})",
+            current_status
+        );
         return Err(StatusCode::BAD_REQUEST);
     }
 
@@ -73,7 +77,7 @@ pub async fn resolve_report(
         "UPDATE reports
          SET status = 'resolved', resolved_by_did = $2, resolved_at = $3,
              resolution_action = $4, resolution_notes = $5
-         WHERE id = $1"
+         WHERE id = $1",
     )
     .bind(&input.report_id)
     .bind(&auth_user.did)
@@ -93,8 +97,10 @@ pub async fn resolve_report(
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    info!("✅ [resolve_report] SUCCESS - report {} resolved with action '{}'",
-          input.report_id, input.action);
+    info!(
+        "✅ [resolve_report] SUCCESS - report {} resolved with action '{}'",
+        input.report_id, input.action
+    );
 
     Ok(Json(Output::from(OutputData { ok: true })))
 }

@@ -23,10 +23,9 @@ pub async fn group_info_refresh(
     Json(input): Json<Input>,
 ) -> Result<Json<Output>, StatusCode> {
     // Enforce authentication
-    if let Err(_e) = crate::auth::enforce_standard(
-        &auth_user.claims,
-        "blue.catbird.mls.groupInfoRefresh",
-    ) {
+    if let Err(_e) =
+        crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.groupInfoRefresh")
+    {
         return Err(StatusCode::UNAUTHORIZED);
     }
 

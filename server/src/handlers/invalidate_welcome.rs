@@ -21,10 +21,9 @@ pub async fn invalidate_welcome(
     Json(input): Json<Input>,
 ) -> Result<Json<Output>, StatusCode> {
     // Enforce authentication
-    if let Err(_e) = crate::auth::enforce_standard(
-        &auth_user.claims,
-        "blue.catbird.mls.invalidateWelcome",
-    ) {
+    if let Err(_e) =
+        crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.invalidateWelcome")
+    {
         return Err(StatusCode::UNAUTHORIZED);
     }
 

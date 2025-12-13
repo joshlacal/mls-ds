@@ -1,14 +1,10 @@
-use base64::Engine;
 use axum::{extract::State, http::StatusCode, Json};
+use base64::Engine;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
-use crate::{
-    auth::AuthUser,
-    device_utils::parse_device_did,
-    storage::DbPool,
-};
+use crate::{auth::AuthUser, device_utils::parse_device_did, storage::DbPool};
 
 const MAX_BATCH_SIZE: usize = 100;
 const MAX_UNCONSUMED_PER_USER: i64 = 100;
@@ -60,18 +56,19 @@ pub async fn publish_key_packages(
     auth_user: AuthUser,
     Json(input): Json<PublishKeyPackagesInput>,
 ) -> Result<Json<PublishKeyPackagesOutput>, StatusCode> {
-    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.publishKeyPackages") {
+    if let Err(_e) =
+        crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.publishKeyPackages")
+    {
         return Err(StatusCode::UNAUTHORIZED);
     }
 
     let did = &auth_user.did;
 
     // Extract user DID from device DID (handles both single and multi-device mode)
-    let (user_did, _device_id) = parse_device_did(did)
-        .map_err(|e| {
-            error!("Invalid device DID format: {}", e);
-            StatusCode::BAD_REQUEST
-        })?;
+    let (user_did, _device_id) = parse_device_did(did).map_err(|e| {
+        error!("Invalid device DID format: {}", e);
+        StatusCode::BAD_REQUEST
+    })?;
 
     // Validate batch size
     if input.key_packages.is_empty() {
@@ -80,11 +77,18 @@ pub async fn publish_key_packages(
     }
 
     if input.key_packages.len() > MAX_BATCH_SIZE {
-        warn!("Batch size {} exceeds maximum {}", input.key_packages.len(), MAX_BATCH_SIZE);
+        warn!(
+            "Batch size {} exceeds maximum {}",
+            input.key_packages.len(),
+            MAX_BATCH_SIZE
+        );
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    info!("Publishing batch of {} key packages", input.key_packages.len());
+    info!(
+        "Publishing batch of {} key packages",
+        input.key_packages.len()
+    );
 
     let now = Utc::now();
 
@@ -108,7 +112,10 @@ pub async fn publish_key_packages(
     })?;
 
     if unconsumed_count.0 >= MAX_UNCONSUMED_PER_USER {
-        warn!("User {} has {} unconsumed key packages (limit: {})", did, unconsumed_count.0, MAX_UNCONSUMED_PER_USER);
+        warn!(
+            "User {} has {} unconsumed key packages (limit: {})",
+            did, unconsumed_count.0, MAX_UNCONSUMED_PER_USER
+        );
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 
@@ -132,14 +139,22 @@ pub async fn publish_key_packages(
     })?;
 
     if recent_uploads.0 >= MAX_UPLOADS_PER_HOUR {
-        warn!("User {} exceeded rate limit: {} uploads in last hour (limit: {})", did, recent_uploads.0, MAX_UPLOADS_PER_HOUR);
+        warn!(
+            "User {} exceeded rate limit: {} uploads in last hour (limit: {})",
+            did, recent_uploads.0, MAX_UPLOADS_PER_HOUR
+        );
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 
     // Check if this batch would exceed limits
     if unconsumed_count.0 + input.key_packages.len() as i64 > MAX_UNCONSUMED_PER_USER {
-        warn!("Batch would exceed unconsumed limit for user {}: {} + {} > {}",
-            did, unconsumed_count.0, input.key_packages.len(), MAX_UNCONSUMED_PER_USER);
+        warn!(
+            "Batch would exceed unconsumed limit for user {}: {} + {} > {}",
+            did,
+            unconsumed_count.0,
+            input.key_packages.len(),
+            MAX_UNCONSUMED_PER_USER
+        );
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 
@@ -178,7 +193,10 @@ pub async fn publish_key_packages(
         }
 
         // Validate base64 encoding
-        if base64::engine::general_purpose::STANDARD.decode(&item.key_package).is_err() {
+        if base64::engine::general_purpose::STANDARD
+            .decode(&item.key_package)
+            .is_err()
+        {
             errors.push(BatchError {
                 index: idx,
                 error: "Invalid base64 encoding".to_string(),
@@ -257,8 +275,10 @@ pub async fn publish_key_packages(
             key_data,
             item.expires,
             item.device_id.clone(),
-            None,  // credential_did is now extracted from KeyPackage and validated
-        ).await {
+            None, // credential_did is now extracted from KeyPackage and validated
+        )
+        .await
+        {
             Ok(_) => {
                 succeeded += 1;
             }
@@ -282,7 +302,11 @@ pub async fn publish_key_packages(
         succeeded,
         failed,
         skipped: if skipped > 0 { Some(skipped) } else { None },
-        errors: if errors.is_empty() { None } else { Some(errors) },
+        errors: if errors.is_empty() {
+            None
+        } else {
+            Some(errors)
+        },
     }))
 }
 
@@ -293,7 +317,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_batch_upload_success() {
-        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
+        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else {
+            return;
+        };
         let pool = crate::db::init_db(crate::db::DbConfig {
             database_url: db_url,
             max_connections: 5,
@@ -347,7 +373,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_batch_upload_with_validation_errors() {
-        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
+        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else {
+            return;
+        };
         let pool = crate::db::init_db(crate::db::DbConfig {
             database_url: db_url,
             max_connections: 5,

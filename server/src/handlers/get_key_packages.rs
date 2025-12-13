@@ -1,13 +1,14 @@
 use base64::Engine;
 
-use axum::{extract::{RawQuery, State}, http::StatusCode, Json};
-use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn, error};
-
-use crate::{
-    auth::AuthUser,
-    storage::DbPool,
+use axum::{
+    extract::{RawQuery, State},
+    http::StatusCode,
+    Json,
 };
+use serde::{Deserialize, Serialize};
+use tracing::{debug, error, info, warn};
+
+use crate::{auth::AuthUser, storage::DbPool};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -26,18 +27,20 @@ pub async fn get_key_packages(
     auth_user: AuthUser,
     RawQuery(query): RawQuery,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.getKeyPackages") {
+    if let Err(_e) =
+        crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.getKeyPackages")
+    {
         warn!("Unauthorized access attempt");
         return Err(StatusCode::UNAUTHORIZED);
     }
-    
+
     // Parse query string manually to handle ATProto array format (?dids=X&dids=Y)
     let query_str = query.unwrap_or_default();
     info!("getKeyPackages called with query: {}", query_str);
-    
+
     let mut dids = Vec::new();
     let mut cipher_suite = None;
-    
+
     for pair in query_str.split('&') {
         if let Some((key, value)) = pair.split_once('=') {
             let decoded_value = urlencoding::decode(value).unwrap_or_default().to_string();
@@ -48,7 +51,7 @@ pub async fn get_key_packages(
             }
         }
     }
-    
+
     // Validate input
     if dids.is_empty() {
         warn!("Empty dids parameter provided");
@@ -91,7 +94,10 @@ pub async fn get_key_packages(
                 }
             }
             Ok(_) => {
-                debug!("No valid key package found for DID: {}", crate::crypto::hash_for_log(&did));
+                debug!(
+                    "No valid key package found for DID: {}",
+                    crate::crypto::hash_for_log(&did)
+                );
             }
             Err(e) => {
                 error!("Failed to get key packages: {}", e);
@@ -120,9 +126,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_key_packages_success() {
-        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
-        let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
-        
+        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else {
+            return;
+        };
+        let pool = crate::db::init_db(crate::db::DbConfig {
+            database_url: db_url,
+            max_connections: 5,
+            min_connections: 1,
+            acquire_timeout: std::time::Duration::from_secs(5),
+            idle_timeout: std::time::Duration::from_secs(30),
+        })
+        .await
+        .unwrap();
+
         let did1 = "did:plc:user1";
         let did2 = "did:plc:user2";
         let cipher_suite = "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519";
@@ -130,14 +146,25 @@ mod tests {
         publish_key_package(&pool, did1, cipher_suite).await;
         publish_key_package(&pool, did2, cipher_suite).await;
 
-        let auth_user = AuthUser { did: "did:plc:requester".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:requester".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
+        let auth_user = AuthUser {
+            did: "did:plc:requester".to_string(),
+            claims: crate::auth::AtProtoClaims {
+                iss: "did:plc:requester".to_string(),
+                aud: "test".to_string(),
+                exp: 9999999999,
+                iat: None,
+                sub: None,
+                jti: Some("test-jti".to_string()),
+                lxm: None,
+            },
+        };
         let params = GetKeyPackagesParams {
             dids: vec![did1.to_string(), did2.to_string()],
         };
 
         let result = get_key_packages(State(pool), auth_user, Query(params)).await;
         assert!(result.is_ok());
-        
+
         let json = result.unwrap().0;
         let key_packages = json.get("keyPackages").unwrap().as_array().unwrap();
         assert_eq!(key_packages.len(), 2);
@@ -145,17 +172,38 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_key_packages_not_found() {
-        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
-        let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
-        
-        let auth_user = AuthUser { did: "did:plc:requester".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:requester".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
+        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else {
+            return;
+        };
+        let pool = crate::db::init_db(crate::db::DbConfig {
+            database_url: db_url,
+            max_connections: 5,
+            min_connections: 1,
+            acquire_timeout: std::time::Duration::from_secs(5),
+            idle_timeout: std::time::Duration::from_secs(30),
+        })
+        .await
+        .unwrap();
+
+        let auth_user = AuthUser {
+            did: "did:plc:requester".to_string(),
+            claims: crate::auth::AtProtoClaims {
+                iss: "did:plc:requester".to_string(),
+                aud: "test".to_string(),
+                exp: 9999999999,
+                iat: None,
+                sub: None,
+                jti: Some("test-jti".to_string()),
+                lxm: None,
+            },
+        };
         let params = GetKeyPackagesParams {
             dids: vec!["did:plc:nonexistent".to_string()],
         };
 
         let result = get_key_packages(State(pool), auth_user, Query(params)).await;
         assert!(result.is_ok());
-        
+
         let json = result.unwrap().0;
         let key_packages = json.get("keyPackages").unwrap().as_array().unwrap();
         assert_eq!(key_packages.len(), 0);
@@ -163,13 +211,32 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_key_packages_empty_dids() {
-        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
-        let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
-        
-        let auth_user = AuthUser { did: "did:plc:requester".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:requester".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
-        let params = GetKeyPackagesParams {
-            dids: vec![],
+        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else {
+            return;
         };
+        let pool = crate::db::init_db(crate::db::DbConfig {
+            database_url: db_url,
+            max_connections: 5,
+            min_connections: 1,
+            acquire_timeout: std::time::Duration::from_secs(5),
+            idle_timeout: std::time::Duration::from_secs(30),
+        })
+        .await
+        .unwrap();
+
+        let auth_user = AuthUser {
+            did: "did:plc:requester".to_string(),
+            claims: crate::auth::AtProtoClaims {
+                iss: "did:plc:requester".to_string(),
+                aud: "test".to_string(),
+                exp: 9999999999,
+                iat: None,
+                sub: None,
+                jti: Some("test-jti".to_string()),
+                lxm: None,
+            },
+        };
+        let params = GetKeyPackagesParams { dids: vec![] };
 
         let result = get_key_packages(State(pool), auth_user, Query(params)).await;
         assert_eq!(result.unwrap_err(), StatusCode::BAD_REQUEST);
@@ -177,9 +244,28 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_key_packages_invalid_did() {
-        let pool = crate::db::init_db(crate::db::DbConfig { database_url: ":memory:".to_string(), max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
-        
-        let auth_user = AuthUser { did: "did:plc:requester".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:requester".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
+        let pool = crate::db::init_db(crate::db::DbConfig {
+            database_url: ":memory:".to_string(),
+            max_connections: 5,
+            min_connections: 1,
+            acquire_timeout: std::time::Duration::from_secs(5),
+            idle_timeout: std::time::Duration::from_secs(30),
+        })
+        .await
+        .unwrap();
+
+        let auth_user = AuthUser {
+            did: "did:plc:requester".to_string(),
+            claims: crate::auth::AtProtoClaims {
+                iss: "did:plc:requester".to_string(),
+                aud: "test".to_string(),
+                exp: 9999999999,
+                iat: None,
+                sub: None,
+                jti: Some("test-jti".to_string()),
+                lxm: None,
+            },
+        };
         let params = GetKeyPackagesParams {
             dids: vec!["invalid_did".to_string()],
         };
@@ -190,9 +276,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_key_packages_expired() {
-        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
-        let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
-        
+        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else {
+            return;
+        };
+        let pool = crate::db::init_db(crate::db::DbConfig {
+            database_url: db_url,
+            max_connections: 5,
+            min_connections: 1,
+            acquire_timeout: std::time::Duration::from_secs(5),
+            idle_timeout: std::time::Duration::from_secs(30),
+        })
+        .await
+        .unwrap();
+
         let did = "did:plc:user1";
         let cipher_suite = "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519";
         let now = chrono::Utc::now();
@@ -201,7 +297,18 @@ mod tests {
 
         let _ = crate::db::store_key_package(&pool, did, cipher_suite, key_data, expires).await;
 
-        let auth_user = AuthUser { did: "did:plc:requester".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:requester".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
+        let auth_user = AuthUser {
+            did: "did:plc:requester".to_string(),
+            claims: crate::auth::AtProtoClaims {
+                iss: "did:plc:requester".to_string(),
+                aud: "test".to_string(),
+                exp: 9999999999,
+                iat: None,
+                sub: None,
+                jti: Some("test-jti".to_string()),
+                lxm: None,
+            },
+        };
         let params = GetKeyPackagesParams {
             dids: vec![did.to_string()],
         };
@@ -216,9 +323,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_key_packages_consumed() {
-        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
-        let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
-        
+        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else {
+            return;
+        };
+        let pool = crate::db::init_db(crate::db::DbConfig {
+            database_url: db_url,
+            max_connections: 5,
+            min_connections: 1,
+            acquire_timeout: std::time::Duration::from_secs(5),
+            idle_timeout: std::time::Duration::from_secs(30),
+        })
+        .await
+        .unwrap();
+
         let did = "did:plc:user1";
         let cipher_suite = "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519";
         let now = chrono::Utc::now();
@@ -226,10 +343,22 @@ mod tests {
         let key_data = b"consumed_key_package".to_vec();
 
         // Insert then mark consumed
-        let _ = crate::db::store_key_package(&pool, did, cipher_suite, key_data.clone(), expires).await;
+        let _ =
+            crate::db::store_key_package(&pool, did, cipher_suite, key_data.clone(), expires).await;
         let _ = crate::db::consume_key_package(&pool, did, cipher_suite, &key_data).await;
 
-        let auth_user = AuthUser { did: "did:plc:requester".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:requester".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
+        let auth_user = AuthUser {
+            did: "did:plc:requester".to_string(),
+            claims: crate::auth::AtProtoClaims {
+                iss: "did:plc:requester".to_string(),
+                aud: "test".to_string(),
+                exp: 9999999999,
+                iat: None,
+                sub: None,
+                jti: Some("test-jti".to_string()),
+                lxm: None,
+            },
+        };
         let params = GetKeyPackagesParams {
             dids: vec![did.to_string()],
         };

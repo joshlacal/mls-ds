@@ -2,11 +2,11 @@ use axum::{extract::State, http::StatusCode, Json};
 use base64::Engine;
 use std::sync::Arc;
 use tokio::sync::oneshot;
-use tracing::{info, error};
+use tracing::{error, info};
 
 use crate::{
     actors::{ActorRegistry, ConvoMessage},
-    auth::{AuthUser, verify_is_admin, verify_is_member, enforce_standard},
+    auth::{enforce_standard, verify_is_admin, verify_is_member, AuthUser},
     generated::blue::catbird::mls::remove_member::{Input, Output, OutputData, NSID},
     realtime::SseState,
     storage::{get_current_epoch, DbPool},
@@ -24,8 +24,12 @@ pub async fn remove_member(
 ) -> Result<Json<Output>, StatusCode> {
     let input = input.data;
 
-    info!("📍 [remove_member] START - actor: {}, convo: {}, target: {}",
-          auth_user.did, input.convo_id, input.target_did.as_str());
+    info!(
+        "📍 [remove_member] START - actor: {}, convo: {}, target: {}",
+        auth_user.did,
+        input.convo_id,
+        input.target_did.as_str()
+    );
 
     // Enforce standard auth
     if let Err(_) = enforce_standard(&auth_user.claims, NSID) {
@@ -57,17 +61,22 @@ pub async fn remove_member(
 
         // Decode commit if provided
         let commit_bytes = if let Some(ref commit) = input.commit {
-            Some(base64::engine::general_purpose::STANDARD.decode(commit)
-                .map_err(|e| {
-                    error!("Invalid base64 commit: {}", e);
-                    StatusCode::BAD_REQUEST
-                })?)
+            Some(
+                base64::engine::general_purpose::STANDARD
+                    .decode(commit)
+                    .map_err(|e| {
+                        error!("Invalid base64 commit: {}", e);
+                        StatusCode::BAD_REQUEST
+                    })?,
+            )
         } else {
             None
         };
 
         // Get or spawn conversation actor
-        let actor_ref = actor_registry.get_or_spawn(&input.convo_id).await
+        let actor_ref = actor_registry
+            .get_or_spawn(&input.convo_id)
+            .await
             .map_err(|e| {
                 error!("Failed to get conversation actor: {}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -75,14 +84,16 @@ pub async fn remove_member(
 
         // Send RemoveMember message
         let (tx, rx) = oneshot::channel();
-        actor_ref.send_message(ConvoMessage::RemoveMember {
-            member_did: input.target_did.as_str().to_string(),
-            commit: commit_bytes,
-            reply: tx,
-        }).map_err(|_| {
-            error!("Failed to send message to actor");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        actor_ref
+            .send_message(ConvoMessage::RemoveMember {
+                member_did: input.target_did.as_str().to_string(),
+                commit: commit_bytes,
+                reply: tx,
+            })
+            .map_err(|_| {
+                error!("Failed to send message to actor");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
         // Await response
         rx.await
@@ -108,7 +119,8 @@ pub async fn remove_member(
 
         // Process commit if provided
         if let Some(ref commit) = input.commit {
-            let commit_bytes = base64::engine::general_purpose::STANDARD.decode(commit)
+            let commit_bytes = base64::engine::general_purpose::STANDARD
+                .decode(commit)
                 .map_err(|e| {
                     error!("Invalid base64 commit: {}", e);
                     StatusCode::BAD_REQUEST
@@ -169,7 +181,10 @@ pub async fn remove_member(
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
-            info!("✅ [remove_member] Commit message stored with seq={}, epoch={}", seq, new_epoch);
+            info!(
+                "✅ [remove_member] Commit message stored with seq={}, epoch={}",
+                seq, new_epoch
+            );
 
             // Fan out commit message to all remaining members (async)
             let pool_clone = pool.clone();
@@ -194,7 +209,10 @@ pub async fn remove_member(
 
                 match members_result {
                     Ok(members) => {
-                        tracing::debug!("📍 [remove_member:fanout] fan-out commit to {} members", members.len());
+                        tracing::debug!(
+                            "📍 [remove_member:fanout] fan-out commit to {} members",
+                            members.len()
+                        );
 
                         // Create envelopes for each member
                         for (member_did,) in &members {
@@ -237,7 +255,17 @@ pub async fn remove_member(
                     .await;
 
                 // Fetch the commit message from database
-                let message_result = sqlx::query_as::<_, (String, Option<String>, Option<Vec<u8>>, i64, i64, chrono::DateTime<chrono::Utc>)>(
+                let message_result = sqlx::query_as::<
+                    _,
+                    (
+                        String,
+                        Option<String>,
+                        Option<Vec<u8>>,
+                        i64,
+                        i64,
+                        chrono::DateTime<chrono::Utc>,
+                    ),
+                >(
                     r#"
                     SELECT id, sender_did, ciphertext, epoch, seq, created_at
                     FROM messages
@@ -250,15 +278,16 @@ pub async fn remove_member(
 
                 match message_result {
                     Ok((id, _sender_did, ciphertext, epoch, seq, created_at)) => {
-                        let message_view = crate::models::MessageView::from(crate::models::MessageViewData {
-                            id,
-                            convo_id: convo_id_clone.clone(),
-                            ciphertext: ciphertext.unwrap_or_default(),
-                            epoch: epoch as usize,
-                            seq: seq as usize,
-                            created_at: crate::sqlx_atrium::chrono_to_datetime(created_at),
-                            message_type: None,
-                        });
+                        let message_view =
+                            crate::models::MessageView::from(crate::models::MessageViewData {
+                                id,
+                                convo_id: convo_id_clone.clone(),
+                                ciphertext: ciphertext.unwrap_or_default(),
+                                epoch: epoch as usize,
+                                seq: seq as usize,
+                                created_at: crate::sqlx_atrium::chrono_to_datetime(created_at),
+                                message_type: None,
+                            });
 
                         let event = crate::realtime::StreamEvent::MessageEvent {
                             cursor: cursor.clone(),
@@ -275,14 +304,22 @@ pub async fn remove_member(
                         )
                         .await
                         {
-                            tracing::error!("❌ [remove_member:fanout] Failed to store event: {:?}", e);
+                            tracing::error!(
+                                "❌ [remove_member:fanout] Failed to store event: {:?}",
+                                e
+                            );
                         }
 
                         // Emit to SSE subscribers
                         if let Err(e) = sse_state_clone.emit(&convo_id_clone, event).await {
-                            tracing::error!("❌ [remove_member:fanout] Failed to emit SSE event: {}", e);
+                            tracing::error!(
+                                "❌ [remove_member:fanout] Failed to emit SSE event: {}",
+                                e
+                            );
                         } else {
-                            tracing::debug!("✅ [remove_member:fanout] SSE event emitted for commit");
+                            tracing::debug!(
+                                "✅ [remove_member:fanout] SSE event emitted for commit"
+                            );
                         }
                     }
                     Err(e) => {
@@ -297,7 +334,7 @@ pub async fn remove_member(
         // Note: We check both user_did (for multi-device entries) and member_did (for legacy single-device entries)
         let affected_rows = sqlx::query(
             "UPDATE members SET left_at = $3
-             WHERE convo_id = $1 AND (user_did = $2 OR member_did = $2) AND left_at IS NULL"
+             WHERE convo_id = $1 AND (user_did = $2 OR member_did = $2) AND left_at IS NULL",
         )
         .bind(&input.convo_id)
         .bind(input.target_did.as_str())
@@ -325,11 +362,16 @@ pub async fn remove_member(
         .await;
 
     // Determine action based on reason - use "kicked" if there's a reason suggesting disciplinary action
-    let event_action = if input.reason.as_ref().map(|r|
-        r.to_lowercase().contains("violat") ||
-        r.to_lowercase().contains("abuse") ||
-        r.to_lowercase().contains("spam")
-    ).unwrap_or(false) {
+    let event_action = if input
+        .reason
+        .as_ref()
+        .map(|r| {
+            r.to_lowercase().contains("violat")
+                || r.to_lowercase().contains("abuse")
+                || r.to_lowercase().contains("spam")
+        })
+        .unwrap_or(false)
+    {
         "kicked"
     } else {
         "removed"
@@ -368,12 +410,20 @@ pub async fn remove_member(
     if let Err(e) = sse_state.emit(&input.convo_id, membership_event).await {
         error!("Failed to emit membershipChangeEvent: {}", e);
     } else {
-        info!("✅ Emitted membershipChangeEvent for {} being {} by {}",
-              input.target_did.as_str(), event_action, auth_user.did);
+        info!(
+            "✅ Emitted membershipChangeEvent for {} being {} by {}",
+            input.target_did.as_str(),
+            event_action,
+            auth_user.did
+        );
     }
 
-    info!("✅ [remove_member] SUCCESS - {} removed by {}, epoch_hint: {}",
-          input.target_did.as_str(), auth_user.did, new_epoch);
+    info!(
+        "✅ [remove_member] SUCCESS - {} removed by {}, epoch_hint: {}",
+        input.target_did.as_str(),
+        auth_user.did,
+        new_epoch
+    );
 
     Ok(Json(Output::from(OutputData {
         ok: true,

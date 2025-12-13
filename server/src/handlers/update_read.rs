@@ -3,7 +3,11 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{error, info};
 
-use crate::{auth::AuthUser, realtime::{SseState, StreamEvent}, storage::DbPool};
+use crate::{
+    auth::AuthUser,
+    realtime::{SseState, StreamEvent},
+    storage::DbPool,
+};
 
 #[derive(Debug, Deserialize)]
 pub struct UpdateReadInput {
@@ -36,7 +40,8 @@ pub async fn update_read(
     );
 
     // Enforce authorization
-    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.updateRead") {
+    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.updateRead")
+    {
         error!("❌ [update_read] Unauthorized - failed auth check");
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -60,7 +65,7 @@ pub async fn update_read(
     // If messageId is provided, validate it exists in this conversation
     if let Some(ref msg_id) = input.message_id {
         let message_exists = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM messages WHERE id = $1 AND convo_id = $2)"
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE id = $1 AND convo_id = $2)",
         )
         .bind(msg_id)
         .bind(&input.convo_id)
@@ -72,7 +77,10 @@ pub async fn update_read(
         })?;
 
         if !message_exists {
-            error!("❌ [update_read] Message {} not found in conversation {}", msg_id, input.convo_id);
+            error!(
+                "❌ [update_read] Message {} not found in conversation {}",
+                msg_id, input.convo_id
+            );
             return Err(StatusCode::NOT_FOUND);
         }
     }
@@ -86,7 +94,7 @@ pub async fn update_read(
         ON CONFLICT (convo_id, member_did, message_id)
         DO UPDATE SET read_at = NOW()
         RETURNING read_at
-        "#
+        "#,
     )
     .bind(&input.convo_id)
     .bind(&auth_user.did)
@@ -94,7 +102,10 @@ pub async fn update_read(
     .fetch_one(&pool)
     .await
     .map_err(|e| {
-        error!("❌ [update_read] Failed to insert/update read receipt: {}", e);
+        error!(
+            "❌ [update_read] Failed to insert/update read receipt: {}",
+            e
+        );
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
@@ -114,7 +125,10 @@ pub async fn update_read(
     }
 
     // Emit SSE read event to notify other conversation members
-    let cursor = sse_state.cursor_gen.next(&input.convo_id, "readEvent").await;
+    let cursor = sse_state
+        .cursor_gen
+        .next(&input.convo_id, "readEvent")
+        .await;
     let event = StreamEvent::ReadEvent {
         cursor,
         convo_id: input.convo_id.clone(),

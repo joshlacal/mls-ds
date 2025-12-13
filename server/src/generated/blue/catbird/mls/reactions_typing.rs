@@ -5,9 +5,9 @@ use serde::{Deserialize, Serialize};
 
 pub mod add_reaction {
     use super::*;
-    
+
     pub const NSID: &str = "blue.catbird.mls.addReaction";
-    
+
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub struct Input {
@@ -15,7 +15,7 @@ pub mod add_reaction {
         pub message_id: String,
         pub reaction: String,
     }
-    
+
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub struct Output {
@@ -27,9 +27,9 @@ pub mod add_reaction {
 
 pub mod remove_reaction {
     use super::*;
-    
+
     pub const NSID: &str = "blue.catbird.mls.removeReaction";
-    
+
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub struct Input {
@@ -37,7 +37,7 @@ pub mod remove_reaction {
         pub message_id: String,
         pub reaction: String,
     }
-    
+
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub struct Output {
@@ -47,16 +47,16 @@ pub mod remove_reaction {
 
 pub mod send_typing_indicator {
     use super::*;
-    
+
     pub const NSID: &str = "blue.catbird.mls.sendTypingIndicator";
-    
+
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub struct Input {
         pub convo_id: String,
         pub is_typing: bool,
     }
-    
+
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub struct Output {

@@ -44,9 +44,7 @@ pub struct GroupInfoRefreshRequestedEventData {
     ///DID of the member requesting the refresh (so they don't respond to their own request)
     pub requested_by: crate::types::string::Did,
 }
-pub type GroupInfoRefreshRequestedEvent = crate::types::Object<
-    GroupInfoRefreshRequestedEventData,
->;
+pub type GroupInfoRefreshRequestedEvent = crate::types::Object<GroupInfoRefreshRequestedEventData>;
 ///Event carrying informational messages (heartbeat or notices)
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -185,9 +183,7 @@ pub enum EventWrapperEventRefs {
     InfoEvent(Box<InfoEvent>),
     #[serde(rename = "blue.catbird.mls.streamConvoEvents#newDeviceEvent")]
     NewDeviceEvent(Box<NewDeviceEvent>),
-    #[serde(
-        rename = "blue.catbird.mls.streamConvoEvents#groupInfoRefreshRequestedEvent"
-    )]
+    #[serde(rename = "blue.catbird.mls.streamConvoEvents#groupInfoRefreshRequestedEvent")]
     GroupInfoRefreshRequestedEvent(Box<GroupInfoRefreshRequestedEvent>),
     #[serde(rename = "blue.catbird.mls.streamConvoEvents#readditionRequestedEvent")]
     ReadditionRequestedEvent(Box<ReadditionRequestedEvent>),

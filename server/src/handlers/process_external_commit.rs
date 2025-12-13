@@ -1,18 +1,18 @@
-use axum::{extract::State, Json};
 use axum::http::StatusCode;
-use openmls::prelude::*;
+use axum::{extract::State, Json};
+use base64::Engine;
 use openmls::prelude::tls_codec::Deserialize;
+use openmls::prelude::*;
 use serde::{Deserialize as SerdeDeserialize, Serialize};
 use tracing::{error, info, warn};
-use base64::Engine;
 
 use crate::{
     auth::AuthUser,
-    storage::{get_current_epoch, DbPool},
     realtime::{SseState, StreamEvent},
+    storage::{get_current_epoch, DbPool},
 };
-use std::sync::Arc;
 use axum::response::{IntoResponse, Response};
+use std::sync::Arc;
 
 // Query result types
 #[derive(sqlx::FromRow)]
@@ -122,7 +122,7 @@ impl From<Error> for ProcessExternalCommitError {
 
 /// Hash PSK using SHA256 and return hex string
 fn hash_psk(psk: &str) -> String {
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(psk.as_bytes());
     let result = hasher.finalize();
@@ -162,7 +162,7 @@ pub async fn handle(
             rejoin_window_days
         FROM conversation_policy
         WHERE convo_id = $1
-        "#
+        "#,
     )
     .bind(convo_id)
     .fetch_optional(&pool)
@@ -178,9 +178,10 @@ pub async fn handle(
 
     // Master switch: if external commits disabled entirely, reject immediately
     if !policy.allow_external_commits {
-        return Err(Error::PolicyViolation(
-            Some("External commits are disabled for this conversation".into())
-        ).into());
+        return Err(Error::PolicyViolation(Some(
+            "External commits are disabled for this conversation".into(),
+        ))
+        .into());
     }
 
     // =========================================================================
@@ -200,7 +201,7 @@ pub async fn handle(
         WHERE convo_id = $1 AND user_did = $2
         ORDER BY joined_at DESC
         LIMIT 1
-        "#
+        "#,
     )
     .bind(convo_id)
     .bind(did)
@@ -223,9 +224,10 @@ pub async fn handle(
         Some(member) if member.left_at.is_some() => {
             // Member left the group - treat as unauthorized
             // (Rejoining after leaving is different from resyncing after desync)
-            return Err(Error::Unauthorized(
-                Some("Member was removed or left. Request re-add from admin.".into())
-            ).into());
+            return Err(Error::Unauthorized(Some(
+                "Member was removed or left. Request re-add from admin.".into(),
+            ))
+            .into());
         }
         None => {
             // Not a member - this is a new join
@@ -248,9 +250,10 @@ pub async fn handle(
 
         // Check rejoin policy
         if !policy.allow_rejoin {
-            return Err(Error::PolicyViolation(
-                Some("Rejoin is disabled for this conversation".into())
-            ).into());
+            return Err(Error::PolicyViolation(Some(
+                "Rejoin is disabled for this conversation".into(),
+            ))
+            .into());
         }
 
         // Check rejoin window (0 = unlimited)
@@ -260,12 +263,11 @@ pub async fn handle(
             let now = chrono::Utc::now();
 
             if now > rejoin_deadline {
-                return Err(Error::PolicyViolation(
-                    Some(format!(
-                        "Rejoin window expired. Members can only rejoin within {} days of joining.",
-                        policy.rejoin_window_days
-                    ))
-                ).into());
+                return Err(Error::PolicyViolation(Some(format!(
+                    "Rejoin window expired. Members can only rejoin within {} days of joining.",
+                    policy.rejoin_window_days
+                )))
+                .into());
             }
         }
 
@@ -280,9 +282,7 @@ pub async fn handle(
                             "❌ Rejoin PSK verification failed for {} in {}",
                             did, convo_id
                         );
-                        return Err(Error::InvalidPsk(
-                            Some("Invalid rejoin PSK".into())
-                        ).into());
+                        return Err(Error::InvalidPsk(Some("Invalid rejoin PSK".into())).into());
                     }
                     info!("✅ Rejoin PSK verified for {} in {}", did, convo_id);
                 }
@@ -300,13 +300,12 @@ pub async fn handle(
             // PSK not provided
             if member.rejoin_psk_hash.is_some() {
                 // Member has PSK but didn't provide it
-                return Err(Error::InvalidPsk(
-                    Some("Rejoin PSK required but not provided".into())
-                ).into());
+                return Err(
+                    Error::InvalidPsk(Some("Rejoin PSK required but not provided".into())).into(),
+                );
             }
             // No PSK required (legacy member)
         }
-
     } else {
         // =====================================================================
         // NEW JOIN FLOW: Non-member attempting to join
@@ -318,9 +317,7 @@ pub async fn handle(
         if policy.require_invite_for_join {
             // Invite PSK verification required
             let psk = input.psk.as_ref().ok_or_else(|| {
-                Error::InvalidPsk(
-                    Some("Invite PSK required but not provided".into())
-                )
+                Error::InvalidPsk(Some("Invite PSK required but not provided".into()))
             })?;
 
             let psk_hash = hash_psk(psk);
@@ -336,19 +333,23 @@ pub async fn handle(
                 })?
                 .ok_or_else(|| {
                     warn!("❌ Invalid or expired invite for {} in {}", did, convo_id);
-                    Error::InvalidPsk(
-                        Some("Invalid, expired, or already-used invite".into())
-                    )
+                    Error::InvalidPsk(Some("Invalid, expired, or already-used invite".into()))
                 })?;
 
-            info!("✅ Invite PSK verified for {} in {} (invite_id: {})", did, convo_id, invite_id);
+            info!(
+                "✅ Invite PSK verified for {} in {} (invite_id: {})",
+                did, convo_id, invite_id
+            );
 
             // Increment invite uses count (will be committed with the transaction)
             // We do this after all validations to ensure atomicity
             // Note: This happens in the transaction below
         } else {
             // Invites not required - open join allowed
-            info!("Open join allowed for {} in {} (no invite required)", did, convo_id);
+            info!(
+                "Open join allowed for {} in {} (no invite required)",
+                did, convo_id
+            );
         }
     }
 
@@ -369,21 +370,21 @@ pub async fn handle(
     // STEP 5: Store commit and update state
     // =========================================================================
 
-    let current_epoch = get_current_epoch(&pool, convo_id)
-        .await
-        .map_err(|e| {
-            error!("Failed to get current epoch: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let current_epoch = get_current_epoch(&pool, convo_id).await.map_err(|e| {
+        error!("Failed to get current epoch: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let new_epoch = current_epoch + 1;
     let now = chrono::Utc::now();
 
     // Decode GroupInfo if present
     let group_info_bytes = if let Some(gi_str) = &input.group_info {
-        Some(base64::engine::general_purpose::STANDARD
-            .decode(gi_str)
-            .map_err(|e| Error::InvalidGroupInfo(Some(format!("Invalid base64: {}", e))))?)
+        Some(
+            base64::engine::general_purpose::STANDARD
+                .decode(gi_str)
+                .map_err(|e| Error::InvalidGroupInfo(Some(format!("Invalid base64: {}", e))))?,
+        )
     } else {
         None
     };
@@ -397,7 +398,7 @@ pub async fn handle(
     // Insert commit message
     let msg_id = uuid::Uuid::new_v4().to_string();
     let seq: i64 = sqlx::query_scalar(
-        "SELECT CAST(COALESCE(MAX(seq), 0) + 1 AS BIGINT) FROM messages WHERE convo_id = $1"
+        "SELECT CAST(COALESCE(MAX(seq), 0) + 1 AS BIGINT) FROM messages WHERE convo_id = $1",
     )
     .bind(convo_id)
     .fetch_one(&mut *tx)
@@ -442,7 +443,7 @@ pub async fn handle(
              SET group_info = $1,
                  group_info_updated_at = $2,
                  group_info_epoch = $3
-             WHERE id = $4"
+             WHERE id = $4",
         )
         .bind(&gi_bytes)
         .bind(now)
@@ -467,7 +468,7 @@ pub async fn handle(
              SET needs_rejoin = false,
                  rejoin_requested_at = NULL,
                  rejoin_key_package_hash = NULL
-             WHERE convo_id = $1 AND user_did = $2"
+             WHERE convo_id = $1 AND user_did = $2",
         )
         .bind(convo_id)
         .bind(did)
@@ -493,7 +494,7 @@ pub async fn handle(
                   AND (max_uses IS NULL OR uses_count < max_uses)
                   AND ($2::TEXT IS NULL OR target_did IS NULL OR target_did = $2)
                 LIMIT 1
-                "#
+                "#,
             )
             .bind(&psk_hash)
             .bind(did)
@@ -506,16 +507,14 @@ pub async fn handle(
 
             if let Some(invite_id) = invite_id {
                 // Increment uses count
-                sqlx::query(
-                    "UPDATE invites SET uses_count = uses_count + 1 WHERE id = $1"
-                )
-                .bind(&invite_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| {
-                    error!("Failed to increment invite uses: {}", e);
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?;
+                sqlx::query("UPDATE invites SET uses_count = uses_count + 1 WHERE id = $1")
+                    .bind(&invite_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| {
+                        error!("Failed to increment invite uses: {}", e);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?;
             }
         }
 
@@ -560,7 +559,9 @@ pub async fn handle(
         Ok(result) if result.rows_affected() > 0 => {
             info!(
                 "Marked {} pending addition(s) as self_joined for device {} in {}",
-                result.rows_affected(), did, convo_id
+                result.rows_affected(),
+                did,
+                convo_id
             );
         }
         Ok(_) => {
@@ -572,7 +573,10 @@ pub async fn handle(
         }
     }
 
-    info!("External commit processed: {} -> epoch {}", convo_id, new_epoch);
+    info!(
+        "External commit processed: {} -> epoch {}",
+        convo_id, new_epoch
+    );
 
     // =========================================================================
     // STEP 7: Fanout (Async)
@@ -600,7 +604,10 @@ pub async fn handle(
 
         match members_result {
             Ok(members) => {
-                tracing::debug!("📍 [process_external_commit:fanout] fan-out commit to {} members", members.len());
+                tracing::debug!(
+                    "📍 [process_external_commit:fanout] fan-out commit to {} members",
+                    members.len()
+                );
 
                 // Create envelopes for each member
                 for (member_did,) in &members {
@@ -629,15 +636,31 @@ pub async fn handle(
                 }
             }
             Err(e) => {
-                error!("❌ [process_external_commit:fanout] Failed to get members: {:?}", e);
+                error!(
+                    "❌ [process_external_commit:fanout] Failed to get members: {:?}",
+                    e
+                );
             }
         }
 
         // Emit SSE
-        let cursor = sse_state_clone.cursor_gen.next(&convo_id_clone, "messageEvent").await;
+        let cursor = sse_state_clone
+            .cursor_gen
+            .next(&convo_id_clone, "messageEvent")
+            .await;
 
         // Fetch the commit message from database
-        let message_result = sqlx::query_as::<_, (String, Option<String>, Option<Vec<u8>>, i64, i64, chrono::DateTime<chrono::Utc>)>(
+        let message_result = sqlx::query_as::<
+            _,
+            (
+                String,
+                Option<String>,
+                Option<Vec<u8>>,
+                i64,
+                i64,
+                chrono::DateTime<chrono::Utc>,
+            ),
+        >(
             r#"
             SELECT id, sender_did, ciphertext, epoch, seq, created_at
             FROM messages
@@ -650,15 +673,16 @@ pub async fn handle(
 
         match message_result {
             Ok((id, _sender_did, ciphertext, epoch, seq, created_at)) => {
-                let message_view = crate::models::MessageView::from(crate::models::MessageViewData {
-                    id,
-                    convo_id: convo_id_clone.clone(),
-                    ciphertext: ciphertext.unwrap_or_default(),
-                    epoch: epoch as usize,
-                    seq: seq as usize,
-                    created_at: crate::sqlx_atrium::chrono_to_datetime(created_at),
-                    message_type: None,
-                });
+                let message_view =
+                    crate::models::MessageView::from(crate::models::MessageViewData {
+                        id,
+                        convo_id: convo_id_clone.clone(),
+                        ciphertext: ciphertext.unwrap_or_default(),
+                        epoch: epoch as usize,
+                        seq: seq as usize,
+                        created_at: crate::sqlx_atrium::chrono_to_datetime(created_at),
+                        message_type: None,
+                    });
 
                 let event = StreamEvent::MessageEvent {
                     cursor: cursor.clone(),
@@ -675,12 +699,18 @@ pub async fn handle(
                 )
                 .await
                 {
-                    error!("❌ [process_external_commit:fanout] Failed to store event: {:?}", e);
+                    error!(
+                        "❌ [process_external_commit:fanout] Failed to store event: {:?}",
+                        e
+                    );
                 }
 
                 // Emit to SSE subscribers
                 if let Err(e) = sse_state_clone.emit(&convo_id_clone, event).await {
-                    error!("❌ [process_external_commit:fanout] Failed to emit SSE event: {}", e);
+                    error!(
+                        "❌ [process_external_commit:fanout] Failed to emit SSE event: {}",
+                        e
+                    );
                 }
             }
             Err(e) => {

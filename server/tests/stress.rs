@@ -117,7 +117,10 @@ async fn test_1000_conversations_concurrent() {
     println!("Conversations created.\n");
 
     // Spawn all actors and send messages concurrently
-    println!("Spawning actors and sending {} messages to each...", messages_per_conversation);
+    println!(
+        "Spawning actors and sending {} messages to each...",
+        messages_per_conversation
+    );
     let mut handles = vec![];
 
     for i in 0..num_conversations {
@@ -186,11 +189,19 @@ async fn test_1000_conversations_concurrent() {
     println!("  p50: {} µs ({:.2} ms)", p50, p50 as f64 / 1000.0);
     println!("  p95: {} µs ({:.2} ms)", p95, p95 as f64 / 1000.0);
     println!("  p99: {} µs ({:.2} ms)", p99, p99 as f64 / 1000.0);
-    println!("  max: {} µs ({:.2} ms)", max_latency, max_latency as f64 / 1000.0);
+    println!(
+        "  max: {} µs ({:.2} ms)",
+        max_latency,
+        max_latency as f64 / 1000.0
+    );
     println!("\nActive actors: {}", registry.actor_count());
 
     // Performance assertions
-    assert!(throughput > 100.0, "Throughput too low: {:.2} msg/sec", throughput);
+    assert!(
+        throughput > 100.0,
+        "Throughput too low: {:.2} msg/sec",
+        throughput
+    );
     assert!(p99 < 1_000_000, "p99 latency too high: {} µs", p99); // Less than 1 second
 
     // Cleanup
@@ -242,7 +253,10 @@ async fn test_sustained_load() {
     let mut latencies = Vec::new();
 
     println!("Starting sustained load test...");
-    println!("Target: {} req/sec for {} seconds", target_rps, duration_seconds);
+    println!(
+        "Target: {} req/sec for {} seconds",
+        target_rps, duration_seconds
+    );
     println!("Interval between requests: {:?}\n", interval);
 
     let start = Instant::now();
@@ -280,8 +294,14 @@ async fn test_sustained_load() {
         if total_messages % (target_rps * 10) == 0 {
             let elapsed = start.elapsed().as_secs();
             let actual_rps = total_messages as f64 / elapsed as f64;
-            println!("  {}s: {} messages sent ({:.2} req/sec), {} errors, {} actors",
-                elapsed, total_messages, actual_rps, error_count, registry.actor_count());
+            println!(
+                "  {}s: {} messages sent ({:.2} req/sec), {} errors, {} actors",
+                elapsed,
+                total_messages,
+                actual_rps,
+                error_count,
+                registry.actor_count()
+            );
         }
 
         // Sleep until next tick
@@ -314,8 +334,16 @@ async fn test_sustained_load() {
 
     // Performance assertions
     assert_eq!(error_count, 0, "Should have no errors");
-    assert!(actual_rps >= target_rps as f64 * 0.9, "Actual RPS too low: {:.2}", actual_rps);
-    assert_eq!(registry.actor_count(), num_conversations, "Actor count should remain stable");
+    assert!(
+        actual_rps >= target_rps as f64 * 0.9,
+        "Actual RPS too low: {:.2}",
+        actual_rps
+    );
+    assert_eq!(
+        registry.actor_count(),
+        num_conversations,
+        "Actor count should remain stable"
+    );
 
     // Cleanup
     println!("\nCleaning up...");
@@ -426,7 +454,8 @@ async fn test_actor_restart_under_load() {
     // Verify actors can be restarted
     let expected_messages = num_conversations * messages_per_convo;
     let killed_messages = (num_conversations * kill_percentage / 100) * 1; // 1 message lost per killed actor
-    let min_expected = expected_messages - killed_messages - (num_conversations * kill_percentage / 100);
+    let min_expected =
+        expected_messages - killed_messages - (num_conversations * kill_percentage / 100);
 
     assert!(
         total_messages_sent >= min_expected,

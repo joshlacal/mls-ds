@@ -1,8 +1,8 @@
 use axum::{extract::State, http::StatusCode, Json};
+use base64::Engine;
 use std::sync::Arc;
 use tokio::sync::oneshot;
-use tracing::{info, warn, error};
-use base64::Engine;
+use tracing::{error, info, warn};
 
 use crate::{
     actors::{ActorRegistry, ConvoMessage},
@@ -22,7 +22,8 @@ pub async fn leave_convo(
     auth_user: AuthUser,
     Json(input): Json<LeaveConvoInput>,
 ) -> Result<Json<LeaveConvoOutput>, StatusCode> {
-    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.leaveConvo") {
+    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.leaveConvo")
+    {
         return Err(StatusCode::UNAUTHORIZED);
     }
     let did = &auth_user.did;
@@ -41,29 +42,25 @@ pub async fn leave_convo(
     }
 
     // Check if requester is a member
-    if !is_member(&pool, did, &input.convo_id)
-        .await
-        .map_err(|e| {
-            error!("Failed to check membership: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?
-    {
+    if !is_member(&pool, did, &input.convo_id).await.map_err(|e| {
+        error!("Failed to check membership: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })? {
         warn!("User is not a member of conversation");
         return Err(StatusCode::FORBIDDEN);
     }
 
     // Users can only remove themselves unless they're the creator
     if &target_did != did {
-        let creator_did: String = sqlx::query_scalar(
-            "SELECT creator_did FROM conversations WHERE id = $1"
-        )
-        .bind(&input.convo_id)
-        .fetch_one(&pool)
-        .await
-        .map_err(|e| {
-            error!("Failed to fetch conversation creator: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        let creator_did: String =
+            sqlx::query_scalar("SELECT creator_did FROM conversations WHERE id = $1")
+                .bind(&input.convo_id)
+                .fetch_one(&pool)
+                .await
+                .map_err(|e| {
+                    error!("Failed to fetch conversation creator: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
 
         if creator_did != *did {
             warn!("User is not the creator, cannot remove other members");
@@ -83,17 +80,22 @@ pub async fn leave_convo(
 
         // Decode commit if provided
         let commit_bytes = if let Some(ref commit) = input.commit {
-            Some(base64::engine::general_purpose::STANDARD.decode(commit)
-                .map_err(|e| {
-                    warn!("Invalid base64 commit: {}", e);
-                    StatusCode::BAD_REQUEST
-                })?)
+            Some(
+                base64::engine::general_purpose::STANDARD
+                    .decode(commit)
+                    .map_err(|e| {
+                        warn!("Invalid base64 commit: {}", e);
+                        StatusCode::BAD_REQUEST
+                    })?,
+            )
         } else {
             None
         };
 
         // Get or spawn conversation actor
-        let actor_ref = actor_registry.get_or_spawn(&input.convo_id).await
+        let actor_ref = actor_registry
+            .get_or_spawn(&input.convo_id)
+            .await
             .map_err(|e| {
                 error!("Failed to get conversation actor: {}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -101,14 +103,16 @@ pub async fn leave_convo(
 
         // Send RemoveMember message
         let (tx, rx) = oneshot::channel();
-        actor_ref.send_message(ConvoMessage::RemoveMember {
-            member_did: target_did.clone(),
-            commit: commit_bytes,
-            reply: tx,
-        }).map_err(|_| {
-            error!("Failed to send message to actor");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        actor_ref
+            .send_message(ConvoMessage::RemoveMember {
+                member_did: target_did.clone(),
+                commit: commit_bytes,
+                reply: tx,
+            })
+            .map_err(|_| {
+                error!("Failed to send message to actor");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
         // Await response
         rx.await
@@ -136,7 +140,8 @@ pub async fn leave_convo(
         // Process commit if provided
         if let Some(commit) = input.commit {
             use base64::Engine;
-            let commit_bytes = base64::engine::general_purpose::STANDARD.decode(commit)
+            let commit_bytes = base64::engine::general_purpose::STANDARD
+                .decode(commit)
                 .map_err(|e| {
                     warn!("Invalid base64 commit: {}", e);
                     StatusCode::BAD_REQUEST
@@ -197,7 +202,10 @@ pub async fn leave_convo(
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
-            info!("✅ [leave_convo] Commit message stored with seq={}, epoch={}", seq, new_epoch);
+            info!(
+                "✅ [leave_convo] Commit message stored with seq={}, epoch={}",
+                seq, new_epoch
+            );
 
             // Fan out commit message to all members (async)
             let pool_clone = pool.clone();
@@ -222,7 +230,10 @@ pub async fn leave_convo(
 
                 match members_result {
                     Ok(members) => {
-                        tracing::debug!("📍 [leave_convo:fanout] fan-out commit to {} members", members.len());
+                        tracing::debug!(
+                            "📍 [leave_convo:fanout] fan-out commit to {} members",
+                            members.len()
+                        );
 
                         // Create envelopes for each member
                         for (member_did,) in &members {
@@ -278,15 +289,16 @@ pub async fn leave_convo(
 
                 match message_result {
                     Ok(msg) => {
-                        let message_view = crate::models::MessageView::from(crate::models::MessageViewData {
-                            id: msg.id,
-                            convo_id: convo_id_clone.clone(),
-                            ciphertext: msg.ciphertext.unwrap_or_default(),
-                            epoch: msg.epoch as usize,
-                            seq: msg.seq as usize,
-                            created_at: crate::sqlx_atrium::chrono_to_datetime(msg.created_at),
-                            message_type: None,
-                        });
+                        let message_view =
+                            crate::models::MessageView::from(crate::models::MessageViewData {
+                                id: msg.id,
+                                convo_id: convo_id_clone.clone(),
+                                ciphertext: msg.ciphertext.unwrap_or_default(),
+                                epoch: msg.epoch as usize,
+                                seq: msg.seq as usize,
+                                created_at: crate::sqlx_atrium::chrono_to_datetime(msg.created_at),
+                                message_type: None,
+                            });
 
                         let event = crate::realtime::StreamEvent::MessageEvent {
                             cursor: cursor.clone(),
@@ -300,7 +312,10 @@ pub async fn leave_convo(
                         }
                     }
                     Err(e) => {
-                        error!("❌ [leave_convo:fanout] Failed to fetch message for SSE: {:?}", e);
+                        error!(
+                            "❌ [leave_convo:fanout] Failed to fetch message for SSE: {:?}",
+                            e
+                        );
                     }
                 }
             });
@@ -346,14 +361,20 @@ pub async fn leave_convo(
             if let Err(e) = sse_state.emit(&input.convo_id, membership_event).await {
                 error!("Failed to emit membershipChangeEvent: {}", e);
             } else {
-                info!("✅ Emitted membershipChangeEvent for {} leaving", target_did);
+                info!(
+                    "✅ Emitted membershipChangeEvent for {} leaving",
+                    target_did
+                );
             }
         }
 
         new_epoch as u32
     };
 
-    info!("User successfully left conversation, new epoch: {}", new_epoch);
+    info!(
+        "User successfully left conversation, new epoch: {}",
+        new_epoch
+    );
 
     Ok(Json(LeaveConvoOutput {
         success: true,
@@ -375,29 +396,52 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
-        
+
         for member in members {
-            sqlx::query("INSERT INTO members (convo_id, member_did, joined_at) VALUES ($1, $2, $3)")
-                .bind(convo_id)
-                .bind(member)
-                .bind(&now)
-                .execute(pool)
-                .await
-                .unwrap();
+            sqlx::query(
+                "INSERT INTO members (convo_id, member_did, joined_at) VALUES ($1, $2, $3)",
+            )
+            .bind(convo_id)
+            .bind(member)
+            .bind(&now)
+            .execute(pool)
+            .await
+            .unwrap();
         }
     }
 
     #[tokio::test]
     async fn test_leave_convo_success() {
-        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
-        let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
+        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else {
+            return;
+        };
+        let pool = crate::db::init_db(crate::db::DbConfig {
+            database_url: db_url,
+            max_connections: 5,
+            min_connections: 1,
+            acquire_timeout: std::time::Duration::from_secs(5),
+            idle_timeout: std::time::Duration::from_secs(30),
+        })
+        .await
+        .unwrap();
         let convo_id = "test-convo-1";
         let creator = "did:plc:creator";
         let member = "did:plc:member";
-        
+
         setup_test_convo(&pool, creator, convo_id, vec![creator, member]).await;
 
-        let did = AuthUser { did: member.to_string(), claims: crate::auth::AtProtoClaims { iss: member.to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
+        let did = AuthUser {
+            did: member.to_string(),
+            claims: crate::auth::AtProtoClaims {
+                iss: member.to_string(),
+                aud: "test".to_string(),
+                exp: 9999999999,
+                iat: None,
+                sub: None,
+                jti: Some("test-jti".to_string()),
+                lxm: None,
+            },
+        };
         let input = LeaveConvoInput {
             convo_id: convo_id.to_string(),
             target_did: None,
@@ -406,7 +450,7 @@ mod tests {
 
         let result = leave_convo(State(pool.clone()), did, Json(input)).await;
         assert!(result.is_ok());
-        
+
         let output = result.unwrap().0;
         assert!(output.success);
         assert_eq!(output.new_epoch, 1);
@@ -418,14 +462,35 @@ mod tests {
 
     #[tokio::test]
     async fn test_leave_convo_not_member() {
-        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
-        let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
+        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else {
+            return;
+        };
+        let pool = crate::db::init_db(crate::db::DbConfig {
+            database_url: db_url,
+            max_connections: 5,
+            min_connections: 1,
+            acquire_timeout: std::time::Duration::from_secs(5),
+            idle_timeout: std::time::Duration::from_secs(30),
+        })
+        .await
+        .unwrap();
         let convo_id = "test-convo-2";
         let creator = "did:plc:creator";
-        
+
         setup_test_convo(&pool, creator, convo_id, vec![creator]).await;
 
-        let did = AuthUser { did: "did:plc:outsider".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:outsider".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
+        let did = AuthUser {
+            did: "did:plc:outsider".to_string(),
+            claims: crate::auth::AtProtoClaims {
+                iss: "did:plc:outsider".to_string(),
+                aud: "test".to_string(),
+                exp: 9999999999,
+                iat: None,
+                sub: None,
+                jti: Some("test-jti".to_string()),
+                lxm: None,
+            },
+        };
         let input = LeaveConvoInput {
             convo_id: convo_id.to_string(),
             target_did: None,
@@ -438,15 +503,36 @@ mod tests {
 
     #[tokio::test]
     async fn test_leave_convo_creator_removes_member() {
-        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
-        let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
+        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else {
+            return;
+        };
+        let pool = crate::db::init_db(crate::db::DbConfig {
+            database_url: db_url,
+            max_connections: 5,
+            min_connections: 1,
+            acquire_timeout: std::time::Duration::from_secs(5),
+            idle_timeout: std::time::Duration::from_secs(30),
+        })
+        .await
+        .unwrap();
         let convo_id = "test-convo-3";
         let creator = "did:plc:creator";
         let member = "did:plc:member";
-        
+
         setup_test_convo(&pool, creator, convo_id, vec![creator, member]).await;
 
-        let did = AuthUser { did: creator.to_string(), claims: crate::auth::AtProtoClaims { iss: creator.to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
+        let did = AuthUser {
+            did: creator.to_string(),
+            claims: crate::auth::AtProtoClaims {
+                iss: creator.to_string(),
+                aud: "test".to_string(),
+                exp: 9999999999,
+                iat: None,
+                sub: None,
+                jti: Some("test-jti".to_string()),
+                lxm: None,
+            },
+        };
         let input = LeaveConvoInput {
             convo_id: convo_id.to_string(),
             target_did: Some(member.to_string()),
@@ -455,23 +541,44 @@ mod tests {
 
         let result = leave_convo(State(pool.clone()), did, Json(input)).await;
         assert!(result.is_ok());
-        
+
         let is_active = is_member(&pool, member, convo_id).await.unwrap();
         assert!(!is_active);
     }
 
     #[tokio::test]
     async fn test_leave_convo_non_creator_cannot_remove_others() {
-        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
-        let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
+        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else {
+            return;
+        };
+        let pool = crate::db::init_db(crate::db::DbConfig {
+            database_url: db_url,
+            max_connections: 5,
+            min_connections: 1,
+            acquire_timeout: std::time::Duration::from_secs(5),
+            idle_timeout: std::time::Duration::from_secs(30),
+        })
+        .await
+        .unwrap();
         let convo_id = "test-convo-4";
         let creator = "did:plc:creator";
         let member1 = "did:plc:member1";
         let member2 = "did:plc:member2";
-        
+
         setup_test_convo(&pool, creator, convo_id, vec![creator, member1, member2]).await;
 
-        let did = AuthUser { did: member1.to_string(), claims: crate::auth::AtProtoClaims { iss: member1.to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
+        let did = AuthUser {
+            did: member1.to_string(),
+            claims: crate::auth::AtProtoClaims {
+                iss: member1.to_string(),
+                aud: "test".to_string(),
+                exp: 9999999999,
+                iat: None,
+                sub: None,
+                jti: Some("test-jti".to_string()),
+                lxm: None,
+            },
+        };
         let input = LeaveConvoInput {
             convo_id: convo_id.to_string(),
             target_did: Some(member2.to_string()),

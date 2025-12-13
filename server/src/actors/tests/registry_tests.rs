@@ -4,8 +4,8 @@ mod registry_tests {
     use sqlx::PgPool;
     use std::sync::Arc;
     use std::time::Duration;
-    use tokio::sync::Barrier;
     use tokio::sync::oneshot;
+    use tokio::sync::Barrier;
 
     /// Test helper to set up a test database
     async fn setup_test_db() -> PgPool {
@@ -228,11 +228,7 @@ mod registry_tests {
         assert_eq!(registry.actor_count(), 0);
 
         // Create multiple conversations
-        let convos = vec![
-            "test-count-1",
-            "test-count-2",
-            "test-count-3",
-        ];
+        let convos = vec!["test-count-1", "test-count-2", "test-count-3"];
 
         for convo_id in &convos {
             cleanup_test_data(&pool, convo_id).await;

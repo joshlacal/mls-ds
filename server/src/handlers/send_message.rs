@@ -1,4 +1,8 @@
-use axum::{extract::{rejection::JsonRejection, State}, http::StatusCode, Json};
+use axum::{
+    extract::{rejection::JsonRejection, State},
+    http::StatusCode,
+    Json,
+};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use tracing::{error, info};
@@ -6,12 +10,12 @@ use tracing::{error, info};
 use crate::{
     actors::{ActorRegistry, ConvoMessage},
     auth::AuthUser,
+    db,
     generated::blue::catbird::mls::send_message::{Input, NSID},
+    notifications::NotificationService,
     realtime::{SseState, StreamEvent},
     sqlx_atrium::chrono_to_datetime,
-    db,
     storage::{is_member, DbPool},
-    notifications::NotificationService,
 };
 
 /// Send a message to a conversation
@@ -26,7 +30,10 @@ pub async fn send_message(
     input: Result<Json<Input>, JsonRejection>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let Json(input) = input.map_err(|rejection| {
-        error!("❌ [send_message] Failed to deserialize request body: {}", rejection);
+        error!(
+            "❌ [send_message] Failed to deserialize request body: {}",
+            rejection
+        );
         StatusCode::BAD_REQUEST
     })?;
     let input = input.data; // Unwrap Object<InputData>
@@ -52,8 +59,13 @@ pub async fn send_message(
     // Clients derive sender from decrypted MLS content
 
     // Validate msgId format (accept ULID 26 chars or UUID 36 chars with hyphens)
-    let is_ulid = input.msg_id.len() == 26 && input.msg_id.chars().all(|c| c.is_ascii_alphanumeric());
-    let is_uuid = input.msg_id.len() == 36 && input.msg_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    let is_ulid =
+        input.msg_id.len() == 26 && input.msg_id.chars().all(|c| c.is_ascii_alphanumeric());
+    let is_uuid = input.msg_id.len() == 36
+        && input
+            .msg_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-');
     if !is_ulid && !is_uuid {
         error!("❌ [send_message] Invalid msgId format (expected ULID or UUID)");
         return Err(StatusCode::BAD_REQUEST);
@@ -65,7 +77,10 @@ pub async fn send_message(
         return Err(StatusCode::BAD_REQUEST);
     }
     if input.ciphertext.len() > 10 * 1024 * 1024 {
-        error!("❌ [send_message] Ciphertext too large: {} bytes", input.ciphertext.len());
+        error!(
+            "❌ [send_message] Ciphertext too large: {} bytes",
+            input.ciphertext.len()
+        );
         return Err(StatusCode::BAD_REQUEST);
     }
 
@@ -82,9 +97,7 @@ pub async fn send_message(
     // Validate padded_size is a valid bucket size
     let valid_buckets = [512, 1024, 2048, 4096, 8192];
     let is_valid_bucket = valid_buckets.contains(&padded_size)
-        || (padded_size > 8192
-            && padded_size <= 10 * 1024 * 1024
-            && padded_size % 8192 == 0);
+        || (padded_size > 8192 && padded_size <= 10 * 1024 * 1024 && padded_size % 8192 == 0);
 
     if !is_valid_bucket {
         error!(
@@ -96,10 +109,13 @@ pub async fn send_message(
 
     tracing::debug!("📍 [send_message] checking membership");
     // Check if sender is a member
-    if !is_member(&pool, &auth_user.did, &input.convo_id).await.map_err(|e| {
-        error!("❌ [send_message] Failed to check membership: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })? {
+    if !is_member(&pool, &auth_user.did, &input.convo_id)
+        .await
+        .map_err(|e| {
+            error!("❌ [send_message] Failed to check membership: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+    {
         error!(
             "❌ [send_message] User {} is not a member of conversation {}",
             auth_user.did, input.convo_id
@@ -159,7 +175,7 @@ pub async fn send_message(
     // Update server's last-seen epoch for telemetry (best-effort, non-blocking)
     if client_epoch as i32 > convo.current_epoch {
         let _ = sqlx::query(
-            "UPDATE conversations SET current_epoch = GREATEST(current_epoch, $1) WHERE id = $2"
+            "UPDATE conversations SET current_epoch = GREATEST(current_epoch, $1) WHERE id = $2",
         )
         .bind(client_epoch as i32)
         .bind(&input.convo_id)
@@ -179,7 +195,9 @@ pub async fn send_message(
         tracing::debug!("Using actor system for send_message");
 
         // Get or spawn conversation actor
-        let actor_ref = actor_registry.get_or_spawn(&input.convo_id).await
+        let actor_ref = actor_registry
+            .get_or_spawn(&input.convo_id)
+            .await
             .map_err(|e| {
                 error!("Failed to get conversation actor: {}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -187,21 +205,24 @@ pub async fn send_message(
 
         // Send message via actor with all privacy fields
         let (tx, rx) = oneshot::channel();
-        actor_ref.send_message(ConvoMessage::SendMessage {
-            sender_did: auth_user.did.clone(),
-            ciphertext: input.ciphertext.clone(),
-            msg_id: input.msg_id.clone(),
-            epoch: input.epoch as i64,
-            padded_size: padded_size as i64,
-            idempotency_key: input.idempotency_key.clone(),
-            reply: tx,
-        }).map_err(|_| {
-            error!("Failed to send message to actor");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        actor_ref
+            .send_message(ConvoMessage::SendMessage {
+                sender_did: auth_user.did.clone(),
+                ciphertext: input.ciphertext.clone(),
+                msg_id: input.msg_id.clone(),
+                epoch: input.epoch as i64,
+                padded_size: padded_size as i64,
+                idempotency_key: input.idempotency_key.clone(),
+                reply: tx,
+            })
+            .map_err(|_| {
+                error!("Failed to send message to actor");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
         // Await response - actor already stored message and returns (msg_id, timestamp)
-        let (msg_id, created_at) = rx.await
+        let (msg_id, created_at) = rx
+            .await
             .map_err(|_| {
                 error!("Actor channel closed unexpectedly");
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -258,7 +279,12 @@ pub async fn send_message(
         let seq = message.seq;
         let epoch = message.epoch;
 
-        tracing::debug!("send_message message created: msgId={}, seq={}, epoch={}", crate::crypto::redact_for_log(&msg_id), seq, epoch);
+        tracing::debug!(
+            "send_message message created: msgId={}, seq={}, epoch={}",
+            crate::crypto::redact_for_log(&msg_id),
+            seq,
+            epoch
+        );
 
         tracing::debug!("📍 [send_message] updating unread counts");
         // Update unread counts for all members except sender's devices
@@ -278,7 +304,10 @@ pub async fn send_message(
         (msg_id, now, seq, epoch)
     };
 
-    tracing::debug!("send_message message created: msgId={}", crate::crypto::redact_for_log(&msg_id));
+    tracing::debug!(
+        "send_message message created: msgId={}",
+        crate::crypto::redact_for_log(&msg_id)
+    );
 
     tracing::debug!("📍 [send_message] spawning fan-out task");
     // Spawn async task for fan-out, push notifications, and realtime emission
@@ -339,13 +368,13 @@ pub async fn send_message(
                 let fanout_duration = fanout_start.elapsed();
                 crate::metrics::record_envelope_write_duration(&convo_id, fanout_duration);
 
-                tracing::debug!("send_message:fanout completed in {}ms", fanout_duration.as_millis());
+                tracing::debug!(
+                    "send_message:fanout completed in {}ms",
+                    fanout_duration.as_millis()
+                );
             }
             Err(e) => {
-                error!(
-                    "❌ [send_message:fanout] Failed to get members: {:?}",
-                    e
-                );
+                error!("❌ [send_message:fanout] Failed to get members: {:?}", e);
             }
         }
 
@@ -371,15 +400,16 @@ pub async fn send_message(
         match message_result {
             Ok(msg) => {
                 // Note: sender field removed per security hardening - clients derive sender from decrypted MLS content
-                let message_view = crate::models::MessageView::from(crate::models::MessageViewData {
-                    id: msg.id,
-                    convo_id: convo_id.clone(),
-                    ciphertext: msg.ciphertext.unwrap_or_default(),
-                    epoch: msg.epoch as usize,
-                    seq: msg.seq as usize,
-                    created_at: crate::sqlx_atrium::chrono_to_datetime(msg.created_at),
-                    message_type: None,
-                });
+                let message_view =
+                    crate::models::MessageView::from(crate::models::MessageViewData {
+                        id: msg.id,
+                        convo_id: convo_id.clone(),
+                        ciphertext: msg.ciphertext.unwrap_or_default(),
+                        epoch: msg.epoch as usize,
+                        seq: msg.seq as usize,
+                        created_at: crate::sqlx_atrium::chrono_to_datetime(msg.created_at),
+                        message_type: None,
+                    });
 
                 let event = StreamEvent::MessageEvent {
                     cursor: cursor.clone(),
@@ -402,10 +432,7 @@ pub async fn send_message(
 
                 // Emit to SSE subscribers
                 if let Err(e) = sse_state_clone.emit(&convo_id, event).await {
-                    error!(
-                        "❌ [send_message:fanout] Failed to emit SSE event: {}",
-                        e
-                    );
+                    error!("❌ [send_message:fanout] Failed to emit SSE event: {}", e);
                 } else {
                     tracing::debug!("✅ [send_message:fanout] SSE event emitted");
                 }
@@ -520,11 +547,13 @@ mod tests {
                 iss: sender.to_string(),
                 aud: "test".to_string(),
                 exp: 9999999999,
-                iat: None, jti: Some("test-jti".to_string()), lxm: None,
+                iat: None,
+                jti: Some("test-jti".to_string()),
+                lxm: None,
                 sub: None,
             },
         };
-        
+
         let input = SendMessageInput {
             convo_id: convo_id.to_string(),
             ciphertext: b"encrypted message data".to_vec(),
@@ -534,12 +563,7 @@ mod tests {
             embed_uri: None,
         };
 
-        let result = send_message(
-            State(pool), 
-            State(sse_state), 
-            auth_user, 
-            Json(input)
-        ).await;
+        let result = send_message(State(pool), State(sse_state), auth_user, Json(input)).await;
         assert!(result.is_ok());
 
         let output = result.unwrap().0;
@@ -572,11 +596,13 @@ mod tests {
                 iss: "did:plc:outsider".to_string(),
                 aud: "test".to_string(),
                 exp: 9999999999,
-                iat: None, jti: Some("test-jti".to_string()), lxm: None,
+                iat: None,
+                jti: Some("test-jti".to_string()),
+                lxm: None,
                 sub: None,
             },
         };
-        
+
         let input = SendMessageInput {
             convo_id: convo_id.to_string(),
             ciphertext: b"encrypted message data".to_vec(),
@@ -586,12 +612,7 @@ mod tests {
             embed_uri: None,
         };
 
-        let result = send_message(
-            State(pool), 
-            State(sse_state), 
-            auth_user, 
-            Json(input)
-        ).await;
+        let result = send_message(State(pool), State(sse_state), auth_user, Json(input)).await;
         assert_eq!(result.unwrap_err(), StatusCode::FORBIDDEN);
     }
 
@@ -621,11 +642,13 @@ mod tests {
                 iss: sender.to_string(),
                 aud: "test".to_string(),
                 exp: 9999999999,
-                iat: None, jti: Some("test-jti".to_string()), lxm: None,
+                iat: None,
+                jti: Some("test-jti".to_string()),
+                lxm: None,
                 sub: None,
             },
         };
-        
+
         let input = SendMessageInput {
             convo_id: convo_id.to_string(),
             ciphertext: b"".to_vec(), // Empty ciphertext should fail
@@ -635,12 +658,7 @@ mod tests {
             embed_uri: None,
         };
 
-        let result = send_message(
-            State(pool), 
-            State(sse_state), 
-            auth_user, 
-            Json(input)
-        ).await;
+        let result = send_message(State(pool), State(sse_state), auth_user, Json(input)).await;
         assert_eq!(result.unwrap_err(), StatusCode::BAD_REQUEST);
     }
 
@@ -670,11 +688,13 @@ mod tests {
                 iss: sender.to_string(),
                 aud: "test".to_string(),
                 exp: 9999999999,
-                iat: None, jti: Some("test-jti".to_string()), lxm: None,
+                iat: None,
+                jti: Some("test-jti".to_string()),
+                lxm: None,
                 sub: None,
             },
         };
-        
+
         let input = SendMessageInput {
             convo_id: convo_id.to_string(),
             ciphertext: b"encrypted message data".to_vec(),
@@ -684,12 +704,7 @@ mod tests {
             embed_uri: None,
         };
 
-        let result = send_message(
-            State(pool), 
-            State(sse_state), 
-            auth_user, 
-            Json(input)
-        ).await;
+        let result = send_message(State(pool), State(sse_state), auth_user, Json(input)).await;
         assert_eq!(result.unwrap_err(), StatusCode::FORBIDDEN);
     }
 }

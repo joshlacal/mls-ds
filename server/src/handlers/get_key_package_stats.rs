@@ -1,13 +1,13 @@
-use axum::{extract::{RawQuery, State}, http::StatusCode, Json};
+use axum::{
+    extract::{RawQuery, State},
+    http::StatusCode,
+    Json,
+};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
-use crate::{
-    auth::AuthUser,
-    device_utils::parse_device_did,
-    storage::DbPool,
-};
+use crate::{auth::AuthUser, device_utils::parse_device_did, storage::DbPool};
 
 const RECOMMENDED_THRESHOLD: i32 = 5;
 
@@ -41,10 +41,10 @@ pub struct KeyPackageStatsResponse {
     #[serde(rename = "consumedLast7d")]
     consumed_last_7d: i32,
     #[serde(rename = "averageDailyConsumption")]
-    average_daily_consumption: i32,  // Multiplied by 100 (e.g., 250 = 2.5/day)
+    average_daily_consumption: i32, // Multiplied by 100 (e.g., 250 = 2.5/day)
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "predictedDepletionDays")]
-    predicted_depletion_days: Option<i32>,  // Multiplied by 100 (e.g., 350 = 3.5 days)
+    predicted_depletion_days: Option<i32>, // Multiplied by 100 (e.g., 350 = 3.5 days)
 }
 
 /// Get key package inventory statistics
@@ -55,7 +55,9 @@ pub async fn get_key_package_stats(
     auth_user: AuthUser,
     RawQuery(query): RawQuery,
 ) -> Result<Json<KeyPackageStatsResponse>, StatusCode> {
-    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.getKeyPackageStats") {
+    if let Err(_e) =
+        crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.getKeyPackageStats")
+    {
         warn!("Unauthorized access attempt");
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -80,45 +82,44 @@ pub async fn get_key_package_stats(
     let did_raw = target_did.as_deref().unwrap_or(&auth_user.did);
 
     // Extract user DID from device DID (handles both single and multi-device mode)
-    let (did, _device_id) = parse_device_did(did_raw)
-        .map_err(|e| {
-            error!("Invalid device DID format: {}", e);
-            StatusCode::BAD_REQUEST
-        })?;
+    let (did, _device_id) = parse_device_did(did_raw).map_err(|e| {
+        error!("Invalid device DID format: {}", e);
+        StatusCode::BAD_REQUEST
+    })?;
 
     info!("Fetching key package stats");
 
     // Get available key packages count
-    let available = get_available_count(&pool, &did, cipher_suite_filter.as_deref()).await
+    let available = get_available_count(&pool, &did, cipher_suite_filter.as_deref())
+        .await
         .map_err(|e| {
             error!("Failed to count available key packages: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
     // Get oldest expiration timestamp
-    let oldest_expires_at = get_oldest_expiration(&pool, &did, cipher_suite_filter.as_deref()).await
+    let oldest_expires_at = get_oldest_expiration(&pool, &did, cipher_suite_filter.as_deref())
+        .await
         .map_err(|e| {
             error!("Failed to get oldest expiration: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    let oldest_expires_in = oldest_expires_at.map(|exp| {
-        format_duration_until(exp)
-    });
+    let oldest_expires_in = oldest_expires_at.map(|exp| format_duration_until(exp));
 
     // Get breakdown by cipher suite if no filter is provided
     let by_cipher_suite = if cipher_suite_filter.is_none() {
-        Some(get_stats_by_cipher_suite(&pool, &did).await
-            .map_err(|e| {
-                error!("Failed to get stats by cipher suite: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?)
+        Some(get_stats_by_cipher_suite(&pool, &did).await.map_err(|e| {
+            error!("Failed to get stats by cipher suite: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?)
     } else {
         None
     };
 
     // Get consumption statistics
-    let total = crate::db::count_all_key_packages(&pool, &did, cipher_suite_filter.as_deref()).await
+    let total = crate::db::count_all_key_packages(&pool, &did, cipher_suite_filter.as_deref())
+        .await
         .map_err(|e| {
             error!("Failed to count all key packages: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
@@ -126,19 +127,22 @@ pub async fn get_key_package_stats(
 
     let consumed = total - available;
 
-    let consumed_last_24h = crate::db::count_consumed_key_packages(&pool, &did, 24).await
+    let consumed_last_24h = crate::db::count_consumed_key_packages(&pool, &did, 24)
+        .await
         .map_err(|e| {
             error!("Failed to count consumed packages (24h): {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })? as i32;
 
-    let consumed_last_7d = crate::db::count_consumed_key_packages(&pool, &did, 24 * 7).await
+    let consumed_last_7d = crate::db::count_consumed_key_packages(&pool, &did, 24 * 7)
+        .await
         .map_err(|e| {
             error!("Failed to count consumed packages (7d): {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })? as i32;
 
-    let average_daily_consumption_f64 = crate::db::get_consumption_rate(&pool, &did).await
+    let average_daily_consumption_f64 = crate::db::get_consumption_rate(&pool, &did)
+        .await
         .map_err(|e| {
             error!("Failed to get consumption rate: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
@@ -150,15 +154,15 @@ pub async fn get_key_package_stats(
     // Calculate predicted depletion days
     let predicted_depletion_days = if average_daily_consumption_f64 > 0.1 && available > 0 {
         let days = (available as f64) / average_daily_consumption_f64;
-        Some((days * 100.0) as i32)  // Multiply by 100
+        Some((days * 100.0) as i32) // Multiply by 100
     } else {
         None
     };
 
     // Enhanced needs_replenish logic: replenish if below threshold OR predicted to deplete in < 3 days
     // Note: predicted_depletion_days is multiplied by 100, so < 300 means < 3.0 days
-    let needs_replenish = available < RECOMMENDED_THRESHOLD ||
-        predicted_depletion_days.map_or(false, |days| days < 300);
+    let needs_replenish = available < RECOMMENDED_THRESHOLD
+        || predicted_depletion_days.map_or(false, |days| days < 300);
 
     info!(
         "Key package stats for {}: available={}, threshold={}, needs_replenish={}, consumption_rate={:.2}/day",
@@ -194,7 +198,7 @@ async fn get_available_count(
               AND cipher_suite = $2
               AND consumed_at IS NULL
               AND expires_at > NOW()
-            "#
+            "#,
         )
         .bind(did)
         .bind(suite)
@@ -208,7 +212,7 @@ async fn get_available_count(
             WHERE owner_did = $1
               AND consumed_at IS NULL
               AND expires_at > NOW()
-            "#
+            "#,
         )
         .bind(did)
         .fetch_one(pool)
@@ -232,7 +236,7 @@ async fn get_oldest_expiration(
               AND cipher_suite = $2
               AND consumed_at IS NULL
               AND expires_at > NOW()
-            "#
+            "#,
         )
         .bind(did)
         .bind(suite)
@@ -246,7 +250,7 @@ async fn get_oldest_expiration(
             WHERE owner_did = $1
               AND consumed_at IS NULL
               AND expires_at > NOW()
-            "#
+            "#,
         )
         .bind(did)
         .fetch_optional(pool)
@@ -283,11 +287,14 @@ async fn get_stats_by_cipher_suite(
     .fetch_all(pool)
     .await?;
 
-    Ok(rows.into_iter().map(|row| CipherSuiteStats {
-        cipher_suite: row.cipher_suite,
-        available: row.available as i32,
-        consumed: Some(row.consumed as i32),
-    }).collect())
+    Ok(rows
+        .into_iter()
+        .map(|row| CipherSuiteStats {
+            cipher_suite: row.cipher_suite,
+            available: row.available as i32,
+            consumed: Some(row.consumed as i32),
+        })
+        .collect())
 }
 
 fn format_duration_until(expires_at: DateTime<Utc>) -> String {
@@ -326,7 +333,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_stats_with_available_packages() {
-        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
+        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else {
+            return;
+        };
         let pool = crate::db::init_db(crate::db::DbConfig {
             database_url: db_url,
             max_connections: 5,
@@ -361,12 +370,7 @@ mod tests {
             },
         };
 
-        let result = get_key_package_stats(
-            State(pool),
-            auth_user,
-            RawQuery(None),
-        )
-        .await;
+        let result = get_key_package_stats(State(pool), auth_user, RawQuery(None)).await;
 
         assert!(result.is_ok());
         let stats = result.unwrap().0;

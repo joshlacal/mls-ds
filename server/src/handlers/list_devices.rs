@@ -1,12 +1,9 @@
 use axum::{extract::State, http::StatusCode, Json};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use tracing::{info, error};
+use tracing::{error, info};
 
-use crate::{
-    auth::AuthUser,
-    storage::DbPool,
-};
+use crate::{auth::AuthUser, storage::DbPool};
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -35,7 +32,9 @@ pub async fn list_devices(
     State(pool): State<DbPool>,
     auth_user: AuthUser,
 ) -> Result<Json<ListDevicesOutput>, StatusCode> {
-    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.listDevices") {
+    if let Err(_e) =
+        crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.listDevices")
+    {
         return Err(StatusCode::UNAUTHORIZED);
     }
 

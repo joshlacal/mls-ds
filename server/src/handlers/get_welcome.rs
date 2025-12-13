@@ -1,12 +1,12 @@
-use axum::{extract::{Query, State}, http::StatusCode, Json};
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    Json,
+};
 use serde::Deserialize;
 use tracing::{error, warn};
 
-use crate::{
-    auth::AuthUser,
-    device_utils::parse_device_did,
-    storage::DbPool,
-};
+use crate::{auth::AuthUser, device_utils::parse_device_did, storage::DbPool};
 
 #[derive(Debug, Deserialize)]
 pub struct GetWelcomeParams {
@@ -25,7 +25,8 @@ pub async fn get_welcome(
     auth_user: AuthUser,
     Query(params): Query<GetWelcomeParams>,
 ) -> Result<Json<Output>, StatusCode> {
-    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.getWelcome") {
+    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.getWelcome")
+    {
         return Err(StatusCode::UNAUTHORIZED);
     }
 
@@ -38,26 +39,27 @@ pub async fn get_welcome(
     }
 
     // Extract user DID from device DID (handles both single and multi-device mode)
-    let (user_did, _device_id) = parse_device_did(device_did)
-        .map_err(|e| {
-            error!("Invalid device DID format: {}", e);
-            StatusCode::BAD_REQUEST
-        })?;
-
-    // Check if the conversation exists
-    let convo_exists = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM conversations WHERE id = $1)"
-    )
-    .bind(&params.convo_id)
-    .fetch_one(&pool)
-    .await
-    .map_err(|e| {
-        error!("Failed to check conversation existence: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
+    let (user_did, _device_id) = parse_device_did(device_did).map_err(|e| {
+        error!("Invalid device DID format: {}", e);
+        StatusCode::BAD_REQUEST
     })?;
 
+    // Check if the conversation exists
+    let convo_exists =
+        sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM conversations WHERE id = $1)")
+            .bind(&params.convo_id)
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| {
+                error!("Failed to check conversation existence: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
     if !convo_exists {
-        warn!("Conversation not found: {}", crate::crypto::redact_for_log(&params.convo_id));
+        warn!(
+            "Conversation not found: {}",
+            crate::crypto::redact_for_log(&params.convo_id)
+        );
         return Err(StatusCode::NOT_FOUND);
     }
 
@@ -123,7 +125,7 @@ pub async fn get_welcome(
             // Encode welcome data as standard base64
             let welcome_base64 = base64::Engine::encode(
                 &base64::engine::general_purpose::STANDARD,
-                &row.welcome_data
+                &row.welcome_data,
             );
 
             tracing::info!(
@@ -152,7 +154,7 @@ pub async fn get_welcome(
                       AND wm.key_package_hash IS NOT NULL
                       AND (kp.consumed_at IS NOT NULL OR kp.expires_at <= NOW())
                 )
-                "#
+                "#,
             )
             .bind(&user_did)
             .bind(&params.convo_id)
@@ -206,7 +208,7 @@ mod tests {
         // Create conversation
         sqlx::query(
             "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at)
-             VALUES ($1, $2, 0, $3, $3)"
+             VALUES ($1, $2, 0, $3, $3)",
         )
         .bind(convo_id)
         .bind(creator)
@@ -218,7 +220,7 @@ mod tests {
         // Add creator as member
         sqlx::query(
             "INSERT INTO members (convo_id, member_did, joined_at)
-             VALUES ($1, $2, $3)"
+             VALUES ($1, $2, $3)",
         )
         .bind(convo_id)
         .bind(creator)
@@ -244,7 +246,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_welcome_success() {
-        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
+        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else {
+            return;
+        };
         let pool = crate::db::init_db(crate::db::DbConfig {
             database_url: db_url,
             max_connections: 5,
@@ -288,14 +292,17 @@ mod tests {
         // Decode and verify the welcome data
         let decoded = base64::Engine::decode(
             &base64::engine::general_purpose::STANDARD,
-            &response.welcome
-        ).unwrap();
+            &response.welcome,
+        )
+        .unwrap();
         assert_eq!(decoded, welcome_data);
     }
 
     #[tokio::test]
     async fn test_get_welcome_not_found() {
-        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
+        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else {
+            return;
+        };
         let pool = crate::db::init_db(crate::db::DbConfig {
             database_url: db_url,
             max_connections: 5,
@@ -313,7 +320,7 @@ mod tests {
         // Create conversation without welcome message
         sqlx::query(
             "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at)
-             VALUES ($1, $2, 0, $3, $3)"
+             VALUES ($1, $2, 0, $3, $3)",
         )
         .bind(convo_id)
         .bind(creator)
@@ -345,7 +352,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_welcome_convo_not_found() {
-        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
+        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else {
+            return;
+        };
         let pool = crate::db::init_db(crate::db::DbConfig {
             database_url: db_url,
             max_connections: 5,

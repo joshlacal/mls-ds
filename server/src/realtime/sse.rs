@@ -53,10 +53,7 @@ pub enum StreamEvent {
         is_typing: bool,
     },
     #[serde(rename = "blue.catbird.mls.streamConvoEvents#infoEvent")]
-    InfoEvent {
-        cursor: String,
-        info: String,
-    },
+    InfoEvent { cursor: String, info: String },
     /// Event indicating a user has registered a new device that needs to be added to the conversation
     #[serde(rename = "blue.catbird.mls.streamConvoEvents#newDeviceEvent")]
     NewDeviceEvent {

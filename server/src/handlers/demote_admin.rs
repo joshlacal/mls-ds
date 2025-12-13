@@ -1,8 +1,8 @@
 use axum::{extract::State, http::StatusCode, Json};
-use tracing::{info, error};
+use tracing::{error, info};
 
 use crate::{
-    auth::{AuthUser, verify_is_admin, verify_is_member, count_admins},
+    auth::{count_admins, verify_is_admin, verify_is_member, AuthUser},
     generated::blue::catbird::mls::demote_admin::{Input, Output, OutputData, NSID},
     storage::DbPool,
 };
@@ -17,8 +17,12 @@ pub async fn demote_admin(
 ) -> Result<Json<Output>, StatusCode> {
     let input = input.data;
 
-    info!("📍 [demote_admin] START - actor: {}, convo: {}, target: {}",
-          auth_user.did, input.convo_id, input.target_did.as_str());
+    info!(
+        "📍 [demote_admin] START - actor: {}, convo: {}, target: {}",
+        auth_user.did,
+        input.convo_id,
+        input.target_did.as_str()
+    );
 
     // Enforce standard auth
     if let Err(_) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
@@ -42,7 +46,7 @@ pub async fn demote_admin(
     let is_admin: bool = sqlx::query_scalar(
         "SELECT is_admin FROM members
          WHERE convo_id = $1 AND user_did = $2 AND left_at IS NULL
-         LIMIT 1"
+         LIMIT 1",
     )
     .bind(&input.convo_id)
     .bind(input.target_did.as_str())
@@ -72,7 +76,7 @@ pub async fn demote_admin(
     sqlx::query(
         "UPDATE members
          SET is_admin = false
-         WHERE convo_id = $1 AND user_did = $2 AND left_at IS NULL"
+         WHERE convo_id = $1 AND user_did = $2 AND left_at IS NULL",
     )
     .bind(&input.convo_id)
     .bind(input.target_did.as_str())
@@ -87,7 +91,7 @@ pub async fn demote_admin(
     let action_id = uuid::Uuid::new_v4().to_string();
     sqlx::query(
         "INSERT INTO admin_actions (id, convo_id, actor_did, action, target_did, created_at)
-         VALUES ($1, $2, $3, 'demote', $4, $5)"
+         VALUES ($1, $2, $3, 'demote', $4, $5)",
     )
     .bind(&action_id)
     .bind(&input.convo_id)
@@ -103,7 +107,5 @@ pub async fn demote_admin(
 
     info!("✅ [demote_admin] SUCCESS - admin demoted");
 
-    Ok(Json(Output::from(OutputData {
-        ok: true,
-    })))
+    Ok(Json(Output::from(OutputData { ok: true })))
 }

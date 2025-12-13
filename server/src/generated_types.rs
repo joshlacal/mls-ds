@@ -80,7 +80,10 @@ pub struct MemberView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub leaf_index: Option<i32>,
     /// MLS credential bytes
-    #[serde(skip_serializing_if = "Option::is_none", with = "optional_base64_bytes")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        with = "optional_base64_bytes"
+    )]
     pub credential: Option<Vec<u8>>,
 }
 

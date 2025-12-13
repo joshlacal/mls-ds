@@ -1,8 +1,8 @@
 use axum::{extract::State, http::StatusCode, Json};
-use tracing::{info, error};
+use tracing::{error, info};
 
 use crate::{
-    auth::{AuthUser, verify_is_member, enforce_standard},
+    auth::{enforce_standard, verify_is_member, AuthUser},
     generated::blue::catbird::mls::report_member::{Input, Output, OutputData, NSID},
     sqlx_atrium::chrono_to_datetime,
     storage::DbPool,
@@ -18,8 +18,13 @@ pub async fn report_member(
 ) -> Result<Json<Output>, StatusCode> {
     let input = input.data;
 
-    info!("📍 [report_member] START - reporter: {}, convo: {}, reported: {}, category: {}",
-          auth_user.did, input.convo_id, input.reported_did.as_str(), input.category);
+    info!(
+        "📍 [report_member] START - reporter: {}, convo: {}, reported: {}, category: {}",
+        auth_user.did,
+        input.convo_id,
+        input.reported_did.as_str(),
+        input.category
+    );
 
     // Enforce standard auth
     if let Err(_) = enforce_standard(&auth_user.claims, NSID) {
@@ -62,7 +67,7 @@ pub async fn report_member(
         "sexual_content",
         "impersonation",
         "privacy_violation",
-        "other"
+        "other",
     ];
     if !valid_categories.contains(&input.category.as_str()) {
         error!("❌ [report_member] Invalid category: {}", input.category);
@@ -77,7 +82,7 @@ pub async fn report_member(
         "INSERT INTO reports (
             id, convo_id, reporter_did, reported_did, category,
             encrypted_content, message_ids, created_at, status
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')"
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')",
     )
     .bind(&report_id)
     .bind(&input.convo_id)

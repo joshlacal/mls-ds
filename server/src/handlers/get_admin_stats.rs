@@ -1,12 +1,16 @@
-use axum::{extract::{Query, State}, http::StatusCode, Json};
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    Json,
+};
 use std::collections::HashMap;
-use tracing::{info, error};
+use tracing::{error, info};
 
 use crate::{
-    auth::{AuthUser, verify_is_admin, enforce_standard},
+    auth::{enforce_standard, verify_is_admin, AuthUser},
     generated::blue::catbird::mls::get_admin_stats::{
-        Parameters, Output, OutputData, ModerationStats, ModerationStatsData,
-        ReportCategoryCounts, ReportCategoryCountsData, NSID
+        ModerationStats, ModerationStatsData, Output, OutputData, Parameters, ReportCategoryCounts,
+        ReportCategoryCountsData, NSID,
     },
     sqlx_atrium::chrono_to_datetime,
     storage::DbPool,
@@ -22,8 +26,10 @@ pub async fn get_admin_stats(
 ) -> Result<Json<Output>, StatusCode> {
     let params = params.data;
 
-    info!("📍 [get_admin_stats] START - actor: {}, convo: {:?}, since: {:?}",
-          auth_user.did, params.convo_id, params.since);
+    info!(
+        "📍 [get_admin_stats] START - actor: {}, convo: {:?}, since: {:?}",
+        auth_user.did, params.convo_id, params.since
+    );
 
     // Enforce standard auth
     if let Err(_) = enforce_standard(&auth_user.claims, NSID) {
@@ -44,8 +50,8 @@ pub async fn get_admin_stats(
     };
 
     // Query report statistics
-    let (total_reports, pending_reports, resolved_reports): (i64, i64, i64) = sqlx::query_as(
-        &format!(
+    let (total_reports, pending_reports, resolved_reports): (i64, i64, i64) =
+        sqlx::query_as(&format!(
             "SELECT
                 COUNT(*) as total,
                 COUNT(*) FILTER (WHERE status = 'pending') as pending,
@@ -53,24 +59,21 @@ pub async fn get_admin_stats(
              FROM reports
              WHERE ($1::TEXT IS NULL OR convo_id = $1) {}",
             time_filter
-        )
-    )
-    .bind(&params.convo_id)
-    .fetch_one(&pool)
-    .await
-    .map_err(|e| {
-        error!("❌ [get_admin_stats] Failed to query report stats: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+        ))
+        .bind(&params.convo_id)
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| {
+            error!("❌ [get_admin_stats] Failed to query report stats: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     // Query removal count
-    let total_removals: i64 = sqlx::query_scalar(
-        &format!(
-            "SELECT COUNT(*) FROM admin_actions
+    let total_removals: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM admin_actions
              WHERE action = 'remove' AND ($1::TEXT IS NULL OR convo_id = $1) {}",
-            time_filter
-        )
-    )
+        time_filter
+    ))
     .bind(&params.convo_id)
     .fetch_one(&pool)
     .await
@@ -80,19 +83,20 @@ pub async fn get_admin_stats(
     })?;
 
     // Query reports by category
-    let category_rows: Vec<(String, i64)> = sqlx::query_as(
-        &format!(
-            "SELECT category, COUNT(*) FROM reports
+    let category_rows: Vec<(String, i64)> = sqlx::query_as(&format!(
+        "SELECT category, COUNT(*) FROM reports
              WHERE ($1::TEXT IS NULL OR convo_id = $1) {}
              GROUP BY category",
-            time_filter
-        )
-    )
+        time_filter
+    ))
     .bind(&params.convo_id)
     .fetch_all(&pool)
     .await
     .map_err(|e| {
-        error!("❌ [get_admin_stats] Failed to query category counts: {}", e);
+        error!(
+            "❌ [get_admin_stats] Failed to query category counts: {}",
+            e
+        );
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
@@ -112,19 +116,20 @@ pub async fn get_admin_stats(
     });
 
     // Calculate average resolution time in hours
-    let avg_resolution_hours: Option<f64> = sqlx::query_scalar(
-        &format!(
-            "SELECT AVG(EXTRACT(EPOCH FROM (resolved_at - created_at)) / 3600)
+    let avg_resolution_hours: Option<f64> = sqlx::query_scalar(&format!(
+        "SELECT AVG(EXTRACT(EPOCH FROM (resolved_at - created_at)) / 3600)
              FROM reports
              WHERE status = 'resolved' AND ($1::TEXT IS NULL OR convo_id = $1) {}",
-            time_filter
-        )
-    )
+        time_filter
+    ))
     .bind(&params.convo_id)
     .fetch_one(&pool)
     .await
     .map_err(|e| {
-        error!("❌ [get_admin_stats] Failed to query avg resolution time: {}", e);
+        error!(
+            "❌ [get_admin_stats] Failed to query avg resolution time: {}",
+            e
+        );
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
@@ -143,8 +148,10 @@ pub async fn get_admin_stats(
 
     let generated_at = chrono_to_datetime(chrono::Utc::now());
 
-    info!("✅ [get_admin_stats] SUCCESS - total_reports: {}, pending: {}, resolved: {}",
-          total_reports, pending_reports, resolved_reports);
+    info!(
+        "✅ [get_admin_stats] SUCCESS - total_reports: {}, pending: {}, resolved: {}",
+        total_reports, pending_reports, resolved_reports
+    );
 
     Ok(Json(Output::from(OutputData {
         stats,

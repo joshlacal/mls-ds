@@ -59,7 +59,8 @@ mod tests {
         assert_eq!(device, "abc-123");
 
         // UUID format
-        let (user2, device2) = parse_device_did("did:plc:alice#a1b2c3d4-5678-90ab-cdef-1234567890ab").unwrap();
+        let (user2, device2) =
+            parse_device_did("did:plc:alice#a1b2c3d4-5678-90ab-cdef-1234567890ab").unwrap();
         assert_eq!(user2, "did:plc:alice");
         assert_eq!(device2, "a1b2c3d4-5678-90ab-cdef-1234567890ab");
 
@@ -92,10 +93,7 @@ mod tests {
         );
 
         // Single-device mode
-        assert_eq!(
-            construct_device_did("did:plc:bob", ""),
-            "did:plc:bob"
-        );
+        assert_eq!(construct_device_did("did:plc:bob", ""), "did:plc:bob");
     }
 
     #[test]

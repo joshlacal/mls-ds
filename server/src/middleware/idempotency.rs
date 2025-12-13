@@ -143,10 +143,7 @@ pub async fn idempotency_middleware(
 
     // Only apply to write operations (POST/PUT/PATCH)
     let method = request.method().clone();
-    if !matches!(
-        method.as_str(),
-        "POST" | "PUT" | "PATCH"
-    ) {
+    if !matches!(method.as_str(), "POST" | "PUT" | "PATCH") {
         debug!("Skipping idempotency check for {} {}", method, endpoint);
         return Ok(next.run(request).await);
     }
@@ -197,15 +194,12 @@ pub async fn idempotency_middleware(
             let status = StatusCode::from_u16(cached.status_code as u16)
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
-            let body_string = serde_json::to_string(&cached.response_body)
-                .unwrap_or_else(|_| "{}".to_string());
+            let body_string =
+                serde_json::to_string(&cached.response_body).unwrap_or_else(|_| "{}".to_string());
 
-            return Ok((
-                status,
-                [("content-type", "application/json")],
-                body_string,
-            )
-                .into_response());
+            return Ok(
+                (status, [("content-type", "application/json")], body_string).into_response(),
+            );
         }
         Ok(None) => {
             tracing::info!(
@@ -280,10 +274,7 @@ pub async fn idempotency_middleware(
                 }
             }
             Err(e) => {
-                warn!(
-                    "Response body is not valid JSON, skipping cache: {}",
-                    e
-                );
+                warn!("Response body is not valid JSON, skipping cache: {}", e);
             }
         }
     } else {

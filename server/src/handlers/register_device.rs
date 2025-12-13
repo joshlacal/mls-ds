@@ -1,9 +1,9 @@
 use axum::{extract::State, http::StatusCode, Json};
 use base64::Engine;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::{info, warn, error};
-use chrono::{DateTime, Utc};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -60,18 +60,19 @@ pub async fn register_device(
     auth_user: AuthUser,
     Json(input): Json<RegisterDeviceInput>,
 ) -> Result<Json<RegisterDeviceOutput>, StatusCode> {
-    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.registerDevice") {
+    if let Err(_e) =
+        crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.registerDevice")
+    {
         return Err(StatusCode::UNAUTHORIZED);
     }
 
     // Extract user DID from device DID (handles both single and multi-device mode)
     // During initial registration, auth_user.did is the user DID
     // During re-registration, it might be a device DID
-    let (user_did, _device_id_from_auth) = parse_device_did(&auth_user.did)
-        .map_err(|e| {
-            error!("Invalid device DID format: {}", e);
-            StatusCode::BAD_REQUEST
-        })?;
+    let (user_did, _device_id_from_auth) = parse_device_did(&auth_user.did).map_err(|e| {
+        error!("Invalid device DID format: {}", e);
+        StatusCode::BAD_REQUEST
+    })?;
 
     // Validate device name
     if input.device_name.trim().is_empty() {
@@ -80,13 +81,19 @@ pub async fn register_device(
     }
 
     if input.device_name.len() > 100 {
-        warn!("Device name too long: {} characters", input.device_name.len());
+        warn!(
+            "Device name too long: {} characters",
+            input.device_name.len()
+        );
         return Err(StatusCode::BAD_REQUEST);
     }
 
     // Validate signature public key
     if input.signature_public_key.len() != 32 {
-        warn!("Invalid signature public key length: {} (expected 32 bytes)", input.signature_public_key.len());
+        warn!(
+            "Invalid signature public key length: {} (expected 32 bytes)",
+            input.signature_public_key.len()
+        );
         return Err(StatusCode::BAD_REQUEST);
     }
 
@@ -97,7 +104,10 @@ pub async fn register_device(
     }
 
     if input.key_packages.len() > 200 {
-        warn!("Too many key packages: {} (max 200)", input.key_packages.len());
+        warn!(
+            "Too many key packages: {} (max 200)",
+            input.key_packages.len()
+        );
         return Err(StatusCode::BAD_REQUEST);
     }
 
@@ -147,8 +157,10 @@ pub async fn register_device(
         })?;
 
         if let Some((db_id, old_device_id, old_credential_did)) = existing_by_uuid {
-            info!("Device re-registration detected for user {}: device_uuid={}, old_device_id={}",
-                user_did, device_uuid, old_device_id);
+            info!(
+                "Device re-registration detected for user {}: device_uuid={}, old_device_id={}",
+                user_did, device_uuid, old_device_id
+            );
 
             // Delete all old key packages for this device
             let deleted_count = sqlx::query!(
@@ -167,7 +179,10 @@ pub async fn register_device(
             })?
             .rows_affected();
 
-            info!("Deleted {} old key packages for re-registered device {}", deleted_count, old_device_id);
+            info!(
+                "Deleted {} old key packages for re-registered device {}",
+                deleted_count, old_device_id
+            );
 
             // CRITICAL FIX: Invalidate all pending Welcome messages for this user
             // When a device re-registers with fresh key packages, any pending Welcomes
@@ -253,8 +268,10 @@ pub async fn register_device(
         })?;
 
         if let Some((db_id, old_device_id, _old_credential_did)) = existing_device {
-            info!("Device re-registration detected by signature key for user {}: old_device_id={}",
-                user_did, old_device_id);
+            info!(
+                "Device re-registration detected by signature key for user {}: old_device_id={}",
+                user_did, old_device_id
+            );
 
             // Delete all old key packages for this device
             let deleted_count = sqlx::query!(
@@ -273,7 +290,10 @@ pub async fn register_device(
             })?
             .rows_affected();
 
-            info!("Deleted {} old key packages for re-registered device {} (signature key match)", deleted_count, old_device_id);
+            info!(
+                "Deleted {} old key packages for re-registered device {} (signature key match)",
+                deleted_count, old_device_id
+            );
 
             // CRITICAL FIX: Invalidate all pending Welcome messages for this user
             // When a device re-registers with fresh key packages, any pending Welcomes
@@ -330,13 +350,18 @@ pub async fn register_device(
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
-            info!("Updated device record for re-registration by signature key: {}", device_id);
+            info!(
+                "Updated device record for re-registration by signature key: {}",
+                device_id
+            );
             is_reregistration = true;
         }
     }
 
-    info!("Registering device for user {}: {} ({}) [re-registration: {}]",
-        user_did, device_id, input.device_name, is_reregistration);
+    info!(
+        "Registering device for user {}: {} ({}) [re-registration: {}]",
+        user_did, device_id, input.device_name, is_reregistration
+    );
 
     // Only insert new device if this is NOT a re-registration
     if !is_reregistration {
@@ -357,7 +382,10 @@ pub async fn register_device(
         })?;
 
         if device_count.0 >= 10 {
-            warn!("User {} has reached device limit: {}", user_did, device_count.0);
+            warn!(
+                "User {} has reached device limit: {}",
+                user_did, device_count.0
+            );
             return Err(StatusCode::TOO_MANY_REQUESTS);
         }
 
@@ -423,8 +451,10 @@ pub async fn register_device(
             key_data,
             kp.expires,
             Some(device_id.clone()),
-            None,  // credential_did is now extracted from KeyPackage and validated
-        ).await {
+            None, // credential_did is now extracted from KeyPackage and validated
+        )
+        .await
+        {
             Ok(_) => {
                 stored_count += 1;
             }
@@ -434,7 +464,10 @@ pub async fn register_device(
         }
     }
 
-    info!("Stored {} key packages for device {}", stored_count, device_id);
+    info!(
+        "Stored {} key packages for device {}",
+        stored_count, device_id
+    );
 
     // Find all conversations this user is a member of (for auto-rejoin)
     let convos: Vec<(String,)> = sqlx::query_as(
@@ -454,7 +487,11 @@ pub async fn register_device(
 
     let auto_joined_convos: Vec<String> = convos.iter().map(|(id,)| id.clone()).collect();
 
-    info!("Device {} can auto-join {} conversations", device_id, auto_joined_convos.len());
+    info!(
+        "Device {} can auto-join {} conversations",
+        device_id,
+        auto_joined_convos.len()
+    );
 
     // Create pending device additions for all conversations (for automatic multi-device sync)
     // This allows other online members to proactively add this device to conversations
@@ -509,22 +546,37 @@ pub async fn register_device(
                 };
 
                 if let Err(e) = sse_state.emit(convo_id, event).await {
-                    warn!("Failed to emit NewDeviceEvent for convo {}: {}", convo_id, e);
+                    warn!(
+                        "Failed to emit NewDeviceEvent for convo {}: {}",
+                        convo_id, e
+                    );
                 } else {
-                    info!("Emitted NewDeviceEvent for device {} in convo {}", device_id_clone, convo_id);
+                    info!(
+                        "Emitted NewDeviceEvent for device {} in convo {}",
+                        device_id_clone, convo_id
+                    );
                 }
             }
             Ok(None) => {
                 // Conflict - pending addition already exists, skip
-                info!("Pending addition already exists for device {} in convo {}", device_id_clone, convo_id);
+                info!(
+                    "Pending addition already exists for device {} in convo {}",
+                    device_id_clone, convo_id
+                );
             }
             Err(e) => {
-                warn!("Failed to create pending addition for convo {}: {}", convo_id, e);
+                warn!(
+                    "Failed to create pending addition for convo {}: {}",
+                    convo_id, e
+                );
             }
         }
     }
 
-    info!("Created pending device additions for {} conversations", auto_joined_convos.len());
+    info!(
+        "Created pending device additions for {} conversations",
+        auto_joined_convos.len()
+    );
 
     // For now, we don't generate welcome messages during registration
     // The device will need to request rejoin via blue.catbird.mls.rejoin

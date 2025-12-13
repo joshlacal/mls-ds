@@ -1,8 +1,8 @@
 use axum::{extract::State, http::StatusCode, Json};
-use tracing::{info, error};
+use tracing::{error, info};
 
 use crate::{
-    auth::{AuthUser, verify_is_admin, verify_is_member},
+    auth::{verify_is_admin, verify_is_member, AuthUser},
     storage::DbPool,
 };
 
@@ -55,8 +55,10 @@ pub async fn promote_moderator(
 ) -> Result<Json<Output>, StatusCode> {
     let input = input.data;
 
-    info!("📍 [promote_moderator] START - actor: {}, convo: {}, target: {}",
-          auth_user.did, input.convo_id, input.target_did);
+    info!(
+        "📍 [promote_moderator] START - actor: {}, convo: {}, target: {}",
+        auth_user.did, input.convo_id, input.target_did
+    );
 
     // Enforce standard auth
     if let Err(_) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
@@ -74,7 +76,7 @@ pub async fn promote_moderator(
     let is_admin: bool = sqlx::query_scalar(
         "SELECT COALESCE(is_admin, false) FROM members
          WHERE convo_id = $1 AND user_did = $2 AND left_at IS NULL
-         LIMIT 1"
+         LIMIT 1",
     )
     .bind(&input.convo_id)
     .bind(&input.target_did)
@@ -94,7 +96,7 @@ pub async fn promote_moderator(
     let is_already_moderator: bool = sqlx::query_scalar(
         "SELECT COALESCE(is_moderator, false) FROM members
          WHERE convo_id = $1 AND user_did = $2 AND left_at IS NULL
-         LIMIT 1"
+         LIMIT 1",
     )
     .bind(&input.convo_id)
     .bind(&input.target_did)
@@ -116,7 +118,7 @@ pub async fn promote_moderator(
     sqlx::query(
         "UPDATE members
          SET is_moderator = true, moderator_promoted_at = $3, moderator_promoted_by_did = $4
-         WHERE convo_id = $1 AND user_did = $2 AND left_at IS NULL"
+         WHERE convo_id = $1 AND user_did = $2 AND left_at IS NULL",
     )
     .bind(&input.convo_id)
     .bind(&input.target_did)
@@ -133,7 +135,7 @@ pub async fn promote_moderator(
     let action_id = uuid::Uuid::new_v4().to_string();
     sqlx::query(
         "INSERT INTO admin_actions (id, convo_id, actor_did, action, target_did, created_at)
-         VALUES ($1, $2, $3, 'promote_moderator', $4, $5)"
+         VALUES ($1, $2, $3, 'promote_moderator', $4, $5)",
     )
     .bind(&action_id)
     .bind(&input.convo_id)

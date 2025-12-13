@@ -5,7 +5,7 @@ pub const NSID: &str = "blue.catbird.mls.sendMessage";
 #[serde(rename_all = "camelCase")]
 pub struct InputData {
     ///MLS encrypted message ciphertext bytes (MUST be padded to paddedSize). The actual message length MUST be encrypted inside the MLS ciphertext for recipients to strip padding.
-    #[serde(with = "serde_bytes")]
+    #[serde(with = "crate::atproto_bytes")]
     pub ciphertext: Vec<u8>,
     ///Conversation identifier
     pub convo_id: String,

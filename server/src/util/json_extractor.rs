@@ -24,7 +24,9 @@ where
             Ok(b) => b,
             Err(e) => {
                 error!("Failed to read request body: {}", e);
-                return Err((StatusCode::BAD_REQUEST, "Failed to read request body").into_response());
+                return Err(
+                    (StatusCode::BAD_REQUEST, "Failed to read request body").into_response()
+                );
             }
         };
 

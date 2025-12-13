@@ -1,11 +1,8 @@
 use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
-use crate::{
-    auth::AuthUser,
-    storage::DbPool,
-};
+use crate::{auth::AuthUser, storage::DbPool};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -29,7 +26,9 @@ pub async fn delete_device(
     auth_user: AuthUser,
     Json(input): Json<DeleteDeviceInput>,
 ) -> Result<Json<DeleteDeviceOutput>, StatusCode> {
-    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.deleteDevice") {
+    if let Err(_e) =
+        crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.deleteDevice")
+    {
         return Err(StatusCode::UNAUTHORIZED);
     }
 
@@ -60,7 +59,10 @@ pub async fn delete_device(
 
     // Verify ownership
     if owner_did != *user_did {
-        warn!("User {} attempted to delete device {} owned by {}", user_did, input.device_id, owner_did);
+        warn!(
+            "User {} attempted to delete device {} owned by {}",
+            user_did, input.device_id, owner_did
+        );
         return Err(StatusCode::UNAUTHORIZED);
     }
 
@@ -70,7 +72,7 @@ pub async fn delete_device(
         UPDATE members
         SET left_at = NOW()
         WHERE device_id = $1 AND left_at IS NULL
-        "#
+        "#,
     )
     .bind(&input.device_id)
     .execute(&pool)
@@ -81,7 +83,10 @@ pub async fn delete_device(
     })?
     .rows_affected();
 
-    info!("Removed device {} from {} conversations", input.device_id, members_removed);
+    info!(
+        "Removed device {} from {} conversations",
+        input.device_id, members_removed
+    );
 
     // Clean up pending welcome messages for this device
     sqlx::query(
@@ -89,7 +94,7 @@ pub async fn delete_device(
         DELETE FROM welcome_messages
         WHERE recipient_did = $1
         AND consumed = false
-        "#
+        "#,
     )
     .bind(&credential_did)
     .execute(&pool)
@@ -112,7 +117,10 @@ pub async fn delete_device(
     })?
     .rows_affected();
 
-    info!("Deleted {} key packages for device {}", key_packages_deleted, input.device_id);
+    info!(
+        "Deleted {} key packages for device {}",
+        key_packages_deleted, input.device_id
+    );
 
     // Delete the device record
     let devices_deleted = sqlx::query!(
@@ -131,11 +139,17 @@ pub async fn delete_device(
     .rows_affected();
 
     if devices_deleted == 0 {
-        error!("Device deletion failed - device not found: {}", input.device_id);
+        error!(
+            "Device deletion failed - device not found: {}",
+            input.device_id
+        );
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    info!("Successfully deleted device {} and {} key packages", input.device_id, key_packages_deleted);
+    info!(
+        "Successfully deleted device {} and {} key packages",
+        input.device_id, key_packages_deleted
+    );
 
     Ok(Json(DeleteDeviceOutput {
         deleted: true,

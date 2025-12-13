@@ -1,17 +1,23 @@
-use axum::{extract::{Query, State}, http::StatusCode, Json};
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    Json,
+};
 use std::sync::Arc;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 use crate::{
-    auth::{AuthUser, enforce_standard},
+    auth::{enforce_standard, AuthUser},
     block_sync::BlockSyncService,
-    generated::blue::catbird::mls::check_blocks::{Parameters, Output, OutputData, BlockRelationship, BlockRelationshipData, NSID},
+    generated::blue::catbird::mls::check_blocks::{
+        BlockRelationship, BlockRelationshipData, Output, OutputData, Parameters, NSID,
+    },
     sqlx_atrium::{chrono_to_datetime, string_to_did},
     storage::DbPool,
 };
 
 /// Check blocks between users by querying their PDSes directly
-/// 
+///
 /// This handler:
 /// 1. First queries PDSes for fresh block data (via BlockSyncService)
 /// 2. Syncs the blocks to local DB for caching
@@ -38,15 +44,21 @@ pub async fn check_blocks(
 
     // Query each user's PDS for their block records
     // This is the authoritative source, not our cached DB
-    info!("Checking blocks for {} DIDs via PDS queries", did_strs.len());
-    
+    info!(
+        "Checking blocks for {} DIDs via PDS queries",
+        did_strs.len()
+    );
+
     match block_sync.check_block_conflicts(&did_strs).await {
         Ok(conflicts) => {
             for (blocker_str, blocked_str) in conflicts {
                 // Also sync to DB for caching
                 if let Err(e) = block_sync.sync_blocks_to_db(&pool, &blocker_str).await {
-                    warn!("Failed to sync blocks to DB for {}: {}", 
-                          crate::crypto::redact_for_log(&blocker_str), e);
+                    warn!(
+                        "Failed to sync blocks to DB for {}: {}",
+                        crate::crypto::redact_for_log(&blocker_str),
+                        e
+                    );
                 }
 
                 let blocker_did = string_to_did(&blocker_str).map_err(|e| {
@@ -69,11 +81,11 @@ pub async fn check_blocks(
         Err(e) => {
             // Fall back to local DB if PDS queries fail
             warn!("PDS block check failed, falling back to local DB: {}", e);
-            
+
             let rows: Vec<(String, String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
                 "SELECT user_did, target_did, synced_at
                  FROM bsky_blocks
-                 WHERE user_did = ANY($1) AND target_did = ANY($1)"
+                 WHERE user_did = ANY($1) AND target_did = ANY($1)",
             )
             .bind(&did_strs)
             .fetch_all(&pool)
@@ -103,7 +115,11 @@ pub async fn check_blocks(
         }
     }
 
-    info!("Found {} block relationships among {} DIDs", blocks.len(), did_strs.len());
+    info!(
+        "Found {} block relationships among {} DIDs",
+        blocks.len(),
+        did_strs.len()
+    );
 
     Ok(Json(Output::from(OutputData {
         blocks,

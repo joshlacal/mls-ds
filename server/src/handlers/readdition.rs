@@ -23,10 +23,8 @@ pub async fn readdition(
     Json(input): Json<Input>,
 ) -> Result<Json<Output>, StatusCode> {
     // Enforce authentication
-    if let Err(_e) = crate::auth::enforce_standard(
-        &auth_user.claims,
-        "blue.catbird.mls.readdition",
-    ) {
+    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.readdition")
+    {
         return Err(StatusCode::UNAUTHORIZED);
     }
 
@@ -46,16 +44,15 @@ pub async fn readdition(
     );
 
     // 1. Check if conversation exists
-    let convo_exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM conversations WHERE id = $1)",
-    )
-    .bind(convo_id)
-    .fetch_one(&pool)
-    .await
-    .map_err(|e| {
-        error!("Failed to check conversation existence: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let convo_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversations WHERE id = $1)")
+            .bind(convo_id)
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| {
+                error!("Failed to check conversation existence: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
     if !convo_exists {
         warn!(

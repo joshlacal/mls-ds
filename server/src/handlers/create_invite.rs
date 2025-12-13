@@ -9,14 +9,17 @@
 ///! - Server stores SHA256(PSK) only, never sees plaintext PSK
 ///! - PSK is generated client-side and included in invite link
 ///! - Only admins can create/revoke invites
-
-use axum::{extract::{Query, State}, http::StatusCode, Json};
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    Json,
+};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tracing::{error, info, warn};
 
-use crate::auth::AuthUser;
 use crate::admin_system::verify_is_admin;
+use crate::auth::AuthUser;
 use crate::error::Error;
 
 // =============================================================================
@@ -272,23 +275,21 @@ pub async fn revoke_invite(
     );
 
     // Step 1: Get conversation ID from invite (and verify it exists)
-    let convo_id = sqlx::query_scalar::<_, String>(
-        "SELECT convo_id FROM invites WHERE id = $1"
-    )
-    .bind(&input.invite_id)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|e| {
-        error!("Database error fetching invite: {}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Database error".to_string(),
-        )
-    })?
-    .ok_or_else(|| {
-        warn!("Invite not found: {}", input.invite_id);
-        (StatusCode::NOT_FOUND, "Invite not found".to_string())
-    })?;
+    let convo_id = sqlx::query_scalar::<_, String>("SELECT convo_id FROM invites WHERE id = $1")
+        .bind(&input.invite_id)
+        .fetch_optional(&pool)
+        .await
+        .map_err(|e| {
+            error!("Database error fetching invite: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Database error".to_string(),
+            )
+        })?
+        .ok_or_else(|| {
+            warn!("Invite not found: {}", input.invite_id);
+            (StatusCode::NOT_FOUND, "Invite not found".to_string())
+        })?;
 
     // Step 2: Verify caller is an admin of this conversation
     verify_is_admin(&pool, &convo_id, caller_did)

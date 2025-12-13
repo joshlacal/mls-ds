@@ -5,11 +5,11 @@ use tracing::{error, info};
 
 use crate::{
     auth::AuthUser,
+    db,
     generated::blue::catbird::mls::add_reaction::{Input, Output, OutputData, NSID},
     realtime::{SseState, StreamEvent},
-    db,
-    storage::DbPool,
     sqlx_atrium::chrono_to_datetime,
+    storage::DbPool,
 };
 
 /// Add a reaction to a message
@@ -22,7 +22,7 @@ pub async fn add_reaction(
     Json(input): Json<Input>,
 ) -> Result<Json<Output>, StatusCode> {
     let user_did = auth_user.did.clone();
-    
+
     info!(
         "add_reaction: user={}, convo={}, message={}, reaction={}",
         crate::crypto::redact_for_log(&user_did),
@@ -97,7 +97,10 @@ pub async fn add_reaction(
     }
 
     // Emit SSE event to all conversation members
-    let cursor = sse_state.cursor_gen.next(&input.convo_id, "reactionEvent").await;
+    let cursor = sse_state
+        .cursor_gen
+        .next(&input.convo_id, "reactionEvent")
+        .await;
     let event = StreamEvent::ReactionEvent {
         cursor: cursor.clone(),
         convo_id: input.convo_id.clone(),

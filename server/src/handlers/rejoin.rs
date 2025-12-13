@@ -59,34 +59,39 @@ pub async fn rejoin(
     }
 
     // Extract user DID from device DID
-    let (user_did, device_id) = parse_device_did(device_did)
-        .map_err(|e| {
-            error!("Invalid device DID format: {}", e);
-            StatusCode::BAD_REQUEST
-        })?;
+    let (user_did, device_id) = parse_device_did(device_did).map_err(|e| {
+        error!("Invalid device DID format: {}", e);
+        StatusCode::BAD_REQUEST
+    })?;
 
     info!(
         "Processing rejoin request: user={}, device={}, convo={}, reason={}",
         crate::crypto::redact_for_log(&user_did),
-        if device_id.is_empty() { "none" } else { &device_id },
+        if device_id.is_empty() {
+            "none"
+        } else {
+            &device_id
+        },
         crate::crypto::redact_for_log(convo_id),
         reason
     );
 
     // Check if conversation exists
-    let convo_exists = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM conversations WHERE id = $1)"
-    )
-    .bind(convo_id)
-    .fetch_one(&pool)
-    .await
-    .map_err(|e| {
-        error!("Failed to check conversation existence: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let convo_exists =
+        sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM conversations WHERE id = $1)")
+            .bind(convo_id)
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| {
+                error!("Failed to check conversation existence: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
     if !convo_exists {
-        warn!("Conversation not found: {}", crate::crypto::redact_for_log(convo_id));
+        warn!(
+            "Conversation not found: {}",
+            crate::crypto::redact_for_log(convo_id)
+        );
         return Err(StatusCode::NOT_FOUND);
     }
 
@@ -117,7 +122,7 @@ pub async fn rejoin(
         WHERE convo_id = $1 AND (user_did = $2 OR member_did = $3)
         ORDER BY joined_at DESC
         LIMIT 1
-        "#
+        "#,
     )
     .bind(convo_id)
     .bind(&user_did)
@@ -173,7 +178,7 @@ pub async fn rejoin(
         WHERE convo_id = $1
           AND (user_did = $2 OR member_did = $3)
           AND rejoin_requested_at > NOW() - INTERVAL '1 hour'
-        "#
+        "#,
     )
     .bind(convo_id)
     .bind(&user_did)
@@ -236,7 +241,7 @@ pub async fn rejoin(
             left_at = NULL
         WHERE convo_id = $4 AND member_did = $5
         RETURNING member_did
-        "#
+        "#,
     )
     .bind(now)
     .bind(&key_package_hash)
@@ -267,7 +272,7 @@ pub async fn rejoin(
                 is_admin
             )
             VALUES ($1, $2, $3, $4, $5, true, $6, $7, $8, false)
-            "#
+            "#,
         )
         .bind(convo_id)
         .bind(device_did)
@@ -306,7 +311,7 @@ pub async fn rejoin(
         )
         VALUES ($1, $2, $3, $4, 'MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519', $5, $6, $7, $8)
         ON CONFLICT (key_package_hash) DO NOTHING
-        "#
+        "#,
     )
     .bind(&kp_id)
     .bind(&user_did)
@@ -367,7 +372,7 @@ mod tests {
         // Create conversation
         sqlx::query(
             "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at)
-             VALUES ($1, $2, 0, $3, $3)"
+             VALUES ($1, $2, 0, $3, $3)",
         )
         .bind(convo_id)
         .bind(creator)
@@ -393,7 +398,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_rejoin_auto_approved() {
-        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
+        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else {
+            return;
+        };
         let pool = crate::db::init_db(crate::db::DbConfig {
             database_url: db_url,
             max_connections: 5,
@@ -426,8 +433,7 @@ mod tests {
 
         // Create a mock KeyPackage (in reality this would be an MLS KeyPackage)
         let key_package = b"mock-key-package-data";
-        let key_package_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(key_package);
+        let key_package_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key_package);
 
         let input = Input::from(crate::generated::blue::catbird::mls::rejoin::InputData {
             convo_id: convo_id.to_string(),
@@ -445,7 +451,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_rejoin_not_member() {
-        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
+        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else {
+            return;
+        };
         let pool = crate::db::init_db(crate::db::DbConfig {
             database_url: db_url,
             max_connections: 5,
@@ -463,7 +471,7 @@ mod tests {
         // Create conversation without adding the user as member
         sqlx::query(
             "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at)
-             VALUES ($1, $2, 0, $3, $3)"
+             VALUES ($1, $2, 0, $3, $3)",
         )
         .bind(convo_id)
         .bind(creator)
@@ -489,8 +497,7 @@ mod tests {
         };
 
         let key_package = b"mock-key-package-data";
-        let key_package_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(key_package);
+        let key_package_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key_package);
 
         let input = Input::from(crate::generated::blue::catbird::mls::rejoin::InputData {
             convo_id: convo_id.to_string(),

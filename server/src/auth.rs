@@ -12,8 +12,8 @@ use governor::{
     state::{InMemoryState, NotKeyed},
     Quota, RateLimiter,
 };
-use once_cell::sync::Lazy;
 use moka::future::Cache;
+use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -101,10 +101,10 @@ impl IntoResponse for AuthError {
 /// AT Protocol JWT claims
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AtProtoClaims {
-    pub iss: String,    // Issuer (DID)
-    pub aud: String,    // Audience (service DID or URL)
-    pub exp: i64,       // Expiration time
-    pub iat: Option<i64>, // Issued at
+    pub iss: String,         // Issuer (DID)
+    pub aud: String,         // Audience (service DID or URL)
+    pub exp: i64,            // Expiration time
+    pub iat: Option<i64>,    // Issued at
     pub sub: Option<String>, // Subject (can be same as iss)
     pub lxm: Option<String>, // Optional: authorized endpoint NSID
     pub jti: Option<String>, // Optional: nonce for replay-prevention
@@ -166,7 +166,8 @@ pub struct AuthUser {
 #[derive(Clone)]
 pub struct AuthMiddleware {
     did_cache: Cache<String, CachedDidDoc>,
-    rate_limiters: Arc<RwLock<HashMap<String, Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>>>>,
+    rate_limiters:
+        Arc<RwLock<HashMap<String, Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>>>>,
     http_client: reqwest::Client,
     cache_ttl_seconds: u64,
     rate_limit_quota: Quota,
@@ -202,114 +203,164 @@ impl AuthMiddleware {
             rate_limiters: Arc::new(RwLock::new(HashMap::new())),
             http_client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
-                .build().unwrap_or_else(|_| reqwest::Client::new()),
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             cache_ttl_seconds,
             rate_limit_quota: quota,
         }
     }
 
-/// Verify JWT token and extract claims (HS256 for dev, ES256/ES256K for inter-service)
-async fn verify_jwt(&self, token: &str) -> Result<AtProtoClaims, AuthError> {
-    let parts: Vec<&str> = token.split('.').collect();
-    if parts.len() != 3 { return Err(AuthError::InvalidToken("Invalid JWT format".into())); }
-
-    let header_json = URL_SAFE_NO_PAD
-        .decode(parts[0])
-        .map_err(|e| AuthError::InvalidToken(format!("Invalid base64 header: {}", e)))?;
-    let payload_json = URL_SAFE_NO_PAD
-        .decode(parts[1])
-        .map_err(|e| AuthError::InvalidToken(format!("Invalid base64 payload: {}", e)))?;
-
-    #[derive(Deserialize)]
-    struct JwtHeader { alg: String, #[allow(dead_code)] typ: Option<String> }
-    let header: JwtHeader = serde_json::from_slice(&header_json)
-        .map_err(|e| AuthError::InvalidToken(format!("Invalid header JSON: {}", e)))?;
-    let claims: AtProtoClaims = serde_json::from_slice(&payload_json)
-        .map_err(|e| AuthError::InvalidToken(format!("Invalid claims JSON: {}", e)))?;
-
-    // Do not log full identities or tokens at info level
-    tracing::debug!(
-        iss = %crate::crypto::redact_for_log(&claims.iss),
-        aud = %crate::crypto::redact_for_log(&claims.aud),
-        exp = claims.exp,
-        has_lxm = claims.lxm.is_some(),
-        has_jti = claims.jti.is_some(),
-        "Parsed JWT claims"
-    );
-
-    // Expiration
-    let now = Utc::now().timestamp();
-    if claims.exp < now { return Err(AuthError::TokenExpired); }
-
-    // Audience enforcement when configured
-    if let Ok(service_did) = std::env::var("SERVICE_DID") {
-        tracing::debug!("Validating JWT audience against configured SERVICE_DID");
-        if claims.aud != service_did {
-            tracing::warn!("JWT audience mismatch with SERVICE_DID");
-            return Err(AuthError::InvalidToken("aud does not match SERVICE_DID".into()));
+    /// Verify JWT token and extract claims (HS256 for dev, ES256/ES256K for inter-service)
+    async fn verify_jwt(&self, token: &str) -> Result<AtProtoClaims, AuthError> {
+        let parts: Vec<&str> = token.split('.').collect();
+        if parts.len() != 3 {
+            return Err(AuthError::InvalidToken("Invalid JWT format".into()));
         }
-    }
 
-    let signing_input = format!("{}.{}", parts[0], parts[1]);
+        let header_json = URL_SAFE_NO_PAD
+            .decode(parts[0])
+            .map_err(|e| AuthError::InvalidToken(format!("Invalid base64 header: {}", e)))?;
+        let payload_json = URL_SAFE_NO_PAD
+            .decode(parts[1])
+            .map_err(|e| AuthError::InvalidToken(format!("Invalid base64 payload: {}", e)))?;
 
-    match header.alg.as_str() {
-        // Dev/staging shared-secret auth
-        "HS256" => {
-            let secret = std::env::var("JWT_SECRET")
-                .map_err(|_| AuthError::InvalidToken("HS256 requires JWT_SECRET".into()))?;
-            let mut val = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
-            if let Ok(service_did) = std::env::var("SERVICE_DID") {
-                val.set_audience(&[service_did.as_str()]);
+        #[derive(Deserialize)]
+        struct JwtHeader {
+            alg: String,
+            #[allow(dead_code)]
+            typ: Option<String>,
+        }
+        let header: JwtHeader = serde_json::from_slice(&header_json)
+            .map_err(|e| AuthError::InvalidToken(format!("Invalid header JSON: {}", e)))?;
+        let claims: AtProtoClaims = serde_json::from_slice(&payload_json)
+            .map_err(|e| AuthError::InvalidToken(format!("Invalid claims JSON: {}", e)))?;
+
+        // Do not log full identities or tokens at info level
+        tracing::debug!(
+            iss = %crate::crypto::redact_for_log(&claims.iss),
+            aud = %crate::crypto::redact_for_log(&claims.aud),
+            exp = claims.exp,
+            has_lxm = claims.lxm.is_some(),
+            has_jti = claims.jti.is_some(),
+            "Parsed JWT claims"
+        );
+
+        // Expiration
+        let now = Utc::now().timestamp();
+        if claims.exp < now {
+            return Err(AuthError::TokenExpired);
+        }
+
+        // Audience enforcement when configured
+        if let Ok(service_did) = std::env::var("SERVICE_DID") {
+            tracing::debug!("Validating JWT audience against configured SERVICE_DID");
+            if claims.aud != service_did {
+                tracing::warn!("JWT audience mismatch with SERVICE_DID");
+                return Err(AuthError::InvalidToken(
+                    "aud does not match SERVICE_DID".into(),
+                ));
             }
-            jsonwebtoken::decode::<AtProtoClaims>(token, &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()), &val)
+        }
+
+        let signing_input = format!("{}.{}", parts[0], parts[1]);
+
+        match header.alg.as_str() {
+            // Dev/staging shared-secret auth
+            "HS256" => {
+                let secret = std::env::var("JWT_SECRET")
+                    .map_err(|_| AuthError::InvalidToken("HS256 requires JWT_SECRET".into()))?;
+                let mut val = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+                if let Ok(service_did) = std::env::var("SERVICE_DID") {
+                    val.set_audience(&[service_did.as_str()]);
+                }
+                jsonwebtoken::decode::<AtProtoClaims>(
+                    token,
+                    &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
+                    &val,
+                )
                 .map_err(|e| AuthError::InvalidToken(format!("HS256 verify failed: {}", e)))
                 .map(|d| d.claims)
+            }
+            // ES256: P-256 ECDSA (JOSE signature R||S)
+            "ES256" => {
+                use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+                use p256::EncodedPoint;
+                let did_doc = self.resolve_did(&claims.iss).await?;
+                let vm = did_doc
+                    .verification_method
+                    .first()
+                    .ok_or(AuthError::MissingVerificationMethod)?;
+                let jwk = vm
+                    .public_key_jwk
+                    .as_ref()
+                    .ok_or(AuthError::MissingVerificationMethod)?;
+                if jwk.kty != "EC" || jwk.crv.to_ascii_uppercase() != "P-256" {
+                    return Err(AuthError::UnsupportedKeyType(format!(
+                        "Expected EC P-256, got {} {}",
+                        jwk.kty, jwk.crv
+                    )));
+                }
+                let x = URL_SAFE_NO_PAD
+                    .decode(&jwk.x)
+                    .map_err(|e| AuthError::InvalidToken(format!("bad jwk.x: {}", e)))?;
+                let y = URL_SAFE_NO_PAD
+                    .decode(
+                        jwk.y
+                            .as_ref()
+                            .ok_or_else(|| AuthError::MissingVerificationMethod)?,
+                    )
+                    .map_err(|e| AuthError::InvalidToken(format!("bad jwk.y: {}", e)))?;
+                let ep = EncodedPoint::from_affine_coordinates(
+                    p256::FieldBytes::from_slice(&x),
+                    p256::FieldBytes::from_slice(&y),
+                    false,
+                );
+                let vk = VerifyingKey::from_encoded_point(&ep)
+                    .map_err(|_| AuthError::InvalidToken("invalid P-256 point".into()))?;
+                let sig_bytes = URL_SAFE_NO_PAD
+                    .decode(parts[2])
+                    .map_err(|e| AuthError::InvalidToken(format!("Invalid b64 sig: {}", e)))?;
+                let sig = Signature::from_slice(&sig_bytes)
+                    .map_err(|_| AuthError::InvalidToken("invalid ES256 signature".into()))?;
+                vk.verify(signing_input.as_bytes(), &sig)
+                    .map_err(|_| AuthError::InvalidSignature)?;
+                Ok(claims)
+            }
+            // ES256K: secp256k1 ECDSA (R||S)
+            "ES256K" => {
+                use k256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+                let did_doc = self.resolve_did(&claims.iss).await?;
+                let vm = did_doc
+                    .verification_method
+                    .first()
+                    .ok_or(AuthError::MissingVerificationMethod)?;
+
+                // Extract public key from either Multikey or JWK format
+                let key_bytes = Self::extract_secp256k1_key(vm)?;
+
+                // Create verifying key from the public key bytes
+                let vk = VerifyingKey::from_sec1_bytes(&key_bytes).map_err(|e| {
+                    AuthError::InvalidToken(format!("invalid secp256k1 key: {}", e))
+                })?;
+
+                // Decode and verify signature
+                let sig_bytes = URL_SAFE_NO_PAD
+                    .decode(parts[2])
+                    .map_err(|e| AuthError::InvalidToken(format!("Invalid b64 sig: {}", e)))?;
+                let sig = Signature::from_slice(&sig_bytes)
+                    .map_err(|_| AuthError::InvalidToken("invalid ES256K signature".into()))?;
+
+                vk.verify(signing_input.as_bytes(), &sig)
+                    .map_err(|_| AuthError::InvalidSignature)?;
+
+                Ok(claims)
+            }
+            other => Err(AuthError::UnsupportedKeyType(format!(
+                "Unsupported alg: {}",
+                other
+            ))),
         }
-        // ES256: P-256 ECDSA (JOSE signature R||S)
-        "ES256" => {
-            use p256::ecdsa::{signature::Verifier, VerifyingKey, Signature};
-            use p256::EncodedPoint;
-            let did_doc = self.resolve_did(&claims.iss).await?;
-            let vm = did_doc.verification_method.first().ok_or(AuthError::MissingVerificationMethod)?;
-            let jwk = vm.public_key_jwk.as_ref().ok_or(AuthError::MissingVerificationMethod)?;
-            if jwk.kty != "EC" || jwk.crv.to_ascii_uppercase() != "P-256" { return Err(AuthError::UnsupportedKeyType(format!("Expected EC P-256, got {} {}", jwk.kty, jwk.crv))); }
-            let x = URL_SAFE_NO_PAD.decode(&jwk.x).map_err(|e| AuthError::InvalidToken(format!("bad jwk.x: {}", e)))?;
-            let y = URL_SAFE_NO_PAD.decode(jwk.y.as_ref().ok_or_else(|| AuthError::MissingVerificationMethod)?)
-                .map_err(|e| AuthError::InvalidToken(format!("bad jwk.y: {}", e)))?;
-            let ep = EncodedPoint::from_affine_coordinates(p256::FieldBytes::from_slice(&x), p256::FieldBytes::from_slice(&y), false);
-            let vk = VerifyingKey::from_encoded_point(&ep).map_err(|_| AuthError::InvalidToken("invalid P-256 point".into()))?;
-            let sig_bytes = URL_SAFE_NO_PAD.decode(parts[2]).map_err(|e| AuthError::InvalidToken(format!("Invalid b64 sig: {}", e)))?;
-            let sig = Signature::from_slice(&sig_bytes).map_err(|_| AuthError::InvalidToken("invalid ES256 signature".into()))?;
-            vk.verify(signing_input.as_bytes(), &sig).map_err(|_| AuthError::InvalidSignature)?;
-            Ok(claims)
-        }
-        // ES256K: secp256k1 ECDSA (R||S)
-        "ES256K" => {
-            use k256::ecdsa::{signature::Verifier, VerifyingKey, Signature};
-            let did_doc = self.resolve_did(&claims.iss).await?;
-            let vm = did_doc.verification_method.first().ok_or(AuthError::MissingVerificationMethod)?;
-            
-            // Extract public key from either Multikey or JWK format
-            let key_bytes = Self::extract_secp256k1_key(vm)?;
-            
-            // Create verifying key from the public key bytes
-            let vk = VerifyingKey::from_sec1_bytes(&key_bytes)
-                .map_err(|e| AuthError::InvalidToken(format!("invalid secp256k1 key: {}", e)))?;
-            
-            // Decode and verify signature
-            let sig_bytes = URL_SAFE_NO_PAD.decode(parts[2])
-                .map_err(|e| AuthError::InvalidToken(format!("Invalid b64 sig: {}", e)))?;
-            let sig = Signature::from_slice(&sig_bytes)
-                .map_err(|_| AuthError::InvalidToken("invalid ES256K signature".into()))?;
-            
-            vk.verify(signing_input.as_bytes(), &sig)
-                .map_err(|_| AuthError::InvalidSignature)?;
-            
-            Ok(claims)
-        }
-        other => Err(AuthError::UnsupportedKeyType(format!("Unsupported alg: {}", other))),
     }
-}
 
     /// Extract secp256k1 public key bytes from DID verification method
     /// Supports both JWK and Multikey formats
@@ -318,22 +369,34 @@ async fn verify_jwt(&self, token: &str) -> Result<AtProtoClaims, AuthError> {
         if let Some(multibase) = &vm.public_key_multibase {
             return Self::decode_multikey_secp256k1(multibase);
         }
-        
+
         // Fall back to JWK format (older)
         if let Some(jwk) = &vm.public_key_jwk {
             if jwk.kty != "EC" {
-                return Err(AuthError::UnsupportedKeyType(format!("Expected EC, got {}", jwk.kty)));
+                return Err(AuthError::UnsupportedKeyType(format!(
+                    "Expected EC, got {}",
+                    jwk.kty
+                )));
             }
             let crv = jwk.crv.to_ascii_lowercase();
             if crv != "secp256k1" && crv != "k-256" && crv != "p-256k" {
-                return Err(AuthError::UnsupportedKeyType(format!("Expected secp256k1, got {}", jwk.crv)));
+                return Err(AuthError::UnsupportedKeyType(format!(
+                    "Expected secp256k1, got {}",
+                    jwk.crv
+                )));
             }
-            
-            let x = URL_SAFE_NO_PAD.decode(&jwk.x)
+
+            let x = URL_SAFE_NO_PAD
+                .decode(&jwk.x)
                 .map_err(|e| AuthError::InvalidToken(format!("bad jwk.x: {}", e)))?;
-            let y = URL_SAFE_NO_PAD.decode(jwk.y.as_ref().ok_or_else(|| AuthError::MissingVerificationMethod)?)
+            let y = URL_SAFE_NO_PAD
+                .decode(
+                    jwk.y
+                        .as_ref()
+                        .ok_or_else(|| AuthError::MissingVerificationMethod)?,
+                )
                 .map_err(|e| AuthError::InvalidToken(format!("bad jwk.y: {}", e)))?;
-            
+
             // Uncompressed point: 0x04 || x || y
             let mut key_bytes = Vec::with_capacity(65);
             key_bytes.push(0x04);
@@ -341,7 +404,7 @@ async fn verify_jwt(&self, token: &str) -> Result<AtProtoClaims, AuthError> {
             key_bytes.extend_from_slice(&y);
             return Ok(key_bytes);
         }
-        
+
         Err(AuthError::MissingVerificationMethod)
     }
 
@@ -352,12 +415,12 @@ async fn verify_jwt(&self, token: &str) -> Result<AtProtoClaims, AuthError> {
         // Decode multibase (z prefix = base58btc)
         let (_base, bytes) = multibase::decode(multibase_str)
             .map_err(|e| AuthError::InvalidToken(format!("multibase decode failed: {}", e)))?;
-        
+
         // Check multicodec prefix for secp256k1-pub (0xe7, varint encoded as 0xe7 0x01)
         if bytes.len() < 2 {
             return Err(AuthError::InvalidToken("multikey too short".into()));
         }
-        
+
         // secp256k1-pub multicodec: 0xe7 0x01
         if bytes[0] == 0xe7 && bytes[1] == 0x01 {
             // Compressed or uncompressed public key follows
@@ -365,16 +428,20 @@ async fn verify_jwt(&self, token: &str) -> Result<AtProtoClaims, AuthError> {
         } else {
             Err(AuthError::UnsupportedKeyType(format!(
                 "Expected secp256k1-pub multicodec (0xe7 0x01), got {:02x} {:02x}",
-                bytes[0], bytes.get(1).unwrap_or(&0)
+                bytes[0],
+                bytes.get(1).unwrap_or(&0)
             )))
         }
     }
 
-/// Resolve DID document with caching
+    /// Resolve DID document with caching
     async fn resolve_did(&self, did: &str) -> Result<DidDocument, AuthError> {
         // Validate DID format
         if !did.starts_with("did:") {
-            return Err(AuthError::InvalidDid(format!("DID must start with 'did:': {}", did)));
+            return Err(AuthError::InvalidDid(format!(
+                "DID must start with 'did:': {}",
+                did
+            )));
         }
 
         // Check cache first
@@ -391,7 +458,10 @@ async fn verify_jwt(&self, token: &str) -> Result<AtProtoClaims, AuthError> {
         } else if did.starts_with("did:web:") {
             self.resolve_web_did(did).await?
         } else {
-            return Err(AuthError::InvalidDid(format!("Unsupported DID method: {}", did)));
+            return Err(AuthError::InvalidDid(format!(
+                "Unsupported DID method: {}",
+                did
+            )));
         };
 
         // Cache the result
@@ -406,7 +476,9 @@ async fn verify_jwt(&self, token: &str) -> Result<AtProtoClaims, AuthError> {
 
     /// Resolve did:plc DID via PLC directory
     async fn resolve_plc_did(&self, did: &str) -> Result<DidDocument, AuthError> {
-        let _plc_id = did.strip_prefix("did:plc:").ok_or_else(|| AuthError::InvalidDid(format!("Invalid PLC DID: {}", did)))?;
+        let _plc_id = did
+            .strip_prefix("did:plc:")
+            .ok_or_else(|| AuthError::InvalidDid(format!("Invalid PLC DID: {}", did)))?;
         let url = format!("https://plc.directory/{}", did);
 
         tracing::debug!(
@@ -432,21 +504,24 @@ async fn verify_jwt(&self, token: &str) -> Result<AtProtoClaims, AuthError> {
             )));
         }
 
-        let doc = response
-            .json::<DidDocument>()
-            .await
-            .map_err(|e| AuthError::DidResolutionFailed(format!("Failed to parse DID document: {}", e)))?;
+        let doc = response.json::<DidDocument>().await.map_err(|e| {
+            AuthError::DidResolutionFailed(format!("Failed to parse DID document: {}", e))
+        })?;
 
         Ok(doc)
     }
 
     /// Resolve did:web DID via HTTPS
     async fn resolve_web_did(&self, did: &str) -> Result<DidDocument, AuthError> {
-        let web_path = did.strip_prefix("did:web:").ok_or_else(|| AuthError::InvalidDid(format!("Invalid WEB DID: {}", did)))?;
+        let web_path = did
+            .strip_prefix("did:web:")
+            .ok_or_else(|| AuthError::InvalidDid(format!("Invalid WEB DID: {}", did)))?;
         let domain = web_path.replace(':', "/");
         let host = domain.split('/').next().unwrap_or("");
         if is_disallowed_host(host) {
-            return Err(AuthError::DidResolutionFailed("disallowed did:web host".into()));
+            return Err(AuthError::DidResolutionFailed(
+                "disallowed did:web host".into(),
+            ));
         }
         let url = format!("https://{}/.well-known/did.json", domain);
 
@@ -464,29 +539,24 @@ async fn verify_jwt(&self, token: &str) -> Result<AtProtoClaims, AuthError> {
             )));
         }
 
-        let doc = response
-            .json::<DidDocument>()
-            .await
-            .map_err(|e| AuthError::DidResolutionFailed(format!("Failed to parse DID document: {}", e)))?;
+        let doc = response.json::<DidDocument>().await.map_err(|e| {
+            AuthError::DidResolutionFailed(format!("Failed to parse DID document: {}", e))
+        })?;
 
         Ok(doc)
     }
     /// Check rate limit for a DID
     fn check_rate_limit(&self, did: &str) -> Result<(), AuthError> {
         let mut limiters = self.rate_limiters.write();
-        
+
         let limiter = limiters
             .entry(did.to_string())
-            .or_insert_with(|| {
-                Arc::new(RateLimiter::direct(self.rate_limit_quota))
-            })
+            .or_insert_with(|| Arc::new(RateLimiter::direct(self.rate_limit_quota)))
             .clone();
 
         drop(limiters);
 
-        limiter
-            .check()
-            .map_err(|_| AuthError::RateLimitExceeded)?;
+        limiter.check().map_err(|_| AuthError::RateLimitExceeded)?;
 
         Ok(())
     }
@@ -528,8 +598,12 @@ fn is_disallowed_host(host: &str) -> bool {
     }
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         match ip {
-            std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_multicast(),
-            std::net::IpAddr::V6(v6) => v6.is_unique_local() || v6.is_loopback() || v6.is_unspecified() || v6.is_multicast(),
+            std::net::IpAddr::V4(v4) => {
+                v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_multicast()
+            }
+            std::net::IpAddr::V6(v6) => {
+                v6.is_unique_local() || v6.is_loopback() || v6.is_unspecified() || v6.is_multicast()
+            }
         }
     } else {
         false
@@ -553,9 +627,7 @@ pub fn enforce_standard(claims: &AtProtoClaims, endpoint_nsid: &str) -> Result<(
     if enforce_lxm {
         if let Some(lxm) = &claims.lxm {
             if lxm != endpoint_nsid {
-                tracing::warn!(
-                    "LXM mismatch: JWT lxm does not match endpoint NSID"
-                );
+                tracing::warn!("LXM mismatch: JWT lxm does not match endpoint NSID");
                 return Err(AuthError::LxmMismatch);
             }
         } else {
@@ -626,12 +698,10 @@ where
             })?;
 
         // Parse bearer token (redacted in logs)
-        let token = auth_header
-            .strip_prefix("Bearer ")
-            .ok_or_else(|| {
-                tracing::error!("Invalid auth format - expected 'Bearer <token>'");
-                AuthError::InvalidAuthFormat
-            })?;
+        let token = auth_header.strip_prefix("Bearer ").ok_or_else(|| {
+            tracing::error!("Invalid auth format - expected 'Bearer <token>'");
+            AuthError::InvalidAuthFormat
+        })?;
 
         // Use shared auth middleware (cached DID docs, rate limiting)
         let middleware: &AuthMiddleware = &AUTH_MIDDLEWARE;
@@ -657,7 +727,10 @@ where
             return Err(AuthError::RateLimitExceeded);
         }
 
-        debug!("Authenticated request from DID: {}", crate::crypto::redact_for_log(&claims.iss));
+        debug!(
+            "Authenticated request from DID: {}",
+            crate::crypto::redact_for_log(&claims.iss)
+        );
 
         Ok(AuthUser {
             did: claims.iss.clone(),
@@ -687,7 +760,7 @@ pub async fn verify_is_admin(
     let is_admin: Option<bool> = sqlx::query_scalar(
         "SELECT is_admin FROM members
          WHERE convo_id = $1 AND (member_did = $2 OR user_did = $2) AND left_at IS NULL
-         LIMIT 1"
+         LIMIT 1",
     )
     .bind(convo_id)
     .bind(user_did)
@@ -730,7 +803,7 @@ pub async fn verify_is_member(
         "SELECT EXISTS(
             SELECT 1 FROM members
             WHERE convo_id = $1 AND (member_did = $2 OR user_did = $2) AND left_at IS NULL
-        )"
+        )",
     )
     .bind(convo_id)
     .bind(user_did)
@@ -759,7 +832,7 @@ pub async fn count_admins(
 ) -> Result<i64, StatusCode> {
     sqlx::query_scalar(
         "SELECT COUNT(*) FROM members
-         WHERE convo_id = $1 AND is_admin = true AND left_at IS NULL"
+         WHERE convo_id = $1 AND is_admin = true AND left_at IS NULL",
     )
     .bind(convo_id)
     .fetch_one(pool)
@@ -787,7 +860,7 @@ pub async fn verify_is_moderator_or_admin(
         "SELECT is_admin, COALESCE(is_moderator, false)
          FROM members
          WHERE convo_id = $1 AND (member_did = $2 OR user_did = $2) AND left_at IS NULL
-         LIMIT 1"
+         LIMIT 1",
     )
     .bind(convo_id)
     .bind(user_did)

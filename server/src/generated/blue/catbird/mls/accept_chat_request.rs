@@ -8,7 +8,7 @@ pub struct InputData {
     pub request_id: String,
     ///MLS Welcome message for sender to join group
     #[serde(default)]
-    #[serde(with = "serde_bytes")]
+    #[serde(with = "crate::atproto_bytes::option")]
     #[serde(skip_serializing_if = "core::option::Option::is_none")]
     pub welcome_data: core::option::Option<Vec<u8>>,
 }
@@ -60,11 +60,11 @@ impl std::fmt::Display for Error {
 #[serde(rename_all = "camelCase")]
 pub struct DeliveredMessageData {
     ///MLS encrypted message
-    #[serde(with = "serde_bytes")]
+    #[serde(with = "crate::atproto_bytes")]
     pub ciphertext: Vec<u8>,
     ///Ephemeral public key if present
     #[serde(default)]
-    #[serde(with = "serde_bytes")]
+    #[serde(with = "crate::atproto_bytes::option")]
     #[serde(skip_serializing_if = "core::option::Option::is_none")]
     pub eph_pub_key: core::option::Option<Vec<u8>>,
     ///Message ID

@@ -19,7 +19,10 @@ pub async fn run_mark_inactive_devices_worker(pool: PgPool) {
 
         match mark_inactive_devices(&pool).await {
             Ok(count) if count > 0 => {
-                info!("Marked {} devices as inactive (no activity for 30+ days)", count);
+                info!(
+                    "Marked {} devices as inactive (no activity for 30+ days)",
+                    count
+                );
             }
             Ok(_) => {
                 info!("No devices to mark as inactive");
@@ -69,7 +72,7 @@ pub async fn get_all_key_packages_prioritize_active(
     let reservation_timeout = now - chrono::Duration::minutes(5);
 
     // Get ONE key package per unique DEVICE, prioritizing active devices
-    // 
+    //
     // CRITICAL FIX: Use device_id (not credential_did) for DISTINCT ON.
     // - credential_did is the bare user DID (same for ALL devices of a user)
     // - device_id is unique per device, ensuring we get one key package per device

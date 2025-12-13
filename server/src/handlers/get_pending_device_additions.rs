@@ -1,4 +1,8 @@
-use axum::{extract::{Query, State}, http::StatusCode, Json};
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    Json,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
@@ -48,9 +52,10 @@ pub async fn get_pending_device_additions(
     auth_user: AuthUser,
     Query(input): Query<GetPendingDeviceAdditionsInput>,
 ) -> Result<Json<GetPendingDeviceAdditionsOutput>, StatusCode> {
-    if let Err(_e) =
-        crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.getPendingDeviceAdditions")
-    {
+    if let Err(_e) = crate::auth::enforce_standard(
+        &auth_user.claims,
+        "blue.catbird.mls.getPendingDeviceAdditions",
+    ) {
         return Err(StatusCode::UNAUTHORIZED);
     }
 

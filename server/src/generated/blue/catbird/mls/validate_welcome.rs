@@ -5,7 +5,7 @@ pub const NSID: &str = "blue.catbird.mls.validateWelcome";
 #[serde(rename_all = "camelCase")]
 pub struct InputData {
     ///MLS Welcome message bytes to validate
-    #[serde(with = "serde_bytes")]
+    #[serde(with = "crate::atproto_bytes")]
     pub welcome_message: Vec<u8>,
 }
 pub type Input = crate::types::Object<InputData>;
