@@ -2044,3 +2044,37 @@ pub async fn get_message_reactions(
 
     Ok(rows)
 }
+
+/// Get reactions for multiple messages in a single query
+pub async fn get_reactions_for_messages(
+    pool: &DbPool,
+    convo_id: &str,
+    message_ids: &[&str],
+) -> Result<std::collections::HashMap<String, Vec<crate::generated_types::ReactionView>>> {
+    use std::collections::HashMap;
+    use crate::generated_types::ReactionView;
+
+    let rows: Vec<(String, String, String, DateTime<Utc>)> = sqlx::query_as(
+        r#"
+        SELECT message_id, user_did, reaction, created_at
+        FROM message_reactions
+        WHERE conversation_id = $1 AND message_id = ANY($2)
+        ORDER BY created_at ASC
+        "#,
+    )
+    .bind(convo_id)
+    .bind(message_ids)
+    .fetch_all(pool)
+    .await
+    .context("Failed to fetch reactions for messages")?;
+
+    let mut map: HashMap<String, Vec<ReactionView>> = HashMap::new();
+    for (msg_id, user_did, reaction, created_at) in rows {
+        map.entry(msg_id).or_default().push(ReactionView {
+            user_did,
+            reaction,
+            created_at,
+        });
+    }
+    Ok(map)
+}
