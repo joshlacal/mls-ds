@@ -6,7 +6,7 @@
     "payloadView": {
       "type": "object",
       "description": "Decrypted message payload structure (what's inside the encrypted ciphertext). This is what clients decrypt from the ciphertext bytes.",
-      "required": ["version"],
+      "required": ["version", "messageType"],
       "properties": {
         "version": {
           "type": "integer",
@@ -15,8 +15,8 @@
         },
         "messageType": {
           "type": "string",
-          "description": "Message type discriminator: text (default), adminRoster, adminAction",
-          "knownValues": ["text", "adminRoster", "adminAction"]
+          "description": "Message type discriminator",
+          "knownValues": ["text", "adminRoster", "adminAction", "reaction", "readReceipt", "typing"]
         },
         "text": {
           "type": "string",
@@ -41,6 +41,21 @@
           "type": "ref",
           "ref": "#adminAction",
           "description": "Admin action notification (for messageType: adminAction)"
+        },
+        "reaction": {
+          "type": "ref",
+          "ref": "#reactionPayload",
+          "description": "Reaction payload (for messageType: reaction)"
+        },
+        "readReceipt": {
+          "type": "ref",
+          "ref": "#readReceiptPayload",
+          "description": "Read receipt payload (for messageType: readReceipt)"
+        },
+        "typing": {
+          "type": "ref",
+          "ref": "#typingPayload",
+          "description": "Typing indicator payload (for messageType: typing)"
         }
       }
     },
@@ -195,6 +210,56 @@
           "type": "string",
           "maxLength": 500,
           "description": "Optional reason for the action"
+        }
+      }
+    },
+
+    "reactionPayload": {
+      "type": "object",
+      "description": "Encrypted reaction to a message (add or remove emoji)",
+      "required": ["messageId", "emoji", "action"],
+      "properties": {
+        "messageId": {
+          "type": "string",
+          "description": "ID of the message being reacted to"
+        },
+        "emoji": {
+          "type": "string",
+          "maxLength": 16,
+          "description": "Emoji reaction (single emoji or short sequence)"
+        },
+        "action": {
+          "type": "string",
+          "description": "Whether to add or remove the reaction",
+          "knownValues": ["add", "remove"]
+        }
+      }
+    },
+
+    "readReceiptPayload": {
+      "type": "object",
+      "description": "Encrypted read receipt for a specific message",
+      "required": ["messageId"],
+      "properties": {
+        "messageId": {
+          "type": "string",
+          "description": "ID of the message that was read"
+        }
+      }
+    },
+
+    "typingPayload": {
+      "type": "object",
+      "description": "Encrypted typing indicator (ephemeral, not stored). Sent as MLS PrivateMessage without epoch advancement.",
+      "required": ["isTyping"],
+      "properties": {
+        "isTyping": {
+          "type": "boolean",
+          "description": "Whether the user is currently typing"
+        },
+        "ts": {
+          "type": "integer",
+          "description": "Unix timestamp in milliseconds when typing state changed"
         }
       }
     }

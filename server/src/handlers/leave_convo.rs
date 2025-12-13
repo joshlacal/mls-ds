@@ -305,6 +305,19 @@ pub async fn leave_convo(
                             message: message_view.clone(),
                         };
 
+                        // Store event for cursor-based SSE replay
+                        if let Err(e) = crate::db::store_event(
+                            &pool_clone,
+                            &cursor,
+                            &convo_id_clone,
+                            "messageEvent",
+                            Some(&msg_id_clone),
+                        )
+                        .await
+                        {
+                            error!("❌ [leave_convo:fanout] Failed to store event: {:?}", e);
+                        }
+
                         if let Err(e) = sse_state_clone.emit(&convo_id_clone, event).await {
                             error!("❌ [leave_convo:fanout] Failed to emit SSE event: {}", e);
                         } else {

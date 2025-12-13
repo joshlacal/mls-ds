@@ -245,21 +245,20 @@ pub async fn subscribe_convo_events(
     let tx = sse_state.get_channel(&convo_id).await;
     let rx = tx.subscribe();
 
-    // If the client provided a cursor, backfill missed reaction events from the DB first.
-    // (Messages are fetched via getMessages; reactions need full payload for replay.)
+    // If the client provided a cursor, backfill missed events from the DB first.
+    //
+    // We intentionally do NOT backfill all message events (app messages) here because clients
+    // fetch chat messages via getMessages. However, MLS commit messages are required to maintain
+    // local MLS state, so we do backfill commit messageEvent entries to avoid epoch desync when
+    // a client reconnects after missing commits.
     let mut replayed_cursors: HashSet<String> = HashSet::new();
     let mut replay_sse_events: Vec<Event> = Vec::new();
 
     if let Some(ref resume_cur) = resume_cursor {
-        match crate::db::get_events_after_cursor(
-            &pool,
-            &convo_id,
-            Some("reactionEvent"),
-            resume_cur,
-            200,
-        )
-        .await
-        {
+        let mut replay_items: Vec<(String, String)> = Vec::new();
+
+        // Backfill reaction events (needed for cursor-based SSE replay).
+        match crate::db::get_events_after_cursor(&pool, &convo_id, Some("reactionEvent"), resume_cur, 200).await {
             Ok(events) => {
                 for (id, payload, _emitted_at) in events {
                     let message_id = payload.get("messageId").and_then(|v| v.as_str());
@@ -286,13 +285,12 @@ pub async fn subscribe_convo_events(
                     let json = match serde_json::to_string(&event) {
                         Ok(j) => j,
                         Err(e) => {
-                            error!(error = ?e, "Failed to serialize replay event");
+                            error!(error = ?e, "Failed to serialize replay reactionEvent");
                             continue;
                         }
                     };
 
-                    replayed_cursors.insert(id);
-                    replay_sse_events.push(Event::default().data(json));
+                    replay_items.push((id, json));
                 }
             }
             Err(e) => {
@@ -302,6 +300,95 @@ pub async fn subscribe_convo_events(
                     "Failed to backfill reaction events"
                 );
             }
+        }
+
+        // Backfill commit message events (required for MLS state correctness).
+        //
+        // NOTE: This intentionally replays ONLY commit messages, not all app messages.
+        // Clients should fetch any missed chat content via getMessages.
+        let commit_rows = sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                Option<Vec<u8>>,
+                i64,
+                i64,
+                chrono::DateTime<chrono::Utc>,
+            ),
+        >(
+            r#"
+            SELECT
+                e.id AS cursor,
+                m.id AS message_id,
+                m.ciphertext,
+                m.epoch,
+                m.seq,
+                m.created_at
+            FROM event_stream e
+            JOIN messages m
+              ON m.id = (e.payload->>'messageId')
+            WHERE e.convo_id = $1
+              AND e.event_type = 'messageEvent'
+              AND e.id > $2
+              AND m.message_type = 'commit'
+            ORDER BY e.id ASC
+            "#,
+        )
+        .bind(&convo_id)
+        .bind(resume_cur)
+        .fetch_all(&pool)
+        .await;
+
+        match commit_rows {
+            Ok(rows) => {
+                for (cursor, message_id, ciphertext, epoch, seq, created_at) in rows {
+                    let Some(ciphertext) = ciphertext else {
+                        // Should never happen for commit messages, but don't emit empty ciphertext.
+                        continue;
+                    };
+
+                    let message_view =
+                        crate::models::MessageView::from(crate::models::MessageViewData {
+                            id: message_id,
+                            convo_id: convo_id.clone(),
+                            ciphertext,
+                            epoch: epoch as usize,
+                            seq: seq as usize,
+                            created_at: crate::sqlx_atrium::chrono_to_datetime(created_at),
+                            message_type: None,
+                        });
+
+                    let event = StreamEvent::MessageEvent {
+                        cursor: cursor.clone(),
+                        message: message_view,
+                    };
+
+                    let json = match serde_json::to_string(&event) {
+                        Ok(j) => j,
+                        Err(e) => {
+                            error!(error = ?e, "Failed to serialize replay commit messageEvent");
+                            continue;
+                        }
+                    };
+
+                    replay_items.push((cursor, json));
+                }
+            }
+            Err(e) => {
+                warn!(
+                    convo = %crate::crypto::redact_for_log(&convo_id),
+                    error = ?e,
+                    "Failed to backfill commit messages"
+                );
+            }
+        }
+
+        // Emit replay events in cursor order to preserve server-side ordering semantics.
+        replay_items.sort_by(|a, b| a.0.cmp(&b.0));
+        for (cursor, json) in replay_items {
+            replayed_cursors.insert(cursor);
+            replay_sse_events.push(Event::default().data(json));
         }
     }
 
