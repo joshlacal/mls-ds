@@ -1,4 +1,7 @@
-use a2::{Client, ClientConfig, DefaultNotificationBuilder, Endpoint, NotificationBuilder, NotificationOptions, Priority, PushType};
+use a2::{
+    Client, ClientConfig, DefaultNotificationBuilder, Endpoint, NotificationBuilder,
+    NotificationOptions, Priority, PushType,
+};
 use anyhow::{Context, Result};
 use base64::Engine;
 use sqlx::PgPool;
@@ -30,7 +33,7 @@ impl ApnsClient {
         topic: &str,
     ) -> Result<Self> {
         let key_path = Path::new(key_path);
-        
+
         if !key_path.exists() {
             anyhow::bail!("APNs key file not found: {}", key_path.display());
         }
@@ -70,9 +73,7 @@ impl ApnsClient {
         message_id: &str,
         recipient_did: &str,
     ) -> Result<()> {
-        info!(
-            "🔔 [push_notification] Starting send_message_notification"
-        );
+        info!("🔔 [push_notification] Starting send_message_notification");
 
         // Encode ciphertext as base64 for JSON payload
         let ciphertext_b64 = base64::engine::general_purpose::STANDARD.encode(ciphertext);
@@ -87,9 +88,7 @@ impl ApnsClient {
             "🔔 [push_notification] Preparing MLS message notification"
         );
 
-        info!(
-            "🔔 [push_notification] Building notification payload with custom MLS data"
-        );
+        info!("🔔 [push_notification] Building notification payload with custom MLS data");
 
         // Build notification with mutable-content for Notification Service Extension
         // IMPORTANT: We MUST set an initial alert (title/body) for iOS to display a banner.
@@ -98,7 +97,7 @@ impl ApnsClient {
         let mut notification = DefaultNotificationBuilder::new()
             .set_title("New Message")
             .set_body("Decrypting...")
-            .set_mutable_content()    // Enables Notification Service Extension to modify the alert
+            .set_mutable_content() // Enables Notification Service Extension to modify the alert
             .set_sound("default")
             .build(
                 device_token,
@@ -107,7 +106,7 @@ impl ApnsClient {
                     apns_priority: Some(Priority::High),
                     apns_collapse_id: None,
                     apns_expiration: None,
-                    apns_push_type: Some(PushType::Alert),  // Required for Notification Service Extension
+                    apns_push_type: Some(PushType::Alert), // Required for Notification Service Extension
                     apns_id: None,
                 },
             );
@@ -226,7 +225,10 @@ impl NotificationService {
                 Some(Arc::new(client))
             }
             Err(e) => {
-                warn!("Failed to initialize APNs client: {}. Push notifications disabled.", e);
+                warn!(
+                    "Failed to initialize APNs client: {}. Push notifications disabled.",
+                    e
+                );
                 None
             }
         };
@@ -241,14 +243,14 @@ impl NotificationService {
 
     /// Initialize APNs client from environment variables
     fn init_apns_client() -> Result<ApnsClient> {
-        let key_path = std::env::var("APNS_KEY_PATH")
-            .context("APNS_KEY_PATH environment variable not set")?;
-        let key_id = std::env::var("APNS_KEY_ID")
-            .context("APNS_KEY_ID environment variable not set")?;
-        let team_id = std::env::var("APNS_TEAM_ID")
-            .context("APNS_TEAM_ID environment variable not set")?;
-        let topic = std::env::var("APNS_TOPIC")
-            .context("APNS_TOPIC environment variable not set")?;
+        let key_path =
+            std::env::var("APNS_KEY_PATH").context("APNS_KEY_PATH environment variable not set")?;
+        let key_id =
+            std::env::var("APNS_KEY_ID").context("APNS_KEY_ID environment variable not set")?;
+        let team_id =
+            std::env::var("APNS_TEAM_ID").context("APNS_TEAM_ID environment variable not set")?;
+        let topic =
+            std::env::var("APNS_TOPIC").context("APNS_TOPIC environment variable not set")?;
         let production = std::env::var("APNS_PRODUCTION")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
@@ -371,24 +373,26 @@ impl NotificationService {
             let task = tokio::spawn(async move {
                 info!(
                     "🔔 [push_notification] Task {}/{} starting send_message_notification",
-                    task_num,
-                    total_devices
+                    task_num, total_devices
                 );
                 let result = client
-                    .send_message_notification(&device_token, &ciphertext, &convo_id, &message_id, &recipient_did)
+                    .send_message_notification(
+                        &device_token,
+                        &ciphertext,
+                        &convo_id,
+                        &message_id,
+                        &recipient_did,
+                    )
                     .await;
 
                 match &result {
                     Ok(_) => info!(
                         "🔔 [push_notification] Task {}/{} completed successfully",
-                        task_num,
-                        total_devices
+                        task_num, total_devices
                     ),
                     Err(e) => error!(
                         "🔔 [push_notification] Task {}/{} failed: {}",
-                        task_num,
-                        total_devices,
-                        e
+                        task_num, total_devices, e
                     ),
                 }
 
@@ -410,8 +414,7 @@ impl NotificationService {
             let task_num = idx + 1;
             info!(
                 "🔔 [push_notification] Awaiting task {}/{}",
-                task_num,
-                total_devices
+                task_num, total_devices
             );
 
             match task.await {
@@ -419,19 +422,14 @@ impl NotificationService {
                     success_count += 1;
                     info!(
                         "🔔 [push_notification] Task {}/{} result: SUCCESS (total success: {})",
-                        task_num,
-                        total_devices,
-                        success_count
+                        task_num, total_devices, success_count
                     );
                 }
                 Ok(Err(e)) => {
                     error_count += 1;
                     error!(
                         "❌ [push_notification] Task {}/{} result: FAILED - {} (total errors: {})",
-                        task_num,
-                        total_devices,
-                        e,
-                        error_count
+                        task_num, total_devices, e, error_count
                     );
                 }
                 Err(e) => {

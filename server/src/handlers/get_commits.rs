@@ -1,6 +1,10 @@
-use axum::{extract::{Query, State}, http::StatusCode, Json};
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    Json,
+};
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 use crate::{
     auth::AuthUser,
@@ -43,67 +47,64 @@ pub async fn get_commits(
     auth_user: AuthUser,
     Query(params): Query<GetCommitsParams>,
 ) -> Result<Json<CommitsResponse>, StatusCode> {
-    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.getCommits") {
+    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.getCommits")
+    {
         return Err(StatusCode::UNAUTHORIZED);
     }
-    
+
     let did = &auth_user.did;
-    
+
     // Validate input
     if params.convo_id.is_empty() {
         warn!("Empty convo_id provided");
         return Err(StatusCode::BAD_REQUEST);
     }
-    
+
     if params.from_epoch < 0 {
         warn!("Invalid from_epoch: {}", params.from_epoch);
         return Err(StatusCode::BAD_REQUEST);
     }
-    
+
     // Check if user is a member
-    if !is_member(&pool, did, &params.convo_id)
-        .await
-        .map_err(|e| {
-            error!("Failed to check membership: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?
-    {
+    if !is_member(&pool, did, &params.convo_id).await.map_err(|e| {
+        error!("Failed to check membership: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })? {
         warn!("User is not a member of conversation");
         return Err(StatusCode::FORBIDDEN);
     }
-    
+
     // Determine end epoch - default to current epoch if not specified
     let to_epoch = if let Some(to) = params.to_epoch {
         to
     } else {
         // Get current epoch
-        let current_epoch: i32 = sqlx::query_scalar(
-            "SELECT current_epoch FROM conversations WHERE id = $1"
-        )
-        .bind(&params.convo_id)
-        .fetch_one(&pool)
-        .await
-        .map_err(|e| {
-            error!("Failed to fetch current epoch: {}", e);
-            match e {
-                sqlx::Error::RowNotFound => StatusCode::NOT_FOUND,
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
-            }
-        })?;
+        let current_epoch: i32 =
+            sqlx::query_scalar("SELECT current_epoch FROM conversations WHERE id = $1")
+                .bind(&params.convo_id)
+                .fetch_one(&pool)
+                .await
+                .map_err(|e| {
+                    error!("Failed to fetch current epoch: {}", e);
+                    match e {
+                        sqlx::Error::RowNotFound => StatusCode::NOT_FOUND,
+                        _ => StatusCode::INTERNAL_SERVER_ERROR,
+                    }
+                })?;
         current_epoch as i64
     };
-    
+
     // Validate epoch range
     if params.from_epoch > to_epoch {
         warn!("Invalid epoch range: {} to {}", params.from_epoch, to_epoch);
         return Err(StatusCode::BAD_REQUEST);
     }
-    
+
     info!(
         "Fetching commits for conversation {} from epoch {} to {}",
         params.convo_id, params.from_epoch, to_epoch
     );
-    
+
     // Fetch commit messages in epoch range
     let commits = sqlx::query_as::<_, CommitMessage>(
         "SELECT id, epoch, ciphertext, sender_did, created_at 
@@ -112,7 +113,7 @@ pub async fn get_commits(
            AND message_type = 'commit'
            AND epoch >= $2 
            AND epoch <= $3
-         ORDER BY epoch ASC, created_at ASC"
+         ORDER BY epoch ASC, created_at ASC",
     )
     .bind(&params.convo_id)
     .bind(params.from_epoch)
@@ -123,9 +124,9 @@ pub async fn get_commits(
         error!("Failed to fetch commits: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    
+
     info!("Fetched {} commits", commits.len());
-    
+
     Ok(Json(CommitsResponse {
         convo_id: params.convo_id,
         commits,
@@ -143,12 +144,12 @@ mod tests {
         epochs: &[i64],
     ) {
         let now = chrono::Utc::now();
-        
+
         // Create conversation
         let max_epoch = epochs.iter().max().unwrap_or(&0);
         sqlx::query(
             "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at) 
-             VALUES ($1, $2, $3, $4, $4)"
+             VALUES ($1, $2, $3, $4, $4)",
         )
         .bind(convo_id)
         .bind(creator)
@@ -157,11 +158,11 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
-        
+
         // Add member
         sqlx::query(
             "INSERT INTO members (convo_id, member_did, joined_at) 
-             VALUES ($1, $2, $3)"
+             VALUES ($1, $2, $3)",
         )
         .bind(convo_id)
         .bind(creator)
@@ -169,7 +170,7 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
-        
+
         // Add commit messages
         for (idx, &epoch) in epochs.iter().enumerate() {
             let msg_id = format!("commit-{}", idx);
@@ -193,7 +194,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_commits_success() {
-        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
+        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else {
+            return;
+        };
         let pool = crate::db::init_db(crate::db::DbConfig {
             database_url: db_url,
             max_connections: 5,
@@ -203,10 +206,10 @@ mod tests {
         })
         .await
         .unwrap();
-        
+
         let convo_id = "test-commits-convo-1";
         let user = "did:plc:user";
-        
+
         setup_test_convo_with_commits(&pool, user, convo_id, &[1, 2, 3, 5, 8]).await;
 
         let auth_user = AuthUser {
@@ -221,7 +224,7 @@ mod tests {
                 lxm: None,
             },
         };
-        
+
         // Test fetching range 2-5
         let params = GetCommitsParams {
             convo_id: convo_id.to_string(),
@@ -231,13 +234,13 @@ mod tests {
 
         let result = get_commits(State(pool.clone()), auth_user.clone(), Query(params)).await;
         assert!(result.is_ok());
-        
+
         let response = result.unwrap().0;
         assert_eq!(response.commits.len(), 3); // epochs 2, 3, 5
         assert_eq!(response.commits[0].epoch, 2);
         assert_eq!(response.commits[1].epoch, 3);
         assert_eq!(response.commits[2].epoch, 5);
-        
+
         // Test fetching from epoch 1 to current (should get all)
         let params2 = GetCommitsParams {
             convo_id: convo_id.to_string(),
@@ -247,14 +250,16 @@ mod tests {
 
         let result2 = get_commits(State(pool), auth_user, Query(params2)).await;
         assert!(result2.is_ok());
-        
+
         let response2 = result2.unwrap().0;
         assert_eq!(response2.commits.len(), 5); // all commits
     }
 
     #[tokio::test]
     async fn test_get_commits_not_member() {
-        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
+        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else {
+            return;
+        };
         let pool = crate::db::init_db(crate::db::DbConfig {
             database_url: db_url,
             max_connections: 5,
@@ -264,10 +269,10 @@ mod tests {
         })
         .await
         .unwrap();
-        
+
         let convo_id = "test-commits-convo-2";
         let creator = "did:plc:creator";
-        
+
         setup_test_convo_with_commits(&pool, creator, convo_id, &[1, 2]).await;
 
         let auth_user = AuthUser {
@@ -282,7 +287,7 @@ mod tests {
                 lxm: None,
             },
         };
-        
+
         let params = GetCommitsParams {
             convo_id: convo_id.to_string(),
             from_epoch: 1,
@@ -295,7 +300,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_commits_invalid_range() {
-        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
+        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else {
+            return;
+        };
         let pool = crate::db::init_db(crate::db::DbConfig {
             database_url: db_url,
             max_connections: 5,
@@ -305,10 +312,10 @@ mod tests {
         })
         .await
         .unwrap();
-        
+
         let convo_id = "test-commits-convo-3";
         let user = "did:plc:user";
-        
+
         setup_test_convo_with_commits(&pool, user, convo_id, &[1, 2]).await;
 
         let auth_user = AuthUser {
@@ -323,7 +330,7 @@ mod tests {
                 lxm: None,
             },
         };
-        
+
         // from_epoch > to_epoch
         let params = GetCommitsParams {
             convo_id: convo_id.to_string(),

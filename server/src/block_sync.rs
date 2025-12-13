@@ -147,7 +147,9 @@ impl BlockSyncService {
             .ok_or(BlockSyncError::PdsEndpointNotFound)?;
 
         // Cache the endpoint
-        self.pds_cache.insert(did.to_string(), endpoint.clone()).await;
+        self.pds_cache
+            .insert(did.to_string(), endpoint.clone())
+            .await;
 
         Ok(endpoint)
     }
@@ -200,7 +202,10 @@ impl BlockSyncService {
     ///
     /// This calls com.atproto.repo.listRecords with collection="app.bsky.graph.block"
     /// and paginates through all results.
-    pub async fn fetch_blocks_from_pds(&self, did: &str) -> Result<Vec<BlockRecord>, BlockSyncError> {
+    pub async fn fetch_blocks_from_pds(
+        &self,
+        did: &str,
+    ) -> Result<Vec<BlockRecord>, BlockSyncError> {
         // Check cache first
         if let Some(blocks) = self.blocks_cache.get(did).await {
             debug!(
@@ -241,7 +246,10 @@ impl BlockSyncService {
             if !response.status().is_success() {
                 // 400 might mean no blocks exist, which is fine
                 if response.status() == reqwest::StatusCode::BAD_REQUEST {
-                    debug!("No block records found for {}", crate::crypto::redact_for_log(did));
+                    debug!(
+                        "No block records found for {}",
+                        crate::crypto::redact_for_log(did)
+                    );
                     break;
                 }
                 return Err(BlockSyncError::HttpError(format!(
@@ -285,7 +293,9 @@ impl BlockSyncService {
         );
 
         // Cache the results
-        self.blocks_cache.insert(did.to_string(), all_blocks.clone()).await;
+        self.blocks_cache
+            .insert(did.to_string(), all_blocks.clone())
+            .await;
 
         Ok(all_blocks)
     }
@@ -414,7 +424,7 @@ mod tests {
     #[tokio::test]
     async fn test_pds_endpoint_resolution() {
         let service = BlockSyncService::new();
-        
+
         // Test with a known DID (bsky.app's DID)
         // This is a real test - it will hit the network
         // Skip in CI if needed
@@ -422,20 +432,25 @@ mod tests {
             return;
         }
 
-        let result = service.get_pds_endpoint("did:plc:z72i7hdynmk6r22z27h6tvur").await;
+        let result = service
+            .get_pds_endpoint("did:plc:z72i7hdynmk6r22z27h6tvur")
+            .await;
         assert!(result.is_ok(), "Failed to resolve PDS: {:?}", result);
-        
+
         let endpoint = result.unwrap();
-        assert!(endpoint.starts_with("https://"), "PDS endpoint should be HTTPS");
+        assert!(
+            endpoint.starts_with("https://"),
+            "PDS endpoint should be HTTPS"
+        );
     }
 
     #[test]
     fn test_invalid_did_format() {
         let service = BlockSyncService::new();
-        
+
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(service.resolve_did("not-a-did"));
-        
+
         assert!(matches!(result, Err(BlockSyncError::InvalidDid(_))));
     }
 }

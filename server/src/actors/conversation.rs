@@ -129,7 +129,16 @@ impl Actor for ConversationActor {
                 idempotency_key,
                 reply,
             } => {
-                let result = state.handle_send_message(sender_did, ciphertext, msg_id, epoch, padded_size, idempotency_key).await;
+                let result = state
+                    .handle_send_message(
+                        sender_did,
+                        ciphertext,
+                        msg_id,
+                        epoch,
+                        padded_size,
+                        idempotency_key,
+                    )
+                    .await;
                 let _ = reply.send(result);
             }
             ConvoMessage::IncrementUnread { sender_did } => {
@@ -222,7 +231,11 @@ impl ConversationActorState {
         let now = chrono::Utc::now();
 
         // Begin transaction for atomicity
-        let mut tx = self.db_pool.begin().await.context("Failed to begin transaction")?;
+        let mut tx = self
+            .db_pool
+            .begin()
+            .await
+            .context("Failed to begin transaction")?;
 
         // Process commit if provided (capture msg_id for later fanout)
         let commit_msg_id = if let Some(commit_bytes) = commit {
@@ -252,7 +265,10 @@ impl ConversationActorState {
             .await
             .context("Failed to insert commit message")?;
 
-            info!("✅ [actor:add_members] Commit message stored with seq={}, epoch={}", seq, new_epoch);
+            info!(
+                "✅ [actor:add_members] Commit message stored with seq={}, epoch={}",
+                seq, new_epoch
+            );
             Some(msg_id)
         } else {
             None
@@ -270,7 +286,7 @@ impl ConversationActorState {
         for target_did in &did_list {
             // Check if already a member
             let is_existing = sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM members WHERE convo_id = $1 AND member_did = $2"
+                "SELECT COUNT(*) FROM members WHERE convo_id = $1 AND member_did = $2",
             )
             .bind(&self.convo_id)
             .bind(target_did)
@@ -284,7 +300,7 @@ impl ConversationActorState {
             }
 
             sqlx::query(
-                "INSERT INTO members (convo_id, member_did, joined_at) VALUES ($1, $2, $3)"
+                "INSERT INTO members (convo_id, member_did, joined_at) VALUES ($1, $2, $3)",
             )
             .bind(&self.convo_id)
             .bind(target_did)
@@ -298,26 +314,33 @@ impl ConversationActorState {
 
         // Store Welcome message for new members
         if let Some(ref welcome_b64) = welcome_message {
-            info!("Processing Welcome message for {} new members", did_list.len());
+            info!(
+                "Processing Welcome message for {} new members",
+                did_list.len()
+            );
 
             // Decode base64 Welcome message
-            let welcome_data = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, welcome_b64)
-                .context("Invalid base64 welcome message")?;
+            let welcome_data =
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, welcome_b64)
+                    .context("Invalid base64 welcome message")?;
 
-            info!("Single Welcome message ({} bytes) for {} new members",
-                  welcome_data.len(), did_list.len());
+            info!(
+                "Single Welcome message ({} bytes) for {} new members",
+                welcome_data.len(),
+                did_list.len()
+            );
 
             // Store the SAME Welcome for each new member
             for target_did in &did_list {
                 let welcome_id = uuid::Uuid::new_v4().to_string();
 
                 // Get the key_package_hash for this member from the input
-                let key_package_hash = key_package_hashes.as_ref()
-                    .and_then(|hashes| {
-                        hashes.iter()
-                            .find(|entry| entry.did == *target_did)
-                            .and_then(|entry| hex::decode(&entry.hash).ok())
-                    });
+                let key_package_hash = key_package_hashes.as_ref().and_then(|hashes| {
+                    hashes
+                        .iter()
+                        .find(|entry| entry.did == *target_did)
+                        .and_then(|entry| hex::decode(&entry.hash).ok())
+                });
 
                 sqlx::query(
                     "INSERT INTO welcome_messages (id, convo_id, recipient_did, welcome_data, key_package_hash, created_at)
@@ -365,7 +388,10 @@ impl ConversationActorState {
 
                 match members_result {
                     Ok(members) => {
-                        tracing::debug!("📍 [actor:add_members:fanout] fan-out commit to {} members", members.len());
+                        tracing::debug!(
+                            "📍 [actor:add_members:fanout] fan-out commit to {} members",
+                            members.len()
+                        );
 
                         // Create envelopes for each member
                         for (member_did,) in &members {
@@ -396,16 +422,16 @@ impl ConversationActorState {
                         tracing::debug!("✅ [actor:add_members:fanout] envelopes created");
                     }
                     Err(e) => {
-                        tracing::error!("❌ [actor:add_members:fanout] Failed to get members: {:?}", e);
+                        tracing::error!(
+                            "❌ [actor:add_members:fanout] Failed to get members: {:?}",
+                            e
+                        );
                     }
                 }
 
                 tracing::debug!("📍 [actor:add_members:fanout] emitting SSE event for commit");
                 // Emit SSE event for commit message
-                let cursor = sse_state
-                    .cursor_gen
-                    .next(&convo_id, "messageEvent")
-                    .await;
+                let cursor = sse_state.cursor_gen.next(&convo_id, "messageEvent").await;
 
                 // Fetch the full message from database
                 let message_result = sqlx::query!(
@@ -421,15 +447,16 @@ impl ConversationActorState {
 
                 match message_result {
                     Ok(msg) => {
-                        let message_view = crate::models::MessageView::from(crate::models::MessageViewData {
-                            id: msg.id,
-                            convo_id: convo_id.clone(),
-                            ciphertext: msg.ciphertext.unwrap_or_default(),
-                            epoch: msg.epoch as usize,
-                            seq: msg.seq as usize,
-                            created_at: crate::sqlx_atrium::chrono_to_datetime(msg.created_at),
-                            message_type: None,
-                        });
+                        let message_view =
+                            crate::models::MessageView::from(crate::models::MessageViewData {
+                                id: msg.id,
+                                convo_id: convo_id.clone(),
+                                ciphertext: msg.ciphertext.unwrap_or_default(),
+                                epoch: msg.epoch as usize,
+                                seq: msg.seq as usize,
+                                created_at: crate::sqlx_atrium::chrono_to_datetime(msg.created_at),
+                                message_type: None,
+                            });
 
                         let event = StreamEvent::MessageEvent {
                             cursor: cursor.clone(),
@@ -442,7 +469,10 @@ impl ConversationActorState {
                         tracing::debug!("✅ [actor:add_members:fanout] SSE event emitted");
                     }
                     Err(e) => {
-                        tracing::error!("❌ [actor:add_members:fanout] Failed to fetch message for SSE: {:?}", e);
+                        tracing::error!(
+                            "❌ [actor:add_members:fanout] Failed to fetch message for SSE: {:?}",
+                            e
+                        );
                     }
                 }
             });
@@ -495,7 +525,11 @@ impl ConversationActorState {
         let now = chrono::Utc::now();
 
         // Begin transaction for atomicity
-        let mut tx = self.db_pool.begin().await.context("Failed to begin transaction")?;
+        let mut tx = self
+            .db_pool
+            .begin()
+            .await
+            .context("Failed to begin transaction")?;
 
         // Process commit if provided (capture msg_id for later fanout)
         let commit_msg_id = if let Some(commit_bytes) = commit {
@@ -525,7 +559,10 @@ impl ConversationActorState {
             .await
             .context("Failed to insert commit message")?;
 
-            info!("✅ [actor:remove_member] Commit message stored with seq={}, epoch={}", seq, new_epoch);
+            info!(
+                "✅ [actor:remove_member] Commit message stored with seq={}, epoch={}",
+                seq, new_epoch
+            );
             Some(msg_id)
         } else {
             None
@@ -574,7 +611,10 @@ impl ConversationActorState {
 
                 match members_result {
                     Ok(members) => {
-                        tracing::debug!("📍 [actor:remove_member:fanout] fan-out commit to {} members", members.len());
+                        tracing::debug!(
+                            "📍 [actor:remove_member:fanout] fan-out commit to {} members",
+                            members.len()
+                        );
 
                         // Create envelopes for each member
                         for (member_did,) in &members {
@@ -605,16 +645,16 @@ impl ConversationActorState {
                         tracing::debug!("✅ [actor:remove_member:fanout] envelopes created");
                     }
                     Err(e) => {
-                        tracing::error!("❌ [actor:remove_member:fanout] Failed to get members: {:?}", e);
+                        tracing::error!(
+                            "❌ [actor:remove_member:fanout] Failed to get members: {:?}",
+                            e
+                        );
                     }
                 }
 
                 tracing::debug!("📍 [actor:remove_member:fanout] emitting SSE event for commit");
                 // Emit SSE event for commit message
-                let cursor = sse_state
-                    .cursor_gen
-                    .next(&convo_id, "messageEvent")
-                    .await;
+                let cursor = sse_state.cursor_gen.next(&convo_id, "messageEvent").await;
 
                 // Fetch the full message from database
                 let message_result = sqlx::query!(
@@ -630,15 +670,16 @@ impl ConversationActorState {
 
                 match message_result {
                     Ok(msg) => {
-                        let message_view = crate::models::MessageView::from(crate::models::MessageViewData {
-                            id: msg.id,
-                            convo_id: convo_id.clone(),
-                            ciphertext: msg.ciphertext.unwrap_or_default(),
-                            epoch: msg.epoch as usize,
-                            seq: msg.seq as usize,
-                            created_at: crate::sqlx_atrium::chrono_to_datetime(msg.created_at),
-                            message_type: None,
-                        });
+                        let message_view =
+                            crate::models::MessageView::from(crate::models::MessageViewData {
+                                id: msg.id,
+                                convo_id: convo_id.clone(),
+                                ciphertext: msg.ciphertext.unwrap_or_default(),
+                                epoch: msg.epoch as usize,
+                                seq: msg.seq as usize,
+                                created_at: crate::sqlx_atrium::chrono_to_datetime(msg.created_at),
+                                message_type: None,
+                            });
 
                         let event = StreamEvent::MessageEvent {
                             cursor: cursor.clone(),
@@ -651,7 +692,10 @@ impl ConversationActorState {
                         tracing::debug!("✅ [actor:remove_member:fanout] SSE event emitted");
                     }
                     Err(e) => {
-                        tracing::error!("❌ [actor:remove_member:fanout] Failed to fetch message for SSE: {:?}", e);
+                        tracing::error!(
+                            "❌ [actor:remove_member:fanout] Failed to fetch message for SSE: {:?}",
+                            e
+                        );
                     }
                 }
             });
@@ -727,11 +771,15 @@ impl ConversationActorState {
         let received_bucket_ts = (now.timestamp() / 2) * 2;
 
         // Calculate sequence number within transaction
-        let mut tx = self.db_pool.begin().await.context("Failed to begin transaction")?;
+        let mut tx = self
+            .db_pool
+            .begin()
+            .await
+            .context("Failed to begin transaction")?;
 
         // Check for duplicate msg_id (protocol-layer deduplication)
         let existing_msg: Option<(String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
-            "SELECT id, created_at FROM messages WHERE convo_id = $1 AND msg_id = $2"
+            "SELECT id, created_at FROM messages WHERE convo_id = $1 AND msg_id = $2",
         )
         .bind(&self.convo_id)
         .bind(&msg_id)
@@ -742,30 +790,35 @@ impl ConversationActorState {
         if let Some((existing_id, existing_created_at)) = existing_msg {
             // Return existing message without creating a duplicate
             tx.rollback().await.ok();
-            info!("Duplicate msg_id detected, returning existing message: {}", existing_id);
+            info!(
+                "Duplicate msg_id detected, returning existing message: {}",
+                existing_id
+            );
             return Ok((existing_id, existing_created_at));
         }
 
         // If idempotency key is provided, check for existing message
         if let Some(ref idem_key) = idempotency_key {
-            let existing_by_idem: Option<(String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
-                "SELECT id, created_at FROM messages WHERE idempotency_key = $1"
-            )
-            .bind(idem_key)
-            .fetch_optional(&mut *tx)
-            .await
-            .context("Failed to check idempotency key")?;
+            let existing_by_idem: Option<(String, chrono::DateTime<chrono::Utc>)> =
+                sqlx::query_as("SELECT id, created_at FROM messages WHERE idempotency_key = $1")
+                    .bind(idem_key)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .context("Failed to check idempotency key")?;
 
             if let Some((existing_id, existing_created_at)) = existing_by_idem {
                 // Return existing message without creating a duplicate
                 tx.rollback().await.ok();
-                info!("Duplicate idempotency_key detected, returning existing message: {}", existing_id);
+                info!(
+                    "Duplicate idempotency_key detected, returning existing message: {}",
+                    existing_id
+                );
                 return Ok((existing_id, existing_created_at));
             }
         }
 
         let seq: i64 = sqlx::query_scalar(
-            "SELECT CAST(COALESCE(MAX(seq), 0) + 1 AS BIGINT) FROM messages WHERE convo_id = $1"
+            "SELECT CAST(COALESCE(MAX(seq), 0) + 1 AS BIGINT) FROM messages WHERE convo_id = $1",
         )
         .bind(&self.convo_id)
         .fetch_one(&mut *tx)
@@ -864,7 +917,8 @@ impl ConversationActorState {
                         if let Err(e) = envelope_result {
                             tracing::error!(
                                 "Failed to insert envelope for {}: {:?}",
-                                member.member_did, e
+                                member.member_did,
+                                e
                             );
                         }
                     }
@@ -912,7 +966,7 @@ impl ConversationActorState {
             SELECT member_did, user_did
             FROM members
             WHERE convo_id = $1 AND left_at IS NULL
-            "#
+            "#,
         )
         .bind(&self.convo_id)
         .fetch_all(&self.db_pool)
@@ -924,7 +978,8 @@ impl ConversationActorState {
                 // Increment in-memory counter for all members except sender's devices
                 // In multi-device mode, we exclude all devices where user_did matches sender_did
                 for (member_did, user_did) in members {
-                    let is_sender_device = user_did.as_ref().map_or(false, |uid| uid == &sender_did);
+                    let is_sender_device =
+                        user_did.as_ref().map_or(false, |uid| uid == &sender_did);
                     if !is_sender_device {
                         let count = self.unread_counts.entry(member_did.clone()).or_insert(0);
                         *count += 1;
@@ -946,7 +1001,10 @@ impl ConversationActorState {
                         }
                     }
                 }
-                info!("Incremented unread counts for {} members", member_count.saturating_sub(1));
+                info!(
+                    "Incremented unread counts for {} members",
+                    member_count.saturating_sub(1)
+                );
             }
             Err(e) => {
                 tracing::error!("Failed to get members for unread increment: {}", e);

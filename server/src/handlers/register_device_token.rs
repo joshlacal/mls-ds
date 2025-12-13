@@ -1,11 +1,12 @@
-use axum::{extract::{rejection::JsonRejection, State}, http::StatusCode, Json};
+use axum::{
+    extract::{rejection::JsonRejection, State},
+    http::StatusCode,
+    Json,
+};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
 
-use crate::{
-    auth::AuthUser,
-    storage::DbPool,
-};
+use crate::{auth::AuthUser, storage::DbPool};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -30,7 +31,10 @@ pub async fn register_device_token(
     input: Result<Json<RegisterDeviceTokenInput>, JsonRejection>,
 ) -> Result<Json<RegisterDeviceTokenOutput>, StatusCode> {
     let Json(input) = input.map_err(|rejection| {
-        error!("❌ [register_device_token] Failed to deserialize request body: {}", rejection);
+        error!(
+            "❌ [register_device_token] Failed to deserialize request body: {}",
+            rejection
+        );
         StatusCode::BAD_REQUEST
     })?;
 

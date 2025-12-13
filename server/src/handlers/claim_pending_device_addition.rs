@@ -89,7 +89,10 @@ pub async fn claim_pending_device_addition(
     .rows_affected();
 
     if released > 0 {
-        info!("Released {} expired pending addition claims before claim attempt", released);
+        info!(
+            "Released {} expired pending addition claims before claim attempt",
+            released
+        );
     }
 
     // First, get the pending addition to verify membership and status
@@ -175,7 +178,7 @@ pub async fn claim_pending_device_addition(
             convo_id: Some(pending.convo_id),
             device_credential_did: Some(pending.new_device_credential_did),
             key_package: None,
-            claimed_by: None,  // No claimed_by for self-claim - client detects via claimed=false + no claimedBy
+            claimed_by: None, // No claimed_by for self-claim - client detects via claimed=false + no claimedBy
         }));
     }
 

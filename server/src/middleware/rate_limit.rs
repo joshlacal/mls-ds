@@ -5,13 +5,13 @@ use axum::{
     response::Response,
 };
 use base64::Engine;
+use once_cell::sync::Lazy;
 use std::{
     collections::HashMap,
     sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::sync::RwLock;
-use once_cell::sync::Lazy;
 
 /// Token bucket rate limiter
 #[derive(Clone)]
@@ -248,7 +248,12 @@ pub async fn rate_limit_middleware(request: Request, next: Next) -> Result<Respo
                 Ok(next.run(request).await)
             }
             Err(retry_after) => {
-                tracing::warn!("DID rate limit exceeded for {}: {} (retry after {} seconds)", did, uri, retry_after);
+                tracing::warn!(
+                    "DID rate limit exceeded for {}: {} (retry after {} seconds)",
+                    did,
+                    uri,
+                    retry_after
+                );
                 let mut resp = Response::new(axum::body::Body::empty());
                 let headers = resp.headers_mut();
                 headers.insert(
@@ -269,7 +274,12 @@ pub async fn rate_limit_middleware(request: Request, next: Next) -> Result<Respo
                 Ok(next.run(request).await)
             }
             Err(retry_after) => {
-                tracing::warn!("IP rate limit exceeded for {}: {} (retry after {} seconds)", client_ip, uri, retry_after);
+                tracing::warn!(
+                    "IP rate limit exceeded for {}: {} (retry after {} seconds)",
+                    client_ip,
+                    uri,
+                    retry_after
+                );
                 let mut resp = Response::new(axum::body::Body::empty());
                 let headers = resp.headers_mut();
                 headers.insert(

@@ -1,11 +1,12 @@
-use axum::{extract::{RawQuery, State}, http::StatusCode, Json};
+use axum::{
+    extract::{RawQuery, State},
+    http::StatusCode,
+    Json,
+};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::{
-    auth::AuthUser,
-    storage::DbPool,
-};
+use crate::{auth::AuthUser, storage::DbPool};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -36,7 +37,9 @@ pub async fn validate_device_state(
     auth_user: AuthUser,
     RawQuery(query): RawQuery,
 ) -> Result<Json<ValidateDeviceStateResponse>, StatusCode> {
-    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.validateDeviceState") {
+    if let Err(_e) =
+        crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.validateDeviceState")
+    {
         warn!("Unauthorized access attempt");
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -55,19 +58,24 @@ pub async fn validate_device_state(
     }
 
     let user_did = &auth_user.claims.iss;
-    info!("Validating device state for user: {} (device: {:?})", user_did, device_id);
+    info!(
+        "Validating device state for user: {} (device: {:?})",
+        user_did, device_id
+    );
 
     let mut issues = Vec::new();
     let mut recommendations = Vec::new();
 
     // 1. Check conversation memberships
-    let expected_convos = count_expected_conversations(&pool, user_did).await
+    let expected_convos = count_expected_conversations(&pool, user_did)
+        .await
         .map_err(|e| {
             warn!("Failed to count expected conversations: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    let actual_convos = count_actual_conversations(&pool, user_did).await
+    let actual_convos = count_actual_conversations(&pool, user_did)
+        .await
         .map_err(|e| {
             warn!("Failed to count actual conversations: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
@@ -94,11 +102,10 @@ pub async fn validate_device_state(
     let needs_replenishment = available < target_threshold;
 
     // Calculate per-device count (total / number of active devices)
-    let device_count = count_active_devices(&pool, user_did).await
-        .map_err(|e| {
-            warn!("Failed to count active devices: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let device_count = count_active_devices(&pool, user_did).await.map_err(|e| {
+        warn!("Failed to count active devices: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let per_device_count = if device_count > 0 {
         total / device_count
@@ -126,11 +133,13 @@ pub async fn validate_device_state(
     }
 
     // 3. Check for pending rejoin requests
-    let pending_rejoin_requests = get_pending_rejoin_requests(&pool, user_did).await
-        .map_err(|e| {
-            warn!("Failed to get pending rejoin requests: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let pending_rejoin_requests =
+        get_pending_rejoin_requests(&pool, user_did)
+            .await
+            .map_err(|e| {
+                warn!("Failed to get pending rejoin requests: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
     if !pending_rejoin_requests.is_empty() {
         issues.push(format!(
@@ -141,7 +150,8 @@ pub async fn validate_device_state(
     }
 
     // 4. Check for expired key packages
-    let expired_count = count_expired_key_packages(&pool, user_did).await
+    let expired_count = count_expired_key_packages(&pool, user_did)
+        .await
         .map_err(|e| {
             warn!("Failed to count expired key packages: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
@@ -184,7 +194,7 @@ async fn count_expected_conversations(pool: &DbPool, user_did: &str) -> anyhow::
         SELECT COUNT(DISTINCT convo_id)
         FROM members
         WHERE (member_did = $1 OR user_did = $1) AND left_at IS NULL
-        "#
+        "#,
     )
     .bind(user_did)
     .fetch_one(pool)
@@ -208,7 +218,7 @@ async fn count_active_devices(pool: &DbPool, user_did: &str) -> anyhow::Result<i
         SELECT COUNT(*)
         FROM devices
         WHERE user_did = $1
-        "#
+        "#,
     )
     .bind(user_did)
     .fetch_one(pool)
@@ -228,7 +238,7 @@ async fn get_pending_rejoin_requests(pool: &DbPool, user_did: &str) -> anyhow::R
         LEFT JOIN members m ON rr.convo_id = m.convo_id AND rr.member_did = m.member_did
         WHERE rr.member_did = $1 OR m.user_did = $1
         ORDER BY rr.convo_id DESC
-        "#
+        "#,
     )
     .bind(user_did)
     .fetch_all(pool)
@@ -245,7 +255,7 @@ async fn count_expired_key_packages(pool: &DbPool, user_did: &str) -> anyhow::Re
         SELECT COUNT(*)
         FROM key_packages
         WHERE owner_did = $1 AND expires_at < $2 AND consumed_at IS NULL
-        "#
+        "#,
     )
     .bind(user_did)
     .bind(now)

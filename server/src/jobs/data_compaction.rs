@@ -30,7 +30,10 @@ pub async fn run_compaction_worker(pool: PgPool) {
         // Compact messages
         match crate::db::compact_messages(&pool, message_ttl).await {
             Ok(count) if count > 0 => {
-                info!("Compacted {} old messages (older than {} days)", count, message_ttl);
+                info!(
+                    "Compacted {} old messages (older than {} days)",
+                    count, message_ttl
+                );
             }
             Ok(_) => {
                 info!("No messages to compact");
@@ -43,7 +46,10 @@ pub async fn run_compaction_worker(pool: PgPool) {
         // Compact event stream
         match crate::db::compact_event_stream(&pool, event_ttl).await {
             Ok(count) if count > 0 => {
-                info!("Compacted {} old events (older than {} days)", count, event_ttl);
+                info!(
+                    "Compacted {} old events (older than {} days)",
+                    count, event_ttl
+                );
             }
             Ok(_) => {
                 info!("No events to compact");
@@ -56,7 +62,10 @@ pub async fn run_compaction_worker(pool: PgPool) {
         // Compact welcome messages
         match crate::db::compact_welcome_messages(&pool).await {
             Ok(count) if count > 0 => {
-                info!("Compacted {} old consumed welcome messages (older than 24 hours)", count);
+                info!(
+                    "Compacted {} old consumed welcome messages (older than 24 hours)",
+                    count
+                );
             }
             Ok(_) => {
                 info!("No welcome messages to compact");

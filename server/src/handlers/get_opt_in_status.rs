@@ -1,12 +1,13 @@
-use axum::{extract::{RawQuery, State}, http::StatusCode, Json};
+use axum::{
+    extract::{RawQuery, State},
+    http::StatusCode,
+    Json,
+};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
-use crate::{
-    auth::AuthUser,
-    storage::DbPool,
-};
+use crate::{auth::AuthUser, storage::DbPool};
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -33,7 +34,9 @@ pub async fn get_opt_in_status(
     RawQuery(query): RawQuery,
 ) -> Result<Json<GetOptInStatusOutput>, StatusCode> {
     // Enforce authentication
-    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.getOptInStatus") {
+    if let Err(_e) =
+        crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.getOptInStatus")
+    {
         return Err(StatusCode::UNAUTHORIZED);
     }
 
@@ -54,7 +57,7 @@ pub async fn get_opt_in_status(
                         decoded_value
                             .split(',')
                             .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty())
+                            .filter(|s| !s.is_empty()),
                     );
                 } else if !decoded_value.is_empty() {
                     // Single DID from ATProto array format
@@ -81,7 +84,7 @@ pub async fn get_opt_in_status(
     let results = sqlx::query_as::<_, (String, DateTime<Utc>)>(
         "SELECT did, opted_in_at
          FROM opt_in
-         WHERE did = ANY($1)"
+         WHERE did = ANY($1)",
     )
     .bind(&dids)
     .fetch_all(&pool)
@@ -115,7 +118,5 @@ pub async fn get_opt_in_status(
         })
         .collect();
 
-    Ok(Json(GetOptInStatusOutput {
-        statuses,
-    }))
+    Ok(Json(GetOptInStatusOutput { statuses }))
 }

@@ -1,11 +1,12 @@
-use axum::{extract::{Query, State}, http::StatusCode, Json};
-use serde::{Deserialize, Serialize};
-use tracing::{info, error};
-
-use crate::{
-    auth::AuthUser,
-    storage::DbPool,
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    Json,
 };
+use serde::{Deserialize, Serialize};
+use tracing::{error, info};
+
+use crate::{auth::AuthUser, storage::DbPool};
 
 #[derive(Debug, Deserialize)]
 pub struct GetKeyPackageStatusParams {
@@ -42,7 +43,9 @@ pub async fn get_key_package_status(
     auth_user: AuthUser,
     Query(params): Query<GetKeyPackageStatusParams>,
 ) -> Result<Json<GetKeyPackageStatusOutput>, StatusCode> {
-    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.getKeyPackageStatus") {
+    if let Err(_e) =
+        crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.getKeyPackageStatus")
+    {
         return Err(StatusCode::UNAUTHORIZED);
     }
 
@@ -50,13 +53,14 @@ pub async fn get_key_package_status(
     let limit = params.limit.unwrap_or(20).min(100);
 
     // Get stats
-    let (total, available, consumed, reserved) = match crate::db::get_key_package_stats(&pool, did).await {
-        Ok(stats) => stats,
-        Err(e) => {
-            error!("Failed to get key package stats: {}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
-        }
-    };
+    let (total, available, consumed, reserved) =
+        match crate::db::get_key_package_stats(&pool, did).await {
+            Ok(stats) => stats,
+            Err(e) => {
+                error!("Failed to get key package stats: {}", e);
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        };
 
     // Get consumed packages with pagination
     let (consumed_pkgs, next_cursor) = match crate::db::get_consumed_key_packages_paginated(
@@ -64,7 +68,9 @@ pub async fn get_key_package_status(
         did,
         limit,
         params.cursor,
-    ).await {
+    )
+    .await
+    {
         Ok(result) => result,
         Err(e) => {
             error!("Failed to get consumed key packages: {}", e);
@@ -78,7 +84,10 @@ pub async fn get_key_package_status(
         .map(|pkg| ConsumedPackageView {
             key_package_hash: pkg.key_package_hash,
             used_in_group: pkg.consumed_by_convo,
-            consumed_at: pkg.consumed_at.map(|dt| dt.to_rfc3339()).unwrap_or_default(),
+            consumed_at: pkg
+                .consumed_at
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_default(),
             cipher_suite: Some(pkg.cipher_suite),
         })
         .collect();

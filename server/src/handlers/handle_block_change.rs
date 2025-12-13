@@ -1,17 +1,19 @@
 use axum::{extract::State, http::StatusCode, Json};
 use std::sync::Arc;
-use tracing::{info, error};
+use tracing::{error, info};
 
 use crate::{
-    auth::{AuthUser, enforce_standard},
+    auth::{enforce_standard, AuthUser},
     block_sync::BlockSyncService,
-    generated::blue::catbird::mls::handle_block_change::{Input, Output, OutputData, AffectedConvo, AffectedConvoData, NSID},
+    generated::blue::catbird::mls::handle_block_change::{
+        AffectedConvo, AffectedConvoData, Input, Output, OutputData, NSID,
+    },
     sqlx_atrium::chrono_to_datetime,
     storage::DbPool,
 };
 
 /// Handle a block change notification from the client.
-/// 
+///
 /// This is called when a user blocks/unblocks someone on Bluesky.
 /// We update our local cache and find affected conversations.
 #[tracing::instrument(skip(pool, block_sync, auth_user))]
@@ -37,7 +39,7 @@ pub async fn handle_block_change(
         sqlx::query(
             "INSERT INTO bsky_blocks (user_did, target_did, source, synced_at)
              VALUES ($1, $2, 'client', $3)
-             ON CONFLICT (user_did, target_did) DO UPDATE SET synced_at = $3"
+             ON CONFLICT (user_did, target_did) DO UPDATE SET synced_at = $3",
         )
         .bind(&blocker_str)
         .bind(&blocked_str)
@@ -49,9 +51,11 @@ pub async fn handle_block_change(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-        info!("Block created: {} blocked {}", 
-              crate::crypto::redact_for_log(&blocker_str), 
-              crate::crypto::redact_for_log(&blocked_str));
+        info!(
+            "Block created: {} blocked {}",
+            crate::crypto::redact_for_log(&blocker_str),
+            crate::crypto::redact_for_log(&blocked_str)
+        );
     } else {
         // Remove block
         sqlx::query("DELETE FROM bsky_blocks WHERE user_did = $1 AND target_did = $2")
@@ -64,9 +68,11 @@ pub async fn handle_block_change(
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
-        info!("Block removed: {} unblocked {}", 
-              crate::crypto::redact_for_log(&blocker_str), 
-              crate::crypto::redact_for_log(&blocked_str));
+        info!(
+            "Block removed: {} unblocked {}",
+            crate::crypto::redact_for_log(&blocker_str),
+            crate::crypto::redact_for_log(&blocked_str)
+        );
     }
 
     // Find affected conversations where both users are members
@@ -75,7 +81,7 @@ pub async fn handle_block_change(
          FROM members m1
          JOIN members m2 ON m1.convo_id = m2.convo_id
          WHERE m1.member_did = $1 AND m2.member_did = $2
-         AND m1.left_at IS NULL AND m2.left_at IS NULL"
+         AND m1.left_at IS NULL AND m2.left_at IS NULL",
     )
     .bind(&blocker_str)
     .bind(&blocked_str)
@@ -112,7 +118,5 @@ pub async fn handle_block_change(
         affected_convos.len()
     );
 
-    Ok(Json(Output::from(OutputData {
-        affected_convos,
-    })))
+    Ok(Json(Output::from(OutputData { affected_convos })))
 }

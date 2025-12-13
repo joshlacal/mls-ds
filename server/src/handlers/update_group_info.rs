@@ -1,17 +1,17 @@
-use axum::{extract::State, Json};
 use axum::http::StatusCode;
+use axum::{extract::State, Json};
 use base64::Engine;
-use sqlx::FromRow;
 use openmls::messages::group_info::VerifiableGroupInfo;
 use openmls::prelude::MlsMessageIn;
+use sqlx::FromRow;
 use tls_codec::Deserialize as TlsDeserialize;
 
 use crate::{
     auth::AuthUser,
     error_responses::UpdateGroupInfoError,
-    generated::blue::catbird::mls::update_group_info::{Input, Output, OutputData, Error},
+    generated::blue::catbird::mls::update_group_info::{Error, Input, Output, OutputData},
+    group_info::{get_group_info, store_group_info, MAX_GROUP_INFO_SIZE, MIN_GROUP_INFO_SIZE},
     storage::DbPool,
-    group_info::{store_group_info, get_group_info, MIN_GROUP_INFO_SIZE, MAX_GROUP_INFO_SIZE},
 };
 
 #[derive(FromRow)]
@@ -26,26 +26,24 @@ pub async fn handle(
     Json(input): Json<Input>,
 ) -> Result<Json<Output>, UpdateGroupInfoError> {
     let did = &auth.did;
-    
+
     // 1. Check authorization: must be current member
     let member_check: Option<MemberCheckRow> = sqlx::query_as(
         "SELECT member_did 
          FROM members 
          WHERE convo_id = $1 AND user_did = $2
-         LIMIT 1"
+         LIMIT 1",
     )
     .bind(&input.data.convo_id)
     .bind(did)
     .fetch_optional(&pool)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    
+
     if member_check.is_none() {
-        return Err(Error::Unauthorized(
-            Some("Not a member of this conversation".into())
-        ).into());
+        return Err(Error::Unauthorized(Some("Not a member of this conversation".into())).into());
     }
-    
+
     // 2. Decode GroupInfo from base64
     let group_info_bytes = base64::engine::general_purpose::STANDARD
         .decode(&input.data.group_info)
@@ -68,8 +66,10 @@ pub async fn handle(
         );
         return Err(Error::InvalidGroupInfo(Some(format!(
             "GroupInfo too small: {} bytes (minimum {} required)",
-            group_info_bytes.len(), MIN_GROUP_INFO_SIZE
-        ))).into());
+            group_info_bytes.len(),
+            MIN_GROUP_INFO_SIZE
+        )))
+        .into());
     }
 
     if group_info_bytes.len() > MAX_GROUP_INFO_SIZE {
@@ -81,8 +81,10 @@ pub async fn handle(
         );
         return Err(Error::InvalidGroupInfo(Some(format!(
             "GroupInfo too large: {} bytes (maximum {} allowed)",
-            group_info_bytes.len(), MAX_GROUP_INFO_SIZE
-        ))).into());
+            group_info_bytes.len(),
+            MAX_GROUP_INFO_SIZE
+        )))
+        .into());
     }
 
     // 4. Validate MLS structure - CRITICAL: prevents storing corrupted data
@@ -90,7 +92,7 @@ pub async fn handle(
     // Try MlsMessage first (newer client format), then fall back to raw GroupInfo
     let group_info_valid = MlsMessageIn::tls_deserialize(&mut group_info_bytes.as_slice()).is_ok()
         || VerifiableGroupInfo::tls_deserialize(&mut group_info_bytes.as_slice()).is_ok();
-    
+
     if !group_info_valid {
         tracing::error!(
             convo_id = %input.data.convo_id,
@@ -98,8 +100,10 @@ pub async fn handle(
             "Invalid MLS GroupInfo structure - deserialization failed for both wrapped and raw formats"
         );
         return Err(Error::InvalidGroupInfo(Some(
-            "Invalid MLS GroupInfo structure: could not deserialize as MlsMessage or raw GroupInfo".into()
-        )).into());
+            "Invalid MLS GroupInfo structure: could not deserialize as MlsMessage or raw GroupInfo"
+                .into(),
+        ))
+        .into());
     }
 
     // 5. Validate epoch consistency - epoch must increase (no regression)
@@ -114,7 +118,8 @@ pub async fn handle(
             return Err(Error::InvalidGroupInfo(Some(format!(
                 "Epoch {} must be greater than current epoch {}",
                 input.data.epoch, existing_epoch
-            ))).into());
+            )))
+            .into());
         }
     }
 
@@ -130,8 +135,10 @@ pub async fn handle(
         &pool,
         &input.data.convo_id,
         &group_info_bytes,
-        input.data.epoch as i32
-    ).await.map_err(|e| {
+        input.data.epoch as i32,
+    )
+    .await
+    .map_err(|e| {
         tracing::error!(
             convo_id = %input.data.convo_id,
             error = %e,
@@ -139,8 +146,6 @@ pub async fn handle(
         );
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    
-    Ok(Json(Output::from(OutputData {
-        updated: true,
-    })))
+
+    Ok(Json(Output::from(OutputData { updated: true })))
 }

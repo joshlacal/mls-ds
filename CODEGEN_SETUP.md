@@ -77,7 +77,7 @@ server/src/generated/
 - ✅ Message payload types (embeds, admin actions, etc.)
 - ✅ All error types from lexicons
 - ✅ Union types for SSE events (subscription messages)
-- ✅ Proper `bytes` handling with `serde_bytes`
+- ✅ Proper ATProto `bytes` handling with `crate::atproto_bytes` (`{"$bytes":"..."}`)
 
 ### Example Generated Types
 

@@ -94,10 +94,7 @@ pub async fn complete_pending_device_addition(
 
         match pending {
             None => {
-                warn!(
-                    "Pending addition not found: {}",
-                    input.pending_addition_id
-                );
+                warn!("Pending addition not found: {}", input.pending_addition_id);
                 return Err(StatusCode::NOT_FOUND);
             }
             Some((status, claimed_by)) => {

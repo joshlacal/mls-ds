@@ -36,8 +36,8 @@ pub use crate::generated::blue::catbird::mls::{
 /// Maps to `conversations` table (updated schema - id is the group_id)
 #[derive(Debug, Clone, FromRow)]
 pub struct Conversation {
-    pub id: String,               // MLS group identifier (hex-encoded) - canonical ID
-    pub creator_did: String,      // Stored as TEXT, convert to Did when needed
+    pub id: String,          // MLS group identifier (hex-encoded) - canonical ID
+    pub creator_did: String, // Stored as TEXT, convert to Did when needed
     pub current_epoch: i32,
     pub cipher_suite: Option<String>, // Optional in current schema
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -60,12 +60,13 @@ impl Conversation {
             None
         };
 
-        let creator = self.creator_did.parse().map_err(|e| {
-            format!("Invalid creator DID '{}': {}", self.creator_did, e)
-        })?;
+        let creator = self
+            .creator_did
+            .parse()
+            .map_err(|e| format!("Invalid creator DID '{}': {}", self.creator_did, e))?;
 
         Ok(ConvoView::from(ConvoViewData {
-            group_id: self.id.clone(),  // id is the group_id (canonical ID)
+            group_id: self.id.clone(), // id is the group_id (canonical ID)
             creator,
             members,
             epoch: self.current_epoch as usize,
@@ -102,8 +103,8 @@ pub struct Membership {
     pub unread_count: i32,
     pub last_read_at: Option<chrono::DateTime<chrono::Utc>>,
     // Multi-device support fields
-    pub user_did: Option<String>,    // Base user DID (without device suffix)
-    pub device_id: Option<String>,   // Device identifier (UUID)
+    pub user_did: Option<String>, // Base user DID (without device suffix)
+    pub device_id: Option<String>, // Device identifier (UUID)
     pub device_name: Option<String>, // Human-readable device name
 }
 
@@ -119,25 +120,32 @@ impl Membership {
     pub fn to_member_view(&self) -> Result<MemberView, String> {
         // Strip fragment (#...) from DID if present (e.g., did:plc:abc#device-uuid -> did:plc:abc)
         // Fragments are used for credential DIDs but not valid in AT Protocol DID strings
-        let did_without_fragment = self.member_did.split('#').next().unwrap_or(&self.member_did);
+        let did_without_fragment = self
+            .member_did
+            .split('#')
+            .next()
+            .unwrap_or(&self.member_did);
 
-        let did: atrium_api::types::string::Did = did_without_fragment.parse().map_err(|e| {
-            format!("Invalid member DID '{}': {}", self.member_did, e)
-        })?;
+        let did: atrium_api::types::string::Did = did_without_fragment
+            .parse()
+            .map_err(|e| format!("Invalid member DID '{}': {}", self.member_did, e))?;
 
         let promoted_by = if let Some(ref promoted_by_did) = self.promoted_by_did {
-            Some(promoted_by_did.parse().map_err(|e| {
-                format!("Invalid promoted_by DID '{}': {}", promoted_by_did, e)
-            })?)
+            Some(
+                promoted_by_did
+                    .parse()
+                    .map_err(|e| format!("Invalid promoted_by DID '{}': {}", promoted_by_did, e))?,
+            )
         } else {
             None
         };
 
         // Parse user_did if present, otherwise fall back to member_did for backward compatibility
-        let user_did: atrium_api::types::string::Did = if let Some(ref user_did_str) = self.user_did {
-            user_did_str.parse().map_err(|e| {
-                format!("Invalid user DID '{}': {}", user_did_str, e)
-            })?
+        let user_did: atrium_api::types::string::Did = if let Some(ref user_did_str) = self.user_did
+        {
+            user_did_str
+                .parse()
+                .map_err(|e| format!("Invalid user DID '{}': {}", user_did_str, e))?
         } else {
             // Backward compatibility: use member_did as user_did
             did.clone()
@@ -175,7 +183,7 @@ pub struct Message {
 }
 
 impl Message {
-        /// Convert to API MessageView
+    /// Convert to API MessageView
     ///
     /// Note: sender field removed per security hardening - clients derive sender from decrypted MLS content
     pub fn to_message_view(&self) -> Result<MessageView, String> {
@@ -215,12 +223,12 @@ impl KeyPackage {
     /// Returns an error if the DID is not a valid DID string.
     pub fn to_key_package_ref(&self) -> Result<KeyPackageRef, String> {
         use base64::Engine;
-        let key_package_b64 = base64::engine::general_purpose::STANDARD
-            .encode(&self.key_data);
+        let key_package_b64 = base64::engine::general_purpose::STANDARD.encode(&self.key_data);
 
-        let did = self.owner_did.parse().map_err(|e| {
-            format!("Invalid key package DID '{}': {}", self.owner_did, e)
-        })?;
+        let did = self
+            .owner_did
+            .parse()
+            .map_err(|e| format!("Invalid key package DID '{}': {}", self.owner_did, e))?;
 
         Ok(KeyPackageRef::from(KeyPackageRefData {
             did,
@@ -279,8 +287,8 @@ pub struct UserDevice {
 pub struct AdminAction {
     pub id: String, // ULID
     pub convo_id: String,
-    pub actor_did: String,  // Admin who performed the action
-    pub target_did: String, // Member who was acted upon
+    pub actor_did: String,   // Admin who performed the action
+    pub target_did: String,  // Member who was acted upon
     pub action_type: String, // "promote", "demote", "remove"
     pub reason: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -294,10 +302,10 @@ pub struct Report {
     pub convo_id: String,
     pub reporter_did: String,
     pub reported_did: String,
-    pub category: String, // "spam", "harassment", "illegal", etc.
+    pub category: String,           // "spam", "harassment", "illegal", etc.
     pub encrypted_content: Vec<u8>, // Encrypted report details
     pub message_ids: Option<Vec<String>>, // JSON array of related message IDs
-    pub status: String,   // "pending", "resolved", "dismissed"
+    pub status: String,             // "pending", "resolved", "dismissed"
     pub resolved_at: Option<chrono::DateTime<chrono::Utc>>,
     pub resolved_by: Option<String>, // Admin DID
     pub resolution_notes: Option<String>,
@@ -313,7 +321,7 @@ pub struct BskyBlock {
     pub blocked_did: String,
     pub block_uri: Option<String>, // AT-URI of block record
     pub created_at: chrono::DateTime<chrono::Utc>, // When block was created on Bluesky
-    pub cached_at: chrono::DateTime<chrono::Utc>,  // When we cached it
+    pub cached_at: chrono::DateTime<chrono::Utc>, // When we cached it
     pub checked_at: chrono::DateTime<chrono::Utc>, // Last verification
 }
 

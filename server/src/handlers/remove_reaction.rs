@@ -4,9 +4,9 @@ use tracing::{error, info};
 
 use crate::{
     auth::AuthUser,
+    db,
     generated::blue::catbird::mls::remove_reaction::{Input, Output, OutputData, NSID},
     realtime::{SseState, StreamEvent},
-    db,
     storage::DbPool,
 };
 
@@ -20,7 +20,7 @@ pub async fn remove_reaction(
     Json(input): Json<Input>,
 ) -> Result<Json<Output>, StatusCode> {
     let user_did = auth_user.did.clone();
-    
+
     info!(
         "remove_reaction: user={}, convo={}, message={}, reaction={}",
         crate::crypto::redact_for_log(&user_did),
@@ -69,7 +69,10 @@ pub async fn remove_reaction(
     }
 
     // Emit SSE event to all conversation members
-    let cursor = sse_state.cursor_gen.next(&input.convo_id, "reactionEvent").await;
+    let cursor = sse_state
+        .cursor_gen
+        .next(&input.convo_id, "reactionEvent")
+        .await;
     let event = StreamEvent::ReactionEvent {
         cursor: cursor.clone(),
         convo_id: input.convo_id.clone(),

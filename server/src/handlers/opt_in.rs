@@ -1,12 +1,9 @@
 use axum::{extract::State, http::StatusCode, Json};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tracing::{info, error};
+use tracing::{error, info};
 
-use crate::{
-    auth::AuthUser,
-    storage::DbPool,
-};
+use crate::{auth::AuthUser, storage::DbPool};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -38,23 +35,22 @@ pub async fn opt_in(
     let user_did = &auth_user.did;
 
     // Ensure user exists in users table (for FK constraint)
-    let user_exists = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM users WHERE did = $1)"
-    )
-    .bind(user_did)
-    .fetch_one(&pool)
-    .await
-    .map_err(|e| {
-        error!("Failed to check if user exists: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let user_exists =
+        sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM users WHERE did = $1)")
+            .bind(user_did)
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| {
+                error!("Failed to check if user exists: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
     if !user_exists {
         // Insert user record if it doesn't exist
         sqlx::query(
             "INSERT INTO users (did, created_at, last_seen_at)
              VALUES ($1, NOW(), NOW())
-             ON CONFLICT (did) DO NOTHING"
+             ON CONFLICT (did) DO NOTHING",
         )
         .bind(user_did)
         .execute(&pool)
@@ -73,7 +69,7 @@ pub async fn opt_in(
          DO UPDATE SET
             device_id = EXCLUDED.device_id,
             opted_in_at = NOW()
-         RETURNING opted_in_at"
+         RETURNING opted_in_at",
     )
     .bind(user_did)
     .bind(&input.device_id)

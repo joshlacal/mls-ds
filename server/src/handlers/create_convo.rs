@@ -1,16 +1,18 @@
 use axum::{extract::State, http::StatusCode, Json};
 use base64::Engine;
 use chrono::{DateTime, Utc};
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 use crate::{
     auth::AuthUser,
     block_sync::BlockSyncService,
     error_responses::CreateConvoError,
-    generated::blue::catbird::mls::create_convo::{Input, NSID, Error},
-    generated::blue::catbird::mls::defs::{ConvoView, ConvoViewData, ConvoMetadata, ConvoMetadataData, MemberView, MemberViewData},
+    generated::blue::catbird::mls::create_convo::{Error, Input, NSID},
+    generated::blue::catbird::mls::defs::{
+        ConvoMetadata, ConvoMetadataData, ConvoView, ConvoViewData, MemberView, MemberViewData,
+    },
     sqlx_atrium::{chrono_to_datetime, did_to_string},
     storage::DbPool,
 };
@@ -49,14 +51,20 @@ pub async fn create_convo(
 
     tracing::debug!("📍 [create_convo] Validating cipher suite");
     // Validate cipher suite
-    let valid_suites = ["MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519",
-                        "MLS_128_DHKEMP256_AES128GCM_SHA256_P256"];
+    let valid_suites = [
+        "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519",
+        "MLS_128_DHKEMP256_AES128GCM_SHA256_P256",
+    ];
     if !valid_suites.contains(&input.cipher_suite.as_str()) {
-        warn!("❌ [create_convo] Invalid cipher suite: {}", input.cipher_suite);
+        warn!(
+            "❌ [create_convo] Invalid cipher suite: {}",
+            input.cipher_suite
+        );
         return Err(Error::InvalidCipherSuite(Some(format!(
             "Cipher suite '{}' is not supported",
             input.cipher_suite
-        ))).into());
+        )))
+        .into());
     }
 
     // Validate initial members count
@@ -73,11 +81,15 @@ pub async fn create_convo(
         let max_members = 1000;
 
         if total_member_count > max_members {
-            warn!("❌ [create_convo] Too many initial members: {} (max {})", total_member_count, max_members);
+            warn!(
+                "❌ [create_convo] Too many initial members: {} (max {})",
+                total_member_count, max_members
+            );
             return Err(Error::TooManyMembers(Some(format!(
                 "Cannot add more than {} initial members (got {} including creator)",
                 max_members, total_member_count
-            ))).into());
+            )))
+            .into());
         }
     }
 
@@ -96,7 +108,10 @@ pub async fn create_convo(
     // Only check if there are multiple members (more than just the creator)
     if all_member_dids_for_block_check.len() > 1 {
         // Query PDSes for authoritative block data
-        match block_sync.check_block_conflicts(&all_member_dids_for_block_check).await {
+        match block_sync
+            .check_block_conflicts(&all_member_dids_for_block_check)
+            .await
+        {
             Ok(conflicts) => {
                 if !conflicts.is_empty() {
                     // Sync blocks to DB for future reference
@@ -105,24 +120,27 @@ pub async fn create_convo(
                             warn!("Failed to sync blocks to DB: {}", e);
                         }
                     }
-                    
+
                     warn!(
                         "❌ [create_convo] Block detected between members: {} blocks found via PDS",
                         conflicts.len()
                     );
                     return Err(Error::MutualBlockDetected(Some(format!(
                         "Cannot create conversation: one or more members have blocked each other"
-                    ))).into());
+                    )))
+                    .into());
                 }
-                tracing::debug!("✅ [create_convo] No blocks detected between members (PDS verified)");
+                tracing::debug!(
+                    "✅ [create_convo] No blocks detected between members (PDS verified)"
+                );
             }
             Err(e) => {
                 // Fall back to local DB if PDS queries fail
                 warn!("PDS block check failed, falling back to local DB: {}", e);
-                
+
                 let blocks: Vec<(String, String)> = sqlx::query_as(
                     "SELECT user_did, target_did FROM bsky_blocks
-                     WHERE user_did = ANY($1) AND target_did = ANY($1)"
+                     WHERE user_did = ANY($1) AND target_did = ANY($1)",
                 )
                 .bind(&all_member_dids_for_block_check)
                 .fetch_all(&pool)
@@ -139,9 +157,12 @@ pub async fn create_convo(
                     );
                     return Err(Error::MutualBlockDetected(Some(format!(
                         "Cannot create conversation: one or more members have blocked each other"
-                    ))).into());
+                    )))
+                    .into());
                 }
-                tracing::debug!("✅ [create_convo] No blocks detected between members (DB fallback)");
+                tracing::debug!(
+                    "✅ [create_convo] No blocks detected between members (DB fallback)"
+                );
             }
         }
     }
@@ -171,7 +192,7 @@ pub async fn create_convo(
     // If idempotency key is provided, check for existing conversation
     if let Some(ref idem_key) = input.idempotency_key {
         if let Ok(Some(existing_convo_id)) = sqlx::query_scalar::<_, String>(
-            "SELECT id FROM conversations WHERE idempotency_key = $1"
+            "SELECT id FROM conversations WHERE idempotency_key = $1",
         )
         .bind(idem_key)
         .fetch_optional(&pool)
@@ -194,31 +215,41 @@ pub async fn create_convo(
 
             let members: Vec<MemberView> = existing_members
                 .into_iter()
-                .map(|(member_did, user_did, device_id, device_name, joined_at, is_admin, leaf_index)| {
-                    let did = member_did.parse().map_err(|e| {
-                        error!("Invalid member DID '{}': {}", member_did, e);
-                        StatusCode::INTERNAL_SERVER_ERROR
-                    })?;
-
-                    let user_did_parsed = user_did.parse().map_err(|e| {
-                        error!("Invalid user DID '{}': {}", user_did, e);
-                        StatusCode::INTERNAL_SERVER_ERROR
-                    })?;
-
-                    Ok(MemberView::from(MemberViewData {
-                        did,
-                        user_did: user_did_parsed,
+                .map(
+                    |(
+                        member_did,
+                        user_did,
                         device_id,
                         device_name,
-                        joined_at: chrono_to_datetime(joined_at),
+                        joined_at,
                         is_admin,
-                        leaf_index: leaf_index.map(|i| i as usize),
-                        credential: None,
-                        promoted_at: None,
-                        promoted_by: None,
-                        is_moderator: Some(false),
-                    }))
-                })
+                        leaf_index,
+                    )| {
+                        let did = member_did.parse().map_err(|e| {
+                            error!("Invalid member DID '{}': {}", member_did, e);
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        })?;
+
+                        let user_did_parsed = user_did.parse().map_err(|e| {
+                            error!("Invalid user DID '{}': {}", user_did, e);
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        })?;
+
+                        Ok(MemberView::from(MemberViewData {
+                            did,
+                            user_did: user_did_parsed,
+                            device_id,
+                            device_name,
+                            joined_at: chrono_to_datetime(joined_at),
+                            is_admin,
+                            leaf_index: leaf_index.map(|i| i as usize),
+                            credential: None,
+                            promoted_at: None,
+                            promoted_by: None,
+                            is_moderator: Some(false),
+                        }))
+                    },
+                )
                 .collect::<Result<Vec<_>, StatusCode>>()?;
 
             let metadata = if name.is_some() || description.is_some() {
@@ -231,7 +262,7 @@ pub async fn create_convo(
             };
 
             return Ok(Json(ConvoView::from(ConvoViewData {
-                group_id: existing_convo_id,  // existing_convo_id is the group_id
+                group_id: existing_convo_id, // existing_convo_id is the group_id
                 creator: creator_did,
                 members,
                 epoch: 0,
@@ -347,29 +378,48 @@ pub async fn create_convo(
                 StatusCode::BAD_REQUEST
             })?;
 
-        info!("📍 [create_convo] Single Welcome message ({} bytes) for all members/devices", welcome_data.len());
+        info!(
+            "📍 [create_convo] Single Welcome message ({} bytes) for all members/devices",
+            welcome_data.len()
+        );
 
         // 📨 [CREATE_CONVO] Log Welcome message BEFORE storing for corruption detection
         let mut hasher = Sha256::new();
         hasher.update(&welcome_data);
         let checksum = hasher.finalize();
-        info!("📨 [CREATE_CONVO] Storing Welcome message for convo {}:", input.group_id);
+        info!(
+            "📨 [CREATE_CONVO] Storing Welcome message for convo {}:",
+            input.group_id
+        );
         info!("   Size: {} bytes", welcome_data.len());
         if welcome_data.len() >= 100 {
-            info!("   First 100 bytes (hex): {}", hex::encode(&welcome_data[..100]));
+            info!(
+                "   First 100 bytes (hex): {}",
+                hex::encode(&welcome_data[..100])
+            );
         } else {
-            info!("   First {} bytes (hex): {}", welcome_data.len(), hex::encode(&welcome_data));
+            info!(
+                "   First {} bytes (hex): {}",
+                welcome_data.len(),
+                hex::encode(&welcome_data)
+            );
         }
         if welcome_data.len() > 100 {
             let start = welcome_data.len().saturating_sub(100);
-            info!("   Last 100 bytes (hex): {}", hex::encode(&welcome_data[start..]));
+            info!(
+                "   Last 100 bytes (hex): {}",
+                hex::encode(&welcome_data[start..])
+            );
         }
         info!("   SHA256 checksum: {}", hex::encode(checksum));
         info!("   ✅ Welcome message stored for group: {}", input.group_id);
 
         // Validate all key packages are available BEFORE storing anything
         if let Some(ref kp_hashes) = input.key_package_hashes {
-            info!("📍 [create_convo] Validating {} key packages are available...", kp_hashes.len());
+            info!(
+                "📍 [create_convo] Validating {} key packages are available...",
+                kp_hashes.len()
+            );
 
             for entry in kp_hashes {
                 let member_did_str = did_to_string(&entry.data.did);
@@ -385,14 +435,17 @@ pub async fn create_convo(
                           AND consumed_at IS NULL
                           AND (reserved_at IS NULL OR reserved_at < NOW() - INTERVAL '5 minutes')
                     )
-                    "#
+                    "#,
                 )
                 .bind(&member_did_str)
                 .bind(hash_hex)
                 .fetch_one(&pool)
                 .await
                 .map_err(|e| {
-                    error!("❌ [create_convo] Failed to check key package availability: {}", e);
+                    error!(
+                        "❌ [create_convo] Failed to check key package availability: {}",
+                        e
+                    );
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
 
@@ -406,7 +459,7 @@ pub async fn create_convo(
                           AND (reserved_at IS NULL OR reserved_at < NOW() - INTERVAL '5 minutes')
                         ORDER BY created_at DESC
                         LIMIT 10
-                        "#
+                        "#,
                     )
                     .bind(&member_did_str)
                     .fetch_all(&pool)
@@ -423,7 +476,10 @@ pub async fn create_convo(
                     ))).into());
                 }
             }
-            info!("✅ [create_convo] All {} key packages are available", kp_hashes.len());
+            info!(
+                "✅ [create_convo] All {} key packages are available",
+                kp_hashes.len()
+            );
         }
 
         // Store the SAME Welcome for ALL members (creator + initial members)
@@ -442,19 +498,22 @@ pub async fn create_convo(
             }
         }
 
-        info!("📍 [create_convo] Storing Welcome message for {} total members (including creator)", all_member_dids.len());
+        info!(
+            "📍 [create_convo] Storing Welcome message for {} total members (including creator)",
+            all_member_dids.len()
+        );
 
         for member_did_str in all_member_dids.iter() {
             let welcome_id = uuid::Uuid::new_v4().to_string();
 
             // Get the key_package_hash for this member from the input
-            let key_package_hash = input.key_package_hashes.as_ref()
-                .and_then(|hashes| {
-                    hashes.iter()
-                        .find(|entry| did_to_string(&entry.data.did) == *member_did_str)
-                        .map(|entry| hex::decode(&entry.data.hash).ok())
-                        .flatten()
-                });
+            let key_package_hash = input.key_package_hashes.as_ref().and_then(|hashes| {
+                hashes
+                    .iter()
+                    .find(|entry| did_to_string(&entry.data.did) == *member_did_str)
+                    .map(|entry| hex::decode(&entry.data.hash).ok())
+                    .flatten()
+            });
 
             sqlx::query(
                 "INSERT INTO welcome_messages (id, convo_id, recipient_did, welcome_data, key_package_hash, created_at)
@@ -475,9 +534,15 @@ pub async fn create_convo(
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
-            tracing::debug!("✅ [create_convo] welcome stored for member: {}", member_did_str);
+            tracing::debug!(
+                "✅ [create_convo] welcome stored for member: {}",
+                member_did_str
+            );
         }
-        tracing::debug!("📍 [create_convo] stored welcome for {} members", all_member_dids.len());
+        tracing::debug!(
+            "📍 [create_convo] stored welcome for {} members",
+            all_member_dids.len()
+        );
 
         // Mark key packages as consumed
         if let Some(ref kp_hashes) = input.key_package_hashes {
@@ -488,17 +553,26 @@ pub async fn create_convo(
                 match crate::db::mark_key_package_consumed(&pool, &member_did_str, hash_hex).await {
                     Ok(consumed) => {
                         if consumed {
-                            tracing::debug!("✅ [create_convo] marked key package as consumed for {}", member_did_str);
+                            tracing::debug!(
+                                "✅ [create_convo] marked key package as consumed for {}",
+                                member_did_str
+                            );
                         } else {
                             tracing::warn!("⚠️ [create_convo] key package not found or already consumed for {}", member_did_str);
                         }
                     }
                     Err(e) => {
-                        tracing::warn!("⚠️ [create_convo] failed to mark key package as consumed: {}", e);
+                        tracing::warn!(
+                            "⚠️ [create_convo] failed to mark key package as consumed: {}",
+                            e
+                        );
                     }
                 }
             }
-            tracing::debug!("📍 [create_convo] marked {} key packages as consumed", kp_hashes.len());
+            tracing::debug!(
+                "📍 [create_convo] marked {} key packages as consumed",
+                kp_hashes.len()
+            );
         }
     } else {
         tracing::debug!("📍 [create_convo] no welcome message provided");
@@ -513,16 +587,13 @@ pub async fn create_convo(
 
     // Build metadata view if metadata exists
     let metadata = if name.is_some() || description.is_some() {
-        Some(ConvoMetadata::from(ConvoMetadataData {
-            name,
-            description,
-        }))
+        Some(ConvoMetadata::from(ConvoMetadataData { name, description }))
     } else {
         None
     };
 
     Ok(Json(ConvoView::from(ConvoViewData {
-        group_id: convo_id,  // convo_id is the group_id
+        group_id: convo_id, // convo_id is the group_id
         creator: creator_did,
         members,
         epoch: 0,

@@ -4,9 +4,9 @@ use tracing::{error, info};
 
 use crate::{
     auth::AuthUser,
+    db,
     generated::blue::catbird::mls::send_typing_indicator::{Input, Output, OutputData, NSID},
     realtime::{SseState, StreamEvent},
-    db,
     storage::DbPool,
 };
 
@@ -20,7 +20,7 @@ pub async fn send_typing_indicator(
     Json(input): Json<Input>,
 ) -> Result<Json<Output>, StatusCode> {
     let user_did = auth_user.did.clone();
-    
+
     info!(
         "send_typing_indicator: user={}, convo={}, isTyping={}",
         crate::crypto::redact_for_log(&user_did),
@@ -49,7 +49,10 @@ pub async fn send_typing_indicator(
 
     // Emit SSE event to all conversation members
     // Note: Typing indicators are ephemeral - we don't persist them to the database
-    let cursor = sse_state.cursor_gen.next(&input.convo_id, "typingEvent").await;
+    let cursor = sse_state
+        .cursor_gen
+        .next(&input.convo_id, "typingEvent")
+        .await;
     let event = StreamEvent::TypingEvent {
         cursor: cursor.clone(),
         convo_id: input.convo_id.clone(),

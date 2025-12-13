@@ -1,18 +1,22 @@
-use axum::{extract::{Query, State}, http::StatusCode, Json};
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    Json,
+};
 use std::sync::Arc;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 use crate::{
-    auth::{AuthUser, enforce_standard},
+    auth::{enforce_standard, AuthUser},
     block_sync::BlockSyncService,
-    generated::blue::catbird::mls::get_block_status::{Parameters, Output, OutputData, NSID},
     generated::blue::catbird::mls::check_blocks::{BlockRelationship, BlockRelationshipData},
+    generated::blue::catbird::mls::get_block_status::{Output, OutputData, Parameters, NSID},
     sqlx_atrium::{chrono_to_datetime, string_to_did},
     storage::DbPool,
 };
 
 /// Get block status for a conversation by querying member PDSes.
-/// 
+///
 /// This is useful for admins to see block conflicts that need resolution.
 #[tracing::instrument(skip(pool, block_sync, auth_user))]
 pub async fn get_block_status(
@@ -29,7 +33,7 @@ pub async fn get_block_status(
 
     // Get all members
     let member_dids: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT member_did FROM members WHERE convo_id = $1 AND left_at IS NULL"
+        "SELECT DISTINCT member_did FROM members WHERE convo_id = $1 AND left_at IS NULL",
     )
     .bind(convo_id)
     .fetch_all(&pool)
@@ -86,7 +90,7 @@ pub async fn get_block_status(
             let rows: Vec<(String, String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
                 "SELECT user_did, target_did, synced_at
                  FROM bsky_blocks
-                 WHERE user_did = ANY($1) AND target_did = ANY($1)"
+                 WHERE user_did = ANY($1) AND target_did = ANY($1)",
             )
             .bind(&member_dids)
             .fetch_all(&pool)
@@ -120,8 +124,8 @@ pub async fn get_block_status(
 
     info!(
         "Conversation {} has {} members, {} block conflicts",
-        crate::crypto::redact_for_log(convo_id), 
-        member_dids.len(), 
+        crate::crypto::redact_for_log(convo_id),
+        member_dids.len(),
         blocks.len()
     );
 

@@ -1,4 +1,4 @@
 pub mod cursor;
 pub mod sse;
 
-pub use sse::{SseState, StreamEvent, subscribe_convo_events};
+pub use sse::{subscribe_convo_events, SseState, StreamEvent};

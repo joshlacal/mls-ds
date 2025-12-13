@@ -268,13 +268,25 @@ async fn test_key_package_operations() {
     let key_data2 = vec![5, 6, 7, 8];
 
     // Store key packages
-    store_key_package(&pool, "did:plc:alice", cipher_suite, key_data1.clone(), expires_at)
-        .await
-        .expect("Failed to store key package 1");
+    store_key_package(
+        &pool,
+        "did:plc:alice",
+        cipher_suite,
+        key_data1.clone(),
+        expires_at,
+    )
+    .await
+    .expect("Failed to store key package 1");
 
-    store_key_package(&pool, "did:plc:alice", cipher_suite, key_data2.clone(), expires_at)
-        .await
-        .expect("Failed to store key package 2");
+    store_key_package(
+        &pool,
+        "did:plc:alice",
+        cipher_suite,
+        key_data2.clone(),
+        expires_at,
+    )
+    .await
+    .expect("Failed to store key package 2");
 
     // Count key packages
     let count = count_key_packages(&pool, "did:plc:alice", cipher_suite)
@@ -402,9 +414,15 @@ async fn test_list_conversations_for_user() {
         .expect("Failed to create convo 3");
 
     // Add user to conversations
-    add_member(&pool, &convo1.id, "did:plc:alice").await.unwrap();
-    add_member(&pool, &convo2.id, "did:plc:alice").await.unwrap();
-    add_member(&pool, &convo3.id, "did:plc:alice").await.unwrap();
+    add_member(&pool, &convo1.id, "did:plc:alice")
+        .await
+        .unwrap();
+    add_member(&pool, &convo2.id, "did:plc:alice")
+        .await
+        .unwrap();
+    add_member(&pool, &convo3.id, "did:plc:alice")
+        .await
+        .unwrap();
 
     // List conversations for alice
     let convos = list_conversations(&pool, "did:plc:alice", 10, 0)
@@ -414,7 +432,9 @@ async fn test_list_conversations_for_user() {
     assert_eq!(convos.len(), 3);
 
     // Leave one conversation
-    remove_member(&pool, &convo2.id, "did:plc:alice").await.unwrap();
+    remove_member(&pool, &convo2.id, "did:plc:alice")
+        .await
+        .unwrap();
 
     // Should only see 2 now
     let active_convos = list_conversations(&pool, "did:plc:alice", 10, 0)
@@ -428,9 +448,7 @@ async fn test_list_conversations_for_user() {
 async fn test_health_check() {
     let pool = setup_test_db().await;
 
-    let healthy = health_check(&pool)
-        .await
-        .expect("Health check failed");
+    let healthy = health_check(&pool).await.expect("Health check failed");
 
     assert!(healthy);
 }

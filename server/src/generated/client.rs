@@ -108,20 +108,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::accept_chat_request::NSID.into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::accept_chat_request::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -138,20 +131,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::add_members::NSID.into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::add_members::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -168,20 +154,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::add_reaction::NSID.into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::add_reaction::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -198,20 +177,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::block_chat_sender::NSID.into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::block_chat_sender::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -228,20 +200,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                _,
-                (),
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::GET,
-                    nsid: crate::blue::catbird::mls::check_blocks::NSID.into(),
-                    parameters: Some(params),
-                    input: None,
-                    encoding: None,
-                },
-            )
+            .send_xrpc::<_, (), _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::GET,
+                nsid: crate::blue::catbird::mls::check_blocks::NSID.into(),
+                parameters: Some(params),
+                input: None,
+                encoding: None,
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -258,21 +223,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::claim_pending_device_addition::NSID
-                        .into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::claim_pending_device_addition::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -289,21 +246,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::complete_pending_device_addition::NSID
-                        .into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::complete_pending_device_addition::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -320,20 +269,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::create_convo::NSID.into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::create_convo::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -350,20 +292,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::create_invite::NSID.into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::create_invite::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -380,20 +315,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::decline_chat_request::NSID.into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::decline_chat_request::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -410,20 +338,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::delete_device::NSID.into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::delete_device::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -440,20 +361,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::demote_admin::NSID.into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::demote_admin::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -470,20 +384,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::demote_moderator::NSID.into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::demote_moderator::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -500,20 +407,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                _,
-                (),
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::GET,
-                    nsid: crate::blue::catbird::mls::get_admin_stats::NSID.into(),
-                    parameters: Some(params),
-                    input: None,
-                    encoding: None,
-                },
-            )
+            .send_xrpc::<_, (), _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::GET,
+                nsid: crate::blue::catbird::mls::get_admin_stats::NSID.into(),
+                parameters: Some(params),
+                input: None,
+                encoding: None,
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -530,20 +430,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                _,
-                (),
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::GET,
-                    nsid: crate::blue::catbird::mls::get_block_status::NSID.into(),
-                    parameters: Some(params),
-                    input: None,
-                    encoding: None,
-                },
-            )
+            .send_xrpc::<_, (), _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::GET,
+                nsid: crate::blue::catbird::mls::get_block_status::NSID.into(),
+                parameters: Some(params),
+                input: None,
+                encoding: None,
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -559,21 +452,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                (),
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::GET,
-                    nsid: crate::blue::catbird::mls::get_chat_request_settings::NSID
-                        .into(),
-                    parameters: None,
-                    input: None,
-                    encoding: None,
-                },
-            )
+            .send_xrpc::<(), (), _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::GET,
+                nsid: crate::blue::catbird::mls::get_chat_request_settings::NSID.into(),
+                parameters: None,
+                input: None,
+                encoding: None,
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -590,20 +475,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                _,
-                (),
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::GET,
-                    nsid: crate::blue::catbird::mls::get_commits::NSID.into(),
-                    parameters: Some(params),
-                    input: None,
-                    encoding: None,
-                },
-            )
+            .send_xrpc::<_, (), _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::GET,
+                nsid: crate::blue::catbird::mls::get_commits::NSID.into(),
+                parameters: Some(params),
+                input: None,
+                encoding: None,
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -620,20 +498,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                _,
-                (),
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::GET,
-                    nsid: crate::blue::catbird::mls::get_convos::NSID.into(),
-                    parameters: Some(params),
-                    input: None,
-                    encoding: None,
-                },
-            )
+            .send_xrpc::<_, (), _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::GET,
+                nsid: crate::blue::catbird::mls::get_convos::NSID.into(),
+                parameters: Some(params),
+                input: None,
+                encoding: None,
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -650,20 +521,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                _,
-                (),
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::GET,
-                    nsid: crate::blue::catbird::mls::get_epoch::NSID.into(),
-                    parameters: Some(params),
-                    input: None,
-                    encoding: None,
-                },
-            )
+            .send_xrpc::<_, (), _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::GET,
+                nsid: crate::blue::catbird::mls::get_epoch::NSID.into(),
+                parameters: Some(params),
+                input: None,
+                encoding: None,
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -680,21 +544,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                _,
-                (),
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::GET,
-                    nsid: crate::blue::catbird::mls::get_expected_conversations::NSID
-                        .into(),
-                    parameters: Some(params),
-                    input: None,
-                    encoding: None,
-                },
-            )
+            .send_xrpc::<_, (), _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::GET,
+                nsid: crate::blue::catbird::mls::get_expected_conversations::NSID.into(),
+                parameters: Some(params),
+                input: None,
+                encoding: None,
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -711,20 +567,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                _,
-                (),
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::GET,
-                    nsid: crate::blue::catbird::mls::get_group_info::NSID.into(),
-                    parameters: Some(params),
-                    input: None,
-                    encoding: None,
-                },
-            )
+            .send_xrpc::<_, (), _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::GET,
+                nsid: crate::blue::catbird::mls::get_group_info::NSID.into(),
+                parameters: Some(params),
+                input: None,
+                encoding: None,
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -741,21 +590,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                _,
-                (),
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::GET,
-                    nsid: crate::blue::catbird::mls::get_key_package_history::NSID
-                        .into(),
-                    parameters: Some(params),
-                    input: None,
-                    encoding: None,
-                },
-            )
+            .send_xrpc::<_, (), _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::GET,
+                nsid: crate::blue::catbird::mls::get_key_package_history::NSID.into(),
+                parameters: Some(params),
+                input: None,
+                encoding: None,
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -772,20 +613,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                _,
-                (),
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::GET,
-                    nsid: crate::blue::catbird::mls::get_key_package_stats::NSID.into(),
-                    parameters: Some(params),
-                    input: None,
-                    encoding: None,
-                },
-            )
+            .send_xrpc::<_, (), _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::GET,
+                nsid: crate::blue::catbird::mls::get_key_package_stats::NSID.into(),
+                parameters: Some(params),
+                input: None,
+                encoding: None,
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -802,20 +636,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                _,
-                (),
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::GET,
-                    nsid: crate::blue::catbird::mls::get_key_package_status::NSID.into(),
-                    parameters: Some(params),
-                    input: None,
-                    encoding: None,
-                },
-            )
+            .send_xrpc::<_, (), _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::GET,
+                nsid: crate::blue::catbird::mls::get_key_package_status::NSID.into(),
+                parameters: Some(params),
+                input: None,
+                encoding: None,
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -832,20 +659,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                _,
-                (),
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::GET,
-                    nsid: crate::blue::catbird::mls::get_key_packages::NSID.into(),
-                    parameters: Some(params),
-                    input: None,
-                    encoding: None,
-                },
-            )
+            .send_xrpc::<_, (), _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::GET,
+                nsid: crate::blue::catbird::mls::get_key_packages::NSID.into(),
+                parameters: Some(params),
+                input: None,
+                encoding: None,
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -862,20 +682,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                _,
-                (),
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::GET,
-                    nsid: crate::blue::catbird::mls::get_messages::NSID.into(),
-                    parameters: Some(params),
-                    input: None,
-                    encoding: None,
-                },
-            )
+            .send_xrpc::<_, (), _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::GET,
+                nsid: crate::blue::catbird::mls::get_messages::NSID.into(),
+                parameters: Some(params),
+                input: None,
+                encoding: None,
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -892,20 +705,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                _,
-                (),
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::GET,
-                    nsid: crate::blue::catbird::mls::get_opt_in_status::NSID.into(),
-                    parameters: Some(params),
-                    input: None,
-                    encoding: None,
-                },
-            )
+            .send_xrpc::<_, (), _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::GET,
+                nsid: crate::blue::catbird::mls::get_opt_in_status::NSID.into(),
+                parameters: Some(params),
+                input: None,
+                encoding: None,
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -922,21 +728,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                _,
-                (),
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::GET,
-                    nsid: crate::blue::catbird::mls::get_pending_device_additions::NSID
-                        .into(),
-                    parameters: Some(params),
-                    input: None,
-                    encoding: None,
-                },
-            )
+            .send_xrpc::<_, (), _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::GET,
+                nsid: crate::blue::catbird::mls::get_pending_device_additions::NSID.into(),
+                parameters: Some(params),
+                input: None,
+                encoding: None,
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -953,20 +751,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                _,
-                (),
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::GET,
-                    nsid: crate::blue::catbird::mls::get_policy::NSID.into(),
-                    parameters: Some(params),
-                    input: None,
-                    encoding: None,
-                },
-            )
+            .send_xrpc::<_, (), _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::GET,
+                nsid: crate::blue::catbird::mls::get_policy::NSID.into(),
+                parameters: Some(params),
+                input: None,
+                encoding: None,
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -983,20 +774,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                _,
-                (),
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::GET,
-                    nsid: crate::blue::catbird::mls::get_reports::NSID.into(),
-                    parameters: Some(params),
-                    input: None,
-                    encoding: None,
-                },
-            )
+            .send_xrpc::<_, (), _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::GET,
+                nsid: crate::blue::catbird::mls::get_reports::NSID.into(),
+                parameters: Some(params),
+                input: None,
+                encoding: None,
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -1012,20 +796,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                (),
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::GET,
-                    nsid: crate::blue::catbird::mls::get_request_count::NSID.into(),
-                    parameters: None,
-                    input: None,
-                    encoding: None,
-                },
-            )
+            .send_xrpc::<(), (), _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::GET,
+                nsid: crate::blue::catbird::mls::get_request_count::NSID.into(),
+                parameters: None,
+                input: None,
+                encoding: None,
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -1042,20 +819,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::group_info_refresh::NSID.into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::group_info_refresh::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -1072,20 +842,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::handle_block_change::NSID.into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::handle_block_change::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -1102,20 +865,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::invalidate_welcome::NSID.into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::invalidate_welcome::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -1132,20 +888,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::leave_convo::NSID.into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::leave_convo::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -1162,20 +911,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                _,
-                (),
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::GET,
-                    nsid: crate::blue::catbird::mls::list_chat_requests::NSID.into(),
-                    parameters: Some(params),
-                    input: None,
-                    encoding: None,
-                },
-            )
+            .send_xrpc::<_, (), _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::GET,
+                nsid: crate::blue::catbird::mls::list_chat_requests::NSID.into(),
+                parameters: Some(params),
+                input: None,
+                encoding: None,
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -1192,20 +934,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                _,
-                (),
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::GET,
-                    nsid: crate::blue::catbird::mls::list_devices::NSID.into(),
-                    parameters: Some(params),
-                    input: None,
-                    encoding: None,
-                },
-            )
+            .send_xrpc::<_, (), _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::GET,
+                nsid: crate::blue::catbird::mls::list_devices::NSID.into(),
+                parameters: Some(params),
+                input: None,
+                encoding: None,
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -1222,20 +957,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                _,
-                (),
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::GET,
-                    nsid: crate::blue::catbird::mls::list_invites::NSID.into(),
-                    parameters: Some(params),
-                    input: None,
-                    encoding: None,
-                },
-            )
+            .send_xrpc::<_, (), _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::GET,
+                nsid: crate::blue::catbird::mls::list_invites::NSID.into(),
+                parameters: Some(params),
+                input: None,
+                encoding: None,
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -1252,20 +980,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::opt_in::NSID.into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::opt_in::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -1281,20 +1002,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                (),
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::opt_out::NSID.into(),
-                    parameters: None,
-                    input: None,
-                    encoding: None,
-                },
-            )
+            .send_xrpc::<(), (), _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::opt_out::NSID.into(),
+                parameters: None,
+                input: None,
+                encoding: None,
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -1311,21 +1025,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::process_external_commit::NSID
-                        .into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::process_external_commit::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -1342,20 +1048,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::promote_admin::NSID.into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::promote_admin::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -1372,20 +1071,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::promote_moderator::NSID.into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::promote_moderator::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -1402,20 +1094,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::publish_key_package::NSID.into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::publish_key_package::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -1432,20 +1117,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::publish_key_packages::NSID.into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::publish_key_packages::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -1462,20 +1140,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::readdition::NSID.into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::readdition::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -1492,20 +1163,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::register_device::NSID.into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::register_device::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -1522,20 +1186,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::register_device_token::NSID.into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::register_device_token::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -1552,20 +1209,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::rejoin::NSID.into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::rejoin::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -1582,20 +1232,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::remove_member::NSID.into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::remove_member::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -1612,20 +1255,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::remove_reaction::NSID.into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::remove_reaction::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -1642,20 +1278,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::report_member::NSID.into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::report_member::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -1672,20 +1301,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::resolve_report::NSID.into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::resolve_report::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -1702,20 +1324,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::revoke_invite::NSID.into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::revoke_invite::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -1732,20 +1347,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::send_chat_request::NSID.into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::send_chat_request::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -1762,20 +1370,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::send_message::NSID.into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::send_message::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -1792,20 +1393,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::send_typing_indicator::NSID.into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::send_typing_indicator::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -1822,20 +1416,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                _,
-                (),
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::GET,
-                    nsid: crate::blue::catbird::mls::stream_convo_events::NSID.into(),
-                    parameters: Some(params),
-                    input: None,
-                    encoding: None,
-                },
-            )
+            .send_xrpc::<_, (), _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::GET,
+                nsid: crate::blue::catbird::mls::stream_convo_events::NSID.into(),
+                parameters: Some(params),
+                input: None,
+                encoding: None,
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -1852,20 +1439,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::sync_key_packages::NSID.into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::sync_key_packages::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -1882,21 +1462,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::unregister_device_token::NSID
-                        .into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::unregister_device_token::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -1913,21 +1485,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::update_chat_request_settings::NSID
-                        .into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::update_chat_request_settings::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -1944,20 +1508,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::update_group_info::NSID.into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::update_group_info::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -1974,20 +1531,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::update_policy::NSID.into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::update_policy::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -2004,20 +1554,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::update_read::NSID.into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::update_read::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -2034,20 +1577,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                _,
-                (),
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::GET,
-                    nsid: crate::blue::catbird::mls::validate_device_state::NSID.into(),
-                    parameters: Some(params),
-                    input: None,
-                    encoding: None,
-                },
-            )
+            .send_xrpc::<_, (), _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::GET,
+                nsid: crate::blue::catbird::mls::validate_device_state::NSID.into(),
+                parameters: Some(params),
+                input: None,
+                encoding: None,
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -2064,20 +1600,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::validate_welcome::NSID.into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::validate_welcome::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),
@@ -2094,20 +1623,13 @@ where
     > {
         let response = self
             .xrpc
-            .send_xrpc::<
-                (),
-                _,
-                _,
-                _,
-            >(
-                &atrium_xrpc::XrpcRequest {
-                    method: http::Method::POST,
-                    nsid: crate::blue::catbird::mls::warn_member::NSID.into(),
-                    parameters: None,
-                    input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
-                    encoding: Some(String::from("application/json")),
-                },
-            )
+            .send_xrpc::<(), _, _, _>(&atrium_xrpc::XrpcRequest {
+                method: http::Method::POST,
+                nsid: crate::blue::catbird::mls::warn_member::NSID.into(),
+                parameters: None,
+                input: Some(atrium_xrpc::InputDataOrBytes::Data(input)),
+                encoding: Some(String::from("application/json")),
+            })
             .await?;
         match response {
             atrium_xrpc::OutputDataOrBytes::Data(data) => Ok(data),

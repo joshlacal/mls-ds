@@ -12,7 +12,7 @@ pub struct InputData {
     ///MLS key packages for this device (1-200 packages)
     pub key_packages: Vec<KeyPackageItem>,
     ///Device Ed25519 signature public key (32 bytes)
-    #[serde(with = "serde_bytes")]
+    #[serde(with = "crate::atproto_bytes")]
     pub signature_public_key: Vec<u8>,
 }
 pub type Input = crate::types::Object<InputData>;

@@ -26,15 +26,11 @@
 // ❌ Admins CANNOT delete messages (E2EE fundamental limitation)
 // =============================================================================
 
-use axum::{
-    extract::State,
-    http::StatusCode,
-    Json,
-};
+use crate::auth::AuthUser;
+use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tracing::{error, info};
-use crate::auth::AuthUser;
 
 // =============================================================================
 // Request/Response Models
@@ -301,16 +297,15 @@ pub async fn demote_admin(
     verify_is_admin(&pool, &input.convo_id, caller_did).await?;
 
     // 2. Verify target is not the creator (creator cannot be demoted)
-    let creator_did = sqlx::query_scalar::<_, String>(
-        "SELECT creator_did FROM conversations WHERE id = $1"
-    )
-    .bind(&input.convo_id)
-    .fetch_one(&pool)
-    .await
-    .map_err(|e| {
-        error!("Database error: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let creator_did =
+        sqlx::query_scalar::<_, String>("SELECT creator_did FROM conversations WHERE id = $1")
+            .bind(&input.convo_id)
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| {
+                error!("Database error: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
     if input.admin_did == creator_did {
         error!("Cannot demote conversation creator");
@@ -397,16 +392,15 @@ pub async fn remove_member(
     }
 
     // 3. Verify target is not the creator
-    let creator_did = sqlx::query_scalar::<_, String>(
-        "SELECT creator_did FROM conversations WHERE id = $1"
-    )
-    .bind(&input.convo_id)
-    .fetch_one(&pool)
-    .await
-    .map_err(|e| {
-        error!("Database error: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let creator_did =
+        sqlx::query_scalar::<_, String>("SELECT creator_did FROM conversations WHERE id = $1")
+            .bind(&input.convo_id)
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| {
+                error!("Database error: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
     if input.member_did == creator_did {
         error!("Cannot remove conversation creator");
@@ -614,16 +608,14 @@ pub async fn resolve_report(
     );
 
     // 1. Get convo_id from report
-    let convo_id = sqlx::query_scalar::<_, String>(
-        "SELECT convo_id FROM reports WHERE id = $1"
-    )
-    .bind(&input.report_id)
-    .fetch_one(&pool)
-    .await
-    .map_err(|e| {
-        error!("Database error: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let convo_id = sqlx::query_scalar::<_, String>("SELECT convo_id FROM reports WHERE id = $1")
+        .bind(&input.report_id)
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| {
+            error!("Database error: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     // 2. Verify caller is an admin
     verify_is_admin(&pool, &convo_id, caller_did).await?;
@@ -657,11 +649,7 @@ pub async fn resolve_report(
 // =============================================================================
 
 /// Verify user is an admin in the conversation
-pub async fn verify_is_admin(
-    pool: &PgPool,
-    convo_id: &str,
-    did: &str,
-) -> Result<(), StatusCode> {
+pub async fn verify_is_admin(pool: &PgPool, convo_id: &str, did: &str) -> Result<(), StatusCode> {
     let is_admin = sqlx::query_scalar::<_, bool>(
         r#"
         SELECT is_admin
@@ -687,11 +675,7 @@ pub async fn verify_is_admin(
 }
 
 /// Verify user is a member in the conversation
-async fn verify_is_member(
-    pool: &PgPool,
-    convo_id: &str,
-    did: &str,
-) -> Result<(), StatusCode> {
+async fn verify_is_member(pool: &PgPool, convo_id: &str, did: &str) -> Result<(), StatusCode> {
     let is_member = sqlx::query_scalar::<_, bool>(
         r#"
         SELECT EXISTS(

@@ -3,14 +3,16 @@ use base64::Engine;
 use axum::{extract::State, http::StatusCode, Json};
 use std::sync::Arc;
 use tokio::sync::oneshot;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 use crate::{
     actors::{ActorRegistry, ConvoMessage, KeyPackageHashEntry},
     auth::AuthUser,
     block_sync::BlockSyncService,
     error_responses::AddMembersError,
-    generated::blue::catbird::mls::add_members::{Input as AddMembersInput, Output as AddMembersOutput, OutputData, Error},
+    generated::blue::catbird::mls::add_members::{
+        Error, Input as AddMembersInput, Output as AddMembersOutput, OutputData,
+    },
     realtime::{SseState, StreamEvent},
     storage::{get_current_epoch, is_member, DbPool},
 };
@@ -26,7 +28,8 @@ pub async fn add_members(
     auth_user: AuthUser,
     Json(input): Json<AddMembersInput>,
 ) -> Result<Json<AddMembersOutput>, AddMembersError> {
-    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.addMembers") {
+    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.addMembers")
+    {
         return Err(StatusCode::UNAUTHORIZED.into());
     }
     let did = &auth_user.did;
@@ -45,26 +48,29 @@ pub async fn add_members(
     }
 
     // Check if requester is a member
-    if !is_member(&pool, did, &input.convo_id)
-        .await
-        .map_err(|e| {
-            error!("Failed to check membership: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?
-    {
+    if !is_member(&pool, did, &input.convo_id).await.map_err(|e| {
+        error!("Failed to check membership: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })? {
         warn!("User is not a member of conversation");
         return Err(StatusCode::FORBIDDEN.into());
     }
 
     // Note: Reduced logging per security hardening - no convo IDs at info level
-    tracing::debug!("Adding {} members to convo {}", input.did_list.len(), crate::crypto::redact_for_log(&input.convo_id));
+    tracing::debug!(
+        "Adding {} members to convo {}",
+        input.did_list.len(),
+        crate::crypto::redact_for_log(&input.convo_id)
+    );
 
     // Check for blocks between existing members and new members
-    tracing::debug!("📍 [add_members] checking for blocks between existing and new members via PDS");
-    
+    tracing::debug!(
+        "📍 [add_members] checking for blocks between existing and new members via PDS"
+    );
+
     // Get existing members
     let existing_member_dids: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT member_did FROM members WHERE convo_id = $1 AND left_at IS NULL"
+        "SELECT DISTINCT member_did FROM members WHERE convo_id = $1 AND left_at IS NULL",
     )
     .bind(&input.convo_id)
     .fetch_all(&pool)
@@ -73,27 +79,35 @@ pub async fn add_members(
         error!("Failed to query existing members: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    
+
     // Combine existing + new members for block check
-    let new_member_dids: Vec<String> = input.did_list.iter().map(|d| d.as_str().to_string()).collect();
+    let new_member_dids: Vec<String> = input
+        .did_list
+        .iter()
+        .map(|d| d.as_str().to_string())
+        .collect();
     let mut all_dids_for_block_check = existing_member_dids.clone();
     for new_did in &new_member_dids {
         if !all_dids_for_block_check.contains(new_did) {
             all_dids_for_block_check.push(new_did.clone());
         }
     }
-    
+
     // Check for block conflicts between new members and existing members
     if all_dids_for_block_check.len() > 1 {
-        match block_sync.check_block_conflicts(&all_dids_for_block_check).await {
+        match block_sync
+            .check_block_conflicts(&all_dids_for_block_check)
+            .await
+        {
             Ok(conflicts) => {
                 // Filter to only conflicts involving new members
-                let relevant_conflicts: Vec<_> = conflicts.iter()
+                let relevant_conflicts: Vec<_> = conflicts
+                    .iter()
                     .filter(|(blocker, blocked)| {
                         new_member_dids.contains(blocker) || new_member_dids.contains(blocked)
                     })
                     .collect();
-                    
+
                 if !relevant_conflicts.is_empty() {
                     // Sync blocks to DB for future reference
                     for (blocker, _blocked) in &relevant_conflicts {
@@ -101,25 +115,26 @@ pub async fn add_members(
                             warn!("Failed to sync blocks to DB: {}", e);
                         }
                     }
-                    
+
                     warn!(
                         "❌ [add_members] Block detected: {} conflicts found via PDS",
                         relevant_conflicts.len()
                     );
                     return Err(Error::BlockedByMember(Some(format!(
                         "Cannot add members: block exists between new and existing members"
-                    ))).into());
+                    )))
+                    .into());
                 }
                 tracing::debug!("✅ [add_members] No blocks detected (PDS verified)");
             }
             Err(e) => {
                 // Fall back to local DB if PDS queries fail
                 warn!("PDS block check failed, falling back to local DB: {}", e);
-                
+
                 let blocks: Vec<(String, String)> = sqlx::query_as(
                     "SELECT user_did, target_did FROM bsky_blocks
                      WHERE user_did = ANY($1) AND target_did = ANY($2)
-                        OR user_did = ANY($2) AND target_did = ANY($1)"
+                        OR user_did = ANY($2) AND target_did = ANY($1)",
                 )
                 .bind(&existing_member_dids)
                 .bind(&new_member_dids)
@@ -137,7 +152,8 @@ pub async fn add_members(
                     );
                     return Err(Error::BlockedByMember(Some(format!(
                         "Cannot add members: block exists between new and existing members"
-                    ))).into());
+                    )))
+                    .into());
                 }
                 tracing::debug!("✅ [add_members] No blocks detected (DB fallback)");
             }
@@ -155,7 +171,7 @@ pub async fn add_members(
         LEFT JOIN conversation_policy p ON m.convo_id = p.convo_id
         WHERE m.convo_id = $1 AND m.left_at IS NULL
         GROUP BY p.max_members
-        "#
+        "#,
     )
     .bind(&input.convo_id)
     .fetch_optional(&pool)
@@ -166,18 +182,29 @@ pub async fn add_members(
     })?
     .unwrap_or((0, 1000)); // Default to 0 current members and 1000 max if conversation not found
 
-    tracing::debug!("Current members: {}, max allowed: {}, attempting to add: {}",
-                    current_count, max_members, input.did_list.len());
+    tracing::debug!(
+        "Current members: {}, max allowed: {}, attempting to add: {}",
+        current_count,
+        max_members,
+        input.did_list.len()
+    );
 
     // Check if adding new members would exceed max_members
     let new_total = current_count as usize + input.did_list.len();
     if new_total > max_members as usize {
-        warn!("❌ [add_members] Would exceed max_members: current={}, adding={}, max={}",
-              current_count, input.did_list.len(), max_members);
+        warn!(
+            "❌ [add_members] Would exceed max_members: current={}, adding={}, max={}",
+            current_count,
+            input.did_list.len(),
+            max_members
+        );
         return Err(Error::TooManyMembers(Some(format!(
             "Adding {} members would exceed maximum of {} members (current: {})",
-            input.did_list.len(), max_members, current_count
-        ))).into());
+            input.did_list.len(),
+            max_members,
+            current_count
+        )))
+        .into());
     }
 
     // Enforce idempotency key for write endpoints unless explicitly disabled
@@ -217,12 +244,13 @@ pub async fn add_members(
 
             if all_exist {
                 info!("📍 [add_members] Idempotency: All members already exist (no commit), returning success");
-                let current_epoch = get_current_epoch(&pool, &input.convo_id)
-                    .await
-                    .map_err(|e| {
-                        error!("Failed to get current epoch: {}", e);
-                        StatusCode::INTERNAL_SERVER_ERROR
-                    })?;
+                let current_epoch =
+                    get_current_epoch(&pool, &input.convo_id)
+                        .await
+                        .map_err(|e| {
+                            error!("Failed to get current epoch: {}", e);
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        })?;
 
                 return Ok(Json(AddMembersOutput::from(OutputData {
                     success: true,
@@ -244,25 +272,33 @@ pub async fn add_members(
 
         // Decode commit if provided
         let commit_bytes = if let Some(ref commit) = input.commit {
-            Some(base64::engine::general_purpose::STANDARD.decode(commit)
-                .map_err(|e| {
-                    warn!("Invalid base64 commit: {}", e);
-                    StatusCode::BAD_REQUEST
-                })?)
+            Some(
+                base64::engine::general_purpose::STANDARD
+                    .decode(commit)
+                    .map_err(|e| {
+                        warn!("Invalid base64 commit: {}", e);
+                        StatusCode::BAD_REQUEST
+                    })?,
+            )
         } else {
             None
         };
 
         // Convert key_package_hashes to actor message format
         let key_package_hashes = input.key_package_hashes.as_ref().map(|hashes| {
-            hashes.iter().map(|entry| KeyPackageHashEntry {
-                did: entry.data.did.to_string(),
-                hash: entry.data.hash.clone(),
-            }).collect()
+            hashes
+                .iter()
+                .map(|entry| KeyPackageHashEntry {
+                    did: entry.data.did.to_string(),
+                    hash: entry.data.hash.clone(),
+                })
+                .collect()
         });
 
         // Get or spawn conversation actor
-        let actor_ref = actor_registry.get_or_spawn(&input.convo_id).await
+        let actor_ref = actor_registry
+            .get_or_spawn(&input.convo_id)
+            .await
             .map_err(|e| {
                 error!("Failed to get conversation actor: {}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -270,16 +306,18 @@ pub async fn add_members(
 
         // Send AddMembers message
         let (tx, rx) = oneshot::channel();
-        actor_ref.send_message(ConvoMessage::AddMembers {
-            did_list: input.did_list.iter().map(|d| d.to_string()).collect(),
-            commit: commit_bytes,
-            welcome_message: input.welcome_message.clone(),
-            key_package_hashes,
-            reply: tx,
-        }).map_err(|_| {
-            error!("Failed to send message to actor");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        actor_ref
+            .send_message(ConvoMessage::AddMembers {
+                did_list: input.did_list.iter().map(|d| d.to_string()).collect(),
+                commit: commit_bytes,
+                welcome_message: input.welcome_message.clone(),
+                key_package_hashes,
+                reply: tx,
+            })
+            .map_err(|_| {
+                error!("Failed to send message to actor");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
         // Await response
         rx.await
@@ -306,7 +344,8 @@ pub async fn add_members(
 
         // Process commit if provided
         let _commit_msg_id = if let Some(ref commit) = input.commit {
-            let commit_bytes = base64::engine::general_purpose::STANDARD.decode(commit)
+            let commit_bytes = base64::engine::general_purpose::STANDARD
+                .decode(commit)
                 .map_err(|e| {
                     warn!("Invalid base64 commit: {}", e);
                     StatusCode::BAD_REQUEST
@@ -367,7 +406,10 @@ pub async fn add_members(
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
-            info!("✅ [add_members] Commit message stored with seq={}, epoch={}", seq, new_epoch);
+            info!(
+                "✅ [add_members] Commit message stored with seq={}, epoch={}",
+                seq, new_epoch
+            );
 
             // Fan out commit message to all members (async)
             let pool_clone = pool.clone();
@@ -392,7 +434,10 @@ pub async fn add_members(
 
                 match members_result {
                     Ok(members) => {
-                        tracing::debug!("📍 [add_members:fanout] fan-out commit to {} members", members.len());
+                        tracing::debug!(
+                            "📍 [add_members:fanout] fan-out commit to {} members",
+                            members.len()
+                        );
 
                         // Create envelopes for each member
                         for (member_did,) in &members {
@@ -435,7 +480,17 @@ pub async fn add_members(
                     .await;
 
                 // Fetch the commit message from database
-                let message_result = sqlx::query_as::<_, (String, Option<String>, Option<Vec<u8>>, i64, i64, chrono::DateTime<chrono::Utc>)>(
+                let message_result = sqlx::query_as::<
+                    _,
+                    (
+                        String,
+                        Option<String>,
+                        Option<Vec<u8>>,
+                        i64,
+                        i64,
+                        chrono::DateTime<chrono::Utc>,
+                    ),
+                >(
                     r#"
                     SELECT id, sender_did, ciphertext, epoch, seq, created_at
                     FROM messages
@@ -448,15 +503,16 @@ pub async fn add_members(
 
                 match message_result {
                     Ok((id, _sender_did, ciphertext, epoch, seq, created_at)) => {
-                        let message_view = crate::models::MessageView::from(crate::models::MessageViewData {
-                            id,
-                            convo_id: convo_id_clone.clone(),
-                            ciphertext: ciphertext.unwrap_or_default(),
-                            epoch: epoch as usize,
-                            seq: seq as usize,
-                            created_at: crate::sqlx_atrium::chrono_to_datetime(created_at),
-                            message_type: None,
-                        });
+                        let message_view =
+                            crate::models::MessageView::from(crate::models::MessageViewData {
+                                id,
+                                convo_id: convo_id_clone.clone(),
+                                ciphertext: ciphertext.unwrap_or_default(),
+                                epoch: epoch as usize,
+                                seq: seq as usize,
+                                created_at: crate::sqlx_atrium::chrono_to_datetime(created_at),
+                                message_type: None,
+                            });
 
                         let event = StreamEvent::MessageEvent {
                             cursor: cursor.clone(),
@@ -504,7 +560,7 @@ pub async fn add_members(
                 "SELECT device_id, credential_did, device_name
                  FROM devices
                  WHERE user_did = $1
-                 ORDER BY registered_at"
+                 ORDER BY registered_at",
             )
             .bind(target_did_str)
             .fetch_all(&pool)
@@ -520,7 +576,7 @@ pub async fn add_members(
 
                 // Check if already a member
                 let is_existing = sqlx::query_scalar::<_, i64>(
-                    "SELECT COUNT(*) FROM members WHERE convo_id = $1 AND member_did = $2"
+                    "SELECT COUNT(*) FROM members WHERE convo_id = $1 AND member_did = $2",
                 )
                 .bind(&input.convo_id)
                 .bind(target_did_str)
@@ -538,7 +594,7 @@ pub async fn add_members(
 
                 sqlx::query(
                     "INSERT INTO members (convo_id, member_did, user_did, joined_at, is_admin)
-                     VALUES ($1, $2, $3, $4, false)"
+                     VALUES ($1, $2, $3, $4, false)",
                 )
                 .bind(&input.convo_id)
                 .bind(target_did_str)
@@ -559,7 +615,7 @@ pub async fn add_members(
                 for (device_id, device_mls_did, device_name) in devices {
                     // Check if device already a member
                     let is_existing = sqlx::query_scalar::<_, i64>(
-                        "SELECT COUNT(*) FROM members WHERE convo_id = $1 AND member_did = $2"
+                        "SELECT COUNT(*) FROM members WHERE convo_id = $1 AND member_did = $2",
                     )
                     .bind(&input.convo_id)
                     .bind(&device_mls_did)
@@ -610,12 +666,18 @@ pub async fn add_members(
                     StatusCode::BAD_REQUEST
                 })?;
 
-            info!("📍 [add_members] Single Welcome message ({} bytes) for {} new members",
-                  welcome_data.len(), input.did_list.len());
+            info!(
+                "📍 [add_members] Single Welcome message ({} bytes) for {} new members",
+                welcome_data.len(),
+                input.did_list.len()
+            );
 
             // Validate all key packages are available BEFORE storing anything
             if let Some(ref kp_hashes) = input.key_package_hashes {
-                info!("📍 [add_members] Validating {} key packages are available...", kp_hashes.len());
+                info!(
+                    "📍 [add_members] Validating {} key packages are available...",
+                    kp_hashes.len()
+                );
 
                 for entry in kp_hashes {
                     let member_did_str = entry.did.as_str();
@@ -650,10 +712,14 @@ pub async fn add_members(
                         return Err(Error::KeyPackageNotFound(Some(format!(
                             "Key package not available for {}: hash={}",
                             member_did_str, hash_hex
-                        ))).into());
+                        )))
+                        .into());
                     }
                 }
-                info!("✅ [add_members] All {} key packages are available", kp_hashes.len());
+                info!(
+                    "✅ [add_members] All {} key packages are available",
+                    kp_hashes.len()
+                );
             }
 
             // Store the SAME Welcome for each new member
@@ -662,13 +728,13 @@ pub async fn add_members(
                 let welcome_id = uuid::Uuid::new_v4().to_string();
 
                 // Get the key_package_hash for this member from the input
-                let key_package_hash = input.key_package_hashes.as_ref()
-                    .and_then(|hashes| {
-                        hashes.iter()
-                            .find(|entry| entry.did.as_str() == target_did_str)
-                            .map(|entry| hex::decode(&entry.hash).ok())
-                            .flatten()
-                    });
+                let key_package_hash = input.key_package_hashes.as_ref().and_then(|hashes| {
+                    hashes
+                        .iter()
+                        .find(|entry| entry.did.as_str() == target_did_str)
+                        .map(|entry| hex::decode(&entry.hash).ok())
+                        .flatten()
+                });
 
                 sqlx::query(
                     "INSERT INTO welcome_messages (id, convo_id, recipient_did, welcome_data, key_package_hash, created_at)
@@ -691,7 +757,10 @@ pub async fn add_members(
 
                 info!("✅ [add_members] Welcome stored for member");
             }
-            info!("📍 [add_members] Stored Welcome for {} members", input.did_list.len());
+            info!(
+                "📍 [add_members] Stored Welcome for {} members",
+                input.did_list.len()
+            );
 
             // Mark key packages as consumed
             if let Some(ref kp_hashes) = input.key_package_hashes {
@@ -699,20 +768,31 @@ pub async fn add_members(
                     let member_did_str = entry.did.as_str();
                     let hash_hex = &entry.hash;
 
-                    match crate::db::mark_key_package_consumed(&pool, member_did_str, hash_hex).await {
+                    match crate::db::mark_key_package_consumed(&pool, member_did_str, hash_hex)
+                        .await
+                    {
                         Ok(consumed) => {
                             if consumed {
-                                tracing::debug!("✅ [add_members] marked key package as consumed for {}", member_did_str);
+                                tracing::debug!(
+                                    "✅ [add_members] marked key package as consumed for {}",
+                                    member_did_str
+                                );
                             } else {
                                 tracing::warn!("⚠️ [add_members] key package not found or already consumed for {}", member_did_str);
                             }
                         }
                         Err(e) => {
-                            tracing::warn!("⚠️ [add_members] failed to mark key package as consumed: {}", e);
+                            tracing::warn!(
+                                "⚠️ [add_members] failed to mark key package as consumed: {}",
+                                e
+                            );
                         }
                     }
                 }
-                tracing::debug!("📍 [add_members] marked {} key packages as consumed", kp_hashes.len());
+                tracing::debug!(
+                    "📍 [add_members] marked {} key packages as consumed",
+                    kp_hashes.len()
+                );
 
                 // Check inventory and send notification if low
                 for entry in kp_hashes {
@@ -730,7 +810,12 @@ pub async fn add_members(
                             // Notify if below threshold (5 packages)
                             if available < 5 {
                                 // Check if we should send notification (throttling)
-                                match crate::db::should_send_low_inventory_notification(&pool, member_did_str).await {
+                                match crate::db::should_send_low_inventory_notification(
+                                    &pool,
+                                    member_did_str,
+                                )
+                                .await
+                                {
                                     Ok(should_send) => {
                                         if should_send {
                                             tracing::info!(
@@ -749,9 +834,12 @@ pub async fn add_members(
                                             // }
 
                                             // Record that we sent the notification
-                                            crate::db::record_low_inventory_notification(&pool, member_did_str)
-                                                .await
-                                                .ok(); // Log but don't fail
+                                            crate::db::record_low_inventory_notification(
+                                                &pool,
+                                                member_did_str,
+                                            )
+                                            .await
+                                            .ok(); // Log but don't fail
                                         } else {
                                             tracing::debug!(
                                                 "Skipping notification for {} (already notified within 24h)",
@@ -786,7 +874,10 @@ pub async fn add_members(
         new_epoch as u32
     };
 
-    info!("Successfully added members to conversation, new epoch: {}", new_epoch);
+    info!(
+        "Successfully added members to conversation, new epoch: {}",
+        new_epoch
+    );
 
     Ok(Json(AddMembersOutput::from(OutputData {
         success: true,
@@ -808,7 +899,7 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
-        
+
         sqlx::query("INSERT INTO members (convo_id, member_did, joined_at) VALUES ($1, $2, $3)")
             .bind(convo_id)
             .bind(creator)
@@ -821,14 +912,35 @@ mod tests {
     #[tokio::test]
     async fn test_add_members_success() {
         // Use TEST_DATABASE_URL for Postgres-backed tests; skip if unset
-        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
-        let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
+        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else {
+            return;
+        };
+        let pool = crate::db::init_db(crate::db::DbConfig {
+            database_url: db_url,
+            max_connections: 5,
+            min_connections: 1,
+            acquire_timeout: std::time::Duration::from_secs(5),
+            idle_timeout: std::time::Duration::from_secs(30),
+        })
+        .await
+        .unwrap();
         let convo_id = "test-convo-1";
         let creator = "did:plc:creator";
-        
+
         setup_test_convo(&pool, creator, convo_id).await;
 
-        let did = AuthUser { did: creator.to_string(), claims: crate::auth::AtProtoClaims { iss: creator.to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
+        let did = AuthUser {
+            did: creator.to_string(),
+            claims: crate::auth::AtProtoClaims {
+                iss: creator.to_string(),
+                aud: "test".to_string(),
+                exp: 9999999999,
+                iat: None,
+                sub: None,
+                jti: Some("test-jti".to_string()),
+                lxm: None,
+            },
+        };
         let input = AddMembersInput {
             convo_id: convo_id.to_string(),
             did_list: vec!["did:plc:member1".to_string()],
@@ -838,7 +950,7 @@ mod tests {
 
         let result = add_members(State(pool), did, Json(input)).await;
         assert!(result.is_ok());
-        
+
         let output = result.unwrap().0;
         assert!(output.success);
         assert_eq!(output.new_epoch, 1);
@@ -846,14 +958,35 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_members_not_member() {
-        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
-        let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
+        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else {
+            return;
+        };
+        let pool = crate::db::init_db(crate::db::DbConfig {
+            database_url: db_url,
+            max_connections: 5,
+            min_connections: 1,
+            acquire_timeout: std::time::Duration::from_secs(5),
+            idle_timeout: std::time::Duration::from_secs(30),
+        })
+        .await
+        .unwrap();
         let convo_id = "test-convo-2";
         let creator = "did:plc:creator";
-        
+
         setup_test_convo(&pool, creator, convo_id).await;
 
-        let did = AuthUser { did: "did:plc:outsider".to_string(), claims: crate::auth::AtProtoClaims { iss: "did:plc:outsider".to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
+        let did = AuthUser {
+            did: "did:plc:outsider".to_string(),
+            claims: crate::auth::AtProtoClaims {
+                iss: "did:plc:outsider".to_string(),
+                aud: "test".to_string(),
+                exp: 9999999999,
+                iat: None,
+                sub: None,
+                jti: Some("test-jti".to_string()),
+                lxm: None,
+            },
+        };
         let input = AddMembersInput {
             convo_id: convo_id.to_string(),
             did_list: vec!["did:plc:member1".to_string()],
@@ -867,14 +1000,35 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_members_empty_list() {
-        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else { return; };
-        let pool = crate::db::init_db(crate::db::DbConfig { database_url: db_url, max_connections: 5, min_connections: 1, acquire_timeout: std::time::Duration::from_secs(5), idle_timeout: std::time::Duration::from_secs(30) }).await.unwrap();
+        let Ok(db_url) = std::env::var("TEST_DATABASE_URL") else {
+            return;
+        };
+        let pool = crate::db::init_db(crate::db::DbConfig {
+            database_url: db_url,
+            max_connections: 5,
+            min_connections: 1,
+            acquire_timeout: std::time::Duration::from_secs(5),
+            idle_timeout: std::time::Duration::from_secs(30),
+        })
+        .await
+        .unwrap();
         let convo_id = "test-convo-3";
         let creator = "did:plc:creator";
-        
+
         setup_test_convo(&pool, creator, convo_id).await;
 
-        let did = AuthUser { did: creator.to_string(), claims: crate::auth::AtProtoClaims { iss: creator.to_string(), aud: "test".to_string(), exp: 9999999999, iat: None, sub: None, jti: Some("test-jti".to_string()), lxm: None } };
+        let did = AuthUser {
+            did: creator.to_string(),
+            claims: crate::auth::AtProtoClaims {
+                iss: creator.to_string(),
+                aud: "test".to_string(),
+                exp: 9999999999,
+                iat: None,
+                sub: None,
+                jti: Some("test-jti".to_string()),
+                lxm: None,
+            },
+        };
         let input = AddMembersInput {
             convo_id: convo_id.to_string(),
             did_list: vec![],

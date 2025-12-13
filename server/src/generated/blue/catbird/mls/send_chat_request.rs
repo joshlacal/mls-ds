@@ -86,11 +86,11 @@ impl std::fmt::Display for Error {
 #[serde(rename_all = "camelCase")]
 pub struct HeldMessageData {
     ///MLS encrypted message ciphertext
-    #[serde(with = "serde_bytes")]
+    #[serde(with = "crate::atproto_bytes")]
     pub ciphertext: Vec<u8>,
     ///Optional ephemeral public key for forward secrecy
     #[serde(default)]
-    #[serde(with = "serde_bytes")]
+    #[serde(with = "crate::atproto_bytes::option")]
     #[serde(skip_serializing_if = "core::option::Option::is_none")]
     pub eph_pub_key: core::option::Option<Vec<u8>>,
     ///Padded ciphertext size (power of 2 buckets)

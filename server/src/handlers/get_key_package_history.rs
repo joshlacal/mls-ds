@@ -1,12 +1,13 @@
-use axum::{extract::{RawQuery, State}, http::StatusCode, Json};
+use axum::{
+    extract::{RawQuery, State},
+    http::StatusCode,
+    Json,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::{
-    auth::AuthUser,
-    storage::DbPool,
-};
+use crate::{auth::AuthUser, storage::DbPool};
 
 // Database row struct for query results
 #[derive(Debug, Clone)]
@@ -50,7 +51,9 @@ pub async fn get_key_package_history(
     auth_user: AuthUser,
     RawQuery(query): RawQuery,
 ) -> Result<Json<GetKeyPackageHistoryResponse>, StatusCode> {
-    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.getKeyPackageHistory") {
+    if let Err(_e) =
+        crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.getKeyPackageHistory")
+    {
         warn!("Unauthorized access attempt");
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -76,7 +79,10 @@ pub async fn get_key_package_history(
     }
 
     let user_did = &auth_user.claims.iss;
-    info!("Fetching key package history for user: {} (limit: {})", user_did, limit);
+    info!(
+        "Fetching key package history for user: {} (limit: {})",
+        user_did, limit
+    );
 
     // Fetch history from database
     let rows: Vec<KeyPackageHistoryRow> = if let Some(cursor_id) = cursor {

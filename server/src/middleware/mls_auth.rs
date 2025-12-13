@@ -1,17 +1,13 @@
 //! MLS Authorization Middleware
-//! 
+//!
 //! Enforces group membership authorization before allowing MLS operations.
 //! This is CRITICAL for security - prevents unauthorized access to group messages.
 
+use anyhow::{anyhow, Result};
 use sqlx::PgPool;
-use anyhow::{Result, anyhow};
 
 /// Verify that a user is an active member of a group
-pub async fn verify_group_membership(
-    user_did: &str,
-    convo_id: &str,
-    db: &PgPool,
-) -> Result<()> {
+pub async fn verify_group_membership(user_did: &str, convo_id: &str, db: &PgPool) -> Result<()> {
     let member = sqlx::query!(
         r#"
         SELECT member_did 
@@ -25,23 +21,20 @@ pub async fn verify_group_membership(
     )
     .fetch_optional(db)
     .await?;
-    
+
     if member.is_none() {
         return Err(anyhow!(
             "User {} is not an active member of conversation {}",
-            user_did, convo_id
+            user_did,
+            convo_id
         ));
     }
-    
+
     Ok(())
 }
 
 /// Verify that a user is the creator of a group
-pub async fn verify_group_creator(
-    user_did: &str,
-    convo_id: &str,
-    db: &PgPool,
-) -> Result<()> {
+pub async fn verify_group_creator(user_did: &str, convo_id: &str, db: &PgPool) -> Result<()> {
     let conversation = sqlx::query!(
         r#"
         SELECT creator_did 
@@ -52,28 +45,22 @@ pub async fn verify_group_creator(
     )
     .fetch_optional(db)
     .await?;
-    
+
     match conversation {
         Some(convo) if convo.creator_did == user_did => Ok(()),
         Some(_) => Err(anyhow!(
             "User {} is not the creator of conversation {}",
-            user_did, convo_id
-        )),
-        None => Err(anyhow!(
-            "Conversation {} not found",
+            user_did,
             convo_id
         )),
+        None => Err(anyhow!("Conversation {} not found", convo_id)),
     }
 }
 
 /// Check if a user can add members to a group
 /// Currently: only the creator can add members
 /// Future: could support admin roles
-pub async fn verify_can_add_members(
-    user_did: &str,
-    convo_id: &str,
-    db: &PgPool,
-) -> Result<()> {
+pub async fn verify_can_add_members(user_did: &str, convo_id: &str, db: &PgPool) -> Result<()> {
     // For now, only creators can add members
     verify_group_creator(user_did, convo_id, db).await
 }
@@ -91,16 +78,13 @@ pub async fn verify_can_remove_members(
     if user_did == target_did {
         return verify_group_membership(user_did, convo_id, db).await;
     }
-    
+
     // Otherwise, must be creator
     verify_group_creator(user_did, convo_id, db).await
 }
 
 /// Get the current epoch for a conversation
-pub async fn get_conversation_epoch(
-    convo_id: &str,
-    db: &PgPool,
-) -> Result<i32> {
+pub async fn get_conversation_epoch(convo_id: &str, db: &PgPool) -> Result<i32> {
     // Get epoch from conversations table
     let result = sqlx::query!(
         r#"
@@ -112,17 +96,17 @@ pub async fn get_conversation_epoch(
     )
     .fetch_one(db)
     .await?;
-    
+
     Ok(result.current_epoch)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     // Note: Integration tests should be in tests/ directory
     // These are unit tests for helper functions
-    
+
     #[test]
     fn test_conversation_id_string() {
         let convo_id = "0123456789abcdef";

@@ -38,7 +38,10 @@ pub async fn run_key_package_cleanup_worker(pool: PgPool) {
         // Cleanup consumed key packages older than 24 hours
         match crate::db::delete_consumed_key_packages(&pool, 24).await {
             Ok(count) if count > 0 => {
-                info!("Cleaned up {} consumed key packages (older than 24 hours)", count);
+                info!(
+                    "Cleaned up {} consumed key packages (older than 24 hours)",
+                    count
+                );
             }
             Ok(_) => {
                 info!("No consumed key packages to clean up");
@@ -51,7 +54,10 @@ pub async fn run_key_package_cleanup_worker(pool: PgPool) {
         // Cleanup old unconsumed key packages (older than 7 days)
         match crate::db::delete_old_unconsumed_key_packages(&pool, 7).await {
             Ok(count) if count > 0 => {
-                info!("Cleaned up {} unconsumed key packages (older than 7 days)", count);
+                info!(
+                    "Cleaned up {} unconsumed key packages (older than 7 days)",
+                    count
+                );
             }
             Ok(_) => {
                 info!("No old unconsumed key packages to clean up");
@@ -64,7 +70,10 @@ pub async fn run_key_package_cleanup_worker(pool: PgPool) {
         // Enforce per-device limit
         match crate::db::enforce_key_package_limit(&pool, max_per_device).await {
             Ok(count) if count > 0 => {
-                info!("Enforced limit of {} packages per device, removed {} excess key packages", max_per_device, count);
+                info!(
+                    "Enforced limit of {} packages per device, removed {} excess key packages",
+                    max_per_device, count
+                );
             }
             Ok(_) => {
                 info!("All devices within key package limit of {}", max_per_device);

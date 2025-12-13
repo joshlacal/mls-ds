@@ -243,7 +243,9 @@ mod conversation_tests {
                 reply: tx,
             })
             .expect("Failed to send AddMembers");
-        rx.await.expect("Failed to receive result").expect("AddMembers failed");
+        rx.await
+            .expect("Failed to receive result")
+            .expect("AddMembers failed");
 
         // Send shutdown message
         actor_ref
@@ -254,13 +256,12 @@ mod conversation_tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Verify epoch was persisted in database
-        let db_epoch: i32 = sqlx::query_scalar(
-            "SELECT current_epoch FROM conversations WHERE id = $1"
-        )
-        .bind(convo_id)
-        .fetch_one(&pool)
-        .await
-        .expect("Failed to get epoch from database");
+        let db_epoch: i32 =
+            sqlx::query_scalar("SELECT current_epoch FROM conversations WHERE id = $1")
+                .bind(convo_id)
+                .fetch_one(&pool)
+                .await
+                .expect("Failed to get epoch from database");
         assert_eq!(db_epoch, 1);
 
         // Cleanup
@@ -370,13 +371,12 @@ mod conversation_tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Verify all messages were stored with sequential sequence numbers
-        let messages: Vec<(i64,)> = sqlx::query_as(
-            "SELECT seq FROM messages WHERE convo_id = $1 ORDER BY seq ASC"
-        )
-        .bind(convo_id)
-        .fetch_all(&pool)
-        .await
-        .expect("Failed to get messages");
+        let messages: Vec<(i64,)> =
+            sqlx::query_as("SELECT seq FROM messages WHERE convo_id = $1 ORDER BY seq ASC")
+                .bind(convo_id)
+                .fetch_all(&pool)
+                .await
+                .expect("Failed to get messages");
 
         assert_eq!(messages.len(), 10);
 

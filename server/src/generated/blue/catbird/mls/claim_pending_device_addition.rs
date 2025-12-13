@@ -25,9 +25,7 @@ pub struct OutputData {
     pub device_credential_did: core::option::Option<String>,
     ///Key package for the new device (returned on successful claim)
     #[serde(skip_serializing_if = "core::option::Option::is_none")]
-    pub key_package: core::option::Option<
-        crate::blue::catbird::mls::defs::KeyPackageRef,
-    >,
+    pub key_package: core::option::Option<crate::blue::catbird::mls::defs::KeyPackageRef>,
 }
 pub type Output = crate::types::Object<OutputData>;
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]

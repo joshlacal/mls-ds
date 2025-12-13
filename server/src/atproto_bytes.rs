@@ -21,7 +21,10 @@ where
     }
 
     let base64_string = base64::engine::general_purpose::STANDARD.encode(bytes);
-    Wrapper { bytes: &base64_string }.serialize(serializer)
+    Wrapper {
+        bytes: &base64_string,
+    }
+    .serialize(serializer)
 }
 
 pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
@@ -61,7 +64,10 @@ pub mod option {
             None => serializer.serialize_none(),
             Some(b) => {
                 let base64_string = base64::engine::general_purpose::STANDARD.encode(b);
-                Wrapper { bytes: &base64_string }.serialize(serializer)
+                Wrapper {
+                    bytes: &base64_string,
+                }
+                .serialize(serializer)
             }
         }
     }
@@ -151,9 +157,7 @@ mod tests {
 
     #[test]
     fn test_optional_serialize_none() {
-        let test_struct = TestOptionalStruct {
-            data: None,
-        };
+        let test_struct = TestOptionalStruct { data: None };
         let json = serde_json::to_string(&test_struct).unwrap();
         // With skip_serializing_if, None should not appear in JSON
         assert_eq!(json, "{}");

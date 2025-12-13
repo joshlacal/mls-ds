@@ -41,18 +41,9 @@ impl MetricsRecorder {
         );
 
         // Actor system metrics
-        metrics::describe_counter!(
-            "actor_spawns_total",
-            "Total number of actors spawned"
-        );
-        metrics::describe_counter!(
-            "actor_stops_total",
-            "Total number of actors stopped"
-        );
-        metrics::describe_counter!(
-            "actor_restarts_total",
-            "Total number of actor restarts"
-        );
+        metrics::describe_counter!("actor_spawns_total", "Total number of actors spawned");
+        metrics::describe_counter!("actor_stops_total", "Total number of actors stopped");
+        metrics::describe_counter!("actor_restarts_total", "Total number of actor restarts");
         metrics::describe_gauge!(
             "actor_mailbox_depth",
             "Number of messages waiting in actor mailbox"
@@ -118,11 +109,19 @@ pub async fn metrics_handler(
                 }
                 Some(_) => {
                     tracing::warn!("Metrics endpoint accessed with invalid token");
-                    return (StatusCode::UNAUTHORIZED, "Invalid metrics token".to_string()).into_response();
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        "Invalid metrics token".to_string(),
+                    )
+                        .into_response();
                 }
                 None => {
                     tracing::warn!("Metrics endpoint accessed without authentication");
-                    return (StatusCode::UNAUTHORIZED, "Missing or malformed Authorization header".to_string()).into_response();
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        "Missing or malformed Authorization header".to_string(),
+                    )
+                        .into_response();
                 }
             }
         }

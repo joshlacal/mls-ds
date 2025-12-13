@@ -45,7 +45,10 @@ impl ChatRequestStatus {
     }
 
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Accepted | Self::Declined | Self::Blocked | Self::Expired)
+        matches!(
+            self,
+            Self::Accepted | Self::Declined | Self::Blocked | Self::Expired
+        )
     }
 }
 
@@ -56,26 +59,26 @@ impl ChatRequestStatus {
 /// Database representation of a chat request
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct ChatRequest {
-    pub id: String,  // ULID
+    pub id: String, // ULID
     pub sender_did: String,
     pub recipient_did: String,
     pub status: ChatRequestStatus,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    
+
     // Group invite fields
     pub is_group_invite: bool,
     pub group_id: Option<String>,
-    
+
     // Held message metadata
     pub held_message_count: i32,
     pub first_message_preview: Option<String>,
-    
+
     // Acceptance tracking
     pub accepted_at: Option<DateTime<Utc>>,
     pub accepted_convo_id: Option<String>,
-    
+
     // Blocking
     pub blocked_at: Option<DateTime<Utc>>,
     pub blocked_reason: Option<String>,
@@ -109,7 +112,8 @@ impl ChatRequest {
 
     /// Get the conversation ID (either accepted_convo_id or group_id for invites)
     pub fn conversation_id(&self) -> Option<&str> {
-        self.accepted_convo_id.as_deref()
+        self.accepted_convo_id
+            .as_deref()
             .or_else(|| self.group_id.as_deref())
     }
 }
@@ -121,20 +125,20 @@ impl ChatRequest {
 /// Database representation of a held encrypted message
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct HeldMessage {
-    pub id: String,  // ULID
+    pub id: String, // ULID
     pub request_id: String,
-    
+
     // MLS ciphertext
     #[sqlx(default)]
     pub ciphertext: Vec<u8>,
-    
+
     // Ephemeral key material
     pub eph_pub_key: Option<Vec<u8>>,
-    
+
     // Ordering
     pub sequence: i32,
     pub created_at: DateTime<Utc>,
-    
+
     // Privacy
     pub padded_size: i32,
 }
@@ -160,12 +164,12 @@ impl HeldMessage {
 pub struct ChatRequestRateLimit {
     pub sender_did: String,
     pub recipient_did: String,
-    
+
     // Rate limiting counters
     pub request_count: i32,
     pub last_request_at: DateTime<Utc>,
     pub window_start: DateTime<Utc>,
-    
+
     // Block tracking
     pub blocked_until: Option<DateTime<Utc>>,
     pub block_count: i32,
@@ -243,7 +247,9 @@ impl ChatRequestBuilder {
         ChatRequestParams {
             sender_did: self.sender_did,
             recipient_did: self.recipient_did,
-            expires_at: self.expires_at.unwrap_or_else(|| Utc::now() + chrono::Duration::days(7)),
+            expires_at: self
+                .expires_at
+                .unwrap_or_else(|| Utc::now() + chrono::Duration::days(7)),
             is_group_invite: self.is_group_invite,
             group_id: self.group_id,
             first_message_preview: self.first_message_preview,
@@ -378,7 +384,7 @@ mod tests {
     fn test_chat_request_builder() {
         let params = ChatRequestBuilder::new(
             "did:plc:sender".to_string(),
-            "did:plc:recipient".to_string()
+            "did:plc:recipient".to_string(),
         )
         .expires_in_days(7)
         .with_preview("Hello!".to_string())

@@ -1,7 +1,7 @@
+use chrono::Utc;
+use sqlx::PgPool;
 use std::sync::Arc;
 use tokio::sync::Barrier;
-use sqlx::PgPool;
-use chrono::Utc;
 
 // Test setup helper
 async fn setup_test_db() -> PgPool {
@@ -55,7 +55,7 @@ async fn create_test_convo(pool: &PgPool, convo_id: &str, creator: &str) {
     sqlx::query(
         "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at)
          VALUES ($1, $2, 0, $3, $3)
-         ON CONFLICT (id) DO NOTHING"
+         ON CONFLICT (id) DO NOTHING",
     )
     .bind(convo_id)
     .bind(creator)
@@ -67,7 +67,7 @@ async fn create_test_convo(pool: &PgPool, convo_id: &str, creator: &str) {
     sqlx::query(
         "INSERT INTO members (convo_id, member_did, joined_at, unread_count)
          VALUES ($1, $2, $3, 0)
-         ON CONFLICT (convo_id, member_did) DO NOTHING"
+         ON CONFLICT (convo_id, member_did) DO NOTHING",
     )
     .bind(convo_id)
     .bind(creator)
@@ -82,7 +82,7 @@ async fn add_member_db(pool: &PgPool, convo_id: &str, member_did: &str) {
     sqlx::query(
         "INSERT INTO members (convo_id, member_did, joined_at, unread_count)
          VALUES ($1, $2, $3, 0)
-         ON CONFLICT (convo_id, member_did) DO NOTHING"
+         ON CONFLICT (convo_id, member_did) DO NOTHING",
     )
     .bind(convo_id)
     .bind(member_did)
@@ -102,21 +102,26 @@ async fn simulate_add_members_via_actor(
     use tokio::sync::oneshot;
 
     // Get or spawn conversation actor
-    let actor_ref = actor_registry.get_or_spawn(convo_id).await
+    let actor_ref = actor_registry
+        .get_or_spawn(convo_id)
+        .await
         .map_err(|e| format!("Failed to get actor: {}", e))?;
 
     // Send AddMembers message
     let (tx, rx) = oneshot::channel();
-    actor_ref.send_message(catbird_server::actors::ConvoMessage::AddMembers {
-        did_list,
-        commit: None,
-        welcome_message: None,
-        key_package_hashes: None,
-        reply: tx,
-    }).map_err(|e| format!("Failed to send message: {:?}", e))?;
+    actor_ref
+        .send_message(catbird_server::actors::ConvoMessage::AddMembers {
+            did_list,
+            commit: None,
+            welcome_message: None,
+            key_package_hashes: None,
+            reply: tx,
+        })
+        .map_err(|e| format!("Failed to send message: {:?}", e))?;
 
     // Await response
-    let new_epoch = rx.await
+    let new_epoch = rx
+        .await
         .map_err(|_| "Actor channel closed unexpectedly".to_string())?
         .map_err(|e| format!("Actor failed: {}", e))?;
 
@@ -132,15 +137,19 @@ async fn simulate_send_message_via_actor(
 ) -> Result<(), String> {
     use tokio::sync::oneshot;
 
-    let actor_ref = actor_registry.get_or_spawn(convo_id).await
+    let actor_ref = actor_registry
+        .get_or_spawn(convo_id)
+        .await
         .map_err(|e| format!("Failed to get actor: {}", e))?;
 
     let (tx, rx) = oneshot::channel();
-    actor_ref.send_message(catbird_server::actors::ConvoMessage::SendMessage {
-        sender_did: sender_did.to_string(),
-        ciphertext,
-        reply: tx,
-    }).map_err(|e| format!("Failed to send message: {:?}", e))?;
+    actor_ref
+        .send_message(catbird_server::actors::ConvoMessage::SendMessage {
+            sender_did: sender_did.to_string(),
+            ciphertext,
+            reply: tx,
+        })
+        .map_err(|e| format!("Failed to send message: {:?}", e))?;
 
     rx.await
         .map_err(|_| "Actor channel closed unexpectedly".to_string())?
@@ -150,25 +159,26 @@ async fn simulate_send_message_via_actor(
 }
 
 // Simulate get_messages handler (resets unread count)
-async fn simulate_get_messages(pool: &PgPool, convo_id: &str, member_did: &str) -> Result<Vec<String>, String> {
+async fn simulate_get_messages(
+    pool: &PgPool,
+    convo_id: &str,
+    member_did: &str,
+) -> Result<Vec<String>, String> {
     // Reset unread count
-    sqlx::query(
-        "UPDATE members SET unread_count = 0 WHERE convo_id = $1 AND member_did = $2"
-    )
-    .bind(convo_id)
-    .bind(member_did)
-    .execute(pool)
-    .await
-    .map_err(|e| format!("Failed to reset unread: {}", e))?;
+    sqlx::query("UPDATE members SET unread_count = 0 WHERE convo_id = $1 AND member_did = $2")
+        .bind(convo_id)
+        .bind(member_did)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("Failed to reset unread: {}", e))?;
 
     // Fetch message IDs
-    let message_ids: Vec<String> = sqlx::query_scalar(
-        "SELECT id FROM messages WHERE convo_id = $1 ORDER BY created_at"
-    )
-    .bind(convo_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| format!("Failed to fetch messages: {}", e))?;
+    let message_ids: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM messages WHERE convo_id = $1 ORDER BY created_at")
+            .bind(convo_id)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| format!("Failed to fetch messages: {}", e))?;
 
     Ok(message_ids)
 }
@@ -215,7 +225,8 @@ async fn test_concurrent_add_members_no_duplicate_epochs() {
                 actor_registry_clone,
                 &convo_id_str,
                 vec![did],
-            ).await
+            )
+            .await
         });
 
         handles.push(handle);
@@ -238,7 +249,11 @@ async fn test_concurrent_add_members_no_duplicate_epochs() {
     }
 
     // Verify all 10 operations succeeded
-    assert_eq!(epochs.len(), 10, "All 10 add_members operations should succeed");
+    assert_eq!(
+        epochs.len(),
+        10,
+        "All 10 add_members operations should succeed"
+    );
 
     // Verify epochs are sequential (1 through 10)
     epochs.sort();
@@ -249,23 +264,26 @@ async fn test_concurrent_add_members_no_duplicate_epochs() {
     let epoch_duplicates: Vec<(i32, i64)> = sqlx::query_as(
         "SELECT epoch, COUNT(*) as count FROM messages
          WHERE convo_id = $1 AND message_type = 'commit'
-         GROUP BY epoch HAVING COUNT(*) > 1"
+         GROUP BY epoch HAVING COUNT(*) > 1",
     )
     .bind(convo_id)
     .fetch_all(&pool)
     .await
     .unwrap();
 
-    assert!(epoch_duplicates.is_empty(), "Found duplicate epochs: {:?}", epoch_duplicates);
+    assert!(
+        epoch_duplicates.is_empty(),
+        "Found duplicate epochs: {:?}",
+        epoch_duplicates
+    );
 
     // Verify final conversation epoch
-    let final_epoch: i32 = sqlx::query_scalar(
-        "SELECT current_epoch FROM conversations WHERE id = $1"
-    )
-    .bind(convo_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let final_epoch: i32 =
+        sqlx::query_scalar("SELECT current_epoch FROM conversations WHERE id = $1")
+            .bind(convo_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
 
     assert_eq!(final_epoch, 10, "Final conversation epoch should be 10");
 
@@ -307,7 +325,9 @@ async fn test_concurrent_send_and_read_unread_count_consistency() {
                 &sender_convo_id,
                 alice,
                 msg,
-            ).await {
+            )
+            .await
+            {
                 eprintln!("Failed to send message {}: {}", i, e);
             }
             tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
@@ -338,7 +358,7 @@ async fn test_concurrent_send_and_read_unread_count_consistency() {
 
     // Verify unread count is 0 (all messages read)
     let unread: i32 = sqlx::query_scalar(
-        "SELECT unread_count FROM members WHERE convo_id = $1 AND member_did = $2"
+        "SELECT unread_count FROM members WHERE convo_id = $1 AND member_did = $2",
     )
     .bind(convo_id)
     .bind(bob)
@@ -346,11 +366,14 @@ async fn test_concurrent_send_and_read_unread_count_consistency() {
     .await
     .unwrap();
 
-    assert_eq!(unread, 0, "Unread count should be 0 after reading all messages");
+    assert_eq!(
+        unread, 0,
+        "Unread count should be 0 after reading all messages"
+    );
 
     // Verify we have exactly 50 messages
     let message_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM messages WHERE convo_id = $1 AND message_type = 'app'"
+        "SELECT COUNT(*) FROM messages WHERE convo_id = $1 AND message_type = 'app'",
     )
     .bind(convo_id)
     .fetch_one(&pool)
@@ -397,12 +420,7 @@ async fn test_message_sequence_numbers_sequential() {
             barrier_clone.wait().await;
 
             let msg = format!("concurrent message {}", i).into_bytes();
-            simulate_send_message_via_actor(
-                registry,
-                &convo_id_str,
-                creator,
-                msg,
-            ).await
+            simulate_send_message_via_actor(registry, &convo_id_str, creator, msg).await
         });
 
         handles.push(handle);
@@ -421,7 +439,7 @@ async fn test_message_sequence_numbers_sequential() {
 
     // Verify sequence numbers are sequential (1 through 20)
     let sequences: Vec<i64> = sqlx::query_scalar(
-        "SELECT seq FROM messages WHERE convo_id = $1 AND message_type = 'app' ORDER BY seq"
+        "SELECT seq FROM messages WHERE convo_id = $1 AND message_type = 'app' ORDER BY seq",
     )
     .bind(convo_id)
     .fetch_all(&pool)
@@ -431,20 +449,27 @@ async fn test_message_sequence_numbers_sequential() {
     assert_eq!(sequences.len(), 20, "Should have 20 messages");
 
     let expected: Vec<i64> = (1..=20).collect();
-    assert_eq!(sequences, expected, "Sequence numbers should be sequential 1-20");
+    assert_eq!(
+        sequences, expected,
+        "Sequence numbers should be sequential 1-20"
+    );
 
     // Verify no duplicate sequence numbers
     let duplicates: Vec<(i64, i64)> = sqlx::query_as(
         "SELECT seq, COUNT(*) FROM messages
          WHERE convo_id = $1 AND message_type = 'app'
-         GROUP BY seq HAVING COUNT(*) > 1"
+         GROUP BY seq HAVING COUNT(*) > 1",
     )
     .bind(convo_id)
     .fetch_all(&pool)
     .await
     .unwrap();
 
-    assert!(duplicates.is_empty(), "Found duplicate sequence numbers: {:?}", duplicates);
+    assert!(
+        duplicates.is_empty(),
+        "Found duplicate sequence numbers: {:?}",
+        duplicates
+    );
 
     println!("✅ Test passed: Sequential message sequence numbers");
 
@@ -486,12 +511,7 @@ async fn test_out_of_order_commits_prevented() {
                 tokio::time::sleep(tokio::time::Duration::from_millis(50 * (i - 2) as u64)).await;
             }
 
-            simulate_add_members_via_actor(
-                pool_clone,
-                registry,
-                &convo_id_str,
-                vec![did],
-            ).await
+            simulate_add_members_via_actor(pool_clone, registry, &convo_id_str, vec![did]).await
         });
 
         handles.push(handle);
@@ -513,14 +533,17 @@ async fn test_out_of_order_commits_prevented() {
     epochs.sort();
     assert_eq!(epochs.len(), 5);
     let expected: Vec<u32> = (1..=5).collect();
-    assert_eq!(epochs, expected, "Epochs should be 1-5 regardless of clock skew");
+    assert_eq!(
+        epochs, expected,
+        "Epochs should be 1-5 regardless of clock skew"
+    );
 
     // Verify commits in DB are ordered by epoch, not just timestamp
     let commits: Vec<(i32, chrono::DateTime<Utc>)> = sqlx::query_as(
         "SELECT epoch::int4, created_at
          FROM messages
          WHERE convo_id = $1 AND message_type = 'commit'
-         ORDER BY created_at"
+         ORDER BY created_at",
     )
     .bind(convo_id)
     .fetch_all(&pool)
@@ -529,8 +552,14 @@ async fn test_out_of_order_commits_prevented() {
 
     // Even if timestamps are out of order, epochs should be sequential
     for (i, (epoch, _created_at)) in commits.iter().enumerate() {
-        assert_eq!(*epoch as usize, i + 1,
-            "Epoch should be {} but got {} at position {}", i + 1, epoch, i);
+        assert_eq!(
+            *epoch as usize,
+            i + 1,
+            "Epoch should be {} but got {} at position {}",
+            i + 1,
+            epoch,
+            i
+        );
     }
 
     println!("✅ Test passed: Out-of-order commits prevented by actor serialization");
@@ -570,12 +599,7 @@ async fn test_mixed_operations_no_race_conditions() {
         let convo_id_str = convo_id.to_string();
 
         let handle = tokio::spawn(async move {
-            simulate_add_members_via_actor(
-                pool_clone,
-                registry,
-                &convo_id_str,
-                vec![did],
-            ).await
+            simulate_add_members_via_actor(pool_clone, registry, &convo_id_str, vec![did]).await
         });
 
         add_handles.push(handle);
@@ -588,12 +612,7 @@ async fn test_mixed_operations_no_race_conditions() {
 
         let handle = tokio::spawn(async move {
             let msg = format!("message during member add {}", i).into_bytes();
-            simulate_send_message_via_actor(
-                registry,
-                &convo_id_str,
-                creator,
-                msg,
-            ).await
+            simulate_send_message_via_actor(registry, &convo_id_str, creator, msg).await
         });
 
         msg_handles.push(handle);
@@ -607,7 +626,7 @@ async fn test_mixed_operations_no_race_conditions() {
 
     // 1. Check we have 5 commit messages (one per add_members)
     let commit_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM messages WHERE convo_id = $1 AND message_type = 'commit'"
+        "SELECT COUNT(*) FROM messages WHERE convo_id = $1 AND message_type = 'commit'",
     )
     .bind(convo_id)
     .fetch_one(&pool)
@@ -618,7 +637,7 @@ async fn test_mixed_operations_no_race_conditions() {
 
     // 2. Check we have 5 app messages
     let app_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM messages WHERE convo_id = $1 AND message_type = 'app'"
+        "SELECT COUNT(*) FROM messages WHERE convo_id = $1 AND message_type = 'app'",
     )
     .bind(convo_id)
     .fetch_one(&pool)
@@ -631,7 +650,7 @@ async fn test_mixed_operations_no_race_conditions() {
     let commit_epochs: Vec<i32> = sqlx::query_scalar(
         "SELECT epoch::int4 FROM messages
          WHERE convo_id = $1 AND message_type = 'commit'
-         ORDER BY epoch"
+         ORDER BY epoch",
     )
     .bind(convo_id)
     .fetch_all(&pool)
@@ -639,20 +658,22 @@ async fn test_mixed_operations_no_race_conditions() {
     .unwrap();
 
     let expected_epochs: Vec<i32> = (1..=5).collect();
-    assert_eq!(commit_epochs, expected_epochs, "Commit epochs should be 1-5");
+    assert_eq!(
+        commit_epochs, expected_epochs,
+        "Commit epochs should be 1-5"
+    );
 
     // 4. Verify all messages have valid epochs (not higher than current conversation epoch)
-    let current_epoch: i32 = sqlx::query_scalar(
-        "SELECT current_epoch FROM conversations WHERE id = $1"
-    )
-    .bind(convo_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let current_epoch: i32 =
+        sqlx::query_scalar("SELECT current_epoch FROM conversations WHERE id = $1")
+            .bind(convo_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
 
     let invalid_epochs: Vec<i64> = sqlx::query_scalar(
         "SELECT epoch FROM messages
-         WHERE convo_id = $1 AND epoch::int4 > $2"
+         WHERE convo_id = $1 AND epoch::int4 > $2",
     )
     .bind(convo_id)
     .bind(current_epoch)
@@ -660,8 +681,11 @@ async fn test_mixed_operations_no_race_conditions() {
     .await
     .unwrap();
 
-    assert!(invalid_epochs.is_empty(),
-        "No messages should have epoch > current conversation epoch. Found: {:?}", invalid_epochs);
+    assert!(
+        invalid_epochs.is_empty(),
+        "No messages should have epoch > current conversation epoch. Found: {:?}",
+        invalid_epochs
+    );
 
     println!("✅ Test passed: Mixed operations maintain consistency");
 
