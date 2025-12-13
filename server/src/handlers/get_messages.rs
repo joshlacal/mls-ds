@@ -94,19 +94,26 @@ pub async fn get_messages(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
+    // Fetch reactions for all messages in batch
+    let message_ids: Vec<&str> = messages.iter().map(|m| m.id.as_str()).collect();
+    let reactions_map = db::get_reactions_for_messages(&pool, &params.convo_id, &message_ids)
+        .await
+        .unwrap_or_default();
+
     // Convert to view models with ciphertext and message_type
     // Note: sender field removed per security hardening - clients derive sender from decrypted MLS content
     // message_type is included so clients can distinguish 'app' messages from 'commit' messages
     let message_views: Vec<MessageView> = messages
         .into_iter()
         .map(|m| MessageView {
-            id: m.id,
+            id: m.id.clone(),
             convo_id: m.convo_id,
             ciphertext: m.ciphertext,
             epoch: m.epoch,
             seq: m.seq,
             created_at: m.created_at,
             message_type: m.message_type,
+            reactions: reactions_map.get(&m.id).cloned(),
         })
         .collect();
 

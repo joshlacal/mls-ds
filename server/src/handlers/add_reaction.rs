@@ -107,6 +107,19 @@ pub async fn add_reaction(
         action: "add".to_string(),
     };
 
+    // Store event for cursor-based replay
+    if let Err(e) = crate::db::store_event(
+        &pool,
+        &cursor,
+        &input.convo_id,
+        "reactionEvent",
+        Some(&input.message_id),
+    )
+    .await
+    {
+        error!("Failed to store reaction event: {:?}", e);
+    }
+
     if let Err(e) = sse_state.emit(&input.convo_id, event).await {
         error!("Failed to emit reaction event: {}", e);
         // Don't fail the request, reaction was still saved
