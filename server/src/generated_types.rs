@@ -87,6 +87,18 @@ pub struct MemberView {
     pub credential: Option<Vec<u8>>,
 }
 
+/// View of a reaction on a message
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReactionView {
+    /// User DID who reacted
+    pub user_did: String,
+    /// Reaction emoji or text
+    pub reaction: String,
+    /// When the reaction was created
+    pub created_at: DateTime<Utc>,
+}
+
 /// View of an encrypted MLS message.
 /// Server follows 'dumb delivery service' model - sender identity must be derived
 /// by clients from decrypted MLS content for metadata privacy.
@@ -109,6 +121,9 @@ pub struct MessageView {
     /// Message type: 'app' for application messages, 'commit' for MLS protocol control messages
     #[serde(rename = "messageType")]
     pub message_type: String,
+    /// Reactions on this message (optional, only included if requested)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reactions: Option<Vec<ReactionView>>,
 }
 
 /// Reference to an MLS key package for adding members
