@@ -295,14 +295,20 @@ impl NotificationService {
         info!("🔔 [push_notification] Querying database for recipient devices");
 
         // Get all devices for members of this conversation (excluding sender)
+        // Join is robust to legacy rows where members.user_did is NULL.
         let devices = sqlx::query_as::<_, (String, String)>(
             r#"
             SELECT DISTINCT d.push_token, d.user_did
-            FROM devices d
-            JOIN members m ON m.user_did = d.user_did
+            FROM members m
+            JOIN devices d
+              ON d.push_token IS NOT NULL
+             AND (
+                   (m.user_did IS NOT NULL AND d.user_did = m.user_did)
+                OR d.credential_did = m.member_did
+                OR d.user_did = m.member_did
+             )
             WHERE m.convo_id = $1
               AND m.left_at IS NULL
-              AND d.push_token IS NOT NULL
               AND d.user_did != $2
             "#,
         )

@@ -492,13 +492,23 @@ pub async fn send_message(
             }
         }
 
-        // NOTE: Push notifications disabled for control messages (reactions, read receipts, typing)
-        // These are MLS application messages that should not trigger push notifications.
-        // All messages through sendMessage are now control messages.
-        // For chat messages that should trigger push, a separate mechanism or flag is needed.
-        let _ = notification_service_clone; // Silence unused warning
-        let _ = sender_did_clone;
-        let _ = ciphertext_clone;
+        // Push notifications (skip ephemeral delivery)
+        if !is_ephemeral {
+            if let Some(notification_service) = notification_service_clone.as_ref() {
+                if let Err(e) = notification_service
+                    .notify_new_message(
+                        &pool_clone,
+                        &convo_id,
+                        &msg_id_clone,
+                        &ciphertext_clone,
+                        &sender_did_clone,
+                    )
+                    .await
+                {
+                    error!("❌ [send_message:push] Failed to send push notifications: {}", e);
+                }
+            }
+        }
     });
 
     info!("✅ [send_message] COMPLETE - async fan-out initiated");
