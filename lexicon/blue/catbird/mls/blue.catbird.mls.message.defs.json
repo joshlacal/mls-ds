@@ -16,7 +16,14 @@
         "messageType": {
           "type": "string",
           "description": "Message type discriminator",
-          "knownValues": ["text", "adminRoster", "adminAction", "reaction", "readReceipt", "typing"]
+          "knownValues": [
+            "text",
+            "adminRoster",
+            "adminAction",
+            "reaction",
+            "readReceipt",
+            "typing"
+          ]
         },
         "text": {
           "type": "string",
@@ -26,11 +33,7 @@
         "embed": {
           "type": "union",
           "description": "Optional rich media embed (record, link, or GIF). Clients can add new types in future versions.",
-          "refs": [
-            "#recordEmbed",
-            "#linkEmbed",
-            "#gifEmbed"
-          ]
+          "refs": ["#recordEmbed", "#linkEmbed", "#gifEmbed"]
         },
         "adminRoster": {
           "type": "ref",

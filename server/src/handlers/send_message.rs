@@ -57,7 +57,11 @@ pub async fn send_message(
         crate::crypto::redact_for_log(&input.msg_id),
         crate::crypto::redact_for_log(&input.convo_id),
         input.epoch,
-        if is_ephemeral { "ephemeral" } else { "persistent" }
+        if is_ephemeral {
+            "ephemeral"
+        } else {
+            "persistent"
+        }
     );
 
     // Enforce authorization
@@ -336,7 +340,10 @@ pub async fn send_message(
 
     tokio::spawn(async move {
         let fanout_start = std::time::Instant::now();
-        tracing::debug!("📍 [send_message:fanout] starting fan-out, is_ephemeral={}", is_ephemeral);
+        tracing::debug!(
+            "📍 [send_message:fanout] starting fan-out, is_ephemeral={}",
+            is_ephemeral
+        );
 
         // For persistent messages, create envelopes for message tracking
         if !is_ephemeral {
@@ -406,16 +413,15 @@ pub async fn send_message(
 
         if is_ephemeral {
             // For ephemeral messages, construct MessageView directly without DB fetch
-            let message_view =
-                crate::models::MessageView::from(crate::models::MessageViewData {
-                    id: msg_id_clone.clone(),
-                    convo_id: convo_id.clone(),
-                    ciphertext: ciphertext_for_sse,
-                    epoch: epoch_for_sse,
-                    seq: 0, // Ephemeral messages don't have a seq
-                    created_at: crate::sqlx_atrium::chrono_to_datetime(chrono::Utc::now()),
-                    message_type: None,
-                });
+            let message_view = crate::models::MessageView::from(crate::models::MessageViewData {
+                id: msg_id_clone.clone(),
+                convo_id: convo_id.clone(),
+                ciphertext: ciphertext_for_sse,
+                epoch: epoch_for_sse,
+                seq: 0, // Ephemeral messages don't have a seq
+                created_at: crate::sqlx_atrium::chrono_to_datetime(chrono::Utc::now()),
+                message_type: None,
+            });
 
             let event = StreamEvent::MessageEvent {
                 cursor: cursor.clone(),
@@ -423,7 +429,7 @@ pub async fn send_message(
             };
 
             // Do NOT store event for ephemeral messages - they should not be replayed
-            
+
             // Emit to SSE subscribers
             if let Err(e) = sse_state_clone.emit(&convo_id, event).await {
                 error!("❌ [send_message:fanout] Failed to emit SSE event: {}", e);
