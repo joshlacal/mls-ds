@@ -165,6 +165,31 @@ pub async fn sync_key_packages(
         deleted_count, device_id
     );
 
+    // Also invalidate any pending Welcome messages that reference the deleted key packages.
+    // Otherwise, clients may still fetch a stale Welcome and hit NoMatchingKeyPackage.
+    if deleted_count > 0 {
+        match crate::db::invalidate_welcomes_for_orphaned_key_packages(
+            &pool,
+            user_did,
+            &orphaned_hashes,
+            "Key package invalidated (client lost private key)",
+        )
+        .await
+        {
+            Ok(invalidated) => {
+                if invalidated > 0 {
+                    info!(
+                        "🗑️ [syncKeyPackages] Invalidated {} Welcome message(s) for deleted key packages",
+                        invalidated
+                    );
+                }
+            }
+            Err(e) => {
+                warn!("Failed to invalidate stale Welcome messages: {}", e);
+            }
+        }
+    }
+
     // Get updated server hashes after cleanup
     let remaining_hashes =
         match crate::db::get_available_key_package_hashes_for_device(&pool, user_did, device_id)
