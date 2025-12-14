@@ -1981,6 +1981,41 @@ pub async fn delete_key_packages_by_hashes_for_device(
     Ok(result.rows_affected())
 }
 
+/// Invalidate pending Welcome messages for a recipient when the referenced key packages are deleted.
+///
+/// `welcome_messages.key_package_hash` is BYTEA, while server key package hashes are stored/returned as hex TEXT.
+pub async fn invalidate_welcomes_for_orphaned_key_packages(
+    pool: &DbPool,
+    user_did: &str,
+    key_package_hashes_hex: &[String],
+    reason: &str,
+) -> Result<u64> {
+    if key_package_hashes_hex.is_empty() {
+        return Ok(0);
+    }
+
+    let result = sqlx::query(
+        r#"
+        UPDATE welcome_messages
+        SET consumed = true,
+            consumed_at = NOW(),
+            error_reason = $3
+        WHERE recipient_did = $1
+          AND consumed = false
+          AND key_package_hash IS NOT NULL
+          AND encode(key_package_hash, 'hex') = ANY($2)
+        "#,
+    )
+    .bind(user_did)
+    .bind(key_package_hashes_hex)
+    .bind(reason)
+    .execute(pool)
+    .await
+    .context("Failed to invalidate welcomes for orphaned key packages")?;
+
+    Ok(result.rows_affected())
+}
+
 // ==================== REACTIONS ====================
 
 /// Check if a message exists in a conversation

@@ -11,7 +11,10 @@
           "type": "object",
           "required": ["convoId", "ciphertext", "epoch", "msgId", "paddedSize"],
           "properties": {
-            "convoId": { "type": "string", "description": "Conversation identifier" },
+            "convoId": {
+              "type": "string",
+              "description": "Conversation identifier"
+            },
             "msgId": {
               "type": "string",
               "description": "Client-generated ULID for message deduplication. MUST be included in MLS message AAD.",
@@ -53,8 +56,15 @@
           "type": "object",
           "required": ["messageId", "receivedAt", "seq", "epoch"],
           "properties": {
-            "messageId": { "type": "string", "description": "Created message identifier (echoed from input msgId)" },
-            "receivedAt": { "type": "string", "format": "datetime", "description": "Server timestamp when message was received (bucketed to 2-second intervals)" },
+            "messageId": {
+              "type": "string",
+              "description": "Created message identifier (echoed from input msgId)"
+            },
+            "receivedAt": {
+              "type": "string",
+              "format": "datetime",
+              "description": "Server timestamp when message was received (bucketed to 2-second intervals)"
+            },
             "seq": {
               "type": "integer",
               "minimum": 0,
@@ -70,10 +80,22 @@
       },
       "errors": [
         { "name": "ConvoNotFound", "description": "Conversation not found" },
-        { "name": "NotMember", "description": "Caller is not a member of the conversation" },
-        { "name": "InvalidAsset", "description": "Payload or attachment pointer is invalid" },
-        { "name": "EpochMismatch", "description": "Message epoch does not match current conversation epoch" },
-        { "name": "MessageTooLarge", "description": "Message exceeds maximum size policy" }
+        {
+          "name": "NotMember",
+          "description": "Caller is not a member of the conversation"
+        },
+        {
+          "name": "InvalidAsset",
+          "description": "Payload or attachment pointer is invalid"
+        },
+        {
+          "name": "EpochMismatch",
+          "description": "Message epoch does not match current conversation epoch"
+        },
+        {
+          "name": "MessageTooLarge",
+          "description": "Message exceeds maximum size policy"
+        }
       ]
     }
   }
