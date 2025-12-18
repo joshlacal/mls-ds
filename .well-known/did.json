@@ -9,7 +9,7 @@
       "id": "did:web:mls.catbird.blue#atproto",
       "type": "Multikey",
       "controller": "did:web:mls.catbird.blue",
-      "publicKeyMultibase": "zWo9ufkfcQw8iA4yO-6XCwv0XhfGN1AmV01jJ0K5rmpc"
+      "publicKeyMultibase": "z6MkvTNXk57pes2tei8N2uXogzXsf3RT3WmdLtiojcEgMUb6"
     }
   ],
   "service": [
