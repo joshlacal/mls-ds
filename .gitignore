@@ -40,6 +40,9 @@ Pods/
 .env
 .env.local
 
+# Local keys (never commit)
+did_key.pem
+
 # Logs
 *.log
 npm-debug.log*
