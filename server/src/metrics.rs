@@ -71,6 +71,48 @@ impl MetricsRecorder {
             "Number of detected epoch conflicts"
         );
 
+        // Idempotency metrics
+        metrics::describe_counter!(
+            "idempotency_cache_hits_total",
+            "Total number of idempotency cache hits"
+        );
+        metrics::describe_counter!(
+            "idempotency_cache_misses_total",
+            "Total number of idempotency cache misses"
+        );
+        metrics::describe_counter!(
+            "idempotency_requests_without_key_total",
+            "Total number of write requests without an idempotency key"
+        );
+        metrics::describe_counter!(
+            "idempotency_cache_check_errors_total",
+            "Total number of idempotency cache check errors"
+        );
+        metrics::describe_counter!(
+            "idempotency_cache_stores_total",
+            "Total number of responses stored in the idempotency cache"
+        );
+        metrics::describe_counter!(
+            "idempotency_cache_store_errors_total",
+            "Total number of idempotency cache store errors"
+        );
+        metrics::describe_counter!(
+            "idempotency_cache_skipped_total",
+            "Total number of responses skipped for idempotency caching"
+        );
+        metrics::describe_counter!(
+            "idempotency_cache_cleanup_deleted_total",
+            "Total number of idempotency cache entries deleted during cleanup"
+        );
+        metrics::describe_histogram!(
+            "idempotency_cache_check_duration_seconds",
+            "Idempotency cache check duration in seconds"
+        );
+        metrics::describe_histogram!(
+            "idempotency_cache_store_duration_seconds",
+            "Idempotency cache store duration in seconds"
+        );
+
         Self { handle }
     }
 
