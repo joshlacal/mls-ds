@@ -30,8 +30,8 @@ use sqlx::PgPool;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
-/// Default TTL for cached responses (1 hour)
-const DEFAULT_TTL_SECONDS: i64 = 3600;
+/// Default TTL for cached responses (24 hours)
+const DEFAULT_TTL_SECONDS: i64 = 86400;
 
 /// Idempotency layer configuration
 #[derive(Clone)]
@@ -169,6 +169,12 @@ pub async fn idempotency_middleware(
         }
         None => {
             // No idempotency key provided - skip caching
+            metrics::counter!(
+                "idempotency_requests_without_key_total",
+                1,
+                "method" => method.as_str().to_string(),
+                "endpoint" => endpoint.clone()
+            );
             tracing::debug!(
                 method = ?method,
                 uri = %endpoint,
@@ -180,8 +186,20 @@ pub async fn idempotency_middleware(
     };
 
     // Check cache for existing response
+    let cache_check_start = std::time::Instant::now();
     match check_cache(&layer.pool, &idempotency_key, &endpoint).await {
         Ok(Some(cached)) => {
+            metrics::histogram!(
+                "idempotency_cache_check_duration_seconds",
+                cache_check_start.elapsed().as_secs_f64(),
+                "endpoint" => endpoint.clone()
+            );
+            metrics::counter!(
+                "idempotency_cache_hits_total",
+                1,
+                "method" => method.as_str().to_string(),
+                "endpoint" => endpoint.clone()
+            );
             tracing::info!(
                 idempotency_key = ?idempotency_key,
                 method = ?method,
@@ -202,6 +220,17 @@ pub async fn idempotency_middleware(
             );
         }
         Ok(None) => {
+            metrics::histogram!(
+                "idempotency_cache_check_duration_seconds",
+                cache_check_start.elapsed().as_secs_f64(),
+                "endpoint" => endpoint.clone()
+            );
+            metrics::counter!(
+                "idempotency_cache_misses_total",
+                1,
+                "method" => method.as_str().to_string(),
+                "endpoint" => endpoint.clone()
+            );
             tracing::info!(
                 idempotency_key = ?idempotency_key,
                 method = ?method,
@@ -210,6 +239,12 @@ pub async fn idempotency_middleware(
             );
         }
         Err(e) => {
+            metrics::counter!(
+                "idempotency_cache_check_errors_total",
+                1,
+                "method" => method.as_str().to_string(),
+                "endpoint" => endpoint.clone()
+            );
             error!(
                 "Failed to check idempotency cache: {} (continuing anyway)",
                 e
@@ -248,6 +283,7 @@ pub async fn idempotency_middleware(
         match serde_json::from_slice::<serde_json::Value>(&response_bytes) {
             Ok(json_body) => {
                 // Store in cache
+                let store_start = std::time::Instant::now();
                 if let Err(e) = store_cache(
                     &layer.pool,
                     &idempotency_key,
@@ -258,12 +294,29 @@ pub async fn idempotency_middleware(
                 )
                 .await
                 {
+                    metrics::counter!(
+                        "idempotency_cache_store_errors_total",
+                        1,
+                        "method" => method.as_str().to_string(),
+                        "endpoint" => endpoint.clone()
+                    );
                     error!(
                         "Failed to store idempotency cache for key={}: {}",
                         idempotency_key, e
                     );
                     // Continue anyway - caching is best-effort
                 } else {
+                    metrics::histogram!(
+                        "idempotency_cache_store_duration_seconds",
+                        store_start.elapsed().as_secs_f64(),
+                        "endpoint" => endpoint.clone()
+                    );
+                    metrics::counter!(
+                        "idempotency_cache_stores_total",
+                        1,
+                        "method" => method.as_str().to_string(),
+                        "endpoint" => endpoint.clone()
+                    );
                     tracing::info!(
                         idempotency_key = ?idempotency_key,
                         status = status_code as u16,
@@ -278,6 +331,13 @@ pub async fn idempotency_middleware(
             }
         }
     } else {
+        metrics::counter!(
+            "idempotency_cache_skipped_total",
+            1,
+            "method" => method.as_str().to_string(),
+            "endpoint" => endpoint.clone(),
+            "reason" => "server_error".to_string()
+        );
         debug!(
             "Not caching response with status {} (server error)",
             status_code
@@ -321,6 +381,9 @@ pub async fn cleanup_expired_entries(pool: &PgPool) -> Result<u64, sqlx::Error> 
     .await?;
 
     let deleted = result.rows_affected();
+    if deleted > 0 {
+        metrics::counter!("idempotency_cache_cleanup_deleted_total", deleted);
+    }
     if deleted > 0 {
         info!("Cleaned up {} expired idempotency cache entries", deleted);
     }
