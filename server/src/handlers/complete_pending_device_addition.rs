@@ -16,6 +16,8 @@ pub struct CompletePendingDeviceAdditionInput {
 #[serde(rename_all = "camelCase")]
 pub struct CompletePendingDeviceAdditionOutput {
     success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 /// Mark a pending device addition as complete
@@ -95,7 +97,11 @@ pub async fn complete_pending_device_addition(
         match pending {
             None => {
                 warn!("Pending addition not found: {}", input.pending_addition_id);
-                return Err(StatusCode::NOT_FOUND);
+                // Return structured response instead of 404 for better ATProto proxy compatibility
+                return Ok(Json(CompletePendingDeviceAdditionOutput {
+                    success: false,
+                    error: Some("PendingAdditionNotFound".to_string()),
+                }));
             }
             Some((status, claimed_by)) => {
                 if status != "in_progress" {
@@ -103,7 +109,11 @@ pub async fn complete_pending_device_addition(
                         "Pending addition {} is not in_progress (status: {})",
                         input.pending_addition_id, status
                     );
-                    return Err(StatusCode::CONFLICT);
+                    // Return structured response instead of CONFLICT for better ATProto proxy compatibility
+                    return Ok(Json(CompletePendingDeviceAdditionOutput {
+                        success: false,
+                        error: Some(format!("InvalidStatus:{}", status)),
+                    }));
                 }
                 if claimed_by.as_deref() != Some(&user_did) {
                     warn!(
@@ -123,5 +133,8 @@ pub async fn complete_pending_device_addition(
         input.pending_addition_id, input.new_epoch
     );
 
-    Ok(Json(CompletePendingDeviceAdditionOutput { success: true }))
+    Ok(Json(CompletePendingDeviceAdditionOutput {
+        success: true,
+        error: None,
+    }))
 }

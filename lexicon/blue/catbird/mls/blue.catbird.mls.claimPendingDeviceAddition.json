@@ -5,7 +5,7 @@
   "defs": {
     "main": {
       "type": "procedure",
-      "description": "Claims a pending device addition so only one member processes it. Claim expires after 60 seconds if not completed.",
+      "description": "Claims a pending device addition so only one member processes it. Claim expires after 60 seconds if not completed. Returns claimed=false with no convoId if pending addition not found or already completed.",
       "input": {
         "encoding": "application/json",
         "schema": {
@@ -27,15 +27,15 @@
           "properties": {
             "claimed": {
               "type": "boolean",
-              "description": "True if claim was successful, false if already claimed by another"
+              "description": "True if claim was successful, false if already claimed by another or not found/completed"
             },
             "convoId": {
               "type": "string",
-              "description": "Conversation ID (returned on successful claim)"
+              "description": "Conversation ID (returned on successful claim or if already claimed by another)"
             },
             "deviceCredentialDid": {
               "type": "string",
-              "description": "Full device credential DID to add (returned on successful claim)"
+              "description": "Full device credential DID to add (returned on successful claim or if already claimed)"
             },
             "keyPackage": {
               "type": "ref",
@@ -45,23 +45,15 @@
             "claimedBy": {
               "type": "string",
               "format": "did",
-              "description": "DID of the member who has the claim (returned when claimed=false)"
+              "description": "DID of the member who has the claim (returned when claimed=false and another member has it)"
             }
           }
         }
       },
       "errors": [
         {
-          "name": "NotFound",
-          "description": "Pending addition not found or already completed"
-        },
-        {
           "name": "NotMember",
           "description": "Caller is not a member of the conversation"
-        },
-        {
-          "name": "NoKeyPackage",
-          "description": "No available key package for the new device"
         }
       ]
     }
