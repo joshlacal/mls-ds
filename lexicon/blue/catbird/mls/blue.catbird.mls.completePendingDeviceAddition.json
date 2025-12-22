@@ -5,7 +5,7 @@
   "defs": {
     "main": {
       "type": "procedure",
-      "description": "Marks a claimed pending device addition as completed. Call this after successfully adding the device via addMembers.",
+      "description": "Marks a claimed pending device addition as completed. Call this after successfully adding the device via addMembers. Returns success=false with error field if pending addition not found or in wrong state.",
       "input": {
         "encoding": "application/json",
         "schema": {
@@ -33,15 +33,15 @@
             "success": {
               "type": "boolean",
               "description": "Whether the completion was recorded"
+            },
+            "error": {
+              "type": "string",
+              "description": "Error code if success=false: 'PendingAdditionNotFound' or 'InvalidStatus:<status>'"
             }
           }
         }
       },
       "errors": [
-        {
-          "name": "NotFound",
-          "description": "Pending addition not found"
-        },
         {
           "name": "NotClaimed",
           "description": "Pending addition was not claimed by caller"

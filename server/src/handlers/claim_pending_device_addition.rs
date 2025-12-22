@@ -124,7 +124,14 @@ pub async fn claim_pending_device_addition(
         Some(p) => p,
         None => {
             warn!("Pending addition not found: {}", input.pending_addition_id);
-            return Err(StatusCode::NOT_FOUND);
+            // Return structured response instead of 404 for better ATProto proxy compatibility
+            return Ok(Json(ClaimPendingDeviceAdditionOutput {
+                claimed: false,
+                convo_id: None,
+                device_credential_did: None,
+                key_package: None,
+                claimed_by: None,
+            }));
         }
     };
 
@@ -134,7 +141,14 @@ pub async fn claim_pending_device_addition(
             "Pending addition {} already in terminal state: {}",
             input.pending_addition_id, pending.status
         );
-        return Err(StatusCode::NOT_FOUND);
+        // Return structured response indicating already completed instead of 404
+        return Ok(Json(ClaimPendingDeviceAdditionOutput {
+            claimed: false,
+            convo_id: Some(pending.convo_id),
+            device_credential_did: Some(pending.new_device_credential_did),
+            key_package: None,
+            claimed_by: pending.claimed_by_did,
+        }));
     }
 
     // Verify caller is a member of the conversation

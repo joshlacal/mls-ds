@@ -778,8 +778,10 @@ pub async fn verify_is_admin(
             Err(StatusCode::FORBIDDEN)
         }
         None => {
+            // Return FORBIDDEN (not NOT_FOUND) for non-members to avoid information disclosure
+            // and for proper handling through ATProto PDS proxy
             tracing::warn!("User is not a member of conversation");
-            Err(StatusCode::NOT_FOUND)
+            Err(StatusCode::FORBIDDEN)
         }
     }
 }
@@ -817,8 +819,10 @@ pub async fn verify_is_member(
     if is_member {
         Ok(())
     } else {
+        // Return FORBIDDEN (not NOT_FOUND) for non-members to avoid information disclosure
+        // and for proper handling through ATProto PDS proxy
         tracing::warn!("User is not a member of conversation");
-        Err(StatusCode::NOT_FOUND)
+        Err(StatusCode::FORBIDDEN)
     }
 }
 
@@ -878,8 +882,10 @@ pub async fn verify_is_moderator_or_admin(
             Err(StatusCode::FORBIDDEN)
         }
         None => {
+            // Return FORBIDDEN (not NOT_FOUND) for non-members to avoid information disclosure
+            // and for proper handling through ATProto PDS proxy
             tracing::warn!("User is not a member of conversation");
-            Err(StatusCode::NOT_FOUND)
+            Err(StatusCode::FORBIDDEN)
         }
     }
 }
