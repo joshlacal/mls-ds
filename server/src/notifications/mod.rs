@@ -72,6 +72,8 @@ impl ApnsClient {
         convo_id: &str,
         message_id: &str,
         recipient_did: &str,
+        seq: i64,
+        epoch: i64,
     ) -> Result<()> {
         info!("🔔 [push_notification] Starting send_message_notification");
 
@@ -118,6 +120,8 @@ impl ApnsClient {
         notification.add_custom_data("convo_id", &convo_id)?;
         notification.add_custom_data("message_id", &message_id)?;
         notification.add_custom_data("recipient_did", &recipient_did)?;
+        notification.add_custom_data("seq", &seq.to_string())?;  // Add sequence number
+        notification.add_custom_data("epoch", &epoch.to_string())?;  // Add epoch
 
         info!(
             "🔔 [push_notification] Notification built with custom MLS data, starting delivery (max retries: {})",
@@ -266,6 +270,8 @@ impl NotificationService {
     /// * `message_id` - Message ID
     /// * `ciphertext` - Encrypted message ciphertext to include in push payload
     /// * `sender_did` - DID of the sender (to exclude from notifications)
+    /// * `seq` - Message sequence number for ordering
+    /// * `epoch` - Message epoch for reconstruction
     pub async fn notify_new_message(
         &self,
         pool: &PgPool,
@@ -273,6 +279,8 @@ impl NotificationService {
         message_id: &str,
         ciphertext: &[u8],
         sender_did: &str,
+        seq: i64,
+        epoch: i64,
     ) -> Result<()> {
         info!(
             "🔔 [push_notification] notify_new_message called for convo={}, message={}, ciphertext_size={}, sender={}",
@@ -388,6 +396,8 @@ impl NotificationService {
                         &convo_id,
                         &message_id,
                         &recipient_did,
+                        seq,
+                        epoch,
                     )
                     .await;
 

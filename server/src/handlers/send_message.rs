@@ -337,6 +337,8 @@ pub async fn send_message(
     let notification_service_clone = notification_service.clone();
     let ciphertext_for_sse = input.ciphertext.clone();
     let epoch_for_sse = input.epoch;
+    let seq_for_push = seq;  // Clone seq for push notification
+    let epoch_for_push = epoch;  // Clone epoch for push notification
 
     tokio::spawn(async move {
         let fanout_start = std::time::Instant::now();
@@ -508,6 +510,8 @@ pub async fn send_message(
                         &msg_id_clone,
                         &ciphertext_clone,
                         &sender_did_clone,
+                        seq_for_push,
+                        epoch_for_push,
                     )
                     .await
                 {
