@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use ractor::{Actor, ActorProcessingErr, ActorRef};
 use sqlx::PgPool;
 use std::{collections::HashMap, sync::Arc};
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 use super::messages::{ConvoMessage, KeyPackageHashEntry};
 use crate::notifications::NotificationService;
@@ -131,7 +131,7 @@ impl Actor for ConversationActor {
                         handle_notify_new_message(
                             &pool,
                             &sse_state,
-                            notification_service.as_ref(),
+                            notification_service.as_deref(),
                             &convo_id,
                             &msg_id,
                             &sender_did,
@@ -909,7 +909,7 @@ async fn handle_notify_new_message(
     sender_did: &str,
     ciphertext: &Vec<u8>,
     seq: i64,
-    epoch: i32,
+    epoch: i64,
     is_ephemeral: bool,
 ) {
     let fanout_start = std::time::Instant::now();
@@ -979,7 +979,7 @@ async fn handle_notify_new_message(
         id: msg_id.to_string(),
         convo_id: convo_id.to_string(),
         ciphertext: ciphertext.clone(),
-        epoch: epoch as usize,
+        epoch: epoch as i32 as usize,
         seq: seq as usize,
         created_at: crate::sqlx_atrium::chrono_to_datetime(chrono::Utc::now()),
         message_type: None,
