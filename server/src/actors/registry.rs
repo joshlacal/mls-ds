@@ -57,6 +57,7 @@ pub struct ActorRegistry {
     actors: Arc<DashMap<String, ActorRef<ConvoMessage>>>,
     db_pool: PgPool,
     sse_state: Arc<SseState>,
+    notification_service: Option<Arc<crate::notifications::NotificationService>>,
 }
 
 impl ActorRegistry {
@@ -70,12 +71,17 @@ impl ActorRegistry {
     /// # Returns
     ///
     /// A new `ActorRegistry` instance ready to spawn actors.
-    pub fn new(db_pool: PgPool, sse_state: Arc<SseState>) -> Self {
+    pub fn new(
+        db_pool: PgPool, 
+        sse_state: Arc<SseState>,
+        notification_service: Option<Arc<crate::notifications::NotificationService>>,
+    ) -> Self {
         info!("Initializing ActorRegistry");
         Self {
             actors: Arc::new(DashMap::new()),
             db_pool,
             sse_state,
+            notification_service,
         }
     }
 
@@ -128,6 +134,7 @@ impl ActorRegistry {
             convo_id: convo_id.to_string(),
             db_pool: self.db_pool.clone(),
             sse_state: self.sse_state.clone(),
+            notification_service: self.notification_service.clone(),
         };
 
         let (actor_ref, _handle) = ractor::Actor::spawn(None, ConversationActor, args)
@@ -239,6 +246,7 @@ impl Clone for ActorRegistry {
             actors: Arc::clone(&self.actors),
             db_pool: self.db_pool.clone(),
             sse_state: self.sse_state.clone(),
+            notification_service: self.notification_service.clone(),
         }
     }
 }

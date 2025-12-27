@@ -5,7 +5,9 @@ use std::{collections::HashMap, sync::Arc};
 use tracing::{debug, info};
 
 use super::messages::{ConvoMessage, KeyPackageHashEntry};
+use crate::notifications::NotificationService;
 use crate::realtime::{SseState, StreamEvent};
+use tokio::sync::mpsc;
 
 /// Manages state for a single conversation, ensuring sequential processing
 /// of all epoch-modifying operations to prevent race conditions.
@@ -61,6 +63,26 @@ pub struct ConvoActorArgs {
     pub convo_id: String,
     pub db_pool: PgPool,
     pub sse_state: Arc<SseState>,
+    pub notification_service: Option<Arc<NotificationService>>,
+}
+
+/// Represents a background job to be processed sequentially by the actor's worker.
+#[derive(Debug)]
+enum SideEffectJob {
+    /// Fan-out a new message to all members (envelopes + SSE + Push)
+    NotifyNewMessage {
+        msg_id: String,
+        sender_did: String,
+        ciphertext: Vec<u8>,
+        seq: i64,
+        epoch: i64,
+        is_ephemeral: bool,
+    },
+    /// Fan-out a system message (commit) to all members (envelopes + SSE)
+    NotifySystemMessage {
+        msg_id: String,
+        message_type: String, // "commit", etc.
+    },
 }
 
 #[async_trait]
@@ -84,12 +106,70 @@ impl Actor for ConversationActor {
             args.convo_id, current_epoch
         );
 
+        // Create channel for serialized background jobs
+        let (tx, mut rx) = mpsc::channel::<SideEffectJob>(100);
+
+        // Spawn background worker for serialized side effects (Push/SSE)
+        let pool = args.db_pool.clone();
+        let sse_state = args.sse_state.clone();
+        let notification_service = args.notification_service.clone();
+        let convo_id = args.convo_id.clone();
+
+        tokio::spawn(async move {
+            info!("🔄 [actor:worker] Background worker started for {}", convo_id);
+            while let Some(job) = rx.recv().await {
+                match job {
+                    SideEffectJob::NotifyNewMessage {
+                        msg_id,
+                        sender_did,
+                        ciphertext,
+                        seq,
+                        epoch,
+                        is_ephemeral,
+                    } => {
+                        debug!("🔄 [actor:worker] Processing NotifyNewMessage: {}", msg_id);
+                        handle_notify_new_message(
+                            &pool,
+                            &sse_state,
+                            notification_service.as_ref(),
+                            &convo_id,
+                            &msg_id,
+                            &sender_did,
+                            &ciphertext,
+                            seq,
+                            epoch,
+                            is_ephemeral,
+                        )
+                        .await;
+                    }
+                    SideEffectJob::NotifySystemMessage {
+                        msg_id,
+                        message_type,
+                    } => {
+                        debug!("🔄 [actor:worker] Processing NotifySystemMessage: {}", msg_id);
+                        // Reuse similar logic or dedicated handler for system messages
+                        // For commits, we mostly need envelopes + SSE
+                        handle_notify_system_message(
+                            &pool,
+                            &sse_state,
+                            &convo_id,
+                            &msg_id,
+                            &message_type,
+                        )
+                        .await;
+                    }
+                }
+            }
+            info!("🔄 [actor:worker] Background worker stopped for {}", convo_id);
+        });
+
         Ok(ConversationActorState {
             convo_id: args.convo_id,
             current_epoch: current_epoch as u32,
             unread_counts: HashMap::new(),
             db_pool: args.db_pool,
             sse_state: args.sse_state,
+            side_effect_tx: tx,
         })
     }
 
@@ -184,6 +264,7 @@ pub struct ConversationActorState {
     unread_counts: HashMap<String, u32>, // member_did -> count
     db_pool: PgPool,
     sse_state: Arc<SseState>,
+    side_effect_tx: mpsc::Sender<SideEffectJob>,
 }
 
 impl ConversationActorState {
@@ -365,132 +446,12 @@ impl ConversationActorState {
         // Commit transaction
         tx.commit().await.context("Failed to commit transaction")?;
 
-        // Fan out commit message to all members (if commit was provided)
+        // Send side effect job for fan-out (envelopes + SSE)
+        // We use a simplified job for system messages (commits)
         if let Some(msg_id) = commit_msg_id {
-            let pool = self.db_pool.clone();
-            let convo_id = self.convo_id.clone();
-            let sse_state = self.sse_state.clone();
-
-            tokio::spawn(async move {
-                tracing::debug!("📍 [actor:add_members:fanout] starting commit fan-out");
-
-                // Get all active members
-                let members_result = sqlx::query_as::<_, (String,)>(
-                    r#"
-                    SELECT member_did
-                    FROM members
-                    WHERE convo_id = $1 AND left_at IS NULL
-                    "#,
-                )
-                .bind(&convo_id)
-                .fetch_all(&pool)
-                .await;
-
-                match members_result {
-                    Ok(members) => {
-                        tracing::debug!(
-                            "📍 [actor:add_members:fanout] fan-out commit to {} members",
-                            members.len()
-                        );
-
-                        // Create envelopes for each member
-                        for (member_did,) in &members {
-                            let envelope_id = uuid::Uuid::new_v4().to_string();
-
-                            let envelope_result = sqlx::query(
-                                r#"
-                                INSERT INTO envelopes (id, convo_id, recipient_did, message_id, created_at)
-                                VALUES ($1, $2, $3, $4, NOW())
-                                ON CONFLICT (recipient_did, message_id) DO NOTHING
-                                "#,
-                            )
-                            .bind(&envelope_id)
-                            .bind(&convo_id)
-                            .bind(member_did)
-                            .bind(&msg_id)
-                            .execute(&pool)
-                            .await;
-
-                            if let Err(e) = envelope_result {
-                                tracing::error!(
-                                    "❌ [actor:add_members:fanout] Failed to insert envelope for {}: {:?}",
-                                    member_did, e
-                                );
-                            }
-                        }
-
-                        tracing::debug!("✅ [actor:add_members:fanout] envelopes created");
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "❌ [actor:add_members:fanout] Failed to get members: {:?}",
-                            e
-                        );
-                    }
-                }
-
-                tracing::debug!("📍 [actor:add_members:fanout] emitting SSE event for commit");
-                // Emit SSE event for commit message
-                let cursor = sse_state.cursor_gen.next(&convo_id, "messageEvent").await;
-
-                // Fetch the full message from database
-                let message_result = sqlx::query!(
-                    r#"
-                    SELECT id, sender_did, ciphertext, epoch, seq, created_at
-                    FROM messages
-                    WHERE id = $1
-                    "#,
-                    &msg_id
-                )
-                .fetch_one(&pool)
-                .await;
-
-                match message_result {
-                    Ok(msg) => {
-                        let message_view =
-                            crate::models::MessageView::from(crate::models::MessageViewData {
-                                id: msg.id,
-                                convo_id: convo_id.clone(),
-                                ciphertext: msg.ciphertext.unwrap_or_default(),
-                                epoch: msg.epoch as usize,
-                                seq: msg.seq as usize,
-                                created_at: crate::sqlx_atrium::chrono_to_datetime(msg.created_at),
-                                message_type: None,
-                            });
-
-                        let event = StreamEvent::MessageEvent {
-                            cursor: cursor.clone(),
-                            message: message_view.clone(),
-                        };
-
-                        // Store event for cursor-based SSE replay
-                        if let Err(e) = crate::db::store_event(
-                            &pool,
-                            &cursor,
-                            &convo_id,
-                            "messageEvent",
-                            Some(&msg_id),
-                        )
-                        .await
-                        {
-                            tracing::error!(
-                                "❌ [actor:add_members:fanout] Failed to store event: {:?}",
-                                e
-                            );
-                        }
-
-                        if let Err(e) = sse_state.emit(&convo_id, event).await {
-                            tracing::error!("Failed to emit SSE event: {}", e);
-                        }
-                        tracing::debug!("✅ [actor:add_members:fanout] SSE event emitted");
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "❌ [actor:add_members:fanout] Failed to fetch message for SSE: {:?}",
-                            e
-                        );
-                    }
-                }
+            let _ = self.side_effect_tx.try_send(SideEffectJob::NotifySystemMessage {
+                msg_id,
+                message_type: "commit".to_string(),
             });
         }
 
@@ -604,132 +565,12 @@ impl ConversationActorState {
         // Commit transaction
         tx.commit().await.context("Failed to commit transaction")?;
 
-        // Fan out commit message to all members (if commit was provided)
+        // Send side effect job for fan-out (envelopes + SSE)
+        // We use a simplified job for system messages (commits)
         if let Some(msg_id) = commit_msg_id {
-            let pool = self.db_pool.clone();
-            let convo_id = self.convo_id.clone();
-            let sse_state = self.sse_state.clone();
-
-            tokio::spawn(async move {
-                tracing::debug!("📍 [actor:remove_member:fanout] starting commit fan-out");
-
-                // Get all active members (including the one leaving, so they get the commit)
-                let members_result = sqlx::query_as::<_, (String,)>(
-                    r#"
-                    SELECT member_did
-                    FROM members
-                    WHERE convo_id = $1 AND left_at IS NULL
-                    "#,
-                )
-                .bind(&convo_id)
-                .fetch_all(&pool)
-                .await;
-
-                match members_result {
-                    Ok(members) => {
-                        tracing::debug!(
-                            "📍 [actor:remove_member:fanout] fan-out commit to {} members",
-                            members.len()
-                        );
-
-                        // Create envelopes for each member
-                        for (member_did,) in &members {
-                            let envelope_id = uuid::Uuid::new_v4().to_string();
-
-                            let envelope_result = sqlx::query(
-                                r#"
-                                INSERT INTO envelopes (id, convo_id, recipient_did, message_id, created_at)
-                                VALUES ($1, $2, $3, $4, NOW())
-                                ON CONFLICT (recipient_did, message_id) DO NOTHING
-                                "#,
-                            )
-                            .bind(&envelope_id)
-                            .bind(&convo_id)
-                            .bind(member_did)
-                            .bind(&msg_id)
-                            .execute(&pool)
-                            .await;
-
-                            if let Err(e) = envelope_result {
-                                tracing::error!(
-                                    "❌ [actor:remove_member:fanout] Failed to insert envelope for {}: {:?}",
-                                    member_did, e
-                                );
-                            }
-                        }
-
-                        tracing::debug!("✅ [actor:remove_member:fanout] envelopes created");
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "❌ [actor:remove_member:fanout] Failed to get members: {:?}",
-                            e
-                        );
-                    }
-                }
-
-                tracing::debug!("📍 [actor:remove_member:fanout] emitting SSE event for commit");
-                // Emit SSE event for commit message
-                let cursor = sse_state.cursor_gen.next(&convo_id, "messageEvent").await;
-
-                // Fetch the full message from database
-                let message_result = sqlx::query!(
-                    r#"
-                    SELECT id, sender_did, ciphertext, epoch, seq, created_at
-                    FROM messages
-                    WHERE id = $1
-                    "#,
-                    &msg_id
-                )
-                .fetch_one(&pool)
-                .await;
-
-                match message_result {
-                    Ok(msg) => {
-                        let message_view =
-                            crate::models::MessageView::from(crate::models::MessageViewData {
-                                id: msg.id,
-                                convo_id: convo_id.clone(),
-                                ciphertext: msg.ciphertext.unwrap_or_default(),
-                                epoch: msg.epoch as usize,
-                                seq: msg.seq as usize,
-                                created_at: crate::sqlx_atrium::chrono_to_datetime(msg.created_at),
-                                message_type: None,
-                            });
-
-                        let event = StreamEvent::MessageEvent {
-                            cursor: cursor.clone(),
-                            message: message_view.clone(),
-                        };
-
-                        // Store event for cursor-based SSE replay
-                        if let Err(e) = crate::db::store_event(
-                            &pool,
-                            &cursor,
-                            &convo_id,
-                            "messageEvent",
-                            Some(&msg_id),
-                        )
-                        .await
-                        {
-                            tracing::error!(
-                                "❌ [actor:remove_member:fanout] Failed to store event: {:?}",
-                                e
-                            );
-                        }
-
-                        if let Err(e) = sse_state.emit(&convo_id, event).await {
-                            tracing::error!("Failed to emit SSE event: {}", e);
-                        }
-                        tracing::debug!("✅ [actor:remove_member:fanout] SSE event emitted");
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "❌ [actor:remove_member:fanout] Failed to fetch message for SSE: {:?}",
-                            e
-                        );
-                    }
-                }
+            let _ = self.side_effect_tx.try_send(SideEffectJob::NotifySystemMessage {
+                msg_id,
+                message_type: "commit".to_string(),
             });
         }
 
@@ -902,69 +743,18 @@ impl ConversationActorState {
         .await
         .context("Failed to update unread counts")?;
 
-        // Spawn async task for fan-out (envelopes)
-        let pool_clone = self.db_pool.clone();
-        let convo_id = self.convo_id.clone();
-        let msg_id_clone = msg_id.clone();
-
-        tokio::spawn(async move {
-            let fanout_start = std::time::Instant::now();
-            debug!("Starting fan-out for conversation");
-
-            // Get all active members
-            let members_result = sqlx::query!(
-                r#"
-                SELECT member_did
-                FROM members
-                WHERE convo_id = $1 AND left_at IS NULL
-                "#,
-                &convo_id
-            )
-            .fetch_all(&pool_clone)
-            .await;
-
-            match members_result {
-                Ok(members) => {
-                    info!("Fan-out to {} members", members.len());
-
-                    // Write envelopes for message tracking
-                    for member in &members {
-                        let envelope_id = uuid::Uuid::new_v4().to_string();
-
-                        // Insert envelope
-                        let envelope_result = sqlx::query!(
-                            r#"
-                            INSERT INTO envelopes (id, convo_id, recipient_did, message_id, created_at)
-                            VALUES ($1, $2, $3, $4, NOW())
-                            ON CONFLICT (recipient_did, message_id) DO NOTHING
-                            "#,
-                            &envelope_id,
-                            &convo_id,
-                            &member.member_did,
-                            &msg_id_clone,
-                        )
-                        .execute(&pool_clone)
-                        .await;
-
-                        if let Err(e) = envelope_result {
-                            tracing::error!(
-                                "Failed to insert envelope for {}: {:?}",
-                                member.member_did,
-                                e
-                            );
-                        }
-                    }
-
-                    info!(
-                        "Fan-out completed in {}ms",
-                        fanout_start.elapsed().as_millis()
-                    );
-                }
-                Err(e) => {
-                    tracing::error!("Failed to get members for fan-out: {:?}", e);
-                }
-            }
-        });
+        // Submit to serialization queue
+        // This replaces the old tokio::spawn logic with a sequential actor-bound queue
+        if let Err(e) = self.side_effect_tx.try_send(SideEffectJob::NotifyNewMessage {
+            msg_id: msg_id.clone(),
+            sender_did: sender_did.clone(),
+            ciphertext: ciphertext.clone(),
+            seq,
+            epoch,
+            is_ephemeral: false, // Actors generally handle persistent messages
+        }) {
+             tracing::error!("❌ [actor:send_message] Failed to enqueue side effects:Full?");
+        }
 
         Ok((row_id, now))
     }
