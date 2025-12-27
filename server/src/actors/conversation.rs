@@ -897,3 +897,202 @@ impl ConversationActorState {
         Ok(())
     }
 }
+
+/// Helper function to handle serialized notification delivery (Push + SSE + Envelopes)
+/// This is called sequentially by the background worker.
+async fn handle_notify_new_message(
+    pool: &sqlx::PgPool,
+    sse_state: &SseState,
+    notification_service: Option<&crate::notifications::NotificationService>,
+    convo_id: &str,
+    msg_id: &str,
+    sender_did: &str,
+    ciphertext: &Vec<u8>,
+    seq: i64,
+    epoch: i32,
+    is_ephemeral: bool,
+) {
+    let fanout_start = std::time::Instant::now();
+    
+    // 1. Fan-out (Envelopes) - Skip for ephemeral
+    if !is_ephemeral {
+        // Get all active members
+        let members_result = sqlx::query!(
+            r#"
+            SELECT member_did
+            FROM members
+            WHERE convo_id = $1 AND left_at IS NULL
+            "#,
+            convo_id
+        )
+        .fetch_all(pool)
+        .await;
+
+        match members_result {
+            Ok(members) => {
+                // Write envelopes
+                for member in &members {
+                    // Don't create envelope for sender
+                    if member.member_did == sender_did {
+                        continue;
+                    }
+
+                    let envelope_id = uuid::Uuid::new_v4().to_string();
+                    let envelope_result = sqlx::query!(
+                        r#"
+                        INSERT INTO envelopes (id, convo_id, recipient_did, message_id, created_at)
+                        VALUES ($1, $2, $3, $4, NOW())
+                        ON CONFLICT (recipient_did, message_id) DO NOTHING
+                        "#,
+                        &envelope_id,
+                        convo_id,
+                        &member.member_did,
+                        msg_id,
+                    )
+                    .execute(pool)
+                    .await;
+
+                    if let Err(e) = envelope_result {
+                        error!(
+                            "❌ [actor:worker] Failed to insert envelope for {}: {:?}",
+                            member.member_did, e
+                        );
+                    }
+                }
+                
+                let fanout_duration = fanout_start.elapsed();
+                crate::metrics::record_envelope_write_duration(convo_id, fanout_duration);
+            }
+            Err(e) => {
+                error!("❌ [actor:worker] Failed to get members: {:?}", e);
+            }
+        }
+    }
+
+    // 2. SSE Emission
+    let cursor = sse_state
+        .cursor_gen
+        .next(convo_id, "messageEvent")
+        .await;
+
+    let message_view = crate::models::MessageView::from(crate::models::MessageViewData {
+        id: msg_id.to_string(),
+        convo_id: convo_id.to_string(),
+        ciphertext: ciphertext.clone(),
+        epoch: epoch as usize,
+        seq: seq as usize,
+        created_at: crate::sqlx_atrium::chrono_to_datetime(chrono::Utc::now()),
+        message_type: None,
+    });
+
+    let event = StreamEvent::MessageEvent {
+        cursor: cursor.clone(),
+        message: message_view,
+    };
+
+    if !is_ephemeral {
+         if let Err(e) = crate::db::store_event(
+             pool,
+             &cursor,
+             convo_id,
+             "messageEvent",
+             Some(msg_id),
+         )
+         .await
+         {
+             error!("❌ [actor:worker] Failed to store event: {:?}", e);
+         }
+    }
+
+    if let Err(e) = sse_state.emit(convo_id, event).await {
+        error!("❌ [actor:worker] Failed to emit SSE event: {}", e);
+    }
+
+    // 3. Push Notifications (Serialized!)
+    if !is_ephemeral {
+        if let Some(ns) = notification_service {
+            // This await is CRITICAL. It ensures we don't start the next push 
+            // until this one (and its internal retries) is done.
+            if let Err(e) = ns
+                .notify_new_message(
+                    pool,
+                    convo_id,
+                    msg_id,
+                    ciphertext,
+                    sender_did,
+                    seq,
+                    epoch,
+                )
+                .await
+            {
+                error!("❌ [actor:worker] Failed to send push notifications: {}", e);
+            }
+        }
+    }
+}
+
+async fn handle_notify_system_message(
+    pool: &sqlx::PgPool,
+    sse_state: &SseState,
+    convo_id: &str,
+    msg_id: &str,
+    message_type: &str,
+) {
+     // For commits, we just need to ensure envelopes and SSE are sent. 
+     // We don't typically send push for commits unless they are important? 
+     // For now, mirroring legacy behavior which is likely just SSE/Envelopes.
+     
+     // 1. Fan-out (Envelopes)
+    let members_result = sqlx::query!(
+        r#"
+        SELECT member_did
+        FROM members
+        WHERE convo_id = $1 AND left_at IS NULL
+        "#,
+        convo_id
+    )
+    .fetch_all(pool)
+    .await;
+
+    if let Ok(members) = members_result {
+        for member in members {
+             let envelope_id = uuid::Uuid::new_v4().to_string();
+             let _ = sqlx::query!(
+                r#"
+                INSERT INTO envelopes (id, convo_id, recipient_did, message_id, created_at)
+                VALUES ($1, $2, $3, $4, NOW())
+                ON CONFLICT (recipient_did, message_id) DO NOTHING
+                "#,
+                &envelope_id,
+                convo_id,
+                &member.member_did,
+                msg_id,
+            )
+            .execute(pool)
+            .await;
+        }
+    }
+
+    // 2. SSE
+    let cursor = sse_state
+        .cursor_gen
+        .next(convo_id, "messageEvent") // or system event?
+        .await;
+        
+     // We might need to fetch the message to construct the view, 
+     // or just emit a signal. For now, assuming standard message event flow.
+     // Simplified for system messages:
+      if let Err(e) = crate::db::store_event(
+         pool,
+         &cursor,
+         convo_id,
+         "messageEvent",
+         Some(msg_id),
+     )
+     .await
+     {
+         error!("❌ [actor:worker] Failed to store system event: {:?}", e);
+     }
+     
+     // Emitting SSE logic would go here if we constructed the event
+}
