@@ -327,199 +327,203 @@ pub async fn send_message(
         crate::crypto::redact_for_log(&msg_id)
     );
 
-    tracing::debug!("📍 [send_message] spawning fan-out task");
-    // Spawn async task for fan-out, push notifications, and realtime emission
-    let pool_clone = pool.clone();
-    let convo_id = input.convo_id.clone();
-    let msg_id_clone = msg_id.clone();
-    let sse_state_clone = sse_state.clone();
-    let sender_did_clone = auth_user.did.clone();
-    let notification_service_clone = notification_service.clone();
-    let ciphertext_for_sse = input.ciphertext.clone();
-    let epoch_for_sse = input.epoch;
-    let seq_for_push = seq;  // Clone seq for push notification
-    let epoch_for_push = epoch;  // Clone epoch for push notification
+    if !use_actors {
+        tracing::debug!("📍 [send_message] spawning fan-out task (legacy path)");
+        // Spawn async task for fan-out, push notifications, and realtime emission
+        let pool_clone = pool.clone();
+        let convo_id = input.convo_id.clone();
+        let msg_id_clone = msg_id.clone();
+        let sse_state_clone = sse_state.clone();
+        let notification_service_clone = notification_service.clone();
+        let sender_did_clone = auth_user.did.clone();
+        let ciphertext_for_sse = input.ciphertext.clone();
+        let epoch_for_sse = input.epoch;
+        let seq_for_push = seq;  // Clone seq for push notification
+        let epoch_for_push = epoch;  // Clone epoch for push notification
 
-    tokio::spawn(async move {
-        let fanout_start = std::time::Instant::now();
-        tracing::debug!(
-            "📍 [send_message:fanout] starting fan-out, is_ephemeral={}",
-            is_ephemeral
-        );
+        tokio::spawn(async move {
+            let fanout_start = std::time::Instant::now();
+            tracing::debug!(
+                "📍 [send_message:fanout] starting fan-out, is_ephemeral={}",
+                is_ephemeral
+            );
 
-        // For persistent messages, create envelopes for message tracking
-        if !is_ephemeral {
-            // Get all active members
-            let members_result = sqlx::query!(
-                r#"
-                SELECT member_did
-                FROM members
-                WHERE convo_id = $1 AND left_at IS NULL
-                "#,
-                &convo_id
-            )
-            .fetch_all(&pool_clone)
-            .await;
+            // For persistent messages, create envelopes for message tracking
+            if !is_ephemeral {
+                // Get all active members
+                let members_result = sqlx::query!(
+                    r#"
+                    SELECT member_did
+                    FROM members
+                    WHERE convo_id = $1 AND left_at IS NULL
+                    "#,
+                    &convo_id
+                )
+                .fetch_all(&pool_clone)
+                .await;
 
-            match members_result {
-                Ok(members) => {
-                    tracing::debug!("📍 [send_message:fanout] fan-out to members");
+                match members_result {
+                    Ok(members) => {
+                        tracing::debug!("📍 [send_message:fanout] fan-out to members");
 
-                    // Write envelopes for message tracking
-                    for member in &members {
-                        let envelope_id = uuid::Uuid::new_v4().to_string();
+                        // Write envelopes for message tracking
+                        for member in &members {
+                            let envelope_id = uuid::Uuid::new_v4().to_string();
 
-                        // Insert envelope
-                        let envelope_result = sqlx::query!(
-                            r#"
-                            INSERT INTO envelopes (id, convo_id, recipient_did, message_id, created_at)
-                            VALUES ($1, $2, $3, $4, NOW())
-                            ON CONFLICT (recipient_did, message_id) DO NOTHING
-                            "#,
-                            &envelope_id,
+                            // Insert envelope
+                            let envelope_result = sqlx::query!(
+                                r#"
+                                INSERT INTO envelopes (id, convo_id, recipient_did, message_id, created_at)
+                                VALUES ($1, $2, $3, $4, NOW())
+                                ON CONFLICT (recipient_did, message_id) DO NOTHING
+                                "#,
+                                &envelope_id,
+                                &convo_id,
+                                &member.member_did,
+                                &msg_id_clone,
+                            )
+                            .execute(&pool_clone)
+                            .await;
+
+                            if let Err(e) = envelope_result {
+                                error!(
+                                    "❌ [send_message:fanout] Failed to insert envelope for {}: {:?}",
+                                    member.member_did, e
+                                );
+                            }
+                        }
+
+                        let fanout_duration = fanout_start.elapsed();
+                        crate::metrics::record_envelope_write_duration(&convo_id, fanout_duration);
+
+                        tracing::debug!(
+                            "send_message:fanout completed in {}ms",
+                            fanout_duration.as_millis()
+                        );
+                    }
+                    Err(e) => {
+                        error!("❌ [send_message:fanout] Failed to get members: {:?}", e);
+                    }
+                }
+            }
+
+            tracing::debug!("📍 [send_message:fanout] emitting SSE event");
+            // Emit realtime event with full message view including ciphertext
+            let cursor = sse_state_clone
+                .cursor_gen
+                .next(&convo_id, "messageEvent")
+                .await;
+
+            if is_ephemeral {
+                // For ephemeral messages, construct MessageView directly without DB fetch
+                let message_view = crate::models::MessageView::from(crate::models::MessageViewData {
+                    id: msg_id_clone.clone(),
+                    convo_id: convo_id.clone(),
+                    ciphertext: ciphertext_for_sse,
+                    epoch: epoch_for_sse,
+                    seq: 0, // Ephemeral messages don't have a seq
+                    created_at: crate::sqlx_atrium::chrono_to_datetime(chrono::Utc::now()),
+                    message_type: None,
+                });
+
+                let event = StreamEvent::MessageEvent {
+                    cursor: cursor.clone(),
+                    message: message_view,
+                };
+
+                // Do NOT store event for ephemeral messages - they should not be replayed
+
+                // Emit to SSE subscribers
+                if let Err(e) = sse_state_clone.emit(&convo_id, event).await {
+                    error!("❌ [send_message:fanout] Failed to emit SSE event: {}", e);
+                } else {
+                    tracing::debug!("✅ [send_message:fanout] Ephemeral SSE event emitted");
+                }
+            } else {
+                // For persistent messages, fetch from database
+                let message_result = sqlx::query!(
+                    r#"
+                    SELECT id, sender_did, ciphertext, epoch, seq, created_at
+                    FROM messages
+                    WHERE id = $1
+                    "#,
+                    &msg_id_clone
+                )
+                .fetch_one(&pool_clone)
+                .await;
+
+                match message_result {
+                    Ok(msg) => {
+                        // Note: sender field removed per security hardening - clients derive sender from decrypted MLS content
+                        let message_view =
+                            crate::models::MessageView::from(crate::models::MessageViewData {
+                                id: msg.id,
+                                convo_id: convo_id.clone(),
+                                ciphertext: msg.ciphertext.unwrap_or_default(),
+                                epoch: msg.epoch as usize,
+                                seq: msg.seq as usize,
+                                created_at: crate::sqlx_atrium::chrono_to_datetime(msg.created_at),
+                                message_type: None,
+                            });
+
+                        let event = StreamEvent::MessageEvent {
+                            cursor: cursor.clone(),
+                            message: message_view.clone(),
+                        };
+
+                        // Store minimal event envelope (no ciphertext)
+                        // Clients will fetch full message via getMessages
+                        if let Err(e) = crate::db::store_event(
+                            &pool_clone,
+                            &cursor,
                             &convo_id,
-                            &member.member_did,
-                            &msg_id_clone,
+                            "messageEvent",
+                            Some(&msg_id_clone),
                         )
-                        .execute(&pool_clone)
-                        .await;
+                        .await
+                        {
+                            error!("❌ [send_message:fanout] Failed to store event: {:?}", e);
+                        }
 
-                        if let Err(e) = envelope_result {
-                            error!(
-                                "❌ [send_message:fanout] Failed to insert envelope for {}: {:?}",
-                                member.member_did, e
-                            );
+                        // Emit to SSE subscribers
+                        if let Err(e) = sse_state_clone.emit(&convo_id, event).await {
+                            error!("❌ [send_message:fanout] Failed to emit SSE event: {}", e);
+                        } else {
+                            tracing::debug!("✅ [send_message:fanout] SSE event emitted");
                         }
                     }
-
-                    let fanout_duration = fanout_start.elapsed();
-                    crate::metrics::record_envelope_write_duration(&convo_id, fanout_duration);
-
-                    tracing::debug!(
-                        "send_message:fanout completed in {}ms",
-                        fanout_duration.as_millis()
-                    );
-                }
-                Err(e) => {
-                    error!("❌ [send_message:fanout] Failed to get members: {:?}", e);
+                    Err(e) => {
+                        error!(
+                            "❌ [send_message:fanout] Failed to fetch message for SSE event: {:?}",
+                            e
+                        );
+                    }
                 }
             }
-        }
 
-        tracing::debug!("📍 [send_message:fanout] emitting SSE event");
-        // Emit realtime event with full message view including ciphertext
-        let cursor = sse_state_clone
-            .cursor_gen
-            .next(&convo_id, "messageEvent")
-            .await;
-
-        if is_ephemeral {
-            // For ephemeral messages, construct MessageView directly without DB fetch
-            let message_view = crate::models::MessageView::from(crate::models::MessageViewData {
-                id: msg_id_clone.clone(),
-                convo_id: convo_id.clone(),
-                ciphertext: ciphertext_for_sse,
-                epoch: epoch_for_sse,
-                seq: 0, // Ephemeral messages don't have a seq
-                created_at: crate::sqlx_atrium::chrono_to_datetime(chrono::Utc::now()),
-                message_type: None,
-            });
-
-            let event = StreamEvent::MessageEvent {
-                cursor: cursor.clone(),
-                message: message_view,
-            };
-
-            // Do NOT store event for ephemeral messages - they should not be replayed
-
-            // Emit to SSE subscribers
-            if let Err(e) = sse_state_clone.emit(&convo_id, event).await {
-                error!("❌ [send_message:fanout] Failed to emit SSE event: {}", e);
-            } else {
-                tracing::debug!("✅ [send_message:fanout] Ephemeral SSE event emitted");
-            }
-        } else {
-            // For persistent messages, fetch from database
-            let message_result = sqlx::query!(
-                r#"
-                SELECT id, sender_did, ciphertext, epoch, seq, created_at
-                FROM messages
-                WHERE id = $1
-                "#,
-                &msg_id_clone
-            )
-            .fetch_one(&pool_clone)
-            .await;
-
-            match message_result {
-                Ok(msg) => {
-                    // Note: sender field removed per security hardening - clients derive sender from decrypted MLS content
-                    let message_view =
-                        crate::models::MessageView::from(crate::models::MessageViewData {
-                            id: msg.id,
-                            convo_id: convo_id.clone(),
-                            ciphertext: msg.ciphertext.unwrap_or_default(),
-                            epoch: msg.epoch as usize,
-                            seq: msg.seq as usize,
-                            created_at: crate::sqlx_atrium::chrono_to_datetime(msg.created_at),
-                            message_type: None,
-                        });
-
-                    let event = StreamEvent::MessageEvent {
-                        cursor: cursor.clone(),
-                        message: message_view.clone(),
-                    };
-
-                    // Store minimal event envelope (no ciphertext)
-                    // Clients will fetch full message via getMessages
-                    if let Err(e) = crate::db::store_event(
-                        &pool_clone,
-                        &cursor,
-                        &convo_id,
-                        "messageEvent",
-                        Some(&msg_id_clone),
-                    )
-                    .await
+            // Push notifications (skip ephemeral delivery)
+            if !is_ephemeral {
+                if let Some(notification_service) = notification_service_clone.as_ref() {
+                    if let Err(e) = notification_service
+                        .notify_new_message(
+                            &pool_clone,
+                            &convo_id,
+                            &msg_id_clone,
+                            &ciphertext_clone,
+                            &sender_did_clone,  // Use original clone safely inside spawn
+                            seq_for_push,
+                            epoch_for_push,
+                        )
+                        .await
                     {
-                        error!("❌ [send_message:fanout] Failed to store event: {:?}", e);
-                    }
-
-                    // Emit to SSE subscribers
-                    if let Err(e) = sse_state_clone.emit(&convo_id, event).await {
-                        error!("❌ [send_message:fanout] Failed to emit SSE event: {}", e);
-                    } else {
-                        tracing::debug!("✅ [send_message:fanout] SSE event emitted");
+                        error!("❌ [send_message:push] Failed to send push notifications: {}", e);
                     }
                 }
-                Err(e) => {
-                    error!(
-                        "❌ [send_message:fanout] Failed to fetch message for SSE event: {:?}",
-                        e
-                    );
-                }
             }
-        }
-
-        // Push notifications (skip ephemeral delivery)
-        if !is_ephemeral {
-            if let Some(notification_service) = notification_service_clone.as_ref() {
-                if let Err(e) = notification_service
-                    .notify_new_message(
-                        &pool_clone,
-                        &convo_id,
-                        &msg_id_clone,
-                        &ciphertext_clone,
-                        &sender_did_clone,
-                        seq_for_push,
-                        epoch_for_push,
-                    )
-                    .await
-                {
-                    error!("❌ [send_message:push] Failed to send push notifications: {}", e);
-                }
-            }
-        }
-    });
+        });
+    } else {
+        tracing::debug!("📍 [send_message] Fan-out delegated to Actor System");
+    }
 
     info!("✅ [send_message] COMPLETE - async fan-out initiated");
 

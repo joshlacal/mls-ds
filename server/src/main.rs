@@ -92,18 +92,19 @@ async fn main() -> anyhow::Result<()> {
     // });
     // tracing::info!("Compaction worker started");
 
-    // Initialize actor registry
-    let actor_registry = Arc::new(actors::ActorRegistry::new(
-        db_pool.clone(),
-        sse_state.clone(),
-    ));
-    tracing::info!("Actor registry initialized");
-
     // Initialize notification service
     let notification_service = Some(Arc::new(
         catbird_server::notifications::NotificationService::new(),
     ));
     tracing::info!("Notification service initialized");
+
+    // Initialize actor registry
+    let actor_registry = Arc::new(actors::ActorRegistry::new(
+        db_pool.clone(),
+        sse_state.clone(),
+        notification_service.clone(),
+    ));
+    tracing::info!("Actor registry initialized");
 
     // Spawn idempotency cache cleanup worker
     let cleanup_pool = db_pool.clone();
