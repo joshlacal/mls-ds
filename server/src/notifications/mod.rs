@@ -349,7 +349,7 @@ impl NotificationService {
         info!(
             convo_id = %convo_id,
             device_count = devices.len(),
-            "🔔 [push_notification] Starting parallel notification delivery to {} devices",
+            "🔔 [push_notification] Starting SEQUENTIAL notification delivery to {} devices",
             devices.len()
         );
 
@@ -364,99 +364,52 @@ impl NotificationService {
             );
         }
 
-        // Send to all devices in parallel
-        let mut tasks = Vec::new();
+        // Send to all devices SEQUENTIALLY to preserve message ordering
+        // This ensures that for a given conversation, messages are delivered to APNs in order.
+        // The SideEffectJob worker already processes messages sequentially per conversation,
+        // so this sequential delivery maintains end-to-end ordering guarantees.
         let total_devices = devices.len();
-
-        for (idx, (device_token, user_did)) in devices.into_iter().enumerate() {
-            let client = Arc::clone(client);
-            let convo_id = convo_id.to_string();
-            let message_id = message_id.to_string();
-            let ciphertext = ciphertext.to_vec();
-            let recipient_did = user_did.clone();
-            let task_num = idx + 1;
-
-            info!(
-                "🔔 [push_notification] Spawning task {}/{} for device token={}..., user_did={}",
-                task_num,
-                total_devices,
-                &device_token[..device_token.len().min(8)],
-                recipient_did
-            );
-
-            let task = tokio::spawn(async move {
-                info!(
-                    "🔔 [push_notification] Task {}/{} starting send_message_notification",
-                    task_num, total_devices
-                );
-                let result = client
-                    .send_message_notification(
-                        &device_token,
-                        &ciphertext,
-                        &convo_id,
-                        &message_id,
-                        &recipient_did,
-                        seq,
-                        epoch,
-                    )
-                    .await;
-
-                match &result {
-                    Ok(_) => info!(
-                        "🔔 [push_notification] Task {}/{} completed successfully",
-                        task_num, total_devices
-                    ),
-                    Err(e) => error!(
-                        "🔔 [push_notification] Task {}/{} failed: {}",
-                        task_num, total_devices, e
-                    ),
-                }
-
-                result
-            });
-            tasks.push(task);
-        }
-
-        info!(
-            "🔔 [push_notification] All {} tasks spawned, awaiting results",
-            tasks.len()
-        );
-
-        // Await all tasks and collect results
         let mut success_count = 0;
         let mut error_count = 0;
 
-        for (idx, task) in tasks.into_iter().enumerate() {
+        for (idx, (device_token, user_did)) in devices.into_iter().enumerate() {
             let task_num = idx + 1;
+
             info!(
-                "🔔 [push_notification] Awaiting task {}/{}",
-                task_num, total_devices
+                "🔔 [push_notification] Sending {}/{} to device token={}..., user_did={}",
+                task_num,
+                total_devices,
+                &device_token[..device_token.len().min(8)],
+                user_did
             );
 
-            match task.await {
-                Ok(Ok(_)) => {
+            let result = client
+                .send_message_notification(
+                    &device_token,
+                    ciphertext,
+                    convo_id,
+                    message_id,
+                    &user_did,
+                    seq,
+                    epoch,
+                )
+                .await;
+
+            match result {
+                Ok(_) => {
                     success_count += 1;
                     info!(
-                        "🔔 [push_notification] Task {}/{} result: SUCCESS (total success: {})",
+                        "🔔 [push_notification] Device {}/{} result: SUCCESS (total success: {})",
                         task_num, total_devices, success_count
-                    );
-                }
-                Ok(Err(e)) => {
-                    error_count += 1;
-                    error!(
-                        "❌ [push_notification] Task {}/{} result: FAILED - {} (total errors: {})",
-                        task_num, total_devices, e, error_count
                     );
                 }
                 Err(e) => {
                     error_count += 1;
                     error!(
-                        "❌ [push_notification] Task {}/{} result: PANICKED - {} (total errors: {})",
-                        task_num,
-                        total_devices,
-                        e,
-                        error_count
+                        "❌ [push_notification] Device {}/{} result: FAILED - {} (total errors: {})",
+                        task_num, total_devices, e, error_count
                     );
+                    // Continue to remaining devices - don't fail entire batch on single device error
                 }
             }
         }
@@ -467,12 +420,13 @@ impl NotificationService {
             success = success_count,
             errors = error_count,
             total = total_devices,
-            "✅ [push_notification] Push notification delivery complete: {}/{} succeeded, {}/{} failed",
+            "✅ [push_notification] SEQUENTIAL push notification delivery complete: {}/{} succeeded, {}/{} failed",
             success_count, total_devices, error_count, total_devices
         );
 
         Ok(())
     }
+
 
     /// Send a low key package inventory notification to a user
     ///
