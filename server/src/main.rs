@@ -257,6 +257,10 @@ async fn main() -> anyhow::Result<()> {
             "/xrpc/blue.catbird.mls.listDevices",
             get(handlers::list_devices),
         )
+        .route(
+            "/xrpc/blue.catbird.mls.listChatRequests",
+            get(handlers::list_chat_requests),
+        )
         // Pending device additions (multi-device sync)
         .route(
             "/xrpc/blue.catbird.mls.getPendingDeviceAdditions",
