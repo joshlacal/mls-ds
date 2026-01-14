@@ -29,7 +29,7 @@ pub struct SubscribeQuery {
 
 /// Event types for realtime streaming
 /// Uses AT Protocol format with $type tag for proper client compatibility
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "$type")]
 pub enum StreamEvent {
     #[serde(rename = "blue.catbird.mls.streamConvoEvents#messageEvent")]

@@ -1,0 +1,367 @@
+{
+    "lexicon": 1,
+    "id": "blue.catbird.mls.subscribeConvoEvents",
+    "defs": {
+        "main": {
+            "type": "subscription",
+            "description": "WebSocket subscription for real-time conversation events. Authenticate using a ticket from getSubscriptionTicket.",
+            "parameters": {
+                "type": "params",
+                "required": [
+                    "ticket"
+                ],
+                "properties": {
+                    "ticket": {
+                        "type": "string",
+                        "description": "Authentication ticket from getSubscriptionTicket"
+                    },
+                    "cursor": {
+                        "type": "integer",
+                        "description": "Resume from this sequence number to receive missed events"
+                    }
+                }
+            },
+            "message": {
+                "schema": {
+                    "type": "union",
+                    "refs": [
+                        "#messageEvent",
+                        "#reactionEvent",
+                        "#typingEvent",
+                        "#infoEvent",
+                        "#newDeviceEvent",
+                        "#groupInfoRefreshRequestedEvent",
+                        "#readditionRequestedEvent",
+                        "#membershipChangeEvent",
+                        "#readEvent"
+                    ]
+                }
+            },
+            "errors": [
+                {
+                    "name": "InvalidTicket",
+                    "description": "Ticket signature is invalid or malformed"
+                },
+                {
+                    "name": "ExpiredTicket",
+                    "description": "Ticket has expired"
+                },
+                {
+                    "name": "NotMember",
+                    "description": "User is not a member of the conversation"
+                },
+                {
+                    "name": "TooSlow",
+                    "description": "Client cannot keep up with message rate"
+                }
+            ]
+        },
+        "messageEvent": {
+            "type": "object",
+            "description": "Event for a newly sent message",
+            "required": [
+                "seq",
+                "message"
+            ],
+            "properties": {
+                "seq": {
+                    "type": "integer",
+                    "description": "Sequence number for cursor-based resumption"
+                },
+                "message": {
+                    "type": "ref",
+                    "ref": "blue.catbird.mls.defs#messageView"
+                }
+            }
+        },
+        "reactionEvent": {
+            "type": "object",
+            "description": "Event for a reaction added or removed",
+            "required": [
+                "seq",
+                "convoId",
+                "messageId",
+                "did",
+                "reaction",
+                "action"
+            ],
+            "properties": {
+                "seq": {
+                    "type": "integer",
+                    "description": "Sequence number for cursor-based resumption"
+                },
+                "convoId": {
+                    "type": "string",
+                    "description": "Conversation identifier"
+                },
+                "messageId": {
+                    "type": "string",
+                    "description": "ID of the message that was reacted to"
+                },
+                "did": {
+                    "type": "string",
+                    "format": "did",
+                    "description": "DID of the user who performed the reaction"
+                },
+                "reaction": {
+                    "type": "string",
+                    "description": "Reaction content (emoji or short code)"
+                },
+                "action": {
+                    "type": "string",
+                    "description": "Action performed",
+                    "knownValues": [
+                        "add",
+                        "remove"
+                    ]
+                }
+            }
+        },
+        "typingEvent": {
+            "type": "object",
+            "description": "Event indicating a user is typing",
+            "required": [
+                "seq",
+                "convoId",
+                "did",
+                "isTyping"
+            ],
+            "properties": {
+                "seq": {
+                    "type": "integer",
+                    "description": "Sequence number for cursor-based resumption"
+                },
+                "convoId": {
+                    "type": "string",
+                    "description": "Conversation identifier"
+                },
+                "did": {
+                    "type": "string",
+                    "format": "did",
+                    "description": "DID of the user typing"
+                },
+                "isTyping": {
+                    "type": "boolean",
+                    "description": "True if the user started typing, false if they stopped"
+                }
+            }
+        },
+        "infoEvent": {
+            "type": "object",
+            "description": "Informational event (heartbeat or notices)",
+            "required": [
+                "seq",
+                "name"
+            ],
+            "properties": {
+                "seq": {
+                    "type": "integer",
+                    "description": "Sequence number"
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Info event name"
+                },
+                "message": {
+                    "type": "string",
+                    "description": "Human-readable message"
+                }
+            }
+        },
+        "newDeviceEvent": {
+            "type": "object",
+            "description": "Event indicating a user has registered a new device that needs to be added to the conversation",
+            "required": [
+                "seq",
+                "convoId",
+                "userDid",
+                "deviceId",
+                "deviceCredentialDid",
+                "pendingAdditionId"
+            ],
+            "properties": {
+                "seq": {
+                    "type": "integer"
+                },
+                "convoId": {
+                    "type": "string"
+                },
+                "userDid": {
+                    "type": "string",
+                    "format": "did"
+                },
+                "deviceId": {
+                    "type": "string"
+                },
+                "deviceName": {
+                    "type": "string"
+                },
+                "deviceCredentialDid": {
+                    "type": "string"
+                },
+                "pendingAdditionId": {
+                    "type": "string"
+                }
+            }
+        },
+        "groupInfoRefreshRequestedEvent": {
+            "type": "object",
+            "description": "Event requesting active members to publish fresh GroupInfo for external commit joins",
+            "required": [
+                "seq",
+                "convoId",
+                "requestedBy",
+                "requestedAt"
+            ],
+            "properties": {
+                "seq": {
+                    "type": "integer"
+                },
+                "convoId": {
+                    "type": "string"
+                },
+                "requestedBy": {
+                    "type": "string",
+                    "format": "did"
+                },
+                "requestedAt": {
+                    "type": "string",
+                    "format": "datetime"
+                }
+            }
+        },
+        "readditionRequestedEvent": {
+            "type": "object",
+            "description": "Event indicating a member needs to be re-added after Welcome and External Commit failures",
+            "required": [
+                "seq",
+                "convoId",
+                "userDid",
+                "requestedAt"
+            ],
+            "properties": {
+                "seq": {
+                    "type": "integer"
+                },
+                "convoId": {
+                    "type": "string"
+                },
+                "userDid": {
+                    "type": "string",
+                    "format": "did"
+                },
+                "requestedAt": {
+                    "type": "string",
+                    "format": "datetime"
+                }
+            }
+        },
+        "membershipChangeEvent": {
+            "type": "object",
+            "description": "Event indicating a member joined, left, or was removed from the conversation",
+            "required": [
+                "seq",
+                "convoId",
+                "did",
+                "action",
+                "epoch"
+            ],
+            "properties": {
+                "seq": {
+                    "type": "integer"
+                },
+                "convoId": {
+                    "type": "string"
+                },
+                "did": {
+                    "type": "string",
+                    "format": "did"
+                },
+                "action": {
+                    "type": "string",
+                    "knownValues": [
+                        "joined",
+                        "left",
+                        "removed",
+                        "kicked"
+                    ]
+                },
+                "actor": {
+                    "type": "string",
+                    "format": "did"
+                },
+                "reason": {
+                    "type": "string"
+                },
+                "epoch": {
+                    "type": "integer"
+                }
+            }
+        },
+        "readEvent": {
+            "type": "object",
+            "description": "Event indicating a member has read messages in the conversation",
+            "required": [
+                "seq",
+                "convoId",
+                "did",
+                "readAt"
+            ],
+            "properties": {
+                "seq": {
+                    "type": "integer"
+                },
+                "convoId": {
+                    "type": "string"
+                },
+                "did": {
+                    "type": "string",
+                    "format": "did"
+                },
+                "messageId": {
+                    "type": "string"
+                },
+                "readAt": {
+                    "type": "string",
+                    "format": "datetime"
+                }
+            }
+        },
+        "clientTyping": {
+            "type": "object",
+            "description": "Client-to-server message indicating typing status",
+            "required": [
+                "convoId",
+                "isTyping"
+            ],
+            "properties": {
+                "convoId": {
+                    "type": "string",
+                    "description": "Conversation identifier"
+                },
+                "isTyping": {
+                    "type": "boolean",
+                    "description": "True if the user started typing, false if they stopped"
+                }
+            }
+        },
+        "clientAck": {
+            "type": "object",
+            "description": "Client-to-server message acknowledging receipt of events",
+            "required": [
+                "seq"
+            ],
+            "properties": {
+                "seq": {
+                    "type": "integer",
+                    "description": "Sequence number being acknowledged"
+                }
+            }
+        },
+        "clientPing": {
+            "type": "object",
+            "description": "Client-to-server keep-alive ping",
+            "properties": {}
+        }
+    }
+}
