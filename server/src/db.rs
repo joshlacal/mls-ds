@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Transaction};
 use std::time::Duration;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::models::{Conversation, KeyPackage, Membership, Message};
@@ -888,6 +888,14 @@ pub async fn get_all_key_packages(
     let now = Utc::now();
     let reservation_timeout = now - chrono::Duration::minutes(5);
 
+    // 🔍 DIAGNOSTIC: Log the exact DID and cipher suite being queried
+    info!(
+        "🔍 [get_all_key_packages] Query params - did: '{}' (len: {}), cipher_suite: '{}'",
+        did,
+        did.len(),
+        cipher_suite
+    );
+
     // 🔍 DIAGNOSTIC: First, log all device_ids for this user's key packages
     let device_ids: Vec<(Option<String>, i64)> = sqlx::query_as(
         r#"
@@ -907,6 +915,43 @@ pub async fn get_all_key_packages(
     .fetch_all(pool)
     .await
     .unwrap_or_default();
+
+    // 🔍 DIAGNOSTIC: If no packages found, also check if any exist for this DID at all (ignoring cipher suite)
+    if device_ids.is_empty() {
+        let any_packages: Option<i64> = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM key_packages
+            WHERE owner_did = $1
+            "#,
+        )
+        .bind(did)
+        .fetch_optional(pool)
+        .await
+        .unwrap_or_default();
+
+        // Also check similar DIDs to detect format mismatches
+        let similar_dids: Vec<(String, i64)> = sqlx::query_as(
+            r#"
+            SELECT owner_did, COUNT(*) as count FROM key_packages
+            WHERE owner_did LIKE $1 OR owner_did LIKE $2
+            GROUP BY owner_did
+            ORDER BY count DESC
+            LIMIT 5
+            "#,
+        )
+        .bind(format!("%{}%", &did[..did.len().min(20)]))
+        .bind(format!("{}%", &did[..did.len().min(30)]))
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+
+        warn!(
+            "⚠️ [get_all_key_packages] No packages found for DID '{}'. Total packages with this DID (any cipher suite): {:?}. Similar DIDs in DB: {:?}",
+            did,
+            any_packages,
+            similar_dids
+        );
+    }
 
     info!(
         "🔍 [get_all_key_packages] Key package device distribution for {}: {:?}",

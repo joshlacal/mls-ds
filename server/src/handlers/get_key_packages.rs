@@ -76,10 +76,18 @@ pub async fn get_key_packages(
     info!("Fetching key packages for {} DIDs", dids_refs.len());
 
     let mut results = Vec::new();
+    let mut missing_dids: Vec<String> = Vec::new();
     let default_cipher_suite = "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519";
     let suite = cipher_suite.as_deref().unwrap_or(default_cipher_suite);
 
     for did in dids_refs {
+        // 🔍 DIAGNOSTIC: Log the exact DID being queried
+        info!(
+            "🔍 [getKeyPackages] Querying key packages for DID: '{}' (length: {})",
+            did,
+            did.len()
+        );
+
         // Get ALL available key packages for this DID (multi-device support)
         match crate::db::get_all_key_packages(&pool, did, suite).await {
             Ok(kps) if !kps.is_empty() => {
@@ -94,20 +102,35 @@ pub async fn get_key_packages(
                 }
             }
             Ok(_) => {
-                debug!(
-                    "No valid key package found for DID: {}",
-                    crate::crypto::hash_for_log(&did)
+                warn!(
+                    "⚠️ [getKeyPackages] No key packages found for DID: '{}' - adding to missing list",
+                    did
                 );
+                missing_dids.push(did.to_string());
             }
             Err(e) => {
-                error!("Failed to get key packages: {}", e);
+                error!("Failed to get key packages for DID '{}': {}", did, e);
+                // Also add to missing on error so client knows
+                missing_dids.push(did.to_string());
             }
         }
     }
 
-    info!("Found {} key packages", results.len());
+    info!(
+        "Found {} key packages total, {} DIDs missing",
+        results.len(),
+        missing_dids.len()
+    );
 
-    Ok(Json(serde_json::json!({ "keyPackages": results })))
+    // Return response per lexicon: include 'missing' array if any DIDs had no key packages
+    if missing_dids.is_empty() {
+        Ok(Json(serde_json::json!({ "keyPackages": results })))
+    } else {
+        Ok(Json(serde_json::json!({
+            "keyPackages": results,
+            "missing": missing_dids
+        })))
+    }
 }
 
 #[cfg(test)]
