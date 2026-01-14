@@ -16,11 +16,26 @@ pub async fn get_convos(
     // Get all active memberships for the user
     // In multi-device mode, members are stored with device MLS DIDs (e.g., did:plc:abc123#device-xyz)
     // but auth DID is the base user DID (e.g., did:plc:abc123), so we check user_did OR member_did
+    // Note: initial membership inserts in `create_convo` store both `member_did` and `user_did`
+    // as the base user DID for single-device mode. In multi-device mode, `member_did` may include
+    // a device suffix (e.g. `did:plc:abc#device-xyz`) while `user_did` remains the base DID.
+    //
+    // To handle both, we match:
+    // - exact user_did
+    // - exact member_did
+    // - device-suffixed member_did that starts with `{did}#`
     let memberships = sqlx::query_as::<_, Membership>(
         "SELECT convo_id, member_did, user_did, device_id, device_name, joined_at, left_at, unread_count, last_read_at,
                 is_admin, promoted_at, promoted_by_did, COALESCE(is_moderator, false) as is_moderator, leaf_index,
                 needs_rejoin, rejoin_requested_at, rejoin_key_package_hash
-         FROM members WHERE (member_did = $1 OR user_did = $1) AND left_at IS NULL ORDER BY joined_at DESC"
+         FROM members
+         WHERE (
+            user_did = $1 OR
+            member_did = $1 OR
+            member_did LIKE ($1 || '#%')
+         )
+         AND left_at IS NULL
+         ORDER BY joined_at DESC"
     )
     .bind(did)
     .fetch_all(&pool)
