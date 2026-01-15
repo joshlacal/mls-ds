@@ -20,7 +20,9 @@ use futures::{sink::SinkExt, stream::StreamExt};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use std::time::Duration;
+use tokio::sync::{mpsc, Mutex};
+use tokio_stream::{wrappers::BroadcastStream, StreamMap};
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -33,6 +35,9 @@ use crate::{
 
 /// Maximum concurrent WebSocket connections per user DID
 const MAX_CONNECTIONS_PER_USER: usize = 5;
+
+/// Server-side heartbeat interval (ping every 30 seconds to detect stale connections)
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Tracks active WebSocket connections per user
 pub struct ConnectionTracker {
@@ -229,44 +234,69 @@ async fn handle_socket(
     pool: DbPool,
     sse_state: Arc<SseState>,
     user_did: String,
-    convo_id: Option<String>,
+    target_convo_id: Option<String>,
     resume_cursor: Option<String>,
 ) {
-    let (mut sender, mut receiver) = socket.split();
-
-    // Get convo_id or use empty string for global subscription
-    let cid = convo_id.clone().unwrap_or_default();
-
-    // Subscribe to broadcast channel
-    let tx = sse_state.get_channel(&cid).await;
-    let mut rx = tx.subscribe();
+    let (sender, mut receiver) = socket.split();
+    // Wrap sender in Arc<Mutex> for shared access from heartbeat and send tasks
+    let sender = Arc::new(Mutex::new(sender));
+    let mut stream_map = StreamMap::new();
 
     // Sequence counter for this session (starts at 0, increments per event)
     let mut seq: i64 = 0;
 
-    // Backfill missed events if cursor provided
-    if let Some(ref cursor) = resume_cursor {
-        if !cursor.is_empty() {
-            match backfill_events(&pool, &cid, cursor).await {
-                Ok(events) => {
-                    info!(
-                        convo = %crate::crypto::redact_for_log(&cid),
-                        backfill_count = events.len(),
-                        from_cursor = %crate::crypto::redact_for_log(cursor),
-                        "Sending backfill events"
-                    );
-                    for (event, event_cursor) in events {
-                        seq += 1;
-                        if let Err(e) = send_event(&mut sender, &event, seq, Some(&event_cursor)).await {
-                            error!("Failed to send backfill event: {}", e);
-                            return;
+    // 1. Setup Subscriptions
+    if let Some(ref cid) = target_convo_id {
+        // Single conversation mode
+        let tx = sse_state.get_channel(cid).await;
+        let rx = BroadcastStream::new(tx.subscribe());
+        stream_map.insert(cid.clone(), rx);
+
+        // Backfill for single convo
+        if let Some(ref cursor) = resume_cursor {
+            if !cursor.is_empty() {
+                match backfill_events(&pool, cid, cursor).await {
+                    Ok(events) => {
+                        info!(
+                            convo = %crate::crypto::redact_for_log(cid),
+                            backfill_count = events.len(),
+                            "Sending backfill events"
+                        );
+                        for (event, event_cursor) in events {
+                            seq += 1;
+                            let mut sender_guard = sender.lock().await;
+                            if let Err(e) = send_event(&mut *sender_guard, &event, seq, Some(&event_cursor)).await {
+                                error!("Failed to send backfill event: {}", e);
+                                return;
+                            }
                         }
                     }
+                    Err(e) => {
+                        error!("Failed to backfill events: {}", e);
+                        let mut sender_guard = sender.lock().await;
+                        let _ = send_error(&mut *sender_guard, "BackfillFailed", Some(&e)).await;
+                    }
                 }
-                Err(e) => {
-                    error!("Failed to backfill events: {}", e);
-                    let _ = send_error(&mut sender, "BackfillFailed", Some(&e)).await;
+            }
+        }
+    } else {
+        // Global/Multiplexed mode - subscribe to ALL user conversations
+        info!("Initializing global subscription for user {}", crate::crypto::redact_for_log(&user_did));
+        
+        match crate::db::list_conversations(&pool, &user_did, 1000, 0).await {
+            Ok(convos) => {
+                info!("Subscribing to {} conversations", convos.len());
+                for convo in convos {
+                    let tx = sse_state.get_channel(&convo.id).await;
+                    let rx = BroadcastStream::new(tx.subscribe());
+                    stream_map.insert(convo.id, rx);
                 }
+            }
+            Err(e) => {
+                error!("Failed to list conversations for global sub: {}", e);
+                let mut sender_guard = sender.lock().await;
+                let _ = send_error(&mut *sender_guard, "InternalError", Some("Failed to list conversations")).await;
+                return;
             }
         }
     }
@@ -275,7 +305,6 @@ async fn handle_socket(
     let (client_msg_tx, mut client_msg_rx) = mpsc::channel::<ClientMessage>(32);
     let sse_state_clone = sse_state.clone();
     let user_did_clone = user_did.clone();
-    let cid_clone = cid.clone();
 
     // Spawn task to handle client messages
     let client_handler = tokio::spawn(async move {
@@ -310,36 +339,46 @@ async fn handle_socket(
         }
     });
 
-    // Spawn task to receive from broadcast and send to WebSocket
+    // Spawn task to receive from broadcast(s) and send to WebSocket
     let resume_cursor_clone = resume_cursor.clone();
+    let sender_clone = sender.clone();
     let mut send_task = tokio::spawn(async move {
-        while let Ok(event) = rx.recv().await {
-            seq += 1;
-            
-            // Extract cursor from event for filtering
-            let event_cursor = match &event {
-                StreamEvent::MessageEvent { cursor, .. } => cursor.clone(),
-                StreamEvent::ReactionEvent { cursor, .. } => cursor.clone(),
-                StreamEvent::TypingEvent { cursor, .. } => cursor.clone(),
-                StreamEvent::InfoEvent { cursor, .. } => cursor.clone(),
-                StreamEvent::NewDeviceEvent { cursor, .. } => cursor.clone(),
-                StreamEvent::GroupInfoRefreshRequested { cursor, .. } => cursor.clone(),
-                StreamEvent::ReadditionRequested { cursor, .. } => cursor.clone(),
-                StreamEvent::MembershipChangeEvent { cursor, .. } => cursor.clone(),
-                StreamEvent::ReadEvent { cursor, .. } => cursor.clone(),
-            };
-            
-            // Skip events before resume cursor
-            if let Some(ref resume_cur) = resume_cursor_clone {
-                if event_cursor <= *resume_cur {
-                    continue;
+        while let Some((convo_id, event_result)) = stream_map.next().await {
+            match event_result {
+                Ok(event) => {
+                    seq += 1;
+                    
+                    // Extract cursor from event
+                    let event_cursor = match &event {
+                        StreamEvent::MessageEvent { cursor, .. } => cursor.clone(),
+                        StreamEvent::ReactionEvent { cursor, .. } => cursor.clone(),
+                        StreamEvent::TypingEvent { cursor, .. } => cursor.clone(),
+                        StreamEvent::InfoEvent { cursor, .. } => cursor.clone(),
+                        StreamEvent::NewDeviceEvent { cursor, .. } => cursor.clone(),
+                        StreamEvent::GroupInfoRefreshRequested { cursor, .. } => cursor.clone(),
+                        StreamEvent::ReadditionRequested { cursor, .. } => cursor.clone(),
+                        StreamEvent::MembershipChangeEvent { cursor, .. } => cursor.clone(),
+                        StreamEvent::ReadEvent { cursor, .. } => cursor.clone(),
+                    };
+                    
+                    // Filter logic (only for single-convo mode generally, but applied here too)
+                    if let Some(ref resume_cur) = resume_cursor_clone {
+                        if event_cursor <= *resume_cur {
+                            continue;
+                        }
+                    }
+                    
+                    // Convert StreamEvent to WebSocket message
+                    let mut sender_guard = sender_clone.lock().await;
+                    if let Err(e) = send_event(&mut *sender_guard, &event, seq, Some(&event_cursor)).await {
+                        error!("Failed to send event for {}: {}", convo_id, e);
+                        break;
+                    }
                 }
-            }
-            
-            // Convert StreamEvent to WebSocket message with DAG-CBOR framing
-            if let Err(e) = send_event(&mut sender, &event, seq, Some(&event_cursor)).await {
-                error!("Failed to send event: {}", e);
-                break;
+                Err(_lagged) => {
+                     // BroadcastStream handles Lagged by returning error, we should log and continue
+                     warn!("Slow consumer lagged for conversation {}", convo_id);
+                }
             }
         }
     });
@@ -387,17 +426,41 @@ async fn handle_socket(
         }
     });
 
-    // Wait for either task to finish
+    // Spawn heartbeat task to detect stale connections
+    let sender_heartbeat = sender.clone();
+    let mut heartbeat_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+        loop {
+            interval.tick().await;
+            let mut sender_guard = sender_heartbeat.lock().await;
+            if sender_guard.send(Message::Ping(vec![].into())).await.is_err() {
+                debug!("Heartbeat ping failed - connection likely closed");
+                break;
+            }
+            debug!("Sent heartbeat ping");
+        }
+    });
+
+    // Wait for any task to finish (heartbeat failure also terminates connection)
     tokio::select! {
-        _ = (&mut send_task) => recv_task.abort(),
-        _ = (&mut recv_task) => send_task.abort(),
+        _ = (&mut send_task) => {
+            recv_task.abort();
+            heartbeat_task.abort();
+        }
+        _ = (&mut recv_task) => {
+            send_task.abort();
+            heartbeat_task.abort();
+        }
+        _ = (&mut heartbeat_task) => {
+            send_task.abort();
+            recv_task.abort();
+        }
     }
 
     // Cleanup
     client_handler.abort();
 
     info!(
-        convo = %crate::crypto::redact_for_log(&cid),
         user = %crate::crypto::redact_for_log(&user_did),
         "WebSocket connection closed"
     );

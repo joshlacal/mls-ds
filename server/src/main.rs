@@ -346,7 +346,7 @@ async fn main() -> anyhow::Result<()> {
         )
         // Hybrid messaging endpoints
         .route(
-            "/xrpc/blue.catbird.mls.streamConvoEvents",
+            "/xrpc/blue.catbird.mls.subscribeConvoEvents",
             get(realtime::subscribe_convo_events_sse),
         )
         // WebSocket subscription endpoints

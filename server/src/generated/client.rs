@@ -1406,19 +1406,19 @@ where
             _ => Err(atrium_xrpc::Error::UnexpectedResponseType),
         }
     }
-    ///Subscribe to live events (new messages, reactions, etc.) via Server-Sent Events in conversations involving the authenticated user
-    pub async fn stream_convo_events(
+    ///Subscribe to live events (new messages, reactions, etc.) via firehose-style DAG-CBOR framing in conversations involving the authenticated user
+    pub async fn subscribe_convo_events(
         &self,
-        params: crate::blue::catbird::mls::stream_convo_events::Parameters,
+        params: crate::blue::catbird::mls::subscribe_convo_events::Parameters,
     ) -> atrium_xrpc::Result<
-        crate::blue::catbird::mls::stream_convo_events::Output,
-        crate::blue::catbird::mls::stream_convo_events::Error,
+        crate::blue::catbird::mls::subscribe_convo_events::Output,
+        crate::blue::catbird::mls::subscribe_convo_events::Error,
     > {
         let response = self
             .xrpc
             .send_xrpc::<_, (), _, _>(&atrium_xrpc::XrpcRequest {
                 method: http::Method::GET,
-                nsid: crate::blue::catbird::mls::stream_convo_events::NSID.into(),
+                nsid: crate::blue::catbird::mls::subscribe_convo_events::NSID.into(),
                 parameters: Some(params),
                 input: None,
                 encoding: None,

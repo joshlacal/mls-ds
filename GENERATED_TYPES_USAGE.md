@@ -13,7 +13,7 @@ use crate::generated::blue::catbird::mls::defs::*;
 // Endpoint-specific types
 use crate::generated::blue::catbird::mls::create_convo::{Input, Output};
 use crate::generated::blue::catbird::mls::send_message;
-use crate::generated::blue::catbird::mls::stream_convo_events;
+use crate::generated::blue::catbird::mls::subscribe_convo_events;
 ```
 
 ## Working with Generated Types
@@ -72,10 +72,10 @@ fn build_convo_response(convo: &Conversation) -> ConvoView {
 
 ### SSE Event Types (Union Pattern)
 
-The `streamConvoEvents` endpoint demonstrates the union pattern:
+The `subscribeConvoEvents` endpoint demonstrates the union pattern:
 
 ```rust
-use crate::generated::blue::catbird::mls::stream_convo_events::*;
+use crate::generated::blue::catbird::mls::subscribe_convo_events::*;
 
 async fn send_sse_event(
     event_type: &str,
@@ -125,7 +125,7 @@ async fn send_sse_event(
 ### Serialization (for SSE)
 
 ```rust
-use crate::generated::blue::catbird::mls::stream_convo_events::*;
+use crate::generated::blue::catbird::mls::subscribe_convo_events::*;
 
 async fn sse_handler() -> impl IntoResponse {
     let event = EventWrapper::from(EventWrapperData {
@@ -147,7 +147,7 @@ The serialized JSON will have the `$type` discriminator:
 ```json
 {
   "event": {
-    "$type": "blue.catbird.mls.streamConvoEvents#messageEvent",
+    "$type": "blue.catbird.mls.subscribeConvoEvents#messageEvent",
     "cursor": "abc123",
     "message": { /* MessageView */ }
   }

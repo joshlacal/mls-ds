@@ -35,7 +35,7 @@ All major features have been successfully implemented:
    - Timestamp quantization to 2-second buckets ✅
 
 6. **SSE Events** (1 endpoint)
-   - `streamConvoEvents` - Real-time event streaming
+   - `subscribeConvoEvents` - Real-time event streaming
    - Minimal event payloads (no sender leakage)
 
 7. **Database Migrations**
