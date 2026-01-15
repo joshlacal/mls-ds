@@ -319,7 +319,7 @@ Fully functional for sending/receiving new messages
 19. `blue.catbird.mls.resolveReport` - Resolve report
 
 ### Events & Streaming
-20. `blue.catbird.mls.streamConvoEvents` - SSE event stream
+20. `blue.catbird.mls.subscribeConvoEvents` - SSE event stream
 21. `blue.catbird.mls.getEpoch` - Get current epoch
 22. `blue.catbird.mls.getCommits` - Get commit messages
 

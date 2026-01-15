@@ -737,7 +737,7 @@ Add support for control messages (admin actions):
 - [ ] Implement `resolve_report` handler (admin-only, update status)
 - [ ] Add authorization middleware: `require_admin(auth_user, convo_id)`
 - [ ] Update `get_convos` to include `isAdmin` for each membership
-- [ ] Update `streamConvoEvents` to broadcast admin changes
+- [ ] Update `subscribeConvoEvents` to broadcast admin changes
 
 ### Phase 5: Petrel Client Generation
 

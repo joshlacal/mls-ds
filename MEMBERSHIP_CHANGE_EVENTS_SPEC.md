@@ -43,7 +43,7 @@ Added handler callbacks in EventHandler struct:
 
 ## Required Backend Lexicon Updates
 
-The lexicon file `blue.catbird.mls.streamConvoEvents.json` needs the following additions:
+The lexicon file `blue.catbird.mls.subscribeConvoEvents.json` needs the following additions:
 
 ### 1. MembershipChangeEvent
 
@@ -255,7 +255,7 @@ cd Petrel
 python Generator/main.py
 ```
 
-This will generate the Swift types in `Petrel/Sources/Petrel/Generated/Lexicons/Blue/Catbird/BlueCatbirdMlsStreamConvoEvents.swift`.
+This will generate the Swift types in `Petrel/Sources/Petrel/Generated/Lexicons/Blue/Catbird/BlueCatbirdMlsSubscribeConvoEvents.swift`.
 
 The generated union enum will automatically include:
 - `.blueCatbirdMlsStreamConvoEventsMembershipChangeEvent`

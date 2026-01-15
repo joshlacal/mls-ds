@@ -11,6 +11,7 @@ k256 = { version = "0.13", features = ["ecdsa"] }
 # Web framework
 axum = { version = "0.7", features = ["macros", "ws"] }
 tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["trace", "cors"] }
 futures = "0.3"

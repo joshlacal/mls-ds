@@ -62,7 +62,7 @@ pub mod revoke_invite;
 pub mod send_chat_request;
 pub mod send_message;
 pub mod send_typing_indicator;
-pub mod stream_convo_events;
+pub mod subscribe_convo_events;
 pub mod sync_key_packages;
 pub mod unregister_device_token;
 pub mod update_chat_request_settings;

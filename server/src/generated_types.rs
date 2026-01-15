@@ -1065,12 +1065,12 @@ pub struct ConfirmWelcomeOutput {
 }
 
 // =============================================================================
-// blue.catbird.mls.streamConvoEvents
+// blue.catbird.mls.subscribeConvoEvents
 // =============================================================================
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct StreamConvoEventsParams {
+pub struct SubscribeConvoEventsParams {
     /// Opaque resume cursor
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
@@ -1079,17 +1079,17 @@ pub struct StreamConvoEventsParams {
     pub convo_id: Option<String>,
 }
 
-/// SSE event types
+/// Subscription event types
 #[derive(Debug, Serialize)]
 #[serde(tag = "$type")]
 pub enum ConvoEvent {
-    #[serde(rename = "blue.catbird.mls.streamConvoEvents#messageEvent")]
+    #[serde(rename = "blue.catbird.mls.subscribeConvoEvents#messageEvent")]
     Message(MessageEvent),
-    #[serde(rename = "blue.catbird.mls.streamConvoEvents#reactionEvent")]
+    #[serde(rename = "blue.catbird.mls.subscribeConvoEvents#reactionEvent")]
     Reaction(ReactionEvent),
-    #[serde(rename = "blue.catbird.mls.streamConvoEvents#typingEvent")]
+    #[serde(rename = "blue.catbird.mls.subscribeConvoEvents#typingEvent")]
     Typing(TypingEvent),
-    #[serde(rename = "blue.catbird.mls.streamConvoEvents#infoEvent")]
+    #[serde(rename = "blue.catbird.mls.subscribeConvoEvents#infoEvent")]
     Info(InfoEvent),
 }
 

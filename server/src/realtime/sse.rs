@@ -32,12 +32,12 @@ pub struct SubscribeQuery {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "$type")]
 pub enum StreamEvent {
-    #[serde(rename = "blue.catbird.mls.streamConvoEvents#messageEvent")]
+    #[serde(rename = "blue.catbird.mls.subscribeConvoEvents#messageEvent")]
     MessageEvent {
         cursor: String,
         message: MessageView,
     },
-    #[serde(rename = "blue.catbird.mls.streamConvoEvents#reactionEvent")]
+    #[serde(rename = "blue.catbird.mls.subscribeConvoEvents#reactionEvent")]
     ReactionEvent {
         cursor: String,
         #[serde(rename = "convoId")]
@@ -48,7 +48,7 @@ pub enum StreamEvent {
         reaction: String,
         action: String,
     },
-    #[serde(rename = "blue.catbird.mls.streamConvoEvents#typingEvent")]
+    #[serde(rename = "blue.catbird.mls.subscribeConvoEvents#typingEvent")]
     TypingEvent {
         cursor: String,
         #[serde(rename = "convoId")]
@@ -57,10 +57,10 @@ pub enum StreamEvent {
         #[serde(rename = "isTyping")]
         is_typing: bool,
     },
-    #[serde(rename = "blue.catbird.mls.streamConvoEvents#infoEvent")]
+    #[serde(rename = "blue.catbird.mls.subscribeConvoEvents#infoEvent")]
     InfoEvent { cursor: String, info: String },
     /// Event indicating a user has registered a new device that needs to be added to the conversation
-    #[serde(rename = "blue.catbird.mls.streamConvoEvents#newDeviceEvent")]
+    #[serde(rename = "blue.catbird.mls.subscribeConvoEvents#newDeviceEvent")]
     NewDeviceEvent {
         cursor: String,
         #[serde(rename = "convoId")]
@@ -78,7 +78,7 @@ pub enum StreamEvent {
     },
     /// Event requesting active members to publish fresh GroupInfo for external commit joins
     /// Emitted when a member encounters stale GroupInfo and calls groupInfoRefresh
-    #[serde(rename = "blue.catbird.mls.streamConvoEvents#groupInfoRefreshRequestedEvent")]
+    #[serde(rename = "blue.catbird.mls.subscribeConvoEvents#groupInfoRefreshRequestedEvent")]
     GroupInfoRefreshRequested {
         cursor: String,
         #[serde(rename = "convoId")]
@@ -91,7 +91,7 @@ pub enum StreamEvent {
     },
     /// Event indicating a member needs to be re-added to the conversation
     /// Emitted when both Welcome and External Commit have failed
-    #[serde(rename = "blue.catbird.mls.streamConvoEvents#readditionRequestedEvent")]
+    #[serde(rename = "blue.catbird.mls.subscribeConvoEvents#readditionRequestedEvent")]
     ReadditionRequested {
         cursor: String,
         #[serde(rename = "convoId")]
@@ -103,7 +103,7 @@ pub enum StreamEvent {
         requested_at: String,
     },
     /// Event indicating a member joined, left, or was removed from the conversation
-    #[serde(rename = "blue.catbird.mls.streamConvoEvents#membershipChangeEvent")]
+    #[serde(rename = "blue.catbird.mls.subscribeConvoEvents#membershipChangeEvent")]
     MembershipChangeEvent {
         cursor: String,
         #[serde(rename = "convoId")]
@@ -120,7 +120,7 @@ pub enum StreamEvent {
         epoch: usize,
     },
     /// Event indicating a member has read messages in the conversation
-    #[serde(rename = "blue.catbird.mls.streamConvoEvents#readEvent")]
+    #[serde(rename = "blue.catbird.mls.subscribeConvoEvents#readEvent")]
     ReadEvent {
         cursor: String,
         #[serde(rename = "convoId")]

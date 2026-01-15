@@ -6,7 +6,7 @@
 - **Problem**: Union types in lexicons must be wrapped in an object property - they can't be top-level defs
 - **Solution**: Wrapped the SSE event union in an `eventWrapper` object with an `event` property
 - **Pattern**: `query` with `text/event-stream` output (not `subscription` - that's for WebSocket)
-- **File**: `lexicon/blue/catbird/mls/blue.catbird.mls.streamConvoEvents.json`
+- **File**: `lexicon/blue/catbird/mls/blue.catbird.mls.subscribeConvoEvents.json`
 
 ```json
 {
@@ -57,7 +57,7 @@ server/src/generated/
 │       │   ├── add_members.rs             # blue.catbird.mls.addMembers
 │       │   ├── create_convo.rs            # blue.catbird.mls.createConvo
 │       │   ├── send_message.rs            # blue.catbird.mls.sendMessage
-│       │   ├── stream_convo_events.rs     # SSE subscription types
+│       │   ├── subscribe_convo_events.rs     # SSE subscription types
 │       │   └── ... (28 endpoint modules)
 │       ├── mls.rs
 │       └── catbird.rs
