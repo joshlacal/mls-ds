@@ -68,11 +68,13 @@ impl ConnectionTracker {
 
     /// Release a connection slot for a user
     pub fn release(&self, user_did: &str) {
-        if let Some(count) = self.connections.get(user_did) {
-            let prev = count.fetch_sub(1, Ordering::SeqCst);
+        // Use entry API to acquire write lock immediately, avoiding
+        // read-lock -> write-lock deadlock in DashMap
+        if let dashmap::mapref::entry::Entry::Occupied(entry) = self.connections.entry(user_did.to_string()) {
+            let prev = entry.get().fetch_sub(1, Ordering::SeqCst);
             // Clean up entry if no connections remain
             if prev <= 1 {
-                self.connections.remove(user_did);
+                entry.remove();
             }
         }
     }
