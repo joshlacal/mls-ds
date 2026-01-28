@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build:*)",
+      "Bash(cp:*)",
+      "Bash(cat:*)",
+      "Bash(docker build:*)",
+      "Bash(docker restart:*)",
+      "Bash(docker logs:*)",
+      "Bash(docker exec:*)",
+      "Bash(curl:*)",
+      "Bash(docker stop:*)",
+      "Bash(docker rm:*)",
+      "Bash(docker-compose up:*)",
+      "Bash(docker compose:*)",
+      "Bash(make migrate:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

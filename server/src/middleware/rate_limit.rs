@@ -5,13 +5,17 @@ use axum::{
     response::Response,
 };
 use base64::Engine;
+use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use std::{
-    collections::HashMap,
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::sync::RwLock;
+
+/// Header name for recovery mode bypass requests
+/// When set to "true", the middleware allows the request through but
+/// the handler MUST verify the client actually needs recovery (0 key packages)
+pub const RECOVERY_MODE_HEADER: &str = "x-mls-recovery-mode";
 
 /// Token bucket rate limiter
 #[derive(Clone)]
@@ -73,7 +77,7 @@ impl TokenBucket {
 #[derive(Clone)]
 pub struct RateLimiter {
     /// Buckets per key (format: "did:room_id" or just "did" for global)
-    buckets: Arc<RwLock<HashMap<String, TokenBucket>>>,
+    buckets: Arc<DashMap<String, TokenBucket>>,
     /// Default capacity (burst)
     capacity: u32,
     /// Default refill rate (tokens/sec)
@@ -83,17 +87,16 @@ pub struct RateLimiter {
 impl RateLimiter {
     pub fn new(capacity: u32, refill_rate: f64) -> Self {
         Self {
-            buckets: Arc::new(RwLock::new(HashMap::new())),
+            buckets: Arc::new(DashMap::new()),
             capacity,
             refill_rate,
         }
     }
 
     /// Check if request is allowed for given key
-    pub async fn check(&self, key: &str) -> Result<(), u64> {
-        let mut buckets = self.buckets.write().await;
-
-        let bucket = buckets
+    pub fn check(&self, key: &str) -> Result<(), u64> {
+        let mut bucket = self
+            .buckets
             .entry(key.to_string())
             .or_insert_with(|| TokenBucket::new(self.capacity, self.refill_rate));
 
@@ -106,10 +109,9 @@ impl RateLimiter {
 
     /// Cleanup old buckets (call periodically to prevent memory leak)
     pub async fn cleanup_old_buckets(&self, max_age: Duration) {
-        let mut buckets = self.buckets.write().await;
         let now = Instant::now();
-
-        buckets.retain(|_, bucket| now.duration_since(bucket.last_refill) < max_age);
+        self.buckets
+            .retain(|_, bucket| now.duration_since(bucket.last_refill) < max_age);
     }
 }
 
@@ -138,25 +140,25 @@ impl Default for RateLimiter {
 #[derive(Clone)]
 pub struct DidRateLimiter {
     /// Buckets per DID:endpoint key
-    buckets: Arc<RwLock<HashMap<String, TokenBucket>>>,
+    buckets: Arc<DashMap<String, TokenBucket>>,
 }
 
 impl DidRateLimiter {
     pub fn new() -> Self {
         Self {
-            buckets: Arc::new(RwLock::new(HashMap::new())),
+            buckets: Arc::new(DashMap::new()),
         }
     }
 
     /// Check if request is allowed for given DID and endpoint
-    pub async fn check_did_limit(&self, did: &str, endpoint: &str) -> Result<(), u64> {
+    pub fn check_did_limit(&self, did: &str, endpoint: &str) -> Result<(), u64> {
         let (limit, window) = get_endpoint_quota(endpoint);
         let refill_rate = limit as f64 / window.as_secs_f64();
 
-        let mut buckets = self.buckets.write().await;
         let key = format!("{}:{}", did, endpoint);
 
-        let bucket = buckets
+        let mut bucket = self
+            .buckets
             .entry(key)
             .or_insert_with(|| TokenBucket::new(limit, refill_rate));
 
@@ -169,10 +171,9 @@ impl DidRateLimiter {
 
     /// Cleanup old buckets (call periodically to prevent memory leak)
     pub async fn cleanup_old_buckets(&self, max_age: Duration) {
-        let mut buckets = self.buckets.write().await;
         let now = Instant::now();
-
-        buckets.retain(|_, bucket| now.duration_since(bucket.last_refill) < max_age);
+        self.buckets
+            .retain(|_, bucket| now.duration_since(bucket.last_refill) < max_age);
     }
 }
 
@@ -193,14 +194,24 @@ fn get_endpoint_quota(endpoint: &str) -> (u32, Duration) {
 
     let limit = if endpoint_name.contains("sendMessage") {
         std::env::var("RATE_LIMIT_SEND_MESSAGE")
-            .ok()
+        .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(100) // High frequency messaging
     } else if endpoint_name.contains("publishKeyPackage") {
         std::env::var("RATE_LIMIT_PUBLISH_KEY_PACKAGE")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(20) // Batch key package uploads
+            .unwrap_or(50) // Increased from 20 for recovery scenarios (per-device)
+    } else if endpoint_name.contains("registerDevice") {
+        std::env::var("RATE_LIMIT_REGISTER_DEVICE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10) // Device registration (per-device, allows fresh installs)
+    } else if endpoint_name.contains("syncKeyPackages") {
+        std::env::var("RATE_LIMIT_SYNC_KEY_PACKAGES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30) // Key package sync for recovery (per-device)
     } else if endpoint_name.contains("addMembers") || endpoint_name.contains("removeMember") {
         std::env::var("RATE_LIMIT_ADD_MEMBERS")
             .ok()
@@ -229,28 +240,90 @@ fn get_endpoint_quota(endpoint: &str) -> (u32, Duration) {
 /// Global DID rate limiter instance
 pub static DID_RATE_LIMITER: Lazy<DidRateLimiter> = Lazy::new(DidRateLimiter::new);
 
-/// Middleware for rate limiting based on user DID
+/// Per-IP rate limiter instance
+pub static IP_LIMITER: Lazy<RateLimiter> = Lazy::new(RateLimiter::default);
+
+/// Check if an endpoint should use device-based rate limiting
+/// Device-based limits give fresh devices (app reinstall) their own quota
+fn should_use_device_rate_limit(endpoint: &str) -> bool {
+    let endpoint_name = endpoint
+        .trim_start_matches("/xrpc/")
+        .trim_start_matches("blue.catbird.mls.");
+    
+    // Device-specific operations get per-device limits
+    // This allows a fresh device (app reinstall) to upload key packages
+    // even if the user's other devices have exhausted the quota
+    endpoint_name.contains("publishKeyPackage")
+        || endpoint_name.contains("registerDevice")
+        || endpoint_name.contains("syncKeyPackages")
+}
+
+/// Check if request is in recovery mode
+/// Recovery mode bypasses rate limits for key package operations
+/// The HANDLER must verify the client genuinely has 0 key packages
+fn is_recovery_mode_request(headers: &HeaderMap, endpoint: &str) -> bool {
+    // Only allow recovery mode for key package endpoints
+    if !should_use_device_rate_limit(endpoint) {
+        return false;
+    }
+    
+    // Check for recovery mode header
+    headers
+        .get(RECOVERY_MODE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Middleware for rate limiting based on user DID or device DID
 pub async fn rate_limit_middleware(request: Request, next: Next) -> Result<Response, StatusCode> {
-    // Per-IP global limiter to protect unauthenticated paths and act as backstop
-    static IP_LIMITER: Lazy<RateLimiter> = Lazy::new(RateLimiter::default);
 
     let headers = request.headers();
     let uri = request.uri().to_string();
+
+    // Check for recovery mode bypass (handler MUST verify 0 key packages)
+    if is_recovery_mode_request(headers, &uri) {
+        let did = extract_did_from_auth_header(headers).unwrap_or_else(|| "unknown".to_string());
+        tracing::info!(
+            "🚨 Recovery mode bypass requested for {}: {} (handler must verify)",
+            did,
+            uri
+        );
+        return Ok(next.run(request).await);
+    }
 
     // Try to extract DID from Authorization header for authenticated requests
     let did_opt = extract_did_from_auth_header(headers);
 
     // Use DID-based rate limiting for authenticated requests
     if let Some(did) = did_opt {
-        match DID_RATE_LIMITER.check_did_limit(&did, &uri).await {
+        // For device-specific operations, use the full DID (includes #device-uuid)
+        // For other operations, extract just the user DID to share quota across devices
+        let use_device_limit = should_use_device_rate_limit(&uri);
+        let rate_limit_key = if use_device_limit {
+            // Use full DID including device fragment for device-specific operations
+            // Format: did:plc:user#device-uuid
+            did.clone()
+        } else {
+            // Extract base user DID (strip #device-uuid if present)
+            did.split('#').next().unwrap_or(&did).to_string()
+        };
+        
+        match DID_RATE_LIMITER.check_did_limit(&rate_limit_key, &uri) {
             Ok(()) => {
-                tracing::debug!("DID rate limit passed for {}: {}", did, uri);
+                tracing::debug!(
+                    "Rate limit passed for {} (mode: {}): {}",
+                    rate_limit_key,
+                    if use_device_limit { "device" } else { "user" },
+                    uri
+                );
                 Ok(next.run(request).await)
             }
             Err(retry_after) => {
                 tracing::warn!(
-                    "DID rate limit exceeded for {}: {} (retry after {} seconds)",
-                    did,
+                    "Rate limit exceeded for {} (mode: {}): {} (retry after {} seconds)",
+                    rate_limit_key,
+                    if use_device_limit { "device" } else { "user" },
                     uri,
                     retry_after
                 );
@@ -268,7 +341,7 @@ pub async fn rate_limit_middleware(request: Request, next: Next) -> Result<Respo
     } else {
         // Fall back to IP-based rate limiting for unauthenticated requests
         let client_ip = extract_client_ip(headers);
-        match IP_LIMITER.check(&client_ip).await {
+        match IP_LIMITER.check(&client_ip) {
             Ok(()) => {
                 tracing::debug!("IP rate limit passed for {}: {}", client_ip, uri);
                 Ok(next.run(request).await)
@@ -333,14 +406,14 @@ mod tests {
 
         // Should allow first 5 requests
         for _ in 0..5 {
-            assert!(limiter.check("user1").await.is_ok());
+            assert!(limiter.check("user1").is_ok());
         }
 
         // Should deny 6th request
-        assert!(limiter.check("user1").await.is_err());
+        assert!(limiter.check("user1").is_err());
 
         // Different user should have own bucket
-        assert!(limiter.check("user2").await.is_ok());
+        assert!(limiter.check("user2").is_ok());
     }
 }
 

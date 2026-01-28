@@ -6,6 +6,7 @@ use axum::{
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use tracing::{error, info};
+use sqlx::{QueryBuilder, Postgres};
 
 use crate::{
     actors::{ActorRegistry, ConvoMessage},
@@ -366,29 +367,36 @@ pub async fn send_message(
                     Ok(members) => {
                         tracing::debug!("📍 [send_message:fanout] fan-out to members");
 
-                        // Write envelopes for message tracking
-                        for member in &members {
-                            let envelope_id = uuid::Uuid::new_v4().to_string();
+                        // Bulk insert envelopes for much better performance (O(1) query instead of O(N))
+                        if !members.is_empty() {
+                            let mut query_builder: QueryBuilder<Postgres> = QueryBuilder::new(
+                                "INSERT INTO envelopes (id, convo_id, recipient_did, message_id, created_at) "
+                            );
 
-                            // Insert envelope
-                            let envelope_result = sqlx::query!(
-                                r#"
-                                INSERT INTO envelopes (id, convo_id, recipient_did, message_id, created_at)
-                                VALUES ($1, $2, $3, $4, NOW())
-                                ON CONFLICT (recipient_did, message_id) DO NOTHING
-                                "#,
-                                &envelope_id,
-                                &convo_id,
-                                &member.member_did,
-                                &msg_id_clone,
-                            )
-                            .execute(&pool_clone)
-                            .await;
+                            let now = chrono::Utc::now();
+                            
+                            // Note: push_values automatically creates the VALUES (...), (...), ... clause
+                            query_builder.push_values(members.iter(), |mut b, member| {
+                                b.push_bind(uuid::Uuid::new_v4().to_string())
+                                 .push_bind(&convo_id)
+                                 .push_bind(&member.member_did)
+                                 .push_bind(&msg_id_clone)
+                                 .push_bind(now);
+                            });
 
-                            if let Err(e) = envelope_result {
+                            query_builder.push(" ON CONFLICT (recipient_did, message_id) DO NOTHING");
+
+                            let query = query_builder.build();
+                            
+                            if let Err(e) = query.execute(&pool_clone).await {
                                 error!(
-                                    "❌ [send_message:fanout] Failed to insert envelope for {}: {:?}",
-                                    member.member_did, e
+                                    "❌ [send_message:fanout] Failed to bulk insert envelopes: {:?}", 
+                                    e
+                                );
+                            } else {
+                                tracing::debug!(
+                                    "✅ [send_message:fanout] Bulk inserted {} envelopes", 
+                                    members.len()
                                 );
                             }
                         }

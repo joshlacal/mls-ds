@@ -145,6 +145,9 @@ async fn main() -> anyhow::Result<()> {
             middleware::rate_limit::DID_RATE_LIMITER
                 .cleanup_old_buckets(max_age)
                 .await;
+            middleware::rate_limit::IP_LIMITER
+                .cleanup_old_buckets(max_age)
+                .await;
             tracing::debug!("Rate limiter cleanup completed");
         }
     });
@@ -261,6 +264,10 @@ async fn main() -> anyhow::Result<()> {
             "/xrpc/blue.catbird.mls.listChatRequests",
             get(handlers::list_chat_requests),
         )
+        .route(
+            "/xrpc/blue.catbird.mls.getRequestCount",
+            get(handlers::get_request_count::get_request_count),
+        )
         // Pending device additions (multi-device sync)
         .route(
             "/xrpc/blue.catbird.mls.getPendingDeviceAdditions",
@@ -343,11 +350,6 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/xrpc/blue.catbird.mls.getOptInStatus",
             get(handlers::get_opt_in_status),
-        )
-        // Hybrid messaging endpoints
-        .route(
-            "/xrpc/blue.catbird.mls.subscribeConvoEvents",
-            get(realtime::subscribe_convo_events_sse),
         )
         // WebSocket subscription endpoints
         .route(
