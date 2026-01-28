@@ -25,7 +25,9 @@ pub struct GetCommitsParams {
 pub struct CommitMessage {
     pub id: String,
     pub epoch: i64,
-    pub ciphertext: Vec<u8>,
+    #[serde(rename = "commitData")]
+    #[sqlx(rename = "ciphertext")]
+    pub commit_data: Vec<u8>,
     #[serde(rename = "sender")]
     pub sender_did: String,
     #[serde(rename = "createdAt")]
