@@ -18,7 +18,7 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 # Configuration
-MLS_ROOT="/home/ubuntu/mls"
+MLS_ROOT="/home/ubuntu/mls-ds"
 TARGET_DIR="$MLS_ROOT/target"
 BINARY_NAME="catbird-server"
 SERVICE_NAME="catbird-mls-server"

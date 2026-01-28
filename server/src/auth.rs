@@ -87,8 +87,25 @@ impl IntoResponse for AuthError {
             AuthError::ReplayDetected => (StatusCode::UNAUTHORIZED, self.to_string()),
             AuthError::MissingLxm => (StatusCode::UNAUTHORIZED, self.to_string()),
             AuthError::LxmMismatch => (StatusCode::UNAUTHORIZED, self.to_string()),
-            AuthError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
+            AuthError::Internal(e) => {
+                tracing::error!("Internal auth error: {}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("Internal error: {}", e))
+            },
         };
+
+        if status.is_server_error() {
+            tracing::error!(
+                status = %status,
+                error = %error_message,
+                "Returning server error for auth failure"
+            );
+        } else if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+            tracing::warn!(
+                status = %status,
+                error = %error_message,
+                "Auth failure"
+            );
+        }
 
         let body = Json(json!({
             "error": error_message,
@@ -716,7 +733,6 @@ where
         let endpoint = parts.uri.path();
         if let Err(retry_after) = crate::middleware::rate_limit::DID_RATE_LIMITER
             .check_did_limit(&claims.iss, endpoint)
-            .await
         {
             tracing::warn!(
                 did = %crate::crypto::redact_for_log(&claims.iss),
@@ -727,13 +743,18 @@ where
             return Err(AuthError::RateLimitExceeded);
         }
 
+        // Use sub claim for user identity if present (for gateway-signed tokens),
+        // otherwise fall back to iss (for direct client tokens)
+        let user_did = claims.sub.clone().unwrap_or_else(|| claims.iss.clone());
+        
         debug!(
-            "Authenticated request from DID: {}",
+            "Authenticated request from DID: {} (issuer: {})",
+            crate::crypto::redact_for_log(&user_did),
             crate::crypto::redact_for_log(&claims.iss)
         );
 
         Ok(AuthUser {
-            did: claims.iss.clone(),
+            did: user_did,
             claims,
         })
     }

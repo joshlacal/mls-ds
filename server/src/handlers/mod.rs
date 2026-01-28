@@ -23,6 +23,7 @@ mod get_key_packages;
 mod get_messages;
 mod get_opt_in_status;
 mod get_pending_device_additions;
+pub mod get_request_count;
 mod get_reports;
 mod get_welcome;
 mod group_info_refresh;

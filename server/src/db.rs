@@ -1,13 +1,27 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
+use once_cell::sync::Lazy;
 use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Transaction};
 use std::time::Duration;
+use tokio::sync::Semaphore;
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::models::{Conversation, KeyPackage, Membership, Message};
 
 pub type DbPool = PgPool;
+
+static KEY_PACKAGE_PARSE_LIMITER: Lazy<Semaphore> = Lazy::new(|| {
+    let default_limit = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let configured_limit = std::env::var("KEY_PACKAGE_PARSE_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default_limit);
+    Semaphore::new(configured_limit)
+});
 
 /// Database configuration
 #[derive(Debug, Clone)]
@@ -24,7 +38,10 @@ impl Default for DbConfig {
         Self {
             database_url: std::env::var("DATABASE_URL")
                 .unwrap_or_else(|_| "postgres://localhost/catbird".to_string()),
-            max_connections: 10,
+            max_connections: std::env::var("DATABASE_MAX_CONNECTIONS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(90),
             min_connections: 2,
             acquire_timeout: Duration::from_secs(30),
             idle_timeout: Duration::from_secs(600),
@@ -42,6 +59,13 @@ pub async fn init_db(config: DbConfig) -> Result<DbPool> {
         .connect(&config.database_url)
         .await
         .context("Failed to connect to database")?;
+
+    tracing::warn!(
+        "Database pool initialized with max_connections={}, min_connections={}, acquire_timeout={:?}",
+        config.max_connections,
+        config.min_connections,
+        config.acquire_timeout
+    );
 
     // Run migrations
     sqlx::migrate!("./migrations")
@@ -776,50 +800,79 @@ pub async fn store_key_package_with_device(
     .await
     .context("Failed to ensure user exists")?;
 
-    // Compute MLS-compliant hash_ref using OpenMLS
-    use openmls::prelude::tls_codec::Deserialize;
-    use openmls::prelude::{KeyPackageIn, ProtocolVersion};
+    let parse_timeout_secs = std::env::var("KEY_PACKAGE_PARSE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(10);
 
-    // Create crypto provider (RustCrypto implements OpenMlsCrypto)
-    let provider = openmls_rust_crypto::RustCrypto::default();
+    let did_owned = did.to_string();
+    let key_data_for_parse = key_data.clone();
+    let _permit = KEY_PACKAGE_PARSE_LIMITER
+        .acquire()
+        .await
+        .context("Key package validation limiter closed")?;
 
-    // Deserialize and validate the key package
-    let kp_in = KeyPackageIn::tls_deserialize(&mut key_data.as_slice())
-        .context("Failed to deserialize key package")?;
-    let kp = kp_in
-        .validate(&provider, ProtocolVersion::default())
-        .context("Failed to validate key package")?;
+    let mut parse_task =
+        tokio::task::spawn_blocking(move || -> Result<(String, String)> {
+            // Compute MLS-compliant hash_ref using OpenMLS
+            use openmls::prelude::tls_codec::Deserialize;
+            use openmls::prelude::{KeyPackageIn, ProtocolVersion};
 
-    // Extract and validate credential identity
-    let credential = kp.leaf_node().credential();
-    let credential_identity = match credential.credential_type() {
-        openmls::credentials::CredentialType::Basic => {
-            // Extract identity bytes from BasicCredential
-            let identity_bytes = credential.serialized_content();
-            String::from_utf8(identity_bytes.to_vec())
-                .context("Credential identity is not valid UTF-8")?
-        }
-        _ => {
-            anyhow::bail!("Only BasicCredential is supported");
-        }
-    };
+            // Create crypto provider (RustCrypto implements OpenMlsCrypto)
+            let provider = openmls_rust_crypto::RustCrypto::default();
 
-    // Validate that credential identity is the bare DID (owner_did)
-    // This enforces the "bare DID only" policy - no device DIDs allowed in MLS credentials
-    if credential_identity != did {
-        anyhow::bail!(
-            "KeyPackage credential identity must be the bare user DID ({}), got {} instead. \
-             Device DIDs (with #device-id) are not allowed in MLS credentials.",
-            did,
-            credential_identity
-        );
-    }
+            // Deserialize and validate the key package
+            let kp_in = KeyPackageIn::tls_deserialize(&mut key_data_for_parse.as_slice())
+                .context("Failed to deserialize key package")?;
+            let kp = kp_in
+                .validate(&provider, ProtocolVersion::default())
+                .context("Failed to validate key package")?;
 
-    // Compute the MLS-defined hash reference
-    let hash_ref = kp
-        .hash_ref(&provider)
-        .context("Failed to compute hash_ref")?;
-    let key_package_hash = hex::encode(hash_ref.as_slice());
+            // Extract and validate credential identity
+            let credential = kp.leaf_node().credential();
+            let credential_identity = match credential.credential_type() {
+                openmls::credentials::CredentialType::Basic => {
+                    // Extract identity bytes from BasicCredential
+                    let identity_bytes = credential.serialized_content();
+                    String::from_utf8(identity_bytes.to_vec())
+                        .context("Credential identity is not valid UTF-8")?
+                }
+                _ => {
+                    bail!("Only BasicCredential is supported");
+                }
+            };
+
+            // Validate that credential identity is the bare DID (owner_did)
+            // This enforces the "bare DID only" policy - no device DIDs allowed in MLS credentials
+            if credential_identity != did_owned {
+                bail!(
+                    "KeyPackage credential identity must be the bare user DID ({}), got {} instead. \
+                     Device DIDs (with #device-id) are not allowed in MLS credentials.",
+                    did_owned,
+                    credential_identity
+                );
+            }
+
+            // Compute the MLS-defined hash reference
+            let hash_ref = kp
+                .hash_ref(&provider)
+                .context("Failed to compute hash_ref")?;
+            let key_package_hash = hex::encode(hash_ref.as_slice());
+
+            Ok((key_package_hash, credential_identity))
+        });
+
+    let (key_package_hash, credential_identity) =
+        match tokio::time::timeout(Duration::from_secs(parse_timeout_secs), &mut parse_task).await
+        {
+            Ok(join_result) => join_result
+                .context("Key package validation task failed")?
+                .context("Key package validation error")?,
+            Err(_) => {
+                parse_task.abort();
+                bail!("Key package validation timed out after {}s", parse_timeout_secs);
+            }
+        };
 
     // Store with the verified credential identity (not the client-provided one)
     let result = sqlx::query_as::<_, KeyPackage>(

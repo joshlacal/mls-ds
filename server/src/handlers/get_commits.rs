@@ -26,7 +26,7 @@ pub struct CommitMessage {
     pub id: String,
     pub epoch: i64,
     pub ciphertext: Vec<u8>,
-    #[serde(rename = "senderDid")]
+    #[serde(rename = "sender")]
     pub sender_did: String,
     #[serde(rename = "createdAt")]
     pub created_at: chrono::DateTime<chrono::Utc>,

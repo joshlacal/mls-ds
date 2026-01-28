@@ -52,10 +52,17 @@ pub async fn delete_device(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let (owner_did, credential_did) = device_info.ok_or_else(|| {
-        warn!("Device not found: {}", input.device_id);
-        StatusCode::NOT_FOUND
-    })?;
+    let (owner_did, credential_did) = match device_info {
+        Some(info) => info,
+        None => {
+            warn!("Device not found: {} (treating as success)", input.device_id);
+            return Ok(Json(DeleteDeviceOutput {
+                deleted: false,
+                key_packages_deleted: 0,
+                conversations_left: 0,
+            }));
+        }
+    };
 
     // Verify ownership
     if owner_did != *user_did {

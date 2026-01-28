@@ -1,15 +1,26 @@
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    Json,
+};
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
-use crate::{auth::AuthUser, device_utils::parse_device_did, storage::DbPool};
+use crate::{
+    auth::AuthUser,
+    device_utils::parse_device_did,
+    middleware::rate_limit::RECOVERY_MODE_HEADER,
+    storage::DbPool,
+};
 
 const MAX_BATCH_SIZE: usize = 100;
 const MAX_UNCONSUMED_PER_USER: i64 = 100;
 const MAX_UPLOADS_PER_HOUR: i64 = 200;
 const RATE_LIMIT_WINDOW_HOURS: i64 = 1;
+/// Maximum key packages allowed in recovery mode (prevents abuse)
+const MAX_RECOVERY_BATCH: usize = 50;
 
 #[derive(Debug, Deserialize)]
 pub struct KeyPackageItem {
@@ -50,9 +61,14 @@ pub struct PublishKeyPackagesOutput {
 
 /// Publish multiple key packages in a single request (batch upload)
 /// POST /xrpc/blue.catbird.mls.publishKeyPackages
-#[tracing::instrument(skip(pool, input))]
+///
+/// Supports recovery mode via `X-MLS-Recovery-Mode: true` header.
+/// When in recovery mode and device genuinely has 0 key packages,
+/// rate limits are bypassed to allow emergency key package upload.
+#[tracing::instrument(skip(pool, input, headers))]
 pub async fn publish_key_packages(
     State(pool): State<DbPool>,
+    headers: HeaderMap,
     auth_user: AuthUser,
     Json(input): Json<PublishKeyPackagesInput>,
 ) -> Result<Json<PublishKeyPackagesOutput>, StatusCode> {
@@ -64,11 +80,18 @@ pub async fn publish_key_packages(
 
     let did = &auth_user.did;
 
-    // Extract user DID from device DID (handles both single and multi-device mode)
-    let (user_did, _device_id) = parse_device_did(did).map_err(|e| {
+    // Extract user DID and device ID from device DID (handles both single and multi-device mode)
+    let (user_did, device_id) = parse_device_did(did).map_err(|e| {
         error!("Invalid device DID format: {}", e);
         StatusCode::BAD_REQUEST
     })?;
+
+    // Check for recovery mode request
+    let is_recovery_mode = headers
+        .get(RECOVERY_MODE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
 
     // Validate batch size
     if input.key_packages.is_empty() {
@@ -76,23 +99,93 @@ pub async fn publish_key_packages(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    if input.key_packages.len() > MAX_BATCH_SIZE {
+    // Recovery mode has a smaller max batch (prevents abuse)
+    let max_batch = if is_recovery_mode {
+        MAX_RECOVERY_BATCH
+    } else {
+        MAX_BATCH_SIZE
+    };
+
+    if input.key_packages.len() > max_batch {
         warn!(
-            "Batch size {} exceeds maximum {}",
+            "Batch size {} exceeds maximum {} (recovery_mode: {})",
             input.key_packages.len(),
-            MAX_BATCH_SIZE
+            max_batch,
+            is_recovery_mode
         );
         return Err(StatusCode::BAD_REQUEST);
     }
 
     info!(
-        "Publishing batch of {} key packages",
-        input.key_packages.len()
+        "Publishing batch of {} key packages (recovery_mode: {})",
+        input.key_packages.len(),
+        is_recovery_mode
     );
 
     let now = Utc::now();
 
-    // Check 1: Total unconsumed key packages limit
+    // For recovery mode, check if this device actually has 0 key packages
+    // This verification prevents abuse of recovery mode bypass
+    let recovery_verified = if is_recovery_mode {
+        let device_key_count: (i64,) = if device_id.is_empty() {
+            // Single-device mode: check all user key packages
+            sqlx::query_as(
+                r#"
+                SELECT COUNT(*) as count
+                FROM key_packages
+                WHERE owner_did = $1
+                  AND consumed_at IS NULL
+                  AND expires_at > $2
+                "#,
+            )
+            .bind(&user_did)
+            .bind(now)
+            .fetch_one(&pool)
+            .await
+        } else {
+            // Multi-device mode: check key packages for THIS device only
+            sqlx::query_as(
+                r#"
+                SELECT COUNT(*) as count
+                FROM key_packages
+                WHERE owner_did = $1
+                  AND device_id = $2
+                  AND consumed_at IS NULL
+                  AND expires_at > $2
+                "#,
+            )
+            .bind(&user_did)
+            .bind(&device_id)
+            .bind(now)
+            .fetch_one(&pool)
+            .await
+        }
+        .map_err(|e| {
+            error!("Failed to verify recovery mode: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        if device_key_count.0 == 0 {
+            info!(
+                "🚨 Recovery mode VERIFIED for {} (device: {}) - device has 0 key packages",
+                user_did,
+                if device_id.is_empty() { "single" } else { &device_id }
+            );
+            true
+        } else {
+            warn!(
+                "⚠️ Recovery mode DENIED for {} (device: {}) - device has {} key packages (not 0)",
+                user_did,
+                if device_id.is_empty() { "single" } else { &device_id },
+                device_key_count.0
+            );
+            false
+        }
+    } else {
+        false
+    };
+
+    // Check 1: Total unconsumed key packages limit (skip in verified recovery mode)
     let unconsumed_count: (i64,) = sqlx::query_as(
         r#"
         SELECT COUNT(*) as count
@@ -111,7 +204,8 @@ pub async fn publish_key_packages(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    if unconsumed_count.0 >= MAX_UNCONSUMED_PER_USER {
+    // Skip limit check in verified recovery mode
+    if !recovery_verified && unconsumed_count.0 >= MAX_UNCONSUMED_PER_USER {
         warn!(
             "User {} has {} unconsumed key packages (limit: {})",
             did, unconsumed_count.0, MAX_UNCONSUMED_PER_USER
@@ -119,34 +213,36 @@ pub async fn publish_key_packages(
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 
-    // Check 2: Rate limiting - count uploads in the last hour
-    let rate_limit_window = now - chrono::Duration::hours(RATE_LIMIT_WINDOW_HOURS);
-    let recent_uploads: (i64,) = sqlx::query_as(
-        r#"
-        SELECT COUNT(*) as count
-        FROM key_packages
-        WHERE owner_did = $1
-          AND created_at > $2
-        "#,
-    )
-    .bind(&user_did)
-    .bind(rate_limit_window)
-    .fetch_one(&pool)
-    .await
-    .map_err(|e| {
-        error!("Failed to check rate limit: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    // Check 2: Rate limiting - count uploads in the last hour (skip in verified recovery mode)
+    if !recovery_verified {
+        let rate_limit_window = now - chrono::Duration::hours(RATE_LIMIT_WINDOW_HOURS);
+        let recent_uploads: (i64,) = sqlx::query_as(
+            r#"
+            SELECT COUNT(*) as count
+            FROM key_packages
+            WHERE owner_did = $1
+              AND created_at > $2
+            "#,
+        )
+        .bind(&user_did)
+        .bind(rate_limit_window)
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| {
+            error!("Failed to check rate limit: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
-    if recent_uploads.0 >= MAX_UPLOADS_PER_HOUR {
-        warn!(
-            "User {} exceeded rate limit: {} uploads in last hour (limit: {})",
-            did, recent_uploads.0, MAX_UPLOADS_PER_HOUR
-        );
-        return Err(StatusCode::TOO_MANY_REQUESTS);
+        if recent_uploads.0 >= MAX_UPLOADS_PER_HOUR {
+            warn!(
+                "User {} exceeded rate limit: {} uploads in last hour (limit: {})",
+                did, recent_uploads.0, MAX_UPLOADS_PER_HOUR
+            );
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
     }
 
-    // Check if this batch would exceed limits
+    // Check if this batch would exceed limits (still apply in recovery mode)
     if unconsumed_count.0 + input.key_packages.len() as i64 > MAX_UNCONSUMED_PER_USER {
         warn!(
             "Batch would exceed unconsumed limit for user {}: {} + {} > {}",

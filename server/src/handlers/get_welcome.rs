@@ -78,17 +78,17 @@ pub async fn get_welcome(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    // Query for unconsumed welcome message WITH KeyPackage validation
-    // We use user_did (not device_did) because welcome messages are stored per user
-    // Join with key_packages to validate the KeyPackage is still valid (not consumed, not expired)
-    // Note: key_packages.key_package_hash is TEXT (hex), welcome_messages.key_package_hash is BYTEA
+    // Query for unconsumed welcome message with basic KeyPackage existence validation.
+    // We use user_did (not device_did) because welcome messages are stored per user.
+    // NOTE: key_packages.key_package_hash is TEXT (hex), welcome_messages.key_package_hash is BYTEA.
+    // We intentionally do NOT require kp.consumed_at IS NULL here because key packages are
+    // consumed when the Welcome is created. Blocking on consumed_at makes every Welcome stale.
     let welcome_row = sqlx::query!(
         r#"
         SELECT
             wm.welcome_data,
             wm.key_package_hash,
-            kp.consumed_at as "kp_consumed_at?",
-            kp.expires_at as "kp_expires_at?"
+            kp.key_package_hash as "kp_hash?"
         FROM welcome_messages wm
         LEFT JOIN key_packages kp
             ON encode(wm.key_package_hash, 'hex') = kp.key_package_hash
@@ -97,7 +97,7 @@ pub async fn get_welcome(
           AND wm.consumed = false
           AND (
               wm.key_package_hash IS NULL
-              OR (kp.consumed_at IS NULL AND kp.expires_at > NOW())
+              OR kp.key_package_hash IS NOT NULL
           )
         ORDER BY wm.created_at DESC
         LIMIT 1
@@ -140,7 +140,7 @@ pub async fn get_welcome(
             })))
         }
         None => {
-            // Check if there's a Welcome with consumed KeyPackage
+            // Check if there's a Welcome tied to a missing KeyPackage (stale due to re-registration)
             let stale_welcome_exists = sqlx::query_scalar::<_, bool>(
                 r#"
                 SELECT EXISTS(
@@ -152,7 +152,7 @@ pub async fn get_welcome(
                       AND wm.convo_id = $2
                       AND wm.consumed = false
                       AND wm.key_package_hash IS NOT NULL
-                      AND (kp.consumed_at IS NOT NULL OR kp.expires_at <= NOW())
+                      AND kp.key_package_hash IS NULL
                 )
                 "#,
             )
