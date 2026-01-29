@@ -73,8 +73,7 @@
         },
         "sender": {
           "type": "string",
-          "format": "did",
-          "description": "DID of the member who created the commit"
+          "description": "DID of the member who created the commit (may include device fragment)"
         },
         "commitData": {
           "type": "bytes",

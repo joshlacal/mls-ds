@@ -26,6 +26,7 @@ pub struct CommitMessage {
     pub id: String,
     pub epoch: i64,
     #[serde(rename = "commitData")]
+    #[serde(with = "crate::atproto_bytes")]
     #[sqlx(rename = "ciphertext")]
     pub commit_data: Vec<u8>,
     #[serde(rename = "sender")]
