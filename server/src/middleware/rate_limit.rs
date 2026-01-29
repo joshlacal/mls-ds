@@ -197,6 +197,16 @@ fn get_endpoint_quota(endpoint: &str) -> (u32, Duration) {
         .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(100) // High frequency messaging
+    } else if endpoint_name.contains("getMessages") || endpoint_name.contains("getConvos") {
+        std::env::var("RATE_LIMIT_GET_MESSAGES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(500) // High frequency polling/sync operations
+    } else if endpoint_name.contains("updateReadState") || endpoint_name.contains("markRead") {
+        std::env::var("RATE_LIMIT_READ_STATE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300) // Read receipts called frequently
     } else if endpoint_name.contains("publishKeyPackage") {
         std::env::var("RATE_LIMIT_PUBLISH_KEY_PACKAGE")
             .ok()
