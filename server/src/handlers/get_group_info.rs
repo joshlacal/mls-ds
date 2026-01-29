@@ -5,6 +5,7 @@ use axum::{
 };
 use base64::Engine;
 use sqlx::FromRow;
+use tracing::{info, warn};
 
 use crate::{
     auth::AuthUser,
@@ -28,6 +29,19 @@ pub async fn handle(
     Query(params): Query<Parameters>,
 ) -> Result<Json<Output>, GetGroupInfoError> {
     let did = &auth.did;
+    let convo_id = &params.data.convo_id;
+
+    // =========================================================================
+    // AUTHORIZATION LOG: Track GroupInfo requests for audit
+    // =========================================================================
+    info!(
+        target: "mls_auth",
+        event = "group_info_request",
+        did = %did,
+        convo_id = %convo_id,
+        "🔐 [GROUP-INFO] Request by {} for conversation {}",
+        did, convo_id
+    );
 
     // 1. Check authorization: must be current member (not removed/left)
     // GroupInfo is for cryptographic resync, not for re-adding removed members
@@ -37,26 +51,56 @@ pub async fn handle(
          WHERE convo_id = $1 AND user_did = $2
          LIMIT 1",
     )
-    .bind(&params.data.convo_id)
+    .bind(convo_id)
     .bind(did)
     .fetch_optional(&pool)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let member = member_check.ok_or(Error::Unauthorized(Some(
-        "Not a member of this conversation".into(),
-    )))?;
+    let member = match member_check {
+        Some(m) => m,
+        None => {
+            warn!(
+                target: "mls_auth",
+                event = "group_info_rejected",
+                did = %did,
+                convo_id = %convo_id,
+                reason = "not_a_member",
+                "❌ [GROUP-INFO] Rejected: Not a member"
+            );
+            return Err(Error::Unauthorized(Some(
+                "Not a member of this conversation".into(),
+            ))
+            .into());
+        }
+    };
 
     // 2. Only current members can fetch GroupInfo (for external commits/resync)
     if member.left_at.is_some() {
+        warn!(
+            target: "mls_auth",
+            event = "group_info_rejected",
+            did = %did,
+            convo_id = %convo_id,
+            reason = "member_left",
+            "❌ [GROUP-INFO] Rejected: Member was removed/left"
+        );
         return Err(Error::Unauthorized(Some(
             "Member was removed or left. Request re-add from admin.".into(),
         ))
         .into());
     }
 
+    info!(
+        target: "mls_auth",
+        event = "group_info_authorized",
+        did = %did,
+        convo_id = %convo_id,
+        "✅ [GROUP-INFO] Authorized: Current member"
+    );
+
     // 3. Fetch cached GroupInfo
-    let cached = get_group_info(&pool, &params.data.convo_id)
+    let cached = get_group_info(&pool, convo_id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -68,7 +112,7 @@ pub async fn handle(
             // Regenerate fresh GroupInfo
             // Note: generate_and_cache_group_info is currently a placeholder that might fail
             // Clients should proactively refresh via publishGroupInfo before expiration
-            match generate_and_cache_group_info(&pool, &params.data.convo_id).await {
+            match generate_and_cache_group_info(&pool, convo_id).await {
                 Ok(fresh_info) => {
                     return Ok(Json(Output::from(OutputData {
                         group_info: base64::engine::general_purpose::STANDARD.encode(fresh_info),
@@ -93,7 +137,7 @@ pub async fn handle(
     }
 
     // If not found, try to generate it
-    let _fresh_info = generate_and_cache_group_info(&pool, &params.data.convo_id)
+    let _fresh_info = generate_and_cache_group_info(&pool, convo_id)
         .await
         .map_err(|_| {
             Error::GroupInfoUnavailable(Some(
@@ -102,7 +146,7 @@ pub async fn handle(
         })?;
 
     // Fetch again to get epoch
-    let cached_again = get_group_info(&pool, &params.data.convo_id)
+    let cached_again = get_group_info(&pool, convo_id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 

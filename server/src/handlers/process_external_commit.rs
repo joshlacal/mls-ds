@@ -138,14 +138,33 @@ pub async fn handle(
     let did = &auth.did;
     let convo_id = &input.convo_id;
 
-    info!("Processing external commit for {} in {}", did, convo_id);
+    // =========================================================================
+    // AUTHORIZATION LOG: Track all External Commit attempts for audit
+    // =========================================================================
+    info!(
+        target: "mls_auth",
+        event = "external_commit_attempt",
+        did = %did,
+        convo_id = %convo_id,
+        has_psk = input.psk.is_some(),
+        has_group_info = input.group_info.is_some(),
+        "🔐 [EXTERNAL-COMMIT] Attempt by {} for conversation {}",
+        did, convo_id
+    );
 
     // Enforce idempotency key
     let require_idem = std::env::var("REQUIRE_IDEMPOTENCY")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
         .unwrap_or(true);
     if require_idem && input.idempotency_key.is_none() {
-        warn!("❌ [process_external_commit] Missing idempotencyKey");
+        warn!(
+            target: "mls_auth",
+            event = "external_commit_rejected",
+            did = %did,
+            convo_id = %convo_id,
+            reason = "missing_idempotency_key",
+            "❌ [EXTERNAL-COMMIT] Rejected: Missing idempotencyKey"
+        );
         return Err(StatusCode::BAD_REQUEST.into());
     }
 
@@ -178,6 +197,14 @@ pub async fn handle(
 
     // Master switch: if external commits disabled entirely, reject immediately
     if !policy.allow_external_commits {
+        warn!(
+            target: "mls_auth",
+            event = "external_commit_rejected",
+            did = %did,
+            convo_id = %convo_id,
+            reason = "policy_disabled",
+            "❌ [EXTERNAL-COMMIT] Rejected: External commits disabled for conversation"
+        );
         return Err(Error::PolicyViolation(Some(
             "External commits are disabled for this conversation".into(),
         ))
@@ -214,23 +241,50 @@ pub async fn handle(
 
     // =========================================================================
     // STEP 3: Determine flow type and verify authorization
+    // INVARIANT: External Commit is for device-sync (same DID), not new users
     // =========================================================================
 
     let is_rejoin = match &member_check {
         Some(member) if member.left_at.is_none() => {
-            // Member exists and hasn't left
+            // Member exists and hasn't left - this is a DEVICE SYNC (new device for same DID)
+            info!(
+                target: "mls_auth",
+                event = "external_commit_authorized",
+                did = %did,
+                convo_id = %convo_id,
+                flow = "device_sync",
+                member_did = %member.member_did,
+                "✅ [EXTERNAL-COMMIT] Authorized: Same-DID device sync"
+            );
             true
         }
         Some(member) if member.left_at.is_some() => {
-            // Member left the group - treat as unauthorized
-            // (Rejoining after leaving is different from resyncing after desync)
+            // Member left the group - NOT authorized for external commit
+            warn!(
+                target: "mls_auth",
+                event = "external_commit_rejected",
+                did = %did,
+                convo_id = %convo_id,
+                reason = "member_left",
+                left_at = ?member.left_at,
+                "❌ [EXTERNAL-COMMIT] Rejected: Member was removed/left"
+            );
             return Err(Error::Unauthorized(Some(
                 "Member was removed or left. Request re-add from admin.".into(),
             ))
             .into());
         }
         None => {
-            // Not a member - this is a new join
+            // Not a member - check if new joins via external commit are allowed
+            // This is the "adding other users" case, which should use Welcome instead
+            warn!(
+                target: "mls_auth",
+                event = "external_commit_rejected",
+                did = %did,
+                convo_id = %convo_id,
+                reason = "not_a_member",
+                "❌ [EXTERNAL-COMMIT] Rejected: Not a member (use Welcome for new users)"
+            );
             false
         }
         _ => false,
@@ -573,8 +627,17 @@ pub async fn handle(
         }
     }
 
+    // =========================================================================
+    // SUCCESS LOG: External commit completed
+    // =========================================================================
     info!(
-        "External commit processed: {} -> epoch {}",
+        target: "mls_auth",
+        event = "external_commit_success",
+        did = %did,
+        convo_id = %convo_id,
+        new_epoch = new_epoch,
+        flow = if is_rejoin { "device_sync" } else { "new_join" },
+        "✅ [EXTERNAL-COMMIT] Success: {} -> epoch {}",
         convo_id, new_epoch
     );
 
