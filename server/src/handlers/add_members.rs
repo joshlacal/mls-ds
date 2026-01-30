@@ -722,40 +722,70 @@ pub async fn add_members(
                 );
             }
 
-            // Store the SAME Welcome for each new member
+            // Store the SAME Welcome for each new member (multi-device support)
             for target_did in &input.did_list {
                 let target_did_str = target_did.as_str();
-                let welcome_id = uuid::Uuid::new_v4().to_string();
 
-                // Get the key_package_hash for this member from the input
-                let key_package_hash = input.key_package_hashes.as_ref().and_then(|hashes| {
-                    hashes
-                        .iter()
-                        .find(|entry| entry.did.as_str() == target_did_str)
-                        .map(|entry| hex::decode(&entry.hash).ok())
-                        .flatten()
-                });
+                // Get ALL key_package_hashes for this member
+                let member_hashes: Vec<Vec<u8>> = input
+                    .key_package_hashes
+                    .as_ref()
+                    .map(|hashes| {
+                        hashes
+                            .iter()
+                            .filter(|entry| entry.did.as_str() == target_did_str)
+                            .filter_map(|entry| hex::decode(&entry.hash).ok())
+                            .collect()
+                    })
+                    .unwrap_or_default();
 
-                sqlx::query(
-                    "INSERT INTO welcome_messages (id, convo_id, recipient_did, welcome_data, key_package_hash, created_at)
-                     VALUES ($1, $2, $3, $4, $5, $6)
-                     ON CONFLICT (convo_id, recipient_did, COALESCE(key_package_hash, '\\x00'::bytea)) WHERE consumed = false
-                     DO NOTHING"
-                )
-                .bind(&welcome_id)
-                .bind(&input.convo_id)
-                .bind(target_did_str)
-                .bind(&welcome_data)
-                .bind::<Option<Vec<u8>>>(key_package_hash) // key_package_hash from client
-                .bind(&now)
-                .execute(&pool)
-                .await
-                .map_err(|e| {
-                    error!("❌ [add_members] Failed to store welcome message for {}: {}", target_did_str, e);
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?;
-
-                info!("✅ [add_members] Welcome stored for member");
+                if member_hashes.is_empty() {
+                    // Fallback for legacy/no-hash case (store one Welcome with NULL hash)
+                    let welcome_id = uuid::Uuid::new_v4().to_string();
+                    sqlx::query(
+                        "INSERT INTO welcome_messages (id, convo_id, recipient_did, welcome_data, key_package_hash, created_at)
+                         VALUES ($1, $2, $3, $4, $5, $6)
+                         ON CONFLICT (convo_id, recipient_did, COALESCE(key_package_hash, '\\x00'::bytea)) WHERE consumed = false
+                         DO NOTHING"
+                    )
+                    .bind(&welcome_id)
+                    .bind(&input.convo_id)
+                    .bind(target_did_str)
+                    .bind(&welcome_data)
+                    .bind::<Option<Vec<u8>>>(None)
+                    .bind(&now)
+                    .execute(&pool)
+                    .await
+                    .map_err(|e| {
+                        error!("❌ [add_members] Failed to store welcome message for {}: {}", target_did_str, e);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?;
+                    info!("✅ [add_members] Welcome stored for member (legacy/no-hash)");
+                } else {
+                    // Store Welcome for EACH device/hash
+                    for hash in member_hashes {
+                        let welcome_id = uuid::Uuid::new_v4().to_string();
+                        sqlx::query(
+                            "INSERT INTO welcome_messages (id, convo_id, recipient_did, welcome_data, key_package_hash, created_at)
+                             VALUES ($1, $2, $3, $4, $5, $6)
+                             ON CONFLICT (convo_id, recipient_did, COALESCE(key_package_hash, '\\x00'::bytea)) WHERE consumed = false
+                             DO NOTHING"
+                        )
+                        .bind(&welcome_id)
+                        .bind(&input.convo_id)
+                        .bind(target_did_str)
+                        .bind(&welcome_data)
+                        .bind(Some(hash))
+                        .bind(&now)
+                        .execute(&pool)
+                        .await
+                        .map_err(|e| {
+                            error!("❌ [add_members] Failed to store welcome message for {}: {}", target_did_str, e);
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        })?;
+                    }
+                    info!("✅ [add_members] Welcome stored for member (multi-device)");
+                }
             }
             info!(
                 "📍 [add_members] Stored Welcome for {} members",
