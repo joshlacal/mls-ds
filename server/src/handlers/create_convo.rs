@@ -504,40 +504,73 @@ pub async fn create_convo(
         );
 
         for member_did_str in all_member_dids.iter() {
-            let welcome_id = uuid::Uuid::new_v4().to_string();
+            // Get ALL key_package_hashes for this member
+            let member_hashes: Vec<Vec<u8>> = input
+                .key_package_hashes
+                .as_ref()
+                .map(|hashes| {
+                    hashes
+                        .iter()
+                        .filter(|entry| did_to_string(&entry.data.did) == *member_did_str)
+                        .filter_map(|entry| hex::decode(&entry.data.hash).ok())
+                        .collect()
+                })
+                .unwrap_or_default();
 
-            // Get the key_package_hash for this member from the input
-            let key_package_hash = input.key_package_hashes.as_ref().and_then(|hashes| {
-                hashes
-                    .iter()
-                    .find(|entry| did_to_string(&entry.data.did) == *member_did_str)
-                    .map(|entry| hex::decode(&entry.data.hash).ok())
-                    .flatten()
-            });
-
-            sqlx::query(
-                "INSERT INTO welcome_messages (id, convo_id, recipient_did, welcome_data, key_package_hash, created_at)
-                 VALUES ($1, $2, $3, $4, $5, $6)
-                 ON CONFLICT (convo_id, recipient_did, COALESCE(key_package_hash, '\\x00'::bytea)) WHERE consumed = false
-                 DO NOTHING"
-            )
-            .bind(&welcome_id)
-            .bind(&convo_id)
-            .bind(member_did_str)
-            .bind(&welcome_data)
-            .bind::<Option<Vec<u8>>>(key_package_hash) // key_package_hash from client
-            .bind(&now)
-            .execute(&pool)
-            .await
-            .map_err(|e| {
-                error!("❌ [create_convo] Failed to store welcome message for {}: {}", member_did_str, e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-
-            tracing::debug!(
-                "✅ [create_convo] welcome stored for member: {}",
-                member_did_str
-            );
+            if member_hashes.is_empty() {
+                let welcome_id = uuid::Uuid::new_v4().to_string();
+                // Legacy/Fallback: Store one welcome with NULL hash
+                sqlx::query(
+                    "INSERT INTO welcome_messages (id, convo_id, recipient_did, welcome_data, key_package_hash, created_at)
+                     VALUES ($1, $2, $3, $4, $5, $6)
+                     ON CONFLICT (convo_id, recipient_did, COALESCE(key_package_hash, '\\x00'::bytea)) WHERE consumed = false
+                     DO NOTHING"
+                )
+                .bind(&welcome_id)
+                .bind(&convo_id)
+                .bind(member_did_str)
+                .bind(&welcome_data)
+                .bind::<Option<Vec<u8>>>(None)
+                .bind(&now)
+                .execute(&pool)
+                .await
+                .map_err(|e| {
+                    error!("❌ [create_convo] Failed to store welcome message for {}: {}", member_did_str, e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+                
+                tracing::debug!(
+                    "✅ [create_convo] welcome stored for member (legacy): {}",
+                    member_did_str
+                );
+            } else {
+                // Multi-device: Store welcome for EACH hash
+                for hash in member_hashes {
+                    let welcome_id = uuid::Uuid::new_v4().to_string();
+                    sqlx::query(
+                        "INSERT INTO welcome_messages (id, convo_id, recipient_did, welcome_data, key_package_hash, created_at)
+                         VALUES ($1, $2, $3, $4, $5, $6)
+                         ON CONFLICT (convo_id, recipient_did, COALESCE(key_package_hash, '\\x00'::bytea)) WHERE consumed = false
+                         DO NOTHING"
+                    )
+                    .bind(&welcome_id)
+                    .bind(&convo_id)
+                    .bind(member_did_str)
+                    .bind(&welcome_data)
+                    .bind(Some(hash))
+                    .bind(&now)
+                    .execute(&pool)
+                    .await
+                    .map_err(|e| {
+                        error!("❌ [create_convo] Failed to store welcome message for {}: {}", member_did_str, e);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?;
+                }
+                tracing::debug!(
+                    "✅ [create_convo] welcome stored for member (multi-device): {}",
+                    member_did_str
+                );
+            }
         }
         tracing::debug!(
             "📍 [create_convo] stored welcome for {} members",
