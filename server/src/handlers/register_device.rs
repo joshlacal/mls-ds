@@ -74,19 +74,27 @@ pub async fn register_device(
         StatusCode::BAD_REQUEST
     })?;
 
+    // Sanitize device name: remove control characters, null bytes, and ANSI escape sequences
+    // to prevent injection attacks in UI/SSE rendering
+    let sanitized_device_name: String = input
+        .device_name
+        .chars()
+        .filter(|c| {
+            // Allow printable ASCII, common Unicode letters/numbers, and basic punctuation
+            // Reject control characters (0x00-0x1F, 0x7F), and format characters
+            !c.is_control() && *c != '\u{FEFF}' && *c != '\u{200B}'
+        })
+        .take(100) // Enforce max length during sanitization
+        .collect();
+
     // Validate device name
-    if input.device_name.trim().is_empty() {
-        warn!("Empty device name provided");
+    if sanitized_device_name.trim().is_empty() {
+        warn!("Empty device name provided after sanitization");
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    if input.device_name.len() > 100 {
-        warn!(
-            "Device name too long: {} characters",
-            input.device_name.len()
-        );
-        return Err(StatusCode::BAD_REQUEST);
-    }
+    // Use sanitized name for all subsequent operations
+    let device_name = sanitized_device_name;
 
     // Validate signature public key
     if input.signature_public_key.len() != 32 {
@@ -226,7 +234,7 @@ pub async fn register_device(
                 WHERE id = $7
                 "#,
                 device_id,
-                input.device_name,
+                device_name,
                 mls_did,
                 sig_key_hex,
                 now,
@@ -336,7 +344,7 @@ pub async fn register_device(
                 WHERE id = $7
                 "#,
                 device_id,
-                input.device_name,
+                device_name,
                 mls_did,
                 input.device_uuid.as_deref(),
                 now,
@@ -360,7 +368,7 @@ pub async fn register_device(
 
     info!(
         "Registering device for user {}: {} ({}) [re-registration: {}]",
-        user_did, device_id, input.device_name, is_reregistration
+        user_did, device_id, device_name, is_reregistration
     );
 
     // Only insert new device if this is NOT a re-registration
@@ -399,7 +407,7 @@ pub async fn register_device(
             db_device_id,
             user_did,
             device_id,
-            input.device_name,
+            device_name,
             mls_did,
             sig_key_hex,
             input.device_uuid.as_deref(),
@@ -495,7 +503,7 @@ pub async fn register_device(
 
     // Create pending device additions for all conversations (for automatic multi-device sync)
     // This allows other online members to proactively add this device to conversations
-    let device_name_clone = input.device_name.clone();
+    let device_name_clone = device_name.clone();
     let mls_did_clone = mls_did.clone();
     let device_id_clone = device_id.clone();
 
