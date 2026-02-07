@@ -55,7 +55,10 @@ pub async fn delete_device(
     let (owner_did, credential_did) = match device_info {
         Some(info) => info,
         None => {
-            warn!("Device not found: {} (treating as success)", input.device_id);
+            warn!(
+                "Device not found: {} (treating as success)",
+                input.device_id
+            );
             return Ok(Json(DeleteDeviceOutput {
                 deleted: false,
                 key_packages_deleted: 0,

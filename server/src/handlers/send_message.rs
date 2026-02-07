@@ -3,10 +3,10 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use sqlx::{Postgres, QueryBuilder};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use tracing::{error, info};
-use sqlx::{QueryBuilder, Postgres};
 
 use crate::{
     actors::{ActorRegistry, ConvoMessage},
@@ -139,9 +139,8 @@ pub async fn send_message(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    tracing::debug!("📍 [send_message] checking epoch telemetry");
-    // Fetch conversation for epoch telemetry (non-blocking)
-    // Note: Server does NOT enforce epoch - clients are authoritative for MLS state
+    tracing::debug!("📍 [send_message] validating epoch");
+    // Fetch conversation and enforce epoch ordering for app messages.
     let convo = sqlx::query_as::<_, crate::models::Conversation>(
         "SELECT id, creator_did, current_epoch, created_at, updated_at, name, cipher_suite FROM conversations WHERE id = $1"
     )
@@ -153,50 +152,30 @@ pub async fn send_message(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    // Epoch telemetry (mailbox-only, not authoritative)
+    // Server-enforced epoch gate: app messages must match current conversation epoch.
     let client_epoch = input.epoch as i64;
     let server_epoch = convo.current_epoch as i64;
 
     if client_epoch != server_epoch {
-        // Log suspicious patterns
         if client_epoch < server_epoch {
             tracing::warn!(
                 target: "mls_epoch",
                 convo_id = %crate::crypto::redact_for_log(&input.convo_id),
-                server_last_seen = server_epoch,
-                client_reports = client_epoch,
-                "client reported epoch behind last_reported_epoch; device may be out-of-date or restored"
+                server_epoch = server_epoch,
+                client_epoch = client_epoch,
+                "rejecting app message with stale epoch"
             );
-        } else if client_epoch > server_epoch + 50 {
+        } else {
             tracing::warn!(
                 target: "mls_epoch",
                 convo_id = %crate::crypto::redact_for_log(&input.convo_id),
-                server_last_seen = server_epoch,
-                client_reports = client_epoch,
-                jump = client_epoch - server_epoch,
-                "client reported large epoch jump; investigate MLS client state"
-            );
-        } else {
-            // Normal mismatch (client ahead by small amount)
-            tracing::info!(
-                target: "mls_epoch",
-                convo_id = %crate::crypto::redact_for_log(&input.convo_id),
-                server_last_seen = server_epoch,
-                client_reports = client_epoch,
-                "send_message epoch telemetry mismatch (server is mailbox-only, not authoritative)"
+                server_epoch = server_epoch,
+                client_epoch = client_epoch,
+                "rejecting app message with future epoch"
             );
         }
-    }
 
-    // Update server's last-seen epoch for telemetry (best-effort, non-blocking)
-    if client_epoch as i32 > convo.current_epoch {
-        let _ = sqlx::query(
-            "UPDATE conversations SET current_epoch = GREATEST(current_epoch, $1) WHERE id = $2",
-        )
-        .bind(client_epoch as i32)
-        .bind(&input.convo_id)
-        .execute(&pool)
-        .await; // Ignore errors - this is telemetry only
+        return Err(StatusCode::CONFLICT);
     }
 
     // Check if actor system is enabled
@@ -339,8 +318,8 @@ pub async fn send_message(
         let sender_did_clone = auth_user.did.clone();
         let ciphertext_for_sse = input.ciphertext.clone();
         let epoch_for_sse = input.epoch;
-        let seq_for_push = seq;  // Clone seq for push notification
-        let epoch_for_push = epoch;  // Clone epoch for push notification
+        let seq_for_push = seq; // Clone seq for push notification
+        let epoch_for_push = epoch; // Clone epoch for push notification
 
         tokio::spawn(async move {
             let fanout_start = std::time::Instant::now();
@@ -374,20 +353,21 @@ pub async fn send_message(
                             );
 
                             let now = chrono::Utc::now();
-                            
+
                             // Note: push_values automatically creates the VALUES (...), (...), ... clause
                             query_builder.push_values(members.iter(), |mut b, member| {
                                 b.push_bind(uuid::Uuid::new_v4().to_string())
-                                 .push_bind(&convo_id)
-                                 .push_bind(&member.member_did)
-                                 .push_bind(&msg_id_clone)
-                                 .push_bind(now);
+                                    .push_bind(&convo_id)
+                                    .push_bind(&member.member_did)
+                                    .push_bind(&msg_id_clone)
+                                    .push_bind(now);
                             });
 
-                            query_builder.push(" ON CONFLICT (recipient_did, message_id) DO NOTHING");
+                            query_builder
+                                .push(" ON CONFLICT (recipient_did, message_id) DO NOTHING");
 
                             let query = query_builder.build();
-                            
+
                             if let Err(e) = query.execute(&pool_clone).await {
                                 error!(
                                     "❌ [send_message:fanout] Failed to bulk insert envelopes: {:?}", 
@@ -395,7 +375,7 @@ pub async fn send_message(
                                 );
                             } else {
                                 tracing::debug!(
-                                    "✅ [send_message:fanout] Bulk inserted {} envelopes", 
+                                    "✅ [send_message:fanout] Bulk inserted {} envelopes",
                                     members.len()
                                 );
                             }
@@ -424,15 +404,16 @@ pub async fn send_message(
 
             if is_ephemeral {
                 // For ephemeral messages, construct MessageView directly without DB fetch
-                let message_view = crate::models::MessageView::from(crate::models::MessageViewData {
-                    id: msg_id_clone.clone(),
-                    convo_id: convo_id.clone(),
-                    ciphertext: ciphertext_for_sse,
-                    epoch: epoch_for_sse,
-                    seq: 0, // Ephemeral messages don't have a seq
-                    created_at: crate::sqlx_atrium::chrono_to_datetime(chrono::Utc::now()),
-                    message_type: None,
-                });
+                let message_view =
+                    crate::models::MessageView::from(crate::models::MessageViewData {
+                        id: msg_id_clone.clone(),
+                        convo_id: convo_id.clone(),
+                        ciphertext: ciphertext_for_sse,
+                        epoch: epoch_for_sse,
+                        seq: 0, // Ephemeral messages don't have a seq
+                        created_at: crate::sqlx_atrium::chrono_to_datetime(chrono::Utc::now()),
+                        message_type: None,
+                    });
 
                 let event = StreamEvent::MessageEvent {
                     cursor: cursor.clone(),
@@ -518,13 +499,16 @@ pub async fn send_message(
                             &convo_id,
                             &msg_id_clone,
                             &ciphertext_clone,
-                            &sender_did_clone,  // Use original clone safely inside spawn
+                            &sender_did_clone, // Use original clone safely inside spawn
                             seq_for_push,
                             epoch_for_push,
                         )
                         .await
                     {
-                        error!("❌ [send_message:push] Failed to send push notifications: {}", e);
+                        error!(
+                            "❌ [send_message:push] Failed to send push notifications: {}",
+                            e
+                        );
                     }
                 }
             }

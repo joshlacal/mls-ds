@@ -538,7 +538,7 @@ pub async fn create_convo(
                     error!("❌ [create_convo] Failed to store welcome message for {}: {}", member_did_str, e);
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
-                
+
                 tracing::debug!(
                     "✅ [create_convo] welcome stored for member (legacy): {}",
                     member_did_str

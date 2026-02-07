@@ -55,9 +55,12 @@ impl ConnectionTracker {
     /// Try to acquire a connection slot for a user
     /// Returns true if successful, false if limit exceeded
     pub fn try_acquire(&self, user_did: &str) -> bool {
-        let entry = self.connections.entry(user_did.to_string()).or_insert_with(|| AtomicUsize::new(0));
+        let entry = self
+            .connections
+            .entry(user_did.to_string())
+            .or_insert_with(|| AtomicUsize::new(0));
         let current = entry.fetch_add(1, Ordering::SeqCst);
-        
+
         if current >= MAX_CONNECTIONS_PER_USER {
             // Undo the increment
             entry.fetch_sub(1, Ordering::SeqCst);
@@ -70,7 +73,9 @@ impl ConnectionTracker {
     pub fn release(&self, user_did: &str) {
         // Use entry API to acquire write lock immediately, avoiding
         // read-lock -> write-lock deadlock in DashMap
-        if let dashmap::mapref::entry::Entry::Occupied(entry) = self.connections.entry(user_did.to_string()) {
+        if let dashmap::mapref::entry::Entry::Occupied(entry) =
+            self.connections.entry(user_did.to_string())
+        {
             let prev = entry.get().fetch_sub(1, Ordering::SeqCst);
             // Clean up entry if no connections remain
             if prev <= 1 {
@@ -81,7 +86,8 @@ impl ConnectionTracker {
 
     /// Get current connection count for a user
     pub fn count(&self, user_did: &str) -> usize {
-        self.connections.get(user_did)
+        self.connections
+            .get(user_did)
             .map(|c| c.load(Ordering::SeqCst))
             .unwrap_or(0)
     }
@@ -222,7 +228,15 @@ pub async fn subscribe_convo_events(
 
     // Upgrade to WebSocket
     Ok(ws.on_upgrade(move |socket| async move {
-        handle_socket(socket, pool_clone, sse_state, user_did_clone.clone(), convo_id, query.cursor).await;
+        handle_socket(
+            socket,
+            pool_clone,
+            sse_state,
+            user_did_clone.clone(),
+            convo_id,
+            query.cursor,
+        )
+        .await;
         // Release connection slot when done
         CONNECTION_TRACKER.release(&user_did_clone);
     }))
@@ -267,7 +281,10 @@ async fn handle_socket(
                         for (event, event_cursor) in events {
                             seq += 1;
                             let mut sender_guard = sender.lock().await;
-                            if let Err(e) = send_event(&mut *sender_guard, &event, seq, Some(&event_cursor)).await {
+                            if let Err(e) =
+                                send_event(&mut *sender_guard, &event, seq, Some(&event_cursor))
+                                    .await
+                            {
                                 error!("Failed to send backfill event: {}", e);
                                 return;
                             }
@@ -283,8 +300,11 @@ async fn handle_socket(
         }
     } else {
         // Global/Multiplexed mode - subscribe to ALL user conversations
-        info!("Initializing global subscription for user {}", crate::crypto::redact_for_log(&user_did));
-        
+        info!(
+            "Initializing global subscription for user {}",
+            crate::crypto::redact_for_log(&user_did)
+        );
+
         match crate::db::list_conversations(&pool, &user_did, 1000, 0).await {
             Ok(convos) => {
                 info!("Subscribing to {} conversations", convos.len());
@@ -297,7 +317,12 @@ async fn handle_socket(
             Err(e) => {
                 error!("Failed to list conversations for global sub: {}", e);
                 let mut sender_guard = sender.lock().await;
-                let _ = send_error(&mut *sender_guard, "InternalError", Some("Failed to list conversations")).await;
+                let _ = send_error(
+                    &mut *sender_guard,
+                    "InternalError",
+                    Some("Failed to list conversations"),
+                )
+                .await;
                 return;
             }
         }
@@ -312,7 +337,10 @@ async fn handle_socket(
     let client_handler = tokio::spawn(async move {
         while let Some(msg) = client_msg_rx.recv().await {
             match msg {
-                ClientMessage::Typing { convo_id, is_typing } => {
+                ClientMessage::Typing {
+                    convo_id,
+                    is_typing,
+                } => {
                     debug!(
                         user = %crate::crypto::redact_for_log(&user_did_clone),
                         convo = %crate::crypto::redact_for_log(&convo_id),
@@ -349,7 +377,7 @@ async fn handle_socket(
             match event_result {
                 Ok(event) => {
                     seq += 1;
-                    
+
                     // Extract cursor from event
                     let event_cursor = match &event {
                         StreamEvent::MessageEvent { cursor, .. } => cursor.clone(),
@@ -362,24 +390,26 @@ async fn handle_socket(
                         StreamEvent::MembershipChangeEvent { cursor, .. } => cursor.clone(),
                         StreamEvent::ReadEvent { cursor, .. } => cursor.clone(),
                     };
-                    
+
                     // Filter logic (only for single-convo mode generally, but applied here too)
                     if let Some(ref resume_cur) = resume_cursor_clone {
                         if event_cursor <= *resume_cur {
                             continue;
                         }
                     }
-                    
+
                     // Convert StreamEvent to WebSocket message
                     let mut sender_guard = sender_clone.lock().await;
-                    if let Err(e) = send_event(&mut *sender_guard, &event, seq, Some(&event_cursor)).await {
+                    if let Err(e) =
+                        send_event(&mut *sender_guard, &event, seq, Some(&event_cursor)).await
+                    {
                         error!("Failed to send event for {}: {}", convo_id, e);
                         break;
                     }
                 }
                 Err(_lagged) => {
-                     // BroadcastStream handles Lagged by returning error, we should log and continue
-                     warn!("Slow consumer lagged for conversation {}", convo_id);
+                    // BroadcastStream handles Lagged by returning error, we should log and continue
+                    warn!("Slow consumer lagged for conversation {}", convo_id);
                 }
             }
         }
@@ -435,7 +465,11 @@ async fn handle_socket(
         loop {
             interval.tick().await;
             let mut sender_guard = sender_heartbeat.lock().await;
-            if sender_guard.send(Message::Ping(vec![].into())).await.is_err() {
+            if sender_guard
+                .send(Message::Ping(vec![].into()))
+                .await
+                .is_err()
+            {
                 debug!("Heartbeat ping failed - connection likely closed");
                 break;
             }
@@ -505,9 +539,8 @@ fn parse_client_message(data: &[u8]) -> Result<ClientMessage, String> {
     // Client messages are single DAG-CBOR objects (no header+payload like server messages)
     let value: serde_json::Value = serde_ipld_dagcbor::from_slice(data)
         .map_err(|e| format!("Failed to decode CBOR: {}", e))?;
-    
-    serde_json::from_value(value)
-        .map_err(|e| format!("Failed to parse client message: {}", e))
+
+    serde_json::from_value(value).map_err(|e| format!("Failed to parse client message: {}", e))
 }
 
 // MARK: - Event Sending
@@ -539,9 +572,9 @@ async fn send_event(
     };
 
     // Serialize event - it already contains cursor field from StreamEvent
-    let mut payload = serde_json::to_value(event)
-        .map_err(|e| format!("Failed to serialize event: {}", e))?;
-    
+    let mut payload =
+        serde_json::to_value(event).map_err(|e| format!("Failed to serialize event: {}", e))?;
+
     // Add seq for WebSocket-specific ordering
     if let Some(obj) = payload.as_object_mut() {
         obj.insert("seq".to_string(), serde_json::json!(seq));
@@ -578,10 +611,7 @@ async fn send_error(
     error: &str,
     message: Option<&str>,
 ) -> Result<(), String> {
-    let header = MessageHeader {
-        op: -1,
-        t: None,
-    };
+    let header = MessageHeader { op: -1, t: None };
 
     let payload = ErrorPayload {
         error: error.to_string(),
@@ -644,9 +674,12 @@ mod tests {
         };
         let cbor = serde_ipld_dagcbor::to_vec(&serde_json::to_value(&msg).unwrap()).unwrap();
         let parsed = parse_client_message(&cbor).unwrap();
-        
+
         match parsed {
-            ClientMessage::Typing { convo_id, is_typing } => {
+            ClientMessage::Typing {
+                convo_id,
+                is_typing,
+            } => {
                 assert_eq!(convo_id, "convo123");
                 assert!(is_typing);
             }

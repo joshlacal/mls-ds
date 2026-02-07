@@ -184,6 +184,35 @@ pub async fn update_conversation_epoch(
     Ok(())
 }
 
+/// Atomically advance a conversation epoch by one when the expected epoch matches.
+///
+/// Returns `Ok(Some(new_epoch))` on success, `Ok(None)` when the conversation epoch no
+/// longer matches `expected_epoch` (concurrent commit won), or an error for DB failures.
+pub async fn try_advance_conversation_epoch_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    convo_id: &str,
+    expected_epoch: i32,
+) -> Result<Option<i32>> {
+    let advanced_epoch = sqlx::query_scalar::<_, i32>(
+        r#"
+        UPDATE conversations
+        SET current_epoch = current_epoch + 1,
+            updated_at = $1
+        WHERE id = $2
+          AND current_epoch = $3
+        RETURNING current_epoch
+        "#,
+    )
+    .bind(Utc::now())
+    .bind(convo_id)
+    .bind(expected_epoch)
+    .fetch_optional(&mut **tx)
+    .await
+    .context("Failed to advance conversation epoch")?;
+
+    Ok(advanced_epoch)
+}
+
 /// Get current epoch for a conversation
 pub async fn get_current_epoch(pool: &DbPool, convo_id: &str) -> Result<i32> {
     let epoch =
@@ -812,67 +841,72 @@ pub async fn store_key_package_with_device(
         .await
         .context("Key package validation limiter closed")?;
 
-    let mut parse_task =
-        tokio::task::spawn_blocking(move || -> Result<(String, String)> {
-            // Compute MLS-compliant hash_ref using OpenMLS
-            use openmls::prelude::tls_codec::Deserialize;
-            use openmls::prelude::{KeyPackageIn, ProtocolVersion};
+    let mut parse_task = tokio::task::spawn_blocking(move || -> Result<(String, String)> {
+        // Compute MLS-compliant hash_ref using OpenMLS
+        use openmls::prelude::tls_codec::Deserialize;
+        use openmls::prelude::{KeyPackageIn, ProtocolVersion};
 
-            // Create crypto provider (RustCrypto implements OpenMlsCrypto)
-            let provider = openmls_rust_crypto::RustCrypto::default();
+        // Create crypto provider (RustCrypto implements OpenMlsCrypto)
+        let provider = openmls_rust_crypto::RustCrypto::default();
 
-            // Deserialize and validate the key package
-            let kp_in = KeyPackageIn::tls_deserialize(&mut key_data_for_parse.as_slice())
-                .context("Failed to deserialize key package")?;
-            let kp = kp_in
-                .validate(&provider, ProtocolVersion::default())
-                .context("Failed to validate key package")?;
+        // Deserialize and validate the key package
+        let kp_in = KeyPackageIn::tls_deserialize(&mut key_data_for_parse.as_slice())
+            .context("Failed to deserialize key package")?;
+        let kp = kp_in
+            .validate(&provider, ProtocolVersion::default())
+            .context("Failed to validate key package")?;
 
-            // Extract and validate credential identity
-            let credential = kp.leaf_node().credential();
-            let credential_identity = match credential.credential_type() {
-                openmls::credentials::CredentialType::Basic => {
-                    // Extract identity bytes from BasicCredential
-                    let identity_bytes = credential.serialized_content();
-                    String::from_utf8(identity_bytes.to_vec())
-                        .context("Credential identity is not valid UTF-8")?
-                }
-                _ => {
-                    bail!("Only BasicCredential is supported");
-                }
-            };
-
-            // Validate that credential identity is the bare DID (owner_did)
-            // This enforces the "bare DID only" policy - no device DIDs allowed in MLS credentials
-            if credential_identity != did_owned {
-                bail!(
-                    "KeyPackage credential identity must be the bare user DID ({}), got {} instead. \
-                     Device DIDs (with #device-id) are not allowed in MLS credentials.",
-                    did_owned,
-                    credential_identity
-                );
+        // Extract and validate credential identity
+        let credential = kp.leaf_node().credential();
+        let credential_identity = match credential.credential_type() {
+            openmls::credentials::CredentialType::Basic => {
+                // Extract identity bytes from BasicCredential
+                let identity_bytes = credential.serialized_content();
+                String::from_utf8(identity_bytes.to_vec())
+                    .context("Credential identity is not valid UTF-8")?
             }
-
-            // Compute the MLS-defined hash reference
-            let hash_ref = kp
-                .hash_ref(&provider)
-                .context("Failed to compute hash_ref")?;
-            let key_package_hash = hex::encode(hash_ref.as_slice());
-
-            Ok((key_package_hash, credential_identity))
-        });
-
-    let (key_package_hash, credential_identity) =
-        match tokio::time::timeout(Duration::from_secs(parse_timeout_secs), &mut parse_task).await
-        {
-            Ok(join_result) => join_result
-                .context("Key package validation task failed")?
-                .context("Key package validation error")?,
-            Err(_) => {
-                parse_task.abort();
-                bail!("Key package validation timed out after {}s", parse_timeout_secs);
+            _ => {
+                bail!("Only BasicCredential is supported");
             }
         };
+
+        // Validate that credential identity is the bare DID (owner_did)
+        // This enforces the "bare DID only" policy - no device DIDs allowed in MLS credentials
+        if credential_identity != did_owned {
+            bail!(
+                "KeyPackage credential identity must be the bare user DID ({}), got {} instead. \
+                     Device DIDs (with #device-id) are not allowed in MLS credentials.",
+                did_owned,
+                credential_identity
+            );
+        }
+
+        // Compute the MLS-defined hash reference
+        let hash_ref = kp
+            .hash_ref(&provider)
+            .context("Failed to compute hash_ref")?;
+        let key_package_hash = hex::encode(hash_ref.as_slice());
+
+        Ok((key_package_hash, credential_identity))
+    });
+
+    let (key_package_hash, credential_identity) = match tokio::time::timeout(
+        Duration::from_secs(parse_timeout_secs),
+        &mut parse_task,
+    )
+    .await
+    {
+        Ok(join_result) => join_result
+            .context("Key package validation task failed")?
+            .context("Key package validation error")?,
+        Err(_) => {
+            parse_task.abort();
+            bail!(
+                "Key package validation timed out after {}s",
+                parse_timeout_secs
+            );
+        }
+    };
 
     // Store with the verified credential identity (not the client-provided one)
     let result = sqlx::query_as::<_, KeyPackage>(

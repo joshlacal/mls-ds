@@ -429,7 +429,6 @@ pub async fn handle(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let new_epoch = current_epoch + 1;
     let now = chrono::Utc::now();
 
     // Decode GroupInfo if present
@@ -448,6 +447,21 @@ pub async fn handle(
         error!("Failed to start transaction: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+
+    let new_epoch = crate::db::try_advance_conversation_epoch_tx(&mut tx, convo_id, current_epoch)
+        .await
+        .map_err(|e| {
+            error!("Failed to advance conversation epoch: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or_else(|| {
+            warn!(
+                "❌ [process_external_commit] Epoch conflict for convo {}: expected {}",
+                crate::crypto::redact_for_log(convo_id),
+                current_epoch
+            );
+            StatusCode::CONFLICT
+        })?;
 
     // Insert commit message
     let msg_id = uuid::Uuid::new_v4().to_string();
@@ -478,17 +492,6 @@ pub async fn handle(
         error!("Failed to insert commit message: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-
-    // Update conversation epoch
-    sqlx::query("UPDATE conversations SET current_epoch = $1 WHERE id = $2")
-        .bind(new_epoch)
-        .bind(convo_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| {
-            error!("Failed to update conversation epoch: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
 
     // Update GroupInfo if provided
     if let Some(gi_bytes) = group_info_bytes {

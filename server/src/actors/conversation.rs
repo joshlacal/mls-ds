@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use ractor::{Actor, ActorProcessingErr, ActorRef};
 use sqlx::PgPool;
 use std::{collections::HashMap, sync::Arc};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use super::messages::{ConvoMessage, KeyPackageHashEntry};
 use crate::notifications::NotificationService;
@@ -116,7 +116,10 @@ impl Actor for ConversationActor {
         let convo_id = args.convo_id.clone();
 
         tokio::spawn(async move {
-            info!("🔄 [actor:worker] Background worker started for {}", convo_id);
+            info!(
+                "🔄 [actor:worker] Background worker started for {}",
+                convo_id
+            );
             while let Some(job) = rx.recv().await {
                 match job {
                     SideEffectJob::NotifyNewMessage {
@@ -146,7 +149,10 @@ impl Actor for ConversationActor {
                         msg_id,
                         message_type,
                     } => {
-                        debug!("🔄 [actor:worker] Processing NotifySystemMessage: {}", msg_id);
+                        debug!(
+                            "🔄 [actor:worker] Processing NotifySystemMessage: {}",
+                            msg_id
+                        );
                         // Reuse similar logic or dedicated handler for system messages
                         // For commits, we mostly need envelopes + SSE
                         handle_notify_system_message(
@@ -160,7 +166,10 @@ impl Actor for ConversationActor {
                     }
                 }
             }
-            info!("🔄 [actor:worker] Background worker stopped for {}", convo_id);
+            info!(
+                "🔄 [actor:worker] Background worker stopped for {}",
+                convo_id
+            );
         });
 
         Ok(ConversationActorState {
@@ -308,7 +317,7 @@ impl ConversationActorState {
             self.convo_id
         );
 
-        let new_epoch = self.current_epoch + 1;
+        let mut new_epoch = self.current_epoch;
         let now = chrono::Utc::now();
 
         // Begin transaction for atomicity
@@ -321,6 +330,20 @@ impl ConversationActorState {
         // Process commit if provided (capture msg_id for later fanout)
         let commit_msg_id = if let Some(commit_bytes) = commit {
             let msg_id = uuid::Uuid::new_v4().to_string();
+            let advanced_epoch = crate::db::try_advance_conversation_epoch_tx(
+                &mut tx,
+                &self.convo_id,
+                self.current_epoch as i32,
+            )
+            .await
+            .context("Failed to advance conversation epoch")?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Epoch conflict for convo {}: expected {}",
+                    self.convo_id,
+                    self.current_epoch
+                )
+            })?;
 
             // Calculate sequence number
             let seq: i64 = sqlx::query_scalar(
@@ -338,13 +361,14 @@ impl ConversationActorState {
             .bind(&msg_id)
             .bind(&self.convo_id)
             .bind("system") // Commit messages are system-generated
-            .bind(new_epoch as i32)
+            .bind(advanced_epoch)
             .bind(seq)
             .bind(&commit_bytes)
             .bind(&now)
             .execute(&mut *tx)
             .await
             .context("Failed to insert commit message")?;
+            new_epoch = advanced_epoch as u32;
 
             info!(
                 "✅ [actor:add_members] Commit message stored with seq={}, epoch={}",
@@ -352,16 +376,12 @@ impl ConversationActorState {
             );
             Some(msg_id)
         } else {
+            warn!(
+                "⚠️ [actor:add_members] add_members without commit; epoch unchanged for {}",
+                self.convo_id
+            );
             None
         };
-
-        // Update conversation epoch
-        sqlx::query("UPDATE conversations SET current_epoch = $1 WHERE id = $2")
-            .bind(new_epoch as i32)
-            .bind(&self.convo_id)
-            .execute(&mut *tx)
-            .await
-            .context("Failed to update conversation epoch")?;
 
         // Add new members
         for target_did in &did_list {
@@ -449,10 +469,12 @@ impl ConversationActorState {
         // Send side effect job for fan-out (envelopes + SSE)
         // We use a simplified job for system messages (commits)
         if let Some(msg_id) = commit_msg_id {
-            let _ = self.side_effect_tx.try_send(SideEffectJob::NotifySystemMessage {
-                msg_id,
-                message_type: "commit".to_string(),
-            });
+            let _ = self
+                .side_effect_tx
+                .try_send(SideEffectJob::NotifySystemMessage {
+                    msg_id,
+                    message_type: "commit".to_string(),
+                });
         }
 
         // Update local epoch state
@@ -498,7 +520,7 @@ impl ConversationActorState {
             member_did, self.convo_id
         );
 
-        let new_epoch = self.current_epoch + 1;
+        let mut new_epoch = self.current_epoch;
         let now = chrono::Utc::now();
 
         // Begin transaction for atomicity
@@ -511,6 +533,20 @@ impl ConversationActorState {
         // Process commit if provided (capture msg_id for later fanout)
         let commit_msg_id = if let Some(commit_bytes) = commit {
             let msg_id = uuid::Uuid::new_v4().to_string();
+            let advanced_epoch = crate::db::try_advance_conversation_epoch_tx(
+                &mut tx,
+                &self.convo_id,
+                self.current_epoch as i32,
+            )
+            .await
+            .context("Failed to advance conversation epoch")?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Epoch conflict for convo {}: expected {}",
+                    self.convo_id,
+                    self.current_epoch
+                )
+            })?;
 
             // Calculate sequence number
             let seq: i64 = sqlx::query_scalar(
@@ -528,13 +564,14 @@ impl ConversationActorState {
             .bind(&msg_id)
             .bind(&self.convo_id)
             .bind(&member_did)
-            .bind(new_epoch as i32)
+            .bind(advanced_epoch)
             .bind(seq)
             .bind(&commit_bytes)
             .bind(&now)
             .execute(&mut *tx)
             .await
             .context("Failed to insert commit message")?;
+            new_epoch = advanced_epoch as u32;
 
             info!(
                 "✅ [actor:remove_member] Commit message stored with seq={}, epoch={}",
@@ -542,16 +579,12 @@ impl ConversationActorState {
             );
             Some(msg_id)
         } else {
+            warn!(
+                "⚠️ [actor:remove_member] remove_member without commit; epoch unchanged for {}",
+                self.convo_id
+            );
             None
         };
-
-        // Update conversation epoch
-        sqlx::query("UPDATE conversations SET current_epoch = $1 WHERE id = $2")
-            .bind(new_epoch as i32)
-            .bind(&self.convo_id)
-            .execute(&mut *tx)
-            .await
-            .context("Failed to update conversation epoch")?;
 
         // Mark member as left (soft delete with left_at timestamp)
         sqlx::query("UPDATE members SET left_at = $1 WHERE convo_id = $2 AND member_did = $3")
@@ -568,10 +601,12 @@ impl ConversationActorState {
         // Send side effect job for fan-out (envelopes + SSE)
         // We use a simplified job for system messages (commits)
         if let Some(msg_id) = commit_msg_id {
-            let _ = self.side_effect_tx.try_send(SideEffectJob::NotifySystemMessage {
-                msg_id,
-                message_type: "commit".to_string(),
-            });
+            let _ = self
+                .side_effect_tx
+                .try_send(SideEffectJob::NotifySystemMessage {
+                    msg_id,
+                    message_type: "commit".to_string(),
+                });
         }
 
         // Update local epoch state
@@ -745,15 +780,18 @@ impl ConversationActorState {
 
         // Submit to serialization queue
         // This replaces the old tokio::spawn logic with a sequential actor-bound queue
-        if let Err(e) = self.side_effect_tx.try_send(SideEffectJob::NotifyNewMessage {
-            msg_id: msg_id.clone(),
-            sender_did: sender_did.clone(),
-            ciphertext: ciphertext.clone(),
-            seq,
-            epoch,
-            is_ephemeral: false, // Actors generally handle persistent messages
-        }) {
-             tracing::error!("❌ [actor:send_message] Failed to enqueue side effects:Full?");
+        if let Err(e) = self
+            .side_effect_tx
+            .try_send(SideEffectJob::NotifyNewMessage {
+                msg_id: msg_id.clone(),
+                sender_did: sender_did.clone(),
+                ciphertext: ciphertext.clone(),
+                seq,
+                epoch,
+                is_ephemeral: false, // Actors generally handle persistent messages
+            })
+        {
+            tracing::error!("❌ [actor:send_message] Failed to enqueue side effects:Full?");
         }
 
         Ok((row_id, now))
@@ -913,7 +951,7 @@ async fn handle_notify_new_message(
     is_ephemeral: bool,
 ) {
     let fanout_start = std::time::Instant::now();
-    
+
     // 1. Fan-out (Envelopes) - Skip for ephemeral
     if !is_ephemeral {
         // Get all active members
@@ -959,7 +997,7 @@ async fn handle_notify_new_message(
                         );
                     }
                 }
-                
+
                 let fanout_duration = fanout_start.elapsed();
                 crate::metrics::record_envelope_write_duration(convo_id, fanout_duration);
             }
@@ -970,10 +1008,7 @@ async fn handle_notify_new_message(
     }
 
     // 2. SSE Emission
-    let cursor = sse_state
-        .cursor_gen
-        .next(convo_id, "messageEvent")
-        .await;
+    let cursor = sse_state.cursor_gen.next(convo_id, "messageEvent").await;
 
     let message_view = crate::models::MessageView::from(crate::models::MessageViewData {
         id: msg_id.to_string(),
@@ -991,17 +1026,11 @@ async fn handle_notify_new_message(
     };
 
     if !is_ephemeral {
-         if let Err(e) = crate::db::store_event(
-             pool,
-             &cursor,
-             convo_id,
-             "messageEvent",
-             Some(msg_id),
-         )
-         .await
-         {
-             error!("❌ [actor:worker] Failed to store event: {:?}", e);
-         }
+        if let Err(e) =
+            crate::db::store_event(pool, &cursor, convo_id, "messageEvent", Some(msg_id)).await
+        {
+            error!("❌ [actor:worker] Failed to store event: {:?}", e);
+        }
     }
 
     if let Err(e) = sse_state.emit(convo_id, event).await {
@@ -1011,18 +1040,10 @@ async fn handle_notify_new_message(
     // 3. Push Notifications (Serialized!)
     if !is_ephemeral {
         if let Some(ns) = notification_service {
-            // This await is CRITICAL. It ensures we don't start the next push 
+            // This await is CRITICAL. It ensures we don't start the next push
             // until this one (and its internal retries) is done.
             if let Err(e) = ns
-                .notify_new_message(
-                    pool,
-                    convo_id,
-                    msg_id,
-                    ciphertext,
-                    sender_did,
-                    seq,
-                    epoch,
-                )
+                .notify_new_message(pool, convo_id, msg_id, ciphertext, sender_did, seq, epoch)
                 .await
             {
                 error!("❌ [actor:worker] Failed to send push notifications: {}", e);
@@ -1038,11 +1059,11 @@ async fn handle_notify_system_message(
     msg_id: &str,
     message_type: &str,
 ) {
-     // For commits, we just need to ensure envelopes and SSE are sent. 
-     // We don't typically send push for commits unless they are important? 
-     // For now, mirroring legacy behavior which is likely just SSE/Envelopes.
-     
-     // 1. Fan-out (Envelopes)
+    // For commits, we just need to ensure envelopes and SSE are sent.
+    // We don't typically send push for commits unless they are important?
+    // For now, mirroring legacy behavior which is likely just SSE/Envelopes.
+
+    // 1. Fan-out (Envelopes)
     let members_result = sqlx::query!(
         r#"
         SELECT member_did
@@ -1056,8 +1077,8 @@ async fn handle_notify_system_message(
 
     if let Ok(members) = members_result {
         for member in members {
-             let envelope_id = uuid::Uuid::new_v4().to_string();
-             let _ = sqlx::query!(
+            let envelope_id = uuid::Uuid::new_v4().to_string();
+            let _ = sqlx::query!(
                 r#"
                 INSERT INTO envelopes (id, convo_id, recipient_did, message_id, created_at)
                 VALUES ($1, $2, $3, $4, NOW())
@@ -1078,21 +1099,15 @@ async fn handle_notify_system_message(
         .cursor_gen
         .next(convo_id, "messageEvent") // or system event?
         .await;
-        
-     // We might need to fetch the message to construct the view, 
-     // or just emit a signal. For now, assuming standard message event flow.
-     // Simplified for system messages:
-      if let Err(e) = crate::db::store_event(
-         pool,
-         &cursor,
-         convo_id,
-         "messageEvent",
-         Some(msg_id),
-     )
-     .await
-     {
-         error!("❌ [actor:worker] Failed to store system event: {:?}", e);
-     }
-     
-     // Emitting SSE logic would go here if we constructed the event
+
+    // We might need to fetch the message to construct the view,
+    // or just emit a signal. For now, assuming standard message event flow.
+    // Simplified for system messages:
+    if let Err(e) =
+        crate::db::store_event(pool, &cursor, convo_id, "messageEvent", Some(msg_id)).await
+    {
+        error!("❌ [actor:worker] Failed to store system event: {:?}", e);
+    }
+
+    // Emitting SSE logic would go here if we constructed the event
 }
