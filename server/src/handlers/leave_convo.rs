@@ -134,7 +134,7 @@ pub async fn leave_convo(
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
-        let new_epoch = current_epoch + 1;
+        let mut new_epoch = current_epoch;
         let now = chrono::Utc::now();
 
         // Process commit if provided
@@ -153,6 +153,25 @@ pub async fn leave_convo(
             let mut tx = pool.begin().await.map_err(|e| {
                 error!("Failed to begin transaction: {}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+            let advanced_epoch = crate::db::try_advance_conversation_epoch_tx(
+                &mut tx,
+                &input.convo_id,
+                current_epoch,
+            )
+            .await
+            .map_err(|e| {
+                error!("Failed to advance conversation epoch: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .ok_or_else(|| {
+                warn!(
+                    "❌ [leave_convo] Epoch conflict for convo {}: expected {}",
+                    crate::crypto::redact_for_log(&input.convo_id),
+                    current_epoch
+                );
+                StatusCode::CONFLICT
             })?;
 
             // Calculate sequence number
@@ -174,7 +193,7 @@ pub async fn leave_convo(
             .bind(&msg_id)
             .bind(&input.convo_id)
             .bind(did)
-            .bind(new_epoch)
+            .bind(advanced_epoch)
             .bind(seq)
             .bind(&commit_bytes)
             .bind(&now)
@@ -185,22 +204,12 @@ pub async fn leave_convo(
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
-            // Update epoch in same transaction
-            sqlx::query("UPDATE conversations SET current_epoch = $1 WHERE id = $2")
-                .bind(new_epoch)
-                .bind(&input.convo_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| {
-                    error!("Failed to update conversation epoch: {}", e);
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?;
-
             // Commit transaction
             tx.commit().await.map_err(|e| {
                 error!("Failed to commit transaction: {}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
+            new_epoch = advanced_epoch;
 
             info!(
                 "✅ [leave_convo] Commit message stored with seq={}, epoch={}",

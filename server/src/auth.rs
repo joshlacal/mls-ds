@@ -89,8 +89,11 @@ impl IntoResponse for AuthError {
             AuthError::LxmMismatch => (StatusCode::UNAUTHORIZED, self.to_string()),
             AuthError::Internal(e) => {
                 tracing::error!("Internal auth error: {}", e);
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("Internal error: {}", e))
-            },
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Internal error: {}", e),
+                )
+            }
         };
 
         if status.is_server_error() {
@@ -731,8 +734,8 @@ where
 
         // Check per-DID endpoint-specific rate limit
         let endpoint = parts.uri.path();
-        if let Err(retry_after) = crate::middleware::rate_limit::DID_RATE_LIMITER
-            .check_did_limit(&claims.iss, endpoint)
+        if let Err(retry_after) =
+            crate::middleware::rate_limit::DID_RATE_LIMITER.check_did_limit(&claims.iss, endpoint)
         {
             tracing::warn!(
                 did = %crate::crypto::redact_for_log(&claims.iss),
@@ -746,7 +749,7 @@ where
         // Use sub claim for user identity if present (for gateway-signed tokens),
         // otherwise fall back to iss (for direct client tokens)
         let user_did = claims.sub.clone().unwrap_or_else(|| claims.iss.clone());
-        
+
         debug!(
             "Authenticated request from DID: {} (issuer: {})",
             crate::crypto::redact_for_log(&user_did),

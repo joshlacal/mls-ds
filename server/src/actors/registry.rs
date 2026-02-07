@@ -72,7 +72,7 @@ impl ActorRegistry {
     ///
     /// A new `ActorRegistry` instance ready to spawn actors.
     pub fn new(
-        db_pool: PgPool, 
+        db_pool: PgPool,
         sse_state: Arc<SseState>,
         notification_service: Option<Arc<crate::notifications::NotificationService>>,
     ) -> Self {

@@ -105,7 +105,9 @@ pub async fn list_chat_requests(
         (None, None)
     };
 
-    let rows: Vec<ChatRequestRow> = if let (Some(created_at), Some(id)) = (cursor_created_at, cursor_id) {
+    let rows: Vec<ChatRequestRow> = if let (Some(created_at), Some(id)) =
+        (cursor_created_at, cursor_id)
+    {
         sqlx::query_as::<_, ChatRequestRow>(
             r#"
             SELECT
@@ -166,7 +168,10 @@ pub async fn list_chat_requests(
         })?
     };
 
-    let next_cursor = rows.last().map(|r| r.id.clone()).filter(|_| rows.len() as i64 == limit);
+    let next_cursor = rows
+        .last()
+        .map(|r| r.id.clone())
+        .filter(|_| rows.len() as i64 == limit);
 
     let requests = rows
         .into_iter()

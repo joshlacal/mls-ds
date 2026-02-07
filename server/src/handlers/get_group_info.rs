@@ -68,10 +68,9 @@ pub async fn handle(
                 reason = "not_a_member",
                 "❌ [GROUP-INFO] Rejected: Not a member"
             );
-            return Err(Error::Unauthorized(Some(
-                "Not a member of this conversation".into(),
-            ))
-            .into());
+            return Err(
+                Error::Unauthorized(Some("Not a member of this conversation".into())).into(),
+            );
         }
     };
 

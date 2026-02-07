@@ -9,9 +9,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
 use crate::{
-    auth::AuthUser,
-    device_utils::parse_device_did,
-    middleware::rate_limit::RECOVERY_MODE_HEADER,
+    auth::AuthUser, device_utils::parse_device_did, middleware::rate_limit::RECOVERY_MODE_HEADER,
     storage::DbPool,
 };
 
@@ -126,26 +124,27 @@ pub async fn publish_key_packages(
 
     // For recovery mode, check if this device actually has 0 key packages
     // This verification prevents abuse of recovery mode bypass
-    let recovery_verified = if is_recovery_mode {
-        let device_key_count: (i64,) = if device_id.is_empty() {
-            // Single-device mode: check all user key packages
-            sqlx::query_as(
-                r#"
+    let recovery_verified =
+        if is_recovery_mode {
+            let device_key_count: (i64,) = if device_id.is_empty() {
+                // Single-device mode: check all user key packages
+                sqlx::query_as(
+                    r#"
                 SELECT COUNT(*) as count
                 FROM key_packages
                 WHERE owner_did = $1
                   AND consumed_at IS NULL
                   AND expires_at > $2
                 "#,
-            )
-            .bind(&user_did)
-            .bind(now)
-            .fetch_one(&pool)
-            .await
-        } else {
-            // Multi-device mode: check key packages for THIS device only
-            sqlx::query_as(
-                r#"
+                )
+                .bind(&user_did)
+                .bind(now)
+                .fetch_one(&pool)
+                .await
+            } else {
+                // Multi-device mode: check key packages for THIS device only
+                sqlx::query_as(
+                    r#"
                 SELECT COUNT(*) as count
                 FROM key_packages
                 WHERE owner_did = $1
@@ -153,37 +152,41 @@ pub async fn publish_key_packages(
                   AND consumed_at IS NULL
                   AND expires_at > $2
                 "#,
-            )
-            .bind(&user_did)
-            .bind(&device_id)
-            .bind(now)
-            .fetch_one(&pool)
-            .await
-        }
-        .map_err(|e| {
-            error!("Failed to verify recovery mode: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+                )
+                .bind(&user_did)
+                .bind(&device_id)
+                .bind(now)
+                .fetch_one(&pool)
+                .await
+            }
+            .map_err(|e| {
+                error!("Failed to verify recovery mode: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
-        if device_key_count.0 == 0 {
-            info!(
-                "🚨 Recovery mode VERIFIED for {} (device: {}) - device has 0 key packages",
-                user_did,
-                if device_id.is_empty() { "single" } else { &device_id }
-            );
-            true
-        } else {
-            warn!(
+            if device_key_count.0 == 0 {
+                info!(
+                    "🚨 Recovery mode VERIFIED for {} (device: {}) - device has 0 key packages",
+                    user_did,
+                    if device_id.is_empty() {
+                        "single"
+                    } else {
+                        &device_id
+                    }
+                );
+                true
+            } else {
+                warn!(
                 "⚠️ Recovery mode DENIED for {} (device: {}) - device has {} key packages (not 0)",
                 user_did,
                 if device_id.is_empty() { "single" } else { &device_id },
                 device_key_count.0
             );
+                false
+            }
+        } else {
             false
-        }
-    } else {
-        false
-    };
+        };
 
     // Check 1: Total unconsumed key packages limit (skip in verified recovery mode)
     let unconsumed_count: (i64,) = sqlx::query_as(

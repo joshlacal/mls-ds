@@ -120,8 +120,8 @@ impl ApnsClient {
         notification.add_custom_data("convo_id", &convo_id)?;
         notification.add_custom_data("message_id", &message_id)?;
         notification.add_custom_data("recipient_did", &recipient_did)?;
-        notification.add_custom_data("seq", &seq.to_string())?;  // Add sequence number
-        notification.add_custom_data("epoch", &epoch.to_string())?;  // Add epoch
+        notification.add_custom_data("seq", &seq.to_string())?; // Add sequence number
+        notification.add_custom_data("epoch", &epoch.to_string())?; // Add epoch
 
         info!(
             "🔔 [push_notification] Notification built with custom MLS data, starting delivery (max retries: {})",
@@ -426,7 +426,6 @@ impl NotificationService {
 
         Ok(())
     }
-
 
     /// Send a low key package inventory notification to a user
     ///

@@ -2,7 +2,7 @@ use axum::{extract::State, http::StatusCode, Json};
 use base64::Engine;
 use std::sync::Arc;
 use tokio::sync::oneshot;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::{
     actors::{ActorRegistry, ConvoMessage},
@@ -115,7 +115,7 @@ pub async fn remove_member(
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
-        let new_epoch = current_epoch + 1;
+        let mut new_epoch = current_epoch;
 
         // Process commit if provided
         if let Some(ref commit) = input.commit {
@@ -132,6 +132,25 @@ pub async fn remove_member(
             let mut tx = pool.begin().await.map_err(|e| {
                 error!("Failed to start transaction: {}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+            let advanced_epoch = crate::db::try_advance_conversation_epoch_tx(
+                &mut tx,
+                &input.convo_id,
+                current_epoch,
+            )
+            .await
+            .map_err(|e| {
+                error!("Failed to advance conversation epoch: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .ok_or_else(|| {
+                warn!(
+                    "❌ [remove_member] Epoch conflict for convo {}: expected {}",
+                    crate::crypto::redact_for_log(&input.convo_id),
+                    current_epoch
+                );
+                StatusCode::CONFLICT
             })?;
 
             // Calculate sequence number
@@ -153,7 +172,7 @@ pub async fn remove_member(
             .bind(&msg_id)
             .bind(&input.convo_id)
             .bind(&auth_user.did)
-            .bind(new_epoch)
+            .bind(advanced_epoch)
             .bind(seq)
             .bind(&commit_bytes)
             .bind(&now)
@@ -164,22 +183,12 @@ pub async fn remove_member(
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
-            // Update epoch in same transaction
-            sqlx::query("UPDATE conversations SET current_epoch = $1 WHERE id = $2")
-                .bind(new_epoch)
-                .bind(&input.convo_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| {
-                    error!("Failed to update conversation epoch: {}", e);
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?;
-
             // Commit transaction
             tx.commit().await.map_err(|e| {
                 error!("Failed to commit transaction: {}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
+            new_epoch = advanced_epoch;
 
             info!(
                 "✅ [remove_member] Commit message stored with seq={}, epoch={}",

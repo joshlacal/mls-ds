@@ -194,7 +194,7 @@ fn get_endpoint_quota(endpoint: &str) -> (u32, Duration) {
 
     let limit = if endpoint_name.contains("sendMessage") {
         std::env::var("RATE_LIMIT_SEND_MESSAGE")
-        .ok()
+            .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(100) // High frequency messaging
     } else if endpoint_name.contains("getMessages") || endpoint_name.contains("getConvos") {
@@ -259,7 +259,7 @@ fn should_use_device_rate_limit(endpoint: &str) -> bool {
     let endpoint_name = endpoint
         .trim_start_matches("/xrpc/")
         .trim_start_matches("blue.catbird.mls.");
-    
+
     // Device-specific operations get per-device limits
     // This allows a fresh device (app reinstall) to upload key packages
     // even if the user's other devices have exhausted the quota
@@ -276,7 +276,7 @@ fn is_recovery_mode_request(headers: &HeaderMap, endpoint: &str) -> bool {
     if !should_use_device_rate_limit(endpoint) {
         return false;
     }
-    
+
     // Check for recovery mode header
     headers
         .get(RECOVERY_MODE_HEADER)
@@ -287,7 +287,6 @@ fn is_recovery_mode_request(headers: &HeaderMap, endpoint: &str) -> bool {
 
 /// Middleware for rate limiting based on user DID or device DID
 pub async fn rate_limit_middleware(request: Request, next: Next) -> Result<Response, StatusCode> {
-
     let headers = request.headers();
     let uri = request.uri().to_string();
 
@@ -318,7 +317,7 @@ pub async fn rate_limit_middleware(request: Request, next: Next) -> Result<Respo
             // Extract base user DID (strip #device-uuid if present)
             did.split('#').next().unwrap_or(&did).to_string()
         };
-        
+
         match DID_RATE_LIMITER.check_did_limit(&rate_limit_key, &uri) {
             Ok(()) => {
                 tracing::debug!(

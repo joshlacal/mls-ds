@@ -258,7 +258,15 @@ pub async fn subscribe_convo_events(
         let mut replay_items: Vec<(String, String)> = Vec::new();
 
         // Backfill reaction events (needed for cursor-based SSE replay).
-        match crate::db::get_events_after_cursor(&pool, &convo_id, Some("reactionEvent"), resume_cur, 200).await {
+        match crate::db::get_events_after_cursor(
+            &pool,
+            &convo_id,
+            Some("reactionEvent"),
+            resume_cur,
+            200,
+        )
+        .await
+        {
             Ok(events) => {
                 for (id, payload, _emitted_at) in events {
                     let message_id = payload.get("messageId").and_then(|v| v.as_str());

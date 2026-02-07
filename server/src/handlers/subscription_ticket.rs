@@ -54,10 +54,9 @@ pub async fn get_subscription_ticket(
     auth_user: AuthUser,
     Json(input): Json<GetSubscriptionTicketInput>,
 ) -> Result<Json<GetSubscriptionTicketOutput>, StatusCode> {
-    if let Err(_e) = crate::auth::enforce_standard(
-        &auth_user.claims,
-        "blue.catbird.mls.getSubscriptionTicket",
-    ) {
+    if let Err(_e) =
+        crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.getSubscriptionTicket")
+    {
         return Err(StatusCode::UNAUTHORIZED);
     }
 
@@ -87,9 +86,8 @@ pub async fn get_subscription_ticket(
     }
 
     // Get service DID from environment
-    let service_did = std::env::var("SERVICE_DID").unwrap_or_else(|_| {
-        "did:web:mls.catbird.blue".to_string()
-    });
+    let service_did =
+        std::env::var("SERVICE_DID").unwrap_or_else(|_| "did:web:mls.catbird.blue".to_string());
 
     // Get WebSocket endpoint from environment
     let ws_endpoint = std::env::var("WEBSOCKET_ENDPOINT").unwrap_or_else(|_| {
@@ -163,7 +161,7 @@ pub fn verify_ticket(ticket: &str) -> Result<TicketClaims, String> {
         .map_err(|_| "TICKET_SECRET or JWT_SECRET not configured".to_string())?;
 
     let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
-    
+
     // Set audience if SERVICE_DID is configured
     if let Ok(service_did) = std::env::var("SERVICE_DID") {
         validation.set_audience(&[&service_did]);
