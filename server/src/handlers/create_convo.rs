@@ -54,6 +54,7 @@ pub async fn create_convo(
     let valid_suites = [
         "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519",
         "MLS_128_DHKEMP256_AES128GCM_SHA256_P256",
+        "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
     ];
     if !valid_suites.contains(&input.cipher_suite.as_str()) {
         warn!(
