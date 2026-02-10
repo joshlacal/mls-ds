@@ -278,11 +278,11 @@ async fn handle_socket(
                             backfill_count = events.len(),
                             "Sending backfill events"
                         );
-                        for (event, event_cursor) in events {
+                        for (event, _event_cursor) in events {
                             seq += 1;
                             let mut sender_guard = sender.lock().await;
                             if let Err(e) =
-                                send_event(&mut *sender_guard, &event, seq, Some(&event_cursor))
+                                send_event(&mut *sender_guard, &event, seq)
                                     .await
                             {
                                 error!("Failed to send backfill event: {}", e);
@@ -401,7 +401,7 @@ async fn handle_socket(
                     // Convert StreamEvent to WebSocket message
                     let mut sender_guard = sender_clone.lock().await;
                     if let Err(e) =
-                        send_event(&mut *sender_guard, &event, seq, Some(&event_cursor)).await
+                        send_event(&mut *sender_guard, &event, seq).await
                     {
                         error!("Failed to send event for {}: {}", convo_id, e);
                         break;
@@ -550,7 +550,6 @@ async fn send_event(
     sender: &mut futures::stream::SplitSink<WebSocket, Message>,
     event: &StreamEvent,
     seq: i64,
-    cursor: Option<&str>,
 ) -> Result<(), String> {
     // Determine message type from event variant
     let msg_type = match event {
@@ -571,25 +570,26 @@ async fn send_event(
         t: Some(msg_type.to_string()),
     };
 
-    // Serialize event - it already contains cursor field from StreamEvent
-    let mut payload =
-        serde_json::to_value(event).map_err(|e| format!("Failed to serialize event: {}", e))?;
-
-    // Add seq for WebSocket-specific ordering
-    if let Some(obj) = payload.as_object_mut() {
-        obj.insert("seq".to_string(), serde_json::json!(seq));
-        // If cursor provided externally (for backfill), override the event's cursor
-        if let Some(cur) = cursor {
-            obj.insert("cursor".to_string(), serde_json::json!(cur));
-        }
+    // Wrap event with seq field and serialize directly to DAG-CBOR.
+    // IMPORTANT: We must NOT go through serde_json::Value as an intermediate,
+    // because JSON cannot represent CBOR byte strings — Vec<u8> fields
+    // (like ciphertext) become JSON arrays of numbers, which then encode as
+    // CBOR arrays instead of CBOR byte strings (major type 2).
+    #[derive(Serialize)]
+    struct WirePayload<'a> {
+        #[serde(flatten)]
+        event: &'a StreamEvent,
+        seq: i64,
     }
+
+    let wire = WirePayload { event, seq };
 
     // Encode header as DAG-CBOR
     let header_bytes = serde_ipld_dagcbor::to_vec(&header)
         .map_err(|e| format!("Failed to encode header: {}", e))?;
 
-    // Encode payload as DAG-CBOR
-    let payload_bytes = serde_ipld_dagcbor::to_vec(&payload)
+    // Encode payload directly to DAG-CBOR (preserves byte string types)
+    let payload_bytes = serde_ipld_dagcbor::to_vec(&wire)
         .map_err(|e| format!("Failed to encode payload: {}", e))?;
 
     // Concatenate header and payload
