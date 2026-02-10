@@ -52,27 +52,11 @@ pub struct InputData {
     pub psk: Option<String>,
 }
 
-#[derive(Debug, SerdeDeserialize)]
-pub struct Input {
-    pub data: InputData,
-}
-
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct OutputData {
+pub struct Output {
     pub epoch: i64,
     pub rejoined_at: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct Output {
-    pub data: OutputData,
-}
-
-impl From<OutputData> for Output {
-    fn from(data: OutputData) -> Self {
-        Self { data }
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -785,8 +769,8 @@ pub async fn handle(
         }
     });
 
-    Ok(Json(Output::from(OutputData {
+    Ok(Json(Output {
         epoch: new_epoch as i64,
         rejoined_at: now.to_rfc3339(),
-    })))
+    }))
 }
