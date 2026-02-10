@@ -73,7 +73,7 @@ impl Conversation {
             cipher_suite: self
                 .cipher_suite
                 .clone()
-                .unwrap_or_else(|| "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519".to_string()),
+                .unwrap_or_else(|| "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519".to_string()),
             created_at: crate::sqlx_atrium::chrono_to_datetime(self.created_at),
             last_message_at: None,
             metadata,

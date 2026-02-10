@@ -77,7 +77,7 @@ pub async fn get_key_packages(
 
     let mut results = Vec::new();
     let mut missing_dids: Vec<String> = Vec::new();
-    let default_cipher_suite = "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519";
+    let default_cipher_suite = "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519";
     let suite = cipher_suite.as_deref().unwrap_or(default_cipher_suite);
 
     for did in dids_refs {
