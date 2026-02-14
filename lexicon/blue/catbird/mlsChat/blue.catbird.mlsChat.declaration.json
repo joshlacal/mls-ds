@@ -1,0 +1,248 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.mlsChat.declaration",
+  "description": "MLS device declaration chain record. Published to the user's AT Protocol repository. Forms a hash-linked chain of events (rootInit → deviceAdd/revoke → rotations) signed by the online root key, enabling device authorization verification without trusting the delivery service.",
+  "defs": {
+    "main": {
+      "type": "record",
+      "key": "any",
+      "description": "A single declaration chain entry. Keys are deterministic: e{epoch}-s{seq} (zero-padded to 20 digits each).",
+      "record": {
+        "type": "object",
+        "required": ["did", "epoch", "seq", "event", "proofs", "createdAt"],
+        "properties": {
+          "did": {
+            "type": "string",
+            "format": "did",
+            "description": "DID of the account that owns this declaration chain"
+          },
+          "epoch": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Declaration epoch — incremented on root key rotation"
+          },
+          "seq": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Sequence number within the epoch, starting at 0 for rootInit"
+          },
+          "prev": {
+            "type": "ref",
+            "ref": "#prevLink",
+            "description": "Link to the previous declaration record (null for rootInit at seq=0)"
+          },
+          "event": {
+            "type": "union",
+            "refs": [
+              "#rootInit",
+              "#deviceAdd",
+              "#deviceRevoke",
+              "#rootRotate",
+              "#recoveryRotateOnlineRoot",
+              "#chatPolicyUpdate"
+            ],
+            "description": "The declaration event payload"
+          },
+          "proofs": {
+            "type": "ref",
+            "ref": "#proofs",
+            "description": "Cryptographic proofs for this declaration entry"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When this declaration entry was created"
+          }
+        }
+      }
+    },
+
+    "prevLink": {
+      "type": "object",
+      "description": "Link to the previous record in the declaration chain",
+      "required": ["cid"],
+      "properties": {
+        "cid": {
+          "type": "string",
+          "description": "CID of the previous declaration record"
+        }
+      }
+    },
+
+    "rootInit": {
+      "type": "object",
+      "description": "Initialize the declaration chain with root keys. Must be seq=0.",
+      "required": ["onlineRootPublicKey", "onlineRootAlg", "recoveryRootPublicKey", "recoveryRootAlg"],
+      "properties": {
+        "onlineRootPublicKey": {
+          "type": "bytes",
+          "description": "Public key of the online root (used for signing day-to-day declarations)"
+        },
+        "onlineRootAlg": {
+          "type": "string",
+          "description": "Algorithm of the online root key (e.g., 'p256')"
+        },
+        "recoveryRootPublicKey": {
+          "type": "bytes",
+          "description": "Public key of the recovery root (used for emergency root rotation)"
+        },
+        "recoveryRootAlg": {
+          "type": "string",
+          "description": "Algorithm of the recovery root key (e.g., 'p256')"
+        },
+        "note": {
+          "type": "string",
+          "maxLength": 256,
+          "description": "Optional human-readable note (e.g., 'catbird-initialize')"
+        }
+      }
+    },
+
+    "deviceAdd": {
+      "type": "object",
+      "description": "Add a device to the authorized set",
+      "required": ["deviceId", "deviceMlsSignaturePublicKey"],
+      "properties": {
+        "deviceId": {
+          "type": "string",
+          "description": "Device UUID identifier"
+        },
+        "deviceName": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Human-readable device name"
+        },
+        "deviceMlsSignaturePublicKey": {
+          "type": "bytes",
+          "description": "The device's MLS signature public key"
+        }
+      }
+    },
+
+    "deviceRevoke": {
+      "type": "object",
+      "description": "Revoke a device from the authorized set",
+      "properties": {
+        "deviceMlsSignaturePublicKey": {
+          "type": "bytes",
+          "description": "The revoked device's MLS signature public key"
+        },
+        "deviceId": {
+          "type": "string",
+          "description": "The revoked device's UUID"
+        },
+        "reason": {
+          "type": "string",
+          "maxLength": 256,
+          "description": "Reason for revocation"
+        }
+      }
+    },
+
+    "rootRotate": {
+      "type": "object",
+      "description": "Rotate the online root key (signed by the old online root)",
+      "required": ["newOnlineRootPublicKey", "newOnlineRootAlg"],
+      "properties": {
+        "newOnlineRootPublicKey": {
+          "type": "bytes",
+          "description": "New online root public key"
+        },
+        "newOnlineRootAlg": {
+          "type": "string",
+          "description": "Algorithm of the new online root key"
+        },
+        "rotationMode": {
+          "type": "string",
+          "description": "Rotation mode (e.g., 'normal', 'emergency')"
+        }
+      }
+    },
+
+    "recoveryRotateOnlineRoot": {
+      "type": "object",
+      "description": "Emergency rotation of the online root key using the recovery root",
+      "required": ["newOnlineRootPublicKey", "newOnlineRootAlg"],
+      "properties": {
+        "newOnlineRootPublicKey": {
+          "type": "bytes",
+          "description": "New online root public key"
+        },
+        "newOnlineRootAlg": {
+          "type": "string",
+          "description": "Algorithm of the new online root key"
+        },
+        "recoveryReason": {
+          "type": "string",
+          "maxLength": 256,
+          "description": "Reason for recovery rotation"
+        }
+      }
+    },
+
+    "chatPolicyUpdate": {
+      "type": "object",
+      "description": "Update chat policy settings",
+      "properties": {
+        "allowFollowersBypass": {
+          "type": "boolean",
+          "description": "Whether followers can bypass chat request approval"
+        },
+        "allowFollowingBypass": {
+          "type": "boolean",
+          "description": "Whether accounts this user follows can bypass chat request approval"
+        },
+        "autoExpireDays": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Auto-expire pending requests after this many days (0 = no expiry)"
+        }
+      }
+    },
+
+    "proofs": {
+      "type": "object",
+      "description": "Cryptographic proofs authenticating this declaration entry",
+      "required": ["sig", "sigAlg"],
+      "properties": {
+        "sig": {
+          "type": "bytes",
+          "description": "Signature over the canonical signing payload by the online (or recovery) root key"
+        },
+        "sigAlg": {
+          "type": "string",
+          "description": "Algorithm used for the signature (e.g., 'p256')"
+        },
+        "coSig": {
+          "type": "bytes",
+          "description": "Optional co-signature (e.g., from the old key during rotation)"
+        },
+        "coSigAlg": {
+          "type": "string",
+          "description": "Algorithm of the co-signature"
+        },
+        "deviceProof": {
+          "type": "ref",
+          "ref": "#deviceProof",
+          "description": "Optional device-level proof (for deviceAdd events)"
+        }
+      }
+    },
+
+    "deviceProof": {
+      "type": "object",
+      "description": "Proof from the device being added, demonstrating possession of the device key",
+      "required": ["proofSig", "proofAlg"],
+      "properties": {
+        "proofSig": {
+          "type": "bytes",
+          "description": "Signature by the device's MLS signature key"
+        },
+        "proofAlg": {
+          "type": "string",
+          "description": "Algorithm of the device proof signature"
+        }
+      }
+    }
+  }
+}

@@ -1,14 +1,31 @@
 use axum::{extract::State, http::StatusCode, Json};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{error, info};
 
 use crate::{
     auth::AuthUser,
     db,
-    generated::blue::catbird::mls::remove_reaction::{Input, Output, OutputData, NSID},
     realtime::{SseState, StreamEvent},
     storage::DbPool,
 };
+
+// Local types - no jacquard-generated types available for this endpoint
+const NSID: &str = "blue.catbird.mls.removeReaction";
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoveReactionInput {
+    pub convo_id: String,
+    pub message_id: String,
+    pub reaction: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoveReactionOutput {
+    pub success: bool,
+}
 
 /// Remove a reaction from a message
 /// POST /xrpc/blue.catbird.mls.removeReaction
@@ -17,8 +34,8 @@ pub async fn remove_reaction(
     State(pool): State<DbPool>,
     State(sse_state): State<Arc<SseState>>,
     auth_user: AuthUser,
-    Json(input): Json<Input>,
-) -> Result<Json<Output>, StatusCode> {
+    Json(input): Json<RemoveReactionInput>,
+) -> Result<Json<RemoveReactionOutput>, StatusCode> {
     let user_did = auth_user.did.clone();
 
     info!(
@@ -104,5 +121,5 @@ pub async fn remove_reaction(
 
     info!("Reaction removed successfully");
 
-    Ok(Json(Output::from(OutputData { success: true })))
+    Ok(Json(RemoveReactionOutput { success: true }))
 }

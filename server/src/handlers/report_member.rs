@@ -3,8 +3,8 @@ use tracing::{error, info};
 
 use crate::{
     auth::{enforce_standard, verify_is_member, AuthUser},
-    generated::blue::catbird::mls::report_member::{Input, Output, OutputData, NSID},
-    sqlx_atrium::chrono_to_datetime,
+    generated::blue_catbird::mls::report_member::{ReportMember, ReportMemberOutput},
+    sqlx_jacquard::chrono_to_datetime,
     storage::DbPool,
 };
 
@@ -14,10 +14,9 @@ use crate::{
 pub async fn report_member(
     State(pool): State<DbPool>,
     auth_user: AuthUser,
-    Json(input): Json<Input>,
-) -> Result<Json<Output>, StatusCode> {
-    let input = input.data;
-
+    body: String,
+) -> Result<Json<ReportMemberOutput<'static>>, StatusCode> {
+    let input = crate::jacquard_json::from_json_body::<ReportMember>(&body)?;
     info!(
         "📍 [report_member] START - reporter: {}, convo: {}, reported: {}, category: {}",
         auth_user.did,
@@ -27,7 +26,7 @@ pub async fn report_member(
     );
 
     // Enforce standard auth
-    if let Err(_) = enforce_standard(&auth_user.claims, NSID) {
+    if let Err(_) = enforce_standard(&auth_user.claims, "blue.catbird.mls.reportMember") {
         error!("❌ [report_member] Unauthorized");
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -76,6 +75,10 @@ pub async fn report_member(
 
     let now = chrono::Utc::now();
     let report_id = uuid::Uuid::new_v4().to_string();
+    let message_ids_owned: Option<Vec<String>> = input
+        .message_ids
+        .as_ref()
+        .map(|ids| ids.iter().map(|s| s.to_string()).collect());
 
     // Insert report
     sqlx::query(
@@ -85,12 +88,12 @@ pub async fn report_member(
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')",
     )
     .bind(&report_id)
-    .bind(&input.convo_id)
+    .bind(input.convo_id.as_str())
     .bind(&auth_user.did)
     .bind(input.reported_did.as_str())
-    .bind(&input.category)
-    .bind(&input.encrypted_content)
-    .bind(&input.message_ids)
+    .bind(input.category.as_str())
+    .bind(input.encrypted_content.as_ref())
+    .bind(&message_ids_owned)
     .bind(&now)
     .execute(&pool)
     .await
@@ -101,8 +104,9 @@ pub async fn report_member(
 
     info!("✅ [report_member] SUCCESS - report {} created", report_id);
 
-    Ok(Json(Output::from(OutputData {
-        report_id,
+    Ok(Json(ReportMemberOutput {
+        report_id: report_id.into(),
         submitted_at: chrono_to_datetime(now),
-    })))
+        extra_data: None,
+    }))
 }

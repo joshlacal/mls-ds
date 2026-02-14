@@ -9,7 +9,9 @@ use tls_codec::Deserialize as TlsDeserialize;
 use crate::{
     auth::AuthUser,
     error_responses::UpdateGroupInfoError,
-    generated::blue::catbird::mls::update_group_info::{Error, Input, Output, OutputData},
+    generated::blue_catbird::mls::update_group_info::{
+        UpdateGroupInfo, UpdateGroupInfoError as LexUpdateGroupInfoError, UpdateGroupInfoOutput,
+    },
     group_info::{get_group_info, store_group_info, MAX_GROUP_INFO_SIZE, MIN_GROUP_INFO_SIZE},
     storage::DbPool,
 };
@@ -23,8 +25,9 @@ struct MemberCheckRow {
 pub async fn handle(
     State(pool): State<DbPool>,
     auth: AuthUser,
-    Json(input): Json<Input>,
-) -> Result<Json<Output>, UpdateGroupInfoError> {
+    body: String,
+) -> Result<Json<UpdateGroupInfoOutput<'static>>, UpdateGroupInfoError> {
+    let input = crate::jacquard_json::from_json_body::<UpdateGroupInfo>(&body)?;
     let did = &auth.did;
 
     // 1. Check authorization: must be current member
@@ -34,56 +37,65 @@ pub async fn handle(
          WHERE convo_id = $1 AND user_did = $2
          LIMIT 1",
     )
-    .bind(&input.data.convo_id)
+    .bind(&*input.convo_id)
     .bind(did)
     .fetch_optional(&pool)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     if member_check.is_none() {
-        return Err(Error::Unauthorized(Some("Not a member of this conversation".into())).into());
+        return Err(LexUpdateGroupInfoError::Unauthorized(Some(
+            "Not a member of this conversation".into(),
+        ))
+        .into());
     }
 
     // 2. Decode GroupInfo from base64
     let group_info_bytes = base64::engine::general_purpose::STANDARD
-        .decode(&input.data.group_info)
+        .decode(&*input.group_info)
         .map_err(|e| {
             tracing::error!(
-                convo_id = %input.data.convo_id,
+                convo_id = %input.convo_id,
                 error = %e,
                 "Invalid base64 in GroupInfo"
             );
-            Error::InvalidGroupInfo(Some("Invalid base64 encoding".into()))
+            LexUpdateGroupInfoError::InvalidGroupInfo(Some("Invalid base64 encoding".into()))
         })?;
 
     // 3. Validate size bounds
     if group_info_bytes.len() < MIN_GROUP_INFO_SIZE {
         tracing::error!(
-            convo_id = %input.data.convo_id,
+            convo_id = %input.convo_id,
             size = group_info_bytes.len(),
             min_size = MIN_GROUP_INFO_SIZE,
             "GroupInfo too small - likely truncated"
         );
-        return Err(Error::InvalidGroupInfo(Some(format!(
-            "GroupInfo too small: {} bytes (minimum {} required)",
-            group_info_bytes.len(),
-            MIN_GROUP_INFO_SIZE
-        )))
+        return Err(LexUpdateGroupInfoError::InvalidGroupInfo(Some(
+            format!(
+                "GroupInfo too small: {} bytes (minimum {} required)",
+                group_info_bytes.len(),
+                MIN_GROUP_INFO_SIZE
+            )
+            .into(),
+        ))
         .into());
     }
 
     if group_info_bytes.len() > MAX_GROUP_INFO_SIZE {
         tracing::error!(
-            convo_id = %input.data.convo_id,
+            convo_id = %input.convo_id,
             size = group_info_bytes.len(),
             max_size = MAX_GROUP_INFO_SIZE,
             "GroupInfo too large"
         );
-        return Err(Error::InvalidGroupInfo(Some(format!(
-            "GroupInfo too large: {} bytes (maximum {} allowed)",
-            group_info_bytes.len(),
-            MAX_GROUP_INFO_SIZE
-        )))
+        return Err(LexUpdateGroupInfoError::InvalidGroupInfo(Some(
+            format!(
+                "GroupInfo too large: {} bytes (maximum {} allowed)",
+                group_info_bytes.len(),
+                MAX_GROUP_INFO_SIZE
+            )
+            .into(),
+        ))
         .into());
     }
 
@@ -95,11 +107,11 @@ pub async fn handle(
 
     if !group_info_valid {
         tracing::error!(
-            convo_id = %input.data.convo_id,
+            convo_id = %input.convo_id,
             size = group_info_bytes.len(),
             "Invalid MLS GroupInfo structure - deserialization failed for both wrapped and raw formats"
         );
-        return Err(Error::InvalidGroupInfo(Some(
+        return Err(LexUpdateGroupInfoError::InvalidGroupInfo(Some(
             "Invalid MLS GroupInfo structure: could not deserialize as MlsMessage or raw GroupInfo"
                 .into(),
         ))
@@ -107,45 +119,51 @@ pub async fn handle(
     }
 
     // 5. Validate epoch consistency - epoch must increase (no regression)
-    if let Ok(Some((_, existing_epoch, _))) = get_group_info(&pool, &input.data.convo_id).await {
-        if input.data.epoch as i32 <= existing_epoch {
+    if let Ok(Some((_, existing_epoch, _))) = get_group_info(&pool, &input.convo_id).await {
+        if input.epoch as i32 <= existing_epoch {
             tracing::warn!(
-                convo_id = %input.data.convo_id,
-                new_epoch = input.data.epoch,
+                convo_id = %input.convo_id,
+                new_epoch = input.epoch,
                 existing_epoch = existing_epoch,
                 "Rejecting GroupInfo with non-increasing epoch"
             );
-            return Err(Error::InvalidGroupInfo(Some(format!(
-                "Epoch {} must be greater than current epoch {}",
-                input.data.epoch, existing_epoch
-            )))
+            return Err(LexUpdateGroupInfoError::InvalidGroupInfo(Some(
+                format!(
+                    "Epoch {} must be greater than current epoch {}",
+                    input.epoch, existing_epoch
+                )
+                .into(),
+            ))
             .into());
         }
     }
 
     // 6. Store validated GroupInfo
     tracing::info!(
-        convo_id = %input.data.convo_id,
-        epoch = input.data.epoch,
+        convo_id = %input.convo_id,
+        epoch = input.epoch,
         size = group_info_bytes.len(),
         "GroupInfo validated successfully, storing"
     );
 
     store_group_info(
         &pool,
-        &input.data.convo_id,
+        &input.convo_id,
         &group_info_bytes,
-        input.data.epoch as i32,
+        input.epoch as i32,
     )
     .await
     .map_err(|e| {
         tracing::error!(
-            convo_id = %input.data.convo_id,
+            convo_id = %input.convo_id,
             error = %e,
             "Failed to store GroupInfo"
         );
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    Ok(Json(Output::from(OutputData { updated: true })))
+    Ok(Json(UpdateGroupInfoOutput {
+        updated: true,
+        extra_data: Default::default(),
+    }))
 }

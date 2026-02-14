@@ -17,7 +17,7 @@ if [ -f .env ]; then
 fi
 
 # Default values
-JWT_SECRET=${JWT_SECRET:-"dev-secret-key-change-in-production"}
+HS256_TEST_SECRET=${HS256_TEST_SECRET:-"dev-secret-local-only"}
 SERVICE_DID=${SERVICE_DID:-"did:web:catbird.social"}
 ISSUER_DID=${ISSUER_DID:-"did:plc:test123"}
 
@@ -58,7 +58,7 @@ EOF
     local payload_b64=$(echo -e "$claims" | openssl base64 -e -A | tr '+/' '-_' | tr -d '=')
     
     # Create signature
-    local signature=$(echo -n "${header_b64}.${payload_b64}" | openssl dgst -sha256 -hmac "$JWT_SECRET" -binary | openssl base64 -e -A | tr '+/' '-_' | tr -d '=')
+    local signature=$(echo -n "${header_b64}.${payload_b64}" | openssl dgst -sha256 -hmac "$HS256_TEST_SECRET" -binary | openssl base64 -e -A | tr '+/' '-_' | tr -d '=')
     
     local token="${header_b64}.${payload_b64}.${signature}"
     
@@ -73,7 +73,7 @@ EOF
 
 echo ""
 echo "Using configuration:"
-echo "  JWT_SECRET: ${JWT_SECRET:0:10}..."
+echo "  HS256_TEST_SECRET: ${HS256_TEST_SECRET:0:10}..."
 echo "  SERVICE_DID: $SERVICE_DID"
 echo "  ISSUER_DID: $ISSUER_DID"
 echo ""

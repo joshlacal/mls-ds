@@ -40,7 +40,10 @@ pub async fn list_devices(
 
     let user_did = &auth_user.did;
 
-    info!("Listing devices for user {}", user_did);
+    info!(
+        "Listing devices for user {}",
+        crate::crypto::redact_for_log(user_did)
+    );
 
     // Query devices with key package counts
     let devices: Vec<DeviceInfo> = sqlx::query_as!(
@@ -69,7 +72,11 @@ pub async fn list_devices(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    info!("Found {} devices for user {}", devices.len(), user_did);
+    info!(
+        "Found {} devices for user {}",
+        devices.len(),
+        crate::crypto::redact_for_log(user_did)
+    );
 
     Ok(Json(ListDevicesOutput { devices }))
 }

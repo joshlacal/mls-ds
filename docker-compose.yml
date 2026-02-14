@@ -1,0 +1,61 @@
+# mls-ds local E2E testing stack
+# Usage: docker compose up -d
+#        curl http://localhost:3001/health/ready
+
+services:
+  postgres:
+    image: postgres:16-bookworm
+    environment:
+      POSTGRES_USER: catbird
+      POSTGRES_PASSWORD: catbird
+      POSTGRES_DB: catbird_mls
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./server/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U catbird -d catbird_mls"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-bookworm
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  mls-ds:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "3001:3001"
+    environment:
+      DATABASE_URL: postgres://catbird:catbird@postgres:5432/catbird_mls
+      REDIS_URL: redis://redis:6379
+      SERVER_PORT: "3001"
+      JWT_SECRET: test-secret-for-e2e
+      SERVICE_DID: did:web:localhost
+      ENFORCE_LXM: "false"
+      ENFORCE_JTI: "false"
+      RUST_LOG: info
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3001/health/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  pgdata:

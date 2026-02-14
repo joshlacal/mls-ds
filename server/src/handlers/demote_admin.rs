@@ -3,7 +3,7 @@ use tracing::{error, info};
 
 use crate::{
     auth::{count_admins, verify_is_admin, verify_is_member, AuthUser},
-    generated::blue::catbird::mls::demote_admin::{Input, Output, OutputData, NSID},
+    generated::blue_catbird::mls::demote_admin::{DemoteAdmin, DemoteAdminOutput},
     storage::DbPool,
 };
 
@@ -13,10 +13,9 @@ use crate::{
 pub async fn demote_admin(
     State(pool): State<DbPool>,
     auth_user: AuthUser,
-    Json(input): Json<Input>,
-) -> Result<Json<Output>, StatusCode> {
-    let input = input.data;
-
+    body: String,
+) -> Result<Json<DemoteAdminOutput<'static>>, StatusCode> {
+    let input = crate::jacquard_json::from_json_body::<DemoteAdmin>(&body)?;
     info!(
         "📍 [demote_admin] START - actor: {}, convo: {}, target: {}",
         auth_user.did,
@@ -25,7 +24,8 @@ pub async fn demote_admin(
     );
 
     // Enforce standard auth
-    if let Err(_) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
+    if let Err(_) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.demoteAdmin")
+    {
         error!("❌ [demote_admin] Unauthorized");
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -48,7 +48,7 @@ pub async fn demote_admin(
          WHERE convo_id = $1 AND user_did = $2 AND left_at IS NULL
          LIMIT 1",
     )
-    .bind(&input.convo_id)
+    .bind(input.convo_id.as_str())
     .bind(input.target_did.as_str())
     .fetch_one(&pool)
     .await
@@ -78,7 +78,7 @@ pub async fn demote_admin(
          SET is_admin = false
          WHERE convo_id = $1 AND user_did = $2 AND left_at IS NULL",
     )
-    .bind(&input.convo_id)
+    .bind(input.convo_id.as_str())
     .bind(input.target_did.as_str())
     .execute(&pool)
     .await
@@ -94,7 +94,7 @@ pub async fn demote_admin(
          VALUES ($1, $2, $3, 'demote', $4, $5)",
     )
     .bind(&action_id)
-    .bind(&input.convo_id)
+    .bind(input.convo_id.as_str())
     .bind(&auth_user.did)
     .bind(input.target_did.as_str())
     .bind(&now)
@@ -107,5 +107,8 @@ pub async fn demote_admin(
 
     info!("✅ [demote_admin] SUCCESS - admin demoted");
 
-    Ok(Json(Output::from(OutputData { ok: true })))
+    Ok(Json(DemoteAdminOutput {
+        ok: true,
+        extra_data: Default::default(),
+    }))
 }

@@ -1,0 +1,61 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.mlsChat.updateCursor",
+  "description": "Update read cursor and mark messages as read (consolidates cursor update + read receipts)",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Update the read cursor for a conversation and optionally mark messages as read. Supports both cursor-based tracking (by sequence position) and explicit message-based tracking (by message ID).",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["convoId"],
+          "properties": {
+            "convoId": {
+              "type": "string",
+              "description": "Conversation identifier"
+            },
+            "cursor": {
+              "type": "string",
+              "description": "Opaque cursor value representing the read position (e.g., seq number as string)"
+            },
+            "messageId": {
+              "type": "string",
+              "description": "Specific message ID to mark as read (alternative to cursor-based tracking)"
+            },
+            "markRead": {
+              "type": "boolean",
+              "description": "If true, generates a read receipt event visible to other members. Default false (silent cursor update).",
+              "default": false
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["updatedAt"],
+          "properties": {
+            "updatedAt": {
+              "type": "string",
+              "format": "datetime",
+              "description": "Timestamp when the cursor was updated"
+            },
+            "readAt": {
+              "type": "string",
+              "format": "datetime",
+              "description": "Timestamp of the read receipt (only present when markRead is true)"
+            }
+          }
+        }
+      },
+      "errors": [
+        {"name": "ConvoNotFound", "description": "Conversation not found"},
+        {"name": "NotMember", "description": "Caller is not a member of the conversation"},
+        {"name": "InvalidCursor", "description": "The provided cursor value is invalid"}
+      ]
+    }
+  }
+}

@@ -85,7 +85,6 @@ make restore BACKUP=/path/to/backup.sql.gz
      - `ENFORCE_LXM`: Require JWT `lxm` claim to match called NSID
      - `ENFORCE_JTI`: Require `jti` and reject replays (default: true)
      - `JTI_TTL_SECONDS`: TTL for jti replay cache (default: 120)
-     - `JWT_SECRET`: Enables HS256 dev-mode tokens
 
 2. **XRPC API Handlers** (`src/handlers/`)
    - Modular handler structure, one file per endpoint

@@ -65,7 +65,16 @@ pub async fn get_key_package_history(
 
     for pair in query_str.split('&') {
         if let Some((key, value)) = pair.split_once('=') {
-            let decoded_value = urlencoding::decode(value).unwrap_or_default().to_string();
+            let decoded_value = match urlencoding::decode(value) {
+                Ok(v) => v.to_string(),
+                Err(e) => {
+                    warn!(
+                        "Invalid URL encoding for query parameter '{}': {}",
+                        key, e
+                    );
+                    return Err(StatusCode::BAD_REQUEST);
+                }
+            };
             match key {
                 "limit" => {
                     if let Ok(l) = decoded_value.parse::<i64>() {

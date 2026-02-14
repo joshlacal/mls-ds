@@ -1,13 +1,15 @@
 use axum::{
-    extract::Request,
+    extract::{connect_info::ConnectInfo, Request},
     http::{HeaderMap, StatusCode},
     middleware::Next,
     response::Response,
 };
-use base64::Engine;
-use dashmap::DashMap;
+use ipnet::IpNet;
+use moka::sync::Cache;
 use once_cell::sync::Lazy;
+use parking_lot::Mutex;
 use std::{
+    net::{IpAddr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -76,18 +78,40 @@ impl TokenBucket {
 /// Rate limiter state shared across middleware
 #[derive(Clone)]
 pub struct RateLimiter {
-    /// Buckets per key (format: "did:room_id" or just "did" for global)
-    buckets: Arc<DashMap<String, TokenBucket>>,
+    /// Buckets per key (bounded + expiring cache)
+    buckets: Arc<Cache<String, Arc<Mutex<TokenBucket>>>>,
     /// Default capacity (burst)
     capacity: u32,
     /// Default refill rate (tokens/sec)
     refill_rate: f64,
 }
 
+fn parse_u64_env(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
+fn build_bucket_cache(
+    capacity: u64,
+    ttl_seconds: u64,
+) -> Arc<Cache<String, Arc<Mutex<TokenBucket>>>> {
+    Arc::new(
+        Cache::builder()
+            .max_capacity(capacity)
+            .time_to_idle(Duration::from_secs(ttl_seconds))
+            .build(),
+    )
+}
+
 impl RateLimiter {
     pub fn new(capacity: u32, refill_rate: f64) -> Self {
+        let max_keys = parse_u64_env("RATE_LIMIT_IP_MAX_KEYS", 100_000);
+        let ttl_seconds = parse_u64_env("RATE_LIMIT_BUCKET_TTL_SECONDS", 600);
         Self {
-            buckets: Arc::new(DashMap::new()),
+            buckets: build_bucket_cache(max_keys, ttl_seconds),
             capacity,
             refill_rate,
         }
@@ -95,10 +119,13 @@ impl RateLimiter {
 
     /// Check if request is allowed for given key
     pub fn check(&self, key: &str) -> Result<(), u64> {
-        let mut bucket = self
-            .buckets
-            .entry(key.to_string())
-            .or_insert_with(|| TokenBucket::new(self.capacity, self.refill_rate));
+        let bucket = self.buckets.get_with(key.to_string(), || {
+            Arc::new(Mutex::new(TokenBucket::new(
+                self.capacity,
+                self.refill_rate,
+            )))
+        });
+        let mut bucket = bucket.lock();
 
         if bucket.try_consume() {
             Ok(())
@@ -108,10 +135,8 @@ impl RateLimiter {
     }
 
     /// Cleanup old buckets (call periodically to prevent memory leak)
-    pub async fn cleanup_old_buckets(&self, max_age: Duration) {
-        let now = Instant::now();
-        self.buckets
-            .retain(|_, bucket| now.duration_since(bucket.last_refill) < max_age);
+    pub async fn cleanup_old_buckets(&self, _max_age: Duration) {
+        self.buckets.run_pending_tasks();
     }
 }
 
@@ -127,7 +152,7 @@ impl Default for RateLimiter {
         let burst = std::env::var("IP_RATE_BURST")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(per_minute.max(10) / 10);
+            .unwrap_or(per_minute.max(20));
 
         // Refill rate: per_minute / 60 = tokens per second
         let refill = per_minute as f64 / 60.0;
@@ -139,14 +164,16 @@ impl Default for RateLimiter {
 /// Per-DID rate limiter with endpoint-specific quotas
 #[derive(Clone)]
 pub struct DidRateLimiter {
-    /// Buckets per DID:endpoint key
-    buckets: Arc<DashMap<String, TokenBucket>>,
+    /// Buckets per DID:endpoint key (bounded + expiring cache)
+    buckets: Arc<Cache<String, Arc<Mutex<TokenBucket>>>>,
 }
 
 impl DidRateLimiter {
     pub fn new() -> Self {
+        let max_keys = parse_u64_env("RATE_LIMIT_DID_MAX_KEYS", 300_000);
+        let ttl_seconds = parse_u64_env("RATE_LIMIT_DID_BUCKET_TTL_SECONDS", 900);
         Self {
-            buckets: Arc::new(DashMap::new()),
+            buckets: build_bucket_cache(max_keys, ttl_seconds),
         }
     }
 
@@ -155,12 +182,13 @@ impl DidRateLimiter {
         let (limit, window) = get_endpoint_quota(endpoint);
         let refill_rate = limit as f64 / window.as_secs_f64();
 
-        let key = format!("{}:{}", did, endpoint);
+        // Include effective limit in key so dynamic quota changes do not reuse stale capacity.
+        let key = format!("{}:{}:{}", did, endpoint, limit);
 
-        let mut bucket = self
-            .buckets
-            .entry(key)
-            .or_insert_with(|| TokenBucket::new(limit, refill_rate));
+        let bucket = self.buckets.get_with(key, || {
+            Arc::new(Mutex::new(TokenBucket::new(limit, refill_rate)))
+        });
+        let mut bucket = bucket.lock();
 
         if bucket.try_consume() {
             Ok(())
@@ -170,14 +198,65 @@ impl DidRateLimiter {
     }
 
     /// Cleanup old buckets (call periodically to prevent memory leak)
-    pub async fn cleanup_old_buckets(&self, max_age: Duration) {
-        let now = Instant::now();
-        self.buckets
-            .retain(|_, bucket| now.duration_since(bucket.last_refill) < max_age);
+    pub async fn cleanup_old_buckets(&self, _max_age: Duration) {
+        self.buckets.run_pending_tasks();
     }
 }
 
 impl Default for DidRateLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Per-DS federation rate limiter (separate from user DID quotas).
+#[derive(Clone)]
+pub struct FederationPeerRateLimiter {
+    buckets: Arc<Cache<String, Arc<Mutex<TokenBucket>>>>,
+}
+
+impl FederationPeerRateLimiter {
+    pub fn new() -> Self {
+        let max_keys = parse_u64_env("RATE_LIMIT_FEDERATION_MAX_KEYS", 100_000);
+        let ttl_seconds = parse_u64_env("RATE_LIMIT_FEDERATION_BUCKET_TTL_SECONDS", 900);
+        Self {
+            buckets: build_bucket_cache(max_keys, ttl_seconds),
+        }
+    }
+
+    /// Check if request is allowed for given peer DS and federation NSID.
+    ///
+    /// `per_minute_override` comes from peer policy and, when set, overrides endpoint defaults.
+    pub fn check_peer_limit(
+        &self,
+        peer_ds_did: &str,
+        endpoint_nsid: &str,
+        per_minute_override: Option<u32>,
+    ) -> Result<(), u64> {
+        let (limit, window) = get_federation_endpoint_quota(endpoint_nsid, per_minute_override);
+        let refill_rate = limit as f64 / window.as_secs_f64();
+
+        // Include effective limit in the key so quota changes don't reuse stale bucket capacity.
+        let key = format!("{}:{}:{}", peer_ds_did, endpoint_nsid, limit);
+
+        let bucket = self.buckets.get_with(key, || {
+            Arc::new(Mutex::new(TokenBucket::new(limit, refill_rate)))
+        });
+        let mut bucket = bucket.lock();
+
+        if bucket.try_consume() {
+            Ok(())
+        } else {
+            Err(bucket.retry_after_secs())
+        }
+    }
+
+    pub async fn cleanup_old_buckets(&self, _max_age: Duration) {
+        self.buckets.run_pending_tasks();
+    }
+}
+
+impl Default for FederationPeerRateLimiter {
     fn default() -> Self {
         Self::new()
     }
@@ -247,8 +326,56 @@ fn get_endpoint_quota(endpoint: &str) -> (u32, Duration) {
     (limit, window)
 }
 
+fn get_federation_endpoint_quota(
+    endpoint_nsid: &str,
+    per_minute_override: Option<u32>,
+) -> (u32, Duration) {
+    let window = Duration::from_secs(60);
+
+    if let Some(limit) = per_minute_override {
+        return (limit.max(1), window);
+    }
+
+    let limit = if endpoint_nsid.ends_with(".deliverMessage") {
+        std::env::var("FEDERATION_RATE_LIMIT_DELIVER_MESSAGE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(240)
+    } else if endpoint_nsid.ends_with(".deliverWelcome") {
+        std::env::var("FEDERATION_RATE_LIMIT_DELIVER_WELCOME")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(120)
+    } else if endpoint_nsid.ends_with(".submitCommit") {
+        std::env::var("FEDERATION_RATE_LIMIT_SUBMIT_COMMIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(120)
+    } else if endpoint_nsid.ends_with(".fetchKeyPackage") {
+        std::env::var("FEDERATION_RATE_LIMIT_FETCH_KEY_PACKAGE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(120)
+    } else if endpoint_nsid.ends_with(".transferSequencer") {
+        std::env::var("FEDERATION_RATE_LIMIT_TRANSFER_SEQUENCER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30)
+    } else {
+        std::env::var("FEDERATION_RATE_LIMIT_DEFAULT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(180)
+    };
+
+    (limit.max(1), window)
+}
+
 /// Global DID rate limiter instance
 pub static DID_RATE_LIMITER: Lazy<DidRateLimiter> = Lazy::new(DidRateLimiter::new);
+/// Global per-source-DS limiter for federation endpoints.
+pub static FEDERATION_DS_RATE_LIMITER: Lazy<FederationPeerRateLimiter> =
+    Lazy::new(FederationPeerRateLimiter::new);
 
 /// Per-IP rate limiter instance
 pub static IP_LIMITER: Lazy<RateLimiter> = Lazy::new(RateLimiter::default);
@@ -285,93 +412,67 @@ fn is_recovery_mode_request(headers: &HeaderMap, endpoint: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Middleware for rate limiting based on user DID or device DID
+static TRUSTED_PROXY_CIDRS: Lazy<Vec<IpNet>> = Lazy::new(|| {
+    std::env::var("TRUSTED_PROXY_CIDRS")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .filter_map(|entry| match entry.parse::<IpNet>() {
+                    Ok(net) => Some(net),
+                    Err(err) => {
+                        tracing::warn!(
+                            cidr = entry,
+                            error = %err,
+                            "Ignoring invalid TRUSTED_PROXY_CIDRS entry"
+                        );
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+});
+
+/// Middleware for pre-auth throttling.
+/// Uses only source IP identity (optionally from trusted proxy headers).
 pub async fn rate_limit_middleware(request: Request, next: Next) -> Result<Response, StatusCode> {
     let headers = request.headers();
     let uri = request.uri().to_string();
+    let client_ip = extract_client_ip(&request);
 
     // Check for recovery mode bypass (handler MUST verify 0 key packages)
     if is_recovery_mode_request(headers, &uri) {
-        let did = extract_did_from_auth_header(headers).unwrap_or_else(|| "unknown".to_string());
         tracing::info!(
-            "🚨 Recovery mode bypass requested for {}: {} (handler must verify)",
-            did,
-            uri
+            client_ip = %client_ip,
+            endpoint = %uri,
+            "Recovery mode bypass requested (handler must verify true recovery state)"
         );
         return Ok(next.run(request).await);
     }
 
-    // Try to extract DID from Authorization header for authenticated requests
-    let did_opt = extract_did_from_auth_header(headers);
-
-    // Use DID-based rate limiting for authenticated requests
-    if let Some(did) = did_opt {
-        // For device-specific operations, use the full DID (includes #device-uuid)
-        // For other operations, extract just the user DID to share quota across devices
-        let use_device_limit = should_use_device_rate_limit(&uri);
-        let rate_limit_key = if use_device_limit {
-            // Use full DID including device fragment for device-specific operations
-            // Format: did:plc:user#device-uuid
-            did.clone()
-        } else {
-            // Extract base user DID (strip #device-uuid if present)
-            did.split('#').next().unwrap_or(&did).to_string()
-        };
-
-        match DID_RATE_LIMITER.check_did_limit(&rate_limit_key, &uri) {
-            Ok(()) => {
-                tracing::debug!(
-                    "Rate limit passed for {} (mode: {}): {}",
-                    rate_limit_key,
-                    if use_device_limit { "device" } else { "user" },
-                    uri
-                );
-                Ok(next.run(request).await)
-            }
-            Err(retry_after) => {
-                tracing::warn!(
-                    "Rate limit exceeded for {} (mode: {}): {} (retry after {} seconds)",
-                    rate_limit_key,
-                    if use_device_limit { "device" } else { "user" },
-                    uri,
-                    retry_after
-                );
-                let mut resp = Response::new(axum::body::Body::empty());
-                let headers = resp.headers_mut();
-                headers.insert(
-                    axum::http::header::RETRY_AFTER,
-                    axum::http::HeaderValue::from_str(&retry_after.to_string())
-                        .unwrap_or(axum::http::HeaderValue::from_static("1")),
-                );
-                *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
-                Ok(resp)
-            }
+    match IP_LIMITER.check(&client_ip) {
+        Ok(()) => {
+            tracing::debug!("IP pre-auth rate limit passed for {}: {}", client_ip, uri);
+            Ok(next.run(request).await)
         }
-    } else {
-        // Fall back to IP-based rate limiting for unauthenticated requests
-        let client_ip = extract_client_ip(headers);
-        match IP_LIMITER.check(&client_ip) {
-            Ok(()) => {
-                tracing::debug!("IP rate limit passed for {}: {}", client_ip, uri);
-                Ok(next.run(request).await)
-            }
-            Err(retry_after) => {
-                tracing::warn!(
-                    "IP rate limit exceeded for {}: {} (retry after {} seconds)",
-                    client_ip,
-                    uri,
-                    retry_after
-                );
-                let mut resp = Response::new(axum::body::Body::empty());
-                let headers = resp.headers_mut();
-                headers.insert(
-                    axum::http::header::RETRY_AFTER,
-                    axum::http::HeaderValue::from_str(&retry_after.to_string())
-                        .unwrap_or(axum::http::HeaderValue::from_static("1")),
-                );
-                *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
-                Ok(resp)
-            }
+        Err(retry_after) => {
+            tracing::warn!(
+                "IP pre-auth rate limit exceeded for {}: {} (retry after {} seconds)",
+                client_ip,
+                uri,
+                retry_after
+            );
+            let mut resp = Response::new(axum::body::Body::empty());
+            let headers = resp.headers_mut();
+            headers.insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_str(&retry_after.to_string())
+                    .unwrap_or(axum::http::HeaderValue::from_static("1")),
+            );
+            *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+            Ok(resp)
         }
     }
 }
@@ -379,6 +480,9 @@ pub async fn rate_limit_middleware(request: Request, next: Next) -> Result<Respo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use axum::http::Request as HttpRequest;
+    use std::net::{IpAddr, Ipv4Addr};
 
     #[test]
     fn test_token_bucket() {
@@ -424,53 +528,82 @@ mod tests {
         // Different user should have own bucket
         assert!(limiter.check("user2").is_ok());
     }
+
+    #[test]
+    fn test_trusted_proxy_uses_forwarded_ip() {
+        let request = HttpRequest::builder()
+            .uri("/xrpc/blue.catbird.mls.getMessages")
+            .header("cf-connecting-ip", "203.0.113.10")
+            .body(Body::empty())
+            .expect("request");
+        let mut request = request;
+        request.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            443,
+        )));
+
+        let trusted = vec!["10.0.0.0/8".parse::<IpNet>().expect("cidr parse")];
+        assert_eq!(
+            extract_client_ip_with_trusted(&request, &trusted),
+            "203.0.113.10"
+        );
+    }
+
+    #[test]
+    fn test_untrusted_proxy_ignores_forwarded_ip() {
+        let request = HttpRequest::builder()
+            .uri("/xrpc/blue.catbird.mls.getMessages")
+            .header("cf-connecting-ip", "203.0.113.10")
+            .body(Body::empty())
+            .expect("request");
+        let mut request = request;
+        request.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
+            443,
+        )));
+
+        let trusted = vec!["10.0.0.0/8".parse::<IpNet>().expect("cidr parse")];
+        assert_eq!(
+            extract_client_ip_with_trusted(&request, &trusted),
+            "198.51.100.20"
+        );
+    }
 }
 
-fn extract_client_ip(headers: &HeaderMap) -> String {
-    // Prefer X-Forwarded-For first value
-    if let Some(xff) = headers.get("x-forwarded-for").and_then(|h| h.to_str().ok()) {
-        if let Some(ip) = xff.split(',').next().map(|s| s.trim().to_string()) {
-            if !ip.is_empty() {
-                return ip;
+fn parse_ip_from_header(headers: &HeaderMap, name: &str) -> Option<IpAddr> {
+    headers
+        .get(name)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .and_then(|value| value.parse::<IpAddr>().ok())
+}
+
+fn is_trusted_proxy(ip: IpAddr, trusted_cidrs: &[IpNet]) -> bool {
+    !trusted_cidrs.is_empty() && trusted_cidrs.iter().any(|cidr| cidr.contains(&ip))
+}
+
+fn extract_client_ip_with_trusted(request: &Request, trusted_cidrs: &[IpNet]) -> String {
+    let peer_ip = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip());
+
+    if let Some(source_ip) = peer_ip {
+        if is_trusted_proxy(source_ip, trusted_cidrs) {
+            if let Some(ip) = parse_ip_from_header(request.headers(), "cf-connecting-ip")
+                .or_else(|| parse_ip_from_header(request.headers(), "x-forwarded-for"))
+                .or_else(|| parse_ip_from_header(request.headers(), "x-real-ip"))
+            {
+                return ip.to_string();
             }
         }
+        return source_ip.to_string();
     }
-    // Then Cloudflare / Nginx style headers
-    if let Some(ip) = headers
-        .get("cf-connecting-ip")
-        .or_else(|| headers.get("x-real-ip"))
-        .and_then(|h| h.to_str().ok())
-    {
-        return ip.to_string();
-    }
-    // Fall back to opaque key
+
     "unknown".to_string()
 }
 
-/// Extract DID from Authorization header (lightweight parsing, no validation)
-fn extract_did_from_auth_header(headers: &HeaderMap) -> Option<String> {
-    let auth_header = headers.get(axum::http::header::AUTHORIZATION)?;
-    let auth_str = auth_header.to_str().ok()?;
-
-    // Extract Bearer token
-    let token = auth_str.strip_prefix("Bearer ")?.trim();
-
-    // Parse JWT without validation (we only need the DID for rate limiting)
-    // JWT format: header.payload.signature
-    let parts: Vec<&str> = token.split('.').collect();
-    if parts.len() != 3 {
-        return None;
-    }
-
-    // Decode payload (base64url)
-    let payload = parts[1];
-    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload)
-        .ok()?;
-
-    // Parse JSON to extract issuer (DID)
-    let json: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
-    let iss = json.get("iss")?.as_str()?;
-
-    Some(iss.to_string())
+fn extract_client_ip(request: &Request) -> String {
+    extract_client_ip_with_trusted(request, &TRUSTED_PROXY_CIDRS)
 }

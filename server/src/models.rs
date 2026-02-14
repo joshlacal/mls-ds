@@ -1,7 +1,7 @@
-//! Database models using generated Atrium types
+//! Database models and jacquard-generated type re-exports
 //!
-//! These models use the generated lexicon types directly with sqlx extensions
-//! for Atrium types (Did, Datetime, etc.)
+//! These models map DB rows to API views using jacquard-generated types
+//! with CowStr/Did/Datetime conversions.
 
 use sqlx::FromRow;
 
@@ -14,19 +14,12 @@ pub use chat_request::{
 };
 
 // Re-export generated types for convenience
-pub use crate::generated::blue::catbird::mls::defs::{
-    ConvoMetadata, ConvoMetadataData, ConvoView, ConvoViewData, KeyPackageRef, KeyPackageRefData,
-    MemberView, MemberViewData, MessageView, MessageViewData,
+pub use crate::generated::blue_catbird::mls::{
+    ConvoMetadata, ConvoView, KeyPackageRef, MemberView, MessageView,
 };
 
-// Re-export endpoint types that handlers need
-pub use crate::generated::blue::catbird::mls::{
-    add_members::{Input as AddMembersInput, Output as AddMembersOutput},
-    get_welcome::Output as GetWelcomeOutput,
-    leave_convo::{Input as LeaveConvoInput, Output as LeaveConvoOutput},
-    publish_key_package::Input as PublishKeyPackageInput,
-    send_message::{Input as SendMessageInput, Output as SendMessageOutput},
-};
+// Note: handler-specific types (AddMembers, LeaveConvo, etc.) are imported
+// directly by each handler from crate::generated::blue_catbird::mls::*
 
 // =============================================================================
 // Database-specific models (not in lexicon)
@@ -43,6 +36,11 @@ pub struct Conversation {
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
     pub name: Option<String>, // From metadata
+    // Federation support
+    #[sqlx(default)]
+    pub sequencer_ds: Option<String>, // DID of sequencer DS; NULL = this DS is sequencer
+    #[sqlx(default)]
+    pub is_remote: bool, // True if this DS is only a participant mailbox
 }
 
 impl Conversation {
@@ -50,34 +48,41 @@ impl Conversation {
     ///
     /// # Errors
     /// Returns an error if the creator_did is not a valid DID string.
-    pub fn to_convo_view(&self, members: Vec<MemberView>) -> Result<ConvoView, String> {
-        let metadata = if self.name.is_some() {
-            Some(ConvoMetadata::from(ConvoMetadataData {
-                name: self.name.clone(),
-                description: None, // TODO: Add description column to conversations table
-            }))
+    pub fn to_convo_view(
+        &self,
+        members: Vec<MemberView<'static>>,
+    ) -> Result<ConvoView<'static>, String> {
+        use jacquard_common::IntoStatic;
+
+        let metadata: Option<ConvoMetadata<'static>> = if self.name.is_some() {
+            Some(ConvoMetadata {
+                name: self.name.clone().map(|s| s.into()),
+                description: None,
+                extra_data: Default::default(),
+            })
         } else {
             None
         };
 
-        let creator = self
-            .creator_did
-            .parse()
-            .map_err(|e| format!("Invalid creator DID '{}': {}", self.creator_did, e))?;
+        let creator = crate::sqlx_jacquard::try_string_to_did(&self.creator_did)
+            .map_err(|e| format!("Invalid creator DID: {}", e))?;
 
-        Ok(ConvoView::from(ConvoViewData {
-            group_id: self.id.clone(), // id is the group_id (canonical ID)
+        let view = ConvoView {
+            group_id: self.id.clone().into(),
             creator,
             members,
-            epoch: self.current_epoch as usize,
+            epoch: self.current_epoch as i64,
             cipher_suite: self
                 .cipher_suite
                 .clone()
-                .unwrap_or_else(|| "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519".to_string()),
-            created_at: crate::sqlx_atrium::chrono_to_datetime(self.created_at),
+                .unwrap_or_else(|| "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519".to_string())
+                .into(),
+            created_at: crate::sqlx_jacquard::chrono_to_datetime(self.created_at),
             last_message_at: None,
             metadata,
-        }))
+            extra_data: Default::default(),
+        };
+        Ok(view.into_static())
     }
 }
 
@@ -106,6 +111,9 @@ pub struct Membership {
     pub user_did: Option<String>, // Base user DID (without device suffix)
     pub device_id: Option<String>, // Device identifier (UUID)
     pub device_name: Option<String>, // Human-readable device name
+    // Federation support
+    #[sqlx(default)]
+    pub ds_did: Option<String>, // DID of the DS serving this member; NULL = local
 }
 
 impl Membership {
@@ -117,53 +125,51 @@ impl Membership {
     ///
     /// # Errors
     /// Returns an error if member_did is not a valid DID string or promoted_by_did is invalid.
-    pub fn to_member_view(&self) -> Result<MemberView, String> {
-        // Strip fragment (#...) from DID if present (e.g., did:plc:abc#device-uuid -> did:plc:abc)
-        // Fragments are used for credential DIDs but not valid in AT Protocol DID strings
+    pub fn to_member_view(&self) -> Result<MemberView<'static>, String> {
+        use jacquard_common::IntoStatic;
+
         let did_without_fragment = self
             .member_did
             .split('#')
             .next()
             .unwrap_or(&self.member_did);
 
-        let did: atrium_api::types::string::Did = did_without_fragment
-            .parse()
+        let did = crate::sqlx_jacquard::try_string_to_did(did_without_fragment)
             .map_err(|e| format!("Invalid member DID '{}': {}", self.member_did, e))?;
 
         let promoted_by = if let Some(ref promoted_by_did) = self.promoted_by_did {
             Some(
-                promoted_by_did
-                    .parse()
+                crate::sqlx_jacquard::try_string_to_did(promoted_by_did)
                     .map_err(|e| format!("Invalid promoted_by DID '{}': {}", promoted_by_did, e))?,
             )
         } else {
             None
         };
 
-        // Parse user_did if present, otherwise fall back to member_did for backward compatibility
-        let user_did: atrium_api::types::string::Did = if let Some(ref user_did_str) = self.user_did
-        {
-            user_did_str
-                .parse()
+        let user_did = if let Some(ref user_did_str) = self.user_did {
+            crate::sqlx_jacquard::try_string_to_did(user_did_str)
                 .map_err(|e| format!("Invalid user DID '{}': {}", user_did_str, e))?
         } else {
-            // Backward compatibility: use member_did as user_did
             did.clone()
         };
 
-        Ok(MemberView::from(MemberViewData {
-            did: did.clone(),
+        let view = MemberView {
+            did,
             user_did,
-            device_id: self.device_id.clone(),
-            device_name: self.device_name.clone(),
-            joined_at: crate::sqlx_atrium::chrono_to_datetime(self.joined_at),
+            device_id: self.device_id.as_deref().map(|s| s.into()),
+            device_name: self.device_name.as_deref().map(|s| s.into()),
+            joined_at: crate::sqlx_jacquard::chrono_to_datetime(self.joined_at),
             is_admin: self.is_admin,
             is_moderator: Some(self.is_moderator),
-            leaf_index: self.leaf_index.map(|i| i as usize),
+            leaf_index: self.leaf_index.map(|i| i as i64),
             credential: None,
-            promoted_at: self.promoted_at.map(crate::sqlx_atrium::chrono_to_datetime),
+            promoted_at: self
+                .promoted_at
+                .map(crate::sqlx_jacquard::chrono_to_datetime),
             promoted_by,
-        }))
+            extra_data: Default::default(),
+        };
+        Ok(view.into_static())
     }
 }
 
@@ -173,7 +179,10 @@ impl Membership {
 pub struct Message {
     pub id: String,
     pub convo_id: String,
-    pub sender_did: Option<String>, // Made nullable per privacy hardening migration
+    /// Intentionally stored as NULL for privacy. Sender identity is derived
+    /// from MLS decryption by clients. Used ephemerally during send flow
+    /// for unread count exclusion and notification routing, then discarded.
+    pub sender_did: Option<String>,
     pub message_type: String,
     pub epoch: i64,
     pub seq: i64,
@@ -186,16 +195,17 @@ impl Message {
     /// Convert to API MessageView
     ///
     /// Note: sender field removed per security hardening - clients derive sender from decrypted MLS content
-    pub fn to_message_view(&self) -> Result<MessageView, String> {
-        Ok(MessageView::from(MessageViewData {
-            id: self.id.clone(),
-            convo_id: self.convo_id.clone(),
-            ciphertext: self.ciphertext.clone(),
-            epoch: self.epoch as usize,
-            seq: self.seq as usize,
-            created_at: crate::sqlx_atrium::chrono_to_datetime(self.created_at),
-            message_type: Some(self.message_type.clone()),
-        }))
+    pub fn to_message_view(&self) -> Result<MessageView<'static>, String> {
+        Ok(MessageView {
+            id: self.id.clone().into(),
+            convo_id: self.convo_id.clone().into(),
+            ciphertext: bytes::Bytes::from(self.ciphertext.clone()),
+            epoch: self.epoch,
+            seq: self.seq,
+            created_at: crate::sqlx_jacquard::chrono_to_datetime(self.created_at),
+            message_type: Some(self.message_type.clone().into()),
+            extra_data: Default::default(),
+        })
     }
 }
 
@@ -221,21 +231,20 @@ impl KeyPackage {
     ///
     /// # Errors
     /// Returns an error if the DID is not a valid DID string.
-    pub fn to_key_package_ref(&self) -> Result<KeyPackageRef, String> {
+    pub fn to_key_package_ref(&self) -> Result<KeyPackageRef<'static>, String> {
         use base64::Engine;
         let key_package_b64 = base64::engine::general_purpose::STANDARD.encode(&self.key_data);
 
-        let did = self
-            .owner_did
-            .parse()
-            .map_err(|e| format!("Invalid key package DID '{}': {}", self.owner_did, e))?;
+        let did = crate::sqlx_jacquard::try_string_to_did(&self.owner_did)
+            .map_err(|e| format!("Invalid key package DID: {}", e))?;
 
-        Ok(KeyPackageRef::from(KeyPackageRefData {
+        Ok(KeyPackageRef {
             did,
-            key_package: key_package_b64,
-            cipher_suite: self.cipher_suite.clone(),
-            key_package_hash: Some(self.key_package_hash.clone()),
-        }))
+            key_package: key_package_b64.into(),
+            cipher_suite: self.cipher_suite.clone().into(),
+            key_package_hash: Some(self.key_package_hash.clone().into()),
+            extra_data: Default::default(),
+        })
     }
 }
 
@@ -323,6 +332,66 @@ pub struct BskyBlock {
     pub created_at: chrono::DateTime<chrono::Utc>, // When block was created on Bluesky
     pub cached_at: chrono::DateTime<chrono::Utc>, // When we cached it
     pub checked_at: chrono::DateTime<chrono::Utc>, // Last verification
+}
+
+// =============================================================================
+// Federation Models
+// =============================================================================
+
+/// Cached DS endpoint resolved from AT Protocol repo records
+/// Maps to `ds_endpoints` table
+#[derive(Debug, Clone, FromRow)]
+pub struct DsEndpoint {
+    pub did: String,
+    pub endpoint: String,
+    pub supported_cipher_suites: Option<String>, // JSON array as text
+    pub resolved_at: chrono::DateTime<chrono::Utc>,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl DsEndpoint {
+    /// Check if the cached endpoint has expired
+    pub fn is_expired(&self) -> bool {
+        self.expires_at < chrono::Utc::now()
+    }
+}
+
+/// Outbound delivery queue item for DS-to-DS fan-out with retry
+/// Maps to `outbound_queue` table
+#[derive(Debug, Clone, FromRow)]
+pub struct OutboundQueueItem {
+    pub id: String,
+    pub target_ds_did: String,
+    pub target_endpoint: String,
+    pub method: String,
+    pub payload: Vec<u8>,
+    pub convo_id: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub next_retry_at: chrono::DateTime<chrono::Utc>,
+    pub retry_count: i32,
+    pub max_retries: i32,
+    pub last_error: Option<String>,
+    pub status: String,
+}
+
+impl OutboundQueueItem {
+    /// Check if this item can still be retried
+    pub fn can_retry(&self) -> bool {
+        self.retry_count < self.max_retries && self.status == "pending"
+    }
+}
+
+/// Sequencer receipt: cryptographic proof of epoch assignment for equivocation detection.
+/// Maps to `sequencer_receipts` table.
+#[derive(Debug, Clone, FromRow)]
+pub struct SequencerReceipt {
+    pub convo_id: String,
+    pub epoch: i32,
+    pub commit_hash: Vec<u8>,
+    pub sequencer_did: String,
+    pub issued_at: i64,
+    pub signature: Vec<u8>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Pending welcome message for rejoin orchestration

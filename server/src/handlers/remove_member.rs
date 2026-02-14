@@ -7,7 +7,7 @@ use tracing::{error, info, warn};
 use crate::{
     actors::{ActorRegistry, ConvoMessage},
     auth::{enforce_standard, verify_is_admin, verify_is_member, AuthUser},
-    generated::blue::catbird::mls::remove_member::{Input, Output, OutputData, NSID},
+    generated::blue_catbird::mls::remove_member::{RemoveMember, RemoveMemberOutput},
     realtime::SseState,
     storage::{get_current_epoch, DbPool},
 };
@@ -20,19 +20,19 @@ pub async fn remove_member(
     State(sse_state): State<Arc<SseState>>,
     State(actor_registry): State<Arc<ActorRegistry>>,
     auth_user: AuthUser,
-    Json(input): Json<Input>,
-) -> Result<Json<Output>, StatusCode> {
-    let input = input.data;
+    body: String,
+) -> Result<Json<RemoveMemberOutput<'static>>, StatusCode> {
+    let input = crate::jacquard_json::from_json_body::<RemoveMember>(&body)?;
 
     info!(
         "📍 [remove_member] START - actor: {}, convo: {}, target: {}",
-        auth_user.did,
-        input.convo_id,
-        input.target_did.as_str()
+        crate::crypto::redact_for_log(&auth_user.did),
+        crate::crypto::redact_for_log(&input.convo_id),
+        crate::crypto::redact_for_log(input.target_did.as_str())
     );
 
     // Enforce standard auth
-    if let Err(_) = enforce_standard(&auth_user.claims, NSID) {
+    if let Err(_) = enforce_standard(&auth_user.claims, "blue.catbird.mls.removeMember") {
         error!("❌ [remove_member] Unauthorized");
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -63,7 +63,7 @@ pub async fn remove_member(
         let commit_bytes = if let Some(ref commit) = input.commit {
             Some(
                 base64::engine::general_purpose::STANDARD
-                    .decode(commit)
+                    .decode(commit.as_str())
                     .map_err(|e| {
                         error!("Invalid base64 commit: {}", e);
                         StatusCode::BAD_REQUEST
@@ -120,7 +120,7 @@ pub async fn remove_member(
         // Process commit if provided
         if let Some(ref commit) = input.commit {
             let commit_bytes = base64::engine::general_purpose::STANDARD
-                .decode(commit)
+                .decode(commit.as_str())
                 .map_err(|e| {
                     error!("Invalid base64 commit: {}", e);
                     StatusCode::BAD_REQUEST
@@ -157,7 +157,7 @@ pub async fn remove_member(
             let seq: i64 = sqlx::query_scalar(
                 "SELECT CAST(COALESCE(MAX(seq), 0) + 1 AS BIGINT) FROM messages WHERE convo_id = $1"
             )
-            .bind(&input.convo_id)
+            .bind(input.convo_id.as_str())
             .fetch_one(&mut *tx)
             .await
             .map_err(|e| {
@@ -170,8 +170,8 @@ pub async fn remove_member(
                 "INSERT INTO messages (id, convo_id, sender_did, message_type, epoch, seq, ciphertext, created_at) VALUES ($1, $2, $3, 'commit', $4, $5, $6, $7)"
             )
             .bind(&msg_id)
-            .bind(&input.convo_id)
-            .bind(&auth_user.did)
+            .bind(input.convo_id.as_str())
+            .bind(Option::<&str>::None) // sender_did intentionally NULL — PRIV-001 (docs/PRIVACY.md)
             .bind(advanced_epoch)
             .bind(seq)
             .bind(&commit_bytes)
@@ -197,7 +197,7 @@ pub async fn remove_member(
 
             // Fan out commit message to all remaining members (async)
             let pool_clone = pool.clone();
-            let convo_id_clone = input.convo_id.clone();
+            let convo_id_clone = input.convo_id.to_string();
             let msg_id_clone = msg_id.clone();
             let sse_state_clone = sse_state.clone();
 
@@ -287,20 +287,21 @@ pub async fn remove_member(
 
                 match message_result {
                     Ok((id, _sender_did, ciphertext, epoch, seq, created_at)) => {
-                        let message_view =
-                            crate::models::MessageView::from(crate::models::MessageViewData {
-                                id,
-                                convo_id: convo_id_clone.clone(),
-                                ciphertext: ciphertext.unwrap_or_default(),
-                                epoch: epoch as usize,
-                                seq: seq as usize,
-                                created_at: crate::sqlx_atrium::chrono_to_datetime(created_at),
-                                message_type: None,
-                            });
+                        let message_view = crate::generated_types::MessageView {
+                            id,
+                            convo_id: convo_id_clone.clone(),
+                            ciphertext: ciphertext.unwrap_or_default(),
+                            epoch: epoch as i64,
+                            seq: seq as i64,
+                            created_at,
+                            message_type: "app".to_string(),
+                            reactions: None,
+                        };
 
                         let event = crate::realtime::StreamEvent::MessageEvent {
                             cursor: cursor.clone(),
                             message: message_view,
+                            ephemeral: false,
                         };
 
                         // Store event
@@ -345,7 +346,7 @@ pub async fn remove_member(
             "UPDATE members SET left_at = $3
              WHERE convo_id = $1 AND (user_did = $2 OR member_did = $2) AND left_at IS NULL",
         )
-        .bind(&input.convo_id)
+        .bind(input.convo_id.as_str())
         .bind(input.target_did.as_str())
         .bind(&now)
         .execute(&pool)
@@ -393,10 +394,10 @@ pub async fn remove_member(
          VALUES ($1, $2, $3, 'remove', $4, $5, $6)"
     )
     .bind(&action_id)
-    .bind(&input.convo_id)
+    .bind(input.convo_id.as_str())
     .bind(&auth_user.did)
     .bind(input.target_did.as_str())
-    .bind(&input.reason)
+    .bind(input.reason.as_deref())
     .bind(&now)
     .execute(&pool)
     .await
@@ -408,11 +409,11 @@ pub async fn remove_member(
     // Emit the membership event with the correct epoch
     let membership_event = crate::realtime::StreamEvent::MembershipChangeEvent {
         cursor: event_cursor,
-        convo_id: input.convo_id.clone(),
+        convo_id: input.convo_id.to_string(),
         did: input.target_did.as_str().to_string(),
         action: event_action.to_string(),
         actor: Some(auth_user.did.clone()),
-        reason: input.reason.clone(),
+        reason: input.reason.as_ref().map(|s| s.to_string()),
         epoch: new_epoch as usize,
     };
 
@@ -421,21 +422,22 @@ pub async fn remove_member(
     } else {
         info!(
             "✅ Emitted membershipChangeEvent for {} being {} by {}",
-            input.target_did.as_str(),
+            crate::crypto::redact_for_log(input.target_did.as_str()),
             event_action,
-            auth_user.did
+            crate::crypto::redact_for_log(&auth_user.did)
         );
     }
 
     info!(
         "✅ [remove_member] SUCCESS - {} removed by {}, epoch_hint: {}",
-        input.target_did.as_str(),
-        auth_user.did,
+        crate::crypto::redact_for_log(input.target_did.as_str()),
+        crate::crypto::redact_for_log(&auth_user.did),
         new_epoch
     );
 
-    Ok(Json(Output::from(OutputData {
+    Ok(Json(RemoveMemberOutput {
         ok: true,
-        epoch_hint: Some(new_epoch as usize),
-    })))
+        epoch_hint: Some(new_epoch as i64),
+        extra_data: None,
+    }))
 }

@@ -160,7 +160,7 @@ mod tests {
         .bind(&now)
         .execute(pool)
         .await
-        .unwrap();
+        .expect("test setup");
 
         // Add member
         sqlx::query(
@@ -172,7 +172,7 @@ mod tests {
         .bind(&now)
         .execute(pool)
         .await
-        .unwrap();
+        .expect("test setup");
 
         // Add commit messages
         for (idx, &epoch) in epochs.iter().enumerate() {
@@ -191,7 +191,7 @@ mod tests {
             .bind(&now)
             .execute(pool)
             .await
-            .unwrap();
+            .expect("test setup");
         }
     }
 
@@ -208,7 +208,7 @@ mod tests {
             idle_timeout: std::time::Duration::from_secs(30),
         })
         .await
-        .unwrap();
+        .expect("test setup");
 
         let convo_id = "test-commits-convo-1";
         let user = "did:plc:user";
@@ -238,7 +238,7 @@ mod tests {
         let result = get_commits(State(pool.clone()), auth_user.clone(), Query(params)).await;
         assert!(result.is_ok());
 
-        let response = result.unwrap().0;
+        let response = result.expect("handler should return Ok").0;
         assert_eq!(response.commits.len(), 3); // epochs 2, 3, 5
         assert_eq!(response.commits[0].epoch, 2);
         assert_eq!(response.commits[1].epoch, 3);
@@ -254,7 +254,7 @@ mod tests {
         let result2 = get_commits(State(pool), auth_user, Query(params2)).await;
         assert!(result2.is_ok());
 
-        let response2 = result2.unwrap().0;
+        let response2 = result2.expect("handler should return Ok").0;
         assert_eq!(response2.commits.len(), 5); // all commits
     }
 
@@ -271,7 +271,7 @@ mod tests {
             idle_timeout: std::time::Duration::from_secs(30),
         })
         .await
-        .unwrap();
+        .expect("test setup");
 
         let convo_id = "test-commits-convo-2";
         let creator = "did:plc:creator";
@@ -314,7 +314,7 @@ mod tests {
             idle_timeout: std::time::Duration::from_secs(30),
         })
         .await
-        .unwrap();
+        .expect("test setup");
 
         let convo_id = "test-commits-convo-3";
         let user = "did:plc:user";

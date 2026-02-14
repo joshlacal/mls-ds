@@ -9,7 +9,6 @@ Use this checklist when deploying the Catbird MLS Server to production.
   - [ ] PostgreSQL password (min 32 characters)
   - [ ] Redis password (min 32 characters, if applicable)
 - [ ] Configure `SERVICE_DID` for JWT validation
-- [ ] Disable `JWT_SECRET` (only use ATProto JWTs in production)
 - [ ] Configure firewall rules (only expose port 3000)
 - [ ] Set up SSL/TLS termination (nginx/caddy)
 - [ ] Review rate limiting configuration

@@ -25,7 +25,10 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_stream::{wrappers::BroadcastStream, StreamMap};
 use tracing::{debug, error, info, warn};
 
+use std::collections::HashSet;
+
 use crate::{
+    federation::UpstreamManager,
     handlers::subscription_ticket::{verify_ticket, TicketClaims},
     realtime::sse::{SseState, StreamEvent},
     storage::DbPool,
@@ -136,7 +139,8 @@ pub struct ErrorPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "$type")]
 pub enum ClientMessage {
-    /// Client is typing
+    /// Client is typing (DEPRECATED: Prefer E2EE ephemeral messages via v2.sendEphemeral.
+    /// This creates plaintext typing events visible to the server.)
     #[serde(rename = "blue.catbird.mls.subscribeConvoEvents#typing")]
     Typing {
         #[serde(rename = "convoId")]
@@ -170,6 +174,7 @@ pub async fn subscribe_convo_events(
     ws: WebSocketUpgrade,
     State(pool): State<DbPool>,
     State(sse_state): State<Arc<SseState>>,
+    State(upstream_manager): State<Option<Arc<UpstreamManager>>>,
     Query(query): Query<SubscribeQuery>,
 ) -> Result<Response, StatusCode> {
     // Verify the ticket
@@ -225,6 +230,7 @@ pub async fn subscribe_convo_events(
 
     let pool_clone = pool.clone();
     let user_did_clone = user_did.clone();
+    let upstream_clone = upstream_manager.clone();
 
     // Upgrade to WebSocket
     Ok(ws.on_upgrade(move |socket| async move {
@@ -232,6 +238,7 @@ pub async fn subscribe_convo_events(
             socket,
             pool_clone,
             sse_state,
+            upstream_clone,
             user_did_clone.clone(),
             convo_id,
             query.cursor,
@@ -249,6 +256,7 @@ async fn handle_socket(
     socket: WebSocket,
     pool: DbPool,
     sse_state: Arc<SseState>,
+    upstream_manager: Option<Arc<UpstreamManager>>,
     user_did: String,
     target_convo_id: Option<String>,
     resume_cursor: Option<String>,
@@ -261,39 +269,70 @@ async fn handle_socket(
     // Sequence counter for this session (starts at 0, increments per event)
     let mut seq: i64 = 0;
 
+    // Track remote (upstream) subscriptions for cleanup on disconnect
+    let mut remote_subscriptions: Vec<(String, String)> = Vec::new();
+
     // 1. Setup Subscriptions
     if let Some(ref cid) = target_convo_id {
-        // Single conversation mode
-        let tx = sse_state.get_channel(cid).await;
-        let rx = BroadcastStream::new(tx.subscribe());
-        stream_map.insert(cid.clone(), rx);
+        // Single conversation mode — check if remote
+        let sequencer_ds = get_sequencer_ds(&pool, cid).await;
 
-        // Backfill for single convo
-        if let Some(ref cursor) = resume_cursor {
-            if !cursor.is_empty() {
-                match backfill_events(&pool, cid, cursor).await {
-                    Ok(events) => {
-                        info!(
+        match (&sequencer_ds, &upstream_manager) {
+            (Some(seq_did), Some(um)) => {
+                // Remote conversation with federation enabled
+                match um.subscribe(cid, seq_did, resume_cursor.as_deref()).await {
+                    Ok(rx) => {
+                        stream_map.insert(cid.clone(), BroadcastStream::new(rx));
+                        remote_subscriptions.push((cid.clone(), seq_did.clone()));
+                        debug!(
                             convo = %crate::crypto::redact_for_log(cid),
-                            backfill_count = events.len(),
-                            "Sending backfill events"
+                            "Subscribed to remote conversation via upstream"
                         );
-                        for (event, _event_cursor) in events {
-                            seq += 1;
-                            let mut sender_guard = sender.lock().await;
-                            if let Err(e) =
-                                send_event(&mut *sender_guard, &event, seq)
-                                    .await
-                            {
-                                error!("Failed to send backfill event: {}", e);
-                                return;
-                            }
-                        }
                     }
                     Err(e) => {
-                        error!("Failed to backfill events: {}", e);
-                        let mut sender_guard = sender.lock().await;
-                        let _ = send_error(&mut *sender_guard, "BackfillFailed", Some(&e)).await;
+                        warn!(
+                            convo = %crate::crypto::redact_for_log(cid),
+                            error = %e,
+                            "Failed upstream subscribe, falling back to local"
+                        );
+                        let tx = sse_state.get_channel(cid).await;
+                        stream_map.insert(cid.clone(), BroadcastStream::new(tx.subscribe()));
+                    }
+                }
+            }
+            _ => {
+                // Local conversation or federation disabled
+                let tx = sse_state.get_channel(cid).await;
+                stream_map.insert(cid.clone(), BroadcastStream::new(tx.subscribe()));
+            }
+        }
+
+        // Backfill only for local conversations (upstream handles its own backfill via cursor)
+        if sequencer_ds.is_none() {
+            if let Some(ref cursor) = resume_cursor {
+                if !cursor.is_empty() {
+                    match backfill_events(&pool, cid, cursor).await {
+                        Ok(events) => {
+                            info!(
+                                convo = %crate::crypto::redact_for_log(cid),
+                                backfill_count = events.len(),
+                                "Sending backfill events"
+                            );
+                            for (event, _event_cursor) in events {
+                                seq += 1;
+                                let mut sender_guard = sender.lock().await;
+                                if let Err(e) = send_event(&mut *sender_guard, &event, seq).await {
+                                    error!("Failed to send backfill event: {}", e);
+                                    return;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to backfill events: {}", e);
+                            let mut sender_guard = sender.lock().await;
+                            let _ =
+                                send_error(&mut *sender_guard, "BackfillFailed", Some(&e)).await;
+                        }
                     }
                 }
             }
@@ -305,13 +344,37 @@ async fn handle_socket(
             crate::crypto::redact_for_log(&user_did)
         );
 
-        match crate::db::list_conversations(&pool, &user_did, 1000, 0).await {
+        match get_user_convos_with_sequencer(&pool, &user_did).await {
             Ok(convos) => {
                 info!("Subscribing to {} conversations", convos.len());
-                for convo in convos {
-                    let tx = sse_state.get_channel(&convo.id).await;
-                    let rx = BroadcastStream::new(tx.subscribe());
-                    stream_map.insert(convo.id, rx);
+                for (convo_id, sequencer_ds) in convos {
+                    match (&sequencer_ds, &upstream_manager) {
+                        (Some(seq_did), Some(um)) => {
+                            match um
+                                .subscribe(&convo_id, seq_did, resume_cursor.as_deref())
+                                .await
+                            {
+                                Ok(rx) => {
+                                    stream_map.insert(convo_id.clone(), BroadcastStream::new(rx));
+                                    remote_subscriptions.push((convo_id, seq_did.clone()));
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        convo = %crate::crypto::redact_for_log(&convo_id),
+                                        error = %e,
+                                        "Failed upstream subscribe, falling back to local"
+                                    );
+                                    let tx = sse_state.get_channel(&convo_id).await;
+                                    stream_map
+                                        .insert(convo_id, BroadcastStream::new(tx.subscribe()));
+                                }
+                            }
+                        }
+                        _ => {
+                            let tx = sse_state.get_channel(&convo_id).await;
+                            stream_map.insert(convo_id, BroadcastStream::new(tx.subscribe()));
+                        }
+                    }
                 }
             }
             Err(e) => {
@@ -328,6 +391,12 @@ async fn handle_socket(
         }
     }
 
+    // Build set of remote convo IDs for typing indicator filtering
+    let remote_convo_ids: HashSet<String> = remote_subscriptions
+        .iter()
+        .map(|(cid, _)| cid.clone())
+        .collect();
+
     // Channel for client->server message handling
     let (client_msg_tx, mut client_msg_rx) = mpsc::channel::<ClientMessage>(32);
     let sse_state_clone = sse_state.clone();
@@ -341,6 +410,14 @@ async fn handle_socket(
                     convo_id,
                     is_typing,
                 } => {
+                    // Do not forward typing indicators for remote conversations
+                    if remote_convo_ids.contains(&convo_id) {
+                        debug!(
+                            convo = %crate::crypto::redact_for_log(&convo_id),
+                            "Ignoring typing indicator for remote conversation"
+                        );
+                        continue;
+                    }
                     debug!(
                         user = %crate::crypto::redact_for_log(&user_did_clone),
                         convo = %crate::crypto::redact_for_log(&convo_id),
@@ -400,9 +477,7 @@ async fn handle_socket(
 
                     // Convert StreamEvent to WebSocket message
                     let mut sender_guard = sender_clone.lock().await;
-                    if let Err(e) =
-                        send_event(&mut *sender_guard, &event, seq).await
-                    {
+                    if let Err(e) = send_event(&mut *sender_guard, &event, seq).await {
                         error!("Failed to send event for {}: {}", convo_id, e);
                         break;
                     }
@@ -495,6 +570,19 @@ async fn handle_socket(
 
     // Cleanup
     client_handler.abort();
+
+    // Unsubscribe from upstream connections for remote conversations
+    if let Some(ref um) = upstream_manager {
+        for (convo_id, seq_did) in &remote_subscriptions {
+            um.unsubscribe(convo_id, seq_did).await;
+        }
+        if !remote_subscriptions.is_empty() {
+            debug!(
+                count = remote_subscriptions.len(),
+                "Unsubscribed from upstream connections"
+            );
+        }
+    }
 
     info!(
         user = %crate::crypto::redact_for_log(&user_did),
@@ -633,6 +721,41 @@ async fn send_error(
         .map_err(|e| format!("Failed to send error: {}", e))?;
 
     Ok(())
+}
+
+// MARK: - Federation Helpers
+
+/// Look up the sequencer_ds for a single conversation.
+/// Returns `None` for local conversations or if the row is not found.
+async fn get_sequencer_ds(pool: &DbPool, convo_id: &str) -> Option<String> {
+    sqlx::query_scalar::<_, Option<String>>("SELECT sequencer_ds FROM conversations WHERE id = $1")
+        .bind(convo_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .flatten()
+}
+
+/// Get conversation IDs with their sequencer_ds for all of a user's conversations.
+/// Used by the global/multiplexed subscription mode.
+async fn get_user_convos_with_sequencer(
+    pool: &DbPool,
+    user_did: &str,
+) -> Result<Vec<(String, Option<String>)>, String> {
+    let rows = sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT c.id, c.sequencer_ds FROM conversations c \
+         INNER JOIN members m ON c.id = m.convo_id \
+         WHERE (m.member_did = $1 OR m.user_did = $1) AND m.left_at IS NULL \
+         ORDER BY c.created_at DESC \
+         LIMIT 1000",
+    )
+    .bind(user_did)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("Failed to list conversations: {}", e))?;
+
+    Ok(rows)
 }
 
 // MARK: - Tests

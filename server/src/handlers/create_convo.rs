@@ -9,11 +9,11 @@ use crate::{
     auth::AuthUser,
     block_sync::BlockSyncService,
     error_responses::CreateConvoError,
-    generated::blue::catbird::mls::create_convo::{Error, Input, NSID},
-    generated::blue::catbird::mls::defs::{
-        ConvoMetadata, ConvoMetadataData, ConvoView, ConvoViewData, MemberView, MemberViewData,
+    generated::blue_catbird::mls::create_convo::{
+        CreateConvo, CreateConvoError as LexCreateConvoError,
     },
-    sqlx_atrium::{chrono_to_datetime, did_to_string},
+    generated::blue_catbird::mls::{ConvoMetadata, ConvoView, MemberView},
+    sqlx_jacquard::{chrono_to_datetime, did_to_string},
     storage::DbPool,
 };
 
@@ -24,9 +24,9 @@ pub async fn create_convo(
     State(pool): State<DbPool>,
     State(block_sync): State<Arc<BlockSyncService>>,
     auth_user: AuthUser,
-    Json(input): Json<Input>,
-) -> Result<Json<ConvoView>, CreateConvoError> {
-    let input = input.data;
+    body: String,
+) -> Result<Json<ConvoView<'static>>, CreateConvoError> {
+    let input = crate::jacquard_json::from_json_body::<CreateConvo>(&body)?;
 
     tracing::debug!("🔷 [create_convo] incoming create request");
 
@@ -38,14 +38,20 @@ pub async fn create_convo(
         "[create_convo] start"
     );
 
-    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
+    if let Err(_e) =
+        crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.createConvo")
+    {
         error!("❌ [create_convo] Unauthorized");
         return Err(StatusCode::UNAUTHORIZED.into());
     }
 
     // Parse creator DID safely
     let creator_did = auth_user.did.parse().map_err(|e| {
-        error!("Invalid creator DID '{}': {}", auth_user.did, e);
+        error!(
+            "Invalid creator DID '{}': {}",
+            crate::crypto::redact_for_log(&auth_user.did),
+            e
+        );
         StatusCode::BAD_REQUEST
     })?;
 
@@ -61,10 +67,9 @@ pub async fn create_convo(
             "❌ [create_convo] Invalid cipher suite: {}",
             input.cipher_suite
         );
-        return Err(Error::InvalidCipherSuite(Some(format!(
-            "Cipher suite '{}' is not supported",
-            input.cipher_suite
-        )))
+        return Err(LexCreateConvoError::InvalidCipherSuite(Some(
+            format!("Cipher suite '{}' is not supported", input.cipher_suite).into(),
+        ))
         .into());
     }
 
@@ -86,10 +91,13 @@ pub async fn create_convo(
                 "❌ [create_convo] Too many initial members: {} (max {})",
                 total_member_count, max_members
             );
-            return Err(Error::TooManyMembers(Some(format!(
-                "Cannot add more than {} initial members (got {} including creator)",
-                max_members, total_member_count
-            )))
+            return Err(LexCreateConvoError::TooManyMembers(Some(
+                format!(
+                    "Cannot add more than {} initial members (got {} including creator)",
+                    max_members, total_member_count
+                )
+                .into(),
+            ))
             .into());
         }
     }
@@ -126,9 +134,12 @@ pub async fn create_convo(
                         "❌ [create_convo] Block detected between members: {} blocks found via PDS",
                         conflicts.len()
                     );
-                    return Err(Error::MutualBlockDetected(Some(format!(
+                    return Err(LexCreateConvoError::MutualBlockDetected(Some(
+                        format!(
                         "Cannot create conversation: one or more members have blocked each other"
-                    )))
+                    )
+                        .into(),
+                    ))
                     .into());
                 }
                 tracing::debug!(
@@ -156,9 +167,12 @@ pub async fn create_convo(
                         "❌ [create_convo] Block detected between members: {} blocks found (from DB cache)",
                         blocks.len()
                     );
-                    return Err(Error::MutualBlockDetected(Some(format!(
+                    return Err(LexCreateConvoError::MutualBlockDetected(Some(
+                        format!(
                         "Cannot create conversation: one or more members have blocked each other"
-                    )))
+                    )
+                        .into(),
+                    ))
                     .into());
                 }
                 tracing::debug!(
@@ -169,12 +183,14 @@ pub async fn create_convo(
     }
 
     // Use client-provided group_id as the canonical conversation ID
-    let convo_id = input.group_id.clone();
+    let convo_id = input.group_id.to_string();
     let now = chrono::Utc::now();
 
     let (name, description) = if let Some(ref meta) = input.metadata {
-        let meta_data = &meta.data;
-        (meta_data.name.clone(), meta_data.description.clone())
+        (
+            meta.name.as_deref().map(String::from),
+            meta.description.as_deref().map(String::from),
+        )
     } else {
         (None, None)
     };
@@ -195,7 +211,7 @@ pub async fn create_convo(
         if let Ok(Some(existing_convo_id)) = sqlx::query_scalar::<_, String>(
             "SELECT id FROM conversations WHERE idempotency_key = $1",
         )
-        .bind(idem_key)
+        .bind(idem_key.as_ref())
         .fetch_optional(&pool)
         .await
         {
@@ -227,43 +243,53 @@ pub async fn create_convo(
                         leaf_index,
                     )| {
                         let did = member_did.parse().map_err(|e| {
-                            error!("Invalid member DID '{}': {}", member_did, e);
+                            error!(
+                                "Invalid member DID '{}': {}",
+                                crate::crypto::redact_for_log(&member_did),
+                                e
+                            );
                             StatusCode::INTERNAL_SERVER_ERROR
                         })?;
 
                         let user_did_parsed = user_did.parse().map_err(|e| {
-                            error!("Invalid user DID '{}': {}", user_did, e);
+                            error!(
+                                "Invalid user DID '{}': {}",
+                                crate::crypto::redact_for_log(&user_did),
+                                e
+                            );
                             StatusCode::INTERNAL_SERVER_ERROR
                         })?;
 
-                        Ok(MemberView::from(MemberViewData {
+                        Ok(MemberView {
                             did,
                             user_did: user_did_parsed,
-                            device_id,
-                            device_name,
+                            device_id: device_id.map(Into::into),
+                            device_name: device_name.map(Into::into),
                             joined_at: chrono_to_datetime(joined_at),
                             is_admin,
-                            leaf_index: leaf_index.map(|i| i as usize),
+                            leaf_index: leaf_index.map(|i| i as i64),
                             credential: None,
                             promoted_at: None,
                             promoted_by: None,
                             is_moderator: Some(false),
-                        }))
+                            extra_data: Default::default(),
+                        })
                     },
                 )
                 .collect::<Result<Vec<_>, StatusCode>>()?;
 
             let metadata = if name.is_some() || description.is_some() {
-                Some(ConvoMetadata::from(ConvoMetadataData {
-                    name: name.clone(),
-                    description: description.clone(),
-                }))
+                Some(ConvoMetadata {
+                    name: name.clone().map(Into::into),
+                    description: description.clone().map(Into::into),
+                    extra_data: Default::default(),
+                })
             } else {
                 None
             };
 
-            return Ok(Json(ConvoView::from(ConvoViewData {
-                group_id: existing_convo_id, // existing_convo_id is the group_id
+            return Ok(Json(ConvoView {
+                group_id: existing_convo_id.into(), // existing_convo_id is the group_id
                 creator: creator_did,
                 members,
                 epoch: 0,
@@ -271,21 +297,25 @@ pub async fn create_convo(
                 created_at: chrono_to_datetime(now),
                 last_message_at: None,
                 metadata,
-            })));
+                extra_data: Default::default(),
+            }));
         }
     }
 
     // Create conversation - id is the client-provided group_id
+    // Federation: sequencer_ds is NULL for locally-created conversations (NULL means "this DS is the sequencer").
+    // is_remote defaults to false. When federation is enabled, remote participants' DSes will
+    // see sequencer_ds set to the creating DS's DID.
     sqlx::query(
-        "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at, name, cipher_suite, idempotency_key)
-         VALUES ($1, $2, 0, $3, $3, $4, $5, $6)"
+        "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at, name, cipher_suite, idempotency_key, sequencer_ds, is_remote)
+         VALUES ($1, $2, 0, $3, $3, $4, $5, $6, NULL, false)"
     )
-    .bind(&convo_id)  // convo_id is now input.group_id
+    .bind(&convo_id)  // convo_id is now String from input.group_id
     .bind(&auth_user.did)
     .bind(&now)
     .bind(&name)
-    .bind(&input.cipher_suite)
-    .bind(&input.idempotency_key)
+    .bind(&*input.cipher_suite)
+    .bind(input.idempotency_key.as_deref())
     .execute(&pool)
     .await
     .map_err(|e| {
@@ -309,7 +339,7 @@ pub async fn create_convo(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let mut members = vec![MemberView::from(MemberViewData {
+    let mut members = vec![MemberView {
         did: creator_did.clone(),
         user_did: creator_did.clone(), // For single-device: same as did
         device_id: None,
@@ -321,7 +351,8 @@ pub async fn create_convo(
         credential: None,
         promoted_at: None,
         promoted_by: None,
-    })];
+        extra_data: Default::default(),
+    }];
 
     // Add initial members if specified
     if let Some(ref initial_members) = input.initial_members {
@@ -349,7 +380,7 @@ pub async fn create_convo(
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
-            members.push(MemberView::from(MemberViewData {
+            members.push(MemberView {
                 did: member_did.clone(),
                 user_did: member_did.clone(), // For single-device: same as did
                 device_id: None,
@@ -357,11 +388,12 @@ pub async fn create_convo(
                 joined_at: chrono_to_datetime(now),
                 is_admin: false,
                 is_moderator: Some(false),
-                leaf_index: Some((idx + 1) as usize),
+                leaf_index: Some((idx + 1) as i64),
                 credential: None,
                 promoted_at: None,
                 promoted_by: None,
-            }));
+                extra_data: Default::default(),
+            });
         }
     }
 
@@ -373,7 +405,7 @@ pub async fn create_convo(
 
         // Decode base64 Welcome message
         let welcome_data = base64::engine::general_purpose::STANDARD
-            .decode(welcome_b64)
+            .decode(&**welcome_b64)
             .map_err(|e| {
                 warn!("❌ [create_convo] Invalid base64 welcome message: {}", e);
                 StatusCode::BAD_REQUEST
@@ -423,8 +455,8 @@ pub async fn create_convo(
             );
 
             for entry in kp_hashes {
-                let member_did_str = did_to_string(&entry.data.did);
-                let hash_hex = &entry.data.hash;
+                let member_did_str = did_to_string(&entry.did);
+                let hash_hex: &str = &entry.hash;
 
                 // Check if key package exists and is available (not consumed/reserved)
                 let available = sqlx::query_scalar::<_, bool>(
@@ -471,10 +503,10 @@ pub async fn create_convo(
                         "❌ [create_convo] Key package not available for {}: requested_hash={}, available_hashes_count={}, available_hashes={:?}",
                         member_did_str, hash_hex, available_hashes.len(), available_hashes
                     );
-                    return Err(Error::KeyPackageNotFound(Some(format!(
+                    return Err(LexCreateConvoError::KeyPackageNotFound(Some(format!(
                         "Key package not available for {}: hash={}. Server has {} available key packages.",
                         member_did_str, hash_hex, available_hashes.len()
-                    ))).into());
+                    ).into())).into());
                 }
             }
             info!(
@@ -512,8 +544,8 @@ pub async fn create_convo(
                 .map(|hashes| {
                     hashes
                         .iter()
-                        .filter(|entry| did_to_string(&entry.data.did) == *member_did_str)
-                        .filter_map(|entry| hex::decode(&entry.data.hash).ok())
+                        .filter(|entry| did_to_string(&entry.did) == *member_did_str)
+                        .filter_map(|entry| hex::decode(&*entry.hash).ok())
                         .collect()
                 })
                 .unwrap_or_default();
@@ -536,13 +568,13 @@ pub async fn create_convo(
                 .execute(&pool)
                 .await
                 .map_err(|e| {
-                    error!("❌ [create_convo] Failed to store welcome message for {}: {}", member_did_str, e);
+                    error!("❌ [create_convo] Failed to store welcome message for {}: {}", crate::crypto::redact_for_log(member_did_str), e);
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
 
                 tracing::debug!(
                     "✅ [create_convo] welcome stored for member (legacy): {}",
-                    member_did_str
+                    crate::crypto::redact_for_log(member_did_str)
                 );
             } else {
                 // Multi-device: Store welcome for EACH hash
@@ -563,13 +595,13 @@ pub async fn create_convo(
                     .execute(&pool)
                     .await
                     .map_err(|e| {
-                        error!("❌ [create_convo] Failed to store welcome message for {}: {}", member_did_str, e);
+                        error!("❌ [create_convo] Failed to store welcome message for {}: {}", crate::crypto::redact_for_log(member_did_str), e);
                         StatusCode::INTERNAL_SERVER_ERROR
                     })?;
                 }
                 tracing::debug!(
                     "✅ [create_convo] welcome stored for member (multi-device): {}",
-                    member_did_str
+                    crate::crypto::redact_for_log(member_did_str)
                 );
             }
         }
@@ -581,18 +613,18 @@ pub async fn create_convo(
         // Mark key packages as consumed
         if let Some(ref kp_hashes) = input.key_package_hashes {
             for entry in kp_hashes {
-                let member_did_str = did_to_string(&entry.data.did);
-                let hash_hex = &entry.data.hash;
+                let member_did_str = did_to_string(&entry.did);
+                let hash_hex: &str = &entry.hash;
 
                 match crate::db::mark_key_package_consumed(&pool, &member_did_str, hash_hex).await {
                     Ok(consumed) => {
                         if consumed {
                             tracing::debug!(
                                 "✅ [create_convo] marked key package as consumed for {}",
-                                member_did_str
+                                crate::crypto::redact_for_log(&member_did_str)
                             );
                         } else {
-                            tracing::warn!("⚠️ [create_convo] key package not found or already consumed for {}", member_did_str);
+                            tracing::warn!("⚠️ [create_convo] key package not found or already consumed for {}", crate::crypto::redact_for_log(&member_did_str));
                         }
                     }
                     Err(e) => {
@@ -621,13 +653,17 @@ pub async fn create_convo(
 
     // Build metadata view if metadata exists
     let metadata = if name.is_some() || description.is_some() {
-        Some(ConvoMetadata::from(ConvoMetadataData { name, description }))
+        Some(ConvoMetadata {
+            name: name.map(Into::into),
+            description: description.map(Into::into),
+            extra_data: Default::default(),
+        })
     } else {
         None
     };
 
-    Ok(Json(ConvoView::from(ConvoViewData {
-        group_id: convo_id, // convo_id is the group_id
+    Ok(Json(ConvoView {
+        group_id: convo_id.into(), // convo_id is String, convert to CowStr
         creator: creator_did,
         members,
         epoch: 0,
@@ -635,5 +671,6 @@ pub async fn create_convo(
         created_at: chrono_to_datetime(now),
         last_message_at: None,
         metadata,
-    })))
+        extra_data: Default::default(),
+    }))
 }

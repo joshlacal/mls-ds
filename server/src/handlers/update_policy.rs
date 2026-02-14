@@ -135,7 +135,7 @@ pub async fn update_policy(
         let current_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM members WHERE convo_id = $1 AND left_at IS NULL",
         )
-        .bind(&input.convo_id)
+        .bind(input.convo_id.as_str())
         .fetch_one(&pool)
         .await
         .map_err(|e| {
@@ -214,7 +214,7 @@ pub async fn update_policy(
     // Note: This is a simplified version - production should use sqlx query builder
     let mut query_builder = sqlx::query_as::<_, PolicyView>(&query)
         .bind(caller_did)
-        .bind(&input.convo_id);
+        .bind(input.convo_id.as_str());
 
     if let Some(val) = input.allow_external_commits {
         query_builder = query_builder.bind(val);
@@ -283,7 +283,7 @@ pub async fn get_policy(
         )
         "#,
     )
-    .bind(&input.convo_id)
+    .bind(input.convo_id.as_str())
     .bind(caller_did)
     .fetch_one(&pool)
     .await
@@ -312,7 +312,7 @@ pub async fn get_policy(
         WHERE convo_id = $1
         "#,
     )
-    .bind(&input.convo_id)
+    .bind(input.convo_id.as_str())
     .fetch_one(&pool)
     .await
     .map_err(|e| {

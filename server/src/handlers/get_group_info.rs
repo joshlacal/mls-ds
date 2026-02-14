@@ -10,9 +10,11 @@ use tracing::{info, warn};
 use crate::{
     auth::AuthUser,
     error_responses::GetGroupInfoError,
-    generated::blue::catbird::mls::get_group_info::{Error, Output, OutputData, Parameters},
+    generated::blue_catbird::mls::get_group_info::{
+        GetGroupInfo, GetGroupInfoError as GeneratedError, GetGroupInfoOutput,
+    },
     group_info::{generate_and_cache_group_info, get_group_info},
-    sqlx_atrium::chrono_to_datetime,
+    sqlx_jacquard::chrono_to_datetime,
     storage::DbPool,
 };
 
@@ -26,10 +28,13 @@ struct MemberCheckRow {
 pub async fn handle(
     State(pool): State<DbPool>,
     auth: AuthUser,
-    Query(params): Query<Parameters>,
-) -> Result<Json<Output>, GetGroupInfoError> {
+    raw_query: axum::extract::RawQuery,
+) -> Result<Json<GetGroupInfoOutput<'static>>, GetGroupInfoError> {
+    let params = crate::jacquard_json::from_query_string::<GetGroupInfo>(
+        raw_query.0.as_deref().unwrap_or(""),
+    )?;
     let did = &auth.did;
-    let convo_id = &params.data.convo_id;
+    let convo_id = &params.convo_id;
 
     // =========================================================================
     // AUTHORIZATION LOG: Track GroupInfo requests for audit
@@ -51,7 +56,7 @@ pub async fn handle(
          WHERE convo_id = $1 AND user_did = $2
          LIMIT 1",
     )
-    .bind(convo_id)
+    .bind(convo_id.as_str())
     .bind(did)
     .fetch_optional(&pool)
     .await
@@ -68,9 +73,10 @@ pub async fn handle(
                 reason = "not_a_member",
                 "❌ [GROUP-INFO] Rejected: Not a member"
             );
-            return Err(
-                Error::Unauthorized(Some("Not a member of this conversation".into())).into(),
-            );
+            return Err(GeneratedError::Unauthorized(Some(
+                "Not a member of this conversation".into(),
+            ))
+            .into());
         }
     };
 
@@ -84,7 +90,7 @@ pub async fn handle(
             reason = "member_left",
             "❌ [GROUP-INFO] Rejected: Member was removed/left"
         );
-        return Err(Error::Unauthorized(Some(
+        return Err(GeneratedError::Unauthorized(Some(
             "Member was removed or left. Request re-add from admin.".into(),
         ))
         .into());
@@ -113,13 +119,16 @@ pub async fn handle(
             // Clients should proactively refresh via publishGroupInfo before expiration
             match generate_and_cache_group_info(&pool, convo_id).await {
                 Ok(fresh_info) => {
-                    return Ok(Json(Output::from(OutputData {
-                        group_info: base64::engine::general_purpose::STANDARD.encode(fresh_info),
+                    return Ok(Json(GetGroupInfoOutput {
+                        group_info: base64::engine::general_purpose::STANDARD
+                            .encode(fresh_info)
+                            .into(),
                         epoch: epoch as i64,
                         expires_at: Some(chrono_to_datetime(
                             chrono::Utc::now() + chrono::Duration::hours(6),
                         )),
-                    })));
+                        extra_data: None,
+                    }));
                 }
                 Err(_) => {
                     // If regeneration fails (e.g. not implemented), return cached one if available
@@ -128,18 +137,21 @@ pub async fn handle(
             }
         }
 
-        return Ok(Json(Output::from(OutputData {
-            group_info: base64::engine::general_purpose::STANDARD.encode(group_info_bytes),
+        return Ok(Json(GetGroupInfoOutput {
+            group_info: base64::engine::general_purpose::STANDARD
+                .encode(group_info_bytes)
+                .into(),
             epoch: epoch as i64,
             expires_at: Some(chrono_to_datetime(updated_at + chrono::Duration::hours(6))),
-        })));
+            extra_data: None,
+        }));
     }
 
     // If not found, try to generate it
     let _fresh_info = generate_and_cache_group_info(&pool, convo_id)
         .await
         .map_err(|_| {
-            Error::GroupInfoUnavailable(Some(
+            GeneratedError::GroupInfoUnavailable(Some(
                 "GroupInfo not available and cannot be generated".into(),
             ))
         })?;
@@ -150,12 +162,18 @@ pub async fn handle(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     if let Some((group_info_bytes, epoch, updated_at)) = cached_again {
-        return Ok(Json(Output::from(OutputData {
-            group_info: base64::engine::general_purpose::STANDARD.encode(group_info_bytes),
+        return Ok(Json(GetGroupInfoOutput {
+            group_info: base64::engine::general_purpose::STANDARD
+                .encode(group_info_bytes)
+                .into(),
             epoch: epoch as i64,
             expires_at: Some(chrono_to_datetime(updated_at + chrono::Duration::hours(6))),
-        })));
+            extra_data: None,
+        }));
     }
 
-    Err(Error::GroupInfoUnavailable(Some("Failed to retrieve generated GroupInfo".into())).into())
+    Err(
+        GeneratedError::GroupInfoUnavailable(Some("Failed to retrieve generated GroupInfo".into()))
+            .into(),
+    )
 }

@@ -1,0 +1,75 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.mlsChat.getReports",
+  "description": "List moderation reports for a conversation (admin only)",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "List moderation reports for a conversation. Requires admin privileges.",
+      "parameters": {
+        "type": "params",
+        "required": ["convoId"],
+        "properties": {
+          "convoId": {
+            "type": "string",
+            "description": "Conversation identifier"
+          },
+          "status": {
+            "type": "string",
+            "description": "Filter reports by status",
+            "knownValues": ["pending", "resolved", "dismissed"]
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 50,
+            "description": "Maximum number of reports to return"
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Pagination cursor"
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["reports"],
+          "properties": {
+            "reports": {
+              "type": "array",
+              "items": {
+                "type": "ref",
+                "ref": "#reportView"
+              }
+            },
+            "cursor": {
+              "type": "string",
+              "description": "Pagination cursor for next page"
+            }
+          }
+        }
+      },
+      "errors": [
+        {"name": "ConvoNotFound", "description": "Conversation not found"},
+        {"name": "NotAdmin", "description": "Caller is not an admin of this conversation"}
+      ]
+    },
+    "reportView": {
+      "type": "object",
+      "required": ["id", "reporterDid", "reportedDid", "category", "createdAt", "status"],
+      "properties": {
+        "id": { "type": "string" },
+        "reporterDid": { "type": "string", "format": "did" },
+        "reportedDid": { "type": "string", "format": "did" },
+        "category": { "type": "string" },
+        "createdAt": { "type": "string", "format": "datetime" },
+        "status": { "type": "string" },
+        "resolvedByDid": { "type": "string", "format": "did" },
+        "resolvedAt": { "type": "string", "format": "datetime" }
+      }
+    }
+  }
+}

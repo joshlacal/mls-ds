@@ -3,8 +3,8 @@ use tracing::{error, info};
 
 use crate::{
     auth::{verify_is_admin, verify_is_member, AuthUser},
-    generated::blue::catbird::mls::promote_admin::{Input, Output, OutputData, NSID},
-    sqlx_atrium::chrono_to_datetime,
+    generated::blue_catbird::mls::promote_admin::{PromoteAdmin, PromoteAdminOutput},
+    sqlx_jacquard::chrono_to_datetime,
     storage::DbPool,
 };
 
@@ -14,10 +14,9 @@ use crate::{
 pub async fn promote_admin(
     State(pool): State<DbPool>,
     auth_user: AuthUser,
-    Json(input): Json<Input>,
-) -> Result<Json<Output>, StatusCode> {
-    let input = input.data;
-
+    body: String,
+) -> Result<Json<PromoteAdminOutput<'static>>, StatusCode> {
+    let input = crate::jacquard_json::from_json_body::<PromoteAdmin>(&body)?;
     info!(
         "📍 [promote_admin] START - actor: {}, convo: {}, target: {}",
         auth_user.did,
@@ -26,7 +25,9 @@ pub async fn promote_admin(
     );
 
     // Enforce standard auth
-    if let Err(_) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
+    if let Err(_) =
+        crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.promoteAdmin")
+    {
         error!("❌ [promote_admin] Unauthorized");
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -44,7 +45,7 @@ pub async fn promote_admin(
          WHERE convo_id = $1 AND user_did = $2 AND left_at IS NULL
          LIMIT 1",
     )
-    .bind(&input.convo_id)
+    .bind(input.convo_id.as_str())
     .bind(input.target_did.as_str())
     .fetch_one(&pool)
     .await
@@ -67,7 +68,7 @@ pub async fn promote_admin(
          SET is_admin = true, promoted_at = $3, promoted_by_did = $4
          WHERE convo_id = $1 AND user_did = $2 AND left_at IS NULL",
     )
-    .bind(&input.convo_id)
+    .bind(input.convo_id.as_str())
     .bind(input.target_did.as_str())
     .bind(&now)
     .bind(&auth_user.did)
@@ -85,7 +86,7 @@ pub async fn promote_admin(
          VALUES ($1, $2, $3, 'promote', $4, $5)",
     )
     .bind(&action_id)
-    .bind(&input.convo_id)
+    .bind(input.convo_id.as_str())
     .bind(&auth_user.did)
     .bind(input.target_did.as_str())
     .bind(&now)
@@ -98,8 +99,9 @@ pub async fn promote_admin(
 
     info!("✅ [promote_admin] SUCCESS - user promoted to admin");
 
-    Ok(Json(Output::from(OutputData {
+    Ok(Json(PromoteAdminOutput {
         ok: true,
         promoted_at: chrono_to_datetime(now),
-    })))
+        extra_data: Default::default(),
+    }))
 }

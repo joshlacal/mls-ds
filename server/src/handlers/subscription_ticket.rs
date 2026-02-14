@@ -138,13 +138,10 @@ fn generate_jti() -> String {
     hex::encode(random_bytes)
 }
 
-/// Sign a ticket using HS256 (shared secret) or ES256K (service key)
+/// Sign a ticket using HS256 with dedicated ticket secret.
 fn sign_ticket(claims: &TicketClaims) -> Result<String, String> {
-    // Use HS256 with TICKET_SECRET for now
-    // In production, should use ES256K with service private key
-    let secret = std::env::var("TICKET_SECRET")
-        .or_else(|_| std::env::var("JWT_SECRET"))
-        .map_err(|_| "TICKET_SECRET or JWT_SECRET not configured".to_string())?;
+    let secret =
+        std::env::var("TICKET_SECRET").map_err(|_| "TICKET_SECRET not configured".to_string())?;
 
     let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
     let key = jsonwebtoken::EncodingKey::from_secret(secret.as_bytes());
@@ -156,9 +153,8 @@ fn sign_ticket(claims: &TicketClaims) -> Result<String, String> {
 /// Verify a subscription ticket
 /// Returns the claims if valid
 pub fn verify_ticket(ticket: &str) -> Result<TicketClaims, String> {
-    let secret = std::env::var("TICKET_SECRET")
-        .or_else(|_| std::env::var("JWT_SECRET"))
-        .map_err(|_| "TICKET_SECRET or JWT_SECRET not configured".to_string())?;
+    let secret =
+        std::env::var("TICKET_SECRET").map_err(|_| "TICKET_SECRET not configured".to_string())?;
 
     let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
 
@@ -187,7 +183,7 @@ mod tests {
 
     #[test]
     fn test_sign_and_verify_ticket() {
-        std::env::set_var("JWT_SECRET", "test-secret-for-unit-tests");
+        std::env::set_var("TICKET_SECRET", "test-secret-for-unit-tests");
 
         let claims = TicketClaims {
             iss: "did:web:mls.test".to_string(),
@@ -208,7 +204,7 @@ mod tests {
 
     #[test]
     fn test_expired_ticket() {
-        std::env::set_var("JWT_SECRET", "test-secret-for-unit-tests");
+        std::env::set_var("TICKET_SECRET", "test-secret-for-unit-tests");
 
         let claims = TicketClaims {
             iss: "did:web:mls.test".to_string(),

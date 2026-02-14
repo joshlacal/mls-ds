@@ -56,3 +56,6 @@ dist/
 *.dylib
 *.dll
 *.a
+e2e-tests/target/
+.letta/
+.claude/CLAUDE.md

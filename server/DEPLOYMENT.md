@@ -193,13 +193,11 @@ ls -la /var/backups/catbird/
 | `DATABASE_URL` | PostgreSQL connection string | Yes |
 | `REDIS_URL` | Redis connection string | Yes |
 | `SERVICE_DID` | Service DID for JWT validation | Recommended |
-| `JWT_SECRET` | Secret for dev tokens (disable in prod) | No |
 
 ### Production Checklist
 
 - [ ] Use strong database password
 - [ ] Use strong Redis password (if applicable)
-- [ ] Disable `JWT_SECRET` (use only ATProto JWTs)
 - [ ] Set `RUST_LOG=info` (not debug)
 - [ ] Enable firewall, only expose port 3000
 - [ ] Set up TLS termination (nginx/caddy)

@@ -436,9 +436,31 @@ CREATE OR REPLACE FUNCTION cleanup_expired_idempotency_cache()
 RETURNS INTEGER AS $$
 DECLARE
     deleted_count INTEGER;
+    batch_deleted INTEGER;
+    batch_limit INTEGER := 5000;
+    batch_sleep_seconds DOUBLE PRECISION := 0.02;
 BEGIN
-    DELETE FROM idempotency_cache WHERE expires_at < NOW();
-    GET DIAGNOSTICS deleted_count = ROW_COUNT;
+    deleted_count := 0;
+
+    LOOP
+        WITH deleted AS (
+            DELETE FROM idempotency_cache
+            WHERE ctid IN (
+                SELECT ctid
+                FROM idempotency_cache
+                WHERE expires_at < NOW()
+                LIMIT batch_limit
+            )
+            RETURNING 1
+        )
+        SELECT COUNT(*) INTO batch_deleted FROM deleted;
+
+        EXIT WHEN batch_deleted = 0;
+        deleted_count := deleted_count + batch_deleted;
+
+        PERFORM pg_sleep(batch_sleep_seconds);
+    END LOOP;
+
     RETURN deleted_count;
 END;
 $$ LANGUAGE plpgsql;

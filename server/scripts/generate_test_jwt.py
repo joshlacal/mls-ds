@@ -17,7 +17,7 @@ def base64url_encode(data):
         data = data.encode('utf-8')
     return base64.urlsafe_b64encode(data).rstrip(b'=').decode('utf-8')
 
-def generate_token(jwt_secret, service_did, issuer_did, hours, lxm=None):
+def generate_token(shared_secret, service_did, issuer_did, hours, lxm=None):
     """Generate a JWT token"""
     now = int(time.time())
     exp = now + (hours * 3600)
@@ -46,7 +46,7 @@ def generate_token(jwt_secret, service_did, issuer_did, hours, lxm=None):
     # Create signature
     message = f"{header_b64}.{payload_b64}".encode('utf-8')
     signature = hmac.new(
-        jwt_secret.encode('utf-8'),
+        shared_secret.encode('utf-8'),
         message,
         hashlib.sha256
     ).digest()
@@ -59,7 +59,7 @@ def generate_token(jwt_secret, service_did, issuer_did, hours, lxm=None):
 
 def main():
     # Load environment variables
-    jwt_secret = os.getenv('JWT_SECRET', 'dev-secret-key-change-in-production')
+    hs256_secret = os.getenv('HS256_TEST_SECRET', 'dev-secret-local-only')
     service_did = os.getenv('SERVICE_DID', 'did:web:catbird.social')
     issuer_did = os.getenv('ISSUER_DID', 'did:plc:test123')
     
@@ -67,7 +67,7 @@ def main():
     print("=" * 50)
     print()
     print("Configuration:")
-    print(f"  JWT_SECRET: {jwt_secret[:10]}...")
+    print(f"  HS256_TEST_SECRET: {hs256_secret[:10]}...")
     print(f"  SERVICE_DID: {service_did}")
     print(f"  ISSUER_DID: {issuer_did}")
     print()
@@ -81,7 +81,7 @@ def main():
     ]
     
     for hours, description, lxm in tokens:
-        token, exp = generate_token(jwt_secret, service_did, issuer_did, hours, lxm)
+        token, exp = generate_token(hs256_secret, service_did, issuer_did, hours, lxm)
         exp_date = datetime.fromtimestamp(exp)
         
         print(f"✓ {description}")

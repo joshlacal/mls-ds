@@ -7,7 +7,7 @@
 export DATABASE_URL="postgresql://catbird:changeme@localhost:5432/catbird"
 export REDIS_URL="redis://localhost:6379"
 export RUST_LOG="info,catbird_server=debug"
-export SERVICE_DID="did:web:mls.catbird.blue"
+export SERVICE_DID="did:web:mlschat.catbird.blue"
 export SERVER_PORT=3000
 
 echo "🚀 Starting MLS Server (Development Mode)"

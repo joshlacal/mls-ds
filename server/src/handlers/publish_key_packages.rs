@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
@@ -5,6 +7,7 @@ use axum::{
 };
 use base64::Engine;
 use chrono::{DateTime, Utc};
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
@@ -17,8 +20,62 @@ const MAX_BATCH_SIZE: usize = 100;
 const MAX_UNCONSUMED_PER_USER: i64 = 100;
 const MAX_UPLOADS_PER_HOUR: i64 = 200;
 const RATE_LIMIT_WINDOW_HOURS: i64 = 1;
+const DEFAULT_RECOVERY_CACHE_CAPACITY: u64 = 10_000;
+const DEFAULT_RECOVERY_CACHE_TTL_SECS: u64 = 3_600;
 /// Maximum key packages allowed in recovery mode (prevents abuse)
 const MAX_RECOVERY_BATCH: usize = 50;
+
+/// Cooldown between recovery mode attempts per DID (5 minutes)
+const RECOVERY_COOLDOWN_SECS: u64 = 300;
+/// Maximum recovery mode attempts per DID per hour
+const MAX_RECOVERY_PER_HOUR: u32 = 3;
+
+fn env_u64(var_name: &str, default: u64) -> u64 {
+    match std::env::var(var_name) {
+        Ok(raw) => match raw.parse::<u64>() {
+            Ok(parsed) if parsed > 0 => parsed,
+            _ => {
+                warn!(%var_name, value = %raw, fallback = default, "Invalid env var, using default");
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
+
+/// Tracks the last recovery mode attempt time per DID
+static RECOVERY_COOLDOWN: Lazy<moka::sync::Cache<String, Instant>> = Lazy::new(|| {
+    let capacity = env_u64(
+        "KEY_PACKAGE_RECOVERY_CACHE_CAPACITY",
+        DEFAULT_RECOVERY_CACHE_CAPACITY,
+    );
+    let ttl_secs = env_u64(
+        "KEY_PACKAGE_RECOVERY_CACHE_TTL_SECS",
+        DEFAULT_RECOVERY_CACHE_TTL_SECS,
+    );
+
+    moka::sync::Cache::builder()
+        .max_capacity(capacity)
+        .time_to_live(Duration::from_secs(ttl_secs))
+        .build()
+});
+
+/// Tracks the number of recovery mode attempts per DID within the TTL window
+static RECOVERY_COUNT: Lazy<moka::sync::Cache<String, u32>> = Lazy::new(|| {
+    let capacity = env_u64(
+        "KEY_PACKAGE_RECOVERY_CACHE_CAPACITY",
+        DEFAULT_RECOVERY_CACHE_CAPACITY,
+    );
+    let ttl_secs = env_u64(
+        "KEY_PACKAGE_RECOVERY_CACHE_TTL_SECS",
+        DEFAULT_RECOVERY_CACHE_TTL_SECS,
+    );
+
+    moka::sync::Cache::builder()
+        .max_capacity(capacity)
+        .time_to_live(Duration::from_secs(ttl_secs))
+        .build()
+});
 
 #[derive(Debug, Deserialize)]
 pub struct KeyPackageItem {
@@ -90,6 +147,29 @@ pub async fn publish_key_packages(
         .and_then(|v| v.to_str().ok())
         .map(|v| v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+
+    // Recovery mode per-DID cooldown and hourly cap
+    if is_recovery_mode {
+        if let Some(last_recovery) = RECOVERY_COOLDOWN.get(&auth_user.did) {
+            let elapsed = last_recovery.elapsed().as_secs();
+            if elapsed < RECOVERY_COOLDOWN_SECS {
+                warn!(
+                    "Recovery mode cooldown active for {} ({} seconds remaining)",
+                    did,
+                    RECOVERY_COOLDOWN_SECS - elapsed
+                );
+                return Err(StatusCode::TOO_MANY_REQUESTS);
+            }
+        }
+        let count = RECOVERY_COUNT.get(&auth_user.did).unwrap_or(0);
+        if count >= MAX_RECOVERY_PER_HOUR {
+            warn!(
+                "Recovery mode hourly limit reached for {} (count: {}, max: {})",
+                did, count, MAX_RECOVERY_PER_HOUR
+            );
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
+    }
 
     // Validate batch size
     if input.key_packages.is_empty() {
@@ -397,6 +477,19 @@ pub async fn publish_key_packages(
         succeeded, failed, skipped
     );
 
+    // Update recovery tracking after successful recovery publish
+    if recovery_verified && succeeded > 0 {
+        RECOVERY_COOLDOWN.insert(auth_user.did.clone(), Instant::now());
+        let prev_count = RECOVERY_COUNT.get(&auth_user.did).unwrap_or(0);
+        RECOVERY_COUNT.insert(auth_user.did.clone(), prev_count + 1);
+
+        info!(
+            did_prefix = %&auth_user.did[..std::cmp::min(16, auth_user.did.len())],
+            recovery_count = prev_count + 1,
+            "Recovery mode key package publish"
+        );
+    }
+
     Ok(Json(PublishKeyPackagesOutput {
         succeeded,
         failed,
@@ -412,6 +505,7 @@ pub async fn publish_key_packages(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderMap;
     use chrono::Duration;
 
     #[tokio::test]
@@ -451,17 +545,22 @@ mod tests {
                     cipher_suite: "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519".to_string(),
                     expires,
                     idempotency_key: None,
+                    device_id: None,
+                    credential_did: None,
                 },
                 KeyPackageItem {
                     key_package: base64::engine::general_purpose::STANDARD.encode(b"test_key_2"),
                     cipher_suite: "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519".to_string(),
                     expires,
                     idempotency_key: None,
+                    device_id: None,
+                    credential_did: None,
                 },
             ],
         };
 
-        let result = publish_key_packages(State(pool), auth_user, Json(input)).await;
+        let result =
+            publish_key_packages(State(pool), HeaderMap::new(), auth_user, Json(input)).await;
         assert!(result.is_ok());
 
         let output = result.unwrap().0;
@@ -507,17 +606,22 @@ mod tests {
                     cipher_suite: "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519".to_string(),
                     expires: Utc::now() + Duration::days(30),
                     idempotency_key: None,
+                    device_id: None,
+                    credential_did: None,
                 },
                 KeyPackageItem {
                     key_package: base64::engine::general_purpose::STANDARD.encode(b"test_key"),
                     cipher_suite: "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519".to_string(),
                     expires: expires_past, // Past expiration - should fail
                     idempotency_key: None,
+                    device_id: None,
+                    credential_did: None,
                 },
             ],
         };
 
-        let result = publish_key_packages(State(pool), auth_user, Json(input)).await;
+        let result =
+            publish_key_packages(State(pool), HeaderMap::new(), auth_user, Json(input)).await;
         assert!(result.is_ok());
 
         let output = result.unwrap().0;

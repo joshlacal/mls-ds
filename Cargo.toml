@@ -1,5 +1,6 @@
 [workspace]
 members = ["server", "codegen"]
+exclude = ["e2e-tests"]
 resolver = "2"
 
 [workspace.package]

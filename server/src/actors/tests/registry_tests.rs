@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod registry_tests {
     use crate::actors::{ActorRegistry, ConvoMessage};
+    use crate::realtime::SseState;
     use sqlx::PgPool;
     use std::sync::Arc;
     use std::time::Duration;
@@ -77,7 +78,7 @@ mod registry_tests {
         cleanup_test_data(&pool, convo_id).await;
         create_test_convo(&pool, convo_id, "did:plc:creator").await;
 
-        let registry = ActorRegistry::new(pool.clone());
+        let registry = ActorRegistry::new(pool.clone(), Arc::new(SseState::new(1000)), None);
 
         // First access - should spawn new actor
         let initial_count = registry.actor_count();
@@ -124,7 +125,11 @@ mod registry_tests {
         cleanup_test_data(&pool, convo_id).await;
         create_test_convo(&pool, convo_id, "did:plc:creator").await;
 
-        let registry = Arc::new(ActorRegistry::new(pool.clone()));
+        let registry = Arc::new(ActorRegistry::new(
+            pool.clone(),
+            Arc::new(SseState::new(1000)),
+            None,
+        ));
         let barrier = Arc::new(Barrier::new(10));
 
         // Launch 10 concurrent tasks trying to get/spawn the same actor
@@ -187,7 +192,7 @@ mod registry_tests {
         cleanup_test_data(&pool, convo_id).await;
         create_test_convo(&pool, convo_id, "did:plc:creator").await;
 
-        let registry = ActorRegistry::new(pool.clone());
+        let registry = ActorRegistry::new(pool.clone(), Arc::new(SseState::new(1000)), None);
 
         // Spawn actor
         let actor = registry
@@ -222,7 +227,7 @@ mod registry_tests {
     #[tokio::test]
     async fn test_actor_count() {
         let pool = setup_test_db().await;
-        let registry = ActorRegistry::new(pool.clone());
+        let registry = ActorRegistry::new(pool.clone(), Arc::new(SseState::new(1000)), None);
 
         // Initially should be 0
         assert_eq!(registry.actor_count(), 0);
@@ -271,8 +276,8 @@ mod registry_tests {
         create_test_convo(&pool, convo_id, "did:plc:creator").await;
 
         // Create two separate registries with the same pool
-        let registry1 = ActorRegistry::new(pool.clone());
-        let registry2 = ActorRegistry::new(pool.clone());
+        let registry1 = ActorRegistry::new(pool.clone(), Arc::new(SseState::new(1000)), None);
+        let registry2 = ActorRegistry::new(pool.clone(), Arc::new(SseState::new(1000)), None);
 
         // Each registry spawns its own actor for the same conversation
         let actor1 = registry1

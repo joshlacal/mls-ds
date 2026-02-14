@@ -128,7 +128,6 @@ psql -h localhost -U catbird -d catbird -c "\d conversations"
 
 - [ ] Configure strong database password
 - [ ] Set appropriate `SERVICE_DID`
-- [ ] Disable `JWT_SECRET` in production
 - [ ] Enable TLS/SSL via reverse proxy
 - [ ] Configure firewall rules
 - [ ] Enable automated backups
