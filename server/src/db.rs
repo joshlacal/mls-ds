@@ -7,7 +7,7 @@ use tokio::sync::Semaphore;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::models::{Conversation, KeyPackage, Membership, Message};
+use crate::models::{Conversation, KeyPackage, Membership, Message, SequencerReceipt};
 
 pub type DbPool = PgPool;
 
@@ -1407,7 +1407,7 @@ pub async fn get_key_package_stats(pool: &DbPool, owner_did: &str) -> Result<(i6
 }
 
 /// Get paginated list of consumed key packages for a user
-#[derive(Debug)]
+#[derive(Debug, sqlx::FromRow)]
 pub struct ConsumedKeyPackage {
     pub key_package_hash: String,
     pub consumed_at: Option<DateTime<Utc>>,
@@ -1422,10 +1422,13 @@ pub async fn get_consumed_key_packages_paginated(
     cursor: Option<String>,
 ) -> Result<(Vec<ConsumedKeyPackage>, Option<String>)> {
     let rows = if let Some(cursor_id) = cursor {
-        sqlx::query_as!(
-            ConsumedKeyPackage,
+        sqlx::query_as::<_, ConsumedKeyPackage>(
             r#"
-            SELECT key_package_hash, consumed_at, consumed_by_convo, cipher_suite
+            SELECT
+                key_package_hash,
+                consumed_at,
+                COALESCE(consumed_for_convo_id, consumed_by_convo) AS consumed_by_convo,
+                cipher_suite
             FROM key_packages
             WHERE owner_did = $1
               AND consumed_at IS NOT NULL
@@ -1433,27 +1436,30 @@ pub async fn get_consumed_key_packages_paginated(
             ORDER BY consumed_at DESC, id DESC
             LIMIT $2
             "#,
-            owner_did,
-            limit,
-            cursor_id
         )
+        .bind(owner_did)
+        .bind(limit)
+        .bind(cursor_id)
         .fetch_all(pool)
         .await
         .context("Failed to fetch consumed key packages")?
     } else {
-        sqlx::query_as!(
-            ConsumedKeyPackage,
+        sqlx::query_as::<_, ConsumedKeyPackage>(
             r#"
-            SELECT key_package_hash, consumed_at, consumed_by_convo, cipher_suite
+            SELECT
+                key_package_hash,
+                consumed_at,
+                COALESCE(consumed_for_convo_id, consumed_by_convo) AS consumed_by_convo,
+                cipher_suite
             FROM key_packages
             WHERE owner_did = $1
               AND consumed_at IS NOT NULL
             ORDER BY consumed_at DESC, id DESC
             LIMIT $2
             "#,
-            owner_did,
-            limit
         )
+        .bind(owner_did)
+        .bind(limit)
         .fetch_all(pool)
         .await
         .context("Failed to fetch consumed key packages")?
@@ -1605,7 +1611,7 @@ mod tests {
                 .expect("Failed to create conversation");
 
         assert_eq!(conversation.creator_did, "did:plc:test123");
-        assert_eq!(conversation.title, Some("Test Convo".to_string()));
+        assert_eq!(conversation.name, Some("Test Convo".to_string()));
 
         let fetched = get_conversation(&pool, &conversation.id)
             .await
@@ -1651,10 +1657,10 @@ mod tests {
         let message = create_message(
             &pool,
             &conversation.id,
-            "did:plc:sender",
+            "msg-test-1",
             vec![1, 2, 3, 4],
             0,
-            None,
+            512,
             None,
         )
         .await
@@ -2279,4 +2285,162 @@ pub async fn get_reactions_for_messages(
         });
     }
     Ok(map)
+}
+
+// ---------------------------------------------------------------------------
+// Delivery ACKs
+// ---------------------------------------------------------------------------
+
+/// Store a delivery acknowledgment received from a remote DS.
+pub async fn store_delivery_ack(
+    pool: &DbPool,
+    ack: &crate::federation::ack::DeliveryAck,
+) -> Result<()> {
+    let id = ulid::Ulid::new().to_string();
+    sqlx::query(
+        "INSERT INTO delivery_acks (id, message_id, convo_id, epoch, target_ds_did, acked_at, signature) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+         ON CONFLICT (convo_id, message_id, target_ds_did) DO UPDATE SET \
+         acked_at = EXCLUDED.acked_at, \
+         signature = EXCLUDED.signature",
+    )
+    .bind(&id)
+    .bind(&ack.message_id)
+    .bind(&ack.convo_id)
+    .bind(ack.epoch)
+    .bind(&ack.receiver_ds_did)
+    .bind(ack.acked_at)
+    .bind(&ack.signature)
+    .execute(pool)
+    .await
+    .context("Failed to store delivery ack")?;
+    Ok(())
+}
+
+/// Retrieve all delivery acknowledgments for a given message.
+pub async fn get_delivery_acks_for_message(
+    pool: &DbPool,
+    convo_id: &str,
+    message_id: &str,
+) -> Result<Vec<crate::federation::ack::DeliveryAck>> {
+    let rows: Vec<(String, String, i32, String, i64, Vec<u8>)> = sqlx::query_as(
+        "SELECT message_id, convo_id, epoch, target_ds_did, acked_at, signature \
+         FROM delivery_acks WHERE convo_id = $1 AND message_id = $2 ORDER BY received_at ASC",
+    )
+    .bind(convo_id)
+    .bind(message_id)
+    .fetch_all(pool)
+    .await
+    .context("Failed to fetch delivery acks")?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(message_id, convo_id, epoch, receiver_ds_did, acked_at, signature)| {
+                crate::federation::ack::DeliveryAck {
+                    message_id,
+                    convo_id,
+                    epoch,
+                    receiver_ds_did,
+                    acked_at,
+                    signature,
+                }
+            },
+        )
+        .collect())
+}
+
+/// Batch-fetch delivery ACKs for multiple messages in a single query.
+pub async fn get_delivery_acks_for_messages(
+    pool: &DbPool,
+    convo_id: &str,
+    message_ids: &[&str],
+) -> Result<Vec<crate::federation::ack::DeliveryAck>> {
+    let ids: Vec<String> = message_ids.iter().map(|s| s.to_string()).collect();
+    let rows: Vec<(String, String, i32, String, i64, Vec<u8>)> = sqlx::query_as(
+        "SELECT message_id, convo_id, epoch, target_ds_did, acked_at, signature \
+         FROM delivery_acks WHERE convo_id = $1 AND message_id = ANY($2) \
+         ORDER BY message_id, received_at ASC LIMIT 500",
+    )
+    .bind(convo_id)
+    .bind(&ids)
+    .fetch_all(pool)
+    .await
+    .context("Failed to batch-fetch delivery acks")?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(message_id, convo_id, epoch, receiver_ds_did, acked_at, signature)| {
+                crate::federation::ack::DeliveryAck {
+                    message_id,
+                    convo_id,
+                    epoch,
+                    receiver_ds_did,
+                    acked_at,
+                    signature,
+                }
+            },
+        )
+        .collect())
+}
+
+// =============================================================================
+// Sequencer Receipts
+// =============================================================================
+
+/// Store a sequencer receipt (cryptographic proof of epoch assignment).
+pub async fn store_sequencer_receipt(pool: &DbPool, receipt: &SequencerReceipt) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO sequencer_receipts (convo_id, epoch, commit_hash, sequencer_did, issued_at, signature)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (convo_id, epoch) DO NOTHING
+        "#,
+    )
+    .bind(&receipt.convo_id)
+    .bind(receipt.epoch)
+    .bind(&receipt.commit_hash)
+    .bind(&receipt.sequencer_did)
+    .bind(receipt.issued_at)
+    .bind(&receipt.signature)
+    .execute(pool)
+    .await
+    .context("Failed to store sequencer receipt")?;
+    Ok(())
+}
+
+/// Get sequencer receipts for a conversation, optionally filtered by epoch.
+pub async fn get_sequencer_receipts(
+    pool: &DbPool,
+    convo_id: &str,
+    since_epoch: Option<i32>,
+) -> Result<Vec<SequencerReceipt>> {
+    let receipts = if let Some(epoch) = since_epoch {
+        sqlx::query_as::<_, SequencerReceipt>(
+            r#"
+            SELECT convo_id, epoch, commit_hash, sequencer_did, issued_at, signature, created_at
+            FROM sequencer_receipts
+            WHERE convo_id = $1 AND epoch >= $2
+            ORDER BY epoch DESC
+            "#,
+        )
+        .bind(convo_id)
+        .bind(epoch)
+        .fetch_all(pool)
+        .await
+    } else {
+        sqlx::query_as::<_, SequencerReceipt>(
+            r#"
+            SELECT convo_id, epoch, commit_hash, sequencer_did, issued_at, signature, created_at
+            FROM sequencer_receipts
+            WHERE convo_id = $1
+            ORDER BY epoch DESC
+            "#,
+        )
+        .bind(convo_id)
+        .fetch_all(pool)
+        .await
+    };
+    receipts.context("Failed to fetch sequencer receipts")
 }

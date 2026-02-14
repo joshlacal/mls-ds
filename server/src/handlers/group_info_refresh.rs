@@ -5,7 +5,7 @@ use tracing::{error, info, warn};
 use crate::{
     auth::AuthUser,
     device_utils::parse_device_did,
-    generated::blue::catbird::mls::group_info_refresh::{Input, Output, OutputData},
+    generated::blue_catbird::mls::group_info_refresh::{GroupInfoRefresh, GroupInfoRefreshOutput},
     realtime::{SseState, StreamEvent},
     storage::DbPool,
 };
@@ -20,8 +20,9 @@ pub async fn group_info_refresh(
     State(pool): State<DbPool>,
     State(sse_state): State<Arc<SseState>>,
     auth_user: AuthUser,
-    Json(input): Json<Input>,
-) -> Result<Json<Output>, StatusCode> {
+    body: String,
+) -> Result<Json<GroupInfoRefreshOutput<'static>>, StatusCode> {
+    let input = crate::jacquard_json::from_json_body::<GroupInfoRefresh>(&body)?;
     // Enforce authentication
     if let Err(_e) =
         crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.groupInfoRefresh")
@@ -30,7 +31,7 @@ pub async fn group_info_refresh(
     }
 
     let device_did = &auth_user.did;
-    let convo_id = &input.data.convo_id;
+    let convo_id = input.convo_id.as_str();
 
     // Extract user DID from device DID
     let (user_did, _device_id) = parse_device_did(device_did).map_err(|e| {
@@ -109,10 +110,11 @@ pub async fn group_info_refresh(
             "No active members to notify"
         );
         // Still return success - no one to notify but request was valid
-        return Ok(Json(Output::from(OutputData {
+        return Ok(Json(GroupInfoRefreshOutput {
             requested: false,
             active_members: Some(0),
-        })));
+            extra_data: Default::default(),
+        }));
     }
 
     // 4. Emit GroupInfoRefreshRequested SSE event
@@ -122,7 +124,7 @@ pub async fn group_info_refresh(
         .await;
     let event = StreamEvent::GroupInfoRefreshRequested {
         cursor,
-        convo_id: convo_id.clone(),
+        convo_id: convo_id.to_string(),
         requested_by: user_did.clone(),
         requested_at: chrono::Utc::now().to_rfc3339(),
     };
@@ -143,8 +145,9 @@ pub async fn group_info_refresh(
         );
     }
 
-    Ok(Json(Output::from(OutputData {
+    Ok(Json(GroupInfoRefreshOutput {
         requested: true,
         active_members: Some(active_members),
-    })))
+        extra_data: Default::default(),
+    }))
 }

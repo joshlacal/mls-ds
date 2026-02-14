@@ -1,0 +1,22 @@
+[package]
+name = "mls-e2e-tests"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+reqwest = { version = "0.12", features = ["json"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+jsonwebtoken = "9"
+uuid = { version = "1", features = ["v4"] }
+rand = "0.8"
+chrono = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+base64 = "0.22"
+anyhow = "1"
+async-trait = "0.1"
+catbird_mls = { path = "../../catbird-mls" }
+hex = "0.4"
+ulid = "1.2.1"

@@ -12,7 +12,9 @@ use crate::{
     actors::{ActorRegistry, ConvoMessage},
     auth::AuthUser,
     db,
-    generated_types::MessageView,
+    generated::blue_catbird::mls::get_messages::{GapInfo as GeneratedGapInfo, GetMessagesOutput},
+    generated::blue_catbird::mls::MessageView as GeneratedMessageView,
+    sqlx_jacquard::chrono_to_datetime,
     storage::{is_member, DbPool},
 };
 
@@ -25,16 +27,6 @@ pub struct GetMessagesParams {
     pub limit: Option<i32>,
 }
 
-#[derive(Debug, serde::Serialize)]
-pub struct GapInfoResponse {
-    #[serde(rename = "hasGaps")]
-    pub has_gaps: bool,
-    #[serde(rename = "missingSeqs")]
-    pub missing_seqs: Vec<i64>,
-    #[serde(rename = "totalMessages")]
-    pub total_messages: i64,
-}
-
 /// Get messages from a conversation
 /// GET /xrpc/chat.bsky.convo.getMessages
 #[tracing::instrument(skip(pool, actor_registry))]
@@ -43,7 +35,7 @@ pub async fn get_messages(
     State(actor_registry): State<Arc<ActorRegistry>>,
     auth_user: AuthUser,
     Query(params): Query<GetMessagesParams>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<GetMessagesOutput<'static>>, StatusCode> {
     if let Err(_e) =
         crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.getMessages")
     {
@@ -100,26 +92,20 @@ pub async fn get_messages(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    // Fetch reactions for all messages in batch
-    let message_ids: Vec<&str> = messages.iter().map(|m| m.id.as_str()).collect();
-    let reactions_map = db::get_reactions_for_messages(&pool, &params.convo_id, &message_ids)
-        .await
-        .unwrap_or_default();
-
-    // Convert to view models with ciphertext and message_type
+    // Convert to generated MessageView types
     // Note: sender field removed per security hardening - clients derive sender from decrypted MLS content
     // message_type is included so clients can distinguish 'app' messages from 'commit' messages
-    let message_views: Vec<MessageView> = messages
+    let message_views: Vec<GeneratedMessageView<'static>> = messages
         .into_iter()
-        .map(|m| MessageView {
-            id: m.id.clone(),
-            convo_id: m.convo_id,
-            ciphertext: m.ciphertext,
+        .map(|m| GeneratedMessageView {
+            id: m.id.into(),
+            convo_id: m.convo_id.into(),
+            ciphertext: bytes::Bytes::from(m.ciphertext),
             epoch: m.epoch,
             seq: m.seq,
-            created_at: m.created_at,
-            message_type: m.message_type,
-            reactions: reactions_map.get(&m.id).cloned(),
+            created_at: chrono_to_datetime(m.created_at),
+            message_type: Some(m.message_type.into()),
+            extra_data: Default::default(),
         })
         .collect();
 
@@ -180,31 +166,32 @@ pub async fn get_messages(
     // Calculate lastSeq from the last message in the result
     let last_seq = message_views.last().map(|m| m.seq);
 
-    // Build response with messages, lastSeq, and gapInfo
-    let mut response = serde_json::json!({
-        "messages": message_views,
-    });
-
-    // Add lastSeq if we have messages
-    if let Some(seq) = last_seq {
-        response["lastSeq"] = serde_json::json!(seq);
-    }
-
-    // Add gapInfo if there are gaps
-    if gap_info.has_gaps {
-        response["gapInfo"] = serde_json::json!(GapInfoResponse {
+    // Build gapInfo if there are gaps
+    let gap_info_output = if gap_info.has_gaps {
+        Some(GeneratedGapInfo {
             has_gaps: gap_info.has_gaps,
             missing_seqs: gap_info.missing_seqs,
             total_messages: gap_info.total_messages,
-        });
-    }
+            extra_data: Default::default(),
+        })
+    } else {
+        None
+    };
 
-    Ok(Json(response))
+    let output = GetMessagesOutput {
+        messages: message_views,
+        last_seq,
+        gap_info: gap_info_output,
+        extra_data: Default::default(),
+    };
+
+    Ok(Json(output))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::realtime::SseState;
     use crate::storage::init_db;
 
     async fn setup_test_convo_with_messages(pool: &DbPool, creator: &str, convo_id: &str) {
@@ -215,7 +202,7 @@ mod tests {
             .bind(&now)
             .execute(pool)
             .await
-            .unwrap();
+            .expect("test setup");
 
         sqlx::query("INSERT INTO members (convo_id, member_did, joined_at) VALUES ($1, $2, $3)")
             .bind(convo_id)
@@ -223,7 +210,7 @@ mod tests {
             .bind(&now)
             .execute(pool)
             .await
-            .unwrap();
+            .expect("test setup");
 
         // Add some messages
         for i in 0..3 {
@@ -238,7 +225,7 @@ mod tests {
             .bind(&now)
             .execute(pool)
             .await
-            .unwrap();
+            .expect("test setup");
         }
     }
 
@@ -255,8 +242,12 @@ mod tests {
             idle_timeout: std::time::Duration::from_secs(30),
         })
         .await
-        .unwrap();
-        let actor_registry = Arc::new(crate::actors::ActorRegistry::new(pool.clone()));
+        .expect("test setup");
+        let actor_registry = Arc::new(crate::actors::ActorRegistry::new(
+            pool.clone(),
+            Arc::new(SseState::new(1000)),
+            None,
+        ));
         let convo_id = "test-convo-1";
         let user = "did:plc:user";
 
@@ -276,15 +267,20 @@ mod tests {
         };
         let params = GetMessagesParams {
             convo_id: convo_id.to_string(),
-            since_message: None,
+            since_seq: None,
             limit: None,
         };
 
         let result = get_messages(State(pool), State(actor_registry), did, Query(params)).await;
         assert!(result.is_ok());
 
-        let json = result.unwrap().0;
-        let messages = json.get("messages").unwrap().as_array().unwrap();
+        let output = result.expect("handler should return Ok").0;
+        let json = serde_json::to_value(&output).unwrap();
+        let messages = json
+            .get("messages")
+            .expect("response should have 'messages' field")
+            .as_array()
+            .expect("should be array");
         assert_eq!(messages.len(), 3);
     }
 
@@ -301,8 +297,12 @@ mod tests {
             idle_timeout: std::time::Duration::from_secs(30),
         })
         .await
-        .unwrap();
-        let actor_registry = Arc::new(crate::actors::ActorRegistry::new(pool.clone()));
+        .expect("test setup");
+        let actor_registry = Arc::new(crate::actors::ActorRegistry::new(
+            pool.clone(),
+            Arc::new(SseState::new(1000)),
+            None,
+        ));
         let convo_id = "test-convo-2";
         let creator = "did:plc:creator";
 
@@ -322,7 +322,7 @@ mod tests {
         };
         let params = GetMessagesParams {
             convo_id: convo_id.to_string(),
-            since_message: None,
+            since_seq: None,
             limit: None,
         };
 
@@ -343,8 +343,12 @@ mod tests {
             idle_timeout: std::time::Duration::from_secs(30),
         })
         .await
-        .unwrap();
-        let actor_registry = Arc::new(crate::actors::ActorRegistry::new(pool.clone()));
+        .expect("test setup");
+        let actor_registry = Arc::new(crate::actors::ActorRegistry::new(
+            pool.clone(),
+            Arc::new(SseState::new(1000)),
+            None,
+        ));
         let convo_id = "test-convo-3";
         let user = "did:plc:user";
 
@@ -364,15 +368,20 @@ mod tests {
         };
         let params = GetMessagesParams {
             convo_id: convo_id.to_string(),
-            since_message: None,
+            since_seq: None,
             limit: Some(2),
         };
 
         let result = get_messages(State(pool), State(actor_registry), did, Query(params)).await;
         assert!(result.is_ok());
 
-        let json = result.unwrap().0;
-        let messages = json.get("messages").unwrap().as_array().unwrap();
+        let output = result.expect("handler should return Ok").0;
+        let json = serde_json::to_value(&output).unwrap();
+        let messages = json
+            .get("messages")
+            .expect("response should have 'messages' field")
+            .as_array()
+            .expect("should be array");
         assert_eq!(messages.len(), 2);
     }
 }

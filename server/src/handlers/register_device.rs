@@ -1,7 +1,7 @@
 use axum::{extract::State, http::StatusCode, Json};
 use base64::Engine;
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use chrono::Utc;
+use serde::Serialize;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -9,30 +9,13 @@ use uuid::Uuid;
 use crate::{
     auth::AuthUser,
     device_utils::parse_device_did,
+    generated::blue_catbird::mls::register_device::RegisterDevice,
     realtime::{SseState, StreamEvent},
     storage::DbPool,
 };
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct KeyPackageItem {
-    #[serde(rename = "keyPackage")]
-    pub key_package: String,
-    #[serde(rename = "cipherSuite")]
-    pub cipher_suite: String,
-    pub expires: DateTime<Utc>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RegisterDeviceInput {
-    device_name: String,
-    #[serde(default)]
-    device_uuid: Option<String>,
-    key_packages: Vec<KeyPackageItem>,
-    #[serde(with = "crate::atproto_bytes")]
-    signature_public_key: Vec<u8>,
-}
+/// Type alias preserving the old name for v2 handler compatibility.
+pub type RegisterDeviceInput = RegisterDevice<'static>;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -53,13 +36,14 @@ pub struct RegisterDeviceOutput {
 
 /// Register a device for multi-device MLS support
 /// POST /xrpc/blue.catbird.mls.registerDevice
-#[tracing::instrument(skip(pool, sse_state, input))]
+#[tracing::instrument(skip(pool, sse_state, body))]
 pub async fn register_device(
     State(pool): State<DbPool>,
     State(sse_state): State<Arc<SseState>>,
     auth_user: AuthUser,
-    Json(input): Json<RegisterDeviceInput>,
+    body: String,
 ) -> Result<Json<RegisterDeviceOutput>, StatusCode> {
+    let input = crate::jacquard_json::from_json_body::<RegisterDevice>(&body)?;
     if let Err(_e) =
         crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.registerDevice")
     {
@@ -78,6 +62,8 @@ pub async fn register_device(
     // to prevent injection attacks in UI/SSE rendering
     let sanitized_device_name: String = input
         .device_name
+        .as_deref()
+        .unwrap_or("")
         .chars()
         .filter(|c| {
             // Allow printable ASCII, common Unicode letters/numbers, and basic punctuation
@@ -156,7 +142,7 @@ pub async fn register_device(
             "#,
         )
         .bind(&user_did)
-        .bind(device_uuid)
+        .bind(device_uuid.as_str())
         .fetch_optional(&pool)
         .await
         .map_err(|e| {
@@ -430,13 +416,14 @@ pub async fn register_device(
     let mut stored_count = 0;
     for (idx, kp) in input.key_packages.iter().enumerate() {
         // Validate base64 encoding
-        let key_data = match base64::engine::general_purpose::STANDARD.decode(&kp.key_package) {
-            Ok(data) => data,
-            Err(e) => {
-                warn!("Invalid base64 in key package {}: {}", idx, e);
-                continue;
-            }
-        };
+        let key_data =
+            match base64::engine::general_purpose::STANDARD.decode(kp.key_package.as_str()) {
+                Ok(data) => data,
+                Err(e) => {
+                    warn!("Invalid base64 in key package {}: {}", idx, e);
+                    continue;
+                }
+            };
 
         if key_data.is_empty() {
             warn!("Empty key package at index {}", idx);
@@ -444,7 +431,7 @@ pub async fn register_device(
         }
 
         // Validate expiration
-        if kp.expires <= now {
+        if *kp.expires.as_ref() <= now.fixed_offset() {
             warn!("Key package {} has past expiration", idx);
             continue;
         }
@@ -455,9 +442,9 @@ pub async fn register_device(
         match crate::db::store_key_package_with_device(
             &pool,
             &user_did,
-            &kp.cipher_suite,
+            kp.cipher_suite.as_str(),
             key_data,
-            kp.expires,
+            kp.expires.as_ref().with_timezone(&Utc),
             Some(device_id.clone()),
             None, // credential_did is now extracted from KeyPackage and validated
         )

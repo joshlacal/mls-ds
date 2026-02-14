@@ -23,6 +23,18 @@ struct ApnsClient {
     topic: String,
 }
 
+fn mask_device_token(device_token: &str) -> String {
+    if device_token.len() <= 12 {
+        return format!("{}...", &device_token[..device_token.len().min(4)]);
+    }
+
+    format!(
+        "{}...{}",
+        &device_token[..8],
+        &device_token[device_token.len().saturating_sub(4)..]
+    )
+}
+
 impl ApnsClient {
     /// Create a new APNs client
     fn new(
@@ -79,9 +91,10 @@ impl ApnsClient {
 
         // Encode ciphertext as base64 for JSON payload
         let ciphertext_b64 = base64::engine::general_purpose::STANDARD.encode(ciphertext);
+        let masked_device_token = mask_device_token(device_token);
 
         info!(
-            device_token = %device_token,
+            device_token = %masked_device_token,
             convo_id = %convo_id,
             message_id = %message_id,
             recipient_did = %recipient_did,
@@ -149,7 +162,7 @@ impl ApnsClient {
 
                     if response.code >= 200 && response.code < 300 {
                         info!(
-                            device_token = %device_token,
+                            device_token = %masked_device_token,
                             status = response.code,
                             convo_id = %convo_id,
                             message_id = %message_id,
@@ -160,7 +173,7 @@ impl ApnsClient {
                         return Ok(());
                     } else {
                         warn!(
-                            device_token = %device_token,
+                            device_token = %masked_device_token,
                             status = response.code,
                             convo_id = %convo_id,
                             message_id = %message_id,
@@ -172,7 +185,7 @@ impl ApnsClient {
                 Err(e) => {
                     retry_count += 1;
                     warn!(
-                        device_token = %device_token,
+                        device_token = %masked_device_token,
                         error = %e,
                         attempt = retry_count,
                         max_retries = MAX_RETRIES,
@@ -184,7 +197,7 @@ impl ApnsClient {
 
                     if retry_count >= MAX_RETRIES {
                         error!(
-                            device_token = %device_token,
+                            device_token = %masked_device_token,
                             error = %e,
                             total_attempts = retry_count,
                             convo_id = %convo_id,
@@ -199,6 +212,138 @@ impl ApnsClient {
                         "🔔 [push_notification] Backing off for {}ms before retry",
                         backoff_ms
                     );
+                    tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+                    backoff_ms *= 2;
+                }
+            }
+        }
+    }
+
+    /// Send a key package replenish request notification
+    async fn send_key_package_replenish_notification(
+        &self,
+        device_token: &str,
+        target_did: &str,
+        requester_did: &str,
+        requested_at: &str,
+        reason: Option<&str>,
+        convo_id: Option<&str>,
+    ) -> Result<()> {
+        let masked_device_token = mask_device_token(device_token);
+
+        let mut notification = DefaultNotificationBuilder::new()
+            .set_title("Security Update Needed")
+            .set_body("Open Catbird to refresh message keys.")
+            .set_mutable_content()
+            .set_sound("default")
+            .build(
+                device_token,
+                NotificationOptions {
+                    apns_topic: Some(&self.topic),
+                    apns_priority: Some(Priority::High),
+                    apns_collapse_id: None,
+                    apns_expiration: None,
+                    apns_push_type: Some(PushType::Alert),
+                    apns_id: None,
+                },
+            );
+
+        notification.add_custom_data("type", &"key_package_replenish_request")?;
+        notification.add_custom_data("target_did", &target_did)?;
+        notification.add_custom_data("requester_did", &requester_did)?;
+        notification.add_custom_data("requested_at", &requested_at)?;
+
+        if let Some(reason) = reason {
+            notification.add_custom_data("reason", &reason)?;
+        }
+
+        if let Some(convo_id) = convo_id {
+            notification.add_custom_data("convo_id", &convo_id)?;
+        }
+
+        const MAX_RETRIES: u8 = 3;
+        let mut retry_count = 0;
+        let mut backoff_ms = 100;
+
+        loop {
+            match self.client.send(notification.clone()).await {
+                Ok(response) if (200..300).contains(&response.code) => {
+                    info!(
+                        device_token = %masked_device_token,
+                        status = response.code,
+                        target_did = %target_did,
+                        requester_did = %requester_did,
+                        "✅ [push_notification] Key package replenish request delivered successfully"
+                    );
+                    return Ok(());
+                }
+                Ok(response) if response.code == 429 || response.code >= 500 => {
+                    retry_count += 1;
+                    warn!(
+                        device_token = %masked_device_token,
+                        status = response.code,
+                        attempt = retry_count,
+                        max_retries = MAX_RETRIES,
+                        target_did = %target_did,
+                        requester_did = %requester_did,
+                        backoff_ms = backoff_ms,
+                        "⚠️ [push_notification] Transient APNs status for replenish request, retrying"
+                    );
+
+                    if retry_count >= MAX_RETRIES {
+                        error!(
+                            device_token = %masked_device_token,
+                            status = response.code,
+                            target_did = %target_did,
+                            requester_did = %requester_did,
+                            "❌ [push_notification] Replenish request failed after maximum retries"
+                        );
+                        return Err(anyhow::anyhow!(
+                            "APNs replenish request failed with transient status {} after retries",
+                            response.code
+                        ));
+                    }
+
+                    tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+                    backoff_ms *= 2;
+                }
+                Ok(response) => {
+                    warn!(
+                        device_token = %masked_device_token,
+                        status = response.code,
+                        target_did = %target_did,
+                        requester_did = %requester_did,
+                        "⚠️ [push_notification] Permanent APNs failure for replenish request (not retrying)"
+                    );
+                    return Err(anyhow::anyhow!(
+                        "APNs rejected replenish request with permanent status {}",
+                        response.code
+                    ));
+                }
+                Err(e) => {
+                    retry_count += 1;
+                    warn!(
+                        device_token = %masked_device_token,
+                        error = %e,
+                        attempt = retry_count,
+                        max_retries = MAX_RETRIES,
+                        target_did = %target_did,
+                        requester_did = %requester_did,
+                        backoff_ms = backoff_ms,
+                        "⚠️ [push_notification] Transport error sending replenish request, retrying"
+                    );
+
+                    if retry_count >= MAX_RETRIES {
+                        error!(
+                            device_token = %masked_device_token,
+                            error = %e,
+                            target_did = %target_did,
+                            requester_did = %requester_did,
+                            "❌ [push_notification] Replenish request failed after maximum transport retries"
+                        );
+                        return Err(e.into());
+                    }
+
                     tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
                     backoff_ms *= 2;
                 }
@@ -243,6 +388,10 @@ impl NotificationService {
             apns_client,
             enabled,
         }
+    }
+
+    pub fn can_send_pushes(&self) -> bool {
+        self.enabled && self.apns_client.is_some()
     }
 
     /// Initialize APNs client from environment variables
@@ -359,7 +508,7 @@ impl NotificationService {
                 "🔔 [push_notification] Device {}/{}: token={}, user_did={}",
                 idx + 1,
                 devices.len(),
-                &token[..token.len().min(8)], // Show only first 8 chars for privacy
+                mask_device_token(token),
                 did
             );
         }
@@ -376,10 +525,10 @@ impl NotificationService {
             let task_num = idx + 1;
 
             info!(
-                "🔔 [push_notification] Sending {}/{} to device token={}..., user_did={}",
+                "🔔 [push_notification] Sending {}/{} to device token={}, user_did={}",
                 task_num,
                 total_devices,
-                &device_token[..device_token.len().min(8)],
+                mask_device_token(&device_token),
                 user_did
             );
 
@@ -425,6 +574,38 @@ impl NotificationService {
         );
 
         Ok(())
+    }
+
+    pub async fn notify_key_package_replenish_request(
+        &self,
+        device_token: &str,
+        target_did: &str,
+        requester_did: &str,
+        requested_at: &str,
+        reason: Option<&str>,
+        convo_id: Option<&str>,
+    ) -> Result<()> {
+        if !self.enabled || self.apns_client.is_none() {
+            debug!(
+                target_did = %target_did,
+                requester_did = %requester_did,
+                "Notification service disabled, skipping key package replenish request notification"
+            );
+            return Ok(());
+        }
+
+        self.apns_client
+            .as_ref()
+            .unwrap()
+            .send_key_package_replenish_notification(
+                device_token,
+                target_did,
+                requester_did,
+                requested_at,
+                reason,
+                convo_id,
+            )
+            .await
     }
 
     /// Send a low key package inventory notification to a user

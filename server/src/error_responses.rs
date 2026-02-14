@@ -6,9 +6,16 @@ use axum::{
     Json,
 };
 
+use crate::generated::blue_catbird::mls::{
+    add_members::AddMembersError as LexAddMembersError,
+    create_convo::CreateConvoError as LexCreateConvoError,
+    get_group_info::GetGroupInfoError as LexGetGroupInfoError,
+    update_group_info::UpdateGroupInfoError as LexUpdateGroupInfoError,
+};
+
 /// Wrapper for createConvo errors that can be either structured or generic HTTP
 pub enum CreateConvoError {
-    Structured(crate::generated::blue::catbird::mls::create_convo::Error),
+    Structured(LexCreateConvoError),
     Generic(StatusCode),
 }
 
@@ -17,10 +24,11 @@ impl IntoResponse for CreateConvoError {
         match self {
             Self::Structured(err) => {
                 let status = match &err {
-                    crate::generated::blue::catbird::mls::create_convo::Error::InvalidCipherSuite(_) => StatusCode::BAD_REQUEST,
-                    crate::generated::blue::catbird::mls::create_convo::Error::KeyPackageNotFound(_) => StatusCode::CONFLICT,
-                    crate::generated::blue::catbird::mls::create_convo::Error::TooManyMembers(_) => StatusCode::BAD_REQUEST,
-                    crate::generated::blue::catbird::mls::create_convo::Error::MutualBlockDetected(_) => StatusCode::FORBIDDEN,
+                    LexCreateConvoError::InvalidCipherSuite(_) => StatusCode::BAD_REQUEST,
+                    LexCreateConvoError::KeyPackageNotFound(_) => StatusCode::CONFLICT,
+                    LexCreateConvoError::TooManyMembers(_) => StatusCode::BAD_REQUEST,
+                    LexCreateConvoError::MutualBlockDetected(_) => StatusCode::FORBIDDEN,
+                    _ => StatusCode::INTERNAL_SERVER_ERROR,
                 };
                 (status, Json(err)).into_response()
             }
@@ -35,15 +43,15 @@ impl From<StatusCode> for CreateConvoError {
     }
 }
 
-impl From<crate::generated::blue::catbird::mls::create_convo::Error> for CreateConvoError {
-    fn from(err: crate::generated::blue::catbird::mls::create_convo::Error) -> Self {
+impl From<LexCreateConvoError> for CreateConvoError {
+    fn from(err: LexCreateConvoError) -> Self {
         Self::Structured(err)
     }
 }
 
 /// Wrapper for addMembers errors that can be either structured or generic HTTP
 pub enum AddMembersError {
-    Structured(crate::generated::blue::catbird::mls::add_members::Error),
+    Structured(LexAddMembersError),
     Generic(StatusCode),
 }
 
@@ -52,12 +60,13 @@ impl IntoResponse for AddMembersError {
         match self {
             Self::Structured(err) => {
                 let status = match &err {
-                    crate::generated::blue::catbird::mls::add_members::Error::ConvoNotFound(_) => StatusCode::NOT_FOUND,
-                    crate::generated::blue::catbird::mls::add_members::Error::NotMember(_) => StatusCode::FORBIDDEN,
-                    crate::generated::blue::catbird::mls::add_members::Error::KeyPackageNotFound(_) => StatusCode::CONFLICT,
-                    crate::generated::blue::catbird::mls::add_members::Error::AlreadyMember(_) => StatusCode::CONFLICT,
-                    crate::generated::blue::catbird::mls::add_members::Error::TooManyMembers(_) => StatusCode::BAD_REQUEST,
-                    crate::generated::blue::catbird::mls::add_members::Error::BlockedByMember(_) => StatusCode::FORBIDDEN,
+                    LexAddMembersError::ConvoNotFound(_) => StatusCode::NOT_FOUND,
+                    LexAddMembersError::NotMember(_) => StatusCode::FORBIDDEN,
+                    LexAddMembersError::KeyPackageNotFound(_) => StatusCode::CONFLICT,
+                    LexAddMembersError::AlreadyMember(_) => StatusCode::CONFLICT,
+                    LexAddMembersError::TooManyMembers(_) => StatusCode::BAD_REQUEST,
+                    LexAddMembersError::BlockedByMember(_) => StatusCode::FORBIDDEN,
+                    _ => StatusCode::INTERNAL_SERVER_ERROR,
                 };
                 (status, Json(err)).into_response()
             }
@@ -72,15 +81,15 @@ impl From<StatusCode> for AddMembersError {
     }
 }
 
-impl From<crate::generated::blue::catbird::mls::add_members::Error> for AddMembersError {
-    fn from(err: crate::generated::blue::catbird::mls::add_members::Error) -> Self {
+impl From<LexAddMembersError> for AddMembersError {
+    fn from(err: LexAddMembersError) -> Self {
         Self::Structured(err)
     }
 }
 
 /// Wrapper for getGroupInfo errors
 pub enum GetGroupInfoError {
-    Structured(crate::generated::blue::catbird::mls::get_group_info::Error),
+    Structured(LexGetGroupInfoError),
     Generic(StatusCode),
 }
 
@@ -89,9 +98,10 @@ impl IntoResponse for GetGroupInfoError {
         match self {
             Self::Structured(err) => {
                 let status = match &err {
-                    crate::generated::blue::catbird::mls::get_group_info::Error::GroupInfoUnavailable(_) => StatusCode::NOT_FOUND,
-                    crate::generated::blue::catbird::mls::get_group_info::Error::NotFound(_) => StatusCode::NOT_FOUND,
-                    crate::generated::blue::catbird::mls::get_group_info::Error::Unauthorized(_) => StatusCode::FORBIDDEN,
+                    LexGetGroupInfoError::GroupInfoUnavailable(_) => StatusCode::NOT_FOUND,
+                    LexGetGroupInfoError::NotFound(_) => StatusCode::NOT_FOUND,
+                    LexGetGroupInfoError::Unauthorized(_) => StatusCode::FORBIDDEN,
+                    _ => StatusCode::INTERNAL_SERVER_ERROR,
                 };
                 (status, Json(err)).into_response()
             }
@@ -106,15 +116,15 @@ impl From<StatusCode> for GetGroupInfoError {
     }
 }
 
-impl From<crate::generated::blue::catbird::mls::get_group_info::Error> for GetGroupInfoError {
-    fn from(err: crate::generated::blue::catbird::mls::get_group_info::Error) -> Self {
+impl From<LexGetGroupInfoError> for GetGroupInfoError {
+    fn from(err: LexGetGroupInfoError) -> Self {
         Self::Structured(err)
     }
 }
 
 /// Wrapper for updateGroupInfo errors
 pub enum UpdateGroupInfoError {
-    Structured(crate::generated::blue::catbird::mls::update_group_info::Error),
+    Structured(LexUpdateGroupInfoError),
     Generic(StatusCode),
 }
 
@@ -123,8 +133,9 @@ impl IntoResponse for UpdateGroupInfoError {
         match self {
             Self::Structured(err) => {
                 let status = match &err {
-                    crate::generated::blue::catbird::mls::update_group_info::Error::Unauthorized(_) => StatusCode::FORBIDDEN,
-                    crate::generated::blue::catbird::mls::update_group_info::Error::InvalidGroupInfo(_) => StatusCode::BAD_REQUEST,
+                    LexUpdateGroupInfoError::Unauthorized(_) => StatusCode::FORBIDDEN,
+                    LexUpdateGroupInfoError::InvalidGroupInfo(_) => StatusCode::BAD_REQUEST,
+                    _ => StatusCode::INTERNAL_SERVER_ERROR,
                 };
                 (status, Json(err)).into_response()
             }
@@ -139,8 +150,8 @@ impl From<StatusCode> for UpdateGroupInfoError {
     }
 }
 
-impl From<crate::generated::blue::catbird::mls::update_group_info::Error> for UpdateGroupInfoError {
-    fn from(err: crate::generated::blue::catbird::mls::update_group_info::Error) -> Self {
+impl From<LexUpdateGroupInfoError> for UpdateGroupInfoError {
+    fn from(err: LexUpdateGroupInfoError) -> Self {
         Self::Structured(err)
     }
 }

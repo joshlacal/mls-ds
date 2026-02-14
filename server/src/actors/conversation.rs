@@ -360,7 +360,7 @@ impl ConversationActorState {
             )
             .bind(&msg_id)
             .bind(&self.convo_id)
-            .bind("system") // Commit messages are system-generated
+            .bind(Option::<&str>::None) // sender_did intentionally NULL — PRIV-001 (docs/PRIVACY.md)
             .bind(advanced_epoch)
             .bind(seq)
             .bind(&commit_bytes)
@@ -563,7 +563,7 @@ impl ConversationActorState {
             )
             .bind(&msg_id)
             .bind(&self.convo_id)
-            .bind(&member_did)
+            .bind(Option::<&str>::None) // sender_did intentionally NULL — PRIV-001 (docs/PRIVACY.md)
             .bind(advanced_epoch)
             .bind(seq)
             .bind(&commit_bytes)
@@ -749,7 +749,7 @@ impl ConversationActorState {
         )
         .bind(&row_id)
         .bind(&self.convo_id)
-        .bind(&sender_did)
+        .bind(Option::<&str>::None) // sender_did intentionally NULL — PRIV-001 (docs/PRIVACY.md)
         .bind(epoch)
         .bind(seq)
         .bind(&ciphertext)
@@ -1010,19 +1010,21 @@ async fn handle_notify_new_message(
     // 2. SSE Emission
     let cursor = sse_state.cursor_gen.next(convo_id, "messageEvent").await;
 
-    let message_view = crate::models::MessageView::from(crate::models::MessageViewData {
+    let message_view = crate::generated_types::MessageView {
         id: msg_id.to_string(),
         convo_id: convo_id.to_string(),
         ciphertext: ciphertext.clone(),
-        epoch: epoch as i32 as usize,
-        seq: seq as usize,
-        created_at: crate::sqlx_atrium::chrono_to_datetime(chrono::Utc::now()),
-        message_type: None,
-    });
+        epoch: epoch as i64,
+        seq: seq as i64,
+        created_at: chrono::Utc::now(),
+        message_type: "app".to_string(),
+        reactions: None,
+    };
 
     let event = StreamEvent::MessageEvent {
         cursor: cursor.clone(),
         message: message_view,
+        ephemeral: is_ephemeral,
     };
 
     if !is_ephemeral {

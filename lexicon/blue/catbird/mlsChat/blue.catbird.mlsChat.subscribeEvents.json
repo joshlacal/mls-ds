@@ -1,0 +1,181 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.mlsChat.subscribeEvents",
+  "description": "Subscribe to live conversation events via WebSocket (consolidates subscribeConvoEvents with streamlined event types)",
+  "defs": {
+    "main": {
+      "type": "subscription",
+      "description": "Subscribe to live events (messages, membership changes, epoch advances, conversation updates) via firehose-style DAG-CBOR framing. Requires a valid ticket from getSubscriptionTicket.",
+      "parameters": {
+        "type": "params",
+        "properties": {
+          "ticket": {
+            "type": "string",
+            "description": "JWT ticket from getSubscriptionTicket for authentication"
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Opaque resume cursor. If provided, resume after this position."
+          }
+        }
+      },
+      "message": {
+        "schema": {
+          "type": "union",
+          "refs": [
+            "#messageEvent",
+            "#memberJoined",
+            "#memberLeft",
+            "#epochAdvanced",
+            "#conversationUpdated",
+            "#reactionEvent",
+            "#typingEvent",
+            "#readEvent",
+            "#newDeviceEvent",
+            "#infoEvent"
+          ]
+        }
+      }
+    },
+    "messageEvent": {
+      "type": "object",
+      "description": "A new encrypted message was sent",
+      "required": ["cursor", "message"],
+      "properties": {
+        "cursor": { "type": "string", "description": "Resume cursor for this event position" },
+        "message": { "type": "ref", "ref": "blue.catbird.mlsChat.defs#messageView" }
+      }
+    },
+    "memberJoined": {
+      "type": "object",
+      "description": "A member joined the conversation (via Welcome, ExternalCommit, or re-addition)",
+      "required": ["cursor", "convoId", "did", "epoch"],
+      "properties": {
+        "cursor": { "type": "string", "description": "Resume cursor" },
+        "convoId": { "type": "string", "description": "Conversation identifier" },
+        "did": { "type": "string", "format": "did", "description": "DID of the member who joined" },
+        "deviceId": { "type": "string", "description": "Device ID if this was a device addition" },
+        "epoch": { "type": "integer", "description": "New epoch after join" },
+        "method": {
+          "type": "string",
+          "description": "How the member joined",
+          "knownValues": ["welcome", "externalCommit", "readdition", "deviceAddition"]
+        }
+      }
+    },
+    "memberLeft": {
+      "type": "object",
+      "description": "A member left or was removed from the conversation",
+      "required": ["cursor", "convoId", "did", "action", "epoch"],
+      "properties": {
+        "cursor": { "type": "string", "description": "Resume cursor" },
+        "convoId": { "type": "string", "description": "Conversation identifier" },
+        "did": { "type": "string", "format": "did", "description": "DID of the member who left/was removed" },
+        "action": {
+          "type": "string",
+          "description": "How the member departed",
+          "knownValues": ["left", "removed", "kicked"]
+        },
+        "actor": { "type": "string", "format": "did", "description": "DID of the admin who removed (for removed/kicked)" },
+        "reason": { "type": "string", "description": "Optional reason for removal" },
+        "epoch": { "type": "integer", "description": "New epoch after departure" }
+      }
+    },
+    "epochAdvanced": {
+      "type": "object",
+      "description": "The MLS epoch advanced (group state change)",
+      "required": ["cursor", "convoId", "epoch"],
+      "properties": {
+        "cursor": { "type": "string", "description": "Resume cursor" },
+        "convoId": { "type": "string", "description": "Conversation identifier" },
+        "epoch": { "type": "integer", "description": "New epoch number" },
+        "reason": {
+          "type": "string",
+          "description": "Why the epoch advanced",
+          "knownValues": ["memberAdd", "memberRemove", "commit", "externalCommit", "update"]
+        }
+      }
+    },
+    "conversationUpdated": {
+      "type": "object",
+      "description": "Conversation metadata or policy was updated",
+      "required": ["cursor", "convoId"],
+      "properties": {
+        "cursor": { "type": "string", "description": "Resume cursor" },
+        "convoId": { "type": "string", "description": "Conversation identifier" },
+        "updatedFields": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "List of fields that changed (e.g., 'name', 'policy', 'groupInfo')"
+        },
+        "updatedBy": { "type": "string", "format": "did", "description": "DID of the member who made the update" }
+      }
+    },
+    "reactionEvent": {
+      "type": "object",
+      "description": "A reaction was added or removed",
+      "required": ["cursor", "convoId", "messageId", "did", "reaction", "action"],
+      "properties": {
+        "cursor": { "type": "string", "description": "Resume cursor" },
+        "convoId": { "type": "string", "description": "Conversation identifier" },
+        "messageId": { "type": "string", "description": "Message that was reacted to" },
+        "did": { "type": "string", "format": "did", "description": "DID of the reactor" },
+        "reaction": { "type": "string", "description": "Emoji or short code" },
+        "action": { "type": "string", "knownValues": ["add", "remove"] }
+      }
+    },
+    "typingEvent": {
+      "type": "object",
+      "description": "A user started or stopped typing",
+      "required": ["cursor", "convoId", "did", "isTyping"],
+      "properties": {
+        "cursor": { "type": "string", "description": "Resume cursor" },
+        "convoId": { "type": "string", "description": "Conversation identifier" },
+        "did": { "type": "string", "format": "did", "description": "DID of the typist" },
+        "isTyping": { "type": "boolean", "description": "True if started typing, false if stopped" }
+      }
+    },
+    "readEvent": {
+      "type": "object",
+      "description": "A member read messages in the conversation",
+      "required": ["cursor", "convoId", "did", "readAt"],
+      "properties": {
+        "cursor": { "type": "string", "description": "Resume cursor" },
+        "convoId": { "type": "string", "description": "Conversation identifier" },
+        "did": { "type": "string", "format": "did", "description": "DID of the reader" },
+        "messageId": { "type": "string", "description": "Specific message marked as read (omit for all)" },
+        "readAt": { "type": "string", "format": "datetime", "description": "When messages were read" }
+      }
+    },
+    "newDeviceEvent": {
+      "type": "object",
+      "description": "A user registered a new device needing addition to the conversation",
+      "required": ["cursor", "convoId", "userDid", "deviceId", "deviceCredentialDid", "pendingAdditionId"],
+      "properties": {
+        "cursor": { "type": "string", "description": "Resume cursor" },
+        "convoId": { "type": "string", "description": "Conversation identifier" },
+        "userDid": { "type": "string", "format": "did", "description": "Base user DID" },
+        "deviceId": { "type": "string", "description": "Device identifier" },
+        "deviceName": { "type": "string", "description": "Human-readable device name" },
+        "deviceCredentialDid": { "type": "string", "description": "Full device credential DID (did:plc:user#device-uuid)" },
+        "pendingAdditionId": { "type": "string", "description": "ID of the pending addition for claim/complete flow" }
+      }
+    },
+    "infoEvent": {
+      "type": "object",
+      "description": "Informational message (heartbeat, notices, or GroupInfo refresh request)",
+      "required": ["cursor", "info"],
+      "properties": {
+        "cursor": { "type": "string", "description": "Resume cursor" },
+        "info": { "type": "string", "description": "Human-readable info or keep-alive message" },
+        "infoType": {
+          "type": "string",
+          "description": "Structured info type for programmatic handling",
+          "knownValues": ["heartbeat", "groupInfoRefreshRequested", "readditionRequested"]
+        },
+        "convoId": { "type": "string", "description": "Conversation ID (for groupInfoRefreshRequested, readditionRequested)" },
+        "requestedBy": { "type": "string", "format": "did", "description": "DID of the requester" }
+      }
+    }
+  }
+}

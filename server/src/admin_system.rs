@@ -455,7 +455,7 @@ pub async fn remove_member(
     )
     .bind(&commit_id)
     .bind(&input.convo_id)
-    .bind(caller_did)
+    .bind(Option::<&str>::None) // sender_did intentionally NULL — PRIV-001 (docs/PRIVACY.md)
     .bind(new_epoch)
     .bind(&input.commit)
     .execute(&pool)

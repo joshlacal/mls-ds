@@ -1,8 +1,10 @@
 #[cfg(test)]
 mod conversation_tests {
     use crate::actors::{ConversationActor, ConvoActorArgs, ConvoMessage, KeyPackageHashEntry};
+    use crate::realtime::SseState;
     use ractor::Actor;
     use sqlx::PgPool;
+    use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::oneshot;
 
@@ -78,6 +80,8 @@ mod conversation_tests {
 
         // Spawn actor
         let args = ConvoActorArgs {
+            sse_state: Arc::new(SseState::new(1000)),
+            notification_service: None,
             convo_id: convo_id.to_string(),
             db_pool: pool.clone(),
         };
@@ -170,6 +174,8 @@ mod conversation_tests {
 
         // Spawn actor
         let args = ConvoActorArgs {
+            sse_state: Arc::new(SseState::new(1000)),
+            notification_service: None,
             convo_id: convo_id.to_string(),
             db_pool: pool.clone(),
         };
@@ -224,6 +230,8 @@ mod conversation_tests {
 
         // Spawn actor
         let args = ConvoActorArgs {
+            sse_state: Arc::new(SseState::new(1000)),
+            notification_service: None,
             convo_id: convo_id.to_string(),
             db_pool: pool.clone(),
         };
@@ -278,6 +286,8 @@ mod conversation_tests {
 
         // Spawn actor
         let args = ConvoActorArgs {
+            sse_state: Arc::new(SseState::new(1000)),
+            notification_service: None,
             convo_id: convo_id.to_string(),
             db_pool: pool.clone(),
         };
@@ -335,6 +345,8 @@ mod conversation_tests {
 
         // Spawn actor
         let args = ConvoActorArgs {
+            sse_state: Arc::new(SseState::new(1000)),
+            notification_service: None,
             convo_id: convo_id.to_string(),
             db_pool: pool.clone(),
         };
@@ -353,6 +365,10 @@ mod conversation_tests {
                     .cast(ConvoMessage::SendMessage {
                         sender_did: "did:plc:alice".to_string(),
                         ciphertext: vec![i as u8; 10],
+                        msg_id: format!("msg-{}", i),
+                        epoch: 0,
+                        padded_size: 512,
+                        idempotency_key: None,
                         reply: tx,
                     })
                     .expect("Failed to send message");

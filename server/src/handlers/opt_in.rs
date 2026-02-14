@@ -80,7 +80,7 @@ pub async fn opt_in(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    info!(did = %user_did, device_id = ?input.device_id, "User opted in to MLS chat");
+    info!(did = %crate::crypto::redact_for_log(&user_did), device_id = ?input.device_id, "User opted in to MLS chat");
 
     Ok(Json(OptInOutput {
         opted_in: true,

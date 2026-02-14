@@ -119,6 +119,7 @@ pub async fn get_epoch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::realtime::SseState;
 
     async fn setup_test_convo(pool: &DbPool, creator: &str, convo_id: &str, epoch: i64) {
         let now = chrono::Utc::now();
@@ -132,7 +133,7 @@ mod tests {
         .bind(&now)
         .execute(pool)
         .await
-        .unwrap();
+        .expect("test setup");
 
         sqlx::query(
             "INSERT INTO members (convo_id, member_did, joined_at) 
@@ -143,7 +144,7 @@ mod tests {
         .bind(&now)
         .execute(pool)
         .await
-        .unwrap();
+        .expect("test setup");
     }
 
     #[tokio::test]
@@ -159,7 +160,7 @@ mod tests {
             idle_timeout: std::time::Duration::from_secs(30),
         })
         .await
-        .unwrap();
+        .expect("test setup");
 
         let convo_id = "test-epoch-convo-1";
         let user = "did:plc:user";
@@ -183,10 +184,15 @@ mod tests {
             convo_id: convo_id.to_string(),
         };
 
-        let result = get_epoch(State(pool), auth_user, Query(params)).await;
+        let actor_registry = Arc::new(crate::actors::ActorRegistry::new(
+            pool.clone(),
+            Arc::new(SseState::new(1000)),
+            None,
+        ));
+        let result = get_epoch(State(pool), State(actor_registry), auth_user, Query(params)).await;
         assert!(result.is_ok());
 
-        let response = result.unwrap().0;
+        let response = result.expect("handler should return Ok").0;
         assert_eq!(response.current_epoch, 42);
         assert_eq!(response.convo_id, convo_id);
     }
@@ -204,7 +210,7 @@ mod tests {
             idle_timeout: std::time::Duration::from_secs(30),
         })
         .await
-        .unwrap();
+        .expect("test setup");
 
         let convo_id = "test-epoch-convo-2";
         let creator = "did:plc:creator";
@@ -228,7 +234,12 @@ mod tests {
             convo_id: convo_id.to_string(),
         };
 
-        let result = get_epoch(State(pool), auth_user, Query(params)).await;
+        let actor_registry = Arc::new(crate::actors::ActorRegistry::new(
+            pool.clone(),
+            Arc::new(SseState::new(1000)),
+            None,
+        ));
+        let result = get_epoch(State(pool), State(actor_registry), auth_user, Query(params)).await;
         assert_eq!(result.unwrap_err(), StatusCode::FORBIDDEN);
     }
 
@@ -245,7 +256,7 @@ mod tests {
             idle_timeout: std::time::Duration::from_secs(30),
         })
         .await
-        .unwrap();
+        .expect("test setup");
 
         let user = "did:plc:user";
         let auth_user = AuthUser {
@@ -265,7 +276,12 @@ mod tests {
             convo_id: "nonexistent-convo".to_string(),
         };
 
-        let result = get_epoch(State(pool), auth_user, Query(params)).await;
+        let actor_registry = Arc::new(crate::actors::ActorRegistry::new(
+            pool.clone(),
+            Arc::new(SseState::new(1000)),
+            None,
+        ));
+        let result = get_epoch(State(pool), State(actor_registry), auth_user, Query(params)).await;
         assert_eq!(result.unwrap_err(), StatusCode::NOT_FOUND);
     }
 }

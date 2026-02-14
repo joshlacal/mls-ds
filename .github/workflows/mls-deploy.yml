@@ -69,6 +69,15 @@ jobs:
           cargo fmt -- --check
           cargo clippy -- -D warnings
 
+      - name: Log redaction lint
+        working-directory: ./server
+        run: |
+          ./scripts/log_redaction_lint.sh
+
+      - name: Deployment policy lint
+        run: |
+          ./server/scripts/check_deploy_policy.sh
+
       - name: Run tests
         working-directory: ./server
         env:
@@ -186,6 +195,10 @@ jobs:
       - name: Configure kubectl
         uses: azure/setup-kubectl@v3
 
+      - name: Verify deploy policy (staging)
+        run: |
+          ./server/scripts/check_deploy_policy.sh
+
       - name: Deploy to staging
         env:
           KUBE_CONFIG: ${{ secrets.STAGING_KUBE_CONFIG }}
@@ -234,6 +247,10 @@ jobs:
 
       - name: Configure kubectl
         uses: azure/setup-kubectl@v3
+
+      - name: Verify deploy policy (production)
+        run: |
+          ./server/scripts/check_deploy_policy.sh
 
       - name: Create database backup
         env:

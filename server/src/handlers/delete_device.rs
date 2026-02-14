@@ -1,14 +1,13 @@
 use axum::{extract::State, http::StatusCode, Json};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tracing::{error, info, warn};
 
-use crate::{auth::AuthUser, storage::DbPool};
+use crate::{
+    auth::AuthUser, generated::blue_catbird::mls::delete_device::DeleteDevice, storage::DbPool,
+};
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DeleteDeviceInput {
-    device_id: String,
-}
+/// Type alias preserving the old name for v2 handler compatibility.
+pub type DeleteDeviceInput = DeleteDevice<'static>;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -20,12 +19,13 @@ pub struct DeleteDeviceOutput {
 
 /// Delete a registered device and all its associated key packages
 /// POST /xrpc/blue.catbird.mls.deleteDevice
-#[tracing::instrument(skip(pool, input))]
+#[tracing::instrument(skip(pool, body))]
 pub async fn delete_device(
     State(pool): State<DbPool>,
     auth_user: AuthUser,
-    Json(input): Json<DeleteDeviceInput>,
+    body: String,
 ) -> Result<Json<DeleteDeviceOutput>, StatusCode> {
+    let input = crate::jacquard_json::from_json_body::<DeleteDevice>(&body)?;
     if let Err(_e) =
         crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.deleteDevice")
     {
@@ -33,8 +33,13 @@ pub async fn delete_device(
     }
 
     let user_did = &auth_user.did;
+    let device_id: String = input.device_id.into();
 
-    info!("Deleting device {} for user {}", input.device_id, user_did);
+    info!(
+        "Deleting device {} for user {}",
+        device_id,
+        crate::crypto::redact_for_log(user_did)
+    );
 
     // Verify the device exists and is owned by the authenticated user
     let device_info: Option<(String, String)> = sqlx::query_as(
@@ -44,7 +49,7 @@ pub async fn delete_device(
         WHERE device_id = $1
         "#,
     )
-    .bind(&input.device_id)
+    .bind(&device_id)
     .fetch_optional(&pool)
     .await
     .map_err(|e| {
@@ -55,10 +60,7 @@ pub async fn delete_device(
     let (owner_did, credential_did) = match device_info {
         Some(info) => info,
         None => {
-            warn!(
-                "Device not found: {} (treating as success)",
-                input.device_id
-            );
+            warn!("Device not found: {} (treating as success)", device_id);
             return Ok(Json(DeleteDeviceOutput {
                 deleted: false,
                 key_packages_deleted: 0,
@@ -71,7 +73,7 @@ pub async fn delete_device(
     if owner_did != *user_did {
         warn!(
             "User {} attempted to delete device {} owned by {}",
-            user_did, input.device_id, owner_did
+            user_did, device_id, owner_did
         );
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -84,7 +86,7 @@ pub async fn delete_device(
         WHERE device_id = $1 AND left_at IS NULL
         "#,
     )
-    .bind(&input.device_id)
+    .bind(&device_id)
     .execute(&pool)
     .await
     .map_err(|e| {
@@ -95,7 +97,7 @@ pub async fn delete_device(
 
     info!(
         "Removed device {} from {} conversations",
-        input.device_id, members_removed
+        device_id, members_removed
     );
 
     // Clean up pending welcome messages for this device
@@ -117,7 +119,7 @@ pub async fn delete_device(
         DELETE FROM key_packages
         WHERE device_id = $1
         "#,
-        input.device_id
+        device_id
     )
     .execute(&pool)
     .await
@@ -129,7 +131,7 @@ pub async fn delete_device(
 
     info!(
         "Deleted {} key packages for device {}",
-        key_packages_deleted, input.device_id
+        key_packages_deleted, device_id
     );
 
     // Delete the device record
@@ -138,7 +140,7 @@ pub async fn delete_device(
         DELETE FROM devices
         WHERE device_id = $1
         "#,
-        input.device_id
+        device_id
     )
     .execute(&pool)
     .await
@@ -149,16 +151,13 @@ pub async fn delete_device(
     .rows_affected();
 
     if devices_deleted == 0 {
-        error!(
-            "Device deletion failed - device not found: {}",
-            input.device_id
-        );
+        error!("Device deletion failed - device not found: {}", device_id);
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     info!(
         "Successfully deleted device {} and {} key packages",
-        input.device_id, key_packages_deleted
+        device_id, key_packages_deleted
     );
 
     Ok(Json(DeleteDeviceOutput {

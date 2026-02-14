@@ -5,7 +5,9 @@ use tracing::{error, info, warn};
 use crate::{
     auth::AuthUser,
     device_utils::parse_device_did,
-    generated::blue::catbird::mls::invalidate_welcome::{Input, Output, OutputData},
+    generated::blue_catbird::mls::invalidate_welcome::{
+        InvalidateWelcome, InvalidateWelcomeOutput,
+    },
     storage::DbPool,
 };
 
@@ -18,8 +20,9 @@ use crate::{
 pub async fn invalidate_welcome(
     State(pool): State<DbPool>,
     auth_user: AuthUser,
-    Json(input): Json<Input>,
-) -> Result<Json<Output>, StatusCode> {
+    body: String,
+) -> Result<Json<InvalidateWelcomeOutput<'static>>, StatusCode> {
+    let input = crate::jacquard_json::from_json_body::<InvalidateWelcome>(&body)?;
     // Enforce authentication
     if let Err(_e) =
         crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.invalidateWelcome")
@@ -28,8 +31,8 @@ pub async fn invalidate_welcome(
     }
 
     let device_did = &auth_user.did;
-    let convo_id = &input.data.convo_id;
-    let reason = &input.data.reason;
+    let convo_id = input.convo_id.as_str();
+    let reason = input.reason.as_str();
 
     // Extract user DID from device DID
     let (user_did, _device_id) = parse_device_did(device_did).map_err(|e| {
@@ -77,10 +80,11 @@ pub async fn invalidate_welcome(
                 welcome_id = %welcome_id,
                 "Welcome invalidated successfully"
             );
-            Ok(Json(Output::from(OutputData {
+            Ok(Json(InvalidateWelcomeOutput {
                 invalidated: true,
-                welcome_id: Some(welcome_id),
-            })))
+                welcome_id: Some(welcome_id.into()),
+                extra_data: Default::default(),
+            }))
         }
         None => {
             warn!(
@@ -90,10 +94,11 @@ pub async fn invalidate_welcome(
             );
             // Return success with invalidated=false rather than an error
             // This is non-critical - the Welcome might have already been invalidated
-            Ok(Json(Output::from(OutputData {
+            Ok(Json(InvalidateWelcomeOutput {
                 invalidated: false,
                 welcome_id: None,
-            })))
+                extra_data: Default::default(),
+            }))
         }
     }
 }

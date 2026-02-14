@@ -9,10 +9,10 @@ use tracing::{error, info, warn};
 use crate::{
     auth::{enforce_standard, AuthUser},
     block_sync::BlockSyncService,
-    generated::blue::catbird::mls::check_blocks::{
-        BlockRelationship, BlockRelationshipData, Output, OutputData, Parameters, NSID,
+    generated::blue_catbird::mls::check_blocks::{
+        BlockRelationship, CheckBlocks, CheckBlocksOutput,
     },
-    sqlx_atrium::{chrono_to_datetime, string_to_did},
+    sqlx_jacquard::{chrono_to_datetime, try_string_to_did},
     storage::DbPool,
 };
 
@@ -27,11 +27,13 @@ pub async fn check_blocks(
     State(pool): State<DbPool>,
     State(block_sync): State<Arc<BlockSyncService>>,
     auth_user: AuthUser,
-    Query(params): Query<Parameters>,
-) -> Result<Json<Output>, StatusCode> {
-    let params = params.data;
-
-    enforce_standard(&auth_user.claims, NSID).map_err(|_| StatusCode::UNAUTHORIZED)?;
+    raw_query: axum::extract::RawQuery,
+) -> Result<Json<CheckBlocksOutput<'static>>, StatusCode> {
+    let params = crate::jacquard_json::from_query_string::<CheckBlocks>(
+        raw_query.0.as_deref().unwrap_or(""),
+    )?;
+    enforce_standard(&auth_user.claims, "blue.catbird.mls.checkBlocks")
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
 
     // Validate DID count (2-100)
     if params.dids.len() < 2 || params.dids.len() > 100 {
@@ -61,21 +63,22 @@ pub async fn check_blocks(
                     );
                 }
 
-                let blocker_did = string_to_did(&blocker_str).map_err(|e| {
+                let blocker_did = try_string_to_did(&blocker_str).map_err(|e| {
                     error!("Invalid blocker DID: {}", e);
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
-                let blocked_did = string_to_did(&blocked_str).map_err(|e| {
+                let blocked_did = try_string_to_did(&blocked_str).map_err(|e| {
                     error!("Invalid blocked DID: {}", e);
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
 
-                blocks.push(BlockRelationship::from(BlockRelationshipData {
+                blocks.push(BlockRelationship {
                     blocker_did,
                     blocked_did,
                     block_uri: None,
                     created_at: chrono_to_datetime(now),
-                }));
+                    extra_data: None,
+                });
             }
         }
         Err(e) => {
@@ -96,21 +99,22 @@ pub async fn check_blocks(
             })?;
 
             for (blocker_str, blocked_str, synced_at) in rows {
-                let blocker_did = string_to_did(&blocker_str).map_err(|e| {
+                let blocker_did = try_string_to_did(&blocker_str).map_err(|e| {
                     error!("Invalid blocker DID: {}", e);
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
-                let blocked_did = string_to_did(&blocked_str).map_err(|e| {
+                let blocked_did = try_string_to_did(&blocked_str).map_err(|e| {
                     error!("Invalid blocked DID: {}", e);
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
 
-                blocks.push(BlockRelationship::from(BlockRelationshipData {
+                blocks.push(BlockRelationship {
                     blocker_did,
                     blocked_did,
                     block_uri: None,
                     created_at: chrono_to_datetime(synced_at),
-                }));
+                    extra_data: None,
+                });
             }
         }
     }
@@ -121,8 +125,9 @@ pub async fn check_blocks(
         did_strs.len()
     );
 
-    Ok(Json(Output::from(OutputData {
+    Ok(Json(CheckBlocksOutput {
         blocks,
         checked_at: chrono_to_datetime(now),
-    })))
+        extra_data: None,
+    }))
 }

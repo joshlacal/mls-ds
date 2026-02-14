@@ -1,0 +1,151 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.mlsChat.report",
+  "description": "Manage moderation reports (consolidates reportMember + resolveReport + warnMember + getReports)",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Create, resolve, warn, or list moderation reports for a conversation. The 'action' field determines the operation. Report content is E2EE and only admins can decrypt.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["convoId", "action"],
+          "properties": {
+            "convoId": {
+              "type": "string",
+              "description": "Conversation identifier"
+            },
+            "action": {
+              "type": "string",
+              "description": "Moderation action to perform",
+              "knownValues": ["create", "resolve", "warn", "list"]
+            },
+            "targetDid": {
+              "type": "string",
+              "format": "did",
+              "description": "DID of member being reported or warned (required for 'create' and 'warn')"
+            },
+            "reason": {
+              "type": "string",
+              "description": "Report category or warning reason (required for 'create')",
+              "knownValues": [
+                "harassment",
+                "spam",
+                "hate_speech",
+                "violence",
+                "sexual_content",
+                "impersonation",
+                "privacy_violation",
+                "other"
+              ]
+            },
+            "details": {
+              "type": "bytes",
+              "description": "Encrypted report content (E2EE blob for 'create' action, only admins can decrypt)",
+              "maxLength": 51200
+            },
+            "reportId": {
+              "type": "string",
+              "description": "Report ID to resolve (required for 'resolve')"
+            },
+            "messageIds": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Message IDs being reported (for reference, max 20)",
+              "maxLength": 20
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "reportId": {
+              "type": "string",
+              "description": "Created or resolved report identifier (for 'create' and 'resolve')"
+            },
+            "reports": {
+              "type": "array",
+              "items": {
+                "type": "ref",
+                "ref": "#reportView"
+              },
+              "description": "List of reports (for 'list' action)"
+            },
+            "success": {
+              "type": "boolean",
+              "description": "Whether the operation succeeded"
+            },
+            "submittedAt": {
+              "type": "string",
+              "format": "datetime",
+              "description": "When the report was submitted (for 'create')"
+            }
+          }
+        }
+      },
+      "errors": [
+        {"name": "ConvoNotFound", "description": "Conversation not found"},
+        {"name": "NotMember", "description": "Caller is not a member of the conversation"},
+        {"name": "Unauthorized", "description": "Admin privileges required for resolve/warn/list"},
+        {"name": "InvalidAction", "description": "Unknown action value"},
+        {"name": "TargetNotMember", "description": "Target DID is not a member of the conversation"},
+        {"name": "CannotReportSelf", "description": "Cannot report yourself"},
+        {"name": "ReportNotFound", "description": "Report ID not found (for 'resolve')"},
+        {"name": "MissingTargetDid", "description": "targetDid is required for 'create' and 'warn'"},
+        {"name": "MissingReason", "description": "reason is required for 'create'"}
+      ]
+    },
+    "reportView": {
+      "type": "object",
+      "required": ["reportId", "convoId", "reporterDid", "reportedDid", "category", "status", "submittedAt"],
+      "properties": {
+        "reportId": {
+          "type": "string",
+          "description": "Unique report identifier"
+        },
+        "convoId": {
+          "type": "string",
+          "description": "Conversation identifier"
+        },
+        "reporterDid": {
+          "type": "string",
+          "format": "did",
+          "description": "DID of the reporter"
+        },
+        "reportedDid": {
+          "type": "string",
+          "format": "did",
+          "description": "DID of the reported member"
+        },
+        "category": {
+          "type": "string",
+          "description": "Report category"
+        },
+        "status": {
+          "type": "string",
+          "description": "Report status",
+          "knownValues": ["pending", "resolved", "dismissed"]
+        },
+        "submittedAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "When the report was submitted"
+        },
+        "resolvedAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "When the report was resolved (if applicable)"
+        },
+        "resolvedBy": {
+          "type": "string",
+          "format": "did",
+          "description": "DID of the admin who resolved the report"
+        }
+      }
+    }
+  }
+}

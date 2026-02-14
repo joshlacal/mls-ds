@@ -1,5 +1,4 @@
 use axum::{
-    async_trait,
     body::Bytes,
     extract::{FromRequest, Request},
     http::StatusCode,
@@ -10,7 +9,6 @@ use tracing::error;
 /// Custom JSON extractor that logs deserialization errors
 pub struct LoggedJson<T>(pub T);
 
-#[async_trait]
 impl<T, S> FromRequest<S> for LoggedJson<T>
 where
     T: serde::de::DeserializeOwned,

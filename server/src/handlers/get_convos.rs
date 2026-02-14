@@ -1,7 +1,10 @@
 use axum::{extract::State, http::StatusCode, Json};
 use tracing::{error, info};
 
-use crate::{auth::AuthUser, models::Membership, storage::DbPool};
+use crate::{
+    auth::AuthUser, generated::blue_catbird::mls::get_convos::GetConvosOutput, models::Membership,
+    storage::DbPool,
+};
 
 /// Get all conversations for the authenticated user
 /// GET /xrpc/chat.bsky.convo.getConvos
@@ -9,7 +12,7 @@ use crate::{auth::AuthUser, models::Membership, storage::DbPool};
 pub async fn get_convos(
     State(pool): State<DbPool>,
     auth_user: AuthUser,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<GetConvosOutput<'static>>, StatusCode> {
     let did = &auth_user.did;
     info!("Fetching conversations for user");
 
@@ -50,7 +53,7 @@ pub async fn get_convos(
     for membership in memberships {
         // Get conversation details
         let convo: Option<crate::models::Conversation> = sqlx::query_as(
-            "SELECT id, creator_did, current_epoch, created_at, updated_at, name, cipher_suite FROM conversations WHERE id = $1"
+            "SELECT id, creator_did, current_epoch, created_at, updated_at, name, cipher_suite, sequencer_ds, is_remote FROM conversations WHERE id = $1"
         )
         .bind(&membership.convo_id)
         .fetch_optional(&pool)
@@ -76,7 +79,7 @@ pub async fn get_convos(
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
-            let members: Vec<crate::models::MemberView> = member_rows
+            let members: Vec<crate::models::MemberView<'static>> = member_rows
                 .into_iter()
                 .map(|m| {
                     m.to_member_view().map_err(|e| {
@@ -104,7 +107,12 @@ pub async fn get_convos(
 
     info!("Found {} conversations for user", convos.len());
 
-    Ok(Json(serde_json::json!({ "conversations": convos })))
+    let output = GetConvosOutput {
+        conversations: convos,
+        cursor: None,
+        extra_data: Default::default(),
+    };
+    Ok(Json(output))
 }
 
 #[cfg(test)]
@@ -121,7 +129,7 @@ mod tests {
             .bind(&now)
             .execute(pool)
             .await
-            .unwrap();
+            .expect("test setup");
 
         for member in members {
             sqlx::query(
@@ -132,7 +140,7 @@ mod tests {
             .bind(&now)
             .execute(pool)
             .await
-            .unwrap();
+            .expect("test setup");
         }
     }
 
@@ -149,7 +157,7 @@ mod tests {
             idle_timeout: std::time::Duration::from_secs(30),
         })
         .await
-        .unwrap();
+        .expect("test setup");
         let user = "did:plc:user";
 
         setup_test_convo(&pool, "convo-1", user, vec![user, "did:plc:member1"]).await;
@@ -176,8 +184,13 @@ mod tests {
         let result = get_convos(State(pool), did).await;
         assert!(result.is_ok());
 
-        let json = result.unwrap().0;
-        let convos = json.get("conversations").unwrap().as_array().unwrap();
+        let output = result.expect("handler should return Ok").0;
+        let json = serde_json::to_value(&output).unwrap();
+        let convos = json
+            .get("conversations")
+            .expect("response should have 'conversations' field")
+            .as_array()
+            .expect("should be array");
         assert_eq!(convos.len(), 2);
     }
 
@@ -194,7 +207,7 @@ mod tests {
             idle_timeout: std::time::Duration::from_secs(30),
         })
         .await
-        .unwrap();
+        .expect("test setup");
 
         let did = AuthUser {
             did: "did:plc:lonely".to_string(),
@@ -211,8 +224,13 @@ mod tests {
         let result = get_convos(State(pool), did).await;
         assert!(result.is_ok());
 
-        let json = result.unwrap().0;
-        let convos = json.get("conversations").unwrap().as_array().unwrap();
+        let output = result.expect("handler should return Ok").0;
+        let json = serde_json::to_value(&output).unwrap();
+        let convos = json
+            .get("conversations")
+            .expect("response should have 'conversations' field")
+            .as_array()
+            .expect("should be array");
         assert_eq!(convos.len(), 0);
     }
 
@@ -229,7 +247,7 @@ mod tests {
             idle_timeout: std::time::Duration::from_secs(30),
         })
         .await
-        .unwrap();
+        .expect("test setup");
         let user = "did:plc:user";
 
         // Create conversation
@@ -243,7 +261,7 @@ mod tests {
             .bind(user)
             .execute(&pool)
             .await
-            .unwrap();
+            .expect("test setup");
 
         let did = AuthUser {
             did: user.to_string(),
@@ -260,8 +278,13 @@ mod tests {
         let result = get_convos(State(pool), did).await;
         assert!(result.is_ok());
 
-        let json = result.unwrap().0;
-        let convos = json.get("conversations").unwrap().as_array().unwrap();
+        let output = result.expect("handler should return Ok").0;
+        let json = serde_json::to_value(&output).unwrap();
+        let convos = json
+            .get("conversations")
+            .expect("response should have 'conversations' field")
+            .as_array()
+            .expect("should be array");
         assert_eq!(convos.len(), 0);
     }
 
@@ -278,7 +301,7 @@ mod tests {
             idle_timeout: std::time::Duration::from_secs(30),
         })
         .await
-        .unwrap();
+        .expect("test setup");
         let user = "did:plc:user";
 
         setup_test_convo(&pool, "convo-1", user, vec![user]).await;
@@ -289,7 +312,7 @@ mod tests {
             .bind(user)
             .execute(&pool)
             .await
-            .unwrap();
+            .expect("test setup");
 
         let did = AuthUser {
             did: user.to_string(),
@@ -306,12 +329,24 @@ mod tests {
         let result = get_convos(State(pool), did).await;
         assert!(result.is_ok());
 
-        let json = result.unwrap().0;
-        let convos = json.get("conversations").unwrap().as_array().unwrap();
+        let output = result.expect("handler should return Ok").0;
+        let json = serde_json::to_value(&output).unwrap();
+        let convos = json
+            .get("conversations")
+            .expect("response should have 'conversations' field")
+            .as_array()
+            .expect("should be array");
         assert_eq!(convos.len(), 1);
 
         let convo = &convos[0];
-        assert_eq!(convo.get("unreadCount").unwrap().as_i64().unwrap(), 5);
+        assert_eq!(
+            convo
+                .get("unreadCount")
+                .expect("response should have 'unreadCount' field")
+                .as_i64()
+                .expect("should be i64"),
+            5
+        );
     }
 
     #[tokio::test]
@@ -327,7 +362,7 @@ mod tests {
             idle_timeout: std::time::Duration::from_secs(30),
         })
         .await
-        .unwrap();
+        .expect("test setup");
         let user = "did:plc:user";
         let member1 = "did:plc:member1";
         let member2 = "did:plc:member2";
@@ -349,12 +384,21 @@ mod tests {
         let result = get_convos(State(pool), did).await;
         assert!(result.is_ok());
 
-        let json = result.unwrap().0;
-        let convos = json.get("conversations").unwrap().as_array().unwrap();
+        let output = result.expect("handler should return Ok").0;
+        let json = serde_json::to_value(&output).unwrap();
+        let convos = json
+            .get("conversations")
+            .expect("response should have 'conversations' field")
+            .as_array()
+            .expect("should be array");
         assert_eq!(convos.len(), 1);
 
         let convo = &convos[0];
-        let members = convo.get("members").unwrap().as_array().unwrap();
+        let members = convo
+            .get("members")
+            .expect("response should have 'members' field")
+            .as_array()
+            .expect("should be array");
         assert_eq!(members.len(), 3);
     }
 }

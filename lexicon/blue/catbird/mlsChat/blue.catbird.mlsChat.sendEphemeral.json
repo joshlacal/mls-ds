@@ -1,0 +1,58 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.mlsChat.sendEphemeral",
+  "description": "Send an encrypted ephemeral message (typing indicators, read receipts, presence). Identical to sendMessage but the server does not persist the message.",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Send an MLS-encrypted ephemeral signal to a conversation. The server treats the ciphertext as opaque — it cannot distinguish typing indicators from text messages. Messages are broadcast to conversation subscribers with an ephemeral flag and are NOT persisted.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["convoId", "ciphertext", "epoch", "paddedSize"],
+          "properties": {
+            "convoId": {
+              "type": "string",
+              "description": "Conversation identifier"
+            },
+            "ciphertext": {
+              "type": "bytes",
+              "description": "MLS encrypted message ciphertext bytes (padded to paddedSize)",
+              "maxLength": 10485760
+            },
+            "epoch": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "MLS epoch number when message was encrypted"
+            },
+            "paddedSize": {
+              "type": "integer",
+              "minimum": 512,
+              "maximum": 10485760,
+              "description": "Padded ciphertext size in bytes (must match ciphertext length)"
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["cursor"],
+          "properties": {
+            "cursor": {
+              "type": "string",
+              "description": "Server-assigned cursor for the emitted event"
+            }
+          }
+        }
+      },
+      "errors": [
+        {"name": "ConvoNotFound", "description": "Conversation not found"},
+        {"name": "NotMember", "description": "Caller is not a member of the conversation"},
+        {"name": "InvalidCiphertext", "description": "Ciphertext is invalid or does not match paddedSize"}
+      ]
+    }
+  }
+}

@@ -1,0 +1,189 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.mlsChat.commitGroupChange",
+  "description": "Commit MLS group membership changes (consolidates addMembers + processExternalCommit + rejoin + readdition + getPendingDeviceAdditions + claimPendingDeviceAddition + completePendingDeviceAddition)",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Perform MLS group membership operations. The 'action' field determines the operation type. This consolidates all membership-changing operations into a single endpoint.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["convoId", "action"],
+          "properties": {
+            "convoId": {
+              "type": "string",
+              "description": "Conversation identifier"
+            },
+            "action": {
+              "type": "string",
+              "description": "Membership action to perform",
+              "knownValues": [
+                "addMembers",
+                "processExternalCommit",
+                "rejoin",
+                "readdition",
+                "getPendingDeviceAdditions",
+                "claimPendingDeviceAddition",
+                "completePendingDeviceAddition"
+              ]
+            },
+            "memberDids": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "format": "did"
+              },
+              "description": "DIDs of members to add (required for 'addMembers')",
+              "maxLength": 50
+            },
+            "commit": {
+              "type": "string",
+              "description": "Base64url-encoded MLS Commit message (used by addMembers, processExternalCommit, rejoin)"
+            },
+            "welcome": {
+              "type": "string",
+              "description": "Base64url-encoded MLS Welcome message (used by addMembers, completePendingDeviceAddition)"
+            },
+            "groupInfo": {
+              "type": "string",
+              "description": "Base64-encoded GroupInfo to update after commit (used by processExternalCommit, addMembers)"
+            },
+            "keyPackageHashes": {
+              "type": "array",
+              "items": {
+                "type": "ref",
+                "ref": "#keyPackageHashEntry"
+              },
+              "description": "Key package hash mappings for new members (used by addMembers, completePendingDeviceAddition)"
+            },
+            "deviceId": {
+              "type": "string",
+              "description": "Device ID for pending device addition operations (used by claimPendingDeviceAddition)"
+            },
+            "pendingAdditionId": {
+              "type": "string",
+              "description": "ID of the pending addition to claim or complete"
+            },
+            "idempotencyKey": {
+              "type": "string",
+              "description": "Client-generated UUID for idempotent retries"
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["success"],
+          "properties": {
+            "success": {
+              "type": "boolean",
+              "description": "Whether the operation succeeded"
+            },
+            "newEpoch": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "New epoch number after the change (for addMembers, processExternalCommit, rejoin)"
+            },
+            "rejoinedAt": {
+              "type": "string",
+              "format": "datetime",
+              "description": "Timestamp of rejoin (for processExternalCommit, rejoin)"
+            },
+            "pendingAdditions": {
+              "type": "array",
+              "items": {
+                "type": "ref",
+                "ref": "#pendingDeviceAddition"
+              },
+              "description": "List of pending device additions (for getPendingDeviceAdditions)"
+            },
+            "claimedAddition": {
+              "type": "ref",
+              "ref": "#pendingDeviceAddition",
+              "description": "The claimed pending addition (for claimPendingDeviceAddition)"
+            }
+          }
+        }
+      },
+      "errors": [
+        {"name": "ConvoNotFound", "description": "Conversation not found"},
+        {"name": "NotMember", "description": "Caller is not a member of the conversation"},
+        {"name": "InvalidAction", "description": "Unknown action value"},
+        {"name": "KeyPackageNotFound", "description": "Key package not found for one or more members"},
+        {"name": "AlreadyMember", "description": "One or more DIDs are already members"},
+        {"name": "TooManyMembers", "description": "Would exceed maximum member count"},
+        {"name": "BlockedByMember", "description": "Cannot add user who has blocked or been blocked by an existing member"},
+        {"name": "InvalidCommit", "description": "The provided MLS Commit message is invalid"},
+        {"name": "InvalidGroupInfo", "description": "The provided GroupInfo is invalid"},
+        {"name": "PendingAdditionNotFound", "description": "The specified pending addition does not exist"},
+        {"name": "PendingAdditionAlreadyClaimed", "description": "The pending addition was already claimed by another member"},
+        {"name": "Unauthorized", "description": "Insufficient privileges for this operation"}
+      ]
+    },
+    "keyPackageHashEntry": {
+      "type": "object",
+      "required": ["did", "hash"],
+      "properties": {
+        "did": {
+          "type": "string",
+          "format": "did",
+          "description": "DID of the member"
+        },
+        "hash": {
+          "type": "string",
+          "description": "Hex-encoded SHA-256 hash of the key package used"
+        }
+      }
+    },
+    "pendingDeviceAddition": {
+      "type": "object",
+      "required": ["id", "convoId", "userDid", "deviceId", "deviceCredentialDid", "status", "createdAt"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique identifier for this pending addition"
+        },
+        "convoId": {
+          "type": "string",
+          "description": "Conversation identifier"
+        },
+        "userDid": {
+          "type": "string",
+          "format": "did",
+          "description": "Base user DID (without device suffix)"
+        },
+        "deviceId": {
+          "type": "string",
+          "description": "Device identifier"
+        },
+        "deviceName": {
+          "type": "string",
+          "description": "Human-readable device name"
+        },
+        "deviceCredentialDid": {
+          "type": "string",
+          "description": "Full device credential DID (format: did:plc:user#device-uuid)"
+        },
+        "status": {
+          "type": "string",
+          "description": "Current status of the pending addition",
+          "knownValues": ["pending", "in_progress"]
+        },
+        "claimedBy": {
+          "type": "string",
+          "format": "did",
+          "description": "DID of the member who claimed this addition (if in_progress)"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "datetime",
+          "description": "When this pending addition was created"
+        }
+      }
+    }
+  }
+}

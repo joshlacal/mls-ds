@@ -1,3 +1,7 @@
+// DEPRECATED: Prefer E2EE ephemeral messages via v2.sendEphemeral.
+// This handler creates plaintext typing events visible to the server.
+// Kept for backward compatibility with clients that don't support E2EE signals.
+
 use axum::{extract::State, http::StatusCode, Json};
 use std::sync::Arc;
 use tracing::{error, info};
@@ -5,10 +9,24 @@ use tracing::{error, info};
 use crate::{
     auth::AuthUser,
     db,
-    generated::blue::catbird::mls::send_typing_indicator::{Input, Output, OutputData, NSID},
     realtime::{SseState, StreamEvent},
     storage::DbPool,
 };
+
+/// Local types for sendTypingIndicator (no generated lexicon module)
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendTypingIndicatorInput {
+    convo_id: String,
+    is_typing: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct SendTypingIndicatorOutput {
+    success: bool,
+}
+
+const NSID: &str = "blue.catbird.mls.sendTypingIndicator";
 
 /// Send a typing indicator to a conversation
 /// POST /xrpc/blue.catbird.mls.sendTypingIndicator
@@ -17,8 +35,8 @@ pub async fn send_typing_indicator(
     State(pool): State<DbPool>,
     State(sse_state): State<Arc<SseState>>,
     auth_user: AuthUser,
-    Json(input): Json<Input>,
-) -> Result<Json<Output>, StatusCode> {
+    Json(input): Json<SendTypingIndicatorInput>,
+) -> Result<Json<SendTypingIndicatorOutput>, StatusCode> {
     let user_did = auth_user.did.clone();
 
     info!(
@@ -67,5 +85,5 @@ pub async fn send_typing_indicator(
 
     info!("Typing indicator sent successfully");
 
-    Ok(Json(Output::from(OutputData { success: true })))
+    Ok(Json(SendTypingIndicatorOutput { success: true }))
 }

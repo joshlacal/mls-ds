@@ -1,5 +1,5 @@
 use axum::{
-    async_trait,
+    extract::FromRef,
     extract::FromRequestParts,
     http::{request::Parts, StatusCode},
     response::{IntoResponse, Response},
@@ -14,12 +14,13 @@ use governor::{
 };
 use moka::future::Cache;
 use once_cell::sync::Lazy;
-use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{collections::HashMap, num::NonZeroU32, sync::Arc};
+use std::{num::NonZeroU32, sync::Arc};
 use thiserror::Error;
 use tracing::debug;
+
+use crate::identity::canonical_did;
 
 /// Authentication errors
 #[derive(Debug, Error)]
@@ -130,6 +131,15 @@ pub struct AtProtoClaims {
     pub jti: Option<String>, // Optional: nonce for replay-prevention
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct JwtHeader {
+    alg: String,
+    #[allow(dead_code)]
+    typ: Option<String>,
+    #[allow(dead_code)]
+    kid: Option<String>,
+}
+
 /// DID Document (simplified for AT Protocol)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DidDocument {
@@ -170,7 +180,7 @@ pub struct Service {
 
 /// Cached DID document with expiration
 #[derive(Debug, Clone)]
-struct CachedDidDoc {
+pub struct CachedDidDoc {
     doc: DidDocument,
     cached_at: DateTime<Utc>,
 }
@@ -187,15 +197,20 @@ pub struct AuthUser {
 pub struct AuthMiddleware {
     did_cache: Cache<String, CachedDidDoc>,
     rate_limiters:
-        Arc<RwLock<HashMap<String, Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>>>>,
+        Arc<moka::sync::Cache<String, Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>>>,
     http_client: reqwest::Client,
     cache_ttl_seconds: u64,
     rate_limit_quota: Quota,
+    did_host_allowlist: Option<Vec<String>>,
 }
 
 impl AuthMiddleware {
     pub fn new() -> Self {
-        Self::with_config(300, 100, 60) // 5 min cache, 100 requests per 60 seconds
+        let rate_limit = std::env::var("AUTH_RATE_LIMIT_PER_SECOND")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100);
+        Self::with_config(300, rate_limit, 60)
     }
 
     pub fn with_config(
@@ -203,6 +218,13 @@ impl AuthMiddleware {
         rate_limit_requests: u32,
         _rate_limit_period_seconds: u64,
     ) -> Self {
+        let did_resolution_timeout_seconds = std::env::var("DID_RESOLUTION_TIMEOUT_SECONDS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(10);
+        let did_host_allowlist = parse_host_allowlist("DID_RESOLUTION_HOST_ALLOWLIST");
+
         let did_cache = Cache::builder()
             .max_capacity(10_000)
             .time_to_live(std::time::Duration::from_secs(cache_ttl_seconds))
@@ -220,17 +242,25 @@ impl AuthMiddleware {
 
         Self {
             did_cache,
-            rate_limiters: Arc::new(RwLock::new(HashMap::new())),
+            rate_limiters: Arc::new(
+                moka::sync::Cache::builder()
+                    .max_capacity(50_000)
+                    .time_to_live(std::time::Duration::from_secs(300))
+                    .build(),
+            ),
             http_client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(
+                    did_resolution_timeout_seconds,
+                ))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             cache_ttl_seconds,
             rate_limit_quota: quota,
+            did_host_allowlist,
         }
     }
 
-    /// Verify JWT token and extract claims (HS256 for dev, ES256/ES256K for inter-service)
+    /// Verify JWT token and extract claims.
     async fn verify_jwt(&self, token: &str) -> Result<AtProtoClaims, AuthError> {
         let parts: Vec<&str> = token.split('.').collect();
         if parts.len() != 3 {
@@ -244,20 +274,15 @@ impl AuthMiddleware {
             .decode(parts[1])
             .map_err(|e| AuthError::InvalidToken(format!("Invalid base64 payload: {}", e)))?;
 
-        #[derive(Deserialize)]
-        struct JwtHeader {
-            alg: String,
-            #[allow(dead_code)]
-            typ: Option<String>,
-        }
         let header: JwtHeader = serde_json::from_slice(&header_json)
             .map_err(|e| AuthError::InvalidToken(format!("Invalid header JSON: {}", e)))?;
         let claims: AtProtoClaims = serde_json::from_slice(&payload_json)
             .map_err(|e| AuthError::InvalidToken(format!("Invalid claims JSON: {}", e)))?;
+        let issuer_did = canonical_did(&claims.iss);
 
         // Do not log full identities or tokens at info level
         tracing::debug!(
-            iss = %crate::crypto::redact_for_log(&claims.iss),
+            iss = %crate::crypto::redact_for_log(issuer_did),
             aud = %crate::crypto::redact_for_log(&claims.aud),
             exp = claims.exp,
             has_lxm = claims.lxm.is_some(),
@@ -285,31 +310,12 @@ impl AuthMiddleware {
         let signing_input = format!("{}.{}", parts[0], parts[1]);
 
         match header.alg.as_str() {
-            // Dev/staging shared-secret auth
-            "HS256" => {
-                let secret = std::env::var("JWT_SECRET")
-                    .map_err(|_| AuthError::InvalidToken("HS256 requires JWT_SECRET".into()))?;
-                let mut val = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
-                if let Ok(service_did) = std::env::var("SERVICE_DID") {
-                    val.set_audience(&[service_did.as_str()]);
-                }
-                jsonwebtoken::decode::<AtProtoClaims>(
-                    token,
-                    &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
-                    &val,
-                )
-                .map_err(|e| AuthError::InvalidToken(format!("HS256 verify failed: {}", e)))
-                .map(|d| d.claims)
-            }
             // ES256: P-256 ECDSA (JOSE signature R||S)
             "ES256" => {
                 use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
                 use p256::EncodedPoint;
-                let did_doc = self.resolve_did(&claims.iss).await?;
-                let vm = did_doc
-                    .verification_method
-                    .first()
-                    .ok_or(AuthError::MissingVerificationMethod)?;
+                let did_doc = self.resolve_did(issuer_did).await?;
+                let vm = select_verification_method(&did_doc, header.kid.as_deref())?;
                 let jwk = vm
                     .public_key_jwk
                     .as_ref()
@@ -349,11 +355,8 @@ impl AuthMiddleware {
             // ES256K: secp256k1 ECDSA (R||S)
             "ES256K" => {
                 use k256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
-                let did_doc = self.resolve_did(&claims.iss).await?;
-                let vm = did_doc
-                    .verification_method
-                    .first()
-                    .ok_or(AuthError::MissingVerificationMethod)?;
+                let did_doc = self.resolve_did(issuer_did).await?;
+                let vm = select_verification_method(&did_doc, header.kid.as_deref())?;
 
                 // Extract public key from either Multikey or JWK format
                 let key_bytes = Self::extract_secp256k1_key(vm)?;
@@ -455,7 +458,7 @@ impl AuthMiddleware {
     }
 
     /// Resolve DID document with caching
-    async fn resolve_did(&self, did: &str) -> Result<DidDocument, AuthError> {
+    pub async fn resolve_did(&self, did: &str) -> Result<DidDocument, AuthError> {
         // Validate DID format
         if !did.starts_with("did:") {
             return Err(AuthError::InvalidDid(format!(
@@ -466,11 +469,17 @@ impl AuthMiddleware {
 
         // Check cache first
         if let Some(cached) = self.did_cache.get(did).await {
-            debug!("DID document cache hit for {}", did);
+            debug!(
+                did = %crate::crypto::redact_for_log(did),
+                "DID document cache hit"
+            );
             return Ok(cached.doc);
         }
 
-        debug!("Resolving DID document for {}", did);
+        debug!(
+            did = %crate::crypto::redact_for_log(did),
+            "Resolving DID document"
+        );
 
         // Resolve based on DID method
         let doc = if did.starts_with("did:plc:") {
@@ -499,6 +508,15 @@ impl AuthMiddleware {
         let _plc_id = did
             .strip_prefix("did:plc:")
             .ok_or_else(|| AuthError::InvalidDid(format!("Invalid PLC DID: {}", did)))?;
+        let plc_host = "plc.directory";
+        if let Some(allowlist) = &self.did_host_allowlist {
+            if !host_is_allowlisted(plc_host, allowlist) {
+                return Err(AuthError::DidResolutionFailed(
+                    "plc.directory is not allowlisted".to_string(),
+                ));
+            }
+        }
+        validate_resolved_host_is_public(plc_host, 443).await?;
         let url = format!("https://plc.directory/{}", did);
 
         tracing::debug!(
@@ -543,6 +561,14 @@ impl AuthMiddleware {
                 "disallowed did:web host".into(),
             ));
         }
+        if let Some(allowlist) = &self.did_host_allowlist {
+            if !host_is_allowlisted(host, allowlist) {
+                return Err(AuthError::DidResolutionFailed(
+                    "did:web host is not allowlisted".to_string(),
+                ));
+            }
+        }
+        validate_resolved_host_is_public(host, 443).await?;
         let url = format!("https://{}/.well-known/did.json", domain);
 
         let response = self
@@ -567,14 +593,10 @@ impl AuthMiddleware {
     }
     /// Check rate limit for a DID
     fn check_rate_limit(&self, did: &str) -> Result<(), AuthError> {
-        let mut limiters = self.rate_limiters.write();
-
-        let limiter = limiters
-            .entry(did.to_string())
-            .or_insert_with(|| Arc::new(RateLimiter::direct(self.rate_limit_quota)))
-            .clone();
-
-        drop(limiters);
+        let quota = self.rate_limit_quota;
+        let limiter = self
+            .rate_limiters
+            .get_with(did.to_string(), || Arc::new(RateLimiter::direct(quota)));
 
         limiter.check().map_err(|_| AuthError::RateLimitExceeded)?;
 
@@ -586,6 +608,48 @@ impl Default for AuthMiddleware {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// -----------------------------------------------------------------------------
+// P-256 key extraction helper
+// -----------------------------------------------------------------------------
+
+/// Extract the first P-256 [`p256::ecdsa::VerifyingKey`] from a DID document's
+/// verification methods.  Works with both JWK (`publicKeyJwk`) and multikey
+/// (`publicKeyMultibase`) representations.
+pub fn extract_p256_key(did_doc: &DidDocument) -> Option<p256::ecdsa::VerifyingKey> {
+    use p256::ecdsa::VerifyingKey;
+    use p256::EncodedPoint;
+
+    for vm in &did_doc.verification_method {
+        // Try JWK first
+        if let Some(ref jwk) = vm.public_key_jwk {
+            if jwk.kty == "EC" && jwk.crv.to_ascii_uppercase() == "P-256" {
+                let x = URL_SAFE_NO_PAD.decode(&jwk.x).ok()?;
+                let y = URL_SAFE_NO_PAD.decode(jwk.y.as_ref()?).ok()?;
+                let ep = EncodedPoint::from_affine_coordinates(
+                    p256::FieldBytes::from_slice(&x),
+                    p256::FieldBytes::from_slice(&y),
+                    false,
+                );
+                if let Ok(vk) = VerifyingKey::from_encoded_point(&ep) {
+                    return Some(vk);
+                }
+            }
+        }
+
+        // Try multibase (multicodec P-256 key: 0x80 0x24 prefix + 33-byte compressed key)
+        if let Some(ref mb) = vm.public_key_multibase {
+            if let Ok((_base, bytes)) = multibase::decode(mb) {
+                if bytes.len() == 35 && bytes[0] == 0x80 && bytes[1] == 0x24 {
+                    if let Ok(vk) = VerifyingKey::from_sec1_bytes(&bytes[2..]) {
+                        return Some(vk);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 // -----------------------------------------------------------------------------
@@ -611,28 +675,143 @@ fn truthy(var: &str) -> bool {
     matches!(var, "1" | "true" | "TRUE" | "yes" | "YES")
 }
 
-/// Enforce optional lxm (endpoint) and jti (replay) constraints.
+fn parse_host_allowlist(var_name: &str) -> Option<Vec<String>> {
+    let raw = std::env::var(var_name).ok()?;
+    let hosts: Vec<String> = raw
+        .split(',')
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty())
+        .collect();
+    if hosts.is_empty() {
+        None
+    } else {
+        Some(hosts)
+    }
+}
+
+fn host_is_allowlisted(host: &str, allowlist: &[String]) -> bool {
+    let host_lc = host.to_ascii_lowercase();
+    allowlist
+        .iter()
+        .any(|allowed| host_lc == *allowed || host_lc.ends_with(&format!(".{allowed}")))
+}
+
+fn ip_is_disallowed(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_multicast()
+                || v4.is_unspecified()
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_unique_local()
+                || v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || v6.is_unicast_link_local()
+        }
+    }
+}
+
+fn kid_matches(vm_id: &str, kid: &str) -> bool {
+    if vm_id == kid {
+        return true;
+    }
+    let kid_fragment = kid.trim_start_matches('#');
+    vm_id
+        .rsplit('#')
+        .next()
+        .map(|frag| frag == kid_fragment)
+        .unwrap_or(false)
+}
+
+fn select_verification_method<'a>(
+    did_doc: &'a DidDocument,
+    kid: Option<&str>,
+) -> Result<&'a VerificationMethod, AuthError> {
+    if did_doc.verification_method.is_empty() {
+        return Err(AuthError::MissingVerificationMethod);
+    }
+
+    if let Some(kid_value) = kid {
+        return did_doc
+            .verification_method
+            .iter()
+            .find(|vm| kid_matches(&vm.id, kid_value))
+            .ok_or_else(|| {
+                AuthError::InvalidToken(format!(
+                    "No verification method matches JWT kid '{}'",
+                    kid_value
+                ))
+            });
+    }
+
+    if let Some(vm) = did_doc
+        .verification_method
+        .iter()
+        .find(|vm| vm.id.rsplit('#').next() == Some("atproto"))
+    {
+        return Ok(vm);
+    }
+
+    did_doc
+        .verification_method
+        .first()
+        .ok_or(AuthError::MissingVerificationMethod)
+}
+
 fn is_disallowed_host(host: &str) -> bool {
     if host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost") {
         return true;
     }
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        match ip {
-            std::net::IpAddr::V4(v4) => {
-                v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_multicast()
-            }
-            std::net::IpAddr::V6(v6) => {
-                v6.is_unique_local() || v6.is_loopback() || v6.is_unspecified() || v6.is_multicast()
-            }
-        }
+        ip_is_disallowed(&ip)
     } else {
         false
     }
 }
 
+async fn validate_resolved_host_is_public(host: &str, port: u16) -> Result<(), AuthError> {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        if ip_is_disallowed(&ip) {
+            return Err(AuthError::DidResolutionFailed(format!(
+                "host resolved to blocked IP: {ip}"
+            )));
+        }
+        return Ok(());
+    }
+
+    let addrs = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| AuthError::DidResolutionFailed(format!("DNS resolution failed: {e}")))?;
+
+    let mut saw_any = false;
+    for addr in addrs {
+        saw_any = true;
+        if ip_is_disallowed(&addr.ip()) {
+            return Err(AuthError::DidResolutionFailed(format!(
+                "host resolved to blocked IP: {}",
+                addr.ip()
+            )));
+        }
+    }
+
+    if !saw_any {
+        return Err(AuthError::DidResolutionFailed(
+            "host resolved to zero addresses".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Enforce optional lxm and jti-claim presence.
+/// Replay uniqueness must be enforced with `enforce_standard_with_replay_store`.
+
 pub fn enforce_standard(claims: &AtProtoClaims, endpoint_nsid: &str) -> Result<(), AuthError> {
     tracing::debug!(
-        iss = %claims.iss,
+        iss = %crate::crypto::redact_for_log(&claims.iss),
         endpoint = endpoint_nsid,
         lxm = claims.lxm.as_deref().unwrap_or("none"),
         jti = claims.jti.as_deref().unwrap_or("none"),
@@ -655,48 +834,109 @@ pub fn enforce_standard(claims: &AtProtoClaims, endpoint_nsid: &str) -> Result<(
         }
     }
 
-    // Enforce jti replay-prevention unless disabled
+    // Enforce jti presence unless disabled
     let enforce_jti = std::env::var("ENFORCE_JTI")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
         .unwrap_or(true);
 
     if enforce_jti {
-        match &claims.jti {
-            None => {
-                tracing::warn!(
-                    iss = %claims.iss,
-                    endpoint = endpoint_nsid,
-                    "Missing jti claim when ENFORCE_JTI is enabled"
-                );
-                return Err(AuthError::MissingJti);
-            }
-            Some(jti) => {
-                let key = format!("{}|{}", claims.iss, jti);
-                if JTI_CACHE.get(&key).is_some() {
-                    tracing::warn!(
-                        jti = jti,
-                        iss = %claims.iss,
-                        endpoint = endpoint_nsid,
-                        "Duplicate jti detected - possible replay attack"
-                    );
-                    return Err(AuthError::ReplayDetected);
-                }
-                JTI_CACHE.insert(key, ());
-            }
+        if claims.jti.is_none() {
+            tracing::warn!(
+                iss = %crate::crypto::redact_for_log(&claims.iss),
+                endpoint = endpoint_nsid,
+                "Missing jti claim when ENFORCE_JTI is enabled"
+            );
+            return Err(AuthError::MissingJti);
         }
     }
     Ok(())
 }
 
+pub async fn enforce_standard_with_replay_store(
+    claims: &AtProtoClaims,
+    endpoint_nsid: &str,
+    pool: &crate::storage::DbPool,
+) -> Result<(), AuthError> {
+    tracing::debug!(
+        iss = %crate::crypto::redact_for_log(&claims.iss),
+        endpoint = endpoint_nsid,
+        lxm = claims.lxm.as_deref().unwrap_or("none"),
+        jti = claims.jti.as_deref().unwrap_or("none"),
+        "Enforcing authorization constraints with shared replay store"
+    );
+
+    let enforce_lxm = std::env::var("ENFORCE_LXM")
+        .map(|v| truthy(&v))
+        .unwrap_or(true);
+    if enforce_lxm {
+        match &claims.lxm {
+            Some(lxm) if lxm == endpoint_nsid => {}
+            Some(_) => return Err(AuthError::LxmMismatch),
+            None => return Err(AuthError::MissingLxm),
+        }
+    }
+
+    let enforce_jti = std::env::var("ENFORCE_JTI")
+        .map(|v| truthy(&v))
+        .unwrap_or(true);
+    if !enforce_jti {
+        return Ok(());
+    }
+
+    let ttl_seconds = std::env::var("JTI_TTL_SECONDS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(120);
+
+    let jti = claims.jti.as_ref().ok_or(AuthError::MissingJti)?;
+    let canonical_issuer = canonical_did(&claims.iss);
+    let local_key = format!("{}|{}", canonical_issuer, jti);
+    if JTI_CACHE.get(&local_key).is_some() {
+        return Err(AuthError::ReplayDetected);
+    }
+
+    let inserted: Option<String> = sqlx::query_scalar(
+        "INSERT INTO auth_jti_nonce (issuer_did, jti, endpoint_nsid, expires_at, created_at) \
+         VALUES ($1, $2, $3, NOW() + make_interval(secs => $4), NOW()) \
+         ON CONFLICT (issuer_did, jti) DO NOTHING \
+         RETURNING issuer_did",
+    )
+    .bind(canonical_issuer)
+    .bind(jti)
+    .bind(endpoint_nsid)
+    .bind(ttl_seconds as f64)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| AuthError::Internal(format!("shared jti store failed: {e}")))?;
+
+    if inserted.is_none() {
+        return Err(AuthError::ReplayDetected);
+    }
+
+    JTI_CACHE.insert(local_key, ());
+    Ok(())
+}
+
+pub async fn cleanup_expired_jti_nonces(pool: &crate::storage::DbPool) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM auth_jti_nonce WHERE expires_at < NOW()")
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+fn endpoint_nsid_from_path(path: &str) -> Option<&str> {
+    path.strip_prefix("/xrpc/")
+}
+
 /// Axum extractor for authenticated requests
-#[async_trait]
 impl<S> FromRequestParts<S> for AuthUser
 where
     S: Send + Sync,
+    crate::storage::DbPool: FromRef<S>,
 {
     type Rejection = AuthError;
 
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let has_authorization = parts.headers.contains_key("authorization");
         let has_atproto_proxy = parts.headers.contains_key("atproto-proxy");
         tracing::debug!(
@@ -729,16 +969,36 @@ where
         // Verify JWT and extract claims
         let claims = middleware.verify_jwt(token).await?;
 
+        // Enforce lxm/jti + shared replay store across all authenticated XRPC endpoints.
+        let endpoint = parts.uri.path();
+        let mut issuer_for_limits = claims.iss.clone();
+        if let Some(endpoint_nsid) = endpoint_nsid_from_path(endpoint) {
+            let pool = crate::storage::DbPool::from_ref(state);
+            if let Err(err) =
+                enforce_standard_with_replay_store(&claims, endpoint_nsid, &pool).await
+            {
+                if endpoint_nsid.starts_with("blue.catbird.mls.ds.") {
+                    crate::federation::peer_policy::record_invalid_token(
+                        &pool,
+                        canonical_did(&claims.iss),
+                    )
+                    .await;
+                }
+                return Err(err);
+            }
+            issuer_for_limits = canonical_did(&claims.iss).to_string();
+        }
+
         // Check rate limit
-        middleware.check_rate_limit(&claims.iss)?;
+        middleware.check_rate_limit(&issuer_for_limits)?;
 
         // Check per-DID endpoint-specific rate limit
         let endpoint = parts.uri.path();
-        if let Err(retry_after) =
-            crate::middleware::rate_limit::DID_RATE_LIMITER.check_did_limit(&claims.iss, endpoint)
+        if let Err(retry_after) = crate::middleware::rate_limit::DID_RATE_LIMITER
+            .check_did_limit(&issuer_for_limits, endpoint)
         {
             tracing::warn!(
-                did = %crate::crypto::redact_for_log(&claims.iss),
+                did = %crate::crypto::redact_for_log(&issuer_for_limits),
                 endpoint = endpoint,
                 retry_after = retry_after,
                 "DID rate limit exceeded for endpoint"

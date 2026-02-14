@@ -1,16 +1,34 @@
 use axum::{extract::State, http::StatusCode, Json};
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{error, info};
 
 use crate::{
     auth::AuthUser,
     db,
-    generated::blue::catbird::mls::add_reaction::{Input, Output, OutputData, NSID},
     realtime::{SseState, StreamEvent},
-    sqlx_atrium::chrono_to_datetime,
     storage::DbPool,
 };
+
+// Local types - no jacquard-generated types available for this endpoint
+const NSID: &str = "blue.catbird.mls.addReaction";
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddReactionInput {
+    pub convo_id: String,
+    pub message_id: String,
+    pub reaction: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddReactionOutput {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reacted_at: Option<chrono::DateTime<chrono::Utc>>,
+}
 
 /// Add a reaction to a message
 /// POST /xrpc/blue.catbird.mls.addReaction
@@ -19,8 +37,8 @@ pub async fn add_reaction(
     State(pool): State<DbPool>,
     State(sse_state): State<Arc<SseState>>,
     auth_user: AuthUser,
-    Json(input): Json<Input>,
-) -> Result<Json<Output>, StatusCode> {
+    Json(input): Json<AddReactionInput>,
+) -> Result<Json<AddReactionOutput>, StatusCode> {
     let user_did = auth_user.did.clone();
 
     info!(
@@ -132,8 +150,8 @@ pub async fn add_reaction(
 
     info!("Reaction added successfully");
 
-    Ok(Json(Output::from(OutputData {
+    Ok(Json(AddReactionOutput {
         success: true,
-        reacted_at: Some(chrono_to_datetime(now)),
-    })))
+        reacted_at: Some(now),
+    }))
 }

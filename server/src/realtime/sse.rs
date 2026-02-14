@@ -17,7 +17,9 @@ use std::{
 use tokio::sync::{broadcast, RwLock};
 use tracing::{error, info, warn};
 
-use crate::{auth::AuthUser, db::DbPool, models::MessageView, realtime::cursor::CursorGenerator};
+use crate::{
+    auth::AuthUser, db::DbPool, generated_types::MessageView, realtime::cursor::CursorGenerator,
+};
 
 /// SSE query parameters for subscribeConvoEvents
 #[derive(Debug, Deserialize)]
@@ -36,6 +38,11 @@ pub enum StreamEvent {
     MessageEvent {
         cursor: String,
         message: MessageView,
+        /// When true, this is an ephemeral signal (typing, read receipt, presence)
+        /// that should NOT be shown in chat history. Omitted (defaults to false)
+        /// for regular persistent messages.
+        #[serde(default, skip_serializing_if = "crate::realtime::sse::is_false")]
+        ephemeral: bool,
     },
     #[serde(rename = "blue.catbird.mls.subscribeConvoEvents#reactionEvent")]
     ReactionEvent {
@@ -134,6 +141,11 @@ pub enum StreamEvent {
         #[serde(rename = "readAt")]
         read_at: String,
     },
+}
+
+/// Helper for `skip_serializing_if` on the `ephemeral` field.
+pub fn is_false(v: &bool) -> bool {
+    !(*v)
 }
 
 /// Shared state for SSE connections
@@ -356,20 +368,21 @@ pub async fn subscribe_convo_events(
                         continue;
                     };
 
-                    let message_view =
-                        crate::models::MessageView::from(crate::models::MessageViewData {
-                            id: message_id,
-                            convo_id: convo_id.clone(),
-                            ciphertext,
-                            epoch: epoch as usize,
-                            seq: seq as usize,
-                            created_at: crate::sqlx_atrium::chrono_to_datetime(created_at),
-                            message_type: None,
-                        });
+                    let message_view = crate::generated_types::MessageView {
+                        id: message_id,
+                        convo_id: convo_id.clone(),
+                        ciphertext,
+                        epoch: epoch as i64,
+                        seq: seq as i64,
+                        created_at,
+                        message_type: "commit".to_string(),
+                        reactions: None,
+                    };
 
                     let event = StreamEvent::MessageEvent {
                         cursor: cursor.clone(),
                         message: message_view,
+                        ephemeral: false,
                     };
 
                     let json = match serde_json::to_string(&event) {
@@ -544,5 +557,55 @@ mod tests {
 
         let received = rx.recv().await.unwrap();
         assert!(matches!(received, StreamEvent::InfoEvent { .. }));
+    }
+
+    #[test]
+    fn test_ephemeral_false_skipped_in_serialization() {
+        let event = StreamEvent::MessageEvent {
+            cursor: "cursor-1".into(),
+            message: MessageView {
+                id: "m1".into(),
+                convo_id: "c1".into(),
+                ciphertext: vec![],
+                epoch: 0,
+                seq: 0,
+                created_at: chrono::Utc::now(),
+                message_type: "app".into(),
+                reactions: None,
+            },
+            ephemeral: false,
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            !json.contains("\"ephemeral\""),
+            "ephemeral:false should be skipped, got: {}",
+            json
+        );
+    }
+
+    #[test]
+    fn test_ephemeral_true_included() {
+        let event = StreamEvent::MessageEvent {
+            cursor: "cursor-2".into(),
+            message: MessageView {
+                id: "m2".into(),
+                convo_id: "c1".into(),
+                ciphertext: vec![],
+                epoch: 0,
+                seq: 0,
+                created_at: chrono::Utc::now(),
+                message_type: "app".into(),
+                reactions: None,
+            },
+            ephemeral: true,
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            json.contains("\"ephemeral\":true"),
+            "ephemeral:true should be included, got: {}",
+            json
+        );
     }
 }

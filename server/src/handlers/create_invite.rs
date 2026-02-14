@@ -176,7 +176,10 @@ pub async fn create_invite(
     // Step 3: If target_did provided, validate it's a valid DID
     if let Some(ref target) = input.target_did {
         if !target.starts_with("did:") {
-            error!("Invalid target DID format: {}", target);
+            error!(
+                "Invalid target DID format: {}",
+                crate::crypto::redact_for_log(target)
+            );
             return Err((
                 StatusCode::BAD_REQUEST,
                 "Target DID must start with 'did:'".to_string(),

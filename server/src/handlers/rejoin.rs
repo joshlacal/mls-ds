@@ -5,7 +5,7 @@ use tracing::{error, info, warn};
 use crate::{
     auth::AuthUser,
     device_utils::parse_device_did,
-    generated::blue::catbird::mls::rejoin::{Input, Output, OutputData},
+    generated::blue_catbird::mls::rejoin::{Rejoin, RejoinOutput},
     storage::DbPool,
 };
 
@@ -22,8 +22,9 @@ use crate::{
 pub async fn rejoin(
     State(pool): State<DbPool>,
     auth_user: AuthUser,
-    Json(input): Json<Input>,
-) -> Result<Json<Output>, StatusCode> {
+    body: String,
+) -> Result<Json<RejoinOutput<'static>>, StatusCode> {
+    let input = crate::jacquard_json::from_json_body::<Rejoin>(&body)?;
     // Enforce authentication
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.rejoin") {
         return Err(StatusCode::UNAUTHORIZED);
@@ -47,7 +48,7 @@ pub async fn rejoin(
 
     // Decode and validate KeyPackage
     let key_package_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(key_package_b64)
+        .decode(key_package_b64.as_str())
         .map_err(|e| {
             warn!("Invalid base64url KeyPackage: {}", e);
             StatusCode::BAD_REQUEST
@@ -79,7 +80,7 @@ pub async fn rejoin(
     // Check if conversation exists
     let convo_exists =
         sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM conversations WHERE id = $1)")
-            .bind(convo_id)
+            .bind(convo_id.as_str())
             .fetch_one(&pool)
             .await
             .map_err(|e| {
@@ -124,7 +125,7 @@ pub async fn rejoin(
         LIMIT 1
         "#,
     )
-    .bind(convo_id)
+    .bind(convo_id.as_str())
     .bind(&user_did)
     .bind(device_did)
     .fetch_optional(&pool)
@@ -180,7 +181,7 @@ pub async fn rejoin(
           AND rejoin_requested_at > NOW() - INTERVAL '1 hour'
         "#,
     )
-    .bind(convo_id)
+    .bind(convo_id.as_str())
     .bind(&user_did)
     .bind(device_did)
     .fetch_one(&pool)
@@ -246,7 +247,7 @@ pub async fn rejoin(
     .bind(now)
     .bind(&key_package_hash)
     .bind(auto_approved)
-    .bind(convo_id)
+    .bind(convo_id.as_str())
     .bind(device_did)
     .fetch_optional(&mut *tx)
     .await
@@ -274,7 +275,7 @@ pub async fn rejoin(
             VALUES ($1, $2, $3, $4, $5, true, $6, $7, $8, false)
             "#,
         )
-        .bind(convo_id)
+        .bind(convo_id.as_str())
         .bind(device_did)
         .bind(&user_did)
         .bind(&device_id)
@@ -337,7 +338,7 @@ pub async fn rejoin(
     })?;
 
     let approved_at = if auto_approved {
-        Some(crate::sqlx_atrium::chrono_to_datetime(now))
+        Some(crate::sqlx_jacquard::chrono_to_datetime(now))
     } else {
         None
     };
@@ -349,11 +350,12 @@ pub async fn rejoin(
         !auto_approved
     );
 
-    Ok(Json(Output::from(OutputData {
-        request_id,
+    Ok(Json(RejoinOutput {
+        request_id: request_id.into(),
         pending: !auto_approved,
         approved_at,
-    })))
+        extra_data: None,
+    }))
 }
 
 #[cfg(test)]
@@ -379,7 +381,7 @@ mod tests {
         .bind(&now)
         .execute(pool)
         .await
-        .unwrap();
+        .expect("test setup");
 
         // Add member with recent activity (should auto-approve)
         sqlx::query(
@@ -393,7 +395,7 @@ mod tests {
         .bind(now - chrono::Duration::days(5)) // Active 5 days ago
         .execute(pool)
         .await
-        .unwrap();
+        .expect("test setup");
     }
 
     #[tokio::test]
@@ -409,7 +411,7 @@ mod tests {
             idle_timeout: std::time::Duration::from_secs(30),
         })
         .await
-        .unwrap();
+        .expect("test setup");
 
         let convo_id = "test-rejoin-convo-1";
         let creator = "did:plc:creator";
@@ -435,16 +437,22 @@ mod tests {
         let key_package = b"mock-key-package-data";
         let key_package_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key_package);
 
-        let input = Input::from(crate::generated::blue::catbird::mls::rejoin::InputData {
-            convo_id: convo_id.to_string(),
-            key_package: key_package_b64,
-            reason: Some("test_device_state_loss".to_string()),
-        });
+        let input = Rejoin {
+            convo_id: convo_id.into(),
+            key_package: key_package_b64.into(),
+            reason: Some("test_device_state_loss".into()),
+            ..Default::default()
+        };
 
-        let result = rejoin(State(pool.clone()), auth_user, Json(input)).await;
+        let result = rejoin(
+            State(pool.clone()),
+            auth_user,
+            serde_json::to_string(&input).unwrap(),
+        )
+        .await;
         assert!(result.is_ok());
 
-        let output = result.unwrap().0;
+        let output = result.expect("handler should return Ok").0;
         assert!(!output.pending); // Should be auto-approved
         assert!(output.approved_at.is_some());
     }
@@ -462,7 +470,7 @@ mod tests {
             idle_timeout: std::time::Duration::from_secs(30),
         })
         .await
-        .unwrap();
+        .expect("test setup");
 
         let convo_id = "test-rejoin-convo-2";
         let creator = "did:plc:creator";
@@ -478,7 +486,7 @@ mod tests {
         .bind(&now)
         .execute(&pool)
         .await
-        .unwrap();
+        .expect("test setup");
 
         let user_did = "did:plc:nonmember";
         let device_did = format!("{}#device-1", user_did);
@@ -499,13 +507,19 @@ mod tests {
         let key_package = b"mock-key-package-data";
         let key_package_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key_package);
 
-        let input = Input::from(crate::generated::blue::catbird::mls::rejoin::InputData {
-            convo_id: convo_id.to_string(),
-            key_package: key_package_b64,
-            reason: Some("test".to_string()),
-        });
+        let input = Rejoin {
+            convo_id: convo_id.into(),
+            key_package: key_package_b64.into(),
+            reason: Some("test".into()),
+            ..Default::default()
+        };
 
-        let result = rejoin(State(pool), auth_user, Json(input)).await;
+        let result = rejoin(
+            State(pool),
+            auth_user,
+            serde_json::to_string(&input).unwrap(),
+        )
+        .await;
         assert_eq!(result.unwrap_err(), StatusCode::FORBIDDEN);
     }
 }

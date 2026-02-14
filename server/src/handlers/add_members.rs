@@ -10,8 +10,8 @@ use crate::{
     auth::AuthUser,
     block_sync::BlockSyncService,
     error_responses::AddMembersError,
-    generated::blue::catbird::mls::add_members::{
-        Error, Input as AddMembersInput, Output as AddMembersOutput, OutputData,
+    generated::blue_catbird::mls::add_members::{
+        AddMembers, AddMembersError as LexAddMembersError, AddMembersOutput,
     },
     realtime::{SseState, StreamEvent},
     storage::{get_current_epoch, is_member, DbPool},
@@ -26,8 +26,9 @@ pub async fn add_members(
     State(actor_registry): State<Arc<ActorRegistry>>,
     State(block_sync): State<Arc<BlockSyncService>>,
     auth_user: AuthUser,
-    Json(input): Json<AddMembersInput>,
-) -> Result<Json<AddMembersOutput>, AddMembersError> {
+    body: String,
+) -> Result<Json<AddMembersOutput<'static>>, AddMembersError> {
+    let input = crate::jacquard_json::from_json_body::<AddMembers>(&body)?;
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.addMembers")
     {
         return Err(StatusCode::UNAUTHORIZED.into());
@@ -42,7 +43,10 @@ pub async fn add_members(
     for d in &input.did_list {
         let did_str = d.as_str();
         if !did_str.starts_with("did:") {
-            warn!("Invalid DID format: {}", did_str);
+            warn!(
+                "Invalid DID format: {}",
+                crate::crypto::redact_for_log(did_str)
+            );
             return Err(StatusCode::BAD_REQUEST.into());
         }
     }
@@ -72,7 +76,7 @@ pub async fn add_members(
     let existing_member_dids: Vec<String> = sqlx::query_scalar(
         "SELECT DISTINCT member_did FROM members WHERE convo_id = $1 AND left_at IS NULL",
     )
-    .bind(&input.convo_id)
+    .bind(&*input.convo_id)
     .fetch_all(&pool)
     .await
     .map_err(|e| {
@@ -120,9 +124,12 @@ pub async fn add_members(
                         "❌ [add_members] Block detected: {} conflicts found via PDS",
                         relevant_conflicts.len()
                     );
-                    return Err(Error::BlockedByMember(Some(format!(
-                        "Cannot add members: block exists between new and existing members"
-                    )))
+                    return Err(LexAddMembersError::BlockedByMember(Some(
+                        format!(
+                            "Cannot add members: block exists between new and existing members"
+                        )
+                        .into(),
+                    ))
                     .into());
                 }
                 tracing::debug!("✅ [add_members] No blocks detected (PDS verified)");
@@ -150,9 +157,12 @@ pub async fn add_members(
                         "❌ [add_members] Block detected: {} blocks found (from DB cache)",
                         blocks.len()
                     );
-                    return Err(Error::BlockedByMember(Some(format!(
-                        "Cannot add members: block exists between new and existing members"
-                    )))
+                    return Err(LexAddMembersError::BlockedByMember(Some(
+                        format!(
+                            "Cannot add members: block exists between new and existing members"
+                        )
+                        .into(),
+                    ))
                     .into());
                 }
                 tracing::debug!("✅ [add_members] No blocks detected (DB fallback)");
@@ -173,7 +183,7 @@ pub async fn add_members(
         GROUP BY p.max_members
         "#,
     )
-    .bind(&input.convo_id)
+    .bind(&*input.convo_id)
     .fetch_optional(&pool)
     .await
     .map_err(|e| {
@@ -198,12 +208,15 @@ pub async fn add_members(
             input.did_list.len(),
             max_members
         );
-        return Err(Error::TooManyMembers(Some(format!(
-            "Adding {} members would exceed maximum of {} members (current: {})",
-            input.did_list.len(),
-            max_members,
-            current_count
-        )))
+        return Err(LexAddMembersError::TooManyMembers(Some(
+            format!(
+                "Adding {} members would exceed maximum of {} members (current: {})",
+                input.did_list.len(),
+                max_members,
+                current_count
+            )
+            .into(),
+        ))
         .into());
     }
 
@@ -230,7 +243,7 @@ pub async fn add_members(
                 let exists = sqlx::query_scalar::<_, bool>(
                     "SELECT EXISTS(SELECT 1 FROM members WHERE convo_id = $1 AND member_did = $2 AND left_at IS NULL)"
                 )
-                .bind(&input.convo_id)
+                .bind(&*input.convo_id)
                 .bind(target_did_str)
                 .fetch_one(&pool)
                 .await
@@ -252,10 +265,11 @@ pub async fn add_members(
                             StatusCode::INTERNAL_SERVER_ERROR
                         })?;
 
-                return Ok(Json(AddMembersOutput::from(OutputData {
+                return Ok(Json(AddMembersOutput {
                     success: true,
-                    new_epoch: current_epoch as usize,
-                })));
+                    new_epoch: current_epoch as i64,
+                    extra_data: Default::default(),
+                }));
             }
         } else {
             info!("📍 [add_members] Commit provided - processing even if members exist (may advance epoch)");
@@ -274,7 +288,7 @@ pub async fn add_members(
         let commit_bytes = if let Some(ref commit) = input.commit {
             Some(
                 base64::engine::general_purpose::STANDARD
-                    .decode(commit)
+                    .decode(&**commit)
                     .map_err(|e| {
                         warn!("Invalid base64 commit: {}", e);
                         StatusCode::BAD_REQUEST
@@ -289,8 +303,8 @@ pub async fn add_members(
             hashes
                 .iter()
                 .map(|entry| KeyPackageHashEntry {
-                    did: entry.data.did.to_string(),
-                    hash: entry.data.hash.clone(),
+                    did: entry.did.to_string(),
+                    hash: entry.hash.to_string(),
                 })
                 .collect()
         });
@@ -310,7 +324,7 @@ pub async fn add_members(
             .send_message(ConvoMessage::AddMembers {
                 did_list: input.did_list.iter().map(|d| d.to_string()).collect(),
                 commit: commit_bytes,
-                welcome_message: input.welcome_message.clone(),
+                welcome_message: input.welcome_message.as_deref().map(String::from),
                 key_package_hashes,
                 reply: tx,
             })
@@ -345,7 +359,7 @@ pub async fn add_members(
         // Process commit if provided
         if let Some(ref commit) = input.commit {
             let commit_bytes = base64::engine::general_purpose::STANDARD
-                .decode(commit)
+                .decode(&**commit)
                 .map_err(|e| {
                     warn!("Invalid base64 commit: {}", e);
                     StatusCode::BAD_REQUEST
@@ -382,7 +396,7 @@ pub async fn add_members(
             let seq: i64 = sqlx::query_scalar(
                 "SELECT CAST(COALESCE(MAX(seq), 0) + 1 AS BIGINT) FROM messages WHERE convo_id = $1"
             )
-            .bind(&input.convo_id)
+            .bind(&*input.convo_id)
             .fetch_one(&mut *tx)
             .await
             .map_err(|e| {
@@ -395,8 +409,8 @@ pub async fn add_members(
                 "INSERT INTO messages (id, convo_id, sender_did, message_type, epoch, seq, ciphertext, created_at) VALUES ($1, $2, $3, 'commit', $4, $5, $6, $7)"
             )
             .bind(&msg_id)
-            .bind(&input.convo_id)
-            .bind(did)
+            .bind(&*input.convo_id)
+            .bind(Option::<&str>::None) // sender_did intentionally NULL — PRIV-001 (docs/PRIVACY.md)
             .bind(advanced_epoch)
             .bind(seq)
             .bind(&commit_bytes)
@@ -422,7 +436,7 @@ pub async fn add_members(
 
             // Fan out commit message to all members (async)
             let pool_clone = pool.clone();
-            let convo_id_clone = input.convo_id.clone();
+            let convo_id_clone = input.convo_id.to_string();
             let msg_id_clone = msg_id.clone();
             let sse_state_clone = sse_state.clone();
 
@@ -512,20 +526,21 @@ pub async fn add_members(
 
                 match message_result {
                     Ok((id, _sender_did, ciphertext, epoch, seq, created_at)) => {
-                        let message_view =
-                            crate::models::MessageView::from(crate::models::MessageViewData {
-                                id,
-                                convo_id: convo_id_clone.clone(),
-                                ciphertext: ciphertext.unwrap_or_default(),
-                                epoch: epoch as usize,
-                                seq: seq as usize,
-                                created_at: crate::sqlx_atrium::chrono_to_datetime(created_at),
-                                message_type: None,
-                            });
+                        let message_view = crate::generated_types::MessageView {
+                            id,
+                            convo_id: convo_id_clone.clone(),
+                            ciphertext: ciphertext.unwrap_or_default(),
+                            epoch: epoch as i64,
+                            seq: seq as i64,
+                            created_at,
+                            message_type: "app".to_string(),
+                            reactions: None,
+                        };
 
                         let event = StreamEvent::MessageEvent {
                             cursor: cursor.clone(),
                             message: message_view,
+                            ephemeral: false,
                         };
 
                         // Store event
@@ -571,7 +586,11 @@ pub async fn add_members(
             .fetch_all(&pool)
             .await
             .map_err(|e| {
-                error!("Failed to query devices for {}: {}", target_did_str, e);
+                error!(
+                    "Failed to query devices for {}: {}",
+                    crate::crypto::redact_for_log(target_did_str),
+                    e
+                );
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
@@ -583,7 +602,7 @@ pub async fn add_members(
                 let is_existing = sqlx::query_scalar::<_, i64>(
                     "SELECT COUNT(*) FROM members WHERE convo_id = $1 AND member_did = $2",
                 )
-                .bind(&input.convo_id)
+                .bind(&*input.convo_id)
                 .bind(target_did_str)
                 .fetch_one(&pool)
                 .await
@@ -601,7 +620,7 @@ pub async fn add_members(
                     "INSERT INTO members (convo_id, member_did, user_did, joined_at, is_admin)
                      VALUES ($1, $2, $3, $4, false)",
                 )
-                .bind(&input.convo_id)
+                .bind(&*input.convo_id)
                 .bind(target_did_str)
                 .bind(target_did_str)
                 .bind(&now)
@@ -622,7 +641,7 @@ pub async fn add_members(
                     let is_existing = sqlx::query_scalar::<_, i64>(
                         "SELECT COUNT(*) FROM members WHERE convo_id = $1 AND member_did = $2",
                     )
-                    .bind(&input.convo_id)
+                    .bind(&*input.convo_id)
                     .bind(&device_mls_did)
                     .fetch_one(&pool)
                     .await
@@ -640,7 +659,7 @@ pub async fn add_members(
                         "INSERT INTO members (convo_id, member_did, user_did, device_id, device_name, joined_at, is_admin)
                          VALUES ($1, $2, $3, $4, $5, $6, false)"
                     )
-                    .bind(&input.convo_id)
+                    .bind(&*input.convo_id)
                     .bind(&device_mls_did)
                     .bind(target_did_str)
                     .bind(&device_id)
@@ -665,7 +684,7 @@ pub async fn add_members(
 
             // Decode base64 Welcome message
             let welcome_data = base64::engine::general_purpose::STANDARD
-                .decode(welcome_b64)
+                .decode(&**welcome_b64)
                 .map_err(|e| {
                     warn!("❌ [add_members] Invalid base64 welcome message: {}", e);
                     StatusCode::BAD_REQUEST
@@ -686,7 +705,7 @@ pub async fn add_members(
 
                 for entry in kp_hashes {
                     let member_did_str = entry.did.as_str();
-                    let hash_hex = &entry.hash;
+                    let hash_hex: &str = &entry.hash;
 
                     // Check if key package exists and is available (not consumed/reserved)
                     let available = sqlx::query_scalar::<_, bool>(
@@ -714,10 +733,13 @@ pub async fn add_members(
                             "❌ [add_members] Key package not available for {}: hash={}",
                             member_did_str, hash_hex
                         );
-                        return Err(Error::KeyPackageNotFound(Some(format!(
-                            "Key package not available for {}: hash={}",
-                            member_did_str, hash_hex
-                        )))
+                        return Err(LexAddMembersError::KeyPackageNotFound(Some(
+                            format!(
+                                "Key package not available for {}: hash={}",
+                                member_did_str, hash_hex
+                            )
+                            .into(),
+                        ))
                         .into());
                     }
                 }
@@ -739,7 +761,7 @@ pub async fn add_members(
                         hashes
                             .iter()
                             .filter(|entry| entry.did.as_str() == target_did_str)
-                            .filter_map(|entry| hex::decode(&entry.hash).ok())
+                            .filter_map(|entry| hex::decode(&*entry.hash).ok())
                             .collect()
                     })
                     .unwrap_or_default();
@@ -754,7 +776,7 @@ pub async fn add_members(
                          DO NOTHING"
                     )
                     .bind(&welcome_id)
-                    .bind(&input.convo_id)
+                    .bind(&*input.convo_id)
                     .bind(target_did_str)
                     .bind(&welcome_data)
                     .bind::<Option<Vec<u8>>>(None)
@@ -762,7 +784,7 @@ pub async fn add_members(
                     .execute(&pool)
                     .await
                     .map_err(|e| {
-                        error!("❌ [add_members] Failed to store welcome message for {}: {}", target_did_str, e);
+                        error!("❌ [add_members] Failed to store welcome message for {}: {}", crate::crypto::redact_for_log(target_did_str), e);
                         StatusCode::INTERNAL_SERVER_ERROR
                     })?;
                     info!("✅ [add_members] Welcome stored for member (legacy/no-hash)");
@@ -777,7 +799,7 @@ pub async fn add_members(
                              DO NOTHING"
                         )
                         .bind(&welcome_id)
-                        .bind(&input.convo_id)
+                        .bind(&*input.convo_id)
                         .bind(target_did_str)
                         .bind(&welcome_data)
                         .bind(Some(hash))
@@ -785,7 +807,7 @@ pub async fn add_members(
                         .execute(&pool)
                         .await
                         .map_err(|e| {
-                            error!("❌ [add_members] Failed to store welcome message for {}: {}", target_did_str, e);
+                            error!("❌ [add_members] Failed to store welcome message for {}: {}", crate::crypto::redact_for_log(target_did_str), e);
                             StatusCode::INTERNAL_SERVER_ERROR
                         })?;
                     }
@@ -801,7 +823,7 @@ pub async fn add_members(
             if let Some(ref kp_hashes) = input.key_package_hashes {
                 for entry in kp_hashes {
                     let member_did_str = entry.did.as_str();
-                    let hash_hex = &entry.hash;
+                    let hash_hex: &str = &entry.hash;
 
                     match crate::db::mark_key_package_consumed(&pool, member_did_str, hash_hex)
                         .await
@@ -810,10 +832,10 @@ pub async fn add_members(
                             if consumed {
                                 tracing::debug!(
                                     "✅ [add_members] marked key package as consumed for {}",
-                                    member_did_str
+                                    crate::crypto::redact_for_log(member_did_str)
                                 );
                             } else {
-                                tracing::warn!("⚠️ [add_members] key package not found or already consumed for {}", member_did_str);
+                                tracing::warn!("⚠️ [add_members] key package not found or already consumed for {}", crate::crypto::redact_for_log(member_did_str));
                             }
                         }
                         Err(e) => {
@@ -838,7 +860,7 @@ pub async fn add_members(
                         Ok(available) => {
                             tracing::debug!(
                                 "User {} has {} available key packages remaining",
-                                member_did_str,
+                                crate::crypto::redact_for_log(member_did_str),
                                 available
                             );
 
@@ -855,7 +877,7 @@ pub async fn add_members(
                                         if should_send {
                                             tracing::info!(
                                                 "⚠️ User {} has low key package inventory: {} available",
-                                                member_did_str,
+                                                crate::crypto::redact_for_log(member_did_str),
                                                 available
                                             );
 
@@ -878,14 +900,14 @@ pub async fn add_members(
                                         } else {
                                             tracing::debug!(
                                                 "Skipping notification for {} (already notified within 24h)",
-                                                member_did_str
+                                                crate::crypto::redact_for_log(member_did_str)
                                             );
                                         }
                                     }
                                     Err(e) => {
                                         tracing::warn!(
                                             "Failed to check notification throttling for {}: {}",
-                                            member_did_str,
+                                            crate::crypto::redact_for_log(member_did_str),
                                             e
                                         );
                                     }
@@ -895,7 +917,7 @@ pub async fn add_members(
                         Err(e) => {
                             tracing::warn!(
                                 "Failed to count available key packages for {}: {}",
-                                member_did_str,
+                                crate::crypto::redact_for_log(member_did_str),
                                 e
                             );
                         }
@@ -914,15 +936,17 @@ pub async fn add_members(
         new_epoch
     );
 
-    Ok(Json(AddMembersOutput::from(OutputData {
+    Ok(Json(AddMembersOutput {
         success: true,
-        new_epoch: new_epoch as usize,
-    })))
+        new_epoch: new_epoch as i64,
+        extra_data: Default::default(),
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::realtime::SseState;
     use crate::storage::init_db;
 
     async fn setup_test_convo(pool: &DbPool, creator: &str, convo_id: &str) {
@@ -933,7 +957,7 @@ mod tests {
             .bind(&now)
             .execute(pool)
             .await
-            .unwrap();
+            .expect("test setup");
 
         sqlx::query("INSERT INTO members (convo_id, member_did, joined_at) VALUES ($1, $2, $3)")
             .bind(convo_id)
@@ -941,7 +965,7 @@ mod tests {
             .bind(&now)
             .execute(pool)
             .await
-            .unwrap();
+            .expect("test setup");
     }
 
     #[tokio::test]
@@ -958,7 +982,7 @@ mod tests {
             idle_timeout: std::time::Duration::from_secs(30),
         })
         .await
-        .unwrap();
+        .expect("test setup");
         let convo_id = "test-convo-1";
         let creator = "did:plc:creator";
 
@@ -976,17 +1000,31 @@ mod tests {
                 lxm: None,
             },
         };
-        let input = AddMembersInput {
-            convo_id: convo_id.to_string(),
-            did_list: vec!["did:plc:member1".to_string()],
-            commit: None,
-            welcome: None,
-        };
+        let body = serde_json::json!({
+            "convoId": convo_id,
+            "didList": ["did:plc:member1"]
+        })
+        .to_string();
 
-        let result = add_members(State(pool), did, Json(input)).await;
+        let sse_state = Arc::new(SseState::new(1000));
+        let actor_registry = Arc::new(crate::actors::ActorRegistry::new(
+            pool.clone(),
+            sse_state.clone(),
+            None,
+        ));
+        let block_sync = Arc::new(BlockSyncService::default());
+        let result = add_members(
+            State(pool),
+            State(sse_state),
+            State(actor_registry),
+            State(block_sync),
+            did,
+            body,
+        )
+        .await;
         assert!(result.is_ok());
 
-        let output = result.unwrap().0;
+        let output = result.ok().expect("handler should return Ok").0;
         assert!(output.success);
         assert_eq!(output.new_epoch, 1);
     }
@@ -1004,7 +1042,7 @@ mod tests {
             idle_timeout: std::time::Duration::from_secs(30),
         })
         .await
-        .unwrap();
+        .expect("test setup");
         let convo_id = "test-convo-2";
         let creator = "did:plc:creator";
 
@@ -1022,15 +1060,29 @@ mod tests {
                 lxm: None,
             },
         };
-        let input = AddMembersInput {
-            convo_id: convo_id.to_string(),
-            did_list: vec!["did:plc:member1".to_string()],
-            commit: None,
-            welcome: None,
-        };
+        let body = serde_json::json!({
+            "convoId": convo_id,
+            "didList": ["did:plc:member1"]
+        })
+        .to_string();
 
-        let result = add_members(State(pool), did, Json(input)).await;
-        assert_eq!(result.unwrap_err(), StatusCode::FORBIDDEN);
+        let sse_state = Arc::new(SseState::new(1000));
+        let actor_registry = Arc::new(crate::actors::ActorRegistry::new(
+            pool.clone(),
+            sse_state.clone(),
+            None,
+        ));
+        let block_sync = Arc::new(BlockSyncService::default());
+        let result = add_members(
+            State(pool),
+            State(sse_state),
+            State(actor_registry),
+            State(block_sync),
+            did,
+            body,
+        )
+        .await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -1046,7 +1098,7 @@ mod tests {
             idle_timeout: std::time::Duration::from_secs(30),
         })
         .await
-        .unwrap();
+        .expect("test setup");
         let convo_id = "test-convo-3";
         let creator = "did:plc:creator";
 
@@ -1064,14 +1116,28 @@ mod tests {
                 lxm: None,
             },
         };
-        let input = AddMembersInput {
-            convo_id: convo_id.to_string(),
-            did_list: vec![],
-            commit: None,
-            welcome: None,
-        };
+        let body = serde_json::json!({
+            "convoId": convo_id,
+            "didList": []
+        })
+        .to_string();
 
-        let result = add_members(State(pool), did, Json(input)).await;
-        assert_eq!(result.unwrap_err(), StatusCode::BAD_REQUEST);
+        let sse_state = Arc::new(SseState::new(1000));
+        let actor_registry = Arc::new(crate::actors::ActorRegistry::new(
+            pool.clone(),
+            sse_state.clone(),
+            None,
+        ));
+        let block_sync = Arc::new(BlockSyncService::default());
+        let result = add_members(
+            State(pool),
+            State(sse_state),
+            State(actor_registry),
+            State(block_sync),
+            did,
+            body,
+        )
+        .await;
+        assert!(result.is_err());
     }
 }

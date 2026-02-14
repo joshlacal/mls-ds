@@ -7,6 +7,7 @@ use tracing::{error, info, warn};
 use crate::{
     actors::{ActorRegistry, ConvoMessage},
     auth::AuthUser,
+    federation::SequencerTransfer,
     generated_types::{LeaveConvoInput, LeaveConvoOutput},
     realtime::SseState,
     storage::{get_current_epoch, is_member, DbPool},
@@ -14,11 +15,12 @@ use crate::{
 
 /// Leave a conversation
 /// POST /xrpc/chat.bsky.convo.leaveConvo
-#[tracing::instrument(skip(pool, actor_registry, sse_state))]
+#[tracing::instrument(skip(pool, actor_registry, sse_state, sequencer_transfer))]
 pub async fn leave_convo(
     State(pool): State<DbPool>,
     State(actor_registry): State<Arc<ActorRegistry>>,
     State(sse_state): State<Arc<SseState>>,
+    State(sequencer_transfer): State<Arc<SequencerTransfer>>,
     auth_user: AuthUser,
     Json(input): Json<LeaveConvoInput>,
 ) -> Result<Json<LeaveConvoOutput>, StatusCode> {
@@ -37,7 +39,10 @@ pub async fn leave_convo(
 
     // Validate target DID format
     if !target_did.starts_with("did:") {
-        warn!("Invalid target DID format: {}", target_did);
+        warn!(
+            "Invalid target DID format: {}",
+            crate::crypto::redact_for_log(&target_did)
+        );
         return Err(StatusCode::BAD_REQUEST);
     }
 
@@ -192,7 +197,7 @@ pub async fn leave_convo(
             )
             .bind(&msg_id)
             .bind(&input.convo_id)
-            .bind(did)
+            .bind(Option::<&str>::None) // sender_did intentionally NULL — PRIV-001 (docs/PRIVACY.md)
             .bind(advanced_epoch)
             .bind(seq)
             .bind(&commit_bytes)
@@ -298,20 +303,21 @@ pub async fn leave_convo(
 
                 match message_result {
                     Ok(msg) => {
-                        let message_view =
-                            crate::models::MessageView::from(crate::models::MessageViewData {
-                                id: msg.id,
-                                convo_id: convo_id_clone.clone(),
-                                ciphertext: msg.ciphertext.unwrap_or_default(),
-                                epoch: msg.epoch as usize,
-                                seq: msg.seq as usize,
-                                created_at: crate::sqlx_atrium::chrono_to_datetime(msg.created_at),
-                                message_type: None,
-                            });
+                        let message_view = crate::generated_types::MessageView {
+                            id: msg.id,
+                            convo_id: convo_id_clone.clone(),
+                            ciphertext: msg.ciphertext.unwrap_or_default(),
+                            epoch: msg.epoch as i64,
+                            seq: msg.seq as i64,
+                            created_at: msg.created_at,
+                            message_type: "app".to_string(),
+                            reactions: None,
+                        };
 
                         let event = crate::realtime::StreamEvent::MessageEvent {
                             cursor: cursor.clone(),
                             message: message_view.clone(),
+                            ephemeral: false,
                         };
 
                         // Store event for cursor-based SSE replay
@@ -385,8 +391,55 @@ pub async fn leave_convo(
             } else {
                 info!(
                     "✅ Emitted membershipChangeEvent for {} leaving",
-                    target_did
+                    crate::crypto::redact_for_log(&target_did)
                 );
+            }
+        }
+
+        // Federation: Check if leaving member is the conversation creator.
+        // The creator's DS is typically the sequencer — if they leave, a sequencer
+        // transfer to another participant's DS may be needed.
+        let creator_did: Option<String> =
+            sqlx::query_scalar("SELECT creator_did FROM conversations WHERE id = $1")
+                .bind(&input.convo_id)
+                .fetch_optional(&pool)
+                .await
+                .unwrap_or(None);
+
+        if creator_did.as_deref() == Some(target_did.as_str()) {
+            warn!(
+                convo_id = %input.convo_id,
+                creator_did = %crate::crypto::redact_for_log(&target_did),
+                "Creator leaving conversation — sequencer transfer may be needed"
+            );
+            // Federation: if creator is leaving, initiate sequencer transfer
+            match sequencer_transfer.pick_new_sequencer(&input.convo_id).await {
+                Ok(Some(new_ds_did)) => {
+                    if let Err(e) = sequencer_transfer
+                        .initiate_transfer(&input.convo_id, &new_ds_did)
+                        .await
+                    {
+                        tracing::warn!(
+                            convo_id = %input.convo_id,
+                            new_sequencer = %crate::crypto::redact_for_log(&new_ds_did),
+                            error = %e,
+                            "Sequencer transfer failed on leave (non-fatal)"
+                        );
+                    }
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        convo_id = %input.convo_id,
+                        "No eligible new sequencer found after creator left"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        convo_id = %input.convo_id,
+                        error = %e,
+                        "Failed to pick new sequencer on leave (non-fatal)"
+                    );
+                }
             }
         }
 
@@ -407,6 +460,7 @@ pub async fn leave_convo(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::realtime::SseState;
     use crate::storage::init_db;
 
     async fn setup_test_convo(pool: &DbPool, creator: &str, convo_id: &str, members: Vec<&str>) {
@@ -417,7 +471,7 @@ mod tests {
             .bind(&now)
             .execute(pool)
             .await
-            .unwrap();
+            .expect("test setup");
 
         for member in members {
             sqlx::query(
@@ -428,7 +482,7 @@ mod tests {
             .bind(&now)
             .execute(pool)
             .await
-            .unwrap();
+            .expect("test setup");
         }
     }
 
@@ -445,7 +499,7 @@ mod tests {
             idle_timeout: std::time::Duration::from_secs(30),
         })
         .await
-        .unwrap();
+        .expect("test setup");
         let convo_id = "test-convo-1";
         let creator = "did:plc:creator";
         let member = "did:plc:member";
@@ -470,15 +524,35 @@ mod tests {
             commit: None,
         };
 
-        let result = leave_convo(State(pool.clone()), did, Json(input)).await;
+        let sse_state = Arc::new(SseState::new(1000));
+        let actor_registry = Arc::new(crate::actors::ActorRegistry::new(
+            pool.clone(),
+            sse_state.clone(),
+            None,
+        ));
+        let sequencer_transfer = Arc::new(crate::federation::transfer::SequencerTransfer::new(
+            pool.clone(),
+            "did:web:test".to_string(),
+        ));
+        let result = leave_convo(
+            State(pool.clone()),
+            State(actor_registry),
+            State(sse_state),
+            State(sequencer_transfer),
+            did,
+            Json(input),
+        )
+        .await;
         assert!(result.is_ok());
 
-        let output = result.unwrap().0;
+        let output = result.expect("handler should return Ok").0;
         assert!(output.success);
         assert_eq!(output.new_epoch, 1);
 
         // Verify member is marked as left
-        let is_active = is_member(&pool, member, convo_id).await.unwrap();
+        let is_active = is_member(&pool, member, convo_id)
+            .await
+            .expect("membership check should succeed");
         assert!(!is_active);
     }
 
@@ -495,7 +569,7 @@ mod tests {
             idle_timeout: std::time::Duration::from_secs(30),
         })
         .await
-        .unwrap();
+        .expect("test setup");
         let convo_id = "test-convo-2";
         let creator = "did:plc:creator";
 
@@ -519,7 +593,25 @@ mod tests {
             commit: None,
         };
 
-        let result = leave_convo(State(pool), did, Json(input)).await;
+        let sse_state = Arc::new(SseState::new(1000));
+        let actor_registry = Arc::new(crate::actors::ActorRegistry::new(
+            pool.clone(),
+            sse_state.clone(),
+            None,
+        ));
+        let sequencer_transfer = Arc::new(crate::federation::transfer::SequencerTransfer::new(
+            pool.clone(),
+            "did:web:test".to_string(),
+        ));
+        let result = leave_convo(
+            State(pool),
+            State(actor_registry),
+            State(sse_state),
+            State(sequencer_transfer),
+            did,
+            Json(input),
+        )
+        .await;
         assert_eq!(result.unwrap_err(), StatusCode::FORBIDDEN);
     }
 
@@ -536,7 +628,7 @@ mod tests {
             idle_timeout: std::time::Duration::from_secs(30),
         })
         .await
-        .unwrap();
+        .expect("test setup");
         let convo_id = "test-convo-3";
         let creator = "did:plc:creator";
         let member = "did:plc:member";
@@ -561,10 +653,30 @@ mod tests {
             commit: None,
         };
 
-        let result = leave_convo(State(pool.clone()), did, Json(input)).await;
+        let sse_state = Arc::new(SseState::new(1000));
+        let actor_registry = Arc::new(crate::actors::ActorRegistry::new(
+            pool.clone(),
+            sse_state.clone(),
+            None,
+        ));
+        let sequencer_transfer = Arc::new(crate::federation::transfer::SequencerTransfer::new(
+            pool.clone(),
+            "did:web:test".to_string(),
+        ));
+        let result = leave_convo(
+            State(pool.clone()),
+            State(actor_registry),
+            State(sse_state),
+            State(sequencer_transfer),
+            did,
+            Json(input),
+        )
+        .await;
         assert!(result.is_ok());
 
-        let is_active = is_member(&pool, member, convo_id).await.unwrap();
+        let is_active = is_member(&pool, member, convo_id)
+            .await
+            .expect("membership check should succeed");
         assert!(!is_active);
     }
 
@@ -581,7 +693,7 @@ mod tests {
             idle_timeout: std::time::Duration::from_secs(30),
         })
         .await
-        .unwrap();
+        .expect("test setup");
         let convo_id = "test-convo-4";
         let creator = "did:plc:creator";
         let member1 = "did:plc:member1";
@@ -607,7 +719,25 @@ mod tests {
             commit: None,
         };
 
-        let result = leave_convo(State(pool), did, Json(input)).await;
+        let sse_state = Arc::new(SseState::new(1000));
+        let actor_registry = Arc::new(crate::actors::ActorRegistry::new(
+            pool.clone(),
+            sse_state.clone(),
+            None,
+        ));
+        let sequencer_transfer = Arc::new(crate::federation::transfer::SequencerTransfer::new(
+            pool.clone(),
+            "did:web:test".to_string(),
+        ));
+        let result = leave_convo(
+            State(pool),
+            State(actor_registry),
+            State(sse_state),
+            State(sequencer_transfer),
+            did,
+            Json(input),
+        )
+        .await;
         assert_eq!(result.unwrap_err(), StatusCode::FORBIDDEN);
     }
 }

@@ -8,6 +8,5 @@ name = "gen-lexicons"
 path = "src/main.rs"
 
 [dependencies]
-# ATrium codegen from git (not published to crates.io)
-atrium-codegen = { git = "https://github.com/atrium-rs/atrium.git", branch = "main" }
+jacquard-lexicon = "0.9"
 clap = { version = "4", features = ["derive"] }

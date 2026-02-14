@@ -3,7 +3,7 @@ use tracing::{error, info};
 
 use crate::{
     auth::{enforce_standard, verify_is_admin, AuthUser},
-    generated::blue::catbird::mls::resolve_report::{Input, Output, OutputData, NSID},
+    generated::blue_catbird::mls::resolve_report::{ResolveReport, ResolveReportOutput},
     storage::DbPool,
 };
 
@@ -13,17 +13,16 @@ use crate::{
 pub async fn resolve_report(
     State(pool): State<DbPool>,
     auth_user: AuthUser,
-    Json(input): Json<Input>,
-) -> Result<Json<Output>, StatusCode> {
-    let input = input.data;
-
+    body: String,
+) -> Result<Json<ResolveReportOutput<'static>>, StatusCode> {
+    let input = crate::jacquard_json::from_json_body::<ResolveReport>(&body)?;
     info!(
         "📍 [resolve_report] START - actor: {}, report: {}, action: {}",
         auth_user.did, input.report_id, input.action
     );
 
     // Enforce standard auth
-    if let Err(_) = enforce_standard(&auth_user.claims, NSID) {
+    if let Err(_) = enforce_standard(&auth_user.claims, "blue.catbird.mls.resolveReport") {
         error!("❌ [resolve_report] Unauthorized");
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -46,7 +45,7 @@ pub async fn resolve_report(
     // Fetch report to get convo_id and verify it exists
     let (convo_id, current_status): (String, String) =
         sqlx::query_as("SELECT convo_id, status FROM reports WHERE id = $1")
-            .bind(&input.report_id)
+            .bind(input.report_id.as_str())
             .fetch_optional(&pool)
             .await
             .map_err(|e| {
@@ -79,11 +78,11 @@ pub async fn resolve_report(
              resolution_action = $4, resolution_notes = $5
          WHERE id = $1",
     )
-    .bind(&input.report_id)
+    .bind(input.report_id.as_str())
     .bind(&auth_user.did)
     .bind(&now)
-    .bind(&input.action)
-    .bind(&input.notes)
+    .bind(input.action.as_str())
+    .bind(input.notes.as_deref())
     .execute(&pool)
     .await
     .map_err(|e| {
@@ -102,5 +101,8 @@ pub async fn resolve_report(
         input.report_id, input.action
     );
 
-    Ok(Json(Output::from(OutputData { ok: true })))
+    Ok(Json(ResolveReportOutput {
+        ok: true,
+        extra_data: Default::default(),
+    }))
 }

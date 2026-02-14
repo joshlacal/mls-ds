@@ -5,7 +5,7 @@ use tracing::{error, info, warn};
 use crate::{
     auth::AuthUser,
     device_utils::parse_device_did,
-    generated::blue::catbird::mls::readdition::{Input, Output, OutputData},
+    generated::blue_catbird::mls::readdition::{Readdition, ReadditionOutput},
     realtime::{SseState, StreamEvent},
     storage::DbPool,
 };
@@ -20,8 +20,9 @@ pub async fn readdition(
     State(pool): State<DbPool>,
     State(sse_state): State<Arc<SseState>>,
     auth_user: AuthUser,
-    Json(input): Json<Input>,
-) -> Result<Json<Output>, StatusCode> {
+    body: String,
+) -> Result<Json<ReadditionOutput<'static>>, StatusCode> {
+    let input = crate::jacquard_json::from_json_body::<Readdition>(&body)?;
     // Enforce authentication
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.readdition")
     {
@@ -29,7 +30,7 @@ pub async fn readdition(
     }
 
     let device_did = &auth_user.did;
-    let convo_id = &input.data.convo_id;
+    let convo_id = &input.convo_id;
 
     // Extract user DID from device DID
     let (user_did, _device_id) = parse_device_did(device_did).map_err(|e| {
@@ -46,7 +47,7 @@ pub async fn readdition(
     // 1. Check if conversation exists
     let convo_exists: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversations WHERE id = $1)")
-            .bind(convo_id)
+            .bind(convo_id.as_str())
             .fetch_one(&pool)
             .await
             .map_err(|e| {
@@ -66,7 +67,7 @@ pub async fn readdition(
     let is_member: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM members WHERE convo_id = $1 AND user_did = $2)",
     )
-    .bind(convo_id)
+    .bind(convo_id.as_str())
     .bind(&user_did)
     .fetch_one(&pool)
     .await
@@ -94,7 +95,7 @@ pub async fn readdition(
         WHERE convo_id = $1 AND user_did = $2
         "#,
     )
-    .bind(convo_id)
+    .bind(convo_id.as_str())
     .bind(&user_did)
     .execute(&pool)
     .await
@@ -114,7 +115,7 @@ pub async fn readdition(
           AND user_did != $2
         "#,
     )
-    .bind(convo_id)
+    .bind(convo_id.as_str())
     .bind(&user_did)
     .fetch_one(&pool)
     .await
@@ -129,10 +130,11 @@ pub async fn readdition(
             "No active members to process re-addition"
         );
         // Still return success - no one to notify but request was valid
-        return Ok(Json(Output::from(OutputData {
+        return Ok(Json(ReadditionOutput {
             requested: false,
             active_members: Some(0),
-        })));
+            extra_data: None,
+        }));
     }
 
     // 5. Emit ReadditionRequested SSE event
@@ -142,12 +144,12 @@ pub async fn readdition(
         .await;
     let event = StreamEvent::ReadditionRequested {
         cursor,
-        convo_id: convo_id.clone(),
+        convo_id: convo_id.to_string(),
         user_did: user_did.clone(),
         requested_at: chrono::Utc::now().to_rfc3339(),
     };
 
-    if let Err(e) = sse_state.emit(convo_id, event).await {
+    if let Err(e) = sse_state.emit(convo_id.as_str(), event).await {
         warn!(
             convo = %crate::crypto::redact_for_log(convo_id),
             error = %e,
@@ -162,8 +164,9 @@ pub async fn readdition(
         );
     }
 
-    Ok(Json(Output::from(OutputData {
+    Ok(Json(ReadditionOutput {
         requested: true,
         active_members: Some(active_members as i64),
-    })))
+        extra_data: None,
+    }))
 }
