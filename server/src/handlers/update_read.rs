@@ -39,12 +39,8 @@ pub async fn update_read(
         "Marking messages as read"
     );
 
-    // Enforce authorization
-    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.updateRead")
-    {
-        error!("❌ [update_read] Unauthorized - failed auth check");
-        return Err(StatusCode::UNAUTHORIZED);
-    }
+    // Auth already enforced by AuthUser extractor.
+    // Skipping v1 NSID check here to allow v2 (mlsChat) delegation.
 
     // Check if user is a member of the conversation
     let is_member = crate::storage::is_member(&pool, &auth_user.did, &input.convo_id)

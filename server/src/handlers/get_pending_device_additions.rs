@@ -13,9 +13,9 @@ use crate::{auth::AuthUser, device_utils::parse_device_did, storage::DbPool};
 #[serde(rename_all = "camelCase")]
 pub struct GetPendingDeviceAdditionsInput {
     #[serde(default)]
-    convo_ids: Option<Vec<String>>,
+    pub convo_ids: Option<Vec<String>>,
     #[serde(default = "default_limit")]
-    limit: i64,
+    pub limit: i64,
 }
 
 fn default_limit() -> i64 {
@@ -52,12 +52,8 @@ pub async fn get_pending_device_additions(
     auth_user: AuthUser,
     Query(input): Query<GetPendingDeviceAdditionsInput>,
 ) -> Result<Json<GetPendingDeviceAdditionsOutput>, StatusCode> {
-    if let Err(_e) = crate::auth::enforce_standard(
-        &auth_user.claims,
-        "blue.catbird.mls.getPendingDeviceAdditions",
-    ) {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
+    // Auth already enforced by AuthUser extractor.
+    // Skipping v1 NSID check here to allow v2 (mlsChat) delegation.
 
     // Extract user DID from potentially device-qualified DID
     let (user_did, _) = parse_device_did(&auth_user.did).map_err(|e| {

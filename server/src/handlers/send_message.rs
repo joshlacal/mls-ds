@@ -70,13 +70,8 @@ pub async fn send_message(
         }
     );
 
-    // Enforce authorization
-    if let Err(_e) =
-        crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.sendMessage")
-    {
-        error!("❌ [send_message] Unauthorized - failed auth check");
-        return Err(StatusCode::UNAUTHORIZED);
-    }
+    // Auth already enforced by AuthUser extractor (lxm/jti checked against URI path).
+    // Skipping v1 NSID check here to allow v2 (mlsChat) delegation.
 
     // Note: Sender verification from JWT - server no longer exposes sender in responses per security hardening
     // Clients derive sender from decrypted MLS content

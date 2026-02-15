@@ -37,12 +37,8 @@ pub async fn create_convo(
         "[create_convo] start"
     );
 
-    if let Err(_e) =
-        crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.createConvo")
-    {
-        error!("❌ [create_convo] Unauthorized");
-        return Err(StatusCode::UNAUTHORIZED.into());
-    }
+    // Auth already enforced by AuthUser extractor (lxm/jti checked against URI path).
+    // Skipping v1 NSID check here to allow v2 (mlsChat) delegation.
 
     // Parse creator DID safely
     let creator_did = auth_user.did.parse().map_err(|e| {

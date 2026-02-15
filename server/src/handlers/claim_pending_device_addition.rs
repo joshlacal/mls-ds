@@ -43,12 +43,8 @@ pub async fn claim_pending_device_addition(
     auth_user: AuthUser,
     Json(input): Json<ClaimPendingDeviceAdditionInput>,
 ) -> Result<Json<ClaimPendingDeviceAdditionOutput>, StatusCode> {
-    if let Err(_e) = crate::auth::enforce_standard(
-        &auth_user.claims,
-        "blue.catbird.mls.claimPendingDeviceAddition",
-    ) {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
+    // Auth already enforced by AuthUser extractor.
+    // Skipping v1 NSID check here to allow v2 (mlsChat) delegation.
 
     // Extract user DID from potentially device-qualified DID
     let (user_did, _) = parse_device_did(&auth_user.did).map_err(|e| {

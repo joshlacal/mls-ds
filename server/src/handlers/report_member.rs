@@ -2,7 +2,7 @@ use axum::{extract::State, http::StatusCode, Json};
 use tracing::{error, info};
 
 use crate::{
-    auth::{enforce_standard, verify_is_member, AuthUser},
+    auth::{verify_is_member, AuthUser},
     generated::blue_catbird::mls::report_member::{ReportMember, ReportMemberOutput},
     sqlx_jacquard::chrono_to_datetime,
     storage::DbPool,
@@ -25,11 +25,8 @@ pub async fn report_member(
         input.category
     );
 
-    // Enforce standard auth
-    if let Err(_) = enforce_standard(&auth_user.claims, "blue.catbird.mls.reportMember") {
-        error!("❌ [report_member] Unauthorized");
-        return Err(StatusCode::UNAUTHORIZED);
-    }
+    // Auth already enforced by AuthUser extractor.
+    // Skipping v1 NSID check here to allow v2 (mlsChat) delegation.
 
     // Verify reporter is member
     verify_is_member(&pool, &input.convo_id, &auth_user.did).await?;

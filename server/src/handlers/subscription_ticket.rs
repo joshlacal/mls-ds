@@ -54,11 +54,8 @@ pub async fn get_subscription_ticket(
     auth_user: AuthUser,
     Json(input): Json<GetSubscriptionTicketInput>,
 ) -> Result<Json<GetSubscriptionTicketOutput>, StatusCode> {
-    if let Err(_e) =
-        crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.getSubscriptionTicket")
-    {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
+    // Auth already enforced by AuthUser extractor.
+    // Skipping v1 NSID check here to allow v2 (mlsChat) delegation.
 
     let user_did = &auth_user.did;
 

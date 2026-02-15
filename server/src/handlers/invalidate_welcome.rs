@@ -23,12 +23,8 @@ pub async fn invalidate_welcome(
     body: String,
 ) -> Result<Json<InvalidateWelcomeOutput<'static>>, StatusCode> {
     let input = crate::jacquard_json::from_json_body::<InvalidateWelcome>(&body)?;
-    // Enforce authentication
-    if let Err(_e) =
-        crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.invalidateWelcome")
-    {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
+    // Auth already enforced by AuthUser extractor.
+    // Skipping v1 NSID check here to allow v2 (mlsChat) delegation.
 
     let device_did = &auth_user.did;
     let convo_id = input.convo_id.as_str();
