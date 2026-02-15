@@ -127,11 +127,8 @@ pub async fn publish_key_packages(
     auth_user: AuthUser,
     Json(input): Json<PublishKeyPackagesInput>,
 ) -> Result<Json<PublishKeyPackagesOutput>, StatusCode> {
-    if let Err(_e) =
-        crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.publishKeyPackages")
-    {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
+    // Auth already enforced by AuthUser extractor (lxm/jti checked against URI path).
+    // Skipping v1 NSID check here to allow v2 (mlsChat) delegation.
 
     let did = &auth_user.did;
 

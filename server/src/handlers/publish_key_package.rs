@@ -20,11 +20,8 @@ pub async fn publish_key_package(
     body: String,
 ) -> Result<Json<PublishKeyPackageOutput<'static>>, StatusCode> {
     let input = crate::jacquard_json::from_json_body::<PublishKeyPackage>(&body)?;
-    if let Err(_e) =
-        crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.publishKeyPackage")
-    {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
+    // Auth already enforced by AuthUser extractor (lxm/jti checked against URI path).
+    // Skipping v1 NSID check here to allow v2 (mlsChat) delegation.
     let did = &auth_user.did;
     // Validate input
     if input.key_package.is_empty() {

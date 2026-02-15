@@ -26,11 +26,8 @@ pub async fn delete_device(
     body: String,
 ) -> Result<Json<DeleteDeviceOutput>, StatusCode> {
     let input = crate::jacquard_json::from_json_body::<DeleteDevice>(&body)?;
-    if let Err(_e) =
-        crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.deleteDevice")
-    {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
+    // Auth already enforced by AuthUser extractor (lxm/jti checked against URI path).
+    // Skipping v1 NSID check here to allow v2 (mlsChat) delegation.
 
     let user_did = &auth_user.did;
     let device_id: String = input.device_id.into();

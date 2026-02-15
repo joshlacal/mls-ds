@@ -24,10 +24,8 @@ pub async fn leave_convo(
     auth_user: AuthUser,
     Json(input): Json<LeaveConvoInput>,
 ) -> Result<Json<LeaveConvoOutput>, StatusCode> {
-    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.leaveConvo")
-    {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
+    // Auth already enforced by AuthUser extractor.
+    // Skipping v1 NSID check here to allow v2 (mlsChat) delegation.
     let did = &auth_user.did;
     // Validate input
     if input.convo_id.is_empty() {

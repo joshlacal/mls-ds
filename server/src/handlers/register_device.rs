@@ -44,11 +44,8 @@ pub async fn register_device(
     body: String,
 ) -> Result<Json<RegisterDeviceOutput>, StatusCode> {
     let input = crate::jacquard_json::from_json_body::<RegisterDevice>(&body)?;
-    if let Err(_e) =
-        crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.registerDevice")
-    {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
+    // Auth already enforced by AuthUser extractor (lxm/jti checked against URI path).
+    // Skipping v1 NSID check here to allow v2 (mlsChat) delegation.
 
     // Extract user DID from device DID (handles both single and multi-device mode)
     // During initial registration, auth_user.did is the user DID

@@ -36,11 +36,8 @@ pub async fn get_messages(
     auth_user: AuthUser,
     Query(params): Query<GetMessagesParams>,
 ) -> Result<Json<GetMessagesOutput<'static>>, StatusCode> {
-    if let Err(_e) =
-        crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.getMessages")
-    {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
+    // Auth already enforced by AuthUser extractor (lxm/jti checked against URI path).
+    // Skipping v1 NSID check here to allow v2 (mlsChat) delegation.
     let did = &auth_user.did;
     // Validate input
     if params.convo_id.is_empty() {

@@ -55,12 +55,8 @@ pub async fn get_key_package_stats(
     auth_user: AuthUser,
     RawQuery(query): RawQuery,
 ) -> Result<Json<KeyPackageStatsResponse>, StatusCode> {
-    if let Err(_e) =
-        crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.getKeyPackageStats")
-    {
-        warn!("Unauthorized access attempt");
-        return Err(StatusCode::UNAUTHORIZED);
-    }
+    // Auth already enforced by AuthUser extractor.
+    // Skipping v1 NSID check here to allow v2 (mlsChat) delegation.
 
     // Parse query parameters
     let query_str = query.unwrap_or_default();

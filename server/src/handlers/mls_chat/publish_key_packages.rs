@@ -94,6 +94,17 @@ pub async fn publish_key_packages_post(
             Ok(Json(serde_json::to_value(result.0).unwrap_or_default()))
         }
 
+        "stats" => {
+            // Delegate to existing get_key_package_stats handler
+            let result = crate::handlers::get_key_package_stats::get_key_package_stats(
+                State(pool),
+                auth_user,
+                axum::extract::RawQuery(None),
+            )
+            .await?;
+            Ok(Json(serde_json::to_value(result.0).unwrap_or_default()))
+        }
+
         unknown => {
             warn!("Unknown action for v2 publishKeyPackages POST: {}", unknown);
             Err(StatusCode::BAD_REQUEST)
