@@ -58,8 +58,15 @@ pub async fn get_group_state(
         match crate::group_info::get_group_info(&pool, convo_id).await {
             Ok(Some((group_info_bytes, gi_epoch, _updated_at))) => {
                 use base64::Engine;
-                group_info =
-                    Some(base64::engine::general_purpose::STANDARD.encode(&group_info_bytes));
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&group_info_bytes);
+                info!(
+                    convo_id = %crate::crypto::redact_for_log(convo_id),
+                    raw_bytes = group_info_bytes.len(),
+                    base64_len = encoded.len(),
+                    epoch = gi_epoch,
+                    "GroupInfo encoded for response"
+                );
+                group_info = Some(encoded);
                 // Set epoch from group info if not already fetched
                 if epoch.is_none() {
                     epoch = Some(gi_epoch as i64);
