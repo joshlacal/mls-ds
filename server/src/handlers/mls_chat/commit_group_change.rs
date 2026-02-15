@@ -236,8 +236,146 @@ pub async fn commit_group_change(
             })))
         }
         "externalCommit" => {
+            let convo_id = input.convo_id.to_string();
             info!("v2.commitGroupChange: externalCommit for convo");
-            Ok(Json(success_response()))
+
+            // ── Idempotency check ──────────────────────────────────────
+            if let Some(ref idem_key) = input.idempotency_key {
+                let idem_key_str = idem_key.to_string();
+                let already: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM idempotency_cache WHERE key = $1)",
+                )
+                .bind(&idem_key_str)
+                .fetch_one(&pool)
+                .await
+                .unwrap_or(false);
+
+                if already {
+                    let current_epoch: Option<i32> =
+                        sqlx::query_scalar("SELECT current_epoch FROM conversations WHERE id = $1")
+                            .bind(&convo_id)
+                            .fetch_optional(&pool)
+                            .await
+                            .ok()
+                            .flatten();
+                    info!("v2.commitGroupChange: externalCommit idempotent hit");
+                    return Ok(Json(serde_json::json!({
+                        "success": true,
+                        "newEpoch": current_epoch.unwrap_or(0),
+                    })));
+                }
+            }
+
+            // ── Validate required fields ───────────────────────────────
+            let commit_b64 = input.commit.as_ref().ok_or_else(|| {
+                warn!("externalCommit: missing commit");
+                StatusCode::BAD_REQUEST
+            })?;
+
+            // ── Decode commit ───────────────────────────────────────────
+            let commit_bytes = base64::engine::general_purpose::STANDARD
+                .decode(commit_b64.as_bytes())
+                .map_err(|e| {
+                    warn!("externalCommit: invalid base64 commit: {}", e);
+                    StatusCode::BAD_REQUEST
+                })?;
+
+            // ── Verify caller is current/past member ───────────────────
+            let (caller_did, _) = parse_device_did(&auth_user.did).map_err(|e| {
+                error!("externalCommit: invalid DID format: {}", e);
+                StatusCode::BAD_REQUEST
+            })?;
+            let is_member_or_past: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM members WHERE convo_id = $1 AND (user_did = $2 OR member_did = $2))",
+            )
+            .bind(&convo_id)
+            .bind(&caller_did)
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| {
+                error!("externalCommit: membership check failed: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+            if !is_member_or_past {
+                return Err(StatusCode::FORBIDDEN);
+            }
+
+            let now = chrono::Utc::now();
+
+            // Ensure caller is marked as active after successful rejoin.
+            sqlx::query(
+                "UPDATE members SET left_at = NULL, needs_rejoin = false, rejoin_requested_at = NULL WHERE convo_id = $1 AND (user_did = $2 OR member_did = $2)",
+            )
+            .bind(&convo_id)
+            .bind(&caller_did)
+            .execute(&pool)
+            .await
+            .map_err(|e| {
+                error!("externalCommit: failed to reactivate member: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+            // ── Advance epoch ──────────────────────────────────────────
+            let new_epoch: i32 = sqlx::query_scalar(
+                "UPDATE conversations SET current_epoch = current_epoch + 1, updated_at = NOW() WHERE id = $1 RETURNING current_epoch",
+            )
+            .bind(&convo_id)
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| {
+                error!("externalCommit: failed to advance epoch: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+            // ── Store commit message ───────────────────────────────────
+            let msg_id = uuid::Uuid::new_v4().to_string();
+            let seq: i64 = sqlx::query_scalar(
+                "SELECT CAST(COALESCE(MAX(seq), 0) + 1 AS BIGINT) FROM messages WHERE convo_id = $1",
+            )
+            .bind(&convo_id)
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| {
+                error!("externalCommit: failed to get seq: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+            sqlx::query(
+                "INSERT INTO messages (id, convo_id, sender_did, message_type, epoch, seq, ciphertext, created_at) VALUES ($1, $2, $3, 'commit', $4, $5, $6, $7)",
+            )
+            .bind(&msg_id)
+            .bind(&convo_id)
+            .bind(Option::<&str>::None)
+            .bind(new_epoch)
+            .bind(seq)
+            .bind(&commit_bytes)
+            .bind(&now)
+            .execute(&pool)
+            .await
+            .map_err(|e| {
+                error!("externalCommit: failed to insert commit message: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+            // ── Store idempotency key ──────────────────────────────────
+            if let Some(ref idem_key) = input.idempotency_key {
+                let _ = sqlx::query(
+                    "INSERT INTO idempotency_cache (key, endpoint, response_body, status_code, created_at, expires_at) VALUES ($1, $2, '{}'::jsonb, 200, NOW(), NOW() + INTERVAL '24 hours') ON CONFLICT DO NOTHING",
+                )
+                .bind(idem_key.to_string())
+                .bind(NSID)
+                .execute(&pool)
+                .await;
+            }
+
+            info!(
+                "✅ v2.commitGroupChange: externalCommit complete, epoch={}",
+                new_epoch
+            );
+            Ok(Json(serde_json::json!({
+                "success": true,
+                "newEpoch": new_epoch,
+            })))
         }
         "rejoin" => {
             info!("v2.commitGroupChange: rejoin for convo");
