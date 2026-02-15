@@ -96,7 +96,7 @@ pub async fn get_messages(
             Ok(Json(messages))
         }
 
-        "commit" => {
+        "commit" | "commits" => {
             let commits =
                 fetch_commits(&pool, did, &convo_id, from_epoch, to_epoch).await?;
             Ok(Json(commits))

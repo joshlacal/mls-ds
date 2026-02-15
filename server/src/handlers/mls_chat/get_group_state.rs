@@ -99,20 +99,9 @@ pub async fn get_group_state(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-        if let Some((welcome_id, data)) = welcome_row {
+        if let Some((_welcome_id, data)) = welcome_row {
             use base64::Engine;
             welcome = Some(base64::engine::general_purpose::STANDARD.encode(&data));
-
-            // Mark welcome as consumed
-            if let Err(e) = sqlx::query(
-                "UPDATE welcome_messages SET consumed = true, consumed_at = NOW() WHERE id = $1",
-            )
-            .bind(&welcome_id)
-            .execute(&pool)
-            .await
-            {
-                error!("Failed to mark welcome as consumed: {}", e);
-            }
         }
     }
 

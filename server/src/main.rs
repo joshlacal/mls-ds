@@ -530,6 +530,7 @@ async fn main() -> anyhow::Result<()> {
         report::ReportRequest, send_ephemeral::SendEphemeralRequest,
         send_message::SendMessageRequest, update_convo::UpdateConvoRequest,
         update_cursor::UpdateCursorRequest,
+        get_subscription_ticket::GetSubscriptionTicketRequest,
     };
     use jacquard_axum::IntoRouter;
 
@@ -596,6 +597,10 @@ async fn main() -> anyhow::Result<()> {
         ))
         .merge(BlocksRequest::into_router(handlers::mls_chat::blocks_post))
         .merge(OptInRequest::into_router(handlers::mls_chat::opt_in_post))
+        // Subscriptions
+        .merge(GetSubscriptionTicketRequest::into_router(
+            handlers::mls_chat::get_subscription_ticket,
+        ))
         // Federation
         .route(
             "/xrpc/blue.catbird.mlsChat.requestFailover",

@@ -37,6 +37,9 @@ pub mod report;
 // Delivery Status
 pub mod get_delivery_status;
 
+// Subscriptions
+pub mod get_subscription_ticket;
+
 // Federation
 pub mod request_failover;
 
@@ -73,6 +76,9 @@ pub use report::report_post;
 
 // Re-exports: Delivery Status
 pub use get_delivery_status::get_delivery_status;
+
+// Re-exports: Subscriptions
+pub use get_subscription_ticket::get_subscription_ticket;
 
 // Re-exports: Federation
 pub use request_failover::request_failover;
