@@ -846,8 +846,9 @@ pub async fn store_key_package_with_device(
         use openmls::prelude::tls_codec::Deserialize;
         use openmls::prelude::{KeyPackageIn, ProtocolVersion};
 
-        // Create crypto provider (RustCrypto implements OpenMlsCrypto)
-        let provider = openmls_rust_crypto::RustCrypto::default();
+        // Use libcrux crypto provider for post-quantum XWing cipher suite support
+        let provider = openmls_libcrux_crypto::CryptoProvider::new()
+            .expect("Failed to initialize libcrux crypto provider");
 
         // Deserialize and validate the key package
         let kp_in = KeyPackageIn::tls_deserialize(&mut key_data_for_parse.as_slice())
