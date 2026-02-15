@@ -381,7 +381,7 @@ async fn handle_sync(
     let server_hashes: Vec<String> = sqlx::query_scalar::<_, String>(
         r#"
         SELECT key_package_hash FROM key_packages
-        WHERE owner_did = $1 AND device_id = $2
+        WHERE owner_did = $1 AND (device_id = $2 OR device_id IS NULL)
           AND consumed_at IS NULL AND expires_at > $3
           AND (reserved_at IS NULL OR reserved_at < $4)
         ORDER BY created_at DESC
@@ -437,7 +437,7 @@ async fn handle_sync(
         let result = sqlx::query(
             r#"
             DELETE FROM key_packages
-            WHERE owner_did = $1 AND device_id = $2
+            WHERE owner_did = $1 AND (device_id = $2 OR device_id IS NULL)
               AND key_package_hash = ANY($3) AND consumed_at IS NULL
             "#,
         )
@@ -493,7 +493,7 @@ async fn handle_sync(
     let remaining: (i64,) = sqlx::query_as(
         r#"
         SELECT COUNT(*) FROM key_packages
-        WHERE owner_did = $1 AND device_id = $2
+        WHERE owner_did = $1 AND (device_id = $2 OR device_id IS NULL)
           AND consumed_at IS NULL AND expires_at > NOW()
         "#,
     )
@@ -565,10 +565,20 @@ pub async fn publish_key_packages_post(
 
     let did = auth_user.did.clone();
 
-    let (user_did, device_id) = parse_device_did(&did).map_err(|e| {
+    let (user_did, mut device_id) = parse_device_did(&did).map_err(|e| {
         error!("Invalid DID format: {}", e);
         StatusCode::BAD_REQUEST
     })?;
+
+    // If the auth DID doesn't include a #device fragment, use device_id from the request body
+    if device_id.is_empty() {
+        if let Some(ref req_device_id) = input.device_id {
+            let req_dev = req_device_id.as_ref().trim();
+            if !req_dev.is_empty() {
+                device_id = req_dev.to_string();
+            }
+        }
+    }
 
     match input.action.as_ref() {
         "publish" => {
