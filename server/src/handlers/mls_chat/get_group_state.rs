@@ -87,9 +87,10 @@ pub async fn get_group_state(
     if includes.contains(&"welcome") {
         let welcome_row: Option<(String, Vec<u8>)> = sqlx::query_as(
             "SELECT id, welcome_data FROM welcome_messages \
-             WHERE recipient_did = $1 AND consumed = false \
+             WHERE convo_id = $1 AND recipient_did = $2 AND consumed = false \
              ORDER BY created_at DESC LIMIT 1",
         )
+        .bind(convo_id)
         .bind(&auth_user.did)
         .fetch_optional(&pool)
         .await
@@ -98,9 +99,20 @@ pub async fn get_group_state(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-        if let Some((_id, data)) = welcome_row {
+        if let Some((welcome_id, data)) = welcome_row {
             use base64::Engine;
             welcome = Some(base64::engine::general_purpose::STANDARD.encode(&data));
+
+            // Mark welcome as consumed
+            if let Err(e) = sqlx::query(
+                "UPDATE welcome_messages SET consumed = true, consumed_at = NOW() WHERE id = $1",
+            )
+            .bind(&welcome_id)
+            .execute(&pool)
+            .await
+            {
+                error!("Failed to mark welcome as consumed: {}", e);
+            }
         }
     }
 
