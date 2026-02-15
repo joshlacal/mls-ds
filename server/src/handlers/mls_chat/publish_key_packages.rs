@@ -4,10 +4,11 @@ use axum::{
     Json,
 };
 use jacquard_axum::ExtractXrpc;
-use tracing::warn;
+use tracing::{error, warn};
 
 use crate::{
     auth::AuthUser,
+    device_utils::parse_device_did,
     generated::blue_catbird::mlsChat::publish_key_packages::PublishKeyPackagesRequest,
     storage::DbPool,
 };
@@ -15,17 +16,63 @@ use crate::{
 // NSID for auth enforcement
 const NSID: &str = "blue.catbird.mlsChat.publishKeyPackages";
 
+/// Build the `stats` object matching the lexicon `#keyPackageStats` shape:
+/// `{ published, available, expired }`
+async fn build_stats(pool: &DbPool, did: &str) -> Result<serde_json::Value, StatusCode> {
+    let (user_did, _) = parse_device_did(did).map_err(|e| {
+        error!("Invalid DID format for stats: {}", e);
+        StatusCode::BAD_REQUEST
+    })?;
+
+    let available: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM key_packages WHERE owner_did = $1 AND consumed_at IS NULL AND expires_at > NOW()",
+    )
+    .bind(&user_did)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| {
+        error!("Failed to count available key packages: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM key_packages WHERE owner_did = $1",
+    )
+    .bind(&user_did)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| {
+        error!("Failed to count total key packages: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let expired: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM key_packages WHERE owner_did = $1 AND consumed_at IS NULL AND expires_at <= NOW()",
+    )
+    .bind(&user_did)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| {
+        error!("Failed to count expired key packages: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let published = total; // "total ever published" = total rows
+
+    Ok(serde_json::json!({
+        "published": published,
+        "available": available,
+        "expired": expired,
+    }))
+}
+
 // ─── POST handler ───
 
 /// Consolidated key package management endpoint (POST)
 /// POST /xrpc/blue.catbird.mlsChat.publishKeyPackages
 ///
-/// Dispatches based on `action` field to the appropriate v1 handler.
-///
-/// Actions:
-///   - publish: Publish a single key package (v1 publishKeyPackage fields)
-///   - publishBatch: Publish multiple key packages (v1 publishKeyPackages fields)
-///   - sync: Synchronize key packages between client and server (v1 syncKeyPackages fields)
+/// All actions return `{ stats: KeyPackageStats, syncResult?, publishResult? }`
+/// per the lexicon output schema.
 #[tracing::instrument(skip(pool, headers, auth_user, input))]
 pub async fn publish_key_packages_post(
     State(pool): State<DbPool>,
@@ -37,12 +84,11 @@ pub async fn publish_key_packages_post(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    // Serialize parsed input back to body string for v1 delegation
     let body = serde_json::to_string(&input).unwrap_or_default();
+    let did = auth_user.did.clone();
 
     match input.action.as_ref() {
         "publish" => {
-            // Delegate to existing publish_key_package handler (single key package)
             let v1_input: crate::generated::blue_catbird::mls::publish_key_package::PublishKeyPackage<'static> = {
                 use jacquard_common::IntoStatic;
                 let parsed: crate::generated::blue_catbird::mls::publish_key_package::PublishKeyPackage =
@@ -52,57 +98,68 @@ pub async fn publish_key_packages_post(
                     })?;
                 parsed.into_static()
             };
-            let result = crate::handlers::publish_key_package::publish_key_package(
-                State(pool),
+            let _result = crate::handlers::publish_key_package::publish_key_package(
+                State(pool.clone()),
                 auth_user,
                 serde_json::to_string(&v1_input).unwrap(),
             )
             .await?;
-            Ok(Json(serde_json::to_value(result.0).unwrap()))
+
+            let stats = build_stats(&pool, &did).await?;
+            Ok(Json(serde_json::json!({
+                "stats": stats,
+                "publishResult": { "succeeded": 1, "failed": 0 },
+            })))
         }
 
         "publishBatch" => {
-            // Delegate to existing publish_key_packages handler (batch upload)
             let batch_input: crate::handlers::publish_key_packages::PublishKeyPackagesInput =
                 serde_json::from_str(&body).map_err(|e| {
                     warn!("Failed to parse publishBatch action body: {}", e);
                     StatusCode::BAD_REQUEST
                 })?;
             let result = crate::handlers::publish_key_packages::publish_key_packages(
-                State(pool),
+                State(pool.clone()),
                 headers,
                 auth_user,
                 Json(batch_input),
             )
             .await?;
-            Ok(Json(serde_json::to_value(result.0).unwrap_or_default()))
+
+            let publish_result = serde_json::to_value(result.0).unwrap_or_default();
+            let stats = build_stats(&pool, &did).await?;
+            Ok(Json(serde_json::json!({
+                "stats": stats,
+                "publishResult": publish_result,
+            })))
         }
 
         "sync" => {
-            // Delegate to existing sync_key_packages handler
             let sync_input: crate::handlers::sync_key_packages::SyncKeyPackagesInput =
                 serde_json::from_str(&body).map_err(|e| {
                     warn!("Failed to parse sync action body: {}", e);
                     StatusCode::BAD_REQUEST
                 })?;
             let result = crate::handlers::sync_key_packages::sync_key_packages(
-                State(pool),
+                State(pool.clone()),
                 auth_user,
                 Json(sync_input),
             )
             .await?;
-            Ok(Json(serde_json::to_value(result.0).unwrap_or_default()))
+
+            let sync_result = serde_json::to_value(result.0).unwrap_or_default();
+            let stats = build_stats(&pool, &did).await?;
+            Ok(Json(serde_json::json!({
+                "stats": stats,
+                "syncResult": sync_result,
+            })))
         }
 
         "stats" => {
-            // Delegate to existing get_key_package_stats handler
-            let result = crate::handlers::get_key_package_stats::get_key_package_stats(
-                State(pool),
-                auth_user,
-                axum::extract::RawQuery(None),
-            )
-            .await?;
-            Ok(Json(serde_json::to_value(result.0).unwrap_or_default()))
+            let stats = build_stats(&pool, &did).await?;
+            Ok(Json(serde_json::json!({
+                "stats": stats,
+            })))
         }
 
         unknown => {
