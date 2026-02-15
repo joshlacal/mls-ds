@@ -33,7 +33,7 @@ pub async fn get_key_packages(
     for did in &input.dids {
         let result = if let Some(ref cs) = input.cipher_suite {
             sqlx::query_as::<_, (String, String, String, Option<String>)>(
-                "UPDATE key_packages SET consumed_at = NOW(), consumed_by_device_id = $3
+                "UPDATE key_packages SET consumed_at = NOW()
                  WHERE id = (
                    SELECT id FROM key_packages
                    WHERE owner_did = $1 AND consumed_at IS NULL AND expires_at > NOW()
@@ -45,12 +45,11 @@ pub async fn get_key_packages(
             )
             .bind(did.as_ref())
             .bind(cs.as_ref())
-            .bind(&auth_user.did)
             .fetch_optional(&pool)
             .await
         } else {
             sqlx::query_as::<_, (String, String, String, Option<String>)>(
-                "UPDATE key_packages SET consumed_at = NOW(), consumed_by_device_id = $2
+                "UPDATE key_packages SET consumed_at = NOW()
                  WHERE id = (
                    SELECT id FROM key_packages
                    WHERE owner_did = $1 AND consumed_at IS NULL AND expires_at > NOW()
@@ -60,7 +59,6 @@ pub async fn get_key_packages(
                  RETURNING owner_did, cipher_suite, replace(encode(key_package, 'base64'), chr(10), ''), key_package_hash",
             )
             .bind(did.as_ref())
-            .bind(&auth_user.did)
             .fetch_optional(&pool)
             .await
         };
@@ -78,7 +76,7 @@ pub async fn get_key_packages(
                 missing.push(did.as_ref().to_string());
             }
             Err(e) => {
-                error!("Failed to fetch key package for {}: {}", did.as_ref(), e);
+                error!("Failed to fetch key package for h:{}: {}", &crate::crypto::hash_for_log(did.as_ref()), e);
                 missing.push(did.as_ref().to_string());
             }
         }
@@ -88,7 +86,6 @@ pub async fn get_key_packages(
         requested = input.dids.len(),
         found = key_packages.len(),
         missing = missing.len(),
-        requester = %auth_user.did,
         "Key packages fetched and consumed"
     );
 

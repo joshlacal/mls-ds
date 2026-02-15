@@ -1117,13 +1117,13 @@ pub async fn consume_key_package_with_metadata(
     did: &str,
     cipher_suite: &str,
     key_data: &[u8],
-    consumed_for_convo_id: Option<&str>,
-    consumed_by_device_id: Option<&str>,
+    _consumed_for_convo_id: Option<&str>,
+    _consumed_by_device_id: Option<&str>,
 ) -> Result<()> {
     sqlx::query(
         r#"
         UPDATE key_packages
-        SET consumed_at = $1, consumed_for_convo_id = $5, consumed_by_device_id = $6
+        SET consumed_at = $1
         WHERE owner_did = $2 AND cipher_suite = $3 AND key_package = $4 AND consumed_at IS NULL
         "#,
     )
@@ -1131,8 +1131,6 @@ pub async fn consume_key_package_with_metadata(
     .bind(did)
     .bind(cipher_suite)
     .bind(key_data)
-    .bind(consumed_for_convo_id)
-    .bind(consumed_by_device_id)
     .execute(pool)
     .await
     .context("Failed to consume key package")?;
@@ -1154,21 +1152,19 @@ pub async fn mark_key_package_consumed_with_metadata(
     pool: &DbPool,
     did: &str,
     key_package_hash: &str,
-    consumed_for_convo_id: Option<&str>,
-    consumed_by_device_id: Option<&str>,
+    _consumed_for_convo_id: Option<&str>,
+    _consumed_by_device_id: Option<&str>,
 ) -> Result<bool> {
     let result = sqlx::query(
         r#"
         UPDATE key_packages
-        SET consumed_at = $1, consumed_for_convo_id = $4, consumed_by_device_id = $5
+        SET consumed_at = $1
         WHERE owner_did = $2 AND key_package_hash = $3 AND consumed_at IS NULL
         "#,
     )
     .bind(Utc::now())
     .bind(did)
     .bind(key_package_hash)
-    .bind(consumed_for_convo_id)
-    .bind(consumed_by_device_id)
     .execute(pool)
     .await
     .context("Failed to mark key package as consumed")?;
@@ -1420,7 +1416,6 @@ pub async fn get_key_package_stats(pool: &DbPool, owner_did: &str) -> Result<(i6
 pub struct ConsumedKeyPackage {
     pub key_package_hash: String,
     pub consumed_at: Option<DateTime<Utc>>,
-    pub consumed_by_convo: Option<String>,
     pub cipher_suite: String,
 }
 
@@ -1436,7 +1431,6 @@ pub async fn get_consumed_key_packages_paginated(
             SELECT
                 key_package_hash,
                 consumed_at,
-                COALESCE(consumed_for_convo_id, consumed_by_convo) AS consumed_by_convo,
                 cipher_suite
             FROM key_packages
             WHERE owner_did = $1
@@ -1458,7 +1452,6 @@ pub async fn get_consumed_key_packages_paginated(
             SELECT
                 key_package_hash,
                 consumed_at,
-                COALESCE(consumed_for_convo_id, consumed_by_convo) AS consumed_by_convo,
                 cipher_suite
             FROM key_packages
             WHERE owner_did = $1

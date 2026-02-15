@@ -128,7 +128,7 @@ pub async fn get_key_package_status(
                     sqlx::query(
                         r#"
                         SELECT id, cipher_suite, key_package_hash, created_at, expires_at,
-                               consumed_at, consumed_for_convo_id, device_id
+                               consumed_at, device_id
                         FROM key_packages
                         WHERE owner_did = $1 AND consumed_at IS NOT NULL AND id < $2
                         ORDER BY consumed_at DESC
@@ -144,7 +144,7 @@ pub async fn get_key_package_status(
                     sqlx::query(
                         r#"
                         SELECT id, cipher_suite, key_package_hash, created_at, expires_at,
-                               consumed_at, consumed_for_convo_id, device_id
+                               consumed_at, device_id
                         FROM key_packages
                         WHERE owner_did = $1 AND consumed_at IS NOT NULL
                         ORDER BY consumed_at DESC
@@ -176,7 +176,6 @@ pub async fn get_key_package_status(
                             "createdAt": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at").to_rfc3339(),
                             "expiresAt": r.get::<chrono::DateTime<chrono::Utc>, _>("expires_at").to_rfc3339(),
                             "consumedAt": r.get::<Option<chrono::DateTime<chrono::Utc>>, _>("consumed_at").map(|d| d.to_rfc3339()),
-                            "usedInGroup": r.get::<Option<String>, _>("consumed_for_convo_id"),
                             "deviceId": r.get::<Option<String>, _>("device_id"),
                         })
                     })
@@ -198,12 +197,8 @@ pub async fn get_key_package_status(
                             kp.cipher_suite,
                             kp.created_at,
                             kp.consumed_at,
-                            kp.consumed_for_convo_id,
-                            kp.consumed_by_device_id,
-                            kp.device_id,
-                            c.name as convo_name
+                            kp.device_id
                         FROM key_packages kp
-                        LEFT JOIN conversations c ON kp.consumed_for_convo_id = c.id
                         WHERE kp.owner_did = $1
                           AND kp.consumed_at IS NOT NULL
                           AND kp.key_package_hash < $2
@@ -224,12 +219,8 @@ pub async fn get_key_package_status(
                             kp.cipher_suite,
                             kp.created_at,
                             kp.consumed_at,
-                            kp.consumed_for_convo_id,
-                            kp.consumed_by_device_id,
-                            kp.device_id,
-                            c.name as convo_name
+                            kp.device_id
                         FROM key_packages kp
-                        LEFT JOIN conversations c ON kp.consumed_for_convo_id = c.id
                         WHERE kp.owner_did = $1
                           AND kp.consumed_at IS NOT NULL
                         ORDER BY kp.consumed_at DESC, kp.key_package_hash DESC
@@ -259,9 +250,6 @@ pub async fn get_key_package_status(
                             "packageId": r.get::<String, _>("key_package_hash"),
                             "createdAt": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at").to_rfc3339(),
                             "consumedAt": r.get::<Option<chrono::DateTime<chrono::Utc>>, _>("consumed_at").map(|d| d.to_rfc3339()),
-                            "consumedForConvo": r.get::<Option<String>, _>("consumed_for_convo_id"),
-                            "consumedForConvoName": r.get::<Option<String>, _>("convo_name"),
-                            "consumedByDevice": r.get::<Option<String>, _>("consumed_by_device_id"),
                             "deviceId": r.get::<Option<String>, _>("device_id"),
                             "cipherSuite": r.get::<String, _>("cipher_suite"),
                         })

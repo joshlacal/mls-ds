@@ -97,7 +97,6 @@ impl ApnsClient {
             device_token = %masked_device_token,
             convo_id = %convo_id,
             message_id = %message_id,
-            recipient_did = %recipient_did,
             ciphertext_size = ciphertext.len(),
             ciphertext_b64_length = ciphertext_b64.len(),
             "🔔 [push_notification] Preparing MLS message notification"
@@ -132,7 +131,8 @@ impl ApnsClient {
         notification.add_custom_data("ciphertext", &ciphertext_b64)?;
         notification.add_custom_data("convo_id", &convo_id)?;
         notification.add_custom_data("message_id", &message_id)?;
-        notification.add_custom_data("recipient_did", &recipient_did)?;
+        let recipient_hash = crate::crypto::hash_for_push(recipient_did);
+        notification.add_custom_data("recipient_account", &recipient_hash)?;
         notification.add_custom_data("seq", &seq.to_string())?; // Add sequence number
         notification.add_custom_data("epoch", &epoch.to_string())?; // Add epoch
 
@@ -166,7 +166,6 @@ impl ApnsClient {
                             status = response.code,
                             convo_id = %convo_id,
                             message_id = %message_id,
-                            recipient_did = %recipient_did,
                             attempts = retry_count + 1,
                             "✅ [push_notification] MLS message notification delivered successfully"
                         );
@@ -202,7 +201,6 @@ impl ApnsClient {
                             total_attempts = retry_count,
                             convo_id = %convo_id,
                             message_id = %message_id,
-                            recipient_did = %recipient_did,
                             "❌ [push_notification] Failed to send notification after maximum retries"
                         );
                         return Err(e.into());
@@ -249,8 +247,6 @@ impl ApnsClient {
             );
 
         notification.add_custom_data("type", &"key_package_replenish_request")?;
-        notification.add_custom_data("target_did", &target_did)?;
-        notification.add_custom_data("requester_did", &requester_did)?;
         notification.add_custom_data("requested_at", &requested_at)?;
 
         if let Some(reason) = reason {
@@ -271,8 +267,6 @@ impl ApnsClient {
                     info!(
                         device_token = %masked_device_token,
                         status = response.code,
-                        target_did = %target_did,
-                        requester_did = %requester_did,
                         "✅ [push_notification] Key package replenish request delivered successfully"
                     );
                     return Ok(());
@@ -284,8 +278,6 @@ impl ApnsClient {
                         status = response.code,
                         attempt = retry_count,
                         max_retries = MAX_RETRIES,
-                        target_did = %target_did,
-                        requester_did = %requester_did,
                         backoff_ms = backoff_ms,
                         "⚠️ [push_notification] Transient APNs status for replenish request, retrying"
                     );
@@ -294,8 +286,6 @@ impl ApnsClient {
                         error!(
                             device_token = %masked_device_token,
                             status = response.code,
-                            target_did = %target_did,
-                            requester_did = %requester_did,
                             "❌ [push_notification] Replenish request failed after maximum retries"
                         );
                         return Err(anyhow::anyhow!(
@@ -432,8 +422,8 @@ impl NotificationService {
         epoch: i64,
     ) -> Result<()> {
         info!(
-            "🔔 [push_notification] notify_new_message called for convo={}, message={}, ciphertext_size={}, sender={}",
-            convo_id, message_id, ciphertext.len(), sender_did
+            "🔔 [push_notification] notify_new_message called for convo={}, message={}, ciphertext_size={}",
+            convo_id, message_id, ciphertext.len()
         );
 
         if !self.enabled || self.apns_client.is_none() {
@@ -489,7 +479,6 @@ impl NotificationService {
         if devices.is_empty() {
             info!(
                 convo_id = %convo_id,
-                sender_did = %sender_did,
                 "🔔 [push_notification] No devices with push tokens found for conversation (all members may have left or sender is only member)"
             );
             return Ok(());
@@ -503,13 +492,12 @@ impl NotificationService {
         );
 
         // Log each device (for debugging)
-        for (idx, (token, did)) in devices.iter().enumerate() {
+        for (idx, (token, _did)) in devices.iter().enumerate() {
             info!(
-                "🔔 [push_notification] Device {}/{}: token={}, user_did={}",
+                "🔔 [push_notification] Device {}/{}: token={}",
                 idx + 1,
                 devices.len(),
                 mask_device_token(token),
-                did
             );
         }
 
@@ -525,11 +513,10 @@ impl NotificationService {
             let task_num = idx + 1;
 
             info!(
-                "🔔 [push_notification] Sending {}/{} to device token={}, user_did={}",
+                "🔔 [push_notification] Sending {}/{} to device token={}",
                 task_num,
                 total_devices,
                 mask_device_token(&device_token),
-                user_did
             );
 
             let result = client
