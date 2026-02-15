@@ -51,15 +51,15 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e18c1f2a1505ca1 # stable (2025-02-13)
         with:
           components: rustfmt, clippy
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
         with:
           workspaces: server
 
@@ -107,13 +107,13 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
 
       - name: Log in to Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -121,7 +121,7 @@ jobs:
 
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
@@ -133,7 +133,7 @@ jobs:
 
       - name: Build and push Docker image
         id: build
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@14487ce63c7a62a4a324b0bfb37086795e31c6c1 # v6.14.0
         with:
           context: ./server
           push: true
@@ -144,14 +144,14 @@ jobs:
           platforms: linux/amd64,linux/arm64
 
       - name: Generate SBOM
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@f325610c9f50a54015d37c8d16cb3b0e2c8f4de0 # v0.18.0
         with:
           image: ${{ steps.meta.outputs.tags }}
           format: spdx-json
           output-file: sbom.spdx.json
 
       - name: Upload SBOM
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: sbom
           path: sbom.spdx.json
@@ -165,17 +165,17 @@ jobs:
     
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@18f2510ee396bbf400402947e795f7e35b3cb404 # 0.30.0
         with:
           image-ref: ${{ needs.build.outputs.image-tag }}
           format: 'sarif'
           output: 'trivy-results.sarif'
 
       - name: Upload Trivy results to GitHub Security
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@f5c2471be782132e47a6e6f9c725e56730d6e9a3 # v3
         with:
           sarif_file: 'trivy-results.sarif'
 
@@ -190,10 +190,10 @@ jobs:
     
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Configure kubectl
-        uses: azure/setup-kubectl@v3
+        uses: azure/setup-kubectl@901a10e89ea615cf61f57ac05cecdf23e7de06d8 # v3
 
       - name: Verify deploy policy (staging)
         run: |
@@ -226,7 +226,7 @@ jobs:
 
       - name: Notify deployment status
         if: always()
-        uses: 8398a7/action-slack@v3
+        uses: 8398a7/action-slack@1750b8ecfe9005e65e0e4aae75c9837b64e693af # v3.18.0
         with:
           status: ${{ job.status }}
           text: 'Staging deployment ${{ job.status }}'
@@ -243,10 +243,10 @@ jobs:
     
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Configure kubectl
-        uses: azure/setup-kubectl@v3
+        uses: azure/setup-kubectl@901a10e89ea615cf61f57ac05cecdf23e7de06d8 # v3
 
       - name: Verify deploy policy (production)
         run: |
@@ -302,7 +302,7 @@ jobs:
 
       - name: Notify deployment status
         if: always()
-        uses: 8398a7/action-slack@v3
+        uses: 8398a7/action-slack@1750b8ecfe9005e65e0e4aae75c9837b64e693af # v3.18.0
         with:
           status: ${{ job.status }}
           text: 'Production deployment ${{ job.status }}'
@@ -317,10 +317,10 @@ jobs:
     
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Configure kubectl
-        uses: azure/setup-kubectl@v3
+        uses: azure/setup-kubectl@901a10e89ea615cf61f57ac05cecdf23e7de06d8 # v3
 
       - name: Rollback to blue
         env:
@@ -337,7 +337,7 @@ jobs:
           kubectl scale deployment/mls-server-blue -n production --replicas=3
 
       - name: Notify rollback
-        uses: 8398a7/action-slack@v3
+        uses: 8398a7/action-slack@1750b8ecfe9005e65e0e4aae75c9837b64e693af # v3.18.0
         with:
           status: 'warning'
           text: 'Production deployment rolled back'
