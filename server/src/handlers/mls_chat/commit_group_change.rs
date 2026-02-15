@@ -59,8 +59,177 @@ pub async fn commit_group_change(
 
     match input.action.as_ref() {
         "addMembers" => {
+            let convo_id = input.convo_id.to_string();
             info!("v2.commitGroupChange: addMembers for convo");
-            Ok(Json(success_response()))
+
+            // ── Idempotency check ──────────────────────────────────────
+            if let Some(ref idem_key) = input.idempotency_key {
+                let idem_key_str = idem_key.to_string();
+                let already: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM idempotency_cache WHERE key = $1)",
+                )
+                .bind(&idem_key_str)
+                .fetch_one(&pool)
+                .await
+                .unwrap_or(false);
+
+                if already {
+                    info!("v2.commitGroupChange: addMembers idempotent hit");
+                    return Ok(Json(success_response()));
+                }
+            }
+
+            // ── Validate required fields ───────────────────────────────
+            let welcome_b64 = input.welcome.as_ref().ok_or_else(|| {
+                warn!("addMembers: missing welcome");
+                StatusCode::BAD_REQUEST
+            })?;
+            let commit_b64 = input.commit.as_ref().ok_or_else(|| {
+                warn!("addMembers: missing commit");
+                StatusCode::BAD_REQUEST
+            })?;
+            let member_dids = input.member_dids.as_ref().ok_or_else(|| {
+                warn!("addMembers: missing member_dids");
+                StatusCode::BAD_REQUEST
+            })?;
+
+            // ── Decode welcome & commit ────────────────────────────────
+            let welcome_bytes = base64::engine::general_purpose::STANDARD
+                .decode(welcome_b64.as_bytes())
+                .map_err(|e| {
+                    warn!("addMembers: invalid base64 welcome: {}", e);
+                    StatusCode::BAD_REQUEST
+                })?;
+            let commit_bytes = base64::engine::general_purpose::STANDARD
+                .decode(commit_b64.as_bytes())
+                .map_err(|e| {
+                    warn!("addMembers: invalid base64 commit: {}", e);
+                    StatusCode::BAD_REQUEST
+                })?;
+
+            // ── Verify caller is a member ──────────────────────────────
+            let (caller_did, _) = parse_device_did(&auth_user.did).map_err(|e| {
+                error!("addMembers: invalid DID format: {}", e);
+                StatusCode::BAD_REQUEST
+            })?;
+            let is_member: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM members WHERE convo_id = $1 AND user_did = $2 AND left_at IS NULL)",
+            )
+            .bind(&convo_id)
+            .bind(&caller_did)
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| {
+                error!("addMembers: membership check failed: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+            if !is_member {
+                return Err(StatusCode::FORBIDDEN);
+            }
+
+            let now = chrono::Utc::now();
+
+            // ── Add members ────────────────────────────────────────────
+            for member_did in member_dids {
+                let member_did_str = crate::sqlx_jacquard::did_to_string(member_did);
+                sqlx::query(
+                    r#"INSERT INTO members (convo_id, member_did, user_did, joined_at)
+                       VALUES ($1, $2, $2, $3)
+                       ON CONFLICT (convo_id, member_did) DO UPDATE SET left_at = NULL, needs_rejoin = false"#,
+                )
+                .bind(&convo_id)
+                .bind(&member_did_str)
+                .bind(&now)
+                .execute(&pool)
+                .await
+                .map_err(|e| {
+                    error!("addMembers: failed to insert member: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+            }
+
+            // ── Advance epoch ──────────────────────────────────────────
+            let new_epoch: i32 = sqlx::query_scalar(
+                "UPDATE conversations SET current_epoch = current_epoch + 1, updated_at = NOW() WHERE id = $1 RETURNING current_epoch",
+            )
+            .bind(&convo_id)
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| {
+                error!("addMembers: failed to advance epoch: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+            // ── Store commit message ───────────────────────────────────
+            let msg_id = uuid::Uuid::new_v4().to_string();
+            let seq: i64 = sqlx::query_scalar(
+                "SELECT CAST(COALESCE(MAX(seq), 0) + 1 AS BIGINT) FROM messages WHERE convo_id = $1",
+            )
+            .bind(&convo_id)
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| {
+                error!("addMembers: failed to get seq: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+            sqlx::query(
+                "INSERT INTO messages (id, convo_id, sender_did, message_type, epoch, seq, ciphertext, created_at) VALUES ($1, $2, $3, 'commit', $4, $5, $6, $7)",
+            )
+            .bind(&msg_id)
+            .bind(&convo_id)
+            .bind(Option::<&str>::None)
+            .bind(new_epoch)
+            .bind(seq)
+            .bind(&commit_bytes)
+            .bind(&now)
+            .execute(&pool)
+            .await
+            .map_err(|e| {
+                error!("addMembers: failed to insert commit message: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+            // ── Store welcome for each new member ──────────────────────
+            for member_did in member_dids {
+                let member_did_str = crate::sqlx_jacquard::did_to_string(member_did);
+                let welcome_id = uuid::Uuid::new_v4().to_string();
+                sqlx::query(
+                    r#"INSERT INTO welcome_messages (id, convo_id, recipient_did, welcome_data, key_package_hash, created_at)
+                       VALUES ($1, $2, $3, $4, $5, $6)
+                       ON CONFLICT (convo_id, recipient_did, COALESCE(key_package_hash, '\x00'::bytea)) WHERE consumed = false
+                       DO NOTHING"#,
+                )
+                .bind(&welcome_id)
+                .bind(&convo_id)
+                .bind(&member_did_str)
+                .bind(&welcome_bytes)
+                .bind::<Option<Vec<u8>>>(None)
+                .bind(&now)
+                .execute(&pool)
+                .await
+                .map_err(|e| {
+                    error!("addMembers: failed to store welcome: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+            }
+
+            // ── Store idempotency key ──────────────────────────────────
+            if let Some(ref idem_key) = input.idempotency_key {
+                let _ = sqlx::query(
+                    "INSERT INTO idempotency_cache (key, endpoint, response_body, status_code, created_at, expires_at) VALUES ($1, $2, '{}'::jsonb, 200, NOW(), NOW() + INTERVAL '24 hours') ON CONFLICT DO NOTHING",
+                )
+                .bind(idem_key.to_string())
+                .bind(NSID)
+                .execute(&pool)
+                .await;
+            }
+
+            info!("✅ v2.commitGroupChange: addMembers complete, epoch={}", new_epoch);
+            Ok(Json(serde_json::json!({
+                "success": true,
+                "newEpoch": new_epoch,
+            })))
         }
         "externalCommit" => {
             info!("v2.commitGroupChange: externalCommit for convo");
