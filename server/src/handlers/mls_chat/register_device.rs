@@ -126,8 +126,7 @@ async fn handle_register(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let device_id = Uuid::new_v4().to_string();
-    let mls_did = format!("{}#{}", &user_did, device_id);
+    let mut device_id = Uuid::new_v4().to_string();
     let now = Utc::now();
     let sig_key_hex = hex::encode(&input.signature_public_key);
 
@@ -160,10 +159,12 @@ async fn handle_register(
         })?;
 
         if let Some((db_id, old_device_id, _old_credential_did)) = existing {
+            // Reuse existing device_id for stability
+            device_id = old_device_id.clone();
             info!(
-                "Device re-registration detected for user h:{}: old_device_id={}",
+                "Device re-registration detected for user h:{}: reusing device_id={}",
                 crate::crypto::hash_for_log(&user_did),
-                old_device_id
+                device_id
             );
 
             // Clean up old key packages
@@ -198,16 +199,16 @@ async fn handle_register(
                 info!("Invalidated {} stale Welcome messages for re-registered user h:{}", invalidated, crate::crypto::hash_for_log(&user_did));
             }
 
-            // Update existing device record
+            // Update existing device record (keep device_id stable, update metadata)
+            let rereg_mls_did = format!("{}#{}", &user_did, &device_id);
             sqlx::query(
                 r#"UPDATE devices
-                   SET device_id = $1, device_name = $2, credential_did = $3,
-                       signature_public_key = $4, registered_at = NOW(), last_seen_at = NOW()
-                   WHERE id = $5"#,
+                   SET device_name = $1, credential_did = $2,
+                       signature_public_key = $3, registered_at = NOW(), last_seen_at = NOW()
+                   WHERE id = $4"#,
             )
-            .bind(&device_id)
             .bind(&device_name)
-            .bind(&mls_did)
+            .bind(&rereg_mls_did)
             .bind(&sig_key_hex)
             .bind(&db_id)
             .execute(pool)
@@ -240,9 +241,11 @@ async fn handle_register(
         })?;
 
         if let Some((db_id, old_device_id, _old_credential_did)) = existing {
+            // Reuse existing device_id for stability
+            device_id = old_device_id.clone();
             info!(
-                "Device re-registration detected by signature key for user h:{}: old_device_id={}",
-                crate::crypto::hash_for_log(&user_did), old_device_id
+                "Device re-registration detected by signature key for user h:{}: reusing device_id={}",
+                crate::crypto::hash_for_log(&user_did), device_id
             );
 
             let deleted_count = sqlx::query("DELETE FROM key_packages WHERE owner_did = $1 AND device_id = $2")
@@ -275,15 +278,15 @@ async fn handle_register(
                 info!("Invalidated {} stale Welcome messages for re-registered user h:{} (sig key match)", invalidated, crate::crypto::hash_for_log(&user_did));
             }
 
+            let rereg_mls_did2 = format!("{}#{}", &user_did, &device_id);
             sqlx::query(
                 r#"UPDATE devices
-                   SET device_id = $1, device_name = $2, credential_did = $3,
-                       device_uuid = $4, registered_at = NOW(), last_seen_at = NOW()
-                   WHERE id = $5"#,
+                   SET device_name = $1, credential_did = $2,
+                       device_uuid = $3, registered_at = NOW(), last_seen_at = NOW()
+                   WHERE id = $4"#,
             )
-            .bind(&device_id)
             .bind(&device_name)
-            .bind(&mls_did)
+            .bind(&rereg_mls_did2)
             .bind(input.device_uuid.as_ref().map(|s| s.as_ref()))
             .bind(&db_id)
             .execute(pool)
@@ -296,6 +299,9 @@ async fn handle_register(
             is_reregistration = true;
         }
     }
+
+    // Compute mls_did after device_id is finalized (may be reused from existing device)
+    let mls_did = format!("{}#{}", &user_did, device_id);
 
     info!(
         "Registering device for user h:{}: {} ({}) [re-registration: {}]",
