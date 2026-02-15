@@ -348,67 +348,90 @@ async fn handle_expected(
         user_did
     };
 
-    let conversations = sqlx::query_as::<_, (
-        String,                                 // convo_id
-        String,                                 // name
-        i64,                                    // member_count
-        Option<DateTime<Utc>>,                  // last_activity
-        bool,                                   // needs_rejoin
-        Option<String>,                         // device_id from members
-    )>(
+    // Fetch full conversation + membership data so we can build proper ConvoView objects
+    let memberships = sqlx::query_as::<_, Membership>(
         r#"
-        SELECT DISTINCT ON (c.id)
-            c.id as convo_id,
-            COALESCE(c.name, 'Unnamed Conversation') as name,
-            (SELECT COUNT(*) FROM members m2 WHERE m2.convo_id = c.id AND m2.left_at IS NULL) as member_count,
-            (SELECT MAX(created_at) FROM messages WHERE convo_id = c.id) as last_activity,
-            m.needs_rejoin,
-            m.device_id
-        FROM conversations c
-        INNER JOIN members m ON c.id = m.convo_id
-        WHERE m.user_did = $1 AND m.left_at IS NULL
-        ORDER BY c.id,
-                 CASE WHEN $2::text IS NOT NULL AND m.device_id = $2 THEN 0 ELSE 1 END,
-                 m.device_id NULLS LAST,
-                 c.updated_at DESC
+        SELECT convo_id, member_did, user_did, device_id, device_name, joined_at, left_at,
+               unread_count, last_read_at, is_admin, promoted_at, promoted_by_did,
+               COALESCE(is_moderator, false) as is_moderator, leaf_index,
+               needs_rejoin, rejoin_requested_at, rejoin_key_package_hash
+        FROM members
+        WHERE user_did = $1 AND left_at IS NULL
+        ORDER BY joined_at DESC
         "#,
     )
     .bind(base_user_did)
-    .bind(&device_id)
     .fetch_all(pool)
     .await
     .map_err(|e| {
-        error!("❌ [v2.getConvos] Failed to fetch expected conversations: {}", e);
+        error!("❌ [v2.getConvos] Failed to fetch expected memberships: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let result: Vec<serde_json::Value> = conversations
-        .into_iter()
-        .map(|(convo_id, name, member_count, last_activity, needs_rejoin, member_device_id)| {
-            let device_in_group = if let Some(target_device) = &device_id {
-                member_device_id.as_ref() == Some(target_device)
-            } else {
-                member_device_id.is_some()
-            };
-            let should_be_in_group = !device_in_group && !needs_rejoin;
+    let mut convos = Vec::new();
 
-            serde_json::json!({
-                "convoId": convo_id,
-                "name": name,
-                "memberCount": member_count,
-                "shouldBeInGroup": should_be_in_group,
-                "lastActivity": last_activity.map(|dt| dt.to_rfc3339()),
-                "needsRejoin": needs_rejoin,
-                "deviceInGroup": device_in_group,
-            })
-        })
-        .collect();
+    for membership in memberships {
+        let convo: Option<Conversation> = sqlx::query_as(
+            "SELECT id, creator_did, current_epoch, created_at, updated_at, name, cipher_suite, sequencer_ds, is_remote FROM conversations WHERE id = $1",
+        )
+        .bind(&membership.convo_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| {
+            error!("❌ [v2.getConvos] Failed to fetch conversation: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        if let Some(c) = convo {
+            if c.id.is_empty() {
+                continue;
+            }
+
+            let member_rows: Vec<Membership> = sqlx::query_as(
+                r#"
+                SELECT convo_id, member_did, user_did, device_id, device_name, joined_at, left_at,
+                       unread_count, last_read_at, is_admin, promoted_at, promoted_by_did,
+                       COALESCE(is_moderator, false) as is_moderator, leaf_index,
+                       needs_rejoin, rejoin_requested_at, rejoin_key_package_hash
+                FROM members WHERE convo_id = $1 AND left_at IS NULL ORDER BY user_did, joined_at
+                "#,
+            )
+            .bind(&membership.convo_id)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| {
+                error!("❌ [v2.getConvos] Failed to fetch members: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+            let members: Vec<crate::models::MemberView<'static>> = member_rows
+                .into_iter()
+                .map(|m| {
+                    m.to_member_view().map_err(|e| {
+                        error!("❌ [v2.getConvos] Failed to convert member view: {}", e);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })
+                })
+                .collect::<Result<Vec<_>, StatusCode>>()?;
+
+            let convo_view = c.to_convo_view(members).map_err(|e| {
+                error!("❌ [v2.getConvos] Failed to convert convo view: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+            convos.push(convo_view);
+        }
+    }
 
     info!(
-        "✅ [v2.getConvos] Expected: {} convos, {} missing",
-        result.len(),
-        result.iter().filter(|c| c["shouldBeInGroup"] == true).count()
+        "✅ [v2.getConvos] Expected: {} convos",
+        convos.len(),
     );
 
-    Ok(Json(serde_json::json!({ "conversations": result })))
+    let output = crate::generated::blue_catbird::mls::get_convos::GetConvosOutput {
+        conversations: convos,
+        cursor: None,
+        extra_data: Default::default(),
+    };
+    Ok(Json(serde_json::to_value(output).unwrap()))
 }
