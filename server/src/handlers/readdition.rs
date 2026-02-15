@@ -24,11 +24,6 @@ pub async fn readdition(
 ) -> Result<Json<ReadditionOutput<'static>>, StatusCode> {
     let input = crate::jacquard_json::from_json_body::<Readdition>(&body)?;
     // Enforce authentication
-    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.readdition")
-    {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
     let device_did = &auth_user.did;
     let convo_id = &input.convo_id;
 

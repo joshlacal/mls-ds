@@ -6,7 +6,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     actors::{ActorRegistry, ConvoMessage},
-    auth::{enforce_standard, verify_is_admin, verify_is_member, AuthUser},
+    auth::{verify_is_admin, verify_is_member, AuthUser},
     generated::blue_catbird::mls::remove_member::{RemoveMember, RemoveMemberOutput},
     realtime::SseState,
     storage::{get_current_epoch, DbPool},
@@ -32,11 +32,6 @@ pub async fn remove_member(
     );
 
     // Enforce standard auth
-    if let Err(_) = enforce_standard(&auth_user.claims, "blue.catbird.mls.removeMember") {
-        error!("❌ [remove_member] Unauthorized");
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
     // Verify actor is an admin
     verify_is_admin(&pool, &input.convo_id, &auth_user.did).await?;
 

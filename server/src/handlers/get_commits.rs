@@ -50,11 +50,6 @@ pub async fn get_commits(
     auth_user: AuthUser,
     Query(params): Query<GetCommitsParams>,
 ) -> Result<Json<CommitsResponse>, StatusCode> {
-    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.getCommits")
-    {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
     let did = &auth_user.did;
 
     // Validate input

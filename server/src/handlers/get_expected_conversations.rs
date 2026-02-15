@@ -44,14 +44,6 @@ pub async fn get_expected_conversations(
     auth_user: AuthUser,
     Query(params): Query<GetExpectedConversationsParams>,
 ) -> Result<Json<GetExpectedConversationsOutput>, StatusCode> {
-    if let Err(_e) = crate::auth::enforce_standard(
-        &auth_user.claims,
-        "blue.catbird.mls.getExpectedConversations",
-    ) {
-        error!("Unauthorized - failed auth check");
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
     let user_did = &auth_user.did;
 
     // Extract device_id from auth token or use provided parameter

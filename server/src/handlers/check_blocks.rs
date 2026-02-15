@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use crate::{
-    auth::{enforce_standard, AuthUser},
+    auth::AuthUser,
     block_sync::BlockSyncService,
     generated::blue_catbird::mls::check_blocks::{
         BlockRelationship, CheckBlocks, CheckBlocksOutput,
@@ -32,8 +32,6 @@ pub async fn check_blocks(
     let params = crate::jacquard_json::from_query_string::<CheckBlocks>(
         raw_query.0.as_deref().unwrap_or(""),
     )?;
-    enforce_standard(&auth_user.claims, "blue.catbird.mls.checkBlocks")
-        .map_err(|_| StatusCode::UNAUTHORIZED)?;
 
     // Validate DID count (2-100)
     if params.dids.len() < 2 || params.dids.len() > 100 {

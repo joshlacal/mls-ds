@@ -25,13 +25,6 @@ pub async fn promote_admin(
     );
 
     // Enforce standard auth
-    if let Err(_) =
-        crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.promoteAdmin")
-    {
-        error!("❌ [promote_admin] Unauthorized");
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
     // Verify actor is an admin
     verify_is_admin(&pool, &input.convo_id, &auth_user.did).await?;
 

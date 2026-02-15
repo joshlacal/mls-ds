@@ -47,11 +47,6 @@ pub async fn remove_reaction(
     );
 
     // Enforce authorization
-    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
-        error!("❌ [remove_reaction] Unauthorized - failed auth check");
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
     // Check membership
     let is_member = db::is_member(&pool, &user_did, &input.convo_id)
         .await

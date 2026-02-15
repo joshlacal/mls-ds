@@ -29,10 +29,6 @@ pub async fn add_members(
     body: String,
 ) -> Result<Json<AddMembersOutput<'static>>, AddMembersError> {
     let input = crate::jacquard_json::from_json_body::<AddMembers>(&body)?;
-    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.addMembers")
-    {
-        return Err(StatusCode::UNAUTHORIZED.into());
-    }
     let did = &auth_user.did;
     // Validate input
     if input.did_list.is_empty() {

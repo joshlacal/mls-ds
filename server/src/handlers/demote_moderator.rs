@@ -60,11 +60,6 @@ pub async fn demote_moderator(
     );
 
     // Enforce standard auth
-    if let Err(_) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
-        error!("❌ [demote_moderator] Unauthorized");
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
     // Verify actor is an admin (or is self-demoting)
     if auth_user.did != input.target_did {
         verify_is_admin(&pool, &input.convo_id, &auth_user.did).await?;

@@ -47,11 +47,6 @@ pub async fn send_typing_indicator(
     );
 
     // Enforce authorization
-    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
-        error!("❌ [send_typing_indicator] Unauthorized - failed auth check");
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
     // Check membership
     let is_member = db::is_member(&pool, &user_did, &input.convo_id)
         .await

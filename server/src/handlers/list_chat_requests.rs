@@ -63,12 +63,6 @@ pub async fn list_chat_requests(
     auth_user: AuthUser,
     Query(params): Query<ListChatRequestsParams>,
 ) -> Result<Json<ListChatRequestsOutput>, StatusCode> {
-    if let Err(_e) =
-        crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.listChatRequests")
-    {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
     let recipient_did = &auth_user.did;
     let limit = params.limit.unwrap_or(50).max(1).min(100);
 
