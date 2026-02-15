@@ -21,6 +21,12 @@ pub fn sha256_hex(data: &[u8]) -> String {
     hex::encode(result)
 }
 
+/// Compute full SHA256 hash of a string for use in push notification payloads.
+/// Returns the complete 64-char hex digest (not truncated like `hash_for_log`).
+pub fn hash_for_push(input: &str) -> String {
+    sha256_hex(input.as_bytes())
+}
+
 /// Redact a sensitive value for logs by returning a short, non-reversible tag
 /// Example: "h:3fae91b2c4d5e677"
 pub fn redact_for_log(value: &str) -> String {

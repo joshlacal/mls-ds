@@ -161,9 +161,8 @@ async fn handle_register(
 
         if let Some((db_id, old_device_id, _old_credential_did)) = existing {
             info!(
-                "Device re-registration detected for user {}: device_uuid={}, old_device_id={}",
-                user_did,
-                device_uuid.as_ref(),
+                "Device re-registration detected for user h:{}: old_device_id={}",
+                crate::crypto::hash_for_log(&user_did),
                 old_device_id
             );
 
@@ -196,7 +195,7 @@ async fn handle_register(
             .rows_affected();
 
             if invalidated > 0 {
-                info!("Invalidated {} stale Welcome messages for re-registered user {}", invalidated, user_did);
+                info!("Invalidated {} stale Welcome messages for re-registered user h:{}", invalidated, crate::crypto::hash_for_log(&user_did));
             }
 
             // Update existing device record
@@ -242,8 +241,8 @@ async fn handle_register(
 
         if let Some((db_id, old_device_id, _old_credential_did)) = existing {
             info!(
-                "Device re-registration detected by signature key for user {}: old_device_id={}",
-                user_did, old_device_id
+                "Device re-registration detected by signature key for user h:{}: old_device_id={}",
+                crate::crypto::hash_for_log(&user_did), old_device_id
             );
 
             let deleted_count = sqlx::query("DELETE FROM key_packages WHERE owner_did = $1 AND device_id = $2")
@@ -273,7 +272,7 @@ async fn handle_register(
             .rows_affected();
 
             if invalidated > 0 {
-                info!("Invalidated {} stale Welcome messages for re-registered user {} (sig key match)", invalidated, user_did);
+                info!("Invalidated {} stale Welcome messages for re-registered user h:{} (sig key match)", invalidated, crate::crypto::hash_for_log(&user_did));
             }
 
             sqlx::query(
@@ -299,8 +298,8 @@ async fn handle_register(
     }
 
     info!(
-        "Registering device for user {}: {} ({}) [re-registration: {}]",
-        user_did, device_id, device_name, is_reregistration
+        "Registering device for user h:{}: {} ({}) [re-registration: {}]",
+        crate::crypto::hash_for_log(&user_did), device_id, device_name, is_reregistration
     );
 
     // Insert new device if not re-registration
@@ -315,7 +314,7 @@ async fn handle_register(
             })?;
 
         if device_count.0 >= 10 {
-            warn!("User {} has reached device limit: {}", user_did, device_count.0);
+            warn!("User h:{} has reached device limit: {}", crate::crypto::hash_for_log(&user_did), device_count.0);
             return Err(StatusCode::TOO_MANY_REQUESTS);
         }
 
@@ -521,8 +520,8 @@ async fn handle_update_token(
 
     let (device_id, _) = device.ok_or_else(|| {
         warn!(
-            "No device found for user {} - must register first",
-            auth_user.did
+            "No device found for user h:{} - must register first",
+            crate::crypto::hash_for_log(&auth_user.did)
         );
         StatusCode::NOT_FOUND
     })?;
@@ -547,7 +546,7 @@ async fn handle_update_token(
     })?;
 
     let mls_did = format!("{}#{}", auth_user.did, device_id);
-    info!(user_did = %auth_user.did, device_id = %device_id, "Push token updated");
+    info!(device_id = %device_id, "Push token updated");
 
     Ok(Json(serde_json::json!({
         "deviceId": device_id,
@@ -583,7 +582,7 @@ async fn handle_remove_token(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    info!(user_did = %auth_user.did, device_id = %device_id, "Push token removed");
+    info!(device_id = %device_id, "Push token removed");
 
     Ok(Json(serde_json::json!({ "success": true })))
 }
@@ -631,8 +630,8 @@ async fn handle_delete(
 
     if owner_did != *user_did {
         warn!(
-            "User {} attempted to delete device {} owned by {}",
-            user_did, device_id, owner_did
+            "User h:{} attempted to delete device {} owned by another user",
+            crate::crypto::hash_for_log(user_did), device_id
         );
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -810,13 +809,13 @@ async fn handle_claim_pending_addition(
     })?;
 
     if is_member.is_none() {
-        warn!("User {} is not a member of conversation {}", user_did, p_convo_id);
+        warn!("User h:{} is not a member of conversation {}", crate::crypto::hash_for_log(&user_did), p_convo_id);
         return Err(StatusCode::FORBIDDEN);
     }
 
     // Prevent self-claim
     if p_user_did == user_did {
-        info!("User {} attempted to claim their own device addition - returning not claimed", crate::crypto::redact_for_log(&user_did));
+        info!("User h:{} attempted to claim their own device addition - returning not claimed", crate::crypto::hash_for_log(&user_did));
         return Ok(Json(serde_json::json!({
             "claimed": false,
             "convoId": p_convo_id,
@@ -845,9 +844,8 @@ async fn handle_claim_pending_addition(
 
     if claim_result.is_none() {
         info!(
-            "Pending addition {} already claimed by {}",
+            "Pending addition {} already claimed",
             pending_addition_id,
-            p_claimed_by_did.as_deref().unwrap_or("unknown")
         );
         return Ok(Json(serde_json::json!({
             "claimed": false,
@@ -889,7 +887,7 @@ async fn handle_claim_pending_addition(
     });
 
     if key_package_json.is_none() {
-        warn!("No available key package for device {} (user {})", p_new_device_id, p_user_did);
+        warn!("No available key package for device {} (user h:{})", p_new_device_id, crate::crypto::hash_for_log(&p_user_did));
     }
 
     Ok(Json(serde_json::json!({
