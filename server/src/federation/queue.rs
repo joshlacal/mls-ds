@@ -6,6 +6,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use super::outbound::{OutboundClient, OutboundError};
+use super::resolver::{validate_endpoint_url, validate_resolved_host_is_public};
 use crate::auth::AuthMiddleware;
 
 // ---------------------------------------------------------------------------
@@ -243,7 +244,7 @@ impl OutboundQueue {
                                             "ACK signature verified for queue item"
                                         );
                                         if let Err(e) =
-                                            crate::db::store_delivery_ack(&self.pool, ack).await
+                                            crate::db::store_delivery_ack(&self.pool, ack, true).await
                                         {
                                             warn!(queue_id = %item.id, error = %e, "Failed to store delivery ack");
                                         }
@@ -258,10 +259,11 @@ impl OutboundQueue {
                                     warn!(
                                         queue_id = %item.id,
                                         remote_ds = %crate::crypto::redact_for_log(&ack.receiver_ds_did),
-                                        "No P-256 key found in DID doc — storing ACK field-validated only"
+                                        "ACK stored as UNVERIFIED — no P-256 key found in DID doc for {}",
+                                        crate::crypto::redact_for_log(&ack.receiver_ds_did),
                                     );
                                     if let Err(e) =
-                                        crate::db::store_delivery_ack(&self.pool, ack).await
+                                        crate::db::store_delivery_ack(&self.pool, ack, false).await
                                     {
                                         warn!(queue_id = %item.id, error = %e, "Failed to store delivery ack");
                                     }
@@ -271,9 +273,10 @@ impl OutboundQueue {
                                 warn!(
                                     queue_id = %item.id,
                                     error = %e,
-                                    "DID resolution failed for ACK verification — storing field-validated only"
+                                    "ACK stored as UNVERIFIED — DID resolution failed for {}",
+                                    crate::crypto::redact_for_log(&ack.receiver_ds_did),
                                 );
-                                if let Err(e) = crate::db::store_delivery_ack(&self.pool, ack).await
+                                if let Err(e) = crate::db::store_delivery_ack(&self.pool, ack, false).await
                                 {
                                     warn!(queue_id = %item.id, error = %e, "Failed to store delivery ack");
                                 }
@@ -332,6 +335,19 @@ impl OutboundQueue {
         }
 
         if let Some(derived_endpoint) = did_web_to_endpoint(&item.target_ds_did) {
+            // Validate the derived URL against SSRF protections before using it
+            let parsed = validate_endpoint_url(&derived_endpoint).map_err(|e| {
+                OutboundError::RequestFailed {
+                    endpoint: derived_endpoint.clone(),
+                    reason: format!("SSRF validation failed: {e}"),
+                }
+            })?;
+            validate_resolved_host_is_public(&parsed)
+                .await
+                .map_err(|e| OutboundError::RequestFailed {
+                    endpoint: derived_endpoint.clone(),
+                    reason: format!("SSRF validation failed: {e}"),
+                })?;
             return Ok(derived_endpoint);
         }
 
