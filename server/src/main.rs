@@ -601,6 +601,15 @@ async fn main() -> anyhow::Result<()> {
         .merge(GetSubscriptionTicketRequest::into_router(
             handlers::mls_chat::get_subscription_ticket,
         ))
+        // WebSocket subscription endpoint
+        .route(
+            "/xrpc/blue.catbird.mlsChat.subscribeConvoEvents",
+            get(realtime::websocket::subscribe_convo_events),
+        )
+        .route(
+            "/xrpc/blue.catbird.mls.subscribeConvoEvents",
+            get(realtime::websocket::subscribe_convo_events),
+        )
         // Federation
         .route(
             "/xrpc/blue.catbird.mlsChat.requestFailover",
