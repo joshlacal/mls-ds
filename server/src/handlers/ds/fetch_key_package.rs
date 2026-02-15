@@ -80,8 +80,8 @@ pub async fn fetch_key_package(
             });
         }
 
-            // Consume one key package (atomically claim via CTE).
-            let row = sqlx::query_as::<_, (Vec<u8>, String)>(
+        // Consume one key package (atomically claim via CTE).
+        let row = sqlx::query_as::<_, (Vec<u8>, String)>(
             "WITH claimed AS ( \
                SELECT id, key_package, key_package_hash \
                FROM key_packages \

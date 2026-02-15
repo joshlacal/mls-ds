@@ -244,7 +244,8 @@ impl OutboundQueue {
                                             "ACK signature verified for queue item"
                                         );
                                         if let Err(e) =
-                                            crate::db::store_delivery_ack(&self.pool, ack, true).await
+                                            crate::db::store_delivery_ack(&self.pool, ack, true)
+                                                .await
                                         {
                                             warn!(queue_id = %item.id, error = %e, "Failed to store delivery ack");
                                         }
@@ -276,7 +277,8 @@ impl OutboundQueue {
                                     "ACK stored as UNVERIFIED — DID resolution failed for {}",
                                     crate::crypto::redact_for_log(&ack.receiver_ds_did),
                                 );
-                                if let Err(e) = crate::db::store_delivery_ack(&self.pool, ack, false).await
+                                if let Err(e) =
+                                    crate::db::store_delivery_ack(&self.pool, ack, false).await
                                 {
                                     warn!(queue_id = %item.id, error = %e, "Failed to store delivery ack");
                                 }

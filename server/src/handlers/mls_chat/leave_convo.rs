@@ -104,13 +104,10 @@ pub async fn leave_convo(
             None
         };
 
-        let actor_ref = actor_registry
-            .get_or_spawn(&convo_id)
-            .await
-            .map_err(|e| {
-                error!("Failed to get conversation actor: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+        let actor_ref = actor_registry.get_or_spawn(&convo_id).await.map_err(|e| {
+            error!("Failed to get conversation actor: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
         let (tx, rx) = oneshot::channel();
         actor_ref
@@ -157,20 +154,20 @@ pub async fn leave_convo(
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
-            let advanced_epoch = crate::db::try_advance_conversation_epoch_tx(
-                &mut db_tx,
-                &convo_id,
-                current_epoch,
-            )
-            .await
-            .map_err(|e| {
-                error!("Failed to advance conversation epoch: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?
-            .ok_or_else(|| {
-                warn!("❌ [leave_convo] Epoch conflict: expected {}", current_epoch);
-                StatusCode::CONFLICT
-            })?;
+            let advanced_epoch =
+                crate::db::try_advance_conversation_epoch_tx(&mut db_tx, &convo_id, current_epoch)
+                    .await
+                    .map_err(|e| {
+                        error!("Failed to advance conversation epoch: {}", e);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?
+                    .ok_or_else(|| {
+                        warn!(
+                            "❌ [leave_convo] Epoch conflict: expected {}",
+                            current_epoch
+                        );
+                        StatusCode::CONFLICT
+                    })?;
 
             let seq: i64 = sqlx::query_scalar(
                 "SELECT CAST(COALESCE(MAX(seq), 0) + 1 AS BIGINT) FROM messages WHERE convo_id = $1",
@@ -206,7 +203,10 @@ pub async fn leave_convo(
             })?;
             new_epoch = advanced_epoch;
 
-            info!("✅ [leave_convo] Commit stored seq={}, epoch={}", seq, new_epoch);
+            info!(
+                "✅ [leave_convo] Commit stored seq={}, epoch={}",
+                seq, new_epoch
+            );
 
             // Fan out commit to all members (async)
             let pool_clone = pool.clone();
@@ -251,7 +251,16 @@ pub async fn leave_convo(
                     .next(&convo_id_clone, "messageEvent")
                     .await;
 
-                let message_result = sqlx::query_as::<_, (String, Option<Vec<u8>>, i32, i64, chrono::DateTime<chrono::Utc>)>(
+                let message_result = sqlx::query_as::<
+                    _,
+                    (
+                        String,
+                        Option<Vec<u8>>,
+                        i32,
+                        i64,
+                        chrono::DateTime<chrono::Utc>,
+                    ),
+                >(
                     "SELECT id, ciphertext, epoch, seq, created_at FROM messages WHERE id = $1",
                 )
                 .bind(&msg_id_clone)
@@ -369,7 +378,10 @@ pub async fn leave_convo(
         new_epoch as u32
     };
 
-    info!("User successfully left conversation, new epoch: {}", new_epoch);
+    info!(
+        "User successfully left conversation, new epoch: {}",
+        new_epoch
+    );
 
     Ok(Json(LeaveConvoOutput {
         success: true,

@@ -39,9 +39,9 @@ impl FederatedBackend {
     .fetch_optional(&self.pool)
     .await?;
 
-        Ok(ds_did
-            .flatten()
-            .map_or(true, |did| canonical_did(&did) == canonical_did(&self.self_did)))
+        Ok(ds_did.flatten().map_or(true, |did| {
+            canonical_did(&did) == canonical_did(&self.self_did)
+        }))
     }
 
     /// Get the sequencer DS DID for a conversation.

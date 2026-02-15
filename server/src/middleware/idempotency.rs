@@ -366,10 +366,7 @@ pub async fn idempotency_middleware(
             "endpoint" => endpoint.clone(),
             "reason" => "non_2xx".to_string()
         );
-        debug!(
-            "Not caching response with status {} (non-2xx)",
-            status_code
-        );
+        debug!("Not caching response with status {} (non-2xx)", status_code);
     }
 
     // Reconstruct and return response

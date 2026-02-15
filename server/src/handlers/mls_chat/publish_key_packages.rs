@@ -11,8 +11,7 @@ use jacquard_axum::ExtractXrpc;
 use tracing::{error, info, warn};
 
 use crate::{
-    auth::AuthUser,
-    device_utils::parse_device_did,
+    auth::AuthUser, device_utils::parse_device_did,
     generated::blue_catbird::mlsChat::publish_key_packages::PublishKeyPackagesRequest,
     storage::DbPool,
 };
@@ -44,16 +43,14 @@ async fn build_stats(pool: &DbPool, did: &str) -> Result<serde_json::Value, Stat
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let total: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM key_packages WHERE owner_did = $1",
-    )
-    .bind(&user_did)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| {
-        error!("Failed to count total key packages: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM key_packages WHERE owner_did = $1")
+        .bind(&user_did)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| {
+            error!("Failed to count total key packages: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     let expired: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM key_packages WHERE owner_did = $1 AND consumed_at IS NULL AND expires_at <= NOW()",
@@ -152,7 +149,7 @@ async fn handle_publish(
 /// Handle "publishBatch" action — validate and store multiple key packages.
 async fn handle_publish_batch(
     pool: &DbPool,
-    _headers: &HeaderMap,
+    headers: &HeaderMap,
     input: &crate::generated::blue_catbird::mlsChat::publish_key_packages::PublishKeyPackages<'_>,
     user_did: &str,
     device_id: &str,
@@ -176,16 +173,71 @@ async fn handle_publish_batch(
     }
 
     let now = Utc::now();
+    let recovery_mode_requested = headers
+        .get(crate::middleware::rate_limit::RECOVERY_MODE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    let recovery_mode_verified = if recovery_mode_requested && !device_id.is_empty() {
+        let available_for_device: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM key_packages
+             WHERE owner_did = $1
+               AND (device_id = $2 OR device_id IS NULL)
+               AND consumed_at IS NULL
+               AND expires_at > $3",
+        )
+        .bind(user_did)
+        .bind(device_id)
+        .bind(now)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| {
+            error!("Failed to verify recovery mode eligibility: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        if available_for_device.0 == 0 {
+            info!(
+                "Recovery mode verified for user {} on device {}",
+                user_did, device_id
+            );
+            true
+        } else {
+            warn!(
+                "Recovery mode requested but denied for user {} on device {} (available: {})",
+                user_did, device_id, available_for_device.0
+            );
+            false
+        }
+    } else {
+        if recovery_mode_requested && device_id.is_empty() {
+            warn!("Recovery mode requested without device_id, applying normal limits");
+        }
+        false
+    };
 
     // Rate limit: uploads in the last hour
     let rate_limit_window = now - chrono::Duration::hours(RATE_LIMIT_WINDOW_HOURS);
-    let recent_uploads: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM key_packages WHERE owner_did = $1 AND created_at > $2",
-    )
-    .bind(user_did)
-    .bind(rate_limit_window)
-    .fetch_one(pool)
-    .await
+    let recent_uploads: (i64,) = if recovery_mode_verified {
+        sqlx::query_as(
+            "SELECT COUNT(*) FROM key_packages
+             WHERE owner_did = $1
+               AND (device_id = $2 OR device_id IS NULL)
+               AND created_at > $3",
+        )
+        .bind(user_did)
+        .bind(device_id)
+        .bind(rate_limit_window)
+        .fetch_one(pool)
+        .await
+    } else {
+        sqlx::query_as("SELECT COUNT(*) FROM key_packages WHERE owner_did = $1 AND created_at > $2")
+            .bind(user_did)
+            .bind(rate_limit_window)
+            .fetch_one(pool)
+            .await
+    }
     .map_err(|e| {
         error!("Failed to check rate limit: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
@@ -193,20 +245,42 @@ async fn handle_publish_batch(
 
     if recent_uploads.0 >= MAX_UPLOADS_PER_HOUR {
         warn!(
-            "User {} exceeded rate limit: {} uploads in last hour (limit: {})",
-            user_did, recent_uploads.0, MAX_UPLOADS_PER_HOUR
+            "User {} exceeded {} upload rate limit: {} in last hour (limit: {})",
+            user_did,
+            if recovery_mode_verified {
+                "device-scoped recovery"
+            } else {
+                "user-scoped"
+            },
+            recent_uploads.0,
+            MAX_UPLOADS_PER_HOUR
         );
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 
     // Unconsumed limit
-    let unconsumed: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM key_packages WHERE owner_did = $1 AND consumed_at IS NULL AND expires_at > $2",
-    )
-    .bind(user_did)
-    .bind(now)
-    .fetch_one(pool)
-    .await
+    let unconsumed: (i64,) = if recovery_mode_verified {
+        sqlx::query_as(
+            "SELECT COUNT(*) FROM key_packages
+             WHERE owner_did = $1
+               AND (device_id = $2 OR device_id IS NULL)
+               AND consumed_at IS NULL
+               AND expires_at > $3",
+        )
+        .bind(user_did)
+        .bind(device_id)
+        .bind(now)
+        .fetch_one(pool)
+        .await
+    } else {
+        sqlx::query_as(
+            "SELECT COUNT(*) FROM key_packages WHERE owner_did = $1 AND consumed_at IS NULL AND expires_at > $2",
+        )
+        .bind(user_did)
+        .bind(now)
+        .fetch_one(pool)
+        .await
+    }
     .map_err(|e| {
         error!("Failed to count unconsumed key packages: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
@@ -279,7 +353,9 @@ async fn handle_publish_batch(
         let key_data = match STANDARD.decode(item.key_package.as_ref()) {
             Ok(data) if !data.is_empty() => data,
             Ok(_) => {
-                errors.push(serde_json::json!({ "index": idx, "error": "Decoded key package is empty" }));
+                errors.push(
+                    serde_json::json!({ "index": idx, "error": "Decoded key package is empty" }),
+                );
                 failed += 1;
                 continue;
             }
@@ -326,7 +402,9 @@ async fn handle_publish_batch(
             Ok(_) => succeeded += 1,
             Err(e) => {
                 error!("Failed to store key package {}: {}", idx, e);
-                errors.push(serde_json::json!({ "index": idx, "error": format!("Database error: {}", e) }));
+                errors.push(
+                    serde_json::json!({ "index": idx, "error": format!("Database error: {}", e) }),
+                );
                 failed += 1;
             }
         }
@@ -591,7 +669,17 @@ pub async fn publish_key_packages_post(
 
     match input.action.as_ref() {
         "publish" => {
-            let publish_result = handle_publish(&pool, &input, &user_did, &device_id).await?;
+            let publish_result = if input
+                .key_packages
+                .as_ref()
+                .map(|items| items.len() > 1)
+                .unwrap_or(false)
+            {
+                warn!("publish action received multiple key packages; handling as publishBatch");
+                handle_publish_batch(&pool, &headers, &input, &user_did, &device_id).await?
+            } else {
+                handle_publish(&pool, &input, &user_did, &device_id).await?
+            };
             let stats = build_stats(&pool, &did).await?;
             Ok(Json(serde_json::json!({
                 "stats": stats,

@@ -54,7 +54,10 @@ pub async fn get_convos(
             let decoded = match urlencoding::decode(value) {
                 Ok(v) => v.to_string(),
                 Err(e) => {
-                    error!("❌ [v2.getConvos] Failed to decode query parameter '{}': {}", key, e);
+                    error!(
+                        "❌ [v2.getConvos] Failed to decode query parameter '{}': {}",
+                        key, e
+                    );
                     return Err(StatusCode::BAD_REQUEST);
                 }
             };
@@ -240,9 +243,10 @@ async fn handle_pending(
         (None, None)
     };
 
-    let rows: Vec<ChatRequestRow> =
-        if let (Some(created_at), Some(id)) = (cursor_created_at, cursor_id) {
-            sqlx::query_as::<_, ChatRequestRow>(
+    let rows: Vec<ChatRequestRow> = if let (Some(created_at), Some(id)) =
+        (cursor_created_at, cursor_id)
+    {
+        sqlx::query_as::<_, ChatRequestRow>(
                 r#"
                 SELECT cr.id, cr.sender_did, cr.status::TEXT as status, cr.created_at, cr.expires_at,
                        cr.is_group_invite, cr.group_id,
@@ -265,8 +269,8 @@ async fn handle_pending(
                 error!("❌ [v2.getConvos] Failed to list chat requests: {}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })?
-        } else {
-            sqlx::query_as::<_, ChatRequestRow>(
+    } else {
+        sqlx::query_as::<_, ChatRequestRow>(
                 r#"
                 SELECT cr.id, cr.sender_did, cr.status::TEXT as status, cr.created_at, cr.expires_at,
                        cr.is_group_invite, cr.group_id,
@@ -286,7 +290,7 @@ async fn handle_pending(
                 error!("❌ [v2.getConvos] Failed to list chat requests: {}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })?
-        };
+    };
 
     let next_cursor = rows
         .last()
@@ -364,7 +368,10 @@ async fn handle_expected(
     .fetch_all(pool)
     .await
     .map_err(|e| {
-        error!("❌ [v2.getConvos] Failed to fetch expected memberships: {}", e);
+        error!(
+            "❌ [v2.getConvos] Failed to fetch expected memberships: {}",
+            e
+        );
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
@@ -423,10 +430,7 @@ async fn handle_expected(
         }
     }
 
-    info!(
-        "✅ [v2.getConvos] Expected: {} convos",
-        convos.len(),
-    );
+    info!("✅ [v2.getConvos] Expected: {} convos", convos.len(),);
 
     let output = crate::generated::blue_catbird::mls::get_convos::GetConvosOutput {
         conversations: convos,
