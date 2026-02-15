@@ -25,6 +25,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::time::Duration;
@@ -65,6 +66,19 @@ struct CachedResponse {
     status_code: i32,
 }
 
+/// Extract caller DID from Authorization header by decoding the JWT payload (no verification).
+fn extract_caller_did(headers: &axum::http::HeaderMap) -> Option<String> {
+    let auth_header = headers.get("authorization")?.to_str().ok()?;
+    let token = auth_header.strip_prefix("Bearer ")?;
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let payload_json = URL_SAFE_NO_PAD.decode(parts[1]).ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&payload_json).ok()?;
+    claims.get("iss")?.as_str().map(|s| s.to_string())
+}
+
 /// Extract idempotency key from request body (if present)
 fn extract_idempotency_key(body: &[u8]) -> Option<String> {
     // Parse JSON body
@@ -82,6 +96,7 @@ fn extract_idempotency_key(body: &[u8]) -> Option<String> {
 /// Check idempotency cache for existing response
 async fn check_cache(
     pool: &PgPool,
+    caller_did: &str,
     idempotency_key: &str,
     endpoint: &str,
 ) -> Result<Option<CachedResponse>, sqlx::Error> {
@@ -89,11 +104,13 @@ async fn check_cache(
         r#"
         SELECT response_body, status_code
         FROM idempotency_cache
-        WHERE key = $1
-          AND endpoint = $2
+        WHERE caller_did = $1
+          AND key = $2
+          AND endpoint = $3
           AND expires_at > NOW()
         "#,
     )
+    .bind(caller_did)
     .bind(idempotency_key)
     .bind(endpoint)
     .fetch_optional(pool)
@@ -105,6 +122,7 @@ async fn check_cache(
 /// Store response in idempotency cache
 async fn store_cache(
     pool: &PgPool,
+    caller_did: &str,
     idempotency_key: &str,
     endpoint: &str,
     status_code: i32,
@@ -113,14 +131,15 @@ async fn store_cache(
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
-        INSERT INTO idempotency_cache (key, endpoint, response_body, status_code, expires_at)
-        VALUES ($1, $2, $3, $4, NOW() + $5 * INTERVAL '1 second')
-        ON CONFLICT (key) DO UPDATE SET
+        INSERT INTO idempotency_cache (caller_did, key, endpoint, response_body, status_code, expires_at)
+        VALUES ($1, $2, $3, $4, $5, NOW() + $6 * INTERVAL '1 second')
+        ON CONFLICT (caller_did, endpoint, key) DO UPDATE SET
             response_body = EXCLUDED.response_body,
             status_code = EXCLUDED.status_code,
             expires_at = EXCLUDED.expires_at
         "#,
     )
+    .bind(caller_did)
     .bind(idempotency_key)
     .bind(endpoint)
     .bind(response_body)
@@ -147,6 +166,15 @@ pub async fn idempotency_middleware(
         debug!("Skipping idempotency check for {} {}", method, endpoint);
         return Ok(next.run(request).await);
     }
+
+    // Extract caller DID from Authorization header; skip caching for unauthenticated requests
+    let caller_did = match extract_caller_did(request.headers()) {
+        Some(did) => did,
+        None => {
+            debug!("No caller DID found - skipping idempotency caching");
+            return Ok(next.run(request).await);
+        }
+    };
 
     // Read the request body using Axum's Bytes extractor
     let (mut parts, body) = request.into_parts();
@@ -187,7 +215,7 @@ pub async fn idempotency_middleware(
 
     // Check cache for existing response
     let cache_check_start = std::time::Instant::now();
-    match check_cache(&layer.pool, &idempotency_key, &endpoint).await {
+    match check_cache(&layer.pool, &caller_did, &idempotency_key, &endpoint).await {
         Ok(Some(cached)) => {
             metrics::histogram!(
                 "idempotency_cache_check_duration_seconds",
@@ -276,9 +304,8 @@ pub async fn idempotency_middleware(
         }
     };
 
-    // Only cache successful responses (2xx) and client errors (4xx)
-    // Don't cache server errors (5xx) as they may be transient
-    if (200..500).contains(&status_code) {
+    // Only cache successful responses (2xx)
+    if (200..300).contains(&status_code) {
         // Parse response body as JSON
         match serde_json::from_slice::<serde_json::Value>(&response_bytes) {
             Ok(json_body) => {
@@ -286,6 +313,7 @@ pub async fn idempotency_middleware(
                 let store_start = std::time::Instant::now();
                 if let Err(e) = store_cache(
                     &layer.pool,
+                    &caller_did,
                     &idempotency_key,
                     &endpoint,
                     status_code,
@@ -336,10 +364,10 @@ pub async fn idempotency_middleware(
             1,
             "method" => method.as_str().to_string(),
             "endpoint" => endpoint.clone(),
-            "reason" => "server_error".to_string()
+            "reason" => "non_2xx".to_string()
         );
         debug!(
-            "Not caching response with status {} (server error)",
+            "Not caching response with status {} (non-2xx)",
             status_code
         );
     }

@@ -1,7 +1,6 @@
 use axum::{extract::State, http::StatusCode, Json};
 use base64::Engine;
 use chrono::{DateTime, Utc};
-use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
@@ -416,36 +415,7 @@ pub async fn create_convo(
             welcome_data.len()
         );
 
-        // 📨 [CREATE_CONVO] Log Welcome message BEFORE storing for corruption detection
-        let mut hasher = Sha256::new();
-        hasher.update(&welcome_data);
-        let checksum = hasher.finalize();
-        info!(
-            "📨 [CREATE_CONVO] Storing Welcome message for convo {}:",
-            input.group_id
-        );
-        info!("   Size: {} bytes", welcome_data.len());
-        if welcome_data.len() >= 100 {
-            info!(
-                "   First 100 bytes (hex): {}",
-                hex::encode(&welcome_data[..100])
-            );
-        } else {
-            info!(
-                "   First {} bytes (hex): {}",
-                welcome_data.len(),
-                hex::encode(&welcome_data)
-            );
-        }
-        if welcome_data.len() > 100 {
-            let start = welcome_data.len().saturating_sub(100);
-            info!(
-                "   Last 100 bytes (hex): {}",
-                hex::encode(&welcome_data[start..])
-            );
-        }
-        info!("   SHA256 checksum: {}", hex::encode(checksum));
-        info!("   ✅ Welcome message stored for group: {}", input.group_id);
+        info!("📨 [CREATE_CONVO] Stored Welcome message for convo {}: {} bytes", input.group_id, welcome_data.len());
 
         // Validate all key packages are available BEFORE storing anything
         if let Some(ref kp_hashes) = input.key_package_hashes {
@@ -500,8 +470,8 @@ pub async fn create_convo(
                     .unwrap_or_default();
 
                     warn!(
-                        "❌ [create_convo] Key package not available for {}: requested_hash={}, available_hashes_count={}, available_hashes={:?}",
-                        member_did_str, hash_hex, available_hashes.len(), available_hashes
+                        "❌ [create_convo] Key package not available for {}: available_hashes_count={}",
+                        crate::crypto::redact_for_log(&member_did_str), available_hashes.len()
                     );
                     return Err(LexCreateConvoError::KeyPackageNotFound(Some(format!(
                         "Key package not available for {}: hash={}. Server has {} available key packages.",

@@ -371,7 +371,7 @@ fn host_is_allowlisted(host: &str, allowlist: &[String]) -> bool {
 }
 
 /// Validate a DS endpoint URL for SSRF protection.
-fn validate_endpoint_url(url_str: &str) -> Result<url::Url, FederationError> {
+pub(crate) fn validate_endpoint_url(url_str: &str) -> Result<url::Url, FederationError> {
     validate_endpoint_url_with_policy(url_str, allow_insecure_http())
 }
 
@@ -426,7 +426,7 @@ fn validate_endpoint_url_with_policy(
     Ok(parsed)
 }
 
-async fn validate_resolved_host_is_public(parsed: &url::Url) -> Result<(), FederationError> {
+pub(crate) async fn validate_resolved_host_is_public(parsed: &url::Url) -> Result<(), FederationError> {
     let Some(host) = parsed.host_str() else {
         return Err(FederationError::ResolutionFailed {
             did: String::new(),

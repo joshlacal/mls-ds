@@ -2299,14 +2299,16 @@ pub async fn get_reactions_for_messages(
 pub async fn store_delivery_ack(
     pool: &DbPool,
     ack: &crate::federation::ack::DeliveryAck,
+    verified: bool,
 ) -> Result<()> {
     let id = ulid::Ulid::new().to_string();
     sqlx::query(
-        "INSERT INTO delivery_acks (id, message_id, convo_id, epoch, target_ds_did, acked_at, signature) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+        "INSERT INTO delivery_acks (id, message_id, convo_id, epoch, target_ds_did, acked_at, signature, verified) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
          ON CONFLICT (convo_id, message_id, target_ds_did) DO UPDATE SET \
          acked_at = EXCLUDED.acked_at, \
-         signature = EXCLUDED.signature",
+         signature = EXCLUDED.signature, \
+         verified = EXCLUDED.verified",
     )
     .bind(&id)
     .bind(&ack.message_id)
@@ -2315,6 +2317,7 @@ pub async fn store_delivery_ack(
     .bind(&ack.receiver_ds_did)
     .bind(ack.acked_at)
     .bind(&ack.signature)
+    .bind(verified)
     .execute(pool)
     .await
     .context("Failed to store delivery ack")?;

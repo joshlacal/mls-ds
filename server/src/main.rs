@@ -1,5 +1,5 @@
 use axum::{
-    extract::FromRef,
+    extract::{DefaultBodyLimit, FromRef},
     routing::{any, get, post},
     Router,
 };
@@ -471,6 +471,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/health/live", get(health::liveness))
         .route("/health/ready", get(health::readiness))
         .merge(metrics_router)
+        .layer(DefaultBodyLimit::max(2 * 1024 * 1024)) // 2 MB
         .layer(TraceLayer::new_for_http())
         .layer(axum::middleware::from_fn(
             middleware::logging::log_headers_middleware,
