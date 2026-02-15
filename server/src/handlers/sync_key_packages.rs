@@ -50,13 +50,6 @@ pub async fn sync_key_packages(
     auth_user: AuthUser,
     Json(input): Json<SyncKeyPackagesInput>,
 ) -> Result<Json<SyncKeyPackagesOutput>, StatusCode> {
-    if let Err(_e) =
-        crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.syncKeyPackages")
-    {
-        warn!("Unauthorized access attempt for syncKeyPackages");
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
     let user_did = &auth_user.did;
     let device_id = &input.device_id;
 

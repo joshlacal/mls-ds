@@ -61,11 +61,6 @@ pub async fn promote_moderator(
     );
 
     // Enforce standard auth
-    if let Err(_) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
-        error!("❌ [promote_moderator] Unauthorized");
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
     // Verify actor is an admin
     verify_is_admin(&pool, &input.convo_id, &auth_user.did).await?;
 

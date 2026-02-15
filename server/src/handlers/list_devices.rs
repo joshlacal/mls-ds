@@ -32,12 +32,6 @@ pub async fn list_devices(
     State(pool): State<DbPool>,
     auth_user: AuthUser,
 ) -> Result<Json<ListDevicesOutput>, StatusCode> {
-    if let Err(_e) =
-        crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.listDevices")
-    {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
     let user_did = &auth_user.did;
 
     info!(

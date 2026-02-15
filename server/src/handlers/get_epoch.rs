@@ -37,10 +37,6 @@ pub async fn get_epoch(
     auth_user: AuthUser,
     Query(params): Query<GetEpochParams>,
 ) -> Result<Json<EpochResponse>, StatusCode> {
-    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.getEpoch") {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
     let did = &auth_user.did;
 
     // Validate input

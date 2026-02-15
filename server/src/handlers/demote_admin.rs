@@ -24,12 +24,6 @@ pub async fn demote_admin(
     );
 
     // Enforce standard auth
-    if let Err(_) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.demoteAdmin")
-    {
-        error!("❌ [demote_admin] Unauthorized");
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
     // Verify actor is an admin (or is self-demoting)
     if auth_user.did != input.target_did.as_str() {
         verify_is_admin(&pool, &input.convo_id, &auth_user.did).await?;

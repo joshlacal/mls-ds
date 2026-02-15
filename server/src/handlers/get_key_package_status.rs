@@ -43,12 +43,6 @@ pub async fn get_key_package_status(
     auth_user: AuthUser,
     Query(params): Query<GetKeyPackageStatusParams>,
 ) -> Result<Json<GetKeyPackageStatusOutput>, StatusCode> {
-    if let Err(_e) =
-        crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.getKeyPackageStatus")
-    {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
     let did = &auth_user.did;
     let limit = params.limit.unwrap_or(20).min(100);
 

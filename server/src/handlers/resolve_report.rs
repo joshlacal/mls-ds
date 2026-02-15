@@ -2,7 +2,7 @@ use axum::{extract::State, http::StatusCode, Json};
 use tracing::{error, info};
 
 use crate::{
-    auth::{enforce_standard, verify_is_admin, AuthUser},
+    auth::{verify_is_admin, AuthUser},
     generated::blue_catbird::mls::resolve_report::{ResolveReport, ResolveReportOutput},
     storage::DbPool,
 };
@@ -22,11 +22,6 @@ pub async fn resolve_report(
     );
 
     // Enforce standard auth
-    if let Err(_) = enforce_standard(&auth_user.claims, "blue.catbird.mls.resolveReport") {
-        error!("❌ [resolve_report] Unauthorized");
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
     // Validate action enum
     let valid_actions = ["removed_member", "dismissed", "no_action"];
     if !valid_actions.contains(&input.action.as_str()) {

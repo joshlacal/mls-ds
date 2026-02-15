@@ -17,12 +17,6 @@ pub async fn get_request_count(
     State(pool): State<DbPool>,
     auth_user: AuthUser,
 ) -> Result<Json<GetRequestCountOutput>, StatusCode> {
-    if let Err(_e) =
-        crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.getRequestCount")
-    {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
     let recipient_did = &auth_user.did;
 
     let count: i64 = sqlx::query_scalar(

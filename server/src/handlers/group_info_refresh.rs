@@ -24,12 +24,6 @@ pub async fn group_info_refresh(
 ) -> Result<Json<GroupInfoRefreshOutput<'static>>, StatusCode> {
     let input = crate::jacquard_json::from_json_body::<GroupInfoRefresh>(&body)?;
     // Enforce authentication
-    if let Err(_e) =
-        crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.groupInfoRefresh")
-    {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
     let device_did = &auth_user.did;
     let convo_id = input.convo_id.as_str();
 

@@ -26,10 +26,6 @@ pub async fn rejoin(
 ) -> Result<Json<RejoinOutput<'static>>, StatusCode> {
     let input = crate::jacquard_json::from_json_body::<Rejoin>(&body)?;
     // Enforce authentication
-    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, "blue.catbird.mls.rejoin") {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
     let device_did = &auth_user.did;
     let convo_id = &input.convo_id;
     let key_package_b64 = &input.key_package;

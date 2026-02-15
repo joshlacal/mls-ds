@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use tracing::{error, info};
 
 use crate::{
-    auth::{enforce_standard, verify_is_admin, AuthUser},
+    auth::{verify_is_admin, AuthUser},
     generated::blue_catbird::mls::get_reports::{GetReports, GetReportsOutput, ReportView},
     sqlx_jacquard::{chrono_to_datetime, try_string_to_did},
     storage::DbPool,
@@ -31,11 +31,6 @@ pub async fn get_reports(
     );
 
     // Enforce standard auth
-    if let Err(_) = enforce_standard(&auth_user.claims, "blue.catbird.mls.getReports") {
-        error!("❌ [get_reports] Unauthorized");
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
     // Verify admin status
     verify_is_admin(&pool, &params.convo_id, &auth_user.did).await?;
 
