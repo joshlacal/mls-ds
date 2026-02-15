@@ -430,6 +430,8 @@ async fn handle_sync(
     pool: &DbPool,
     input: &crate::generated::blue_catbird::mlsChat::publish_key_packages::PublishKeyPackages<'_>,
     user_did: &str,
+    raw_device_id: &str,
+    bucketed_device_id: &str,
 ) -> Result<serde_json::Value, StatusCode> {
     let local_hashes_cow = input.local_hashes.as_ref().ok_or_else(|| {
         warn!("sync action requires localHashes");
@@ -437,20 +439,15 @@ async fn handle_sync(
     })?;
     let local_hashes: Vec<String> = local_hashes_cow.iter().map(|s| s.to_string()).collect();
 
-    let device_id = input.device_id.as_ref().ok_or_else(|| {
+    if raw_device_id.trim().is_empty() || bucketed_device_id.trim().is_empty() {
         warn!("sync action requires deviceId");
-        StatusCode::BAD_REQUEST
-    })?;
-    let device_id = device_id.as_ref();
-    if device_id.trim().is_empty() {
-        warn!("Empty device_id provided for sync");
         return Err(StatusCode::BAD_REQUEST);
     }
 
     info!(
         "🔄 [sync] START - user has {} local hashes, device_id: {}",
         local_hashes.len(),
-        device_id
+        raw_device_id
     );
 
     // Get available server hashes for this device
@@ -459,14 +456,15 @@ async fn handle_sync(
     let server_hashes: Vec<String> = sqlx::query_scalar::<_, String>(
         r#"
         SELECT key_package_hash FROM key_packages
-        WHERE owner_did = $1 AND (device_id = $2 OR device_id IS NULL)
-          AND consumed_at IS NULL AND expires_at > $3
-          AND (reserved_at IS NULL OR reserved_at < $4)
+        WHERE owner_did = $1 AND (device_id = $2 OR device_id = $3 OR device_id IS NULL)
+          AND consumed_at IS NULL AND expires_at > $4
+          AND (reserved_at IS NULL OR reserved_at < $5)
         ORDER BY created_at DESC
         "#,
     )
     .bind(user_did)
-    .bind(device_id)
+    .bind(bucketed_device_id)
+    .bind(raw_device_id)
     .bind(now)
     .bind(reservation_timeout)
     .fetch_all(pool)
@@ -479,7 +477,7 @@ async fn handle_sync(
     info!(
         "📊 [sync] Server has {} available key packages for device {}",
         server_hashes.len(),
-        device_id
+        raw_device_id
     );
 
     // Find orphaned: on server but not in local
@@ -494,20 +492,20 @@ async fn handle_sync(
     if orphaned_count == 0 {
         info!(
             "✅ [sync] No orphaned key packages found for device {}",
-            device_id
+            raw_device_id
         );
         return Ok(serde_json::json!({
             "serverHashes": server_hashes,
             "orphanedCount": 0,
             "deletedCount": 0,
             "remainingAvailable": server_hashes.len() as i64,
-            "deviceId": device_id,
+            "deviceId": raw_device_id,
         }));
     }
 
     warn!(
         "⚠️ [sync] Found {} orphaned key packages for device {}",
-        orphaned_count, device_id
+        orphaned_count, raw_device_id
     );
 
     // Delete orphaned packages (scoped to this device)
@@ -515,12 +513,13 @@ async fn handle_sync(
         let result = sqlx::query(
             r#"
             DELETE FROM key_packages
-            WHERE owner_did = $1 AND (device_id = $2 OR device_id IS NULL)
-              AND key_package_hash = ANY($3) AND consumed_at IS NULL
+            WHERE owner_did = $1 AND (device_id = $2 OR device_id = $3 OR device_id IS NULL)
+              AND key_package_hash = ANY($4) AND consumed_at IS NULL
             "#,
         )
         .bind(user_did)
-        .bind(device_id)
+        .bind(bucketed_device_id)
+        .bind(raw_device_id)
         .bind(&orphaned_hashes)
         .execute(pool)
         .await
@@ -535,7 +534,7 @@ async fn handle_sync(
 
     info!(
         "🗑️ [sync] Deleted {} orphaned key packages for device {}",
-        deleted_count, device_id
+        deleted_count, raw_device_id
     );
 
     // Invalidate pending welcomes referencing deleted key packages
@@ -571,12 +570,13 @@ async fn handle_sync(
     let remaining: (i64,) = sqlx::query_as(
         r#"
         SELECT COUNT(*) FROM key_packages
-        WHERE owner_did = $1 AND (device_id = $2 OR device_id IS NULL)
+        WHERE owner_did = $1 AND (device_id = $2 OR device_id = $3 OR device_id IS NULL)
           AND consumed_at IS NULL AND expires_at > NOW()
         "#,
     )
     .bind(user_did)
-    .bind(device_id)
+    .bind(bucketed_device_id)
+    .bind(raw_device_id)
     .fetch_one(pool)
     .await
     .map_err(|e| {
@@ -588,14 +588,15 @@ async fn handle_sync(
     let remaining_hashes: Vec<String> = sqlx::query_scalar::<_, String>(
         r#"
         SELECT key_package_hash FROM key_packages
-        WHERE owner_did = $1 AND device_id = $2
-          AND consumed_at IS NULL AND expires_at > $3
-          AND (reserved_at IS NULL OR reserved_at < $4)
+        WHERE owner_did = $1 AND (device_id = $2 OR device_id = $3 OR device_id IS NULL)
+          AND consumed_at IS NULL AND expires_at > $4
+          AND (reserved_at IS NULL OR reserved_at < $5)
         ORDER BY created_at DESC
         "#,
     )
     .bind(user_did)
-    .bind(device_id)
+    .bind(bucketed_device_id)
+    .bind(raw_device_id)
     .bind(now)
     .bind(reservation_timeout)
     .fetch_all(pool)
@@ -611,7 +612,7 @@ async fn handle_sync(
 
     info!(
         "✅ [sync] COMPLETE for device {} - deleted {}, {} remaining",
-        device_id, deleted_count, remaining.0
+        raw_device_id, deleted_count, remaining.0
     );
 
     Ok(serde_json::json!({
@@ -619,7 +620,7 @@ async fn handle_sync(
         "orphanedCount": orphaned_count,
         "deletedCount": deleted_count,
         "remainingAvailable": remaining.0,
-        "deviceId": device_id,
+        "deviceId": raw_device_id,
     }))
 }
 
@@ -643,27 +644,27 @@ pub async fn publish_key_packages_post(
 
     let did = auth_user.did.clone();
 
-    let (user_did, mut device_id) = parse_device_did(&did).map_err(|e| {
+    let (user_did, mut raw_device_id) = parse_device_did(&did).map_err(|e| {
         error!("Invalid DID format: {}", e);
         StatusCode::BAD_REQUEST
     })?;
 
     // If the auth DID doesn't include a #device fragment, use device_id from the request body
-    if device_id.is_empty() {
+    if raw_device_id.is_empty() {
         if let Some(ref req_device_id) = input.device_id {
             let req_dev = req_device_id.as_ref().trim();
             if !req_dev.is_empty() {
-                device_id = req_dev.to_string();
+                raw_device_id = req_dev.to_string();
             }
         }
     }
 
     // Privacy: hash device_id into an opaque bucket so the server can partition
     // key packages per device without learning actual device identifiers.
-    let device_id = if device_id.is_empty() {
-        device_id
+    let device_id = if raw_device_id.is_empty() {
+        raw_device_id.clone()
     } else {
-        let bucket_input = format!("{}#{}", user_did, device_id);
+        let bucket_input = format!("{}#{}", user_did, raw_device_id);
         crate::crypto::sha256_hex(bucket_input.as_bytes())[..16].to_string()
     };
 
@@ -698,7 +699,8 @@ pub async fn publish_key_packages_post(
         }
 
         "sync" => {
-            let sync_result = handle_sync(&pool, &input, &user_did).await?;
+            let sync_result =
+                handle_sync(&pool, &input, &user_did, &raw_device_id, &device_id).await?;
             let stats = build_stats(&pool, &did).await?;
             Ok(Json(serde_json::json!({
                 "stats": stats,
