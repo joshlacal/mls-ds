@@ -978,7 +978,7 @@ pub async fn get_all_key_packages(
     // 🔍 DIAGNOSTIC: Log the exact DID and cipher suite being queried
     info!(
         "🔍 [get_all_key_packages] Query params - did: '{}' (len: {}), cipher_suite: '{}'",
-        did,
+        crate::crypto::hash_for_log(did),
         did.len(),
         cipher_suite
     );
@@ -1032,11 +1032,15 @@ pub async fn get_all_key_packages(
         .await
         .unwrap_or_default();
 
+        let redacted_similar: Vec<(String, i64)> = similar_dids
+            .into_iter()
+            .map(|(d, c)| (crate::crypto::hash_for_log(&d), c))
+            .collect();
         warn!(
             "⚠️ [get_all_key_packages] No packages found for DID '{}'. Total packages with this DID (any cipher suite): {:?}. Similar DIDs in DB: {:?}",
-            did,
+            crate::crypto::hash_for_log(did),
             any_packages,
-            similar_dids
+            redacted_similar
         );
     }
 
