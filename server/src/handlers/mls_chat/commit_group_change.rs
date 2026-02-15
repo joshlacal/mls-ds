@@ -414,8 +414,7 @@ pub async fn commit_group_change(
 
             info!("✅ [v2.commitGroupChange] updateGroupInfo stored for convo {} epoch {}", convo_id, new_epoch);
             Ok(Json(serde_json::json!({
-                "action": "updateGroupInfo",
-                "updated": true,
+                "success": true,
             })))
         }
         "claimPending" => {
