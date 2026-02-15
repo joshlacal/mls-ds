@@ -525,12 +525,12 @@ async fn main() -> anyhow::Result<()> {
         get_key_package_status::GetKeyPackageStatusRequest,
         get_key_packages::GetKeyPackagesRequest, get_messages::GetMessagesRequest,
         get_pending_devices::GetPendingDevicesRequest, get_reports::GetReportsRequest,
-        leave_convo::LeaveConvoRequest, list_devices::ListDevicesRequest, opt_in::OptInRequest,
+        get_subscription_ticket::GetSubscriptionTicketRequest, leave_convo::LeaveConvoRequest,
+        list_devices::ListDevicesRequest, opt_in::OptInRequest,
         publish_key_packages::PublishKeyPackagesRequest, register_device::RegisterDeviceRequest,
         report::ReportRequest, send_ephemeral::SendEphemeralRequest,
         send_message::SendMessageRequest, update_convo::UpdateConvoRequest,
         update_cursor::UpdateCursorRequest,
-        get_subscription_ticket::GetSubscriptionTicketRequest,
     };
     use jacquard_axum::IntoRouter;
 

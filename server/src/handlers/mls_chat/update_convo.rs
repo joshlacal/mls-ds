@@ -13,7 +13,7 @@ use tls_codec::Deserialize as TlsDeserialize;
 use tracing::{error, info, warn};
 
 use crate::{
-    auth::{verify_is_admin, verify_is_member, count_admins, AuthUser},
+    auth::{count_admins, verify_is_admin, verify_is_member, AuthUser},
     device_utils::parse_device_did,
     generated::blue_catbird::mlsChat::update_convo::{UpdateConvo, UpdateConvoRequest},
     group_info::{get_group_info, store_group_info, MAX_GROUP_INFO_SIZE, MIN_GROUP_INFO_SIZE},
@@ -408,8 +408,12 @@ async fn handle_update_policy(
         .map(|p| serde_json::to_value(p).unwrap_or_default())
         .unwrap_or_default();
 
-    let allow_external_commits = policy_json.get("allowExternalCommits").and_then(|v| v.as_bool());
-    let require_invite_for_join = policy_json.get("requireInviteForJoin").and_then(|v| v.as_bool());
+    let allow_external_commits = policy_json
+        .get("allowExternalCommits")
+        .and_then(|v| v.as_bool());
+    let require_invite_for_join = policy_json
+        .get("requireInviteForJoin")
+        .and_then(|v| v.as_bool());
     let allow_rejoin = policy_json.get("allowRejoin").and_then(|v| v.as_bool());
     let rejoin_window_days = policy_json
         .get("rejoinWindowDays")
@@ -578,7 +582,10 @@ async fn handle_update_group_info(
                 existing_epoch = existing_epoch,
                 "Rejecting GroupInfo with non-increasing epoch"
             );
-            return (StatusCode::CONFLICT, "Epoch must be greater than current epoch")
+            return (
+                StatusCode::CONFLICT,
+                "Epoch must be greater than current epoch",
+            )
                 .into_response();
         }
     }

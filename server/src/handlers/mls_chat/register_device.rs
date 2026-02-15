@@ -168,17 +168,21 @@ async fn handle_register(
             );
 
             // Clean up old key packages
-            let deleted_count = sqlx::query("DELETE FROM key_packages WHERE owner_did = $1 AND device_id = $2")
-                .bind(&user_did)
-                .bind(&old_device_id)
-                .execute(pool)
-                .await
-                .map_err(|e| {
-                    error!("Failed to delete old key packages: {}", e);
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?
-                .rows_affected();
-            info!("Deleted {} old key packages for re-registered device {}", deleted_count, old_device_id);
+            let deleted_count =
+                sqlx::query("DELETE FROM key_packages WHERE owner_did = $1 AND device_id = $2")
+                    .bind(&user_did)
+                    .bind(&old_device_id)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| {
+                        error!("Failed to delete old key packages: {}", e);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?
+                    .rows_affected();
+            info!(
+                "Deleted {} old key packages for re-registered device {}",
+                deleted_count, old_device_id
+            );
 
             // Invalidate pending welcomes
             let invalidated = sqlx::query(
@@ -196,7 +200,11 @@ async fn handle_register(
             .rows_affected();
 
             if invalidated > 0 {
-                info!("Invalidated {} stale Welcome messages for re-registered user h:{}", invalidated, crate::crypto::hash_for_log(&user_did));
+                info!(
+                    "Invalidated {} stale Welcome messages for re-registered user h:{}",
+                    invalidated,
+                    crate::crypto::hash_for_log(&user_did)
+                );
             }
 
             // Update existing device record (keep device_id stable, update metadata)
@@ -248,17 +256,21 @@ async fn handle_register(
                 crate::crypto::hash_for_log(&user_did), device_id
             );
 
-            let deleted_count = sqlx::query("DELETE FROM key_packages WHERE owner_did = $1 AND device_id = $2")
-                .bind(&user_did)
-                .bind(&old_device_id)
-                .execute(pool)
-                .await
-                .map_err(|e| {
-                    error!("Failed to delete old key packages: {}", e);
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?
-                .rows_affected();
-            info!("Deleted {} old key packages for re-registered device {} (signature key match)", deleted_count, old_device_id);
+            let deleted_count =
+                sqlx::query("DELETE FROM key_packages WHERE owner_did = $1 AND device_id = $2")
+                    .bind(&user_did)
+                    .bind(&old_device_id)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| {
+                        error!("Failed to delete old key packages: {}", e);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?
+                    .rows_affected();
+            info!(
+                "Deleted {} old key packages for re-registered device {} (signature key match)",
+                deleted_count, old_device_id
+            );
 
             let invalidated = sqlx::query(
                 r#"UPDATE welcome_messages
@@ -305,22 +317,30 @@ async fn handle_register(
 
     info!(
         "Registering device for user h:{}: {} ({}) [re-registration: {}]",
-        crate::crypto::hash_for_log(&user_did), device_id, device_name, is_reregistration
+        crate::crypto::hash_for_log(&user_did),
+        device_id,
+        device_name,
+        is_reregistration
     );
 
     // Insert new device if not re-registration
     if !is_reregistration {
-        let device_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM devices WHERE user_did = $1")
-            .bind(&user_did)
-            .fetch_one(pool)
-            .await
-            .map_err(|e| {
-                error!("Failed to count user devices: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+        let device_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM devices WHERE user_did = $1")
+                .bind(&user_did)
+                .fetch_one(pool)
+                .await
+                .map_err(|e| {
+                    error!("Failed to count user devices: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
 
         if device_count.0 >= 10 {
-            warn!("User h:{} has reached device limit: {}", crate::crypto::hash_for_log(&user_did), device_count.0);
+            warn!(
+                "User h:{} has reached device limit: {}",
+                crate::crypto::hash_for_log(&user_did),
+                device_count.0
+            );
             return Err(StatusCode::TOO_MANY_REQUESTS);
         }
 
@@ -379,7 +399,10 @@ async fn handle_register(
             Err(e) => error!("Failed to store key package {}: {}", idx, e),
         }
     }
-    info!("Stored {} key packages for device {}", stored_count, device_id);
+    info!(
+        "Stored {} key packages for device {}",
+        stored_count, device_id
+    );
 
     // Update push token atomically if provided during registration
     if let Some(ref push_token) = input.push_token {
@@ -460,14 +483,23 @@ async fn handle_register(
                     pending_addition_id: pending_id.clone(),
                 };
                 if let Err(e) = sse_state.emit(convo_id, event).await {
-                    warn!("Failed to emit NewDeviceEvent for convo {}: {}", convo_id, e);
+                    warn!(
+                        "Failed to emit NewDeviceEvent for convo {}: {}",
+                        convo_id, e
+                    );
                 }
             }
             Ok(None) => {
-                info!("Pending addition already exists for device {} in convo {}", device_id, convo_id);
+                info!(
+                    "Pending addition already exists for device {} in convo {}",
+                    device_id, convo_id
+                );
             }
             Err(e) => {
-                warn!("Failed to create pending addition for convo {}: {}", convo_id, e);
+                warn!(
+                    "Failed to create pending addition for convo {}: {}",
+                    convo_id, e
+                );
             }
         }
     }
@@ -611,16 +643,15 @@ async fn handle_delete(
     let user_did = &auth_user.did;
 
     // Verify device exists and is owned by caller
-    let device_info: Option<(String, String)> = sqlx::query_as(
-        "SELECT user_did, credential_did FROM devices WHERE device_id = $1",
-    )
-    .bind(device_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| {
-        error!("Failed to query device: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let device_info: Option<(String, String)> =
+        sqlx::query_as("SELECT user_did, credential_did FROM devices WHERE device_id = $1")
+            .bind(device_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| {
+                error!("Failed to query device: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
     let (owner_did, credential_did) = match device_info {
         Some(info) => info,
@@ -637,21 +668,23 @@ async fn handle_delete(
     if owner_did != *user_did {
         warn!(
             "User h:{} attempted to delete device {} owned by another user",
-            crate::crypto::hash_for_log(user_did), device_id
+            crate::crypto::hash_for_log(user_did),
+            device_id
         );
         return Err(StatusCode::UNAUTHORIZED);
     }
 
     // Mark device as left in all conversations
-    let members_removed = sqlx::query("UPDATE members SET left_at = NOW() WHERE device_id = $1 AND left_at IS NULL")
-        .bind(device_id)
-        .execute(pool)
-        .await
-        .map_err(|e| {
-            error!("Failed to remove device from conversations: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?
-        .rows_affected();
+    let members_removed =
+        sqlx::query("UPDATE members SET left_at = NOW() WHERE device_id = $1 AND left_at IS NULL")
+            .bind(device_id)
+            .execute(pool)
+            .await
+            .map_err(|e| {
+                error!("Failed to remove device from conversations: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .rows_affected();
 
     // Clean up pending welcome messages (non-critical)
     sqlx::query("DELETE FROM welcome_messages WHERE recipient_did = $1 AND consumed = false")
@@ -792,7 +825,10 @@ async fn handle_claim_pending_addition(
 
     // Check terminal state
     if p_status != "pending" && p_status != "in_progress" {
-        warn!("Pending addition {} already in terminal state: {}", pending_addition_id, p_status);
+        warn!(
+            "Pending addition {} already in terminal state: {}",
+            pending_addition_id, p_status
+        );
         return Ok(Json(serde_json::json!({
             "claimed": false,
             "convoId": p_convo_id,
@@ -815,13 +851,20 @@ async fn handle_claim_pending_addition(
     })?;
 
     if is_member.is_none() {
-        warn!("User h:{} is not a member of conversation {}", crate::crypto::hash_for_log(&user_did), p_convo_id);
+        warn!(
+            "User h:{} is not a member of conversation {}",
+            crate::crypto::hash_for_log(&user_did),
+            p_convo_id
+        );
         return Err(StatusCode::FORBIDDEN);
     }
 
     // Prevent self-claim
     if p_user_did == user_did {
-        info!("User h:{} attempted to claim their own device addition - returning not claimed", crate::crypto::hash_for_log(&user_did));
+        info!(
+            "User h:{} attempted to claim their own device addition - returning not claimed",
+            crate::crypto::hash_for_log(&user_did)
+        );
         return Ok(Json(serde_json::json!({
             "claimed": false,
             "convoId": p_convo_id,
@@ -849,10 +892,7 @@ async fn handle_claim_pending_addition(
     })?;
 
     if claim_result.is_none() {
-        info!(
-            "Pending addition {} already claimed",
-            pending_addition_id,
-        );
+        info!("Pending addition {} already claimed", pending_addition_id,);
         return Ok(Json(serde_json::json!({
             "claimed": false,
             "convoId": p_convo_id,
@@ -861,7 +901,10 @@ async fn handle_claim_pending_addition(
         })));
     }
 
-    info!("Successfully claimed pending addition {} for conversation {}", pending_addition_id, p_convo_id);
+    info!(
+        "Successfully claimed pending addition {} for conversation {}",
+        pending_addition_id, p_convo_id
+    );
 
     // Fetch key package for new device
     let key_package: Option<(String, Option<String>, Option<String>, String)> = sqlx::query_as(
@@ -893,7 +936,11 @@ async fn handle_claim_pending_addition(
     });
 
     if key_package_json.is_none() {
-        warn!("No available key package for device {} (user h:{})", p_new_device_id, crate::crypto::hash_for_log(&p_user_did));
+        warn!(
+            "No available key package for device {} (user h:{})",
+            p_new_device_id,
+            crate::crypto::hash_for_log(&p_user_did)
+        );
     }
 
     Ok(Json(serde_json::json!({
@@ -983,7 +1030,10 @@ async fn handle_complete_pending_addition(
             }
             Some((status, claimed_by)) => {
                 if status != "in_progress" {
-                    warn!("Pending addition {} is not in_progress (status: {})", pending_addition_id, status);
+                    warn!(
+                        "Pending addition {} is not in_progress (status: {})",
+                        pending_addition_id, status
+                    );
                     return Ok(Json(serde_json::json!({
                         "success": false,
                         "error": format!("InvalidStatus:{}", status),
@@ -1002,7 +1052,10 @@ async fn handle_complete_pending_addition(
         }
     }
 
-    info!("Successfully completed pending addition {} at epoch {}", pending_addition_id, new_epoch);
+    info!(
+        "Successfully completed pending addition {} at epoch {}",
+        pending_addition_id, new_epoch
+    );
 
     Ok(Json(serde_json::json!({
         "success": true,

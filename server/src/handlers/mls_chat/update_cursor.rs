@@ -157,10 +157,7 @@ pub async fn update_cursor(
         }
 
         // Emit SSE read event
-        let cursor = sse_state
-            .cursor_gen
-            .next(&convo_id, "readEvent")
-            .await;
+        let cursor = sse_state.cursor_gen.next(&convo_id, "readEvent").await;
         let event = StreamEvent::ReadEvent {
             cursor,
             convo_id: convo_id.clone(),

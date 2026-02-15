@@ -61,24 +61,24 @@ pub async fn send_message(
     let delivery = input.delivery.as_deref().unwrap_or("persistent");
 
     match delivery {
-        "persistent" => handle_persistent(
-            pool,
-            sse_state,
-            notification_service,
-            federated_backend,
-            federation_config,
-            outbound_queue,
-            auth_user,
-            &input,
-        )
-        .await,
+        "persistent" => {
+            handle_persistent(
+                pool,
+                sse_state,
+                notification_service,
+                federated_backend,
+                federation_config,
+                outbound_queue,
+                auth_user,
+                &input,
+            )
+            .await
+        }
 
         "ephemeral" => {
             let action = input.action.as_deref().unwrap_or("typing");
             match action {
-                "addReaction" => {
-                    handle_add_reaction(pool, sse_state, auth_user, &input).await
-                }
+                "addReaction" => handle_add_reaction(pool, sse_state, auth_user, &input).await,
                 "removeReaction" => {
                     handle_remove_reaction(pool, sse_state, auth_user, &input).await
                 }
@@ -113,10 +113,11 @@ async fn handle_persistent(
     let idempotency_key = input.idempotency_key.as_ref().map(|k| k.to_string());
 
     // --- Validate msgId format (ULID 26 chars or UUID 36 chars) ---
-    let is_ulid =
-        msg_id.len() == 26 && msg_id.chars().all(|c| c.is_ascii_alphanumeric());
-    let is_uuid =
-        msg_id.len() == 36 && msg_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    let is_ulid = msg_id.len() == 26 && msg_id.chars().all(|c| c.is_ascii_alphanumeric());
+    let is_uuid = msg_id.len() == 36
+        && msg_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-');
     if !is_ulid && !is_uuid {
         error!("❌ [v2.sendMessage] Invalid msgId format");
         return Err(StatusCode::BAD_REQUEST);
@@ -128,7 +129,10 @@ async fn handle_persistent(
         return Err(StatusCode::BAD_REQUEST);
     }
     if input.ciphertext.len() > 10 * 1024 * 1024 {
-        error!("❌ [v2.sendMessage] Ciphertext too large: {} bytes", input.ciphertext.len());
+        error!(
+            "❌ [v2.sendMessage] Ciphertext too large: {} bytes",
+            input.ciphertext.len()
+        );
         return Err(StatusCode::BAD_REQUEST);
     }
     if input.ciphertext.len() as u32 != padded_size {
@@ -168,20 +172,19 @@ async fn handle_persistent(
     }
 
     // --- Fetch conversation epoch ---
-    let server_epoch: i64 = sqlx::query_scalar(
-        "SELECT CAST(current_epoch AS BIGINT) FROM conversations WHERE id = $1",
-    )
-    .bind(&convo_id)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|e| {
-        error!("❌ [v2.sendMessage] Failed to fetch conversation: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?
-    .ok_or_else(|| {
-        error!("❌ [v2.sendMessage] Conversation not found");
-        StatusCode::NOT_FOUND
-    })?;
+    let server_epoch: i64 =
+        sqlx::query_scalar("SELECT CAST(current_epoch AS BIGINT) FROM conversations WHERE id = $1")
+            .bind(&convo_id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| {
+                error!("❌ [v2.sendMessage] Failed to fetch conversation: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .ok_or_else(|| {
+                error!("❌ [v2.sendMessage] Conversation not found");
+                StatusCode::NOT_FOUND
+            })?;
 
     let client_epoch = input.epoch;
     if client_epoch != server_epoch {
@@ -300,7 +303,9 @@ async fn handle_persistent(
 
     tracing::debug!(
         "✅ [v2.sendMessage] message created: msgId={}, seq={}, epoch={}",
-        crate::crypto::redact_for_log(&row_id), seq, client_epoch
+        crate::crypto::redact_for_log(&row_id),
+        seq,
+        client_epoch
     );
 
     // --- Spawn async fan-out (envelopes, SSE, push, federation) ---
@@ -432,10 +437,16 @@ async fn handle_persistent(
                     }
                 };
 
-                match federated_backend.get_participant_ds_dids(&convo_id_clone).await {
+                match federated_backend
+                    .get_participant_ds_dids(&convo_id_clone)
+                    .await
+                {
                     Ok(ds_dids) => {
                         for ds_did in ds_dids {
-                            if crate::identity::dids_equivalent(&ds_did, &federation_config.self_did) {
+                            if crate::identity::dids_equivalent(
+                                &ds_did,
+                                &federation_config.self_did,
+                            ) {
                                 continue;
                             }
                             let target_endpoint = ds_did
@@ -492,8 +503,16 @@ async fn handle_add_reaction(
     input: &crate::generated::blue_catbird::mlsChat::send_message::SendMessage<'_>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let convo_id = input.convo_id.to_string();
-    let target_msg = input.target_message_id.as_deref().unwrap_or_default().to_string();
-    let emoji = input.reaction_emoji.as_deref().unwrap_or_default().to_string();
+    let target_msg = input
+        .target_message_id
+        .as_deref()
+        .unwrap_or_default()
+        .to_string();
+    let emoji = input
+        .reaction_emoji
+        .as_deref()
+        .unwrap_or_default()
+        .to_string();
     let user_did = auth_user.did.clone();
 
     if emoji.is_empty() || emoji.len() > 16 {
@@ -520,17 +539,16 @@ async fn handle_add_reaction(
     }
 
     // Check message exists
-    let msg_exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM messages WHERE convo_id = $1 AND id = $2)",
-    )
-    .bind(&convo_id)
-    .bind(&target_msg)
-    .fetch_one(&pool)
-    .await
-    .map_err(|e| {
-        error!("❌ [v2.sendMessage:addReaction] msg existence: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let msg_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM messages WHERE convo_id = $1 AND id = $2)")
+            .bind(&convo_id)
+            .bind(&target_msg)
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| {
+                error!("❌ [v2.sendMessage:addReaction] msg existence: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
     if !msg_exists {
         error!("❌ [v2.sendMessage:addReaction] Message not found");
@@ -573,7 +591,13 @@ async fn handle_add_reaction(
     };
 
     if let Err(e) = crate::db::store_reaction_event(
-        &pool, &cursor, &convo_id, &target_msg, &user_did, &emoji, "add",
+        &pool,
+        &cursor,
+        &convo_id,
+        &target_msg,
+        &user_did,
+        &emoji,
+        "add",
     )
     .await
     {
@@ -601,8 +625,16 @@ async fn handle_remove_reaction(
     input: &crate::generated::blue_catbird::mlsChat::send_message::SendMessage<'_>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let convo_id = input.convo_id.to_string();
-    let target_msg = input.target_message_id.as_deref().unwrap_or_default().to_string();
-    let emoji = input.reaction_emoji.as_deref().unwrap_or_default().to_string();
+    let target_msg = input
+        .target_message_id
+        .as_deref()
+        .unwrap_or_default()
+        .to_string();
+    let emoji = input
+        .reaction_emoji
+        .as_deref()
+        .unwrap_or_default()
+        .to_string();
     let user_did = auth_user.did.clone();
 
     // Check membership
@@ -655,7 +687,13 @@ async fn handle_remove_reaction(
     };
 
     if let Err(e) = crate::db::store_reaction_event(
-        &pool, &cursor, &convo_id, &target_msg, &user_did, &emoji, "remove",
+        &pool,
+        &cursor,
+        &convo_id,
+        &target_msg,
+        &user_did,
+        &emoji,
+        "remove",
     )
     .await
     {

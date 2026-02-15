@@ -23,7 +23,10 @@ pub async fn list_devices(
     }
 
     let user_did = &auth_user.did;
-    info!("Listing devices for user {}", crate::crypto::redact_for_log(user_did));
+    info!(
+        "Listing devices for user {}",
+        crate::crypto::redact_for_log(user_did)
+    );
 
     let rows = sqlx::query(
         r#"
@@ -53,7 +56,11 @@ pub async fn list_devices(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    info!("Found {} devices for user {}", rows.len(), crate::crypto::redact_for_log(user_did));
+    info!(
+        "Found {} devices for user {}",
+        rows.len(),
+        crate::crypto::redact_for_log(user_did)
+    );
 
     let devices_json: Vec<serde_json::Value> = rows
         .into_iter()

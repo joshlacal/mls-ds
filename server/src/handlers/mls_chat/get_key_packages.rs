@@ -3,8 +3,7 @@ use jacquard_axum::ExtractXrpc;
 use tracing::{error, info};
 
 use crate::{
-    auth::AuthUser,
-    generated::blue_catbird::mlsChat::get_key_packages::GetKeyPackagesRequest,
+    auth::AuthUser, generated::blue_catbird::mlsChat::get_key_packages::GetKeyPackagesRequest,
     storage::DbPool,
 };
 
@@ -84,7 +83,11 @@ pub async fn get_key_packages(
                 missing.push(did.as_ref().to_string());
             }
             Err(e) => {
-                error!("Failed to fetch key packages for h:{}: {}", &crate::crypto::hash_for_log(did.as_ref()), e);
+                error!(
+                    "Failed to fetch key packages for h:{}: {}",
+                    &crate::crypto::hash_for_log(did.as_ref()),
+                    e
+                );
                 missing.push(did.as_ref().to_string());
             }
         }

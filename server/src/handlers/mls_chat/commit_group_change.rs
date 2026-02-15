@@ -8,13 +8,10 @@ use tracing::{error, info, warn};
 use jacquard_axum::ExtractXrpc;
 
 use crate::{
-    actors::ActorRegistry,
-    auth::AuthUser,
-    block_sync::BlockSyncService,
+    actors::ActorRegistry, auth::AuthUser, block_sync::BlockSyncService,
     device_utils::parse_device_did,
     generated::blue_catbird::mlsChat::commit_group_change::CommitGroupChangeRequest,
-    realtime::SseState,
-    storage::DbPool,
+    realtime::SseState, storage::DbPool,
 };
 
 const NSID: &str = "blue.catbird.mlsChat.commitGroupChange";
@@ -36,6 +33,12 @@ struct PendingAdditionRow {
     created_at: DateTime<Utc>,
 }
 
+fn invalidate_welcome_response(rows_affected: u64) -> serde_json::Value {
+    serde_json::json!({
+        "success": rows_affected > 0,
+    })
+}
+
 /// Consolidated group change handler
 /// POST /xrpc/blue.catbird.mlsChat.commitGroupChange
 ///
@@ -53,9 +56,7 @@ pub async fn commit_group_change(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    let success_response = || {
-        serde_json::json!({ "success": true })
-    };
+    let success_response = || serde_json::json!({ "success": true });
 
     match input.action.as_ref() {
         "addMembers" => {
@@ -225,7 +226,10 @@ pub async fn commit_group_change(
                 .await;
             }
 
-            info!("✅ v2.commitGroupChange: addMembers complete, epoch={}", new_epoch);
+            info!(
+                "✅ v2.commitGroupChange: addMembers complete, epoch={}",
+                new_epoch
+            );
             Ok(Json(serde_json::json!({
                 "success": true,
                 "newEpoch": new_epoch,
@@ -242,6 +246,42 @@ pub async fn commit_group_change(
         "readdition" => {
             info!("v2.commitGroupChange: readdition for convo");
             Ok(Json(success_response()))
+        }
+        "invalidateWelcome" => {
+            let convo_id = input.convo_id.to_string();
+            if convo_id.trim().is_empty() {
+                warn!("invalidateWelcome: missing convo_id");
+                return Err(StatusCode::BAD_REQUEST);
+            }
+
+            let invalidated = sqlx::query(
+                r#"
+                UPDATE welcome_messages
+                SET consumed = true,
+                    consumed_at = NOW(),
+                    error_reason = COALESCE(error_reason, 'Client invalidated Welcome')
+                WHERE convo_id = $1
+                  AND recipient_did = $2
+                  AND consumed = false
+                "#,
+            )
+            .bind(&convo_id)
+            .bind(&auth_user.did)
+            .execute(&pool)
+            .await
+            .map_err(|e| {
+                error!("invalidateWelcome: failed to invalidate welcome: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .rows_affected();
+
+            info!(
+                "✅ [v2.commitGroupChange] invalidateWelcome complete for convo {} (rows={})",
+                crate::crypto::redact_for_log(&convo_id),
+                invalidated
+            );
+
+            Ok(Json(invalidate_welcome_response(invalidated)))
         }
         "listPending" => {
             let convo_id = input.convo_id.to_string();
@@ -264,7 +304,10 @@ pub async fn commit_group_change(
             .execute(&pool)
             .await
             .map_err(|e| {
-                error!("❌ [v2.commitGroupChange] Failed to release expired claims: {}", e);
+                error!(
+                    "❌ [v2.commitGroupChange] Failed to release expired claims: {}",
+                    e
+                );
                 StatusCode::INTERNAL_SERVER_ERROR
             })?
             .rows_affected();
@@ -314,11 +357,17 @@ pub async fn commit_group_change(
                 .await
             }
             .map_err(|e| {
-                error!("❌ [v2.commitGroupChange] Failed to fetch pending additions: {}", e);
+                error!(
+                    "❌ [v2.commitGroupChange] Failed to fetch pending additions: {}",
+                    e
+                );
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
-            info!("✅ [v2.commitGroupChange] Found {} pending additions", pending.len());
+            info!(
+                "✅ [v2.commitGroupChange] Found {} pending additions",
+                pending.len()
+            );
 
             let additions: Vec<serde_json::Value> = pending
                 .into_iter()
@@ -385,17 +434,16 @@ pub async fn commit_group_change(
                 })?;
 
             // Store group_info
-            let current_epoch: Option<i32> = sqlx::query_scalar(
-                "SELECT group_info_epoch FROM conversations WHERE id = $1",
-            )
-            .bind(&convo_id)
-            .fetch_optional(&pool)
-            .await
-            .map_err(|e| {
-                error!("Failed to fetch current epoch: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?
-            .flatten();
+            let current_epoch: Option<i32> =
+                sqlx::query_scalar("SELECT group_info_epoch FROM conversations WHERE id = $1")
+                    .bind(&convo_id)
+                    .fetch_optional(&pool)
+                    .await
+                    .map_err(|e| {
+                        error!("Failed to fetch current epoch: {}", e);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?
+                    .flatten();
 
             let new_epoch = current_epoch.unwrap_or(0) + 1;
 
@@ -412,7 +460,10 @@ pub async fn commit_group_change(
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
-            info!("✅ [v2.commitGroupChange] updateGroupInfo stored for convo {} epoch {}", convo_id, new_epoch);
+            info!(
+                "✅ [v2.commitGroupChange] updateGroupInfo stored for convo {} epoch {}",
+                convo_id, new_epoch
+            );
             Ok(Json(serde_json::json!({
                 "success": true,
             })))
@@ -488,5 +539,28 @@ pub async fn commit_group_change(
             warn!("v2.commitGroupChange: unknown action: {}", other);
             Err(StatusCode::BAD_REQUEST)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalidate_welcome_response_returns_false_when_nothing_invalidated() {
+        let response = invalidate_welcome_response(0);
+        assert_eq!(
+            response.get("success").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn invalidate_welcome_response_returns_true_when_rows_invalidated() {
+        let response = invalidate_welcome_response(2);
+        assert_eq!(
+            response.get("success").and_then(|v| v.as_bool()),
+            Some(true)
+        );
     }
 }

@@ -481,7 +481,7 @@ pub async fn rate_limit_middleware(request: Request, next: Next) -> Result<Respo
 mod tests {
     use super::*;
     use axum::body::Body;
-    use axum::http::Request as HttpRequest;
+    use axum::http::{HeaderMap, HeaderValue, Request as HttpRequest};
     use std::net::{IpAddr, Ipv4Addr};
 
     #[test]
@@ -527,6 +527,28 @@ mod tests {
 
         // Different user should have own bucket
         assert!(limiter.check("user2").is_ok());
+    }
+
+    #[test]
+    fn recovery_mode_header_is_case_insensitive_for_key_package_endpoints() {
+        let mut headers = HeaderMap::new();
+        headers.insert(RECOVERY_MODE_HEADER, HeaderValue::from_static("TrUe"));
+
+        assert!(is_recovery_mode_request(
+            &headers,
+            "/xrpc/blue.catbird.mlsChat.publishKeyPackages"
+        ));
+    }
+
+    #[test]
+    fn recovery_mode_does_not_apply_to_non_recovery_endpoints() {
+        let mut headers = HeaderMap::new();
+        headers.insert(RECOVERY_MODE_HEADER, HeaderValue::from_static("true"));
+
+        assert!(!is_recovery_mode_request(
+            &headers,
+            "/xrpc/blue.catbird.mlsChat.commitGroupChange"
+        ));
     }
 
     #[test]

@@ -426,7 +426,9 @@ fn validate_endpoint_url_with_policy(
     Ok(parsed)
 }
 
-pub(crate) async fn validate_resolved_host_is_public(parsed: &url::Url) -> Result<(), FederationError> {
+pub(crate) async fn validate_resolved_host_is_public(
+    parsed: &url::Url,
+) -> Result<(), FederationError> {
     let Some(host) = parsed.host_str() else {
         return Err(FederationError::ResolutionFailed {
             did: String::new(),

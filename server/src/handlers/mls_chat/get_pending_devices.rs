@@ -5,8 +5,7 @@ use sqlx::Row;
 use tracing::{error, info};
 
 use crate::{
-    auth::AuthUser,
-    device_utils::parse_device_did,
+    auth::AuthUser, device_utils::parse_device_did,
     generated::blue_catbird::mlsChat::get_pending_devices::GetPendingDevicesRequest,
     storage::DbPool,
 };
@@ -157,5 +156,7 @@ pub async fn get_pending_devices(
         })
         .collect();
 
-    Ok(Json(serde_json::json!({ "pendingAdditions": pending_additions })))
+    Ok(Json(
+        serde_json::json!({ "pendingAdditions": pending_additions }),
+    ))
 }

@@ -10,8 +10,7 @@ use sqlx::FromRow;
 use tracing::{error, info, warn};
 
 use crate::{
-    auth::AuthUser,
-    generated::blue_catbird::mlsChat::get_messages::GetMessagesRequest,
+    auth::AuthUser, generated::blue_catbird::mlsChat::get_messages::GetMessagesRequest,
     storage::DbPool,
 };
 
@@ -97,16 +96,13 @@ pub async fn get_messages(
         }
 
         "commit" | "commits" => {
-            let commits =
-                fetch_commits(&pool, did, &convo_id, from_epoch, to_epoch).await?;
+            let commits = fetch_commits(&pool, did, &convo_id, from_epoch, to_epoch).await?;
             Ok(Json(commits))
         }
 
         "all" => {
-            let messages =
-                fetch_app_messages(&pool, did, &convo_id, since_seq, limit).await?;
-            let commits =
-                fetch_commits(&pool, did, &convo_id, from_epoch, to_epoch).await?;
+            let messages = fetch_app_messages(&pool, did, &convo_id, since_seq, limit).await?;
+            let commits = fetch_commits(&pool, did, &convo_id, from_epoch, to_epoch).await?;
 
             let mut response = messages;
             if let Some(commit_list) = commits.get("commits") {
@@ -171,7 +167,10 @@ async fn fetch_app_messages(
         .fetch_all(pool)
         .await
         .map_err(|e| {
-            error!("❌ [v2.getMessages] Failed to fetch messages since seq: {}", e);
+            error!(
+                "❌ [v2.getMessages] Failed to fetch messages since seq: {}",
+                e
+            );
             StatusCode::INTERNAL_SERVER_ERROR
         })?
     } else {
@@ -214,8 +213,7 @@ async fn fetch_app_messages(
     let message_views: Vec<serde_json::Value> = messages
         .into_iter()
         .map(|m| {
-            let ciphertext_b64 =
-                base64::engine::general_purpose::STANDARD.encode(&m.ciphertext);
+            let ciphertext_b64 = base64::engine::general_purpose::STANDARD.encode(&m.ciphertext);
             serde_json::json!({
                 "id": m.id,
                 "convoId": m.convo_id,
@@ -228,7 +226,10 @@ async fn fetch_app_messages(
         })
         .collect();
 
-    info!("✅ [v2.getMessages] Fetched {} app messages", message_views.len());
+    info!(
+        "✅ [v2.getMessages] Fetched {} app messages",
+        message_views.len()
+    );
 
     let mut response = serde_json::json!({
         "messages": message_views,
@@ -324,8 +325,7 @@ async fn fetch_commits(
     let commit_views: Vec<serde_json::Value> = commits
         .into_iter()
         .map(|c| {
-            let commit_data_b64 =
-                base64::engine::general_purpose::STANDARD.encode(&c.ciphertext);
+            let commit_data_b64 = base64::engine::general_purpose::STANDARD.encode(&c.ciphertext);
             serde_json::json!({
                 "id": c.id,
                 "epoch": c.epoch,

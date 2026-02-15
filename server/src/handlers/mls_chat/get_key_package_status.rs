@@ -4,8 +4,7 @@ use sqlx::Row;
 use tracing::{error, info, warn};
 
 use crate::{
-    auth::AuthUser,
-    device_utils::parse_device_did,
+    auth::AuthUser, device_utils::parse_device_did,
     generated::blue_catbird::mlsChat::get_key_package_status::GetKeyPackageStatusRequest,
     storage::DbPool,
 };
@@ -108,7 +107,10 @@ pub async fn get_key_package_status(
                 let threshold = 5;
                 let needs_replenish = available < threshold;
 
-                info!("Key package stats: available={}, total={}, expired={}", available, total, expired);
+                info!(
+                    "Key package stats: available={}, total={}, expired={}",
+                    available, total, expired
+                );
 
                 result.insert(
                     "stats".to_string(),

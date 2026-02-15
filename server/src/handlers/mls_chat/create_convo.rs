@@ -73,12 +73,11 @@ async fn handle_revoke_invite(
     info!(invite_id = %invite_id, caller = %caller_did, "v2.createConvo: revoking invite");
 
     // Get conversation ID from invite
-    let convo_id: Option<String> =
-        sqlx::query_scalar("SELECT convo_id FROM invites WHERE id = $1")
-            .bind(&invite_id)
-            .fetch_optional(pool)
-            .await
-            .unwrap_or(None);
+    let convo_id: Option<String> = sqlx::query_scalar("SELECT convo_id FROM invites WHERE id = $1")
+        .bind(&invite_id)
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None);
 
     let convo_id = match convo_id {
         Some(cid) => cid,
@@ -151,7 +150,10 @@ async fn handle_create_convo(
         "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
     ];
     if !valid_suites.contains(&input.cipher_suite.as_str()) {
-        warn!("❌ [v2.createConvo] Invalid cipher suite: {}", input.cipher_suite);
+        warn!(
+            "❌ [v2.createConvo] Invalid cipher suite: {}",
+            input.cipher_suite
+        );
         return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -167,7 +169,10 @@ async fn handle_create_convo(
         let total_member_count = members.len() + 1;
         let max_members = 1000;
         if total_member_count > max_members {
-            warn!("❌ [v2.createConvo] Too many members: {}", total_member_count);
+            warn!(
+                "❌ [v2.createConvo] Too many members: {}",
+                total_member_count
+            );
             return Err((
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
@@ -231,7 +236,10 @@ async fn handle_create_convo(
                 })?;
 
                 if !blocks.is_empty() {
-                    warn!("❌ [v2.createConvo] Block detected: {} blocks (DB cache)", blocks.len());
+                    warn!(
+                        "❌ [v2.createConvo] Block detected: {} blocks (DB cache)",
+                        blocks.len()
+                    );
                     return Err((
                         StatusCode::FORBIDDEN,
                         Json(serde_json::json!({
@@ -260,21 +268,28 @@ async fn handle_create_convo(
 
     // ── Idempotency check (group_id is the primary key) ──────────────────
     // Check if conversation already exists with this group_id
-    let existing: Option<String> =
-        sqlx::query_scalar("SELECT id FROM conversations WHERE id = $1")
-            .bind(&convo_id)
-            .fetch_optional(&pool)
-            .await
-            .map_err(|e| {
-                error!("❌ [v2.createConvo] idempotency check: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
-            })?;
+    let existing: Option<String> = sqlx::query_scalar("SELECT id FROM conversations WHERE id = $1")
+        .bind(&convo_id)
+        .fetch_optional(&pool)
+        .await
+        .map_err(|e| {
+            error!("❌ [v2.createConvo] idempotency check: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        })?;
 
     if existing.is_some() {
         tracing::debug!("📍 [v2.createConvo] Idempotency: returning existing conversation");
 
         // Fetch existing members
-        let existing_members: Vec<(String, String, Option<String>, Option<String>, DateTime<Utc>, bool, Option<i32>)> = sqlx::query_as(
+        let existing_members: Vec<(
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            DateTime<Utc>,
+            bool,
+            Option<i32>,
+        )> = sqlx::query_as(
             "SELECT member_did, user_did, device_id, device_name, joined_at, is_admin, leaf_index
              FROM members WHERE convo_id = $1 AND left_at IS NULL ORDER BY joined_at",
         )
@@ -288,18 +303,28 @@ async fn handle_create_convo(
 
         let members_json: Vec<serde_json::Value> = existing_members
             .into_iter()
-            .map(|(member_did, user_did, device_id, device_name, joined_at, is_admin, leaf_index)| {
-                serde_json::json!({
-                    "did": member_did,
-                    "userDid": user_did,
-                    "deviceId": device_id,
-                    "deviceName": device_name,
-                    "joinedAt": chrono_to_datetime(joined_at).to_string(),
-                    "isAdmin": is_admin,
-                    "leafIndex": leaf_index,
-                    "isModerator": false,
-                })
-            })
+            .map(
+                |(
+                    member_did,
+                    user_did,
+                    device_id,
+                    device_name,
+                    joined_at,
+                    is_admin,
+                    leaf_index,
+                )| {
+                    serde_json::json!({
+                        "did": member_did,
+                        "userDid": user_did,
+                        "deviceId": device_id,
+                        "deviceName": device_name,
+                        "joinedAt": chrono_to_datetime(joined_at).to_string(),
+                        "isAdmin": is_admin,
+                        "leafIndex": leaf_index,
+                        "isModerator": false,
+                    })
+                },
+            )
             .collect();
 
         let mut convo_json = serde_json::json!({
@@ -465,7 +490,10 @@ async fn handle_create_convo(
                         .into_response());
                 }
             }
-            info!("✅ [v2.createConvo] All {} key package hashes validated", kp_hashes.len());
+            info!(
+                "✅ [v2.createConvo] All {} key package hashes validated",
+                kp_hashes.len()
+            );
         }
 
         // Collect all member DIDs (creator + initial_members)
