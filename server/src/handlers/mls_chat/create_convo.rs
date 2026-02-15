@@ -420,23 +420,22 @@ async fn handle_create_convo(
             welcome_data.len()
         );
 
-        // Validate key packages
+        // Validate key package hashes exist (key packages are already consumed
+        // at getKeyPackages time, so we only check existence, not availability)
         if let Some(ref kp_hashes) = input.key_package_hashes {
             info!(
-                "📍 [v2.createConvo] Validating {} key packages...",
+                "📍 [v2.createConvo] Validating {} key package hashes...",
                 kp_hashes.len()
             );
             for entry in kp_hashes {
                 let member_did_str = did_to_string(&entry.did);
                 let hash_hex: &str = &entry.hash;
 
-                let available: bool = sqlx::query_scalar(
+                let exists: bool = sqlx::query_scalar(
                     r#"SELECT EXISTS(
                         SELECT 1 FROM key_packages
                         WHERE owner_did = $1
                           AND key_package_hash = $2
-                          AND consumed_at IS NULL
-                          AND (reserved_at IS NULL OR reserved_at < NOW() - INTERVAL '5 minutes')
                     )"#,
                 )
                 .bind(&member_did_str)
@@ -448,37 +447,25 @@ async fn handle_create_convo(
                     StatusCode::INTERNAL_SERVER_ERROR.into_response()
                 })?;
 
-                if !available {
-                    let available_count: i64 = sqlx::query_scalar(
-                        r#"SELECT COUNT(*) FROM key_packages
-                           WHERE owner_did = $1
-                             AND consumed_at IS NULL
-                             AND (reserved_at IS NULL OR reserved_at < NOW() - INTERVAL '5 minutes')"#,
-                    )
-                    .bind(&member_did_str)
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap_or(0);
-
+                if !exists {
                     warn!(
-                        "❌ [v2.createConvo] Key package not available for {}: available={}",
+                        "❌ [v2.createConvo] Key package hash not found for {}",
                         crate::crypto::redact_for_log(&member_did_str),
-                        available_count
                     );
                     return Err((
-                        StatusCode::CONFLICT,
+                        StatusCode::BAD_REQUEST,
                         Json(serde_json::json!({
                             "error": "KeyPackageNotFound",
                             "message": format!(
-                                "Key package not available for {}: hash={}. Server has {} available.",
-                                member_did_str, hash_hex, available_count
+                                "Key package hash not found for {}: hash={}",
+                                member_did_str, hash_hex
                             )
                         })),
                     )
                         .into_response());
                 }
             }
-            info!("✅ [v2.createConvo] All {} key packages available", kp_hashes.len());
+            info!("✅ [v2.createConvo] All {} key package hashes validated", kp_hashes.len());
         }
 
         // Collect all member DIDs (creator + initial_members)
