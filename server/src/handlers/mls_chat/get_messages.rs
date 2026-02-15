@@ -25,7 +25,6 @@ const NSID: &str = "blue.catbird.mlsChat.getMessages";
 struct MessageRow {
     id: String,
     convo_id: String,
-    sender_did: String,
     message_type: String,
     epoch: i64,
     seq: i64,
@@ -38,7 +37,6 @@ struct CommitRow {
     id: String,
     epoch: i64,
     ciphertext: Vec<u8>,
-    sender_did: String,
     created_at: DateTime<Utc>,
 }
 
@@ -158,7 +156,7 @@ async fn fetch_app_messages(
     let messages: Vec<MessageRow> = if let Some(since) = since_seq {
         sqlx::query_as::<_, MessageRow>(
             r#"
-            SELECT id, convo_id, sender_did, message_type,
+            SELECT id, convo_id, message_type,
                    CAST(epoch AS BIGINT) as epoch, CAST(seq AS BIGINT) as seq,
                    ciphertext, created_at
             FROM messages
@@ -179,7 +177,7 @@ async fn fetch_app_messages(
     } else {
         sqlx::query_as::<_, MessageRow>(
             r#"
-            SELECT id, convo_id, sender_did, message_type,
+            SELECT id, convo_id, message_type,
                    CAST(epoch AS BIGINT) as epoch, CAST(seq AS BIGINT) as seq,
                    ciphertext, created_at
             FROM messages
@@ -305,7 +303,7 @@ async fn fetch_commits(
 
     let commits = sqlx::query_as::<_, CommitRow>(
         r#"
-        SELECT id, epoch, ciphertext, sender_did, created_at
+        SELECT id, epoch, ciphertext, created_at
         FROM messages
         WHERE convo_id = $1 AND message_type = 'commit' AND epoch >= $2 AND epoch <= $3
         ORDER BY epoch ASC, created_at ASC
@@ -332,7 +330,7 @@ async fn fetch_commits(
                 "id": c.id,
                 "epoch": c.epoch,
                 "commitData": { "$bytes": commit_data_b64 },
-                "sender": c.sender_did,
+                "sender": serde_json::Value::Null,
                 "createdAt": c.created_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             })
         })
