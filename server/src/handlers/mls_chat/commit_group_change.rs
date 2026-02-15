@@ -39,7 +39,7 @@ struct PendingAdditionRow {
 /// Consolidated group change handler
 /// POST /xrpc/blue.catbird.mlsChat.commitGroupChange
 ///
-/// Consolidates: addMembers, processExternalCommit, rejoin, readdition, listPending
+/// Consolidates: addMembers, processExternalCommit, rejoin, readdition, listPending, claimPending
 #[tracing::instrument(skip(pool, _sse_state, _actor_registry, _block_sync, auth_user, input))]
 pub async fn commit_group_change(
     State(pool): State<DbPool>,
@@ -417,6 +417,73 @@ pub async fn commit_group_change(
                 "action": "updateGroupInfo",
                 "updated": true,
             })))
+        }
+        "claimPending" => {
+            let convo_id = input.convo_id.to_string();
+            let (caller_did, _) = parse_device_did(&auth_user.did).map_err(|e| {
+                error!("claimPending: invalid DID: {}", e);
+                StatusCode::BAD_REQUEST
+            })?;
+
+            let pending_id = input.pending_addition_id.as_ref().ok_or_else(|| {
+                warn!("claimPending: missing pending_addition_id");
+                StatusCode::BAD_REQUEST
+            })?;
+
+            let claimed = sqlx::query_as::<_, PendingAdditionRow>(
+                r#"
+                UPDATE pending_device_additions
+                SET status = 'in_progress',
+                    claimed_by_did = $1,
+                    claimed_at = NOW(),
+                    claim_expires_at = NOW() + INTERVAL '5 minutes',
+                    updated_at = NOW()
+                WHERE id = $2 AND convo_id = $3 AND status = 'pending'
+                RETURNING id, convo_id, user_did, new_device_id, new_device_credential_did,
+                          device_name, status, claimed_by_did, created_at
+                "#,
+            )
+            .bind(&caller_did)
+            .bind(pending_id.to_string())
+            .bind(&convo_id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| {
+                error!("claimPending: DB error: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+            match claimed {
+                Some(row) => {
+                    info!("✅ [v2.commitGroupChange] Claimed pending addition");
+                    let mut obj = serde_json::json!({
+                        "id": row.id,
+                        "convoId": row.convo_id,
+                        "userDid": row.user_did,
+                        "deviceId": row.new_device_id,
+                        "deviceCredentialDid": row.new_device_credential_did,
+                        "status": row.status,
+                        "createdAt": row.created_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    });
+                    if let Some(name) = row.device_name {
+                        obj["deviceName"] = serde_json::json!(name);
+                    }
+                    if let Some(claimed_by) = row.claimed_by_did {
+                        obj["claimedBy"] = serde_json::json!(claimed_by);
+                    }
+                    Ok(Json(serde_json::json!({
+                        "success": true,
+                        "claimedAddition": obj,
+                    })))
+                }
+                None => {
+                    warn!("claimPending: no matching pending addition found");
+                    Ok(Json(serde_json::json!({
+                        "success": false,
+                        "claimedAddition": null,
+                    })))
+                }
+            }
         }
         other => {
             warn!("v2.commitGroupChange: unknown action: {}", other);
