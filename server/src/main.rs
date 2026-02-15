@@ -522,7 +522,8 @@ async fn main() -> anyhow::Result<()> {
         blocks::BlocksRequest, commit_group_change::CommitGroupChangeRequest,
         create_convo::CreateConvoRequest, get_convo_settings::GetConvoSettingsRequest,
         get_convos::GetConvosRequest, get_group_state::GetGroupStateRequest,
-        get_key_package_status::GetKeyPackageStatusRequest, get_messages::GetMessagesRequest,
+        get_key_package_status::GetKeyPackageStatusRequest,
+        get_key_packages::GetKeyPackagesRequest, get_messages::GetMessagesRequest,
         get_pending_devices::GetPendingDevicesRequest, get_reports::GetReportsRequest,
         leave_convo::LeaveConvoRequest, list_devices::ListDevicesRequest, opt_in::OptInRequest,
         publish_key_packages::PublishKeyPackagesRequest, register_device::RegisterDeviceRequest,
@@ -548,6 +549,9 @@ async fn main() -> anyhow::Result<()> {
         ))
         .merge(GetKeyPackageStatusRequest::into_router(
             handlers::mls_chat::get_key_package_status,
+        ))
+        .merge(GetKeyPackagesRequest::into_router(
+            handlers::mls_chat::get_key_packages,
         ))
         // Conversations & Messaging
         .merge(CreateConvoRequest::into_router(

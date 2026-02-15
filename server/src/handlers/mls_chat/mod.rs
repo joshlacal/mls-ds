@@ -3,6 +3,7 @@
 
 // Identity & Devices
 pub mod get_key_package_status;
+pub mod get_key_packages;
 pub mod get_pending_devices;
 pub mod list_devices;
 pub mod publish_key_packages;
@@ -41,6 +42,7 @@ pub mod request_failover;
 
 // Re-exports: Identity & Devices
 pub use get_key_package_status::get_key_package_status;
+pub use get_key_packages::get_key_packages;
 pub use get_pending_devices::get_pending_devices;
 pub use list_devices::list_devices;
 pub use publish_key_packages::publish_key_packages_post;
