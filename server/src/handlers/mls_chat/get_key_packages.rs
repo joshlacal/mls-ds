@@ -41,7 +41,7 @@ pub async fn get_key_packages(
                      AND cipher_suite = $2
                    ORDER BY created_at ASC LIMIT 1
                  )
-                 RETURNING owner_did, cipher_suite, encode(key_package, 'base64'), key_package_hash",
+                 RETURNING owner_did, cipher_suite, replace(encode(key_package, 'base64'), chr(10), ''), key_package_hash",
             )
             .bind(did.as_ref())
             .bind(cs.as_ref())
@@ -57,7 +57,7 @@ pub async fn get_key_packages(
                      AND (reserved_at IS NULL OR reserved_at < NOW() - INTERVAL '5 minutes')
                    ORDER BY created_at ASC LIMIT 1
                  )
-                 RETURNING owner_did, cipher_suite, encode(key_package, 'base64'), key_package_hash",
+                 RETURNING owner_did, cipher_suite, replace(encode(key_package, 'base64'), chr(10), ''), key_package_hash",
             )
             .bind(did.as_ref())
             .bind(&auth_user.did)

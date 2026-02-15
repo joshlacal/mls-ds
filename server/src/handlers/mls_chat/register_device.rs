@@ -861,7 +861,7 @@ async fn handle_claim_pending_addition(
 
     // Fetch key package for new device
     let key_package: Option<(String, Option<String>, Option<String>, String)> = sqlx::query_as(
-        r#"SELECT kp.owner_did, encode(kp.key_package, 'base64'), kp.key_package_hash, kp.cipher_suite
+        r#"SELECT kp.owner_did, replace(encode(kp.key_package, 'base64'), chr(10), ''), kp.key_package_hash, kp.cipher_suite
            FROM key_packages kp
            WHERE kp.owner_did = $1 AND kp.device_id = $2
              AND kp.consumed_at IS NULL AND kp.expires_at > $3
