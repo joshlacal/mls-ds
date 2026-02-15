@@ -1,4 +1,5 @@
 use axum::{extract::State, http::StatusCode, Json};
+use base64::Engine;
 use chrono::{DateTime, Utc};
 use sqlx::FromRow;
 use std::sync::Arc;
@@ -175,6 +176,78 @@ pub async fn commit_group_change(
             let mut output = success_response();
             output["pendingAdditions"] = serde_json::json!(additions);
             Ok(Json(output))
+        }
+        "updateGroupInfo" => {
+            let convo_id = input.convo_id.to_string();
+            let group_info_b64 = match input.group_info.as_ref() {
+                Some(gi) => gi.to_string(),
+                None => {
+                    error!("updateGroupInfo: missing groupInfo field");
+                    return Err(StatusCode::BAD_REQUEST);
+                }
+            };
+
+            // Verify membership
+            let (caller_did, _) = parse_device_did(&auth_user.did).map_err(|e| {
+                error!("Invalid DID format: {}", e);
+                StatusCode::BAD_REQUEST
+            })?;
+            let is_member: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM members WHERE convo_id = $1 AND user_did = $2 AND left_at IS NULL)",
+            )
+            .bind(&convo_id)
+            .bind(&caller_did)
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| {
+                error!("Membership check failed: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+            if !is_member {
+                return Err(StatusCode::FORBIDDEN);
+            }
+
+            // Decode and validate
+            let group_info_bytes = base64::engine::general_purpose::STANDARD
+                .decode(&group_info_b64)
+                .map_err(|e| {
+                    error!("Invalid base64 in GroupInfo: {}", e);
+                    StatusCode::BAD_REQUEST
+                })?;
+
+            // Store group_info
+            let current_epoch: Option<i32> = sqlx::query_scalar(
+                "SELECT group_info_epoch FROM conversations WHERE id = $1",
+            )
+            .bind(&convo_id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| {
+                error!("Failed to fetch current epoch: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .flatten();
+
+            let new_epoch = current_epoch.unwrap_or(0) + 1;
+
+            sqlx::query(
+                "UPDATE conversations SET group_info = $1, group_info_epoch = $2 WHERE id = $3",
+            )
+            .bind(&group_info_bytes)
+            .bind(new_epoch)
+            .bind(&convo_id)
+            .execute(&pool)
+            .await
+            .map_err(|e| {
+                error!("Failed to store GroupInfo: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+            info!("✅ [v2.commitGroupChange] updateGroupInfo stored for convo {} epoch {}", convo_id, new_epoch);
+            Ok(Json(serde_json::json!({
+                "action": "updateGroupInfo",
+                "updated": true,
+            })))
         }
         other => {
             warn!("v2.commitGroupChange: unknown action: {}", other);

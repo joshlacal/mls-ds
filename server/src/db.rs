@@ -899,6 +899,10 @@ pub async fn store_key_package_with_device(
     {
         Ok(join_result) => join_result
             .context("Key package validation task failed")?
+            .map_err(|e| {
+                tracing::error!("Key package validation detail: {:?}", e);
+                e
+            })
             .context("Key package validation error")?,
         Err(_) => {
             parse_task.abort();
