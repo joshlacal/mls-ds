@@ -1,7 +1,7 @@
 use axum::{extract::State, http::StatusCode, Json};
 use jacquard_axum::ExtractXrpc;
 use std::sync::Arc;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::{
     auth::AuthUser, generated::blue_catbird::mlsChat::register_device::RegisterDeviceRequest,
@@ -39,14 +39,25 @@ pub async fn register_device_post(
     // Serialize parsed input back to body string for v1 delegation
     let body = serde_json::to_string(&input).unwrap_or_default();
 
-    // RegisterDevice doesn't model the action field — defaults to "register"
+    // Determine action: explicit field, or infer from payload shape
     let raw: serde_json::Value = serde_json::to_value(&input).unwrap_or_default();
-    let action = raw
-        .get("action")
-        .and_then(|v| v.as_str())
-        .unwrap_or("register");
+    let explicit_action = raw.get("action").and_then(|v| v.as_str());
 
-    match action {
+    let action = if let Some(a) = explicit_action {
+        a.to_string()
+    } else {
+        // Infer action from payload: empty keyPackages + pushToken = token update
+        let key_packages_empty = input.key_packages.is_empty();
+        let has_push_token = input.push_token.is_some();
+        if key_packages_empty && has_push_token {
+            info!("Inferred updateToken action (empty keyPackages + pushToken present)");
+            "updateToken".to_string()
+        } else {
+            "register".to_string()
+        }
+    };
+
+    match action.as_str() {
         "register" => {
             // Delegate to v1 register_device handler using the body string
             let v1_input: crate::generated::blue_catbird::mls::register_device::RegisterDevice<
@@ -71,18 +82,82 @@ pub async fn register_device_post(
         }
 
         "updateToken" => {
-            let input: crate::handlers::register_device_token::RegisterDeviceTokenInput =
-                serde_json::from_str(&body).map_err(|e| {
-                    warn!("Failed to parse updateToken action body: {}", e);
+            // Handle push token update using RegisterDevice input fields.
+            // iOS sends: { deviceName, pushToken, keyPackages: [], signaturePublicKey: "" }
+            let push_token = input
+                .push_token
+                .as_ref()
+                .map(|s| s.as_ref().to_string())
+                .ok_or_else(|| {
+                    warn!("updateToken action requires pushToken field");
                     StatusCode::BAD_REQUEST
                 })?;
-            let result = crate::handlers::register_device_token::register_device_token(
-                State(pool),
-                auth_user,
-                Ok(Json(input)),
+
+            let device_name = input.device_name.as_ref().to_string();
+            let device_uuid = input.device_uuid.as_ref().map(|s| s.as_ref().to_string());
+
+            // Find the device to update — prefer deviceUUID, fall back to most recent device
+            let device: Option<(String, String)> = if let Some(ref uuid) = device_uuid {
+                sqlx::query_as(
+                    "SELECT device_id, user_did FROM devices WHERE user_did = $1 AND device_uuid = $2",
+                )
+                .bind(&auth_user.did)
+                .bind(uuid)
+                .fetch_optional(&pool)
+                .await
+                .map_err(|e| {
+                    warn!("Failed to query device by UUID: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?
+            } else {
+                sqlx::query_as(
+                    "SELECT device_id, user_did FROM devices WHERE user_did = $1 ORDER BY created_at DESC LIMIT 1",
+                )
+                .bind(&auth_user.did)
+                .fetch_optional(&pool)
+                .await
+                .map_err(|e| {
+                    warn!("Failed to query device: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?
+            };
+
+            let (device_id, _) = device.ok_or_else(|| {
+                warn!(
+                    "No device found for user {} - must register first",
+                    auth_user.did
+                );
+                StatusCode::NOT_FOUND
+            })?;
+
+            // Update push token
+            sqlx::query(
+                r#"UPDATE devices
+                   SET push_token = $3,
+                       push_token_updated_at = NOW(),
+                       device_name = COALESCE(NULLIF($4, ''), device_name),
+                       last_seen_at = NOW()
+                   WHERE user_did = $1 AND device_id = $2"#,
             )
-            .await?;
-            Ok(Json(serde_json::to_value(result.0).unwrap_or_default()))
+            .bind(&auth_user.did)
+            .bind(&device_id)
+            .bind(&push_token)
+            .bind(&device_name)
+            .execute(&pool)
+            .await
+            .map_err(|e| {
+                warn!("Failed to update push token: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+            let mls_did = format!("{}#{}", auth_user.did, device_id);
+            info!(user_did = %auth_user.did, device_id = %device_id, "Push token updated");
+
+            Ok(Json(serde_json::json!({
+                "deviceId": device_id,
+                "mlsDid": mls_did,
+                "autoJoinedConvos": [],
+            })))
         }
 
         "removeToken" => {
