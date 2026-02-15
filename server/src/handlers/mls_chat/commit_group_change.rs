@@ -448,7 +448,7 @@ pub async fn commit_group_change(
             let new_epoch = current_epoch.unwrap_or(0) + 1;
 
             sqlx::query(
-                "UPDATE conversations SET group_info = $1, group_info_epoch = $2 WHERE id = $3",
+                "UPDATE conversations SET group_info = $1, group_info_epoch = $2, group_info_updated_at = NOW() WHERE id = $3",
             )
             .bind(&group_info_bytes)
             .bind(new_epoch)
