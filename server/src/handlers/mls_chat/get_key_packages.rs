@@ -11,7 +11,8 @@ use crate::{
 const NSID: &str = "blue.catbird.mlsChat.getKeyPackages";
 
 /// Fetch and consume key packages for the given DIDs.
-/// Used when adding members to a group — the creator fetches one key package per invited member.
+/// Returns one key package per device (identified by hashed device_id bucket)
+/// for each requested DID, so that all of a user's devices can be added to a group.
 /// GET /xrpc/blue.catbird.mlsChat.getKeyPackages
 #[tracing::instrument(skip(pool, auth_user))]
 pub async fn get_key_packages(
@@ -31,52 +32,59 @@ pub async fn get_key_packages(
     let mut missing = Vec::new();
 
     for did in &input.dids {
-        let result = if let Some(ref cs) = input.cipher_suite {
+        // Claim one key package per distinct device_id bucket for this DID.
+        // DISTINCT ON(device_id) picks the oldest available key package per device.
+        // Devices without a device_id bucket get one package under NULL.
+        let results = if let Some(ref cs) = input.cipher_suite {
             sqlx::query_as::<_, (String, String, String, Option<String>)>(
                 "UPDATE key_packages SET consumed_at = NOW()
-                 WHERE id = (
-                   SELECT id FROM key_packages
+                 WHERE id IN (
+                   SELECT DISTINCT ON (COALESCE(device_id, '')) id
+                   FROM key_packages
                    WHERE owner_did = $1 AND consumed_at IS NULL AND expires_at > NOW()
                      AND (reserved_at IS NULL OR reserved_at < NOW() - INTERVAL '5 minutes')
                      AND cipher_suite = $2
-                   ORDER BY created_at ASC LIMIT 1
+                   ORDER BY COALESCE(device_id, ''), created_at ASC
                  )
                  RETURNING owner_did, cipher_suite, replace(encode(key_package, 'base64'), chr(10), ''), key_package_hash",
             )
             .bind(did.as_ref())
             .bind(cs.as_ref())
-            .fetch_optional(&pool)
+            .fetch_all(&pool)
             .await
         } else {
             sqlx::query_as::<_, (String, String, String, Option<String>)>(
                 "UPDATE key_packages SET consumed_at = NOW()
-                 WHERE id = (
-                   SELECT id FROM key_packages
+                 WHERE id IN (
+                   SELECT DISTINCT ON (COALESCE(device_id, '')) id
+                   FROM key_packages
                    WHERE owner_did = $1 AND consumed_at IS NULL AND expires_at > NOW()
                      AND (reserved_at IS NULL OR reserved_at < NOW() - INTERVAL '5 minutes')
-                   ORDER BY created_at ASC LIMIT 1
+                   ORDER BY COALESCE(device_id, ''), created_at ASC
                  )
                  RETURNING owner_did, cipher_suite, replace(encode(key_package, 'base64'), chr(10), ''), key_package_hash",
             )
             .bind(did.as_ref())
-            .fetch_optional(&pool)
+            .fetch_all(&pool)
             .await
         };
 
-        match result {
-            Ok(Some((owner_did, cipher_suite, kp_b64, kp_hash))) => {
-                key_packages.push(serde_json::json!({
-                    "did": owner_did,
-                    "cipherSuite": cipher_suite,
-                    "keyPackage": kp_b64,
-                    "keyPackageHash": kp_hash,
-                }));
+        match results {
+            Ok(rows) if !rows.is_empty() => {
+                for (owner_did, cipher_suite, kp_b64, kp_hash) in rows {
+                    key_packages.push(serde_json::json!({
+                        "did": owner_did,
+                        "cipherSuite": cipher_suite,
+                        "keyPackage": kp_b64,
+                        "keyPackageHash": kp_hash,
+                    }));
+                }
             }
-            Ok(None) => {
+            Ok(_) => {
                 missing.push(did.as_ref().to_string());
             }
             Err(e) => {
-                error!("Failed to fetch key package for h:{}: {}", &crate::crypto::hash_for_log(did.as_ref()), e);
+                error!("Failed to fetch key packages for h:{}: {}", &crate::crypto::hash_for_log(did.as_ref()), e);
                 missing.push(did.as_ref().to_string());
             }
         }
@@ -86,7 +94,7 @@ pub async fn get_key_packages(
         requested = input.dids.len(),
         found = key_packages.len(),
         missing = missing.len(),
-        "Key packages fetched and consumed"
+        "Key packages fetched and consumed (one per device)"
     );
 
     let mut response = serde_json::json!({ "keyPackages": key_packages });

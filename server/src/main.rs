@@ -601,9 +601,9 @@ async fn main() -> anyhow::Result<()> {
         .merge(GetSubscriptionTicketRequest::into_router(
             handlers::mls_chat::get_subscription_ticket,
         ))
-        // WebSocket subscription endpoint
+        // WebSocket subscription endpoints (lexicon + legacy NSIDs)
         .route(
-            "/xrpc/blue.catbird.mlsChat.subscribeConvoEvents",
+            "/xrpc/blue.catbird.mlsChat.subscribeEvents",
             get(realtime::websocket::subscribe_convo_events),
         )
         .route(

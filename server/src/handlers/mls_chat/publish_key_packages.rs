@@ -580,6 +580,15 @@ pub async fn publish_key_packages_post(
         }
     }
 
+    // Privacy: hash device_id into an opaque bucket so the server can partition
+    // key packages per device without learning actual device identifiers.
+    let device_id = if device_id.is_empty() {
+        device_id
+    } else {
+        let bucket_input = format!("{}#{}", user_did, device_id);
+        crate::crypto::sha256_hex(bucket_input.as_bytes())[..16].to_string()
+    };
+
     match input.action.as_ref() {
         "publish" => {
             let publish_result = handle_publish(&pool, &input, &user_did, &device_id).await?;
