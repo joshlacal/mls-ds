@@ -137,7 +137,7 @@ async fn fetch_app_messages(
     limit: i64,
 ) -> Result<serde_json::Value, StatusCode> {
     // Check membership
-    let is_member: Option<(i64,)> = sqlx::query_as(
+    let is_member: Option<(i32,)> = sqlx::query_as(
         "SELECT 1 as v FROM members WHERE convo_id = $1 AND (user_did = $2 OR member_did = $2) AND left_at IS NULL LIMIT 1",
     )
     .bind(convo_id)
@@ -259,7 +259,7 @@ async fn fetch_commits(
     }
 
     // Check membership
-    let is_member: Option<(i64,)> = sqlx::query_as(
+    let is_member: Option<(i32,)> = sqlx::query_as(
         "SELECT 1 as v FROM members WHERE convo_id = $1 AND (user_did = $2 OR member_did = $2) AND left_at IS NULL LIMIT 1",
     )
     .bind(convo_id)
