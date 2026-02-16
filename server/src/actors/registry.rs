@@ -227,7 +227,7 @@ impl ActorRegistry {
 
         // Send shutdown message to all actors
         for entry in self.actors.iter() {
-            let convo_id = entry.key();
+            let _convo_id = entry.key();
             let actor_ref = entry.value();
 
             debug!("Sending shutdown to actor");

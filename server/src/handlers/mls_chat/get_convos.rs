@@ -338,7 +338,7 @@ async fn handle_expected(
     user_did: &str,
     device_id_param: Option<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let device_id = device_id_param.or_else(|| {
+    let _device_id = device_id_param.or_else(|| {
         if user_did.contains('#') {
             user_did.split('#').nth(1).map(|s| s.to_string())
         } else {

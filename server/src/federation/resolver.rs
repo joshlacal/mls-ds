@@ -228,7 +228,7 @@ impl DsResolver {
     }
 
     /// Resolve a DID to its PDS endpoint via DID document.
-    async fn resolve_did_to_pds(&self, did: &str) -> Result<String, FederationError> {
+    pub(crate) async fn resolve_did_to_pds(&self, did: &str) -> Result<String, FederationError> {
         let did_doc_url = if did.starts_with("did:web:") {
             let domain = did.strip_prefix("did:web:").unwrap_or(did);
             format!("https://{}/.well-known/did.json", domain.replace(':', "/"))
