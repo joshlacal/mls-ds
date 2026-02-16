@@ -41,6 +41,7 @@ struct AppState {
     federated_backend: Arc<federation::FederatedBackend>,
     upstream_manager: Option<Arc<federation::UpstreamManager>>,
     ack_signer: Option<Arc<federation::AckSigner>>,
+    declaration_client: Arc<federation::DeclarationClient>,
 }
 
 fn truthy_env_var(name: &str) -> bool {
@@ -376,6 +377,12 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Federation components initialized");
 
+    // Declaration client for fetching MLS declarations from users' PDSes
+    let declaration_client = Arc::new(federation::DeclarationClient::new(
+        http_client.clone(),
+        resolver.clone(),
+    ));
+
     // Shared shutdown token for federation workers
     let shutdown_token = tokio_util::sync::CancellationToken::new();
 
@@ -422,6 +429,7 @@ async fn main() -> anyhow::Result<()> {
         federated_backend,
         upstream_manager: upstream_manager.clone(),
         ack_signer,
+        declaration_client,
     };
 
     // Start federation queue worker (only when federation is enabled)

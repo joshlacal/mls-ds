@@ -1,10 +1,12 @@
 use axum::{extract::State, http::StatusCode, Json};
-use tracing::{error, info, warn};
+use std::sync::Arc;
+use tracing::{debug, error, info, warn};
 
 use jacquard_axum::ExtractXrpc;
 
 use crate::{
     auth::AuthUser,
+    federation::DeclarationClient,
     generated::blue_catbird::mlsChat::opt_in::{OptInOutput, OptInRequest, OptInStatus},
     sqlx_jacquard::chrono_to_datetime,
     storage::DbPool,
@@ -19,9 +21,10 @@ const NSID: &str = "blue.catbird.mlsChat.optIn";
 ///   - "optIn": Enable MLS chat
 ///   - "optOut": Disable MLS chat
 ///   - "getStatus": Check opt-in status for a list of DIDs
-#[tracing::instrument(skip(pool, input))]
+#[tracing::instrument(skip(pool, declaration_client, input))]
 pub async fn opt_in_post(
     State(pool): State<DbPool>,
+    State(declaration_client): State<Arc<DeclarationClient>>,
     auth_user: AuthUser,
     ExtractXrpc(input): ExtractXrpc<OptInRequest>,
 ) -> Result<Json<OptInOutput<'static>>, StatusCode> {
@@ -128,6 +131,7 @@ pub async fn opt_in_post(
 
             info!("Checking opt-in status for {} DIDs", dids.len());
 
+            // Step 1: Check local opt_in table
             let results = sqlx::query_as::<_, (String, chrono::DateTime<chrono::Utc>)>(
                 "SELECT did, opted_in_at
                  FROM opt_in
@@ -143,6 +147,62 @@ pub async fn opt_in_post(
 
             let mut status_map: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>> =
                 results.into_iter().collect();
+
+            // Step 2: For DIDs not found locally, check their PDS for declaration records
+            let missing_dids: Vec<&str> = dids
+                .iter()
+                .filter(|did| !status_map.contains_key(did.as_str()))
+                .map(|s| s.as_str())
+                .collect();
+
+            if !missing_dids.is_empty() {
+                debug!("Checking PDS declarations for {} missing DIDs", missing_dids.len());
+
+                for did in &missing_dids {
+                    match declaration_client.fetch_declarations(did).await {
+                        Ok(records) if !records.is_empty() => {
+                            // User has a declaration chain on their PDS — they're opted in.
+                            // Auto-populate the local opt_in table so future lookups are fast.
+                            let now = chrono::Utc::now();
+
+                            if let Err(e) = sqlx::query(
+                                "INSERT INTO users (did, created_at, last_seen_at)
+                                 VALUES ($1, NOW(), NOW())
+                                 ON CONFLICT (did) DO NOTHING",
+                            )
+                            .bind(did)
+                            .execute(&pool)
+                            .await
+                            {
+                                debug!("Failed to upsert user for {}: {}", did, e);
+                            }
+
+                            if let Err(e) = sqlx::query(
+                                "INSERT INTO opt_in (did, opted_in_at)
+                                 VALUES ($1, NOW())
+                                 ON CONFLICT (did) DO NOTHING",
+                            )
+                            .bind(did)
+                            .execute(&pool)
+                            .await
+                            {
+                                debug!("Failed to auto-insert opt_in for {}: {}", did, e);
+                            }
+
+                            info!(did = %crate::crypto::redact_for_log(did), "Auto-opted in user from PDS declaration");
+                            status_map.insert(did.to_string(), now);
+                        }
+                        Ok(_) => {
+                            // No declaration records — user hasn't set up MLS
+                            debug!(did = %crate::crypto::redact_for_log(did), "No declaration records on PDS");
+                        }
+                        Err(e) => {
+                            // PDS unreachable or error — don't block, just log
+                            debug!(did = %crate::crypto::redact_for_log(did), error = %e, "Failed to fetch declarations from PDS");
+                        }
+                    }
+                }
+            }
 
             let statuses: Vec<OptInStatus<'static>> = dids
                 .into_iter()
