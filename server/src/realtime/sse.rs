@@ -423,7 +423,7 @@ pub async fn subscribe_convo_events(
     let live_stream = stream::unfold(
         (rx, resume_cursor, replayed_cursors, convo_id.clone()),
         move |(mut rx, resume_cursor, replayed_cursors, convo_id)| async move {
-            let mut replayed_cursors = replayed_cursors;
+            let replayed_cursors = replayed_cursors;
             loop {
                 tokio::select! {
                     // Wait for broadcast event

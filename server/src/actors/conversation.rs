@@ -780,7 +780,7 @@ impl ConversationActorState {
 
         // Submit to serialization queue
         // This replaces the old tokio::spawn logic with a sequential actor-bound queue
-        if let Err(e) = self
+        if let Err(_e) = self
             .side_effect_tx
             .try_send(SideEffectJob::NotifyNewMessage {
                 msg_id: msg_id.clone(),

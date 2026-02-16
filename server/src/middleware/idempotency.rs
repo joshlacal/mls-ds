@@ -177,7 +177,7 @@ pub async fn idempotency_middleware(
     };
 
     // Read the request body using Axum's Bytes extractor
-    let (mut parts, body) = request.into_parts();
+    let (parts, body) = request.into_parts();
 
     // Reconstruct request temporarily to use Bytes extractor
     let temp_request = Request::from_parts(parts.clone(), body);
