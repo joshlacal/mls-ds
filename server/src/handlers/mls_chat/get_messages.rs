@@ -3,14 +3,15 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use base64::Engine;
 use chrono::{DateTime, Utc};
 use jacquard_axum::ExtractXrpc;
 use sqlx::FromRow;
 use tracing::{error, info, warn};
 
 use crate::{
-    auth::AuthUser, generated::blue_catbird::mlsChat::get_messages::GetMessagesRequest,
+    auth::AuthUser,
+    generated::blue_catbird::mlsChat::get_messages::GetMessagesRequest,
+    generated_types::MessageView,
     storage::DbPool,
 };
 
@@ -27,14 +28,6 @@ struct MessageRow {
     message_type: String,
     epoch: i64,
     seq: i64,
-    ciphertext: Vec<u8>,
-    created_at: DateTime<Utc>,
-}
-
-#[derive(Debug, FromRow)]
-struct CommitRow {
-    id: String,
-    epoch: i64,
     ciphertext: Vec<u8>,
     created_at: DateTime<Utc>,
 }
@@ -91,25 +84,31 @@ pub async fn get_messages(
 
     match message_type {
         "app" => {
-            let messages = fetch_app_messages(&pool, did, &convo_id, since_seq, limit).await?;
-            Ok(Json(messages))
+            let (messages, last_seq) =
+                fetch_app_messages(&pool, did, &convo_id, since_seq, limit).await?;
+            let mut output = serde_json::json!({ "messages": messages });
+            if let Some(seq) = last_seq {
+                output["lastSeq"] = serde_json::json!(seq);
+            }
+            Ok(Json(output))
         }
 
         "commit" | "commits" => {
-            let commits = fetch_commits(&pool, did, &convo_id, from_epoch, to_epoch).await?;
-            Ok(Json(commits))
+            let messages = fetch_commits(&pool, did, &convo_id, from_epoch, to_epoch).await?;
+            Ok(Json(serde_json::json!({ "messages": messages })))
         }
 
         "all" => {
-            let messages = fetch_app_messages(&pool, did, &convo_id, since_seq, limit).await?;
+            let (mut messages, last_seq) =
+                fetch_app_messages(&pool, did, &convo_id, since_seq, limit).await?;
             let commits = fetch_commits(&pool, did, &convo_id, from_epoch, to_epoch).await?;
-
-            let mut response = messages;
-            if let Some(commit_list) = commits.get("commits") {
-                response["commits"] = commit_list.clone();
+            messages.extend(commits);
+            messages.sort_by(|a, b| a.epoch.cmp(&b.epoch).then(a.seq.cmp(&b.seq)));
+            let mut output = serde_json::json!({ "messages": messages });
+            if let Some(seq) = last_seq {
+                output["lastSeq"] = serde_json::json!(seq);
             }
-
-            Ok(Json(response))
+            Ok(Json(output))
         }
 
         other => {
@@ -129,7 +128,7 @@ async fn fetch_app_messages(
     convo_id: &str,
     since_seq: Option<i64>,
     limit: i64,
-) -> Result<serde_json::Value, StatusCode> {
+) -> Result<(Vec<MessageView>, Option<i64>), StatusCode> {
     // Check membership
     let is_member: Option<(i32,)> = sqlx::query_as(
         "SELECT 1 as v FROM members WHERE convo_id = $1 AND (user_did = $2 OR member_did = $2) AND left_at IS NULL LIMIT 1",
@@ -210,19 +209,17 @@ async fn fetch_app_messages(
 
     let last_seq = messages.last().map(|m| m.seq);
 
-    let message_views: Vec<serde_json::Value> = messages
+    let message_views: Vec<MessageView> = messages
         .into_iter()
-        .map(|m| {
-            let ciphertext_b64 = base64::engine::general_purpose::STANDARD.encode(&m.ciphertext);
-            serde_json::json!({
-                "id": m.id,
-                "convoId": m.convo_id,
-                "ciphertext": { "$bytes": ciphertext_b64 },
-                "epoch": m.epoch,
-                "seq": m.seq,
-                "createdAt": m.created_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                "messageType": m.message_type,
-            })
+        .map(|m| MessageView {
+            id: m.id,
+            convo_id: m.convo_id,
+            ciphertext: m.ciphertext,
+            epoch: m.epoch,
+            seq: m.seq,
+            created_at: m.created_at,
+            message_type: m.message_type,
+            reactions: None,
         })
         .collect();
 
@@ -231,14 +228,7 @@ async fn fetch_app_messages(
         message_views.len()
     );
 
-    let mut response = serde_json::json!({
-        "messages": message_views,
-    });
-    if let Some(seq) = last_seq {
-        response["lastSeq"] = serde_json::json!(seq);
-    }
-
-    Ok(response)
+    Ok((message_views, last_seq))
 }
 
 // ---------------------------------------------------------------------------
@@ -251,7 +241,7 @@ async fn fetch_commits(
     convo_id: &str,
     from_epoch: i64,
     to_epoch: Option<i64>,
-) -> Result<serde_json::Value, StatusCode> {
+) -> Result<Vec<MessageView>, StatusCode> {
     if from_epoch < 0 {
         warn!("❌ [v2.getMessages] Invalid from_epoch: {}", from_epoch);
         return Err(StatusCode::BAD_REQUEST);
@@ -302,12 +292,14 @@ async fn fetch_commits(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let commits = sqlx::query_as::<_, CommitRow>(
+    let commits = sqlx::query_as::<_, MessageRow>(
         r#"
-        SELECT id, epoch, ciphertext, created_at
+        SELECT id, convo_id, 'commit' as message_type,
+               CAST(epoch AS BIGINT) as epoch, CAST(seq AS BIGINT) as seq,
+               ciphertext, created_at
         FROM messages
         WHERE convo_id = $1 AND message_type = 'commit' AND epoch >= $2 AND epoch <= $3
-        ORDER BY epoch ASC, created_at ASC
+        ORDER BY epoch ASC, seq ASC
         "#,
     )
     .bind(convo_id)
@@ -322,22 +314,19 @@ async fn fetch_commits(
 
     info!("✅ [v2.getMessages] Fetched {} commits", commits.len());
 
-    let commit_views: Vec<serde_json::Value> = commits
+    let commit_views: Vec<MessageView> = commits
         .into_iter()
-        .map(|c| {
-            let commit_data_b64 = base64::engine::general_purpose::STANDARD.encode(&c.ciphertext);
-            serde_json::json!({
-                "id": c.id,
-                "epoch": c.epoch,
-                "commitData": { "$bytes": commit_data_b64 },
-                "sender": serde_json::Value::Null,
-                "createdAt": c.created_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-            })
+        .map(|c| MessageView {
+            id: c.id,
+            convo_id: c.convo_id,
+            ciphertext: c.ciphertext,
+            epoch: c.epoch,
+            seq: c.seq,
+            created_at: c.created_at,
+            message_type: c.message_type,
+            reactions: None,
         })
         .collect();
 
-    Ok(serde_json::json!({
-        "convoId": convo_id,
-        "commits": commit_views,
-    }))
+    Ok(commit_views)
 }

@@ -192,6 +192,11 @@
           "type": "boolean",
           "description": "Whether accounts this user follows can bypass chat request approval"
         },
+        "whoCanMessageMe": {
+          "type": "string",
+          "description": "Who can message me",
+          "knownValues": ["everyone", "mutuals", "following", "nobody"]
+        },
         "autoExpireDays": {
           "type": "integer",
           "minimum": 0,

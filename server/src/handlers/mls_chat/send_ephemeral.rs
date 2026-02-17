@@ -134,18 +134,32 @@ mod tests {
 
     #[test]
     fn test_ephemeral_input_deserialize() {
-        let json = serde_json::json!({
+        let json = r#"{
             "convoId": "convo-123",
             "ciphertext": { "$bytes": "AQID" },
             "epoch": 5,
             "paddedSize": 3
-        });
+        }"#;
 
-        let input: SendEphemeral = serde_json::from_value(json).unwrap();
+        // Parse from an input buffer so borrowed Cow fields can reference it.
+        let input: SendEphemeral<'_> = serde_json::from_str(json).unwrap();
         assert_eq!(input.convo_id.as_ref(), "convo-123");
         assert_eq!(input.ciphertext.as_ref(), &[1, 2, 3]);
         assert_eq!(input.epoch, 5);
         assert_eq!(input.padded_size, 3);
+
+        // Zero-copy guarantee: convo_id should be borrowed from the source JSON
+        // buffer (not allocated into a new owned string).
+        let convo_slice = input.convo_id.as_ref();
+        let source_start = json.as_ptr() as usize;
+        let source_end = source_start + json.len();
+        let convo_start = convo_slice.as_ptr() as usize;
+        let convo_end = convo_start + convo_slice.len();
+
+        assert!(
+            convo_start >= source_start && convo_end <= source_end,
+            "convo_id should borrow from input JSON buffer"
+        );
     }
 
     #[test]
