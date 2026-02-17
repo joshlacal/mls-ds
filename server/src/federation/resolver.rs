@@ -397,20 +397,24 @@ fn validate_endpoint_url_with_policy(
     }
 
     if let Some(host) = parsed.host_str() {
-        let host_lc = host.to_ascii_lowercase();
-        let blocked = ["localhost", "127.0.0.1", "0.0.0.0", "::1"];
-        if blocked.contains(&host_lc.as_str()) || host_lc.ends_with(".localhost") {
-            return Err(FederationError::ResolutionFailed {
-                did: String::new(),
-                reason: format!("Blocked private address: {host}"),
-            });
-        }
-        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-            if is_private_ip(&ip) {
+        // When FEDERATION_ALLOW_INSECURE_HTTP is set, also allow private/localhost
+        // addresses for local development and testing.
+        if !allow_http {
+            let host_lc = host.to_ascii_lowercase();
+            let blocked = ["localhost", "127.0.0.1", "0.0.0.0", "::1"];
+            if blocked.contains(&host_lc.as_str()) || host_lc.ends_with(".localhost") {
                 return Err(FederationError::ResolutionFailed {
                     did: String::new(),
-                    reason: format!("Blocked non-global IP: {ip}"),
+                    reason: format!("Blocked private address: {host}"),
                 });
+            }
+            if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                if is_private_ip(&ip) {
+                    return Err(FederationError::ResolutionFailed {
+                        did: String::new(),
+                        reason: format!("Blocked non-global IP: {ip}"),
+                    });
+                }
             }
         }
         if let Some(allowlist) = FEDERATION_HOST_ALLOWLIST.as_ref() {
@@ -429,6 +433,11 @@ fn validate_endpoint_url_with_policy(
 pub(crate) async fn validate_resolved_host_is_public(
     parsed: &url::Url,
 ) -> Result<(), FederationError> {
+    // Skip all private-IP checks when running in insecure local dev mode
+    if allow_insecure_http() {
+        return Ok(());
+    }
+
     let Some(host) = parsed.host_str() else {
         return Err(FederationError::ResolutionFailed {
             did: String::new(),
