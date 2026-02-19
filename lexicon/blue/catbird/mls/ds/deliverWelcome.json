@@ -1,0 +1,98 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.mls.ds.deliverWelcome",
+  "description": "DS-to-DS federation endpoint: deliver an MLS Welcome message for a new member to a remote delivery service.",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Accept a Welcome message for a new member from a remote DS. The recipient must be a local user on this DS. If the conversation already exists locally, the caller must be the sequencer DS.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["convoId", "recipientDid", "senderDsDid", "keyPackageHash", "welcomeData", "initialEpoch"],
+          "properties": {
+            "convoId": {
+              "type": "string",
+              "description": "Conversation identifier the recipient is being added to"
+            },
+            "recipientDid": {
+              "type": "string",
+              "format": "did",
+              "description": "DID of the local user who should receive the Welcome"
+            },
+            "senderDsDid": {
+              "type": "string",
+              "format": "did",
+              "description": "DID of the sending delivery service (must match JWT issuer)"
+            },
+            "keyPackageHash": {
+              "type": "string",
+              "description": "Hex-encoded hash of the key package consumed for this Welcome"
+            },
+            "welcomeData": {
+              "type": "bytes",
+              "description": "MLS Welcome message bytes",
+              "maxLength": 10485760
+            },
+            "initialEpoch": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "MLS epoch number for the group at the time of the Welcome"
+            },
+            "groupInfo": {
+              "type": "string",
+              "description": "Optional base64-encoded MLS GroupInfo for the recipient to use with external commits"
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["accepted"],
+          "properties": {
+            "accepted": {
+              "type": "boolean",
+              "description": "Whether the Welcome was accepted and stored for the recipient"
+            },
+            "ack": {
+              "type": "ref",
+              "ref": "#deliveryAck",
+              "description": "Optional cryptographic acknowledgement signed by the receiving DS"
+            }
+          }
+        }
+      },
+      "errors": [
+        {"name": "RecipientNotFound", "description": "The recipient DID is not a local user on this DS"},
+        {"name": "ConversationNotFound", "description": "The conversation exists locally but the caller is not its sequencer"},
+        {"name": "AuthFailed", "description": "JWT validation failed or senderDsDid does not match JWT issuer"}
+      ]
+    },
+    "deliveryAck": {
+      "type": "object",
+      "description": "Cryptographic receipt acknowledging Welcome delivery, signed by the receiving DS.",
+      "required": ["welcomeId", "convoId", "epoch", "signature"],
+      "properties": {
+        "welcomeId": {
+          "type": "string",
+          "description": "Server-generated identifier for the stored Welcome"
+        },
+        "convoId": {
+          "type": "string",
+          "description": "The conversation identifier"
+        },
+        "epoch": {
+          "type": "integer",
+          "description": "The initial epoch from the Welcome"
+        },
+        "signature": {
+          "type": "string",
+          "description": "Base64-encoded Ed25519 signature over (welcomeId, convoId, epoch)"
+        }
+      }
+    }
+  }
+}

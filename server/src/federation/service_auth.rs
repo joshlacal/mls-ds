@@ -3,6 +3,7 @@ use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use p256::ecdsa::SigningKey;
 use p256::pkcs8::DecodePrivateKey;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tracing::debug;
 
 use super::errors::FederationError;
@@ -30,12 +31,34 @@ pub struct ServiceAuthClient {
 
 impl ServiceAuthClient {
     /// Create from PEM-encoded ES256 private key.
+    ///
+    /// If `key_id` is `None`, a `kid` is automatically derived from the SHA-256
+    /// thumbprint of the public key (first 16 hex characters). This allows
+    /// verifiers to select the correct key during key rotation.
     pub fn from_es256_pem(
         self_did: String,
         pem: &[u8],
         key_id: Option<String>,
     ) -> Result<Self, FederationError> {
         validate_es256_pem(pem)?;
+
+        let kid = match key_id {
+            Some(k) => Some(k),
+            None => {
+                // Derive kid from public key thumbprint for key rotation support.
+                let pem_str = std::str::from_utf8(pem).map_err(|_| {
+                    FederationError::ConfigError {
+                        reason: "Invalid ES256 PEM key: non-UTF-8 input".to_string(),
+                    }
+                })?;
+                let signing_key = SigningKey::from_pkcs8_pem(pem_str).map_err(|e| {
+                    FederationError::ConfigError {
+                        reason: format!("Invalid ES256 PEM key: {e}"),
+                    }
+                })?;
+                Some(derive_es256_kid(&signing_key))
+            }
+        };
 
         let encoding_key =
             EncodingKey::from_ec_pem(pem).map_err(|e| FederationError::ConfigError {
@@ -45,22 +68,39 @@ impl ServiceAuthClient {
             self_did,
             encoding_key,
             algorithm: Algorithm::ES256,
-            key_id,
+            key_id: kid,
         })
     }
 
     /// Create from raw ES256 private key bytes (DER).
+    ///
+    /// If `key_id` is `None`, a `kid` is automatically derived from the SHA-256
+    /// thumbprint of the public key (first 16 hex characters).
     pub fn from_es256_der(
         self_did: String,
         der: &[u8],
         key_id: Option<String>,
     ) -> Result<Self, FederationError> {
+        let kid = match key_id {
+            Some(k) => Some(k),
+            None => {
+                // Derive kid from public key thumbprint for key rotation support.
+                use p256::pkcs8::DecodePrivateKey as _;
+                if let Ok(signing_key) = SigningKey::from_pkcs8_der(der) {
+                    Some(derive_es256_kid(&signing_key))
+                } else {
+                    // DER may be SEC1 format instead of PKCS#8; fall back to no kid.
+                    None
+                }
+            }
+        };
+
         let encoding_key = EncodingKey::from_ec_der(der);
         Ok(Self {
             self_did,
             encoding_key,
             algorithm: Algorithm::ES256,
-            key_id,
+            key_id: kid,
         })
     }
 
@@ -106,6 +146,18 @@ impl ServiceAuthClient {
     }
 }
 
+/// Derive a `kid` (Key ID) from an ES256 signing key by computing the SHA-256
+/// thumbprint of the uncompressed public key point and returning the first 16
+/// hex characters. This provides a stable, deterministic identifier for key
+/// rotation: verifiers can look up which verification key to use based on `kid`.
+fn derive_es256_kid(signing_key: &SigningKey) -> String {
+    let verifying_key = signing_key.verifying_key();
+    let encoded_point = verifying_key.to_encoded_point(false); // uncompressed
+    let thumbprint = Sha256::digest(encoded_point.as_bytes());
+    // Use first 8 bytes (16 hex chars) for a compact but collision-resistant kid.
+    hex::encode(&thumbprint[..8])
+}
+
 fn validate_es256_pem(pem: &[u8]) -> Result<(), FederationError> {
     const MAX_PEM_BYTES: usize = 16 * 1024;
 
@@ -144,6 +196,7 @@ fn validate_es256_pem(pem: &[u8]) -> Result<(), FederationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use p256::pkcs8::EncodePrivateKey;
 
     #[test]
     fn test_shared_secret_sign_request() {
@@ -205,6 +258,91 @@ mod tests {
             b"test-secret",
         );
         assert_eq!(client.self_did(), "did:web:my-ds.example.com");
+    }
+
+    #[test]
+    fn test_es256_pem_auto_derives_kid() {
+        // Generate a test P-256 key pair
+        let signing_key = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
+        let pem = signing_key
+            .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
+            .expect("PEM encoding should succeed");
+
+        let client = ServiceAuthClient::from_es256_pem(
+            "did:web:ds.example.com".to_string(),
+            pem.as_bytes(),
+            None, // no explicit key_id → auto-derive
+        )
+        .expect("should create client");
+
+        // kid should be auto-derived (16 hex chars)
+        assert!(client.key_id.is_some(), "kid should be auto-derived");
+        let kid = client.key_id.as_ref().unwrap();
+        assert_eq!(kid.len(), 16, "kid should be 16 hex chars");
+        assert!(
+            kid.chars().all(|c| c.is_ascii_hexdigit()),
+            "kid should be hex"
+        );
+
+        // Sign a token and verify the kid header is present
+        let token = client
+            .sign_request("did:web:target.example.com", "blue.catbird.mls.ds.deliverMessage")
+            .unwrap();
+        let header = jsonwebtoken::decode_header(&token).unwrap();
+        assert_eq!(
+            header.kid.as_deref(),
+            Some(kid.as_str()),
+            "JWT header kid should match derived kid"
+        );
+    }
+
+    #[test]
+    fn test_es256_pem_explicit_kid_used() {
+        let signing_key = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
+        let pem = signing_key
+            .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
+            .expect("PEM encoding should succeed");
+
+        let client = ServiceAuthClient::from_es256_pem(
+            "did:web:ds.example.com".to_string(),
+            pem.as_bytes(),
+            Some("my-explicit-kid".to_string()),
+        )
+        .expect("should create client");
+
+        assert_eq!(client.key_id.as_deref(), Some("my-explicit-kid"));
+
+        let token = client
+            .sign_request("did:web:target.example.com", "test.method")
+            .unwrap();
+        let header = jsonwebtoken::decode_header(&token).unwrap();
+        assert_eq!(header.kid.as_deref(), Some("my-explicit-kid"));
+    }
+
+    #[test]
+    fn test_kid_deterministic_for_same_key() {
+        let signing_key = p256::ecdsa::SigningKey::random(&mut rand::thread_rng());
+        let pem = signing_key
+            .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
+            .expect("PEM encoding should succeed");
+
+        let client1 = ServiceAuthClient::from_es256_pem(
+            "did:web:ds1.example.com".to_string(),
+            pem.as_bytes(),
+            None,
+        )
+        .unwrap();
+        let client2 = ServiceAuthClient::from_es256_pem(
+            "did:web:ds2.example.com".to_string(),
+            pem.as_bytes(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            client1.key_id, client2.key_id,
+            "Same key should produce same kid regardless of DID"
+        );
     }
 
     #[test]

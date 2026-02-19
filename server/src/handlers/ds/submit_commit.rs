@@ -1,7 +1,7 @@
 use axum::{extract::State, Json};
 use serde_json::json;
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     auth::AuthUser,
@@ -140,6 +140,35 @@ pub async fn submit_commit(
         }
     }
     .await;
+
+    match &result {
+        Ok(json_val) => {
+            let accepted = json_val
+                .0
+                .get("accepted")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            info!(
+                event_type = "federation.submit_commit",
+                peer_did = %requester_ds,
+                convo_id = convo_id,
+                epoch = epoch,
+                proposed_epoch = proposed_epoch,
+                result = if accepted { "accepted" } else { "conflict" },
+                "Federation commit submission processed"
+            );
+        }
+        Err(e) => {
+            warn!(
+                event_type = "federation.submit_commit",
+                peer_did = %requester_ds,
+                convo_id = convo_id,
+                result = "rejected",
+                reason = %e,
+                "Federation commit submission rejected"
+            );
+        }
+    }
 
     super::deliver_message::record_ds_outcome(&pool, &requester_ds, result.is_ok()).await;
     result

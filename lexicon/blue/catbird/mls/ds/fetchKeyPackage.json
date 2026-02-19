@@ -1,0 +1,49 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.mls.ds.fetchKeyPackage",
+  "description": "DS-to-DS federation endpoint: fetch and consume a key package for a local user, requested by a remote DS for adding the user to a conversation.",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Return and atomically consume one key package for a local user. The caller must be either the sequencer DS for the conversation or a participant DS in the group. The oldest available, non-expired key package is claimed.",
+      "parameters": {
+        "type": "params",
+        "required": ["recipientDid", "convoId"],
+        "properties": {
+          "recipientDid": {
+            "type": "string",
+            "format": "did",
+            "description": "DID of the local user whose key package is being requested"
+          },
+          "convoId": {
+            "type": "string",
+            "description": "Conversation identifier the key package will be used for"
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["keyPackage", "keyPackageHash"],
+          "properties": {
+            "keyPackage": {
+              "type": "string",
+              "description": "Base64-encoded MLS KeyPackage bytes"
+            },
+            "keyPackageHash": {
+              "type": "string",
+              "description": "Hex-encoded SHA-256 hash of the consumed key package"
+            }
+          }
+        }
+      },
+      "errors": [
+        {"name": "ConversationNotFound", "description": "The conversation does not exist on this DS"},
+        {"name": "RecipientNotFound", "description": "The recipient DID is not a member of the conversation"},
+        {"name": "NoKeyPackagesAvailable", "description": "No unexpired, unconsumed key packages are available for the recipient"},
+        {"name": "AuthFailed", "description": "JWT validation failed or the calling DS is not authorized for this conversation"}
+      ]
+    }
+  }
+}

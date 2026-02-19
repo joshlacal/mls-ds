@@ -1,0 +1,104 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.mls.ds.deliverMessage",
+  "description": "DS-to-DS federation endpoint: deliver an MLS application message to a remote delivery service for local subscriber fanout.",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Accept an inbound MLS message from a remote DS and store it for local subscribers. The caller must be the sequencer DS for the conversation. Authentication is via a service JWT whose issuer DID matches senderDsDid.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["convoId", "msgId", "epoch", "senderDsDid", "ciphertext", "paddedSize"],
+          "properties": {
+            "convoId": {
+              "type": "string",
+              "description": "Conversation identifier"
+            },
+            "msgId": {
+              "type": "string",
+              "description": "Unique message identifier (idempotency key for deduplication)"
+            },
+            "epoch": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "MLS epoch number when the message was encrypted"
+            },
+            "senderDsDid": {
+              "type": "string",
+              "format": "did",
+              "description": "DID of the sending delivery service (must match JWT issuer)"
+            },
+            "ciphertext": {
+              "type": "bytes",
+              "description": "MLS encrypted message ciphertext",
+              "maxLength": 10485760
+            },
+            "paddedSize": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Padded ciphertext size in bytes"
+            },
+            "messageType": {
+              "type": "string",
+              "description": "Message type hint (e.g. 'app', 'proposal'). Defaults to 'app' if omitted.",
+              "knownValues": ["app", "proposal"]
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["accepted"],
+          "properties": {
+            "accepted": {
+              "type": "boolean",
+              "description": "Whether the message was accepted and stored"
+            },
+            "seq": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Server-assigned monotonically increasing sequence number"
+            },
+            "ack": {
+              "type": "ref",
+              "ref": "#deliveryAck",
+              "description": "Optional cryptographic acknowledgement signed by the receiving DS"
+            }
+          }
+        }
+      },
+      "errors": [
+        {"name": "ConversationNotFound", "description": "The conversation does not exist on this DS"},
+        {"name": "NotSequencer", "description": "The calling DS is not the sequencer for this conversation"},
+        {"name": "AuthFailed", "description": "JWT validation failed or senderDsDid does not match JWT issuer"}
+      ]
+    },
+    "deliveryAck": {
+      "type": "object",
+      "description": "Cryptographic receipt acknowledging message delivery, signed by the receiving DS.",
+      "required": ["msgId", "convoId", "epoch", "signature"],
+      "properties": {
+        "msgId": {
+          "type": "string",
+          "description": "The acknowledged message identifier"
+        },
+        "convoId": {
+          "type": "string",
+          "description": "The conversation identifier"
+        },
+        "epoch": {
+          "type": "integer",
+          "description": "The MLS epoch at the time of acknowledgement"
+        },
+        "signature": {
+          "type": "string",
+          "description": "Base64-encoded Ed25519 signature over (msgId, convoId, epoch)"
+        }
+      }
+    }
+  }
+}

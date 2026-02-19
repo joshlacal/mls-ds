@@ -1,0 +1,71 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.mls.ds.submitCommit",
+  "description": "DS-to-DS federation endpoint: submit an MLS commit for sequencing. Only the sequencer DS for a conversation accepts commits.",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Accept a commit for CAS (compare-and-swap) epoch ordering. The receiving DS must be the sequencer for the conversation. The calling DS must be a participant in the group. Uses optimistic concurrency: if the proposed epoch conflicts with the current epoch, a CommitConflict error is returned.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["convoId", "senderDsDid", "epoch", "proposedEpoch", "commitData"],
+          "properties": {
+            "convoId": {
+              "type": "string",
+              "description": "Conversation identifier"
+            },
+            "senderDsDid": {
+              "type": "string",
+              "format": "did",
+              "description": "DID of the sending delivery service (must match JWT issuer)"
+            },
+            "epoch": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Current MLS epoch the commit is based on"
+            },
+            "proposedEpoch": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Proposed new MLS epoch after the commit is applied"
+            },
+            "commitData": {
+              "type": "bytes",
+              "description": "MLS commit message bytes",
+              "maxLength": 10485760
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["accepted", "assignedEpoch"],
+          "properties": {
+            "accepted": {
+              "type": "boolean",
+              "description": "Whether the commit was accepted and sequenced"
+            },
+            "assignedEpoch": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "The epoch number assigned by the sequencer"
+            },
+            "receipt": {
+              "type": "string",
+              "description": "Optional sequencer receipt or proof of ordering"
+            }
+          }
+        }
+      },
+      "errors": [
+        {"name": "NotSequencer", "description": "This DS is not the sequencer for the specified conversation"},
+        {"name": "CommitConflict", "description": "The proposed epoch conflicts with the current epoch (CAS failure). The client should fetch the latest epoch and retry."},
+        {"name": "AuthFailed", "description": "JWT validation failed, senderDsDid does not match JWT issuer, or the calling DS is not a participant in the conversation"}
+      ]
+    }
+  }
+}

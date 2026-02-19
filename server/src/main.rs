@@ -282,6 +282,7 @@ async fn main() -> anyhow::Result<()> {
         .timeout(std::time::Duration::from_secs(
             fed_config.outbound_timeout_secs,
         ))
+        .redirect(reqwest::redirect::Policy::limited(3))
         .user_agent("catbird-mls-ds/1.0")
         .build()
         .expect("Failed to build HTTP client");
@@ -478,6 +479,15 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(health::health))
         .route("/health/live", get(health::liveness))
         .route("/health/ready", get(health::readiness))
+        // PDS shim: serve DID document and MLS profile records for registered users
+        .route(
+            "/.well-known/did.json",
+            get(handlers::pds_shim::well_known_did_json),
+        )
+        .route(
+            "/xrpc/com.atproto.repo.getRecord",
+            get(handlers::pds_shim::get_record),
+        )
         .merge(metrics_router)
         .layer(DefaultBodyLimit::max(4 * 1024 * 1024)) // 4 MB
         .layer(TraceLayer::new_for_http())

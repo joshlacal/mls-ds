@@ -82,7 +82,7 @@ make restore BACKUP=/path/to/backup.sql.gz
    - Rate limiting and token caching
    - Environment variables control auth behavior:
      - `SERVICE_DID`: Required audience for inter-service JWTs
-     - `ENFORCE_LXM`: Require JWT `lxm` claim to match called NSID
+     - `ENFORCE_LXM`: Require JWT `lxm` claim to match called NSID (default: true)
      - `ENFORCE_JTI`: Require `jti` and reject replays (default: true)
      - `JTI_TTL_SECONDS`: TTL for jti replay cache (default: 120)
 
@@ -223,7 +223,7 @@ psql -h localhost -U catbird -d catbird -c "SELECT column_name FROM information_
 - `RUST_LOG`: Logging level (default: `info`)
 - `SERVER_PORT`: Server port (default: `3000`)
 - `SERVICE_DID`: Required audience for JWTs
-- `ENFORCE_LXM`: Require lxm claim matching endpoint (default: false)
+- `ENFORCE_LXM`: Require lxm claim matching endpoint (default: true)
 - `ENFORCE_JTI`: Require jti for replay prevention (default: true)
 - `JTI_TTL_SECONDS`: Replay cache TTL (default: 120)
 - `SSE_BUFFER_SIZE`: Realtime event buffer size (default: 5000)

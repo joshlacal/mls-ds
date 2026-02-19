@@ -1,0 +1,47 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.mls.ds.transferSequencer",
+  "description": "DS-to-DS federation endpoint: transfer the sequencer role for a conversation from the current sequencer to this DS.",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Accept a sequencer role transfer from the current sequencer DS. The caller must be the current sequencer for the conversation. After a successful transfer, this DS becomes the new sequencer responsible for epoch ordering.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["convoId", "currentEpoch"],
+          "properties": {
+            "convoId": {
+              "type": "string",
+              "description": "Conversation identifier for which the sequencer role is being transferred"
+            },
+            "currentEpoch": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "The current MLS epoch at the time of transfer, used to establish continuity"
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["accepted"],
+          "properties": {
+            "accepted": {
+              "type": "boolean",
+              "description": "Whether the sequencer role transfer was accepted"
+            }
+          }
+        }
+      },
+      "errors": [
+        {"name": "ConversationNotFound", "description": "The conversation does not exist on this DS"},
+        {"name": "NotCurrentSequencer", "description": "The calling DS is not the current sequencer for this conversation"},
+        {"name": "NotAuthorized", "description": "The calling DS is not authorized for this conversation"}
+      ]
+    }
+  }
+}

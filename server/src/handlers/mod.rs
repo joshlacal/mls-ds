@@ -3,6 +3,7 @@ pub mod ds;
 mod federation_peers_admin;
 pub mod get_request_count;
 pub mod mls_chat;
+pub mod pds_shim;
 pub mod resolve_delivery_service;
 pub mod subscription_ticket;
 

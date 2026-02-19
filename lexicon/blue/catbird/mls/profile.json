@@ -1,0 +1,31 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.mls.profile",
+  "description": "Record schema for an MLS delivery service profile, published by a user to advertise their DS endpoint and supported cipher suites.",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "An MLS profile record that declares which delivery service handles messages for this user and what cipher suites are supported.",
+      "key": "literal:self",
+      "record": {
+        "type": "object",
+        "required": ["deliveryService"],
+        "properties": {
+          "deliveryService": {
+            "type": "string",
+            "format": "uri",
+            "description": "The HTTPS endpoint URL of the user's MLS delivery service"
+          },
+          "supportedCipherSuites": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "MLS cipher suites supported by this user's delivery service",
+            "maxLength": 16
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,7 +1,7 @@
 use axum::{extract::State, Json};
 use serde_json::json;
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     auth::AuthUser,
@@ -129,6 +129,29 @@ pub async fn deliver_message(
     }
     .await;
 
+    match &result {
+        Ok(_) => {
+            info!(
+                event_type = "federation.deliver_message",
+                peer_did = %requester_ds,
+                convo_id = convo_id,
+                msg_id = msg_id,
+                result = "accepted",
+                "Federation message delivered successfully"
+            );
+        }
+        Err(e) => {
+            warn!(
+                event_type = "federation.deliver_message",
+                peer_did = %requester_ds,
+                convo_id = convo_id,
+                result = "rejected",
+                reason = %e,
+                "Federation message delivery rejected"
+            );
+        }
+    }
+
     record_ds_outcome(&pool, &requester_ds, result.is_ok()).await;
     result
 }
@@ -138,6 +161,32 @@ pub(super) struct DsSecurityContext {
     pub requester_ds: String,
 }
 
+/// Enforce security invariants for inbound DS-to-DS federation requests.
+///
+/// # Security chain
+///
+/// By the time this function is called, the request has already passed through
+/// the `AuthUser` extractor (see `auth.rs`), which performs the following:
+///
+/// 1. **JWT signature verification against the issuer's DID document**: The
+///    `AuthMiddleware::verify_jwt()` method resolves the issuer DID (`iss` claim)
+///    via PLC directory or `did:web` HTTPS, extracts the public key from the
+///    DID document's `verificationMethod` array (selecting by `kid` header if
+///    present), and cryptographically verifies the JWT signature (ES256/ES256K).
+///
+/// 2. **Token expiration**: Rejects expired tokens.
+///
+/// 3. **Audience validation**: Ensures `aud` matches `SERVICE_DID`.
+///
+/// 4. **lxm + jti enforcement**: Via `enforce_standard_with_replay_store()`,
+///    ensures the token is bound to the correct XRPC method and cannot be replayed.
+///
+/// This function adds DS-specific checks on top:
+/// - `lxm` matches the expected federation endpoint NSID
+/// - Issuer is a well-formed DID
+/// - Peer policy allows the requesting DS (trust/block evaluation)
+/// - `senderDsDid` body field matches the JWT issuer (prevents impersonation)
+/// - Per-DS rate limiting
 pub(super) async fn enforce_ds_request_security(
     pool: &DbPool,
     auth_user: &AuthUser,
@@ -149,8 +198,25 @@ pub(super) async fn enforce_ds_request_security(
 
     let requester_ds = canonical_did(&auth_user.claims.iss).to_string();
     let policy = match peer_policy::enforce_inbound_peer_policy(pool, &requester_ds).await {
-        Ok(policy) => policy,
+        Ok(policy) => {
+            tracing::debug!(
+                event_type = "federation.peer_policy",
+                peer_did = %requester_ds,
+                endpoint = endpoint_nsid,
+                result = "allowed",
+                "Peer policy check passed"
+            );
+            policy
+        }
         Err(err) => {
+            info!(
+                event_type = "federation.peer_policy",
+                peer_did = %requester_ds,
+                endpoint = endpoint_nsid,
+                result = "blocked",
+                reason = %err,
+                "Peer policy rejected inbound request"
+            );
             peer_policy::record_rejected(pool, &requester_ds).await;
             return Err(err);
         }

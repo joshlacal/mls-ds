@@ -1,6 +1,6 @@
 use axum::{extract::State, Json};
 use serde_json::json;
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 use crate::{
     auth::AuthUser,
@@ -72,6 +72,28 @@ pub async fn transfer_sequencer(
         Ok(Json(json!({ "accepted": true })))
     }
     .await;
+
+    match &result {
+        Ok(_) => {
+            info!(
+                event_type = "federation.transfer_sequencer",
+                peer_did = %requester_ds,
+                convo_id = convo_id,
+                result = "accepted",
+                "Federation sequencer transfer accepted"
+            );
+        }
+        Err(e) => {
+            warn!(
+                event_type = "federation.transfer_sequencer",
+                peer_did = %requester_ds,
+                convo_id = convo_id,
+                result = "rejected",
+                reason = %e,
+                "Federation sequencer transfer rejected"
+            );
+        }
+    }
 
     super::deliver_message::record_ds_outcome(&pool, &requester_ds, result.is_ok()).await;
     result

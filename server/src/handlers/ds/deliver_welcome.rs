@@ -1,7 +1,7 @@
 use axum::{extract::State, Json};
 use serde_json::json;
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -124,6 +124,29 @@ pub async fn deliver_welcome(
         Ok(Json(response))
     }
     .await;
+
+    match &result {
+        Ok(_) => {
+            info!(
+                event_type = "federation.deliver_welcome",
+                peer_did = %requester_ds,
+                convo_id = convo_id,
+                recipient_did = recipient_did,
+                result = "accepted",
+                "Federation welcome delivered successfully"
+            );
+        }
+        Err(e) => {
+            warn!(
+                event_type = "federation.deliver_welcome",
+                peer_did = %requester_ds,
+                convo_id = convo_id,
+                result = "rejected",
+                reason = %e,
+                "Federation welcome delivery rejected"
+            );
+        }
+    }
 
     super::deliver_message::record_ds_outcome(&pool, &requester_ds, result.is_ok()).await;
     result

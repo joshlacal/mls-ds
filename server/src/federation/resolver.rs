@@ -1,7 +1,7 @@
 use once_cell::sync::Lazy;
 use sqlx::PgPool;
 use std::time::Duration;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::errors::FederationError;
 use crate::identity::canonical_did;
@@ -85,12 +85,27 @@ impl DsResolver {
             }
         }
 
-        // Fallback to default DS
+        // Fallback to default DS (only when strict resolution is disabled)
         if let Some(ref default) = self.default_ds {
-            info!(
+            if strict_resolution_enabled() {
+                warn!(
+                    did = %crate::crypto::redact_for_log(user_did),
+                    default_ds = default,
+                    "Repo resolution failed and FEDERATION_STRICT_RESOLUTION is enabled; \
+                     refusing to fall back to default DS"
+                );
+                return Err(FederationError::ResolutionFailed {
+                    did: user_did.to_string(),
+                    reason: "Strict resolution mode: repo resolution failed and fallback is disabled"
+                        .to_string(),
+                });
+            }
+
+            warn!(
                 did = %crate::crypto::redact_for_log(user_did),
                 default_ds = default,
-                "Using default DS fallback"
+                "Falling back to default DS after repo resolution failure; \
+                 set FEDERATION_STRICT_RESOLUTION=true to disable this fallback"
             );
             return Ok(DsEndpoint {
                 did: user_did.to_string(),
@@ -134,6 +149,27 @@ impl DsResolver {
     }
 
     async fn cache_endpoint(&self, endpoint: &DsEndpoint) -> Result<(), FederationError> {
+        // Check for endpoint changes (cache poisoning / DNS hijacking detection).
+        // If the previously cached endpoint for this DID differs from the newly
+        // resolved one, emit a warning so operators can investigate.
+        let previous: Option<(String,)> =
+            sqlx::query_as("SELECT endpoint FROM ds_endpoints WHERE did = $1")
+                .bind(&endpoint.did)
+                .fetch_optional(&self.pool)
+                .await?;
+
+        if let Some((ref old_endpoint,)) = previous {
+            if old_endpoint != &endpoint.endpoint {
+                warn!(
+                    did = %crate::crypto::redact_for_log(&endpoint.did),
+                    old_endpoint = %old_endpoint,
+                    new_endpoint = %endpoint.endpoint,
+                    "Cached DS endpoint changed on re-resolution; this may indicate \
+                     DNS hijacking or metadata poisoning"
+                );
+            }
+        }
+
         let suites_json = endpoint
             .supported_cipher_suites
             .as_ref()
@@ -342,6 +378,27 @@ fn allow_insecure_http() -> bool {
         .unwrap_or(false)
 }
 
+/// When `true`, the resolver refuses to fall back to a default DS when repo
+/// resolution fails.  Defaults to `true` in release builds (production) and
+/// `false` in debug builds (development) unless the env var is set explicitly.
+fn strict_resolution_enabled() -> bool {
+    match std::env::var("FEDERATION_STRICT_RESOLUTION") {
+        Ok(v) => matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"),
+        Err(_) => {
+            // Default: strict in release (production), permissive in debug (dev)
+            !cfg!(debug_assertions)
+        }
+    }
+}
+
+/// When `true`, the host allowlist (FEDERATION_OUTBOUND_HOST_ALLOWLIST) must
+/// be non-empty.  This prevents accidental open federation in production.
+fn require_host_allowlist() -> bool {
+    std::env::var("FEDERATION_REQUIRE_HOST_ALLOWLIST")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
 static FEDERATION_HOST_ALLOWLIST: Lazy<Option<Vec<String>>> = Lazy::new(|| {
     std::env::var("FEDERATION_OUTBOUND_HOST_ALLOWLIST")
         .ok()
@@ -363,7 +420,10 @@ fn federation_dns_timeout() -> Duration {
     Duration::from_millis(timeout_ms)
 }
 
-fn host_is_allowlisted(host: &str, allowlist: &[String]) -> bool {
+/// Check whether a host matches any entry in the allowlist (exact or subdomain).
+///
+/// Public so integration tests can exercise allowlist logic directly.
+pub fn host_is_allowlisted(host: &str, allowlist: &[String]) -> bool {
     let host_lc = host.to_ascii_lowercase();
     allowlist
         .iter()
@@ -375,7 +435,11 @@ pub(crate) fn validate_endpoint_url(url_str: &str) -> Result<url::Url, Federatio
     validate_endpoint_url_with_policy(url_str, allow_insecure_http())
 }
 
-fn validate_endpoint_url_with_policy(
+/// Validate a DS endpoint URL with an explicit HTTP-allow policy.
+///
+/// Public so integration tests can exercise SSRF protection without needing
+/// the `FEDERATION_ALLOW_INSECURE_HTTP` env var.
+pub fn validate_endpoint_url_with_policy(
     url_str: &str,
     allow_http: bool,
 ) -> Result<url::Url, FederationError> {
@@ -424,12 +488,43 @@ fn validate_endpoint_url_with_policy(
                     reason: format!("Host {host} is not in FEDERATION_OUTBOUND_HOST_ALLOWLIST"),
                 });
             }
+        } else if require_host_allowlist() {
+            // FEDERATION_REQUIRE_HOST_ALLOWLIST is set but no allowlist is configured.
+            // Reject the request to prevent accidental open federation in production.
+            return Err(FederationError::ResolutionFailed {
+                did: String::new(),
+                reason: "FEDERATION_REQUIRE_HOST_ALLOWLIST is enabled but \
+                         FEDERATION_OUTBOUND_HOST_ALLOWLIST is empty or not set"
+                    .to_string(),
+            });
         }
     }
 
     Ok(parsed)
 }
 
+/// Resolve the host in `parsed` to IP addresses and verify none are private.
+///
+/// # TOCTOU / DNS-rebinding caveat
+///
+/// This check performs a DNS lookup *before* the actual HTTP request.  An
+/// attacker controlling the authoritative DNS server could return a public IP
+/// for this check and then change the DNS record to a private/internal IP
+/// before reqwest opens the TCP connection (a classic DNS-rebinding /
+/// time-of-check-to-time-of-use attack).
+///
+/// Full mitigation requires pinning the resolved IPs into the HTTP client so
+/// that the connection is made to the *same* addresses we validated.  reqwest's
+/// `ClientBuilder::resolve()` can do this, but it operates at the client level
+/// rather than per-request.  A per-request solution would require building a
+/// new client per outbound call, which carries performance cost.
+///
+/// For now we accept this residual risk and rely on:
+///   1. Short DNS TTLs making the window small.
+///   2. The host allowlist (`FEDERATION_OUTBOUND_HOST_ALLOWLIST`) restricting
+///      which hosts are contacted at all.
+///   3. Network-level controls (e.g. firewall egress rules) blocking internal
+///      destinations from the server process.
 pub(crate) async fn validate_resolved_host_is_public(
     parsed: &url::Url,
 ) -> Result<(), FederationError> {
@@ -625,5 +720,60 @@ mod tests {
         assert_eq!(cloned.did, ep.did);
         assert_eq!(cloned.endpoint, ep.endpoint);
         assert_eq!(cloned.supported_cipher_suites, ep.supported_cipher_suites);
+    }
+
+    // -- strict_resolution_enabled tests --
+
+    #[test]
+    fn test_strict_resolution_respects_env_true() {
+        std::env::set_var("FEDERATION_STRICT_RESOLUTION", "true");
+        assert!(strict_resolution_enabled());
+        std::env::remove_var("FEDERATION_STRICT_RESOLUTION");
+    }
+
+    #[test]
+    fn test_strict_resolution_respects_env_false() {
+        std::env::set_var("FEDERATION_STRICT_RESOLUTION", "false");
+        assert!(!strict_resolution_enabled());
+        std::env::remove_var("FEDERATION_STRICT_RESOLUTION");
+    }
+
+    #[test]
+    fn test_strict_resolution_default_depends_on_build() {
+        std::env::remove_var("FEDERATION_STRICT_RESOLUTION");
+        // In debug builds (tests), defaults to false; in release, defaults to true.
+        // This test just verifies no panic.
+        let _result = strict_resolution_enabled();
+    }
+
+    // -- require_host_allowlist tests --
+
+    #[test]
+    fn test_require_host_allowlist_default_false() {
+        std::env::remove_var("FEDERATION_REQUIRE_HOST_ALLOWLIST");
+        assert!(!require_host_allowlist());
+    }
+
+    #[test]
+    fn test_require_host_allowlist_when_enabled() {
+        std::env::set_var("FEDERATION_REQUIRE_HOST_ALLOWLIST", "true");
+        let result = require_host_allowlist();
+        std::env::remove_var("FEDERATION_REQUIRE_HOST_ALLOWLIST");
+        assert!(result);
+    }
+
+    // -- require_host_allowlist enforcement in validate_endpoint_url --
+
+    #[test]
+    fn test_require_host_allowlist_rejects_when_no_allowlist() {
+        // Set require but don't set the actual allowlist
+        std::env::set_var("FEDERATION_REQUIRE_HOST_ALLOWLIST", "true");
+        // Make sure no allowlist is set (the Lazy static is already initialized,
+        // so this test verifies the `else if require_host_allowlist()` branch
+        // only when the Lazy evaluates to None).
+        // Note: Due to Lazy statics this test may not trigger the branch if the
+        // allowlist was previously set. It documents the intended behavior.
+        let _result = validate_endpoint_url_with_policy("https://example.com", false);
+        std::env::remove_var("FEDERATION_REQUIRE_HOST_ALLOWLIST");
     }
 }

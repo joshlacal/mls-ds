@@ -1,0 +1,38 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.mls.ds.healthCheck",
+  "description": "DS-to-DS federation endpoint: health and status probe for delivery service discovery and monitoring.",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Simple health/status endpoint for DS-to-DS discovery. No authentication required. Returns the service DID, version, and uptime.",
+      "parameters": {
+        "type": "params",
+        "properties": {}
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["did", "version", "uptime"],
+          "properties": {
+            "did": {
+              "type": "string",
+              "format": "did",
+              "description": "The DID of this delivery service"
+            },
+            "version": {
+              "type": "string",
+              "description": "Server software version string"
+            },
+            "uptime": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Process uptime in seconds"
+            }
+          }
+        }
+      }
+    }
+  }
+}
