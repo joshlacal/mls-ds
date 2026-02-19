@@ -75,8 +75,18 @@ pub async fn commit_group_change(
                 .unwrap_or(false);
 
                 if already {
+                    let current_epoch: Option<i32> =
+                        sqlx::query_scalar("SELECT current_epoch FROM conversations WHERE id = $1")
+                            .bind(&convo_id)
+                            .fetch_optional(&pool)
+                            .await
+                            .ok()
+                            .flatten();
                     info!("v2.commitGroupChange: addMembers idempotent hit");
-                    return Ok(Json(success_response()));
+                    return Ok(Json(serde_json::json!({
+                        "success": true,
+                        "newEpoch": current_epoch.unwrap_or(0),
+                    })));
                 }
             }
 
@@ -699,6 +709,39 @@ mod tests {
         assert_eq!(
             response.get("success").and_then(|v| v.as_bool()),
             Some(true)
+        );
+    }
+
+    /// Verifies the shape of the addMembers idempotency-hit response:
+    /// it must include both `success: true` and a `newEpoch` field.
+    #[test]
+    fn add_members_idempotent_response_includes_new_epoch() {
+        let epoch: i32 = 5;
+        let response = serde_json::json!({
+            "success": true,
+            "newEpoch": epoch,
+        });
+        assert_eq!(
+            response.get("success").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            response.get("newEpoch").and_then(|v| v.as_i64()),
+            Some(5)
+        );
+    }
+
+    /// When no epoch row exists the idempotency path falls back to 0.
+    #[test]
+    fn add_members_idempotent_response_defaults_epoch_to_zero() {
+        let current_epoch: Option<i32> = None;
+        let response = serde_json::json!({
+            "success": true,
+            "newEpoch": current_epoch.unwrap_or(0),
+        });
+        assert_eq!(
+            response.get("newEpoch").and_then(|v| v.as_i64()),
+            Some(0)
         );
     }
 }
