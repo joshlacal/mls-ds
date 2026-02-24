@@ -23,6 +23,7 @@ pub struct RequestFailoverOutput {
     pub new_sequencer_did: String,
     pub convo_id: String,
     pub epoch: i32,
+    pub sequencer_term: u64,
 }
 
 /// POST /xrpc/blue.catbird.mlsChat.requestFailover
@@ -60,8 +61,8 @@ pub async fn request_failover(
     crate::auth::verify_is_member(&pool, &input.convo_id, &auth_user.did).await?;
 
     // Fetch current sequencer and epoch
-    let row = sqlx::query_as::<_, (Option<String>, Option<i32>)>(
-        "SELECT sequencer_ds, current_epoch FROM conversations WHERE id = $1",
+    let row = sqlx::query_as::<_, (Option<String>, Option<i32>, Option<i64>)>(
+        "SELECT sequencer_ds, current_epoch, sequencer_term FROM conversations WHERE id = $1",
     )
     .bind(&input.convo_id)
     .fetch_optional(&pool)
@@ -71,12 +72,13 @@ pub async fn request_failover(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let (sequencer_ds, current_epoch) = match row {
+    let (sequencer_ds, current_epoch, current_term_raw) = match row {
         Some(r) => r,
         None => return Err(StatusCode::NOT_FOUND),
     };
 
     let epoch = current_epoch.unwrap_or(0);
+    let sequencer_term = current_term_raw.unwrap_or(0).max(0) as u64;
     let self_did = &fed_config.self_did;
 
     // If this DS is already the sequencer, return early
@@ -88,6 +90,7 @@ pub async fn request_failover(
             new_sequencer_did: self_did.clone(),
             convo_id: input.convo_id,
             epoch,
+            sequencer_term,
         }));
     }
 
@@ -101,26 +104,21 @@ pub async fn request_failover(
                 sequencer = %crate::crypto::redact_for_log(&current_seq),
                 "Cannot resolve sequencer endpoint, assuming unreachable"
             );
-            do_assume(
-                &sequencer_transfer,
-                &input.convo_id,
-                self_did,
-                epoch,
-                &current_seq,
-            )
-            .await?;
-            let new_epoch = increment_epoch(&pool, &input.convo_id).await?;
+            let (new_epoch, new_term) =
+                do_assume(&sequencer_transfer, &input.convo_id, self_did, &current_seq).await?;
             broadcast_sequencer_change(
                 &federated_backend,
                 &outbound_queue,
                 &input.convo_id,
                 self_did,
                 new_epoch,
+                new_term,
             );
             return Ok(Json(RequestFailoverOutput {
                 new_sequencer_did: self_did.clone(),
                 convo_id: input.convo_id,
                 epoch: new_epoch,
+                sequencer_term: new_term,
             }));
         }
     };
@@ -165,15 +163,8 @@ pub async fn request_failover(
     }
 
     // Sequencer is unreachable — assume the role
-    do_assume(
-        &sequencer_transfer,
-        &input.convo_id,
-        self_did,
-        epoch,
-        &current_seq,
-    )
-    .await?;
-    let new_epoch = increment_epoch(&pool, &input.convo_id).await?;
+    let (new_epoch, new_term) =
+        do_assume(&sequencer_transfer, &input.convo_id, self_did, &current_seq).await?;
 
     // Best-effort broadcast to all remote DSes (non-blocking)
     broadcast_sequencer_change(
@@ -182,63 +173,59 @@ pub async fn request_failover(
         &input.convo_id,
         self_did,
         new_epoch,
+        new_term,
     );
 
     Ok(Json(RequestFailoverOutput {
         new_sequencer_did: self_did.clone(),
         convo_id: input.convo_id,
         epoch: new_epoch,
+        sequencer_term: new_term,
     }))
-}
-
-/// Atomically increment the conversation epoch after a failover to prevent
-/// the old and new sequencer from accepting commits at the same epoch.
-async fn increment_epoch(pool: &DbPool, convo_id: &str) -> Result<i32, StatusCode> {
-    let new_epoch: i32 = sqlx::query_scalar(
-        "UPDATE conversations SET current_epoch = current_epoch + 1 WHERE id = $1 RETURNING current_epoch",
-    )
-    .bind(convo_id)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| {
-        error!(
-            convo_id = %crate::crypto::redact_for_log(convo_id),
-            error = %e,
-            "Failed to increment epoch"
-        );
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    info!(
-        convo_id = %crate::crypto::redact_for_log(convo_id),
-        new_epoch,
-        "Epoch incremented after failover"
-    );
-    Ok(new_epoch)
 }
 
 async fn do_assume(
     transfer: &SequencerTransfer,
     convo_id: &str,
     self_did: &str,
-    epoch: i32,
     expected_sequencer: &str,
-) -> Result<(), StatusCode> {
-    transfer
+) -> Result<(i32, u64), StatusCode> {
+    let result = transfer
         .assume_sequencer_role(convo_id, expected_sequencer)
         .await
         .map_err(|e| {
             error!("Failed to assume sequencer role: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
+            match e {
+                crate::federation::TransferError::ConversationNotFound(_) => StatusCode::NOT_FOUND,
+                crate::federation::TransferError::NotAuthorized { .. } => StatusCode::FORBIDDEN,
+                crate::federation::TransferError::NotCurrentSequencer { .. }
+                | crate::federation::TransferError::TermStale { .. }
+                | crate::federation::TransferError::TermJumpTooLarge { .. }
+                | crate::federation::TransferError::LeaseStillActive { .. } => StatusCode::CONFLICT,
+                crate::federation::TransferError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            }
         })?;
+
+    let (new_epoch, new_sequencer_term) = match result {
+        crate::federation::TransferResult::Accepted {
+            new_epoch,
+            new_sequencer_term,
+            ..
+        } => (new_epoch, new_sequencer_term),
+        crate::federation::TransferResult::Transferred { .. } => {
+            error!("Unexpected transfer result while assuming sequencer role");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
 
     info!(
         convo_id = %crate::crypto::redact_for_log(convo_id),
         new_sequencer = %crate::crypto::redact_for_log(self_did),
-        epoch,
+        epoch = new_epoch,
+        sequencer_term = new_sequencer_term,
         "Failover complete — assumed sequencer role"
     );
-    Ok(())
+    Ok((new_epoch, new_sequencer_term))
 }
 
 /// Spawn a background task to broadcast the sequencer change to all remote DSes.
@@ -249,6 +236,7 @@ fn broadcast_sequencer_change(
     convo_id: &str,
     new_sequencer_did: &str,
     epoch: i32,
+    new_sequencer_term: u64,
 ) {
     let fb = Arc::clone(federated_backend);
     let oq = Arc::clone(outbound_queue);
@@ -271,6 +259,7 @@ fn broadcast_sequencer_change(
         let payload = serde_json::json!({
             "convoId": convo_id,
             "currentEpoch": epoch,
+            "newSequencerTerm": new_sequencer_term,
         });
         let payload_bytes = match serde_json::to_vec(&payload) {
             Ok(b) => b,
@@ -285,15 +274,10 @@ fn broadcast_sequencer_change(
                 continue;
             }
 
-            let target_endpoint = ds_did
-                .strip_prefix("did:web:")
-                .map(|path| format!("https://{}", path.replace(':', "/")))
-                .unwrap_or_default();
-
             if let Err(e) = oq
                 .enqueue(
                     &ds_did,
-                    &target_endpoint,
+                    "",
                     "blue.catbird.mls.ds.transferSequencer",
                     &payload_bytes,
                     &convo_id,

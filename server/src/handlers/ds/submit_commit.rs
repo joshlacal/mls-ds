@@ -5,10 +5,24 @@ use tracing::{debug, warn};
 
 use crate::{
     auth::AuthUser,
+    crypto::redact_for_log,
     federation::{CommitResult, FederationError, Sequencer},
     identity::canonical_did,
     storage::DbPool,
 };
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubmitCommit<'a> {
+    #[serde(borrow)]
+    convo_id: jacquard_common::CowStr<'a>,
+    #[serde(borrow)]
+    sender_ds_did: jacquard_common::CowStr<'a>,
+    epoch: i64,
+    proposed_epoch: i64,
+    #[serde(with = "jacquard_common::serde_bytes_helper")]
+    commit_data: bytes::Bytes,
+}
 
 const NSID: &str = "blue.catbird.mls.ds.submitCommit";
 
@@ -22,10 +36,7 @@ pub async fn submit_commit(
     auth_user: AuthUser,
     body: String,
 ) -> Result<Json<serde_json::Value>, FederationError> {
-    let commit = crate::jacquard_json::from_json_body::<
-        crate::generated::blue_catbird::mls::ds::submit_commit::SubmitCommit<'_>,
-    >(&body)
-    .map_err(|_| {
+    let commit: SubmitCommit<'_> = serde_json::from_str(&body).map_err(|_| {
         FederationError::Json(serde_json::Error::io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "Invalid SubmitCommit body",
@@ -36,6 +47,21 @@ pub async fn submit_commit(
     let sender_ds = commit.sender_ds_did.as_ref();
     let epoch = commit.epoch as i32;
     let proposed_epoch = commit.proposed_epoch as i32;
+    let raw_body: serde_json::Value = serde_json::from_str(&body).map_err(|_| {
+        FederationError::Json(serde_json::Error::io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Invalid SubmitCommit body",
+        )))
+    })?;
+    let sequencer_term = raw_body
+        .get("sequencerTerm")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            FederationError::Json(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Missing or invalid sequencerTerm",
+            )))
+        })?;
 
     let security = super::deliver_message::enforce_ds_request_security(
         &pool,
@@ -53,7 +79,27 @@ pub async fn submit_commit(
     .to_string();
 
     let result: Result<Json<serde_json::Value>, FederationError> = async {
-        // Verify this DS is the sequencer for the conversation
+        let Some(sequencer_state) =
+            super::deliver_message::load_convo_sequencer_state_optional(&pool, convo_id).await?
+        else {
+            return Err(FederationError::ConversationNotFound {
+                convo_id: convo_id.to_string(),
+            });
+        };
+        if canonical_did(&sequencer_state.expected_sequencer) != canonical_did(&self_did) {
+            return Err(FederationError::NotSequencer {
+                convo_id: convo_id.to_string(),
+            });
+        }
+        if sequencer_term != sequencer_state.current_term {
+            return Err(FederationError::TermStale {
+                convo_id: convo_id.to_string(),
+                provided_term: sequencer_term as i64,
+                current_term: sequencer_state.current_term as i64,
+            });
+        }
+
+        // Verify this DS is still the sequencer for the conversation (runtime check)
         let is_sequencer = sequencer
             .is_sequencer_for(convo_id)
             .await
@@ -92,7 +138,13 @@ pub async fn submit_commit(
         // Submit the commit for CAS ordering
         let commit_data_bytes = commit.commit_data.as_ref();
         let result = sequencer
-            .submit_commit(convo_id, epoch, proposed_epoch, commit_data_bytes)
+            .submit_commit(
+                convo_id,
+                epoch,
+                proposed_epoch,
+                sequencer_term,
+                commit_data_bytes,
+            )
             .await
             .map_err(FederationError::Database)?;
 
@@ -116,21 +168,46 @@ pub async fn submit_commit(
                 .map_err(FederationError::Database)?;
 
                 debug!(
-                    convo_id,
-                    assigned_epoch, sender_ds, "Commit accepted and sequenced"
+                    convo = %redact_for_log(convo_id),
+                    assigned_epoch,
+                    sender_ds = %redact_for_log(sender_ds),
+                    "Commit accepted and sequenced"
                 );
 
                 Ok(Json(json!({
                     "accepted": true,
                     "assignedEpoch": assigned_epoch,
+                    "sequencerTerm": sequencer_term,
                     "receipt": receipt
                 })))
+            }
+            CommitResult::TermStale {
+                current_term,
+                reason,
+            } => {
+                warn!(
+                    convo = %redact_for_log(convo_id),
+                    provided_term = sequencer_term,
+                    current_term,
+                    %reason,
+                    "Commit rejected due to stale sequencer term"
+                );
+                Err(FederationError::TermStale {
+                    convo_id: convo_id.to_string(),
+                    provided_term: sequencer_term as i64,
+                    current_term: current_term as i64,
+                })
             }
             CommitResult::Conflict {
                 current_epoch,
                 reason,
             } => {
-                warn!(convo_id, current_epoch, %reason, "Commit conflict");
+                warn!(
+                    convo = %redact_for_log(convo_id),
+                    current_epoch,
+                    %reason,
+                    "Commit conflict"
+                );
 
                 Err(FederationError::CommitConflict {
                     convo_id: convo_id.to_string(),

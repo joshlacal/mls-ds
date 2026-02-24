@@ -20,6 +20,15 @@ pub enum FederationError {
     #[error("Not the sequencer for conversation {convo_id}")]
     NotSequencer { convo_id: String },
 
+    #[error(
+        "Stale sequencer term for conversation {convo_id}: provided {provided_term}, current {current_term}"
+    )]
+    TermStale {
+        convo_id: String,
+        provided_term: i64,
+        current_term: i64,
+    },
+
     #[error("Service auth failed: {reason}")]
     AuthFailed { reason: String },
 
@@ -47,6 +56,25 @@ pub enum FederationError {
     #[error("Configuration error: {reason}")]
     ConfigError { reason: String },
 
+    #[error(
+        "Outbound queue per-peer pending cap exceeded for {target_ds_did}: {pending} pending (limit {limit})"
+    )]
+    OutboundQueuePeerCapExceeded {
+        target_ds_did: String,
+        pending: i64,
+        limit: i64,
+    },
+
+    #[error(
+        "Outbound queue per-conversation pending cap exceeded for peer {target_ds_did} in conversation {convo_id}: {pending} pending (limit {limit})"
+    )]
+    OutboundQueueConvoPeerCapExceeded {
+        target_ds_did: String,
+        convo_id: String,
+        pending: i64,
+        limit: i64,
+    },
+
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
 
@@ -64,13 +92,15 @@ impl FederationError {
             | Self::ConversationNotFound { .. }
             | Self::RecipientNotFound { .. }
             | Self::NoKeyPackagesAvailable { .. } => StatusCode::NOT_FOUND,
-            Self::CommitConflict { .. } => StatusCode::CONFLICT,
+            Self::CommitConflict { .. } | Self::TermStale { .. } => StatusCode::CONFLICT,
             Self::NotSequencer { .. } => StatusCode::FORBIDDEN,
             Self::AuthFailed { .. } => StatusCode::UNAUTHORIZED,
             Self::InvalidProof => StatusCode::BAD_REQUEST,
             Self::DsUnreachable { .. } | Self::ResolutionFailed { .. } | Self::Http(_) => {
                 StatusCode::BAD_GATEWAY
             }
+            Self::OutboundQueuePeerCapExceeded { .. }
+            | Self::OutboundQueueConvoPeerCapExceeded { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::RemoteError { status, .. } => {
                 StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY)
             }
@@ -87,6 +117,7 @@ impl FederationError {
             Self::DsUnreachable { .. } => "DsUnreachable",
             Self::CommitConflict { .. } => "ConflictDetected",
             Self::NotSequencer { .. } => "NotSequencer",
+            Self::TermStale { .. } => "TermStale",
             Self::AuthFailed { .. } => "Unauthorized",
             Self::TransferFailed { .. } => "TransferFailed",
             Self::RemoteError { .. } => "RemoteError",
@@ -96,9 +127,25 @@ impl FederationError {
             Self::NoKeyPackagesAvailable { .. } => "NoKeyPackagesAvailable",
             Self::InvalidProof => "InvalidProof",
             Self::ConfigError { .. } => "ConfigError",
+            Self::OutboundQueuePeerCapExceeded { .. }
+            | Self::OutboundQueueConvoPeerCapExceeded { .. } => "QueueCapacityExceeded",
             Self::Database(_) => "InternalError",
             Self::Http(_) => "NetworkError",
             Self::Json(_) => "InvalidRequest",
+        }
+    }
+
+    pub fn reason_code(&self) -> &'static str {
+        match self {
+            Self::AuthFailed { .. } => "auth_failed",
+            Self::NotSequencer { .. } => "not_sequencer",
+            Self::TermStale { .. } => "term_stale",
+            Self::CommitConflict { .. } | Self::ConversationNotFound { .. } => "conflict",
+            Self::RemoteError { status, .. } if *status == 429 => "rate_limited",
+            Self::OutboundQueuePeerCapExceeded { .. }
+            | Self::OutboundQueueConvoPeerCapExceeded { .. } => "queue_capacity_exceeded",
+            Self::Json(_) | Self::InvalidProof => "invalid_payload",
+            _ => "conflict",
         }
     }
 }
@@ -107,10 +154,15 @@ impl IntoResponse for FederationError {
     fn into_response(self) -> Response {
         let status = self.status_code();
         let error_name = self.error_name();
+        crate::metrics::record_federation_rejection_reason(self.reason_code());
         tracing::error!(error = %self, error_name, "Federation error");
         (
             status,
-            Json(json!({ "error": error_name, "message": self.to_string() })),
+            Json(json!({
+                "error": error_name,
+                "message": self.to_string(),
+                "reasonCode": self.reason_code()
+            })),
         )
             .into_response()
     }
@@ -158,6 +210,15 @@ mod tests {
             StatusCode::FORBIDDEN
         );
         assert_eq!(
+            FederationError::TermStale {
+                convo_id: "x".into(),
+                provided_term: 1,
+                current_term: 2
+            }
+            .status_code(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
             FederationError::AuthFailed { reason: "x".into() }.status_code(),
             StatusCode::UNAUTHORIZED
         );
@@ -184,6 +245,15 @@ mod tests {
         assert_eq!(
             FederationError::TransferFailed { reason: "x".into() }.status_code(),
             StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            FederationError::OutboundQueuePeerCapExceeded {
+                target_ds_did: "x".into(),
+                pending: 5,
+                limit: 5
+            }
+            .status_code(),
+            StatusCode::TOO_MANY_REQUESTS
         );
         assert_eq!(
             FederationError::ConfigError { reason: "x".into() }.status_code(),
@@ -261,9 +331,65 @@ mod tests {
             "NotSequencer"
         );
         assert_eq!(
+            FederationError::TermStale {
+                convo_id: "x".into(),
+                provided_term: 1,
+                current_term: 2
+            }
+            .error_name(),
+            "TermStale"
+        );
+        assert_eq!(
             FederationError::AuthFailed { reason: "x".into() }.error_name(),
             "Unauthorized"
         );
         assert_eq!(FederationError::InvalidProof.error_name(), "InvalidProof");
+    }
+
+    #[test]
+    fn test_reason_code_mapping() {
+        assert_eq!(
+            FederationError::AuthFailed { reason: "x".into() }.reason_code(),
+            "auth_failed"
+        );
+        assert_eq!(
+            FederationError::NotSequencer {
+                convo_id: "x".into()
+            }
+            .reason_code(),
+            "not_sequencer"
+        );
+        assert_eq!(
+            FederationError::TermStale {
+                convo_id: "x".into(),
+                provided_term: 1,
+                current_term: 2
+            }
+            .reason_code(),
+            "term_stale"
+        );
+        assert_eq!(
+            FederationError::RemoteError {
+                status: 429,
+                body: "x".into()
+            }
+            .reason_code(),
+            "rate_limited"
+        );
+        assert_eq!(
+            FederationError::Json(serde_json::Error::io(std::io::Error::other("bad payload")))
+                .reason_code(),
+            "invalid_payload"
+        );
+        assert_eq!(
+            FederationError::OutboundQueueConvoPeerCapExceeded {
+                target_ds_did: "x".into(),
+                convo_id: "c".into(),
+                pending: 10,
+                limit: 10
+            }
+            .reason_code(),
+            "queue_capacity_exceeded"
+        );
     }
 }

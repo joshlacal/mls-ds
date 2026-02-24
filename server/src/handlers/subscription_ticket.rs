@@ -95,8 +95,33 @@ pub async fn get_subscription_ticket(
     let now = Utc::now();
     let expires_at = now + Duration::seconds(30);
 
-    // Generate unique JTI
-    let jti = generate_jti();
+    // Generate unique JTI and persist nonce for one-time WS use.
+    let mut jti: Option<String> = None;
+    for _ in 0..3 {
+        let candidate = generate_jti();
+        let inserted = sqlx::query(
+            "INSERT INTO ws_ticket_nonce (issuer_did, jti, expires_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+        )
+        .bind(&service_did)
+        .bind(&candidate)
+        .bind(expires_at)
+        .execute(&pool)
+        .await
+        .map_err(|e| {
+            error!("Failed to store ticket nonce: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .rows_affected()
+            == 1;
+        if inserted {
+            jti = Some(candidate);
+            break;
+        }
+    }
+    let Some(jti) = jti else {
+        error!("Failed to allocate unique ticket nonce");
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    };
 
     let claims = TicketClaims {
         iss: service_did.clone(),
@@ -181,6 +206,7 @@ mod tests {
     #[test]
     fn test_sign_and_verify_ticket() {
         std::env::set_var("TICKET_SECRET", "test-secret-for-unit-tests");
+        std::env::set_var("SERVICE_DID", "did:web:mls.test");
 
         let claims = TicketClaims {
             iss: "did:web:mls.test".to_string(),
@@ -202,6 +228,7 @@ mod tests {
     #[test]
     fn test_expired_ticket() {
         std::env::set_var("TICKET_SECRET", "test-secret-for-unit-tests");
+        std::env::set_var("SERVICE_DID", "did:web:mls.test");
 
         let claims = TicketClaims {
             iss: "did:web:mls.test".to_string(),

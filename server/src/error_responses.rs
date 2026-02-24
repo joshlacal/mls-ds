@@ -6,12 +6,13 @@ use axum::{
     Json,
 };
 
-use crate::generated::blue_catbird::mls::{
-    add_members::AddMembersError as LexAddMembersError,
-    create_convo::CreateConvoError as LexCreateConvoError,
-    get_group_info::GetGroupInfoError as LexGetGroupInfoError,
-    update_group_info::UpdateGroupInfoError as LexUpdateGroupInfoError,
-};
+type LexCreateConvoError = crate::generated::blue_catbird::mlsChat::create_convo::CreateConvoError<'static>;
+type LexAddMembersError =
+    crate::generated::blue_catbird::mlsChat::commit_group_change::CommitGroupChangeError<'static>;
+type LexGetGroupInfoError =
+    crate::generated::blue_catbird::mlsChat::get_group_state::GetGroupStateError<'static>;
+type LexUpdateGroupInfoError =
+    crate::generated::blue_catbird::mlsChat::update_convo::UpdateConvoError<'static>;
 
 /// Wrapper for createConvo errors that can be either structured or generic HTTP
 pub enum CreateConvoError {

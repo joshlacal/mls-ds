@@ -11,7 +11,7 @@ use crate::{
     auth::AuthUser,
     federation::SequencerTransfer,
     generated::blue_catbird::mlsChat::leave_convo::{LeaveConvoOutput, LeaveConvoRequest},
-    realtime::SseState,
+    realtime::{SseState, StreamMessageView},
     storage::{get_current_epoch, is_member, DbPool},
 };
 
@@ -269,16 +269,18 @@ pub async fn leave_convo(
 
                 match message_result {
                     Ok((id, ciphertext, epoch, seq, created_at)) => {
-                        let message_view = crate::generated_types::MessageView {
-                            id,
-                            convo_id: convo_id_clone.clone(),
-                            ciphertext: ciphertext.unwrap_or_default(),
-                            epoch: epoch as i64,
-                            seq,
-                            created_at,
-                            message_type: "app".to_string(),
-                            reactions: None,
-                        };
+                        let message_view: StreamMessageView =
+                            crate::generated::blue_catbird::mlsChat::MessageView {
+                                id: id.into(),
+                                convo_id: convo_id_clone.clone().into(),
+                                ciphertext: bytes::Bytes::from(ciphertext.unwrap_or_default()),
+                                epoch: epoch as i64,
+                                seq,
+                                created_at: crate::sqlx_jacquard::chrono_to_datetime(created_at),
+                                message_type: Some("app".into()),
+                                extra_data: Default::default(),
+                            }
+                            .into();
 
                         let event = crate::realtime::StreamEvent::MessageEvent {
                             cursor: cursor.clone(),

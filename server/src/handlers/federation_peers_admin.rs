@@ -83,6 +83,7 @@ pub async fn upsert_federation_peer(
     let status = peer_policy::PeerStatus::from_str(&input.status).ok_or(StatusCode::BAD_REQUEST)?;
     let record = peer_policy::upsert_peer_policy(
         &pool,
+        &auth_user.did,
         &input.ds_did,
         status,
         input.max_requests_per_minute,
@@ -117,7 +118,7 @@ pub async fn delete_federation_peer(
     enforce_standard(&auth_user.claims, DELETE_NSID).map_err(|_| StatusCode::UNAUTHORIZED)?;
     require_federation_admin(&auth_user)?;
 
-    let deleted = peer_policy::delete_peer_policy(&pool, &input.ds_did)
+    let deleted = peer_policy::delete_peer_policy(&pool, &auth_user.did, &input.ds_did)
         .await
         .map_err(map_federation_error)?;
     if !deleted {
@@ -143,7 +144,7 @@ fn parse_admin_dids() -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn require_federation_admin(auth_user: &AuthUser) -> Result<(), StatusCode> {
+pub(crate) fn require_federation_admin(auth_user: &AuthUser) -> Result<(), StatusCode> {
     let allowed = parse_admin_dids();
     let requester = canonical_did(&auth_user.did);
     if allowed.iter().any(|did| did == requester) {
@@ -151,7 +152,7 @@ fn require_federation_admin(auth_user: &AuthUser) -> Result<(), StatusCode> {
     }
     warn!(
         requester = %requester,
-        "Rejected federation peer admin request from non-admin DID"
+        "Rejected federation admin request from non-admin DID"
     );
     Err(StatusCode::FORBIDDEN)
 }

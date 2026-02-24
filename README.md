@@ -307,9 +307,11 @@ MIT
 
 ## XRPC Proxy via PDS
 
-# This service validates inter-service JWTs (at+jwt) from the PDS when proxying.
+This service validates inter-service JWTs (at+jwt) from the PDS when proxying.
 - Set `SERVICE_DID` to this service's DID.
 - Optionally set `PDS_XRPC_BASE` to enable fallback proxying for non-MLS endpoints (disabled by default).
+- Local DS nodes do not provide a shim for `/xrpc/com.atproto.repo.getRecord` (expect HTTP 404).
+- Federation discovery must resolve user DID documents to a real PDS/AppView and fetch `blue.catbird.mls.profile` there.
 
 ## 🐳 Docker Deployment (Current)
 
@@ -344,4 +346,3 @@ sudo docker compose down
 - 📚 **Full Migration Guide**: [DOCKER_MIGRATION_SUMMARY.md](DOCKER_MIGRATION_SUMMARY.md)
 - ⚡ **Quick Reference**: [DOCKER_QUICKSTART.md](DOCKER_QUICKSTART.md)
 - 📖 **Original Setup Guide**: [SERVER_SETUP.md](SERVER_SETUP.md) (legacy systemd approach)
-

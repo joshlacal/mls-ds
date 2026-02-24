@@ -14,12 +14,12 @@ pub use chat_request::{
 };
 
 // Re-export generated types for convenience
-pub use crate::generated::blue_catbird::mls::{
+pub use crate::generated::blue_catbird::mlsChat::{
     ConvoMetadata, ConvoView, KeyPackageRef, MemberView, MessageView,
 };
 
 // Note: handler-specific types (AddMembers, LeaveConvo, etc.) are imported
-// directly by each handler from crate::generated::blue_catbird::mls::*
+// directly by each handler from crate::generated::blue_catbird::mlsChat::*
 
 // =============================================================================
 // Database-specific models (not in lexicon)
@@ -387,6 +387,7 @@ impl OutboundQueueItem {
 pub struct SequencerReceipt {
     pub convo_id: String,
     pub epoch: i32,
+    pub sequencer_term: i64,
     pub commit_hash: Vec<u8>,
     pub sequencer_did: String,
     pub issued_at: i64,

@@ -19,6 +19,8 @@ pub struct DeliveryAck {
     pub convo_id: String,
     /// MLS epoch at the time of delivery.
     pub epoch: i32,
+    /// Sequencer term bound to the delivered message.
+    pub sequencer_term: u64,
     /// DID of the DS that received the message.
     pub receiver_ds_did: String,
     /// Unix timestamp (seconds) when the ack was created.
@@ -37,6 +39,7 @@ impl DeliveryAck {
             &self.message_id,
             &self.convo_id,
             self.epoch,
+            self.sequencer_term,
             &self.receiver_ds_did,
             self.acked_at,
         );
@@ -74,15 +77,29 @@ impl AckSigner {
     }
 
     /// Produce a signed [`DeliveryAck`] for a delivered message.
-    pub fn sign_ack(&self, message_id: &str, convo_id: &str, epoch: i32) -> DeliveryAck {
+    pub fn sign_ack(
+        &self,
+        message_id: &str,
+        convo_id: &str,
+        epoch: i32,
+        sequencer_term: u64,
+    ) -> DeliveryAck {
         let acked_at = Utc::now().timestamp();
-        let canonical = canonical_bytes(message_id, convo_id, epoch, &self.ds_did, acked_at);
+        let canonical = canonical_bytes(
+            message_id,
+            convo_id,
+            epoch,
+            sequencer_term,
+            &self.ds_did,
+            acked_at,
+        );
         let sig: Signature = self.signing_key.sign(&canonical);
 
         DeliveryAck {
             message_id: message_id.to_string(),
             convo_id: convo_id.to_string(),
             epoch,
+            sequencer_term,
             receiver_ds_did: self.ds_did.clone(),
             acked_at,
             signature: sig.to_bytes().to_vec(),
@@ -97,16 +114,17 @@ impl AckSigner {
 
 /// Build the canonical byte representation for signing/verification.
 ///
-/// Format: `"CATBIRD-ACK-V1:" || len(message_id) || message_id || len(convo_id) || convo_id || epoch (big-endian i32) || len(receiver_ds_did) || receiver_ds_did || acked_at (big-endian i64)`
+/// Format: `"CATBIRD-ACK-V1:" || len(message_id) || message_id || len(convo_id) || convo_id || epoch (big-endian i32) || sequencer_term (big-endian u64) || len(receiver_ds_did) || receiver_ds_did || acked_at (big-endian i64)`
 fn canonical_bytes(
     message_id: &str,
     convo_id: &str,
     epoch: i32,
+    sequencer_term: u64,
     receiver_ds_did: &str,
     acked_at: i64,
 ) -> Vec<u8> {
     let mut buf = Vec::with_capacity(
-        15 + 4 + message_id.len() + 4 + convo_id.len() + 4 + 4 + receiver_ds_did.len() + 8,
+        15 + 4 + message_id.len() + 4 + convo_id.len() + 4 + 8 + 4 + receiver_ds_did.len() + 8,
     );
     // Domain separator prevents cross-protocol signature reuse
     buf.extend_from_slice(b"CATBIRD-ACK-V1:");
@@ -116,6 +134,7 @@ fn canonical_bytes(
     buf.extend_from_slice(&(convo_id.len() as u32).to_le_bytes());
     buf.extend_from_slice(convo_id.as_bytes());
     buf.extend_from_slice(&epoch.to_be_bytes());
+    buf.extend_from_slice(&sequencer_term.to_be_bytes());
     buf.extend_from_slice(&(receiver_ds_did.len() as u32).to_le_bytes());
     buf.extend_from_slice(receiver_ds_did.as_bytes());
     buf.extend_from_slice(&acked_at.to_be_bytes());
@@ -137,11 +156,12 @@ mod tests {
         let (sk, vk) = test_keypair();
         let signer = AckSigner::new(sk, "did:web:ds-a.example.com".to_string());
 
-        let ack = signer.sign_ack("msg-001", "convo-abc", 5);
+        let ack = signer.sign_ack("msg-001", "convo-abc", 5, 9);
 
         assert_eq!(ack.message_id, "msg-001");
         assert_eq!(ack.convo_id, "convo-abc");
         assert_eq!(ack.epoch, 5);
+        assert_eq!(ack.sequencer_term, 9);
         assert_eq!(ack.receiver_ds_did, "did:web:ds-a.example.com");
         assert!(ack.verify(&vk), "signature should verify with correct key");
     }
@@ -152,7 +172,7 @@ mod tests {
         let (_, wrong_vk) = test_keypair();
         let signer = AckSigner::new(sk, "did:web:ds.example.com".to_string());
 
-        let ack = signer.sign_ack("msg-002", "convo-xyz", 10);
+        let ack = signer.sign_ack("msg-002", "convo-xyz", 10, 11);
 
         assert!(
             !ack.verify(&wrong_vk),
@@ -165,7 +185,7 @@ mod tests {
         let (sk, vk) = test_keypair();
         let signer = AckSigner::new(sk, "did:web:ds.example.com".to_string());
 
-        let mut ack = signer.sign_ack("msg-003", "convo-123", 1);
+        let mut ack = signer.sign_ack("msg-003", "convo-123", 1, 1);
         ack.epoch = 999; // tamper
 
         assert!(
@@ -178,7 +198,7 @@ mod tests {
     fn serde_roundtrip() {
         let (sk, vk) = test_keypair();
         let signer = AckSigner::new(sk, "did:web:ds.example.com".to_string());
-        let ack = signer.sign_ack("msg-004", "convo-serde", 42);
+        let ack = signer.sign_ack("msg-004", "convo-serde", 42, 7);
 
         let json = serde_json::to_string(&ack).expect("serialize");
         let decoded: DeliveryAck = serde_json::from_str(&json).expect("deserialize");

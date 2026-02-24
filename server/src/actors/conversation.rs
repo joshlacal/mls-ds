@@ -4,9 +4,10 @@ use sqlx::PgPool;
 use std::{collections::HashMap, sync::Arc};
 use tracing::{debug, error, info, warn};
 
+use super::broadcaster::BroadcasterPool;
 use super::messages::{ConvoMessage, KeyPackageHashEntry};
 use crate::notifications::NotificationService;
-use crate::realtime::{SseState, StreamEvent};
+use crate::realtime::{SseState, StreamEvent, StreamMessageView};
 use tokio::sync::mpsc;
 
 /// Manages state for a single conversation, ensuring sequential processing
@@ -59,6 +60,7 @@ pub struct ConversationActor;
 /// - `convo_id`: Unique identifier for the conversation
 /// - `db_pool`: Database connection pool for persistent operations
 /// - `sse_state`: SSE state for real-time event broadcasting
+#[derive(Clone)]
 pub struct ConvoActorArgs {
     pub convo_id: String,
     pub db_pool: PgPool,
@@ -106,6 +108,25 @@ impl Actor for ConversationActor {
             args.convo_id, current_epoch
         );
 
+        let broadcaster_worker_count = std::env::var("BROADCASTER_POOL_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(4);
+        let broadcaster_chunk_size = std::env::var("BROADCASTER_CHUNK_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(1000);
+
+        let broadcaster_pool = BroadcasterPool::spawn(
+            args.db_pool.clone(),
+            broadcaster_worker_count,
+            broadcaster_chunk_size,
+        )
+        .await
+        .map_err(|e| format!("Failed to initialize broadcaster pool: {}", e))?;
+
         // Create channel for serialized background jobs
         let (tx, mut rx) = mpsc::channel::<SideEffectJob>(100);
 
@@ -114,6 +135,7 @@ impl Actor for ConversationActor {
         let sse_state = args.sse_state.clone();
         let notification_service = args.notification_service.clone();
         let convo_id = args.convo_id.clone();
+        let broadcaster_pool_for_worker = broadcaster_pool.clone();
 
         tokio::spawn(async move {
             info!(
@@ -134,6 +156,7 @@ impl Actor for ConversationActor {
                         handle_notify_new_message(
                             &pool,
                             &sse_state,
+                            &broadcaster_pool_for_worker,
                             notification_service.as_deref(),
                             &convo_id,
                             &msg_id,
@@ -158,6 +181,7 @@ impl Actor for ConversationActor {
                         handle_notify_system_message(
                             &pool,
                             &sse_state,
+                            &broadcaster_pool_for_worker,
                             &convo_id,
                             &msg_id,
                             &message_type,
@@ -179,6 +203,7 @@ impl Actor for ConversationActor {
             db_pool: args.db_pool,
             sse_state: args.sse_state,
             side_effect_tx: tx,
+            broadcaster_pool,
         })
     }
 
@@ -242,6 +267,7 @@ impl Actor for ConversationActor {
             }
             ConvoMessage::Shutdown => {
                 info!("ConversationActor shutting down");
+                state.broadcaster_pool.shutdown();
                 // Could persist state here if needed
             }
         }
@@ -274,6 +300,7 @@ pub struct ConversationActorState {
     db_pool: PgPool,
     sse_state: Arc<SseState>,
     side_effect_tx: mpsc::Sender<SideEffectJob>,
+    broadcaster_pool: BroadcasterPool,
 }
 
 impl ConversationActorState {
@@ -941,6 +968,7 @@ impl ConversationActorState {
 async fn handle_notify_new_message(
     pool: &sqlx::PgPool,
     sse_state: &SseState,
+    broadcaster_pool: &BroadcasterPool,
     notification_service: Option<&crate::notifications::NotificationService>,
     convo_id: &str,
     msg_id: &str,
@@ -954,52 +982,24 @@ async fn handle_notify_new_message(
 
     // 1. Fan-out (Envelopes) - Skip for ephemeral
     if !is_ephemeral {
-        // Get all active members
-        let members_result = sqlx::query!(
-            r#"
-            SELECT member_did
-            FROM members
-            WHERE convo_id = $1 AND left_at IS NULL
-            "#,
-            convo_id
+        let members_result = sqlx::query_scalar::<_, String>(
+            "SELECT member_did FROM members WHERE convo_id = $1 AND left_at IS NULL",
         )
+        .bind(convo_id)
         .fetch_all(pool)
         .await;
 
         match members_result {
-            Ok(members) => {
-                // Write envelopes
-                for member in &members {
-                    // Don't create envelope for sender
-                    if member.member_did == sender_did {
-                        continue;
-                    }
-
-                    let envelope_id = uuid::Uuid::new_v4().to_string();
-                    let envelope_result = sqlx::query!(
-                        r#"
-                        INSERT INTO envelopes (id, convo_id, recipient_did, message_id, created_at)
-                        VALUES ($1, $2, $3, $4, NOW())
-                        ON CONFLICT (recipient_did, message_id) DO NOTHING
-                        "#,
-                        &envelope_id,
-                        convo_id,
-                        &member.member_did,
-                        msg_id,
-                    )
-                    .execute(pool)
-                    .await;
-
-                    if let Err(e) = envelope_result {
-                        error!(
-                            "❌ [actor:worker] Failed to insert envelope for {}: {:?}",
-                            member.member_did, e
-                        );
-                    }
+            Ok(member_dids) => {
+                if let Err(e) = broadcaster_pool
+                    .fanout_envelopes(convo_id, msg_id, member_dids, Some(sender_did))
+                    .await
+                {
+                    error!("❌ [actor:worker] Failed to fan out envelopes: {:?}", e);
+                } else {
+                    let fanout_duration = fanout_start.elapsed();
+                    crate::metrics::record_envelope_write_duration(convo_id, fanout_duration);
                 }
-
-                let fanout_duration = fanout_start.elapsed();
-                crate::metrics::record_envelope_write_duration(convo_id, fanout_duration);
             }
             Err(e) => {
                 error!("❌ [actor:worker] Failed to get members: {:?}", e);
@@ -1010,16 +1010,17 @@ async fn handle_notify_new_message(
     // 2. SSE Emission
     let cursor = sse_state.cursor_gen.next(convo_id, "messageEvent").await;
 
-    let message_view = crate::generated_types::MessageView {
-        id: msg_id.to_string(),
-        convo_id: convo_id.to_string(),
-        ciphertext: ciphertext.clone(),
-        epoch: epoch as i64,
-        seq: seq as i64,
-        created_at: chrono::Utc::now(),
-        message_type: "app".to_string(),
-        reactions: None,
-    };
+    let message_view: StreamMessageView = crate::generated::blue_catbird::mlsChat::MessageView {
+        id: msg_id.to_string().into(),
+        convo_id: convo_id.to_string().into(),
+        ciphertext: bytes::Bytes::from(ciphertext.clone()),
+        epoch,
+        seq,
+        created_at: crate::sqlx_jacquard::chrono_to_datetime(chrono::Utc::now()),
+        message_type: Some("app".into()),
+        extra_data: Default::default(),
+    }
+    .into();
 
     let event = StreamEvent::MessageEvent {
         cursor: cursor.clone(),
@@ -1057,42 +1058,31 @@ async fn handle_notify_new_message(
 async fn handle_notify_system_message(
     pool: &sqlx::PgPool,
     sse_state: &SseState,
+    broadcaster_pool: &BroadcasterPool,
     convo_id: &str,
     msg_id: &str,
-    message_type: &str,
+    _message_type: &str,
 ) {
     // For commits, we just need to ensure envelopes and SSE are sent.
     // We don't typically send push for commits unless they are important?
     // For now, mirroring legacy behavior which is likely just SSE/Envelopes.
 
-    // 1. Fan-out (Envelopes)
-    let members_result = sqlx::query!(
-        r#"
-        SELECT member_did
-        FROM members
-        WHERE convo_id = $1 AND left_at IS NULL
-        "#,
-        convo_id
+    let members_result = sqlx::query_scalar::<_, String>(
+        "SELECT member_did FROM members WHERE convo_id = $1 AND left_at IS NULL",
     )
+    .bind(convo_id)
     .fetch_all(pool)
     .await;
 
-    if let Ok(members) = members_result {
-        for member in members {
-            let envelope_id = uuid::Uuid::new_v4().to_string();
-            let _ = sqlx::query!(
-                r#"
-                INSERT INTO envelopes (id, convo_id, recipient_did, message_id, created_at)
-                VALUES ($1, $2, $3, $4, NOW())
-                ON CONFLICT (recipient_did, message_id) DO NOTHING
-                "#,
-                &envelope_id,
-                convo_id,
-                &member.member_did,
-                msg_id,
-            )
-            .execute(pool)
-            .await;
+    if let Ok(member_dids) = members_result {
+        if let Err(e) = broadcaster_pool
+            .fanout_envelopes(convo_id, msg_id, member_dids, None)
+            .await
+        {
+            error!(
+                "❌ [actor:worker] Failed to fan out system message envelopes: {:?}",
+                e
+            );
         }
     }
 

@@ -6,10 +6,26 @@ use uuid::Uuid;
 
 use crate::{
     auth::AuthUser,
+    crypto::redact_for_log,
     federation::{AckSigner, FederationError},
-    identity::canonical_did,
     storage::DbPool,
 };
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeliverWelcome<'a> {
+    #[serde(borrow)]
+    convo_id: jacquard_common::CowStr<'a>,
+    #[serde(borrow)]
+    recipient_did: jacquard_common::CowStr<'a>,
+    #[serde(borrow)]
+    sender_ds_did: jacquard_common::CowStr<'a>,
+    #[serde(borrow)]
+    key_package_hash: jacquard_common::CowStr<'a>,
+    #[serde(with = "jacquard_common::serde_bytes_helper")]
+    welcome_data: bytes::Bytes,
+    initial_epoch: i64,
+}
 
 const NSID: &str = "blue.catbird.mls.ds.deliverWelcome";
 
@@ -23,10 +39,7 @@ pub async fn deliver_welcome(
     auth_user: AuthUser,
     body: String,
 ) -> Result<Json<serde_json::Value>, FederationError> {
-    let welcome = crate::jacquard_json::from_json_body::<
-        crate::generated::blue_catbird::mls::ds::deliver_welcome::DeliverWelcome<'_>,
-    >(&body)
-    .map_err(|_| {
+    let welcome: DeliverWelcome<'_> = serde_json::from_str(&body).map_err(|_| {
         FederationError::Json(serde_json::Error::io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "Invalid DeliverWelcome body",
@@ -65,26 +78,19 @@ pub async fn deliver_welcome(
             });
         }
 
-        // If conversation already exists locally, enforce sequencer binding.
-        let sequencer_ds = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT sequencer_ds FROM conversations WHERE id = $1",
-        )
-        .bind(convo_id)
-        .fetch_optional(&pool)
-        .await
-        .map_err(FederationError::Database)?;
-        if let Some(seq) = sequencer_ds {
-            let self_did = std::env::var("SERVICE_DID")
-                .unwrap_or_else(|_| "did:web:mls.catbird.blue".to_string());
-            let expected_sequencer = canonical_did(&seq.unwrap_or(self_did)).to_string();
-            if requester_ds != expected_sequencer {
+        let mut sequencer_term: u64 = 0;
+        if let Some(sequencer_state) =
+            super::deliver_message::load_convo_sequencer_state_optional(&pool, convo_id).await?
+        {
+            if requester_ds != sequencer_state.expected_sequencer {
                 return Err(FederationError::AuthFailed {
                     reason: format!(
                         "DS {} is not the sequencer for {} (expected {})",
-                        requester_ds, convo_id, expected_sequencer
+                        requester_ds, convo_id, sequencer_state.expected_sequencer
                     ),
                 });
             }
+            sequencer_term = sequencer_state.current_term;
         }
 
         // Store the welcome data.
@@ -111,13 +117,15 @@ pub async fn deliver_welcome(
         .map_err(FederationError::Database)?;
 
         debug!(
-            convo_id,
-            recipient_did, sender_ds, "Accepted federated welcome"
+            convo = %redact_for_log(convo_id),
+            recipient = %redact_for_log(recipient_did),
+            sender_ds = %redact_for_log(sender_ds),
+            "Accepted federated welcome"
         );
 
         let mut response = json!({ "accepted": true });
         if let Some(ref signer) = ack_signer {
-            let ack = signer.sign_ack(&welcome_id, convo_id, initial_epoch as i32);
+            let ack = signer.sign_ack(&welcome_id, convo_id, initial_epoch as i32, sequencer_term);
             response["ack"] = serde_json::to_value(&ack).unwrap_or_default();
         }
 

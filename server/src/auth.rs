@@ -20,7 +20,7 @@ use std::{num::NonZeroU32, sync::Arc};
 use thiserror::Error;
 use tracing::debug;
 
-use crate::identity::canonical_did;
+use crate::identity::{canonical_did, did_web_document_url};
 
 /// Authentication errors
 #[derive(Debug, Error)]
@@ -261,7 +261,7 @@ impl AuthMiddleware {
     }
 
     /// Verify JWT token and extract claims.
-    async fn verify_jwt(&self, token: &str) -> Result<AtProtoClaims, AuthError> {
+    pub async fn verify_jwt(&self, token: &str) -> Result<AtProtoClaims, AuthError> {
         let parts: Vec<&str> = token.split('.').collect();
         if parts.len() != 3 {
             return Err(AuthError::InvalidToken("Invalid JWT format".into()));
@@ -551,11 +551,12 @@ impl AuthMiddleware {
 
     /// Resolve did:web DID via HTTPS
     async fn resolve_web_did(&self, did: &str) -> Result<DidDocument, AuthError> {
-        let web_path = did
-            .strip_prefix("did:web:")
+        let url = did_web_document_url(did)
             .ok_or_else(|| AuthError::InvalidDid(format!("Invalid WEB DID: {}", did)))?;
-        let domain = web_path.replace(':', "/");
-        let host = domain.split('/').next().unwrap_or("");
+        let parsed = url::Url::parse(&url).map_err(|e| {
+            AuthError::DidResolutionFailed(format!("Invalid did:web URL for {}: {}", did, e))
+        })?;
+        let host = parsed.host_str().unwrap_or("");
         if is_disallowed_host(host) {
             return Err(AuthError::DidResolutionFailed(
                 "disallowed did:web host".into(),
@@ -568,8 +569,8 @@ impl AuthMiddleware {
                 ));
             }
         }
-        validate_resolved_host_is_public(host, 443).await?;
-        let url = format!("https://{}/.well-known/did.json", domain);
+        let port = parsed.port_or_known_default().unwrap_or(443);
+        validate_resolved_host_is_public(host, port).await?;
 
         let response = self
             .http_client

@@ -270,6 +270,7 @@ async fn main() -> anyhow::Result<()> {
     let fed_config = federation::FederationConfig::from_env();
     tracing::info!(
         federation_enabled = fed_config.enabled,
+        federation_mode = fed_config.mode.as_str(),
         self_did = %fed_config.self_did,
         self_endpoint = %fed_config.self_endpoint,
         "Federation config loaded"
@@ -453,9 +454,35 @@ async fn main() -> anyhow::Result<()> {
                     .await;
             });
             tracing::info!("Federation outbound queue worker started");
+
+            let reconcile_pool = db_pool.clone();
+            let reconcile_resolver = app_state.resolver.clone();
+            let reconcile_outbound = outbound.clone();
+            let reconcile_shutdown = shutdown_token.child_token();
+            let reconcile_self_did = fed_config.self_did.clone();
+            let auth_clone = auth.clone();
+            let reconcile_auth_fn: Arc<dyn Fn(&str, &str) -> Result<String, String> + Send + Sync> =
+                Arc::new(move |target: &str, method: &str| {
+                    auth_clone
+                        .sign_request(target, method)
+                        .map_err(|e| e.to_string())
+                });
+
+            tokio::spawn(async move {
+                federation::reconciliation::run_reconciliation_worker(
+                    reconcile_pool,
+                    reconcile_resolver,
+                    reconcile_outbound,
+                    reconcile_auth_fn,
+                    reconcile_self_did,
+                    reconcile_shutdown,
+                )
+                .await;
+            });
+            tracing::info!("Federation reconciliation worker started");
         } else {
             tracing::warn!(
-                "Federation enabled but no service auth configured; queue worker not started"
+                "Federation enabled but no service auth configured; federation workers not started"
             );
         }
     }
@@ -649,6 +676,14 @@ async fn main() -> anyhow::Result<()> {
             get(handlers::ds::fetch_key_package),
         )
         .route(
+            "/xrpc/blue.catbird.mls.ds.getConvoDigest",
+            get(handlers::ds::get_convo_digest),
+        )
+        .route(
+            "/xrpc/blue.catbird.mls.ds.getConvoEvents",
+            get(handlers::ds::get_convo_events),
+        )
+        .route(
             "/xrpc/blue.catbird.mls.ds.transferSequencer",
             post(handlers::ds::transfer_sequencer),
         )
@@ -667,6 +702,14 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/xrpc/blue.catbird.mls.admin.deleteFederationPeer",
             post(handlers::delete_federation_peer),
+        )
+        .route(
+            "/xrpc/blue.catbird.mls.admin.getFederationMode",
+            get(handlers::get_federation_mode),
+        )
+        .route(
+            "/xrpc/blue.catbird.mls.admin.setFederationMode",
+            post(handlers::set_federation_mode),
         )
         .route(
             "/xrpc/blue.catbird.mls.resolveDeliveryService",

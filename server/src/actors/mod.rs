@@ -1,9 +1,12 @@
+mod broadcaster;
 mod conversation;
+mod directory;
 mod messages;
 mod registry;
 mod supervisor;
 
 pub use conversation::{ConversationActor, ConvoActorArgs};
+pub use directory::DirectoryKeyPackage;
 pub use messages::{ConvoMessage, KeyPackageHashEntry};
 pub use registry::ActorRegistry;
 

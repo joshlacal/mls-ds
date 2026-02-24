@@ -725,10 +725,7 @@ mod tests {
             response.get("success").and_then(|v| v.as_bool()),
             Some(true)
         );
-        assert_eq!(
-            response.get("newEpoch").and_then(|v| v.as_i64()),
-            Some(5)
-        );
+        assert_eq!(response.get("newEpoch").and_then(|v| v.as_i64()), Some(5));
     }
 
     /// When no epoch row exists the idempotency path falls back to 0.
@@ -739,9 +736,6 @@ mod tests {
             "success": true,
             "newEpoch": current_epoch.unwrap_or(0),
         });
-        assert_eq!(
-            response.get("newEpoch").and_then(|v| v.as_i64()),
-            Some(0)
-        );
+        assert_eq!(response.get("newEpoch").and_then(|v| v.as_i64()), Some(0));
     }
 }

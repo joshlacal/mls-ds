@@ -10,8 +10,10 @@ use tracing::{error, info, warn};
 
 use crate::{
     auth::AuthUser,
-    generated::blue_catbird::mlsChat::get_messages::GetMessagesRequest,
-    generated_types::MessageView,
+    generated::blue_catbird::mlsChat::{
+        get_messages::{GetMessagesOutput, GetMessagesRequest},
+        MessageView,
+    },
     storage::DbPool,
 };
 
@@ -50,7 +52,7 @@ pub async fn get_messages(
     auth_user: AuthUser,
     RawQuery(extra_query): RawQuery,
     ExtractXrpc(params): ExtractXrpc<GetMessagesRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<GetMessagesOutput<'static>>, StatusCode> {
     let extra_query_str = extra_query.as_deref().unwrap_or("");
 
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
@@ -86,16 +88,22 @@ pub async fn get_messages(
         "app" => {
             let (messages, last_seq) =
                 fetch_app_messages(&pool, did, &convo_id, since_seq, limit).await?;
-            let mut output = serde_json::json!({ "messages": messages });
-            if let Some(seq) = last_seq {
-                output["lastSeq"] = serde_json::json!(seq);
-            }
-            Ok(Json(output))
+            Ok(Json(GetMessagesOutput {
+                messages,
+                last_seq,
+                gap_info: None,
+                extra_data: Default::default(),
+            }))
         }
 
         "commit" | "commits" => {
             let messages = fetch_commits(&pool, did, &convo_id, from_epoch, to_epoch).await?;
-            Ok(Json(serde_json::json!({ "messages": messages })))
+            Ok(Json(GetMessagesOutput {
+                messages,
+                last_seq: None,
+                gap_info: None,
+                extra_data: Default::default(),
+            }))
         }
 
         "all" => {
@@ -104,11 +112,12 @@ pub async fn get_messages(
             let commits = fetch_commits(&pool, did, &convo_id, from_epoch, to_epoch).await?;
             messages.extend(commits);
             messages.sort_by(|a, b| a.epoch.cmp(&b.epoch).then(a.seq.cmp(&b.seq)));
-            let mut output = serde_json::json!({ "messages": messages });
-            if let Some(seq) = last_seq {
-                output["lastSeq"] = serde_json::json!(seq);
-            }
-            Ok(Json(output))
+            Ok(Json(GetMessagesOutput {
+                messages,
+                last_seq,
+                gap_info: None,
+                extra_data: Default::default(),
+            }))
         }
 
         other => {
@@ -128,7 +137,7 @@ async fn fetch_app_messages(
     convo_id: &str,
     since_seq: Option<i64>,
     limit: i64,
-) -> Result<(Vec<MessageView>, Option<i64>), StatusCode> {
+) -> Result<(Vec<MessageView<'static>>, Option<i64>), StatusCode> {
     // Check membership
     let is_member: Option<(i32,)> = sqlx::query_as(
         "SELECT 1 as v FROM members WHERE convo_id = $1 AND (user_did = $2 OR member_did = $2) AND left_at IS NULL LIMIT 1",
@@ -209,17 +218,17 @@ async fn fetch_app_messages(
 
     let last_seq = messages.last().map(|m| m.seq);
 
-    let message_views: Vec<MessageView> = messages
+    let message_views: Vec<MessageView<'static>> = messages
         .into_iter()
         .map(|m| MessageView {
-            id: m.id,
-            convo_id: m.convo_id,
-            ciphertext: m.ciphertext,
+            id: m.id.into(),
+            convo_id: m.convo_id.into(),
+            ciphertext: bytes::Bytes::from(m.ciphertext),
             epoch: m.epoch,
             seq: m.seq,
-            created_at: m.created_at,
-            message_type: m.message_type,
-            reactions: None,
+            created_at: crate::sqlx_jacquard::chrono_to_datetime(m.created_at),
+            message_type: Some(m.message_type.into()),
+            extra_data: Default::default(),
         })
         .collect();
 
@@ -241,7 +250,7 @@ async fn fetch_commits(
     convo_id: &str,
     from_epoch: i64,
     to_epoch: Option<i64>,
-) -> Result<Vec<MessageView>, StatusCode> {
+) -> Result<Vec<MessageView<'static>>, StatusCode> {
     if from_epoch < 0 {
         warn!("❌ [v2.getMessages] Invalid from_epoch: {}", from_epoch);
         return Err(StatusCode::BAD_REQUEST);
@@ -314,17 +323,17 @@ async fn fetch_commits(
 
     info!("✅ [v2.getMessages] Fetched {} commits", commits.len());
 
-    let commit_views: Vec<MessageView> = commits
+    let commit_views: Vec<MessageView<'static>> = commits
         .into_iter()
         .map(|c| MessageView {
-            id: c.id,
-            convo_id: c.convo_id,
-            ciphertext: c.ciphertext,
+            id: c.id.into(),
+            convo_id: c.convo_id.into(),
+            ciphertext: bytes::Bytes::from(c.ciphertext),
             epoch: c.epoch,
             seq: c.seq,
-            created_at: c.created_at,
-            message_type: c.message_type,
-            reactions: None,
+            created_at: crate::sqlx_jacquard::chrono_to_datetime(c.created_at),
+            message_type: Some(c.message_type.into()),
+            extra_data: Default::default(),
         })
         .collect();
 

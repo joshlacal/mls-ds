@@ -126,6 +126,24 @@ pub struct MessageView {
     pub reactions: Option<Vec<ReactionView>>,
 }
 
+impl<'a> From<crate::generated::blue_catbird::mlsChat::MessageView<'a>> for MessageView {
+    fn from(value: crate::generated::blue_catbird::mlsChat::MessageView<'a>) -> Self {
+        Self {
+            id: value.id.as_ref().to_string(),
+            convo_id: value.convo_id.as_ref().to_string(),
+            ciphertext: value.ciphertext.to_vec(),
+            epoch: value.epoch,
+            seq: value.seq,
+            created_at: crate::sqlx_jacquard::datetime_to_chrono(&value.created_at),
+            message_type: value
+                .message_type
+                .map(|m| m.as_ref().to_string())
+                .unwrap_or_else(|| "app".to_string()),
+            reactions: None,
+        }
+    }
+}
+
 /// Reference to an MLS key package for adding members
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

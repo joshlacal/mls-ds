@@ -9,19 +9,27 @@ use crate::federation::FederationError;
 /// Simple health/status endpoint for DS-to-DS discovery.
 /// No authentication required.
 pub async fn health_check() -> Result<Json<serde_json::Value>, FederationError> {
+    if !crate::federation::FederationMode::effective().allows_remote_traffic() {
+        return Err(FederationError::AuthFailed {
+            reason: "Federation mode is off".to_string(),
+        });
+    }
+
     let did =
         std::env::var("SERVICE_DID").unwrap_or_else(|_| "did:web:mls.catbird.blue".to_string());
 
     // Approximate uptime via process start (lazy_static would be cleaner,
     // but env-based is acceptable for Phase 1)
     let uptime = PROCESS_START.elapsed().as_secs() as i64;
+    let federation_capabilities = crate::federation::local_federation_capabilities();
 
     debug!("DS health check requested");
 
     Ok(Json(json!({
         "did": did,
         "version": "1.0.0",
-        "uptime": uptime
+        "uptime": uptime,
+        "federationCapabilities": federation_capabilities
     })))
 }
 

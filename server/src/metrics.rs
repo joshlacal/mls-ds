@@ -112,6 +112,26 @@ impl MetricsRecorder {
             "idempotency_cache_store_duration_seconds",
             "Idempotency cache store duration in seconds"
         );
+        metrics::describe_counter!(
+            "federation_auto_quarantine_total",
+            "Total number of federation peers automatically quarantined"
+        );
+        metrics::describe_counter!(
+            "federation_rejections_total",
+            "Total number of federation rejection outcomes by category"
+        );
+        metrics::describe_counter!(
+            "federation_queue_capacity_rejections_total",
+            "Total number of outbound federation queue capacity rejections"
+        );
+        metrics::describe_counter!(
+            "federation_risk_transitions_total",
+            "Total number of federation peer risk tier transitions"
+        );
+        metrics::describe_counter!(
+            "federation_trust_transitions_total",
+            "Total number of federation trust score transitions"
+        );
 
         Self { handle }
     }
@@ -248,6 +268,60 @@ pub fn record_cursor_operation(operation: &str, success: bool) {
 #[allow(dead_code)]
 pub fn record_rate_limit_drop(endpoint: &str) {
     metrics::counter!("rate_limit_drops_total", 1, "endpoint" => endpoint.to_string());
+}
+
+#[allow(dead_code)]
+pub fn record_federation_auto_quarantine(trigger: &str) {
+    metrics::counter!(
+        "federation_auto_quarantine_total",
+        1,
+        "trigger" => trigger.to_string()
+    );
+}
+
+#[allow(dead_code)]
+pub fn record_federation_rejection_reason(reason_category: &str) {
+    metrics::counter!(
+        "federation_rejections_total",
+        1,
+        "reason_category" => reason_category.to_string()
+    );
+}
+
+#[allow(dead_code)]
+pub fn record_federation_queue_capacity_rejection(scope: &str, risk_tier: &str) {
+    metrics::counter!(
+        "federation_queue_capacity_rejections_total",
+        1,
+        "scope" => scope.to_string(),
+        "risk_tier" => risk_tier.to_string()
+    );
+}
+
+#[allow(dead_code)]
+pub fn record_federation_risk_transition(from: &str, to: &str, status: &str) {
+    metrics::counter!(
+        "federation_risk_transitions_total",
+        1,
+        "from" => from.to_string(),
+        "to" => to.to_string(),
+        "status" => status.to_string()
+    );
+}
+
+#[allow(dead_code)]
+pub fn record_federation_trust_transition(
+    direction: &str,
+    from_risk_tier: &str,
+    to_risk_tier: &str,
+) {
+    metrics::counter!(
+        "federation_trust_transitions_total",
+        1,
+        "direction" => direction.to_string(),
+        "from_risk_tier" => from_risk_tier.to_string(),
+        "to_risk_tier" => to_risk_tier.to_string()
+    );
 }
 
 #[allow(dead_code)]

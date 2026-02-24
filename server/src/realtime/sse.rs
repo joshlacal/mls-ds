@@ -18,7 +18,9 @@ use tokio::sync::{broadcast, RwLock};
 use tracing::{error, info, warn};
 
 use crate::{
-    auth::AuthUser, db::DbPool, generated_types::MessageView, realtime::cursor::CursorGenerator,
+    auth::AuthUser,
+    db::DbPool,
+    realtime::{cursor::CursorGenerator, StreamMessageView},
 };
 
 /// SSE query parameters for subscribeConvoEvents
@@ -37,7 +39,7 @@ pub enum StreamEvent {
     #[serde(rename = "blue.catbird.mls.subscribeConvoEvents#messageEvent")]
     MessageEvent {
         cursor: String,
-        message: MessageView,
+        message: StreamMessageView,
         /// When true, this is an ephemeral signal (typing, read receipt, presence)
         /// that should NOT be shown in chat history. Omitted (defaults to false)
         /// for regular persistent messages.
@@ -368,16 +370,18 @@ pub async fn subscribe_convo_events(
                         continue;
                     };
 
-                    let message_view = crate::generated_types::MessageView {
-                        id: message_id,
-                        convo_id: convo_id.clone(),
-                        ciphertext,
-                        epoch: epoch as i64,
-                        seq: seq as i64,
-                        created_at,
-                        message_type: "commit".to_string(),
-                        reactions: None,
-                    };
+                    let message_view: StreamMessageView =
+                        crate::generated::blue_catbird::mlsChat::MessageView {
+                            id: message_id.into(),
+                            convo_id: convo_id.clone().into(),
+                            ciphertext: bytes::Bytes::from(ciphertext),
+                            epoch,
+                            seq,
+                            created_at: crate::sqlx_jacquard::chrono_to_datetime(created_at),
+                            message_type: Some("commit".into()),
+                            extra_data: Default::default(),
+                        }
+                        .into();
 
                     let event = StreamEvent::MessageEvent {
                         cursor: cursor.clone(),
@@ -563,7 +567,7 @@ mod tests {
     fn test_ephemeral_false_skipped_in_serialization() {
         let event = StreamEvent::MessageEvent {
             cursor: "cursor-1".into(),
-            message: MessageView {
+            message: StreamMessageView {
                 id: "m1".into(),
                 convo_id: "c1".into(),
                 ciphertext: vec![],
@@ -588,7 +592,7 @@ mod tests {
     fn test_ephemeral_true_included() {
         let event = StreamEvent::MessageEvent {
             cursor: "cursor-2".into(),
-            message: MessageView {
+            message: StreamMessageView {
                 id: "m2".into(),
                 convo_id: "c1".into(),
                 ciphertext: vec![],

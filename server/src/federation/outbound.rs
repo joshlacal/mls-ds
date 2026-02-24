@@ -21,6 +21,8 @@ pub struct DsResponse {
     pub conflict_reason: Option<String>,
     pub key_package: Option<String>,
     pub key_package_hash: Option<String>,
+    #[serde(rename = "reasonCode")]
+    pub reason_code: Option<String>,
     pub error: Option<String>,
     pub message: Option<String>,
     pub ack: Option<DeliveryAck>,
@@ -86,6 +88,47 @@ impl OutboundClient {
             .map_err(|e| classify_reqwest_error(e, endpoint, method))?;
 
         parse_response(resp, endpoint, method).await
+    }
+
+    /// Make an authenticated XRPC query call returning raw JSON.
+    pub async fn call_query_json(
+        &self,
+        endpoint: &str,
+        method: &str,
+        auth_token: &str,
+        params: &[(&str, &str)],
+    ) -> Result<serde_json::Value, OutboundError> {
+        let url = format!("{}/xrpc/{}", endpoint.trim_end_matches('/'), method);
+        debug!(url = %url, method, "Outbound DS query (raw json)");
+
+        let resp = self
+            .http
+            .get(&url)
+            .header("Authorization", format!("Bearer {auth_token}"))
+            .query(params)
+            .send()
+            .await
+            .map_err(|e| classify_reqwest_error(e, endpoint, method))?;
+
+        let status = resp.status();
+        if status.is_success() {
+            resp.json::<serde_json::Value>()
+                .await
+                .map_err(|e| OutboundError::InvalidResponse {
+                    reason: e.to_string(),
+                })
+        } else {
+            let body_text = resp
+                .text()
+                .await
+                .unwrap_or_else(|_| String::from("<unreadable>"));
+            Err(OutboundError::RemoteError {
+                status: status.as_u16(),
+                body: body_text,
+                endpoint: endpoint.to_string(),
+                method: method.to_string(),
+            })
+        }
     }
 
     /// Check if a remote DS is reachable.

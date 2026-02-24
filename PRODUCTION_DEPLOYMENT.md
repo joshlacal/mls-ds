@@ -646,6 +646,92 @@ kubectl delete secret <tls-secret> -n production
 
 ### Emergency Procedures
 
+#### Federation Incident Runbook (DS-to-DS)
+
+Use this runbook for federation abuse, hostile peer behavior, or emergency traffic shutdowns.
+
+```bash
+# Required once per shell
+export BASE_URL="https://<your-mls-host>"
+# Admin DID must be present in FEDERATION_ADMIN_DIDS.
+# Tokens must carry matching lxm for each NSID:
+#   MODE_READ_TOKEN   -> blue.catbird.mls.admin.getFederationMode
+#   MODE_WRITE_TOKEN  -> blue.catbird.mls.admin.setFederationMode
+#   PEER_READ_TOKEN   -> blue.catbird.mls.admin.getFederationPeers
+#   PEER_WRITE_TOKEN  -> blue.catbird.mls.admin.upsertFederationPeer
+#   PEER_DELETE_TOKEN -> blue.catbird.mls.admin.deleteFederationPeer
+```
+
+1) **Global federation emergency off**
+```bash
+# Immediate runtime stop (no restart): force effective federation mode to off
+curl -sS -X POST "$BASE_URL/xrpc/blue.catbird.mls.admin.setFederationMode" \
+  -H "Authorization: Bearer $MODE_WRITE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"mode":"off"}' | jq .
+
+# Persist across restarts + hard inbound kill switch (checked by DS handlers)
+kubectl set env deployment/mls-server -n production \
+  FEDERATION_MODE=off \
+  FEDERATION_EMERGENCY_KILL_SWITCH=true
+kubectl rollout restart deployment/mls-server -n production
+kubectl rollout status deployment/mls-server -n production
+```
+
+2) **Isolate a single malicious peer**
+```bash
+export MALICIOUS_DS_DID="did:web:malicious.example"
+
+# Quarantine: suspend peer (reject traffic but preserve record)
+curl -sS -X POST "$BASE_URL/xrpc/blue.catbird.mls.admin.upsertFederationPeer" \
+  -H "Authorization: Bearer $PEER_WRITE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"dsDid\":\"$MALICIOUS_DS_DID\",\"status\":\"suspend\",\"note\":\"incident quarantine\"}" | jq .
+
+# Escalate to hard block if needed
+curl -sS -X POST "$BASE_URL/xrpc/blue.catbird.mls.admin.upsertFederationPeer" \
+  -H "Authorization: Bearer $PEER_WRITE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"dsDid\":\"$MALICIOUS_DS_DID\",\"status\":\"block\",\"note\":\"confirmed malicious\"}" | jq .
+```
+
+3) **Restore from quarantine/suspend**
+```bash
+# Remove emergency inbound kill switch and return baseline mode
+kubectl set env deployment/mls-server -n production FEDERATION_EMERGENCY_KILL_SWITCH-
+kubectl set env deployment/mls-server -n production FEDERATION_MODE=allowlist
+kubectl rollout restart deployment/mls-server -n production
+
+# Re-enable peer after validation
+curl -sS -X POST "$BASE_URL/xrpc/blue.catbird.mls.admin.upsertFederationPeer" \
+  -H "Authorization: Bearer $PEER_WRITE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"dsDid\":\"$MALICIOUS_DS_DID\",\"status\":\"allow\",\"maxRequestsPerMinute\":60,\"note\":\"restored after incident\"}" | jq .
+
+# Optional (open_intelligent only): return peer to unmanaged state
+curl -sS -X POST "$BASE_URL/xrpc/blue.catbird.mls.admin.deleteFederationPeer" \
+  -H "Authorization: Bearer $PEER_DELETE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"dsDid\":\"$MALICIOUS_DS_DID\"}" | jq .
+```
+
+4) **Verify system returns to healthy state**
+```bash
+# Federation mode should match expected recovery mode (not off)
+curl -sS "$BASE_URL/xrpc/blue.catbird.mls.admin.getFederationMode" \
+  -H "Authorization: Bearer $MODE_READ_TOKEN" | jq .
+
+# Peer should be out of suspend/block lists
+curl -sS "$BASE_URL/xrpc/blue.catbird.mls.admin.getFederationPeers?status=suspend" \
+  -H "Authorization: Bearer $PEER_READ_TOKEN" | jq .
+curl -sS "$BASE_URL/xrpc/blue.catbird.mls.admin.getFederationPeers?status=block" \
+  -H "Authorization: Bearer $PEER_READ_TOKEN" | jq .
+
+# DS federation endpoint and core readiness should both be healthy
+curl -sS "$BASE_URL/xrpc/blue.catbird.mls.ds.healthCheck" | jq .
+curl -sS "$BASE_URL/health/ready" | jq .
+```
+
 #### Complete Service Outage
 
 1. **Activate incident response team**

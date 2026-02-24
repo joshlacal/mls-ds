@@ -3,7 +3,8 @@ use serde_json::json;
 use tracing::{debug, warn};
 
 use crate::{
-    auth::AuthUser, federation::FederationError, identity::canonical_did, storage::DbPool,
+    auth::AuthUser, crypto::redact_for_log, federation::FederationError, identity::canonical_did,
+    storage::DbPool,
 };
 
 const NSID: &str = "blue.catbird.mls.ds.fetchKeyPackage";
@@ -110,10 +111,10 @@ pub async fn fetch_key_package(
         match row {
             Some((key_package_data, key_package_hash)) => {
                 debug!(
-                    recipient_did,
-                    key_package_hash,
-                    requester = requester_ds,
-                    convo_id = convo_id,
+                    recipient = %redact_for_log(recipient_did),
+                    key_package_hash = %redact_for_log(&key_package_hash),
+                    requester = %redact_for_log(&requester_ds),
+                    convo = %redact_for_log(convo_id),
                     "Key package consumed for federation"
                 );
 
@@ -126,7 +127,7 @@ pub async fn fetch_key_package(
             }
             None => {
                 warn!(
-                    recipient_did,
+                    recipient = %redact_for_log(recipient_did),
                     "No available key packages for federation request"
                 );
                 Err(FederationError::NoKeyPackagesAvailable {

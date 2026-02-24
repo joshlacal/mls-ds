@@ -1,125 +1,108 @@
-//! Idempotency Middleware
+//! Idempotency middleware for mlsChat write endpoints.
 //!
-//! Provides idempotency guarantees for write operations by:
-//! 1. Extracting idempotencyKey from request body (JSON)
-//! 2. Checking PostgreSQL idempotency_cache table for cached responses
-//! 3. Caching successful responses with configurable TTL (default: 1 hour)
-//! 4. Handling both success and error responses appropriately
-//!
-//! ## Usage
-//!
-//! Add to router with state containing DbPool:
-//! ```rust
-//! use axum::Router;
-//! use crate::middleware::idempotency::IdempotencyLayer;
-//!
-//! let app = Router::new()
-//!     .route("/xrpc/blue.catbird.mls.sendMessage", post(handler))
-//!     .layer(IdempotencyLayer::new(pool.clone()));
-//! ```
+//! Security and behavior:
+//! - Requires `Idempotency-Key` header for write requests to `/xrpc/blue.catbird.mlsChat.*`
+//! - Verifies bearer JWT before cache lookup
+//! - Caches only successful JSON responses scoped by canonical caller DID + endpoint + key
+//! - Caps cacheable response bodies to 256 KiB
 
 use axum::{
-    body::{Body, Bytes},
-    extract::{FromRequest, Request, State},
-    http::StatusCode,
+    body::Body,
+    extract::{Request, State},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
-/// Default TTL for cached responses (24 hours)
-const DEFAULT_TTL_SECONDS: i64 = 86400;
+use crate::{auth::AuthMiddleware, identity::canonical_did};
 
-/// Idempotency layer configuration
+const DEFAULT_TTL_SECONDS: i64 = 86400;
+const IDEMPOTENCY_KEY_HEADER: &str = "Idempotency-Key";
+const IDEMPOTENCY_REPLAYED_HEADER: &str = "Idempotency-Replayed";
+const MLS_CHAT_XRPC_PREFIX: &str = "/xrpc/blue.catbird.mlsChat.";
+const MAX_IDEMPOTENCY_KEY_LEN: usize = 128;
+const MAX_CACHEABLE_RESPONSE_BYTES: usize = 256 * 1024;
+
 #[derive(Clone)]
 pub struct IdempotencyLayer {
     pool: PgPool,
     ttl_seconds: i64,
+    auth_middleware: AuthMiddleware,
 }
 
 impl IdempotencyLayer {
-    /// Create new idempotency layer with default TTL (1 hour)
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool,
             ttl_seconds: DEFAULT_TTL_SECONDS,
+            auth_middleware: AuthMiddleware::new(),
         }
     }
 
-    /// Create new idempotency layer with custom TTL
     pub fn with_ttl(pool: PgPool, ttl: Duration) -> Self {
         Self {
             pool,
             ttl_seconds: ttl.as_secs() as i64,
+            auth_middleware: AuthMiddleware::new(),
         }
     }
 }
 
-/// Cached response from idempotency_cache table
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 struct CachedResponse {
     response_body: serde_json::Value,
     status_code: i32,
 }
 
-/// Extract caller DID from Authorization header by decoding the JWT payload (no verification).
-fn extract_caller_did(headers: &axum::http::HeaderMap) -> Option<String> {
-    let auth_header = headers.get("authorization")?.to_str().ok()?;
-    let token = auth_header.strip_prefix("Bearer ")?;
-    let parts: Vec<&str> = token.split('.').collect();
-    if parts.len() != 3 {
-        return None;
-    }
-    let payload_json = URL_SAFE_NO_PAD.decode(parts[1]).ok()?;
-    let claims: serde_json::Value = serde_json::from_slice(&payload_json).ok()?;
-    claims.get("iss")?.as_str().map(|s| s.to_string())
+fn should_apply(endpoint: &str, method: &Method) -> bool {
+    endpoint.starts_with(MLS_CHAT_XRPC_PREFIX)
+        && matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE")
 }
 
-/// Extract idempotency key from request body (if present)
-fn extract_idempotency_key(body: &[u8]) -> Option<String> {
-    // Parse JSON body
-    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) {
-        // Try to extract idempotencyKey field
-        if let Some(key) = json.get("idempotencyKey") {
-            if let Some(key_str) = key.as_str() {
-                return Some(key_str.to_string());
-            }
-        }
-    }
-    None
+fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let auth_header = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    auth_header.strip_prefix("Bearer ")
 }
 
-/// Check idempotency cache for existing response
+fn extract_required_idempotency_key(headers: &HeaderMap) -> Result<String, StatusCode> {
+    let raw = headers
+        .get(IDEMPOTENCY_KEY_HEADER)
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let key = raw.to_str().map_err(|_| StatusCode::BAD_REQUEST)?.trim();
+
+    if key.is_empty() || key.len() > MAX_IDEMPOTENCY_KEY_LEN {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    Ok(key.to_string())
+}
+
 async fn check_cache(
     pool: &PgPool,
     caller_did: &str,
     idempotency_key: &str,
     endpoint: &str,
 ) -> Result<Option<CachedResponse>, sqlx::Error> {
-    let result = sqlx::query_as::<_, CachedResponse>(
+    sqlx::query_as::<_, CachedResponse>(
         r#"
         SELECT response_body, status_code
         FROM idempotency_cache
         WHERE caller_did = $1
-          AND key = $2
-          AND endpoint = $3
+          AND endpoint = $2
+          AND key = $3
           AND expires_at > NOW()
         "#,
     )
     .bind(caller_did)
-    .bind(idempotency_key)
     .bind(endpoint)
+    .bind(idempotency_key)
     .fetch_optional(pool)
-    .await?;
-
-    Ok(result)
+    .await
 }
 
-/// Store response in idempotency cache
 async fn store_cache(
     pool: &PgPool,
     caller_did: &str,
@@ -131,17 +114,17 @@ async fn store_cache(
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
-        INSERT INTO idempotency_cache (caller_did, key, endpoint, response_body, status_code, expires_at)
+        INSERT INTO idempotency_cache (caller_did, endpoint, key, response_body, status_code, expires_at)
         VALUES ($1, $2, $3, $4, $5, NOW() + $6 * INTERVAL '1 second')
-        ON CONFLICT (caller_did, endpoint, key) DO UPDATE SET
-            response_body = EXCLUDED.response_body,
-            status_code = EXCLUDED.status_code,
-            expires_at = EXCLUDED.expires_at
+        ON CONFLICT (caller_did, endpoint, key) DO UPDATE
+            SET response_body = EXCLUDED.response_body,
+                status_code = EXCLUDED.status_code,
+                expires_at = EXCLUDED.expires_at
         "#,
     )
     .bind(caller_did)
-    .bind(idempotency_key)
     .bind(endpoint)
+    .bind(idempotency_key)
     .bind(response_body)
     .bind(status_code)
     .bind(ttl_seconds)
@@ -151,69 +134,46 @@ async fn store_cache(
     Ok(())
 }
 
-/// Idempotency middleware handler
+fn set_replayed_header(response: &mut Response, replayed: bool) {
+    let value = if replayed { "true" } else { "false" };
+    response
+        .headers_mut()
+        .insert(IDEMPOTENCY_REPLAYED_HEADER, HeaderValue::from_static(value));
+}
+
 pub async fn idempotency_middleware(
     State(layer): State<IdempotencyLayer>,
     request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    // Extract endpoint path
     let endpoint = request.uri().path().to_string();
-
-    // Only apply to write operations (POST/PUT/PATCH)
     let method = request.method().clone();
-    if !matches!(method.as_str(), "POST" | "PUT" | "PATCH") {
-        debug!("Skipping idempotency check for {} {}", method, endpoint);
+
+    if !should_apply(&endpoint, &method) {
         return Ok(next.run(request).await);
     }
 
-    // Extract caller DID from Authorization header; skip caching for unauthenticated requests
-    let caller_did = match extract_caller_did(request.headers()) {
-        Some(did) => did,
-        None => {
-            debug!("No caller DID found - skipping idempotency caching");
-            return Ok(next.run(request).await);
-        }
-    };
-
-    // Read the request body using Axum's Bytes extractor
-    let (parts, body) = request.into_parts();
-
-    // Reconstruct request temporarily to use Bytes extractor
-    let temp_request = Request::from_parts(parts.clone(), body);
-    let body_bytes = match Bytes::from_request(temp_request, &()).await {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            error!("Failed to extract request body bytes");
-            return Err(StatusCode::BAD_REQUEST);
-        }
-    };
-
-    // Extract idempotency key from body
-    let idempotency_key = match extract_idempotency_key(&body_bytes) {
-        Some(key) => {
-            debug!("Extracted idempotency key: {}", key);
-            key
-        }
-        None => {
-            // No idempotency key provided - skip caching
+    let idempotency_key = match extract_required_idempotency_key(request.headers()) {
+        Ok(key) => key,
+        Err(status) => {
             metrics::counter!(
                 "idempotency_requests_without_key_total",
                 1,
                 "method" => method.as_str().to_string(),
                 "endpoint" => endpoint.clone()
             );
-            tracing::debug!(
-                method = ?method,
-                uri = %endpoint,
-                "No idempotency key found in request body - skipping idempotency check"
-            );
-            let request = Request::from_parts(parts, Body::from(body_bytes));
-            return Ok(next.run(request).await);
+            return Err(status);
         }
     };
 
-    // Check cache for existing response
+    let token = extract_bearer_token(request.headers()).ok_or(StatusCode::UNAUTHORIZED)?;
+    let claims = layer
+        .auth_middleware
+        .verify_jwt(token)
+        .await
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let caller_did = canonical_did(&claims.iss).to_string();
+
     let cache_check_start = std::time::Instant::now();
     match check_cache(&layer.pool, &caller_did, &idempotency_key, &endpoint).await {
         Ok(Some(cached)) => {
@@ -228,24 +188,19 @@ pub async fn idempotency_middleware(
                 "method" => method.as_str().to_string(),
                 "endpoint" => endpoint.clone()
             );
-            tracing::info!(
-                idempotency_key = ?idempotency_key,
-                method = ?method,
-                uri = %endpoint,
-                cached_status = cached.status_code,
-                "Idempotency cache HIT - returning cached response"
-            );
 
-            // Return cached response
             let status = StatusCode::from_u16(cached.status_code as u16)
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let body = serde_json::to_string(&cached.response_body).unwrap_or_else(|_| "{}".into());
 
-            let body_string =
-                serde_json::to_string(&cached.response_body).unwrap_or_else(|_| "{}".to_string());
-
-            return Ok(
-                (status, [("content-type", "application/json")], body_string).into_response(),
-            );
+            let mut response = (
+                status,
+                [(header::CONTENT_TYPE.as_str(), "application/json")],
+                body,
+            )
+                .into_response();
+            set_replayed_header(&mut response, true);
+            return Ok(response);
         }
         Ok(None) => {
             metrics::histogram!(
@@ -259,12 +214,6 @@ pub async fn idempotency_middleware(
                 "method" => method.as_str().to_string(),
                 "endpoint" => endpoint.clone()
             );
-            tracing::info!(
-                idempotency_key = ?idempotency_key,
-                method = ?method,
-                uri = %endpoint,
-                "Idempotency cache MISS - processing request"
-            );
         }
         Err(e) => {
             metrics::counter!(
@@ -273,92 +222,17 @@ pub async fn idempotency_middleware(
                 "method" => method.as_str().to_string(),
                 "endpoint" => endpoint.clone()
             );
-            error!(
-                "Failed to check idempotency cache: {} (continuing anyway)",
-                e
-            );
-            // Continue processing even if cache check fails
+            error!(error = %e, "Failed to check idempotency cache (continuing)");
         }
     }
 
-    // Reconstruct request and process it
-    let request = Request::from_parts(parts, Body::from(body_bytes.clone()));
     let response = next.run(request).await;
-
-    // Extract response status
     let status_code = response.status().as_u16() as i32;
 
-    // Convert response to extract body
-    let (response_parts, response_body) = response.into_parts();
-
-    // Extract response body bytes using Bytes extractor
-    let temp_response = Response::from_parts(response_parts, response_body);
-    let (response_parts, response_body) = temp_response.into_parts();
-
-    // Manually read the body stream
-    let response_bytes = match axum::body::to_bytes(response_body, usize::MAX).await {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            error!("Failed to collect response body: {}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
-        }
-    };
-
-    // Only cache successful responses (2xx)
-    if (200..300).contains(&status_code) {
-        // Parse response body as JSON
-        match serde_json::from_slice::<serde_json::Value>(&response_bytes) {
-            Ok(json_body) => {
-                // Store in cache
-                let store_start = std::time::Instant::now();
-                if let Err(e) = store_cache(
-                    &layer.pool,
-                    &caller_did,
-                    &idempotency_key,
-                    &endpoint,
-                    status_code,
-                    &json_body,
-                    layer.ttl_seconds,
-                )
-                .await
-                {
-                    metrics::counter!(
-                        "idempotency_cache_store_errors_total",
-                        1,
-                        "method" => method.as_str().to_string(),
-                        "endpoint" => endpoint.clone()
-                    );
-                    error!(
-                        "Failed to store idempotency cache for key={}: {}",
-                        idempotency_key, e
-                    );
-                    // Continue anyway - caching is best-effort
-                } else {
-                    metrics::histogram!(
-                        "idempotency_cache_store_duration_seconds",
-                        store_start.elapsed().as_secs_f64(),
-                        "endpoint" => endpoint.clone()
-                    );
-                    metrics::counter!(
-                        "idempotency_cache_stores_total",
-                        1,
-                        "method" => method.as_str().to_string(),
-                        "endpoint" => endpoint.clone()
-                    );
-                    tracing::info!(
-                        idempotency_key = ?idempotency_key,
-                        status = status_code as u16,
-                        method = ?method,
-                        uri = %endpoint,
-                        "Storing response in idempotency cache"
-                    );
-                }
-            }
-            Err(e) => {
-                warn!("Response body is not valid JSON, skipping cache: {}", e);
-            }
-        }
-    } else {
+    // Only cache successful JSON responses.
+    if !(200..300).contains(&status_code) {
+        let mut response = response;
+        set_replayed_header(&mut response, false);
         metrics::counter!(
             "idempotency_cache_skipped_total",
             1,
@@ -366,35 +240,129 @@ pub async fn idempotency_middleware(
             "endpoint" => endpoint.clone(),
             "reason" => "non_2xx".to_string()
         );
-        debug!("Not caching response with status {} (non-2xx)", status_code);
+        return Ok(response);
     }
 
-    // Reconstruct and return response
-    let response = Response::from_parts(response_parts, Body::from(response_bytes));
+    let is_json = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.starts_with("application/json"))
+        .unwrap_or(false);
+
+    if !is_json {
+        let mut response = response;
+        set_replayed_header(&mut response, false);
+        metrics::counter!(
+            "idempotency_cache_skipped_total",
+            1,
+            "method" => method.as_str().to_string(),
+            "endpoint" => endpoint.clone(),
+            "reason" => "non_json".to_string()
+        );
+        return Ok(response);
+    }
+
+    let content_len = response
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok());
+
+    let Some(content_len) = content_len else {
+        let mut response = response;
+        set_replayed_header(&mut response, false);
+        metrics::counter!(
+            "idempotency_cache_skipped_total",
+            1,
+            "method" => method.as_str().to_string(),
+            "endpoint" => endpoint.clone(),
+            "reason" => "unknown_content_length".to_string()
+        );
+        return Ok(response);
+    };
+
+    if content_len > MAX_CACHEABLE_RESPONSE_BYTES {
+        let mut response = response;
+        set_replayed_header(&mut response, false);
+        metrics::counter!(
+            "idempotency_cache_skipped_total",
+            1,
+            "method" => method.as_str().to_string(),
+            "endpoint" => endpoint.clone(),
+            "reason" => "body_too_large".to_string()
+        );
+        return Ok(response);
+    }
+
+    let (response_parts, response_body) = response.into_parts();
+    let response_bytes =
+        match axum::body::to_bytes(response_body, MAX_CACHEABLE_RESPONSE_BYTES).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                error!(error = %e, "Failed to collect response body for idempotency cache");
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        };
+
+    match serde_json::from_slice::<serde_json::Value>(&response_bytes) {
+        Ok(json_body) => {
+            let store_start = std::time::Instant::now();
+            if let Err(e) = store_cache(
+                &layer.pool,
+                &caller_did,
+                &idempotency_key,
+                &endpoint,
+                status_code,
+                &json_body,
+                layer.ttl_seconds,
+            )
+            .await
+            {
+                metrics::counter!(
+                    "idempotency_cache_store_errors_total",
+                    1,
+                    "method" => method.as_str().to_string(),
+                    "endpoint" => endpoint.clone()
+                );
+                warn!(error = %e, "Failed to store idempotency cache entry");
+            } else {
+                metrics::histogram!(
+                    "idempotency_cache_store_duration_seconds",
+                    store_start.elapsed().as_secs_f64(),
+                    "endpoint" => endpoint.clone()
+                );
+                metrics::counter!(
+                    "idempotency_cache_stores_total",
+                    1,
+                    "method" => method.as_str().to_string(),
+                    "endpoint" => endpoint.clone()
+                );
+                info!(
+                    caller_did = %crate::crypto::redact_for_log(&caller_did),
+                    endpoint = %endpoint,
+                    "Stored idempotency cache entry"
+                );
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "Response body is not valid JSON, skipping cache");
+            metrics::counter!(
+                "idempotency_cache_skipped_total",
+                1,
+                "method" => method.as_str().to_string(),
+                "endpoint" => endpoint.clone(),
+                "reason" => "json_parse_failed".to_string()
+            );
+        }
+    }
+
+    let mut response = Response::from_parts(response_parts, Body::from(response_bytes));
+    set_replayed_header(&mut response, false);
     Ok(response)
 }
 
-/// Cleanup expired entries from idempotency_cache
-///
-/// This should be called periodically (e.g., via a background task)
-/// to prevent unbounded growth of the cache table.
-///
-/// ## Example
-///
-/// ```rust
-/// use tokio::time::{interval, Duration};
-/// use crate::middleware::idempotency::cleanup_expired_entries;
-///
-/// tokio::spawn(async move {
-///     let mut interval = interval(Duration::from_secs(3600)); // Every hour
-///     loop {
-///         interval.tick().await;
-///         if let Err(e) = cleanup_expired_entries(&pool).await {
-///             tracing::error!("Failed to cleanup idempotency cache: {}", e);
-///         }
-///     }
-/// });
-/// ```
+/// Cleanup expired entries from idempotency_cache.
 pub async fn cleanup_expired_entries(pool: &PgPool) -> Result<u64, sqlx::Error> {
     let result = sqlx::query(
         r#"
@@ -408,9 +376,9 @@ pub async fn cleanup_expired_entries(pool: &PgPool) -> Result<u64, sqlx::Error> 
     let deleted = result.rows_affected();
     if deleted > 0 {
         metrics::counter!("idempotency_cache_cleanup_deleted_total", deleted);
-    }
-    if deleted > 0 {
-        info!("Cleaned up {} expired idempotency cache entries", deleted);
+        info!(deleted, "Cleaned up expired idempotency cache entries");
+    } else {
+        debug!("No expired idempotency cache entries to clean");
     }
 
     Ok(deleted)
@@ -421,23 +389,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_extract_idempotency_key() {
-        let body = r#"{"idempotencyKey": "test-key-123", "other": "data"}"#;
-        let key = extract_idempotency_key(body.as_bytes());
-        assert_eq!(key, Some("test-key-123".to_string()));
+    fn apply_only_to_mls_chat_write_endpoints() {
+        assert!(should_apply(
+            "/xrpc/blue.catbird.mlsChat.sendMessage",
+            &Method::POST
+        ));
+        assert!(!should_apply(
+            "/xrpc/blue.catbird.mls.ds.deliverMessage",
+            &Method::POST
+        ));
+        assert!(!should_apply(
+            "/xrpc/blue.catbird.mlsChat.getConvos",
+            &Method::GET
+        ));
     }
 
     #[test]
-    fn test_extract_idempotency_key_missing() {
-        let body = r#"{"other": "data"}"#;
-        let key = extract_idempotency_key(body.as_bytes());
-        assert_eq!(key, None);
-    }
+    fn reject_invalid_idempotency_key() {
+        let mut headers = HeaderMap::new();
+        headers.insert(IDEMPOTENCY_KEY_HEADER, HeaderValue::from_static("   "));
+        assert!(extract_required_idempotency_key(&headers).is_err());
 
-    #[test]
-    fn test_extract_idempotency_key_invalid_json() {
-        let body = b"invalid json";
-        let key = extract_idempotency_key(body);
-        assert_eq!(key, None);
+        let long_key = "a".repeat(MAX_IDEMPOTENCY_KEY_LEN + 1);
+        headers.insert(
+            IDEMPOTENCY_KEY_HEADER,
+            HeaderValue::from_str(&long_key).unwrap(),
+        );
+        assert!(extract_required_idempotency_key(&headers).is_err());
     }
 }

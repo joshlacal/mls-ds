@@ -69,14 +69,29 @@ jobs:
           cargo fmt -- --check
           cargo clippy -- -D warnings
 
+      - name: Install cargo-audit
+        working-directory: ./server
+        run: |
+          cargo install cargo-audit --locked
+
       - name: Log redaction lint
         working-directory: ./server
         run: |
           ./scripts/log_redaction_lint.sh
 
+      - name: Federation static policy lint
+        run: |
+          ./server/scripts/did_web_builder_lint.sh
+          ./server/scripts/check_idempotency_schema.sh
+
       - name: Deployment policy lint
         run: |
           ./server/scripts/check_deploy_policy.sh
+
+      - name: Cargo audit
+        working-directory: ./server
+        run: |
+          cargo audit --deny warnings
 
       - name: Run tests
         working-directory: ./server

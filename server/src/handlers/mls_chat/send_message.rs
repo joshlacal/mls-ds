@@ -11,7 +11,7 @@ use crate::{
     federation::{self, FederatedBackend},
     generated::blue_catbird::mlsChat::send_message::SendMessageRequest,
     notifications::NotificationService,
-    realtime::{SseState, StreamEvent},
+    realtime::{SseState, StreamEvent, StreamMessageView},
     storage::DbPool,
 };
 
@@ -171,20 +171,22 @@ async fn handle_persistent(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    // --- Fetch conversation epoch ---
-    let server_epoch: i64 =
-        sqlx::query_scalar("SELECT CAST(current_epoch AS BIGINT) FROM conversations WHERE id = $1")
-            .bind(&convo_id)
-            .fetch_optional(&pool)
-            .await
-            .map_err(|e| {
-                error!("❌ [v2.sendMessage] Failed to fetch conversation: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?
-            .ok_or_else(|| {
-                error!("❌ [v2.sendMessage] Conversation not found");
-                StatusCode::NOT_FOUND
-            })?;
+    // --- Fetch conversation epoch and sequencer term ---
+    let (server_epoch, server_sequencer_term): (i64, i64) = sqlx::query_as(
+        "SELECT CAST(current_epoch AS BIGINT), CAST(COALESCE(sequencer_term, 0) AS BIGINT) \
+         FROM conversations WHERE id = $1",
+    )
+    .bind(&convo_id)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|e| {
+        error!("❌ [v2.sendMessage] Failed to fetch conversation: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .ok_or_else(|| {
+        error!("❌ [v2.sendMessage] Conversation not found");
+        StatusCode::NOT_FOUND
+    })?;
 
     let client_epoch = input.epoch;
     if client_epoch != server_epoch {
@@ -317,6 +319,8 @@ async fn handle_persistent(
     let ciphertext_for_push = ciphertext_vec;
     let sender_did_clone = auth_user.did.clone();
     let epoch_for_sse = client_epoch;
+    let sequencer_term_for_federation = server_sequencer_term.max(0) as u64;
+    let federation_delivery_id = ulid::Ulid::new().to_string();
 
     tokio::spawn(async move {
         let fanout_start = std::time::Instant::now();
@@ -363,16 +367,17 @@ async fn handle_persistent(
             .next(&convo_id_clone, "messageEvent")
             .await;
 
-        let message_view = crate::generated_types::MessageView {
-            id: msg_id_clone.clone(),
-            convo_id: convo_id_clone.clone(),
-            ciphertext: ciphertext_for_sse,
+        let message_view: StreamMessageView = crate::generated::blue_catbird::mlsChat::MessageView {
+            id: msg_id_clone.clone().into(),
+            convo_id: convo_id_clone.clone().into(),
+            ciphertext: bytes::Bytes::from(ciphertext_for_sse),
             epoch: epoch_for_sse,
             seq,
-            created_at: now,
-            message_type: "app".to_string(),
-            reactions: None,
-        };
+            created_at: crate::sqlx_jacquard::chrono_to_datetime(now),
+            message_type: Some("app".into()),
+            extra_data: Default::default(),
+        }
+        .into();
 
         let event = StreamEvent::MessageEvent {
             cursor: cursor.clone(),
@@ -418,17 +423,20 @@ async fn handle_persistent(
         // Federation
         if federation_config.enabled {
             if let Ok(true) = federated_backend.is_sequencer(&convo_id_clone).await {
-                let deliver_payload =
-                    crate::blue_catbird::mls::ds::deliver_message::DeliverMessage {
-                        convo_id: convo_id_clone.clone().into(),
-                        msg_id: msg_id_clone.clone().into(),
-                        epoch: epoch_for_sse,
-                        sender_ds_did: federation_config.self_did.clone().into(),
-                        ciphertext: bytes::Bytes::from(ciphertext_for_push.clone()),
-                        padded_size: padded_size as i64,
-                        message_type: Some("app".into()),
-                        extra_data: None,
-                    };
+                use base64::Engine;
+                let ciphertext_b64 =
+                    base64::engine::general_purpose::STANDARD.encode(&ciphertext_for_push);
+                let deliver_payload = serde_json::json!({
+                    "convoId": &convo_id_clone,
+                    "msgId": &msg_id_clone,
+                    "deliveryId": &federation_delivery_id,
+                    "sequencerTerm": sequencer_term_for_federation,
+                    "epoch": epoch_for_sse,
+                    "senderDsDid": &federation_config.self_did,
+                    "ciphertext": { "$bytes": ciphertext_b64 },
+                    "paddedSize": padded_size as i64,
+                    "messageType": "app"
+                });
                 let payload_bytes = match serde_json::to_vec(&deliver_payload) {
                     Ok(p) => p,
                     Err(e) => {
@@ -449,14 +457,10 @@ async fn handle_persistent(
                             ) {
                                 continue;
                             }
-                            let target_endpoint = ds_did
-                                .strip_prefix("did:web:")
-                                .map(|p| format!("https://{}", p.replace(':', "/")))
-                                .unwrap_or_default();
                             if let Err(e) = outbound_queue
                                 .enqueue(
                                     &ds_did,
-                                    &target_endpoint,
+                                    "",
                                     "blue.catbird.mls.ds.deliverMessage",
                                     &payload_bytes,
                                     &convo_id_clone,

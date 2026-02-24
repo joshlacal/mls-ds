@@ -1,19 +1,20 @@
-# Using Generated Types from Atrium Codegen
+# Using Generated Types from Jacquard Codegen
 
 ## Quick Reference
 
-All generated types are in `server/src/generated/blue/catbird/mls/`
+All generated types are in `server/src/generated/blue_catbird/mlsChat/`
+Preferred Jacquard-first import path is `crate::generated::blue_catbird::mlsChat::*` (or `crate::blue_catbird::mlsChat::*` via crate re-export).
 
 ### Importing Types
 
 ```rust
 // Shared definitions (ConvoView, MemberView, MessageView, etc.)
-use crate::generated::blue::catbird::mls::defs::*;
+use crate::generated::blue_catbird::mlsChat::*;
 
 // Endpoint-specific types
-use crate::generated::blue::catbird::mls::create_convo::{Input, Output};
-use crate::generated::blue::catbird::mls::send_message;
-use crate::generated::blue::catbird::mls::subscribe_convo_events;
+use crate::generated::blue_catbird::mlsChat::create_convo::{Input, Output};
+use crate::generated::blue_catbird::mlsChat::send_message;
+use crate::generated::blue_catbird::mlsChat::subscribe_events;
 ```
 
 ## Working with Generated Types
@@ -27,7 +28,7 @@ Each endpoint has:
 - `NSID` - Constant with the endpoint identifier
 
 ```rust
-use crate::generated::blue::catbird::mls::send_message;
+use crate::generated::blue_catbird::mlsChat::send_message;
 
 async fn send_message_handler(
     input: send_message::Input,
@@ -53,7 +54,7 @@ async fn send_message_handler(
 ### Working with Shared Types
 
 ```rust
-use crate::generated::blue::catbird::mls::defs::*;
+use crate::generated::blue_catbird::mlsChat::*;
 
 fn build_convo_response(convo: &Conversation) -> ConvoView {
     ConvoView::from(ConvoViewData {
@@ -72,10 +73,10 @@ fn build_convo_response(convo: &Conversation) -> ConvoView {
 
 ### SSE Event Types (Union Pattern)
 
-The `subscribeConvoEvents` endpoint demonstrates the union pattern:
+The `subscribeEvents` endpoint demonstrates the union pattern:
 
 ```rust
-use crate::generated::blue::catbird::mls::subscribe_convo_events::*;
+use crate::generated::blue_catbird::mlsChat::subscribe_events::*;
 
 async fn send_sse_event(
     event_type: &str,
@@ -125,7 +126,7 @@ async fn send_sse_event(
 ### Serialization (for SSE)
 
 ```rust
-use crate::generated::blue::catbird::mls::subscribe_convo_events::*;
+use crate::generated::blue_catbird::mlsChat::subscribe_events::*;
 
 async fn sse_handler() -> impl IntoResponse {
     let event = EventWrapper::from(EventWrapperData {
@@ -147,7 +148,7 @@ The serialized JSON will have the `$type` discriminator:
 ```json
 {
   "event": {
-    "$type": "blue.catbird.mls.subscribeConvoEvents#messageEvent",
+    "$type": "blue.catbird.mlsChat.subscribeEvents#messageEvent",
     "cursor": "abc123",
     "message": { /* MessageView */ }
   }
@@ -186,9 +187,9 @@ fn db_to_member_view(db: &DbMember) -> MemberView {
 }
 ```
 
-### Atrium Type Wrappers
+### Type Wrappers
 
-Generated types use `atrium_api::types` wrappers:
+Generated types use `crate::types` wrappers (re-exported jacquard-common types):
 
 - `types::Object<T>` - Wraps object data with `.data` field
 - `types::string::Did` - DID string with validation
@@ -206,7 +207,7 @@ let group_id: &String = &data.group_id;
 ## Error Handling
 
 ```rust
-use crate::generated::blue::catbird::mls::create_convo;
+use crate::generated::blue_catbird::mlsChat::create_convo;
 
 match handler().await {
     Ok(output) => {
@@ -229,8 +230,8 @@ match handler().await {
 4. **Type aliases** - Create type aliases for commonly used generated types:
 
 ```rust
-pub type MlsConvoView = crate::generated::blue::catbird::mls::defs::ConvoView;
-pub type MlsMemberView = crate::generated::blue::catbird::mls::defs::MemberView;
+pub type MlsConvoView = crate::generated::blue_catbird::mlsChat::ConvoView;
+pub type MlsMemberView = crate::generated::blue_catbird::mlsChat::MemberView;
 ```
 
 5. **Regenerate after lexicon changes**:

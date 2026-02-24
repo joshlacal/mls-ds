@@ -14,6 +14,8 @@ pub enum CommitResult {
     },
     /// Commit rejected due to epoch conflict.
     Conflict { current_epoch: i32, reason: String },
+    /// Commit rejected because the provided sequencer term is stale.
+    TermStale { current_term: u64, reason: String },
 }
 
 /// Handles commit ordering for conversations this DS sequences.
@@ -59,6 +61,13 @@ impl Sequencer {
 
     /// Submit a commit for sequencing via CAS on `current_epoch`.
     ///
+    /// MIMI-inspired safety invariants for sequencing:
+    /// - `sequencer_term` is the lease term for the active sequencer and must
+    ///   match exactly for the commit to be accepted.
+    /// - `current_epoch` advances by exactly one per accepted commit.
+    /// - `(convo_id, current_epoch, sequencer_term)` CAS guarantees a single
+    ///   writer per term and fences out stale sequencers during failover.
+    ///
     /// `commit_ciphertext` is the raw commit data used to produce a receipt
     /// when a `ReceiptSigner` is configured.
     pub async fn submit_commit(
@@ -66,6 +75,7 @@ impl Sequencer {
         convo_id: &str,
         current_epoch: i32,
         proposed_epoch: i32,
+        sequencer_term: u64,
         commit_ciphertext: &[u8],
     ) -> Result<CommitResult, sqlx::Error> {
         if proposed_epoch != current_epoch + 1 {
@@ -79,37 +89,54 @@ impl Sequencer {
 
         // CAS: atomically advance the epoch only if it still matches
         let result = sqlx::query(
-            "UPDATE conversations SET current_epoch = $2 \
-       WHERE id = $1 AND current_epoch = $3",
+            "UPDATE conversations SET current_epoch = $2, updated_at = NOW() \
+        WHERE id = $1 AND current_epoch = $3 AND sequencer_term = $4",
         )
         .bind(convo_id)
         .bind(proposed_epoch)
         .bind(current_epoch)
+        .bind(sequencer_term as i64)
         .execute(&self.pool)
         .await?;
 
         if result.rows_affected() == 1 {
             debug!(convo_id, proposed_epoch, "Commit accepted, epoch advanced");
-            let receipt = self
-                .receipt_signer
-                .as_ref()
-                .map(|s| s.sign_receipt(convo_id, proposed_epoch, commit_ciphertext));
+            let receipt = self.receipt_signer.as_ref().map(|s| {
+                s.sign_receipt(convo_id, proposed_epoch, sequencer_term, commit_ciphertext)
+            });
             return Ok(CommitResult::Accepted {
                 assigned_epoch: proposed_epoch,
                 receipt,
             });
         }
 
-        // Someone else committed first — fetch the actual current epoch
-        let actual_epoch = sqlx::query_scalar::<_, Option<i32>>(
-            "SELECT current_epoch FROM conversations WHERE id = $1",
+        // Either epoch moved or term moved — fetch current values.
+        let current = sqlx::query_as::<_, (Option<i32>, Option<i64>)>(
+            "SELECT current_epoch, sequencer_term FROM conversations WHERE id = $1",
         )
         .bind(convo_id)
         .fetch_optional(&self.pool)
         .await?;
 
-        match actual_epoch {
-            Some(Some(actual)) => {
+        match current {
+            Some((Some(actual_epoch), Some(actual_term)))
+                if actual_term.max(0) as u64 != sequencer_term =>
+            {
+                let current_term = actual_term.max(0) as u64;
+                warn!(
+                    convo_id,
+                    provided_term = sequencer_term,
+                    current_term,
+                    "Commit rejected due to stale sequencer term"
+                );
+                Ok(CommitResult::TermStale {
+                    current_term,
+                    reason: format!(
+                        "provided sequencer_term ({sequencer_term}) does not match current term ({current_term})"
+                    ),
+                })
+            }
+            Some((Some(actual), _)) => {
                 warn!(
                     convo_id,
                     proposed_epoch,

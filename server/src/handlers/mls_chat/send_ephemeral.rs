@@ -25,8 +25,7 @@ use crate::{
     generated::blue_catbird::mlsChat::send_ephemeral::{
         SendEphemeralOutput as GenOutput, SendEphemeralRequest,
     },
-    generated_types::MessageView,
-    realtime::{SseState, StreamEvent},
+    realtime::{SseState, StreamEvent, StreamMessageView},
     storage::DbPool,
 };
 
@@ -94,16 +93,17 @@ pub async fn send_ephemeral(
     // Construct a MessageView identical to a regular message — the server
     // treats it as opaque ciphertext. The `ephemeral` flag on the StreamEvent
     // tells clients not to insert it into chat history.
-    let message_view = MessageView {
-        id: msg_id,
-        convo_id: convo_id.clone(),
-        ciphertext: ciphertext_bytes.to_vec(),
+    let message_view: StreamMessageView = crate::generated::blue_catbird::mlsChat::MessageView {
+        id: msg_id.into(),
+        convo_id: convo_id.clone().into(),
+        ciphertext: ciphertext_bytes,
         epoch: input.epoch,
         seq: 0, // Ephemeral messages don't get a real sequence number
-        created_at: chrono::Utc::now(),
-        message_type: "app".to_string(),
-        reactions: None,
-    };
+        created_at: crate::sqlx_jacquard::chrono_to_datetime(chrono::Utc::now()),
+        message_type: Some("app".into()),
+        extra_data: Default::default(),
+    }
+    .into();
 
     let event = StreamEvent::MessageEvent {
         cursor: cursor.clone(),

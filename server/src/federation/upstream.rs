@@ -551,16 +551,17 @@ mod tests {
     fn test_extract_cursor_message() {
         let event = StreamEvent::MessageEvent {
             cursor: "01ABC".into(),
-            message: crate::generated_types::MessageView {
+            message: crate::generated::blue_catbird::mlsChat::MessageView {
                 id: "m1".into(),
                 convo_id: "c1".into(),
-                ciphertext: vec![],
+                ciphertext: bytes::Bytes::new(),
                 epoch: 0,
                 seq: 0,
-                created_at: chrono::Utc::now(),
-                message_type: "app".into(),
-                reactions: None,
-            },
+                created_at: crate::sqlx_jacquard::chrono_to_datetime(chrono::Utc::now()),
+                message_type: Some("app".into()),
+                extra_data: Default::default(),
+            }
+            .into(),
             ephemeral: false,
         };
         assert_eq!(extract_cursor(&event), Some("01ABC".into()));
@@ -612,16 +613,18 @@ mod tests {
     #[test]
     fn test_extract_cursor_all_variants() {
         let now = chrono::Utc::now();
-        let msg_view = crate::generated_types::MessageView {
-            id: "m1".into(),
-            convo_id: "c1".into(),
-            ciphertext: vec![],
-            epoch: 0,
-            seq: 0,
-            created_at: now,
-            message_type: "app".into(),
-            reactions: None,
-        };
+        let msg_view: crate::realtime::StreamMessageView =
+            crate::generated::blue_catbird::mlsChat::MessageView {
+                id: "m1".into(),
+                convo_id: "c1".into(),
+                ciphertext: bytes::Bytes::new(),
+                epoch: 0,
+                seq: 0,
+                created_at: crate::sqlx_jacquard::chrono_to_datetime(now),
+                message_type: Some("app".into()),
+                extra_data: Default::default(),
+            }
+            .into();
 
         let variants: Vec<(&str, StreamEvent)> = vec![
             (

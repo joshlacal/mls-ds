@@ -36,6 +36,9 @@ CREATE TABLE conversations (
     id TEXT PRIMARY KEY,
     creator_did TEXT NOT NULL,
     current_epoch INTEGER NOT NULL DEFAULT 0,
+    sequencer_term BIGINT NOT NULL DEFAULT 0,
+    sequencer_ds TEXT,
+    is_remote BOOLEAN NOT NULL DEFAULT FALSE,
     name TEXT,
     description TEXT,
     group_id TEXT,
@@ -65,6 +68,7 @@ COMMENT ON COLUMN conversations.group_info_epoch IS 'The epoch number correspond
 CREATE TABLE members (
     convo_id TEXT NOT NULL,
     member_did TEXT NOT NULL,
+    ds_did TEXT,
 
     -- Multi-device support (device-specific MLS identity)
     user_did TEXT,
@@ -418,12 +422,14 @@ CREATE INDEX idx_message_recipients_delivered ON message_recipients(delivered_at
 
 -- Idempotency Cache (for API operation deduplication)
 CREATE TABLE idempotency_cache (
-    key TEXT PRIMARY KEY,
+    caller_did TEXT NOT NULL,
     endpoint TEXT NOT NULL,
+    key TEXT NOT NULL,
     response_body JSONB NOT NULL,
     status_code INTEGER NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    expires_at TIMESTAMPTZ NOT NULL
+    expires_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (caller_did, endpoint, key)
 );
 
 CREATE INDEX idx_idempotency_cache_expires ON idempotency_cache(expires_at);

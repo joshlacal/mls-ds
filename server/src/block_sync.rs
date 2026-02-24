@@ -13,7 +13,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
-use crate::storage::DbPool;
+use crate::{identity::did_web_document_url, storage::DbPool};
 
 /// Errors that can occur during block synchronization
 #[derive(Debug, Error)]
@@ -166,11 +166,7 @@ impl BlockSyncService {
         let url = if did.starts_with("did:plc:") {
             format!("https://plc.directory/{}", did)
         } else if did.starts_with("did:web:") {
-            let web_path = did
-                .strip_prefix("did:web:")
-                .ok_or_else(|| BlockSyncError::InvalidDid(did.to_string()))?;
-            let domain = web_path.replace(':', "/");
-            format!("https://{}/.well-known/did.json", domain)
+            did_web_document_url(did).ok_or_else(|| BlockSyncError::InvalidDid(did.to_string()))?
         } else {
             return Err(BlockSyncError::InvalidDid(format!(
                 "Unsupported DID method: {}",

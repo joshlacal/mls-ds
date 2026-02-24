@@ -4,9 +4,17 @@ use tracing::debug;
 use crate::{
     auth::AuthUser,
     federation::{DsResolver, FederationError},
-    generated::blue_catbird::mls::resolve_delivery_service::ResolveDeliveryServiceOutput,
     storage::DbPool,
 };
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolveDeliveryServiceOutput<'a> {
+    did: jacquard_common::types::string::Did<'a>,
+    endpoint: jacquard_common::CowStr<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    supported_cipher_suites: Option<Vec<jacquard_common::CowStr<'a>>>,
+}
 
 /// GET /xrpc/blue.catbird.mls.resolveDeliveryService
 ///
@@ -72,7 +80,6 @@ pub async fn resolve(
         did,
         endpoint: jacquard_common::CowStr::Owned(endpoint.as_str().into()),
         supported_cipher_suites,
-        extra_data: Default::default(),
     }))
 }
 

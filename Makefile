@@ -1,4 +1,4 @@
-.PHONY: help build test run clean fmt lint install-deps
+.PHONY: help build test run clean fmt lint check-codegen-guardrails install-deps
 
 help:
 	@echo "Catbird MLS - Development Commands"
@@ -11,6 +11,7 @@ help:
 	@echo "make clean          - Clean build artifacts"
 	@echo "make fmt            - Format code"
 	@echo "make lint           - Run linters"
+	@echo "make check-codegen-guardrails - Enforce generated lexicon runtime guardrails"
 	@echo "make install-deps   - Install dependencies"
 
 build:
@@ -52,6 +53,9 @@ lint:
 	@echo "Running clippy..."
 	cd server && cargo clippy -- -D warnings
 	cd mls-ffi && cargo clippy -- -D warnings
+
+check-codegen-guardrails:
+	@./server/scripts/check_codegen_guardrails.sh
 
 install-deps:
 	@echo "Installing Rust toolchain..."

@@ -156,7 +156,10 @@ pub async fn opt_in_post(
                 .collect();
 
             if !missing_dids.is_empty() {
-                debug!("Checking PDS declarations for {} missing DIDs", missing_dids.len());
+                debug!(
+                    "Checking PDS declarations for {} missing DIDs",
+                    missing_dids.len()
+                );
 
                 for did in &missing_dids {
                     match declaration_client.fetch_declarations(did).await {

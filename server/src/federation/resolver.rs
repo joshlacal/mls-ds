@@ -4,7 +4,18 @@ use std::time::Duration;
 use tracing::{debug, info};
 
 use super::errors::FederationError;
-use crate::identity::canonical_did;
+use crate::identity::{canonical_did, did_web_document_url};
+
+const PROFILE_COLLECTION: &str = "blue.catbird.mls.profile";
+const PROFILE_RKEY: &str = "self";
+
+fn profile_record_url(pds_endpoint: &str, user_did: &str) -> String {
+    format!(
+        "{}/xrpc/com.atproto.repo.getRecord?repo={}&collection={PROFILE_COLLECTION}&rkey={PROFILE_RKEY}",
+        pds_endpoint,
+        urlencoding::encode(user_did)
+    )
+}
 
 /// Cached DS endpoint information.
 #[derive(Debug, Clone)]
@@ -12,6 +23,7 @@ pub struct DsEndpoint {
     pub did: String,
     pub endpoint: String,
     pub supported_cipher_suites: Option<Vec<String>>,
+    pub federation_capabilities: Option<Vec<String>>,
 }
 
 /// Resolves a user's DID to their DS endpoint.
@@ -66,6 +78,7 @@ impl DsResolver {
                 did: self.self_did.clone(),
                 endpoint: self.self_endpoint.clone(),
                 supported_cipher_suites: None,
+                federation_capabilities: Some(super::local_federation_capabilities()),
             });
         }
 
@@ -96,6 +109,7 @@ impl DsResolver {
                 did: user_did.to_string(),
                 endpoint: default.clone(),
                 supported_cipher_suites: None,
+                federation_capabilities: None,
             });
         }
 
@@ -130,6 +144,7 @@ impl DsResolver {
             did,
             endpoint,
             supported_cipher_suites: suites.and_then(|s| serde_json::from_str(&s).ok()),
+            federation_capabilities: None,
         }))
     }
 
@@ -162,11 +177,7 @@ impl DsResolver {
     async fn resolve_from_repo(&self, user_did: &str) -> Result<DsEndpoint, FederationError> {
         let pds_endpoint = self.resolve_did_to_pds(user_did).await?;
 
-        let profile_url = format!(
-      "{}/xrpc/com.atproto.repo.getRecord?repo={}&collection=blue.catbird.mls.profile&rkey=self",
-      pds_endpoint,
-      urlencoding::encode(user_did)
-    );
+        let profile_url = profile_record_url(&pds_endpoint, user_did);
 
         let resp = self
             .http
@@ -219,19 +230,25 @@ impl DsResolver {
                     .filter_map(|v| v.as_str().map(String::from))
                     .collect()
             });
+        let federation_capabilities =
+            super::parse_capabilities_from_json_array(value.get("federationCapabilities"))
+                .or_else(|| super::parse_capabilities_from_json_array(value.get("capabilities")));
 
         Ok(DsEndpoint {
             did: user_did.to_string(),
             endpoint: delivery_service.to_string(),
             supported_cipher_suites: suites,
+            federation_capabilities,
         })
     }
 
     /// Resolve a DID to its PDS endpoint via DID document.
     pub(crate) async fn resolve_did_to_pds(&self, did: &str) -> Result<String, FederationError> {
         let did_doc_url = if did.starts_with("did:web:") {
-            let domain = did.strip_prefix("did:web:").unwrap_or(did);
-            format!("https://{}/.well-known/did.json", domain.replace(':', "/"))
+            did_web_document_url(did).ok_or_else(|| FederationError::ResolutionFailed {
+                did: did.to_string(),
+                reason: format!("Invalid did:web identifier: {did}"),
+            })?
         } else if did.starts_with("did:plc:") {
             format!("https://plc.directory/{did}")
         } else {
@@ -485,7 +502,9 @@ pub(crate) async fn validate_resolved_host_is_public(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::postgres::PgPoolOptions;
     use std::net::IpAddr;
+    use uuid::Uuid;
 
     // -- is_private_ip tests --
 
@@ -611,10 +630,129 @@ mod tests {
             supported_cipher_suites: Some(vec![
                 "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519".to_string()
             ]),
+            federation_capabilities: Some(vec![
+                "baseline".to_string(),
+                "reconciliation-v1".to_string(),
+            ]),
         };
         let cloned = ep.clone();
         assert_eq!(cloned.did, ep.did);
         assert_eq!(cloned.endpoint, ep.endpoint);
         assert_eq!(cloned.supported_cipher_suites, ep.supported_cipher_suites);
+        assert_eq!(cloned.federation_capabilities, ep.federation_capabilities);
+    }
+
+    #[test]
+    fn test_profile_record_url_uses_supported_collection_and_rkey() {
+        let url = profile_record_url("https://pds.example.com", "did:plc:alice:123");
+        let parsed = url::Url::parse(&url).expect("valid URL");
+        let query: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+
+        assert_eq!(query.get("repo"), Some(&"did:plc:alice:123".to_string()));
+        assert_eq!(
+            query.get("collection"),
+            Some(&PROFILE_COLLECTION.to_string())
+        );
+        assert_eq!(query.get("rkey"), Some(&PROFILE_RKEY.to_string()));
+    }
+
+    async fn setup_cache_test_pool() -> Option<PgPool> {
+        let database_url = std::env::var("TEST_DATABASE_URL").ok()?;
+        let pool = match PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&database_url)
+            .await
+        {
+            Ok(pool) => pool,
+            Err(err) => {
+                eprintln!("Skipping cache test: failed to connect to TEST_DATABASE_URL ({err})");
+                return None;
+            }
+        };
+
+        if let Err(err) = sqlx::query(
+            "CREATE TABLE IF NOT EXISTS ds_endpoints (
+                did TEXT PRIMARY KEY,
+                endpoint TEXT NOT NULL,
+                supported_cipher_suites TEXT,
+                resolved_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '1 hour'
+            )",
+        )
+        .execute(&pool)
+        .await
+        {
+            eprintln!("Skipping cache test: unable to ensure ds_endpoints table ({err})");
+            return None;
+        }
+
+        Some(pool)
+    }
+
+    #[tokio::test]
+    async fn test_cache_refresh_and_invalidate() {
+        let Some(pool) = setup_cache_test_pool().await else {
+            eprintln!("Skipping cache test: TEST_DATABASE_URL not set");
+            return;
+        };
+
+        let resolver = DsResolver::new(
+            pool.clone(),
+            reqwest::Client::new(),
+            "did:web:self.example.com".to_string(),
+            "https://self.example.com".to_string(),
+            None,
+            3600,
+        );
+
+        let did = format!("did:plc:{}", Uuid::new_v4().as_simple());
+        let first = DsEndpoint {
+            did: did.clone(),
+            endpoint: "https://ds-one.example.com".to_string(),
+            supported_cipher_suites: Some(vec!["suite-a".to_string()]),
+            federation_capabilities: Some(vec!["baseline".to_string()]),
+        };
+        resolver
+            .cache_endpoint(&first)
+            .await
+            .expect("cache insert succeeds");
+        let cached = resolver
+            .get_cached(&did)
+            .await
+            .expect("cache read succeeds")
+            .expect("cache entry exists");
+        assert_eq!(cached.endpoint, first.endpoint);
+
+        let refreshed = DsEndpoint {
+            did: did.clone(),
+            endpoint: "https://ds-two.example.com".to_string(),
+            supported_cipher_suites: Some(vec!["suite-b".to_string(), "suite-c".to_string()]),
+            federation_capabilities: Some(vec!["reconciliation-v1".to_string()]),
+        };
+        resolver
+            .cache_endpoint(&refreshed)
+            .await
+            .expect("cache refresh succeeds");
+        let cached_refreshed = resolver
+            .get_cached(&did)
+            .await
+            .expect("cache read succeeds")
+            .expect("cache entry exists");
+        assert_eq!(cached_refreshed.endpoint, refreshed.endpoint);
+        assert_eq!(
+            cached_refreshed.supported_cipher_suites,
+            refreshed.supported_cipher_suites
+        );
+        assert!(cached_refreshed.federation_capabilities.is_none());
+
+        resolver
+            .invalidate(&did)
+            .await
+            .expect("cache invalidation succeeds");
+        let after_invalidate = resolver
+            .get_cached(&did)
+            .await
+            .expect("cache read succeeds");
+        assert!(after_invalidate.is_none());
     }
 }

@@ -168,9 +168,11 @@ async fn handle_all(pool: &DbPool, did: &str) -> Result<Json<serde_json::Value>,
 
     info!("✅ [v2.getConvos] Found {} conversations", convos.len());
 
-    let output = crate::generated::blue_catbird::mls::get_convos::GetConvosOutput {
+    let output = crate::generated::blue_catbird::mlsChat::get_convos::GetConvosOutput {
         conversations: convos,
         cursor: None,
+        pending_count: None,
+        request_count: None,
         extra_data: Default::default(),
     };
     Ok(Json(serde_json::to_value(output).unwrap()))
@@ -432,9 +434,11 @@ async fn handle_expected(
 
     info!("✅ [v2.getConvos] Expected: {} convos", convos.len(),);
 
-    let output = crate::generated::blue_catbird::mls::get_convos::GetConvosOutput {
+    let output = crate::generated::blue_catbird::mlsChat::get_convos::GetConvosOutput {
         conversations: convos,
         cursor: None,
+        pending_count: None,
+        request_count: None,
         extra_data: Default::default(),
     };
     Ok(Json(serde_json::to_value(output).unwrap()))

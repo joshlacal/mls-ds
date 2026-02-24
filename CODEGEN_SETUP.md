@@ -127,6 +127,14 @@ cargo run -p mls-codegen
 
 The generated files include `@generated` markers indicating they're auto-generated and shouldn't be manually edited.
 
+Run the guardrail check to ensure runtime code stays on canonical generated lexicon paths:
+
+```bash
+./server/scripts/check_codegen_guardrails.sh
+# or
+make check-codegen-guardrails
+```
+
 ## Why This Works Better Than Manual Types
 
 **atrium-codegen:**

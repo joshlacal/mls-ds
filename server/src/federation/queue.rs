@@ -5,9 +5,30 @@ use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use super::errors::FederationError;
 use super::outbound::{OutboundClient, OutboundError};
+use super::peer_policy;
 use super::resolver::{validate_endpoint_url, validate_resolved_host_is_public};
 use crate::auth::AuthMiddleware;
+use crate::identity::{canonical_did, did_web_service_endpoint};
+
+const OUTBOUND_QUEUE_PER_PEER_PENDING_CAP_ENV: &str =
+    "FEDERATION_OUTBOUND_QUEUE_PER_PEER_PENDING_CAP";
+const OUTBOUND_QUEUE_PER_CONVO_PEER_PENDING_CAP_ENV: &str =
+    "FEDERATION_OUTBOUND_QUEUE_PER_CONVO_PEER_PENDING_CAP";
+const OUTBOUND_QUEUE_PER_PEER_PENDING_CAP_DEFAULT: i64 = 500;
+const OUTBOUND_QUEUE_PER_CONVO_PEER_PENDING_CAP_DEFAULT: i64 = 100;
+const OUTBOUND_QUEUE_PENDING_CAP_MAX: i64 = 100_000;
+
+fn parse_pending_cap(raw: Option<&str>, default: i64) -> i64 {
+    raw.and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(default)
+        .clamp(1, OUTBOUND_QUEUE_PENDING_CAP_MAX)
+}
+
+fn pending_cap_from_env(var_name: &str, default: i64) -> i64 {
+    parse_pending_cap(std::env::var(var_name).ok().as_deref(), default)
+}
 
 // ---------------------------------------------------------------------------
 // Queue item
@@ -46,13 +67,29 @@ pub struct QueueStats {
 pub struct OutboundQueue {
     pool: PgPool,
     auth_middleware: AuthMiddleware,
+    per_peer_pending_cap: i64,
+    per_convo_peer_pending_cap: i64,
 }
 
 impl OutboundQueue {
     pub fn new(pool: PgPool, auth_middleware: AuthMiddleware) -> Self {
+        let per_peer_pending_cap = pending_cap_from_env(
+            OUTBOUND_QUEUE_PER_PEER_PENDING_CAP_ENV,
+            OUTBOUND_QUEUE_PER_PEER_PENDING_CAP_DEFAULT,
+        );
+        let per_convo_peer_pending_cap = pending_cap_from_env(
+            OUTBOUND_QUEUE_PER_CONVO_PEER_PENDING_CAP_ENV,
+            OUTBOUND_QUEUE_PER_CONVO_PEER_PENDING_CAP_DEFAULT,
+        );
+        info!(
+            per_peer_pending_cap,
+            per_convo_peer_pending_cap, "Outbound queue resource fencing configured"
+        );
         Self {
             pool,
             auth_middleware,
+            per_peer_pending_cap,
+            per_convo_peer_pending_cap,
         }
     }
 
@@ -67,7 +104,13 @@ impl OutboundQueue {
         payload: &[u8],
         convo_id: &str,
         error_msg: &str,
-    ) -> Result<String, sqlx::Error> {
+    ) -> Result<String, FederationError> {
+        let canonical_target_ds_did = canonical_did(target_ds_did).to_string();
+        let policy =
+            peer_policy::enforce_outbound_peer_policy(&self.pool, &canonical_target_ds_did).await?;
+        self.enforce_pending_caps(&canonical_target_ds_did, convo_id, &policy)
+            .await?;
+
         let id = ulid::Ulid::new().to_string();
         let initial_delay_secs: f64 = 5.0;
 
@@ -77,7 +120,7 @@ impl OutboundQueue {
              VALUES ($1, $2, $3, $4, $5, $6, $7, NOW() + make_interval(secs => $8))",
         )
         .bind(&id)
-        .bind(target_ds_did)
+        .bind(&canonical_target_ds_did)
         .bind(target_endpoint)
         .bind(method)
         .bind(payload)
@@ -85,10 +128,131 @@ impl OutboundQueue {
         .bind(error_msg)
         .bind(initial_delay_secs)
         .execute(&self.pool)
-        .await?;
+        .await
+        .map_err(FederationError::Database)?;
 
-        debug!(queue_id = %id, target_ds_did, method, convo_id, "Enqueued for retry");
+        debug!(
+            queue_id = %id,
+            target_ds_did = %canonical_target_ds_did,
+            method,
+            convo_id,
+            "Enqueued for retry"
+        );
         Ok(id)
+    }
+
+    async fn enforce_pending_caps(
+        &self,
+        target_ds_did: &str,
+        convo_id: &str,
+        policy: &peer_policy::PeerPolicy,
+    ) -> Result<(), FederationError> {
+        let cap_ratio = policy
+            .configured_max_requests_per_minute
+            .zip(policy.max_requests_per_minute)
+            .map(|(configured, effective)| {
+                (effective as f64 / configured.max(1) as f64).clamp(0.05, 1.0)
+            })
+            .unwrap_or_else(|| match policy.risk_tier {
+                peer_policy::RiskTier::Low => 1.0,
+                peer_policy::RiskTier::Medium => 0.75,
+                peer_policy::RiskTier::High => 0.5,
+                peer_policy::RiskTier::Critical => 0.25,
+            });
+        let adaptive_peer_cap = ((self.per_peer_pending_cap as f64) * cap_ratio)
+            .floor()
+            .max(1.0) as i64;
+        let adaptive_convo_peer_cap = ((self.per_convo_peer_pending_cap as f64) * cap_ratio)
+            .floor()
+            .max(1.0) as i64;
+
+        let (peer_pending, convo_peer_pending): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*)::BIGINT AS peer_pending, \
+                    COUNT(*) FILTER (WHERE convo_id = $2)::BIGINT AS convo_peer_pending \
+             FROM outbound_queue \
+             WHERE status = 'pending' AND target_ds_did = $1",
+        )
+        .bind(target_ds_did)
+        .bind(convo_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(FederationError::Database)?;
+
+        if peer_pending >= adaptive_peer_cap {
+            crate::metrics::record_federation_queue_capacity_rejection(
+                "peer",
+                policy.risk_tier.as_str(),
+            );
+            crate::metrics::record_federation_rejection_reason("queue_capacity_exceeded");
+            warn!(
+                event = "federation_outbound_queue_enqueue_rejected",
+                scope = "peer",
+                target_ds = %crate::crypto::redact_for_log(target_ds_did),
+                convo_id = %crate::crypto::redact_for_log(convo_id),
+                risk_tier = %policy.risk_tier.as_str(),
+                pending = peer_pending,
+                cap = adaptive_peer_cap,
+                configured_cap = self.per_peer_pending_cap,
+                "Rejected outbound queue enqueue: per-peer pending cap exceeded"
+            );
+            if peer_policy::federation_alerts_enabled() {
+                error!(
+                    event = "federation_alert_hook",
+                    alert_type = "queue_capacity_rejection",
+                    scope = "peer",
+                    target_ds = %crate::crypto::redact_for_log(target_ds_did),
+                    risk_tier = %policy.risk_tier.as_str(),
+                    pending = peer_pending,
+                    cap = adaptive_peer_cap,
+                    "Federation alert hook emitted"
+                );
+            }
+            return Err(FederationError::OutboundQueuePeerCapExceeded {
+                target_ds_did: target_ds_did.to_string(),
+                pending: peer_pending,
+                limit: adaptive_peer_cap,
+            });
+        }
+
+        if convo_peer_pending >= adaptive_convo_peer_cap {
+            crate::metrics::record_federation_queue_capacity_rejection(
+                "conversation_peer",
+                policy.risk_tier.as_str(),
+            );
+            crate::metrics::record_federation_rejection_reason("queue_capacity_exceeded");
+            warn!(
+                event = "federation_outbound_queue_enqueue_rejected",
+                scope = "conversation_peer",
+                target_ds = %crate::crypto::redact_for_log(target_ds_did),
+                convo_id = %crate::crypto::redact_for_log(convo_id),
+                risk_tier = %policy.risk_tier.as_str(),
+                pending = convo_peer_pending,
+                cap = adaptive_convo_peer_cap,
+                configured_cap = self.per_convo_peer_pending_cap,
+                "Rejected outbound queue enqueue: per-conversation per-peer pending cap exceeded"
+            );
+            if peer_policy::federation_alerts_enabled() {
+                error!(
+                    event = "federation_alert_hook",
+                    alert_type = "queue_capacity_rejection",
+                    scope = "conversation_peer",
+                    target_ds = %crate::crypto::redact_for_log(target_ds_did),
+                    convo_id = %crate::crypto::redact_for_log(convo_id),
+                    risk_tier = %policy.risk_tier.as_str(),
+                    pending = convo_peer_pending,
+                    cap = adaptive_convo_peer_cap,
+                    "Federation alert hook emitted"
+                );
+            }
+            return Err(FederationError::OutboundQueueConvoPeerCapExceeded {
+                target_ds_did: target_ds_did.to_string(),
+                convo_id: convo_id.to_string(),
+                pending: convo_peer_pending,
+                limit: adaptive_convo_peer_cap,
+            });
+        }
+
+        Ok(())
     }
 
     // -- Background worker ------------------------------------------------------
@@ -212,6 +376,7 @@ impl OutboundQueue {
                 return;
             }
         };
+        let expected_sequencer_term = extract_expected_sequencer_term(&item.method, &body);
 
         match outbound
             .call_procedure(&target_endpoint, &item.method, &token, &body)
@@ -221,8 +386,11 @@ impl OutboundQueue {
                 debug!(queue_id = %item.id, "Retry delivery succeeded");
                 if let Some(ref ack) = resp.ack {
                     // Validate ACK fields match the delivery we sent
-                    let fields_valid =
-                        ack.receiver_ds_did == item.target_ds_did && ack.convo_id == item.convo_id;
+                    let fields_valid = ack.receiver_ds_did == item.target_ds_did
+                        && ack.convo_id == item.convo_id
+                        && expected_sequencer_term
+                            .map(|term| ack.sequencer_term == term)
+                            .unwrap_or(true);
                     if !fields_valid {
                         warn!(
                             queue_id = %item.id,
@@ -230,6 +398,8 @@ impl OutboundQueue {
                             got_ds = %ack.receiver_ds_did,
                             expected_convo = %item.convo_id,
                             got_convo = %ack.convo_id,
+                            expected_term = ?expected_sequencer_term,
+                            got_term = ack.sequencer_term,
                             "Delivery ACK field mismatch — possible forgery, skipping storage"
                         );
                     } else {
@@ -289,8 +459,22 @@ impl OutboundQueue {
                 let _ = self.mark_delivered(&item.id).await;
             }
             Ok(resp) => {
-                let reason = resp.message.unwrap_or_else(|| "rejected".to_string());
-                warn!(queue_id = %item.id, reason = %reason, "Remote DS rejected delivery");
+                let rejection_category = classify_remote_rejection_category(
+                    resp.reason_code.as_deref(),
+                    resp.error.as_deref(),
+                    resp.message.as_deref(),
+                );
+                crate::metrics::record_federation_rejection_reason(rejection_category);
+                let reason = resp
+                    .reason_code
+                    .or(resp.message)
+                    .unwrap_or_else(|| "rejected".to_string());
+                warn!(
+                    queue_id = %item.id,
+                    reason = %reason,
+                    rejection_category,
+                    "Remote DS rejected delivery"
+                );
                 let _ = self.mark_failed(&item.id, &reason).await;
             }
             Err(e) if e.is_retryable() && item.retry_count < item.max_retries => {
@@ -319,44 +503,51 @@ impl OutboundQueue {
     }
 
     async fn resolve_target_endpoint(&self, item: &QueueItem) -> Result<String, OutboundError> {
-        if !item.target_endpoint.trim().is_empty() {
-            return Ok(item.target_endpoint.clone());
-        }
+        let canonical_target_ds_did = canonical_did(&item.target_ds_did).to_string();
 
         let cached_endpoint = sqlx::query_scalar::<_, String>(
             "SELECT endpoint FROM ds_endpoints WHERE did = $1 AND expires_at > NOW()",
         )
-        .bind(&item.target_ds_did)
+        .bind(&canonical_target_ds_did)
         .fetch_optional(&self.pool)
         .await
         .ok()
         .flatten();
 
         if let Some(endpoint) = cached_endpoint {
-            return Ok(endpoint);
+            return self
+                .validate_endpoint_candidate(&endpoint, &canonical_target_ds_did)
+                .await;
         }
 
-        if let Some(derived_endpoint) = did_web_to_endpoint(&item.target_ds_did) {
-            // Validate the derived URL against SSRF protections before using it
-            let parsed = validate_endpoint_url(&derived_endpoint).map_err(|e| {
-                OutboundError::RequestFailed {
-                    endpoint: derived_endpoint.clone(),
-                    reason: format!("SSRF validation failed: {e}"),
-                }
-            })?;
-            validate_resolved_host_is_public(&parsed)
-                .await
-                .map_err(|e| OutboundError::RequestFailed {
-                    endpoint: derived_endpoint.clone(),
-                    reason: format!("SSRF validation failed: {e}"),
-                })?;
-            return Ok(derived_endpoint);
+        if let Some(derived_endpoint) = did_web_service_endpoint(&canonical_target_ds_did) {
+            return self
+                .validate_endpoint_candidate(&derived_endpoint, &canonical_target_ds_did)
+                .await;
         }
 
         Err(OutboundError::RequestFailed {
-            endpoint: item.target_ds_did.clone(),
+            endpoint: canonical_target_ds_did,
             reason: "target endpoint missing and DS endpoint could not be resolved".to_string(),
         })
+    }
+
+    async fn validate_endpoint_candidate(
+        &self,
+        endpoint: &str,
+        target_ds_did: &str,
+    ) -> Result<String, OutboundError> {
+        let parsed = validate_endpoint_url(endpoint).map_err(|e| OutboundError::RequestFailed {
+            endpoint: endpoint.to_string(),
+            reason: format!("SSRF validation failed for {target_ds_did}: {e}"),
+        })?;
+        validate_resolved_host_is_public(&parsed)
+            .await
+            .map_err(|e| OutboundError::RequestFailed {
+                endpoint: endpoint.to_string(),
+                reason: format!("SSRF validation failed for {target_ds_did}: {e}"),
+            })?;
+        Ok(endpoint.to_string())
     }
 
     // -- Status mutations -------------------------------------------------------
@@ -437,6 +628,47 @@ impl OutboundQueue {
     }
 }
 
+fn extract_expected_sequencer_term(method: &str, body: &serde_json::Value) -> Option<u64> {
+    match method {
+        "blue.catbird.mls.ds.deliverMessage" | "blue.catbird.mls.ds.submitCommit" => body
+            .get("sequencerTerm")
+            .and_then(serde_json::Value::as_u64),
+        _ => None,
+    }
+}
+
+fn classify_remote_rejection_category(
+    reason_code: Option<&str>,
+    error: Option<&str>,
+    message: Option<&str>,
+) -> &'static str {
+    if let Some(code) = reason_code {
+        return match code {
+            "rate_limited" => "rate_limited",
+            "auth_failed" => "auth_failed",
+            "not_sequencer" | "term_stale" | "conflict" => "conflict",
+            "queue_capacity_exceeded" => "queue_capacity_exceeded",
+            "invalid_payload" => "invalid_payload",
+            _ => "remote_rejected",
+        };
+    }
+
+    let context = error.or(message).unwrap_or_default().to_ascii_lowercase();
+    if context.contains("rate") && context.contains("limit") {
+        "rate_limited"
+    } else if context.contains("auth") || context.contains("token") {
+        "auth_failed"
+    } else if context.contains("queue") || context.contains("capacity") {
+        "queue_capacity_exceeded"
+    } else if context.contains("conflict") || context.contains("stale") {
+        "conflict"
+    } else if context.contains("invalid") || context.contains("payload") {
+        "invalid_payload"
+    } else {
+        "remote_rejected"
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Backoff
 // ---------------------------------------------------------------------------
@@ -448,15 +680,24 @@ fn backoff_delay(retry_count: i32) -> Duration {
     Duration::from_secs(delay.min(300))
 }
 
-fn did_web_to_endpoint(did: &str) -> Option<String> {
-    let web_path = did.strip_prefix("did:web:")?;
-    let domain = web_path.replace(':', "/");
-    Some(format!("https://{}", domain))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_cap_uses_default_for_invalid_or_missing_values() {
+        assert_eq!(parse_pending_cap(None, 123), 123);
+        assert_eq!(parse_pending_cap(Some("invalid"), 123), 123);
+    }
+
+    #[test]
+    fn pending_cap_is_clamped_to_safe_range() {
+        assert_eq!(parse_pending_cap(Some("0"), 123), 1);
+        assert_eq!(
+            parse_pending_cap(Some("999999999"), 123),
+            OUTBOUND_QUEUE_PENDING_CAP_MAX
+        );
+    }
 
     #[test]
     fn backoff_values() {
@@ -468,18 +709,5 @@ mod tests {
         assert_eq!(backoff_delay(5), Duration::from_secs(160));
         assert_eq!(backoff_delay(6), Duration::from_secs(300)); // capped
         assert_eq!(backoff_delay(10), Duration::from_secs(300)); // still capped
-    }
-
-    #[test]
-    fn derive_endpoint_from_did_web() {
-        assert_eq!(
-            did_web_to_endpoint("did:web:ds.example.com"),
-            Some("https://ds.example.com".to_string())
-        );
-        assert_eq!(
-            did_web_to_endpoint("did:web:example.com:mls"),
-            Some("https://example.com/mls".to_string())
-        );
-        assert_eq!(did_web_to_endpoint("did:plc:abc123"), None);
     }
 }

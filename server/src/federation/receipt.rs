@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 pub struct SequencerReceipt {
     pub convo_id: String,
     pub epoch: i32,
+    pub sequencer_term: u64,
     /// SHA-256 hash of the commit ciphertext.
     pub commit_hash: Vec<u8>,
     /// DID of the sequencer that issued this receipt.
@@ -31,6 +32,7 @@ impl SequencerReceipt {
         let canonical = canonical_bytes(
             &self.convo_id,
             self.epoch,
+            self.sequencer_term,
             &self.commit_hash,
             &self.sequencer_did,
             self.issued_at,
@@ -65,6 +67,7 @@ impl ReceiptSigner {
         &self,
         convo_id: &str,
         epoch: i32,
+        sequencer_term: u64,
         commit_ciphertext: &[u8],
     ) -> SequencerReceipt {
         let commit_hash = hash_commit(commit_ciphertext);
@@ -72,6 +75,7 @@ impl ReceiptSigner {
         let canonical = canonical_bytes(
             convo_id,
             epoch,
+            sequencer_term,
             &commit_hash,
             &self.sequencer_did,
             issued_at,
@@ -82,6 +86,7 @@ impl ReceiptSigner {
         SequencerReceipt {
             convo_id: convo_id.to_string(),
             epoch,
+            sequencer_term,
             commit_hash: commit_hash.to_vec(),
             sequencer_did: self.sequencer_did.clone(),
             issued_at,
@@ -104,16 +109,17 @@ pub fn hash_commit(ciphertext: &[u8]) -> [u8; 32] {
 
 /// Build the canonical byte representation for signing/verification.
 ///
-/// Format: `"CATBIRD-RECEIPT-V1:" || len(convo_id) (LE u32) || convo_id_bytes || epoch (BE i32) || commit_hash || len(sequencer_did) (LE u32) || sequencer_did_bytes || issued_at (BE i64)`
+/// Format: `"CATBIRD-RECEIPT-V1:" || len(convo_id) (LE u32) || convo_id_bytes || epoch (BE i32) || sequencer_term (BE u64) || commit_hash || len(sequencer_did) (LE u32) || sequencer_did_bytes || issued_at (BE i64)`
 fn canonical_bytes(
     convo_id: &str,
     epoch: i32,
+    sequencer_term: u64,
     commit_hash: &[u8],
     sequencer_did: &str,
     issued_at: i64,
 ) -> Vec<u8> {
     let mut buf = Vec::with_capacity(
-        19 + 4 + convo_id.len() + 4 + commit_hash.len() + 4 + sequencer_did.len() + 8,
+        19 + 4 + convo_id.len() + 4 + 8 + commit_hash.len() + 4 + sequencer_did.len() + 8,
     );
     // Domain separator prevents cross-protocol signature reuse
     buf.extend_from_slice(b"CATBIRD-RECEIPT-V1:");
@@ -121,6 +127,7 @@ fn canonical_bytes(
     buf.extend_from_slice(&(convo_id.len() as u32).to_le_bytes());
     buf.extend_from_slice(convo_id.as_bytes());
     buf.extend_from_slice(&epoch.to_be_bytes());
+    buf.extend_from_slice(&sequencer_term.to_be_bytes());
     buf.extend_from_slice(commit_hash);
     buf.extend_from_slice(&(sequencer_did.len() as u32).to_le_bytes());
     buf.extend_from_slice(sequencer_did.as_bytes());
@@ -140,10 +147,11 @@ mod tests {
         let signer = ReceiptSigner::new(sk.clone(), "did:web:ds.example.com".to_string());
         let vk = signer.verifying_key();
 
-        let receipt = signer.sign_receipt("convo-123", 5, b"fake-commit-ciphertext");
+        let receipt = signer.sign_receipt("convo-123", 5, 2, b"fake-commit-ciphertext");
 
         assert_eq!(receipt.convo_id, "convo-123");
         assert_eq!(receipt.epoch, 5);
+        assert_eq!(receipt.sequencer_term, 2);
         assert_eq!(
             receipt.commit_hash,
             hash_commit(b"fake-commit-ciphertext").to_vec()
@@ -159,7 +167,7 @@ mod tests {
     fn verify_rejects_wrong_key() {
         let sk = SigningKey::random(&mut OsRng);
         let signer = ReceiptSigner::new(sk, "did:web:ds.example.com".to_string());
-        let receipt = signer.sign_receipt("convo-456", 1, b"data");
+        let receipt = signer.sign_receipt("convo-456", 1, 1, b"data");
 
         let other_sk = SigningKey::random(&mut OsRng);
         let wrong_vk = *other_sk.verifying_key();
@@ -175,7 +183,7 @@ mod tests {
         let signer = ReceiptSigner::new(sk.clone(), "did:web:ds.example.com".to_string());
         let vk = signer.verifying_key();
 
-        let mut receipt = signer.sign_receipt("convo-789", 3, b"original");
+        let mut receipt = signer.sign_receipt("convo-789", 3, 9, b"original");
         receipt.epoch = 4; // tamper
         assert!(!receipt.verify(&vk), "tampered receipt should not verify");
     }
@@ -192,7 +200,7 @@ mod tests {
     fn serde_round_trip() {
         let sk = SigningKey::random(&mut OsRng);
         let signer = ReceiptSigner::new(sk, "did:web:ds.example.com".to_string());
-        let receipt = signer.sign_receipt("convo-serde", 10, b"ciphertext");
+        let receipt = signer.sign_receipt("convo-serde", 10, 3, b"ciphertext");
 
         let json = serde_json::to_string(&receipt).expect("serialize");
         let deserialized: SequencerReceipt = serde_json::from_str(&json).expect("deserialize");

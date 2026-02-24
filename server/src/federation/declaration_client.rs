@@ -1,12 +1,12 @@
-use std::sync::Arc;
-use std::time::Duration;
-use tracing::{debug, error};
 use moka::future::Cache;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::time::Duration;
+use tracing::{debug, error};
 
-use super::resolver::DsResolver;
 use super::errors::FederationError;
+use super::resolver::DsResolver;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeclarationRecord {
@@ -32,9 +32,7 @@ pub struct DeclarationValue {
 #[serde(tag = "$type")]
 pub enum DeclarationEvent {
     #[serde(rename = "blue.catbird.mlsChat.declaration#rootInit")]
-    RootInit {
-        note: Option<String>,
-    },
+    RootInit { note: Option<String> },
     #[serde(rename = "blue.catbird.mlsChat.declaration#deviceAdd")]
     DeviceAdd {
         deviceId: Option<String>,
@@ -47,10 +45,7 @@ pub enum DeclarationEvent {
         reason: Option<String>,
     },
     #[serde(rename = "blue.catbird.mlsChat.declaration#rootRotate")]
-    RootRotate {
-        newRoot: String,
-        newRootAlg: String,
-    },
+    RootRotate { newRoot: String, newRootAlg: String },
     #[serde(rename = "blue.catbird.mlsChat.declaration#chatPolicyUpdate")]
     ChatPolicyUpdate {
         #[serde(rename = "allowFollowersBypass")]
@@ -95,7 +90,7 @@ impl DeclarationClient {
             .time_to_live(Duration::from_secs(300))
             .max_capacity(1000)
             .build();
-            
+
         Self {
             http,
             resolver,
@@ -104,28 +99,31 @@ impl DeclarationClient {
     }
 
     /// Fetch declaration records for a DID.
-    /// 
+    ///
     /// This method:
     /// 1. Checks the local short-term cache.
     /// 2. If missing, resolves the user's PDS via DsResolver.
     /// 3. Queries com.atproto.repo.listRecords on the PDS.
     /// 4. Caches and returns the records.
-    pub async fn fetch_declarations(&self, did: &str) -> Result<Vec<DeclarationRecord>, FederationError> {
+    pub async fn fetch_declarations(
+        &self,
+        did: &str,
+    ) -> Result<Vec<DeclarationRecord>, FederationError> {
         if let Some(cached) = self.cache.get(did).await {
             return Ok(cached);
         }
 
         let records = self.fetch_from_pds(did).await?;
-        
+
         // Cache even if empty (user might not have initialized MLS yet)
         self.cache.insert(did.to_string(), records.clone()).await;
-        
+
         Ok(records)
     }
 
     async fn fetch_from_pds(&self, did: &str) -> Result<Vec<DeclarationRecord>, FederationError> {
         let pds_endpoint = self.resolver.resolve_did_to_pds(did).await?;
-        
+
         // com.atproto.repo.listRecords
         // Using "blue.catbird.mlsChat.declaration" collection
         let url = format!(
@@ -136,7 +134,8 @@ impl DeclarationClient {
 
         debug!("Fetching declarations for {} from {}", did, url);
 
-        let resp = self.http
+        let resp = self
+            .http
             .get(&url)
             .timeout(Duration::from_secs(10))
             .send()
@@ -155,13 +154,17 @@ impl DeclarationClient {
             });
         }
 
-        let body: serde_json::Value = resp.json().await.map_err(|e| FederationError::ResolutionFailed {
-            did: did.to_string(),
-            reason: format!("Invalid JSON response: {}", e),
-        })?;
+        let body: serde_json::Value =
+            resp.json()
+                .await
+                .map_err(|e| FederationError::ResolutionFailed {
+                    did: did.to_string(),
+                    reason: format!("Invalid JSON response: {}", e),
+                })?;
 
         // Extract records array
-        let records_json = body.get("records")
+        let records_json = body
+            .get("records")
             .and_then(|v| v.as_array())
             .ok_or_else(|| FederationError::ResolutionFailed {
                 did: did.to_string(),
@@ -182,7 +185,7 @@ impl DeclarationClient {
             }
         }
 
-        // Sort by seq (though listRecords usually returns reverse chronological, or maybe random? 
+        // Sort by seq (though listRecords usually returns reverse chronological, or maybe random?
         // We probably want to sort by seq ASC for processing)
         records.sort_by_key(|r| r.value.seq);
 
@@ -192,24 +195,33 @@ impl DeclarationClient {
     /// Fetch and compute the current chat policy for a user.
     pub async fn get_chat_policy(&self, did: &str) -> Result<MLSChatPolicy, FederationError> {
         let records = self.fetch_declarations(did).await?;
-        
+
         // Replay events to build policy
         let mut policy = MLSChatPolicy::default();
-        
+
         for record in records {
-            if let DeclarationEvent::ChatPolicyUpdate { 
-                allow_followers_bypass, 
-                allow_following_bypass, 
-                who_can_message_me, 
-                auto_expire_days 
-            } = record.value.event {
-                if let Some(val) = allow_followers_bypass { policy.allow_followers_bypass = Some(val); }
-                if let Some(val) = allow_following_bypass { policy.allow_following_bypass = Some(val); }
-                if let Some(val) = who_can_message_me { policy.who_can_message_me = Some(val); }
-                if let Some(val) = auto_expire_days { policy.auto_expire_days = Some(val); }
+            if let DeclarationEvent::ChatPolicyUpdate {
+                allow_followers_bypass,
+                allow_following_bypass,
+                who_can_message_me,
+                auto_expire_days,
+            } = record.value.event
+            {
+                if let Some(val) = allow_followers_bypass {
+                    policy.allow_followers_bypass = Some(val);
+                }
+                if let Some(val) = allow_following_bypass {
+                    policy.allow_following_bypass = Some(val);
+                }
+                if let Some(val) = who_can_message_me {
+                    policy.who_can_message_me = Some(val);
+                }
+                if let Some(val) = auto_expire_days {
+                    policy.auto_expire_days = Some(val);
+                }
             }
         }
-        
+
         Ok(policy)
     }
 }

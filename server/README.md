@@ -17,6 +17,13 @@ cargo test
 cargo run
 ```
 
+### Federation Hostile Release Gate
+
+```bash
+# from repository root
+./scripts/federation-hostile-test-gate.sh
+```
+
 ### Production Deployment
 
 See **[DEPLOYMENT.md](DEPLOYMENT.md)** for complete deployment instructions.
@@ -125,6 +132,17 @@ server/
 | `SERVICE_DID` | Service DID for JWT validation | - |
 | `SSE_BUFFER_SIZE` | SSE event buffer size | `5000` |
 | `ENABLE_ACTOR_SYSTEM` | Enable actor system | `true` |
+| `FEDERATION_RISK_*` | Risk tier ratios and adaptive limit multipliers | See `.env.example` |
+| `FEDERATION_AUTO_QUARANTINE_MIN_RISK_TIER` | Auto-quarantine risk floor (`low`/`medium`/`high`/`critical`) | `critical` |
+| `FEDERATION_ALERTS_ENABLED` | Emit structured federation alert-hook logs | `true` |
+| `FEDERATION_SEQUENCER_FAILOVER_MIN_STALE_SECS` | Minimum observed sequencer lease age required before failover takeover | `30` |
+| `FEDERATION_SEQUENCER_TRANSFER_MAX_TERM_JUMP` | Maximum allowed term jump when accepting sequencer transfer | `8` |
+
+### Sequencer failover invariants
+
+- Sequencer ownership is term-scoped: every handoff must increase `sequencer_term`.
+- Commit and failover paths enforce CAS fencing on epoch + term to prevent split-brain writes.
+- Client-requested failover only assumes leadership after the local sequencer lease observation is stale.
 
 ## 🛠 Make Commands
 

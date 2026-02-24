@@ -189,6 +189,23 @@ pub async fn subscribe_convo_events(
     let user_did = claims.sub.clone();
     let convo_id = claims.convo_id.clone();
 
+    // Enforce one-time JTI usage for replay prevention.
+    match consume_ticket_nonce(&pool, &claims).await {
+        Ok(true) => {}
+        Ok(false) => {
+            warn!(
+                issuer = %crate::crypto::redact_for_log(&claims.iss),
+                jti = %crate::crypto::redact_for_log(&claims.jti),
+                "Subscription ticket replay detected or nonce missing"
+            );
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        Err(e) => {
+            error!("Failed to consume ticket nonce: {}", e);
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
+
     // Check connection limit
     if !CONNECTION_TRACKER.try_acquire(&user_did) {
         warn!(
@@ -247,6 +264,17 @@ pub async fn subscribe_convo_events(
         // Release connection slot when done
         CONNECTION_TRACKER.release(&user_did_clone);
     }))
+}
+
+async fn consume_ticket_nonce(pool: &DbPool, claims: &TicketClaims) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "DELETE FROM ws_ticket_nonce WHERE issuer_did = $1 AND jti = $2 AND expires_at > NOW()",
+    )
+    .bind(&claims.iss)
+    .bind(&claims.jti)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
 }
 
 // MARK: - Socket Handler
