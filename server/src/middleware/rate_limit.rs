@@ -301,7 +301,7 @@ fn get_endpoint_quota(endpoint: &str) -> (u32, Duration) {
         std::env::var("RATE_LIMIT_REGISTER_DEVICE")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(10) // Device registration (per-device, allows fresh installs)
+            .unwrap_or(30) // Device registration – generous for daemon startup retries
     } else if endpoint_name.contains("syncKeyPackages") {
         std::env::var("RATE_LIMIT_SYNC_KEY_PACKAGES")
             .ok()
