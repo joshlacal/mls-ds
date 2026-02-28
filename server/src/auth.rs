@@ -46,8 +46,8 @@ pub enum AuthError {
     #[error("Invalid signature")]
     InvalidSignature,
 
-    #[error("Rate limit exceeded")]
-    RateLimitExceeded,
+    #[error("Rate limit exceeded (retry after {retry_after_secs}s)")]
+    RateLimitExceeded { retry_after_secs: u64 },
 
     #[error("DID document missing verification method")]
     MissingVerificationMethod,
@@ -73,27 +73,53 @@ pub enum AuthError {
 
 impl IntoResponse for AuthError {
     fn into_response(self) -> Response {
-        let (status, error_message) = match self {
-            AuthError::MissingAuthHeader => (StatusCode::UNAUTHORIZED, self.to_string()),
-            AuthError::InvalidAuthFormat => (StatusCode::UNAUTHORIZED, self.to_string()),
-            AuthError::InvalidToken(_) => (StatusCode::UNAUTHORIZED, self.to_string()),
-            AuthError::TokenExpired => (StatusCode::UNAUTHORIZED, self.to_string()),
-            AuthError::InvalidDid(_) => (StatusCode::BAD_REQUEST, self.to_string()),
-            AuthError::DidResolutionFailed(_) => (StatusCode::BAD_REQUEST, self.to_string()),
-            AuthError::InvalidSignature => (StatusCode::UNAUTHORIZED, self.to_string()),
-            AuthError::RateLimitExceeded => (StatusCode::TOO_MANY_REQUESTS, self.to_string()),
-            AuthError::MissingVerificationMethod => (StatusCode::BAD_REQUEST, self.to_string()),
-            AuthError::UnsupportedKeyType(_) => (StatusCode::BAD_REQUEST, self.to_string()),
-            AuthError::MissingJti => (StatusCode::UNAUTHORIZED, self.to_string()),
-            AuthError::ReplayDetected => (StatusCode::UNAUTHORIZED, self.to_string()),
-            AuthError::MissingLxm => (StatusCode::UNAUTHORIZED, self.to_string()),
-            AuthError::LxmMismatch => (StatusCode::UNAUTHORIZED, self.to_string()),
+        // ATProto-compatible error format: { "error": "ErrorName", "message": "Human-readable" }
+        let (status, error_name, error_message) = match &self {
+            AuthError::MissingAuthHeader => {
+                (StatusCode::UNAUTHORIZED, "AuthMissing", self.to_string())
+            }
+            AuthError::InvalidAuthFormat => {
+                (StatusCode::UNAUTHORIZED, "InvalidAuth", self.to_string())
+            }
+            AuthError::InvalidToken(_) => {
+                (StatusCode::UNAUTHORIZED, "InvalidToken", self.to_string())
+            }
+            AuthError::TokenExpired => {
+                (StatusCode::UNAUTHORIZED, "ExpiredToken", self.to_string())
+            }
+            AuthError::InvalidDid(_) => {
+                (StatusCode::BAD_REQUEST, "InvalidDid", self.to_string())
+            }
+            AuthError::DidResolutionFailed(_) => {
+                (StatusCode::BAD_REQUEST, "DidResolutionFailed", self.to_string())
+            }
+            AuthError::InvalidSignature => {
+                (StatusCode::UNAUTHORIZED, "InvalidSignature", self.to_string())
+            }
+            AuthError::RateLimitExceeded { .. } => {
+                (StatusCode::TOO_MANY_REQUESTS, "RateLimitExceeded", self.to_string())
+            }
+            AuthError::MissingVerificationMethod => {
+                (StatusCode::BAD_REQUEST, "MissingVerificationMethod", self.to_string())
+            }
+            AuthError::UnsupportedKeyType(_) => {
+                (StatusCode::BAD_REQUEST, "UnsupportedKeyType", self.to_string())
+            }
+            AuthError::MissingJti => {
+                (StatusCode::UNAUTHORIZED, "MissingJti", self.to_string())
+            }
+            AuthError::ReplayDetected => {
+                (StatusCode::UNAUTHORIZED, "ReplayDetected", self.to_string())
+            }
+            AuthError::MissingLxm => {
+                (StatusCode::UNAUTHORIZED, "MissingLxm", self.to_string())
+            }
+            AuthError::LxmMismatch => {
+                (StatusCode::UNAUTHORIZED, "LxmMismatch", self.to_string())
+            }
             AuthError::Internal(e) => {
                 tracing::error!("Internal auth error: {}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Internal error: {}", e),
-                )
+                (StatusCode::INTERNAL_SERVER_ERROR, "InternalError", format!("Internal error: {}", e))
             }
         };
 
@@ -112,10 +138,20 @@ impl IntoResponse for AuthError {
         }
 
         let body = Json(json!({
-            "error": error_message,
+            "error": error_name,
+            "message": error_message,
         }));
 
-        (status, body).into_response()
+        let mut resp = (status, body).into_response();
+
+        // Attach Retry-After header for rate limit responses
+        if let AuthError::RateLimitExceeded { retry_after_secs } = &self {
+            if let Ok(val) = axum::http::HeaderValue::from_str(&retry_after_secs.to_string()) {
+                resp.headers_mut().insert(axum::http::header::RETRY_AFTER, val);
+            }
+        }
+
+        resp
     }
 }
 
@@ -599,7 +635,9 @@ impl AuthMiddleware {
             .rate_limiters
             .get_with(did.to_string(), || Arc::new(RateLimiter::direct(quota)));
 
-        limiter.check().map_err(|_| AuthError::RateLimitExceeded)?;
+        limiter
+            .check()
+            .map_err(|_| AuthError::RateLimitExceeded { retry_after_secs: 1 })?;
 
         Ok(())
     }
@@ -1004,7 +1042,9 @@ where
                 retry_after = retry_after,
                 "DID rate limit exceeded for endpoint"
             );
-            return Err(AuthError::RateLimitExceeded);
+            return Err(AuthError::RateLimitExceeded {
+                retry_after_secs: retry_after,
+            });
         }
 
         // Use sub claim for user identity if present (for gateway-signed tokens),

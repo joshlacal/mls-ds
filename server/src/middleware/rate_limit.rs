@@ -2,12 +2,14 @@ use axum::{
     extract::{connect_info::ConnectInfo, Request},
     http::{HeaderMap, StatusCode},
     middleware::Next,
-    response::Response,
+    response::{IntoResponse, Response},
+    Json,
 };
 use ipnet::IpNet;
 use moka::sync::Cache;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
+use serde_json::json;
 use std::{
     net::{IpAddr, SocketAddr},
     sync::Arc,
@@ -142,17 +144,21 @@ impl RateLimiter {
 
 impl Default for RateLimiter {
     fn default() -> Self {
-        // Defaults: 60 requests per minute for unauthenticated (per-IP)
+        // Defaults: 300 requests per minute for unauthenticated (per-IP).
+        // This is intentionally generous – real abuse is caught by the
+        // per-DID post-auth limiter.  The pre-auth IP limiter should only
+        // fire under genuine flood/DoS conditions.
         let per_minute = std::env::var("RATE_LIMIT_IP_PER_MINUTE")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(60);
+            .unwrap_or(300);
 
-        // Allow short bursts (10% of per-minute limit)
+        // Allow short bursts – clients legitimately send many requests
+        // during startup (sync, device registration, key packages, etc.).
         let burst = std::env::var("IP_RATE_BURST")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(per_minute.max(20));
+            .unwrap_or(per_minute.max(60));
 
         // Refill rate: per_minute / 60 = tokens per second
         let refill = per_minute as f64 / 60.0;
@@ -464,14 +470,20 @@ pub async fn rate_limit_middleware(request: Request, next: Next) -> Result<Respo
                 uri,
                 retry_after
             );
-            let mut resp = Response::new(axum::body::Body::empty());
-            let headers = resp.headers_mut();
-            headers.insert(
+            // Return ATProto-compatible JSON error body with Retry-After header
+            let body = Json(json!({
+                "error": "RateLimitExceeded",
+                "message": format!(
+                    "Too many requests from this IP. Retry after {} second(s).",
+                    retry_after
+                ),
+            }));
+            let mut resp = (StatusCode::TOO_MANY_REQUESTS, body).into_response();
+            resp.headers_mut().insert(
                 axum::http::header::RETRY_AFTER,
                 axum::http::HeaderValue::from_str(&retry_after.to_string())
                     .unwrap_or(axum::http::HeaderValue::from_static("1")),
             );
-            *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
             Ok(resp)
         }
     }
