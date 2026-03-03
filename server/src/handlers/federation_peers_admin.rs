@@ -10,9 +10,9 @@ use crate::{
     storage::DbPool,
 };
 
-const LIST_NSID: &str = "blue.catbird.mls.admin.getFederationPeers";
-const UPSERT_NSID: &str = "blue.catbird.mls.admin.upsertFederationPeer";
-const DELETE_NSID: &str = "blue.catbird.mls.admin.deleteFederationPeer";
+const LIST_NSID: &str = "blue.catbird.mlsDS.getFederationPeers";
+const UPSERT_NSID: &str = "blue.catbird.mlsDS.upsertFederationPeer";
+const DELETE_NSID: &str = "blue.catbird.mlsDS.deleteFederationPeer";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

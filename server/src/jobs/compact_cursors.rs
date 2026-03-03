@@ -1,5 +1,6 @@
 use anyhow::Result;
 use sqlx::PgPool;
+use sqlx::Row;
 use std::time::Duration;
 use tokio::time::interval;
 use tracing::{info, warn};
@@ -55,14 +56,14 @@ async fn compact_events(pool: &PgPool, config: &CompactionConfig) -> Result<()> 
 
     // Delete ephemeral events (typingEvent) older than retention
     let ephemeral_cutoff = now - chrono::Duration::seconds(config.ephemeral_retention_secs);
-    let ephemeral_deleted = sqlx::query!(
+    let ephemeral_deleted = sqlx::query(
         r#"
         DELETE FROM event_stream
         WHERE event_type = 'typingEvent'
           AND emitted_at < $1
         "#,
-        ephemeral_cutoff
     )
+    .bind(ephemeral_cutoff)
     .execute(pool)
     .await?
     .rows_affected();
@@ -75,14 +76,14 @@ async fn compact_events(pool: &PgPool, config: &CompactionConfig) -> Result<()> 
 
     // Delete old messageEvents beyond retention window
     let message_cutoff = now - chrono::Duration::seconds(config.message_retention_secs);
-    let message_deleted = sqlx::query!(
+    let message_deleted = sqlx::query(
         r#"
         DELETE FROM event_stream
         WHERE event_type IN ('messageEvent', 'reactionEvent')
           AND emitted_at < $1
         "#,
-        message_cutoff
     )
+    .bind(message_cutoff)
     .execute(pool)
     .await?
     .rows_affected();
@@ -95,13 +96,13 @@ async fn compact_events(pool: &PgPool, config: &CompactionConfig) -> Result<()> 
 
     // Clean up stale cursors (no activity in 2x retention window)
     let cursor_cutoff = now - chrono::Duration::seconds(config.message_retention_secs * 2);
-    let cursors_deleted = sqlx::query!(
+    let cursors_deleted = sqlx::query(
         r#"
         DELETE FROM cursors
         WHERE updated_at < $1
         "#,
-        cursor_cutoff
     )
+    .bind(cursor_cutoff)
     .execute(pool)
     .await?
     .rows_affected();
@@ -113,18 +114,18 @@ async fn compact_events(pool: &PgPool, config: &CompactionConfig) -> Result<()> 
     );
 
     // Calculate total event_stream size for monitoring
-    let size_result = sqlx::query!(
+    let size_result = sqlx::query(
         r#"
         SELECT COUNT(*) as count,
                pg_total_relation_size('event_stream') as size_bytes
         FROM event_stream
-        "#
+        "#,
     )
     .fetch_one(pool)
     .await?;
 
-    let total_events = size_result.count.unwrap_or(0);
-    let size_bytes = size_result.size_bytes.unwrap_or(0);
+    let total_events: i64 = size_result.try_get("count")?;
+    let size_bytes: i64 = size_result.try_get("size_bytes")?;
     let size_gb = size_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
 
     info!(

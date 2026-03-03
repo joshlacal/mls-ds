@@ -125,7 +125,7 @@ pub async fn request_failover(
 
     // Health-check the current sequencer (15s timeout)
     let health_url = format!(
-        "{}/xrpc/blue.catbird.mls.ds.healthCheck",
+        "{}/xrpc/blue.catbird.mlsDS.healthCheck",
         sequencer_endpoint.trim_end_matches('/')
     );
 
@@ -278,7 +278,7 @@ fn broadcast_sequencer_change(
                 .enqueue(
                     &ds_did,
                     "",
-                    "blue.catbird.mls.ds.transferSequencer",
+                    "blue.catbird.mlsDS.transferSequencer",
                     &payload_bytes,
                     &convo_id,
                     "failover broadcast",

@@ -79,8 +79,7 @@ pub async fn get_all_key_packages_prioritize_active(
     //
     // This enables multi-device support: when inviting a user, we get key packages
     // for ALL their registered devices, so the Welcome message works on any device.
-    let key_packages = sqlx::query_as!(
-        crate::models::KeyPackage,
+    let key_packages = sqlx::query_as::<_, crate::models::KeyPackage>(
         r#"
         SELECT DISTINCT ON (COALESCE(kp.device_id, kp.key_package_hash))
             kp.owner_did,
@@ -102,11 +101,11 @@ pub async fn get_all_key_packages_prioritize_active(
             kp.created_at ASC
         LIMIT 50
         "#,
-        did,
-        cipher_suite,
-        now,
-        reservation_timeout
     )
+    .bind(did)
+    .bind(cipher_suite)
+    .bind(now)
+    .bind(reservation_timeout)
     .fetch_all(pool)
     .await?;
 

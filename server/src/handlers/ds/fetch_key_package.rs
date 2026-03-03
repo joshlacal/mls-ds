@@ -7,9 +7,9 @@ use crate::{
     storage::DbPool,
 };
 
-const NSID: &str = "blue.catbird.mls.ds.fetchKeyPackage";
+const NSID: &str = "blue.catbird.mlsDS.fetchKeyPackage";
 
-/// GET /xrpc/blue.catbird.mls.ds.fetchKeyPackage
+/// GET /xrpc/blue.catbird.mlsDS.fetchKeyPackage
 ///
 /// Return and consume a key package for a local user, requested by a remote DS.
 #[tracing::instrument(skip(pool, auth_user, query))]

@@ -138,7 +138,7 @@ impl OutboundClient {
         auth_token: &str,
     ) -> Result<bool, OutboundError> {
         match self
-            .call_query(endpoint, "blue.catbird.mls.ds.healthCheck", auth_token, &[])
+            .call_query(endpoint, "blue.catbird.mlsDS.healthCheck", auth_token, &[])
             .await
         {
             Ok(_) => Ok(true),
@@ -258,7 +258,7 @@ mod tests {
     fn test_timeout_is_retryable() {
         assert!(OutboundError::Timeout {
             endpoint: "https://ds.example.com".into(),
-            method: "blue.catbird.mls.ds.deliverMessage".into(),
+            method: "blue.catbird.mlsDS.deliverMessage".into(),
         }
         .is_retryable());
     }

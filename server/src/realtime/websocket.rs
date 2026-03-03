@@ -115,6 +115,8 @@ pub struct SubscribeQuery {
     pub ticket: String,
     /// Resume from cursor (ULID string)
     pub cursor: Option<String>,
+    /// Optional wire format ("json" for text frames, default DAG-CBOR binary frames)
+    pub format: Option<String>,
 }
 
 /// AT Protocol WebSocket message header
@@ -135,13 +137,28 @@ pub struct ErrorPayload {
     pub message: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameFormat {
+    DagCbor,
+    JsonText,
+}
+
+impl FrameFormat {
+    fn from_query(format: Option<&str>) -> Self {
+        match format.unwrap_or_default().to_ascii_lowercase().as_str() {
+            "json" => Self::JsonText,
+            _ => Self::DagCbor,
+        }
+    }
+}
+
 /// Client-to-server message types for bi-directional messaging
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "$type")]
 pub enum ClientMessage {
     /// Client is typing (DEPRECATED: Prefer E2EE ephemeral messages via v2.sendEphemeral.
     /// This creates plaintext typing events visible to the server.)
-    #[serde(rename = "blue.catbird.mls.subscribeConvoEvents#typing")]
+    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#typing")]
     Typing {
         #[serde(rename = "convoId")]
         convo_id: String,
@@ -149,13 +166,13 @@ pub enum ClientMessage {
         is_typing: bool,
     },
     /// Client acknowledges read position
-    #[serde(rename = "blue.catbird.mls.subscribeConvoEvents#ack")]
+    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#ack")]
     Ack {
         /// Sequence number being acknowledged
         seq: i64,
     },
     /// Client ping for keep-alive
-    #[serde(rename = "blue.catbird.mls.subscribeConvoEvents#ping")]
+    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#ping")]
     Ping,
 }
 
@@ -169,7 +186,7 @@ pub struct AckResponse {
 // MARK: - Handler
 
 /// WebSocket handler for subscribeConvoEvents
-/// GET /xrpc/blue.catbird.mls.subscribeConvoEvents (WebSocket upgrade)
+/// GET /xrpc/blue.catbird.mlsChat.subscribeEvents (WebSocket upgrade)
 pub async fn subscribe_convo_events(
     ws: WebSocketUpgrade,
     State(pool): State<DbPool>,
@@ -177,6 +194,9 @@ pub async fn subscribe_convo_events(
     State(upstream_manager): State<Option<Arc<UpstreamManager>>>,
     Query(query): Query<SubscribeQuery>,
 ) -> Result<Response, StatusCode> {
+    let frame_format = FrameFormat::from_query(query.format.as_deref());
+    let resume_cursor = query.cursor.clone();
+
     // Verify the ticket
     let claims = match verify_ticket(&query.ticket) {
         Ok(c) => c,
@@ -258,7 +278,8 @@ pub async fn subscribe_convo_events(
             upstream_clone,
             user_did_clone.clone(),
             convo_id,
-            query.cursor,
+            resume_cursor,
+            frame_format,
         )
         .await;
         // Release connection slot when done
@@ -288,6 +309,7 @@ async fn handle_socket(
     user_did: String,
     target_convo_id: Option<String>,
     resume_cursor: Option<String>,
+    frame_format: FrameFormat,
 ) {
     let (sender, mut receiver) = socket.split();
     // Wrap sender in Arc<Mutex> for shared access from heartbeat and send tasks
@@ -349,7 +371,9 @@ async fn handle_socket(
                             for (event, _event_cursor) in events {
                                 seq += 1;
                                 let mut sender_guard = sender.lock().await;
-                                if let Err(e) = send_event(&mut *sender_guard, &event, seq).await {
+                                if let Err(e) =
+                                    send_event(&mut *sender_guard, &event, seq, frame_format).await
+                                {
                                     error!("Failed to send backfill event: {}", e);
                                     return;
                                 }
@@ -358,8 +382,13 @@ async fn handle_socket(
                         Err(e) => {
                             error!("Failed to backfill events: {}", e);
                             let mut sender_guard = sender.lock().await;
-                            let _ =
-                                send_error(&mut *sender_guard, "BackfillFailed", Some(&e)).await;
+                            let _ = send_error(
+                                &mut *sender_guard,
+                                "BackfillFailed",
+                                Some(&e),
+                                frame_format,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -412,6 +441,7 @@ async fn handle_socket(
                     &mut *sender_guard,
                     "InternalError",
                     Some("Failed to list conversations"),
+                    frame_format,
                 )
                 .await;
                 return;
@@ -505,7 +535,8 @@ async fn handle_socket(
 
                     // Convert StreamEvent to WebSocket message
                     let mut sender_guard = sender_clone.lock().await;
-                    if let Err(e) = send_event(&mut *sender_guard, &event, seq).await {
+                    if let Err(e) = send_event(&mut *sender_guard, &event, seq, frame_format).await
+                    {
                         error!("Failed to send event for {}: {}", convo_id, e);
                         break;
                     }
@@ -666,6 +697,7 @@ async fn send_event(
     sender: &mut futures::stream::SplitSink<WebSocket, Message>,
     event: &StreamEvent,
     seq: i64,
+    frame_format: FrameFormat,
 ) -> Result<(), String> {
     // Determine message type from event variant
     let msg_type = match event {
@@ -679,6 +711,31 @@ async fn send_event(
         StreamEvent::MembershipChangeEvent { .. } => "#membershipChangeEvent",
         StreamEvent::ReadEvent { .. } => "#readEvent",
     };
+
+    if frame_format == FrameFormat::JsonText {
+        #[derive(Serialize)]
+        struct JsonWirePayload<'a> {
+            op: i32,
+            t: &'a str,
+            #[serde(flatten)]
+            event: &'a StreamEvent,
+            seq: i64,
+        }
+
+        let wire = JsonWirePayload {
+            op: 1,
+            t: msg_type,
+            event,
+            seq,
+        };
+        let text = serde_json::to_string(&wire)
+            .map_err(|e| format!("Failed to encode JSON payload: {}", e))?;
+        sender
+            .send(Message::Text(text.into()))
+            .await
+            .map_err(|e| format!("Failed to send WebSocket message: {}", e))?;
+        return Ok(());
+    }
 
     // Create header
     let header = MessageHeader {
@@ -726,7 +783,32 @@ async fn send_error(
     sender: &mut futures::stream::SplitSink<WebSocket, Message>,
     error: &str,
     message: Option<&str>,
+    frame_format: FrameFormat,
 ) -> Result<(), String> {
+    if frame_format == FrameFormat::JsonText {
+        #[derive(Serialize)]
+        struct JsonErrorPayload<'a> {
+            op: i32,
+            error: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            message: Option<&'a str>,
+        }
+
+        let payload = JsonErrorPayload {
+            op: -1,
+            error,
+            message,
+        };
+
+        let text = serde_json::to_string(&payload)
+            .map_err(|e| format!("Failed to encode JSON error payload: {}", e))?;
+        sender
+            .send(Message::Text(text.into()))
+            .await
+            .map_err(|e| format!("Failed to send WebSocket error: {}", e))?;
+        return Ok(());
+    }
+
     let header = MessageHeader { op: -1, t: None };
 
     let payload = ErrorPayload {

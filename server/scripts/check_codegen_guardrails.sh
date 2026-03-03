@@ -5,7 +5,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
 RUNTIME_ROOT="server/src"
-RUNTIME_GLOBS=(--glob '**/*.rs' --glob '!generated/**')
+RUNTIME_GLOBS=(--glob '**/*.rs')
 ALLOWED_GENERATED_TYPES_FILES=(
   "server/src/db.rs"
   "server/src/realtime/mod.rs"
@@ -26,6 +26,23 @@ check_forbidden_pattern() {
     fail=1
   fi
 }
+
+if [ -d "server/src/generated" ] && find "server/src/generated" -maxdepth 1 -type f -name '*.rs' | grep -q .; then
+  echo "[codegen-guardrail] Legacy generated root Rust files must be removed from server/src/generated"
+  find "server/src/generated" -maxdepth 1 -type f -name '*.rs' -print
+  fail=1
+fi
+
+if rg -n --no-heading 'pub mod generated;' "server/src/lib.rs" >"$tmp_matches"; then
+  echo "[codegen-guardrail] server/src/lib.rs must re-export generated code from catbird-atproto, not declare a local module:"
+  cat "$tmp_matches"
+  fail=1
+fi
+
+if ! rg -n --no-heading 'pub use catbird_atproto::generated;' "server/src/lib.rs" >/dev/null; then
+  echo "[codegen-guardrail] server/src/lib.rs must contain: pub use catbird_atproto::generated;"
+  fail=1
+fi
 
 check_forbidden_pattern 'generated::blue_catbird::mls::' 'generated::blue_catbird::mls::'
 check_forbidden_pattern 'crate::blue_catbird::mls::' 'crate::blue_catbird::mls::'

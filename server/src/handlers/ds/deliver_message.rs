@@ -31,9 +31,9 @@ struct DeliverMessage<'a> {
     message_type: Option<jacquard_common::CowStr<'a>>,
 }
 
-const NSID: &str = "blue.catbird.mls.ds.deliverMessage";
+const NSID: &str = "blue.catbird.mlsDS.deliverMessage";
 
-/// POST /xrpc/blue.catbird.mls.ds.deliverMessage
+/// POST /xrpc/blue.catbird.mlsDS.deliverMessage
 ///
 /// Accept an inbound MLS message from a remote DS and store it for local subscribers.
 #[tracing::instrument(skip(pool, sse_state, ack_signer, auth_user, body))]

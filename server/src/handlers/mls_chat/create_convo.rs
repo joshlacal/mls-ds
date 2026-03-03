@@ -14,8 +14,11 @@ use crate::{
     admin_system::verify_is_admin,
     auth::AuthUser,
     block_sync::BlockSyncService,
-    generated::blue_catbird::mlsChat::create_convo::CreateConvoRequest,
-    sqlx_jacquard::{chrono_to_datetime, did_to_string},
+    generated::blue_catbird::mlsChat::{
+        create_convo::{CreateConvoOutput, CreateConvoRequest},
+        ConvoMetadata, ConvoView, MemberView,
+    },
+    sqlx_jacquard::{chrono_to_datetime, did_to_string, string_to_did},
     storage::DbPool,
 };
 
@@ -129,7 +132,7 @@ async fn handle_create_convo(
     block_sync: Arc<BlockSyncService>,
     auth_user: AuthUser,
     input: &crate::generated::blue_catbird::mlsChat::create_convo::CreateConvo<'_>,
-) -> Result<serde_json::Value, Response> {
+) -> Result<CreateConvoOutput<'static>, Response> {
     tracing::debug!("🔷 [v2.createConvo] incoming create request");
 
     info!(
@@ -301,7 +304,7 @@ async fn handle_create_convo(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         })?;
 
-        let members_json: Vec<serde_json::Value> = existing_members
+        let members_typed: Vec<MemberView<'static>> = existing_members
             .into_iter()
             .map(
                 |(
@@ -313,39 +316,50 @@ async fn handle_create_convo(
                     is_admin,
                     leaf_index,
                 )| {
-                    serde_json::json!({
-                        "did": member_did,
-                        "userDid": user_did,
-                        "deviceId": device_id,
-                        "deviceName": device_name,
-                        "joinedAt": chrono_to_datetime(joined_at).to_string(),
-                        "isAdmin": is_admin,
-                        "leafIndex": leaf_index,
-                        "isModerator": false,
-                    })
+                    MemberView {
+                        did: string_to_did(&member_did),
+                        user_did: string_to_did(&user_did),
+                        device_id: device_id.map(|s| s.into()),
+                        device_name: device_name.map(|s| s.into()),
+                        joined_at: chrono_to_datetime(joined_at),
+                        is_admin,
+                        is_moderator: Some(false),
+                        leaf_index: leaf_index.map(|i| i as i64),
+                        credential: None,
+                        promoted_at: None,
+                        promoted_by: None,
+                        extra_data: Default::default(),
+                    }
                 },
             )
             .collect();
 
-        let mut convo_json = serde_json::json!({
-            "convo": {
-                "groupId": convo_id,
-                "creator": creator_did,
-                "members": members_json,
-                "epoch": 0,
-                "cipherSuite": input.cipher_suite.as_ref(),
-                "createdAt": chrono_to_datetime(now).to_string(),
-            }
+        let metadata = if name.is_some() || description.is_some() {
+            Some(ConvoMetadata {
+                name: name.map(|s| s.into()),
+                description: description.map(|s| s.into()),
+                extra_data: Default::default(),
+            })
+        } else {
+            None
+        };
+
+        return Ok(CreateConvoOutput {
+            convo: ConvoView {
+                group_id: convo_id.into(),
+                creator: string_to_did(&creator_did),
+                members: members_typed,
+                epoch: 0,
+                cipher_suite: input.cipher_suite.as_ref().to_string().into(),
+                created_at: chrono_to_datetime(now),
+                last_message_at: None,
+                metadata,
+                extra_data: Default::default(),
+            },
+            invite_code: None,
+            sequencer_ds: None,
+            extra_data: Default::default(),
         });
-
-        if name.is_some() || description.is_some() {
-            convo_json["convo"]["metadata"] = serde_json::json!({
-                "name": name,
-                "description": description,
-            });
-        }
-
-        return Ok(convo_json);
     }
 
     // ── Create conversation ──────────────────────────────────────────────
@@ -383,14 +397,20 @@ async fn handle_create_convo(
         StatusCode::INTERNAL_SERVER_ERROR.into_response()
     })?;
 
-    let mut members_json = vec![serde_json::json!({
-        "did": creator_did,
-        "userDid": creator_did,
-        "joinedAt": chrono_to_datetime(now).to_string(),
-        "isAdmin": true,
-        "isModerator": false,
-        "leafIndex": 0,
-    })];
+    let mut members_typed: Vec<MemberView<'static>> = vec![MemberView {
+        did: string_to_did(&creator_did),
+        user_did: string_to_did(&creator_did),
+        joined_at: chrono_to_datetime(now),
+        is_admin: true,
+        is_moderator: Some(false),
+        leaf_index: Some(0),
+        device_id: None,
+        device_name: None,
+        credential: None,
+        promoted_at: None,
+        promoted_by: None,
+        extra_data: Default::default(),
+    }];
 
     // ── Add initial members ──────────────────────────────────────────────
     if let Some(ref initial_members) = input.initial_members {
@@ -417,14 +437,20 @@ async fn handle_create_convo(
                 StatusCode::INTERNAL_SERVER_ERROR.into_response()
             })?;
 
-            members_json.push(serde_json::json!({
-                "did": member_did_str,
-                "userDid": member_did_str,
-                "joinedAt": chrono_to_datetime(now).to_string(),
-                "isAdmin": false,
-                "isModerator": false,
-                "leafIndex": idx + 1,
-            }));
+            members_typed.push(MemberView {
+                did: string_to_did(&member_did_str),
+                user_did: string_to_did(&member_did_str),
+                joined_at: chrono_to_datetime(now),
+                is_admin: false,
+                is_moderator: Some(false),
+                leaf_index: Some((idx + 1) as i64),
+                device_id: None,
+                device_name: None,
+                credential: None,
+                promoted_at: None,
+                promoted_by: None,
+                extra_data: Default::default(),
+            });
         }
     }
 
@@ -600,29 +626,36 @@ async fn handle_create_convo(
 
     info!(
         convo = %crate::crypto::redact_for_log(&convo_id),
-        member_count = members_json.len(),
+        member_count = members_typed.len(),
         epoch = 0,
         "✅ [v2.createConvo] complete"
     );
 
     // ── Build response ───────────────────────────────────────────────────
-    let mut convo_json = serde_json::json!({
-        "convo": {
-            "groupId": convo_id,
-            "creator": creator_did,
-            "members": members_json,
-            "epoch": 0,
-            "cipherSuite": input.cipher_suite.as_ref(),
-            "createdAt": chrono_to_datetime(now).to_string(),
-        }
-    });
+    let metadata = if name.is_some() || description.is_some() {
+        Some(ConvoMetadata {
+            name: name.map(|s| s.into()),
+            description: description.map(|s| s.into()),
+            extra_data: Default::default(),
+        })
+    } else {
+        None
+    };
 
-    if name.is_some() || description.is_some() {
-        convo_json["convo"]["metadata"] = serde_json::json!({
-            "name": name,
-            "description": description,
-        });
-    }
-
-    Ok(convo_json)
+    Ok(CreateConvoOutput {
+        convo: ConvoView {
+            group_id: convo_id.into(),
+            creator: string_to_did(&creator_did),
+            members: members_typed,
+            epoch: 0,
+            cipher_suite: input.cipher_suite.as_ref().to_string().into(),
+            created_at: chrono_to_datetime(now),
+            last_message_at: None,
+            metadata,
+            extra_data: Default::default(),
+        },
+        invite_code: None,
+        sequencer_ds: None,
+        extra_data: Default::default(),
+    })
 }

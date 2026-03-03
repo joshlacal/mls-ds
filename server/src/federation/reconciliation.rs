@@ -12,9 +12,9 @@ use super::{
 };
 use crate::identity::canonical_did;
 
-const DIGEST_NSID: &str = "blue.catbird.mls.ds.getConvoDigest";
-const EVENTS_NSID: &str = "blue.catbird.mls.ds.getConvoEvents";
-const HEALTH_CHECK_NSID: &str = "blue.catbird.mls.ds.healthCheck";
+const DIGEST_NSID: &str = "blue.catbird.mlsDS.getConvoDigest";
+const EVENTS_NSID: &str = "blue.catbird.mlsDS.getConvoEvents";
+const HEALTH_CHECK_NSID: &str = "blue.catbird.mlsDS.healthCheck";
 const EVENTS_PAGE_LIMIT: i64 = 500;
 
 #[derive(Debug, Deserialize)]

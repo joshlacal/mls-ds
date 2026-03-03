@@ -113,35 +113,35 @@ fn test_router(pool: PgPool) -> Router {
 
     Router::<TestState>::new()
         .route(
-            "/xrpc/blue.catbird.mls.ds.deliverMessage",
+            "/xrpc/blue.catbird.mlsDS.deliverMessage",
             post(handlers::ds::deliver_message),
         )
         .route(
-            "/xrpc/blue.catbird.mls.ds.submitCommit",
+            "/xrpc/blue.catbird.mlsDS.submitCommit",
             post(handlers::ds::submit_commit),
         )
         .route(
-            "/xrpc/blue.catbird.mls.ds.fetchKeyPackage",
+            "/xrpc/blue.catbird.mlsDS.fetchKeyPackage",
             get(handlers::ds::fetch_key_package),
         )
         .route(
-            "/xrpc/blue.catbird.mls.ds.getConvoDigest",
+            "/xrpc/blue.catbird.mlsDS.getConvoDigest",
             get(handlers::ds::get_convo_digest),
         )
         .route(
-            "/xrpc/blue.catbird.mls.ds.getConvoEvents",
+            "/xrpc/blue.catbird.mlsDS.getConvoEvents",
             get(handlers::ds::get_convo_events),
         )
         .route(
-            "/xrpc/blue.catbird.mls.admin.getFederationPeers",
+            "/xrpc/blue.catbird.mlsDS.getFederationPeers",
             get(handlers::get_federation_peers),
         )
         .route(
-            "/xrpc/blue.catbird.mls.admin.upsertFederationPeer",
+            "/xrpc/blue.catbird.mlsDS.upsertFederationPeer",
             post(handlers::upsert_federation_peer),
         )
         .route(
-            "/xrpc/blue.catbird.mls.admin.deleteFederationPeer",
+            "/xrpc/blue.catbird.mlsDS.deleteFederationPeer",
             post(handlers::delete_federation_peer),
         )
         .with_state(state)
@@ -243,7 +243,7 @@ async fn deliver_message_accepts_fragmented_issuer_for_bound_sequencer() {
 
     let token = service_token(
         &format!("{sequencer_base}#atproto_mls"),
-        "blue.catbird.mls.ds.deliverMessage",
+        "blue.catbird.mlsDS.deliverMessage",
         &Uuid::new_v4().to_string(),
     );
     let payload = json!({
@@ -263,7 +263,7 @@ async fn deliver_message_accepts_fragmented_issuer_for_bound_sequencer() {
     let (status, _) = call_json(
         &app,
         "POST",
-        "/xrpc/blue.catbird.mls.ds.deliverMessage",
+        "/xrpc/blue.catbird.mlsDS.deliverMessage",
         &token,
         payload,
     )
@@ -300,7 +300,7 @@ async fn replayed_service_token_is_rejected() {
     allow_peer(&pool, &sequencer_base).await;
 
     let jti = Uuid::new_v4().to_string();
-    let token = service_token(&sequencer_base, "blue.catbird.mls.ds.deliverMessage", &jti);
+    let token = service_token(&sequencer_base, "blue.catbird.mlsDS.deliverMessage", &jti);
 
     let payload = json!({
         "convoId": convo_id,
@@ -319,7 +319,7 @@ async fn replayed_service_token_is_rejected() {
     let (first_status, _) = call_json(
         &app,
         "POST",
-        "/xrpc/blue.catbird.mls.ds.deliverMessage",
+        "/xrpc/blue.catbird.mlsDS.deliverMessage",
         &token,
         payload.clone(),
     )
@@ -329,7 +329,7 @@ async fn replayed_service_token_is_rejected() {
     let (second_status, second_body) = call_json(
         &app,
         "POST",
-        "/xrpc/blue.catbird.mls.ds.deliverMessage",
+        "/xrpc/blue.catbird.mlsDS.deliverMessage",
         &token,
         payload,
     )
@@ -360,7 +360,7 @@ async fn replayed_service_token_is_rejected_across_app_instances() {
     allow_peer(&pool, &sequencer_base).await;
 
     let jti = Uuid::new_v4().to_string();
-    let token = service_token(&sequencer_base, "blue.catbird.mls.ds.deliverMessage", &jti);
+    let token = service_token(&sequencer_base, "blue.catbird.mlsDS.deliverMessage", &jti);
 
     let payload = json!({
         "convoId": convo_id,
@@ -379,7 +379,7 @@ async fn replayed_service_token_is_rejected_across_app_instances() {
     let (first_status, _) = call_json(
         &app_a,
         "POST",
-        "/xrpc/blue.catbird.mls.ds.deliverMessage",
+        "/xrpc/blue.catbird.mlsDS.deliverMessage",
         &token,
         payload.clone(),
     )
@@ -389,7 +389,7 @@ async fn replayed_service_token_is_rejected_across_app_instances() {
     let (second_status, second_body) = call_json(
         &app_b,
         "POST",
-        "/xrpc/blue.catbird.mls.ds.deliverMessage",
+        "/xrpc/blue.catbird.mlsDS.deliverMessage",
         &token,
         payload,
     )
@@ -445,13 +445,13 @@ async fn ds_rate_limit_applies_across_service_fragments() {
 
     let token_a = service_token(
         &format!("{base_ds}#svc-a"),
-        "blue.catbird.mls.ds.deliverMessage",
+        "blue.catbird.mlsDS.deliverMessage",
         &Uuid::new_v4().to_string(),
     );
     let (first_status, _) = call_json(
         &app,
         "POST",
-        "/xrpc/blue.catbird.mls.ds.deliverMessage",
+        "/xrpc/blue.catbird.mlsDS.deliverMessage",
         &token_a,
         payload(format!("msg-{}", Uuid::new_v4()), base_ds.clone()),
     )
@@ -460,13 +460,13 @@ async fn ds_rate_limit_applies_across_service_fragments() {
 
     let token_b = service_token(
         &format!("{base_ds}#svc-b"),
-        "blue.catbird.mls.ds.deliverMessage",
+        "blue.catbird.mlsDS.deliverMessage",
         &Uuid::new_v4().to_string(),
     );
     let (second_status, second_body) = call_json(
         &app,
         "POST",
-        "/xrpc/blue.catbird.mls.ds.deliverMessage",
+        "/xrpc/blue.catbird.mlsDS.deliverMessage",
         &token_b,
         payload(format!("msg-{}", Uuid::new_v4()), base_ds.clone()),
     )
@@ -498,7 +498,7 @@ async fn deliver_message_rejects_sender_issuer_mismatch() {
 
     let token = service_token(
         &sequencer_ds,
-        "blue.catbird.mls.ds.deliverMessage",
+        "blue.catbird.mlsDS.deliverMessage",
         &Uuid::new_v4().to_string(),
     );
     let payload = json!({
@@ -518,7 +518,7 @@ async fn deliver_message_rejects_sender_issuer_mismatch() {
     let (status, body) = call_json(
         &app,
         "POST",
-        "/xrpc/blue.catbird.mls.ds.deliverMessage",
+        "/xrpc/blue.catbird.mlsDS.deliverMessage",
         &token,
         payload,
     )
@@ -550,7 +550,7 @@ async fn deliver_message_rejects_non_sequencer_peer() {
 
     let token = service_token(
         &attacker_ds,
-        "blue.catbird.mls.ds.deliverMessage",
+        "blue.catbird.mlsDS.deliverMessage",
         &Uuid::new_v4().to_string(),
     );
     let payload = json!({
@@ -570,7 +570,7 @@ async fn deliver_message_rejects_non_sequencer_peer() {
     let (status, body) = call_json(
         &app,
         "POST",
-        "/xrpc/blue.catbird.mls.ds.deliverMessage",
+        "/xrpc/blue.catbird.mlsDS.deliverMessage",
         &token,
         payload,
     )
@@ -596,7 +596,7 @@ async fn submit_commit_rejects_non_participant_peer_ds() {
     allow_peer(&pool, &attacker_ds).await;
     let token = service_token(
         &attacker_ds,
-        "blue.catbird.mls.ds.submitCommit",
+        "blue.catbird.mlsDS.submitCommit",
         &Uuid::new_v4().to_string(),
     );
 
@@ -611,7 +611,7 @@ async fn submit_commit_rejects_non_participant_peer_ds() {
     let (status, body) = call_json(
         &app,
         "POST",
-        "/xrpc/blue.catbird.mls.ds.submitCommit",
+        "/xrpc/blue.catbird.mlsDS.submitCommit",
         &token,
         payload,
     )
@@ -643,7 +643,7 @@ async fn deliver_message_rejects_stale_sequencer_term() {
 
     let token = service_token(
         &sequencer_ds,
-        "blue.catbird.mls.ds.deliverMessage",
+        "blue.catbird.mlsDS.deliverMessage",
         &Uuid::new_v4().to_string(),
     );
     let payload = json!({
@@ -663,7 +663,7 @@ async fn deliver_message_rejects_stale_sequencer_term() {
     let (status, body) = call_json(
         &app,
         "POST",
-        "/xrpc/blue.catbird.mls.ds.deliverMessage",
+        "/xrpc/blue.catbird.mlsDS.deliverMessage",
         &token,
         payload,
     )
@@ -688,7 +688,7 @@ async fn deliver_message_denies_unallowlisted_peer() {
 
     let token = service_token(
         &sequencer_ds,
-        "blue.catbird.mls.ds.deliverMessage",
+        "blue.catbird.mlsDS.deliverMessage",
         &Uuid::new_v4().to_string(),
     );
     let payload = json!({
@@ -708,7 +708,7 @@ async fn deliver_message_denies_unallowlisted_peer() {
     let (status, body) = call_json(
         &app,
         "POST",
-        "/xrpc/blue.catbird.mls.ds.deliverMessage",
+        "/xrpc/blue.catbird.mlsDS.deliverMessage",
         &token,
         payload,
     )
@@ -776,13 +776,13 @@ async fn fetch_key_package_requires_convo_id_and_membership_authorization() {
 
     let missing_convo_token = service_token(
         &requester_ds,
-        "blue.catbird.mls.ds.fetchKeyPackage",
+        "blue.catbird.mlsDS.fetchKeyPackage",
         &Uuid::new_v4().to_string(),
     );
     let (missing_status, _) = call_get(
         &app,
         &format!(
-            "/xrpc/blue.catbird.mls.ds.fetchKeyPackage?recipientDid={}",
+            "/xrpc/blue.catbird.mlsDS.fetchKeyPackage?recipientDid={}",
             urlencoding::encode(&recipient_did)
         ),
         &missing_convo_token,
@@ -792,13 +792,13 @@ async fn fetch_key_package_requires_convo_id_and_membership_authorization() {
 
     let unauthorized_token = service_token(
         &unauthorized_ds,
-        "blue.catbird.mls.ds.fetchKeyPackage",
+        "blue.catbird.mlsDS.fetchKeyPackage",
         &Uuid::new_v4().to_string(),
     );
     let (unauth_status, _) = call_get(
         &app,
         &format!(
-            "/xrpc/blue.catbird.mls.ds.fetchKeyPackage?recipientDid={}&convoId={}",
+            "/xrpc/blue.catbird.mlsDS.fetchKeyPackage?recipientDid={}&convoId={}",
             urlencoding::encode(&recipient_did),
             urlencoding::encode(&convo_id)
         ),
@@ -809,13 +809,13 @@ async fn fetch_key_package_requires_convo_id_and_membership_authorization() {
 
     let authorized_token = service_token(
         &format!("{requester_ds}#svc"),
-        "blue.catbird.mls.ds.fetchKeyPackage",
+        "blue.catbird.mlsDS.fetchKeyPackage",
         &Uuid::new_v4().to_string(),
     );
     let (ok_status, ok_body) = call_get(
         &app,
         &format!(
-            "/xrpc/blue.catbird.mls.ds.fetchKeyPackage?recipientDid={}&convoId={}",
+            "/xrpc/blue.catbird.mlsDS.fetchKeyPackage?recipientDid={}&convoId={}",
             urlencoding::encode(&recipient_did),
             urlencoding::encode(&convo_id)
         ),
@@ -836,7 +836,7 @@ async fn federation_peer_admin_lifecycle_endpoints_work() {
 
     let admin_token = service_token(
         "did:plc:federation-admin",
-        "blue.catbird.mls.admin.upsertFederationPeer",
+        "blue.catbird.mlsDS.upsertFederationPeer",
         &Uuid::new_v4().to_string(),
     );
     let target_ds = format!("did:web:managed-peer-{}.example", Uuid::new_v4());
@@ -844,7 +844,7 @@ async fn federation_peer_admin_lifecycle_endpoints_work() {
     let (upsert_status, _) = call_json(
         &app,
         "POST",
-        "/xrpc/blue.catbird.mls.admin.upsertFederationPeer",
+        "/xrpc/blue.catbird.mlsDS.upsertFederationPeer",
         &admin_token,
         json!({
             "dsDid": format!("{target_ds}#service"),
@@ -858,12 +858,12 @@ async fn federation_peer_admin_lifecycle_endpoints_work() {
 
     let list_token = service_token(
         "did:plc:federation-admin",
-        "blue.catbird.mls.admin.getFederationPeers",
+        "blue.catbird.mlsDS.getFederationPeers",
         &Uuid::new_v4().to_string(),
     );
     let (list_status, list_body) = call_get(
         &app,
-        "/xrpc/blue.catbird.mls.admin.getFederationPeers?status=block",
+        "/xrpc/blue.catbird.mlsDS.getFederationPeers?status=block",
         &list_token,
     )
     .await;
@@ -882,13 +882,13 @@ async fn federation_peer_admin_lifecycle_endpoints_work() {
 
     let delete_token = service_token(
         "did:plc:federation-admin",
-        "blue.catbird.mls.admin.deleteFederationPeer",
+        "blue.catbird.mlsDS.deleteFederationPeer",
         &Uuid::new_v4().to_string(),
     );
     let (delete_status, _) = call_json(
         &app,
         "POST",
-        "/xrpc/blue.catbird.mls.admin.deleteFederationPeer",
+        "/xrpc/blue.catbird.mlsDS.deleteFederationPeer",
         &delete_token,
         json!({ "dsDid": target_ds }),
     )
@@ -910,13 +910,13 @@ async fn reconciliation_endpoints_require_allowlist_and_return_events() {
 
     let denied_token = service_token(
         &sequencer_ds,
-        "blue.catbird.mls.ds.getConvoDigest",
+        "blue.catbird.mlsDS.getConvoDigest",
         &Uuid::new_v4().to_string(),
     );
     let (denied_status, _) = call_get(
         &app,
         &format!(
-            "/xrpc/blue.catbird.mls.ds.getConvoDigest?convoId={}",
+            "/xrpc/blue.catbird.mlsDS.getConvoDigest?convoId={}",
             urlencoding::encode(&convo_id)
         ),
         &denied_token,
@@ -928,13 +928,13 @@ async fn reconciliation_endpoints_require_allowlist_and_return_events() {
 
     let digest_token = service_token(
         &sequencer_ds,
-        "blue.catbird.mls.ds.getConvoDigest",
+        "blue.catbird.mlsDS.getConvoDigest",
         &Uuid::new_v4().to_string(),
     );
     let (digest_status, digest_body) = call_get(
         &app,
         &format!(
-            "/xrpc/blue.catbird.mls.ds.getConvoDigest?convoId={}",
+            "/xrpc/blue.catbird.mlsDS.getConvoDigest?convoId={}",
             urlencoding::encode(&convo_id)
         ),
         &digest_token,
@@ -949,13 +949,13 @@ async fn reconciliation_endpoints_require_allowlist_and_return_events() {
 
     let events_token = service_token(
         &sequencer_ds,
-        "blue.catbird.mls.ds.getConvoEvents",
+        "blue.catbird.mlsDS.getConvoEvents",
         &Uuid::new_v4().to_string(),
     );
     let (events_status, events_body) = call_get(
         &app,
         &format!(
-            "/xrpc/blue.catbird.mls.ds.getConvoEvents?convoId={}&afterSeq=0&limit=10",
+            "/xrpc/blue.catbird.mlsDS.getConvoEvents?convoId={}&afterSeq=0&limit=10",
             urlencoding::encode(&convo_id)
         ),
         &events_token,
@@ -1098,13 +1098,13 @@ async fn failover_fences_old_sequencer_after_term_bump() {
 
     let ds1_token_before = service_token(
         &ds1,
-        "blue.catbird.mls.ds.deliverMessage",
+        "blue.catbird.mlsDS.deliverMessage",
         &Uuid::new_v4().to_string(),
     );
     let (before_status, before_body) = call_json(
         &app,
         "POST",
-        "/xrpc/blue.catbird.mls.ds.deliverMessage",
+        "/xrpc/blue.catbird.mlsDS.deliverMessage",
         &ds1_token_before,
         json!({
             "convoId": convo_id.clone(),
@@ -1142,13 +1142,13 @@ async fn failover_fences_old_sequencer_after_term_bump() {
 
     let ds1_token_after = service_token(
         &ds1,
-        "blue.catbird.mls.ds.deliverMessage",
+        "blue.catbird.mlsDS.deliverMessage",
         &Uuid::new_v4().to_string(),
     );
     let (old_status, old_body) = call_json(
         &app,
         "POST",
-        "/xrpc/blue.catbird.mls.ds.deliverMessage",
+        "/xrpc/blue.catbird.mlsDS.deliverMessage",
         &ds1_token_after,
         json!({
             "convoId": convo_id.clone(),
@@ -1173,13 +1173,13 @@ async fn failover_fences_old_sequencer_after_term_bump() {
 
     let ds2_token = service_token(
         &ds2,
-        "blue.catbird.mls.ds.deliverMessage",
+        "blue.catbird.mlsDS.deliverMessage",
         &Uuid::new_v4().to_string(),
     );
     let (new_status, new_body) = call_json(
         &app,
         "POST",
-        "/xrpc/blue.catbird.mls.ds.deliverMessage",
+        "/xrpc/blue.catbird.mlsDS.deliverMessage",
         &ds2_token,
         json!({
             "convoId": convo_id.clone(),

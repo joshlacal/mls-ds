@@ -3,7 +3,10 @@ use jacquard_axum::ExtractXrpc;
 use tracing::error;
 
 use crate::{
-    auth::AuthUser, generated::blue_catbird::mlsChat::get_convo_settings::GetConvoSettingsRequest,
+    auth::AuthUser,
+    generated::blue_catbird::mlsChat::get_convo_settings::{
+        GetConvoSettingsOutput, GetConvoSettingsRequest,
+    },
     storage::DbPool,
 };
 
@@ -16,7 +19,7 @@ pub async fn get_convo_settings(
     State(pool): State<DbPool>,
     auth_user: AuthUser,
     ExtractXrpc(input): ExtractXrpc<GetConvoSettingsRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<GetConvoSettingsOutput<'static>>, StatusCode> {
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -71,16 +74,22 @@ pub async fn get_convo_settings(
     })?;
 
     use sqlx::Row;
-    Ok(Json(serde_json::json!({
-        "convoId": row.get::<String, _>("convo_id"),
-        "policy": {
-            "allowExternalCommits": row.get::<bool, _>("allow_external_commits"),
-            "requireInviteForJoin": row.get::<bool, _>("require_invite_for_join"),
-            "allowRejoin": row.get::<bool, _>("allow_rejoin"),
-            "rejoinWindowDays": row.get::<i32, _>("rejoin_window_days"),
-            "preventRemovingLastAdmin": row.get::<bool, _>("prevent_removing_last_admin"),
-            "maxMembers": row.get::<i32, _>("max_members"),
-            "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at").to_rfc3339(),
-        }
-    })))
+    let policy_json = serde_json::json!({
+        "allowExternalCommits": row.get::<bool, _>("allow_external_commits"),
+        "requireInviteForJoin": row.get::<bool, _>("require_invite_for_join"),
+        "allowRejoin": row.get::<bool, _>("allow_rejoin"),
+        "rejoinWindowDays": row.get::<i32, _>("rejoin_window_days"),
+        "preventRemovingLastAdmin": row.get::<bool, _>("prevent_removing_last_admin"),
+        "maxMembers": row.get::<i32, _>("max_members"),
+        "updatedAt": row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at").to_rfc3339(),
+    });
+    let policy = jacquard_common::types::value::to_data(&policy_json).map_err(|e| {
+        error!("Failed to convert policy to Data: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(GetConvoSettingsOutput {
+        convo_id: row.get::<String, _>("convo_id").into(),
+        policy,
+        extra_data: Default::default(),
+    }))
 }

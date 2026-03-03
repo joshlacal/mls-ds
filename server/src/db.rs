@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use once_cell::sync::Lazy;
-use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Transaction};
+use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Row, Transaction};
 use std::time::Duration;
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
@@ -1385,31 +1385,40 @@ pub async fn get_key_package_stats(pool: &DbPool, owner_did: &str) -> Result<(i6
     let now = Utc::now();
     let reservation_timeout = now - chrono::Duration::minutes(5);
 
-    let row = sqlx::query!(
+    let row = sqlx::query(
         r#"
         SELECT
-            COUNT(*) as "total!",
+            COUNT(*) as total,
             COUNT(*) FILTER (
                 WHERE consumed_at IS NULL
                   AND (reserved_at IS NULL OR reserved_at < $2)
-            ) as "available!",
-            COUNT(*) FILTER (WHERE consumed_at IS NOT NULL) as "consumed!",
+            ) as available,
+            COUNT(*) FILTER (WHERE consumed_at IS NOT NULL) as consumed,
             COUNT(*) FILTER (
                 WHERE consumed_at IS NULL
                   AND reserved_at IS NOT NULL
                   AND reserved_at >= $2
-            ) as "reserved!"
+            ) as reserved
         FROM key_packages
         WHERE owner_did = $1
         "#,
-        owner_did,
-        reservation_timeout
     )
+    .bind(owner_did)
+    .bind(reservation_timeout)
     .fetch_one(pool)
     .await
     .context("Failed to get key package stats")?;
 
-    Ok((row.total, row.available, row.consumed, row.reserved))
+    Ok((
+        row.try_get("total")
+            .context("Missing total key package count")?,
+        row.try_get("available")
+            .context("Missing available key package count")?,
+        row.try_get("consumed")
+            .context("Missing consumed key package count")?,
+        row.try_get("reserved")
+            .context("Missing reserved key package count")?,
+    ))
 }
 
 /// Get paginated list of consumed key packages for a user
@@ -1489,7 +1498,7 @@ pub async fn reserve_key_package(
     let now = Utc::now();
     let reservation_timeout = now - chrono::Duration::minutes(5);
 
-    let result = sqlx::query!(
+    let result = sqlx::query(
         r#"
         UPDATE key_packages
         SET reserved_at = $4, reserved_by_convo = $5
@@ -1498,12 +1507,12 @@ pub async fn reserve_key_package(
           AND consumed_at IS NULL
           AND (reserved_at IS NULL OR reserved_at < $3)
         "#,
-        owner_did,
-        key_package_hash,
-        reservation_timeout,
-        now,
-        convo_id
     )
+    .bind(owner_did)
+    .bind(key_package_hash)
+    .bind(reservation_timeout)
+    .bind(now)
+    .bind(convo_id)
     .execute(pool)
     .await
     .context("Failed to reserve key package")?;
@@ -1758,7 +1767,7 @@ pub async fn update_last_seen_cursor(
     convo_id: &str,
     cursor: &str,
 ) -> Result<()> {
-    sqlx::query!(
+    sqlx::query(
         r#"
         INSERT INTO cursors (user_did, convo_id, last_seen_cursor, updated_at)
         VALUES ($1, $2, $3, NOW())
@@ -1767,10 +1776,10 @@ pub async fn update_last_seen_cursor(
             last_seen_cursor = $3,
             updated_at = NOW()
         "#,
-        user_did,
-        convo_id,
-        cursor,
     )
+    .bind(user_did)
+    .bind(convo_id)
+    .bind(cursor)
     .execute(pool)
     .await
     .context("Failed to update cursor")?;
@@ -1784,20 +1793,20 @@ pub async fn get_last_seen_cursor(
     user_did: &str,
     convo_id: &str,
 ) -> Result<Option<String>> {
-    let result = sqlx::query!(
+    let result = sqlx::query_scalar::<_, String>(
         r#"
         SELECT last_seen_cursor
         FROM cursors
         WHERE user_did = $1 AND convo_id = $2
         "#,
-        user_did,
-        convo_id,
     )
+    .bind(user_did)
+    .bind(convo_id)
     .fetch_optional(pool)
     .await
     .context("Failed to get cursor")?;
 
-    Ok(result.map(|r| r.last_seen_cursor))
+    Ok(result)
 }
 
 // =============================================================================
@@ -1813,18 +1822,18 @@ pub async fn create_envelope(
 ) -> Result<String> {
     let id = Uuid::new_v4().to_string();
 
-    sqlx::query!(
+    sqlx::query(
         r#"
         INSERT INTO envelopes (id, convo_id, recipient_did, message_id, created_at)
         VALUES ($1, $2, $3, $4, NOW())
         ON CONFLICT (recipient_did, message_id) DO NOTHING
         RETURNING id
         "#,
-        &id,
-        convo_id,
-        recipient_did,
-        message_id,
     )
+    .bind(&id)
+    .bind(convo_id)
+    .bind(recipient_did)
+    .bind(message_id)
     .fetch_optional(pool)
     .await
     .context("Failed to create envelope")?;
@@ -1861,16 +1870,16 @@ pub async fn store_event(
         "messageId": message_id,
     });
 
-    sqlx::query!(
+    sqlx::query(
         r#"
         INSERT INTO event_stream (id, convo_id, event_type, payload, emitted_at)
         VALUES ($1, $2, $3, $4, NOW())
         "#,
-        cursor,
-        convo_id,
-        event_type,
-        envelope,
     )
+    .bind(cursor)
+    .bind(convo_id)
+    .bind(event_type)
+    .bind(envelope)
     .execute(pool)
     .await
     .context("Failed to store event")?;
@@ -1897,15 +1906,15 @@ pub async fn store_reaction_event(
         "action": action,
     });
 
-    sqlx::query!(
+    sqlx::query(
         r#"
         INSERT INTO event_stream (id, convo_id, event_type, payload, emitted_at)
         VALUES ($1, $2, 'reactionEvent', $3, NOW())
         "#,
-        cursor,
-        convo_id,
-        envelope,
     )
+    .bind(cursor)
+    .bind(convo_id)
+    .bind(envelope)
     .execute(pool)
     .await
     .context("Failed to store reaction event")?;

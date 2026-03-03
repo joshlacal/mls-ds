@@ -6,7 +6,8 @@ use axum::{
     Json,
 };
 
-type LexCreateConvoError = crate::generated::blue_catbird::mlsChat::create_convo::CreateConvoError<'static>;
+type LexCreateConvoError =
+    crate::generated::blue_catbird::mlsChat::create_convo::CreateConvoError<'static>;
 type LexAddMembersError =
     crate::generated::blue_catbird::mlsChat::commit_group_change::CommitGroupChangeError<'static>;
 type LexGetGroupInfoError =

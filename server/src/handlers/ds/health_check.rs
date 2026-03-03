@@ -4,7 +4,7 @@ use tracing::debug;
 
 use crate::federation::FederationError;
 
-/// GET /xrpc/blue.catbird.mls.ds.healthCheck
+/// GET /xrpc/blue.catbird.mlsDS.healthCheck
 ///
 /// Simple health/status endpoint for DS-to-DS discovery.
 /// No authentication required.

@@ -24,19 +24,18 @@ pub mod realtime;
 pub mod storage;
 pub mod util;
 
-// Re-export jacquard-common types for generated and migrated code
-pub use jacquard_common::types;
+// Re-export shared generated types and common validated types.
+pub use catbird_atproto::generated;
+pub use catbird_atproto::types;
 
-// Generated types from lexicon schemas
-pub mod generated;
 pub mod generated_types;
 
 // Re-export jacquard-generated namespaces at the crate root so external crates
 // can depend on a stable, ergonomic path (e.g., `server::blue_catbird`) rather
 // than importing from the internal `generated` module hierarchy. These re-exports
 // are part of the intended public API surface for jacquard-generated types.
-pub use generated::blue_catbird;
-pub use generated::builder_types;
+pub use catbird_atproto::blue_catbird;
+pub use catbird_atproto::builder_types;
 
 // sqlx conversion helpers for jacquard-common types
 pub mod sqlx_jacquard;

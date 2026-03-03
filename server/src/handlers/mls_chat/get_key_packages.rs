@@ -3,7 +3,11 @@ use jacquard_axum::ExtractXrpc;
 use tracing::{error, info};
 
 use crate::{
-    auth::AuthUser, generated::blue_catbird::mlsChat::get_key_packages::GetKeyPackagesRequest,
+    auth::AuthUser,
+    generated::blue_catbird::mlsChat::{
+        get_key_packages::{GetKeyPackagesOutput, GetKeyPackagesRequest},
+        KeyPackageRef,
+    },
     storage::DbPool,
 };
 
@@ -18,7 +22,7 @@ pub async fn get_key_packages(
     State(pool): State<DbPool>,
     auth_user: AuthUser,
     ExtractXrpc(input): ExtractXrpc<GetKeyPackagesRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<GetKeyPackagesOutput<'static>>, StatusCode> {
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -27,8 +31,8 @@ pub async fn get_key_packages(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let mut key_packages = Vec::new();
-    let mut missing = Vec::new();
+    let mut key_packages: Vec<KeyPackageRef<'static>> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
 
     for did in &input.dids {
         // Claim one key package per distinct device_id bucket for this DID.
@@ -71,12 +75,13 @@ pub async fn get_key_packages(
         match results {
             Ok(rows) if !rows.is_empty() => {
                 for (owner_did, cipher_suite, kp_b64, kp_hash) in rows {
-                    key_packages.push(serde_json::json!({
-                        "did": owner_did,
-                        "cipherSuite": cipher_suite,
-                        "keyPackage": kp_b64,
-                        "keyPackageHash": kp_hash,
-                    }));
+                    key_packages.push(KeyPackageRef {
+                        did: crate::sqlx_jacquard::string_to_did(&owner_did),
+                        cipher_suite: cipher_suite.into(),
+                        key_package: kp_b64.into(),
+                        key_package_hash: kp_hash.map(Into::into),
+                        extra_data: Default::default(),
+                    });
                 }
             }
             Ok(_) => {
@@ -100,10 +105,20 @@ pub async fn get_key_packages(
         "Key packages fetched and consumed (one per device)"
     );
 
-    let mut response = serde_json::json!({ "keyPackages": key_packages });
-    if !missing.is_empty() {
-        response["missing"] = serde_json::json!(missing);
-    }
+    let missing_dids = if missing.is_empty() {
+        None
+    } else {
+        Some(
+            missing
+                .into_iter()
+                .map(|d| crate::sqlx_jacquard::string_to_did(&d))
+                .collect(),
+        )
+    };
 
-    Ok(Json(response))
+    Ok(Json(GetKeyPackagesOutput {
+        key_packages,
+        missing: missing_dids,
+        extra_data: Default::default(),
+    }))
 }

@@ -269,7 +269,7 @@ pub struct FederationConfig {
     pub self_endpoint: String,
     /// PEM-encoded ES256 private key for signing outbound service auth JWTs.
     pub signing_key_pem: Option<String>,
-    /// Fallback DS endpoint for users without a `blue.catbird.mls.profile` record.
+    /// Fallback DS endpoint for users without a `blue.catbird.mlsChat.profile` record.
     pub default_ds_endpoint: Option<String>,
     pub endpoint_cache_ttl_secs: u64,
     pub outbound_timeout_secs: u64,

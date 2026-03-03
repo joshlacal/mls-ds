@@ -30,8 +30,8 @@ use crate::realtime::sse::StreamEvent;
 // ---------------------------------------------------------------------------
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const TICKET_METHOD: &str = "blue.catbird.mls.getSubscriptionTicket";
-const SUBSCRIBE_METHOD: &str = "blue.catbird.mls.subscribeConvoEvents";
+const TICKET_METHOD: &str = "blue.catbird.mlsChat.getSubscriptionTicket";
+const SUBSCRIBE_METHOD: &str = "blue.catbird.mlsChat.subscribeEvents";
 const RECONNECT_BASE: Duration = Duration::from_secs(1);
 const RECONNECT_CAP: Duration = Duration::from_secs(60);
 const GRACE_PERIOD: Duration = Duration::from_secs(30);

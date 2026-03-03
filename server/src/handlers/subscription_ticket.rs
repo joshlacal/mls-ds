@@ -47,7 +47,7 @@ pub struct TicketClaims {
 }
 
 /// Get a short-lived ticket for WebSocket subscription authentication
-/// POST /xrpc/blue.catbird.mls.getSubscriptionTicket
+/// POST /xrpc/blue.catbird.mlsChat.getSubscriptionTicket
 #[tracing::instrument(skip(pool))]
 pub async fn get_subscription_ticket(
     State(pool): State<DbPool>,
@@ -88,7 +88,7 @@ pub async fn get_subscription_ticket(
 
     // Get WebSocket endpoint from environment
     let ws_endpoint = std::env::var("WEBSOCKET_ENDPOINT").unwrap_or_else(|_| {
-        "wss://mls.catbird.blue/xrpc/blue.catbird.mls.subscribeConvoEvents".to_string()
+        "wss://mls.catbird.blue/xrpc/blue.catbird.mlsChat.subscribeEvents".to_string()
     });
 
     // Generate ticket with 30-second expiry

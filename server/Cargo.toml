@@ -50,6 +50,7 @@ multibase = "0.9"
 jsonwebtoken = "9"
 
 # Jacquard (ATProto types)
+catbird-atproto = { path = "../../catbird-atproto" }
 jacquard-common = "0.9"
 jacquard-axum = "0.9"
 jacquard-derive = "0.9"

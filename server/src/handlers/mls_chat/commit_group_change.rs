@@ -1,4 +1,4 @@
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use sqlx::FromRow;
@@ -8,10 +8,15 @@ use tracing::{error, info, warn};
 use jacquard_axum::ExtractXrpc;
 
 use crate::{
-    actors::ActorRegistry, auth::AuthUser, block_sync::BlockSyncService,
+    actors::ActorRegistry,
+    auth::AuthUser,
+    block_sync::BlockSyncService,
     device_utils::parse_device_did,
-    generated::blue_catbird::mlsChat::commit_group_change::CommitGroupChangeRequest,
-    realtime::SseState, storage::DbPool,
+    generated::blue_catbird::mlsChat::commit_group_change::{
+        CommitGroupChangeOutput, CommitGroupChangeRequest, PendingDeviceAddition,
+    },
+    realtime::SseState,
+    storage::DbPool,
 };
 
 const NSID: &str = "blue.catbird.mlsChat.commitGroupChange";
@@ -33,10 +38,15 @@ struct PendingAdditionRow {
     created_at: DateTime<Utc>,
 }
 
-fn invalidate_welcome_response(rows_affected: u64) -> serde_json::Value {
-    serde_json::json!({
-        "success": rows_affected > 0,
-    })
+fn invalidate_welcome_response(rows_affected: u64) -> CommitGroupChangeOutput<'static> {
+    CommitGroupChangeOutput {
+        success: rows_affected > 0,
+        claimed_addition: None,
+        new_epoch: None,
+        pending_additions: None,
+        rejoined_at: None,
+        extra_data: Default::default(),
+    }
 }
 
 /// Consolidated group change handler
@@ -51,12 +61,19 @@ pub async fn commit_group_change(
     State(_block_sync): State<Arc<BlockSyncService>>,
     auth_user: AuthUser,
     ExtractXrpc(input): ExtractXrpc<CommitGroupChangeRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<axum::response::Response, StatusCode> {
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    let success_response = || serde_json::json!({ "success": true });
+    let success_response = || CommitGroupChangeOutput {
+        success: true,
+        claimed_addition: None,
+        new_epoch: None,
+        pending_additions: None,
+        rejoined_at: None,
+        extra_data: Default::default(),
+    };
 
     match input.action.as_ref() {
         "addMembers" => {
@@ -83,10 +100,15 @@ pub async fn commit_group_change(
                             .ok()
                             .flatten();
                     info!("v2.commitGroupChange: addMembers idempotent hit");
-                    return Ok(Json(serde_json::json!({
-                        "success": true,
-                        "newEpoch": current_epoch.unwrap_or(0),
-                    })));
+                    return Ok(Json(CommitGroupChangeOutput {
+                        success: true,
+                        new_epoch: Some(current_epoch.unwrap_or(0) as i64),
+                        claimed_addition: None,
+                        pending_additions: None,
+                        rejoined_at: None,
+                        extra_data: Default::default(),
+                    })
+                    .into_response());
                 }
             }
 
@@ -240,10 +262,15 @@ pub async fn commit_group_change(
                 "✅ v2.commitGroupChange: addMembers complete, epoch={}",
                 new_epoch
             );
-            Ok(Json(serde_json::json!({
-                "success": true,
-                "newEpoch": new_epoch,
-            })))
+            Ok(Json(CommitGroupChangeOutput {
+                success: true,
+                new_epoch: Some(new_epoch as i64),
+                claimed_addition: None,
+                pending_additions: None,
+                rejoined_at: None,
+                extra_data: Default::default(),
+            })
+            .into_response())
         }
         "externalCommit" => {
             let convo_id = input.convo_id.to_string();
@@ -269,10 +296,15 @@ pub async fn commit_group_change(
                             .ok()
                             .flatten();
                     info!("v2.commitGroupChange: externalCommit idempotent hit");
-                    return Ok(Json(serde_json::json!({
-                        "success": true,
-                        "newEpoch": current_epoch.unwrap_or(0),
-                    })));
+                    return Ok(Json(CommitGroupChangeOutput {
+                        success: true,
+                        new_epoch: Some(current_epoch.unwrap_or(0) as i64),
+                        claimed_addition: None,
+                        pending_additions: None,
+                        rejoined_at: None,
+                        extra_data: Default::default(),
+                    })
+                    .into_response());
                 }
             }
 
@@ -382,18 +414,23 @@ pub async fn commit_group_change(
                 "✅ v2.commitGroupChange: externalCommit complete, epoch={}",
                 new_epoch
             );
-            Ok(Json(serde_json::json!({
-                "success": true,
-                "newEpoch": new_epoch,
-            })))
+            Ok(Json(CommitGroupChangeOutput {
+                success: true,
+                new_epoch: Some(new_epoch as i64),
+                claimed_addition: None,
+                pending_additions: None,
+                rejoined_at: None,
+                extra_data: Default::default(),
+            })
+            .into_response())
         }
         "rejoin" => {
             info!("v2.commitGroupChange: rejoin for convo");
-            Ok(Json(success_response()))
+            Ok(Json(success_response()).into_response())
         }
         "readdition" => {
             info!("v2.commitGroupChange: readdition for convo");
-            Ok(Json(success_response()))
+            Ok(Json(success_response()).into_response())
         }
         "invalidateWelcome" => {
             let convo_id = input.convo_id.to_string();
@@ -429,7 +466,7 @@ pub async fn commit_group_change(
                 invalidated
             );
 
-            Ok(Json(invalidate_welcome_response(invalidated)))
+            Ok(Json(invalidate_welcome_response(invalidated)).into_response())
         }
         "listPending" => {
             let convo_id = input.convo_id.to_string();
@@ -517,31 +554,34 @@ pub async fn commit_group_change(
                 pending.len()
             );
 
-            let additions: Vec<serde_json::Value> = pending
+            let additions: Vec<PendingDeviceAddition<'static>> = pending
                 .into_iter()
-                .map(|row| {
-                    let mut obj = serde_json::json!({
-                        "id": row.id,
-                        "convoId": row.convo_id,
-                        "userDid": row.user_did,
-                        "deviceId": row.new_device_id,
-                        "deviceCredentialDid": row.new_device_credential_did,
-                        "status": row.status,
-                        "createdAt": row.created_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                    });
-                    if let Some(name) = row.device_name {
-                        obj["deviceName"] = serde_json::json!(name);
-                    }
-                    if let Some(claimed) = row.claimed_by_did {
-                        obj["claimedBy"] = serde_json::json!(claimed);
-                    }
-                    obj
+                .map(|row| PendingDeviceAddition {
+                    id: row.id.into(),
+                    convo_id: row.convo_id.into(),
+                    user_did: crate::sqlx_jacquard::string_to_did(&row.user_did),
+                    device_id: row.new_device_id.into(),
+                    device_credential_did: row.new_device_credential_did.into(),
+                    status: row.status.into(),
+                    created_at: crate::sqlx_jacquard::chrono_to_datetime(row.created_at),
+                    device_name: row.device_name.map(|n| n.into()),
+                    claimed_by: row
+                        .claimed_by_did
+                        .as_deref()
+                        .map(crate::sqlx_jacquard::string_to_did),
+                    extra_data: Default::default(),
                 })
                 .collect();
 
-            let mut output = success_response();
-            output["pendingAdditions"] = serde_json::json!(additions);
-            Ok(Json(output))
+            Ok(Json(CommitGroupChangeOutput {
+                success: true,
+                pending_additions: Some(additions),
+                claimed_addition: None,
+                new_epoch: None,
+                rejoined_at: None,
+                extra_data: Default::default(),
+            })
+            .into_response())
         }
         "updateGroupInfo" => {
             let convo_id = input.convo_id.to_string();
@@ -612,9 +652,7 @@ pub async fn commit_group_change(
                 "✅ [v2.commitGroupChange] updateGroupInfo stored for convo {} epoch {}",
                 convo_id, new_epoch
             );
-            Ok(Json(serde_json::json!({
-                "success": true,
-            })))
+            Ok(Json(success_response()).into_response())
         }
         "claimPending" => {
             let convo_id = input.convo_id.to_string();
@@ -654,32 +692,42 @@ pub async fn commit_group_change(
             match claimed {
                 Some(row) => {
                     info!("✅ [v2.commitGroupChange] Claimed pending addition");
-                    let mut obj = serde_json::json!({
-                        "id": row.id,
-                        "convoId": row.convo_id,
-                        "userDid": row.user_did,
-                        "deviceId": row.new_device_id,
-                        "deviceCredentialDid": row.new_device_credential_did,
-                        "status": row.status,
-                        "createdAt": row.created_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                    });
-                    if let Some(name) = row.device_name {
-                        obj["deviceName"] = serde_json::json!(name);
-                    }
-                    if let Some(claimed_by) = row.claimed_by_did {
-                        obj["claimedBy"] = serde_json::json!(claimed_by);
-                    }
-                    Ok(Json(serde_json::json!({
-                        "success": true,
-                        "claimedAddition": obj,
-                    })))
+                    let addition = PendingDeviceAddition {
+                        id: row.id.into(),
+                        convo_id: row.convo_id.into(),
+                        user_did: crate::sqlx_jacquard::string_to_did(&row.user_did),
+                        device_id: row.new_device_id.into(),
+                        device_credential_did: row.new_device_credential_did.into(),
+                        status: row.status.into(),
+                        created_at: crate::sqlx_jacquard::chrono_to_datetime(row.created_at),
+                        device_name: row.device_name.map(|n| n.into()),
+                        claimed_by: row
+                            .claimed_by_did
+                            .as_deref()
+                            .map(crate::sqlx_jacquard::string_to_did),
+                        extra_data: Default::default(),
+                    };
+                    Ok(Json(CommitGroupChangeOutput {
+                        success: true,
+                        claimed_addition: Some(addition),
+                        new_epoch: None,
+                        pending_additions: None,
+                        rejoined_at: None,
+                        extra_data: Default::default(),
+                    })
+                    .into_response())
                 }
                 None => {
                     warn!("claimPending: no matching pending addition found");
-                    Ok(Json(serde_json::json!({
-                        "success": false,
-                        "claimedAddition": null,
-                    })))
+                    Ok(Json(CommitGroupChangeOutput {
+                        success: false,
+                        claimed_addition: None,
+                        new_epoch: None,
+                        pending_additions: None,
+                        rejoined_at: None,
+                        extra_data: Default::default(),
+                    })
+                    .into_response())
                 }
             }
         }
@@ -697,19 +745,13 @@ mod tests {
     #[test]
     fn invalidate_welcome_response_returns_false_when_nothing_invalidated() {
         let response = invalidate_welcome_response(0);
-        assert_eq!(
-            response.get("success").and_then(|v| v.as_bool()),
-            Some(false)
-        );
+        assert!(!response.success);
     }
 
     #[test]
     fn invalidate_welcome_response_returns_true_when_rows_invalidated() {
         let response = invalidate_welcome_response(2);
-        assert_eq!(
-            response.get("success").and_then(|v| v.as_bool()),
-            Some(true)
-        );
+        assert!(response.success);
     }
 
     /// Verifies the shape of the addMembers idempotency-hit response:
@@ -717,25 +759,30 @@ mod tests {
     #[test]
     fn add_members_idempotent_response_includes_new_epoch() {
         let epoch: i32 = 5;
-        let response = serde_json::json!({
-            "success": true,
-            "newEpoch": epoch,
-        });
-        assert_eq!(
-            response.get("success").and_then(|v| v.as_bool()),
-            Some(true)
-        );
-        assert_eq!(response.get("newEpoch").and_then(|v| v.as_i64()), Some(5));
+        let response = CommitGroupChangeOutput {
+            success: true,
+            new_epoch: Some(epoch as i64),
+            claimed_addition: None,
+            pending_additions: None,
+            rejoined_at: None,
+            extra_data: Default::default(),
+        };
+        assert!(response.success);
+        assert_eq!(response.new_epoch, Some(5));
     }
 
     /// When no epoch row exists the idempotency path falls back to 0.
     #[test]
     fn add_members_idempotent_response_defaults_epoch_to_zero() {
         let current_epoch: Option<i32> = None;
-        let response = serde_json::json!({
-            "success": true,
-            "newEpoch": current_epoch.unwrap_or(0),
-        });
-        assert_eq!(response.get("newEpoch").and_then(|v| v.as_i64()), Some(0));
+        let response = CommitGroupChangeOutput {
+            success: true,
+            new_epoch: Some(current_epoch.unwrap_or(0) as i64),
+            claimed_addition: None,
+            pending_additions: None,
+            rejoined_at: None,
+            extra_data: Default::default(),
+        };
+        assert_eq!(response.new_epoch, Some(0));
     }
 }

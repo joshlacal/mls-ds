@@ -5,8 +5,11 @@ use sqlx::Row;
 use tracing::{error, info};
 
 use crate::{
-    auth::AuthUser, device_utils::parse_device_did,
-    generated::blue_catbird::mlsChat::get_pending_devices::GetPendingDevicesRequest,
+    auth::AuthUser,
+    device_utils::parse_device_did,
+    generated::blue_catbird::mlsChat::get_pending_devices::{
+        GetPendingDevicesOutput, GetPendingDevicesRequest, PendingDeviceAddition,
+    },
     storage::DbPool,
 };
 
@@ -19,7 +22,7 @@ pub async fn get_pending_devices(
     State(pool): State<DbPool>,
     auth_user: AuthUser,
     ExtractXrpc(input): ExtractXrpc<GetPendingDevicesRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<GetPendingDevicesOutput<'static>>, StatusCode> {
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -134,29 +137,21 @@ pub async fn get_pending_devices(
 
     info!("Found {} pending device additions for user", rows.len());
 
-    let pending_additions: Vec<serde_json::Value> = rows
+    let pending_additions: Vec<PendingDeviceAddition<'static>> = rows
         .into_iter()
-        .map(|r| {
-            let mut obj = serde_json::json!({
-                "id": r.get::<String, _>("id"),
-                "convoId": r.get::<String, _>("convo_id"),
-                "userDid": r.get::<String, _>("user_did"),
-                "newDeviceId": r.get::<String, _>("device_id"),
-                "newDeviceCredentialDid": r.get::<String, _>("device_credential_did"),
-                "status": r.get::<String, _>("status"),
-                "createdAt": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at").to_rfc3339(),
-            });
-            if let Some(name) = r.get::<Option<String>, _>("device_name") {
-                obj["deviceName"] = serde_json::json!(name);
-            }
-            if let Some(claimed) = r.get::<Option<String>, _>("claimed_by") {
-                obj["claimedBy"] = serde_json::json!(claimed);
-            }
-            obj
+        .map(|r| PendingDeviceAddition {
+            convo_id: r.get::<String, _>("convo_id").into(),
+            device_id: r.get::<String, _>("device_id").into(),
+            created_at: crate::sqlx_jacquard::chrono_to_datetime(
+                r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+            ),
+            welcome: None,
+            extra_data: Default::default(),
         })
         .collect();
 
-    Ok(Json(
-        serde_json::json!({ "pendingAdditions": pending_additions }),
-    ))
+    Ok(Json(GetPendingDevicesOutput {
+        pending_additions,
+        extra_data: Default::default(),
+    }))
 }

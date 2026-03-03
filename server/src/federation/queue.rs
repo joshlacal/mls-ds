@@ -630,7 +630,7 @@ impl OutboundQueue {
 
 fn extract_expected_sequencer_term(method: &str, body: &serde_json::Value) -> Option<u64> {
     match method {
-        "blue.catbird.mls.ds.deliverMessage" | "blue.catbird.mls.ds.submitCommit" => body
+        "blue.catbird.mlsDS.deliverMessage" | "blue.catbird.mlsDS.submitCommit" => body
             .get("sequencerTerm")
             .and_then(serde_json::Value::as_u64),
         _ => None,

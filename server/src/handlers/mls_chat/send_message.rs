@@ -1,4 +1,9 @@
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    Json,
+};
 use chrono::Utc;
 use jacquard_axum::ExtractXrpc;
 use sqlx::{Postgres, QueryBuilder};
@@ -9,7 +14,7 @@ use crate::{
     actors::ActorRegistry,
     auth::AuthUser,
     federation::{self, FederatedBackend},
-    generated::blue_catbird::mlsChat::send_message::SendMessageRequest,
+    generated::blue_catbird::mlsChat::send_message::{SendMessageOutput, SendMessageRequest},
     notifications::NotificationService,
     realtime::{SseState, StreamEvent, StreamMessageView},
     storage::DbPool,
@@ -52,7 +57,7 @@ pub async fn send_message(
     State(outbound_queue): State<Arc<federation::queue::OutboundQueue>>,
     auth_user: AuthUser,
     ExtractXrpc(input): ExtractXrpc<SendMessageRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Response, StatusCode> {
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
         error!("❌ [v2.sendMessage] Unauthorized");
         return Err(StatusCode::UNAUTHORIZED);
@@ -61,29 +66,48 @@ pub async fn send_message(
     let delivery = input.delivery.as_deref().unwrap_or("persistent");
 
     match delivery {
-        "persistent" => {
-            handle_persistent(
-                pool,
-                sse_state,
-                notification_service,
-                federated_backend,
-                federation_config,
-                outbound_queue,
-                auth_user,
-                &input,
-            )
-            .await
-        }
+        "persistent" => Ok(handle_persistent(
+            pool,
+            sse_state,
+            notification_service,
+            federated_backend,
+            federation_config,
+            outbound_queue,
+            auth_user,
+            &input,
+        )
+        .await?
+        .into_response()),
 
         "ephemeral" => {
             let action = input.action.as_deref().unwrap_or("typing");
-            match action {
-                "addReaction" => handle_add_reaction(pool, sse_state, auth_user, &input).await,
-                "removeReaction" => {
-                    handle_remove_reaction(pool, sse_state, auth_user, &input).await
+            Ok(match action {
+                "addReaction" => handle_add_reaction(pool, sse_state, auth_user, &input)
+                    .await?
+                    .into_response(),
+                "removeReaction" => handle_remove_reaction(pool, sse_state, auth_user, &input)
+                    .await?
+                    .into_response(),
+                "typingStop" | "stopTyping" => {
+                    handle_typing(pool, sse_state, auth_user, &input, false)
+                        .await?
+                        .into_response()
                 }
-                _ => handle_typing(pool, sse_state, auth_user, &input).await,
-            }
+                "typing" | "typingStart" => {
+                    handle_typing(pool, sse_state, auth_user, &input, true)
+                        .await?
+                        .into_response()
+                }
+                other => {
+                    warn!(
+                        "❌ [v2.sendMessage] Unknown ephemeral action '{}', defaulting to typing start",
+                        other
+                    );
+                    handle_typing(pool, sse_state, auth_user, &input, true)
+                        .await?
+                        .into_response()
+                }
+            })
         }
 
         other => {
@@ -106,11 +130,11 @@ async fn handle_persistent(
     outbound_queue: Arc<federation::queue::OutboundQueue>,
     auth_user: AuthUser,
     input: &crate::generated::blue_catbird::mlsChat::send_message::SendMessage<'_>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<SendMessageOutput<'static>>, StatusCode> {
     let convo_id = input.convo_id.to_string();
     let msg_id = input.msg_id.to_string();
     let padded_size = input.padded_size as u32;
-    let idempotency_key = input.idempotency_key.as_ref().map(|k| k.to_string());
+    let idempotency_key: Option<String> = None; // msgId now serves as the idempotency key
 
     // --- Validate msgId format (ULID 26 chars or UUID 36 chars) ---
     let is_ulid = msg_id.len() == 26 && msg_id.chars().all(|c| c.is_ascii_alphanumeric());
@@ -225,13 +249,13 @@ async fn handle_persistent(
 
     if let Some((eid, eseq, eepoch, eat)) = existing {
         tx.rollback().await.ok();
-        let output = serde_json::json!({
-            "messageId": eid,
-            "receivedAt": crate::sqlx_jacquard::chrono_to_datetime(eat).to_string(),
-            "seq": eseq,
-            "epoch": eepoch,
-        });
-        return Ok(Json(output));
+        return Ok(Json(SendMessageOutput {
+            message_id: eid.into(),
+            received_at: crate::sqlx_jacquard::chrono_to_datetime(eat),
+            seq: eseq,
+            epoch: eepoch,
+            extra_data: Default::default(),
+        }));
     }
 
     // Dedup by idempotency_key
@@ -249,13 +273,13 @@ async fn handle_persistent(
 
         if let Some((eid, eseq, eepoch, eat)) = existing_idem {
             tx.rollback().await.ok();
-            let output = serde_json::json!({
-                "messageId": eid,
-                "receivedAt": crate::sqlx_jacquard::chrono_to_datetime(eat).to_string(),
-                "seq": eseq,
-                "epoch": eepoch,
-            });
-            return Ok(Json(output));
+            return Ok(Json(SendMessageOutput {
+                message_id: eid.into(),
+                received_at: crate::sqlx_jacquard::chrono_to_datetime(eat),
+                seq: eseq,
+                epoch: eepoch,
+                extra_data: Default::default(),
+            }));
         }
     }
 
@@ -367,17 +391,18 @@ async fn handle_persistent(
             .next(&convo_id_clone, "messageEvent")
             .await;
 
-        let message_view: StreamMessageView = crate::generated::blue_catbird::mlsChat::MessageView {
-            id: msg_id_clone.clone().into(),
-            convo_id: convo_id_clone.clone().into(),
-            ciphertext: bytes::Bytes::from(ciphertext_for_sse),
-            epoch: epoch_for_sse,
-            seq,
-            created_at: crate::sqlx_jacquard::chrono_to_datetime(now),
-            message_type: Some("app".into()),
-            extra_data: Default::default(),
-        }
-        .into();
+        let message_view: StreamMessageView =
+            crate::generated::blue_catbird::mlsChat::MessageView {
+                id: msg_id_clone.clone().into(),
+                convo_id: convo_id_clone.clone().into(),
+                ciphertext: bytes::Bytes::from(ciphertext_for_sse),
+                epoch: epoch_for_sse,
+                seq,
+                created_at: crate::sqlx_jacquard::chrono_to_datetime(now),
+                message_type: Some("app".into()),
+                extra_data: Default::default(),
+            }
+            .into();
 
         let event = StreamEvent::MessageEvent {
             cursor: cursor.clone(),
@@ -461,7 +486,7 @@ async fn handle_persistent(
                                 .enqueue(
                                     &ds_did,
                                     "",
-                                    "blue.catbird.mls.ds.deliverMessage",
+                                    "blue.catbird.mlsDS.deliverMessage",
                                     &payload_bytes,
                                     &convo_id_clone,
                                     "initial enqueue",
@@ -487,13 +512,13 @@ async fn handle_persistent(
 
     info!("✅ [v2.sendMessage] COMPLETE");
 
-    let output = serde_json::json!({
-        "messageId": row_id,
-        "receivedAt": crate::sqlx_jacquard::chrono_to_datetime(now).to_string(),
-        "seq": seq,
-        "epoch": client_epoch,
-    });
-    Ok(Json(output))
+    Ok(Json(SendMessageOutput {
+        message_id: row_id.into(),
+        received_at: crate::sqlx_jacquard::chrono_to_datetime(now),
+        seq,
+        epoch: client_epoch,
+        extra_data: Default::default(),
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -720,6 +745,7 @@ async fn handle_typing(
     sse_state: Arc<SseState>,
     auth_user: AuthUser,
     input: &crate::generated::blue_catbird::mlsChat::send_message::SendMessage<'_>,
+    is_typing: bool,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let convo_id = input.convo_id.to_string();
     let user_did = auth_user.did.clone();
@@ -748,12 +774,14 @@ async fn handle_typing(
         cursor: cursor.clone(),
         convo_id: convo_id.clone(),
         did: user_did,
-        is_typing: true,
+        is_typing,
     };
 
     if let Err(e) = sse_state.emit(&convo_id, event).await {
         error!("❌ [v2.sendMessage:typing] SSE emit: {}", e);
     }
 
-    Ok(Json(serde_json::json!({"success": true})))
+    Ok(Json(
+        serde_json::json!({"success": true, "isTyping": is_typing}),
+    ))
 }

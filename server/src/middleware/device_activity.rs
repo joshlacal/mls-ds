@@ -24,15 +24,15 @@ pub async fn track_device_activity(
             // Spawn async task to update last_seen_at without blocking the request
             tokio::spawn(async move {
                 let now = Utc::now();
-                let result = sqlx::query!(
+                let result = sqlx::query(
                     r#"
                     UPDATE devices
                     SET last_seen_at = $1
                     WHERE id = $2
                     "#,
-                    now,
-                    device_id_clone
                 )
+                .bind(now)
+                .bind(device_id_clone.clone())
                 .execute(&pool_clone)
                 .await;
 

@@ -36,7 +36,7 @@ pub struct SubscribeQuery {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "$type")]
 pub enum StreamEvent {
-    #[serde(rename = "blue.catbird.mls.subscribeConvoEvents#messageEvent")]
+    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#messageEvent")]
     MessageEvent {
         cursor: String,
         message: StreamMessageView,
@@ -46,7 +46,7 @@ pub enum StreamEvent {
         #[serde(default, skip_serializing_if = "crate::realtime::sse::is_false")]
         ephemeral: bool,
     },
-    #[serde(rename = "blue.catbird.mls.subscribeConvoEvents#reactionEvent")]
+    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#reactionEvent")]
     ReactionEvent {
         cursor: String,
         #[serde(rename = "convoId")]
@@ -57,7 +57,7 @@ pub enum StreamEvent {
         reaction: String,
         action: String,
     },
-    #[serde(rename = "blue.catbird.mls.subscribeConvoEvents#typingEvent")]
+    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#typingEvent")]
     TypingEvent {
         cursor: String,
         #[serde(rename = "convoId")]
@@ -66,10 +66,10 @@ pub enum StreamEvent {
         #[serde(rename = "isTyping")]
         is_typing: bool,
     },
-    #[serde(rename = "blue.catbird.mls.subscribeConvoEvents#infoEvent")]
+    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#infoEvent")]
     InfoEvent { cursor: String, info: String },
     /// Event indicating a user has registered a new device that needs to be added to the conversation
-    #[serde(rename = "blue.catbird.mls.subscribeConvoEvents#newDeviceEvent")]
+    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#newDeviceEvent")]
     NewDeviceEvent {
         cursor: String,
         #[serde(rename = "convoId")]
@@ -87,7 +87,7 @@ pub enum StreamEvent {
     },
     /// Event requesting active members to publish fresh GroupInfo for external commit joins
     /// Emitted when a member encounters stale GroupInfo and calls groupInfoRefresh
-    #[serde(rename = "blue.catbird.mls.subscribeConvoEvents#groupInfoRefreshRequestedEvent")]
+    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#groupInfoRefreshRequestedEvent")]
     GroupInfoRefreshRequested {
         cursor: String,
         #[serde(rename = "convoId")]
@@ -100,7 +100,7 @@ pub enum StreamEvent {
     },
     /// Event indicating a member needs to be re-added to the conversation
     /// Emitted when both Welcome and External Commit have failed
-    #[serde(rename = "blue.catbird.mls.subscribeConvoEvents#readditionRequestedEvent")]
+    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#readditionRequestedEvent")]
     ReadditionRequested {
         cursor: String,
         #[serde(rename = "convoId")]
@@ -112,7 +112,7 @@ pub enum StreamEvent {
         requested_at: String,
     },
     /// Event indicating a member joined, left, or was removed from the conversation
-    #[serde(rename = "blue.catbird.mls.subscribeConvoEvents#membershipChangeEvent")]
+    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#membershipChangeEvent")]
     MembershipChangeEvent {
         cursor: String,
         #[serde(rename = "convoId")]
@@ -129,7 +129,7 @@ pub enum StreamEvent {
         epoch: usize,
     },
     /// Event indicating a member has read messages in the conversation
-    #[serde(rename = "blue.catbird.mls.subscribeConvoEvents#readEvent")]
+    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#readEvent")]
     ReadEvent {
         cursor: String,
         #[serde(rename = "convoId")]

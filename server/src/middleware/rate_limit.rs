@@ -275,7 +275,8 @@ fn get_endpoint_quota(endpoint: &str) -> (u32, Duration) {
     // Extract base endpoint name from path
     let endpoint_name = endpoint
         .trim_start_matches("/xrpc/")
-        .trim_start_matches("blue.catbird.mls.");
+        .trim_start_matches("blue.catbird.mlsChat.")
+        .trim_start_matches("blue.catbird.mlsDS.");
 
     let limit = if endpoint_name.contains("sendMessage") {
         std::env::var("RATE_LIMIT_SEND_MESSAGE")
@@ -391,7 +392,8 @@ pub static IP_LIMITER: Lazy<RateLimiter> = Lazy::new(RateLimiter::default);
 fn should_use_device_rate_limit(endpoint: &str) -> bool {
     let endpoint_name = endpoint
         .trim_start_matches("/xrpc/")
-        .trim_start_matches("blue.catbird.mls.");
+        .trim_start_matches("blue.catbird.mlsChat.")
+        .trim_start_matches("blue.catbird.mlsDS.");
 
     // Device-specific operations get per-device limits
     // This allows a fresh device (app reinstall) to upload key packages
@@ -566,7 +568,7 @@ mod tests {
     #[test]
     fn test_trusted_proxy_uses_forwarded_ip() {
         let request = HttpRequest::builder()
-            .uri("/xrpc/blue.catbird.mls.getMessages")
+            .uri("/xrpc/blue.catbird.mlsChat.getMessages")
             .header("cf-connecting-ip", "203.0.113.10")
             .body(Body::empty())
             .expect("request");
@@ -586,7 +588,7 @@ mod tests {
     #[test]
     fn test_untrusted_proxy_ignores_forwarded_ip() {
         let request = HttpRequest::builder()
-            .uri("/xrpc/blue.catbird.mls.getMessages")
+            .uri("/xrpc/blue.catbird.mlsChat.getMessages")
             .header("cf-connecting-ip", "203.0.113.10")
             .body(Body::empty())
             .expect("request");

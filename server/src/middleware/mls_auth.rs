@@ -8,7 +8,7 @@ use sqlx::PgPool;
 
 /// Verify that a user is an active member of a group
 pub async fn verify_group_membership(user_did: &str, convo_id: &str, db: &PgPool) -> Result<()> {
-    let member = sqlx::query!(
+    let member = sqlx::query(
         r#"
         SELECT member_did 
         FROM members 
@@ -16,9 +16,9 @@ pub async fn verify_group_membership(user_did: &str, convo_id: &str, db: &PgPool
         AND member_did = $2 
         AND left_at IS NULL
         "#,
-        convo_id,
-        user_did
     )
+    .bind(convo_id)
+    .bind(user_did)
     .fetch_optional(db)
     .await?;
 
@@ -35,19 +35,19 @@ pub async fn verify_group_membership(user_did: &str, convo_id: &str, db: &PgPool
 
 /// Verify that a user is the creator of a group
 pub async fn verify_group_creator(user_did: &str, convo_id: &str, db: &PgPool) -> Result<()> {
-    let conversation = sqlx::query!(
+    let conversation = sqlx::query_scalar::<_, String>(
         r#"
         SELECT creator_did 
         FROM conversations 
         WHERE id = $1
         "#,
-        convo_id
     )
+    .bind(convo_id)
     .fetch_optional(db)
     .await?;
 
     match conversation {
-        Some(convo) if convo.creator_did == user_did => Ok(()),
+        Some(creator_did) if creator_did == user_did => Ok(()),
         Some(_) => Err(anyhow!(
             "User {} is not the creator of conversation {}",
             user_did,
@@ -86,18 +86,18 @@ pub async fn verify_can_remove_members(
 /// Get the current epoch for a conversation
 pub async fn get_conversation_epoch(convo_id: &str, db: &PgPool) -> Result<i32> {
     // Get epoch from conversations table
-    let result = sqlx::query!(
+    let result = sqlx::query_scalar::<_, i32>(
         r#"
         SELECT current_epoch
         FROM conversations
         WHERE id = $1
         "#,
-        convo_id
     )
+    .bind(convo_id)
     .fetch_one(db)
     .await?;
 
-    Ok(result.current_epoch)
+    Ok(result)
 }
 
 #[cfg(test)]

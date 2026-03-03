@@ -27,9 +27,9 @@ struct DeliverWelcome<'a> {
     initial_epoch: i64,
 }
 
-const NSID: &str = "blue.catbird.mls.ds.deliverWelcome";
+const NSID: &str = "blue.catbird.mlsDS.deliverWelcome";
 
-/// POST /xrpc/blue.catbird.mls.ds.deliverWelcome
+/// POST /xrpc/blue.catbird.mlsDS.deliverWelcome
 ///
 /// Accept a Welcome message for a new member from a remote DS.
 #[tracing::instrument(skip(pool, ack_signer, auth_user, body))]

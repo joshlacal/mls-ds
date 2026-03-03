@@ -4,7 +4,10 @@ use sqlx::Row;
 use tracing::{error, info};
 
 use crate::{
-    auth::AuthUser, generated::blue_catbird::mlsChat::list_devices::ListDevicesRequest,
+    auth::AuthUser,
+    generated::blue_catbird::mlsChat::list_devices::{
+        DeviceInfo, ListDevicesOutput, ListDevicesRequest,
+    },
     storage::DbPool,
 };
 
@@ -17,7 +20,7 @@ pub async fn list_devices(
     State(pool): State<DbPool>,
     auth_user: AuthUser,
     ExtractXrpc(_input): ExtractXrpc<ListDevicesRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<ListDevicesOutput<'static>>, StatusCode> {
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -62,31 +65,30 @@ pub async fn list_devices(
         crate::crypto::redact_for_log(user_did)
     );
 
-    let devices_json: Vec<serde_json::Value> = rows
+    let devices: Vec<DeviceInfo<'static>> = rows
         .into_iter()
-        .map(|r| {
-            let mut obj = serde_json::json!({
-                "deviceId": r.get::<String, _>("device_id"),
-                "credentialDid": r.get::<String, _>("credential_did"),
-                "lastSeenAt": r.get::<chrono::DateTime<chrono::Utc>, _>("last_seen_at").to_rfc3339(),
-                "registeredAt": r.get::<chrono::DateTime<chrono::Utc>, _>("registered_at").to_rfc3339(),
-                "keyPackageCount": r.get::<i64, _>("key_package_count"),
-            });
-            if let Some(name) = r.get::<Option<String>, _>("device_name") {
-                obj["deviceName"] = serde_json::json!(name);
-            }
-            if let Some(uuid) = r.get::<Option<String>, _>("device_uuid") {
-                obj["deviceUuid"] = serde_json::json!(uuid);
-            }
-            if let Some(platform) = r.get::<Option<String>, _>("platform") {
-                obj["platform"] = serde_json::json!(platform);
-            }
-            if let Some(push_token) = r.get::<Option<String>, _>("push_token") {
-                obj["pushToken"] = serde_json::json!(push_token);
-            }
-            obj
+        .map(|r| DeviceInfo {
+            device_id: r.get::<String, _>("device_id").into(),
+            credential_did: r.get::<String, _>("credential_did").into(),
+            device_name: r
+                .get::<Option<String>, _>("device_name")
+                .unwrap_or_default()
+                .into(),
+            device_uuid: r.get::<Option<String>, _>("device_uuid").map(Into::into),
+            key_package_count: r.get::<i64, _>("key_package_count"),
+            last_seen_at: crate::sqlx_jacquard::chrono_to_datetime(
+                r.get::<chrono::DateTime<chrono::Utc>, _>("last_seen_at"),
+            ),
+            registered_at: crate::sqlx_jacquard::chrono_to_datetime(
+                r.get::<chrono::DateTime<chrono::Utc>, _>("registered_at"),
+            ),
+            push_token_registered: Some(r.get::<Option<String>, _>("push_token").is_some()),
+            extra_data: Default::default(),
         })
         .collect();
 
-    Ok(Json(serde_json::json!({ "devices": devices_json })))
+    Ok(Json(ListDevicesOutput {
+        devices,
+        extra_data: Default::default(),
+    }))
 }

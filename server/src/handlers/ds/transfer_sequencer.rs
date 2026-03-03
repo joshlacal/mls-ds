@@ -9,7 +9,7 @@ use crate::{
     storage::DbPool,
 };
 
-const NSID: &str = "blue.catbird.mls.ds.transferSequencer";
+const NSID: &str = "blue.catbird.mlsDS.transferSequencer";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -20,7 +20,7 @@ struct TransferSequencerInput {
     new_sequencer_term: u64,
 }
 
-/// POST /xrpc/blue.catbird.mls.ds.transferSequencer
+/// POST /xrpc/blue.catbird.mlsDS.transferSequencer
 ///
 /// Accept a sequencer role transfer from the current sequencer DS.
 #[tracing::instrument(skip(pool, auth_user, body))]

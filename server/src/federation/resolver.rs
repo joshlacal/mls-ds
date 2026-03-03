@@ -6,7 +6,7 @@ use tracing::{debug, info};
 use super::errors::FederationError;
 use crate::identity::{canonical_did, did_web_document_url};
 
-const PROFILE_COLLECTION: &str = "blue.catbird.mls.profile";
+const PROFILE_COLLECTION: &str = "blue.catbird.mlsChat.profile";
 const PROFILE_RKEY: &str = "self";
 
 fn profile_record_url(pds_endpoint: &str, user_did: &str) -> String {
@@ -87,7 +87,7 @@ impl DsResolver {
             return Ok(cached);
         }
 
-        // Resolve from repo record (blue.catbird.mls.profile)
+        // Resolve from repo record (blue.catbird.mlsChat.profile)
         match self.resolve_from_repo(user_did).await {
             Ok(endpoint) => {
                 self.cache_endpoint(&endpoint).await?;
@@ -173,7 +173,7 @@ impl DsResolver {
         Ok(())
     }
 
-    /// Resolve DS endpoint from the user's repo record (blue.catbird.mls.profile).
+    /// Resolve DS endpoint from the user's repo record (blue.catbird.mlsChat.profile).
     async fn resolve_from_repo(&self, user_did: &str) -> Result<DsEndpoint, FederationError> {
         let pds_endpoint = self.resolve_did_to_pds(user_did).await?;
 

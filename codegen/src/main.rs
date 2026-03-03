@@ -12,7 +12,7 @@ struct Args {
     lexdir: PathBuf,
 
     /// Output directory for generated code
-    #[arg(short, long, default_value = "../server/src/generated")]
+    #[arg(short, long, default_value = "../../catbird-atproto/src/generated")]
     outdir: PathBuf,
 }
 

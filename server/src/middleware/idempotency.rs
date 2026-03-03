@@ -395,7 +395,7 @@ mod tests {
             &Method::POST
         ));
         assert!(!should_apply(
-            "/xrpc/blue.catbird.mls.ds.deliverMessage",
+            "/xrpc/blue.catbird.mlsDS.deliverMessage",
             &Method::POST
         ));
         assert!(!should_apply(

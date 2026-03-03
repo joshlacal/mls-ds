@@ -641,10 +641,6 @@ async fn main() -> anyhow::Result<()> {
             "/xrpc/blue.catbird.mlsChat.subscribeEvents",
             get(realtime::websocket::subscribe_convo_events),
         )
-        .route(
-            "/xrpc/blue.catbird.mls.subscribeConvoEvents",
-            get(realtime::websocket::subscribe_convo_events),
-        )
         // Federation
         .route(
             "/xrpc/blue.catbird.mlsChat.requestFailover",
@@ -657,62 +653,62 @@ async fn main() -> anyhow::Result<()> {
         )
         .with_state(app_state.clone());
 
-    // DS-to-DS federation routes (Phase 1)
+    // DS-to-DS federation routes (mlsDS namespace)
     let ds_router = Router::new()
         .route(
-            "/xrpc/blue.catbird.mls.ds.deliverMessage",
+            "/xrpc/blue.catbird.mlsDS.deliverMessage",
             post(handlers::ds::deliver_message),
         )
         .route(
-            "/xrpc/blue.catbird.mls.ds.deliverWelcome",
+            "/xrpc/blue.catbird.mlsDS.deliverWelcome",
             post(handlers::ds::deliver_welcome),
         )
         .route(
-            "/xrpc/blue.catbird.mls.ds.submitCommit",
+            "/xrpc/blue.catbird.mlsDS.submitCommit",
             post(handlers::ds::submit_commit),
         )
         .route(
-            "/xrpc/blue.catbird.mls.ds.fetchKeyPackage",
+            "/xrpc/blue.catbird.mlsDS.fetchKeyPackage",
             get(handlers::ds::fetch_key_package),
         )
         .route(
-            "/xrpc/blue.catbird.mls.ds.getConvoDigest",
+            "/xrpc/blue.catbird.mlsDS.getConvoDigest",
             get(handlers::ds::get_convo_digest),
         )
         .route(
-            "/xrpc/blue.catbird.mls.ds.getConvoEvents",
+            "/xrpc/blue.catbird.mlsDS.getConvoEvents",
             get(handlers::ds::get_convo_events),
         )
         .route(
-            "/xrpc/blue.catbird.mls.ds.transferSequencer",
+            "/xrpc/blue.catbird.mlsDS.transferSequencer",
             post(handlers::ds::transfer_sequencer),
         )
         .route(
-            "/xrpc/blue.catbird.mls.ds.healthCheck",
+            "/xrpc/blue.catbird.mlsDS.healthCheck",
             get(handlers::ds::health_check),
         )
         .route(
-            "/xrpc/blue.catbird.mls.admin.getFederationPeers",
+            "/xrpc/blue.catbird.mlsDS.getFederationPeers",
             get(handlers::get_federation_peers),
         )
         .route(
-            "/xrpc/blue.catbird.mls.admin.upsertFederationPeer",
+            "/xrpc/blue.catbird.mlsDS.upsertFederationPeer",
             post(handlers::upsert_federation_peer),
         )
         .route(
-            "/xrpc/blue.catbird.mls.admin.deleteFederationPeer",
+            "/xrpc/blue.catbird.mlsDS.deleteFederationPeer",
             post(handlers::delete_federation_peer),
         )
         .route(
-            "/xrpc/blue.catbird.mls.admin.getFederationMode",
+            "/xrpc/blue.catbird.mlsDS.getFederationMode",
             get(handlers::get_federation_mode),
         )
         .route(
-            "/xrpc/blue.catbird.mls.admin.setFederationMode",
+            "/xrpc/blue.catbird.mlsDS.setFederationMode",
             post(handlers::set_federation_mode),
         )
         .route(
-            "/xrpc/blue.catbird.mls.resolveDeliveryService",
+            "/xrpc/blue.catbird.mlsDS.resolveDeliveryService",
             get(handlers::resolve_delivery_service::resolve),
         )
         .with_state(app_state.clone());

@@ -7,8 +7,8 @@ use crate::{
     federation::FederationMode,
 };
 
-const GET_MODE_NSID: &str = "blue.catbird.mls.admin.getFederationMode";
-const SET_MODE_NSID: &str = "blue.catbird.mls.admin.setFederationMode";
+const GET_MODE_NSID: &str = "blue.catbird.mlsDS.getFederationMode";
+const SET_MODE_NSID: &str = "blue.catbird.mlsDS.setFederationMode";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

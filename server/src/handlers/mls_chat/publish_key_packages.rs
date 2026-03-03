@@ -11,8 +11,12 @@ use jacquard_axum::ExtractXrpc;
 use tracing::{error, info, warn};
 
 use crate::{
-    auth::AuthUser, device_utils::parse_device_did,
-    generated::blue_catbird::mlsChat::publish_key_packages::PublishKeyPackagesRequest,
+    auth::AuthUser,
+    device_utils::parse_device_did,
+    generated::blue_catbird::mlsChat::publish_key_packages::{
+        BatchError, KeyPackageStats, PublishKeyPackagesOutput, PublishKeyPackagesRequest,
+        PublishResult, SyncResult,
+    },
     storage::DbPool,
 };
 
@@ -26,7 +30,7 @@ const RATE_LIMIT_WINDOW_HOURS: i64 = 1;
 
 /// Build the `stats` object matching the lexicon `#keyPackageStats` shape:
 /// `{ published, available, expired }`
-async fn build_stats(pool: &DbPool, did: &str) -> Result<serde_json::Value, StatusCode> {
+async fn build_stats(pool: &DbPool, did: &str) -> Result<KeyPackageStats<'static>, StatusCode> {
     let (user_did, _) = parse_device_did(did).map_err(|e| {
         error!("Invalid DID format for stats: {}", e);
         StatusCode::BAD_REQUEST
@@ -65,11 +69,12 @@ async fn build_stats(pool: &DbPool, did: &str) -> Result<serde_json::Value, Stat
 
     let published = total; // "total ever published" = total rows
 
-    Ok(serde_json::json!({
-        "published": published,
-        "available": available,
-        "expired": expired,
-    }))
+    Ok(KeyPackageStats {
+        published,
+        available,
+        expired,
+        extra_data: Default::default(),
+    })
 }
 
 // ─── Inline action handlers ───
@@ -80,7 +85,7 @@ async fn handle_publish(
     input: &crate::generated::blue_catbird::mlsChat::publish_key_packages::PublishKeyPackages<'_>,
     user_did: &str,
     device_id: &str,
-) -> Result<serde_json::Value, StatusCode> {
+) -> Result<PublishResult<'static>, StatusCode> {
     let items = input.key_packages.as_ref().ok_or_else(|| {
         warn!("publish action requires keyPackages");
         StatusCode::BAD_REQUEST
@@ -143,7 +148,12 @@ async fn handle_publish(
 
     info!("Key package published successfully");
 
-    Ok(serde_json::json!({ "succeeded": 1, "failed": 0 }))
+    Ok(PublishResult {
+        succeeded: 1,
+        failed: 0,
+        errors: None,
+        extra_data: Default::default(),
+    })
 }
 
 /// Handle "publishBatch" action — validate and store multiple key packages.
@@ -153,7 +163,7 @@ async fn handle_publish_batch(
     input: &crate::generated::blue_catbird::mlsChat::publish_key_packages::PublishKeyPackages<'_>,
     user_did: &str,
     device_id: &str,
-) -> Result<serde_json::Value, StatusCode> {
+) -> Result<PublishResult<'static>, StatusCode> {
     let items = input.key_packages.as_ref().ok_or_else(|| {
         warn!("publishBatch action requires keyPackages");
         StatusCode::BAD_REQUEST
@@ -307,38 +317,55 @@ async fn handle_publish_batch(
     info!("Publishing batch of {} key packages", items.len());
 
     // Validate all packages first (fail fast)
-    let mut errors: Vec<serde_json::Value> = Vec::new();
+    let mut errors: Vec<BatchError<'static>> = Vec::new();
     let mut failed: i64 = 0;
 
     for (idx, item) in items.iter().enumerate() {
         if item.key_package.is_empty() {
-            errors.push(serde_json::json!({ "index": idx, "error": "Empty key_package" }));
+            errors.push(BatchError {
+                index: idx as i64,
+                error: "Empty key_package".into(),
+                extra_data: Default::default(),
+            });
             failed += 1;
             continue;
         }
         if item.cipher_suite.is_empty() {
-            errors.push(serde_json::json!({ "index": idx, "error": "Empty cipher_suite" }));
+            errors.push(BatchError {
+                index: idx as i64,
+                error: "Empty cipher_suite".into(),
+                extra_data: Default::default(),
+            });
             failed += 1;
             continue;
         }
         if *item.expires.as_ref() <= now.fixed_offset() {
-            errors.push(serde_json::json!({ "index": idx, "error": "Expiration is in the past" }));
+            errors.push(BatchError {
+                index: idx as i64,
+                error: "Expiration is in the past".into(),
+                extra_data: Default::default(),
+            });
             failed += 1;
             continue;
         }
         if STANDARD.decode(item.key_package.as_ref()).is_err() {
-            errors.push(serde_json::json!({ "index": idx, "error": "Invalid base64 encoding" }));
+            errors.push(BatchError {
+                index: idx as i64,
+                error: "Invalid base64 encoding".into(),
+                extra_data: Default::default(),
+            });
             failed += 1;
         }
     }
 
     if !errors.is_empty() {
         warn!("Batch validation failed: {} errors", errors.len());
-        return Ok(serde_json::json!({
-            "succeeded": 0,
-            "failed": failed,
-            "errors": errors,
-        }));
+        return Ok(PublishResult {
+            succeeded: 0,
+            failed,
+            errors: Some(errors),
+            extra_data: Default::default(),
+        });
     }
 
     // Process all packages
@@ -353,14 +380,20 @@ async fn handle_publish_batch(
         let key_data = match STANDARD.decode(item.key_package.as_ref()) {
             Ok(data) if !data.is_empty() => data,
             Ok(_) => {
-                errors.push(
-                    serde_json::json!({ "index": idx, "error": "Decoded key package is empty" }),
-                );
+                errors.push(BatchError {
+                    index: idx as i64,
+                    error: "Decoded key package is empty".into(),
+                    extra_data: Default::default(),
+                });
                 failed += 1;
                 continue;
             }
             Err(e) => {
-                errors.push(serde_json::json!({ "index": idx, "error": format!("Failed to decode base64: {}", e) }));
+                errors.push(BatchError {
+                    index: idx as i64,
+                    error: format!("Failed to decode base64: {}", e).into(),
+                    extra_data: Default::default(),
+                });
                 failed += 1;
                 continue;
             }
@@ -382,7 +415,11 @@ async fn handle_publish_batch(
             Ok(false) => {}
             Err(e) => {
                 error!("Failed to check key package duplicate {}: {}", idx, e);
-                errors.push(serde_json::json!({ "index": idx, "error": format!("Database error: {}", e) }));
+                errors.push(BatchError {
+                    index: idx as i64,
+                    error: format!("Database error: {}", e).into(),
+                    extra_data: Default::default(),
+                });
                 failed += 1;
                 continue;
             }
@@ -402,9 +439,11 @@ async fn handle_publish_batch(
             Ok(_) => succeeded += 1,
             Err(e) => {
                 error!("Failed to store key package {}: {}", idx, e);
-                errors.push(
-                    serde_json::json!({ "index": idx, "error": format!("Database error: {}", e) }),
-                );
+                errors.push(BatchError {
+                    index: idx as i64,
+                    error: format!("Database error: {}", e).into(),
+                    extra_data: Default::default(),
+                });
                 failed += 1;
             }
         }
@@ -415,14 +454,12 @@ async fn handle_publish_batch(
         succeeded, failed
     );
 
-    let mut result = serde_json::json!({
-        "succeeded": succeeded,
-        "failed": failed,
-    });
-    if !errors.is_empty() {
-        result["errors"] = serde_json::json!(errors);
-    }
-    Ok(result)
+    Ok(PublishResult {
+        succeeded,
+        failed,
+        errors: if errors.is_empty() { None } else { Some(errors) },
+        extra_data: Default::default(),
+    })
 }
 
 /// Handle "sync" action — reconcile local/server key package state for a device.
@@ -432,7 +469,7 @@ async fn handle_sync(
     user_did: &str,
     raw_device_id: &str,
     bucketed_device_id: &str,
-) -> Result<serde_json::Value, StatusCode> {
+) -> Result<SyncResult<'static>, StatusCode> {
     let local_hashes_cow = input.local_hashes.as_ref().ok_or_else(|| {
         warn!("sync action requires localHashes");
         StatusCode::BAD_REQUEST
@@ -494,13 +531,15 @@ async fn handle_sync(
             "✅ [sync] No orphaned key packages found for device {}",
             raw_device_id
         );
-        return Ok(serde_json::json!({
-            "serverHashes": server_hashes,
-            "orphanedCount": 0,
-            "deletedCount": 0,
-            "remainingAvailable": server_hashes.len() as i64,
-            "deviceId": raw_device_id,
-        }));
+        let count = server_hashes.len() as i64;
+        return Ok(SyncResult {
+            server_hashes: server_hashes.into_iter().map(|s| s.into()).collect(),
+            orphaned_count: 0,
+            deleted_count: 0,
+            remaining_available: Some(count),
+            device_id: raw_device_id.to_string().into(),
+            extra_data: Default::default(),
+        });
     }
 
     warn!(
@@ -615,13 +654,14 @@ async fn handle_sync(
         raw_device_id, deleted_count, remaining.0
     );
 
-    Ok(serde_json::json!({
-        "serverHashes": remaining_hashes,
-        "orphanedCount": orphaned_count,
-        "deletedCount": deleted_count,
-        "remainingAvailable": remaining.0,
-        "deviceId": raw_device_id,
-    }))
+    Ok(SyncResult {
+        server_hashes: remaining_hashes.into_iter().map(|s| s.into()).collect(),
+        orphaned_count,
+        deleted_count,
+        remaining_available: Some(remaining.0),
+        device_id: raw_device_id.to_string().into(),
+        extra_data: Default::default(),
+    })
 }
 
 // ─── POST handler ───
@@ -637,7 +677,7 @@ pub async fn publish_key_packages_post(
     headers: HeaderMap,
     auth_user: AuthUser,
     ExtractXrpc(input): ExtractXrpc<PublishKeyPackagesRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<PublishKeyPackagesOutput<'static>>, StatusCode> {
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -682,37 +722,46 @@ pub async fn publish_key_packages_post(
                 handle_publish(&pool, &input, &user_did, &device_id).await?
             };
             let stats = build_stats(&pool, &did).await?;
-            Ok(Json(serde_json::json!({
-                "stats": stats,
-                "publishResult": publish_result,
-            })))
+            Ok(Json(PublishKeyPackagesOutput {
+                stats,
+                publish_result: Some(publish_result),
+                sync_result: None,
+                extra_data: Default::default(),
+            }))
         }
 
         "publishBatch" => {
             let publish_result =
                 handle_publish_batch(&pool, &headers, &input, &user_did, &device_id).await?;
             let stats = build_stats(&pool, &did).await?;
-            Ok(Json(serde_json::json!({
-                "stats": stats,
-                "publishResult": publish_result,
-            })))
+            Ok(Json(PublishKeyPackagesOutput {
+                stats,
+                publish_result: Some(publish_result),
+                sync_result: None,
+                extra_data: Default::default(),
+            }))
         }
 
         "sync" => {
             let sync_result =
                 handle_sync(&pool, &input, &user_did, &raw_device_id, &device_id).await?;
             let stats = build_stats(&pool, &did).await?;
-            Ok(Json(serde_json::json!({
-                "stats": stats,
-                "syncResult": sync_result,
-            })))
+            Ok(Json(PublishKeyPackagesOutput {
+                stats,
+                publish_result: None,
+                sync_result: Some(sync_result),
+                extra_data: Default::default(),
+            }))
         }
 
         "stats" => {
             let stats = build_stats(&pool, &did).await?;
-            Ok(Json(serde_json::json!({
-                "stats": stats,
-            })))
+            Ok(Json(PublishKeyPackagesOutput {
+                stats,
+                publish_result: None,
+                sync_result: None,
+                extra_data: Default::default(),
+            }))
         }
 
         unknown => {

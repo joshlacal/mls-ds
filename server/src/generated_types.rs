@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 // =============================================================================
-// blue.catbird.mls.defs - Shared type definitions
+// blue.catbird.mlsChat.defs - Shared type definitions
 // =============================================================================
 
 /// MLS conversation view with member and epoch information
@@ -157,7 +157,7 @@ pub struct KeyPackageRef {
 }
 
 // =============================================================================
-// blue.catbird.mls.message.defs - Message payload definitions
+// blue.catbird.mlsChat.message.defs - Message payload definitions
 // =============================================================================
 
 /// Decrypted message payload structure (what's inside the encrypted ciphertext)
@@ -187,11 +187,11 @@ pub struct PayloadView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "$type")]
 pub enum MessageEmbed {
-    #[serde(rename = "blue.catbird.mls.message.defs#recordEmbed")]
+    #[serde(rename = "blue.catbird.mlsChat.message.defs#recordEmbed")]
     Record(RecordEmbed),
-    #[serde(rename = "blue.catbird.mls.message.defs#linkEmbed")]
+    #[serde(rename = "blue.catbird.mlsChat.message.defs#linkEmbed")]
     Link(LinkEmbed),
-    #[serde(rename = "blue.catbird.mls.message.defs#gifEmbed")]
+    #[serde(rename = "blue.catbird.mlsChat.message.defs#gifEmbed")]
     Gif(GifEmbed),
 }
 
@@ -287,7 +287,7 @@ pub struct AdminAction {
 }
 
 // =============================================================================
-// blue.catbird.mls.createConvo
+// blue.catbird.mlsChat.createConvo
 // =============================================================================
 
 #[derive(Debug, Deserialize)]
@@ -337,7 +337,7 @@ pub struct KeyPackageHashEntry {
 // Output is ConvoView
 
 // =============================================================================
-// blue.catbird.mls.getConvos
+// blue.catbird.mlsChat.getConvos
 // =============================================================================
 
 #[derive(Debug, Deserialize)]
@@ -362,7 +362,7 @@ pub struct GetConvosOutput {
 }
 
 // =============================================================================
-// blue.catbird.mls.addMembers
+// blue.catbird.mlsChat.addMembers
 // =============================================================================
 
 #[derive(Debug, Deserialize)]
@@ -396,7 +396,7 @@ pub struct AddMembersOutput {
 }
 
 // =============================================================================
-// blue.catbird.mls.leaveConvo
+// blue.catbird.mlsChat.leaveConvo
 // =============================================================================
 
 #[derive(Debug, Deserialize)]
@@ -422,7 +422,7 @@ pub struct LeaveConvoOutput {
 }
 
 // =============================================================================
-// blue.catbird.mls.sendMessage
+// blue.catbird.mlsChat.sendMessage
 // =============================================================================
 
 #[derive(Debug, Deserialize)]
@@ -458,7 +458,7 @@ pub struct SendMessageOutput {
 }
 
 // =============================================================================
-// blue.catbird.mls.getMessages
+// blue.catbird.mlsChat.getMessages
 // =============================================================================
 
 #[derive(Debug, Deserialize)]
@@ -485,7 +485,7 @@ pub struct GetMessagesOutput {
 }
 
 // =============================================================================
-// blue.catbird.mls.publishKeyPackage
+// blue.catbird.mlsChat.publishKeyPackage
 // =============================================================================
 
 #[derive(Debug, Deserialize)]
@@ -506,7 +506,7 @@ pub struct PublishKeyPackageInput {
 pub struct PublishKeyPackageOutput {}
 
 // =============================================================================
-// blue.catbird.mls.getKeyPackages
+// blue.catbird.mlsChat.getKeyPackages
 // =============================================================================
 
 #[derive(Debug, Deserialize)]
@@ -530,7 +530,7 @@ pub struct GetKeyPackagesOutput {
 }
 
 // =============================================================================
-// blue.catbird.mls.getKeyPackageStats
+// blue.catbird.mlsChat.getKeyPackageStats
 // =============================================================================
 
 #[derive(Debug, Deserialize)]
@@ -574,7 +574,7 @@ pub struct CipherSuiteStats {
 }
 
 // =============================================================================
-// blue.catbird.mls.registerDevice
+// blue.catbird.mlsChat.registerDevice
 // =============================================================================
 
 #[derive(Debug, Deserialize)]
@@ -613,7 +613,7 @@ pub struct WelcomeMessageRef {
 }
 
 // =============================================================================
-// blue.catbird.mls.promoteAdmin
+// blue.catbird.mlsChat.promoteAdmin
 // =============================================================================
 
 #[derive(Debug, Deserialize)]
@@ -635,7 +635,7 @@ pub struct PromoteAdminOutput {
 }
 
 // =============================================================================
-// blue.catbird.mls.demoteAdmin
+// blue.catbird.mlsChat.demoteAdmin
 // =============================================================================
 
 #[derive(Debug, Deserialize)]
@@ -655,7 +655,7 @@ pub struct DemoteAdminOutput {
 }
 
 // =============================================================================
-// blue.catbird.mls.removeMember
+// blue.catbird.mlsChat.removeMember
 // =============================================================================
 
 #[derive(Debug, Deserialize)]
@@ -683,7 +683,7 @@ pub struct RemoveMemberOutput {
 }
 
 // =============================================================================
-// blue.catbird.mls.reportMember
+// blue.catbird.mlsChat.reportMember
 // =============================================================================
 
 #[derive(Debug, Deserialize)]
@@ -713,7 +713,7 @@ pub struct ReportMemberOutput {
 }
 
 // =============================================================================
-// blue.catbird.mls.getReports
+// blue.catbird.mlsChat.getReports
 // =============================================================================
 
 #[derive(Debug, Deserialize)]
@@ -761,7 +761,7 @@ pub struct ReportView {
 }
 
 // =============================================================================
-// blue.catbird.mls.resolveReport
+// blue.catbird.mlsChat.resolveReport
 // =============================================================================
 
 #[derive(Debug, Deserialize)]
@@ -784,7 +784,7 @@ pub struct ResolveReportOutput {
 }
 
 // =============================================================================
-// blue.catbird.mls.checkBlocks
+// blue.catbird.mlsChat.checkBlocks
 // =============================================================================
 
 #[derive(Debug, Deserialize)]
@@ -818,7 +818,7 @@ pub struct BlockRelationship {
 }
 
 // =============================================================================
-// blue.catbird.mls.handleBlockChange
+// blue.catbird.mlsChat.handleBlockChange
 // =============================================================================
 
 #[derive(Debug, Deserialize)]
@@ -857,7 +857,7 @@ pub struct AffectedConvo {
 }
 
 // =============================================================================
-// blue.catbird.mls.getBlockStatus
+// blue.catbird.mlsChat.getBlockStatus
 // =============================================================================
 
 #[derive(Debug, Deserialize)]
@@ -884,7 +884,7 @@ pub struct GetBlockStatusOutput {
 }
 
 // =============================================================================
-// blue.catbird.mls.getAdminStats
+// blue.catbird.mlsChat.getAdminStats
 // =============================================================================
 
 #[derive(Debug, Deserialize)]
@@ -953,7 +953,7 @@ pub struct ReportCategoryCounts {
 }
 
 // =============================================================================
-// blue.catbird.mls.rejoin
+// blue.catbird.mlsChat.rejoin
 // =============================================================================
 
 #[derive(Debug, Deserialize)]
@@ -981,7 +981,7 @@ pub struct RejoinOutput {
 }
 
 // =============================================================================
-// blue.catbird.mls.getEpoch
+// blue.catbird.mlsChat.getEpoch
 // =============================================================================
 
 #[derive(Debug, Deserialize)]
@@ -1001,7 +1001,7 @@ pub struct GetEpochOutput {
 }
 
 // =============================================================================
-// blue.catbird.mls.getCommits
+// blue.catbird.mlsChat.getCommits
 // =============================================================================
 
 #[derive(Debug, Deserialize)]
@@ -1040,7 +1040,7 @@ pub struct CommitMessage {
 }
 
 // =============================================================================
-// blue.catbird.mls.getWelcome
+// blue.catbird.mlsChat.getWelcome
 // =============================================================================
 
 #[derive(Debug, Deserialize)]
@@ -1060,7 +1060,7 @@ pub struct GetWelcomeOutput {
 }
 
 // =============================================================================
-// blue.catbird.mls.confirmWelcome
+// blue.catbird.mlsChat.confirmWelcome
 // =============================================================================
 
 #[derive(Debug, Deserialize)]
@@ -1083,7 +1083,7 @@ pub struct ConfirmWelcomeOutput {
 }
 
 // =============================================================================
-// blue.catbird.mls.subscribeConvoEvents
+// blue.catbird.mlsChat.subscribeEvents
 // =============================================================================
 
 #[derive(Debug, Deserialize)]
@@ -1101,13 +1101,13 @@ pub struct SubscribeConvoEventsParams {
 #[derive(Debug, Serialize)]
 #[serde(tag = "$type")]
 pub enum ConvoEvent {
-    #[serde(rename = "blue.catbird.mls.subscribeConvoEvents#messageEvent")]
+    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#messageEvent")]
     Message(MessageEvent),
-    #[serde(rename = "blue.catbird.mls.subscribeConvoEvents#reactionEvent")]
+    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#reactionEvent")]
     Reaction(ReactionEvent),
-    #[serde(rename = "blue.catbird.mls.subscribeConvoEvents#typingEvent")]
+    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#typingEvent")]
     Typing(TypingEvent),
-    #[serde(rename = "blue.catbird.mls.subscribeConvoEvents#infoEvent")]
+    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#infoEvent")]
     Info(InfoEvent),
 }
 

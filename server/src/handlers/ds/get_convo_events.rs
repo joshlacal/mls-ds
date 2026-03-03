@@ -6,7 +6,7 @@ use crate::{auth::AuthUser, federation::FederationError, storage::DbPool};
 
 use super::get_convo_digest::authorize_convo_read;
 
-const NSID: &str = "blue.catbird.mls.ds.getConvoEvents";
+const NSID: &str = "blue.catbird.mlsDS.getConvoEvents";
 const DEFAULT_LIMIT: i64 = 200;
 const MAX_LIMIT: i64 = 1000;
 
@@ -51,7 +51,7 @@ struct EventRow {
     created_at: DateTime<Utc>,
 }
 
-/// GET /xrpc/blue.catbird.mls.ds.getConvoEvents
+/// GET /xrpc/blue.catbird.mlsDS.getConvoEvents
 #[tracing::instrument(skip(pool, auth_user, query))]
 pub async fn get_convo_events(
     State(pool): State<DbPool>,

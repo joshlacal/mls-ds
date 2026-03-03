@@ -1,6 +1,7 @@
 use axum::{
     extract::{RawQuery, State},
     http::StatusCode,
+    response::IntoResponse,
     Json,
 };
 use chrono::{DateTime, Utc};
@@ -35,7 +36,7 @@ pub async fn get_convos(
     auth_user: AuthUser,
     RawQuery(extra_query): RawQuery,
     ExtractXrpc(params): ExtractXrpc<GetConvosRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<axum::response::Response, StatusCode> {
     let extra_query_str = extra_query.as_deref().unwrap_or("");
 
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
@@ -70,14 +71,16 @@ pub async fn get_convos(
     }
 
     match filter {
-        "all" => handle_all(&pool, did).await,
+        "all" => Ok(handle_all(&pool, did).await?.into_response()),
         "pending" => {
             let cursor = params.cursor.map(|c| c.to_string());
             let limit = params.limit;
             let status = status.unwrap_or_else(|| "pending".to_string());
-            handle_pending(&pool, did, cursor, limit, &status).await
+            Ok(handle_pending(&pool, did, cursor, limit, &status)
+                .await?
+                .into_response())
         }
-        "expected" => handle_expected(&pool, did, device_id).await,
+        "expected" => Ok(handle_expected(&pool, did, device_id).await?.into_response()),
         other => {
             error!("❌ [v2.getConvos] Unknown filter: {}", other);
             Err(StatusCode::BAD_REQUEST)
@@ -89,7 +92,10 @@ pub async fn get_convos(
 // filter="all" — inline of v1 get_convos
 // ---------------------------------------------------------------------------
 
-async fn handle_all(pool: &DbPool, did: &str) -> Result<Json<serde_json::Value>, StatusCode> {
+async fn handle_all(
+    pool: &DbPool,
+    did: &str,
+) -> Result<Json<crate::generated::blue_catbird::mlsChat::get_convos::GetConvosOutput<'static>>, StatusCode> {
     // Get all active memberships (matches user_did, member_did, or device-suffixed member_did)
     let memberships = sqlx::query_as::<_, Membership>(
         r#"
@@ -168,14 +174,13 @@ async fn handle_all(pool: &DbPool, did: &str) -> Result<Json<serde_json::Value>,
 
     info!("✅ [v2.getConvos] Found {} conversations", convos.len());
 
-    let output = crate::generated::blue_catbird::mlsChat::get_convos::GetConvosOutput {
+    Ok(Json(crate::generated::blue_catbird::mlsChat::get_convos::GetConvosOutput {
         conversations: convos,
         cursor: None,
         pending_count: None,
         request_count: None,
         extra_data: Default::default(),
-    };
-    Ok(Json(serde_json::to_value(output).unwrap()))
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -339,7 +344,7 @@ async fn handle_expected(
     pool: &DbPool,
     user_did: &str,
     device_id_param: Option<String>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<crate::generated::blue_catbird::mlsChat::get_convos::GetConvosOutput<'static>>, StatusCode> {
     let _device_id = device_id_param.or_else(|| {
         if user_did.contains('#') {
             user_did.split('#').nth(1).map(|s| s.to_string())
@@ -434,12 +439,11 @@ async fn handle_expected(
 
     info!("✅ [v2.getConvos] Expected: {} convos", convos.len(),);
 
-    let output = crate::generated::blue_catbird::mlsChat::get_convos::GetConvosOutput {
+    Ok(Json(crate::generated::blue_catbird::mlsChat::get_convos::GetConvosOutput {
         conversations: convos,
         cursor: None,
         pending_count: None,
         request_count: None,
         extra_data: Default::default(),
-    };
-    Ok(Json(serde_json::to_value(output).unwrap()))
+    }))
 }

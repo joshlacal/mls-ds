@@ -4,10 +4,10 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-// blue.catbird.mls.defs#cipherSuiteEnum
+// blue.catbird.mlsChat.defs#cipherSuiteEnum
 pub type CipherSuite = String;
 
-// blue.catbird.mls.defs#blobRef
+// blue.catbird.mlsChat.defs#blobRef
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlobRef {
     pub cid: String,
@@ -19,7 +19,7 @@ pub struct BlobRef {
     pub ref_uri: Option<String>,
 }
 
-// blue.catbird.mls.defs#memberView
+// blue.catbird.mlsChat.defs#memberView
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemberView {
     pub did: String,
@@ -32,7 +32,7 @@ pub struct MemberView {
     pub credential: Option<String>,
 }
 
-// blue.catbird.mls.defs#convoView metadata
+// blue.catbird.mlsChat.defs#convoView metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConvoMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -43,7 +43,7 @@ pub struct ConvoMetadata {
     pub avatar: Option<BlobRef>,
 }
 
-// blue.catbird.mls.defs#convoView
+// blue.catbird.mlsChat.defs#convoView
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConvoView {
     pub id: String,
@@ -63,7 +63,7 @@ pub struct ConvoView {
     pub metadata: Option<ConvoMetadata>,
 }
 
-// blue.catbird.mls.createConvo input metadata
+// blue.catbird.mlsChat.createConvo input metadata
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreateConvoMetadataInput {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -74,7 +74,7 @@ pub struct CreateConvoMetadataInput {
     pub avatar: Option<Vec<u8>>, // Blob data
 }
 
-// blue.catbird.mls.createConvo input
+// blue.catbird.mlsChat.createConvo input
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreateConvoInput {
     #[serde(rename = "cipherSuite")]
@@ -86,7 +86,7 @@ pub struct CreateConvoInput {
     pub metadata: Option<CreateConvoMetadataInput>,
 }
 
-// blue.catbird.mls.getConvos output
+// blue.catbird.mlsChat.getConvos output
 #[derive(Debug, Clone, Serialize)]
 pub struct GetConvosOutput {
     pub conversations: Vec<ConvoView>,
@@ -94,7 +94,7 @@ pub struct GetConvosOutput {
     pub cursor: Option<String>,
 }
 
-// blue.catbird.mls.defs#messageView
+// blue.catbird.mlsChat.defs#messageView
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageView {
     pub id: String,
@@ -112,7 +112,7 @@ pub struct MessageView {
     pub attachments: Option<Vec<BlobRef>>,
 }
 
-// blue.catbird.mls.sendMessage input
+// blue.catbird.mlsChat.sendMessage input
 #[derive(Debug, Clone, Deserialize)]
 pub struct SendMessageInput {
     #[serde(rename = "convoId")]
@@ -130,7 +130,7 @@ pub struct SendMessageInput {
     pub idempotency_key: Option<String>,
 }
 
-// blue.catbird.mls.sendMessage output
+// blue.catbird.mlsChat.sendMessage output
 #[derive(Debug, Clone, Serialize)]
 pub struct SendMessageOutput {
     #[serde(rename = "messageId")]
@@ -139,7 +139,7 @@ pub struct SendMessageOutput {
     pub received_at: DateTime<Utc>,
 }
 
-// blue.catbird.mls.getMessages output
+// blue.catbird.mlsChat.getMessages output
 #[derive(Debug, Clone, Serialize)]
 pub struct GetMessagesOutput {
     pub messages: Vec<MessageView>,
@@ -147,7 +147,7 @@ pub struct GetMessagesOutput {
     pub cursor: Option<String>,
 }
 
-// blue.catbird.mls.addMembers input
+// blue.catbird.mlsChat.addMembers input
 #[derive(Debug, Clone, Deserialize)]
 pub struct AddMembersInput {
     #[serde(rename = "convoId")]
@@ -160,7 +160,7 @@ pub struct AddMembersInput {
     pub welcome: Option<String>,
 }
 
-// blue.catbird.mls.addMembers output
+// blue.catbird.mlsChat.addMembers output
 #[derive(Debug, Clone, Serialize)]
 pub struct AddMembersOutput {
     pub success: bool,
@@ -168,7 +168,7 @@ pub struct AddMembersOutput {
     pub new_epoch: i32,
 }
 
-// blue.catbird.mls.leaveConvo input
+// blue.catbird.mlsChat.leaveConvo input
 #[derive(Debug, Clone, Deserialize)]
 pub struct LeaveConvoInput {
     #[serde(rename = "convoId")]
@@ -180,7 +180,7 @@ pub struct LeaveConvoInput {
     pub commit: Option<String>,
 }
 
-// blue.catbird.mls.leaveConvo output
+// blue.catbird.mlsChat.leaveConvo output
 #[derive(Debug, Clone, Serialize)]
 pub struct LeaveConvoOutput {
     pub success: bool,
@@ -188,7 +188,7 @@ pub struct LeaveConvoOutput {
     pub new_epoch: i32,
 }
 
-// blue.catbird.mls.defs#keyPackageRef
+// blue.catbird.mlsChat.defs#keyPackageRef
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeyPackageRef {
     pub id: String,
@@ -204,7 +204,7 @@ pub struct KeyPackageRef {
     pub expires_at: Option<DateTime<Utc>>,
 }
 
-// blue.catbird.mls.publishKeyPackage input
+// blue.catbird.mlsChat.publishKeyPackage input
 #[derive(Debug, Clone, Deserialize)]
 pub struct PublishKeyPackageInput {
     #[serde(rename = "keyPackage")]
@@ -214,20 +214,20 @@ pub struct PublishKeyPackageInput {
     pub expires: DateTime<Utc>,
 }
 
-// blue.catbird.mls.getKeyPackages output
+// blue.catbird.mlsChat.getKeyPackages output
 #[derive(Debug, Clone, Serialize)]
 pub struct GetKeyPackagesOutput {
     #[serde(rename = "keyPackages")]
     pub key_packages: Vec<KeyPackageRef>,
 }
 
-// blue.catbird.mls.uploadBlob output
+// blue.catbird.mlsChat.uploadBlob output
 #[derive(Debug, Clone, Serialize)]
 pub struct UploadBlobOutput {
     pub blob: BlobRef,
 }
 
-// blue.catbird.mls.getKeyPackageStats output
+// blue.catbird.mlsChat.getKeyPackageStats output
 #[derive(Debug, Clone, Serialize)]
 pub struct GetKeyPackageStatsOutput {
     pub available: i32,
@@ -242,7 +242,7 @@ pub struct GetKeyPackageStatsOutput {
     pub by_cipher_suite: Option<Vec<KeyPackageStatsByCipherSuite>>,
 }
 
-// blue.catbird.mls.getKeyPackageStats cipher suite breakdown
+// blue.catbird.mlsChat.getKeyPackageStats cipher suite breakdown
 #[derive(Debug, Clone, Serialize)]
 pub struct KeyPackageStatsByCipherSuite {
     #[serde(rename = "cipherSuite")]

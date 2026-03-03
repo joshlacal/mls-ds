@@ -8,7 +8,7 @@ use crate::{
     auth::AuthUser, federation::FederationError, identity::canonical_did, storage::DbPool,
 };
 
-const NSID: &str = "blue.catbird.mls.ds.getConvoDigest";
+const NSID: &str = "blue.catbird.mlsDS.getConvoDigest";
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -102,7 +102,7 @@ pub(super) async fn authorize_convo_read(
     })
 }
 
-/// GET /xrpc/blue.catbird.mls.ds.getConvoDigest
+/// GET /xrpc/blue.catbird.mlsDS.getConvoDigest
 #[tracing::instrument(skip(pool, auth_user, query))]
 pub async fn get_convo_digest(
     State(pool): State<DbPool>,

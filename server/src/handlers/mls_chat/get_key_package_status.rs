@@ -4,8 +4,12 @@ use sqlx::Row;
 use tracing::{error, info, warn};
 
 use crate::{
-    auth::AuthUser, device_utils::parse_device_did,
-    generated::blue_catbird::mlsChat::get_key_package_status::GetKeyPackageStatusRequest,
+    auth::AuthUser,
+    device_utils::parse_device_did,
+    generated::blue_catbird::mlsChat::get_key_package_status::{
+        GetKeyPackageStatusOutput, GetKeyPackageStatusRequest, KeyPackageHistoryItem,
+        KeyPackageStats, KeyPackageStatusItem,
+    },
     storage::DbPool,
 };
 
@@ -18,7 +22,7 @@ pub async fn get_key_package_status(
     State(pool): State<DbPool>,
     auth_user: AuthUser,
     ExtractXrpc(input): ExtractXrpc<GetKeyPackageStatusRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<GetKeyPackageStatusOutput<'static>>, StatusCode> {
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -45,7 +49,7 @@ pub async fn get_key_package_status(
         .map(|s| s.trim())
         .collect();
 
-    let mut result = serde_json::Map::new();
+    let mut output = GetKeyPackageStatusOutput::default();
 
     for section in &sections {
         match *section {
@@ -71,9 +75,9 @@ pub async fn get_key_package_status(
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
 
-                let total: i64 = if let Some(ref suite) = cipher_suite {
+                let consumed: i64 = if let Some(ref suite) = cipher_suite {
                     sqlx::query_scalar(
-                        "SELECT COUNT(*) FROM key_packages WHERE owner_did = $1 AND cipher_suite = $2",
+                        "SELECT COUNT(*) FROM key_packages WHERE owner_did = $1 AND cipher_suite = $2 AND consumed_at IS NOT NULL",
                     )
                     .bind(&did)
                     .bind(suite)
@@ -81,55 +85,35 @@ pub async fn get_key_package_status(
                     .await
                 } else {
                     sqlx::query_scalar(
-                        "SELECT COUNT(*) FROM key_packages WHERE owner_did = $1",
+                        "SELECT COUNT(*) FROM key_packages WHERE owner_did = $1 AND consumed_at IS NOT NULL",
                     )
                     .bind(&did)
                     .fetch_one(&pool)
                     .await
                 }
                 .map_err(|e| {
-                    error!("Failed to count total key packages: {}", e);
+                    error!("Failed to count consumed key packages: {}", e);
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
-
-                let expired: i64 = sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM key_packages WHERE owner_did = $1 AND consumed_at IS NULL AND expires_at <= NOW()",
-                )
-                .bind(&did)
-                .fetch_one(&pool)
-                .await
-                .map_err(|e| {
-                    error!("Failed to count expired key packages: {}", e);
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?;
-
-                let consumed = total - available - expired;
-                let threshold = 5;
-                let needs_replenish = available < threshold;
 
                 info!(
-                    "Key package stats: available={}, total={}, expired={}",
-                    available, total, expired
+                    "Key package stats: available={}, consumed={}",
+                    available, consumed
                 );
 
-                result.insert(
-                    "stats".to_string(),
-                    serde_json::json!({
-                        "available": available,
-                        "total": total,
-                        "consumed": consumed,
-                        "expired": expired,
-                        "threshold": threshold,
-                        "needsReplenish": needs_replenish,
-                    }),
-                );
+                output.stats = Some(KeyPackageStats {
+                    total_available: available,
+                    total_consumed: consumed,
+                    by_device: None,
+                    extra_data: Default::default(),
+                });
             }
 
             "status" => {
                 let rows = if let Some(ref c) = cursor {
                     sqlx::query(
                         r#"
-                        SELECT id, cipher_suite, key_package_hash, created_at, expires_at,
+                        SELECT id, cipher_suite, created_at, expires_at,
                                consumed_at, device_id
                         FROM key_packages
                         WHERE owner_did = $1 AND consumed_at IS NOT NULL AND id < $2
@@ -145,7 +129,7 @@ pub async fn get_key_package_status(
                 } else {
                     sqlx::query(
                         r#"
-                        SELECT id, cipher_suite, key_package_hash, created_at, expires_at,
+                        SELECT id, cipher_suite, created_at, expires_at,
                                consumed_at, device_id
                         FROM key_packages
                         WHERE owner_did = $1 AND consumed_at IS NOT NULL
@@ -163,31 +147,33 @@ pub async fn get_key_package_status(
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
 
-                let next_cursor = if rows.len() as i64 == limit {
-                    rows.last().map(|r| r.get::<String, _>("id"))
-                } else {
-                    None
-                };
+                if rows.len() as i64 == limit {
+                    if let Some(last) = rows.last() {
+                        output.cursor = Some(last.get::<String, _>("id").into());
+                    }
+                }
 
-                let status_items: Vec<serde_json::Value> = rows
+                let status_items: Vec<KeyPackageStatusItem<'static>> = rows
                     .into_iter()
-                    .map(|r| {
-                        serde_json::json!({
-                            "keyPackageHash": r.get::<String, _>("key_package_hash"),
-                            "cipherSuite": r.get::<String, _>("cipher_suite"),
-                            "createdAt": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at").to_rfc3339(),
-                            "expiresAt": r.get::<chrono::DateTime<chrono::Utc>, _>("expires_at").to_rfc3339(),
-                            "consumedAt": r.get::<Option<chrono::DateTime<chrono::Utc>>, _>("consumed_at").map(|d| d.to_rfc3339()),
-                            "deviceId": r.get::<Option<String>, _>("device_id"),
-                        })
+                    .map(|r| KeyPackageStatusItem {
+                        id: r.get::<String, _>("id").into(),
+                        cipher_suite: r.get::<String, _>("cipher_suite").into(),
+                        consumed: r.get::<Option<chrono::DateTime<chrono::Utc>>, _>("consumed_at").is_some(),
+                        created_at: crate::sqlx_jacquard::chrono_to_datetime(
+                            r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                        ),
+                        expires_at: r
+                            .get::<Option<chrono::DateTime<chrono::Utc>>, _>("expires_at")
+                            .map(crate::sqlx_jacquard::chrono_to_datetime),
+                        device_id: r
+                            .get::<Option<String>, _>("device_id")
+                            .unwrap_or_default()
+                            .into(),
+                        extra_data: Default::default(),
                     })
                     .collect();
 
-                let mut status_obj = serde_json::json!({ "consumedPackages": status_items });
-                if let Some(c) = next_cursor {
-                    status_obj["cursor"] = serde_json::json!(c);
-                }
-                result.insert("status".to_string(), status_obj);
+                output.status = Some(status_items);
             }
 
             "history" => {
@@ -196,10 +182,8 @@ pub async fn get_key_package_status(
                         r#"
                         SELECT
                             kp.key_package_hash,
-                            kp.cipher_suite,
                             kp.created_at,
-                            kp.consumed_at,
-                            kp.device_id
+                            kp.consumed_at
                         FROM key_packages kp
                         WHERE kp.owner_did = $1
                           AND kp.consumed_at IS NOT NULL
@@ -218,10 +202,8 @@ pub async fn get_key_package_status(
                         r#"
                         SELECT
                             kp.key_package_hash,
-                            kp.cipher_suite,
                             kp.created_at,
-                            kp.consumed_at,
-                            kp.device_id
+                            kp.consumed_at
                         FROM key_packages kp
                         WHERE kp.owner_did = $1
                           AND kp.consumed_at IS NOT NULL
@@ -239,30 +221,26 @@ pub async fn get_key_package_status(
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
 
-                let next_cursor = if rows.len() as i64 == limit {
-                    rows.last().map(|r| r.get::<String, _>("key_package_hash"))
-                } else {
-                    None
-                };
+                if rows.len() as i64 == limit {
+                    if let Some(last) = rows.last() {
+                        output.cursor = Some(last.get::<String, _>("key_package_hash").into());
+                    }
+                }
 
-                let history_items: Vec<serde_json::Value> = rows
+                let history_items: Vec<KeyPackageHistoryItem<'static>> = rows
                     .into_iter()
-                    .map(|r| {
-                        serde_json::json!({
-                            "packageId": r.get::<String, _>("key_package_hash"),
-                            "createdAt": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at").to_rfc3339(),
-                            "consumedAt": r.get::<Option<chrono::DateTime<chrono::Utc>>, _>("consumed_at").map(|d| d.to_rfc3339()),
-                            "deviceId": r.get::<Option<String>, _>("device_id"),
-                            "cipherSuite": r.get::<String, _>("cipher_suite"),
-                        })
+                    .map(|r| KeyPackageHistoryItem {
+                        id: r.get::<String, _>("key_package_hash").into(),
+                        action: "consumed".into(),
+                        created_at: crate::sqlx_jacquard::chrono_to_datetime(
+                            r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                        ),
+                        consumed_by_did: None,
+                        extra_data: Default::default(),
                     })
                     .collect();
 
-                let mut history_obj = serde_json::json!({ "history": history_items });
-                if let Some(c) = next_cursor {
-                    history_obj["cursor"] = serde_json::json!(c);
-                }
-                result.insert("history".to_string(), history_obj);
+                output.history = Some(history_items);
             }
 
             unknown => {
@@ -274,5 +252,5 @@ pub async fn get_key_package_status(
         }
     }
 
-    Ok(Json(serde_json::Value::Object(result)))
+    Ok(Json(output))
 }

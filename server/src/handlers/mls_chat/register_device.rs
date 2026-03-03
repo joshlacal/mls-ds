@@ -1,4 +1,9 @@
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    Json,
+};
 use base64::Engine;
 use chrono::{Duration, Utc};
 use jacquard_axum::ExtractXrpc;
@@ -9,7 +14,9 @@ use uuid::Uuid;
 use crate::{
     auth::AuthUser,
     device_utils::parse_device_did,
-    generated::blue_catbird::mlsChat::register_device::RegisterDeviceRequest,
+    generated::blue_catbird::mlsChat::register_device::{
+        RegisterDeviceOutput, RegisterDeviceRequest,
+    },
     realtime::{SseState, StreamEvent},
     storage::DbPool,
 };
@@ -37,7 +44,7 @@ pub async fn register_device_post(
     State(sse_state): State<Arc<SseState>>,
     auth_user: AuthUser,
     ExtractXrpc(input): ExtractXrpc<RegisterDeviceRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Response, StatusCode> {
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -61,13 +68,25 @@ pub async fn register_device_post(
     };
 
     match action.as_str() {
-        "register" => handle_register(&pool, &sse_state, &auth_user, &input).await,
-        "updateToken" => handle_update_token(&pool, &auth_user, &input).await,
-        "removeToken" => handle_remove_token(&pool, &auth_user, &raw).await,
-        "delete" => handle_delete(&pool, &auth_user, &raw).await,
-        "claimPendingAddition" => handle_claim_pending_addition(&pool, &auth_user, &raw).await,
+        "register" => Ok(handle_register(&pool, &sse_state, &auth_user, &input)
+            .await?
+            .into_response()),
+        "updateToken" => Ok(handle_update_token(&pool, &auth_user, &input)
+            .await?
+            .into_response()),
+        "removeToken" => Ok(handle_remove_token(&pool, &auth_user, &raw)
+            .await?
+            .into_response()),
+        "delete" => Ok(handle_delete(&pool, &auth_user, &raw)
+            .await?
+            .into_response()),
+        "claimPendingAddition" => Ok(handle_claim_pending_addition(&pool, &auth_user, &raw)
+            .await?
+            .into_response()),
         "completePendingAddition" => {
-            handle_complete_pending_addition(&pool, &auth_user, &raw).await
+            Ok(handle_complete_pending_addition(&pool, &auth_user, &raw)
+                .await?
+                .into_response())
         }
         unknown => {
             warn!("Unknown action for v2 registerDevice POST: {}", unknown);
@@ -83,7 +102,7 @@ async fn handle_register(
     sse_state: &Arc<SseState>,
     auth_user: &AuthUser,
     input: &crate::generated::blue_catbird::mlsChat::register_device::RegisterDevice<'_>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<RegisterDeviceOutput<'static>>, StatusCode> {
     let (user_did, _) = parse_device_did(&auth_user.did).map_err(|e| {
         error!("Invalid device DID format: {}", e);
         StatusCode::BAD_REQUEST
@@ -504,11 +523,16 @@ async fn handle_register(
         }
     }
 
-    Ok(Json(serde_json::json!({
-        "deviceId": device_id,
-        "mlsDid": mls_did,
-        "autoJoinedConvos": auto_joined_convos,
-    })))
+    Ok(Json(RegisterDeviceOutput {
+        device_id: device_id.into(),
+        mls_did: mls_did.into(),
+        auto_joined_convos: auto_joined_convos
+            .into_iter()
+            .map(|s| s.into())
+            .collect(),
+        welcome_messages: None,
+        extra_data: Default::default(),
+    }))
 }
 
 // ─── Action: updateToken ───

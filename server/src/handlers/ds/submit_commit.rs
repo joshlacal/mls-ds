@@ -24,9 +24,9 @@ struct SubmitCommit<'a> {
     commit_data: bytes::Bytes,
 }
 
-const NSID: &str = "blue.catbird.mls.ds.submitCommit";
+const NSID: &str = "blue.catbird.mlsDS.submitCommit";
 
-/// POST /xrpc/blue.catbird.mls.ds.submitCommit
+/// POST /xrpc/blue.catbird.mlsDS.submitCommit
 ///
 /// Accept a commit for sequencing (sequencer role). Uses CAS ordering on epoch.
 #[tracing::instrument(skip(pool, sequencer, auth_user, body))]

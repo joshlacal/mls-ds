@@ -153,7 +153,7 @@ mod tests {
         );
         let token = client.sign_request(
             "did:web:ds-b.example.com",
-            "blue.catbird.mls.ds.deliverMessage",
+            "blue.catbird.mlsDS.deliverMessage",
         );
         assert!(token.is_ok());
         let token = token.unwrap();
@@ -169,7 +169,7 @@ mod tests {
         let claims = decoded.unwrap().claims;
         assert_eq!(claims.iss, "did:web:ds-a.example.com");
         assert_eq!(claims.aud, "did:web:ds-b.example.com");
-        assert_eq!(claims.lxm, "blue.catbird.mls.ds.deliverMessage");
+        assert_eq!(claims.lxm, "blue.catbird.mlsDS.deliverMessage");
         assert!(claims.exp > claims.iat);
         assert!(!claims.jti.is_empty());
     }
@@ -182,7 +182,7 @@ mod tests {
         );
         let token = client.sign_request(
             "did:web:other.example.com",
-            "blue.catbird.mls.ds.submitCommit",
+            "blue.catbird.mlsDS.submitCommit",
         );
         assert!(token.is_ok());
         let token = token.unwrap();
