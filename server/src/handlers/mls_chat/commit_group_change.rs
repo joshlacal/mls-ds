@@ -1,6 +1,12 @@
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    Json,
+};
 use base64::Engine;
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 use sqlx::FromRow;
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -20,6 +26,51 @@ use crate::{
 };
 
 const NSID: &str = "blue.catbird.mlsChat.commitGroupChange";
+
+#[derive(Serialize)]
+struct XrpcErrorBody {
+    error: &'static str,
+    message: String,
+}
+
+pub struct XrpcError(StatusCode, &'static str, String);
+
+impl IntoResponse for XrpcError {
+    fn into_response(self) -> Response {
+        (
+            self.0,
+            Json(XrpcErrorBody {
+                error: self.1,
+                message: self.2,
+            }),
+        )
+            .into_response()
+    }
+}
+
+fn bad_request(message: impl Into<String>) -> XrpcError {
+    XrpcError(StatusCode::BAD_REQUEST, "InvalidRequest", message.into())
+}
+
+fn auth_required(message: impl Into<String>) -> XrpcError {
+    XrpcError(StatusCode::UNAUTHORIZED, "AuthRequired", message.into())
+}
+
+fn forbidden(message: impl Into<String>) -> XrpcError {
+    XrpcError(StatusCode::FORBIDDEN, "Forbidden", message.into())
+}
+
+fn conflict(message: impl Into<String>) -> XrpcError {
+    XrpcError(StatusCode::CONFLICT, "Conflict", message.into())
+}
+
+fn internal_server_error(message: impl Into<String>) -> XrpcError {
+    XrpcError(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "InternalServerError",
+        message.into(),
+    )
+}
 
 // ---------------------------------------------------------------------------
 // Row type for pending device additions
@@ -61,9 +112,9 @@ pub async fn commit_group_change(
     State(_block_sync): State<Arc<BlockSyncService>>,
     auth_user: AuthUser,
     ExtractXrpc(input): ExtractXrpc<CommitGroupChangeRequest>,
-) -> Result<axum::response::Response, StatusCode> {
+) -> Result<Response, XrpcError> {
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
-        return Err(StatusCode::UNAUTHORIZED);
+        return Err(auth_required("Authentication required"));
     }
 
     let success_response = || CommitGroupChangeOutput {
@@ -115,15 +166,15 @@ pub async fn commit_group_change(
             // ── Validate required fields ───────────────────────────────
             let welcome_b64 = input.welcome.as_ref().ok_or_else(|| {
                 warn!("addMembers: missing welcome");
-                StatusCode::BAD_REQUEST
+                bad_request("Missing welcome")
             })?;
             let commit_b64 = input.commit.as_ref().ok_or_else(|| {
                 warn!("addMembers: missing commit");
-                StatusCode::BAD_REQUEST
+                bad_request("Missing commit")
             })?;
             let member_dids = input.member_dids.as_ref().ok_or_else(|| {
                 warn!("addMembers: missing member_dids");
-                StatusCode::BAD_REQUEST
+                bad_request("Missing memberDids")
             })?;
 
             // ── Decode welcome & commit ────────────────────────────────
@@ -131,19 +182,19 @@ pub async fn commit_group_change(
                 .decode(welcome_b64.as_bytes())
                 .map_err(|e| {
                     warn!("addMembers: invalid base64 welcome: {}", e);
-                    StatusCode::BAD_REQUEST
+                    bad_request("Invalid base64 welcome")
                 })?;
             let commit_bytes = base64::engine::general_purpose::STANDARD
                 .decode(commit_b64.as_bytes())
                 .map_err(|e| {
                     warn!("addMembers: invalid base64 commit: {}", e);
-                    StatusCode::BAD_REQUEST
+                    bad_request("Invalid base64 commit")
                 })?;
 
             // ── Verify caller is a member ──────────────────────────────
             let (caller_did, _) = parse_device_did(&auth_user.did).map_err(|e| {
                 error!("addMembers: invalid DID format: {}", e);
-                StatusCode::BAD_REQUEST
+                bad_request("Invalid DID format")
             })?;
             let is_member: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM members WHERE convo_id = $1 AND user_did = $2 AND left_at IS NULL)",
@@ -154,10 +205,10 @@ pub async fn commit_group_change(
             .await
             .map_err(|e| {
                 error!("addMembers: membership check failed: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
+                internal_server_error("Failed to check membership")
             })?;
             if !is_member {
-                return Err(StatusCode::FORBIDDEN);
+                return Err(forbidden("Not a member of this conversation"));
             }
 
             let now = chrono::Utc::now();
@@ -177,7 +228,7 @@ pub async fn commit_group_change(
                 .await
                 .map_err(|e| {
                     error!("addMembers: failed to insert member: {}", e);
-                    StatusCode::INTERNAL_SERVER_ERROR
+                    internal_server_error("Failed to insert member")
                 })?;
             }
 
@@ -186,13 +237,13 @@ pub async fn commit_group_change(
                 .await
                 .map_err(|e| {
                     error!("addMembers: failed to get current epoch: {}", e);
-                    StatusCode::INTERNAL_SERVER_ERROR
+                    internal_server_error("Failed to get current epoch")
                 })?;
 
             // ── Begin transaction: CAS epoch + commit + welcomes + idempotency ──
             let mut tx = pool.begin().await.map_err(|e| {
                 error!("addMembers: failed to begin transaction: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
+                internal_server_error("Failed to begin transaction")
             })?;
 
             // ── Advance epoch (CAS) ───────────────────────────────────
@@ -204,14 +255,14 @@ pub async fn commit_group_change(
             .await
             .map_err(|e| {
                 error!("addMembers: failed to advance epoch: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
+                internal_server_error("Failed to advance epoch")
             })?;
 
             let new_epoch = match new_epoch {
                 Some(epoch) => epoch,
                 None => {
                     warn!("addMembers: epoch CAS failed (concurrent commit), returning 409");
-                    return Err(StatusCode::CONFLICT);
+                    return Err(conflict("Conversation epoch advanced concurrently"));
                 }
             };
 
@@ -224,7 +275,7 @@ pub async fn commit_group_change(
             .await
             .map_err(|e| {
                 error!("addMembers: failed to invalidate stale GroupInfo after epoch advance: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
+                internal_server_error("Failed to invalidate stale GroupInfo")
             })?;
 
             // ── Store commit message ───────────────────────────────────
@@ -237,7 +288,7 @@ pub async fn commit_group_change(
             .await
             .map_err(|e| {
                 error!("addMembers: failed to get seq: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
+                internal_server_error("Failed to allocate message sequence")
             })?;
 
             sqlx::query(
@@ -254,7 +305,7 @@ pub async fn commit_group_change(
             .await
             .map_err(|e| {
                 error!("addMembers: failed to insert commit message: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
+                internal_server_error("Failed to store commit message")
             })?;
 
             // ── Store welcome for each new member ──────────────────────
@@ -277,7 +328,7 @@ pub async fn commit_group_change(
                 .await
                 .map_err(|e| {
                     error!("addMembers: failed to store welcome: {}", e);
-                    StatusCode::INTERNAL_SERVER_ERROR
+                    internal_server_error("Failed to store welcome")
                 })?;
             }
 
@@ -295,7 +346,7 @@ pub async fn commit_group_change(
             // ── Commit transaction ─────────────────────────────────────
             tx.commit().await.map_err(|e| {
                 error!("addMembers: failed to commit transaction: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
+                internal_server_error("Failed to commit transaction")
             })?;
 
             info!(
@@ -351,7 +402,7 @@ pub async fn commit_group_change(
             // ── Validate required fields ───────────────────────────────
             let commit_b64 = input.commit.as_ref().ok_or_else(|| {
                 warn!("externalCommit: missing commit");
-                StatusCode::BAD_REQUEST
+                bad_request("Missing commit")
             })?;
 
             // ── Decode commit ───────────────────────────────────────────
@@ -359,13 +410,13 @@ pub async fn commit_group_change(
                 .decode(commit_b64.as_bytes())
                 .map_err(|e| {
                     warn!("externalCommit: invalid base64 commit: {}", e);
-                    StatusCode::BAD_REQUEST
+                    bad_request("Invalid base64 commit")
                 })?;
 
             // ── Verify caller is current/past member ───────────────────
             let (caller_did, _) = parse_device_did(&auth_user.did).map_err(|e| {
                 error!("externalCommit: invalid DID format: {}", e);
-                StatusCode::BAD_REQUEST
+                bad_request("Invalid DID format")
             })?;
             let is_member_or_past: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM members WHERE convo_id = $1 AND (user_did = $2 OR member_did = $2))",
@@ -376,10 +427,10 @@ pub async fn commit_group_change(
             .await
             .map_err(|e| {
                 error!("externalCommit: membership check failed: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
+                internal_server_error("Failed to check membership")
             })?;
             if !is_member_or_past {
-                return Err(StatusCode::FORBIDDEN);
+                return Err(forbidden("Not a member of this conversation"));
             }
 
             let now = chrono::Utc::now();
@@ -389,13 +440,13 @@ pub async fn commit_group_change(
                 .await
                 .map_err(|e| {
                     error!("externalCommit: failed to get current epoch: {}", e);
-                    StatusCode::INTERNAL_SERVER_ERROR
+                    internal_server_error("Failed to get current epoch")
                 })?;
 
             // ── Begin transaction: reactivate + CAS epoch + commit + idempotency ──
             let mut tx = pool.begin().await.map_err(|e| {
                 error!("externalCommit: failed to begin transaction: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
+                internal_server_error("Failed to begin transaction")
             })?;
 
             // Ensure caller is marked as active after successful rejoin.
@@ -408,7 +459,7 @@ pub async fn commit_group_change(
             .await
             .map_err(|e| {
                 error!("externalCommit: failed to reactivate member: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
+                internal_server_error("Failed to reactivate member")
             })?;
 
             // ── Advance epoch (CAS) ───────────────────────────────────
@@ -420,14 +471,14 @@ pub async fn commit_group_change(
             .await
             .map_err(|e| {
                 error!("externalCommit: failed to advance epoch: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
+                internal_server_error("Failed to advance epoch")
             })?;
 
             let new_epoch = match new_epoch {
                 Some(epoch) => epoch,
                 None => {
                     warn!("externalCommit: epoch CAS failed (concurrent commit), returning 409");
-                    return Err(StatusCode::CONFLICT);
+                    return Err(conflict("Conversation epoch advanced concurrently"));
                 }
             };
 
@@ -440,7 +491,7 @@ pub async fn commit_group_change(
             .await
             .map_err(|e| {
                 error!("externalCommit: failed to invalidate stale GroupInfo after epoch advance: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
+                internal_server_error("Failed to invalidate stale GroupInfo")
             })?;
 
             // ── Store commit message ───────────────────────────────────
@@ -453,7 +504,7 @@ pub async fn commit_group_change(
             .await
             .map_err(|e| {
                 error!("externalCommit: failed to get seq: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
+                internal_server_error("Failed to allocate message sequence")
             })?;
 
             sqlx::query(
@@ -470,7 +521,7 @@ pub async fn commit_group_change(
             .await
             .map_err(|e| {
                 error!("externalCommit: failed to insert commit message: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
+                internal_server_error("Failed to store commit message")
             })?;
 
             // ── Store idempotency key ──────────────────────────────────
@@ -487,7 +538,7 @@ pub async fn commit_group_change(
             // ── Commit transaction ─────────────────────────────────────
             tx.commit().await.map_err(|e| {
                 error!("externalCommit: failed to commit transaction: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
+                internal_server_error("Failed to commit transaction")
             })?;
 
             info!(
@@ -516,7 +567,7 @@ pub async fn commit_group_change(
             let convo_id = input.convo_id.to_string();
             if convo_id.trim().is_empty() {
                 warn!("invalidateWelcome: missing convo_id");
-                return Err(StatusCode::BAD_REQUEST);
+                return Err(bad_request("Missing convoId"));
             }
 
             let invalidated = sqlx::query(
@@ -536,7 +587,7 @@ pub async fn commit_group_change(
             .await
             .map_err(|e| {
                 error!("invalidateWelcome: failed to invalidate welcome: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
+                internal_server_error("Failed to invalidate welcome")
             })?
             .rows_affected();
 
@@ -554,7 +605,7 @@ pub async fn commit_group_change(
             // Extract base user DID
             let (user_did, _) = parse_device_did(&auth_user.did).map_err(|e| {
                 error!("❌ [v2.commitGroupChange] Invalid DID format: {}", e);
-                StatusCode::BAD_REQUEST
+                bad_request("Invalid DID format")
             })?;
 
             // Release expired claims
@@ -573,7 +624,7 @@ pub async fn commit_group_change(
                     "❌ [v2.commitGroupChange] Failed to release expired claims: {}",
                     e
                 );
-                StatusCode::INTERNAL_SERVER_ERROR
+                internal_server_error("Failed to release expired claims")
             })?
             .rows_affected();
 
@@ -626,7 +677,7 @@ pub async fn commit_group_change(
                     "❌ [v2.commitGroupChange] Failed to fetch pending additions: {}",
                     e
                 );
-                StatusCode::INTERNAL_SERVER_ERROR
+                internal_server_error("Failed to fetch pending additions")
             })?;
 
             info!(
@@ -669,14 +720,14 @@ pub async fn commit_group_change(
                 Some(gi) => gi.to_string(),
                 None => {
                     error!("updateGroupInfo: missing groupInfo field");
-                    return Err(StatusCode::BAD_REQUEST);
+                    return Err(bad_request("Missing groupInfo"));
                 }
             };
 
             // Verify membership
             let (caller_did, _) = parse_device_did(&auth_user.did).map_err(|e| {
                 error!("Invalid DID format: {}", e);
-                StatusCode::BAD_REQUEST
+                bad_request("Invalid DID format")
             })?;
             let is_member: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM members WHERE convo_id = $1 AND user_did = $2 AND left_at IS NULL)",
@@ -687,10 +738,10 @@ pub async fn commit_group_change(
             .await
             .map_err(|e| {
                 error!("Membership check failed: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
+                internal_server_error("Failed to check membership")
             })?;
             if !is_member {
-                return Err(StatusCode::FORBIDDEN);
+                return Err(forbidden("Not a member of this conversation"));
             }
 
             // Decode and validate
@@ -698,7 +749,7 @@ pub async fn commit_group_change(
                 .decode(&group_info_b64)
                 .map_err(|e| {
                     error!("Invalid base64 in GroupInfo: {}", e);
-                    StatusCode::BAD_REQUEST
+                    bad_request("Invalid base64 groupInfo")
                 })?;
 
             // Store group_info
@@ -709,7 +760,7 @@ pub async fn commit_group_change(
                     .await
                     .map_err(|e| {
                         error!("Failed to fetch current epoch: {}", e);
-                        StatusCode::INTERNAL_SERVER_ERROR
+                        internal_server_error("Failed to fetch current GroupInfo epoch")
                     })?
                     .flatten();
 
@@ -725,7 +776,7 @@ pub async fn commit_group_change(
             .await
             .map_err(|e| {
                 error!("Failed to store GroupInfo: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
+                internal_server_error("Failed to store GroupInfo")
             })?;
 
             info!(
@@ -738,12 +789,12 @@ pub async fn commit_group_change(
             let convo_id = input.convo_id.to_string();
             let (caller_did, _) = parse_device_did(&auth_user.did).map_err(|e| {
                 error!("claimPending: invalid DID: {}", e);
-                StatusCode::BAD_REQUEST
+                bad_request("Invalid DID format")
             })?;
 
             let pending_id = input.pending_addition_id.as_ref().ok_or_else(|| {
                 warn!("claimPending: missing pending_addition_id");
-                StatusCode::BAD_REQUEST
+                bad_request("Missing pendingAdditionId")
             })?;
 
             let claimed = sqlx::query_as::<_, PendingAdditionRow>(
@@ -766,7 +817,7 @@ pub async fn commit_group_change(
             .await
             .map_err(|e| {
                 error!("claimPending: DB error: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
+                internal_server_error("Failed to claim pending addition")
             })?;
 
             match claimed {
@@ -818,9 +869,15 @@ pub async fn commit_group_change(
             info!("v2.commitGroupChange: refreshGroupInfo (no-op, SSE not implemented)");
             Ok(Json(success_response()).into_response())
         }
+        "confirmWelcome" => {
+            // Ack-only: clients may send this after successfully processing a Welcome message.
+            // It must not mutate membership, epoch, or welcome state.
+            info!("v2.commitGroupChange: confirmWelcome (ack-only no-op)");
+            Ok(Json(success_response()).into_response())
+        }
         other => {
             warn!("v2.commitGroupChange: unknown action: {}", other);
-            Err(StatusCode::BAD_REQUEST)
+            Err(bad_request(format!("Unknown action: {}", other)))
         }
     }
 }
@@ -828,6 +885,7 @@ pub async fn commit_group_change(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::{header, StatusCode};
 
     #[test]
     fn invalidate_welcome_response_returns_false_when_nothing_invalidated() {
@@ -871,5 +929,15 @@ mod tests {
             extra_data: Default::default(),
         };
         assert_eq!(response.new_epoch, Some(0));
+    }
+
+    #[test]
+    fn xrpc_error_sets_json_content_type() {
+        let response = bad_request("Missing commit").into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
     }
 }

@@ -22,6 +22,14 @@ use crate::{
 
 const NSID: &str = "blue.catbird.mlsChat.sendMessage";
 
+fn resolve_stored_epoch(client_epoch: i64, server_epoch: i64) -> i64 {
+    if client_epoch != server_epoch {
+        client_epoch
+    } else {
+        client_epoch
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Handler
 // ---------------------------------------------------------------------------
@@ -213,16 +221,20 @@ async fn handle_persistent(
 
     let client_epoch = input.epoch;
     let store_epoch = if client_epoch != server_epoch {
+        // Log the mismatch but trust the client's epoch. The client knows what MLS epoch
+        // it encrypted at. The server's current_epoch can be stale (e.g. after createConvo
+        // + addMembers race, or if the client processed commits the server hasn't tracked).
+        // Overriding with server_epoch caused EPOCH-SKIP on the receiver side.
         tracing::warn!(
             target: "mls_epoch",
             convo_id = %crate::crypto::redact_for_log(&convo_id),
             server_epoch, client_epoch,
-            "overriding client epoch with server epoch (client={}, server={})",
+            "epoch mismatch: client={}, server={} — storing client epoch (client is authoritative)",
             client_epoch, server_epoch
         );
-        server_epoch
+        resolve_stored_epoch(client_epoch, server_epoch)
     } else {
-        server_epoch // same value either way — always use server
+        resolve_stored_epoch(client_epoch, server_epoch)
     };
 
     // --- Insert message in a transaction (seq via MAX+1) ---
@@ -519,7 +531,7 @@ async fn handle_persistent(
         message_id: row_id.into(),
         received_at: crate::sqlx_jacquard::chrono_to_datetime(now),
         seq,
-        epoch: server_epoch,
+        epoch: store_epoch,
         extra_data: Default::default(),
     })
     .into_response())
@@ -788,4 +800,19 @@ async fn handle_typing(
     Ok(Json(
         serde_json::json!({"success": true, "isTyping": is_typing}),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_stored_epoch;
+
+    #[test]
+    fn resolve_stored_epoch_prefers_client_epoch_on_mismatch() {
+        assert_eq!(resolve_stored_epoch(1, 0), 1);
+    }
+
+    #[test]
+    fn resolve_stored_epoch_keeps_matching_epoch() {
+        assert_eq!(resolve_stored_epoch(4, 4), 4);
+    }
 }
