@@ -52,9 +52,18 @@ pub async fn get_subscription_ticket(
         .map(chrono_to_datetime)
         .unwrap_or_else(|_| chrono_to_datetime(chrono::Utc::now()));
 
-    let endpoint = jacquard_common::types::string::Uri::new_owned(&v1_output.endpoint)
-        .ok()
-        .map(Into::into);
+    // Clients depend on endpoint to establish WebSocket connections — fail loudly if invalid.
+    let endpoint = match jacquard_common::types::string::Uri::new_owned(&v1_output.endpoint) {
+        Ok(uri) => Some(uri.into()),
+        Err(e) => {
+            tracing::error!(
+                endpoint = %v1_output.endpoint,
+                error = %e,
+                "Failed to parse WEBSOCKET_ENDPOINT as URI"
+            );
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
 
     Ok(Json(GetSubscriptionTicketOutput {
         ticket: v1_output.ticket.into(),

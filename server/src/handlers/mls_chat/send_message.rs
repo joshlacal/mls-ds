@@ -76,8 +76,7 @@ pub async fn send_message(
             auth_user,
             &input,
         )
-        .await?
-        .into_response()),
+        .await?),
 
         "ephemeral" => {
             let action = input.action.as_deref().unwrap_or("typing");
@@ -130,7 +129,7 @@ async fn handle_persistent(
     outbound_queue: Arc<federation::queue::OutboundQueue>,
     auth_user: AuthUser,
     input: &crate::generated::blue_catbird::mlsChat::send_message::SendMessage<'_>,
-) -> Result<Json<SendMessageOutput<'static>>, StatusCode> {
+) -> Result<Response, StatusCode> {
     let convo_id = input.convo_id.to_string();
     let msg_id = input.msg_id.to_string();
     let padded_size = input.padded_size as u32;
@@ -213,16 +212,18 @@ async fn handle_persistent(
     })?;
 
     let client_epoch = input.epoch;
-    if client_epoch != server_epoch {
+    let store_epoch = if client_epoch != server_epoch {
         tracing::warn!(
             target: "mls_epoch",
             convo_id = %crate::crypto::redact_for_log(&convo_id),
             server_epoch, client_epoch,
-            "rejecting app message with {} epoch",
-            if client_epoch < server_epoch { "stale" } else { "future" }
+            "overriding client epoch with server epoch (client={}, server={})",
+            client_epoch, server_epoch
         );
-        return Err(StatusCode::CONFLICT);
-    }
+        server_epoch
+    } else {
+        server_epoch // same value either way — always use server
+    };
 
     // --- Insert message in a transaction (seq via MAX+1) ---
     let now = Utc::now();
@@ -255,7 +256,8 @@ async fn handle_persistent(
             seq: eseq,
             epoch: eepoch,
             extra_data: Default::default(),
-        }));
+        })
+        .into_response());
     }
 
     // Dedup by idempotency_key
@@ -279,7 +281,8 @@ async fn handle_persistent(
                 seq: eseq,
                 epoch: eepoch,
                 extra_data: Default::default(),
-            }));
+            })
+            .into_response());
         }
     }
 
@@ -306,7 +309,7 @@ async fn handle_persistent(
     )
     .bind(&row_id)
     .bind(&convo_id)
-    .bind(client_epoch)
+    .bind(store_epoch)
     .bind(seq)
     .bind(&ciphertext_vec)
     .bind(&now)
@@ -331,7 +334,7 @@ async fn handle_persistent(
         "✅ [v2.sendMessage] message created: msgId={}, seq={}, epoch={}",
         crate::crypto::redact_for_log(&row_id),
         seq,
-        client_epoch
+        store_epoch
     );
 
     // --- Spawn async fan-out (envelopes, SSE, push, federation) ---
@@ -342,7 +345,7 @@ async fn handle_persistent(
     let ciphertext_for_sse = ciphertext_vec.clone();
     let ciphertext_for_push = ciphertext_vec;
     let sender_did_clone = auth_user.did.clone();
-    let epoch_for_sse = client_epoch;
+    let epoch_for_sse = store_epoch;
     let sequencer_term_for_federation = server_sequencer_term.max(0) as u64;
     let federation_delivery_id = ulid::Ulid::new().to_string();
 
@@ -516,9 +519,10 @@ async fn handle_persistent(
         message_id: row_id.into(),
         received_at: crate::sqlx_jacquard::chrono_to_datetime(now),
         seq,
-        epoch: client_epoch,
+        epoch: server_epoch,
         extra_data: Default::default(),
-    }))
+    })
+    .into_response())
 }
 
 // ---------------------------------------------------------------------------

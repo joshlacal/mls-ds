@@ -12,8 +12,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 // Import from library crate instead of re-declaring modules
 use catbird_server::{
-    actors, auth, block_sync, crypto, db, fanout, federation, handlers, health, metrics,
-    middleware, models, realtime, storage, util,
+    actors, auth, blob_store, block_sync, crypto, db, fanout, federation, handlers, health,
+    metrics, middleware, models, realtime, storage, util,
 };
 
 // These modules are only in main.rs (not in lib.rs)
@@ -42,6 +42,7 @@ struct AppState {
     upstream_manager: Option<Arc<federation::UpstreamManager>>,
     ack_signer: Option<Arc<federation::AckSigner>>,
     declaration_client: Arc<federation::DeclarationClient>,
+    blob_store: blob_store::BlobStore,
 }
 
 fn truthy_env_var(name: &str) -> bool {
@@ -384,6 +385,79 @@ async fn main() -> anyhow::Result<()> {
         resolver.clone(),
     ));
 
+    // Initialize blob store (S3-compatible storage for encrypted image blobs)
+    let blob_store = blob_store::BlobStore::new().await;
+    tracing::info!("Blob store initialized");
+
+    // Blob TTL cleanup — runs every hour
+    {
+        let blob_cleanup_pool = db_pool.clone();
+        let blob_cleanup_store = blob_store.clone();
+        tokio::spawn(async move {
+            let mut interval_timer = interval(Duration::from_secs(3600));
+            loop {
+                interval_timer.tick().await;
+
+                // Soft-delete expired blobs
+                match sqlx::query(
+                    "UPDATE blobs SET deleted_at = now() WHERE expires_at < now() AND deleted_at IS NULL",
+                )
+                .execute(&blob_cleanup_pool)
+                .await
+                {
+                    Ok(result) => {
+                        if result.rows_affected() > 0 {
+                            tracing::info!(
+                                "Soft-deleted {} expired blobs",
+                                result.rows_affected()
+                            );
+                        }
+                    }
+                    Err(e) => tracing::error!("Blob TTL soft-delete failed: {}", e),
+                }
+
+                // Hard-delete blobs that were soft-deleted >1 day ago
+                let to_purge: Vec<String> = match sqlx::query_scalar(
+                    "SELECT id FROM blobs WHERE deleted_at IS NOT NULL AND deleted_at < now() - INTERVAL '1 day'",
+                )
+                .fetch_all(&blob_cleanup_pool)
+                .await
+                {
+                    Ok(ids) => ids,
+                    Err(e) => {
+                        tracing::error!("Blob purge query failed: {}", e);
+                        continue;
+                    }
+                };
+
+                for blob_id in &to_purge {
+                    // Delete from S3
+                    if let Err(e) = blob_cleanup_store.delete(blob_id).await {
+                        tracing::error!("Failed to delete blob {} from S3: {}", blob_id, e);
+                        continue;
+                    }
+                    // Hard-delete metadata
+                    if let Err(e) = sqlx::query("DELETE FROM blobs WHERE id = $1")
+                        .bind(blob_id)
+                        .execute(&blob_cleanup_pool)
+                        .await
+                    {
+                        tracing::error!(
+                            "Failed to hard-delete blob {} metadata: {}",
+                            blob_id,
+                            e
+                        );
+                    }
+                }
+
+                if !to_purge.is_empty() {
+                    tracing::info!("Purged {} expired blobs from S3", to_purge.len());
+                }
+            }
+        });
+        tracing::info!("Blob TTL cleanup worker started");
+    }
+
     // Shared shutdown token for federation workers
     let shutdown_token = tokio_util::sync::CancellationToken::new();
 
@@ -431,6 +505,7 @@ async fn main() -> anyhow::Result<()> {
         upstream_manager: upstream_manager.clone(),
         ack_signer,
         declaration_client,
+        blob_store: blob_store.clone(),
     };
 
     // Start federation queue worker (only when federation is enabled)
@@ -555,7 +630,8 @@ async fn main() -> anyhow::Result<()> {
     // All endpoints use IntoRouter for type-safe routing from lexicon-generated types.
     use catbird_server::generated::blue_catbird::mlsChat::{
         blocks::BlocksRequest, commit_group_change::CommitGroupChangeRequest,
-        create_convo::CreateConvoRequest, get_convo_settings::GetConvoSettingsRequest,
+        create_convo::CreateConvoRequest, delete_blob::DeleteBlobRequest,
+        get_blob_usage::GetBlobUsageRequest, get_convo_settings::GetConvoSettingsRequest,
         get_convos::GetConvosRequest, get_group_state::GetGroupStateRequest,
         get_key_package_status::GetKeyPackageStatusRequest,
         get_key_packages::GetKeyPackagesRequest, get_messages::GetMessagesRequest,
@@ -651,6 +727,22 @@ async fn main() -> anyhow::Result<()> {
             "/xrpc/blue.catbird.mlsChat.getDeliveryStatus",
             get(handlers::mls_chat::get_delivery_status),
         )
+        // Blob Storage
+        .route(
+            "/xrpc/blue.catbird.mlsChat.uploadBlob",
+            post(handlers::mls_chat::upload_blob)
+                .layer(DefaultBodyLimit::max(11 * 1024 * 1024)), // 11MB (10MB + overhead)
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsChat.getBlob",
+            get(handlers::mls_chat::get_blob),
+        )
+        .merge(GetBlobUsageRequest::into_router(
+            handlers::mls_chat::get_blob_usage,
+        ))
+        .merge(DeleteBlobRequest::into_router(
+            handlers::mls_chat::delete_blob,
+        ))
         .with_state(app_state.clone());
 
     // DS-to-DS federation routes (mlsDS namespace)

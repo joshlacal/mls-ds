@@ -1,0 +1,52 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.mlsChat.uploadBlob",
+  "description": "Upload an encrypted blob for image DM attachments",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Upload an encrypted blob to the blob store. The blob_id is client-generated (UUIDv4) and doubles as the idempotency key. Content-Type must be application/octet-stream. The blob bytes are opaque encrypted data — the server never sees plaintext.",
+      "input": {
+        "encoding": "*/*",
+        "schema": {
+          "type": "bytes",
+          "description": "Raw encrypted blob bytes",
+          "maxLength": 10485760
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["blobId", "size"],
+          "properties": {
+            "blobId": {
+              "type": "string",
+              "description": "The blob identifier (echoed from input query parameter)"
+            },
+            "size": {
+              "type": "integer",
+              "description": "Stored blob size in bytes"
+            }
+          }
+        }
+      },
+      "parameters": {
+        "type": "params",
+        "required": ["blobId"],
+        "properties": {
+          "blobId": {
+            "type": "string",
+            "description": "Client-generated UUIDv4 blob identifier. Also used as the idempotency key."
+          }
+        }
+      },
+      "errors": [
+        {"name": "QuotaExceeded", "description": "User's blob storage quota has been exceeded (500MB per user)"},
+        {"name": "BlobTooLarge", "description": "Blob exceeds maximum size (10MB)"},
+        {"name": "InvalidBlobId", "description": "blob_id is not a valid UUIDv4"},
+        {"name": "BlobIdConflict", "description": "blob_id already exists for a different owner"}
+      ]
+    }
+  }
+}

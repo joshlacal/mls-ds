@@ -37,6 +37,12 @@ pub mod report;
 // Delivery Status
 pub mod get_delivery_status;
 
+// Blob Storage
+pub mod delete_blob;
+pub mod get_blob;
+pub mod get_blob_usage;
+pub mod upload_blob;
+
 // Subscriptions
 pub mod get_subscription_ticket;
 
@@ -76,6 +82,12 @@ pub use report::report_post;
 
 // Re-exports: Delivery Status
 pub use get_delivery_status::get_delivery_status;
+
+// Re-exports: Blob Storage
+pub use delete_blob::delete_blob;
+pub use get_blob::get_blob;
+pub use get_blob_usage::get_blob_usage;
+pub use upload_blob::upload_blob;
 
 // Re-exports: Subscriptions
 pub use get_subscription_ticket::get_subscription_ticket;

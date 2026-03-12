@@ -162,7 +162,7 @@ pub async fn commit_group_change(
 
             let now = chrono::Utc::now();
 
-            // ── Add members ────────────────────────────────────────────
+            // ── Add members (idempotent, safe outside transaction) ─────
             for member_did in member_dids {
                 let member_did_str = crate::sqlx_jacquard::did_to_string(member_did);
                 sqlx::query(
@@ -181,15 +181,49 @@ pub async fn commit_group_change(
                 })?;
             }
 
-            // ── Advance epoch ──────────────────────────────────────────
-            let new_epoch: i32 = sqlx::query_scalar(
-                "UPDATE conversations SET current_epoch = current_epoch + 1, updated_at = NOW() WHERE id = $1 RETURNING current_epoch",
+            // ── Fetch current epoch for CAS ───────────────────────────
+            let current_epoch = crate::db::get_current_epoch(&pool, &convo_id)
+                .await
+                .map_err(|e| {
+                    error!("addMembers: failed to get current epoch: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+
+            // ── Begin transaction: CAS epoch + commit + welcomes + idempotency ──
+            let mut tx = pool.begin().await.map_err(|e| {
+                error!("addMembers: failed to begin transaction: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+            // ── Advance epoch (CAS) ───────────────────────────────────
+            let new_epoch = crate::db::try_advance_conversation_epoch_tx(
+                &mut tx,
+                &convo_id,
+                current_epoch,
             )
-            .bind(&convo_id)
-            .fetch_one(&pool)
             .await
             .map_err(|e| {
                 error!("addMembers: failed to advance epoch: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+            let new_epoch = match new_epoch {
+                Some(epoch) => epoch,
+                None => {
+                    warn!("addMembers: epoch CAS failed (concurrent commit), returning 409");
+                    return Err(StatusCode::CONFLICT);
+                }
+            };
+
+            // ── Invalidate stale GroupInfo after epoch advance ────────
+            sqlx::query(
+                "UPDATE conversations SET group_info = NULL, group_info_epoch = NULL, group_info_updated_at = NULL WHERE id = $1",
+            )
+            .bind(&convo_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                error!("addMembers: failed to invalidate stale GroupInfo after epoch advance: {}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
@@ -199,7 +233,7 @@ pub async fn commit_group_change(
                 "SELECT CAST(COALESCE(MAX(seq), 0) + 1 AS BIGINT) FROM messages WHERE convo_id = $1",
             )
             .bind(&convo_id)
-            .fetch_one(&pool)
+            .fetch_one(&mut *tx)
             .await
             .map_err(|e| {
                 error!("addMembers: failed to get seq: {}", e);
@@ -216,7 +250,7 @@ pub async fn commit_group_change(
             .bind(seq)
             .bind(&commit_bytes)
             .bind(&now)
-            .execute(&pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| {
                 error!("addMembers: failed to insert commit message: {}", e);
@@ -239,7 +273,7 @@ pub async fn commit_group_change(
                 .bind(&welcome_bytes)
                 .bind::<Option<Vec<u8>>>(None)
                 .bind(&now)
-                .execute(&pool)
+                .execute(&mut *tx)
                 .await
                 .map_err(|e| {
                     error!("addMembers: failed to store welcome: {}", e);
@@ -254,9 +288,15 @@ pub async fn commit_group_change(
                 )
                 .bind(idem_key.to_string())
                 .bind(NSID)
-                .execute(&pool)
+                .execute(&mut *tx)
                 .await;
             }
+
+            // ── Commit transaction ─────────────────────────────────────
+            tx.commit().await.map_err(|e| {
+                error!("addMembers: failed to commit transaction: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
             info!(
                 "✅ v2.commitGroupChange: addMembers complete, epoch={}",
@@ -344,28 +384,62 @@ pub async fn commit_group_change(
 
             let now = chrono::Utc::now();
 
+            // ── Fetch current epoch for CAS ───────────────────────────
+            let current_epoch = crate::db::get_current_epoch(&pool, &convo_id)
+                .await
+                .map_err(|e| {
+                    error!("externalCommit: failed to get current epoch: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+
+            // ── Begin transaction: reactivate + CAS epoch + commit + idempotency ──
+            let mut tx = pool.begin().await.map_err(|e| {
+                error!("externalCommit: failed to begin transaction: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
             // Ensure caller is marked as active after successful rejoin.
             sqlx::query(
                 "UPDATE members SET left_at = NULL, needs_rejoin = false, rejoin_requested_at = NULL WHERE convo_id = $1 AND (user_did = $2 OR member_did = $2)",
             )
             .bind(&convo_id)
             .bind(&caller_did)
-            .execute(&pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| {
                 error!("externalCommit: failed to reactivate member: {}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
-            // ── Advance epoch ──────────────────────────────────────────
-            let new_epoch: i32 = sqlx::query_scalar(
-                "UPDATE conversations SET current_epoch = current_epoch + 1, updated_at = NOW() WHERE id = $1 RETURNING current_epoch",
+            // ── Advance epoch (CAS) ───────────────────────────────────
+            let new_epoch = crate::db::try_advance_conversation_epoch_tx(
+                &mut tx,
+                &convo_id,
+                current_epoch,
             )
-            .bind(&convo_id)
-            .fetch_one(&pool)
             .await
             .map_err(|e| {
                 error!("externalCommit: failed to advance epoch: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+            let new_epoch = match new_epoch {
+                Some(epoch) => epoch,
+                None => {
+                    warn!("externalCommit: epoch CAS failed (concurrent commit), returning 409");
+                    return Err(StatusCode::CONFLICT);
+                }
+            };
+
+            // ── Invalidate stale GroupInfo after epoch advance ────────
+            sqlx::query(
+                "UPDATE conversations SET group_info = NULL, group_info_epoch = NULL, group_info_updated_at = NULL WHERE id = $1",
+            )
+            .bind(&convo_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                error!("externalCommit: failed to invalidate stale GroupInfo after epoch advance: {}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
@@ -375,7 +449,7 @@ pub async fn commit_group_change(
                 "SELECT CAST(COALESCE(MAX(seq), 0) + 1 AS BIGINT) FROM messages WHERE convo_id = $1",
             )
             .bind(&convo_id)
-            .fetch_one(&pool)
+            .fetch_one(&mut *tx)
             .await
             .map_err(|e| {
                 error!("externalCommit: failed to get seq: {}", e);
@@ -392,7 +466,7 @@ pub async fn commit_group_change(
             .bind(seq)
             .bind(&commit_bytes)
             .bind(&now)
-            .execute(&pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| {
                 error!("externalCommit: failed to insert commit message: {}", e);
@@ -406,9 +480,15 @@ pub async fn commit_group_change(
                 )
                 .bind(idem_key.to_string())
                 .bind(NSID)
-                .execute(&pool)
+                .execute(&mut *tx)
                 .await;
             }
+
+            // ── Commit transaction ─────────────────────────────────────
+            tx.commit().await.map_err(|e| {
+                error!("externalCommit: failed to commit transaction: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
             info!(
                 "✅ v2.commitGroupChange: externalCommit complete, epoch={}",
@@ -730,6 +810,13 @@ pub async fn commit_group_change(
                     .into_response())
                 }
             }
+        }
+        "refreshGroupInfo" => {
+            // iOS clients send this to request active members to publish fresh GroupInfo.
+            // Currently a no-op (SSE notification not yet implemented), but return success
+            // so the client doesn't get a 400 error and trigger unnecessary recovery logic.
+            info!("v2.commitGroupChange: refreshGroupInfo (no-op, SSE not implemented)");
+            Ok(Json(success_response()).into_response())
         }
         other => {
             warn!("v2.commitGroupChange: unknown action: {}", other);
