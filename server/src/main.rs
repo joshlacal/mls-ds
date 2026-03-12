@@ -743,6 +743,16 @@ async fn main() -> anyhow::Result<()> {
         .merge(DeleteBlobRequest::into_router(
             handlers::mls_chat::delete_blob,
         ))
+        // Group Metadata Blob Storage
+        .route(
+            "/xrpc/blue.catbird.mlsChat.putGroupMetadataBlob",
+            post(handlers::mls_chat::put_group_metadata_blob)
+                .layer(DefaultBodyLimit::max(2 * 1024 * 1024)), // 2MB (1MB + overhead)
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsChat.getGroupMetadataBlob",
+            get(handlers::mls_chat::get_group_metadata_blob),
+        )
         .with_state(app_state.clone());
 
     // DS-to-DS federation routes (mlsDS namespace)

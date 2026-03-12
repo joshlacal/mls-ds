@@ -41,6 +41,8 @@ pub mod get_delivery_status;
 pub mod delete_blob;
 pub mod get_blob;
 pub mod get_blob_usage;
+pub mod get_group_metadata_blob;
+pub mod put_group_metadata_blob;
 pub mod upload_blob;
 
 // Subscriptions
@@ -87,6 +89,8 @@ pub use get_delivery_status::get_delivery_status;
 pub use delete_blob::delete_blob;
 pub use get_blob::get_blob;
 pub use get_blob_usage::get_blob_usage;
+pub use get_group_metadata_blob::get_group_metadata_blob;
+pub use put_group_metadata_blob::put_group_metadata_blob;
 pub use upload_blob::upload_blob;
 
 // Re-exports: Subscriptions
