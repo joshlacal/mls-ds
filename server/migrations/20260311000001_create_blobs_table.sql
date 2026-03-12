@@ -1,6 +1,8 @@
 -- Blob metadata for encrypted image storage
 -- Actual blob bytes are stored in SeaweedFS via S3 API
-CREATE TABLE IF NOT EXISTS blobs (
+-- Drop legacy blobs table (content-addressed, no owner tracking) if it exists
+DROP TABLE IF EXISTS blobs;
+CREATE TABLE blobs (
     id          TEXT PRIMARY KEY,
     owner_did   TEXT NOT NULL,
     size_bytes  BIGINT NOT NULL,

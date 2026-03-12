@@ -17,8 +17,8 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-# Configuration
-MLS_ROOT="/home/ubuntu/mls-ds"
+# Configuration — derive repo root from script location
+MLS_ROOT="$(cd "$(dirname "$0")" && pwd)"
 TARGET_DIR="$MLS_ROOT/target"
 BINARY_NAME="catbird-server"
 SERVICE_NAME="catbird-mls-server"

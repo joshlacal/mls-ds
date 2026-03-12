@@ -28,6 +28,7 @@ impl BlobStore {
 
         let creds = Credentials::new(&access_key, &secret_key, None, None, "env");
         let config = Builder::new()
+            .behavior_version_latest()
             .endpoint_url(&endpoint)
             .region(Region::new(region))
             .credentials_provider(creds)

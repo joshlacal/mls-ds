@@ -229,8 +229,9 @@ async fn handle_persistent(
             target: "mls_epoch",
             convo_id = %crate::crypto::redact_for_log(&convo_id),
             server_epoch, client_epoch,
-            "epoch mismatch: client={}, server={} — storing client epoch (client is authoritative)",
-            client_epoch, server_epoch
+            "accepting app message with {} epoch (server={}, client={})",
+            if client_epoch < server_epoch { "stale" } else { "future" },
+            server_epoch, client_epoch
         );
         resolve_stored_epoch(client_epoch, server_epoch)
     } else {
