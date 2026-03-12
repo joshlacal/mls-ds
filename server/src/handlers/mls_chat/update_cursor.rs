@@ -1,4 +1,10 @@
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    Json,
+};
+use serde::Serialize;
 use std::sync::Arc;
 use tracing::{error, info};
 
@@ -11,6 +17,27 @@ use crate::{
     sqlx_jacquard::chrono_to_datetime,
     storage::DbPool,
 };
+
+#[derive(Serialize)]
+struct XrpcErrorBody {
+    error: &'static str,
+    message: String,
+}
+
+pub struct XrpcError(StatusCode, &'static str, String);
+
+impl IntoResponse for XrpcError {
+    fn into_response(self) -> Response {
+        (
+            self.0,
+            Json(XrpcErrorBody {
+                error: self.1,
+                message: self.2,
+            }),
+        )
+            .into_response()
+    }
+}
 
 const NSID: &str = "blue.catbird.mlsChat.updateCursor";
 
@@ -27,10 +54,10 @@ pub async fn update_cursor(
     State(sse_state): State<Arc<SseState>>,
     auth_user: AuthUser,
     ExtractXrpc(input): ExtractXrpc<UpdateCursorRequest>,
-) -> Result<Json<UpdateCursorOutput<'static>>, StatusCode> {
+) -> Result<Json<UpdateCursorOutput<'static>>, XrpcError> {
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
         error!("❌ [v2.updateCursor] Unauthorized");
-        return Err(StatusCode::UNAUTHORIZED);
+        return Err(XrpcError(StatusCode::UNAUTHORIZED, "AuthRequired", "Authentication required".into()));
     }
 
     let convo_id = input.convo_id.to_string();
@@ -51,11 +78,11 @@ pub async fn update_cursor(
     .await
     .map_err(|e| {
         error!("Failed to check membership: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
+        XrpcError(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", "Failed to check membership".into())
     })?;
 
     if !is_member {
-        return Err(StatusCode::FORBIDDEN);
+        return Err(XrpcError(StatusCode::FORBIDDEN, "Forbidden", "Not a member of this conversation".into()));
     }
 
     let mut read_at: Option<jacquard_common::types::string::Datetime> = None;
@@ -66,7 +93,7 @@ pub async fn update_cursor(
 
         // Validate cursor format
         crate::realtime::cursor::CursorGenerator::validate(&cursor_str)
-            .map_err(|_| StatusCode::BAD_REQUEST)?;
+            .map_err(|_| XrpcError(StatusCode::BAD_REQUEST, "InvalidRequest", "Invalid cursor format".into()))?;
 
         info!(
             user = %crate::crypto::redact_for_log(caller_did),
@@ -89,7 +116,7 @@ pub async fn update_cursor(
         .await
         .map_err(|e| {
             error!("Failed to update cursor: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
+            XrpcError(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", "Failed to update cursor".into())
         })?;
     }
 
@@ -113,11 +140,11 @@ pub async fn update_cursor(
             .await
             .map_err(|e| {
                 error!("Failed to check message existence: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
+                XrpcError(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", "Failed to check message existence".into())
             })?;
 
             if !message_exists {
-                return Err(StatusCode::NOT_FOUND);
+                return Err(XrpcError(StatusCode::NOT_FOUND, "NotFound", "Message not found".into()));
             }
         }
 
@@ -138,7 +165,7 @@ pub async fn update_cursor(
         .await
         .map_err(|e| {
             error!("Failed to insert/update read receipt: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
+            XrpcError(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", "Failed to update read receipt".into())
         })?;
 
         // If marking all as read (no messageId), reset unread count
@@ -152,7 +179,7 @@ pub async fn update_cursor(
             .await
             .map_err(|e| {
                 error!("Failed to reset unread count: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
+                XrpcError(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", "Failed to reset unread count".into())
             })?;
         }
 
