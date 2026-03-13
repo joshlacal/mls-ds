@@ -224,7 +224,9 @@ pub struct GetKeyPackagesOutput {
 // blue.catbird.mlsChat.uploadBlob output
 #[derive(Debug, Clone, Serialize)]
 pub struct UploadBlobOutput {
-    pub blob: BlobRef,
+    #[serde(rename = "blobId")]
+    pub blob_id: String,
+    pub size: i64,
 }
 
 // blue.catbird.mlsChat.getKeyPackageStats output
