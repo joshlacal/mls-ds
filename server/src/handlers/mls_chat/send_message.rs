@@ -90,20 +90,16 @@ pub async fn send_message(
             let action = input.action.as_deref().unwrap_or("typing");
             Ok(match action {
                 "addReaction" => handle_add_reaction(pool, sse_state, auth_user, &input)
-                    .await?
-                    .into_response(),
+                    .await?,
                 "removeReaction" => handle_remove_reaction(pool, sse_state, auth_user, &input)
-                    .await?
-                    .into_response(),
+                    .await?,
                 "typingStop" | "stopTyping" => {
                     handle_typing(pool, sse_state, auth_user, &input, false)
                         .await?
-                        .into_response()
                 }
                 "typing" | "typingStart" => {
                     handle_typing(pool, sse_state, auth_user, &input, true)
                         .await?
-                        .into_response()
                 }
                 other => {
                     warn!(
@@ -112,7 +108,6 @@ pub async fn send_message(
                     );
                     handle_typing(pool, sse_state, auth_user, &input, true)
                         .await?
-                        .into_response()
                 }
             })
         }
@@ -547,7 +542,7 @@ async fn handle_add_reaction(
     sse_state: Arc<SseState>,
     auth_user: AuthUser,
     input: &crate::generated::blue_catbird::mlsChat::send_message::SendMessage<'_>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Response, StatusCode> {
     let convo_id = input.convo_id.to_string();
     let target_msg = input
         .target_message_id
@@ -654,10 +649,18 @@ async fn handle_add_reaction(
         error!("❌ [v2.sendMessage:addReaction] SSE emit: {}", e);
     }
 
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "reactedAt": now.to_rfc3339(),
-    })))
+    let msg_id = input.msg_id.to_string();
+    let received_bucket_ts = (now.timestamp() / 2) * 2;
+    let received_at = chrono::DateTime::from_timestamp(received_bucket_ts, 0)
+        .unwrap_or(now);
+    Ok(Json(SendMessageOutput {
+        message_id: msg_id.into(),
+        received_at: crate::sqlx_jacquard::chrono_to_datetime(received_at),
+        seq: 0,
+        epoch: input.epoch,
+        extra_data: Default::default(),
+    })
+    .into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -669,7 +672,7 @@ async fn handle_remove_reaction(
     sse_state: Arc<SseState>,
     auth_user: AuthUser,
     input: &crate::generated::blue_catbird::mlsChat::send_message::SendMessage<'_>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Response, StatusCode> {
     let convo_id = input.convo_id.to_string();
     let target_msg = input
         .target_message_id
@@ -750,7 +753,19 @@ async fn handle_remove_reaction(
         error!("❌ [v2.sendMessage:removeReaction] SSE emit: {}", e);
     }
 
-    Ok(Json(serde_json::json!({"success": true})))
+    let now = Utc::now();
+    let msg_id = input.msg_id.to_string();
+    let received_bucket_ts = (now.timestamp() / 2) * 2;
+    let received_at = chrono::DateTime::from_timestamp(received_bucket_ts, 0)
+        .unwrap_or(now);
+    Ok(Json(SendMessageOutput {
+        message_id: msg_id.into(),
+        received_at: crate::sqlx_jacquard::chrono_to_datetime(received_at),
+        seq: 0,
+        epoch: input.epoch,
+        extra_data: Default::default(),
+    })
+    .into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -763,7 +778,7 @@ async fn handle_typing(
     auth_user: AuthUser,
     input: &crate::generated::blue_catbird::mlsChat::send_message::SendMessage<'_>,
     is_typing: bool,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Response, StatusCode> {
     let convo_id = input.convo_id.to_string();
     let user_did = auth_user.did.clone();
 
@@ -798,9 +813,19 @@ async fn handle_typing(
         error!("❌ [v2.sendMessage:typing] SSE emit: {}", e);
     }
 
-    Ok(Json(
-        serde_json::json!({"success": true, "isTyping": is_typing}),
-    ))
+    let now = Utc::now();
+    let msg_id = input.msg_id.to_string();
+    let received_bucket_ts = (now.timestamp() / 2) * 2;
+    let received_at = chrono::DateTime::from_timestamp(received_bucket_ts, 0)
+        .unwrap_or(now);
+    Ok(Json(SendMessageOutput {
+        message_id: msg_id.into(),
+        received_at: crate::sqlx_jacquard::chrono_to_datetime(received_at),
+        seq: 0,
+        epoch: input.epoch,
+        extra_data: Default::default(),
+    })
+    .into_response())
 }
 
 #[cfg(test)]
