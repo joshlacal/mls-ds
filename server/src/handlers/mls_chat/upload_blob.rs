@@ -4,6 +4,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use chrono::{Duration, Utc};
 use serde::Serialize;
 use tracing::{error, info, warn};
 
@@ -62,7 +63,7 @@ pub async fn upload_blob(
 
     // Check quota
     let used_bytes: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(size_bytes), 0) FROM blobs WHERE owner_did = $1 AND deleted_at IS NULL",
+        "SELECT COALESCE(SUM(size_bytes), 0)::BIGINT FROM blobs WHERE owner_did = $1 AND deleted_at IS NULL",
     )
     .bind(owner_did)
     .fetch_one(&pool)
@@ -93,15 +94,15 @@ pub async fn upload_blob(
         })?;
 
     // Insert metadata
-    let ttl_days = blob_store.ttl_days();
+    let expires_at = Utc::now() + Duration::days(blob_store.ttl_days());
     sqlx::query(
         "INSERT INTO blobs (id, owner_did, size_bytes, created_at, expires_at) \
-         VALUES ($1, $2, $3, now(), now() + make_interval(days => $4))",
+         VALUES ($1, $2, $3, now(), $4)",
     )
     .bind(&blob_id)
     .bind(owner_did)
     .bind(size)
-    .bind(ttl_days as f64)
+    .bind(expires_at)
     .execute(&pool)
     .await
     .map_err(|e| {

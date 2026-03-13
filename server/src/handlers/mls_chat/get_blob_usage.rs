@@ -34,7 +34,7 @@ pub async fn get_blob_usage(
     let owner_did = &auth_user.did;
 
     let row: (i64, i64) = sqlx::query_as(
-        "SELECT COALESCE(SUM(size_bytes), 0), COUNT(*) FROM blobs WHERE owner_did = $1 AND deleted_at IS NULL",
+        "SELECT COALESCE(SUM(size_bytes), 0)::BIGINT, COUNT(*) FROM blobs WHERE owner_did = $1 AND deleted_at IS NULL",
     )
     .bind(owner_did)
     .fetch_one(&pool)
