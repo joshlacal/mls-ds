@@ -129,7 +129,7 @@ pub async fn commit_group_change(
     match input.action.as_ref() {
         "addMembers" => {
             let convo_id = input.convo_id.to_string();
-            info!("v2.commitGroupChange: addMembers for convo");
+            info!("v2.commitGroupChange: addMembers for convo {}", crate::crypto::redact_for_log(&convo_id));
 
             // ── Idempotency check ──────────────────────────────────────
             if let Some(ref idem_key) = input.idempotency_key {
@@ -213,7 +213,21 @@ pub async fn commit_group_change(
 
             let now = chrono::Utc::now();
 
-            // ── Add members (idempotent, safe outside transaction) ─────
+            // ── Fetch current epoch for CAS ───────────────────────────
+            let current_epoch = crate::db::get_current_epoch(&pool, &convo_id)
+                .await
+                .map_err(|e| {
+                    error!(convo_id = %crate::crypto::redact_for_log(&convo_id), "addMembers: failed to get current epoch: {}", e);
+                    internal_server_error("Failed to get current epoch")
+                })?;
+
+            // ── Begin transaction: members + CAS epoch + commit + welcomes + idempotency ──
+            let mut tx = pool.begin().await.map_err(|e| {
+                error!(convo_id = %crate::crypto::redact_for_log(&convo_id), "addMembers: failed to begin transaction: {}", e);
+                internal_server_error("Failed to begin transaction")
+            })?;
+
+            // ── Add members (inside transaction for atomicity with welcome) ──
             for member_did in member_dids {
                 let member_did_str = crate::sqlx_jacquard::did_to_string(member_did);
                 sqlx::query(
@@ -224,27 +238,13 @@ pub async fn commit_group_change(
                 .bind(&convo_id)
                 .bind(&member_did_str)
                 .bind(&now)
-                .execute(&pool)
+                .execute(&mut *tx)
                 .await
                 .map_err(|e| {
-                    error!("addMembers: failed to insert member: {}", e);
+                    error!(convo_id = %crate::crypto::redact_for_log(&convo_id), "addMembers: failed to insert member: {}", e);
                     internal_server_error("Failed to insert member")
                 })?;
             }
-
-            // ── Fetch current epoch for CAS ───────────────────────────
-            let current_epoch = crate::db::get_current_epoch(&pool, &convo_id)
-                .await
-                .map_err(|e| {
-                    error!("addMembers: failed to get current epoch: {}", e);
-                    internal_server_error("Failed to get current epoch")
-                })?;
-
-            // ── Begin transaction: CAS epoch + commit + welcomes + idempotency ──
-            let mut tx = pool.begin().await.map_err(|e| {
-                error!("addMembers: failed to begin transaction: {}", e);
-                internal_server_error("Failed to begin transaction")
-            })?;
 
             // ── Advance epoch (CAS) ───────────────────────────────────
             let new_epoch = crate::db::try_advance_conversation_epoch_tx(
@@ -350,7 +350,8 @@ pub async fn commit_group_change(
             })?;
 
             info!(
-                "✅ v2.commitGroupChange: addMembers complete, epoch={}",
+                "✅ v2.commitGroupChange: addMembers complete for convo {}, epoch={}",
+                crate::crypto::redact_for_log(&convo_id),
                 new_epoch
             );
             Ok(Json(CommitGroupChangeOutput {
