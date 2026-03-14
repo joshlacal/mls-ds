@@ -5,7 +5,7 @@
   "defs": {
     "main": {
       "type": "query",
-      "description": "Fetch an encrypted blob from the blob store. Returns raw encrypted bytes (application/octet-stream). No authorization check beyond valid DID — the blob is encrypted and useless without the decryption key from the MLS message.",
+      "description": "Fetch an encrypted blob from the blob store. Returns raw encrypted bytes (application/octet-stream). Only active members of the blob's conversation can download it.",
       "parameters": {
         "type": "params",
         "required": ["blobId"],
@@ -24,7 +24,8 @@
         }
       },
       "errors": [
-        {"name": "BlobNotFound", "description": "Blob does not exist or has expired/been deleted"}
+        {"name": "BlobNotFound", "description": "Blob does not exist or has expired/been deleted"},
+        {"name": "NotAMember", "description": "Requester is not an active member of the blob's conversation"}
       ]
     }
   }

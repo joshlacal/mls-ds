@@ -1,11 +1,11 @@
 use axum::{
     body::Bytes,
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     Json,
 };
 use chrono::{Duration, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
 use crate::{auth::AuthUser, blob_store::BlobStore, storage::DbPool};
@@ -15,6 +15,12 @@ const NSID: &str = "blue.catbird.mlsChat.uploadBlob";
 // ---------------------------------------------------------------------------
 // Request / Response types
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadBlobParams {
+    pub convo_id: String,
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -27,15 +33,17 @@ pub struct UploadBlobOutput {
 // Handler
 // ---------------------------------------------------------------------------
 
-/// POST /xrpc/blue.catbird.mlsChat.uploadBlob
+/// POST /xrpc/blue.catbird.mlsChat.uploadBlob?convoId=<id>
 ///
 /// Uploads encrypted blob bytes to S3-compatible storage (SeaweedFS).
 /// The server assigns a blob_id (UUIDv4) for the uploaded blob.
+/// Requires the uploader to be an active member of the target conversation.
 #[tracing::instrument(skip(pool, blob_store, auth_user, body))]
 pub async fn upload_blob(
     State(pool): State<DbPool>,
     State(blob_store): State<BlobStore>,
     auth_user: AuthUser,
+    Query(params): Query<UploadBlobParams>,
     body: Bytes,
 ) -> Result<Json<UploadBlobOutput>, StatusCode> {
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
@@ -46,6 +54,18 @@ pub async fn upload_blob(
     let owner_did = &auth_user.did;
     let size = body.len() as i64;
     let blob_id = uuid::Uuid::new_v4().to_string().to_lowercase();
+
+    // Verify uploader is a member of the target conversation
+    if let Err(e) =
+        crate::middleware::mls_auth::verify_group_membership(owner_did, &params.convo_id, &pool)
+            .await
+    {
+        warn!(
+            "❌ [uploadBlob] {} is not a member of {}: {}",
+            owner_did, params.convo_id, e
+        );
+        return Err(StatusCode::FORBIDDEN);
+    }
 
     // Validate size
     if size == 0 {
@@ -93,14 +113,15 @@ pub async fn upload_blob(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    // Insert metadata
+    // Insert metadata with convo_id
     let expires_at = Utc::now() + Duration::days(blob_store.ttl_days());
     sqlx::query(
-        "INSERT INTO blobs (id, owner_did, size_bytes, created_at, expires_at) \
-         VALUES ($1, $2, $3, now(), $4)",
+        "INSERT INTO blobs (id, owner_did, convo_id, size_bytes, created_at, expires_at) \
+         VALUES ($1, $2, $3, $4, now(), $5)",
     )
     .bind(&blob_id)
     .bind(owner_did)
+    .bind(&params.convo_id)
     .bind(size)
     .bind(expires_at)
     .execute(&pool)
@@ -117,8 +138,8 @@ pub async fn upload_blob(
     })?;
 
     info!(
-        "✅ [uploadBlob] Uploaded blob {} ({} bytes) for {}",
-        blob_id, size, owner_did
+        "✅ [uploadBlob] Uploaded blob {} ({} bytes) for {} in convo {}",
+        blob_id, size, owner_did, params.convo_id
     );
 
     Ok(Json(UploadBlobOutput {

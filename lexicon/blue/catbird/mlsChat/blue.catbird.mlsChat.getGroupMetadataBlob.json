@@ -8,11 +8,11 @@
       "description": "Download an encrypted metadata blob. Returns raw encrypted bytes. The blob is opaque — decryption requires the MLS epoch key derived by group members.",
       "parameters": {
         "type": "params",
-        "required": ["blobLocator", "groupId"],
+        "required": ["groupId"],
         "properties": {
           "blobLocator": {
             "type": "string",
-            "description": "The blob locator to fetch"
+            "description": "Optional blob locator. When omitted or empty, returns the latest blob for the group."
           },
           "groupId": {
             "type": "string",

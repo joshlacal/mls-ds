@@ -27,8 +27,7 @@ pub struct GetBlobParams {
 /// GET /xrpc/blue.catbird.mlsChat.getBlob?blobId=<id>
 ///
 /// Downloads an encrypted blob from S3-compatible storage.
-/// No ownership check — the blob is encrypted and useless without the
-/// decryption key from the MLS message.
+/// Only active members of the blob's conversation can download it.
 #[tracing::instrument(skip(pool, blob_store, auth_user))]
 pub async fn get_blob(
     State(pool): State<DbPool>,
@@ -41,21 +40,39 @@ pub async fn get_blob(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    // Check blob exists and is not expired/deleted
-    let exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM blobs WHERE id = $1 AND deleted_at IS NULL AND expires_at > now())",
+    // Look up blob metadata: existence, expiry, and owning conversation
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT convo_id FROM blobs WHERE id = $1 AND deleted_at IS NULL AND expires_at > now()",
     )
     .bind(&params.blob_id)
-    .fetch_one(&pool)
+    .fetch_optional(&pool)
     .await
     .map_err(|e| {
         error!("❌ [getBlob] DB error checking blob: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    if !exists {
-        warn!("❌ [getBlob] Blob not found or expired: {}", params.blob_id);
-        return Err(StatusCode::NOT_FOUND);
+    let convo_id = match row {
+        Some((cid,)) => cid,
+        None => {
+            warn!("❌ [getBlob] Blob not found or expired: {}", params.blob_id);
+            return Err(StatusCode::NOT_FOUND);
+        }
+    };
+
+    // Verify requester is a member of the blob's conversation
+    if let Err(e) = crate::middleware::mls_auth::verify_group_membership(
+        &auth_user.did,
+        &convo_id,
+        &pool,
+    )
+    .await
+    {
+        warn!(
+            "❌ [getBlob] {} not a member of convo {} for blob {}: {}",
+            auth_user.did, convo_id, params.blob_id, e
+        );
+        return Err(StatusCode::FORBIDDEN);
     }
 
     // Fetch from S3

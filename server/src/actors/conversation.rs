@@ -1086,20 +1086,55 @@ async fn handle_notify_system_message(
         }
     }
 
-    // 2. SSE
-    let cursor = sse_state
-        .cursor_gen
-        .next(convo_id, "messageEvent") // or system event?
-        .await;
+    // 2. SSE — fetch the commit message row and emit it to live subscribers
+    let msg_row = sqlx::query_as::<_, (Vec<u8>, i32, i64, chrono::DateTime<chrono::Utc>)>(
+        "SELECT ciphertext, epoch, seq, created_at FROM messages WHERE id = $1",
+    )
+    .bind(msg_id)
+    .fetch_optional(pool)
+    .await;
 
-    // We might need to fetch the message to construct the view,
-    // or just emit a signal. For now, assuming standard message event flow.
-    // Simplified for system messages:
-    if let Err(e) =
-        crate::db::store_event(pool, &cursor, convo_id, "messageEvent", Some(msg_id)).await
-    {
-        error!("❌ [actor:worker] Failed to store system event: {:?}", e);
+    match msg_row {
+        Ok(Some((ciphertext, epoch, seq, created_at))) => {
+            let cursor = sse_state
+                .cursor_gen
+                .next(convo_id, "messageEvent")
+                .await;
+
+            let message_view: StreamMessageView =
+                crate::generated::blue_catbird::mlsChat::MessageView {
+                    id: msg_id.to_string().into(),
+                    convo_id: convo_id.to_string().into(),
+                    ciphertext: bytes::Bytes::from(ciphertext),
+                    epoch: epoch.into(),
+                    seq,
+                    created_at: crate::sqlx_jacquard::chrono_to_datetime(created_at),
+                    message_type: Some(_message_type.into()),
+                    extra_data: Default::default(),
+                }
+                .into();
+
+            let event = StreamEvent::MessageEvent {
+                cursor: cursor.clone(),
+                message: message_view,
+                ephemeral: false,
+            };
+
+            if let Err(e) =
+                crate::db::store_event(pool, &cursor, convo_id, "messageEvent", Some(msg_id)).await
+            {
+                error!("❌ [actor:worker] Failed to store system event: {:?}", e);
+            }
+
+            if let Err(e) = sse_state.emit(convo_id, event).await {
+                error!("❌ [actor:worker] Failed to emit system message SSE event: {}", e);
+            }
+        }
+        Ok(None) => {
+            error!("❌ [actor:worker] System message {} not found in DB", msg_id);
+        }
+        Err(e) => {
+            error!("❌ [actor:worker] Failed to fetch system message {}: {:?}", msg_id, e);
+        }
     }
-
-    // Emitting SSE logic would go here if we constructed the event
 }
