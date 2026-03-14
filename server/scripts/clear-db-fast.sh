@@ -7,6 +7,8 @@ set -e
 export PGPASSWORD='dyvmo0-bewnur-tUrqad'
 
 psql -h localhost -U catbird -d catbird_mls <<'EOF'
+-- conversations has no FK to users, so must be truncated explicitly
+TRUNCATE TABLE conversations CASCADE;
 TRUNCATE TABLE users CASCADE;
 EOF
 
