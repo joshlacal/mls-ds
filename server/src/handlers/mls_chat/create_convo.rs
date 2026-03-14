@@ -349,7 +349,7 @@ async fn handle_create_convo(
                 group_id: convo_id.into(),
                 creator: string_to_did(&creator_did),
                 members: members_typed,
-                epoch: 0,
+                epoch: 1,
                 cipher_suite: input.cipher_suite.as_ref().to_string().into(),
                 created_at: chrono_to_datetime(now),
                 last_message_at: None,
@@ -367,7 +367,7 @@ async fn handle_create_convo(
 
     sqlx::query(
         "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at, name, cipher_suite, sequencer_ds, is_remote)
-         VALUES ($1, $2, 0, $3, $3, $4, $5, NULL, false)",
+         VALUES ($1, $2, 1, $3, $3, $4, $5, NULL, false)",
     )
     .bind(&convo_id)
     .bind(&auth_user.did)
@@ -627,7 +627,7 @@ async fn handle_create_convo(
     info!(
         convo = %crate::crypto::redact_for_log(&convo_id),
         member_count = members_typed.len(),
-        epoch = 0,
+        epoch = 1,
         "✅ [v2.createConvo] complete"
     );
 
@@ -647,7 +647,7 @@ async fn handle_create_convo(
             group_id: convo_id.into(),
             creator: string_to_did(&creator_did),
             members: members_typed,
-            epoch: 0,
+            epoch: 1,
             cipher_suite: input.cipher_suite.as_ref().to_string().into(),
             created_at: chrono_to_datetime(now),
             last_message_at: None,

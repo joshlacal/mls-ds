@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sqlx::FromRow;
 use std::sync::Arc;
+use tls_codec::Deserialize as TlsDeserialize;
 use tracing::{error, info, warn};
 
 use jacquard_axum::ExtractXrpc;
@@ -776,25 +777,68 @@ pub async fn commit_group_change(
                     bad_request("Invalid base64 groupInfo")
                 })?;
 
-            // Store group_info
-            let current_epoch: Option<i32> =
-                sqlx::query_scalar("SELECT group_info_epoch FROM conversations WHERE id = $1")
-                    .bind(&convo_id)
-                    .fetch_optional(&pool)
-                    .await
-                    .map_err(|e| {
-                        error!("Failed to fetch current epoch: {}", e);
-                        internal_server_error("Failed to fetch current GroupInfo epoch")
-                    })?
-                    .flatten();
+            // Parse GroupInfo to extract the MLS epoch (GroupInfo is public, no secrets exposed)
+            let mls_epoch = {
+                use openmls::messages::group_info::VerifiableGroupInfo;
+                use openmls::prelude::{MlsMessageIn, MlsMessageBodyIn};
 
-            let new_epoch = current_epoch.unwrap_or(0) + 1;
+                // Try MlsMessage wrapper first, then raw VerifiableGroupInfo
+                let from_mls_msg = MlsMessageIn::tls_deserialize(
+                    &mut group_info_bytes.as_slice(),
+                ).ok().and_then(|msg| match msg.extract() {
+                    MlsMessageBodyIn::GroupInfo(gi) => Some(gi.epoch().as_u64()),
+                    _ => None,
+                });
 
+                from_mls_msg.or_else(|| {
+                    VerifiableGroupInfo::tls_deserialize(
+                        &mut group_info_bytes.as_slice(),
+                    ).ok().map(|gi| gi.epoch().as_u64())
+                }).or_else(|| {
+                    warn!(
+                        convo_id = %crate::crypto::redact_for_log(&convo_id),
+                        "Could not parse GroupInfo to extract epoch, accepting without CAS"
+                    );
+                    None
+                })
+            };
+
+            // CAS protection: reject stale GroupInfo uploads
+            if let Some(mls_epoch) = mls_epoch {
+                let current_server_epoch: i32 = sqlx::query_scalar(
+                    "SELECT current_epoch FROM conversations WHERE id = $1",
+                )
+                .bind(&convo_id)
+                .fetch_one(&pool)
+                .await
+                .map_err(|e| {
+                    error!("Failed to fetch current_epoch: {}", e);
+                    internal_server_error("Failed to fetch current epoch")
+                })?;
+
+                if (mls_epoch as i32) < current_server_epoch {
+                    warn!(
+                        convo_id = %crate::crypto::redact_for_log(&convo_id),
+                        mls_epoch,
+                        current_server_epoch,
+                        "Rejecting stale GroupInfo (epoch < current)"
+                    );
+                    return Err(conflict("GroupInfo epoch is behind current epoch"));
+                }
+            }
+
+            // Store GroupInfo and sync current_epoch atomically
+            let mls_epoch_i32 = mls_epoch.map(|e| e as i32);
             sqlx::query(
-                "UPDATE conversations SET group_info = $1, group_info_epoch = $2, group_info_updated_at = NOW() WHERE id = $3",
+                r#"UPDATE conversations
+                   SET group_info = $1,
+                       group_info_epoch = COALESCE(group_info_epoch, 0) + 1,
+                       group_info_updated_at = NOW(),
+                       current_epoch = GREATEST(current_epoch, COALESCE($2, current_epoch))
+                   WHERE id = $3"#,
             )
             .bind(&group_info_bytes)
-            .bind(new_epoch)
+            .bind(mls_epoch_i32)
             .bind(&convo_id)
             .execute(&pool)
             .await
@@ -803,9 +847,11 @@ pub async fn commit_group_change(
                 internal_server_error("Failed to store GroupInfo")
             })?;
 
+            let stored_epoch = mls_epoch.unwrap_or(0);
             info!(
-                "✅ [v2.commitGroupChange] updateGroupInfo stored for convo {} epoch {}",
-                convo_id, new_epoch
+                "✅ [v2.commitGroupChange] updateGroupInfo stored for convo {} mls_epoch={}",
+                crate::crypto::redact_for_log(&convo_id),
+                stored_epoch
             );
             Ok(Json(success_response()).into_response())
         }
