@@ -4,8 +4,8 @@
 # Usage: ./deploy.sh
 #
 # This script:
-# 1. Builds the release binary
-# 2. Copies it to /usr/local/bin
+# 1. Pulls latest code
+# 2. Builds the release binary (in-place, used directly by systemd)
 # 3. Restarts the systemd service
 #
 
@@ -26,15 +26,23 @@ SERVICE_NAME="catbird-mls-server"
 echo -e "${GREEN}=== Catbird MLS Server Host Deployment ===${NC}"
 echo
 
-# Step 1: Build release binary
-echo -e "${YELLOW}[1/4] Building release binary...${NC}"
+# Step 1: Pull latest code
+echo -e "${YELLOW}[1/4] Pulling latest code...${NC}"
+cd "$MLS_ROOT"
+git pull --ff-only
+echo -e "${GREEN}✓ Code updated${NC}"
+echo
+
+# Step 2: Build release binary
+echo -e "${YELLOW}[2/4] Building release binary...${NC}"
 cd "$MLS_ROOT/server"
 SQLX_OFFLINE=true cargo build --release
 echo -e "${GREEN}✓ Build complete${NC}"
 echo
 
-# Step 2: Verify binary exists
-echo -e "${YELLOW}[2/4] Verifying binary...${NC}"
+# Step 3: Verify binary and restart service
+# Note: systemd runs the binary directly from target/release/
+echo -e "${YELLOW}[3/4] Verifying binary and restarting service...${NC}"
 if [ ! -f "$TARGET_DIR/release/$BINARY_NAME" ]; then
     echo -e "${RED}ERROR: Binary not found at $TARGET_DIR/release/$BINARY_NAME${NC}"
     exit 1
@@ -42,13 +50,6 @@ fi
 echo -e "${GREEN}✓ Binary found${NC}"
 echo "  Path: $TARGET_DIR/release/$BINARY_NAME"
 echo "  Size: $(du -h "$TARGET_DIR/release/$BINARY_NAME" | cut -f1)"
-echo "  Date: $(date -r "$TARGET_DIR/release/$BINARY_NAME" '+%Y-%m-%d %H:%M:%S')"
-echo
-
-# Step 3: Copy binary and restart service
-echo -e "${YELLOW}[3/4] Installing binary and restarting service...${NC}"
-sudo cp -f "$TARGET_DIR/release/$BINARY_NAME" /usr/local/bin/$BINARY_NAME
-sudo chmod +x /usr/local/bin/$BINARY_NAME
 sudo systemctl restart $SERVICE_NAME
 echo -e "${GREEN}✓ Service restarted${NC}"
 echo
