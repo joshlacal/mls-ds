@@ -41,7 +41,31 @@ pub async fn get_pending_devices(
         "Getting pending device additions"
     );
 
-    // Release expired claims
+    // Age out stale pending additions older than 1 hour.
+    // These are unlikely to ever be processed -- the device has either
+    // self-joined via External Commit or gone offline permanently.
+    let aged_out = sqlx::query(
+        r#"
+        UPDATE pending_device_additions
+        SET status = 'failed', updated_at = NOW()
+        WHERE status IN ('pending', 'in_progress')
+          AND created_at < $1 - INTERVAL '1 hour'
+        "#,
+    )
+    .bind(now)
+    .execute(&pool)
+    .await
+    .map_err(|e| {
+        error!("Failed to age out stale pending additions: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .rows_affected();
+
+    if aged_out > 0 {
+        info!("Aged out {} stale pending additions (>1 hour old)", aged_out);
+    }
+
+    // Release expired claims (for additions that are still fresh)
     let released = sqlx::query(
         r#"
         UPDATE pending_device_additions

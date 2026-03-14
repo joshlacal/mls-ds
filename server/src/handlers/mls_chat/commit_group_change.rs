@@ -608,7 +608,30 @@ pub async fn commit_group_change(
                 bad_request("Invalid DID format")
             })?;
 
-            // Release expired claims
+            // Age out stale pending additions older than 1 hour.
+            // These are unlikely to ever be processed -- the device has either
+            // self-joined via External Commit or gone offline permanently.
+            let aged_out = sqlx::query(
+                r#"
+                UPDATE pending_device_additions
+                SET status = 'failed', updated_at = NOW()
+                WHERE status IN ('pending', 'in_progress')
+                  AND created_at < NOW() - INTERVAL '1 hour'
+                "#,
+            )
+            .execute(&pool)
+            .await
+            .map_err(|e| {
+                error!("❌ [v2.commitGroupChange] Failed to age out stale pending additions: {}", e);
+                internal_server_error("Failed to age out stale pending additions")
+            })?
+            .rows_affected();
+
+            if aged_out > 0 {
+                info!("Aged out {} stale pending additions (>1 hour old)", aged_out);
+            }
+
+            // Release expired claims (for additions that are still fresh)
             let released = sqlx::query(
                 r#"
                 UPDATE pending_device_additions
@@ -861,6 +884,471 @@ pub async fn commit_group_change(
                     .into_response())
                 }
             }
+        }
+        "completePending" => {
+            let (caller_did, _) = parse_device_did(&auth_user.did).map_err(|e| {
+                error!("completePending: invalid DID: {}", e);
+                bad_request("Invalid DID format")
+            })?;
+
+            let pending_id = input.pending_addition_id.as_ref().ok_or_else(|| {
+                warn!("completePending: missing pending_addition_id");
+                bad_request("Missing pendingAdditionId")
+            })?;
+
+            let now = chrono::Utc::now();
+
+            // Mark the pending addition as completed.
+            // First try strict match: in_progress + claimed by this user.
+            let result = sqlx::query(
+                r#"
+                UPDATE pending_device_additions
+                SET status = 'completed',
+                    completed_by_did = $2,
+                    completed_at = $3,
+                    updated_at = $3
+                WHERE id = $1
+                  AND status = 'in_progress'
+                  AND claimed_by_did = $2
+                "#,
+            )
+            .bind(pending_id.to_string())
+            .bind(&caller_did)
+            .bind(now)
+            .execute(&pool)
+            .await
+            .map_err(|e| {
+                error!("completePending: DB error: {}", e);
+                internal_server_error("Failed to complete pending addition")
+            })?;
+
+            let mut completed = result.rows_affected() > 0;
+
+            if completed {
+                info!("completePending: marked {} as completed", pending_id);
+            } else {
+                // Fallback: the claim may have expired and been reset to 'pending',
+                // but the MLS operation already succeeded. Accept completion from
+                // any status that isn't already terminal.
+                let fallback = sqlx::query(
+                    r#"
+                    UPDATE pending_device_additions
+                    SET status = 'completed',
+                        completed_by_did = $2,
+                        completed_at = $3,
+                        updated_at = $3
+                    WHERE id = $1
+                      AND status IN ('pending', 'in_progress')
+                    "#,
+                )
+                .bind(pending_id.to_string())
+                .bind(&caller_did)
+                .bind(now)
+                .execute(&pool)
+                .await
+                .map_err(|e| {
+                    error!("completePending fallback: DB error: {}", e);
+                    internal_server_error("Failed to complete pending addition")
+                })?;
+
+                completed = fallback.rows_affected() > 0;
+                if completed {
+                    info!("completePending: fallback completed {}", pending_id);
+                } else {
+                    warn!("completePending: no matching pending addition found for {}", pending_id);
+                }
+            }
+
+            Ok(Json(CommitGroupChangeOutput {
+                success: completed,
+                claimed_addition: None,
+                new_epoch: None,
+                pending_additions: None,
+                rejoined_at: None,
+                extra_data: Default::default(),
+            })
+            .into_response())
+        }
+        "removeMember" => {
+            let convo_id = input.convo_id.to_string();
+            info!("v2.commitGroupChange: removeMember for convo");
+
+            // ── Idempotency check ──────────────────────────────────────
+            if let Some(ref idem_key) = input.idempotency_key {
+                let idem_key_str = idem_key.to_string();
+                let already: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM idempotency_cache WHERE key = $1)",
+                )
+                .bind(&idem_key_str)
+                .fetch_one(&pool)
+                .await
+                .unwrap_or(false);
+
+                if already {
+                    let current_epoch: Option<i32> =
+                        sqlx::query_scalar("SELECT current_epoch FROM conversations WHERE id = $1")
+                            .bind(&convo_id)
+                            .fetch_optional(&pool)
+                            .await
+                            .ok()
+                            .flatten();
+                    info!("v2.commitGroupChange: removeMember idempotent hit");
+                    return Ok(Json(CommitGroupChangeOutput {
+                        success: true,
+                        new_epoch: Some(current_epoch.unwrap_or(0) as i64),
+                        claimed_addition: None,
+                        pending_additions: None,
+                        rejoined_at: None,
+                        extra_data: Default::default(),
+                    })
+                    .into_response());
+                }
+            }
+
+            // ── Validate required fields ───────────────────────────────
+            let commit_b64 = input.commit.as_ref().ok_or_else(|| {
+                warn!("removeMember: missing commit");
+                bad_request("Missing commit")
+            })?;
+            let member_dids = input.member_dids.as_ref().ok_or_else(|| {
+                warn!("removeMember: missing member_dids");
+                bad_request("Missing memberDids")
+            })?;
+
+            // ── Decode commit ──────────────────────────────────────────
+            let commit_bytes = base64::engine::general_purpose::STANDARD
+                .decode(commit_b64.as_bytes())
+                .map_err(|e| {
+                    warn!("removeMember: invalid base64 commit: {}", e);
+                    bad_request("Invalid base64 commit")
+                })?;
+
+            // ── Verify caller is an admin ──────────────────────────────
+            let (caller_did, _) = parse_device_did(&auth_user.did).map_err(|e| {
+                error!("removeMember: invalid DID format: {}", e);
+                bad_request("Invalid DID format")
+            })?;
+            let is_admin: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM members WHERE convo_id = $1 AND user_did = $2 AND left_at IS NULL AND is_admin = true)",
+            )
+            .bind(&convo_id)
+            .bind(&caller_did)
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| {
+                error!("removeMember: admin check failed: {}", e);
+                internal_server_error("Failed to check admin status")
+            })?;
+            if !is_admin {
+                return Err(forbidden("Not an admin of this conversation"));
+            }
+
+            let now = chrono::Utc::now();
+
+            // ── Mark removed members as left ───────────────────────────
+            for member_did in member_dids {
+                let member_did_str = crate::sqlx_jacquard::did_to_string(member_did);
+                sqlx::query(
+                    "UPDATE members SET left_at = $3 WHERE convo_id = $1 AND (user_did = $2 OR member_did = $2) AND left_at IS NULL",
+                )
+                .bind(&convo_id)
+                .bind(&member_did_str)
+                .bind(&now)
+                .execute(&pool)
+                .await
+                .map_err(|e| {
+                    error!("removeMember: failed to mark member as left: {}", e);
+                    internal_server_error("Failed to remove member")
+                })?;
+            }
+
+            // ── Fetch current epoch for CAS ───────────────────────────
+            let current_epoch = crate::db::get_current_epoch(&pool, &convo_id)
+                .await
+                .map_err(|e| {
+                    error!("removeMember: failed to get current epoch: {}", e);
+                    internal_server_error("Failed to get current epoch")
+                })?;
+
+            // ── Begin transaction: CAS epoch + commit + idempotency ───
+            let mut tx = pool.begin().await.map_err(|e| {
+                error!("removeMember: failed to begin transaction: {}", e);
+                internal_server_error("Failed to begin transaction")
+            })?;
+
+            // ── Advance epoch (CAS) ───────────────────────────────────
+            let new_epoch = crate::db::try_advance_conversation_epoch_tx(
+                &mut tx,
+                &convo_id,
+                current_epoch,
+            )
+            .await
+            .map_err(|e| {
+                error!("removeMember: failed to advance epoch: {}", e);
+                internal_server_error("Failed to advance epoch")
+            })?;
+
+            let new_epoch = match new_epoch {
+                Some(epoch) => epoch,
+                None => {
+                    warn!("removeMember: epoch CAS failed (concurrent commit), returning 409");
+                    return Err(conflict("Conversation epoch advanced concurrently"));
+                }
+            };
+
+            // ── Invalidate stale GroupInfo after epoch advance ────────
+            sqlx::query(
+                "UPDATE conversations SET group_info = NULL, group_info_epoch = NULL, group_info_updated_at = NULL WHERE id = $1",
+            )
+            .bind(&convo_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                error!("removeMember: failed to invalidate stale GroupInfo: {}", e);
+                internal_server_error("Failed to invalidate stale GroupInfo")
+            })?;
+
+            // ── Store commit message ───────────────────────────────────
+            let msg_id = uuid::Uuid::new_v4().to_string();
+            let seq: i64 = sqlx::query_scalar(
+                "SELECT CAST(COALESCE(MAX(seq), 0) + 1 AS BIGINT) FROM messages WHERE convo_id = $1",
+            )
+            .bind(&convo_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| {
+                error!("removeMember: failed to get seq: {}", e);
+                internal_server_error("Failed to allocate message sequence")
+            })?;
+
+            sqlx::query(
+                "INSERT INTO messages (id, convo_id, sender_did, message_type, epoch, seq, ciphertext, created_at) VALUES ($1, $2, $3, 'commit', $4, $5, $6, $7)",
+            )
+            .bind(&msg_id)
+            .bind(&convo_id)
+            .bind(Option::<&str>::None)
+            .bind(new_epoch)
+            .bind(seq)
+            .bind(&commit_bytes)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                error!("removeMember: failed to insert commit message: {}", e);
+                internal_server_error("Failed to store commit message")
+            })?;
+
+            // ── Store idempotency key ──────────────────────────────────
+            if let Some(ref idem_key) = input.idempotency_key {
+                let _ = sqlx::query(
+                    "INSERT INTO idempotency_cache (key, endpoint, response_body, status_code, created_at, expires_at) VALUES ($1, $2, '{}'::jsonb, 200, NOW(), NOW() + INTERVAL '24 hours') ON CONFLICT DO NOTHING",
+                )
+                .bind(idem_key.to_string())
+                .bind(NSID)
+                .execute(&mut *tx)
+                .await;
+            }
+
+            // ── Commit transaction ─────────────────────────────────────
+            tx.commit().await.map_err(|e| {
+                error!("removeMember: failed to commit transaction: {}", e);
+                internal_server_error("Failed to commit transaction")
+            })?;
+
+            info!(
+                "✅ v2.commitGroupChange: removeMember complete, epoch={}",
+                new_epoch
+            );
+            Ok(Json(CommitGroupChangeOutput {
+                success: true,
+                new_epoch: Some(new_epoch as i64),
+                claimed_addition: None,
+                pending_additions: None,
+                rejoined_at: None,
+                extra_data: Default::default(),
+            })
+            .into_response())
+        }
+        // Generic commit handler for self-updates, metadata updates, and other
+        // epoch-advancing operations that don't add or remove members.
+        "commit" | "updateMetadata" => {
+            let action_name = input.action.to_string();
+            let convo_id = input.convo_id.to_string();
+            info!("v2.commitGroupChange: {} for convo", action_name);
+
+            // ── Idempotency check ──────────────────────────────────────
+            if let Some(ref idem_key) = input.idempotency_key {
+                let idem_key_str = idem_key.to_string();
+                let already: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM idempotency_cache WHERE key = $1)",
+                )
+                .bind(&idem_key_str)
+                .fetch_one(&pool)
+                .await
+                .unwrap_or(false);
+
+                if already {
+                    let current_epoch: Option<i32> =
+                        sqlx::query_scalar("SELECT current_epoch FROM conversations WHERE id = $1")
+                            .bind(&convo_id)
+                            .fetch_optional(&pool)
+                            .await
+                            .ok()
+                            .flatten();
+                    info!("v2.commitGroupChange: {} idempotent hit", action_name);
+                    return Ok(Json(CommitGroupChangeOutput {
+                        success: true,
+                        new_epoch: Some(current_epoch.unwrap_or(0) as i64),
+                        claimed_addition: None,
+                        pending_additions: None,
+                        rejoined_at: None,
+                        extra_data: Default::default(),
+                    })
+                    .into_response());
+                }
+            }
+
+            // ── Validate commit field ──────────────────────────────────
+            let commit_b64 = input.commit.as_ref().ok_or_else(|| {
+                warn!("{}: missing commit", action_name);
+                bad_request("Missing commit")
+            })?;
+
+            let commit_bytes = base64::engine::general_purpose::STANDARD
+                .decode(commit_b64.as_bytes())
+                .map_err(|e| {
+                    warn!("{}: invalid base64 commit: {}", action_name, e);
+                    bad_request("Invalid base64 commit")
+                })?;
+
+            // ── Verify caller is a member ──────────────────────────────
+            let (caller_did, _) = parse_device_did(&auth_user.did).map_err(|e| {
+                error!("{}: invalid DID format: {}", action_name, e);
+                bad_request("Invalid DID format")
+            })?;
+            let is_member: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM members WHERE convo_id = $1 AND user_did = $2 AND left_at IS NULL)",
+            )
+            .bind(&convo_id)
+            .bind(&caller_did)
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| {
+                error!("{}: membership check failed: {}", action_name, e);
+                internal_server_error("Failed to check membership")
+            })?;
+            if !is_member {
+                return Err(forbidden("Not a member of this conversation"));
+            }
+
+            let now = chrono::Utc::now();
+
+            // ── Fetch current epoch for CAS ───────────────────────────
+            let current_epoch = crate::db::get_current_epoch(&pool, &convo_id)
+                .await
+                .map_err(|e| {
+                    error!("{}: failed to get current epoch: {}", action_name, e);
+                    internal_server_error("Failed to get current epoch")
+                })?;
+
+            // ── Begin transaction: CAS epoch + commit + idempotency ───
+            let mut tx = pool.begin().await.map_err(|e| {
+                error!("{}: failed to begin transaction: {}", action_name, e);
+                internal_server_error("Failed to begin transaction")
+            })?;
+
+            // ── Advance epoch (CAS) ───────────────────────────────────
+            let new_epoch = crate::db::try_advance_conversation_epoch_tx(
+                &mut tx,
+                &convo_id,
+                current_epoch,
+            )
+            .await
+            .map_err(|e| {
+                error!("{}: failed to advance epoch: {}", action_name, e);
+                internal_server_error("Failed to advance epoch")
+            })?;
+
+            let new_epoch = match new_epoch {
+                Some(epoch) => epoch,
+                None => {
+                    warn!("{}: epoch CAS failed (concurrent commit), returning 409", action_name);
+                    return Err(conflict("Conversation epoch advanced concurrently"));
+                }
+            };
+
+            // ── Invalidate stale GroupInfo after epoch advance ────────
+            sqlx::query(
+                "UPDATE conversations SET group_info = NULL, group_info_epoch = NULL, group_info_updated_at = NULL WHERE id = $1",
+            )
+            .bind(&convo_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                error!("{}: failed to invalidate stale GroupInfo: {}", action_name, e);
+                internal_server_error("Failed to invalidate stale GroupInfo")
+            })?;
+
+            // ── Store commit message ───────────────────────────────────
+            let msg_id = uuid::Uuid::new_v4().to_string();
+            let seq: i64 = sqlx::query_scalar(
+                "SELECT CAST(COALESCE(MAX(seq), 0) + 1 AS BIGINT) FROM messages WHERE convo_id = $1",
+            )
+            .bind(&convo_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| {
+                error!("{}: failed to get seq: {}", action_name, e);
+                internal_server_error("Failed to allocate message sequence")
+            })?;
+
+            sqlx::query(
+                "INSERT INTO messages (id, convo_id, sender_did, message_type, epoch, seq, ciphertext, created_at) VALUES ($1, $2, $3, 'commit', $4, $5, $6, $7)",
+            )
+            .bind(&msg_id)
+            .bind(&convo_id)
+            .bind(Option::<&str>::None)
+            .bind(new_epoch)
+            .bind(seq)
+            .bind(&commit_bytes)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                error!("{}: failed to insert commit message: {}", action_name, e);
+                internal_server_error("Failed to store commit message")
+            })?;
+
+            // ── Store idempotency key ──────────────────────────────────
+            if let Some(ref idem_key) = input.idempotency_key {
+                let _ = sqlx::query(
+                    "INSERT INTO idempotency_cache (key, endpoint, response_body, status_code, created_at, expires_at) VALUES ($1, $2, '{}'::jsonb, 200, NOW(), NOW() + INTERVAL '24 hours') ON CONFLICT DO NOTHING",
+                )
+                .bind(idem_key.to_string())
+                .bind(NSID)
+                .execute(&mut *tx)
+                .await;
+            }
+
+            // ── Commit transaction ─────────────────────────────────────
+            tx.commit().await.map_err(|e| {
+                error!("{}: failed to commit transaction: {}", action_name, e);
+                internal_server_error("Failed to commit transaction")
+            })?;
+
+            info!(
+                "✅ v2.commitGroupChange: {} complete, epoch={}",
+                action_name, new_epoch
+            );
+            Ok(Json(CommitGroupChangeOutput {
+                success: true,
+                new_epoch: Some(new_epoch as i64),
+                claimed_addition: None,
+                pending_additions: None,
+                rejoined_at: None,
+                extra_data: Default::default(),
+            })
+            .into_response())
         }
         "refreshGroupInfo" => {
             // iOS clients send this to request active members to publish fresh GroupInfo.
