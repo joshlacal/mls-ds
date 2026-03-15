@@ -346,13 +346,16 @@ pub async fn commit_group_change(
 
             // ── Store idempotency key ──────────────────────────────────
             if let Some(ref idem_key) = input.idempotency_key {
-                let _ = sqlx::query(
-                    "INSERT INTO idempotency_cache (key, endpoint, response_body, status_code, created_at, expires_at) VALUES ($1, $2, '{}'::jsonb, 200, NOW(), NOW() + INTERVAL '24 hours') ON CONFLICT DO NOTHING",
+                if let Err(e) = sqlx::query(
+                    "INSERT INTO idempotency_cache (caller_did, key, endpoint, response_body, status_code, created_at, expires_at) VALUES ($1, $2, $3, '{}'::jsonb, 200, NOW(), NOW() + INTERVAL '24 hours') ON CONFLICT DO NOTHING",
                 )
+                .bind(&caller_did)
                 .bind(idem_key.to_string())
                 .bind(NSID)
                 .execute(&mut *tx)
-                .await;
+                .await {
+                    error!("commitGroupChange: failed to store idempotency key: {}", e);
+                }
             }
 
             // ── Commit transaction ─────────────────────────────────────
@@ -553,24 +556,49 @@ pub async fn commit_group_change(
                     bad_request("Invalid base64 commit")
                 })?;
 
-            // ── Verify caller is current/past member ───────────────────
+            // ── Verify caller is a current or self-left member (NOT admin-removed) ──
             let (caller_did, _) = parse_device_did(&auth_user.did).map_err(|e| {
                 error!("externalCommit: invalid DID format: {}", e);
                 bad_request("Invalid DID format")
             })?;
-            let is_member_or_past: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM members WHERE convo_id = $1 AND (user_did = $2 OR member_did = $2))",
+
+            // Check membership status: active, self-left (needs_rejoin), or removed
+            let member_status: Option<(Option<chrono::DateTime<chrono::Utc>>, bool)> = sqlx::query_as(
+                "SELECT left_at, needs_rejoin FROM members WHERE convo_id = $1 AND (user_did = $2 OR member_did = $2) LIMIT 1",
             )
             .bind(&convo_id)
             .bind(&caller_did)
-            .fetch_one(&pool)
+            .fetch_optional(&pool)
             .await
             .map_err(|e| {
                 error!("externalCommit: membership check failed: {}", e);
                 internal_server_error("Failed to check membership")
             })?;
-            if !is_member_or_past {
-                return Err(forbidden("Not a member of this conversation"));
+
+            match member_status {
+                None => {
+                    return Err(forbidden("Not a member of this conversation"));
+                }
+                Some((Some(_left_at), false)) => {
+                    // Member was removed by admin (left_at set, needs_rejoin=false)
+                    // Block External Commit — they must be re-invited via addMembers
+                    warn!(
+                        "externalCommit: blocked removed member {} from rejoining convo {}",
+                        crate::crypto::redact_for_log(&caller_did),
+                        crate::crypto::redact_for_log(&convo_id)
+                    );
+                    return Err(forbidden("You were removed from this conversation"));
+                }
+                Some((Some(_left_at), true)) => {
+                    // Member self-left or needs rejoin (needs_rejoin=true) — allow External Commit
+                    info!(
+                        "externalCommit: allowing rejoin for member with needs_rejoin=true in convo {}",
+                        crate::crypto::redact_for_log(&convo_id)
+                    );
+                }
+                Some((None, _)) => {
+                    // Active member — allow External Commit (epoch resync)
+                }
             }
 
             let now = chrono::Utc::now();
@@ -589,7 +617,7 @@ pub async fn commit_group_change(
                 internal_server_error("Failed to begin transaction")
             })?;
 
-            // Ensure caller is marked as active after successful rejoin.
+            // Reactivate caller (clear left_at for self-left/needs_rejoin members)
             sqlx::query(
                 "UPDATE members SET left_at = NULL, needs_rejoin = false, rejoin_requested_at = NULL WHERE convo_id = $1 AND (user_did = $2 OR member_did = $2)",
             )
@@ -666,13 +694,16 @@ pub async fn commit_group_change(
 
             // ── Store idempotency key ──────────────────────────────────
             if let Some(ref idem_key) = input.idempotency_key {
-                let _ = sqlx::query(
-                    "INSERT INTO idempotency_cache (key, endpoint, response_body, status_code, created_at, expires_at) VALUES ($1, $2, '{}'::jsonb, 200, NOW(), NOW() + INTERVAL '24 hours') ON CONFLICT DO NOTHING",
+                if let Err(e) = sqlx::query(
+                    "INSERT INTO idempotency_cache (caller_did, key, endpoint, response_body, status_code, created_at, expires_at) VALUES ($1, $2, $3, '{}'::jsonb, 200, NOW(), NOW() + INTERVAL '24 hours') ON CONFLICT DO NOTHING",
                 )
+                .bind(&caller_did)
                 .bind(idem_key.to_string())
                 .bind(NSID)
                 .execute(&mut *tx)
-                .await;
+                .await {
+                    error!("commitGroupChange: failed to store idempotency key: {}", e);
+                }
             }
 
             // ── Commit transaction ─────────────────────────────────────
@@ -1403,13 +1434,16 @@ pub async fn commit_group_change(
 
             // ── Store idempotency key ──────────────────────────────────
             if let Some(ref idem_key) = input.idempotency_key {
-                let _ = sqlx::query(
-                    "INSERT INTO idempotency_cache (key, endpoint, response_body, status_code, created_at, expires_at) VALUES ($1, $2, '{}'::jsonb, 200, NOW(), NOW() + INTERVAL '24 hours') ON CONFLICT DO NOTHING",
+                if let Err(e) = sqlx::query(
+                    "INSERT INTO idempotency_cache (caller_did, key, endpoint, response_body, status_code, created_at, expires_at) VALUES ($1, $2, $3, '{}'::jsonb, 200, NOW(), NOW() + INTERVAL '24 hours') ON CONFLICT DO NOTHING",
                 )
+                .bind(&caller_did)
                 .bind(idem_key.to_string())
                 .bind(NSID)
                 .execute(&mut *tx)
-                .await;
+                .await {
+                    error!("commitGroupChange: failed to store idempotency key: {}", e);
+                }
             }
 
             // ── Commit transaction ─────────────────────────────────────
@@ -1584,13 +1618,16 @@ pub async fn commit_group_change(
 
             // ── Store idempotency key ──────────────────────────────────
             if let Some(ref idem_key) = input.idempotency_key {
-                let _ = sqlx::query(
-                    "INSERT INTO idempotency_cache (key, endpoint, response_body, status_code, created_at, expires_at) VALUES ($1, $2, '{}'::jsonb, 200, NOW(), NOW() + INTERVAL '24 hours') ON CONFLICT DO NOTHING",
+                if let Err(e) = sqlx::query(
+                    "INSERT INTO idempotency_cache (caller_did, key, endpoint, response_body, status_code, created_at, expires_at) VALUES ($1, $2, $3, '{}'::jsonb, 200, NOW(), NOW() + INTERVAL '24 hours') ON CONFLICT DO NOTHING",
                 )
+                .bind(&caller_did)
                 .bind(idem_key.to_string())
                 .bind(NSID)
                 .execute(&mut *tx)
-                .await;
+                .await {
+                    error!("commitGroupChange: failed to store idempotency key: {}", e);
+                }
             }
 
             // ── Commit transaction ─────────────────────────────────────
