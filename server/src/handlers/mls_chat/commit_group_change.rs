@@ -105,10 +105,10 @@ fn invalidate_welcome_response(rows_affected: u64) -> CommitGroupChangeOutput<'s
 /// POST /xrpc/blue.catbird.mlsChat.commitGroupChange
 ///
 /// Consolidates: addMembers, processExternalCommit, rejoin, readdition, listPending, claimPending
-#[tracing::instrument(skip(pool, _sse_state, _actor_registry, _block_sync, auth_user, input))]
+#[tracing::instrument(skip(pool, sse_state, _actor_registry, _block_sync, auth_user, input))]
 pub async fn commit_group_change(
     State(pool): State<DbPool>,
-    State(_sse_state): State<Arc<SseState>>,
+    State(sse_state): State<Arc<SseState>>,
     State(_actor_registry): State<Arc<ActorRegistry>>,
     State(_block_sync): State<Arc<BlockSyncService>>,
     auth_user: AuthUser,
@@ -350,6 +350,88 @@ pub async fn commit_group_change(
                 internal_server_error("Failed to commit transaction")
             })?;
 
+            // ── Broadcast commit via SSE/WebSocket ───────────────────
+            // Without this, connected clients miss epoch-advancing commits
+            // and fail to decrypt subsequent messages at the new epoch.
+            {
+                let pool_clone = pool.clone();
+                let sse_state_clone = sse_state.clone();
+                let convo_id_clone = convo_id.clone();
+                let msg_id_clone = msg_id.clone();
+                let commit_bytes_clone = commit_bytes.clone();
+
+                tokio::spawn(async move {
+                    // Fan-out envelopes so clients pick up the commit via getMessages
+                    let members_result = sqlx::query_scalar::<_, String>(
+                        "SELECT member_did FROM members WHERE convo_id = $1 AND left_at IS NULL",
+                    )
+                    .bind(&convo_id_clone)
+                    .fetch_all(&pool_clone)
+                    .await;
+
+                    if let Ok(member_dids) = members_result {
+                        if !member_dids.is_empty() {
+                            let envelope_now = chrono::Utc::now();
+                            let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
+                                "INSERT INTO envelopes (id, convo_id, recipient_did, message_id, created_at) ",
+                            );
+                            qb.push_values(member_dids.iter(), |mut b, did| {
+                                b.push_bind(uuid::Uuid::new_v4().to_string())
+                                    .push_bind(&convo_id_clone)
+                                    .push_bind(did)
+                                    .push_bind(&msg_id_clone)
+                                    .push_bind(envelope_now);
+                            });
+                            qb.push(" ON CONFLICT (recipient_did, message_id) DO NOTHING");
+                            if let Err(e) = qb.build().execute(&pool_clone).await {
+                                error!("addMembers: envelope fanout failed: {:?}", e);
+                            }
+                        }
+                    }
+
+                    // Emit SSE event so WebSocket subscribers see the commit immediately
+                    let cursor = sse_state_clone
+                        .cursor_gen
+                        .next(&convo_id_clone, "messageEvent")
+                        .await;
+
+                    let message_view: crate::realtime::StreamMessageView =
+                        crate::generated::blue_catbird::mlsChat::MessageView {
+                            id: msg_id_clone.clone().into(),
+                            convo_id: convo_id_clone.clone().into(),
+                            ciphertext: bytes::Bytes::from(commit_bytes_clone),
+                            epoch: new_epoch as i64,
+                            seq,
+                            created_at: crate::sqlx_jacquard::chrono_to_datetime(now),
+                            message_type: Some("commit".into()),
+                            extra_data: Default::default(),
+                        }
+                        .into();
+
+                    let event = crate::realtime::StreamEvent::MessageEvent {
+                        cursor: cursor.clone(),
+                        message: message_view,
+                        ephemeral: false,
+                    };
+
+                    if let Err(e) = crate::db::store_event(
+                        &pool_clone,
+                        &cursor,
+                        &convo_id_clone,
+                        "messageEvent",
+                        Some(&msg_id_clone),
+                    )
+                    .await
+                    {
+                        error!("addMembers: store event failed: {:?}", e);
+                    }
+
+                    if let Err(e) = sse_state_clone.emit(&convo_id_clone, event).await {
+                        error!("addMembers: SSE emit failed: {}", e);
+                    }
+                });
+            }
+
             info!(
                 "✅ v2.commitGroupChange: addMembers complete for convo {}, epoch={}",
                 crate::crypto::redact_for_log(&convo_id),
@@ -542,6 +624,84 @@ pub async fn commit_group_change(
                 error!("externalCommit: failed to commit transaction: {}", e);
                 internal_server_error("Failed to commit transaction")
             })?;
+
+            // ── Broadcast commit via SSE/WebSocket ───────────────────
+            {
+                let pool_clone = pool.clone();
+                let sse_state_clone = sse_state.clone();
+                let convo_id_clone = convo_id.clone();
+                let msg_id_clone = msg_id.clone();
+                let commit_bytes_clone = commit_bytes.clone();
+
+                tokio::spawn(async move {
+                    let members_result = sqlx::query_scalar::<_, String>(
+                        "SELECT member_did FROM members WHERE convo_id = $1 AND left_at IS NULL",
+                    )
+                    .bind(&convo_id_clone)
+                    .fetch_all(&pool_clone)
+                    .await;
+
+                    if let Ok(member_dids) = members_result {
+                        if !member_dids.is_empty() {
+                            let envelope_now = chrono::Utc::now();
+                            let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
+                                "INSERT INTO envelopes (id, convo_id, recipient_did, message_id, created_at) ",
+                            );
+                            qb.push_values(member_dids.iter(), |mut b, did| {
+                                b.push_bind(uuid::Uuid::new_v4().to_string())
+                                    .push_bind(&convo_id_clone)
+                                    .push_bind(did)
+                                    .push_bind(&msg_id_clone)
+                                    .push_bind(envelope_now);
+                            });
+                            qb.push(" ON CONFLICT (recipient_did, message_id) DO NOTHING");
+                            if let Err(e) = qb.build().execute(&pool_clone).await {
+                                error!("externalCommit: envelope fanout failed: {:?}", e);
+                            }
+                        }
+                    }
+
+                    let cursor = sse_state_clone
+                        .cursor_gen
+                        .next(&convo_id_clone, "messageEvent")
+                        .await;
+
+                    let message_view: crate::realtime::StreamMessageView =
+                        crate::generated::blue_catbird::mlsChat::MessageView {
+                            id: msg_id_clone.clone().into(),
+                            convo_id: convo_id_clone.clone().into(),
+                            ciphertext: bytes::Bytes::from(commit_bytes_clone),
+                            epoch: new_epoch as i64,
+                            seq,
+                            created_at: crate::sqlx_jacquard::chrono_to_datetime(now),
+                            message_type: Some("commit".into()),
+                            extra_data: Default::default(),
+                        }
+                        .into();
+
+                    let event = crate::realtime::StreamEvent::MessageEvent {
+                        cursor: cursor.clone(),
+                        message: message_view,
+                        ephemeral: false,
+                    };
+
+                    if let Err(e) = crate::db::store_event(
+                        &pool_clone,
+                        &cursor,
+                        &convo_id_clone,
+                        "messageEvent",
+                        Some(&msg_id_clone),
+                    )
+                    .await
+                    {
+                        error!("externalCommit: store event failed: {:?}", e);
+                    }
+
+                    if let Err(e) = sse_state_clone.emit(&convo_id_clone, event).await {
+                        error!("externalCommit: SSE emit failed: {}", e);
+                    }
+                });
+            }
 
             info!(
                 "✅ v2.commitGroupChange: externalCommit complete, epoch={}",
