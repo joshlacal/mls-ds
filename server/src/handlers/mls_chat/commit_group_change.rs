@@ -229,15 +229,15 @@ pub async fn commit_group_change(
             })?;
 
             // ── Add members (inside transaction for atomicity with welcome) ──
-            for member_did in member_dids {
-                let member_did_str = crate::sqlx_jacquard::did_to_string(member_did);
-                sqlx::query(
+            let member_did_strings: Vec<String> = member_dids.iter().map(|d| crate::sqlx_jacquard::did_to_string(d)).collect();
+            for member_did_str in &member_did_strings {
+                let result = sqlx::query(
                     r#"INSERT INTO members (convo_id, member_did, user_did, joined_at)
                        VALUES ($1, $2, $2, $3)
                        ON CONFLICT (convo_id, member_did) DO UPDATE SET left_at = NULL, needs_rejoin = false"#,
                 )
                 .bind(&convo_id)
-                .bind(&member_did_str)
+                .bind(member_did_str)
                 .bind(&now)
                 .execute(&mut *tx)
                 .await
@@ -245,6 +245,12 @@ pub async fn commit_group_change(
                     error!(convo_id = %crate::crypto::redact_for_log(&convo_id), "addMembers: failed to insert member: {}", e);
                     internal_server_error("Failed to insert member")
                 })?;
+                info!(
+                    "addMembers: inserted member {} into convo {}, rows_affected={}",
+                    crate::crypto::redact_for_log(member_did_str),
+                    crate::crypto::redact_for_log(&convo_id),
+                    result.rows_affected()
+                );
             }
 
             // ── Advance epoch (CAS) ───────────────────────────────────
@@ -292,7 +298,7 @@ pub async fn commit_group_change(
                 internal_server_error("Failed to allocate message sequence")
             })?;
 
-            sqlx::query(
+            let msg_result = sqlx::query(
                 "INSERT INTO messages (id, convo_id, sender_did, message_type, epoch, seq, ciphertext, created_at) VALUES ($1, $2, $3, 'commit', $4, $5, $6, $7)",
             )
             .bind(&msg_id)
@@ -308,12 +314,12 @@ pub async fn commit_group_change(
                 error!("addMembers: failed to insert commit message: {}", e);
                 internal_server_error("Failed to store commit message")
             })?;
+            info!("addMembers: commit message inserted, rows_affected={}", msg_result.rows_affected());
 
             // ── Store welcome for each new member ──────────────────────
-            for member_did in member_dids {
-                let member_did_str = crate::sqlx_jacquard::did_to_string(member_did);
+            for member_did_str in &member_did_strings {
                 let welcome_id = uuid::Uuid::new_v4().to_string();
-                sqlx::query(
+                let welcome_result = sqlx::query(
                     r#"INSERT INTO welcome_messages (id, convo_id, recipient_did, welcome_data, key_package_hash, created_at)
                        VALUES ($1, $2, $3, $4, $5, $6)
                        ON CONFLICT (convo_id, recipient_did, COALESCE(key_package_hash, '\x00'::bytea)) WHERE consumed = false
@@ -321,7 +327,7 @@ pub async fn commit_group_change(
                 )
                 .bind(&welcome_id)
                 .bind(&convo_id)
-                .bind(&member_did_str)
+                .bind(member_did_str)
                 .bind(&welcome_bytes)
                 .bind::<Option<Vec<u8>>>(None)
                 .bind(&now)
@@ -331,6 +337,11 @@ pub async fn commit_group_change(
                     error!("addMembers: failed to store welcome: {}", e);
                     internal_server_error("Failed to store welcome")
                 })?;
+                info!(
+                    "addMembers: welcome stored for {}, rows_affected={}",
+                    crate::crypto::redact_for_log(member_did_str),
+                    welcome_result.rows_affected()
+                );
             }
 
             // ── Store idempotency key ──────────────────────────────────
@@ -349,6 +360,51 @@ pub async fn commit_group_change(
                 error!("addMembers: failed to commit transaction: {}", e);
                 internal_server_error("Failed to commit transaction")
             })?;
+
+            // ── Post-commit verification ─────────────────────────────
+            // Verify the transaction actually persisted (diagnostic for phantom commit bug)
+            {
+                let verify_count: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM members WHERE convo_id = $1 AND left_at IS NULL",
+                )
+                .bind(&convo_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap_or(-1);
+                let verify_welcome: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM welcome_messages WHERE convo_id = $1 AND consumed = false",
+                )
+                .bind(&convo_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap_or(-1);
+                let verify_commit: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM messages WHERE convo_id = $1 AND message_type = 'commit' AND epoch = $2)",
+                )
+                .bind(&convo_id)
+                .bind(new_epoch)
+                .fetch_one(&pool)
+                .await
+                .unwrap_or(false);
+                if !verify_commit || verify_count < (member_did_strings.len() as i64 + 2) {
+                    error!(
+                        "🚨 addMembers POST-COMMIT VERIFICATION FAILED! convo={} members={} welcomes={} commit_exists={} expected_members_added={}",
+                        crate::crypto::redact_for_log(&convo_id),
+                        verify_count,
+                        verify_welcome,
+                        verify_commit,
+                        member_did_strings.len()
+                    );
+                } else {
+                    info!(
+                        "✅ addMembers post-commit verified: convo={} members={} welcomes={} commit_exists={}",
+                        crate::crypto::redact_for_log(&convo_id),
+                        verify_count,
+                        verify_welcome,
+                        verify_commit
+                    );
+                }
+            }
 
             // ── Broadcast commit via SSE/WebSocket ───────────────────
             // Without this, connected clients miss epoch-advancing commits
