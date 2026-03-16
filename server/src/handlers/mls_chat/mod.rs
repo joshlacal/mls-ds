@@ -20,9 +20,6 @@ pub mod update_cursor;
 pub mod commit_group_change;
 pub mod get_group_state;
 
-// Ephemeral E2EE signals (typing, read receipts, presence)
-pub mod send_ephemeral;
-
 // Conversation Management
 pub mod get_convo_settings;
 pub mod leave_convo;
@@ -63,7 +60,6 @@ pub use register_device::register_device_post;
 pub use create_convo::create_convo;
 pub use get_convos::get_convos;
 pub use get_messages::get_messages;
-pub use send_ephemeral::send_ephemeral;
 pub use send_message::send_message;
 pub use update_cursor::update_cursor;
 

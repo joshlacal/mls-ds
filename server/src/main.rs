@@ -583,8 +583,8 @@ async fn main() -> anyhow::Result<()> {
         get_subscription_ticket::GetSubscriptionTicketRequest, leave_convo::LeaveConvoRequest,
         list_devices::ListDevicesRequest, opt_in::OptInRequest,
         publish_key_packages::PublishKeyPackagesRequest, register_device::RegisterDeviceRequest,
-        report::ReportRequest, send_ephemeral::SendEphemeralRequest,
-        send_message::SendMessageRequest, update_convo::UpdateConvoRequest,
+        report::ReportRequest, send_message::SendMessageRequest,
+        update_convo::UpdateConvoRequest,
         update_cursor::UpdateCursorRequest,
     };
     use jacquard_axum::IntoRouter;
@@ -618,9 +618,6 @@ async fn main() -> anyhow::Result<()> {
         ))
         .merge(SendMessageRequest::into_router(
             handlers::mls_chat::send_message,
-        ))
-        .merge(SendEphemeralRequest::into_router(
-            handlers::mls_chat::send_ephemeral,
         ))
         .merge(GetMessagesRequest::into_router(
             handlers::mls_chat::get_messages,
