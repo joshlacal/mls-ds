@@ -46,14 +46,14 @@ pub async fn delete_blob(
     if result.rows_affected() == 0 {
         warn!(
             "❌ [deleteBlob] Blob not found or not owned by {}: {}",
-            owner_did, input.blob_id
+            crate::crypto::redact_for_log(owner_did), crate::crypto::redact_for_log(input.blob_id.as_ref())
         );
         return Err(StatusCode::NOT_FOUND);
     }
 
     info!(
         "✅ [deleteBlob] Soft-deleted blob {} for {}",
-        input.blob_id, owner_did
+        crate::crypto::redact_for_log(input.blob_id.as_ref()), crate::crypto::redact_for_log(owner_did)
     );
     Ok(StatusCode::OK)
 }

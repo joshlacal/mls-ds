@@ -73,7 +73,7 @@ async fn handle_revoke_invite(
     let invite_id = invite.code.as_deref().unwrap_or_default().to_string();
     let caller_did = &auth_user.did;
 
-    info!(invite_id = %invite_id, caller = %caller_did, "v2.createConvo: revoking invite");
+    info!(invite_id = %invite_id, caller = %crate::crypto::redact_for_log(caller_did), "v2.createConvo: revoking invite");
 
     // Get conversation ID from invite
     let convo_id: Option<String> = sqlx::query_scalar("SELECT convo_id FROM invites WHERE id = $1")
@@ -119,7 +119,7 @@ async fn handle_revoke_invite(
         return (StatusCode::NOT_FOUND, "Invite already revoked or not found").into_response();
     }
 
-    info!(invite_id = %invite_id, convo_id = %convo_id, "Invite revoked successfully");
+    info!(invite_id = %invite_id, convo_id = %crate::crypto::redact_for_log(&convo_id), "Invite revoked successfully");
     Json(serde_json::json!({"success": true})).into_response()
 }
 

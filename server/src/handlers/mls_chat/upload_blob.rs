@@ -62,7 +62,7 @@ pub async fn upload_blob(
     {
         warn!(
             "❌ [uploadBlob] {} is not a member of {}: {}",
-            owner_did, params.convo_id, e
+            crate::crypto::redact_for_log(owner_did), crate::crypto::redact_for_log(&params.convo_id), e
         );
         return Err(StatusCode::FORBIDDEN);
     }
@@ -76,7 +76,7 @@ pub async fn upload_blob(
     if size > blob_store.max_blob_size() {
         warn!(
             "❌ [uploadBlob] Blob too large: {} bytes from {}",
-            size, owner_did
+            size, crate::crypto::redact_for_log(owner_did)
         );
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -96,7 +96,7 @@ pub async fn upload_blob(
     if used_bytes + size > blob_store.quota_bytes() {
         warn!(
             "❌ [uploadBlob] Quota exceeded for {}: used={}, new={}, quota={}",
-            owner_did,
+            crate::crypto::redact_for_log(owner_did),
             used_bytes,
             size,
             blob_store.quota_bytes()
@@ -139,7 +139,7 @@ pub async fn upload_blob(
 
     info!(
         "✅ [uploadBlob] Uploaded blob {} ({} bytes) for {} in convo {}",
-        blob_id, size, owner_did, params.convo_id
+        crate::crypto::redact_for_log(&blob_id), size, crate::crypto::redact_for_log(owner_did), crate::crypto::redact_for_log(&params.convo_id)
     );
 
     Ok(Json(UploadBlobOutput {

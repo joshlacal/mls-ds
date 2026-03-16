@@ -2,7 +2,7 @@ use axum::{
     body::Body,
     extract::{Query, State},
     http::{header, StatusCode},
-    response::{IntoResponse, Response},
+    response::Response,
 };
 use serde::Deserialize;
 use tracing::{error, info, warn};
@@ -53,6 +53,46 @@ pub async fn get_group_metadata_blob(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
+    let caller_did = &auth_user.did;
+    let group_id = &params.group_id;
+
+    // Verify caller is a member of the group
+    let convo_id: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM conversations WHERE group_id = $1"
+    )
+    .bind(group_id)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|e| {
+        error!("❌ [getGroupMetadataBlob] Failed to look up conversation for group: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let convo_id = match convo_id {
+        Some(id) => id,
+        None => {
+            warn!("❌ [getGroupMetadataBlob] No conversation found for group_id");
+            return Err(StatusCode::NOT_FOUND);
+        }
+    };
+
+    let is_member: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM members WHERE convo_id = $1 AND (user_did = $2 OR member_did = $2) AND left_at IS NULL)",
+    )
+    .bind(&convo_id)
+    .bind(caller_did)
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| {
+        error!("❌ [getGroupMetadataBlob] membership check failed: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    if !is_member {
+        warn!("❌ [getGroupMetadataBlob] Caller is not a member of the group");
+        return Err(StatusCode::FORBIDDEN);
+    }
+
     // Treat empty string the same as None (Swift client sends "" when no locator)
     let effective_locator = params
         .blob_locator
@@ -96,7 +136,7 @@ pub async fn get_group_metadata_blob(
         Some(blob) => {
             info!(
                 "✅ [getGroupMetadataBlob] Returning blob ({} bytes) for group {}",
-                blob.size, params.group_id
+                blob.size, crate::crypto::redact_for_log(&params.group_id)
             );
             Ok(Response::builder()
                 .status(StatusCode::OK)
@@ -108,7 +148,7 @@ pub async fn get_group_metadata_blob(
         None => {
             warn!(
                 "❌ [getGroupMetadataBlob] Blob not found: locator={:?} group={}",
-                effective_locator, params.group_id
+                effective_locator.map(|l| crate::crypto::redact_for_log(l)), crate::crypto::redact_for_log(&params.group_id)
             );
             Err(StatusCode::NOT_FOUND)
         }

@@ -10,10 +10,10 @@ use sqlx::PgPool;
 pub async fn verify_group_membership(user_did: &str, convo_id: &str, db: &PgPool) -> Result<()> {
     let member = sqlx::query(
         r#"
-        SELECT member_did 
-        FROM members 
+        SELECT member_did
+        FROM members
         WHERE convo_id = $1
-        AND member_did = $2 
+        AND (member_did = $2 OR user_did = $2)
         AND left_at IS NULL
         "#,
     )

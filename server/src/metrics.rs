@@ -133,6 +133,12 @@ impl MetricsRecorder {
             "Total number of federation trust score transitions"
         );
 
+        // Fan-out failure metrics
+        metrics::describe_counter!(
+            "fanout_failures_total",
+            "Total number of fan-out failures by stage"
+        );
+
         Self { handle }
     }
 

@@ -120,6 +120,12 @@ async fn main() -> anyhow::Result<()> {
         if std::env::var("REDIS_ENCRYPTION_KEY").is_err() {
             panic!("Refusing to start in production: REDIS_ENCRYPTION_KEY is required.");
         }
+        if std::env::var("SERVICE_DID").map(|v| v.is_empty()).unwrap_or(true) {
+            panic!(
+                "Refusing to start in production: SERVICE_DID is not configured. \
+                 This is required for JWT audience validation."
+            );
+        }
     }
 
     // Check LXM/JTI enforcement safety

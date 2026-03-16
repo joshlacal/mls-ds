@@ -22,13 +22,9 @@ use crate::{
 
 const NSID: &str = "blue.catbird.mlsChat.sendMessage";
 
-fn resolve_stored_epoch(client_epoch: i64, server_epoch: i64) -> i64 {
-    if client_epoch != server_epoch {
-        client_epoch
-    } else {
-        client_epoch
-    }
-}
+/// Maximum allowed epoch drift between client and server.
+/// Beyond this, the client's epoch claim is likely bogus or the result of severe desync.
+const MAX_EPOCH_DRIFT: i64 = 1000;
 
 // ---------------------------------------------------------------------------
 // Handler
@@ -136,7 +132,6 @@ async fn handle_persistent(
     let convo_id = input.convo_id.to_string();
     let msg_id = input.msg_id.to_string();
     let padded_size = input.padded_size as u32;
-    let idempotency_key: Option<String> = None; // msgId now serves as the idempotency key
 
     // --- Validate msgId format (ULID 26 chars or UUID 36 chars) ---
     let is_ulid = msg_id.len() == 26 && msg_id.chars().all(|c| c.is_ascii_alphanumeric());
@@ -216,10 +211,14 @@ async fn handle_persistent(
 
     let client_epoch = input.epoch;
     let store_epoch = if client_epoch != server_epoch {
-        // Log the mismatch but trust the client's epoch. The client knows what MLS epoch
-        // it encrypted at. The server's current_epoch can be stale (e.g. after createConvo
-        // + addMembers race, or if the client processed commits the server hasn't tracked).
-        // Overriding with server_epoch caused EPOCH-SKIP on the receiver side.
+        let drift = (client_epoch - server_epoch).abs();
+        if drift > MAX_EPOCH_DRIFT {
+            error!(
+                "❌ [v2.sendMessage] Epoch drift too large: client={}, server={}, drift={}",
+                client_epoch, server_epoch, drift
+            );
+            return Err(StatusCode::BAD_REQUEST);
+        }
         tracing::warn!(
             target: "mls_epoch",
             convo_id = %crate::crypto::redact_for_log(&convo_id),
@@ -228,9 +227,9 @@ async fn handle_persistent(
             if client_epoch < server_epoch { "stale" } else { "future" },
             server_epoch, client_epoch
         );
-        resolve_stored_epoch(client_epoch, server_epoch)
+        client_epoch
     } else {
-        resolve_stored_epoch(client_epoch, server_epoch)
+        client_epoch
     };
 
     // --- Insert message in a transaction (seq via MAX+1) ---
@@ -242,6 +241,17 @@ async fn handle_persistent(
         error!("❌ [v2.sendMessage] begin tx: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+
+    // Lock the conversation row to serialize sequence number assignment.
+    // This prevents two concurrent senders from reading the same MAX(seq).
+    sqlx::query("SELECT 1 FROM conversations WHERE id = $1 FOR UPDATE")
+        .bind(&convo_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            error!("❌ [v2.sendMessage] conversation lock: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     // Dedup by msg_id
     let existing: Option<(String, i64, i64, chrono::DateTime<Utc>)> = sqlx::query_as(
@@ -268,32 +278,6 @@ async fn handle_persistent(
         .into_response());
     }
 
-    // Dedup by idempotency_key
-    if let Some(ref idem_key) = idempotency_key {
-        let existing_idem: Option<(String, i64, i64, chrono::DateTime<Utc>)> = sqlx::query_as(
-            "SELECT id, CAST(seq AS BIGINT), CAST(epoch AS BIGINT), created_at FROM messages WHERE idempotency_key = $1",
-        )
-        .bind(idem_key)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| {
-            error!("❌ [v2.sendMessage] idempotency check: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-        if let Some((eid, eseq, eepoch, eat)) = existing_idem {
-            tx.rollback().await.ok();
-            return Ok(Json(SendMessageOutput {
-                message_id: eid.into(),
-                received_at: crate::sqlx_jacquard::chrono_to_datetime(eat),
-                seq: eseq,
-                epoch: eepoch,
-                extra_data: Default::default(),
-            })
-            .into_response());
-        }
-    }
-
     let seq: i64 = sqlx::query_scalar(
         "SELECT CAST(COALESCE(MAX(seq), 0) + 1 AS BIGINT) FROM messages WHERE convo_id = $1",
     )
@@ -312,8 +296,8 @@ async fn handle_persistent(
         r#"INSERT INTO messages (
             id, convo_id, sender_did, message_type, epoch, seq,
             ciphertext, created_at, expires_at,
-            msg_id, padded_size, received_bucket_ts, idempotency_key
-        ) VALUES ($1, $2, NULL, 'app', $3, $4, $5, $6, $7, $8, $9, $10, $11)"#,
+            msg_id, padded_size, received_bucket_ts
+        ) VALUES ($1, $2, NULL, 'app', $3, $4, $5, $6, $7, $8, $9, $10)"#,
     )
     .bind(&row_id)
     .bind(&convo_id)
@@ -325,13 +309,43 @@ async fn handle_persistent(
     .bind(&msg_id)
     .bind(padded_size as i64)
     .bind(received_bucket_ts)
-    .bind(&idempotency_key)
     .execute(&mut *tx)
     .await
     .map_err(|e| {
         error!("❌ [v2.sendMessage] insert message: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+
+    // Query members and create envelopes inside the transaction
+    let member_dids: Vec<String> = sqlx::query_scalar(
+        "SELECT member_did FROM members WHERE convo_id = $1 AND left_at IS NULL",
+    )
+    .bind(&convo_id)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| {
+        error!("❌ [v2.sendMessage] get members for envelopes: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    if !member_dids.is_empty() {
+        let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
+            "INSERT INTO envelopes (id, convo_id, recipient_did, message_id, created_at) ",
+        );
+        let envelope_now = Utc::now();
+        qb.push_values(member_dids.iter(), |mut b, did| {
+            b.push_bind(uuid::Uuid::new_v4().to_string())
+                .push_bind(&convo_id)
+                .push_bind(did)
+                .push_bind(&row_id)
+                .push_bind(envelope_now);
+        });
+        qb.push(" ON CONFLICT (recipient_did, message_id) DO NOTHING");
+        qb.build().execute(&mut *tx).await.map_err(|e| {
+            error!("❌ [v2.sendMessage] envelope insert: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    }
 
     tx.commit().await.map_err(|e| {
         error!("❌ [v2.sendMessage] commit: {}", e);
@@ -345,7 +359,7 @@ async fn handle_persistent(
         store_epoch
     );
 
-    // --- Spawn async fan-out (envelopes, SSE, push, federation) ---
+    // --- Spawn async fan-out (SSE, push, federation) ---
     let pool_clone = pool.clone();
     let convo_id_clone = convo_id.clone();
     let msg_id_clone = row_id.clone();
@@ -359,42 +373,6 @@ async fn handle_persistent(
 
     tokio::spawn(async move {
         let fanout_start = std::time::Instant::now();
-
-        // Fan-out envelopes
-        let members_result = sqlx::query_scalar::<_, String>(
-            "SELECT member_did FROM members WHERE convo_id = $1 AND left_at IS NULL",
-        )
-        .bind(&convo_id_clone)
-        .fetch_all(&pool_clone)
-        .await;
-
-        match members_result {
-            Ok(member_dids) => {
-                if !member_dids.is_empty() {
-                    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
-                        "INSERT INTO envelopes (id, convo_id, recipient_did, message_id, created_at) ",
-                    );
-                    let envelope_now = Utc::now();
-                    qb.push_values(member_dids.iter(), |mut b, did| {
-                        b.push_bind(uuid::Uuid::new_v4().to_string())
-                            .push_bind(&convo_id_clone)
-                            .push_bind(did)
-                            .push_bind(&msg_id_clone)
-                            .push_bind(envelope_now);
-                    });
-                    qb.push(" ON CONFLICT (recipient_did, message_id) DO NOTHING");
-                    if let Err(e) = qb.build().execute(&pool_clone).await {
-                        error!("❌ [v2.sendMessage:fanout] envelope insert: {:?}", e);
-                    }
-                }
-
-                let fanout_duration = fanout_start.elapsed();
-                crate::metrics::record_envelope_write_duration(&convo_id_clone, fanout_duration);
-            }
-            Err(e) => {
-                error!("❌ [v2.sendMessage:fanout] get members: {:?}", e);
-            }
-        }
 
         // SSE event
         let cursor = sse_state_clone
@@ -432,10 +410,12 @@ async fn handle_persistent(
         .await
         {
             error!("❌ [v2.sendMessage:fanout] store event: {:?}", e);
+            metrics::counter!("fanout_failures_total", 1, "stage" => "store_event");
         }
 
         if let Err(e) = sse_state_clone.emit(&convo_id_clone, event).await {
             error!("❌ [v2.sendMessage:fanout] SSE emit: {}", e);
+            metrics::counter!("fanout_failures_total", 1, "stage" => "sse_emit");
         }
 
         // Push notifications
@@ -453,6 +433,7 @@ async fn handle_persistent(
                 .await
             {
                 error!("❌ [v2.sendMessage:push] {}", e);
+                metrics::counter!("fanout_failures_total", 1, "stage" => "push_notification");
             }
         }
 
@@ -476,7 +457,7 @@ async fn handle_persistent(
                 let payload_bytes = match serde_json::to_vec(&deliver_payload) {
                     Ok(p) => p,
                     Err(e) => {
-                        tracing::warn!(convo_id = %convo_id_clone, error = %e, "federation serialize failed");
+                        tracing::warn!(convo_id = %crate::crypto::redact_for_log(&convo_id_clone), error = %e, "federation serialize failed");
                         return;
                     }
                 };
@@ -505,20 +486,25 @@ async fn handle_persistent(
                                 .await
                             {
                                 tracing::warn!(
-                                    convo_id = %convo_id_clone,
+                                    convo_id = %crate::crypto::redact_for_log(&convo_id_clone),
                                     target_ds = %crate::crypto::redact_for_log(&ds_did),
                                     error = %e,
                                     "federation outbound enqueue failed (non-fatal)"
                                 );
+                                metrics::counter!("fanout_failures_total", 1, "stage" => "federation_outbound");
                             }
                         }
                     }
                     Err(e) => {
-                        tracing::warn!(convo_id = %convo_id_clone, error = %e, "get participant DS DIDs failed (non-fatal)");
+                        tracing::warn!(convo_id = %crate::crypto::redact_for_log(&convo_id_clone), error = %e, "get participant DS DIDs failed (non-fatal)");
+                        metrics::counter!("fanout_failures_total", 1, "stage" => "federation_outbound");
                     }
                 }
             }
         }
+
+        let fanout_duration = fanout_start.elapsed();
+        crate::metrics::record_envelope_write_duration(&convo_id_clone, fanout_duration);
     });
 
     info!("✅ [v2.sendMessage] COMPLETE");
@@ -543,6 +529,14 @@ async fn handle_add_reaction(
     auth_user: AuthUser,
     input: &crate::generated::blue_catbird::mlsChat::send_message::SendMessage<'_>,
 ) -> Result<Response, StatusCode> {
+    // DEPRECATED: Server-side plaintext reactions break E2EE privacy model.
+    // Clients should send reactions as encrypted MLS application messages instead.
+    // This handler will be removed in a future release once catmos is updated.
+    tracing::warn!(
+        target: "deprecation",
+        "handle_add_reaction called — this endpoint stores reactions in plaintext and is deprecated"
+    );
+
     let convo_id = input.convo_id.to_string();
     let target_msg = input
         .target_message_id
@@ -673,6 +667,13 @@ async fn handle_remove_reaction(
     auth_user: AuthUser,
     input: &crate::generated::blue_catbird::mlsChat::send_message::SendMessage<'_>,
 ) -> Result<Response, StatusCode> {
+    // DEPRECATED: Server-side plaintext reactions break E2EE privacy model.
+    // This handler will be removed in a future release once catmos is updated.
+    tracing::warn!(
+        target: "deprecation",
+        "handle_remove_reaction called — this endpoint stores reactions in plaintext and is deprecated"
+    );
+
     let convo_id = input.convo_id.to_string();
     let target_msg = input
         .target_message_id
@@ -830,15 +831,11 @@ async fn handle_typing(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_stored_epoch;
+    use super::MAX_EPOCH_DRIFT;
 
     #[test]
-    fn resolve_stored_epoch_prefers_client_epoch_on_mismatch() {
-        assert_eq!(resolve_stored_epoch(1, 0), 1);
-    }
-
-    #[test]
-    fn resolve_stored_epoch_keeps_matching_epoch() {
-        assert_eq!(resolve_stored_epoch(4, 4), 4);
+    fn max_epoch_drift_is_reasonable() {
+        assert!(MAX_EPOCH_DRIFT > 0);
+        assert!(MAX_EPOCH_DRIFT <= 10_000);
     }
 }

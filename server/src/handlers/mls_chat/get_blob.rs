@@ -55,7 +55,7 @@ pub async fn get_blob(
     let convo_id = match row {
         Some((cid,)) => cid,
         None => {
-            warn!("❌ [getBlob] Blob not found or expired: {}", params.blob_id);
+            warn!("❌ [getBlob] Blob not found or expired: {}", crate::crypto::redact_for_log(&params.blob_id));
             return Err(StatusCode::NOT_FOUND);
         }
     };
@@ -70,7 +70,7 @@ pub async fn get_blob(
     {
         warn!(
             "❌ [getBlob] {} not a member of convo {} for blob {}: {}",
-            auth_user.did, convo_id, params.blob_id, e
+            crate::crypto::redact_for_log(&auth_user.did), crate::crypto::redact_for_log(&convo_id), crate::crypto::redact_for_log(&params.blob_id), e
         );
         return Err(StatusCode::FORBIDDEN);
     }

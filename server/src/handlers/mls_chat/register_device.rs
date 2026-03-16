@@ -504,20 +504,20 @@ async fn handle_register(
                 if let Err(e) = sse_state.emit(convo_id, event).await {
                     warn!(
                         "Failed to emit NewDeviceEvent for convo {}: {}",
-                        convo_id, e
+                        crate::crypto::redact_for_log(convo_id), e
                     );
                 }
             }
             Ok(None) => {
                 info!(
                     "Pending addition already exists for device {} in convo {}",
-                    device_id, convo_id
+                    device_id, crate::crypto::redact_for_log(convo_id)
                 );
             }
             Err(e) => {
                 warn!(
                     "Failed to create pending addition for convo {}: {}",
-                    convo_id, e
+                    crate::crypto::redact_for_log(convo_id), e
                 );
             }
         }
@@ -927,7 +927,7 @@ async fn handle_claim_pending_addition(
 
     info!(
         "Successfully claimed pending addition {} for conversation {}",
-        pending_addition_id, p_convo_id
+        crate::crypto::redact_for_log(pending_addition_id), crate::crypto::redact_for_log(&p_convo_id)
     );
 
     // Fetch key package for new device
@@ -1066,9 +1066,9 @@ async fn handle_complete_pending_addition(
                 if claimed_by.as_deref() != Some(&user_did) {
                     warn!(
                         "Pending addition {} claimed by {}, not {}",
-                        pending_addition_id,
-                        claimed_by.as_deref().unwrap_or("unknown"),
-                        user_did
+                        crate::crypto::redact_for_log(pending_addition_id),
+                        claimed_by.as_deref().map(|d| crate::crypto::redact_for_log(d)).unwrap_or_else(|| "unknown".to_string()),
+                        crate::crypto::redact_for_log(&user_did)
                     );
                     return Err(StatusCode::FORBIDDEN);
                 }

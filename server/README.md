@@ -99,20 +99,62 @@ server/
 | `/health/live` | Liveness probe |
 | `/health/ready` | Readiness probe |
 
-## 🔌 API Endpoints
+## API Endpoints
+
+### `blue.catbird.mlsChat.*` (client-facing)
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/xrpc/blue.catbird.mls.createConvo` | POST | Create new conversation |
-| `/xrpc/blue.catbird.mls.addMembers` | POST | Add members to conversation |
-| `/xrpc/blue.catbird.mls.sendMessage` | POST | Send encrypted message |
-| `/xrpc/blue.catbird.mls.getMessages` | GET | Retrieve messages |
-| `/xrpc/blue.catbird.mls.getConvos` | GET | List user's conversations |
-| `/xrpc/blue.catbird.mls.leaveConvo` | POST | Leave conversation |
-| `/xrpc/blue.catbird.mls.publishKeyPackage` | POST | Upload key packages |
-| `/xrpc/blue.catbird.mls.getKeyPackages` | GET | Get key packages |
-| `/xrpc/blue.catbird.mls.getWelcome` | GET | Get welcome messages |
-| `/xrpc/blue.catbird.mls.updateCursor` | POST | Update read position |
+| `registerDevice` | POST | Register a device for MLS |
+| `publishKeyPackages` | POST | Upload MLS key packages |
+| `listDevices` | GET | List registered devices |
+| `getPendingDevices` | GET | Get devices pending key packages |
+| `getKeyPackageStatus` | GET | Key package inventory status |
+| `getKeyPackages` | GET | Fetch key packages for inviting |
+| `createConvo` | POST | Create new conversation |
+| `getConvos` | GET | List user's conversations |
+| `sendMessage` | POST | Send encrypted message |
+| `sendEphemeral` | POST | Send ephemeral message (deprecated) |
+| `getMessages` | GET | Retrieve messages |
+| `updateCursor` | POST | Update read position |
+| `getGroupState` | GET | Get MLS group state |
+| `commitGroupChange` | POST | Commit MLS group change |
+| `updateConvo` | POST | Update conversation metadata |
+| `getConvoSettings` | GET | Get conversation settings |
+| `leaveConvo` | POST | Leave conversation |
+| `report` | POST | Report a member |
+| `getReports` | GET | Get reports (admin) |
+| `blocks` | POST | Block/unblock users |
+| `optIn` | POST | Opt in to messaging |
+| `getSubscriptionTicket` | GET | Get WebSocket auth ticket |
+| `subscribeEvents` | WS | WebSocket event subscription |
+| `requestFailover` | POST | Request sequencer failover |
+| `getDeliveryStatus` | GET | Check message delivery status |
+| `uploadBlob` | POST | Upload encrypted blob |
+| `getBlob` | GET | Download encrypted blob |
+| `getBlobUsage` | GET | Check blob storage usage |
+| `deleteBlob` | POST | Delete a blob |
+| `putGroupMetadataBlob` | POST | Upload group metadata blob |
+| `getGroupMetadataBlob` | GET | Download group metadata blob |
+
+### `blue.catbird.mlsDS.*` (DS-to-DS federation)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `deliverMessage` | POST | Deliver federated message |
+| `deliverWelcome` | POST | Deliver federated welcome |
+| `submitCommit` | POST | Submit federated commit |
+| `fetchKeyPackage` | GET | Fetch key package from remote |
+| `getConvoDigest` | GET | Get conversation digest |
+| `getConvoEvents` | GET | Get conversation events |
+| `transferSequencer` | POST | Transfer sequencer ownership |
+| `healthCheck` | GET | Federation health check |
+| `getFederationPeers` | GET | List federation peers |
+| `upsertFederationPeer` | POST | Add/update federation peer |
+| `deleteFederationPeer` | POST | Remove federation peer |
+| `getFederationMode` | GET | Get federation mode |
+| `setFederationMode` | POST | Set federation mode |
+| `resolveDeliveryService` | GET | Resolve DS for a DID |
 
 ## ⚙️ Configuration
 
@@ -131,7 +173,12 @@ server/
 | `RUST_LOG` | Log level | `info` |
 | `SERVICE_DID` | Service DID for JWT validation | - |
 | `SSE_BUFFER_SIZE` | SSE event buffer size | `5000` |
-| `ENABLE_ACTOR_SYSTEM` | Enable actor system | `true` |
+| `ENFORCE_LXM` | Require JWT `lxm` claim matches endpoint | `true` |
+| `ENFORCE_JTI` | Require `jti` and reject replays | `true` |
+| `JTI_TTL_SECONDS` | Replay cache TTL | `120` |
+| `ALLOW_UNSAFE_AUTH` | Allow disabled LXM/JTI (dev only) | `false` |
+| `ENABLE_METRICS` | Expose `/metrics` endpoint | `false` |
+| `METRICS_TOKEN` | Bearer token for metrics endpoint | - |
 | `FEDERATION_RISK_*` | Risk tier ratios and adaptive limit multipliers | See `.env.example` |
 | `FEDERATION_AUTO_QUARANTINE_MIN_RISK_TIER` | Auto-quarantine risk floor (`low`/`medium`/`high`/`critical`) | `critical` |
 | `FEDERATION_ALERTS_ENABLED` | Emit structured federation alert-hook logs | `true` |
