@@ -20,11 +20,11 @@ REDIS_NAME="e2e-redis"
 MLS_NAME="e2e-mls-ds"
 MLS_IMAGE="mls-ds-e2e:latest"
 
-# Credentials
-PG_USER="catbird"
-PG_PASS="catbird"
-PG_DB="catbird_mls"
-JWT_SECRET="***REDACTED_E2E_SECRET***"
+# Credentials (require env vars — no defaults for secrets)
+PG_USER="${PG_USER:-catbird}"
+PG_PASS="${PG_PASS:?Set PG_PASS environment variable}"
+PG_DB="${PG_DB:-catbird_mls}"
+JWT_SECRET="${JWT_SECRET:?Set JWT_SECRET environment variable}"
 
 wait_for_container() {
   local name="$1"

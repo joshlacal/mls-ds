@@ -4,11 +4,11 @@
 # For production, use: ./deploy.sh
 # This script is for local development/testing only.
 
-export DATABASE_URL="postgresql://catbird:changeme@localhost:5432/catbird"
-export REDIS_URL="redis://localhost:6379"
-export RUST_LOG="info,catbird_server=debug"
-export SERVICE_DID="did:web:mlschat.catbird.blue"
-export SERVER_PORT=3000
+export DATABASE_URL="${DATABASE_URL:?Set DATABASE_URL environment variable}"
+export REDIS_URL="${REDIS_URL:-redis://localhost:6379}"
+export RUST_LOG="${RUST_LOG:-info,catbird_server=debug}"
+export SERVICE_DID="${SERVICE_DID:-did:web:mlschat.catbird.blue}"
+export SERVER_PORT="${SERVER_PORT:-3000}"
 
 echo "🚀 Starting MLS Server (Development Mode)"
 echo "=========================================="

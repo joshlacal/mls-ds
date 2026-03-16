@@ -6,9 +6,9 @@ services:
   postgres:
     image: postgres:16-bookworm
     environment:
-      POSTGRES_USER: catbird
-      POSTGRES_PASSWORD: catbird
-      POSTGRES_DB: catbird_mls
+      POSTGRES_USER: ${POSTGRES_USER:-catbird}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-catbird_mls}
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./server/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
@@ -42,10 +42,10 @@ services:
     ports:
       - "3001:3001"
     environment:
-      DATABASE_URL: postgres://catbird:catbird@postgres:5432/catbird_mls
+      DATABASE_URL: postgres://${POSTGRES_USER:-catbird}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-catbird_mls}
       REDIS_URL: redis://redis:6379
       SERVER_PORT: "3001"
-      JWT_SECRET: ***REDACTED_E2E_SECRET***
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
       SERVICE_DID: did:web:localhost
       ENFORCE_LXM: "false"
       ENFORCE_JTI: "false"

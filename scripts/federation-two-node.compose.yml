@@ -38,7 +38,7 @@ services:
       DATABASE_URL: postgres://catbird:catbird@ds1-postgres:5432/ds1_catbird
       REDIS_URL: redis://ds1-redis:6379
       SERVER_PORT: "${DS1_PORT:-3101}"
-      JWT_SECRET: "${JWT_SECRET:-***REDACTED_FED_SECRET***}"
+      JWT_SECRET: "${JWT_SECRET:?Set JWT_SECRET}"
       SERVICE_DID: "${DS1_SERVICE_DID:-did:web:ds1.local}"
       SELF_ENDPOINT: "${DS1_SELF_ENDPOINT:-http://127.0.0.1:3101}"
       DEFAULT_DS_ENDPOINT: "${DS2_SELF_ENDPOINT:-http://127.0.0.1:3102}"
@@ -96,7 +96,7 @@ services:
       DATABASE_URL: postgres://catbird:catbird@ds2-postgres:5432/ds2_catbird
       REDIS_URL: redis://ds2-redis:6379
       SERVER_PORT: "${DS2_PORT:-3102}"
-      JWT_SECRET: "${JWT_SECRET:-***REDACTED_FED_SECRET***}"
+      JWT_SECRET: "${JWT_SECRET:?Set JWT_SECRET}"
       SERVICE_DID: "${DS2_SERVICE_DID:-did:web:ds2.local}"
       SELF_ENDPOINT: "${DS2_SELF_ENDPOINT:-http://127.0.0.1:3102}"
       DEFAULT_DS_ENDPOINT: "${DS1_SELF_ENDPOINT:-http://127.0.0.1:3101}"

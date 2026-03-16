@@ -56,9 +56,9 @@ catbird-redis         Up and healthy    0.0.0.0:6380->6379/tcp
 ## Configuration
 
 ### Environment Variables (.env.docker)
-- `POSTGRES_PASSWORD`: ***REDACTED_DB_PASSWORD***
-- `REDIS_PASSWORD`: ***REDACTED_REDIS_PASSWORD***
-- `JWT_SECRET`: ***REDACTED_JWT_SECRET***
+- `POSTGRES_PASSWORD`: [SET VIA DOPPLER]
+- `REDIS_PASSWORD`: [SET VIA DOPPLER]
+- `JWT_SECRET`: [SET VIA DOPPLER]
 - `RUST_LOG`: info
 
 ### Database Connection
@@ -122,8 +122,8 @@ sudo docker compose --env-file .env.docker up -d
 
 ### Database Access
 ```bash
-PGPASSWORD=***REDACTED_DB_PASSWORD*** \
-  psql -h localhost -p 5433 -U catbird -d catbird
+# Use Doppler for credentials:
+doppler run --project catbird-mls -- psql -h localhost -p 5433 -U catbird -d catbird
 ```
 
 ## Next Steps

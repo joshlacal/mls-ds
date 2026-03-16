@@ -39,9 +39,21 @@ Pods/
 # Environment
 .env
 .env.local
+.env.docker
+.env.production
+.env.*
+!.env.example
 
 # Local keys (never commit)
 did_key.pem
+*.pem
+*.p8
+*.key
+*.p12
+*.pfx
+
+# Claude/Copilot local settings
+.claude/
 
 # Logs
 *.log
