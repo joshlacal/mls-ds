@@ -628,7 +628,7 @@ mod tests {
             did: "did:web:ds.example.com".to_string(),
             endpoint: "https://ds.example.com".to_string(),
             supported_cipher_suites: Some(vec![
-                "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519".to_string()
+                "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519".to_string()
             ]),
             federation_capabilities: Some(vec![
                 "baseline".to_string(),

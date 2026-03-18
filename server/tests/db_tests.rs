@@ -262,7 +262,7 @@ async fn test_key_package_operations() {
     let pool = setup_test_db().await;
     cleanup_test_data(&pool).await;
 
-    let cipher_suite = "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519";
+    let cipher_suite = "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519";
     let expires_at = Utc::now() + chrono::Duration::hours(24);
     let key_data1 = vec![1, 2, 3, 4];
     let key_data2 = vec![5, 6, 7, 8];
@@ -330,7 +330,7 @@ async fn test_expired_key_package_cleanup() {
     let pool = setup_test_db().await;
     cleanup_test_data(&pool).await;
 
-    let cipher_suite = "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519";
+    let cipher_suite = "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519";
     let expired = Utc::now() - chrono::Duration::hours(1);
     let valid = Utc::now() + chrono::Duration::hours(24);
 

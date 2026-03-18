@@ -767,7 +767,7 @@ async fn fetch_key_package_requires_convo_id_and_membership_authorization() {
     )
     .bind(Uuid::new_v4().to_string())
     .bind(&recipient_did)
-    .bind("MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519")
+    .bind("MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519")
     .bind(b"kp-bytes".as_ref())
     .bind(format!("hash-{}", Uuid::new_v4()))
     .execute(&pool)

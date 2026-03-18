@@ -1697,7 +1697,7 @@ mod tests {
         store_key_package(
             &pool,
             "did:plc:user",
-            "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519",
+            "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
             key_data.clone(),
             expires_at,
         )
@@ -1707,7 +1707,7 @@ mod tests {
         let fetched = get_key_package(
             &pool,
             "did:plc:user",
-            "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519",
+            "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
         )
         .await
         .expect("Failed to get key package")
@@ -1718,7 +1718,7 @@ mod tests {
         consume_key_package(
             &pool,
             "did:plc:user",
-            "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519",
+            "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
             &key_data,
         )
         .await
@@ -1727,7 +1727,7 @@ mod tests {
         let consumed = get_key_package(
             &pool,
             "did:plc:user",
-            "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519",
+            "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
         )
         .await
         .expect("Failed to get key package");
