@@ -19,14 +19,9 @@ pub struct DeviceRecord {
 pub struct DeviceRecordValue {
     #[serde(rename = "$type")]
     pub record_type: Option<String>,
-    #[serde(rename = "deviceId")]
-    pub device_id: String,
-    #[serde(rename = "deviceName")]
-    pub device_name: Option<String>,
     #[serde(rename = "mlsSignaturePublicKey")]
     pub mls_signature_public_key: Option<BytesWrapper>,
     pub algorithm: Option<String>,
-    pub platform: Option<String>,
     #[serde(rename = "createdAt")]
     pub created_at: String,
 }
