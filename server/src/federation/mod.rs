@@ -14,9 +14,7 @@ pub mod transfer;
 pub mod upstream;
 
 pub use ack::*;
-pub use declaration_client::{
-    DeclarationClient, DeclarationEvent, DeclarationProofs, DeclarationRecord, DeclarationValue,
-};
+pub use declaration_client::{DeviceRecord, DeviceRecordClient, DeviceRecordValue, MLSChatPolicy};
 pub use errors::FederationError;
 pub use mailbox::FederatedBackend;
 pub use receipt::*;

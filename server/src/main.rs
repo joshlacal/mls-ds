@@ -41,7 +41,7 @@ struct AppState {
     federated_backend: Arc<federation::FederatedBackend>,
     upstream_manager: Option<Arc<federation::UpstreamManager>>,
     ack_signer: Option<Arc<federation::AckSigner>>,
-    declaration_client: Arc<federation::DeclarationClient>,
+    device_client: Arc<federation::DeviceRecordClient>,
     blob_store: blob_store::BlobStore,
 }
 
@@ -385,8 +385,8 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Federation components initialized");
 
-    // Declaration client for fetching MLS declarations from users' PDSes
-    let declaration_client = Arc::new(federation::DeclarationClient::new(
+    // Device record client for fetching MLS device records from users' PDSes
+    let device_client = Arc::new(federation::DeviceRecordClient::new(
         http_client.clone(),
         resolver.clone(),
     ));
@@ -448,7 +448,7 @@ async fn main() -> anyhow::Result<()> {
         federated_backend,
         upstream_manager: upstream_manager.clone(),
         ack_signer,
-        declaration_client,
+        device_client,
         blob_store: blob_store.clone(),
     };
 
