@@ -11,12 +11,14 @@ use crate::{
 
 const NSID: &str = "blue.catbird.mlsChat.requestFailover";
 
+// TODO: Replace with generated request type once lexicon defines blue.catbird.mlsChat.requestFailover input
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RequestFailoverInput {
     pub convo_id: String,
 }
 
+// TODO: Replace with generated output type once lexicon defines blue.catbird.mlsChat.requestFailover output
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RequestFailoverOutput {

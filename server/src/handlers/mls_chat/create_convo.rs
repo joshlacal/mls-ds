@@ -15,7 +15,7 @@ use crate::{
     auth::AuthUser,
     block_sync::BlockSyncService,
     generated::blue_catbird::mlsChat::{
-        create_convo::{CreateConvoOutput, CreateConvoRequest},
+        create_convo::{CreateConvoError as LexCreateConvoError, CreateConvoOutput, CreateConvoRequest},
         ConvoMetadata, ConvoView, MemberView,
     },
     sqlx_jacquard::{chrono_to_datetime, did_to_string, string_to_did},
@@ -120,6 +120,8 @@ async fn handle_revoke_invite(
     }
 
     info!(invite_id = %invite_id, convo_id = %crate::crypto::redact_for_log(&convo_id), "Invite revoked successfully");
+    // TODO: No generated output type for invite revocation response — fields don't match
+    // CreateConvoOutput. Define a lexicon output for revoke or use a shared success type.
     Json(serde_json::json!({"success": true})).into_response()
 }
 
@@ -157,10 +159,9 @@ async fn handle_create_convo(
         );
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "InvalidCipherSuite",
-                "message": format!("Cipher suite '{}' is not supported", input.cipher_suite)
-            })),
+            Json(LexCreateConvoError::InvalidCipherSuite(Some(
+                format!("Cipher suite '{}' is not supported", input.cipher_suite).into(),
+            ))),
         )
             .into_response());
     }
@@ -176,10 +177,9 @@ async fn handle_create_convo(
             );
             return Err((
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "TooManyMembers",
-                    "message": format!("Cannot add more than {} initial members (got {} including creator)", max_members, total_member_count)
-                })),
+                Json(LexCreateConvoError::TooManyMembers(Some(
+                    format!("Cannot add more than {} initial members (got {} including creator)", max_members, total_member_count).into(),
+                ))),
             )
                 .into_response());
         }
@@ -214,10 +214,9 @@ async fn handle_create_convo(
                     );
                     return Err((
                         StatusCode::FORBIDDEN,
-                        Json(serde_json::json!({
-                            "error": "MutualBlockDetected",
-                            "message": "Cannot create conversation: one or more members have blocked each other"
-                        })),
+                        Json(LexCreateConvoError::MutualBlockDetected(Some(
+                            "Cannot create conversation: one or more members have blocked each other".into(),
+                        ))),
                     )
                         .into_response());
                 }
@@ -243,10 +242,9 @@ async fn handle_create_convo(
                     );
                     return Err((
                         StatusCode::FORBIDDEN,
-                        Json(serde_json::json!({
-                            "error": "MutualBlockDetected",
-                            "message": "Cannot create conversation: one or more members have blocked each other"
-                        })),
+                        Json(LexCreateConvoError::MutualBlockDetected(Some(
+                            "Cannot create conversation: one or more members have blocked each other".into(),
+                        ))),
                     )
                         .into_response());
                 }
@@ -503,13 +501,12 @@ async fn handle_create_convo(
                     );
                     return Err((
                         StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({
-                            "error": "KeyPackageNotFound",
-                            "message": format!(
+                        Json(LexCreateConvoError::KeyPackageNotFound(Some(
+                            format!(
                                 "Key package hash not found for {}: hash={}",
                                 member_did_str, hash_hex
-                            )
-                        })),
+                            ).into(),
+                        ))),
                     )
                         .into_response());
                 }

@@ -541,7 +541,7 @@ async fn handle_update_token(
     pool: &DbPool,
     auth_user: &AuthUser,
     input: &crate::generated::blue_catbird::mlsChat::register_device::RegisterDevice<'_>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<RegisterDeviceOutput<'static>>, StatusCode> {
     let push_token = input
         .push_token
         .as_ref()
@@ -610,11 +610,13 @@ async fn handle_update_token(
     let mls_did = format!("{}#{}", auth_user.did, device_id);
     info!(device_id = %device_id, "Push token updated");
 
-    Ok(Json(serde_json::json!({
-        "deviceId": device_id,
-        "mlsDid": mls_did,
-        "autoJoinedConvos": [],
-    })))
+    Ok(Json(RegisterDeviceOutput {
+        device_id: device_id.into(),
+        mls_did: mls_did.into(),
+        auto_joined_convos: vec![],
+        welcome_messages: None,
+        extra_data: Default::default(),
+    }))
 }
 
 // ─── Action: removeToken ───
@@ -646,6 +648,7 @@ async fn handle_remove_token(
 
     info!(device_id = %device_id, "Push token removed");
 
+    // TODO: Replace json! with generated output type once lexicon defines removeToken output
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
@@ -681,6 +684,7 @@ async fn handle_delete(
         Some(info) => info,
         None => {
             warn!("Device not found: {} (treating as success)", device_id);
+            // TODO: Replace json! with generated output type once lexicon defines delete output
             return Ok(Json(serde_json::json!({
                 "deleted": false,
                 "keyPackagesDeleted": 0,
@@ -749,6 +753,7 @@ async fn handle_delete(
         device_id, key_packages_deleted
     );
 
+    // TODO: Replace json! with generated output type once lexicon defines delete output
     Ok(Json(serde_json::json!({
         "deleted": true,
         "keyPackagesDeleted": key_packages_deleted,
@@ -758,6 +763,7 @@ async fn handle_delete(
 
 // ─── Action: claimPendingAddition ───
 
+// TODO: Replace all json! responses below with generated output type once lexicon defines claimPendingAddition output
 async fn handle_claim_pending_addition(
     pool: &DbPool,
     auth_user: &AuthUser,
@@ -978,6 +984,7 @@ async fn handle_claim_pending_addition(
 
 // ─── Action: completePendingAddition ───
 
+// TODO: Replace all json! responses below with generated output type once lexicon defines completePendingAddition output
 async fn handle_complete_pending_addition(
     pool: &DbPool,
     auth_user: &AuthUser,

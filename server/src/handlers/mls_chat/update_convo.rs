@@ -15,7 +15,9 @@ use tracing::{error, info, warn};
 use crate::{
     auth::{count_admins, verify_is_admin, verify_is_member, AuthUser},
     device_utils::parse_device_did,
-    generated::blue_catbird::mlsChat::update_convo::{UpdateConvo, UpdateConvoRequest},
+    generated::blue_catbird::mlsChat::update_convo::{
+        UpdateConvo, UpdateConvoOutput, UpdateConvoRequest,
+    },
     group_info::{get_group_info, store_group_info, MAX_GROUP_INFO_SIZE, MIN_GROUP_INFO_SIZE},
     realtime::{SseState, StreamEvent},
     storage::DbPool,
@@ -129,11 +131,12 @@ async fn handle_promote_admin(
     .execute(pool)
     .await;
 
-    Json(serde_json::json!({
-        "action": "promoteAdmin",
-        "ok": true,
-        "promotedAt": now.to_rfc3339(),
-    }))
+    Json(UpdateConvoOutput {
+        success: true,
+        new_epoch: None,
+        policy: None,
+        extra_data: Default::default(),
+    })
     .into_response()
 }
 
@@ -215,10 +218,12 @@ async fn handle_demote_admin(
     .execute(pool)
     .await;
 
-    Json(serde_json::json!({
-        "action": "demoteAdmin",
-        "ok": true,
-    }))
+    Json(UpdateConvoOutput {
+        success: true,
+        new_epoch: None,
+        policy: None,
+        extra_data: Default::default(),
+    })
     .into_response()
 }
 
@@ -302,11 +307,12 @@ async fn handle_promote_moderator(
     .execute(pool)
     .await;
 
-    Json(serde_json::json!({
-        "action": "promoteModerator",
-        "ok": true,
-        "promotedAt": now.to_rfc3339(),
-    }))
+    Json(UpdateConvoOutput {
+        success: true,
+        new_epoch: None,
+        policy: None,
+        extra_data: Default::default(),
+    })
     .into_response()
 }
 
@@ -379,10 +385,12 @@ async fn handle_demote_moderator(
     .execute(pool)
     .await;
 
-    Json(serde_json::json!({
-        "action": "demoteModerator",
-        "ok": true,
-    }))
+    Json(UpdateConvoOutput {
+        success: true,
+        new_epoch: None,
+        policy: None,
+        extra_data: Default::default(),
+    })
     .into_response()
 }
 
@@ -502,6 +510,9 @@ async fn handle_update_policy(
         }
     };
 
+    // TODO: Replace serde_json::json! with UpdateConvoOutput + PolicyView once the DB columns
+    // (allow_external_commits, require_invite_for_join, etc.) are mapped to the lexicon PolicyView
+    // fields (allow_invites, allow_member_add, admin_only_invites, etc.).
     use sqlx::Row;
     Json(serde_json::json!({
         "action": "updatePolicy",
@@ -596,10 +607,12 @@ async fn handle_update_group_info(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
-    Json(serde_json::json!({
-        "action": "updateGroupInfo",
-        "updated": true,
-    }))
+    Json(UpdateConvoOutput {
+        success: true,
+        new_epoch: None,
+        policy: None,
+        extra_data: Default::default(),
+    })
     .into_response()
 }
 
@@ -661,11 +674,12 @@ async fn handle_refresh_group_info(
     .unwrap_or(0);
 
     if active_members == 0 {
-        return Json(serde_json::json!({
-            "action": "refreshGroupInfo",
-            "requested": false,
-            "activeMembers": 0,
-        }))
+        return Json(UpdateConvoOutput {
+            success: true,
+            new_epoch: None,
+            policy: None,
+            extra_data: Default::default(),
+        })
         .into_response();
     }
 
@@ -685,10 +699,11 @@ async fn handle_refresh_group_info(
         warn!(error = %e, "Failed to emit GroupInfoRefreshRequested event");
     }
 
-    Json(serde_json::json!({
-        "action": "refreshGroupInfo",
-        "requested": true,
-        "activeMembers": active_members,
-    }))
+    Json(UpdateConvoOutput {
+        success: true,
+        new_epoch: None,
+        policy: None,
+        extra_data: Default::default(),
+    })
     .into_response()
 }

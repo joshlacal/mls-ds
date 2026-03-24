@@ -325,6 +325,8 @@ async fn handle_pending(
         })
         .collect();
 
+    // TODO: Replace json! with generated output type — fields don't match GetConvosOutput
+    // (pending filter returns "requests" array of chat request objects, not ConvoView conversations)
     let mut response = serde_json::json!({
         "requests": requests,
         "pendingCount": pending_count,
