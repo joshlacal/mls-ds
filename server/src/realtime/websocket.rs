@@ -650,13 +650,16 @@ async fn handle_socket(
 
 // MARK: - Backfill
 
-/// Backfill events from database starting after the given cursor (ULID)
+/// Backfill events from database starting after the given cursor (ULID).
+///
+/// Reconstructs `StreamEvent` variants from stored event_stream rows. Message events
+/// are reconstructed by joining with the messages table; other event types are parsed
+/// from their stored JSON payloads.
 async fn backfill_events(
     pool: &DbPool,
     convo_id: &str,
     from_cursor: &str,
 ) -> Result<Vec<(StreamEvent, String)>, String> {
-    // Use the existing db function for event backfill
     let events = crate::db::get_events_after_cursor(pool, convo_id, None, from_cursor, 1000)
         .await
         .map_err(|e| format!("Database query failed: {}", e))?;
@@ -664,14 +667,47 @@ async fn backfill_events(
     let mut result = Vec::with_capacity(events.len());
 
     for (cursor, payload, _emitted_at) in events {
-        // Parse the stored event payload
-        match serde_json::from_value::<StreamEvent>(payload) {
-            Ok(event) => {
-                result.push((event, cursor));
+        // Try to reconstruct the StreamEvent from the stored payload.
+        // Non-message events (reaction, typing, info, etc.) may have a $type tag.
+        // Message events have a minimal envelope with messageId — skip them here
+        // since clients fetch messages via getMessages and the SSE backfill handles
+        // commit replay separately.
+        let type_tag = payload.get("$type").and_then(|v| v.as_str());
+
+        let event = match type_tag {
+            Some("blue.catbird.mlsChat.subscribeEvents#reactionEvent") => {
+                let message_id = payload.get("messageId").and_then(|v| v.as_str());
+                let did = payload.get("did").and_then(|v| v.as_str());
+                let reaction = payload.get("reaction").and_then(|v| v.as_str());
+                let action = payload.get("action").and_then(|v| v.as_str());
+                match (message_id, did, reaction, action) {
+                    (Some(mid), Some(d), Some(r), Some(a)) => Some(StreamEvent::ReactionEvent {
+                        cursor: cursor.clone(),
+                        convo_id: convo_id.to_string(),
+                        message_id: mid.to_string(),
+                        did: d.to_string(),
+                        reaction: r.to_string(),
+                        action: a.to_string(),
+                    }),
+                    _ => None,
+                }
             }
-            Err(e) => {
-                warn!(cursor = %crate::crypto::redact_for_log(&cursor), error = ?e, "Failed to deserialize stored event");
+            Some("blue.catbird.mlsChat.subscribeEvents#infoEvent") => {
+                payload.get("info").and_then(|v| v.as_str()).map(|info| {
+                    StreamEvent::InfoEvent {
+                        cursor: cursor.clone(),
+                        info: info.to_string(),
+                    }
+                })
             }
+            _ => {
+                // Skip message events and unknown types
+                None
+            }
+        };
+
+        if let Some(evt) = event {
+            result.push((evt, cursor));
         }
     }
 
@@ -741,11 +777,23 @@ async fn send_event(
         t: Some(msg_type.to_string()),
     };
 
-    // Wrap event with seq field and serialize directly to DAG-CBOR.
-    // IMPORTANT: We must NOT go through serde_json::Value as an intermediate,
-    // because JSON cannot represent CBOR byte strings — Vec<u8> fields
-    // (like ciphertext) become JSON arrays of numbers, which then encode as
-    // CBOR arrays instead of CBOR byte strings (major type 2).
+    // The generated MessageView uses `jacquard_common::serde_bytes_helper` for
+    // ciphertext, which correctly emits CBOR major type 2 byte strings when
+    // serialized with serde_ipld_dagcbor. No manual wrapper needed.
+
+    /// MessageEvent wrapper for DAG-CBOR encoding.
+    #[derive(Serialize)]
+    struct DagCborMessageEvent<'a> {
+        #[serde(rename = "$type")]
+        type_tag: &'a str,
+        cursor: &'a str,
+        message: &'a crate::generated::blue_catbird::mlsChat::MessageView<'static>,
+        #[serde(default, skip_serializing_if = "crate::realtime::sse::is_false")]
+        ephemeral: bool,
+        seq: i64,
+    }
+
+    /// Generic wire payload for non-MessageEvent variants.
     #[derive(Serialize)]
     struct WirePayload<'a> {
         #[serde(flatten)]
@@ -753,15 +801,34 @@ async fn send_event(
         seq: i64,
     }
 
-    let wire = WirePayload { event, seq };
-
     // Encode header as DAG-CBOR
     let header_bytes = serde_ipld_dagcbor::to_vec(&header)
         .map_err(|e| format!("Failed to encode header: {}", e))?;
 
-    // Encode payload directly to DAG-CBOR (preserves byte string types)
-    let payload_bytes = serde_ipld_dagcbor::to_vec(&wire)
-        .map_err(|e| format!("Failed to encode payload: {}", e))?;
+    // Encode payload — use DagCborMessageEvent for MessageEvent to get proper
+    // byte encoding, fall back to generic WirePayload for other events.
+    let payload_bytes = match event {
+        StreamEvent::MessageEvent {
+            cursor,
+            message,
+            ephemeral,
+        } => {
+            let dag_event = DagCborMessageEvent {
+                type_tag: "blue.catbird.mlsChat.subscribeEvents#messageEvent",
+                cursor,
+                message,
+                ephemeral: *ephemeral,
+                seq,
+            };
+            serde_ipld_dagcbor::to_vec(&dag_event)
+                .map_err(|e| format!("Failed to encode DAG-CBOR MessageEvent payload: {}", e))?
+        }
+        _ => {
+            let wire = WirePayload { event, seq };
+            serde_ipld_dagcbor::to_vec(&wire)
+                .map_err(|e| format!("Failed to encode DAG-CBOR payload: {}", e))?
+        }
+    };
 
     // Concatenate header and payload
     let mut frame = header_bytes;

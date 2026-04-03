@@ -7,8 +7,16 @@ use tokio::sync::Semaphore;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::generated_types::ReactionView;
 use crate::models::{Conversation, KeyPackage, Membership, Message, SequencerReceipt};
+
+/// View of a reaction on a message.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReactionView {
+    pub user_did: String,
+    pub reaction: String,
+    pub created_at: DateTime<Utc>,
+}
 
 pub type DbPool = PgPool;
 

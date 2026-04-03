@@ -107,14 +107,14 @@ pub async fn deliver_message(
 
         // Emit to SSE for local subscribers (best-effort)
         let message_view = crate::realtime::StreamMessageView {
-            id: msg_id.to_string(),
-            convo_id: convo_id.to_string(),
-            ciphertext: msg.ciphertext.to_vec(),
+            id: msg_id.to_string().into(),
+            convo_id: convo_id.to_string().into(),
+            ciphertext: msg.ciphertext.clone(),
             epoch,
             seq,
-            created_at: chrono::Utc::now(),
-            message_type: msg.message_type.as_deref().unwrap_or("app").to_string(),
-            reactions: None,
+            created_at: crate::sqlx_jacquard::chrono_to_datetime(chrono::Utc::now()),
+            message_type: Some(msg.message_type.as_deref().unwrap_or("app").to_string().into()),
+            extra_data: Default::default(),
         };
 
         if let Err(e) = sse_state

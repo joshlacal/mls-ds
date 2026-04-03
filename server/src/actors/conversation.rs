@@ -1109,10 +1109,9 @@ async fn handle_notify_system_message(
                     epoch: epoch.into(),
                     seq,
                     created_at: crate::sqlx_jacquard::chrono_to_datetime(created_at),
-                    message_type: Some(_message_type.into()),
+                    message_type: Some(_message_type.to_string().into()),
                     extra_data: Default::default(),
-                }
-                .into();
+                };
 
             let event = StreamEvent::MessageEvent {
                 cursor: cursor.clone(),

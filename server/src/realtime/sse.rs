@@ -33,7 +33,7 @@ pub struct SubscribeQuery {
 
 /// Event types for realtime streaming
 /// Uses AT Protocol format with $type tag for proper client compatibility
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "$type")]
 pub enum StreamEvent {
     #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#messageEvent")]
@@ -133,6 +133,223 @@ pub enum StreamEvent {
 /// Helper for `skip_serializing_if` on the `ephemeral` field.
 pub fn is_false(v: &bool) -> bool {
     !(*v)
+}
+
+/// Manual `Deserialize` for `StreamEvent`.
+///
+/// The generated `MessageView<'static>` cannot derive `DeserializeOwned` because its
+/// `#[serde(borrow)]` attributes constrain `'de: 'static`. We work around this by
+/// deserializing via an intermediate `RawMessageView` with owned types, then converting.
+impl<'de> serde::Deserialize<'de> for StreamEvent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        /// Mirror of StreamEvent with a raw message view for the MessageEvent variant.
+        #[derive(Deserialize)]
+        #[serde(tag = "$type")]
+        enum RawStreamEvent {
+            #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#messageEvent")]
+            MessageEvent {
+                cursor: String,
+                message: RawMessageView,
+                #[serde(default)]
+                ephemeral: bool,
+            },
+            #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#reactionEvent")]
+            ReactionEvent {
+                cursor: String,
+                #[serde(rename = "convoId")]
+                convo_id: String,
+                #[serde(rename = "messageId")]
+                message_id: String,
+                did: String,
+                reaction: String,
+                action: String,
+            },
+            #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#typingEvent")]
+            TypingEvent {
+                cursor: String,
+                #[serde(rename = "convoId")]
+                convo_id: String,
+                did: String,
+                #[serde(rename = "isTyping")]
+                is_typing: bool,
+            },
+            #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#infoEvent")]
+            InfoEvent { cursor: String, info: String },
+            #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#newDeviceEvent")]
+            NewDeviceEvent {
+                cursor: String,
+                #[serde(rename = "convoId")]
+                convo_id: String,
+                #[serde(rename = "userDid")]
+                user_did: String,
+                #[serde(rename = "deviceId")]
+                device_id: String,
+                #[serde(rename = "deviceName")]
+                device_name: Option<String>,
+                #[serde(rename = "deviceCredentialDid")]
+                device_credential_did: String,
+                #[serde(rename = "pendingAdditionId")]
+                pending_addition_id: String,
+            },
+            #[serde(
+                rename = "blue.catbird.mlsChat.subscribeEvents#groupInfoRefreshRequestedEvent"
+            )]
+            GroupInfoRefreshRequested {
+                cursor: String,
+                #[serde(rename = "convoId")]
+                convo_id: String,
+                #[serde(rename = "requestedBy")]
+                requested_by: String,
+                #[serde(rename = "requestedAt")]
+                requested_at: String,
+            },
+            #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#readditionRequestedEvent")]
+            ReadditionRequested {
+                cursor: String,
+                #[serde(rename = "convoId")]
+                convo_id: String,
+                #[serde(rename = "userDid")]
+                user_did: String,
+                #[serde(rename = "requestedAt")]
+                requested_at: String,
+            },
+            #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#membershipChangeEvent")]
+            MembershipChangeEvent {
+                cursor: String,
+                #[serde(rename = "convoId")]
+                convo_id: String,
+                did: String,
+                action: String,
+                actor: Option<String>,
+                reason: Option<String>,
+                epoch: usize,
+            },
+        }
+
+        /// Owned intermediate for MessageView deserialization.
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct RawMessageView {
+            id: String,
+            convo_id: String,
+            #[serde(with = "jacquard_common::serde_bytes_helper")]
+            ciphertext: bytes::Bytes,
+            epoch: i64,
+            seq: i64,
+            created_at: jacquard_common::types::string::Datetime,
+            message_type: Option<String>,
+        }
+
+        let raw = RawStreamEvent::deserialize(deserializer)?;
+        Ok(match raw {
+            RawStreamEvent::MessageEvent {
+                cursor,
+                message,
+                ephemeral,
+            } => StreamEvent::MessageEvent {
+                cursor,
+                message: StreamMessageView {
+                    id: message.id.into(),
+                    convo_id: message.convo_id.into(),
+                    ciphertext: message.ciphertext,
+                    epoch: message.epoch,
+                    seq: message.seq,
+                    created_at: message.created_at,
+                    message_type: message.message_type.map(Into::into),
+                    extra_data: Default::default(),
+                },
+                ephemeral,
+            },
+            RawStreamEvent::ReactionEvent {
+                cursor,
+                convo_id,
+                message_id,
+                did,
+                reaction,
+                action,
+            } => StreamEvent::ReactionEvent {
+                cursor,
+                convo_id,
+                message_id,
+                did,
+                reaction,
+                action,
+            },
+            RawStreamEvent::TypingEvent {
+                cursor,
+                convo_id,
+                did,
+                is_typing,
+            } => StreamEvent::TypingEvent {
+                cursor,
+                convo_id,
+                did,
+                is_typing,
+            },
+            RawStreamEvent::InfoEvent { cursor, info } => {
+                StreamEvent::InfoEvent { cursor, info }
+            }
+            RawStreamEvent::NewDeviceEvent {
+                cursor,
+                convo_id,
+                user_did,
+                device_id,
+                device_name,
+                device_credential_did,
+                pending_addition_id,
+            } => StreamEvent::NewDeviceEvent {
+                cursor,
+                convo_id,
+                user_did,
+                device_id,
+                device_name,
+                device_credential_did,
+                pending_addition_id,
+            },
+            RawStreamEvent::GroupInfoRefreshRequested {
+                cursor,
+                convo_id,
+                requested_by,
+                requested_at,
+            } => StreamEvent::GroupInfoRefreshRequested {
+                cursor,
+                convo_id,
+                requested_by,
+                requested_at,
+            },
+            RawStreamEvent::ReadditionRequested {
+                cursor,
+                convo_id,
+                user_did,
+                requested_at,
+            } => StreamEvent::ReadditionRequested {
+                cursor,
+                convo_id,
+                user_did,
+                requested_at,
+            },
+            RawStreamEvent::MembershipChangeEvent {
+                cursor,
+                convo_id,
+                did,
+                action,
+                actor,
+                reason,
+                epoch,
+            } => StreamEvent::MembershipChangeEvent {
+                cursor,
+                convo_id,
+                did,
+                action,
+                actor,
+                reason,
+                epoch,
+            },
+        })
+    }
 }
 
 /// Shared state for SSE connections
@@ -547,20 +764,24 @@ mod tests {
         assert!(matches!(received, StreamEvent::InfoEvent { .. }));
     }
 
+    fn test_message_view(id: &str) -> StreamMessageView {
+        StreamMessageView {
+            id: id.to_string().into(),
+            convo_id: "c1".to_string().into(),
+            ciphertext: bytes::Bytes::new(),
+            epoch: 0,
+            seq: 0,
+            created_at: crate::sqlx_jacquard::chrono_to_datetime(chrono::Utc::now()),
+            message_type: Some("app".into()),
+            extra_data: Default::default(),
+        }
+    }
+
     #[test]
     fn test_ephemeral_false_skipped_in_serialization() {
         let event = StreamEvent::MessageEvent {
             cursor: "cursor-1".into(),
-            message: StreamMessageView {
-                id: "m1".into(),
-                convo_id: "c1".into(),
-                ciphertext: vec![],
-                epoch: 0,
-                seq: 0,
-                created_at: chrono::Utc::now(),
-                message_type: "app".into(),
-                reactions: None,
-            },
+            message: test_message_view("m1"),
             ephemeral: false,
         };
 
@@ -576,16 +797,7 @@ mod tests {
     fn test_ephemeral_true_included() {
         let event = StreamEvent::MessageEvent {
             cursor: "cursor-2".into(),
-            message: StreamMessageView {
-                id: "m2".into(),
-                convo_id: "c1".into(),
-                ciphertext: vec![],
-                epoch: 0,
-                seq: 0,
-                created_at: chrono::Utc::now(),
-                message_type: "app".into(),
-                reactions: None,
-            },
+            message: test_message_view("m2"),
             ephemeral: true,
         };
 

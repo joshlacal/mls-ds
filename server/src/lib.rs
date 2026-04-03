@@ -28,8 +28,6 @@ pub mod util;
 pub use catbird_atproto::generated;
 pub use catbird_atproto::types;
 
-pub mod generated_types;
-
 // Re-export jacquard-generated namespaces at the crate root so external crates
 // can depend on a stable, ergonomic path (e.g., `server::blue_catbird`) rather
 // than importing from the internal `generated` module hierarchy. These re-exports
