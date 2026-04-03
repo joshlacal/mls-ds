@@ -22,7 +22,7 @@ use crate::{
     generated::blue_catbird::mlsChat::commit_group_change::{
         CommitGroupChangeOutput, CommitGroupChangeRequest, PendingDeviceAddition,
     },
-    realtime::SseState,
+    realtime::{sse::StreamEvent, SseState},
     storage::DbPool,
 };
 
@@ -1996,10 +1996,69 @@ pub async fn commit_group_change(
             .into_response())
         }
         "refreshGroupInfo" => {
-            // iOS clients send this to request active members to publish fresh GroupInfo.
-            // Currently a no-op (SSE notification not yet implemented), but return success
-            // so the client doesn't get a 400 error and trigger unnecessary recovery logic.
-            info!("v2.commitGroupChange: refreshGroupInfo (no-op, SSE not implemented)");
+            let convo_id = input.convo_id.to_string();
+            info!(
+                "v2.commitGroupChange: refreshGroupInfo for convo {}",
+                crate::crypto::redact_for_log(&convo_id)
+            );
+
+            let (user_did, _) = parse_device_did(&auth_user.did).map_err(|e| {
+                error!("refreshGroupInfo: invalid DID format: {}", e);
+                bad_request(format!("Invalid DID format: {}", e))
+            })?;
+
+            // Check conversation exists
+            let exists: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversations WHERE id = $1)")
+                    .bind(&convo_id)
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(|e| {
+                        error!("refreshGroupInfo: DB error checking convo: {}", e);
+                        internal_server_error("Database error")
+                    })?;
+
+            if !exists {
+                return Err(bad_request("Conversation not found"));
+            }
+
+            // Check requester is/was a member (allows former members needing rejoin)
+            let is_member: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM members WHERE convo_id = $1 AND user_did = $2)",
+            )
+            .bind(&convo_id)
+            .bind(&user_did)
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| {
+                error!("refreshGroupInfo: DB error checking membership: {}", e);
+                internal_server_error("Database error")
+            })?;
+
+            if !is_member {
+                return Err(bad_request("Not a member of this conversation"));
+            }
+
+            // Emit GroupInfoRefreshRequested SSE event
+            let cursor = sse_state
+                .cursor_gen
+                .next(&convo_id, "groupInfoRefreshRequested")
+                .await;
+            let event = StreamEvent::GroupInfoRefreshRequested {
+                cursor,
+                convo_id: convo_id.clone(),
+                requested_by: user_did.clone(),
+                requested_at: chrono::Utc::now().to_rfc3339(),
+            };
+
+            if let Err(e) = sse_state.emit(&convo_id, event).await {
+                warn!(error = %e, "Failed to emit GroupInfoRefreshRequested event");
+            }
+
+            info!(
+                "v2.commitGroupChange: refreshGroupInfo emitted SSE for convo {}",
+                crate::crypto::redact_for_log(&convo_id)
+            );
             Ok(Json(success_response()).into_response())
         }
         "confirmWelcome" => {
