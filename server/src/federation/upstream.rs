@@ -508,7 +508,6 @@ fn extract_cursor(event: &StreamEvent) -> Option<String> {
         | StreamEvent::GroupInfoRefreshRequested { cursor, .. }
         | StreamEvent::ReadditionRequested { cursor, .. }
         | StreamEvent::MembershipChangeEvent { cursor, .. }
-        | StreamEvent::ReadEvent { cursor, .. }
         | StreamEvent::InfoEvent { cursor, .. } => Some(cursor.clone()),
     }
 }
@@ -702,16 +701,6 @@ mod tests {
                     actor: None,
                     reason: None,
                     epoch: 1,
-                },
-            ),
-            (
-                "ReadEvent",
-                StreamEvent::ReadEvent {
-                    cursor: "c-read".into(),
-                    convo_id: "c1".into(),
-                    did: "did:x".into(),
-                    message_id: None,
-                    read_at: now.to_rfc3339(),
                 },
             ),
         ];

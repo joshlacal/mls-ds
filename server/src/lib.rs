@@ -1,5 +1,4 @@
 pub mod actors;
-pub mod admin_system;
 pub mod atproto_bytes;
 pub mod auth;
 pub mod blob_store;

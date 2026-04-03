@@ -30,7 +30,6 @@
             "#conversationUpdated",
             "#reactionEvent",
             "#typingEvent",
-            "#readEvent",
             "#newDeviceEvent",
             "#infoEvent"
           ]
@@ -133,18 +132,6 @@
         "convoId": { "type": "string", "description": "Conversation identifier" },
         "did": { "type": "string", "format": "did", "description": "DID of the typist" },
         "isTyping": { "type": "boolean", "description": "True if started typing, false if stopped" }
-      }
-    },
-    "readEvent": {
-      "type": "object",
-      "description": "A member read messages in the conversation",
-      "required": ["cursor", "convoId", "did", "readAt"],
-      "properties": {
-        "cursor": { "type": "string", "description": "Resume cursor" },
-        "convoId": { "type": "string", "description": "Conversation identifier" },
-        "did": { "type": "string", "format": "did", "description": "DID of the reader" },
-        "messageId": { "type": "string", "description": "Specific message marked as read (omit for all)" },
-        "readAt": { "type": "string", "format": "datetime", "description": "When messages were read" }
       }
     },
     "newDeviceEvent": {

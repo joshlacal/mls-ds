@@ -11,8 +11,7 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use crate::{
-    admin_system::verify_is_admin,
-    auth::AuthUser,
+    auth::{verify_is_admin, AuthUser},
     block_sync::BlockSyncService,
     generated::blue_catbird::mlsChat::{
         create_convo::{CreateConvoError as LexCreateConvoError, CreateConvoOutput, CreateConvoRequest},

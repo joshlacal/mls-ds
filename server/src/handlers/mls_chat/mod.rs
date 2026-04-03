@@ -27,9 +27,8 @@ pub mod update_convo;
 
 // Moderation & Blocks
 pub mod blocks;
-pub mod get_reports;
 pub mod opt_in;
-pub mod report;
+pub mod report_spam;
 
 // Delivery Status
 pub mod get_delivery_status;
@@ -74,9 +73,8 @@ pub use update_convo::update_convo;
 
 // Re-exports: Moderation & Blocks
 pub use blocks::blocks_post;
-pub use get_reports::get_reports;
 pub use opt_in::opt_in_post;
-pub use report::report_post;
+pub use report_spam::report_spam_post;
 
 // Re-exports: Delivery Status
 pub use get_delivery_status::get_delivery_status;

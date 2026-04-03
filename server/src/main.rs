@@ -17,7 +17,6 @@ use catbird_server::{
 };
 
 // These modules are only in main.rs (not in lib.rs)
-mod admin_system;
 mod device_utils;
 mod jobs;
 mod xrpc_proxy;
@@ -579,11 +578,11 @@ async fn main() -> anyhow::Result<()> {
         get_convos::GetConvosRequest, get_group_state::GetGroupStateRequest,
         get_key_package_status::GetKeyPackageStatusRequest,
         get_key_packages::GetKeyPackagesRequest, get_messages::GetMessagesRequest,
-        get_pending_devices::GetPendingDevicesRequest, get_reports::GetReportsRequest,
+        get_pending_devices::GetPendingDevicesRequest,
         get_subscription_ticket::GetSubscriptionTicketRequest, leave_convo::LeaveConvoRequest,
         list_devices::ListDevicesRequest, opt_in::OptInRequest,
         publish_key_packages::PublishKeyPackagesRequest, register_device::RegisterDeviceRequest,
-        report::ReportRequest, send_message::SendMessageRequest,
+        report_spam::ReportSpamRequest, send_message::SendMessageRequest,
         update_convo::UpdateConvoRequest,
         update_cursor::UpdateCursorRequest,
     };
@@ -643,9 +642,8 @@ async fn main() -> anyhow::Result<()> {
             handlers::mls_chat::leave_convo,
         ))
         // Moderation & Blocks
-        .merge(ReportRequest::into_router(handlers::mls_chat::report_post))
-        .merge(GetReportsRequest::into_router(
-            handlers::mls_chat::get_reports,
+        .merge(ReportSpamRequest::into_router(
+            handlers::mls_chat::report_spam_post,
         ))
         .merge(BlocksRequest::into_router(handlers::mls_chat::blocks_post))
         .merge(OptInRequest::into_router(handlers::mls_chat::opt_in_post))

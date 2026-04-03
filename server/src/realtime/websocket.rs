@@ -156,7 +156,7 @@ impl FrameFormat {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "$type")]
 pub enum ClientMessage {
-    /// Client is typing (DEPRECATED: Prefer E2EE ephemeral messages via v2.sendEphemeral.
+    /// Client is typing (DEPRECATED: Prefer E2EE ephemeral messages via sendMessage with delivery: "ephemeral".
     /// This creates plaintext typing events visible to the server.)
     #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#typing")]
     Typing {
@@ -523,7 +523,6 @@ async fn handle_socket(
                         StreamEvent::GroupInfoRefreshRequested { cursor, .. } => cursor.clone(),
                         StreamEvent::ReadditionRequested { cursor, .. } => cursor.clone(),
                         StreamEvent::MembershipChangeEvent { cursor, .. } => cursor.clone(),
-                        StreamEvent::ReadEvent { cursor, .. } => cursor.clone(),
                     };
 
                     // Filter logic (only for single-convo mode generally, but applied here too)
@@ -709,7 +708,6 @@ async fn send_event(
         StreamEvent::GroupInfoRefreshRequested { .. } => "#groupInfoRefreshRequestedEvent",
         StreamEvent::ReadditionRequested { .. } => "#readditionRequestedEvent",
         StreamEvent::MembershipChangeEvent { .. } => "#membershipChangeEvent",
-        StreamEvent::ReadEvent { .. } => "#readEvent",
     };
 
     if frame_format == FrameFormat::JsonText {

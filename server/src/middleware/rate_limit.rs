@@ -288,11 +288,11 @@ fn get_endpoint_quota(endpoint: &str) -> (u32, Duration) {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(500) // High frequency polling/sync operations
-    } else if endpoint_name.contains("updateReadState") || endpoint_name.contains("markRead") {
-        std::env::var("RATE_LIMIT_READ_STATE")
+    } else if endpoint_name.contains("updateCursor") {
+        std::env::var("RATE_LIMIT_UPDATE_CURSOR")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(300) // Read receipts called frequently
+            .unwrap_or(300) // Cursor updates called frequently
     } else if endpoint_name.contains("publishKeyPackage") {
         std::env::var("RATE_LIMIT_PUBLISH_KEY_PACKAGE")
             .ok()

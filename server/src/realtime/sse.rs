@@ -128,21 +128,6 @@ pub enum StreamEvent {
         /// New epoch after this change
         epoch: usize,
     },
-    /// Event indicating a member has read messages in the conversation
-    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#readEvent")]
-    ReadEvent {
-        cursor: String,
-        #[serde(rename = "convoId")]
-        convo_id: String,
-        /// DID of the member who read the messages
-        did: String,
-        /// Optional specific message ID that was marked as read
-        #[serde(rename = "messageId", skip_serializing_if = "Option::is_none")]
-        message_id: Option<String>,
-        /// ISO 8601 timestamp of when messages were read
-        #[serde(rename = "readAt")]
-        read_at: String,
-    },
 }
 
 /// Helper for `skip_serializing_if` on the `ephemeral` field.
@@ -443,7 +428,6 @@ pub async fn subscribe_convo_events(
                                     StreamEvent::GroupInfoRefreshRequested { cursor, .. } => cursor,
                                     StreamEvent::ReadditionRequested { cursor, .. } => cursor,
                                     StreamEvent::MembershipChangeEvent { cursor, .. } => cursor,
-                                    StreamEvent::ReadEvent { cursor, .. } => cursor,
                                 };
 
                                 // Filter based on resume cursor

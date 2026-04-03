@@ -268,47 +268,18 @@ COMMENT ON COLUMN pending_welcomes.created_by_did IS 'DID of any online member w
 -- Admin & Moderation System (E2EE)
 -- =============================================================================
 
--- E2EE Reports (encrypted content, only admins can decrypt)
-CREATE TABLE reports (
+-- Spam Reports (simple per-conversation spam reporting)
+CREATE TABLE IF NOT EXISTS spam_reports (
     id TEXT PRIMARY KEY,
-    convo_id TEXT NOT NULL,
+    convo_id TEXT NOT NULL REFERENCES conversations(id),
     reporter_did TEXT NOT NULL,
     reported_did TEXT NOT NULL,
-    category TEXT NOT NULL CHECK (category IN (
-        'harassment',
-        'spam',
-        'hate_speech',
-        'violence',
-        'sexual_content',
-        'impersonation',
-        'privacy_violation',
-        'other'
-    )),
-    encrypted_content BYTEA NOT NULL,
-    message_ids TEXT[],
+    reason TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    status TEXT NOT NULL DEFAULT 'pending'
-        CHECK (status IN ('pending', 'resolved', 'dismissed')),
-    resolved_by_did TEXT,
-    resolved_at TIMESTAMPTZ,
-    resolution_action TEXT
-        CHECK (resolution_action IN ('removed_member', 'dismissed', 'no_action')),
-    resolution_notes TEXT,
-    FOREIGN KEY (convo_id) REFERENCES conversations(id) ON DELETE CASCADE
+    UNIQUE(convo_id, reporter_did, reported_did)
 );
-
-CREATE INDEX idx_reports_convo ON reports(convo_id);
-CREATE INDEX idx_reports_reporter ON reports(reporter_did);
-CREATE INDEX idx_reports_reported ON reports(reported_did);
-CREATE INDEX idx_reports_status ON reports(status, created_at DESC);
-CREATE INDEX idx_reports_category ON reports(category);
-
-COMMENT ON TABLE reports IS 'E2EE member reports - content encrypted with MLS group key, only admins decrypt';
-COMMENT ON COLUMN reports.category IS 'Report category: harassment, spam, hate_speech, violence, sexual_content, impersonation, privacy_violation, other';
-COMMENT ON COLUMN reports.encrypted_content IS 'Encrypted report details (reason, evidence) - uses MLS group key (max 50KB)';
-COMMENT ON COLUMN reports.message_ids IS 'Array of message IDs referenced in report (max 20)';
-COMMENT ON COLUMN reports.resolution_action IS 'Action taken: removed_member, dismissed, or no_action';
-COMMENT ON COLUMN reports.resolution_notes IS 'Admin notes on resolution (max 1000 chars enforced by application)';
+CREATE INDEX IF NOT EXISTS idx_spam_reports_convo ON spam_reports(convo_id);
+CREATE INDEX IF NOT EXISTS idx_spam_reports_reported ON spam_reports(reported_did);
 
 -- Admin Actions Audit Log (immutable record of admin operations)
 CREATE TABLE admin_actions (

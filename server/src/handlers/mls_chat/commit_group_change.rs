@@ -212,6 +212,45 @@ pub async fn commit_group_change(
                 return Err(forbidden("Not a member of this conversation"));
             }
 
+            // ── Parse MLS epoch from GroupInfo if provided ──────────
+            let (add_group_info_bytes, add_mls_epoch) = if let Some(gi_b64) = input.group_info.as_ref() {
+                let gi_bytes = base64::engine::general_purpose::STANDARD
+                    .decode(gi_b64.as_bytes())
+                    .map_err(|e| {
+                        warn!("addMembers: invalid base64 groupInfo: {}", e);
+                        bad_request("Invalid base64 groupInfo")
+                    })?;
+
+                let epoch = {
+                    use openmls::messages::group_info::VerifiableGroupInfo;
+                    use openmls::prelude::{MlsMessageIn, MlsMessageBodyIn};
+
+                    let from_mls_msg = MlsMessageIn::tls_deserialize(
+                        &mut gi_bytes.as_slice(),
+                    ).ok().and_then(|msg| match msg.extract() {
+                        MlsMessageBodyIn::GroupInfo(gi) => Some(gi.epoch().as_u64()),
+                        _ => None,
+                    });
+
+                    from_mls_msg.or_else(|| {
+                        VerifiableGroupInfo::tls_deserialize(
+                            &mut gi_bytes.as_slice(),
+                        ).ok().map(|gi| gi.epoch().as_u64())
+                    })
+                };
+
+                if let Some(e) = epoch {
+                    info!(
+                        "addMembers: parsed MLS epoch {} from GroupInfo for convo {}",
+                        e, crate::crypto::redact_for_log(&convo_id)
+                    );
+                }
+
+                (Some(gi_bytes), epoch)
+            } else {
+                (None, None)
+            };
+
             let now = chrono::Utc::now();
 
             // ── Fetch current epoch for CAS ───────────────────────────
@@ -273,17 +312,67 @@ pub async fn commit_group_change(
                 }
             };
 
-            // ── Invalidate stale GroupInfo after epoch advance ────────
-            sqlx::query(
-                "UPDATE conversations SET group_info = NULL, group_info_epoch = NULL, group_info_updated_at = NULL WHERE id = $1",
-            )
-            .bind(&convo_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| {
-                error!("addMembers: failed to invalidate stale GroupInfo after epoch advance: {}", e);
-                internal_server_error("Failed to invalidate stale GroupInfo")
-            })?;
+            // If GroupInfo provided a higher MLS epoch, sync server epoch up
+            let new_epoch = if let Some(mls_epoch) = add_mls_epoch {
+                let mls_epoch_i32 = mls_epoch as i32;
+                if mls_epoch_i32 > new_epoch {
+                    info!(
+                        "addMembers: syncing server epoch {} -> {} (MLS epoch) for convo {}",
+                        new_epoch, mls_epoch_i32, crate::crypto::redact_for_log(&convo_id)
+                    );
+                    sqlx::query(
+                        "UPDATE conversations SET current_epoch = $1, updated_at = $2 WHERE id = $3 AND current_epoch < $1",
+                    )
+                    .bind(mls_epoch_i32)
+                    .bind(chrono::Utc::now())
+                    .bind(&convo_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| {
+                        error!("addMembers: failed to sync epoch to MLS epoch: {}", e);
+                        internal_server_error("Failed to sync epoch")
+                    })?;
+                    mls_epoch_i32
+                } else {
+                    new_epoch
+                }
+            } else {
+                new_epoch
+            };
+
+            // ── Store or invalidate GroupInfo ─────────────────────────
+            if let Some(ref gi_bytes) = add_group_info_bytes {
+                sqlx::query(
+                    r#"UPDATE conversations
+                       SET group_info = $1,
+                           group_info_epoch = COALESCE(group_info_epoch, 0) + 1,
+                           group_info_updated_at = NOW()
+                       WHERE id = $2"#,
+                )
+                .bind(gi_bytes)
+                .bind(&convo_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    error!("addMembers: failed to store GroupInfo: {}", e);
+                    internal_server_error("Failed to store GroupInfo")
+                })?;
+                info!(
+                    "addMembers: stored GroupInfo (mls_epoch={:?}) for convo {}",
+                    add_mls_epoch, crate::crypto::redact_for_log(&convo_id)
+                );
+            } else {
+                sqlx::query(
+                    "UPDATE conversations SET group_info = NULL, group_info_epoch = NULL, group_info_updated_at = NULL WHERE id = $1",
+                )
+                .bind(&convo_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    error!("addMembers: failed to invalidate stale GroupInfo after epoch advance: {}", e);
+                    internal_server_error("Failed to invalidate stale GroupInfo")
+                })?;
+            };
 
             // ── Store commit message ───────────────────────────────────
             let msg_id = uuid::Uuid::new_v4().to_string();
@@ -601,6 +690,50 @@ pub async fn commit_group_change(
                 }
             }
 
+            // ── Parse MLS epoch from GroupInfo if provided ──────────
+            let (group_info_bytes_opt, mls_epoch) = if let Some(gi_b64) = input.group_info.as_ref() {
+                let gi_bytes = base64::engine::general_purpose::STANDARD
+                    .decode(gi_b64.as_bytes())
+                    .map_err(|e| {
+                        warn!("externalCommit: invalid base64 groupInfo: {}", e);
+                        bad_request("Invalid base64 groupInfo")
+                    })?;
+
+                let epoch = {
+                    use openmls::messages::group_info::VerifiableGroupInfo;
+                    use openmls::prelude::{MlsMessageIn, MlsMessageBodyIn};
+
+                    let from_mls_msg = MlsMessageIn::tls_deserialize(
+                        &mut gi_bytes.as_slice(),
+                    ).ok().and_then(|msg| match msg.extract() {
+                        MlsMessageBodyIn::GroupInfo(gi) => Some(gi.epoch().as_u64()),
+                        _ => None,
+                    });
+
+                    from_mls_msg.or_else(|| {
+                        VerifiableGroupInfo::tls_deserialize(
+                            &mut gi_bytes.as_slice(),
+                        ).ok().map(|gi| gi.epoch().as_u64())
+                    })
+                };
+
+                if let Some(e) = epoch {
+                    info!(
+                        "externalCommit: parsed MLS epoch {} from GroupInfo for convo {}",
+                        e, crate::crypto::redact_for_log(&convo_id)
+                    );
+                } else {
+                    warn!(
+                        "externalCommit: could not parse epoch from GroupInfo for convo {}",
+                        crate::crypto::redact_for_log(&convo_id)
+                    );
+                }
+
+                (Some(gi_bytes), epoch)
+            } else {
+                (None, None)
+            };
+
             let now = chrono::Utc::now();
 
             // ── Fetch current epoch for CAS ───────────────────────────
@@ -630,7 +763,7 @@ pub async fn commit_group_change(
                 internal_server_error("Failed to reactivate member")
             })?;
 
-            // ── Advance epoch (CAS) ───────────────────────────────────
+            // ── Advance epoch (CAS), syncing to MLS epoch if available ──
             let new_epoch = crate::db::try_advance_conversation_epoch_tx(
                 &mut tx,
                 &convo_id,
@@ -650,17 +783,72 @@ pub async fn commit_group_change(
                 }
             };
 
-            // ── Invalidate stale GroupInfo after epoch advance ────────
-            sqlx::query(
-                "UPDATE conversations SET group_info = NULL, group_info_epoch = NULL, group_info_updated_at = NULL WHERE id = $1",
-            )
-            .bind(&convo_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| {
-                error!("externalCommit: failed to invalidate stale GroupInfo after epoch advance: {}", e);
-                internal_server_error("Failed to invalidate stale GroupInfo")
-            })?;
+            // If GroupInfo provided a higher MLS epoch, sync server epoch up.
+            // For external commits, the input GroupInfo has the pre-commit epoch (N),
+            // and the external commit advances MLS to epoch N+1.
+            let new_epoch = if let Some(mls_epoch) = mls_epoch {
+                let post_commit_epoch = (mls_epoch + 1) as i32;
+                if post_commit_epoch > new_epoch {
+                    info!(
+                        "externalCommit: syncing server epoch {} -> {} (MLS epoch {} + 1) for convo {}",
+                        new_epoch, post_commit_epoch, mls_epoch, crate::crypto::redact_for_log(&convo_id)
+                    );
+                    sqlx::query(
+                        "UPDATE conversations SET current_epoch = $1, updated_at = $2 WHERE id = $3 AND current_epoch < $1",
+                    )
+                    .bind(post_commit_epoch)
+                    .bind(chrono::Utc::now())
+                    .bind(&convo_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| {
+                        error!("externalCommit: failed to sync epoch to MLS epoch: {}", e);
+                        internal_server_error("Failed to sync epoch")
+                    })?;
+                    post_commit_epoch
+                } else {
+                    new_epoch
+                }
+            } else {
+                new_epoch
+            };
+
+            // ── Store or invalidate GroupInfo ─────────────────────────
+            if let Some(ref gi_bytes) = group_info_bytes_opt {
+                // Store the fresh GroupInfo atomically with the epoch advance
+                let mls_epoch_i32 = mls_epoch.map(|e| e as i32);
+                sqlx::query(
+                    r#"UPDATE conversations
+                       SET group_info = $1,
+                           group_info_epoch = COALESCE(group_info_epoch, 0) + 1,
+                           group_info_updated_at = NOW()
+                       WHERE id = $2"#,
+                )
+                .bind(gi_bytes)
+                .bind(&convo_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    error!("externalCommit: failed to store GroupInfo: {}", e);
+                    internal_server_error("Failed to store GroupInfo")
+                })?;
+                info!(
+                    "externalCommit: stored GroupInfo (mls_epoch={:?}) for convo {}",
+                    mls_epoch_i32, crate::crypto::redact_for_log(&convo_id)
+                );
+            } else {
+                // No GroupInfo provided — invalidate stale cached GroupInfo
+                sqlx::query(
+                    "UPDATE conversations SET group_info = NULL, group_info_epoch = NULL, group_info_updated_at = NULL WHERE id = $1",
+                )
+                .bind(&convo_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    error!("externalCommit: failed to invalidate stale GroupInfo after epoch advance: {}", e);
+                    internal_server_error("Failed to invalidate stale GroupInfo")
+                })?;
+            };
 
             // ── Store commit message ───────────────────────────────────
             let msg_id = uuid::Uuid::new_v4().to_string();
