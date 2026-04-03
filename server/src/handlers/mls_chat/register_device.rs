@@ -354,7 +354,7 @@ async fn handle_register(
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
 
-        if device_count.0 >= 10 {
+        if device_count.0 >= 20 {
             warn!(
                 "User h:{} has reached device limit: {}",
                 crate::crypto::hash_for_log(&user_did),

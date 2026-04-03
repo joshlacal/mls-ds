@@ -362,16 +362,10 @@ pub async fn commit_group_change(
                     add_mls_epoch, crate::crypto::redact_for_log(&convo_id)
                 );
             } else {
-                sqlx::query(
-                    "UPDATE conversations SET group_info = NULL, group_info_epoch = NULL, group_info_updated_at = NULL WHERE id = $1",
-                )
-                .bind(&convo_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| {
-                    error!("addMembers: failed to invalidate stale GroupInfo after epoch advance: {}", e);
-                    internal_server_error("Failed to invalidate stale GroupInfo")
-                })?;
+                warn!(
+                    "addMembers: no GroupInfo provided with commit for convo {} — keeping existing (may be stale)",
+                    crate::crypto::redact_for_log(&convo_id)
+                );
             };
 
             // ── Store commit message ───────────────────────────────────
@@ -837,17 +831,10 @@ pub async fn commit_group_change(
                     mls_epoch_i32, crate::crypto::redact_for_log(&convo_id)
                 );
             } else {
-                // No GroupInfo provided — invalidate stale cached GroupInfo
-                sqlx::query(
-                    "UPDATE conversations SET group_info = NULL, group_info_epoch = NULL, group_info_updated_at = NULL WHERE id = $1",
-                )
-                .bind(&convo_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| {
-                    error!("externalCommit: failed to invalidate stale GroupInfo after epoch advance: {}", e);
-                    internal_server_error("Failed to invalidate stale GroupInfo")
-                })?;
+                warn!(
+                    "externalCommit: no GroupInfo provided with commit for convo {} — keeping existing (may be stale)",
+                    crate::crypto::redact_for_log(&convo_id)
+                );
             };
 
             // ── Store commit message ───────────────────────────────────
@@ -1578,17 +1565,11 @@ pub async fn commit_group_change(
                 }
             };
 
-            // ── Invalidate stale GroupInfo after epoch advance ────────
-            sqlx::query(
-                "UPDATE conversations SET group_info = NULL, group_info_epoch = NULL, group_info_updated_at = NULL WHERE id = $1",
-            )
-            .bind(&convo_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| {
-                error!("removeMember: failed to invalidate stale GroupInfo: {}", e);
-                internal_server_error("Failed to invalidate stale GroupInfo")
-            })?;
+            // ── GroupInfo: keep existing (stale is better than absent) ─
+            warn!(
+                "removeMember: no GroupInfo provided with commit for convo {} — keeping existing (may be stale)",
+                crate::crypto::redact_for_log(&convo_id)
+            );
 
             // ── Store commit message ───────────────────────────────────
             let msg_id = uuid::Uuid::new_v4().to_string();
@@ -1840,17 +1821,11 @@ pub async fn commit_group_change(
                 }
             };
 
-            // ── Invalidate stale GroupInfo after epoch advance ────────
-            sqlx::query(
-                "UPDATE conversations SET group_info = NULL, group_info_epoch = NULL, group_info_updated_at = NULL WHERE id = $1",
-            )
-            .bind(&convo_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| {
-                error!("{}: failed to invalidate stale GroupInfo: {}", action_name, e);
-                internal_server_error("Failed to invalidate stale GroupInfo")
-            })?;
+            // ── GroupInfo: keep existing (stale is better than absent) ─
+            warn!(
+                "{}: no GroupInfo provided with commit for convo {} — keeping existing (may be stale)",
+                action_name, crate::crypto::redact_for_log(&convo_id)
+            );
 
             // ── Store commit message ───────────────────────────────────
             let msg_id = uuid::Uuid::new_v4().to_string();
