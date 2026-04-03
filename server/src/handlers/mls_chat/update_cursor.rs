@@ -58,13 +58,7 @@ pub async fn update_cursor(
     let convo_id = input.convo_id.to_string();
     let caller_did = &auth_user.did;
 
-    // Cursor is required
-    let cursor = match input.cursor {
-        Some(ref c) => c.to_string(),
-        None => {
-            return Err(XrpcError(StatusCode::BAD_REQUEST, "InvalidRequest", "cursor is required".into()));
-        }
-    };
+    let cursor = input.cursor.to_string();
 
     // Check membership
     let is_member: bool = sqlx::query_scalar(
@@ -132,7 +126,6 @@ pub async fn update_cursor(
 
     Ok(Json(UpdateCursorOutput {
         updated_at: chrono_to_datetime(chrono::Utc::now()),
-        read_at: None,
         extra_data: Default::default(),
     }))
 }
