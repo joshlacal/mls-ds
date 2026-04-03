@@ -582,7 +582,8 @@ async fn main() -> anyhow::Result<()> {
         get_subscription_ticket::GetSubscriptionTicketRequest, leave_convo::LeaveConvoRequest,
         list_devices::ListDevicesRequest, opt_in::OptInRequest,
         publish_key_packages::PublishKeyPackagesRequest, register_device::RegisterDeviceRequest,
-        report_spam::ReportSpamRequest, send_message::SendMessageRequest,
+        remove_device::RemoveDeviceRequest, report_spam::ReportSpamRequest,
+        send_message::SendMessageRequest,
         update_convo::UpdateConvoRequest,
         update_cursor::UpdateCursorRequest,
     };
@@ -607,6 +608,9 @@ async fn main() -> anyhow::Result<()> {
         ))
         .merge(GetKeyPackagesRequest::into_router(
             handlers::mls_chat::get_key_packages,
+        ))
+        .merge(RemoveDeviceRequest::into_router(
+            handlers::mls_chat::remove_device,
         ))
         // Conversations & Messaging
         .merge(CreateConvoRequest::into_router(
