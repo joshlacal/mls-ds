@@ -57,16 +57,18 @@ pub async fn get_group_metadata_blob(
     let group_id = &params.group_id;
 
     // Verify caller is a member of the group
-    let convo_id: Option<String> = sqlx::query_scalar(
-        "SELECT id FROM conversations WHERE group_id = $1"
-    )
-    .bind(group_id)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|e| {
-        error!("❌ [getGroupMetadataBlob] Failed to look up conversation for group: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let convo_id: Option<String> =
+        sqlx::query_scalar("SELECT id FROM conversations WHERE group_id = $1")
+            .bind(group_id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| {
+                error!(
+                    "❌ [getGroupMetadataBlob] Failed to look up conversation for group: {}",
+                    e
+                );
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
     let convo_id = match convo_id {
         Some(id) => id,
@@ -94,10 +96,7 @@ pub async fn get_group_metadata_blob(
     }
 
     // Treat empty string the same as None (Swift client sends "" when no locator)
-    let effective_locator = params
-        .blob_locator
-        .as_deref()
-        .filter(|s| !s.is_empty());
+    let effective_locator = params.blob_locator.as_deref().filter(|s| !s.is_empty());
 
     let row = match effective_locator {
         Some(locator) => {
@@ -125,10 +124,7 @@ pub async fn get_group_metadata_blob(
         }
     }
     .map_err(|e| {
-        error!(
-            "❌ [getGroupMetadataBlob] DB error fetching blob: {}",
-            e
-        );
+        error!("❌ [getGroupMetadataBlob] DB error fetching blob: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
@@ -136,7 +132,8 @@ pub async fn get_group_metadata_blob(
         Some(blob) => {
             info!(
                 "✅ [getGroupMetadataBlob] Returning blob ({} bytes) for group {}",
-                blob.size, crate::crypto::redact_for_log(&params.group_id)
+                blob.size,
+                crate::crypto::redact_for_log(&params.group_id)
             );
             Ok(Response::builder()
                 .status(StatusCode::OK)
@@ -148,7 +145,8 @@ pub async fn get_group_metadata_blob(
         None => {
             warn!(
                 "❌ [getGroupMetadataBlob] Blob not found: locator={:?} group={}",
-                effective_locator.map(|l| crate::crypto::redact_for_log(l)), crate::crypto::redact_for_log(&params.group_id)
+                effective_locator.map(|l| crate::crypto::redact_for_log(l)),
+                crate::crypto::redact_for_log(&params.group_id)
             );
             Err(StatusCode::NOT_FOUND)
         }

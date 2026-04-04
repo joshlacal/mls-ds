@@ -80,7 +80,9 @@ pub async fn get_convos(
                 .await?
                 .into_response())
         }
-        "expected" => Ok(handle_expected(&pool, did, device_id).await?.into_response()),
+        "expected" => Ok(handle_expected(&pool, did, device_id)
+            .await?
+            .into_response()),
         other => {
             error!("❌ [v2.getConvos] Unknown filter: {}", other);
             Err(StatusCode::BAD_REQUEST)
@@ -95,7 +97,10 @@ pub async fn get_convos(
 async fn handle_all(
     pool: &DbPool,
     did: &str,
-) -> Result<Json<crate::generated::blue_catbird::mlsChat::get_convos::GetConvosOutput<'static>>, StatusCode> {
+) -> Result<
+    Json<crate::generated::blue_catbird::mlsChat::get_convos::GetConvosOutput<'static>>,
+    StatusCode,
+> {
     // Get all active memberships (matches user_did, member_did, or device-suffixed member_did)
     let memberships = sqlx::query_as::<_, Membership>(
         r#"
@@ -174,13 +179,15 @@ async fn handle_all(
 
     info!("✅ [v2.getConvos] Found {} conversations", convos.len());
 
-    Ok(Json(crate::generated::blue_catbird::mlsChat::get_convos::GetConvosOutput {
-        conversations: convos,
-        cursor: None,
-        pending_count: None,
-        request_count: None,
-        extra_data: Default::default(),
-    }))
+    Ok(Json(
+        crate::generated::blue_catbird::mlsChat::get_convos::GetConvosOutput {
+            conversations: convos,
+            cursor: None,
+            pending_count: None,
+            request_count: None,
+            extra_data: Default::default(),
+        },
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -346,7 +353,10 @@ async fn handle_expected(
     pool: &DbPool,
     user_did: &str,
     device_id_param: Option<String>,
-) -> Result<Json<crate::generated::blue_catbird::mlsChat::get_convos::GetConvosOutput<'static>>, StatusCode> {
+) -> Result<
+    Json<crate::generated::blue_catbird::mlsChat::get_convos::GetConvosOutput<'static>>,
+    StatusCode,
+> {
     let _device_id = device_id_param.or_else(|| {
         if user_did.contains('#') {
             user_did.split('#').nth(1).map(|s| s.to_string())
@@ -441,11 +451,13 @@ async fn handle_expected(
 
     info!("✅ [v2.getConvos] Expected: {} convos", convos.len(),);
 
-    Ok(Json(crate::generated::blue_catbird::mlsChat::get_convos::GetConvosOutput {
-        conversations: convos,
-        cursor: None,
-        pending_count: None,
-        request_count: None,
-        extra_data: Default::default(),
-    }))
+    Ok(Json(
+        crate::generated::blue_catbird::mlsChat::get_convos::GetConvosOutput {
+            conversations: convos,
+            cursor: None,
+            pending_count: None,
+            request_count: None,
+            extra_data: Default::default(),
+        },
+    ))
 }

@@ -400,8 +400,7 @@ fn should_use_device_rate_limit(endpoint: &str) -> bool {
     // even if the user's other devices have exhausted the quota.
     // Note: registerDevice is intentionally excluded — it doesn't verify
     // recovery claims and shouldn't bypass the pre-auth IP rate limit.
-    endpoint_name.contains("publishKeyPackage")
-        || endpoint_name.contains("syncKeyPackages")
+    endpoint_name.contains("publishKeyPackage") || endpoint_name.contains("syncKeyPackages")
 }
 
 /// Check if request is in recovery mode

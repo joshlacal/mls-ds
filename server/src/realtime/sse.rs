@@ -289,9 +289,7 @@ impl<'de> serde::Deserialize<'de> for StreamEvent {
                 did,
                 is_typing,
             },
-            RawStreamEvent::InfoEvent { cursor, info } => {
-                StreamEvent::InfoEvent { cursor, info }
-            }
+            RawStreamEvent::InfoEvent { cursor, info } => StreamEvent::InfoEvent { cursor, info },
             RawStreamEvent::NewDeviceEvent {
                 cursor,
                 convo_id,

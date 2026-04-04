@@ -52,7 +52,11 @@ pub async fn update_cursor(
 ) -> Result<Json<UpdateCursorOutput<'static>>, XrpcError> {
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
         error!("❌ [v2.updateCursor] Unauthorized");
-        return Err(XrpcError(StatusCode::UNAUTHORIZED, "AuthRequired", "Authentication required".into()));
+        return Err(XrpcError(
+            StatusCode::UNAUTHORIZED,
+            "AuthRequired",
+            "Authentication required".into(),
+        ));
     }
 
     let convo_id = input.convo_id.to_string();
@@ -75,16 +79,29 @@ pub async fn update_cursor(
     .await
     .map_err(|e| {
         error!("Failed to check membership: {}", e);
-        XrpcError(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", "Failed to check membership".into())
+        XrpcError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalServerError",
+            "Failed to check membership".into(),
+        )
     })?;
 
     if !is_member {
-        return Err(XrpcError(StatusCode::FORBIDDEN, "Forbidden", "Not a member of this conversation".into()));
+        return Err(XrpcError(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            "Not a member of this conversation".into(),
+        ));
     }
 
     // Validate cursor format
-    crate::realtime::cursor::CursorGenerator::validate(&cursor)
-        .map_err(|_| XrpcError(StatusCode::BAD_REQUEST, "InvalidRequest", "Invalid cursor format".into()))?;
+    crate::realtime::cursor::CursorGenerator::validate(&cursor).map_err(|_| {
+        XrpcError(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "Invalid cursor format".into(),
+        )
+    })?;
 
     info!(
         user = %crate::crypto::redact_for_log(caller_did),
@@ -108,7 +125,11 @@ pub async fn update_cursor(
     .await
     .map_err(|e| {
         error!("Failed to update cursor: {}", e);
-        XrpcError(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", "Failed to update cursor".into())
+        XrpcError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalServerError",
+            "Failed to update cursor".into(),
+        )
     })?;
 
     // Reset unread count

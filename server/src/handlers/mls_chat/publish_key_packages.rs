@@ -457,7 +457,11 @@ async fn handle_publish_batch(
     Ok(PublishResult {
         succeeded,
         failed,
-        errors: if errors.is_empty() { None } else { Some(errors) },
+        errors: if errors.is_empty() {
+            None
+        } else {
+            Some(errors)
+        },
         extra_data: Default::default(),
     })
 }

@@ -119,7 +119,10 @@ async fn main() -> anyhow::Result<()> {
         if std::env::var("REDIS_ENCRYPTION_KEY").is_err() {
             panic!("Refusing to start in production: REDIS_ENCRYPTION_KEY is required.");
         }
-        if std::env::var("SERVICE_DID").map(|v| v.is_empty()).unwrap_or(true) {
+        if std::env::var("SERVICE_DID")
+            .map(|v| v.is_empty())
+            .unwrap_or(true)
+        {
             panic!(
                 "Refusing to start in production: SERVICE_DID is not configured. \
                  This is required for JWT audience validation."
@@ -583,8 +586,7 @@ async fn main() -> anyhow::Result<()> {
         list_devices::ListDevicesRequest, opt_in::OptInRequest,
         publish_key_packages::PublishKeyPackagesRequest, register_device::RegisterDeviceRequest,
         remove_device::RemoveDeviceRequest, report_spam::ReportSpamRequest,
-        send_message::SendMessageRequest,
-        update_convo::UpdateConvoRequest,
+        send_message::SendMessageRequest, update_convo::UpdateConvoRequest,
         update_cursor::UpdateCursorRequest,
     };
     use jacquard_axum::IntoRouter;
@@ -673,8 +675,7 @@ async fn main() -> anyhow::Result<()> {
         // Blob Storage
         .route(
             "/xrpc/blue.catbird.mlsChat.uploadBlob",
-            post(handlers::mls_chat::upload_blob)
-                .layer(DefaultBodyLimit::max(11 * 1024 * 1024)), // 11MB (10MB + overhead)
+            post(handlers::mls_chat::upload_blob).layer(DefaultBodyLimit::max(11 * 1024 * 1024)), // 11MB (10MB + overhead)
         )
         .route(
             "/xrpc/blue.catbird.mlsChat.getBlob",

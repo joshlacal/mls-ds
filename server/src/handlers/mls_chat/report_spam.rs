@@ -39,7 +39,10 @@ pub async fn report_spam_post(
             })?;
 
     if convo_exists.is_none() {
-        warn!("Conversation not found: {}", crate::crypto::redact_for_log(convo_id));
+        warn!(
+            "Conversation not found: {}",
+            crate::crypto::redact_for_log(convo_id)
+        );
         return Err(StatusCode::NOT_FOUND);
     }
 

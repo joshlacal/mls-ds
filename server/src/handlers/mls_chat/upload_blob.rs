@@ -62,7 +62,9 @@ pub async fn upload_blob(
     {
         warn!(
             "❌ [uploadBlob] {} is not a member of {}: {}",
-            crate::crypto::redact_for_log(owner_did), crate::crypto::redact_for_log(&params.convo_id), e
+            crate::crypto::redact_for_log(owner_did),
+            crate::crypto::redact_for_log(&params.convo_id),
+            e
         );
         return Err(StatusCode::FORBIDDEN);
     }
@@ -76,7 +78,8 @@ pub async fn upload_blob(
     if size > blob_store.max_blob_size() {
         warn!(
             "❌ [uploadBlob] Blob too large: {} bytes from {}",
-            size, crate::crypto::redact_for_log(owner_did)
+            size,
+            crate::crypto::redact_for_log(owner_did)
         );
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -105,13 +108,10 @@ pub async fn upload_blob(
     }
 
     // Upload to S3
-    blob_store
-        .put(&blob_id, body.to_vec())
-        .await
-        .map_err(|e| {
-            error!("❌ [uploadBlob] S3 upload failed: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    blob_store.put(&blob_id, body.to_vec()).await.map_err(|e| {
+        error!("❌ [uploadBlob] S3 upload failed: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     // Insert metadata with convo_id
     let expires_at = Utc::now() + Duration::days(blob_store.ttl_days());
@@ -139,11 +139,11 @@ pub async fn upload_blob(
 
     info!(
         "✅ [uploadBlob] Uploaded blob {} ({} bytes) for {} in convo {}",
-        crate::crypto::redact_for_log(&blob_id), size, crate::crypto::redact_for_log(owner_did), crate::crypto::redact_for_log(&params.convo_id)
+        crate::crypto::redact_for_log(&blob_id),
+        size,
+        crate::crypto::redact_for_log(owner_did),
+        crate::crypto::redact_for_log(&params.convo_id)
     );
 
-    Ok(Json(UploadBlobOutput {
-        blob_id,
-        size,
-    }))
+    Ok(Json(UploadBlobOutput { blob_id, size }))
 }

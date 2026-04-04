@@ -62,7 +62,10 @@ pub async fn get_pending_devices(
     .rows_affected();
 
     if aged_out > 0 {
-        info!("Aged out {} stale pending additions (>1 hour old)", aged_out);
+        info!(
+            "Aged out {} stale pending additions (>1 hour old)",
+            aged_out
+        );
     }
 
     // Release expired claims (for additions that are still fresh)

@@ -4,9 +4,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     auth::AuthUser,
-    generated::blue_catbird::mlsChat::remove_device::{
-        RemoveDeviceOutput, RemoveDeviceRequest,
-    },
+    generated::blue_catbird::mlsChat::remove_device::{RemoveDeviceOutput, RemoveDeviceRequest},
     storage::DbPool,
 };
 

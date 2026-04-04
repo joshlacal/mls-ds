@@ -14,7 +14,9 @@ use crate::{
     auth::{verify_is_admin, AuthUser},
     block_sync::BlockSyncService,
     generated::blue_catbird::mlsChat::{
-        create_convo::{CreateConvoError as LexCreateConvoError, CreateConvoOutput, CreateConvoRequest},
+        create_convo::{
+            CreateConvoError as LexCreateConvoError, CreateConvoOutput, CreateConvoRequest,
+        },
         ConvoMetadata, ConvoView, MemberView,
     },
     sqlx_jacquard::{chrono_to_datetime, did_to_string, string_to_did},
@@ -148,9 +150,7 @@ async fn handle_create_convo(
     let creator_did: String = auth_user.did.clone();
 
     // Validate cipher suite
-    let valid_suites = [
-        "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
-    ];
+    let valid_suites = ["MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519"];
     if !valid_suites.contains(&input.cipher_suite.as_str()) {
         warn!(
             "❌ [v2.createConvo] Invalid cipher suite: {}",
@@ -177,7 +177,11 @@ async fn handle_create_convo(
             return Err((
                 StatusCode::BAD_REQUEST,
                 Json(LexCreateConvoError::TooManyMembers(Some(
-                    format!("Cannot add more than {} initial members (got {} including creator)", max_members, total_member_count).into(),
+                    format!(
+                        "Cannot add more than {} initial members (got {} including creator)",
+                        max_members, total_member_count
+                    )
+                    .into(),
                 ))),
             )
                 .into_response());
@@ -504,7 +508,8 @@ async fn handle_create_convo(
                             format!(
                                 "Key package hash not found for {}: hash={}",
                                 member_did_str, hash_hex
-                            ).into(),
+                            )
+                            .into(),
                         ))),
                     )
                         .into_response());

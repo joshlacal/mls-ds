@@ -3,8 +3,7 @@ use jacquard_axum::ExtractXrpc;
 use tracing::{error, info, warn};
 
 use crate::{
-    auth::AuthUser,
-    generated::blue_catbird::mlsChat::delete_blob::DeleteBlobRequest,
+    auth::AuthUser, generated::blue_catbird::mlsChat::delete_blob::DeleteBlobRequest,
     storage::DbPool,
 };
 
@@ -46,14 +45,16 @@ pub async fn delete_blob(
     if result.rows_affected() == 0 {
         warn!(
             "❌ [deleteBlob] Blob not found or not owned by {}: {}",
-            crate::crypto::redact_for_log(owner_did), crate::crypto::redact_for_log(input.blob_id.as_ref())
+            crate::crypto::redact_for_log(owner_did),
+            crate::crypto::redact_for_log(input.blob_id.as_ref())
         );
         return Err(StatusCode::NOT_FOUND);
     }
 
     info!(
         "✅ [deleteBlob] Soft-deleted blob {} for {}",
-        crate::crypto::redact_for_log(input.blob_id.as_ref()), crate::crypto::redact_for_log(owner_did)
+        crate::crypto::redact_for_log(input.blob_id.as_ref()),
+        crate::crypto::redact_for_log(owner_did)
     );
     Ok(StatusCode::OK)
 }

@@ -61,21 +61,26 @@ pub async fn put_group_metadata_blob(
     let size = data.len();
 
     // Verify caller is a member of the group
-    let convo_id: Option<String> = sqlx::query_scalar(
-        "SELECT id FROM conversations WHERE group_id = $1"
-    )
-    .bind(group_id)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|e| {
-        error!("❌ [putGroupMetadataBlob] Failed to look up conversation for group: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let convo_id: Option<String> =
+        sqlx::query_scalar("SELECT id FROM conversations WHERE group_id = $1")
+            .bind(group_id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| {
+                error!(
+                    "❌ [putGroupMetadataBlob] Failed to look up conversation for group: {}",
+                    e
+                );
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
     let convo_id = match convo_id {
         Some(id) => id,
         None => {
-            warn!("❌ [putGroupMetadataBlob] No conversation found for group_id {}", crate::crypto::redact_for_log(group_id));
+            warn!(
+                "❌ [putGroupMetadataBlob] No conversation found for group_id {}",
+                crate::crypto::redact_for_log(group_id)
+            );
             return Err(StatusCode::NOT_FOUND);
         }
     };
@@ -106,7 +111,8 @@ pub async fn put_group_metadata_blob(
     if size > MAX_METADATA_BLOB_SIZE {
         warn!(
             "❌ [putGroupMetadataBlob] Blob too large: {} bytes from {}",
-            size, crate::crypto::redact_for_log(owner_did)
+            size,
+            crate::crypto::redact_for_log(owner_did)
         );
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -161,16 +167,16 @@ pub async fn put_group_metadata_blob(
     .execute(&pool)
     .await
     .map_err(|e| {
-        error!(
-            "❌ [putGroupMetadataBlob] DB error inserting blob: {}",
-            e
-        );
+        error!("❌ [putGroupMetadataBlob] DB error inserting blob: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
     info!(
         "✅ [putGroupMetadataBlob] Stored blob {} ({} bytes) for group {} by {}",
-        crate::crypto::redact_for_log(blob_locator), size, crate::crypto::redact_for_log(group_id), crate::crypto::redact_for_log(owner_did)
+        crate::crypto::redact_for_log(blob_locator),
+        size,
+        crate::crypto::redact_for_log(group_id),
+        crate::crypto::redact_for_log(owner_did)
     );
 
     Ok(Json(PutGroupMetadataBlobOutput {

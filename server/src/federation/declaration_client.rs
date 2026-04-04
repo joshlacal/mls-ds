@@ -190,12 +190,8 @@ impl DeviceRecordClient {
         let value = body.get("value").unwrap_or(&body);
 
         let policy = MLSChatPolicy {
-            allow_followers_bypass: value
-                .get("allowFollowersBypass")
-                .and_then(|v| v.as_bool()),
-            allow_following_bypass: value
-                .get("allowFollowingBypass")
-                .and_then(|v| v.as_bool()),
+            allow_followers_bypass: value.get("allowFollowersBypass").and_then(|v| v.as_bool()),
+            allow_following_bypass: value.get("allowFollowingBypass").and_then(|v| v.as_bool()),
             who_can_message_me: value
                 .get("whoCanMessageMe")
                 .and_then(|v| v.as_str())

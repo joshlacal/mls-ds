@@ -158,7 +158,9 @@ pub async fn get_key_package_status(
                     .map(|r| KeyPackageStatusItem {
                         id: r.get::<String, _>("id").into(),
                         cipher_suite: r.get::<String, _>("cipher_suite").into(),
-                        consumed: r.get::<Option<chrono::DateTime<chrono::Utc>>, _>("consumed_at").is_some(),
+                        consumed: r
+                            .get::<Option<chrono::DateTime<chrono::Utc>>, _>("consumed_at")
+                            .is_some(),
                         created_at: crate::sqlx_jacquard::chrono_to_datetime(
                             r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
                         ),

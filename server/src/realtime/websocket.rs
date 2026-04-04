@@ -692,14 +692,13 @@ async fn backfill_events(
                     _ => None,
                 }
             }
-            Some("blue.catbird.mlsChat.subscribeEvents#infoEvent") => {
-                payload.get("info").and_then(|v| v.as_str()).map(|info| {
-                    StreamEvent::InfoEvent {
-                        cursor: cursor.clone(),
-                        info: info.to_string(),
-                    }
-                })
-            }
+            Some("blue.catbird.mlsChat.subscribeEvents#infoEvent") => payload
+                .get("info")
+                .and_then(|v| v.as_str())
+                .map(|info| StreamEvent::InfoEvent {
+                    cursor: cursor.clone(),
+                    info: info.to_string(),
+                }),
             _ => {
                 // Skip message events and unknown types
                 None

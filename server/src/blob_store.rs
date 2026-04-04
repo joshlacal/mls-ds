@@ -17,14 +17,11 @@ pub struct BlobStore {
 
 impl BlobStore {
     pub async fn new() -> Self {
-        let endpoint = std::env::var("S3_ENDPOINT")
-            .unwrap_or_else(|_| "http://127.0.0.1:8333".to_string());
-        let access_key = std::env::var("S3_ACCESS_KEY")
-            .expect("S3_ACCESS_KEY must be set");
-        let secret_key = std::env::var("S3_SECRET_KEY")
-            .expect("S3_SECRET_KEY must be set");
-        let region =
-            std::env::var("S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+        let endpoint =
+            std::env::var("S3_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:8333".to_string());
+        let access_key = std::env::var("S3_ACCESS_KEY").expect("S3_ACCESS_KEY must be set");
+        let secret_key = std::env::var("S3_SECRET_KEY").expect("S3_SECRET_KEY must be set");
+        let region = std::env::var("S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
 
         let creds = Credentials::new(&access_key, &secret_key, None, None, "env");
         let config = Builder::new()

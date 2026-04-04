@@ -1096,10 +1096,7 @@ async fn handle_notify_system_message(
 
     match msg_row {
         Ok(Some((ciphertext, epoch, seq, created_at))) => {
-            let cursor = sse_state
-                .cursor_gen
-                .next(convo_id, "messageEvent")
-                .await;
+            let cursor = sse_state.cursor_gen.next(convo_id, "messageEvent").await;
 
             let message_view: StreamMessageView =
                 crate::generated::blue_catbird::mlsChat::MessageView {
@@ -1126,14 +1123,23 @@ async fn handle_notify_system_message(
             }
 
             if let Err(e) = sse_state.emit(convo_id, event).await {
-                error!("❌ [actor:worker] Failed to emit system message SSE event: {}", e);
+                error!(
+                    "❌ [actor:worker] Failed to emit system message SSE event: {}",
+                    e
+                );
             }
         }
         Ok(None) => {
-            error!("❌ [actor:worker] System message {} not found in DB", msg_id);
+            error!(
+                "❌ [actor:worker] System message {} not found in DB",
+                msg_id
+            );
         }
         Err(e) => {
-            error!("❌ [actor:worker] Failed to fetch system message {}: {:?}", msg_id, e);
+            error!(
+                "❌ [actor:worker] Failed to fetch system message {}: {:?}",
+                msg_id, e
+            );
         }
     }
 }

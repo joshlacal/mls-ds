@@ -55,22 +55,24 @@ pub async fn get_blob(
     let convo_id = match row {
         Some((cid,)) => cid,
         None => {
-            warn!("❌ [getBlob] Blob not found or expired: {}", crate::crypto::redact_for_log(&params.blob_id));
+            warn!(
+                "❌ [getBlob] Blob not found or expired: {}",
+                crate::crypto::redact_for_log(&params.blob_id)
+            );
             return Err(StatusCode::NOT_FOUND);
         }
     };
 
     // Verify requester is a member of the blob's conversation
-    if let Err(e) = crate::middleware::mls_auth::verify_group_membership(
-        &auth_user.did,
-        &convo_id,
-        &pool,
-    )
-    .await
+    if let Err(e) =
+        crate::middleware::mls_auth::verify_group_membership(&auth_user.did, &convo_id, &pool).await
     {
         warn!(
             "❌ [getBlob] {} not a member of convo {} for blob {}: {}",
-            crate::crypto::redact_for_log(&auth_user.did), crate::crypto::redact_for_log(&convo_id), crate::crypto::redact_for_log(&params.blob_id), e
+            crate::crypto::redact_for_log(&auth_user.did),
+            crate::crypto::redact_for_log(&convo_id),
+            crate::crypto::redact_for_log(&params.blob_id),
+            e
         );
         return Err(StatusCode::FORBIDDEN);
     }

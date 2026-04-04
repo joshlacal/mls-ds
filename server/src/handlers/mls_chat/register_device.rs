@@ -83,11 +83,9 @@ pub async fn register_device_post(
         "claimPendingAddition" => Ok(handle_claim_pending_addition(&pool, &auth_user, &raw)
             .await?
             .into_response()),
-        "completePendingAddition" => {
-            Ok(handle_complete_pending_addition(&pool, &auth_user, &raw)
-                .await?
-                .into_response())
-        }
+        "completePendingAddition" => Ok(handle_complete_pending_addition(&pool, &auth_user, &raw)
+            .await?
+            .into_response()),
         unknown => {
             warn!("Unknown action for v2 registerDevice POST: {}", unknown);
             Err(StatusCode::BAD_REQUEST)
@@ -504,20 +502,23 @@ async fn handle_register(
                 if let Err(e) = sse_state.emit(convo_id, event).await {
                     warn!(
                         "Failed to emit NewDeviceEvent for convo {}: {}",
-                        crate::crypto::redact_for_log(convo_id), e
+                        crate::crypto::redact_for_log(convo_id),
+                        e
                     );
                 }
             }
             Ok(None) => {
                 info!(
                     "Pending addition already exists for device {} in convo {}",
-                    device_id, crate::crypto::redact_for_log(convo_id)
+                    device_id,
+                    crate::crypto::redact_for_log(convo_id)
                 );
             }
             Err(e) => {
                 warn!(
                     "Failed to create pending addition for convo {}: {}",
-                    crate::crypto::redact_for_log(convo_id), e
+                    crate::crypto::redact_for_log(convo_id),
+                    e
                 );
             }
         }
@@ -526,10 +527,7 @@ async fn handle_register(
     Ok(Json(RegisterDeviceOutput {
         device_id: device_id.into(),
         mls_did: mls_did.into(),
-        auto_joined_convos: auto_joined_convos
-            .into_iter()
-            .map(|s| s.into())
-            .collect(),
+        auto_joined_convos: auto_joined_convos.into_iter().map(|s| s.into()).collect(),
         welcome_messages: None,
         extra_data: Default::default(),
     }))
@@ -933,7 +931,8 @@ async fn handle_claim_pending_addition(
 
     info!(
         "Successfully claimed pending addition {} for conversation {}",
-        crate::crypto::redact_for_log(pending_addition_id), crate::crypto::redact_for_log(&p_convo_id)
+        crate::crypto::redact_for_log(pending_addition_id),
+        crate::crypto::redact_for_log(&p_convo_id)
     );
 
     // Fetch key package for new device
@@ -1074,7 +1073,10 @@ async fn handle_complete_pending_addition(
                     warn!(
                         "Pending addition {} claimed by {}, not {}",
                         crate::crypto::redact_for_log(pending_addition_id),
-                        claimed_by.as_deref().map(|d| crate::crypto::redact_for_log(d)).unwrap_or_else(|| "unknown".to_string()),
+                        claimed_by
+                            .as_deref()
+                            .map(|d| crate::crypto::redact_for_log(d))
+                            .unwrap_or_else(|| "unknown".to_string()),
                         crate::crypto::redact_for_log(&user_did)
                     );
                     return Err(StatusCode::FORBIDDEN);

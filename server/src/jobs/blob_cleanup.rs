@@ -28,10 +28,7 @@ pub async fn run_blob_cleanup_worker(pool: PgPool, blob_store: BlobStore) {
         {
             Ok(result) => {
                 if result.rows_affected() > 0 {
-                    info!(
-                        "Soft-deleted {} expired blobs",
-                        result.rows_affected()
-                    );
+                    info!("Soft-deleted {} expired blobs", result.rows_affected());
                 }
             }
             Err(e) => error!("Blob TTL soft-delete failed: {}", e),
