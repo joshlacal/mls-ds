@@ -507,6 +507,7 @@ fn extract_cursor(event: &StreamEvent) -> Option<String> {
         | StreamEvent::NewDeviceEvent { cursor, .. }
         | StreamEvent::GroupInfoRefreshRequested { cursor, .. }
         | StreamEvent::ReadditionRequested { cursor, .. }
+        | StreamEvent::TreeChanged { cursor, .. }
         | StreamEvent::MembershipChangeEvent { cursor, .. }
         | StreamEvent::InfoEvent { cursor, .. } => Some(cursor.clone()),
     }

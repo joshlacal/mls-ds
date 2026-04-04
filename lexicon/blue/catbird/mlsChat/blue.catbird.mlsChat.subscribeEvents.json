@@ -31,7 +31,8 @@
             "#reactionEvent",
             "#typingEvent",
             "#newDeviceEvent",
-            "#infoEvent"
+            "#infoEvent",
+            "#treeChanged"
           ]
         }
       }
@@ -146,6 +147,17 @@
         "deviceName": { "type": "string", "description": "Human-readable device name" },
         "deviceCredentialDid": { "type": "string", "description": "Full device credential DID (did:plc:user#device-uuid)" },
         "pendingAdditionId": { "type": "string", "description": "ID of the pending addition for claim/complete flow" }
+      }
+    },
+    "treeChanged": {
+      "type": "object",
+      "description": "The canonical MLS tree state changed. Clients must compare confirmationTag against their local state and re-join if mismatched.",
+      "required": ["cursor", "convoId", "confirmationTag", "epoch"],
+      "properties": {
+        "cursor": { "type": "string", "description": "Resume cursor" },
+        "convoId": { "type": "string", "description": "Conversation identifier" },
+        "confirmationTag": { "type": "string", "maxLength": 64, "description": "Base64-encoded confirmation tag of the new canonical tree" },
+        "epoch": { "type": "integer", "description": "New epoch number" }
       }
     },
     "infoEvent": {

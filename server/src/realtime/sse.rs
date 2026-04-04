@@ -111,6 +111,17 @@ pub enum StreamEvent {
         #[serde(rename = "requestedAt")]
         requested_at: String,
     },
+    /// Event indicating the canonical MLS tree state changed.
+    /// Clients must compare confirmationTag against their local state and re-join if mismatched.
+    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#treeChanged")]
+    TreeChanged {
+        cursor: String,
+        #[serde(rename = "convoId")]
+        convo_id: String,
+        #[serde(rename = "confirmationTag")]
+        confirmation_tag: String,
+        epoch: i64,
+    },
     /// Event indicating a member joined, left, or was removed from the conversation
     #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#membershipChangeEvent")]
     MembershipChangeEvent {
@@ -215,6 +226,15 @@ impl<'de> serde::Deserialize<'de> for StreamEvent {
                 user_did: String,
                 #[serde(rename = "requestedAt")]
                 requested_at: String,
+            },
+            #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#treeChanged")]
+            TreeChanged {
+                cursor: String,
+                #[serde(rename = "convoId")]
+                convo_id: String,
+                #[serde(rename = "confirmationTag")]
+                confirmation_tag: String,
+                epoch: i64,
             },
             #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#membershipChangeEvent")]
             MembershipChangeEvent {
@@ -328,6 +348,17 @@ impl<'de> serde::Deserialize<'de> for StreamEvent {
                 convo_id,
                 user_did,
                 requested_at,
+            },
+            RawStreamEvent::TreeChanged {
+                cursor,
+                convo_id,
+                confirmation_tag,
+                epoch,
+            } => StreamEvent::TreeChanged {
+                cursor,
+                convo_id,
+                confirmation_tag,
+                epoch,
             },
             RawStreamEvent::MembershipChangeEvent {
                 cursor,
@@ -642,6 +673,7 @@ pub async fn subscribe_convo_events(
                                     StreamEvent::NewDeviceEvent { cursor, .. } => cursor,
                                     StreamEvent::GroupInfoRefreshRequested { cursor, .. } => cursor,
                                     StreamEvent::ReadditionRequested { cursor, .. } => cursor,
+                                    StreamEvent::TreeChanged { cursor, .. } => cursor,
                                     StreamEvent::MembershipChangeEvent { cursor, .. } => cursor,
                                 };
 

@@ -36,6 +36,9 @@ pub struct Conversation {
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
     pub name: Option<String>, // From metadata
+    // Tree divergence detection
+    #[sqlx(default)]
+    pub confirmation_tag: Option<Vec<u8>>,
     // Federation support
     #[sqlx(default)]
     pub sequencer_ds: Option<String>, // DID of sequencer DS; NULL = this DS is sequencer
@@ -67,6 +70,11 @@ impl Conversation {
         let creator = crate::sqlx_jacquard::try_string_to_did(&self.creator_did)
             .map_err(|e| format!("Invalid creator DID: {}", e))?;
 
+        let conf_tag_b64 = self.confirmation_tag.as_ref().map(|t| {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(t)
+        });
+
         let view = ConvoView {
             group_id: self.id.clone().into(),
             creator,
@@ -80,6 +88,7 @@ impl Conversation {
             created_at: crate::sqlx_jacquard::chrono_to_datetime(self.created_at),
             last_message_at: None,
             metadata,
+            confirmation_tag: conf_tag_b64.map(|s| s.into()),
             extra_data: Default::default(),
         };
         Ok(view.into_static())

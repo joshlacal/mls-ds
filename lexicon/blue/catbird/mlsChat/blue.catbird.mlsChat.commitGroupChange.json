@@ -70,6 +70,11 @@
             "idempotencyKey": {
               "type": "string",
               "description": "Client-generated UUID for idempotent retries"
+            },
+            "confirmationTag": {
+              "type": "string",
+              "maxLength": 64,
+              "description": "Base64-encoded MLS confirmation tag from the client's post-commit group state."
             }
           }
         }
@@ -106,6 +111,11 @@
               "type": "ref",
               "ref": "#pendingDeviceAddition",
               "description": "The claimed pending addition (for claimPendingDeviceAddition)"
+            },
+            "confirmationTag": {
+              "type": "string",
+              "maxLength": 64,
+              "description": "Base64-encoded confirmation tag of the new canonical tree state."
             }
           }
         }

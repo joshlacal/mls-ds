@@ -522,6 +522,7 @@ async fn handle_socket(
                         StreamEvent::NewDeviceEvent { cursor, .. } => cursor.clone(),
                         StreamEvent::GroupInfoRefreshRequested { cursor, .. } => cursor.clone(),
                         StreamEvent::ReadditionRequested { cursor, .. } => cursor.clone(),
+                        StreamEvent::TreeChanged { cursor, .. } => cursor.clone(),
                         StreamEvent::MembershipChangeEvent { cursor, .. } => cursor.clone(),
                     };
 
@@ -742,6 +743,7 @@ async fn send_event(
         StreamEvent::NewDeviceEvent { .. } => "#newDeviceEvent",
         StreamEvent::GroupInfoRefreshRequested { .. } => "#groupInfoRefreshRequestedEvent",
         StreamEvent::ReadditionRequested { .. } => "#readditionRequestedEvent",
+        StreamEvent::TreeChanged { .. } => "#treeChanged",
         StreamEvent::MembershipChangeEvent { .. } => "#membershipChangeEvent",
     };
 

@@ -94,6 +94,7 @@ fn invalidate_welcome_response(rows_affected: u64) -> CommitGroupChangeOutput<'s
     CommitGroupChangeOutput {
         success: rows_affected > 0,
         claimed_addition: None,
+        confirmation_tag: None,
         new_epoch: None,
         pending_additions: None,
         rejoined_at: None,
@@ -121,6 +122,7 @@ pub async fn commit_group_change(
     let success_response = || CommitGroupChangeOutput {
         success: true,
         claimed_addition: None,
+        confirmation_tag: None,
         new_epoch: None,
         pending_additions: None,
         rejoined_at: None,
@@ -159,6 +161,7 @@ pub async fn commit_group_change(
                         success: true,
                         new_epoch: Some(current_epoch.unwrap_or(0) as i64),
                         claimed_addition: None,
+                        confirmation_tag: None,
                         pending_additions: None,
                         rejoined_at: None,
                         extra_data: Default::default(),
@@ -256,6 +259,24 @@ pub async fn commit_group_change(
                     (None, None)
                 };
 
+            // ── Decode client-provided confirmation_tag ──────────
+            let add_confirmation_tag = if let Some(ref tag_b64) = input.confirmation_tag {
+                let tag_bytes = base64::engine::general_purpose::STANDARD
+                    .decode(tag_b64.as_bytes())
+                    .map_err(|e| {
+                        warn!("addMembers: invalid base64 confirmationTag: {}", e);
+                        bad_request("Invalid base64 confirmationTag")
+                    })?;
+                info!(
+                    "addMembers: client-provided confirmation_tag ({} bytes) for convo {}",
+                    tag_bytes.len(),
+                    crate::crypto::redact_for_log(&convo_id)
+                );
+                Some(tag_bytes)
+            } else {
+                None
+            };
+
             let now = chrono::Utc::now();
 
             // ── Fetch current epoch for CAS ───────────────────────────
@@ -335,11 +356,13 @@ pub async fn commit_group_change(
                     r#"UPDATE conversations
                        SET group_info = $1,
                            group_info_epoch = COALESCE(group_info_epoch, 0) + 1,
-                           group_info_updated_at = NOW()
+                           group_info_updated_at = NOW(),
+                           confirmation_tag = $3
                        WHERE id = $2"#,
                 )
                 .bind(gi_bytes)
                 .bind(&convo_id)
+                .bind(&add_confirmation_tag)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| {
@@ -347,8 +370,9 @@ pub async fn commit_group_change(
                     internal_server_error("Failed to store GroupInfo")
                 })?;
                 info!(
-                    "addMembers: stored GroupInfo (mls_epoch={:?}) for convo {}",
+                    "addMembers: stored GroupInfo (mls_epoch={:?}, has_conf_tag={}) for convo {}",
                     add_mls_epoch,
+                    add_confirmation_tag.is_some(),
                     crate::crypto::redact_for_log(&convo_id)
                 );
             } else {
@@ -567,6 +591,33 @@ pub async fn commit_group_change(
                 });
             }
 
+            let add_conf_tag_b64 = add_confirmation_tag
+                .as_ref()
+                .map(|t| base64::engine::general_purpose::STANDARD.encode(t));
+
+            // ── Emit treeChanged event so other clients detect divergence ──
+            if let Some(ref tag_b64) = add_conf_tag_b64 {
+                let tree_cursor = sse_state
+                    .cursor_gen
+                    .next(&convo_id, "treeChanged")
+                    .await;
+                let tree_event = StreamEvent::TreeChanged {
+                    cursor: tree_cursor.clone(),
+                    convo_id: convo_id.clone(),
+                    confirmation_tag: tag_b64.clone(),
+                    epoch: new_epoch as i64,
+                };
+                if let Err(e) =
+                    crate::db::store_event(&pool, &tree_cursor, &convo_id, "treeChanged", None)
+                        .await
+                {
+                    warn!("addMembers: store treeChanged event failed: {:?}", e);
+                }
+                if let Err(e) = sse_state.emit(&convo_id, tree_event).await {
+                    warn!("addMembers: SSE treeChanged emit failed: {}", e);
+                }
+            }
+
             info!(
                 "✅ v2.commitGroupChange: addMembers complete for convo {}, epoch={}",
                 crate::crypto::redact_for_log(&convo_id),
@@ -575,6 +626,7 @@ pub async fn commit_group_change(
             Ok(Json(CommitGroupChangeOutput {
                 success: true,
                 new_epoch: Some(new_epoch as i64),
+                confirmation_tag: add_conf_tag_b64.map(|s| s.into()),
                 claimed_addition: None,
                 pending_additions: None,
                 rejoined_at: None,
@@ -610,6 +662,7 @@ pub async fn commit_group_change(
                         success: true,
                         new_epoch: Some(current_epoch.unwrap_or(0) as i64),
                         claimed_addition: None,
+                        confirmation_tag: None,
                         pending_additions: None,
                         rejoined_at: None,
                         extra_data: Default::default(),
@@ -723,6 +776,24 @@ pub async fn commit_group_change(
                 (None, None)
             };
 
+            // ── Decode client-provided confirmation_tag ──────────
+            let ec_confirmation_tag = if let Some(ref tag_b64) = input.confirmation_tag {
+                let tag_bytes = base64::engine::general_purpose::STANDARD
+                    .decode(tag_b64.as_bytes())
+                    .map_err(|e| {
+                        warn!("externalCommit: invalid base64 confirmationTag: {}", e);
+                        bad_request("Invalid base64 confirmationTag")
+                    })?;
+                info!(
+                    "externalCommit: client-provided confirmation_tag ({} bytes) for convo {}",
+                    tag_bytes.len(),
+                    crate::crypto::redact_for_log(&convo_id)
+                );
+                Some(tag_bytes)
+            } else {
+                None
+            };
+
             let now = chrono::Utc::now();
 
             // ── Fetch current epoch for CAS ───────────────────────────
@@ -797,11 +868,13 @@ pub async fn commit_group_change(
                     r#"UPDATE conversations
                        SET group_info = $1,
                            group_info_epoch = COALESCE(group_info_epoch, 0) + 1,
-                           group_info_updated_at = NOW()
+                           group_info_updated_at = NOW(),
+                           confirmation_tag = $3
                        WHERE id = $2"#,
                 )
                 .bind(gi_bytes)
                 .bind(&convo_id)
+                .bind(&ec_confirmation_tag)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| {
@@ -809,8 +882,9 @@ pub async fn commit_group_change(
                     internal_server_error("Failed to store GroupInfo")
                 })?;
                 info!(
-                    "externalCommit: stored GroupInfo (mls_epoch={:?}) for convo {}",
+                    "externalCommit: stored GroupInfo (mls_epoch={:?}, has_conf_tag={}) for convo {}",
                     mls_epoch_i32,
+                    ec_confirmation_tag.is_some(),
                     crate::crypto::redact_for_log(&convo_id)
                 );
             } else {
@@ -948,6 +1022,33 @@ pub async fn commit_group_change(
                 });
             }
 
+            let ec_conf_tag_b64 = ec_confirmation_tag
+                .as_ref()
+                .map(|t| base64::engine::general_purpose::STANDARD.encode(t));
+
+            // ── Emit treeChanged event so other clients detect divergence ──
+            if let Some(ref tag_b64) = ec_conf_tag_b64 {
+                let tree_cursor = sse_state
+                    .cursor_gen
+                    .next(&convo_id, "treeChanged")
+                    .await;
+                let tree_event = StreamEvent::TreeChanged {
+                    cursor: tree_cursor.clone(),
+                    convo_id: convo_id.clone(),
+                    confirmation_tag: tag_b64.clone(),
+                    epoch: new_epoch as i64,
+                };
+                if let Err(e) =
+                    crate::db::store_event(&pool, &tree_cursor, &convo_id, "treeChanged", None)
+                        .await
+                {
+                    warn!("externalCommit: store treeChanged event failed: {:?}", e);
+                }
+                if let Err(e) = sse_state.emit(&convo_id, tree_event).await {
+                    warn!("externalCommit: SSE treeChanged emit failed: {}", e);
+                }
+            }
+
             info!(
                 "✅ v2.commitGroupChange: externalCommit complete, epoch={}",
                 new_epoch
@@ -955,6 +1056,7 @@ pub async fn commit_group_change(
             Ok(Json(CommitGroupChangeOutput {
                 success: true,
                 new_epoch: Some(new_epoch as i64),
+                confirmation_tag: ec_conf_tag_b64.map(|s| s.into()),
                 claimed_addition: None,
                 pending_additions: None,
                 rejoined_at: None,
@@ -1144,6 +1246,7 @@ pub async fn commit_group_change(
                 success: true,
                 pending_additions: Some(additions),
                 claimed_addition: None,
+                confirmation_tag: None,
                 new_epoch: None,
                 rejoined_at: None,
                 extra_data: Default::default(),
@@ -1239,6 +1342,24 @@ pub async fn commit_group_change(
                 }
             }
 
+            // Decode client-provided confirmation_tag
+            let ugi_confirmation_tag = if let Some(ref tag_b64) = input.confirmation_tag {
+                let tag_bytes = base64::engine::general_purpose::STANDARD
+                    .decode(tag_b64.as_bytes())
+                    .map_err(|e| {
+                        warn!("updateGroupInfo: invalid base64 confirmationTag: {}", e);
+                        bad_request("Invalid base64 confirmationTag")
+                    })?;
+                info!(
+                    "updateGroupInfo: client-provided confirmation_tag ({} bytes) for convo {}",
+                    tag_bytes.len(),
+                    crate::crypto::redact_for_log(&convo_id)
+                );
+                Some(tag_bytes)
+            } else {
+                None
+            };
+
             // Store GroupInfo and sync current_epoch atomically
             let mls_epoch_i32 = mls_epoch.map(|e| e as i32);
             sqlx::query(
@@ -1246,12 +1367,14 @@ pub async fn commit_group_change(
                    SET group_info = $1,
                        group_info_epoch = COALESCE(group_info_epoch, 0) + 1,
                        group_info_updated_at = NOW(),
-                       current_epoch = GREATEST(current_epoch, COALESCE($2, current_epoch))
+                       current_epoch = GREATEST(current_epoch, COALESCE($2, current_epoch)),
+                       confirmation_tag = $4
                    WHERE id = $3"#,
             )
             .bind(&group_info_bytes)
             .bind(mls_epoch_i32)
             .bind(&convo_id)
+            .bind(&ugi_confirmation_tag)
             .execute(&pool)
             .await
             .map_err(|e| {
@@ -1323,6 +1446,7 @@ pub async fn commit_group_change(
                     Ok(Json(CommitGroupChangeOutput {
                         success: true,
                         claimed_addition: Some(addition),
+                        confirmation_tag: None,
                         new_epoch: None,
                         pending_additions: None,
                         rejoined_at: None,
@@ -1335,6 +1459,7 @@ pub async fn commit_group_change(
                     Ok(Json(CommitGroupChangeOutput {
                         success: false,
                         claimed_addition: None,
+                        confirmation_tag: None,
                         new_epoch: None,
                         pending_additions: None,
                         rejoined_at: None,
@@ -1424,6 +1549,7 @@ pub async fn commit_group_change(
             Ok(Json(CommitGroupChangeOutput {
                 success: completed,
                 claimed_addition: None,
+                confirmation_tag: None,
                 new_epoch: None,
                 pending_additions: None,
                 rejoined_at: None,
@@ -1459,6 +1585,7 @@ pub async fn commit_group_change(
                         success: true,
                         new_epoch: Some(current_epoch.unwrap_or(0) as i64),
                         claimed_addition: None,
+                        confirmation_tag: None,
                         pending_additions: None,
                         rejoined_at: None,
                         extra_data: Default::default(),
@@ -1697,6 +1824,7 @@ pub async fn commit_group_change(
                 success: true,
                 new_epoch: Some(new_epoch as i64),
                 claimed_addition: None,
+                confirmation_tag: None,
                 pending_additions: None,
                 rejoined_at: None,
                 extra_data: Default::default(),
@@ -1734,6 +1862,7 @@ pub async fn commit_group_change(
                         success: true,
                         new_epoch: Some(current_epoch.unwrap_or(0) as i64),
                         claimed_addition: None,
+                        confirmation_tag: None,
                         pending_additions: None,
                         rejoined_at: None,
                         extra_data: Default::default(),
@@ -1954,6 +2083,7 @@ pub async fn commit_group_change(
                 success: true,
                 new_epoch: Some(new_epoch as i64),
                 claimed_addition: None,
+                confirmation_tag: None,
                 pending_additions: None,
                 rejoined_at: None,
                 extra_data: Default::default(),
@@ -2065,6 +2195,7 @@ mod tests {
             success: true,
             new_epoch: Some(epoch as i64),
             claimed_addition: None,
+            confirmation_tag: None,
             pending_additions: None,
             rejoined_at: None,
             extra_data: Default::default(),
@@ -2081,6 +2212,7 @@ mod tests {
             success: true,
             new_epoch: Some(current_epoch.unwrap_or(0) as i64),
             claimed_addition: None,
+            confirmation_tag: None,
             pending_additions: None,
             rejoined_at: None,
             extra_data: Default::default(),

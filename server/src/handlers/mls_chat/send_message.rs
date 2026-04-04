@@ -188,9 +188,9 @@ async fn handle_persistent(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    // --- Fetch conversation epoch and sequencer term ---
-    let (server_epoch, server_sequencer_term): (i64, i64) = sqlx::query_as(
-        "SELECT CAST(current_epoch AS BIGINT), CAST(COALESCE(sequencer_term, 0) AS BIGINT) \
+    // --- Fetch conversation epoch, sequencer term, and confirmation tag ---
+    let (server_epoch, server_sequencer_term, stored_confirmation_tag): (i64, i64, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT CAST(current_epoch AS BIGINT), CAST(COALESCE(sequencer_term, 0) AS BIGINT), confirmation_tag \
          FROM conversations WHERE id = $1",
     )
     .bind(&convo_id)
@@ -204,6 +204,33 @@ async fn handle_persistent(
         error!("❌ [v2.sendMessage] Conversation not found");
         StatusCode::NOT_FOUND
     })?;
+
+    // --- Validate confirmation tag (if client sent one) ---
+    if let Some(ref client_tag_b64) = input.confirmation_tag {
+        if let Some(ref server_tag) = stored_confirmation_tag {
+            use base64::Engine;
+            let client_tag = base64::engine::general_purpose::STANDARD
+                .decode(client_tag_b64.as_bytes())
+                .unwrap_or_default();
+            if client_tag != *server_tag {
+                warn!(
+                    convo_id = %crate::crypto::redact_for_log(&convo_id),
+                    "TREE DIVERGED — client confirmation_tag does not match server canonical tree"
+                );
+                let server_tag_b64 = base64::engine::general_purpose::STANDARD.encode(server_tag);
+                return Ok((
+                    StatusCode::CONFLICT,
+                    axum::Json(serde_json::json!({
+                        "error": "TreeStateDiverged",
+                        "message": "Client MLS tree state does not match server canonical tree. Client must re-join via external commit.",
+                        "serverConfirmationTag": server_tag_b64,
+                        "serverEpoch": server_epoch
+                    })),
+                )
+                    .into_response());
+            }
+        }
+    }
 
     let client_epoch = input.epoch;
 
