@@ -22,9 +22,8 @@ use crate::{
 
 const NSID: &str = "blue.catbird.mlsChat.sendMessage";
 
-/// Maximum allowed epoch drift between client and server.
-/// Beyond this, the client's epoch claim is likely bogus or the result of severe desync.
-const MAX_EPOCH_DRIFT: i64 = 1000;
+/// Maximum allowed epoch drift (client behind server) before requiring sync.
+const MAX_EPOCH_DRIFT: i64 = 5;
 
 // ---------------------------------------------------------------------------
 // Handler
@@ -85,25 +84,22 @@ pub async fn send_message(
         "ephemeral" => {
             let action = input.action.as_deref().unwrap_or("typing");
             Ok(match action {
-                "addReaction" => handle_add_reaction(pool, sse_state, auth_user, &input)
-                    .await?,
-                "removeReaction" => handle_remove_reaction(pool, sse_state, auth_user, &input)
-                    .await?,
+                "addReaction" => handle_add_reaction(pool, sse_state, auth_user, &input).await?,
+                "removeReaction" => {
+                    handle_remove_reaction(pool, sse_state, auth_user, &input).await?
+                }
                 "typingStop" | "stopTyping" => {
-                    handle_typing(pool, sse_state, auth_user, &input, false)
-                        .await?
+                    handle_typing(pool, sse_state, auth_user, &input, false).await?
                 }
                 "typing" | "typingStart" => {
-                    handle_typing(pool, sse_state, auth_user, &input, true)
-                        .await?
+                    handle_typing(pool, sse_state, auth_user, &input, true).await?
                 }
                 other => {
                     warn!(
                         "❌ [v2.sendMessage] Unknown ephemeral action '{}', defaulting to typing start",
                         other
                     );
-                    handle_typing(pool, sse_state, auth_user, &input, true)
-                        .await?
+                    handle_typing(pool, sse_state, auth_user, &input, true).await?
                 }
             })
         }
@@ -210,27 +206,61 @@ async fn handle_persistent(
     })?;
 
     let client_epoch = input.epoch;
-    let store_epoch = if client_epoch != server_epoch {
-        let drift = (client_epoch - server_epoch).abs();
-        if drift > MAX_EPOCH_DRIFT {
-            error!(
-                "❌ [v2.sendMessage] Epoch drift too large: client={}, server={}, drift={}",
-                client_epoch, server_epoch, drift
-            );
-            return Err(StatusCode::BAD_REQUEST);
-        }
+
+    // Reject if client claims to be ahead of server — indicates a bug
+    if client_epoch > server_epoch {
+        warn!(
+            "❌ [v2.sendMessage] Client epoch {} is ahead of server epoch {} — rejecting",
+            client_epoch, server_epoch
+        );
+        return Ok((
+            StatusCode::CONFLICT,
+            axum::Json(serde_json::json!({
+                "error": "EpochMismatch",
+                "message": format!(
+                    "Client epoch {} is ahead of server epoch {}. This indicates a client bug.",
+                    client_epoch, server_epoch
+                ),
+                "serverEpoch": server_epoch
+            })),
+        )
+            .into_response());
+    }
+
+    // Reject if client is too far behind — needs to sync
+    if server_epoch - client_epoch > MAX_EPOCH_DRIFT {
+        warn!(
+            "❌ [v2.sendMessage] Client epoch {} is {} behind server epoch {} — sync required",
+            client_epoch,
+            server_epoch - client_epoch,
+            server_epoch
+        );
+        return Ok((
+            StatusCode::CONFLICT,
+            axum::Json(serde_json::json!({
+                "error": "EpochMismatch",
+                "message": format!(
+                    "Client epoch {} is behind server epoch {}. Sync required.",
+                    client_epoch, server_epoch
+                ),
+                "serverEpoch": server_epoch
+            })),
+        )
+            .into_response());
+    }
+
+    if client_epoch != server_epoch {
         tracing::warn!(
             target: "mls_epoch",
             convo_id = %crate::crypto::redact_for_log(&convo_id),
             server_epoch, client_epoch,
-            "accepting app message with {} epoch (server={}, client={})",
-            if client_epoch < server_epoch { "stale" } else { "future" },
+            "accepting app message with stale epoch (server={}, client={})",
             server_epoch, client_epoch
         );
-        client_epoch
-    } else {
-        client_epoch
-    };
+    }
+
+    // Always store with server epoch, not client epoch
+    let store_epoch = server_epoch;
 
     // --- Insert message in a transaction (seq via MAX+1) ---
     let now = Utc::now();
@@ -645,8 +675,7 @@ async fn handle_add_reaction(
 
     let msg_id = input.msg_id.to_string();
     let received_bucket_ts = (now.timestamp() / 2) * 2;
-    let received_at = chrono::DateTime::from_timestamp(received_bucket_ts, 0)
-        .unwrap_or(now);
+    let received_at = chrono::DateTime::from_timestamp(received_bucket_ts, 0).unwrap_or(now);
     Ok(Json(SendMessageOutput {
         message_id: msg_id.into(),
         received_at: crate::sqlx_jacquard::chrono_to_datetime(received_at),
@@ -757,8 +786,7 @@ async fn handle_remove_reaction(
     let now = Utc::now();
     let msg_id = input.msg_id.to_string();
     let received_bucket_ts = (now.timestamp() / 2) * 2;
-    let received_at = chrono::DateTime::from_timestamp(received_bucket_ts, 0)
-        .unwrap_or(now);
+    let received_at = chrono::DateTime::from_timestamp(received_bucket_ts, 0).unwrap_or(now);
     Ok(Json(SendMessageOutput {
         message_id: msg_id.into(),
         received_at: crate::sqlx_jacquard::chrono_to_datetime(received_at),
@@ -817,8 +845,7 @@ async fn handle_typing(
     let now = Utc::now();
     let msg_id = input.msg_id.to_string();
     let received_bucket_ts = (now.timestamp() / 2) * 2;
-    let received_at = chrono::DateTime::from_timestamp(received_bucket_ts, 0)
-        .unwrap_or(now);
+    let received_at = chrono::DateTime::from_timestamp(received_bucket_ts, 0).unwrap_or(now);
     Ok(Json(SendMessageOutput {
         message_id: msg_id.into(),
         received_at: crate::sqlx_jacquard::chrono_to_datetime(received_at),
