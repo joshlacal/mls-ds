@@ -638,6 +638,37 @@ pub async fn commit_group_change(
             let convo_id = input.convo_id.to_string();
             info!("v2.commitGroupChange: externalCommit for convo");
 
+            // ── Rate-limit: at most 1 external commit per 30s per conversation ──
+            // This is the server-side safety net to prevent epoch inflation spirals
+            // where multiple clients auto-repair via external commit in a feedback loop.
+            {
+                let last_external_commit: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+                    "SELECT MAX(created_at) FROM messages WHERE convo_id = $1 AND message_type = 'commit' AND created_at > NOW() - INTERVAL '30 seconds'"
+                )
+                .bind(&convo_id)
+                .fetch_optional(&pool)
+                .await
+                .ok()
+                .flatten();
+
+                if let Some(last) = last_external_commit {
+                    let elapsed = chrono::Utc::now() - last;
+                    if elapsed < chrono::Duration::seconds(30) {
+                        let retry_after = 30 - elapsed.num_seconds();
+                        warn!(
+                            "externalCommit: rate limited — last commit was {}s ago for convo {}",
+                            elapsed.num_seconds(),
+                            crate::crypto::redact_for_log(&convo_id)
+                        );
+                        return Err(XrpcError(
+                            StatusCode::TOO_MANY_REQUESTS,
+                            "RateLimited",
+                            format!("Another external commit was accepted recently. Retry after {} seconds.", retry_after),
+                        ));
+                    }
+                }
+            }
+
             // ── Idempotency check ──────────────────────────────────────
             if let Some(ref idem_key) = input.idempotency_key {
                 let idem_key_str = idem_key.to_string();
