@@ -139,6 +139,22 @@ pub enum StreamEvent {
         /// New epoch after this change
         epoch: usize,
     },
+    /// Event indicating the MLS group has been reset with a new group_id
+    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#groupResetEvent")]
+    GroupResetEvent {
+        cursor: String,
+        #[serde(rename = "convoId")]
+        convo_id: String,
+        #[serde(rename = "newGroupId")]
+        new_group_id: String,
+        #[serde(rename = "resetGeneration")]
+        reset_generation: i32,
+        #[serde(rename = "resetBy")]
+        reset_by: String,
+        #[serde(rename = "cipherSuite")]
+        cipher_suite: String,
+        reason: Option<String>,
+    },
 }
 
 /// Helper for `skip_serializing_if` on the `ephemeral` field.
@@ -246,6 +262,21 @@ impl<'de> serde::Deserialize<'de> for StreamEvent {
                 actor: Option<String>,
                 reason: Option<String>,
                 epoch: usize,
+            },
+            #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#groupResetEvent")]
+            GroupResetEvent {
+                cursor: String,
+                #[serde(rename = "convoId")]
+                convo_id: String,
+                #[serde(rename = "newGroupId")]
+                new_group_id: String,
+                #[serde(rename = "resetGeneration")]
+                reset_generation: i32,
+                #[serde(rename = "resetBy")]
+                reset_by: String,
+                #[serde(rename = "cipherSuite")]
+                cipher_suite: String,
+                reason: Option<String>,
             },
         }
 
@@ -376,6 +407,23 @@ impl<'de> serde::Deserialize<'de> for StreamEvent {
                 actor,
                 reason,
                 epoch,
+            },
+            RawStreamEvent::GroupResetEvent {
+                cursor,
+                convo_id,
+                new_group_id,
+                reset_generation,
+                reset_by,
+                cipher_suite,
+                reason,
+            } => StreamEvent::GroupResetEvent {
+                cursor,
+                convo_id,
+                new_group_id,
+                reset_generation,
+                reset_by,
+                cipher_suite,
+                reason,
             },
         })
     }
@@ -675,6 +723,7 @@ pub async fn subscribe_convo_events(
                                     StreamEvent::ReadditionRequested { cursor, .. } => cursor,
                                     StreamEvent::TreeChanged { cursor, .. } => cursor,
                                     StreamEvent::MembershipChangeEvent { cursor, .. } => cursor,
+                                    StreamEvent::GroupResetEvent { cursor, .. } => cursor,
                                 };
 
                                 // Filter based on resume cursor

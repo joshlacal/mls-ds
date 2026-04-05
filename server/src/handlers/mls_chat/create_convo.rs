@@ -366,8 +366,8 @@ async fn handle_create_convo(
     tracing::debug!("📍 [v2.createConvo] creating conversation in database");
 
     sqlx::query(
-        "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at, name, cipher_suite, sequencer_ds, is_remote)
-         VALUES ($1, $2, 1, $3, $3, $4, $5, NULL, false)",
+        "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at, name, cipher_suite, sequencer_ds, is_remote, group_id)
+         VALUES ($1, $2, 1, $3, $3, $4, $5, NULL, false, $1)",
     )
     .bind(&convo_id)
     .bind(&auth_user.did)

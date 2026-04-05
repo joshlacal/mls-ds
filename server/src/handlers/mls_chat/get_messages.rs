@@ -32,6 +32,8 @@ struct MessageRow {
     seq: i64,
     ciphertext: Vec<u8>,
     created_at: DateTime<Utc>,
+    #[sqlx(default)]
+    reset_generation: i32,
 }
 
 // ---------------------------------------------------------------------------
@@ -162,7 +164,7 @@ async fn fetch_app_messages(
             r#"
             SELECT id, convo_id, message_type,
                    CAST(epoch AS BIGINT) as epoch, CAST(seq AS BIGINT) as seq,
-                   ciphertext, created_at
+                   ciphertext, created_at, COALESCE(reset_generation, 0) as reset_generation
             FROM messages
             WHERE convo_id = $1 AND seq > $2 AND (expires_at IS NULL OR expires_at > NOW())
             ORDER BY epoch ASC, seq ASC
@@ -186,7 +188,7 @@ async fn fetch_app_messages(
             r#"
             SELECT id, convo_id, message_type,
                    CAST(epoch AS BIGINT) as epoch, CAST(seq AS BIGINT) as seq,
-                   ciphertext, created_at
+                   ciphertext, created_at, COALESCE(reset_generation, 0) as reset_generation
             FROM messages
             WHERE convo_id = $1 AND (expires_at IS NULL OR expires_at > NOW())
             ORDER BY seq DESC
@@ -220,15 +222,22 @@ async fn fetch_app_messages(
 
     let message_views: Vec<MessageView<'static>> = messages
         .into_iter()
-        .map(|m| MessageView {
-            id: m.id.into(),
-            convo_id: m.convo_id.into(),
-            ciphertext: bytes::Bytes::from(m.ciphertext),
-            epoch: m.epoch,
-            seq: m.seq,
-            created_at: crate::sqlx_jacquard::chrono_to_datetime(m.created_at),
-            message_type: Some(m.message_type.into()),
-            extra_data: Default::default(),
+        .map(|m| {
+            let mut extra = std::collections::BTreeMap::new();
+            extra.insert(
+                jacquard_common::smol_str::SmolStr::new("resetGeneration"),
+                jacquard_common::types::value::Data::Integer(m.reset_generation as i64),
+            );
+            MessageView {
+                id: m.id.into(),
+                convo_id: m.convo_id.into(),
+                ciphertext: bytes::Bytes::from(m.ciphertext),
+                epoch: m.epoch,
+                seq: m.seq,
+                created_at: crate::sqlx_jacquard::chrono_to_datetime(m.created_at),
+                message_type: Some(m.message_type.into()),
+                extra_data: Some(extra),
+            }
         })
         .collect();
 
@@ -305,7 +314,7 @@ async fn fetch_commits(
         r#"
         SELECT id, convo_id, 'commit' as message_type,
                CAST(epoch AS BIGINT) as epoch, CAST(seq AS BIGINT) as seq,
-               ciphertext, created_at
+               ciphertext, created_at, COALESCE(reset_generation, 0) as reset_generation
         FROM messages
         WHERE convo_id = $1 AND message_type = 'commit' AND epoch >= $2 AND epoch <= $3
         ORDER BY epoch ASC, seq ASC
@@ -325,15 +334,22 @@ async fn fetch_commits(
 
     let commit_views: Vec<MessageView<'static>> = commits
         .into_iter()
-        .map(|c| MessageView {
-            id: c.id.into(),
-            convo_id: c.convo_id.into(),
-            ciphertext: bytes::Bytes::from(c.ciphertext),
-            epoch: c.epoch,
-            seq: c.seq,
-            created_at: crate::sqlx_jacquard::chrono_to_datetime(c.created_at),
-            message_type: Some(c.message_type.into()),
-            extra_data: Default::default(),
+        .map(|c| {
+            let mut extra = std::collections::BTreeMap::new();
+            extra.insert(
+                jacquard_common::smol_str::SmolStr::new("resetGeneration"),
+                jacquard_common::types::value::Data::Integer(c.reset_generation as i64),
+            );
+            MessageView {
+                id: c.id.into(),
+                convo_id: c.convo_id.into(),
+                ciphertext: bytes::Bytes::from(c.ciphertext),
+                epoch: c.epoch,
+                seq: c.seq,
+                created_at: crate::sqlx_jacquard::chrono_to_datetime(c.created_at),
+                message_type: Some(c.message_type.into()),
+                extra_data: Some(extra),
+            }
         })
         .collect();
 

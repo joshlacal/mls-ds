@@ -20,6 +20,7 @@ pub mod update_cursor;
 // Group State
 pub mod commit_group_change;
 pub mod get_group_state;
+pub mod reset_group;
 
 // Conversation Management
 pub mod get_convo_settings;
@@ -67,6 +68,7 @@ pub use update_cursor::update_cursor;
 // Re-exports: Group State
 pub use commit_group_change::commit_group_change;
 pub use get_group_state::get_group_state;
+pub use reset_group::reset_group;
 
 // Re-exports: Conversation Management
 pub use get_convo_settings::get_convo_settings;

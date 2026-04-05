@@ -188,9 +188,9 @@ async fn handle_persistent(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    // --- Fetch conversation epoch, sequencer term, and confirmation tag ---
-    let (server_epoch, server_sequencer_term, stored_confirmation_tag): (i64, i64, Option<Vec<u8>>) = sqlx::query_as(
-        "SELECT CAST(current_epoch AS BIGINT), CAST(COALESCE(sequencer_term, 0) AS BIGINT), confirmation_tag \
+    // --- Fetch conversation epoch, sequencer term, confirmation tag, and reset_count ---
+    let (server_epoch, server_sequencer_term, stored_confirmation_tag, reset_count): (i64, i64, Option<Vec<u8>>, i32) = sqlx::query_as(
+        "SELECT CAST(current_epoch AS BIGINT), CAST(COALESCE(sequencer_term, 0) AS BIGINT), confirmation_tag, COALESCE(reset_count, 0) \
          FROM conversations WHERE id = $1",
     )
     .bind(&convo_id)
@@ -353,8 +353,8 @@ async fn handle_persistent(
         r#"INSERT INTO messages (
             id, convo_id, sender_did, message_type, epoch, seq,
             ciphertext, created_at, expires_at,
-            msg_id, padded_size, received_bucket_ts
-        ) VALUES ($1, $2, NULL, 'app', $3, $4, $5, $6, $7, $8, $9, $10)"#,
+            msg_id, padded_size, received_bucket_ts, reset_generation
+        ) VALUES ($1, $2, NULL, 'app', $3, $4, $5, $6, $7, $8, $9, $10, $11)"#,
     )
     .bind(&row_id)
     .bind(&convo_id)
@@ -366,6 +366,7 @@ async fn handle_persistent(
     .bind(&msg_id)
     .bind(padded_size as i64)
     .bind(received_bucket_ts)
+    .bind(reset_count)
     .execute(&mut *tx)
     .await
     .map_err(|e| {

@@ -662,6 +662,11 @@ async fn main() -> anyhow::Result<()> {
             "/xrpc/blue.catbird.mlsChat.subscribeEvents",
             get(realtime::websocket::subscribe_convo_events),
         )
+        // Group Reset
+        .route(
+            "/xrpc/blue.catbird.mlsChat.resetGroup",
+            post(handlers::mls_chat::reset_group),
+        )
         // Federation
         .route(
             "/xrpc/blue.catbird.mlsChat.requestFailover",

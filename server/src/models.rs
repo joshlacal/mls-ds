@@ -44,6 +44,11 @@ pub struct Conversation {
     pub sequencer_ds: Option<String>, // DID of sequencer DS; NULL = this DS is sequencer
     #[sqlx(default)]
     pub is_remote: bool, // True if this DS is only a participant mailbox
+    // Group reset support
+    #[sqlx(default)]
+    pub group_id: Option<String>, // Current MLS group_id (may differ from id after reset)
+    #[sqlx(default)]
+    pub reset_count: Option<i32>, // Number of times the group has been reset
 }
 
 impl Conversation {
@@ -75,8 +80,30 @@ impl Conversation {
             base64::engine::general_purpose::STANDARD.encode(t)
         });
 
+        // Use group_id from DB if available (may differ from id after reset), else fall back to id
+        let current_group_id = self
+            .group_id
+            .as_deref()
+            .unwrap_or(&self.id)
+            .to_string();
+
+        let reset_generation = self.reset_count.unwrap_or(0);
+
+        // Build extra_data with reset-related fields
+        let mut extra = std::collections::BTreeMap::new();
+        extra.insert(
+            jacquard_common::smol_str::SmolStr::new("currentGroupId"),
+            jacquard_common::types::value::Data::String(
+                jacquard_common::types::string::AtprotoStr::String(current_group_id.clone().into()),
+            ),
+        );
+        extra.insert(
+            jacquard_common::smol_str::SmolStr::new("resetGeneration"),
+            jacquard_common::types::value::Data::Integer(reset_generation as i64),
+        );
+
         let view = ConvoView {
-            group_id: self.id.clone().into(),
+            group_id: current_group_id.into(),
             creator,
             members,
             epoch: self.current_epoch as i64,
@@ -89,7 +116,7 @@ impl Conversation {
             last_message_at: None,
             metadata,
             confirmation_tag: conf_tag_b64.map(|s| s.into()),
-            extra_data: Default::default(),
+            extra_data: Some(extra),
         };
         Ok(view.into_static())
     }
