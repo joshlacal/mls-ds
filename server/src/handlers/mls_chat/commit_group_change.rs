@@ -854,42 +854,38 @@ pub async fn commit_group_change(
                 internal_server_error("Failed to reactivate member")
             })?;
 
-            // ── Advance epoch: heal to MLS reality ──
+            // ── Advance epoch (CAS) ───────────────────────────────────
             //
-            // External commits are the MLS "rejoin" mechanism. The GroupInfo
-            // epoch is the MLS ground truth. The server epoch may have inflated
-            // due to prior divergent commits. We heal by setting the epoch to
-            // match MLS reality (GroupInfo epoch + 1), regardless of the current
-            // server epoch. This is self-healing — no admin intervention needed.
-            let target_epoch = if let Some(mls_epoch) = mls_epoch {
-                let post_commit = (mls_epoch + 1) as i32;
-                if post_commit < current_epoch {
-                    info!(
-                        "externalCommit: EPOCH HEAL — server epoch {} → {} (from GroupInfo epoch {}) for convo {}",
-                        current_epoch, post_commit, mls_epoch, crate::crypto::redact_for_log(&convo_id)
-                    );
+            // External commits use the same CAS-protected monotonic advance
+            // as addMembers. The server epoch must never go backward — even
+            // if the GroupInfo MLS epoch is behind the server epoch (which
+            // happens after concurrent commits or prior divergence).
+            let new_epoch =
+                crate::db::try_advance_conversation_epoch_tx(&mut tx, &convo_id, current_epoch)
+                    .await
+                    .map_err(|e| {
+                        error!("externalCommit: failed to advance epoch: {}", e);
+                        internal_server_error("Failed to advance epoch")
+                    })?;
+
+            let new_epoch = match new_epoch {
+                Some(epoch) => epoch,
+                None => {
+                    warn!("externalCommit: epoch CAS failed (concurrent commit), returning 409");
+                    return Err(conflict("Conversation epoch advanced concurrently"));
                 }
-                post_commit
-            } else {
-                // No GroupInfo epoch available — increment by 1 as fallback
-                current_epoch + 1
             };
 
-            let new_epoch = sqlx::query_scalar::<_, i32>(
-                "UPDATE conversations SET current_epoch = $1, updated_at = NOW() WHERE id = $2 RETURNING current_epoch",
-            )
-            .bind(target_epoch)
-            .bind(&convo_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| {
-                error!("externalCommit: failed to set epoch: {}", e);
-                internal_server_error("Failed to set epoch")
-            })?
-            .ok_or_else(|| {
-                error!("externalCommit: conversation not found during epoch update");
-                internal_server_error("Conversation not found")
-            })?;
+            // Log MLS epoch from GroupInfo for diagnostics only.
+            if let Some(mls_epoch) = mls_epoch {
+                let mls_epoch_i32 = (mls_epoch + 1) as i32;
+                if mls_epoch_i32 != new_epoch {
+                    warn!(
+                        "externalCommit: MLS epoch divergence — server epoch={}, MLS post-commit epoch={} for convo {}",
+                        new_epoch, mls_epoch_i32, crate::crypto::redact_for_log(&convo_id)
+                    );
+                }
+            }
 
             // ── Store or invalidate GroupInfo ─────────────────────────
             if let Some(ref gi_bytes) = group_info_bytes_opt {
