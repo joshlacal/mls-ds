@@ -516,7 +516,6 @@ async fn handle_socket(
                     // Extract cursor from event
                     let event_cursor = match &event {
                         StreamEvent::MessageEvent { cursor, .. } => cursor.clone(),
-                        StreamEvent::ReactionEvent { cursor, .. } => cursor.clone(),
                         StreamEvent::TypingEvent { cursor, .. } => cursor.clone(),
                         StreamEvent::InfoEvent { cursor, .. } => cursor.clone(),
                         StreamEvent::NewDeviceEvent { cursor, .. } => cursor.clone(),
@@ -677,23 +676,6 @@ async fn backfill_events(
         let type_tag = payload.get("$type").and_then(|v| v.as_str());
 
         let event = match type_tag {
-            Some("blue.catbird.mlsChat.subscribeEvents#reactionEvent") => {
-                let message_id = payload.get("messageId").and_then(|v| v.as_str());
-                let did = payload.get("did").and_then(|v| v.as_str());
-                let reaction = payload.get("reaction").and_then(|v| v.as_str());
-                let action = payload.get("action").and_then(|v| v.as_str());
-                match (message_id, did, reaction, action) {
-                    (Some(mid), Some(d), Some(r), Some(a)) => Some(StreamEvent::ReactionEvent {
-                        cursor: cursor.clone(),
-                        convo_id: convo_id.to_string(),
-                        message_id: mid.to_string(),
-                        did: d.to_string(),
-                        reaction: r.to_string(),
-                        action: a.to_string(),
-                    }),
-                    _ => None,
-                }
-            }
             Some("blue.catbird.mlsChat.subscribeEvents#infoEvent") => payload
                 .get("info")
                 .and_then(|v| v.as_str())
@@ -738,7 +720,6 @@ async fn send_event(
     // Determine message type from event variant
     let msg_type = match event {
         StreamEvent::MessageEvent { .. } => "#messageEvent",
-        StreamEvent::ReactionEvent { .. } => "#reactionEvent",
         StreamEvent::TypingEvent { .. } => "#typingEvent",
         StreamEvent::InfoEvent { .. } => "#infoEvent",
         StreamEvent::NewDeviceEvent { .. } => "#newDeviceEvent",

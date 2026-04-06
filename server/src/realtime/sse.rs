@@ -46,17 +46,6 @@ pub enum StreamEvent {
         #[serde(default, skip_serializing_if = "crate::realtime::sse::is_false")]
         ephemeral: bool,
     },
-    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#reactionEvent")]
-    ReactionEvent {
-        cursor: String,
-        #[serde(rename = "convoId")]
-        convo_id: String,
-        #[serde(rename = "messageId")]
-        message_id: String,
-        did: String,
-        reaction: String,
-        action: String,
-    },
     #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#typingEvent")]
     TypingEvent {
         cursor: String,
@@ -183,17 +172,6 @@ impl<'de> serde::Deserialize<'de> for StreamEvent {
                 #[serde(default)]
                 ephemeral: bool,
             },
-            #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#reactionEvent")]
-            ReactionEvent {
-                cursor: String,
-                #[serde(rename = "convoId")]
-                convo_id: String,
-                #[serde(rename = "messageId")]
-                message_id: String,
-                did: String,
-                reaction: String,
-                action: String,
-            },
             #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#typingEvent")]
             TypingEvent {
                 cursor: String,
@@ -313,21 +291,6 @@ impl<'de> serde::Deserialize<'de> for StreamEvent {
                     extra_data: Default::default(),
                 },
                 ephemeral,
-            },
-            RawStreamEvent::ReactionEvent {
-                cursor,
-                convo_id,
-                message_id,
-                did,
-                reaction,
-                action,
-            } => StreamEvent::ReactionEvent {
-                cursor,
-                convo_id,
-                message_id,
-                did,
-                reaction,
-                action,
             },
             RawStreamEvent::TypingEvent {
                 cursor,
@@ -550,59 +513,6 @@ pub async fn subscribe_convo_events(
     if let Some(ref resume_cur) = resume_cursor {
         let mut replay_items: Vec<(String, String)> = Vec::new();
 
-        // Backfill reaction events (needed for cursor-based SSE replay).
-        match crate::db::get_events_after_cursor(
-            &pool,
-            &convo_id,
-            Some("reactionEvent"),
-            resume_cur,
-            200,
-        )
-        .await
-        {
-            Ok(events) => {
-                for (id, payload, _emitted_at) in events {
-                    let message_id = payload.get("messageId").and_then(|v| v.as_str());
-                    let did = payload.get("did").and_then(|v| v.as_str());
-                    let reaction = payload.get("reaction").and_then(|v| v.as_str());
-                    let action = payload.get("action").and_then(|v| v.as_str());
-
-                    let (Some(message_id), Some(did), Some(reaction), Some(action)) =
-                        (message_id, did, reaction, action)
-                    else {
-                        // Older reactionEvent rows may have only the minimal envelope.
-                        continue;
-                    };
-
-                    let event = StreamEvent::ReactionEvent {
-                        cursor: id.clone(),
-                        convo_id: convo_id.clone(),
-                        message_id: message_id.to_string(),
-                        did: did.to_string(),
-                        reaction: reaction.to_string(),
-                        action: action.to_string(),
-                    };
-
-                    let json = match serde_json::to_string(&event) {
-                        Ok(j) => j,
-                        Err(e) => {
-                            error!(error = ?e, "Failed to serialize replay reactionEvent");
-                            continue;
-                        }
-                    };
-
-                    replay_items.push((id, json));
-                }
-            }
-            Err(e) => {
-                warn!(
-                    convo = %crate::crypto::redact_for_log(&convo_id),
-                    error = ?e,
-                    "Failed to backfill reaction events"
-                );
-            }
-        }
-
         // Backfill commit message events (required for MLS state correctness).
         //
         // NOTE: This intentionally replays ONLY commit messages, not all app messages.
@@ -715,7 +625,6 @@ pub async fn subscribe_convo_events(
                             Ok(event) => {
                                 let event_cursor = match &event {
                                     StreamEvent::MessageEvent { cursor, .. } => cursor,
-                                    StreamEvent::ReactionEvent { cursor, .. } => cursor,
                                     StreamEvent::TypingEvent { cursor, .. } => cursor,
                                     StreamEvent::InfoEvent { cursor, .. } => cursor,
                                     StreamEvent::NewDeviceEvent { cursor, .. } => cursor,

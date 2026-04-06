@@ -502,7 +502,6 @@ fn parse_dagcbor_frame(data: &[u8], convo_id: &str) -> Option<StreamEvent> {
 fn extract_cursor(event: &StreamEvent) -> Option<String> {
     match event {
         StreamEvent::MessageEvent { cursor, .. }
-        | StreamEvent::ReactionEvent { cursor, .. }
         | StreamEvent::TypingEvent { cursor, .. }
         | StreamEvent::NewDeviceEvent { cursor, .. }
         | StreamEvent::GroupInfoRefreshRequested { cursor, .. }
@@ -634,17 +633,6 @@ mod tests {
                     cursor: "c-msg".into(),
                     message: msg_view,
                     ephemeral: false,
-                },
-            ),
-            (
-                "ReactionEvent",
-                StreamEvent::ReactionEvent {
-                    cursor: "c-react".into(),
-                    convo_id: "c1".into(),
-                    message_id: "m1".into(),
-                    did: "did:x".into(),
-                    reaction: "👍".into(),
-                    action: "add".into(),
                 },
             ),
             (
