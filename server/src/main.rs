@@ -667,6 +667,11 @@ async fn main() -> anyhow::Result<()> {
             "/xrpc/blue.catbird.mlsChat.resetGroup",
             post(handlers::mls_chat::reset_group),
         )
+        // Recovery Failure Reporting
+        .route(
+            "/xrpc/blue.catbird.mlsChat.reportRecoveryFailure",
+            post(handlers::mls_chat::report_recovery_failure),
+        )
         // Federation
         .route(
             "/xrpc/blue.catbird.mlsChat.requestFailover",

@@ -20,6 +20,7 @@ pub mod update_cursor;
 // Group State
 pub mod commit_group_change;
 pub mod get_group_state;
+pub mod report_recovery_failure;
 pub mod reset_group;
 
 // Conversation Management
@@ -68,6 +69,7 @@ pub use update_cursor::update_cursor;
 // Re-exports: Group State
 pub use commit_group_change::commit_group_change;
 pub use get_group_state::get_group_state;
+pub use report_recovery_failure::report_recovery_failure;
 pub use reset_group::reset_group;
 
 // Re-exports: Conversation Management
