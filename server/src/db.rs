@@ -68,10 +68,14 @@ pub async fn init_db(config: DbConfig) -> Result<DbPool> {
     );
 
     // Run migrations
+    if std::env::var("SKIP_MIGRATIONS").is_ok() {
+        tracing::warn!("SKIP_MIGRATIONS set — skipping migration check");
+    } else {
     sqlx::migrate!("./migrations")
         .run(&pool)
         .await
         .context("Failed to run migrations")?;
+    }
 
     Ok(pool)
 }

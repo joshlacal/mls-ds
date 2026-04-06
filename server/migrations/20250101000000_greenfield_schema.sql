@@ -17,13 +17,13 @@ GRANT ALL PRIVILEGES ON DATABASE catbird TO catbird;
 -- =============================================================================
 
 -- Users table (just for FK constraints - full profile data lives in ATProto)
-CREATE TABLE users (
+CREATE TABLE IF NOT EXISTS users (
     did TEXT PRIMARY KEY,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     last_seen_at TIMESTAMPTZ
 );
 
-CREATE INDEX idx_users_last_seen ON users(last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS idx_users_last_seen ON users(last_seen_at DESC);
 
 COMMENT ON TABLE users IS 'Minimal user table - full identity/profile data lives in AT Protocol';
 
@@ -32,7 +32,7 @@ COMMENT ON TABLE users IS 'Minimal user table - full identity/profile data lives
 -- =============================================================================
 
 -- Conversations (MLS groups)
-CREATE TABLE conversations (
+CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
     creator_did TEXT NOT NULL,
     current_epoch INTEGER NOT NULL DEFAULT 0,
@@ -52,10 +52,10 @@ CREATE TABLE conversations (
     group_info_epoch INTEGER
 );
 
-CREATE INDEX idx_conversations_creator ON conversations(creator_did);
-CREATE INDEX idx_conversations_group_id ON conversations(group_id) WHERE group_id IS NOT NULL;
-CREATE INDEX idx_conversations_updated ON conversations(updated_at DESC);
-CREATE INDEX idx_conversations_group_info_updated ON conversations(id, group_info_updated_at DESC) WHERE group_info IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_conversations_creator ON conversations(creator_did);
+CREATE INDEX IF NOT EXISTS idx_conversations_group_id ON conversations(group_id) WHERE group_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_conversations_group_info_updated ON conversations(id, group_info_updated_at DESC) WHERE group_info IS NOT NULL;
 
 COMMENT ON TABLE conversations IS 'MLS group conversations with E2EE support';
 COMMENT ON COLUMN conversations.cipher_suite IS 'MLS cipher suite (e.g., MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519)';
@@ -65,7 +65,7 @@ COMMENT ON COLUMN conversations.group_info_updated_at IS 'Timestamp when the Gro
 COMMENT ON COLUMN conversations.group_info_epoch IS 'The epoch number corresponding to the cached GroupInfo object.';
 
 -- Members (conversation participants with admin support)
-CREATE TABLE members (
+CREATE TABLE IF NOT EXISTS members (
     convo_id TEXT NOT NULL,
     member_did TEXT NOT NULL,
     ds_did TEXT,
@@ -98,11 +98,11 @@ CREATE TABLE members (
     FOREIGN KEY (convo_id) REFERENCES conversations(id) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_members_member_did ON members(member_did);
-CREATE INDEX idx_members_active ON members(member_did, convo_id) WHERE left_at IS NULL;
-CREATE INDEX idx_members_admins ON members(convo_id, member_did) WHERE is_admin = true AND left_at IS NULL;
-CREATE INDEX idx_members_unread ON members(member_did, unread_count) WHERE unread_count > 0;
-CREATE INDEX idx_members_rejoin_pending ON members(convo_id, member_did) WHERE needs_rejoin = true;
+CREATE INDEX IF NOT EXISTS idx_members_member_did ON members(member_did);
+CREATE INDEX IF NOT EXISTS idx_members_active ON members(member_did, convo_id) WHERE left_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_members_admins ON members(convo_id, member_did) WHERE is_admin = true AND left_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_members_unread ON members(member_did, unread_count) WHERE unread_count > 0;
+CREATE INDEX IF NOT EXISTS idx_members_rejoin_pending ON members(convo_id, member_did) WHERE needs_rejoin = true;
 
 COMMENT ON TABLE members IS 'Conversation membership with admin privileges and rejoin support';
 COMMENT ON COLUMN members.member_did IS 'Device-specific MLS DID (e.g., did:plc:abc123#device-xyz) - each device has unique MLS identity';
@@ -116,7 +116,7 @@ COMMENT ON COLUMN members.needs_rejoin IS 'True if member deleted app and needs 
 COMMENT ON COLUMN members.leaf_index IS 'MLS leaf index in ratchet tree (NULL if not yet joined group state)';
 
 -- Messages (encrypted MLS messages with privacy metadata)
-CREATE TABLE messages (
+CREATE TABLE IF NOT EXISTS messages (
     id TEXT PRIMARY KEY,
     convo_id TEXT NOT NULL,
     sender_did TEXT,
@@ -140,16 +140,16 @@ CREATE TABLE messages (
     FOREIGN KEY (convo_id) REFERENCES conversations(id) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_messages_convo ON messages(convo_id, created_at DESC);
-CREATE INDEX idx_messages_sender ON messages(sender_did);
-CREATE INDEX idx_messages_epoch ON messages(convo_id, epoch);
-CREATE INDEX idx_messages_expires ON messages(expires_at) WHERE expires_at IS NOT NULL;
-CREATE INDEX idx_messages_bucket_ts ON messages(convo_id, received_bucket_ts DESC) WHERE received_bucket_ts IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_messages_convo ON messages(convo_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_did);
+CREATE INDEX IF NOT EXISTS idx_messages_epoch ON messages(convo_id, epoch);
+CREATE INDEX IF NOT EXISTS idx_messages_expires ON messages(expires_at) WHERE expires_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_messages_bucket_ts ON messages(convo_id, received_bucket_ts DESC) WHERE received_bucket_ts IS NOT NULL;
 
 -- Deduplication indices
-CREATE UNIQUE INDEX idx_messages_msg_id_dedup ON messages(convo_id, msg_id) WHERE msg_id IS NOT NULL;
-CREATE INDEX idx_messages_msg_id ON messages(msg_id) WHERE msg_id IS NOT NULL;
-CREATE UNIQUE INDEX idx_messages_idempotency_key ON messages(idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_msg_id_dedup ON messages(convo_id, msg_id) WHERE msg_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_messages_msg_id ON messages(msg_id) WHERE msg_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_idempotency_key ON messages(idempotency_key) WHERE idempotency_key IS NOT NULL;
 
 COMMENT ON TABLE messages IS 'Encrypted MLS messages with metadata privacy features';
 COMMENT ON COLUMN messages.sender_did IS 'Verified sender DID from JWT (server-provided, NEVER trust client input)';
@@ -162,7 +162,7 @@ COMMENT ON COLUMN messages.received_bucket_ts IS 'Unix timestamp quantized to 2-
 -- =============================================================================
 
 -- Key Packages (pre-keys for adding members to groups)
-CREATE TABLE key_packages (
+CREATE TABLE IF NOT EXISTS key_packages (
     id TEXT PRIMARY KEY,
     owner_did TEXT NOT NULL,
     device_id TEXT,
@@ -181,14 +181,14 @@ CREATE TABLE key_packages (
     FOREIGN KEY (owner_did) REFERENCES users(did) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_key_packages_owner ON key_packages(owner_did);
-CREATE INDEX idx_key_packages_available ON key_packages(owner_did, cipher_suite, expires_at) WHERE consumed_at IS NULL;
-CREATE INDEX idx_key_packages_hash ON key_packages(key_package_hash);
-CREATE INDEX idx_key_packages_expires ON key_packages(expires_at);
+CREATE INDEX IF NOT EXISTS idx_key_packages_owner ON key_packages(owner_did);
+CREATE INDEX IF NOT EXISTS idx_key_packages_available ON key_packages(owner_did, cipher_suite, expires_at) WHERE consumed_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_key_packages_hash ON key_packages(key_package_hash);
+CREATE INDEX IF NOT EXISTS idx_key_packages_expires ON key_packages(expires_at);
 
 -- Consumption tracking indices (for stats and rate calculations)
-CREATE INDEX idx_key_packages_consumed_at ON key_packages(owner_did, consumed_at DESC) WHERE consumed_at IS NOT NULL;
-CREATE INDEX idx_key_packages_hash_lookup ON key_packages(owner_did, key_package_hash) WHERE consumed_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_key_packages_consumed_at ON key_packages(owner_did, consumed_at DESC) WHERE consumed_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_key_packages_hash_lookup ON key_packages(owner_did, key_package_hash) WHERE consumed_at IS NULL;
 
 COMMENT ON TABLE key_packages IS 'Pool of MLS KeyPackages for adding members and automatic rejoin';
 COMMENT ON COLUMN key_packages.consumed_at IS 'NULL = available, NOT NULL = already used';
@@ -199,7 +199,7 @@ COMMENT ON COLUMN key_packages.consumed_by_convo IS 'Which conversation consumed
 -- =============================================================================
 
 -- Welcome messages for new members or automatic rejoin
-CREATE TABLE welcome_messages (
+CREATE TABLE IF NOT EXISTS welcome_messages (
     id TEXT PRIMARY KEY,
     convo_id TEXT NOT NULL,
     recipient_did TEXT NOT NULL,
@@ -212,14 +212,14 @@ CREATE TABLE welcome_messages (
     FOREIGN KEY (convo_id) REFERENCES conversations(id) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_welcome_messages_recipient ON welcome_messages(recipient_did, consumed);
-CREATE INDEX idx_welcome_messages_convo ON welcome_messages(convo_id);
+CREATE INDEX IF NOT EXISTS idx_welcome_messages_recipient ON welcome_messages(recipient_did, consumed);
+CREATE INDEX IF NOT EXISTS idx_welcome_messages_convo ON welcome_messages(convo_id);
 
 -- =============================================================================
 -- Rejoin Requests (auto-rejoin audit trail)
 -- =============================================================================
 
-CREATE TABLE rejoin_requests (
+CREATE TABLE IF NOT EXISTS rejoin_requests (
     id TEXT PRIMARY KEY,
     convo_id TEXT NOT NULL,
     member_did TEXT NOT NULL,
@@ -234,10 +234,10 @@ CREATE INDEX IF NOT EXISTS idx_rejoin_requests_member ON rejoin_requests(member_
 CREATE INDEX IF NOT EXISTS idx_rejoin_requests_auto_approved ON rejoin_requests(auto_approved, requested_at DESC);
 
 COMMENT ON TABLE rejoin_requests IS 'Audit trail for automatic rejoin approvals';
-CREATE INDEX idx_welcome_messages_hash ON welcome_messages(key_package_hash) WHERE key_package_hash IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_welcome_messages_hash ON welcome_messages(key_package_hash) WHERE key_package_hash IS NOT NULL;
 
 -- One unconsumed welcome per (convo, recipient, key_package_hash)
-CREATE UNIQUE INDEX idx_welcome_messages_unique
+CREATE UNIQUE INDEX IF NOT EXISTS idx_welcome_messages_unique
 ON welcome_messages(convo_id, recipient_did, COALESCE(key_package_hash, '\x00'::bytea))
 WHERE consumed = false;
 
@@ -245,7 +245,7 @@ COMMENT ON TABLE welcome_messages IS 'MLS Welcome messages for joining or automa
 COMMENT ON COLUMN welcome_messages.created_by_did IS 'DID of member who generated this Welcome (for automatic rejoin)';
 
 -- Pending automatic rejoin requests (server-orchestrated)
-CREATE TABLE pending_welcomes (
+CREATE TABLE IF NOT EXISTS pending_welcomes (
     id TEXT PRIMARY KEY,
     convo_id TEXT NOT NULL,
     target_did TEXT NOT NULL,
@@ -257,8 +257,8 @@ CREATE TABLE pending_welcomes (
     FOREIGN KEY (convo_id) REFERENCES conversations(id) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_pending_welcomes_target ON pending_welcomes(target_did) WHERE consumed_at IS NULL;
-CREATE INDEX idx_pending_welcomes_convo ON pending_welcomes(convo_id) WHERE consumed_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_pending_welcomes_target ON pending_welcomes(target_did) WHERE consumed_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_pending_welcomes_convo ON pending_welcomes(convo_id) WHERE consumed_at IS NULL;
 
 COMMENT ON TABLE pending_welcomes IS 'Server-orchestrated Welcome delivery for automatic rejoin (2-5 second flow)';
 COMMENT ON COLUMN pending_welcomes.target_did IS 'DID of member who needs to rejoin (lost MLS state but still in DB)';
@@ -268,21 +268,50 @@ COMMENT ON COLUMN pending_welcomes.created_by_did IS 'DID of any online member w
 -- Admin & Moderation System (E2EE)
 -- =============================================================================
 
--- Spam Reports (simple per-conversation spam reporting)
-CREATE TABLE IF NOT EXISTS spam_reports (
+-- E2EE Reports (encrypted content, only admins can decrypt)
+CREATE TABLE IF NOT EXISTS reports (
     id TEXT PRIMARY KEY,
-    convo_id TEXT NOT NULL REFERENCES conversations(id),
+    convo_id TEXT NOT NULL,
     reporter_did TEXT NOT NULL,
     reported_did TEXT NOT NULL,
-    reason TEXT,
+    category TEXT NOT NULL CHECK (category IN (
+        'harassment',
+        'spam',
+        'hate_speech',
+        'violence',
+        'sexual_content',
+        'impersonation',
+        'privacy_violation',
+        'other'
+    )),
+    encrypted_content BYTEA NOT NULL,
+    message_ids TEXT[],
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(convo_id, reporter_did, reported_did)
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'resolved', 'dismissed')),
+    resolved_by_did TEXT,
+    resolved_at TIMESTAMPTZ,
+    resolution_action TEXT
+        CHECK (resolution_action IN ('removed_member', 'dismissed', 'no_action')),
+    resolution_notes TEXT,
+    FOREIGN KEY (convo_id) REFERENCES conversations(id) ON DELETE CASCADE
 );
-CREATE INDEX IF NOT EXISTS idx_spam_reports_convo ON spam_reports(convo_id);
-CREATE INDEX IF NOT EXISTS idx_spam_reports_reported ON spam_reports(reported_did);
+
+CREATE INDEX IF NOT EXISTS idx_reports_convo ON reports(convo_id);
+CREATE INDEX IF NOT EXISTS idx_reports_reporter ON reports(reporter_did);
+CREATE INDEX IF NOT EXISTS idx_reports_reported ON reports(reported_did);
+CREATE INDEX IF NOT EXISTS idx_reports_status ON reports(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_reports_category ON reports(category);
+
+COMMENT ON TABLE reports IS 'E2EE member reports - content encrypted with MLS group key, only admins decrypt';
+COMMENT ON COLUMN reports.category IS 'Report category: harassment, spam, hate_speech, violence, sexual_content, impersonation, privacy_violation, other';
+COMMENT ON COLUMN reports.encrypted_content IS 'Encrypted report details (reason, evidence) - uses MLS group key (max 50KB)';
+COMMENT ON COLUMN reports.message_ids IS 'Array of message IDs referenced in report (max 20)';
+COMMENT ON COLUMN reports.resolution_action IS 'Action taken: removed_member, dismissed, or no_action';
+COMMENT ON COLUMN reports.resolution_notes IS 'Admin notes on resolution (max 1000 chars enforced by application)';
 
 -- Admin Actions Audit Log (immutable record of admin operations)
-CREATE TABLE admin_actions (
+CREATE TABLE IF NOT EXISTS admin_actions (
     id TEXT PRIMARY KEY,
     convo_id TEXT NOT NULL,
     actor_did TEXT NOT NULL,
@@ -293,9 +322,9 @@ CREATE TABLE admin_actions (
     FOREIGN KEY (convo_id) REFERENCES conversations(id) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_admin_actions_convo ON admin_actions(convo_id, created_at DESC);
-CREATE INDEX idx_admin_actions_actor ON admin_actions(actor_did, created_at DESC);
-CREATE INDEX idx_admin_actions_target ON admin_actions(target_did) WHERE target_did IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_admin_actions_convo ON admin_actions(convo_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_admin_actions_actor ON admin_actions(actor_did, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_admin_actions_target ON admin_actions(target_did) WHERE target_did IS NOT NULL;
 
 COMMENT ON TABLE admin_actions IS 'Immutable audit log of all admin actions';
 COMMENT ON COLUMN admin_actions.actor_did IS 'DID of admin who performed the action';
@@ -304,7 +333,7 @@ COMMENT ON COLUMN admin_actions.target_did IS 'DID of member affected by the act
 COMMENT ON COLUMN admin_actions.reason IS 'Optional justification for the action';
 
 -- Bluesky Blocks (synced from AT Protocol)
-CREATE TABLE bsky_blocks (
+CREATE TABLE IF NOT EXISTS bsky_blocks (
     user_did TEXT NOT NULL,
     target_did TEXT NOT NULL,
     source TEXT NOT NULL DEFAULT 'bsky',
@@ -312,8 +341,8 @@ CREATE TABLE bsky_blocks (
     PRIMARY KEY (user_did, target_did)
 );
 
-CREATE INDEX idx_bsky_blocks_user ON bsky_blocks(user_did);
-CREATE INDEX idx_bsky_blocks_target ON bsky_blocks(target_did);
+CREATE INDEX IF NOT EXISTS idx_bsky_blocks_user ON bsky_blocks(user_did);
+CREATE INDEX IF NOT EXISTS idx_bsky_blocks_target ON bsky_blocks(target_did);
 
 COMMENT ON TABLE bsky_blocks IS 'Bluesky block relationships synced from AT Protocol';
 COMMENT ON COLUMN bsky_blocks.user_did IS 'DID of user who blocked (blocker)';
@@ -326,7 +355,7 @@ COMMENT ON COLUMN bsky_blocks.synced_at IS 'When this block was last synced from
 -- =============================================================================
 
 -- Envelopes (message delivery tracking per recipient)
-CREATE TABLE envelopes (
+CREATE TABLE IF NOT EXISTS envelopes (
     id TEXT PRIMARY KEY,
     convo_id TEXT NOT NULL,
     recipient_did TEXT NOT NULL,
@@ -337,16 +366,16 @@ CREATE TABLE envelopes (
     FOREIGN KEY (convo_id) REFERENCES conversations(id) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_envelopes_recipient ON envelopes(recipient_did);
-CREATE INDEX idx_envelopes_message ON envelopes(message_id);
-CREATE INDEX idx_envelopes_convo ON envelopes(convo_id);
-CREATE INDEX idx_envelopes_pending ON envelopes(recipient_did) WHERE delivered_at IS NULL;
-CREATE INDEX idx_envelopes_created ON envelopes(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_envelopes_recipient ON envelopes(recipient_did);
+CREATE INDEX IF NOT EXISTS idx_envelopes_message ON envelopes(message_id);
+CREATE INDEX IF NOT EXISTS idx_envelopes_convo ON envelopes(convo_id);
+CREATE INDEX IF NOT EXISTS idx_envelopes_pending ON envelopes(recipient_did) WHERE delivered_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_envelopes_created ON envelopes(created_at DESC);
 
 COMMENT ON TABLE envelopes IS 'Message delivery tracking - server knows recipients from members table, not from ciphertext';
 
 -- Cursors (user read positions)
-CREATE TABLE cursors (
+CREATE TABLE IF NOT EXISTS cursors (
     user_did TEXT NOT NULL,
     convo_id TEXT NOT NULL,
     last_seen_cursor TEXT NOT NULL,
@@ -355,12 +384,12 @@ CREATE TABLE cursors (
     FOREIGN KEY (convo_id) REFERENCES conversations(id) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_cursors_user ON cursors(user_did);
-CREATE INDEX idx_cursors_convo ON cursors(convo_id);
-CREATE INDEX idx_cursors_updated ON cursors(updated_at);
+CREATE INDEX IF NOT EXISTS idx_cursors_user ON cursors(user_did);
+CREATE INDEX IF NOT EXISTS idx_cursors_convo ON cursors(convo_id);
+CREATE INDEX IF NOT EXISTS idx_cursors_updated ON cursors(updated_at);
 
 -- Event Stream (realtime events via SSE)
-CREATE TABLE event_stream (
+CREATE TABLE IF NOT EXISTS event_stream (
     id TEXT PRIMARY KEY,
     convo_id TEXT NOT NULL,
     event_type TEXT NOT NULL,
@@ -369,14 +398,14 @@ CREATE TABLE event_stream (
     FOREIGN KEY (convo_id) REFERENCES conversations(id) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_event_stream_convo ON event_stream(convo_id, id);
-CREATE INDEX idx_event_stream_type ON event_stream(event_type, emitted_at);
-CREATE INDEX idx_event_stream_emitted ON event_stream(emitted_at DESC);
+CREATE INDEX IF NOT EXISTS idx_event_stream_convo ON event_stream(convo_id, id);
+CREATE INDEX IF NOT EXISTS idx_event_stream_type ON event_stream(event_type, emitted_at);
+CREATE INDEX IF NOT EXISTS idx_event_stream_emitted ON event_stream(emitted_at DESC);
 
 COMMENT ON TABLE event_stream IS 'Realtime event stream for SSE (Server-Sent Events) delivery';
 
 -- Message Recipients (delivery tracking)
-CREATE TABLE message_recipients (
+CREATE TABLE IF NOT EXISTS message_recipients (
     message_id TEXT NOT NULL,
     recipient_did TEXT NOT NULL,
     delivered_at TIMESTAMPTZ,
@@ -384,15 +413,15 @@ CREATE TABLE message_recipients (
     FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_message_recipients_recipient ON message_recipients(recipient_did);
-CREATE INDEX idx_message_recipients_delivered ON message_recipients(delivered_at);
+CREATE INDEX IF NOT EXISTS idx_message_recipients_recipient ON message_recipients(recipient_did);
+CREATE INDEX IF NOT EXISTS idx_message_recipients_delivered ON message_recipients(delivered_at);
 
 -- =============================================================================
 -- Idempotency Support
 -- =============================================================================
 
 -- Idempotency Cache (for API operation deduplication)
-CREATE TABLE idempotency_cache (
+CREATE TABLE IF NOT EXISTS idempotency_cache (
     caller_did TEXT NOT NULL,
     endpoint TEXT NOT NULL,
     key TEXT NOT NULL,
@@ -403,8 +432,8 @@ CREATE TABLE idempotency_cache (
     PRIMARY KEY (caller_did, endpoint, key)
 );
 
-CREATE INDEX idx_idempotency_cache_expires ON idempotency_cache(expires_at);
-CREATE INDEX idx_idempotency_cache_endpoint ON idempotency_cache(endpoint, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_idempotency_cache_expires ON idempotency_cache(expires_at);
+CREATE INDEX IF NOT EXISTS idx_idempotency_cache_endpoint ON idempotency_cache(endpoint, created_at DESC);
 
 COMMENT ON TABLE idempotency_cache IS 'Cache for idempotent API operations (24 hour retention)';
 
@@ -447,7 +476,7 @@ $$ LANGUAGE plpgsql;
 -- =============================================================================
 
 -- Blobs table (for future encrypted attachment storage)
-CREATE TABLE blobs (
+CREATE TABLE IF NOT EXISTS blobs (
     key TEXT PRIMARY KEY,
     content_type TEXT NOT NULL,
     size_bytes BIGINT NOT NULL,
@@ -455,8 +484,8 @@ CREATE TABLE blobs (
     ref_count INTEGER NOT NULL DEFAULT 1
 );
 
-CREATE INDEX idx_blobs_created ON blobs(created_at DESC);
-CREATE INDEX idx_blobs_ref_count ON blobs(ref_count) WHERE ref_count = 0;
+CREATE INDEX IF NOT EXISTS idx_blobs_created ON blobs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_blobs_ref_count ON blobs(ref_count) WHERE ref_count = 0;
 
 COMMENT ON TABLE blobs IS 'Future: Encrypted attachment storage on Cloudflare R2';
 
@@ -476,6 +505,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- Trigger to update conversation timestamp on new messages
+DROP TRIGGER IF EXISTS trigger_update_conversation_timestamp ON messages;
 CREATE TRIGGER trigger_update_conversation_timestamp
     AFTER INSERT ON messages
     FOR EACH ROW
@@ -494,6 +524,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- Trigger to auto-promote creator when conversation is created
+DROP TRIGGER IF EXISTS trigger_promote_creator ON members;
 CREATE TRIGGER trigger_promote_creator
     AFTER INSERT ON conversations
     FOR EACH ROW
@@ -516,7 +547,7 @@ CREATE TABLE IF NOT EXISTS _sqlx_migrations (
 -- Schema Version & Metadata
 -- =============================================================================
 
-CREATE TABLE schema_version (
+CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER PRIMARY KEY,
     applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     description TEXT
@@ -533,7 +564,7 @@ COMMENT ON TABLE schema_version IS 'Database schema version tracking';
 -- =============================================================================
 
 -- Devices table for multi-device support
-CREATE TABLE devices (
+CREATE TABLE IF NOT EXISTS devices (
     id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::TEXT,
     user_did TEXT NOT NULL,
     device_id TEXT NOT NULL,
@@ -553,10 +584,10 @@ CREATE TABLE devices (
     FOREIGN KEY (user_did) REFERENCES users(did) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_devices_user_did ON devices(user_did);
-CREATE INDEX idx_devices_credential_did ON devices(credential_did);
-CREATE INDEX idx_devices_active ON devices(user_did, last_seen_at DESC);
-CREATE INDEX idx_devices_device_uuid ON devices(device_uuid) WHERE device_uuid IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_devices_user_did ON devices(user_did);
+CREATE INDEX IF NOT EXISTS idx_devices_credential_did ON devices(credential_did);
+CREATE INDEX IF NOT EXISTS idx_devices_active ON devices(user_did, last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS idx_devices_device_uuid ON devices(device_uuid) WHERE device_uuid IS NOT NULL;
 
 COMMENT ON TABLE devices IS 'Multi-device registry tracking all devices per user';
 COMMENT ON COLUMN devices.user_did IS 'User DID (did:plc:user)';
@@ -713,6 +744,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+DROP TRIGGER IF EXISTS trigger_create_default_policy ON conversations;
 CREATE TRIGGER trigger_create_default_policy
     AFTER INSERT ON conversations
     FOR EACH ROW
@@ -748,6 +780,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+DROP TRIGGER IF EXISTS trigger_check_last_admin ON members;
 CREATE TRIGGER trigger_check_last_admin
     BEFORE UPDATE ON members
     FOR EACH ROW
