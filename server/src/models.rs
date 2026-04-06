@@ -49,6 +49,9 @@ pub struct Conversation {
     pub group_id: Option<String>, // Current MLS group_id (may differ from id after reset)
     #[sqlx(default)]
     pub reset_count: Option<i32>, // Number of times the group has been reset
+    // Auto-reset circuit breaker
+    #[sqlx(default)]
+    pub auto_reset_disabled_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl Conversation {
