@@ -517,6 +517,7 @@ async fn handle_socket(
                     let event_cursor = match &event {
                         StreamEvent::MessageEvent { cursor, .. } => cursor.clone(),
                         StreamEvent::TypingEvent { cursor, .. } => cursor.clone(),
+                        StreamEvent::ReactionEvent { cursor, .. } => cursor.clone(),
                         StreamEvent::InfoEvent { cursor, .. } => cursor.clone(),
                         StreamEvent::NewDeviceEvent { cursor, .. } => cursor.clone(),
                         StreamEvent::GroupInfoRefreshRequested { cursor, .. } => cursor.clone(),
@@ -721,6 +722,7 @@ async fn send_event(
     let msg_type = match event {
         StreamEvent::MessageEvent { .. } => "#messageEvent",
         StreamEvent::TypingEvent { .. } => "#typingEvent",
+        StreamEvent::ReactionEvent { .. } => "#reactionEvent",
         StreamEvent::InfoEvent { .. } => "#infoEvent",
         StreamEvent::NewDeviceEvent { .. } => "#newDeviceEvent",
         StreamEvent::GroupInfoRefreshRequested { .. } => "#groupInfoRefreshRequestedEvent",

@@ -503,6 +503,7 @@ fn extract_cursor(event: &StreamEvent) -> Option<String> {
     match event {
         StreamEvent::MessageEvent { cursor, .. }
         | StreamEvent::TypingEvent { cursor, .. }
+        | StreamEvent::ReactionEvent { cursor, .. }
         | StreamEvent::NewDeviceEvent { cursor, .. }
         | StreamEvent::GroupInfoRefreshRequested { cursor, .. }
         | StreamEvent::ReadditionRequested { cursor, .. }

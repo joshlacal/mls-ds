@@ -55,6 +55,21 @@ pub enum StreamEvent {
         #[serde(rename = "isTyping")]
         is_typing: bool,
     },
+    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#reactionEvent")]
+    ReactionEvent {
+        cursor: String,
+        #[serde(rename = "convoId")]
+        convo_id: String,
+        /// DID of the user who reacted
+        did: String,
+        /// Target message ID
+        #[serde(rename = "messageId")]
+        message_id: String,
+        /// Emoji character (e.g. "👍")
+        emoji: String,
+        /// "add" or "remove"
+        action: String,
+    },
     #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#infoEvent")]
     InfoEvent { cursor: String, info: String },
     /// Event indicating a user has registered a new device that needs to be added to the conversation
@@ -181,6 +196,17 @@ impl<'de> serde::Deserialize<'de> for StreamEvent {
                 #[serde(rename = "isTyping")]
                 is_typing: bool,
             },
+            #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#reactionEvent")]
+            ReactionEvent {
+                cursor: String,
+                #[serde(rename = "convoId")]
+                convo_id: String,
+                did: String,
+                #[serde(rename = "messageId")]
+                message_id: String,
+                emoji: String,
+                action: String,
+            },
             #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#infoEvent")]
             InfoEvent { cursor: String, info: String },
             #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#newDeviceEvent")]
@@ -302,6 +328,21 @@ impl<'de> serde::Deserialize<'de> for StreamEvent {
                 convo_id,
                 did,
                 is_typing,
+            },
+            RawStreamEvent::ReactionEvent {
+                cursor,
+                convo_id,
+                did,
+                message_id,
+                emoji,
+                action,
+            } => StreamEvent::ReactionEvent {
+                cursor,
+                convo_id,
+                did,
+                message_id,
+                emoji,
+                action,
             },
             RawStreamEvent::InfoEvent { cursor, info } => StreamEvent::InfoEvent { cursor, info },
             RawStreamEvent::NewDeviceEvent {
@@ -626,6 +667,7 @@ pub async fn subscribe_convo_events(
                                 let event_cursor = match &event {
                                     StreamEvent::MessageEvent { cursor, .. } => cursor,
                                     StreamEvent::TypingEvent { cursor, .. } => cursor,
+                                    StreamEvent::ReactionEvent { cursor, .. } => cursor,
                                     StreamEvent::InfoEvent { cursor, .. } => cursor,
                                     StreamEvent::NewDeviceEvent { cursor, .. } => cursor,
                                     StreamEvent::GroupInfoRefreshRequested { cursor, .. } => cursor,
