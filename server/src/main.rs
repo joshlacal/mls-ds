@@ -707,6 +707,38 @@ async fn main() -> anyhow::Result<()> {
             "/xrpc/blue.catbird.mlsChat.getGroupMetadataBlob",
             get(handlers::mls_chat::get_group_metadata_blob),
         )
+        // ── Spec §11 route aliases ──
+        // POST aliases: spec-named endpoints that delegate to consolidated handlers.
+        // The request body already contains the `action` field for dispatch.
+        .route(
+            "/xrpc/blue.catbird.mlsChat.addMembers",
+            post(handlers::mls_chat::commit_group_change),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsChat.removeMembers",
+            post(handlers::mls_chat::commit_group_change),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsChat.processExternalCommit",
+            post(handlers::mls_chat::commit_group_change),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsChat.publishGroupInfo",
+            post(handlers::mls_chat::commit_group_change),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsChat.syncKeyPackages",
+            post(handlers::mls_chat::publish_key_packages_post),
+        )
+        // GET aliases: spec-named endpoints that delegate to consolidated handlers
+        .route(
+            "/xrpc/blue.catbird.mlsChat.getGroupInfo",
+            get(handlers::mls_chat::get_group_state),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsChat.getKeyPackageStats",
+            get(handlers::mls_chat::get_key_package_status),
+        )
         .with_state(app_state.clone());
 
     // DS-to-DS federation routes (mlsDS namespace)
