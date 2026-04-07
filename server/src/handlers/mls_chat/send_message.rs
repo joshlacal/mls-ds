@@ -239,7 +239,7 @@ async fn handle_persistent(
         return Ok((
             StatusCode::CONFLICT,
             axum::Json(serde_json::json!({
-                "error": "EpochMismatch",
+                "error": "TreeStateDiverged",
                 "message": format!(
                     "Client epoch {} is ahead of server epoch {}. This indicates a client bug.",
                     client_epoch, server_epoch
@@ -261,7 +261,7 @@ async fn handle_persistent(
         return Ok((
             StatusCode::CONFLICT,
             axum::Json(serde_json::json!({
-                "error": "EpochMismatch",
+                "error": "TreeStateDiverged",
                 "message": format!(
                     "Client epoch {} is behind server epoch {}. Sync required.",
                     client_epoch, server_epoch
