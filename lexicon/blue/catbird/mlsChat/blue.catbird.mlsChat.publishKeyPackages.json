@@ -135,6 +135,11 @@
           "minimum": 0,
           "description": "Number of orphaned key packages detected"
         },
+        "orphanedHashes": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "SHA256 hex hashes of orphaned key packages that were deleted during sync"
+        },
         "deletedCount": {
           "type": "integer",
           "minimum": 0,

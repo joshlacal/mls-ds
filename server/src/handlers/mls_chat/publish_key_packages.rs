@@ -539,6 +539,7 @@ async fn handle_sync(
         return Ok(SyncResult {
             server_hashes: server_hashes.into_iter().map(|s| s.into()).collect(),
             orphaned_count: 0,
+            orphaned_hashes: None,
             deleted_count: 0,
             remaining_available: Some(count),
             device_id: raw_device_id.to_string().into(),
@@ -661,6 +662,7 @@ async fn handle_sync(
     Ok(SyncResult {
         server_hashes: remaining_hashes.into_iter().map(|s| s.into()).collect(),
         orphaned_count,
+        orphaned_hashes: Some(orphaned_hashes.into_iter().map(|s| s.into()).collect()),
         deleted_count,
         remaining_available: Some(remaining.0),
         device_id: raw_device_id.to_string().into(),
