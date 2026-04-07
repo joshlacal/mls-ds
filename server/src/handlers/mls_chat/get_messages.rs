@@ -310,6 +310,10 @@ async fn fetch_commits(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    // Cap commit fetches to prevent massive payloads.
+    // Clients that are very far behind should rejoin via External Commit instead.
+    const MAX_COMMITS: i64 = 50;
+
     let commits = sqlx::query_as::<_, MessageRow>(
         r#"
         SELECT id, convo_id, 'commit' as message_type,
@@ -318,11 +322,13 @@ async fn fetch_commits(
         FROM messages
         WHERE convo_id = $1 AND message_type = 'commit' AND epoch >= $2 AND epoch <= $3
         ORDER BY epoch ASC, seq ASC
+        LIMIT $4
         "#,
     )
     .bind(convo_id)
     .bind(from_epoch)
     .bind(to_epoch)
+    .bind(MAX_COMMITS)
     .fetch_all(pool)
     .await
     .map_err(|e| {
