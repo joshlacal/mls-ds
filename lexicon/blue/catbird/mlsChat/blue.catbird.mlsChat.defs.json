@@ -6,11 +6,16 @@
     "convoView": {
       "type": "object",
       "description": "View of an MLS conversation with member and epoch information",
-      "required": ["groupId", "creator", "members", "epoch", "cipherSuite", "createdAt"],
+      "required": ["conversationId", "groupId", "creator", "members", "epoch", "cipherSuite", "createdAt"],
       "properties": {
+        "conversationId": {
+          "type": "string",
+          "description": "Stable conversation identifier (survives group resets)",
+          "maxLength": 128
+        },
         "groupId": {
           "type": "string",
-          "description": "MLS group identifier (hex-encoded) - canonical conversation ID",
+          "description": "Current MLS group identifier (hex-encoded). Changes on group reset.",
           "maxLength": 128
         },
         "creator": { "type": "string", "format": "did", "description": "DID of the conversation creator" },
