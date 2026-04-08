@@ -32,37 +32,37 @@ pub mod fetch_key_package_state {
     }
     /// State trait tracking which required fields have been set
     pub trait State: sealed::Sealed {
-        type RecipientDid;
         type ConvoId;
+        type RecipientDid;
     }
     /// Empty state - all required fields are unset
     pub struct Empty(());
     impl sealed::Sealed for Empty {}
     impl State for Empty {
-        type RecipientDid = Unset;
         type ConvoId = Unset;
-    }
-    ///State transition - sets the `recipient_did` field to Set
-    pub struct SetRecipientDid<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetRecipientDid<S> {}
-    impl<S: State> State for SetRecipientDid<S> {
-        type RecipientDid = Set<members::recipient_did>;
-        type ConvoId = S::ConvoId;
+        type RecipientDid = Unset;
     }
     ///State transition - sets the `convo_id` field to Set
     pub struct SetConvoId<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetConvoId<S> {}
     impl<S: State> State for SetConvoId<S> {
-        type RecipientDid = S::RecipientDid;
         type ConvoId = Set<members::convo_id>;
+        type RecipientDid = S::RecipientDid;
+    }
+    ///State transition - sets the `recipient_did` field to Set
+    pub struct SetRecipientDid<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetRecipientDid<S> {}
+    impl<S: State> State for SetRecipientDid<S> {
+        type ConvoId = S::ConvoId;
+        type RecipientDid = Set<members::recipient_did>;
     }
     /// Marker types for field names
     #[allow(non_camel_case_types)]
     pub mod members {
-        ///Marker type for the `recipient_did` field
-        pub struct recipient_did(());
         ///Marker type for the `convo_id` field
         pub struct convo_id(());
+        ///Marker type for the `recipient_did` field
+        pub struct recipient_did(());
     }
 }
 
@@ -135,8 +135,8 @@ where
 impl<'a, S> FetchKeyPackageBuilder<'a, S>
 where
     S: fetch_key_package_state::State,
-    S::RecipientDid: fetch_key_package_state::IsSet,
     S::ConvoId: fetch_key_package_state::IsSet,
+    S::RecipientDid: fetch_key_package_state::IsSet,
 {
     /// Build the final struct
     pub fn build(self) -> FetchKeyPackage<'a> {
