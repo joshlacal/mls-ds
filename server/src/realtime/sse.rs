@@ -159,6 +159,17 @@ pub enum StreamEvent {
         cipher_suite: String,
         reason: Option<String>,
     },
+    /// Event indicating the circuit breaker has tripped — auto-reset is disabled
+    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#circuitBreakerTrippedEvent")]
+    CircuitBreakerTrippedEvent {
+        cursor: String,
+        #[serde(rename = "convoId")]
+        convo_id: String,
+        #[serde(rename = "resetCount")]
+        reset_count: i32,
+        #[serde(rename = "trippedAt")]
+        tripped_at: String,
+    },
 }
 
 /// Helper for `skip_serializing_if` on the `ephemeral` field.
@@ -281,6 +292,16 @@ impl<'de> serde::Deserialize<'de> for StreamEvent {
                 #[serde(rename = "cipherSuite")]
                 cipher_suite: String,
                 reason: Option<String>,
+            },
+            #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#circuitBreakerTrippedEvent")]
+            CircuitBreakerTrippedEvent {
+                cursor: String,
+                #[serde(rename = "convoId")]
+                convo_id: String,
+                #[serde(rename = "resetCount")]
+                reset_count: i32,
+                #[serde(rename = "trippedAt")]
+                tripped_at: String,
             },
         }
 
@@ -428,6 +449,17 @@ impl<'de> serde::Deserialize<'de> for StreamEvent {
                 reset_by,
                 cipher_suite,
                 reason,
+            },
+            RawStreamEvent::CircuitBreakerTrippedEvent {
+                cursor,
+                convo_id,
+                reset_count,
+                tripped_at,
+            } => StreamEvent::CircuitBreakerTrippedEvent {
+                cursor,
+                convo_id,
+                reset_count,
+                tripped_at,
             },
         })
     }
@@ -675,6 +707,7 @@ pub async fn subscribe_convo_events(
                                     StreamEvent::TreeChanged { cursor, .. } => cursor,
                                     StreamEvent::MembershipChangeEvent { cursor, .. } => cursor,
                                     StreamEvent::GroupResetEvent { cursor, .. } => cursor,
+                                    StreamEvent::CircuitBreakerTrippedEvent { cursor, .. } => cursor,
                                 };
 
                                 // Filter based on resume cursor

@@ -28,6 +28,10 @@ pub struct ResetGroupRequest {
     pub cipher_suite: String,
     pub group_info: Option<String>,
     pub reason: Option<String>,
+    /// When true, clears the circuit breaker and resets the counter to 0,
+    /// re-enabling automatic recovery for this conversation.
+    #[serde(default)]
+    pub clear_circuit_breaker: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -92,16 +96,15 @@ pub async fn reset_group(
     }
 
     // --- Validate newGroupId not already in use ---
-    let group_id_in_use: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM conversations WHERE group_id = $1)",
-    )
-    .bind(new_group_id)
-    .fetch_one(&pool)
-    .await
-    .map_err(|e| {
-        error!("[resetGroup] group_id uniqueness check failed: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let group_id_in_use: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversations WHERE group_id = $1)")
+            .bind(new_group_id)
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| {
+                error!("[resetGroup] group_id uniqueness check failed: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
     if group_id_in_use {
         warn!("[resetGroup] newGroupId already in use");
@@ -137,13 +140,17 @@ pub async fn reset_group(
     })?;
 
     // Update conversation
+    // When clearCircuitBreaker is true: reset_count = 0, auto_reset_disabled_at = NULL
+    // Otherwise: increment reset_count normally
     let reset_count: Option<i32> = sqlx::query_scalar(
         r#"UPDATE conversations SET
             group_id = $1, current_epoch = 0,
             group_info = $2, group_info_epoch = CASE WHEN $2 IS NOT NULL THEN 0 ELSE NULL END,
             group_info_updated_at = CASE WHEN $2 IS NOT NULL THEN NOW() ELSE NULL END,
             confirmation_tag = NULL, cipher_suite = $3,
-            reset_count = reset_count + 1, last_reset_at = NOW(), last_reset_by = $4,
+            reset_count = CASE WHEN $6 THEN 0 ELSE reset_count + 1 END,
+            auto_reset_disabled_at = CASE WHEN $6 THEN NULL ELSE auto_reset_disabled_at END,
+            last_reset_at = NOW(), last_reset_by = $4,
             updated_at = NOW()
         WHERE id = $5
         RETURNING reset_count"#,
@@ -153,6 +160,7 @@ pub async fn reset_group(
     .bind(&input.cipher_suite)
     .bind(caller_did)
     .bind(convo_id)
+    .bind(input.clear_circuit_breaker)
     .fetch_optional(&mut *tx)
     .await
     .map_err(|e| {
@@ -164,7 +172,10 @@ pub async fn reset_group(
         Some(rc) => rc,
         None => {
             tx.rollback().await.ok();
-            warn!("[resetGroup] conversation not found: {}", crate::crypto::redact_for_log(convo_id));
+            warn!(
+                "[resetGroup] conversation not found: {}",
+                crate::crypto::redact_for_log(convo_id)
+            );
             return Err(StatusCode::NOT_FOUND);
         }
     };
@@ -195,6 +206,13 @@ pub async fn reset_group(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
+    if input.clear_circuit_breaker {
+        info!(
+            convo = %crate::crypto::redact_for_log(convo_id),
+            "[resetGroup] circuit breaker cleared, reset_count zeroed"
+        );
+    }
+
     info!(
         convo = %crate::crypto::redact_for_log(convo_id),
         new_group_id = %crate::crypto::redact_for_log(new_group_id),
@@ -203,10 +221,7 @@ pub async fn reset_group(
     );
 
     // --- Emit SSE GroupResetEvent ---
-    let cursor = sse_state
-        .cursor_gen
-        .next(convo_id, "groupResetEvent")
-        .await;
+    let cursor = sse_state.cursor_gen.next(convo_id, "groupResetEvent").await;
 
     let event = StreamEvent::GroupResetEvent {
         cursor: cursor.clone(),
@@ -219,8 +234,7 @@ pub async fn reset_group(
     };
 
     // Store event for cursor-based replay
-    if let Err(e) =
-        crate::db::store_event(&pool, &cursor, convo_id, "groupResetEvent", None).await
+    if let Err(e) = crate::db::store_event(&pool, &cursor, convo_id, "groupResetEvent", None).await
     {
         error!("[resetGroup] store event: {:?}", e);
     }

@@ -677,6 +677,11 @@ async fn main() -> anyhow::Result<()> {
             "/xrpc/blue.catbird.mlsChat.requestFailover",
             post(handlers::mls_chat::request_failover),
         )
+        // Group Health
+        .route(
+            "/xrpc/blue.catbird.mlsChat.getGroupHealth",
+            get(handlers::mls_chat::get_group_health),
+        )
         // Delivery Status
         .route(
             "/xrpc/blue.catbird.mlsChat.getDeliveryStatus",

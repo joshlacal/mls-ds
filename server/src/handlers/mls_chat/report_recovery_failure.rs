@@ -128,16 +128,15 @@ pub async fn report_recovery_failure(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let member_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM members WHERE convo_id = $1 AND left_at IS NULL",
-    )
-    .bind(convo_id)
-    .fetch_one(&pool)
-    .await
-    .map_err(|e| {
-        error!("[reportRecoveryFailure] count members: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let member_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM members WHERE convo_id = $1 AND left_at IS NULL")
+            .bind(convo_id)
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| {
+                error!("[reportRecoveryFailure] count members: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
     info!(
         convo = %crate::crypto::redact_for_log(convo_id),
@@ -250,6 +249,36 @@ pub async fn report_recovery_failure(
             reset_count,
             "[reportRecoveryFailure] circuit breaker tripped"
         );
+
+        // Emit CircuitBreakerTrippedEvent via SSE
+        let tripped_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let cb_cursor = sse_state
+            .cursor_gen
+            .next(convo_id, "circuitBreakerTrippedEvent")
+            .await;
+        let cb_event = StreamEvent::CircuitBreakerTrippedEvent {
+            cursor: cb_cursor.clone(),
+            convo_id: convo_id.clone(),
+            reset_count,
+            tripped_at,
+        };
+        if let Err(e) = crate::db::store_event(
+            &pool,
+            &cb_cursor,
+            convo_id,
+            "circuitBreakerTrippedEvent",
+            None,
+        )
+        .await
+        {
+            error!(
+                "[reportRecoveryFailure] store circuit breaker event: {:?}",
+                e
+            );
+        }
+        if let Err(e) = sse_state.emit(convo_id, cb_event).await {
+            error!("[reportRecoveryFailure] SSE emit circuit breaker: {}", e);
+        }
     }
 
     // Delete welcome messages
@@ -268,7 +297,10 @@ pub async fn report_recovery_failure(
         .execute(&mut *tx)
         .await
         .map_err(|e| {
-            error!("[reportRecoveryFailure] delete pending_device_additions: {}", e);
+            error!(
+                "[reportRecoveryFailure] delete pending_device_additions: {}",
+                e
+            );
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
@@ -295,10 +327,7 @@ pub async fn report_recovery_failure(
     );
 
     // --- Emit SSE GroupResetEvent ---
-    let cursor = sse_state
-        .cursor_gen
-        .next(convo_id, "groupResetEvent")
-        .await;
+    let cursor = sse_state.cursor_gen.next(convo_id, "groupResetEvent").await;
 
     let event = StreamEvent::GroupResetEvent {
         cursor: cursor.clone(),
@@ -312,8 +341,7 @@ pub async fn report_recovery_failure(
         ),
     };
 
-    if let Err(e) =
-        crate::db::store_event(&pool, &cursor, convo_id, "groupResetEvent", None).await
+    if let Err(e) = crate::db::store_event(&pool, &cursor, convo_id, "groupResetEvent", None).await
     {
         error!("[reportRecoveryFailure] store event: {:?}", e);
     }

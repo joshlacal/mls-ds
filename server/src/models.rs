@@ -84,11 +84,7 @@ impl Conversation {
         });
 
         // Use group_id from DB if available (may differ from id after reset), else fall back to id
-        let current_group_id = self
-            .group_id
-            .as_deref()
-            .unwrap_or(&self.id)
-            .to_string();
+        let current_group_id = self.group_id.as_deref().unwrap_or(&self.id).to_string();
 
         let reset_generation = self.reset_count.unwrap_or(0);
 
@@ -120,6 +116,7 @@ impl Conversation {
             last_message_at: None,
             metadata,
             confirmation_tag: conf_tag_b64.map(|s| s.into()),
+            reset_generation: Some(reset_generation as i64),
             extra_data: Some(extra),
         };
         Ok(view.into_static())

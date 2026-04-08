@@ -525,6 +525,7 @@ async fn handle_socket(
                         StreamEvent::TreeChanged { cursor, .. } => cursor.clone(),
                         StreamEvent::MembershipChangeEvent { cursor, .. } => cursor.clone(),
                         StreamEvent::GroupResetEvent { cursor, .. } => cursor.clone(),
+                        StreamEvent::CircuitBreakerTrippedEvent { cursor, .. } => cursor.clone(),
                     };
 
                     // Filter logic (only for single-convo mode generally, but applied here too)
@@ -730,6 +731,7 @@ async fn send_event(
         StreamEvent::TreeChanged { .. } => "#treeChanged",
         StreamEvent::MembershipChangeEvent { .. } => "#membershipChangeEvent",
         StreamEvent::GroupResetEvent { .. } => "#groupResetEvent",
+        StreamEvent::CircuitBreakerTrippedEvent { .. } => "#circuitBreakerTrippedEvent",
     };
 
     if frame_format == FrameFormat::JsonText {
