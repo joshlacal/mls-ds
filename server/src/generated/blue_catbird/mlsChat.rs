@@ -981,6 +981,7 @@ pub struct ConvoViewBuilder<'a, S: convo_view_state::State> {
         ::core::option::Option<
             crate::generated::blue_catbird::mlsChat::ConvoMetadata<'a>,
         >,
+        ::core::option::Option<jacquard_common::CowStr<'a>>,
     ),
     _phantom: ::core::marker::PhantomData<&'a ()>,
 }
@@ -998,6 +999,7 @@ impl<'a> ConvoViewBuilder<'a, convo_view_state::Empty> {
         ConvoViewBuilder {
             _phantom_state: ::core::marker::PhantomData,
             __unsafe_private_named: (
+                None,
                 None,
                 None,
                 None,
@@ -1178,6 +1180,14 @@ impl<'a, S: convo_view_state::State> ConvoViewBuilder<'a, S> {
         self.__unsafe_private_named.8 = value;
         self
     }
+    /// Set the `conversationId` field (required for population, stored at tuple index 9)
+    pub fn conversation_id(
+        mut self,
+        value: impl Into<jacquard_common::CowStr<'a>>,
+    ) -> Self {
+        self.__unsafe_private_named.9 = ::core::option::Option::Some(value.into());
+        self
+    }
 }
 
 impl<'a, S> ConvoViewBuilder<'a, S>
@@ -1195,6 +1205,7 @@ where
         ConvoView {
             cipher_suite: self.__unsafe_private_named.0.unwrap(),
             confirmation_tag: self.__unsafe_private_named.1,
+            conversation_id: self.__unsafe_private_named.9.unwrap_or_default(),
             created_at: self.__unsafe_private_named.2.unwrap(),
             creator: self.__unsafe_private_named.3.unwrap(),
             epoch: self.__unsafe_private_named.4.unwrap(),
@@ -1216,6 +1227,7 @@ where
         ConvoView {
             cipher_suite: self.__unsafe_private_named.0.unwrap(),
             confirmation_tag: self.__unsafe_private_named.1,
+            conversation_id: self.__unsafe_private_named.9.unwrap_or_default(),
             created_at: self.__unsafe_private_named.2.unwrap(),
             creator: self.__unsafe_private_named.3.unwrap(),
             epoch: self.__unsafe_private_named.4.unwrap(),

@@ -47,6 +47,8 @@ pub struct ConvoMetadata {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConvoView {
     pub id: String,
+    #[serde(rename = "conversationId")]
+    pub conversation_id: String,
     #[serde(rename = "groupId")]
     pub group_id: String,
     pub creator: String,

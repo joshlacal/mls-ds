@@ -106,6 +106,7 @@ impl Conversation {
         );
 
         let view = ConvoView {
+            conversation_id: self.id.clone().into(),
             group_id: current_group_id.into(),
             creator,
             members,

@@ -345,6 +345,7 @@ async fn handle_create_convo(
 
         return Ok(CreateConvoOutput {
             convo: ConvoView {
+                conversation_id: convo_id.clone().into(),
                 group_id: convo_id.into(),
                 creator: string_to_did(&creator_did),
                 members: members_typed,
@@ -644,6 +645,7 @@ async fn handle_create_convo(
 
     Ok(CreateConvoOutput {
         convo: ConvoView {
+            conversation_id: convo_id.clone().into(),
             group_id: convo_id.into(),
             creator: string_to_did(&creator_did),
             members: members_typed,
