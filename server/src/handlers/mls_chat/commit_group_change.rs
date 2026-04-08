@@ -212,13 +212,12 @@ pub async fn commit_group_change(
                         use openmls::messages::group_info::VerifiableGroupInfo;
                         use openmls::prelude::{MlsMessageBodyIn, MlsMessageIn};
 
-                        let from_mls_msg =
-                            MlsMessageIn::tls_deserialize(&mut &*gi_slice)
-                                .ok()
-                                .and_then(|msg| match msg.extract() {
-                                    MlsMessageBodyIn::GroupInfo(gi) => Some(gi.epoch().as_u64()),
-                                    _ => None,
-                                });
+                        let from_mls_msg = MlsMessageIn::tls_deserialize(&mut &*gi_slice)
+                            .ok()
+                            .and_then(|msg| match msg.extract() {
+                                MlsMessageBodyIn::GroupInfo(gi) => Some(gi.epoch().as_u64()),
+                                _ => None,
+                            });
 
                         from_mls_msg.or_else(|| {
                             VerifiableGroupInfo::tls_deserialize(&mut &*gi_slice)
@@ -572,10 +571,7 @@ pub async fn commit_group_change(
 
             // ── Emit treeChanged event so other clients detect divergence ──
             if let Some(ref tag_b64) = add_conf_tag_b64 {
-                let tree_cursor = sse_state
-                    .cursor_gen
-                    .next(&convo_id, "treeChanged")
-                    .await;
+                let tree_cursor = sse_state.cursor_gen.next(&convo_id, "treeChanged").await;
                 let tree_event = StreamEvent::TreeChanged {
                     cursor: tree_cursor.clone(),
                     convo_id: convo_id.clone(),
@@ -728,46 +724,61 @@ pub async fn commit_group_change(
                 }
             }
 
-            // ── Parse MLS epoch from GroupInfo if provided ──────────
-            let (group_info_bytes_opt, mls_epoch) =
-                if let Some(gi_bytes) = input.group_info.as_ref() {
-                    let gi_slice: &[u8] = gi_bytes;
-                    let epoch = {
-                        use openmls::messages::group_info::VerifiableGroupInfo;
-                        use openmls::prelude::{MlsMessageBodyIn, MlsMessageIn};
+            // ── Parse MLS epoch and group_id from GroupInfo if provided ──────────
+            let (group_info_bytes_opt, mls_epoch, mls_group_id) = if let Some(gi_bytes) =
+                input.group_info.as_ref()
+            {
+                let gi_slice: &[u8] = gi_bytes;
+                let (epoch, group_id) = {
+                    use openmls::messages::group_info::VerifiableGroupInfo;
+                    use openmls::prelude::{MlsMessageBodyIn, MlsMessageIn};
 
-                        let from_mls_msg =
-                            MlsMessageIn::tls_deserialize(&mut &*gi_slice)
+                    let from_mls_msg = MlsMessageIn::tls_deserialize(&mut &*gi_slice)
+                        .ok()
+                        .and_then(|msg| match msg.extract() {
+                            MlsMessageBodyIn::GroupInfo(gi) => {
+                                let e = gi.epoch().as_u64();
+                                let gid = hex::encode(gi.group_id().as_slice());
+                                Some((e, gid))
+                            }
+                            _ => None,
+                        });
+
+                    match from_mls_msg {
+                        Some((e, gid)) => (Some(e), Some(gid)),
+                        None => {
+                            let from_raw = VerifiableGroupInfo::tls_deserialize(&mut &*gi_slice)
                                 .ok()
-                                .and_then(|msg| match msg.extract() {
-                                    MlsMessageBodyIn::GroupInfo(gi) => Some(gi.epoch().as_u64()),
-                                    _ => None,
+                                .map(|gi| {
+                                    let e = gi.epoch().as_u64();
+                                    let gid = hex::encode(gi.group_id().as_slice());
+                                    (e, gid)
                                 });
-
-                        from_mls_msg.or_else(|| {
-                            VerifiableGroupInfo::tls_deserialize(&mut &*gi_slice)
-                                .ok()
-                                .map(|gi| gi.epoch().as_u64())
-                        })
-                    };
-
-                    if let Some(e) = epoch {
-                        info!(
-                            "externalCommit: parsed MLS epoch {} from GroupInfo for convo {}",
-                            e,
-                            crate::crypto::redact_for_log(&convo_id)
-                        );
-                    } else {
-                        warn!(
-                            "externalCommit: could not parse epoch from GroupInfo for convo {}",
-                            crate::crypto::redact_for_log(&convo_id)
-                        );
+                            match from_raw {
+                                Some((e, gid)) => (Some(e), Some(gid)),
+                                None => (None, None),
+                            }
+                        }
                     }
-
-                    (Some(gi_bytes.to_vec()), epoch)
-                } else {
-                    (None, None)
                 };
+
+                if let Some(e) = epoch {
+                    info!(
+                        "externalCommit: parsed MLS epoch {} from GroupInfo for convo {}",
+                        e,
+                        crate::crypto::redact_for_log(&convo_id)
+                    );
+                } else {
+                    warn!(
+                        "externalCommit: could not parse epoch from GroupInfo for convo {}",
+                        crate::crypto::redact_for_log(&convo_id)
+                    );
+                }
+
+                (Some(gi_bytes.to_vec()), epoch, group_id)
+            } else {
+                (None, None, None)
+            };
 
             // ── Decode client-provided confirmation_tag ──────────
             let ec_confirmation_tag = if let Some(ref tag_bytes) = input.confirmation_tag {
@@ -841,6 +852,23 @@ pub async fn commit_group_change(
                         new_epoch, mls_epoch_i32, crate::crypto::redact_for_log(&convo_id)
                     );
                 }
+            }
+
+            // ── Update conversations.group_id from GroupInfo ─────────
+            if let Some(ref new_gid) = mls_group_id {
+                sqlx::query("UPDATE conversations SET group_id = $1 WHERE id = $2")
+                    .bind(new_gid)
+                    .bind(&convo_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| {
+                        error!("externalCommit: failed to update group_id: {}", e);
+                        internal_server_error("Failed to update group_id")
+                    })?;
+                info!(
+                    "externalCommit: updated group_id for convo {}",
+                    crate::crypto::redact_for_log(&convo_id)
+                );
             }
 
             // ── Store or invalidate GroupInfo ─────────────────────────
@@ -1011,10 +1039,7 @@ pub async fn commit_group_change(
 
             // ── Emit treeChanged event so other clients detect divergence ──
             if let Some(ref tag_b64) = ec_conf_tag_b64 {
-                let tree_cursor = sse_state
-                    .cursor_gen
-                    .next(&convo_id, "treeChanged")
-                    .await;
+                let tree_cursor = sse_state.cursor_gen.next(&convo_id, "treeChanged").await;
                 let tree_event = StreamEvent::TreeChanged {
                     cursor: tree_cursor.clone(),
                     convo_id: convo_id.clone(),
@@ -1527,7 +1552,7 @@ pub async fn commit_group_change(
             })
             .into_response())
         }
-        "removeMember" => {
+        "removeMember" | "removeMembers" => {
             let convo_id = input.convo_id.to_string();
             info!("v2.commitGroupChange: removeMember for convo");
 

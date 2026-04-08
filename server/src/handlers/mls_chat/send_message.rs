@@ -261,7 +261,7 @@ async fn handle_persistent(
         return Ok((
             StatusCode::CONFLICT,
             axum::Json(serde_json::json!({
-                "error": "TreeStateDiverged",
+                "error": "EpochMismatch",
                 "message": format!(
                     "Client epoch {} is behind server epoch {}. Sync required.",
                     client_epoch, server_epoch
@@ -684,10 +684,7 @@ async fn handle_reaction(
     // TODO: Persist reaction to DB (INSERT or DELETE from reactions table)
     // For now, just emit the SSE event for ephemeral delivery
 
-    let cursor = sse_state
-        .cursor_gen
-        .next(&convo_id, "reactionEvent")
-        .await;
+    let cursor = sse_state.cursor_gen.next(&convo_id, "reactionEvent").await;
     let event = StreamEvent::ReactionEvent {
         cursor: cursor.clone(),
         convo_id: convo_id.clone(),
