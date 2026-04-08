@@ -46,10 +46,10 @@ pub mod submit_commit_state {
     pub trait State: sealed::Sealed {
         type Epoch;
         type ConvoId;
-        type SequencerTerm;
-        type SenderDsDid;
         type CommitData;
+        type SenderDsDid;
         type ProposedEpoch;
+        type SequencerTerm;
     }
     /// Empty state - all required fields are unset
     pub struct Empty(());
@@ -57,10 +57,10 @@ pub mod submit_commit_state {
     impl State for Empty {
         type Epoch = Unset;
         type ConvoId = Unset;
-        type SequencerTerm = Unset;
-        type SenderDsDid = Unset;
         type CommitData = Unset;
+        type SenderDsDid = Unset;
         type ProposedEpoch = Unset;
+        type SequencerTerm = Unset;
     }
     ///State transition - sets the `epoch` field to Set
     pub struct SetEpoch<S: State = Empty>(PhantomData<fn() -> S>);
@@ -68,10 +68,10 @@ pub mod submit_commit_state {
     impl<S: State> State for SetEpoch<S> {
         type Epoch = Set<members::epoch>;
         type ConvoId = S::ConvoId;
-        type SequencerTerm = S::SequencerTerm;
-        type SenderDsDid = S::SenderDsDid;
         type CommitData = S::CommitData;
+        type SenderDsDid = S::SenderDsDid;
         type ProposedEpoch = S::ProposedEpoch;
+        type SequencerTerm = S::SequencerTerm;
     }
     ///State transition - sets the `convo_id` field to Set
     pub struct SetConvoId<S: State = Empty>(PhantomData<fn() -> S>);
@@ -79,32 +79,10 @@ pub mod submit_commit_state {
     impl<S: State> State for SetConvoId<S> {
         type Epoch = S::Epoch;
         type ConvoId = Set<members::convo_id>;
-        type SequencerTerm = S::SequencerTerm;
+        type CommitData = S::CommitData;
         type SenderDsDid = S::SenderDsDid;
-        type CommitData = S::CommitData;
         type ProposedEpoch = S::ProposedEpoch;
-    }
-    ///State transition - sets the `sequencer_term` field to Set
-    pub struct SetSequencerTerm<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetSequencerTerm<S> {}
-    impl<S: State> State for SetSequencerTerm<S> {
-        type Epoch = S::Epoch;
-        type ConvoId = S::ConvoId;
-        type SequencerTerm = Set<members::sequencer_term>;
-        type SenderDsDid = S::SenderDsDid;
-        type CommitData = S::CommitData;
-        type ProposedEpoch = S::ProposedEpoch;
-    }
-    ///State transition - sets the `sender_ds_did` field to Set
-    pub struct SetSenderDsDid<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetSenderDsDid<S> {}
-    impl<S: State> State for SetSenderDsDid<S> {
-        type Epoch = S::Epoch;
-        type ConvoId = S::ConvoId;
         type SequencerTerm = S::SequencerTerm;
-        type SenderDsDid = Set<members::sender_ds_did>;
-        type CommitData = S::CommitData;
-        type ProposedEpoch = S::ProposedEpoch;
     }
     ///State transition - sets the `commit_data` field to Set
     pub struct SetCommitData<S: State = Empty>(PhantomData<fn() -> S>);
@@ -112,10 +90,21 @@ pub mod submit_commit_state {
     impl<S: State> State for SetCommitData<S> {
         type Epoch = S::Epoch;
         type ConvoId = S::ConvoId;
-        type SequencerTerm = S::SequencerTerm;
-        type SenderDsDid = S::SenderDsDid;
         type CommitData = Set<members::commit_data>;
+        type SenderDsDid = S::SenderDsDid;
         type ProposedEpoch = S::ProposedEpoch;
+        type SequencerTerm = S::SequencerTerm;
+    }
+    ///State transition - sets the `sender_ds_did` field to Set
+    pub struct SetSenderDsDid<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetSenderDsDid<S> {}
+    impl<S: State> State for SetSenderDsDid<S> {
+        type Epoch = S::Epoch;
+        type ConvoId = S::ConvoId;
+        type CommitData = S::CommitData;
+        type SenderDsDid = Set<members::sender_ds_did>;
+        type ProposedEpoch = S::ProposedEpoch;
+        type SequencerTerm = S::SequencerTerm;
     }
     ///State transition - sets the `proposed_epoch` field to Set
     pub struct SetProposedEpoch<S: State = Empty>(PhantomData<fn() -> S>);
@@ -123,10 +112,21 @@ pub mod submit_commit_state {
     impl<S: State> State for SetProposedEpoch<S> {
         type Epoch = S::Epoch;
         type ConvoId = S::ConvoId;
-        type SequencerTerm = S::SequencerTerm;
-        type SenderDsDid = S::SenderDsDid;
         type CommitData = S::CommitData;
+        type SenderDsDid = S::SenderDsDid;
         type ProposedEpoch = Set<members::proposed_epoch>;
+        type SequencerTerm = S::SequencerTerm;
+    }
+    ///State transition - sets the `sequencer_term` field to Set
+    pub struct SetSequencerTerm<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetSequencerTerm<S> {}
+    impl<S: State> State for SetSequencerTerm<S> {
+        type Epoch = S::Epoch;
+        type ConvoId = S::ConvoId;
+        type CommitData = S::CommitData;
+        type SenderDsDid = S::SenderDsDid;
+        type ProposedEpoch = S::ProposedEpoch;
+        type SequencerTerm = Set<members::sequencer_term>;
     }
     /// Marker types for field names
     #[allow(non_camel_case_types)]
@@ -135,14 +135,14 @@ pub mod submit_commit_state {
         pub struct epoch(());
         ///Marker type for the `convo_id` field
         pub struct convo_id(());
-        ///Marker type for the `sequencer_term` field
-        pub struct sequencer_term(());
-        ///Marker type for the `sender_ds_did` field
-        pub struct sender_ds_did(());
         ///Marker type for the `commit_data` field
         pub struct commit_data(());
+        ///Marker type for the `sender_ds_did` field
+        pub struct sender_ds_did(());
         ///Marker type for the `proposed_epoch` field
         pub struct proposed_epoch(());
+        ///Marker type for the `sequencer_term` field
+        pub struct sequencer_term(());
     }
 }
 
@@ -297,10 +297,10 @@ where
     S: submit_commit_state::State,
     S::Epoch: submit_commit_state::IsSet,
     S::ConvoId: submit_commit_state::IsSet,
-    S::SequencerTerm: submit_commit_state::IsSet,
-    S::SenderDsDid: submit_commit_state::IsSet,
     S::CommitData: submit_commit_state::IsSet,
+    S::SenderDsDid: submit_commit_state::IsSet,
     S::ProposedEpoch: submit_commit_state::IsSet,
+    S::SequencerTerm: submit_commit_state::IsSet,
 {
     /// Build the final struct
     pub fn build(self) -> SubmitCommit<'a> {

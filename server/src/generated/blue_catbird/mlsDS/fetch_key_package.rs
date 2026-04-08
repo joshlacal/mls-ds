@@ -32,37 +32,37 @@ pub mod fetch_key_package_state {
     }
     /// State trait tracking which required fields have been set
     pub trait State: sealed::Sealed {
-        type ConvoId;
         type RecipientDid;
+        type ConvoId;
     }
     /// Empty state - all required fields are unset
     pub struct Empty(());
     impl sealed::Sealed for Empty {}
     impl State for Empty {
-        type ConvoId = Unset;
         type RecipientDid = Unset;
-    }
-    ///State transition - sets the `convo_id` field to Set
-    pub struct SetConvoId<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetConvoId<S> {}
-    impl<S: State> State for SetConvoId<S> {
-        type ConvoId = Set<members::convo_id>;
-        type RecipientDid = S::RecipientDid;
+        type ConvoId = Unset;
     }
     ///State transition - sets the `recipient_did` field to Set
     pub struct SetRecipientDid<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetRecipientDid<S> {}
     impl<S: State> State for SetRecipientDid<S> {
-        type ConvoId = S::ConvoId;
         type RecipientDid = Set<members::recipient_did>;
+        type ConvoId = S::ConvoId;
+    }
+    ///State transition - sets the `convo_id` field to Set
+    pub struct SetConvoId<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetConvoId<S> {}
+    impl<S: State> State for SetConvoId<S> {
+        type RecipientDid = S::RecipientDid;
+        type ConvoId = Set<members::convo_id>;
     }
     /// Marker types for field names
     #[allow(non_camel_case_types)]
     pub mod members {
-        ///Marker type for the `convo_id` field
-        pub struct convo_id(());
         ///Marker type for the `recipient_did` field
         pub struct recipient_did(());
+        ///Marker type for the `convo_id` field
+        pub struct convo_id(());
     }
 }
 
@@ -135,8 +135,8 @@ where
 impl<'a, S> FetchKeyPackageBuilder<'a, S>
 where
     S: fetch_key_package_state::State,
-    S::ConvoId: fetch_key_package_state::IsSet,
     S::RecipientDid: fetch_key_package_state::IsSet,
+    S::ConvoId: fetch_key_package_state::IsSet,
 {
     /// Build the final struct
     pub fn build(self) -> FetchKeyPackage<'a> {
@@ -155,14 +155,13 @@ where
     Clone,
     PartialEq,
     Eq,
-    jacquard_derive::IntoStatic,
-    Default
+    jacquard_derive::IntoStatic
 )]
 #[serde(rename_all = "camelCase")]
 pub struct FetchKeyPackageOutput<'a> {
-    /// Base64-encoded MLS key package
-    #[serde(borrow)]
-    pub key_package: jacquard_common::CowStr<'a>,
+    /// MLS key package
+    #[serde(with = "jacquard_common::serde_bytes_helper")]
+    pub key_package: bytes::Bytes,
     /// Hash of the key package
     #[serde(borrow)]
     pub key_package_hash: jacquard_common::CowStr<'a>,

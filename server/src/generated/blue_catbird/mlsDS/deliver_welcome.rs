@@ -48,10 +48,10 @@ pub mod deliver_welcome_state {
     pub trait State: sealed::Sealed {
         type InitialEpoch;
         type SenderDsDid;
-        type RecipientDid;
-        type KeyPackageHash;
         type ConvoId;
         type WelcomeData;
+        type RecipientDid;
+        type KeyPackageHash;
     }
     /// Empty state - all required fields are unset
     pub struct Empty(());
@@ -59,10 +59,10 @@ pub mod deliver_welcome_state {
     impl State for Empty {
         type InitialEpoch = Unset;
         type SenderDsDid = Unset;
-        type RecipientDid = Unset;
-        type KeyPackageHash = Unset;
         type ConvoId = Unset;
         type WelcomeData = Unset;
+        type RecipientDid = Unset;
+        type KeyPackageHash = Unset;
     }
     ///State transition - sets the `initial_epoch` field to Set
     pub struct SetInitialEpoch<S: State = Empty>(PhantomData<fn() -> S>);
@@ -70,10 +70,10 @@ pub mod deliver_welcome_state {
     impl<S: State> State for SetInitialEpoch<S> {
         type InitialEpoch = Set<members::initial_epoch>;
         type SenderDsDid = S::SenderDsDid;
-        type RecipientDid = S::RecipientDid;
-        type KeyPackageHash = S::KeyPackageHash;
         type ConvoId = S::ConvoId;
         type WelcomeData = S::WelcomeData;
+        type RecipientDid = S::RecipientDid;
+        type KeyPackageHash = S::KeyPackageHash;
     }
     ///State transition - sets the `sender_ds_did` field to Set
     pub struct SetSenderDsDid<S: State = Empty>(PhantomData<fn() -> S>);
@@ -81,32 +81,10 @@ pub mod deliver_welcome_state {
     impl<S: State> State for SetSenderDsDid<S> {
         type InitialEpoch = S::InitialEpoch;
         type SenderDsDid = Set<members::sender_ds_did>;
+        type ConvoId = S::ConvoId;
+        type WelcomeData = S::WelcomeData;
         type RecipientDid = S::RecipientDid;
         type KeyPackageHash = S::KeyPackageHash;
-        type ConvoId = S::ConvoId;
-        type WelcomeData = S::WelcomeData;
-    }
-    ///State transition - sets the `recipient_did` field to Set
-    pub struct SetRecipientDid<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetRecipientDid<S> {}
-    impl<S: State> State for SetRecipientDid<S> {
-        type InitialEpoch = S::InitialEpoch;
-        type SenderDsDid = S::SenderDsDid;
-        type RecipientDid = Set<members::recipient_did>;
-        type KeyPackageHash = S::KeyPackageHash;
-        type ConvoId = S::ConvoId;
-        type WelcomeData = S::WelcomeData;
-    }
-    ///State transition - sets the `key_package_hash` field to Set
-    pub struct SetKeyPackageHash<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetKeyPackageHash<S> {}
-    impl<S: State> State for SetKeyPackageHash<S> {
-        type InitialEpoch = S::InitialEpoch;
-        type SenderDsDid = S::SenderDsDid;
-        type RecipientDid = S::RecipientDid;
-        type KeyPackageHash = Set<members::key_package_hash>;
-        type ConvoId = S::ConvoId;
-        type WelcomeData = S::WelcomeData;
     }
     ///State transition - sets the `convo_id` field to Set
     pub struct SetConvoId<S: State = Empty>(PhantomData<fn() -> S>);
@@ -114,10 +92,10 @@ pub mod deliver_welcome_state {
     impl<S: State> State for SetConvoId<S> {
         type InitialEpoch = S::InitialEpoch;
         type SenderDsDid = S::SenderDsDid;
-        type RecipientDid = S::RecipientDid;
-        type KeyPackageHash = S::KeyPackageHash;
         type ConvoId = Set<members::convo_id>;
         type WelcomeData = S::WelcomeData;
+        type RecipientDid = S::RecipientDid;
+        type KeyPackageHash = S::KeyPackageHash;
     }
     ///State transition - sets the `welcome_data` field to Set
     pub struct SetWelcomeData<S: State = Empty>(PhantomData<fn() -> S>);
@@ -125,10 +103,32 @@ pub mod deliver_welcome_state {
     impl<S: State> State for SetWelcomeData<S> {
         type InitialEpoch = S::InitialEpoch;
         type SenderDsDid = S::SenderDsDid;
-        type RecipientDid = S::RecipientDid;
-        type KeyPackageHash = S::KeyPackageHash;
         type ConvoId = S::ConvoId;
         type WelcomeData = Set<members::welcome_data>;
+        type RecipientDid = S::RecipientDid;
+        type KeyPackageHash = S::KeyPackageHash;
+    }
+    ///State transition - sets the `recipient_did` field to Set
+    pub struct SetRecipientDid<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetRecipientDid<S> {}
+    impl<S: State> State for SetRecipientDid<S> {
+        type InitialEpoch = S::InitialEpoch;
+        type SenderDsDid = S::SenderDsDid;
+        type ConvoId = S::ConvoId;
+        type WelcomeData = S::WelcomeData;
+        type RecipientDid = Set<members::recipient_did>;
+        type KeyPackageHash = S::KeyPackageHash;
+    }
+    ///State transition - sets the `key_package_hash` field to Set
+    pub struct SetKeyPackageHash<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetKeyPackageHash<S> {}
+    impl<S: State> State for SetKeyPackageHash<S> {
+        type InitialEpoch = S::InitialEpoch;
+        type SenderDsDid = S::SenderDsDid;
+        type ConvoId = S::ConvoId;
+        type WelcomeData = S::WelcomeData;
+        type RecipientDid = S::RecipientDid;
+        type KeyPackageHash = Set<members::key_package_hash>;
     }
     /// Marker types for field names
     #[allow(non_camel_case_types)]
@@ -137,14 +137,14 @@ pub mod deliver_welcome_state {
         pub struct initial_epoch(());
         ///Marker type for the `sender_ds_did` field
         pub struct sender_ds_did(());
-        ///Marker type for the `recipient_did` field
-        pub struct recipient_did(());
-        ///Marker type for the `key_package_hash` field
-        pub struct key_package_hash(());
         ///Marker type for the `convo_id` field
         pub struct convo_id(());
         ///Marker type for the `welcome_data` field
         pub struct welcome_data(());
+        ///Marker type for the `recipient_did` field
+        pub struct recipient_did(());
+        ///Marker type for the `key_package_hash` field
+        pub struct key_package_hash(());
     }
 }
 
@@ -299,10 +299,10 @@ where
     S: deliver_welcome_state::State,
     S::InitialEpoch: deliver_welcome_state::IsSet,
     S::SenderDsDid: deliver_welcome_state::IsSet,
-    S::RecipientDid: deliver_welcome_state::IsSet,
-    S::KeyPackageHash: deliver_welcome_state::IsSet,
     S::ConvoId: deliver_welcome_state::IsSet,
     S::WelcomeData: deliver_welcome_state::IsSet,
+    S::RecipientDid: deliver_welcome_state::IsSet,
+    S::KeyPackageHash: deliver_welcome_state::IsSet,
 {
     /// Build the final struct
     pub fn build(self) -> DeliverWelcome<'a> {

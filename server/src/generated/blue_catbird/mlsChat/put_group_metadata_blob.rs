@@ -32,37 +32,37 @@ pub mod put_group_metadata_blob_params_state {
     }
     /// State trait tracking which required fields have been set
     pub trait State: sealed::Sealed {
-        type GroupId;
         type BlobLocator;
+        type GroupId;
     }
     /// Empty state - all required fields are unset
     pub struct Empty(());
     impl sealed::Sealed for Empty {}
     impl State for Empty {
-        type GroupId = Unset;
         type BlobLocator = Unset;
-    }
-    ///State transition - sets the `group_id` field to Set
-    pub struct SetGroupId<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetGroupId<S> {}
-    impl<S: State> State for SetGroupId<S> {
-        type GroupId = Set<members::group_id>;
-        type BlobLocator = S::BlobLocator;
+        type GroupId = Unset;
     }
     ///State transition - sets the `blob_locator` field to Set
     pub struct SetBlobLocator<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetBlobLocator<S> {}
     impl<S: State> State for SetBlobLocator<S> {
-        type GroupId = S::GroupId;
         type BlobLocator = Set<members::blob_locator>;
+        type GroupId = S::GroupId;
+    }
+    ///State transition - sets the `group_id` field to Set
+    pub struct SetGroupId<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetGroupId<S> {}
+    impl<S: State> State for SetGroupId<S> {
+        type BlobLocator = S::BlobLocator;
+        type GroupId = Set<members::group_id>;
     }
     /// Marker types for field names
     #[allow(non_camel_case_types)]
     pub mod members {
-        ///Marker type for the `group_id` field
-        pub struct group_id(());
         ///Marker type for the `blob_locator` field
         pub struct blob_locator(());
+        ///Marker type for the `group_id` field
+        pub struct group_id(());
     }
 }
 
@@ -149,8 +149,8 @@ where
 impl<'a, S> PutGroupMetadataBlobParamsBuilder<'a, S>
 where
     S: put_group_metadata_blob_params_state::State,
-    S::GroupId: put_group_metadata_blob_params_state::IsSet,
     S::BlobLocator: put_group_metadata_blob_params_state::IsSet,
+    S::GroupId: put_group_metadata_blob_params_state::IsSet,
 {
     /// Build the final struct
     pub fn build(self) -> PutGroupMetadataBlobParams<'a> {

@@ -4,7 +4,6 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use base64::Engine;
 use chrono::{Duration, Utc};
 use jacquard_axum::ExtractXrpc;
 use std::sync::Arc;
@@ -384,14 +383,7 @@ async fn handle_register(
     // Store key packages via the shared db helper (handles OpenMLS parsing, hash computation, credential validation)
     let mut stored_count = 0u64;
     for (idx, kp) in input.key_packages.iter().enumerate() {
-        let key_data =
-            match base64::engine::general_purpose::STANDARD.decode(kp.key_package.as_ref()) {
-                Ok(data) => data,
-                Err(e) => {
-                    warn!("Invalid base64 in key package {}: {}", idx, e);
-                    continue;
-                }
-            };
+        let key_data = kp.key_package.to_vec();
         if key_data.is_empty() {
             warn!("Empty key package at index {}", idx);
             continue;

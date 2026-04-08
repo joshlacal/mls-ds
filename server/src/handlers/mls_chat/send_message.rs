@@ -205,17 +205,14 @@ async fn handle_persistent(
     })?;
 
     // --- Validate confirmation tag (if client sent one) ---
-    if let Some(ref client_tag_b64) = input.confirmation_tag {
+    if let Some(ref client_tag) = input.confirmation_tag {
         if let Some(ref server_tag) = stored_confirmation_tag {
-            use base64::Engine;
-            let client_tag = base64::engine::general_purpose::STANDARD
-                .decode(client_tag_b64.as_bytes())
-                .unwrap_or_default();
-            if client_tag != *server_tag {
+            if client_tag.as_ref() != server_tag.as_slice() {
                 warn!(
                     convo_id = %crate::crypto::redact_for_log(&convo_id),
                     "TREE DIVERGED — client confirmation_tag does not match server canonical tree"
                 );
+                use base64::Engine;
                 let server_tag_b64 = base64::engine::general_purpose::STANDARD.encode(server_tag);
                 return Ok((
                     StatusCode::CONFLICT,

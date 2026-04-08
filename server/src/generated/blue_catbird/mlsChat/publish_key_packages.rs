@@ -34,37 +34,37 @@ pub mod batch_error_state {
     }
     /// State trait tracking which required fields have been set
     pub trait State: sealed::Sealed {
-        type Index;
         type Error;
+        type Index;
     }
     /// Empty state - all required fields are unset
     pub struct Empty(());
     impl sealed::Sealed for Empty {}
     impl State for Empty {
-        type Index = Unset;
         type Error = Unset;
-    }
-    ///State transition - sets the `index` field to Set
-    pub struct SetIndex<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetIndex<S> {}
-    impl<S: State> State for SetIndex<S> {
-        type Index = Set<members::index>;
-        type Error = S::Error;
+        type Index = Unset;
     }
     ///State transition - sets the `error` field to Set
     pub struct SetError<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetError<S> {}
     impl<S: State> State for SetError<S> {
-        type Index = S::Index;
         type Error = Set<members::error>;
+        type Index = S::Index;
+    }
+    ///State transition - sets the `index` field to Set
+    pub struct SetIndex<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetIndex<S> {}
+    impl<S: State> State for SetIndex<S> {
+        type Error = S::Error;
+        type Index = Set<members::index>;
     }
     /// Marker types for field names
     #[allow(non_camel_case_types)]
     pub mod members {
-        ///Marker type for the `index` field
-        pub struct index(());
         ///Marker type for the `error` field
         pub struct error(());
+        ///Marker type for the `index` field
+        pub struct index(());
     }
 }
 
@@ -137,8 +137,8 @@ where
 impl<'a, S> BatchErrorBuilder<'a, S>
 where
     S: batch_error_state::State,
-    S::Index: batch_error_state::IsSet,
     S::Error: batch_error_state::IsSet,
+    S::Index: batch_error_state::IsSet,
 {
     /// Build the final struct
     pub fn build(self) -> BatchError<'a> {
@@ -285,21 +285,10 @@ fn lexicon_doc_blue_catbird_mlsChat_publishKeyPackages() -> ::jacquard_lexicon::
                             ::jacquard_common::smol_str::SmolStr::new_static(
                                 "keyPackage",
                             ),
-                            ::jacquard_lexicon::lexicon::LexObjectProperty::String(::jacquard_lexicon::lexicon::LexString {
-                                description: Some(
-                                    ::jacquard_common::CowStr::new_static(
-                                        "Base64-encoded MLS key package",
-                                    ),
-                                ),
-                                format: None,
-                                default: None,
+                            ::jacquard_lexicon::lexicon::LexObjectProperty::Bytes(::jacquard_lexicon::lexicon::LexBytes {
+                                description: None,
+                                max_length: None,
                                 min_length: None,
-                                max_length: Some(65536usize),
-                                min_graphemes: None,
-                                max_graphemes: None,
-                                r#enum: None,
-                                r#const: None,
-                                known_values: None,
                             }),
                         );
                         map
@@ -600,6 +589,32 @@ fn lexicon_doc_blue_catbird_mlsChat_publishKeyPackages() -> ::jacquard_lexicon::
                         );
                         map.insert(
                             ::jacquard_common::smol_str::SmolStr::new_static(
+                                "orphanedHashes",
+                            ),
+                            ::jacquard_lexicon::lexicon::LexObjectProperty::Array(::jacquard_lexicon::lexicon::LexArray {
+                                description: Some(
+                                    ::jacquard_common::CowStr::new_static(
+                                        "SHA256 hex hashes of orphaned key packages that were deleted during sync",
+                                    ),
+                                ),
+                                items: ::jacquard_lexicon::lexicon::LexArrayItem::String(::jacquard_lexicon::lexicon::LexString {
+                                    description: None,
+                                    format: None,
+                                    default: None,
+                                    min_length: None,
+                                    max_length: None,
+                                    min_graphemes: None,
+                                    max_graphemes: None,
+                                    r#enum: None,
+                                    r#const: None,
+                                    known_values: None,
+                                }),
+                                min_length: None,
+                                max_length: None,
+                            }),
+                        );
+                        map.insert(
+                            ::jacquard_common::smol_str::SmolStr::new_static(
                                 "remainingAvailable",
                             ),
                             ::jacquard_lexicon::lexicon::LexObjectProperty::Integer(::jacquard_lexicon::lexicon::LexInteger {
@@ -692,9 +707,9 @@ pub struct KeyPackageItem<'a> {
     pub cipher_suite: jacquard_common::CowStr<'a>,
     /// Expiration timestamp (required, max 90 days from now)
     pub expires: jacquard_common::types::string::Datetime,
-    /// Base64-encoded MLS key package
-    #[serde(borrow)]
-    pub key_package: jacquard_common::CowStr<'a>,
+    /// MLS key package
+    #[serde(with = "jacquard_common::serde_bytes_helper")]
+    pub key_package: bytes::Bytes,
 }
 
 pub mod key_package_item_state {
@@ -707,51 +722,51 @@ pub mod key_package_item_state {
     }
     /// State trait tracking which required fields have been set
     pub trait State: sealed::Sealed {
-        type KeyPackage;
-        type CipherSuite;
         type Expires;
+        type CipherSuite;
+        type KeyPackage;
     }
     /// Empty state - all required fields are unset
     pub struct Empty(());
     impl sealed::Sealed for Empty {}
     impl State for Empty {
-        type KeyPackage = Unset;
-        type CipherSuite = Unset;
         type Expires = Unset;
-    }
-    ///State transition - sets the `key_package` field to Set
-    pub struct SetKeyPackage<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetKeyPackage<S> {}
-    impl<S: State> State for SetKeyPackage<S> {
-        type KeyPackage = Set<members::key_package>;
-        type CipherSuite = S::CipherSuite;
-        type Expires = S::Expires;
-    }
-    ///State transition - sets the `cipher_suite` field to Set
-    pub struct SetCipherSuite<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetCipherSuite<S> {}
-    impl<S: State> State for SetCipherSuite<S> {
-        type KeyPackage = S::KeyPackage;
-        type CipherSuite = Set<members::cipher_suite>;
-        type Expires = S::Expires;
+        type CipherSuite = Unset;
+        type KeyPackage = Unset;
     }
     ///State transition - sets the `expires` field to Set
     pub struct SetExpires<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetExpires<S> {}
     impl<S: State> State for SetExpires<S> {
-        type KeyPackage = S::KeyPackage;
-        type CipherSuite = S::CipherSuite;
         type Expires = Set<members::expires>;
+        type CipherSuite = S::CipherSuite;
+        type KeyPackage = S::KeyPackage;
+    }
+    ///State transition - sets the `cipher_suite` field to Set
+    pub struct SetCipherSuite<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetCipherSuite<S> {}
+    impl<S: State> State for SetCipherSuite<S> {
+        type Expires = S::Expires;
+        type CipherSuite = Set<members::cipher_suite>;
+        type KeyPackage = S::KeyPackage;
+    }
+    ///State transition - sets the `key_package` field to Set
+    pub struct SetKeyPackage<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetKeyPackage<S> {}
+    impl<S: State> State for SetKeyPackage<S> {
+        type Expires = S::Expires;
+        type CipherSuite = S::CipherSuite;
+        type KeyPackage = Set<members::key_package>;
     }
     /// Marker types for field names
     #[allow(non_camel_case_types)]
     pub mod members {
-        ///Marker type for the `key_package` field
-        pub struct key_package(());
-        ///Marker type for the `cipher_suite` field
-        pub struct cipher_suite(());
         ///Marker type for the `expires` field
         pub struct expires(());
+        ///Marker type for the `cipher_suite` field
+        pub struct cipher_suite(());
+        ///Marker type for the `key_package` field
+        pub struct key_package(());
     }
 }
 
@@ -761,7 +776,7 @@ pub struct KeyPackageItemBuilder<'a, S: key_package_item_state::State> {
     __unsafe_private_named: (
         ::core::option::Option<jacquard_common::CowStr<'a>>,
         ::core::option::Option<jacquard_common::types::string::Datetime>,
-        ::core::option::Option<jacquard_common::CowStr<'a>>,
+        ::core::option::Option<bytes::Bytes>,
     ),
     _phantom: ::core::marker::PhantomData<&'a ()>,
 }
@@ -830,7 +845,7 @@ where
     /// Set the `keyPackage` field (required)
     pub fn key_package(
         mut self,
-        value: impl Into<jacquard_common::CowStr<'a>>,
+        value: impl Into<bytes::Bytes>,
     ) -> KeyPackageItemBuilder<'a, key_package_item_state::SetKeyPackage<S>> {
         self.__unsafe_private_named.2 = ::core::option::Option::Some(value.into());
         KeyPackageItemBuilder {
@@ -844,9 +859,9 @@ where
 impl<'a, S> KeyPackageItemBuilder<'a, S>
 where
     S: key_package_item_state::State,
-    S::KeyPackage: key_package_item_state::IsSet,
-    S::CipherSuite: key_package_item_state::IsSet,
     S::Expires: key_package_item_state::IsSet,
+    S::CipherSuite: key_package_item_state::IsSet,
+    S::KeyPackage: key_package_item_state::IsSet,
 {
     /// Build the final struct
     pub fn build(self) -> KeyPackageItem<'a> {
@@ -887,19 +902,6 @@ impl<'a> ::jacquard_lexicon::schema::LexiconSchema for KeyPackageItem<'a> {
     fn validate(
         &self,
     ) -> ::std::result::Result<(), ::jacquard_lexicon::validation::ConstraintError> {
-        {
-            let value = &self.key_package;
-            #[allow(unused_comparisons)]
-            if <str>::len(value.as_ref()) > 65536usize {
-                return Err(::jacquard_lexicon::validation::ConstraintError::MaxLength {
-                    path: ::jacquard_lexicon::validation::ValidationPath::from_field(
-                        "key_package",
-                    ),
-                    max: 65536usize,
-                    actual: <str>::len(value.as_ref()),
-                });
-            }
-        }
         Ok(())
     }
 }
@@ -935,50 +937,50 @@ pub mod key_package_stats_state {
     /// State trait tracking which required fields have been set
     pub trait State: sealed::Sealed {
         type Available;
-        type Published;
         type Expired;
+        type Published;
     }
     /// Empty state - all required fields are unset
     pub struct Empty(());
     impl sealed::Sealed for Empty {}
     impl State for Empty {
         type Available = Unset;
-        type Published = Unset;
         type Expired = Unset;
+        type Published = Unset;
     }
     ///State transition - sets the `available` field to Set
     pub struct SetAvailable<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetAvailable<S> {}
     impl<S: State> State for SetAvailable<S> {
         type Available = Set<members::available>;
+        type Expired = S::Expired;
         type Published = S::Published;
-        type Expired = S::Expired;
-    }
-    ///State transition - sets the `published` field to Set
-    pub struct SetPublished<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetPublished<S> {}
-    impl<S: State> State for SetPublished<S> {
-        type Available = S::Available;
-        type Published = Set<members::published>;
-        type Expired = S::Expired;
     }
     ///State transition - sets the `expired` field to Set
     pub struct SetExpired<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetExpired<S> {}
     impl<S: State> State for SetExpired<S> {
         type Available = S::Available;
-        type Published = S::Published;
         type Expired = Set<members::expired>;
+        type Published = S::Published;
+    }
+    ///State transition - sets the `published` field to Set
+    pub struct SetPublished<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetPublished<S> {}
+    impl<S: State> State for SetPublished<S> {
+        type Available = S::Available;
+        type Expired = S::Expired;
+        type Published = Set<members::published>;
     }
     /// Marker types for field names
     #[allow(non_camel_case_types)]
     pub mod members {
         ///Marker type for the `available` field
         pub struct available(());
-        ///Marker type for the `published` field
-        pub struct published(());
         ///Marker type for the `expired` field
         pub struct expired(());
+        ///Marker type for the `published` field
+        pub struct published(());
     }
 }
 
@@ -1072,8 +1074,8 @@ impl<'a, S> KeyPackageStatsBuilder<'a, S>
 where
     S: key_package_stats_state::State,
     S::Available: key_package_stats_state::IsSet,
-    S::Published: key_package_stats_state::IsSet,
     S::Expired: key_package_stats_state::IsSet,
+    S::Published: key_package_stats_state::IsSet,
 {
     /// Build the final struct
     pub fn build(self) -> KeyPackageStats<'a> {
@@ -1604,6 +1606,10 @@ pub struct SyncResult<'a> {
     pub device_id: jacquard_common::CowStr<'a>,
     /// Number of orphaned key packages detected
     pub orphaned_count: i64,
+    /// SHA256 hex hashes of orphaned key packages that were deleted during sync
+    #[serde(skip_serializing_if = "std::option::Option::is_none")]
+    #[serde(borrow)]
+    pub orphaned_hashes: std::option::Option<Vec<jacquard_common::CowStr<'a>>>,
     /// Number of valid key packages remaining after cleanup
     #[serde(skip_serializing_if = "std::option::Option::is_none")]
     pub remaining_available: std::option::Option<i64>,
@@ -1622,67 +1628,67 @@ pub mod sync_result_state {
     }
     /// State trait tracking which required fields have been set
     pub trait State: sealed::Sealed {
-        type ServerHashes;
         type DeletedCount;
-        type DeviceId;
         type OrphanedCount;
+        type ServerHashes;
+        type DeviceId;
     }
     /// Empty state - all required fields are unset
     pub struct Empty(());
     impl sealed::Sealed for Empty {}
     impl State for Empty {
-        type ServerHashes = Unset;
         type DeletedCount = Unset;
-        type DeviceId = Unset;
         type OrphanedCount = Unset;
-    }
-    ///State transition - sets the `server_hashes` field to Set
-    pub struct SetServerHashes<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetServerHashes<S> {}
-    impl<S: State> State for SetServerHashes<S> {
-        type ServerHashes = Set<members::server_hashes>;
-        type DeletedCount = S::DeletedCount;
-        type DeviceId = S::DeviceId;
-        type OrphanedCount = S::OrphanedCount;
+        type ServerHashes = Unset;
+        type DeviceId = Unset;
     }
     ///State transition - sets the `deleted_count` field to Set
     pub struct SetDeletedCount<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetDeletedCount<S> {}
     impl<S: State> State for SetDeletedCount<S> {
-        type ServerHashes = S::ServerHashes;
         type DeletedCount = Set<members::deleted_count>;
-        type DeviceId = S::DeviceId;
         type OrphanedCount = S::OrphanedCount;
-    }
-    ///State transition - sets the `device_id` field to Set
-    pub struct SetDeviceId<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetDeviceId<S> {}
-    impl<S: State> State for SetDeviceId<S> {
         type ServerHashes = S::ServerHashes;
-        type DeletedCount = S::DeletedCount;
-        type DeviceId = Set<members::device_id>;
-        type OrphanedCount = S::OrphanedCount;
+        type DeviceId = S::DeviceId;
     }
     ///State transition - sets the `orphaned_count` field to Set
     pub struct SetOrphanedCount<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetOrphanedCount<S> {}
     impl<S: State> State for SetOrphanedCount<S> {
-        type ServerHashes = S::ServerHashes;
         type DeletedCount = S::DeletedCount;
-        type DeviceId = S::DeviceId;
         type OrphanedCount = Set<members::orphaned_count>;
+        type ServerHashes = S::ServerHashes;
+        type DeviceId = S::DeviceId;
+    }
+    ///State transition - sets the `server_hashes` field to Set
+    pub struct SetServerHashes<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetServerHashes<S> {}
+    impl<S: State> State for SetServerHashes<S> {
+        type DeletedCount = S::DeletedCount;
+        type OrphanedCount = S::OrphanedCount;
+        type ServerHashes = Set<members::server_hashes>;
+        type DeviceId = S::DeviceId;
+    }
+    ///State transition - sets the `device_id` field to Set
+    pub struct SetDeviceId<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetDeviceId<S> {}
+    impl<S: State> State for SetDeviceId<S> {
+        type DeletedCount = S::DeletedCount;
+        type OrphanedCount = S::OrphanedCount;
+        type ServerHashes = S::ServerHashes;
+        type DeviceId = Set<members::device_id>;
     }
     /// Marker types for field names
     #[allow(non_camel_case_types)]
     pub mod members {
-        ///Marker type for the `server_hashes` field
-        pub struct server_hashes(());
         ///Marker type for the `deleted_count` field
         pub struct deleted_count(());
-        ///Marker type for the `device_id` field
-        pub struct device_id(());
         ///Marker type for the `orphaned_count` field
         pub struct orphaned_count(());
+        ///Marker type for the `server_hashes` field
+        pub struct server_hashes(());
+        ///Marker type for the `device_id` field
+        pub struct device_id(());
     }
 }
 
@@ -1693,6 +1699,7 @@ pub struct SyncResultBuilder<'a, S: sync_result_state::State> {
         ::core::option::Option<i64>,
         ::core::option::Option<jacquard_common::CowStr<'a>>,
         ::core::option::Option<i64>,
+        ::core::option::Option<Vec<jacquard_common::CowStr<'a>>>,
         ::core::option::Option<i64>,
         ::core::option::Option<Vec<jacquard_common::CowStr<'a>>>,
     ),
@@ -1711,7 +1718,7 @@ impl<'a> SyncResultBuilder<'a, sync_result_state::Empty> {
     pub fn new() -> Self {
         SyncResultBuilder {
             _phantom_state: ::core::marker::PhantomData,
-            __unsafe_private_named: (None, None, None, None, None),
+            __unsafe_private_named: (None, None, None, None, None, None),
             _phantom: ::core::marker::PhantomData,
         }
     }
@@ -1775,14 +1782,33 @@ where
 }
 
 impl<'a, S: sync_result_state::State> SyncResultBuilder<'a, S> {
+    /// Set the `orphanedHashes` field (optional)
+    pub fn orphaned_hashes(
+        mut self,
+        value: impl Into<Option<Vec<jacquard_common::CowStr<'a>>>>,
+    ) -> Self {
+        self.__unsafe_private_named.3 = value.into();
+        self
+    }
+    /// Set the `orphanedHashes` field to an Option value (optional)
+    pub fn maybe_orphaned_hashes(
+        mut self,
+        value: Option<Vec<jacquard_common::CowStr<'a>>>,
+    ) -> Self {
+        self.__unsafe_private_named.3 = value;
+        self
+    }
+}
+
+impl<'a, S: sync_result_state::State> SyncResultBuilder<'a, S> {
     /// Set the `remainingAvailable` field (optional)
     pub fn remaining_available(mut self, value: impl Into<Option<i64>>) -> Self {
-        self.__unsafe_private_named.3 = value.into();
+        self.__unsafe_private_named.4 = value.into();
         self
     }
     /// Set the `remainingAvailable` field to an Option value (optional)
     pub fn maybe_remaining_available(mut self, value: Option<i64>) -> Self {
-        self.__unsafe_private_named.3 = value;
+        self.__unsafe_private_named.4 = value;
         self
     }
 }
@@ -1797,7 +1823,7 @@ where
         mut self,
         value: impl Into<Vec<jacquard_common::CowStr<'a>>>,
     ) -> SyncResultBuilder<'a, sync_result_state::SetServerHashes<S>> {
-        self.__unsafe_private_named.4 = ::core::option::Option::Some(value.into());
+        self.__unsafe_private_named.5 = ::core::option::Option::Some(value.into());
         SyncResultBuilder {
             _phantom_state: ::core::marker::PhantomData,
             __unsafe_private_named: self.__unsafe_private_named,
@@ -1809,10 +1835,10 @@ where
 impl<'a, S> SyncResultBuilder<'a, S>
 where
     S: sync_result_state::State,
-    S::ServerHashes: sync_result_state::IsSet,
     S::DeletedCount: sync_result_state::IsSet,
-    S::DeviceId: sync_result_state::IsSet,
     S::OrphanedCount: sync_result_state::IsSet,
+    S::ServerHashes: sync_result_state::IsSet,
+    S::DeviceId: sync_result_state::IsSet,
 {
     /// Build the final struct
     pub fn build(self) -> SyncResult<'a> {
@@ -1820,8 +1846,9 @@ where
             deleted_count: self.__unsafe_private_named.0.unwrap(),
             device_id: self.__unsafe_private_named.1.unwrap(),
             orphaned_count: self.__unsafe_private_named.2.unwrap(),
-            remaining_available: self.__unsafe_private_named.3,
-            server_hashes: self.__unsafe_private_named.4.unwrap(),
+            orphaned_hashes: self.__unsafe_private_named.3,
+            remaining_available: self.__unsafe_private_named.4,
+            server_hashes: self.__unsafe_private_named.5.unwrap(),
             extra_data: Default::default(),
         }
     }
@@ -1837,8 +1864,9 @@ where
             deleted_count: self.__unsafe_private_named.0.unwrap(),
             device_id: self.__unsafe_private_named.1.unwrap(),
             orphaned_count: self.__unsafe_private_named.2.unwrap(),
-            remaining_available: self.__unsafe_private_named.3,
-            server_hashes: self.__unsafe_private_named.4.unwrap(),
+            orphaned_hashes: self.__unsafe_private_named.3,
+            remaining_available: self.__unsafe_private_named.4,
+            server_hashes: self.__unsafe_private_named.5.unwrap(),
             extra_data: Some(extra_data),
         }
     }

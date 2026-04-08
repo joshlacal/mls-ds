@@ -206,37 +206,37 @@ pub mod opt_in_status_state {
     }
     /// State trait tracking which required fields have been set
     pub trait State: sealed::Sealed {
-        type OptedIn;
         type Did;
+        type OptedIn;
     }
     /// Empty state - all required fields are unset
     pub struct Empty(());
     impl sealed::Sealed for Empty {}
     impl State for Empty {
-        type OptedIn = Unset;
         type Did = Unset;
-    }
-    ///State transition - sets the `opted_in` field to Set
-    pub struct SetOptedIn<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetOptedIn<S> {}
-    impl<S: State> State for SetOptedIn<S> {
-        type OptedIn = Set<members::opted_in>;
-        type Did = S::Did;
+        type OptedIn = Unset;
     }
     ///State transition - sets the `did` field to Set
     pub struct SetDid<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetDid<S> {}
     impl<S: State> State for SetDid<S> {
-        type OptedIn = S::OptedIn;
         type Did = Set<members::did>;
+        type OptedIn = S::OptedIn;
+    }
+    ///State transition - sets the `opted_in` field to Set
+    pub struct SetOptedIn<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetOptedIn<S> {}
+    impl<S: State> State for SetOptedIn<S> {
+        type Did = S::Did;
+        type OptedIn = Set<members::opted_in>;
     }
     /// Marker types for field names
     #[allow(non_camel_case_types)]
     pub mod members {
-        ///Marker type for the `opted_in` field
-        pub struct opted_in(());
         ///Marker type for the `did` field
         pub struct did(());
+        ///Marker type for the `opted_in` field
+        pub struct opted_in(());
     }
 }
 
@@ -329,8 +329,8 @@ impl<'a, S: opt_in_status_state::State> OptInStatusBuilder<'a, S> {
 impl<'a, S> OptInStatusBuilder<'a, S>
 where
     S: opt_in_status_state::State,
-    S::OptedIn: opt_in_status_state::IsSet,
     S::Did: opt_in_status_state::IsSet,
+    S::OptedIn: opt_in_status_state::IsSet,
 {
     /// Build the final struct
     pub fn build(self) -> OptInStatus<'a> {

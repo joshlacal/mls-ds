@@ -40,8 +40,8 @@
               "description": "Policy settings to update (required for 'updatePolicy' action)"
             },
             "groupInfo": {
-              "type": "string",
-              "description": "Base64-encoded serialized GroupInfo bytes (required for 'updateGroupInfo' action)"
+              "type": "bytes",
+              "description": "Serialized GroupInfo bytes (required for 'updateGroupInfo' action)"
             },
             "epoch": {
               "type": "integer",

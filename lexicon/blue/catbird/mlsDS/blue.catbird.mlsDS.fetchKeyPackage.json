@@ -27,8 +27,8 @@
           "required": ["keyPackage", "keyPackageHash"],
           "properties": {
             "keyPackage": {
-              "type": "string",
-              "description": "Base64-encoded MLS key package"
+              "type": "bytes",
+              "description": "MLS key package"
             },
             "keyPackageHash": {
               "type": "string",

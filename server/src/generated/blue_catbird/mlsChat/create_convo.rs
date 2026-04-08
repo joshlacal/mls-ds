@@ -299,21 +299,10 @@ fn lexicon_doc_blue_catbird_mlsChat_createConvo() -> ::jacquard_lexicon::lexicon
                                         ::jacquard_common::smol_str::SmolStr::new_static(
                                             "welcomeMessage",
                                         ),
-                                        ::jacquard_lexicon::lexicon::LexObjectProperty::String(::jacquard_lexicon::lexicon::LexString {
-                                            description: Some(
-                                                ::jacquard_common::CowStr::new_static(
-                                                    "Base64url-encoded MLS Welcome message for ALL initial members",
-                                                ),
-                                            ),
-                                            format: None,
-                                            default: None,
-                                            min_length: None,
+                                        ::jacquard_lexicon::lexicon::LexObjectProperty::Bytes(::jacquard_lexicon::lexicon::LexBytes {
+                                            description: None,
                                             max_length: None,
-                                            min_graphemes: None,
-                                            max_graphemes: None,
-                                            r#enum: None,
-                                            r#const: None,
-                                            known_values: None,
+                                            min_length: None,
                                         }),
                                     );
                                     map
@@ -631,10 +620,10 @@ pub struct CreateConvo<'a> {
     pub metadata: std::option::Option<
         crate::generated::blue_catbird::mlsChat::create_convo::MetadataInput<'a>,
     >,
-    /// Base64url-encoded MLS Welcome message for ALL initial members
+    /// MLS Welcome message for ALL initial members
     #[serde(skip_serializing_if = "std::option::Option::is_none")]
-    #[serde(borrow)]
-    pub welcome_message: std::option::Option<jacquard_common::CowStr<'a>>,
+    #[serde(default, with = "jacquard_common::opt_serde_bytes_helper")]
+    pub welcome_message: std::option::Option<bytes::Bytes>,
 }
 
 #[jacquard_derive::lexicon]

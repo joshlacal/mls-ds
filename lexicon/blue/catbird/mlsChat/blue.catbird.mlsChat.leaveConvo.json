@@ -22,8 +22,8 @@
               "description": "DID of member to remove (defaults to caller's DID). Admin privileges required to remove others."
             },
             "commit": {
-              "type": "string",
-              "description": "Optional base64url-encoded MLS Commit message for the removal"
+              "type": "bytes",
+              "description": "Optional MLS Commit message for the removal"
             }
           }
         }

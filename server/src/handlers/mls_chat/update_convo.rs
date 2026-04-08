@@ -4,7 +4,6 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use base64::Engine;
 use jacquard_axum::ExtractXrpc;
 use openmls::messages::group_info::VerifiableGroupInfo;
 use openmls::prelude::MlsMessageIn;
@@ -542,8 +541,8 @@ async fn handle_update_group_info(
         crate::crypto::redact_for_log(convo_id)
     );
 
-    let group_info_b64 = match input.group_info.as_ref() {
-        Some(gi) => gi.to_string(),
+    let group_info_bytes = match input.group_info.as_ref() {
+        Some(gi) => gi,
         None => return (StatusCode::BAD_REQUEST, "Missing groupInfo").into_response(),
     };
     let epoch = match input.epoch {
@@ -556,16 +555,7 @@ async fn handle_update_group_info(
         return s.into_response();
     }
 
-    // Decode base64
-    let group_info_bytes = match base64::engine::general_purpose::STANDARD.decode(&group_info_b64) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            error!(convo_id = %convo_id, error = %e, "Invalid base64 in GroupInfo");
-            return (StatusCode::BAD_REQUEST, "Invalid base64 encoding").into_response();
-        }
-    };
-
-    // Validate size bounds
+    // Validate size bounds (bytes arrive already decoded)
     if group_info_bytes.len() < MIN_GROUP_INFO_SIZE {
         error!(size = group_info_bytes.len(), "GroupInfo too small");
         return (StatusCode::BAD_REQUEST, "GroupInfo too small").into_response();
@@ -576,8 +566,9 @@ async fn handle_update_group_info(
     }
 
     // Validate MLS structure
-    let valid = MlsMessageIn::tls_deserialize(&mut group_info_bytes.as_slice()).is_ok()
-        || VerifiableGroupInfo::tls_deserialize(&mut group_info_bytes.as_slice()).is_ok();
+    let gi_slice: &[u8] = group_info_bytes;
+    let valid = MlsMessageIn::tls_deserialize(&mut &*gi_slice).is_ok()
+        || VerifiableGroupInfo::tls_deserialize(&mut &*gi_slice).is_ok();
 
     if !valid {
         error!(convo_id = %convo_id, "Invalid MLS GroupInfo structure");
@@ -602,7 +593,7 @@ async fn handle_update_group_info(
     }
 
     // Store
-    if let Err(e) = store_group_info(pool, convo_id, &group_info_bytes, epoch as i32).await {
+    if let Err(e) = store_group_info(pool, convo_id, gi_slice, epoch as i32).await {
         error!(convo_id = %convo_id, error = %e, "Failed to store GroupInfo");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }

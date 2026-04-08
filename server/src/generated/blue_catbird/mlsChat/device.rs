@@ -37,51 +37,51 @@ pub mod device_state {
     }
     /// State trait tracking which required fields have been set
     pub trait State: sealed::Sealed {
+        type MlsSignaturePublicKey;
         type CreatedAt;
         type Algorithm;
-        type MlsSignaturePublicKey;
     }
     /// Empty state - all required fields are unset
     pub struct Empty(());
     impl sealed::Sealed for Empty {}
     impl State for Empty {
+        type MlsSignaturePublicKey = Unset;
         type CreatedAt = Unset;
         type Algorithm = Unset;
-        type MlsSignaturePublicKey = Unset;
-    }
-    ///State transition - sets the `created_at` field to Set
-    pub struct SetCreatedAt<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetCreatedAt<S> {}
-    impl<S: State> State for SetCreatedAt<S> {
-        type CreatedAt = Set<members::created_at>;
-        type Algorithm = S::Algorithm;
-        type MlsSignaturePublicKey = S::MlsSignaturePublicKey;
-    }
-    ///State transition - sets the `algorithm` field to Set
-    pub struct SetAlgorithm<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetAlgorithm<S> {}
-    impl<S: State> State for SetAlgorithm<S> {
-        type CreatedAt = S::CreatedAt;
-        type Algorithm = Set<members::algorithm>;
-        type MlsSignaturePublicKey = S::MlsSignaturePublicKey;
     }
     ///State transition - sets the `mls_signature_public_key` field to Set
     pub struct SetMlsSignaturePublicKey<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetMlsSignaturePublicKey<S> {}
     impl<S: State> State for SetMlsSignaturePublicKey<S> {
+        type MlsSignaturePublicKey = Set<members::mls_signature_public_key>;
         type CreatedAt = S::CreatedAt;
         type Algorithm = S::Algorithm;
-        type MlsSignaturePublicKey = Set<members::mls_signature_public_key>;
+    }
+    ///State transition - sets the `created_at` field to Set
+    pub struct SetCreatedAt<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetCreatedAt<S> {}
+    impl<S: State> State for SetCreatedAt<S> {
+        type MlsSignaturePublicKey = S::MlsSignaturePublicKey;
+        type CreatedAt = Set<members::created_at>;
+        type Algorithm = S::Algorithm;
+    }
+    ///State transition - sets the `algorithm` field to Set
+    pub struct SetAlgorithm<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetAlgorithm<S> {}
+    impl<S: State> State for SetAlgorithm<S> {
+        type MlsSignaturePublicKey = S::MlsSignaturePublicKey;
+        type CreatedAt = S::CreatedAt;
+        type Algorithm = Set<members::algorithm>;
     }
     /// Marker types for field names
     #[allow(non_camel_case_types)]
     pub mod members {
+        ///Marker type for the `mls_signature_public_key` field
+        pub struct mls_signature_public_key(());
         ///Marker type for the `created_at` field
         pub struct created_at(());
         ///Marker type for the `algorithm` field
         pub struct algorithm(());
-        ///Marker type for the `mls_signature_public_key` field
-        pub struct mls_signature_public_key(());
     }
 }
 
@@ -174,9 +174,9 @@ where
 impl<'a, S> DeviceBuilder<'a, S>
 where
     S: device_state::State,
+    S::MlsSignaturePublicKey: device_state::IsSet,
     S::CreatedAt: device_state::IsSet,
     S::Algorithm: device_state::IsSet,
-    S::MlsSignaturePublicKey: device_state::IsSet,
 {
     /// Build the final struct
     pub fn build(self) -> Device<'a> {

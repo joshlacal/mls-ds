@@ -231,7 +231,7 @@ psql -h localhost -U catbird -d catbird -c "SELECT column_name FROM information_
 ## Systemd Service
 
 The server runs as a systemd service (`catbird-mls-server`). The service file is located at:
-- `/home/ubuntu/mls/server/catbird-mls-server.service`
+- `/home/josh/dev/mls-ds/catbird-mls-server.service`
 
 Key service commands:
 ```bash

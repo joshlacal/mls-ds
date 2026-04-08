@@ -170,12 +170,12 @@ pub async fn commit_group_change(
                 }
             }
 
-            // ── Validate required fields ───────────────────────────────
-            let welcome_b64 = input.welcome.as_ref().ok_or_else(|| {
+            // ── Validate required fields (bytes arrive already decoded) ──
+            let welcome_bytes = input.welcome.as_ref().ok_or_else(|| {
                 warn!("addMembers: missing welcome");
                 bad_request("Missing welcome")
             })?;
-            let commit_b64 = input.commit.as_ref().ok_or_else(|| {
+            let commit_bytes = input.commit.as_ref().ok_or_else(|| {
                 warn!("addMembers: missing commit");
                 bad_request("Missing commit")
             })?;
@@ -183,20 +183,6 @@ pub async fn commit_group_change(
                 warn!("addMembers: missing member_dids");
                 bad_request("Missing memberDids")
             })?;
-
-            // ── Decode welcome & commit ────────────────────────────────
-            let welcome_bytes = base64::engine::general_purpose::STANDARD
-                .decode(welcome_b64.as_bytes())
-                .map_err(|e| {
-                    warn!("addMembers: invalid base64 welcome: {}", e);
-                    bad_request("Invalid base64 welcome")
-                })?;
-            let commit_bytes = base64::engine::general_purpose::STANDARD
-                .decode(commit_b64.as_bytes())
-                .map_err(|e| {
-                    warn!("addMembers: invalid base64 commit: {}", e);
-                    bad_request("Invalid base64 commit")
-                })?;
 
             // ── Verify caller is a member ──────────────────────────────
             let (caller_did, _) = parse_device_did(&auth_user.did).map_err(|e| {
@@ -220,27 +206,22 @@ pub async fn commit_group_change(
 
             // ── Parse MLS epoch from GroupInfo if provided ──────────
             let (add_group_info_bytes, add_mls_epoch) =
-                if let Some(gi_b64) = input.group_info.as_ref() {
-                    let gi_bytes = base64::engine::general_purpose::STANDARD
-                        .decode(gi_b64.as_bytes())
-                        .map_err(|e| {
-                            warn!("addMembers: invalid base64 groupInfo: {}", e);
-                            bad_request("Invalid base64 groupInfo")
-                        })?;
-
+                if let Some(gi_bytes) = input.group_info.as_ref() {
+                    let gi_slice: &[u8] = gi_bytes;
                     let epoch = {
                         use openmls::messages::group_info::VerifiableGroupInfo;
                         use openmls::prelude::{MlsMessageBodyIn, MlsMessageIn};
 
-                        let from_mls_msg = MlsMessageIn::tls_deserialize(&mut gi_bytes.as_slice())
-                            .ok()
-                            .and_then(|msg| match msg.extract() {
-                                MlsMessageBodyIn::GroupInfo(gi) => Some(gi.epoch().as_u64()),
-                                _ => None,
-                            });
+                        let from_mls_msg =
+                            MlsMessageIn::tls_deserialize(&mut &*gi_slice)
+                                .ok()
+                                .and_then(|msg| match msg.extract() {
+                                    MlsMessageBodyIn::GroupInfo(gi) => Some(gi.epoch().as_u64()),
+                                    _ => None,
+                                });
 
                         from_mls_msg.or_else(|| {
-                            VerifiableGroupInfo::tls_deserialize(&mut gi_bytes.as_slice())
+                            VerifiableGroupInfo::tls_deserialize(&mut &*gi_slice)
                                 .ok()
                                 .map(|gi| gi.epoch().as_u64())
                         })
@@ -254,25 +235,19 @@ pub async fn commit_group_change(
                         );
                     }
 
-                    (Some(gi_bytes), epoch)
+                    (Some(gi_bytes.to_vec()), epoch)
                 } else {
                     (None, None)
                 };
 
             // ── Decode client-provided confirmation_tag ──────────
-            let add_confirmation_tag = if let Some(ref tag_b64) = input.confirmation_tag {
-                let tag_bytes = base64::engine::general_purpose::STANDARD
-                    .decode(tag_b64.as_bytes())
-                    .map_err(|e| {
-                        warn!("addMembers: invalid base64 confirmationTag: {}", e);
-                        bad_request("Invalid base64 confirmationTag")
-                    })?;
+            let add_confirmation_tag = if let Some(ref tag_bytes) = input.confirmation_tag {
                 info!(
                     "addMembers: client-provided confirmation_tag ({} bytes) for convo {}",
                     tag_bytes.len(),
                     crate::crypto::redact_for_log(&convo_id)
                 );
-                Some(tag_bytes)
+                Some(tag_bytes.to_vec())
             } else {
                 None
             };
@@ -403,7 +378,7 @@ pub async fn commit_group_change(
             .bind(Option::<&str>::None)
             .bind(new_epoch)
             .bind(seq)
-            .bind(&commit_bytes)
+            .bind(&commit_bytes[..])
             .bind(&now)
             .execute(&mut *tx)
             .await
@@ -428,7 +403,7 @@ pub async fn commit_group_change(
                 .bind(&welcome_id)
                 .bind(&convo_id)
                 .bind(member_did_str)
-                .bind(&welcome_bytes)
+                .bind(&welcome_bytes[..])
                 .bind::<Option<Vec<u8>>>(None)
                 .bind(&now)
                 .execute(&mut *tx)
@@ -626,7 +601,7 @@ pub async fn commit_group_change(
             Ok(Json(CommitGroupChangeOutput {
                 success: true,
                 new_epoch: Some(new_epoch as i64),
-                confirmation_tag: add_conf_tag_b64.map(|s| s.into()),
+                confirmation_tag: add_confirmation_tag.map(bytes::Bytes::from),
                 claimed_addition: None,
                 pending_additions: None,
                 rejoined_at: None,
@@ -702,19 +677,11 @@ pub async fn commit_group_change(
                 }
             }
 
-            // ── Validate required fields ───────────────────────────────
-            let commit_b64 = input.commit.as_ref().ok_or_else(|| {
+            // ── Validate required fields (bytes arrive already decoded) ──
+            let commit_bytes = input.commit.as_ref().ok_or_else(|| {
                 warn!("externalCommit: missing commit");
                 bad_request("Missing commit")
             })?;
-
-            // ── Decode commit ───────────────────────────────────────────
-            let commit_bytes = base64::engine::general_purpose::STANDARD
-                .decode(commit_b64.as_bytes())
-                .map_err(|e| {
-                    warn!("externalCommit: invalid base64 commit: {}", e);
-                    bad_request("Invalid base64 commit")
-                })?;
 
             // ── Verify caller is a current or self-left member (NOT admin-removed) ──
             let (caller_did, _) = parse_device_did(&auth_user.did).map_err(|e| {
@@ -762,65 +729,54 @@ pub async fn commit_group_change(
             }
 
             // ── Parse MLS epoch from GroupInfo if provided ──────────
-            let (group_info_bytes_opt, mls_epoch) = if let Some(gi_b64) = input.group_info.as_ref()
-            {
-                let gi_bytes = base64::engine::general_purpose::STANDARD
-                    .decode(gi_b64.as_bytes())
-                    .map_err(|e| {
-                        warn!("externalCommit: invalid base64 groupInfo: {}", e);
-                        bad_request("Invalid base64 groupInfo")
-                    })?;
+            let (group_info_bytes_opt, mls_epoch) =
+                if let Some(gi_bytes) = input.group_info.as_ref() {
+                    let gi_slice: &[u8] = gi_bytes;
+                    let epoch = {
+                        use openmls::messages::group_info::VerifiableGroupInfo;
+                        use openmls::prelude::{MlsMessageBodyIn, MlsMessageIn};
 
-                let epoch = {
-                    use openmls::messages::group_info::VerifiableGroupInfo;
-                    use openmls::prelude::{MlsMessageBodyIn, MlsMessageIn};
+                        let from_mls_msg =
+                            MlsMessageIn::tls_deserialize(&mut &*gi_slice)
+                                .ok()
+                                .and_then(|msg| match msg.extract() {
+                                    MlsMessageBodyIn::GroupInfo(gi) => Some(gi.epoch().as_u64()),
+                                    _ => None,
+                                });
 
-                    let from_mls_msg = MlsMessageIn::tls_deserialize(&mut gi_bytes.as_slice())
-                        .ok()
-                        .and_then(|msg| match msg.extract() {
-                            MlsMessageBodyIn::GroupInfo(gi) => Some(gi.epoch().as_u64()),
-                            _ => None,
-                        });
+                        from_mls_msg.or_else(|| {
+                            VerifiableGroupInfo::tls_deserialize(&mut &*gi_slice)
+                                .ok()
+                                .map(|gi| gi.epoch().as_u64())
+                        })
+                    };
 
-                    from_mls_msg.or_else(|| {
-                        VerifiableGroupInfo::tls_deserialize(&mut gi_bytes.as_slice())
-                            .ok()
-                            .map(|gi| gi.epoch().as_u64())
-                    })
+                    if let Some(e) = epoch {
+                        info!(
+                            "externalCommit: parsed MLS epoch {} from GroupInfo for convo {}",
+                            e,
+                            crate::crypto::redact_for_log(&convo_id)
+                        );
+                    } else {
+                        warn!(
+                            "externalCommit: could not parse epoch from GroupInfo for convo {}",
+                            crate::crypto::redact_for_log(&convo_id)
+                        );
+                    }
+
+                    (Some(gi_bytes.to_vec()), epoch)
+                } else {
+                    (None, None)
                 };
 
-                if let Some(e) = epoch {
-                    info!(
-                        "externalCommit: parsed MLS epoch {} from GroupInfo for convo {}",
-                        e,
-                        crate::crypto::redact_for_log(&convo_id)
-                    );
-                } else {
-                    warn!(
-                        "externalCommit: could not parse epoch from GroupInfo for convo {}",
-                        crate::crypto::redact_for_log(&convo_id)
-                    );
-                }
-
-                (Some(gi_bytes), epoch)
-            } else {
-                (None, None)
-            };
-
             // ── Decode client-provided confirmation_tag ──────────
-            let ec_confirmation_tag = if let Some(ref tag_b64) = input.confirmation_tag {
-                let tag_bytes = base64::engine::general_purpose::STANDARD
-                    .decode(tag_b64.as_bytes())
-                    .map_err(|e| {
-                        warn!("externalCommit: invalid base64 confirmationTag: {}", e);
-                        bad_request("Invalid base64 confirmationTag")
-                    })?;
+            let ec_confirmation_tag = if let Some(ref tag_bytes) = input.confirmation_tag {
                 info!(
                     "externalCommit: client-provided confirmation_tag ({} bytes) for convo {}",
                     tag_bytes.len(),
                     crate::crypto::redact_for_log(&convo_id)
                 );
-                Some(tag_bytes)
+                Some(tag_bytes.to_vec())
             } else {
                 None
             };
@@ -942,7 +898,7 @@ pub async fn commit_group_change(
             .bind(Option::<&str>::None)
             .bind(new_epoch)
             .bind(seq)
-            .bind(&commit_bytes)
+            .bind(&commit_bytes[..])
             .bind(&now)
             .execute(&mut *tx)
             .await
@@ -1083,7 +1039,7 @@ pub async fn commit_group_change(
             Ok(Json(CommitGroupChangeOutput {
                 success: true,
                 new_epoch: Some(new_epoch as i64),
-                confirmation_tag: ec_conf_tag_b64.map(|s| s.into()),
+                confirmation_tag: ec_confirmation_tag.map(bytes::Bytes::from),
                 claimed_addition: None,
                 pending_additions: None,
                 rejoined_at: None,
@@ -1282,8 +1238,8 @@ pub async fn commit_group_change(
         }
         "updateGroupInfo" => {
             let convo_id = input.convo_id.to_string();
-            let group_info_b64 = match input.group_info.as_ref() {
-                Some(gi) => gi.to_string(),
+            let group_info_bytes = match input.group_info.as_ref() {
+                Some(gi) => gi,
                 None => {
                     error!("updateGroupInfo: missing groupInfo field");
                     return Err(bad_request("Missing groupInfo"));
@@ -1310,21 +1266,14 @@ pub async fn commit_group_change(
                 return Err(forbidden("Not a member of this conversation"));
             }
 
-            // Decode and validate
-            let group_info_bytes = base64::engine::general_purpose::STANDARD
-                .decode(&group_info_b64)
-                .map_err(|e| {
-                    error!("Invalid base64 in GroupInfo: {}", e);
-                    bad_request("Invalid base64 groupInfo")
-                })?;
-
             // Parse GroupInfo to extract the MLS epoch (GroupInfo is public, no secrets exposed)
+            let gi_slice: &[u8] = group_info_bytes;
             let mls_epoch = {
                 use openmls::messages::group_info::VerifiableGroupInfo;
                 use openmls::prelude::{MlsMessageBodyIn, MlsMessageIn};
 
                 // Try MlsMessage wrapper first, then raw VerifiableGroupInfo
-                let from_mls_msg = MlsMessageIn::tls_deserialize(&mut group_info_bytes.as_slice())
+                let from_mls_msg = MlsMessageIn::tls_deserialize(&mut &*gi_slice)
                     .ok()
                     .and_then(|msg| match msg.extract() {
                         MlsMessageBodyIn::GroupInfo(gi) => Some(gi.epoch().as_u64()),
@@ -1333,7 +1282,7 @@ pub async fn commit_group_change(
 
                 from_mls_msg
                     .or_else(|| {
-                        VerifiableGroupInfo::tls_deserialize(&mut group_info_bytes.as_slice())
+                        VerifiableGroupInfo::tls_deserialize(&mut &*gi_slice)
                             .ok()
                             .map(|gi| gi.epoch().as_u64())
                     })
@@ -1370,19 +1319,13 @@ pub async fn commit_group_change(
             }
 
             // Decode client-provided confirmation_tag
-            let ugi_confirmation_tag = if let Some(ref tag_b64) = input.confirmation_tag {
-                let tag_bytes = base64::engine::general_purpose::STANDARD
-                    .decode(tag_b64.as_bytes())
-                    .map_err(|e| {
-                        warn!("updateGroupInfo: invalid base64 confirmationTag: {}", e);
-                        bad_request("Invalid base64 confirmationTag")
-                    })?;
+            let ugi_confirmation_tag = if let Some(ref tag_bytes) = input.confirmation_tag {
                 info!(
                     "updateGroupInfo: client-provided confirmation_tag ({} bytes) for convo {}",
                     tag_bytes.len(),
                     crate::crypto::redact_for_log(&convo_id)
                 );
-                Some(tag_bytes)
+                Some(tag_bytes.to_vec())
             } else {
                 None
             };
@@ -1398,7 +1341,7 @@ pub async fn commit_group_change(
                        confirmation_tag = $4
                    WHERE id = $3"#,
             )
-            .bind(&group_info_bytes)
+            .bind(gi_slice)
             .bind(mls_epoch_i32)
             .bind(&convo_id)
             .bind(&ugi_confirmation_tag)
@@ -1621,8 +1564,8 @@ pub async fn commit_group_change(
                 }
             }
 
-            // ── Validate required fields ───────────────────────────────
-            let commit_b64 = input.commit.as_ref().ok_or_else(|| {
+            // ── Validate required fields (bytes arrive already decoded) ──
+            let commit_bytes = input.commit.as_ref().ok_or_else(|| {
                 warn!("removeMember: missing commit");
                 bad_request("Missing commit")
             })?;
@@ -1630,14 +1573,6 @@ pub async fn commit_group_change(
                 warn!("removeMember: missing member_dids");
                 bad_request("Missing memberDids")
             })?;
-
-            // ── Decode commit ──────────────────────────────────────────
-            let commit_bytes = base64::engine::general_purpose::STANDARD
-                .decode(commit_b64.as_bytes())
-                .map_err(|e| {
-                    warn!("removeMember: invalid base64 commit: {}", e);
-                    bad_request("Invalid base64 commit")
-                })?;
 
             // ── Verify caller is an admin ──────────────────────────────
             let (caller_did, _) = parse_device_did(&auth_user.did).map_err(|e| {
@@ -1736,7 +1671,7 @@ pub async fn commit_group_change(
             .bind(Option::<&str>::None)
             .bind(new_epoch)
             .bind(seq)
-            .bind(&commit_bytes)
+            .bind(&commit_bytes[..])
             .bind(&now)
             .execute(&mut *tx)
             .await
@@ -1898,18 +1833,11 @@ pub async fn commit_group_change(
                 }
             }
 
-            // ── Validate commit field ──────────────────────────────────
-            let commit_b64 = input.commit.as_ref().ok_or_else(|| {
+            // ── Validate commit field (bytes arrive already decoded) ──
+            let commit_bytes = input.commit.as_ref().ok_or_else(|| {
                 warn!("{}: missing commit", action_name);
                 bad_request("Missing commit")
             })?;
-
-            let commit_bytes = base64::engine::general_purpose::STANDARD
-                .decode(commit_b64.as_bytes())
-                .map_err(|e| {
-                    warn!("{}: invalid base64 commit: {}", action_name, e);
-                    bad_request("Invalid base64 commit")
-                })?;
 
             // ── Verify caller is a member ──────────────────────────────
             let (caller_did, _) = parse_device_did(&auth_user.did).map_err(|e| {
@@ -1994,7 +1922,7 @@ pub async fn commit_group_change(
             .bind(Option::<&str>::None)
             .bind(new_epoch)
             .bind(seq)
-            .bind(&commit_bytes)
+            .bind(&commit_bytes[..])
             .bind(&now)
             .execute(&mut *tx)
             .await

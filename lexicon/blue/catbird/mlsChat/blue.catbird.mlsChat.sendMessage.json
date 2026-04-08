@@ -58,9 +58,8 @@
               "description": "Message ID being reacted to (required when action is 'addReaction' or 'removeReaction')"
             },
             "confirmationTag": {
-              "type": "string",
-              "maxLength": 64,
-              "description": "Base64-encoded MLS confirmation tag. Server rejects with TreeStateDiverged if it does not match the canonical tree."
+              "type": "bytes",
+              "description": "MLS confirmation tag. Server rejects with TreeStateDiverged if it does not match the canonical tree."
             }
           }
         }

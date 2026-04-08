@@ -90,8 +90,8 @@
       "required": ["keyPackage", "cipherSuite", "expires"],
       "properties": {
         "keyPackage": {
-          "type": "string",
-          "description": "Base64-encoded MLS key package"
+          "type": "bytes",
+          "description": "MLS key package"
         },
         "cipherSuite": {
           "type": "string",
@@ -113,8 +113,8 @@
           "description": "Conversation ID"
         },
         "welcome": {
-          "type": "string",
-          "description": "Base64-encoded MLS Welcome message"
+          "type": "bytes",
+          "description": "MLS Welcome message"
         }
       }
     }

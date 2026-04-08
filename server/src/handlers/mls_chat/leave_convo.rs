@@ -1,5 +1,4 @@
 use axum::{extract::State, http::StatusCode, Json};
-use base64::Engine;
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use tracing::{error, info, warn};
@@ -91,18 +90,7 @@ pub async fn leave_convo(
         .unwrap_or(false);
 
     let new_epoch = if use_actors {
-        let commit_bytes = if let Some(ref commit) = input.commit {
-            Some(
-                base64::engine::general_purpose::STANDARD
-                    .decode(commit.as_bytes())
-                    .map_err(|e| {
-                        warn!("Invalid base64 commit: {}", e);
-                        StatusCode::BAD_REQUEST
-                    })?,
-            )
-        } else {
-            None
-        };
+        let commit_bytes = input.commit.as_ref().map(|c| c.to_vec());
 
         let actor_ref = actor_registry.get_or_spawn(&convo_id).await.map_err(|e| {
             error!("Failed to get conversation actor: {}", e);
@@ -140,12 +128,7 @@ pub async fn leave_convo(
         let now = chrono::Utc::now();
 
         if let Some(ref commit) = input.commit {
-            let commit_bytes = base64::engine::general_purpose::STANDARD
-                .decode(commit.as_bytes())
-                .map_err(|e| {
-                    warn!("Invalid base64 commit: {}", e);
-                    StatusCode::BAD_REQUEST
-                })?;
+            let commit_bytes = commit.to_vec();
 
             let msg_id = uuid::Uuid::new_v4().to_string();
 

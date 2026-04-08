@@ -5,7 +5,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     Json,
 };
-use base64::{engine::general_purpose::STANDARD, Engine};
+// base64 no longer needed — key_package arrives as bytes::Bytes (already decoded)
 use chrono::Utc;
 use jacquard_axum::ExtractXrpc;
 use tracing::{error, info, warn};
@@ -111,12 +111,9 @@ async fn handle_publish(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let key_data = STANDARD.decode(item.key_package.as_ref()).map_err(|e| {
-        warn!("Invalid base64 key_package: {}", e);
-        StatusCode::BAD_REQUEST
-    })?;
+    let key_data = item.key_package.to_vec();
     if key_data.is_empty() {
-        warn!("Decoded key package is empty");
+        warn!("Key package is empty");
         return Err(StatusCode::BAD_REQUEST);
     }
 
@@ -348,14 +345,7 @@ async fn handle_publish_batch(
             failed += 1;
             continue;
         }
-        if STANDARD.decode(item.key_package.as_ref()).is_err() {
-            errors.push(BatchError {
-                index: idx as i64,
-                error: "Invalid base64 encoding".into(),
-                extra_data: Default::default(),
-            });
-            failed += 1;
-        }
+        // key_package is already decoded bytes — no base64 validation needed
     }
 
     if !errors.is_empty() {
@@ -377,27 +367,16 @@ async fn handle_publish_batch(
     };
 
     for (idx, item) in items.iter().enumerate() {
-        let key_data = match STANDARD.decode(item.key_package.as_ref()) {
-            Ok(data) if !data.is_empty() => data,
-            Ok(_) => {
-                errors.push(BatchError {
-                    index: idx as i64,
-                    error: "Decoded key package is empty".into(),
-                    extra_data: Default::default(),
-                });
-                failed += 1;
-                continue;
-            }
-            Err(e) => {
-                errors.push(BatchError {
-                    index: idx as i64,
-                    error: format!("Failed to decode base64: {}", e).into(),
-                    extra_data: Default::default(),
-                });
-                failed += 1;
-                continue;
-            }
-        };
+        let key_data = item.key_package.to_vec();
+        if key_data.is_empty() {
+            errors.push(BatchError {
+                index: idx as i64,
+                error: "Key package is empty".into(),
+                extra_data: Default::default(),
+            });
+            failed += 1;
+            continue;
+        }
 
         // Compute hash for deduplication
         let key_package_hash = crate::crypto::sha256_hex(&key_data);
