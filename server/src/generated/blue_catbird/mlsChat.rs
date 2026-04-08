@@ -825,6 +825,9 @@ pub struct ConvoView<'a> {
     #[serde(skip_serializing_if = "std::option::Option::is_none")]
     #[serde(default, with = "jacquard_common::opt_serde_bytes_helper")]
     pub confirmation_tag: std::option::Option<bytes::Bytes>,
+    /// Stable conversation identifier (survives group resets)
+    #[serde(borrow)]
+    pub conversation_id: jacquard_common::CowStr<'a>,
     /// Conversation creation timestamp
     pub created_at: jacquard_common::types::string::Datetime,
     /// DID of the conversation creator
@@ -832,7 +835,7 @@ pub struct ConvoView<'a> {
     pub creator: jacquard_common::types::string::Did<'a>,
     /// Current MLS epoch number
     pub epoch: i64,
-    /// MLS group identifier (hex-encoded) - canonical conversation ID
+    /// Current MLS group identifier (hex-encoded). Changes on group reset.
     #[serde(borrow)]
     pub group_id: jacquard_common::CowStr<'a>,
     /// Timestamp of last message
