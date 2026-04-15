@@ -243,11 +243,11 @@ pub async fn commit_group_change(
                                     }
                                 }
                                 warn!(
-                                    "❌ addMembers rejected: {} block edge(s) between members (convo {})",
+                                    "❌ addMembers forbidden: {} block edge(s) between members (convo {})",
                                     conflicts.len(),
                                     crate::crypto::redact_for_log(&convo_id)
                                 );
-                                return Err(bad_request(
+                                return Err(forbidden(
                                     "Cannot add member: one or more members have blocked each other",
                                 ));
                             }
@@ -274,11 +274,11 @@ pub async fn commit_group_change(
 
                             if !blocks.is_empty() {
                                 warn!(
-                                    "❌ addMembers rejected: {} block edge(s) between members via DB cache (convo {})",
+                                    "❌ addMembers forbidden: {} block edge(s) between members via DB cache (convo {})",
                                     blocks.len(),
                                     crate::crypto::redact_for_log(&convo_id)
                                 );
-                                return Err(bad_request(
+                                return Err(forbidden(
                                     "Cannot add member: one or more members have blocked each other",
                                 ));
                             }
