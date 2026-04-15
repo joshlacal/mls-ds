@@ -1054,127 +1054,127 @@ pub mod pending_device_addition_state {
     }
     /// State trait tracking which required fields have been set
     pub trait State: sealed::Sealed {
-        type CreatedAt;
-        type DeviceCredentialDid;
-        type ConvoId;
-        type Status;
         type Id;
         type UserDid;
+        type ConvoId;
         type DeviceId;
+        type Status;
+        type DeviceCredentialDid;
+        type CreatedAt;
     }
     /// Empty state - all required fields are unset
     pub struct Empty(());
     impl sealed::Sealed for Empty {}
     impl State for Empty {
-        type CreatedAt = Unset;
-        type DeviceCredentialDid = Unset;
-        type ConvoId = Unset;
-        type Status = Unset;
         type Id = Unset;
         type UserDid = Unset;
+        type ConvoId = Unset;
         type DeviceId = Unset;
-    }
-    ///State transition - sets the `created_at` field to Set
-    pub struct SetCreatedAt<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetCreatedAt<S> {}
-    impl<S: State> State for SetCreatedAt<S> {
-        type CreatedAt = Set<members::created_at>;
-        type DeviceCredentialDid = S::DeviceCredentialDid;
-        type ConvoId = S::ConvoId;
-        type Status = S::Status;
-        type Id = S::Id;
-        type UserDid = S::UserDid;
-        type DeviceId = S::DeviceId;
-    }
-    ///State transition - sets the `device_credential_did` field to Set
-    pub struct SetDeviceCredentialDid<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetDeviceCredentialDid<S> {}
-    impl<S: State> State for SetDeviceCredentialDid<S> {
-        type CreatedAt = S::CreatedAt;
-        type DeviceCredentialDid = Set<members::device_credential_did>;
-        type ConvoId = S::ConvoId;
-        type Status = S::Status;
-        type Id = S::Id;
-        type UserDid = S::UserDid;
-        type DeviceId = S::DeviceId;
-    }
-    ///State transition - sets the `convo_id` field to Set
-    pub struct SetConvoId<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetConvoId<S> {}
-    impl<S: State> State for SetConvoId<S> {
-        type CreatedAt = S::CreatedAt;
-        type DeviceCredentialDid = S::DeviceCredentialDid;
-        type ConvoId = Set<members::convo_id>;
-        type Status = S::Status;
-        type Id = S::Id;
-        type UserDid = S::UserDid;
-        type DeviceId = S::DeviceId;
-    }
-    ///State transition - sets the `status` field to Set
-    pub struct SetStatus<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetStatus<S> {}
-    impl<S: State> State for SetStatus<S> {
-        type CreatedAt = S::CreatedAt;
-        type DeviceCredentialDid = S::DeviceCredentialDid;
-        type ConvoId = S::ConvoId;
-        type Status = Set<members::status>;
-        type Id = S::Id;
-        type UserDid = S::UserDid;
-        type DeviceId = S::DeviceId;
+        type Status = Unset;
+        type DeviceCredentialDid = Unset;
+        type CreatedAt = Unset;
     }
     ///State transition - sets the `id` field to Set
     pub struct SetId<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetId<S> {}
     impl<S: State> State for SetId<S> {
-        type CreatedAt = S::CreatedAt;
-        type DeviceCredentialDid = S::DeviceCredentialDid;
-        type ConvoId = S::ConvoId;
-        type Status = S::Status;
         type Id = Set<members::id>;
         type UserDid = S::UserDid;
+        type ConvoId = S::ConvoId;
         type DeviceId = S::DeviceId;
+        type Status = S::Status;
+        type DeviceCredentialDid = S::DeviceCredentialDid;
+        type CreatedAt = S::CreatedAt;
     }
     ///State transition - sets the `user_did` field to Set
     pub struct SetUserDid<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetUserDid<S> {}
     impl<S: State> State for SetUserDid<S> {
-        type CreatedAt = S::CreatedAt;
-        type DeviceCredentialDid = S::DeviceCredentialDid;
-        type ConvoId = S::ConvoId;
-        type Status = S::Status;
         type Id = S::Id;
         type UserDid = Set<members::user_did>;
+        type ConvoId = S::ConvoId;
         type DeviceId = S::DeviceId;
+        type Status = S::Status;
+        type DeviceCredentialDid = S::DeviceCredentialDid;
+        type CreatedAt = S::CreatedAt;
+    }
+    ///State transition - sets the `convo_id` field to Set
+    pub struct SetConvoId<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetConvoId<S> {}
+    impl<S: State> State for SetConvoId<S> {
+        type Id = S::Id;
+        type UserDid = S::UserDid;
+        type ConvoId = Set<members::convo_id>;
+        type DeviceId = S::DeviceId;
+        type Status = S::Status;
+        type DeviceCredentialDid = S::DeviceCredentialDid;
+        type CreatedAt = S::CreatedAt;
     }
     ///State transition - sets the `device_id` field to Set
     pub struct SetDeviceId<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetDeviceId<S> {}
     impl<S: State> State for SetDeviceId<S> {
-        type CreatedAt = S::CreatedAt;
-        type DeviceCredentialDid = S::DeviceCredentialDid;
-        type ConvoId = S::ConvoId;
-        type Status = S::Status;
         type Id = S::Id;
         type UserDid = S::UserDid;
+        type ConvoId = S::ConvoId;
         type DeviceId = Set<members::device_id>;
+        type Status = S::Status;
+        type DeviceCredentialDid = S::DeviceCredentialDid;
+        type CreatedAt = S::CreatedAt;
+    }
+    ///State transition - sets the `status` field to Set
+    pub struct SetStatus<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetStatus<S> {}
+    impl<S: State> State for SetStatus<S> {
+        type Id = S::Id;
+        type UserDid = S::UserDid;
+        type ConvoId = S::ConvoId;
+        type DeviceId = S::DeviceId;
+        type Status = Set<members::status>;
+        type DeviceCredentialDid = S::DeviceCredentialDid;
+        type CreatedAt = S::CreatedAt;
+    }
+    ///State transition - sets the `device_credential_did` field to Set
+    pub struct SetDeviceCredentialDid<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetDeviceCredentialDid<S> {}
+    impl<S: State> State for SetDeviceCredentialDid<S> {
+        type Id = S::Id;
+        type UserDid = S::UserDid;
+        type ConvoId = S::ConvoId;
+        type DeviceId = S::DeviceId;
+        type Status = S::Status;
+        type DeviceCredentialDid = Set<members::device_credential_did>;
+        type CreatedAt = S::CreatedAt;
+    }
+    ///State transition - sets the `created_at` field to Set
+    pub struct SetCreatedAt<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetCreatedAt<S> {}
+    impl<S: State> State for SetCreatedAt<S> {
+        type Id = S::Id;
+        type UserDid = S::UserDid;
+        type ConvoId = S::ConvoId;
+        type DeviceId = S::DeviceId;
+        type Status = S::Status;
+        type DeviceCredentialDid = S::DeviceCredentialDid;
+        type CreatedAt = Set<members::created_at>;
     }
     /// Marker types for field names
     #[allow(non_camel_case_types)]
     pub mod members {
-        ///Marker type for the `created_at` field
-        pub struct created_at(());
-        ///Marker type for the `device_credential_did` field
-        pub struct device_credential_did(());
-        ///Marker type for the `convo_id` field
-        pub struct convo_id(());
-        ///Marker type for the `status` field
-        pub struct status(());
         ///Marker type for the `id` field
         pub struct id(());
         ///Marker type for the `user_did` field
         pub struct user_did(());
+        ///Marker type for the `convo_id` field
+        pub struct convo_id(());
         ///Marker type for the `device_id` field
         pub struct device_id(());
+        ///Marker type for the `status` field
+        pub struct status(());
+        ///Marker type for the `device_credential_did` field
+        pub struct device_credential_did(());
+        ///Marker type for the `created_at` field
+        pub struct created_at(());
     }
 }
 
@@ -1409,13 +1409,13 @@ where
 impl<'a, S> PendingDeviceAdditionBuilder<'a, S>
 where
     S: pending_device_addition_state::State,
-    S::CreatedAt: pending_device_addition_state::IsSet,
-    S::DeviceCredentialDid: pending_device_addition_state::IsSet,
-    S::ConvoId: pending_device_addition_state::IsSet,
-    S::Status: pending_device_addition_state::IsSet,
     S::Id: pending_device_addition_state::IsSet,
     S::UserDid: pending_device_addition_state::IsSet,
+    S::ConvoId: pending_device_addition_state::IsSet,
     S::DeviceId: pending_device_addition_state::IsSet,
+    S::Status: pending_device_addition_state::IsSet,
+    S::DeviceCredentialDid: pending_device_addition_state::IsSet,
+    S::CreatedAt: pending_device_addition_state::IsSet,
 {
     /// Build the final struct
     pub fn build(self) -> PendingDeviceAddition<'a> {

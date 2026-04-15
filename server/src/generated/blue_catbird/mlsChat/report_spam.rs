@@ -39,37 +39,37 @@ pub mod report_spam_state {
     }
     /// State trait tracking which required fields have been set
     pub trait State: sealed::Sealed {
-        type ConvoId;
         type ReportedDid;
+        type ConvoId;
     }
     /// Empty state - all required fields are unset
     pub struct Empty(());
     impl sealed::Sealed for Empty {}
     impl State for Empty {
-        type ConvoId = Unset;
         type ReportedDid = Unset;
-    }
-    ///State transition - sets the `convo_id` field to Set
-    pub struct SetConvoId<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetConvoId<S> {}
-    impl<S: State> State for SetConvoId<S> {
-        type ConvoId = Set<members::convo_id>;
-        type ReportedDid = S::ReportedDid;
+        type ConvoId = Unset;
     }
     ///State transition - sets the `reported_did` field to Set
     pub struct SetReportedDid<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetReportedDid<S> {}
     impl<S: State> State for SetReportedDid<S> {
-        type ConvoId = S::ConvoId;
         type ReportedDid = Set<members::reported_did>;
+        type ConvoId = S::ConvoId;
+    }
+    ///State transition - sets the `convo_id` field to Set
+    pub struct SetConvoId<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetConvoId<S> {}
+    impl<S: State> State for SetConvoId<S> {
+        type ReportedDid = S::ReportedDid;
+        type ConvoId = Set<members::convo_id>;
     }
     /// Marker types for field names
     #[allow(non_camel_case_types)]
     pub mod members {
-        ///Marker type for the `convo_id` field
-        pub struct convo_id(());
         ///Marker type for the `reported_did` field
         pub struct reported_did(());
+        ///Marker type for the `convo_id` field
+        pub struct convo_id(());
     }
 }
 
@@ -159,8 +159,8 @@ where
 impl<'a, S> ReportSpamBuilder<'a, S>
 where
     S: report_spam_state::State,
-    S::ConvoId: report_spam_state::IsSet,
     S::ReportedDid: report_spam_state::IsSet,
+    S::ConvoId: report_spam_state::IsSet,
 {
     /// Build the final struct
     pub fn build(self) -> ReportSpam<'a> {

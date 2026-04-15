@@ -34,37 +34,37 @@ pub mod update_mute_status_state {
     }
     /// State trait tracking which required fields have been set
     pub trait State: sealed::Sealed {
-        type Muted;
         type ConvoId;
+        type Muted;
     }
     /// Empty state - all required fields are unset
     pub struct Empty(());
     impl sealed::Sealed for Empty {}
     impl State for Empty {
-        type Muted = Unset;
         type ConvoId = Unset;
-    }
-    ///State transition - sets the `muted` field to Set
-    pub struct SetMuted<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetMuted<S> {}
-    impl<S: State> State for SetMuted<S> {
-        type Muted = Set<members::muted>;
-        type ConvoId = S::ConvoId;
+        type Muted = Unset;
     }
     ///State transition - sets the `convo_id` field to Set
     pub struct SetConvoId<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetConvoId<S> {}
     impl<S: State> State for SetConvoId<S> {
-        type Muted = S::Muted;
         type ConvoId = Set<members::convo_id>;
+        type Muted = S::Muted;
+    }
+    ///State transition - sets the `muted` field to Set
+    pub struct SetMuted<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetMuted<S> {}
+    impl<S: State> State for SetMuted<S> {
+        type ConvoId = S::ConvoId;
+        type Muted = Set<members::muted>;
     }
     /// Marker types for field names
     #[allow(non_camel_case_types)]
     pub mod members {
-        ///Marker type for the `muted` field
-        pub struct muted(());
         ///Marker type for the `convo_id` field
         pub struct convo_id(());
+        ///Marker type for the `muted` field
+        pub struct muted(());
     }
 }
 
@@ -137,8 +137,8 @@ where
 impl<'a, S> UpdateMuteStatusBuilder<'a, S>
 where
     S: update_mute_status_state::State,
-    S::Muted: update_mute_status_state::IsSet,
     S::ConvoId: update_mute_status_state::IsSet,
+    S::Muted: update_mute_status_state::IsSet,
 {
     /// Build the final struct
     pub fn build(self) -> UpdateMuteStatus<'a> {
