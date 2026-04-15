@@ -575,10 +575,11 @@ async fn main() -> anyhow::Result<()> {
     // mlsChat consolidated endpoints (PDSS federation prep)
     // All endpoints use IntoRouter for type-safe routing from lexicon-generated types.
     use catbird_server::generated::blue_catbird::mlsChat::{
-        blocks::BlocksRequest, commit_group_change::CommitGroupChangeRequest,
+        check_blocks::CheckBlocksRequest, commit_group_change::CommitGroupChangeRequest,
         create_convo::CreateConvoRequest, delete_blob::DeleteBlobRequest,
-        get_blob_usage::GetBlobUsageRequest, get_convo_settings::GetConvoSettingsRequest,
-        get_convos::GetConvosRequest, get_group_state::GetGroupStateRequest,
+        get_blob_usage::GetBlobUsageRequest, get_block_status::GetBlockStatusRequest,
+        get_convo_settings::GetConvoSettingsRequest, get_convos::GetConvosRequest,
+        get_group_state::GetGroupStateRequest,
         get_key_package_status::GetKeyPackageStatusRequest,
         get_key_packages::GetKeyPackagesRequest, get_messages::GetMessagesRequest,
         get_pending_devices::GetPendingDevicesRequest,
@@ -651,7 +652,12 @@ async fn main() -> anyhow::Result<()> {
         .merge(ReportSpamRequest::into_router(
             handlers::mls_chat::report_spam_post,
         ))
-        .merge(BlocksRequest::into_router(handlers::mls_chat::blocks_post))
+        .merge(CheckBlocksRequest::into_router(
+            handlers::mls_chat::check_blocks::check_blocks_post,
+        ))
+        .merge(GetBlockStatusRequest::into_router(
+            handlers::mls_chat::get_block_status::get_block_status_post,
+        ))
         .merge(OptInRequest::into_router(handlers::mls_chat::opt_in_post))
         // Subscriptions
         .merge(GetSubscriptionTicketRequest::into_router(

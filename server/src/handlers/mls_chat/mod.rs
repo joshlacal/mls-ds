@@ -30,7 +30,8 @@ pub mod leave_convo;
 pub mod update_convo;
 
 // Moderation & Blocks
-pub mod blocks;
+pub mod check_blocks;
+pub mod get_block_status;
 pub mod opt_in;
 pub mod report_spam;
 
@@ -80,7 +81,6 @@ pub use leave_convo::leave_convo;
 pub use update_convo::update_convo;
 
 // Re-exports: Moderation & Blocks
-pub use blocks::blocks_post;
 pub use opt_in::opt_in_post;
 pub use report_spam::report_spam_post;
 
