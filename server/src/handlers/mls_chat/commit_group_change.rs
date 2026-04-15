@@ -807,6 +807,91 @@ pub async fn commit_group_change(
                 }
             }
 
+            // ── Block detection (PDS-first with bsky_blocks fallback) ──
+            // Reject the external commit if the joiner has any block edge
+            // with a current member of the conversation (in either direction).
+            // Edges between two existing members are not considered here — those
+            // are Task 3.1's responsibility at add time, or an auto-leave on the
+            // client side.
+            // See docs/superpowers/plans/2026-04-15-block-leave-shared-groups.md Phase 3.
+            {
+                let existing_member_dids: Vec<String> = sqlx::query_scalar(
+                    "SELECT DISTINCT member_did FROM members WHERE convo_id = $1 AND left_at IS NULL",
+                )
+                .bind(&convo_id)
+                .fetch_all(&pool)
+                .await
+                .map_err(|e| {
+                    error!("externalCommit: failed to fetch member DIDs for block check: {}", e);
+                    internal_server_error("Failed to check blocks")
+                })?;
+
+                if !existing_member_dids.is_empty() {
+                    let mut all_dids: Vec<String> = existing_member_dids.clone();
+                    all_dids.push(caller_did.clone());
+                    all_dids.sort();
+                    all_dids.dedup();
+
+                    if all_dids.len() >= 2 {
+                        let joiner_involved = match block_sync
+                            .check_block_conflicts(&all_dids)
+                            .await
+                        {
+                            Ok(conflicts) => {
+                                // Sync affected users' blocks to local cache.
+                                for (blocker, _blocked) in &conflicts {
+                                    if let Err(e) =
+                                        block_sync.sync_blocks_to_db(&pool, blocker).await
+                                    {
+                                        warn!("Failed to sync blocks to DB: {}", e);
+                                    }
+                                }
+                                conflicts.iter().any(|(blocker, blocked)| {
+                                    blocker == &caller_did || blocked == &caller_did
+                                })
+                            }
+                            Err(e) => {
+                                // Fallback to local DB cache — fail secure on DB error.
+                                warn!(
+                                    "externalCommit: PDS block check failed, falling back to local DB: {}",
+                                    e
+                                );
+                                let existing_slice: &[String] = &existing_member_dids;
+                                let blocks: Vec<(String, String)> = sqlx::query_as(
+                                    "SELECT user_did, target_did FROM bsky_blocks \
+                                     WHERE (user_did = $1 AND target_did = ANY($2)) \
+                                        OR (target_did = $1 AND user_did = ANY($2))",
+                                )
+                                .bind(&caller_did)
+                                .bind(existing_slice)
+                                .fetch_all(&pool)
+                                .await
+                                .map_err(|e| {
+                                    error!(
+                                        "❌ externalCommit: block fallback DB query failed: {}",
+                                        e
+                                    );
+                                    internal_server_error("Failed to check blocks")
+                                })?;
+
+                                !blocks.is_empty()
+                            }
+                        };
+
+                        if joiner_involved {
+                            warn!(
+                                "❌ externalCommit by {} rejected: block edge with existing member (convo {})",
+                                crate::crypto::redact_for_log(&caller_did),
+                                crate::crypto::redact_for_log(&convo_id)
+                            );
+                            return Err(forbidden(
+                                "Cannot join conversation: block edge exists with an existing member",
+                            ));
+                        }
+                    }
+                }
+            }
+
             // ── Parse MLS epoch and group_id from GroupInfo if provided ──────────
             let (group_info_bytes_opt, mls_epoch, mls_group_id) = if let Some(gi_bytes) =
                 input.group_info.as_ref()
