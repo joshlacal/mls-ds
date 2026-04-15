@@ -106,12 +106,12 @@ fn invalidate_welcome_response(rows_affected: u64) -> CommitGroupChangeOutput<'s
 /// POST /xrpc/blue.catbird.mlsChat.commitGroupChange
 ///
 /// Consolidates: addMembers, processExternalCommit, rejoin, readdition, listPending, claimPending
-#[tracing::instrument(skip(pool, sse_state, _actor_registry, _block_sync, auth_user, input))]
+#[tracing::instrument(skip(pool, sse_state, _actor_registry, block_sync, auth_user, input))]
 pub async fn commit_group_change(
     State(pool): State<DbPool>,
     State(sse_state): State<Arc<SseState>>,
     State(_actor_registry): State<Arc<ActorRegistry>>,
-    State(_block_sync): State<Arc<BlockSyncService>>,
+    State(block_sync): State<Arc<BlockSyncService>>,
     auth_user: AuthUser,
     ExtractXrpc(input): ExtractXrpc<CommitGroupChangeRequest>,
 ) -> Result<Response, XrpcError> {
@@ -202,6 +202,89 @@ pub async fn commit_group_change(
             })?;
             if !is_member {
                 return Err(forbidden("Not a member of this conversation"));
+            }
+
+            // ── Block detection (PDS-first with bsky_blocks fallback) ──
+            // Reject addMembers if any block edge exists between the
+            // post-commit member set (existing members ∪ new members).
+            // Mirrors the gate in createConvo (handle_create_convo).
+            // See docs/superpowers/plans/2026-04-15-block-leave-shared-groups.md Phase 3.
+            {
+                let existing_member_dids: Vec<String> = sqlx::query_scalar(
+                    "SELECT DISTINCT member_did FROM members WHERE convo_id = $1 AND left_at IS NULL",
+                )
+                .bind(&convo_id)
+                .fetch_all(&pool)
+                .await
+                .map_err(|e| {
+                    error!("addMembers: failed to fetch existing members for block check: {}", e);
+                    internal_server_error("Failed to check blocks")
+                })?;
+
+                let new_member_dids: Vec<String> = member_dids
+                    .iter()
+                    .map(|d| crate::sqlx_jacquard::did_to_string(d))
+                    .collect();
+
+                let mut all_dids: Vec<String> = existing_member_dids;
+                all_dids.extend(new_member_dids.iter().cloned());
+                all_dids.sort();
+                all_dids.dedup();
+
+                if all_dids.len() >= 2 {
+                    match block_sync.check_block_conflicts(&all_dids).await {
+                        Ok(conflicts) => {
+                            if !conflicts.is_empty() {
+                                for (blocker, _blocked) in &conflicts {
+                                    if let Err(e) =
+                                        block_sync.sync_blocks_to_db(&pool, blocker).await
+                                    {
+                                        warn!("Failed to sync blocks to DB: {}", e);
+                                    }
+                                }
+                                warn!(
+                                    "❌ addMembers rejected: {} block edge(s) between members (convo {})",
+                                    conflicts.len(),
+                                    crate::crypto::redact_for_log(&convo_id)
+                                );
+                                return Err(bad_request(
+                                    "Cannot add member: one or more members have blocked each other",
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            // Fallback to local DB cache — fail secure on DB error.
+                            warn!(
+                                "addMembers: PDS block check failed, falling back to local DB: {}",
+                                e
+                            );
+                            let blocks: Vec<(String, String)> = sqlx::query_as(
+                                "SELECT user_did, target_did FROM bsky_blocks WHERE user_did = ANY($1) AND target_did = ANY($1)",
+                            )
+                            .bind(&all_dids)
+                            .fetch_all(&pool)
+                            .await
+                            .map_err(|e| {
+                                error!(
+                                    "❌ addMembers: block fallback DB query failed: {}",
+                                    e
+                                );
+                                internal_server_error("Failed to check blocks")
+                            })?;
+
+                            if !blocks.is_empty() {
+                                warn!(
+                                    "❌ addMembers rejected: {} block edge(s) between members via DB cache (convo {})",
+                                    blocks.len(),
+                                    crate::crypto::redact_for_log(&convo_id)
+                                );
+                                return Err(bad_request(
+                                    "Cannot add member: one or more members have blocked each other",
+                                ));
+                            }
+                        }
+                    }
+                }
             }
 
             // ── Parse MLS epoch from GroupInfo if provided ──────────
