@@ -141,8 +141,16 @@ pub async fn get_group_state(
     }
 
     let mut epoch: Option<i64> = None;
-    let mut group_info: Option<String> = None;
-    let mut welcome: Option<String> = None;
+    // group_info / welcome store RAW MLS bytes. The Jacquard
+    // `serde_bytes_helper` serializer converts `bytes::Bytes` to
+    // `{"$bytes": "base64..."}` on the JSON wire. A previous version of this
+    // handler manually base64-encoded the bytes into a String here and then
+    // converted to `bytes::Bytes` — which caused Jacquard to base64-encode
+    // the UTF-8 of that string AGAIN, yielding a double-encoded payload that
+    // clients would unwrap once and then feed (as ASCII of base64) to MLS
+    // parsers, which rejected it with "appears to be base64-encoded text".
+    let mut group_info: Option<bytes::Bytes> = None;
+    let mut welcome: Option<bytes::Bytes> = None;
     let mut expires_at = None;
 
     // Fetch epoch (lightweight, always useful)
@@ -173,16 +181,13 @@ pub async fn get_group_state(
     if includes.contains(&"groupInfo") {
         match crate::group_info::get_group_info(&pool, convo_id).await {
             Ok(Some((group_info_bytes, gi_epoch, _updated_at))) => {
-                use base64::Engine;
-                let encoded = base64::engine::general_purpose::STANDARD.encode(&group_info_bytes);
                 info!(
                     convo_id = %crate::crypto::redact_for_log(convo_id),
                     raw_bytes = group_info_bytes.len(),
-                    base64_len = encoded.len(),
                     epoch = gi_epoch,
-                    "GroupInfo encoded for response"
+                    "GroupInfo loaded for response"
                 );
-                group_info = Some(encoded);
+                group_info = Some(bytes::Bytes::from(group_info_bytes));
                 // Set epoch from group info if not already fetched
                 if epoch.is_none() {
                     epoch = Some(gi_epoch as i64);
@@ -229,8 +234,7 @@ pub async fn get_group_state(
         })?;
 
         if let Some((_welcome_id, data)) = welcome_row {
-            use base64::Engine;
-            welcome = Some(base64::engine::general_purpose::STANDARD.encode(&data));
+            welcome = Some(bytes::Bytes::from(data));
         }
     }
 
@@ -242,8 +246,8 @@ pub async fn get_group_state(
 
     Ok(Json(GetGroupStateOutput {
         epoch,
-        group_info: group_info.map(Into::into),
-        welcome: welcome.map(Into::into),
+        group_info,
+        welcome,
         expires_at,
         extra_data: Default::default(),
     }))
