@@ -2052,6 +2052,58 @@ pub async fn commit_group_change(
                 return Err(forbidden("Not a member of this conversation"));
             }
 
+            // ── Defense-in-depth: action→shape contract ──────────────
+            // See docs/superpowers/plans/2026-04-16-commit-add-proposal-gate.md.
+            // PURE_CIPHERTEXT_WIRE_FORMAT_POLICY means we can't inspect proposal
+            // bodies, so we gate on surface markers + framing well-formedness.
+            let welcome_present = input.welcome.is_some();
+            let member_dids_nonempty =
+                input.member_dids.as_ref().is_some_and(|v| !v.is_empty());
+            match super::commit_inspect::enforce_non_add_action_contract(
+                welcome_present,
+                member_dids_nonempty,
+                commit_bytes,
+            ) {
+                Ok(shape) => info!(
+                    "{}: framing OK (wire={:?}, ct={:?}) convo {}",
+                    action_name,
+                    shape.wire_format,
+                    shape.content_type,
+                    crate::crypto::redact_for_log(&convo_id)
+                ),
+                Err(super::commit_inspect::CommitActionContractError::WelcomeSet) => {
+                    warn!(
+                        "{}: rejected — welcome set under non-addMembers action (caller {}, convo {})",
+                        action_name,
+                        crate::crypto::redact_for_log(&caller_did),
+                        crate::crypto::redact_for_log(&convo_id)
+                    );
+                    return Err(bad_request(
+                        "welcome field is only valid with action=addMembers",
+                    ));
+                }
+                Err(super::commit_inspect::CommitActionContractError::MemberDidsSet) => {
+                    warn!(
+                        "{}: rejected — memberDids set under non-addMembers action (caller {}, convo {})",
+                        action_name,
+                        crate::crypto::redact_for_log(&caller_did),
+                        crate::crypto::redact_for_log(&convo_id)
+                    );
+                    return Err(bad_request(
+                        "memberDids is only valid with action=addMembers",
+                    ));
+                }
+                Err(e @ super::commit_inspect::CommitActionContractError::BadFraming(_)) => {
+                    warn!(
+                        "{}: rejected — framing invalid ({}) for convo {}",
+                        action_name,
+                        e,
+                        crate::crypto::redact_for_log(&convo_id)
+                    );
+                    return Err(bad_request(format!("Invalid commit framing: {e}")));
+                }
+            }
+
             let now = chrono::Utc::now();
 
             // ── Fetch current epoch for CAS ───────────────────────────
