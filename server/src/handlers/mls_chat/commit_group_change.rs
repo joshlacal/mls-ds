@@ -106,12 +106,12 @@ fn invalidate_welcome_response(rows_affected: u64) -> CommitGroupChangeOutput<'s
 /// POST /xrpc/blue.catbird.mlsChat.commitGroupChange
 ///
 /// Consolidates: addMembers, processExternalCommit, rejoin, readdition, listPending, claimPending
-#[tracing::instrument(skip(pool, sse_state, _actor_registry, _block_sync, auth_user, input))]
+#[tracing::instrument(skip(pool, sse_state, _actor_registry, block_sync, auth_user, input))]
 pub async fn commit_group_change(
     State(pool): State<DbPool>,
     State(sse_state): State<Arc<SseState>>,
     State(_actor_registry): State<Arc<ActorRegistry>>,
-    State(_block_sync): State<Arc<BlockSyncService>>,
+    State(block_sync): State<Arc<BlockSyncService>>,
     auth_user: AuthUser,
     ExtractXrpc(input): ExtractXrpc<CommitGroupChangeRequest>,
 ) -> Result<Response, XrpcError> {
@@ -202,6 +202,89 @@ pub async fn commit_group_change(
             })?;
             if !is_member {
                 return Err(forbidden("Not a member of this conversation"));
+            }
+
+            // ── Block detection (PDS-first with bsky_blocks fallback) ──
+            // Reject addMembers if any block edge exists between the
+            // post-commit member set (existing members ∪ new members).
+            // Mirrors the gate in createConvo (handle_create_convo).
+            // See docs/superpowers/plans/2026-04-15-block-leave-shared-groups.md Phase 3.
+            {
+                let existing_member_dids: Vec<String> = sqlx::query_scalar(
+                    "SELECT DISTINCT COALESCE(user_did, member_did) FROM members WHERE convo_id = $1 AND left_at IS NULL",
+                )
+                .bind(&convo_id)
+                .fetch_all(&pool)
+                .await
+                .map_err(|e| {
+                    error!("addMembers: failed to fetch existing members for block check: {}", e);
+                    internal_server_error("Failed to check blocks")
+                })?;
+
+                let new_member_dids: Vec<String> = member_dids
+                    .iter()
+                    .map(|d| crate::sqlx_jacquard::did_to_string(d))
+                    .collect();
+
+                let mut all_dids: Vec<String> = existing_member_dids;
+                all_dids.extend(new_member_dids.iter().cloned());
+                all_dids.sort();
+                all_dids.dedup();
+
+                if all_dids.len() >= 2 {
+                    match block_sync.check_block_conflicts(&all_dids).await {
+                        Ok(conflicts) => {
+                            if !conflicts.is_empty() {
+                                for (blocker, _blocked) in &conflicts {
+                                    if let Err(e) =
+                                        block_sync.sync_blocks_to_db(&pool, blocker).await
+                                    {
+                                        warn!("Failed to sync blocks to DB: {}", e);
+                                    }
+                                }
+                                warn!(
+                                    "❌ addMembers forbidden: {} block edge(s) between members (convo {})",
+                                    conflicts.len(),
+                                    crate::crypto::redact_for_log(&convo_id)
+                                );
+                                return Err(forbidden(
+                                    "Cannot add member: one or more members have blocked each other",
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            // Fallback to local DB cache — fail secure on DB error.
+                            warn!(
+                                "addMembers: PDS block check failed, falling back to local DB: {}",
+                                e
+                            );
+                            let blocks: Vec<(String, String)> = sqlx::query_as(
+                                "SELECT user_did, target_did FROM bsky_blocks WHERE user_did = ANY($1) AND target_did = ANY($1)",
+                            )
+                            .bind(&all_dids)
+                            .fetch_all(&pool)
+                            .await
+                            .map_err(|e| {
+                                error!(
+                                    "❌ addMembers: block fallback DB query failed: {}",
+                                    e
+                                );
+                                internal_server_error("Failed to check blocks")
+                            })?;
+
+                            if !blocks.is_empty() {
+                                warn!(
+                                    "❌ addMembers forbidden: {} block edge(s) between members via DB cache (convo {})",
+                                    blocks.len(),
+                                    crate::crypto::redact_for_log(&convo_id)
+                                );
+                                return Err(forbidden(
+                                    "Cannot add member: one or more members have blocked each other",
+                                ));
+                            }
+                        }
+                    }
+                }
             }
 
             // ── Parse MLS epoch from GroupInfo if provided ──────────
@@ -326,17 +409,24 @@ pub async fn commit_group_change(
 
             // ── Store or invalidate GroupInfo ─────────────────────────
             if let Some(ref gi_bytes) = add_group_info_bytes {
+                // Bind current_epoch to the parsed MLS epoch — try_advance only
+                // increments a counter, but the truth lives in GroupInfo. This
+                // self-heals any prior drift (e.g. from leave commits that bumped
+                // the counter without storing new GroupInfo).
+                let add_mls_epoch_i32 = add_mls_epoch.map(|e| e as i32);
                 sqlx::query(
                     r#"UPDATE conversations
                        SET group_info = $1,
                            group_info_epoch = COALESCE(group_info_epoch, 0) + 1,
                            group_info_updated_at = NOW(),
+                           current_epoch = COALESCE($4, current_epoch),
                            confirmation_tag = $3
                        WHERE id = $2"#,
                 )
                 .bind(gi_bytes)
                 .bind(&convo_id)
                 .bind(&add_confirmation_tag)
+                .bind(add_mls_epoch_i32)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| {
@@ -724,6 +814,91 @@ pub async fn commit_group_change(
                 }
             }
 
+            // ── Block detection (PDS-first with bsky_blocks fallback) ──
+            // Reject the external commit if the joiner has any block edge
+            // with a current member of the conversation (in either direction).
+            // Edges between two existing members are not considered here — those
+            // are Task 3.1's responsibility at add time, or an auto-leave on the
+            // client side.
+            // See docs/superpowers/plans/2026-04-15-block-leave-shared-groups.md Phase 3.
+            {
+                let existing_member_dids: Vec<String> = sqlx::query_scalar(
+                    "SELECT DISTINCT COALESCE(user_did, member_did) FROM members WHERE convo_id = $1 AND left_at IS NULL",
+                )
+                .bind(&convo_id)
+                .fetch_all(&pool)
+                .await
+                .map_err(|e| {
+                    error!("externalCommit: failed to fetch member DIDs for block check: {}", e);
+                    internal_server_error("Failed to check blocks")
+                })?;
+
+                if !existing_member_dids.is_empty() {
+                    let mut all_dids: Vec<String> = existing_member_dids.clone();
+                    all_dids.push(caller_did.clone());
+                    all_dids.sort();
+                    all_dids.dedup();
+
+                    if all_dids.len() >= 2 {
+                        let joiner_involved = match block_sync
+                            .check_block_conflicts(&all_dids)
+                            .await
+                        {
+                            Ok(conflicts) => {
+                                // Sync affected users' blocks to local cache.
+                                for (blocker, _blocked) in &conflicts {
+                                    if let Err(e) =
+                                        block_sync.sync_blocks_to_db(&pool, blocker).await
+                                    {
+                                        warn!("Failed to sync blocks to DB: {}", e);
+                                    }
+                                }
+                                conflicts.iter().any(|(blocker, blocked)| {
+                                    blocker == &caller_did || blocked == &caller_did
+                                })
+                            }
+                            Err(e) => {
+                                // Fallback to local DB cache — fail secure on DB error.
+                                warn!(
+                                    "externalCommit: PDS block check failed, falling back to local DB: {}",
+                                    e
+                                );
+                                let existing_slice: &[String] = &existing_member_dids;
+                                let blocks: Vec<(String, String)> = sqlx::query_as(
+                                    "SELECT user_did, target_did FROM bsky_blocks \
+                                     WHERE (user_did = $1 AND target_did = ANY($2)) \
+                                        OR (target_did = $1 AND user_did = ANY($2))",
+                                )
+                                .bind(&caller_did)
+                                .bind(existing_slice)
+                                .fetch_all(&pool)
+                                .await
+                                .map_err(|e| {
+                                    error!(
+                                        "❌ externalCommit: block fallback DB query failed: {}",
+                                        e
+                                    );
+                                    internal_server_error("Failed to check blocks")
+                                })?;
+
+                                !blocks.is_empty()
+                            }
+                        };
+
+                        if joiner_involved {
+                            warn!(
+                                "❌ externalCommit by {} rejected: block edge with existing member (convo {})",
+                                crate::crypto::redact_for_log(&caller_did),
+                                crate::crypto::redact_for_log(&convo_id)
+                            );
+                            return Err(forbidden(
+                                "Cannot join conversation: block edge exists with an existing member",
+                            ));
+                        }
+                    }
+                }
+            }
+
             // ── Parse MLS epoch and group_id from GroupInfo if provided ──────────
             let (group_info_bytes_opt, mls_epoch, mls_group_id) = if let Some(gi_bytes) =
                 input.group_info.as_ref()
@@ -873,19 +1048,25 @@ pub async fn commit_group_change(
 
             // ── Store or invalidate GroupInfo ─────────────────────────
             if let Some(ref gi_bytes) = group_info_bytes_opt {
-                // Store the fresh GroupInfo atomically with the epoch advance
+                // Store the fresh GroupInfo atomically with the epoch advance.
+                // Bind current_epoch to the parsed MLS epoch — try_advance only
+                // increments a counter, but the truth lives in GroupInfo. This
+                // self-heals any prior drift (e.g. from leave commits that bumped
+                // the counter without storing new GroupInfo).
                 let mls_epoch_i32 = mls_epoch.map(|e| e as i32);
                 sqlx::query(
                     r#"UPDATE conversations
                        SET group_info = $1,
                            group_info_epoch = COALESCE(group_info_epoch, 0) + 1,
                            group_info_updated_at = NOW(),
+                           current_epoch = COALESCE($4, current_epoch),
                            confirmation_tag = $3
                        WHERE id = $2"#,
                 )
                 .bind(gi_bytes)
                 .bind(&convo_id)
                 .bind(&ec_confirmation_tag)
+                .bind(mls_epoch_i32)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| {
@@ -1882,6 +2063,58 @@ pub async fn commit_group_change(
             })?;
             if !is_member {
                 return Err(forbidden("Not a member of this conversation"));
+            }
+
+            // ── Defense-in-depth: action→shape contract ──────────────
+            // See docs/superpowers/plans/2026-04-16-commit-add-proposal-gate.md.
+            // PURE_CIPHERTEXT_WIRE_FORMAT_POLICY means we can't inspect proposal
+            // bodies, so we gate on surface markers + framing well-formedness.
+            let welcome_present = input.welcome.is_some();
+            let member_dids_nonempty =
+                input.member_dids.as_ref().is_some_and(|v| !v.is_empty());
+            match super::commit_inspect::enforce_non_add_action_contract(
+                welcome_present,
+                member_dids_nonempty,
+                commit_bytes,
+            ) {
+                Ok(shape) => info!(
+                    "{}: framing OK (wire={:?}, ct={:?}) convo {}",
+                    action_name,
+                    shape.wire_format,
+                    shape.content_type,
+                    crate::crypto::redact_for_log(&convo_id)
+                ),
+                Err(super::commit_inspect::CommitActionContractError::WelcomeSet) => {
+                    warn!(
+                        "{}: rejected — welcome set under non-addMembers action (caller {}, convo {})",
+                        action_name,
+                        crate::crypto::redact_for_log(&caller_did),
+                        crate::crypto::redact_for_log(&convo_id)
+                    );
+                    return Err(bad_request(
+                        "welcome field is only valid with action=addMembers",
+                    ));
+                }
+                Err(super::commit_inspect::CommitActionContractError::MemberDidsSet) => {
+                    warn!(
+                        "{}: rejected — memberDids set under non-addMembers action (caller {}, convo {})",
+                        action_name,
+                        crate::crypto::redact_for_log(&caller_did),
+                        crate::crypto::redact_for_log(&convo_id)
+                    );
+                    return Err(bad_request(
+                        "memberDids is only valid with action=addMembers",
+                    ));
+                }
+                Err(e @ super::commit_inspect::CommitActionContractError::BadFraming(_)) => {
+                    warn!(
+                        "{}: rejected — framing invalid ({}) for convo {}",
+                        action_name,
+                        e,
+                        crate::crypto::redact_for_log(&convo_id)
+                    );
+                    return Err(bad_request(format!("Invalid commit framing: {e}")));
+                }
             }
 
             let now = chrono::Utc::now();

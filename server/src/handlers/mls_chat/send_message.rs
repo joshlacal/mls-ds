@@ -36,8 +36,6 @@ const MAX_EPOCH_DRIFT: i64 = 5;
 /// Dispatches based on `delivery` field:
 /// - `"persistent"` (default) → insert message + fan-out envelopes + SSE + push + federation
 /// - `"ephemeral"` + `action`:
-///   - `"addReaction"`    → insert reaction + SSE
-///   - `"removeReaction"` → delete reaction + SSE
 ///   - default            → SSE typing indicator (no DB write)
 #[tracing::instrument(skip(
     pool,
@@ -89,9 +87,6 @@ pub async fn send_message(
                 }
                 "typing" | "typingStart" => {
                     handle_typing(pool, sse_state, auth_user, &input, true).await?
-                }
-                "addReaction" | "removeReaction" => {
-                    handle_reaction(pool, sse_state, auth_user, &input, action).await?
                 }
                 other => {
                     warn!(
@@ -624,85 +619,6 @@ async fn handle_typing(
     let received_at = chrono::DateTime::from_timestamp(received_bucket_ts, 0).unwrap_or(now);
     Ok(Json(SendMessageOutput {
         message_id: msg_id.into(),
-        received_at: crate::sqlx_jacquard::chrono_to_datetime(received_at),
-        seq: 0,
-        epoch: input.epoch,
-        extra_data: Default::default(),
-    })
-    .into_response())
-}
-
-// ---------------------------------------------------------------------------
-// Reaction (ephemeral, no DB persistence yet)
-// ---------------------------------------------------------------------------
-
-async fn handle_reaction(
-    pool: DbPool,
-    sse_state: Arc<SseState>,
-    auth_user: AuthUser,
-    input: &crate::generated::blue_catbird::mlsChat::send_message::SendMessage<'_>,
-    action: &str,
-) -> Result<Response, StatusCode> {
-    let convo_id = input.convo_id.to_string();
-    let user_did = auth_user.did.clone();
-
-    // Check membership
-    let is_member: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM members WHERE convo_id = $1 AND (user_did = $2 OR member_did = $2) AND left_at IS NULL)",
-    )
-    .bind(&convo_id)
-    .bind(&user_did)
-    .fetch_one(&pool)
-    .await
-    .map_err(|e| {
-        error!("❌ [v2.sendMessage:reaction] membership check: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    if !is_member {
-        error!("❌ [v2.sendMessage:reaction] Not a member");
-        return Err(StatusCode::FORBIDDEN);
-    }
-
-    let message_id = input
-        .target_message_id
-        .as_deref()
-        .unwrap_or_else(|| input.msg_id.as_ref())
-        .to_string();
-    let emoji = input
-        .reaction_emoji
-        .as_deref()
-        .unwrap_or("\u{1f44d}")
-        .to_string();
-
-    let reaction_action = match action {
-        "addReaction" => "add",
-        "removeReaction" => "remove",
-        _ => "add",
-    };
-
-    // TODO: Persist reaction to DB (INSERT or DELETE from reactions table)
-    // For now, just emit the SSE event for ephemeral delivery
-
-    let cursor = sse_state.cursor_gen.next(&convo_id, "reactionEvent").await;
-    let event = StreamEvent::ReactionEvent {
-        cursor: cursor.clone(),
-        convo_id: convo_id.clone(),
-        did: user_did,
-        message_id,
-        emoji,
-        action: reaction_action.to_string(),
-    };
-
-    if let Err(e) = sse_state.emit(&convo_id, event).await {
-        error!("❌ [v2.sendMessage:reaction] SSE emit: {}", e);
-    }
-
-    let now = Utc::now();
-    let received_bucket_ts = (now.timestamp() / 2) * 2;
-    let received_at = chrono::DateTime::from_timestamp(received_bucket_ts, 0).unwrap_or(now);
-    Ok(Json(SendMessageOutput {
-        message_id: input.msg_id.to_string().into(),
         received_at: crate::sqlx_jacquard::chrono_to_datetime(received_at),
         seq: 0,
         epoch: input.epoch,

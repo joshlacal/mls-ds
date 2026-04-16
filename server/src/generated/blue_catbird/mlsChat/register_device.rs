@@ -37,49 +37,49 @@ pub mod key_package_item_state {
     }
     /// State trait tracking which required fields have been set
     pub trait State: sealed::Sealed {
-        type CipherSuite;
         type Expires;
+        type CipherSuite;
         type KeyPackage;
     }
     /// Empty state - all required fields are unset
     pub struct Empty(());
     impl sealed::Sealed for Empty {}
     impl State for Empty {
-        type CipherSuite = Unset;
         type Expires = Unset;
+        type CipherSuite = Unset;
         type KeyPackage = Unset;
-    }
-    ///State transition - sets the `cipher_suite` field to Set
-    pub struct SetCipherSuite<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetCipherSuite<S> {}
-    impl<S: State> State for SetCipherSuite<S> {
-        type CipherSuite = Set<members::cipher_suite>;
-        type Expires = S::Expires;
-        type KeyPackage = S::KeyPackage;
     }
     ///State transition - sets the `expires` field to Set
     pub struct SetExpires<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetExpires<S> {}
     impl<S: State> State for SetExpires<S> {
-        type CipherSuite = S::CipherSuite;
         type Expires = Set<members::expires>;
+        type CipherSuite = S::CipherSuite;
+        type KeyPackage = S::KeyPackage;
+    }
+    ///State transition - sets the `cipher_suite` field to Set
+    pub struct SetCipherSuite<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetCipherSuite<S> {}
+    impl<S: State> State for SetCipherSuite<S> {
+        type Expires = S::Expires;
+        type CipherSuite = Set<members::cipher_suite>;
         type KeyPackage = S::KeyPackage;
     }
     ///State transition - sets the `key_package` field to Set
     pub struct SetKeyPackage<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetKeyPackage<S> {}
     impl<S: State> State for SetKeyPackage<S> {
-        type CipherSuite = S::CipherSuite;
         type Expires = S::Expires;
+        type CipherSuite = S::CipherSuite;
         type KeyPackage = Set<members::key_package>;
     }
     /// Marker types for field names
     #[allow(non_camel_case_types)]
     pub mod members {
-        ///Marker type for the `cipher_suite` field
-        pub struct cipher_suite(());
         ///Marker type for the `expires` field
         pub struct expires(());
+        ///Marker type for the `cipher_suite` field
+        pub struct cipher_suite(());
         ///Marker type for the `key_package` field
         pub struct key_package(());
     }
@@ -174,8 +174,8 @@ where
 impl<'a, S> KeyPackageItemBuilder<'a, S>
 where
     S: key_package_item_state::State,
-    S::CipherSuite: key_package_item_state::IsSet,
     S::Expires: key_package_item_state::IsSet,
+    S::CipherSuite: key_package_item_state::IsSet,
     S::KeyPackage: key_package_item_state::IsSet,
 {
     /// Build the final struct
@@ -520,50 +520,50 @@ pub mod register_device_state {
     /// State trait tracking which required fields have been set
     pub trait State: sealed::Sealed {
         type KeyPackages;
-        type DeviceName;
         type SignaturePublicKey;
+        type DeviceName;
     }
     /// Empty state - all required fields are unset
     pub struct Empty(());
     impl sealed::Sealed for Empty {}
     impl State for Empty {
         type KeyPackages = Unset;
-        type DeviceName = Unset;
         type SignaturePublicKey = Unset;
+        type DeviceName = Unset;
     }
     ///State transition - sets the `key_packages` field to Set
     pub struct SetKeyPackages<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetKeyPackages<S> {}
     impl<S: State> State for SetKeyPackages<S> {
         type KeyPackages = Set<members::key_packages>;
+        type SignaturePublicKey = S::SignaturePublicKey;
         type DeviceName = S::DeviceName;
-        type SignaturePublicKey = S::SignaturePublicKey;
-    }
-    ///State transition - sets the `device_name` field to Set
-    pub struct SetDeviceName<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetDeviceName<S> {}
-    impl<S: State> State for SetDeviceName<S> {
-        type KeyPackages = S::KeyPackages;
-        type DeviceName = Set<members::device_name>;
-        type SignaturePublicKey = S::SignaturePublicKey;
     }
     ///State transition - sets the `signature_public_key` field to Set
     pub struct SetSignaturePublicKey<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetSignaturePublicKey<S> {}
     impl<S: State> State for SetSignaturePublicKey<S> {
         type KeyPackages = S::KeyPackages;
-        type DeviceName = S::DeviceName;
         type SignaturePublicKey = Set<members::signature_public_key>;
+        type DeviceName = S::DeviceName;
+    }
+    ///State transition - sets the `device_name` field to Set
+    pub struct SetDeviceName<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetDeviceName<S> {}
+    impl<S: State> State for SetDeviceName<S> {
+        type KeyPackages = S::KeyPackages;
+        type SignaturePublicKey = S::SignaturePublicKey;
+        type DeviceName = Set<members::device_name>;
     }
     /// Marker types for field names
     #[allow(non_camel_case_types)]
     pub mod members {
         ///Marker type for the `key_packages` field
         pub struct key_packages(());
-        ///Marker type for the `device_name` field
-        pub struct device_name(());
         ///Marker type for the `signature_public_key` field
         pub struct signature_public_key(());
+        ///Marker type for the `device_name` field
+        pub struct device_name(());
     }
 }
 
@@ -709,8 +709,8 @@ impl<'a, S> RegisterDeviceBuilder<'a, S>
 where
     S: register_device_state::State,
     S::KeyPackages: register_device_state::IsSet,
-    S::DeviceName: register_device_state::IsSet,
     S::SignaturePublicKey: register_device_state::IsSet,
+    S::DeviceName: register_device_state::IsSet,
 {
     /// Build the final struct
     pub fn build(self) -> RegisterDevice<'a> {
@@ -901,37 +901,37 @@ pub mod welcome_message_state {
     }
     /// State trait tracking which required fields have been set
     pub trait State: sealed::Sealed {
-        type ConvoId;
         type Welcome;
+        type ConvoId;
     }
     /// Empty state - all required fields are unset
     pub struct Empty(());
     impl sealed::Sealed for Empty {}
     impl State for Empty {
-        type ConvoId = Unset;
         type Welcome = Unset;
-    }
-    ///State transition - sets the `convo_id` field to Set
-    pub struct SetConvoId<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetConvoId<S> {}
-    impl<S: State> State for SetConvoId<S> {
-        type ConvoId = Set<members::convo_id>;
-        type Welcome = S::Welcome;
+        type ConvoId = Unset;
     }
     ///State transition - sets the `welcome` field to Set
     pub struct SetWelcome<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetWelcome<S> {}
     impl<S: State> State for SetWelcome<S> {
-        type ConvoId = S::ConvoId;
         type Welcome = Set<members::welcome>;
+        type ConvoId = S::ConvoId;
+    }
+    ///State transition - sets the `convo_id` field to Set
+    pub struct SetConvoId<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetConvoId<S> {}
+    impl<S: State> State for SetConvoId<S> {
+        type Welcome = S::Welcome;
+        type ConvoId = Set<members::convo_id>;
     }
     /// Marker types for field names
     #[allow(non_camel_case_types)]
     pub mod members {
-        ///Marker type for the `convo_id` field
-        pub struct convo_id(());
         ///Marker type for the `welcome` field
         pub struct welcome(());
+        ///Marker type for the `convo_id` field
+        pub struct convo_id(());
     }
 }
 
@@ -1004,8 +1004,8 @@ where
 impl<'a, S> WelcomeMessageBuilder<'a, S>
 where
     S: welcome_message_state::State,
-    S::ConvoId: welcome_message_state::IsSet,
     S::Welcome: welcome_message_state::IsSet,
+    S::ConvoId: welcome_message_state::IsSet,
 {
     /// Build the final struct
     pub fn build(self) -> WelcomeMessage<'a> {

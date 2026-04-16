@@ -401,7 +401,7 @@ impl BlockSyncService {
         Ok(blocks.len())
     }
 
-    /// Invalidate cached blocks for a user (call after handleBlockChange)
+    /// Invalidate cached blocks for a user (call after block/unblock events)
     pub async fn invalidate_cache(&self, did: &str) {
         self.blocks_cache.invalidate(did).await;
     }

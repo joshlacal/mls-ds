@@ -1,31 +1,37 @@
 use axum::{extract::State, http::StatusCode, Json};
-use serde::{Deserialize, Serialize};
+use jacquard_axum::ExtractXrpc;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use crate::{
     auth::AuthUser,
     federation::{self, DsResolver, FederatedBackend, FederationConfig, SequencerTransfer},
+    generated::blue_catbird::mlsChat::request_failover::{
+        RequestFailover, RequestFailoverOutput, RequestFailoverRequest,
+    },
     storage::DbPool,
 };
 
 const NSID: &str = "blue.catbird.mlsChat.requestFailover";
 
-// TODO: Replace with generated request type once lexicon defines blue.catbird.mlsChat.requestFailover input
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RequestFailoverInput {
-    pub convo_id: String,
-}
-
-// TODO: Replace with generated output type once lexicon defines blue.catbird.mlsChat.requestFailover output
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RequestFailoverOutput {
-    pub new_sequencer_did: String,
-    pub convo_id: String,
-    pub epoch: i32,
-    pub sequencer_term: u64,
+/// Build a `RequestFailoverOutput` for the success path.
+///
+/// Centralized so every construction site funnels through the same
+/// type-conversion surface and we don't re-implement `i32 → i64` / `u64 → i64`
+/// casts at every call-site.
+fn make_output(
+    new_sequencer_did: &str,
+    convo_id: &str,
+    epoch: i32,
+    sequencer_term: u64,
+) -> RequestFailoverOutput<'static> {
+    RequestFailoverOutput {
+        new_sequencer_did: crate::sqlx_jacquard::string_to_did(new_sequencer_did),
+        convo_id: jacquard_common::CowStr::Owned(convo_id.into()),
+        epoch: epoch as i64,
+        sequencer_term: sequencer_term as i64,
+        extra_data: Default::default(),
+    }
 }
 
 /// POST /xrpc/blue.catbird.mlsChat.requestFailover
@@ -52,21 +58,26 @@ pub async fn request_failover(
     State(federated_backend): State<Arc<FederatedBackend>>,
     State(outbound_queue): State<Arc<federation::queue::OutboundQueue>>,
     auth_user: AuthUser,
-    Json(input): Json<RequestFailoverInput>,
-) -> Result<Json<RequestFailoverOutput>, StatusCode> {
+    ExtractXrpc(input): ExtractXrpc<RequestFailoverRequest>,
+) -> Result<Json<RequestFailoverOutput<'static>>, StatusCode> {
+    // The `ExtractXrpc` associated type is `RequestFailover<'_>` (borrowed);
+    // name it explicitly so the rest of the function reads naturally.
+    let input: RequestFailover<'_> = input;
+    let convo_id: String = input.convo_id.as_ref().to_string();
+
     // Enforce standard client auth
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
         return Err(StatusCode::UNAUTHORIZED);
     }
 
     // Verify caller is a member of the conversation
-    crate::auth::verify_is_member(&pool, &input.convo_id, &auth_user.did).await?;
+    crate::auth::verify_is_member(&pool, &convo_id, &auth_user.did).await?;
 
     // Fetch current sequencer and epoch
     let row = sqlx::query_as::<_, (Option<String>, Option<i32>, Option<i64>)>(
         "SELECT sequencer_ds, current_epoch, sequencer_term FROM conversations WHERE id = $1",
     )
-    .bind(&input.convo_id)
+    .bind(&convo_id)
     .fetch_optional(&pool)
     .await
     .map_err(|e| {
@@ -88,12 +99,12 @@ pub async fn request_failover(
     if current_seq.is_empty()
         || crate::identity::canonical_did(&current_seq) == crate::identity::canonical_did(self_did)
     {
-        return Ok(Json(RequestFailoverOutput {
-            new_sequencer_did: self_did.clone(),
-            convo_id: input.convo_id,
+        return Ok(Json(make_output(
+            self_did,
+            &convo_id,
             epoch,
             sequencer_term,
-        }));
+        )));
     }
 
     // Resolve the current sequencer's endpoint for health-checking
@@ -102,26 +113,26 @@ pub async fn request_failover(
         Err(_) => {
             // Can't even resolve → sequencer is unreachable
             warn!(
-                convo_id = %crate::crypto::redact_for_log(&input.convo_id),
+                convo_id = %crate::crypto::redact_for_log(&convo_id),
                 sequencer = %crate::crypto::redact_for_log(&current_seq),
                 "Cannot resolve sequencer endpoint, assuming unreachable"
             );
             let (new_epoch, new_term) =
-                do_assume(&sequencer_transfer, &input.convo_id, self_did, &current_seq).await?;
+                do_assume(&sequencer_transfer, &convo_id, self_did, &current_seq).await?;
             broadcast_sequencer_change(
                 &federated_backend,
                 &outbound_queue,
-                &input.convo_id,
+                &convo_id,
                 self_did,
                 new_epoch,
                 new_term,
             );
-            return Ok(Json(RequestFailoverOutput {
-                new_sequencer_did: self_did.clone(),
-                convo_id: input.convo_id,
-                epoch: new_epoch,
-                sequencer_term: new_term,
-            }));
+            return Ok(Json(make_output(
+                self_did,
+                &convo_id,
+                new_epoch,
+                new_term,
+            )));
         }
     };
 
@@ -140,7 +151,7 @@ pub async fn request_failover(
         Ok(resp) if resp.status().is_success() => {
             // Sequencer is healthy — failover not needed
             info!(
-                convo_id = %crate::crypto::redact_for_log(&input.convo_id),
+                convo_id = %crate::crypto::redact_for_log(&convo_id),
                 sequencer = %crate::crypto::redact_for_log(&current_seq),
                 "Sequencer is healthy, failover denied"
             );
@@ -148,7 +159,7 @@ pub async fn request_failover(
         }
         Ok(resp) => {
             warn!(
-                convo_id = %crate::crypto::redact_for_log(&input.convo_id),
+                convo_id = %crate::crypto::redact_for_log(&convo_id),
                 sequencer = %crate::crypto::redact_for_log(&current_seq),
                 status = %resp.status(),
                 "Sequencer returned unhealthy status"
@@ -156,7 +167,7 @@ pub async fn request_failover(
         }
         Err(e) => {
             warn!(
-                convo_id = %crate::crypto::redact_for_log(&input.convo_id),
+                convo_id = %crate::crypto::redact_for_log(&convo_id),
                 sequencer = %crate::crypto::redact_for_log(&current_seq),
                 error = %e,
                 "Sequencer health check failed"
@@ -166,24 +177,19 @@ pub async fn request_failover(
 
     // Sequencer is unreachable — assume the role
     let (new_epoch, new_term) =
-        do_assume(&sequencer_transfer, &input.convo_id, self_did, &current_seq).await?;
+        do_assume(&sequencer_transfer, &convo_id, self_did, &current_seq).await?;
 
     // Best-effort broadcast to all remote DSes (non-blocking)
     broadcast_sequencer_change(
         &federated_backend,
         &outbound_queue,
-        &input.convo_id,
+        &convo_id,
         self_did,
         new_epoch,
         new_term,
     );
 
-    Ok(Json(RequestFailoverOutput {
-        new_sequencer_did: self_did.clone(),
-        convo_id: input.convo_id,
-        epoch: new_epoch,
-        sequencer_term: new_term,
-    }))
+    Ok(Json(make_output(self_did, &convo_id, new_epoch, new_term)))
 }
 
 async fn do_assume(
