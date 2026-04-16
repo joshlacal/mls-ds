@@ -19,6 +19,7 @@ pub mod update_cursor;
 
 // Group State
 pub mod commit_group_change;
+pub(crate) mod commit_inspect;
 pub mod get_group_health;
 pub mod get_group_state;
 pub mod report_recovery_failure;
