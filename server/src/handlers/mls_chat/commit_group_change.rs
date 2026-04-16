@@ -211,7 +211,7 @@ pub async fn commit_group_change(
             // See docs/superpowers/plans/2026-04-15-block-leave-shared-groups.md Phase 3.
             {
                 let existing_member_dids: Vec<String> = sqlx::query_scalar(
-                    "SELECT DISTINCT member_did FROM members WHERE convo_id = $1 AND left_at IS NULL",
+                    "SELECT DISTINCT COALESCE(user_did, member_did) FROM members WHERE convo_id = $1 AND left_at IS NULL",
                 )
                 .bind(&convo_id)
                 .fetch_all(&pool)
@@ -816,7 +816,7 @@ pub async fn commit_group_change(
             // See docs/superpowers/plans/2026-04-15-block-leave-shared-groups.md Phase 3.
             {
                 let existing_member_dids: Vec<String> = sqlx::query_scalar(
-                    "SELECT DISTINCT member_did FROM members WHERE convo_id = $1 AND left_at IS NULL",
+                    "SELECT DISTINCT COALESCE(user_did, member_did) FROM members WHERE convo_id = $1 AND left_at IS NULL",
                 )
                 .bind(&convo_id)
                 .fetch_all(&pool)
