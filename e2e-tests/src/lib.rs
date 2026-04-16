@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod federation;
 pub mod mls_engine;
 
 use anyhow::{Context, Result};

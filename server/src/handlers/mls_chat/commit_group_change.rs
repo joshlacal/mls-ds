@@ -409,17 +409,24 @@ pub async fn commit_group_change(
 
             // ── Store or invalidate GroupInfo ─────────────────────────
             if let Some(ref gi_bytes) = add_group_info_bytes {
+                // Bind current_epoch to the parsed MLS epoch — try_advance only
+                // increments a counter, but the truth lives in GroupInfo. This
+                // self-heals any prior drift (e.g. from leave commits that bumped
+                // the counter without storing new GroupInfo).
+                let add_mls_epoch_i32 = add_mls_epoch.map(|e| e as i32);
                 sqlx::query(
                     r#"UPDATE conversations
                        SET group_info = $1,
                            group_info_epoch = COALESCE(group_info_epoch, 0) + 1,
                            group_info_updated_at = NOW(),
+                           current_epoch = COALESCE($4, current_epoch),
                            confirmation_tag = $3
                        WHERE id = $2"#,
                 )
                 .bind(gi_bytes)
                 .bind(&convo_id)
                 .bind(&add_confirmation_tag)
+                .bind(add_mls_epoch_i32)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| {
@@ -1041,19 +1048,25 @@ pub async fn commit_group_change(
 
             // ── Store or invalidate GroupInfo ─────────────────────────
             if let Some(ref gi_bytes) = group_info_bytes_opt {
-                // Store the fresh GroupInfo atomically with the epoch advance
+                // Store the fresh GroupInfo atomically with the epoch advance.
+                // Bind current_epoch to the parsed MLS epoch — try_advance only
+                // increments a counter, but the truth lives in GroupInfo. This
+                // self-heals any prior drift (e.g. from leave commits that bumped
+                // the counter without storing new GroupInfo).
                 let mls_epoch_i32 = mls_epoch.map(|e| e as i32);
                 sqlx::query(
                     r#"UPDATE conversations
                        SET group_info = $1,
                            group_info_epoch = COALESCE(group_info_epoch, 0) + 1,
                            group_info_updated_at = NOW(),
+                           current_epoch = COALESCE($4, current_epoch),
                            confirmation_tag = $3
                        WHERE id = $2"#,
                 )
                 .bind(gi_bytes)
                 .bind(&convo_id)
                 .bind(&ec_confirmation_tag)
+                .bind(mls_epoch_i32)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| {

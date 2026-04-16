@@ -164,15 +164,11 @@ make migrate
 
 ### Schema Inspection
 
-```bash
-# List tables
-psql -h localhost -U catbird -d catbird -c "\dt"
-
-# Describe table
-psql -h localhost -U catbird -d catbird -c "\d conversations"
-
-# Check for column existence
-psql -h localhost -U catbird -d catbird -c "SELECT column_name FROM information_schema.columns WHERE table_name='conversations';"
+Use `doppler run -- psql` to connect, then:
+```sql
+\dt                    -- List tables
+\d conversations       -- Describe table
+SELECT column_name FROM information_schema.columns WHERE table_name='conversations';
 ```
 
 ### Common Database Issues
@@ -215,13 +211,13 @@ psql -h localhost -U catbird -d catbird -c "SELECT column_name FROM information_
 
 ### Required Variables
 
-- `DATABASE_URL`: PostgreSQL connection (e.g., `postgresql://catbird:password@localhost:5432/catbird`)
-- `REDIS_URL`: Redis connection (e.g., `redis://localhost:6379`)
+- `DATABASE_URL`: PostgreSQL connection string (managed via Doppler — never hardcode)
+- `REDIS_URL`: Redis connection string
 
 ### Optional Variables
 
 - `RUST_LOG`: Logging level (default: `info`)
-- `SERVER_PORT`: Server port (default: `3000`)
+- `SERVER_PORT`: Server port (default: `3000`, production uses `3001`)
 - `SERVICE_DID`: Required audience for JWTs
 - `ENFORCE_LXM`: Require lxm claim matching endpoint (default: false)
 - `ENFORCE_JTI`: Require jti for replay prevention (default: true)
@@ -230,8 +226,7 @@ psql -h localhost -U catbird -d catbird -c "SELECT column_name FROM information_
 
 ## Systemd Service
 
-The server runs as a systemd service (`catbird-mls-server`). The service file is located at:
-- `/home/josh/dev/mls-ds/catbird-mls-server.service`
+The server runs as a systemd service (`catbird-mls-server`).
 
 Key service commands:
 ```bash
