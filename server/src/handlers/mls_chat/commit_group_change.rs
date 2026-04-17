@@ -1522,6 +1522,21 @@ pub async fn commit_group_change(
                     );
                     return Err(conflict("GroupInfo epoch is behind current epoch"));
                 }
+                // Epoch transitions require an externalCommit (which persists the commit PDU
+                // into the messages stream so peers can catch up via getMessages?type=commit).
+                // Accepting a higher epoch here would silently advance current_epoch without
+                // a recoverable commit row, stranding every other device at the old epoch.
+                if (mls_epoch as i32) > current_server_epoch {
+                    warn!(
+                        convo_id = %crate::crypto::redact_for_log(&convo_id),
+                        mls_epoch,
+                        current_server_epoch,
+                        "Rejecting updateGroupInfo with higher epoch — epoch transitions require externalCommit"
+                    );
+                    return Err(conflict(
+                        "updateGroupInfo cannot advance the group epoch; use action=\"externalCommit\" for epoch transitions",
+                    ));
+                }
             }
 
             // Decode client-provided confirmation_tag
