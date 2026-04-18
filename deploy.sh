@@ -6,7 +6,9 @@
 # This script:
 # 1. Pulls latest code
 # 2. Builds the release binary (in-place, used directly by systemd)
-# 3. Restarts the systemd service
+# 3. Runs pending SQL migrations via sqlx
+# 4. Restarts the systemd service
+# 5. Verifies the service is healthy
 #
 
 set -euo pipefail
@@ -40,9 +42,8 @@ SQLX_OFFLINE=true cargo build --release
 echo -e "${GREEN}✓ Build complete${NC}"
 echo
 
-# Step 3: Verify binary and restart service
-# Note: systemd runs the binary directly from target/release/
-echo -e "${YELLOW}[3/4] Verifying binary and restarting service...${NC}"
+# Step 3: Verify binary
+echo -e "${YELLOW}[3/5] Verifying binary...${NC}"
 if [ ! -f "$TARGET_DIR/release/$BINARY_NAME" ]; then
     echo -e "${RED}ERROR: Binary not found at $TARGET_DIR/release/$BINARY_NAME${NC}"
     exit 1
@@ -50,12 +51,26 @@ fi
 echo -e "${GREEN}✓ Binary found${NC}"
 echo "  Path: $TARGET_DIR/release/$BINARY_NAME"
 echo "  Size: $(du -h "$TARGET_DIR/release/$BINARY_NAME" | cut -f1)"
-sudo systemctl restart $SERVICE_NAME
-echo -e "${GREEN}✓ Service restarted${NC}"
 echo
 
-# Step 4: Verify deployment
-echo -e "${YELLOW}[4/4] Verifying deployment...${NC}"
+# Step 4: Run SQL migrations BEFORE restart
+# Must run before restart so the new binary boots against a correctly-shaped
+# schema. SKIP_MIGRATIONS=true in systemd env disables the startup check,
+# so this step is the only place migrations actually run.
+echo -e "${YELLOW}[4/5] Running database migrations...${NC}"
+if ! command -v doppler &> /dev/null; then
+    echo -e "${RED}ERROR: doppler CLI not found — cannot source DATABASE_URL${NC}"
+    exit 1
+fi
+doppler run --project catbird-mls --config prd -- \
+    "$MLS_ROOT/server/scripts/run-migrations.sh"
+echo -e "${GREEN}✓ Migrations applied${NC}"
+echo
+
+# Step 5: Restart service
+echo -e "${YELLOW}[5/5] Restarting service and verifying...${NC}"
+sudo systemctl restart $SERVICE_NAME
+echo -e "${GREEN}✓ Service restarted${NC}"
 sleep 2
 
 # Check service is running
