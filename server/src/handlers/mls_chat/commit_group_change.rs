@@ -140,14 +140,23 @@ async fn record_epoch_authenticator_tx(
     .execute(&mut **tx)
     .await
     {
-        // Log but don't fail the commit — this is a best-effort audit insert;
-        // the authenticator store is advisory for quorum voting, not for the
-        // MLS protocol itself.
+        // NOTE: We log here but we CANNOT swallow the error without also
+        // propagating it — in Postgres, any failed statement aborts the
+        // current transaction, so the subsequent `tx.commit()` would also
+        // fail with "current transaction is aborted, commands ignored
+        // until end of transaction block" regardless of what we do here.
+        // In steady state (table exists, PK + `ON CONFLICT DO NOTHING`)
+        // this INSERT cannot fail except under genuine DB outage, so
+        // aborting the commit is the correct behavior.
+        //
+        // IMPORTANT: migration 20260418_001 MUST be applied before this
+        // code ships, otherwise EVERY commit_group_change call that
+        // carries an epoch_authenticator will 500.
         warn!(
             convo_id = %crate::crypto::redact_for_log(convo_id),
             branch,
             epoch,
-            "failed to record epoch_authenticator: {}",
+            "failed to record epoch_authenticator (will poison tx): {}",
             e
         );
     }
