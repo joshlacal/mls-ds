@@ -405,4 +405,429 @@ mod conversation_tests {
         actor_ref.stop(None);
         cleanup_test_data(&pool, convo_id).await;
     }
+
+    // =====================================================================
+    // ADR-002 §A7.5 — RecordResetVote unit tests
+    //
+    // Each test drives `handle_record_reset_vote` via the actor mailbox
+    // (ConvoMessage::RecordResetVote) and asserts on the returned
+    // RecordResetVoteOutcome. Members, epoch_authenticators, and reset_votes
+    // are seeded directly so we don't need a full MLS commit path.
+    //
+    // All tests are #[ignore]'d because they require a live Postgres with
+    // the 20260418_001 migration applied. Run with:
+    //   cargo test -p catbird-server --lib reset_vote -- --ignored
+    // =====================================================================
+
+    use crate::actors::RecordResetVoteOutcome;
+
+    async fn wipe_a7(pool: &PgPool, convo_id: &str) {
+        for table in &[
+            "envelopes",
+            "messages",
+            "welcome_messages",
+            "pending_device_additions",
+            "recovery_failures",
+            "reset_votes",
+            "epoch_authenticators",
+            "auto_reset_history",
+            "members",
+        ] {
+            let _ = sqlx::query(&format!("DELETE FROM {} WHERE convo_id = $1", table))
+                .bind(convo_id)
+                .execute(pool)
+                .await;
+        }
+        let _ = sqlx::query("DELETE FROM conversations WHERE id = $1")
+            .bind(convo_id)
+            .execute(pool)
+            .await;
+    }
+
+    async fn seed_a7_convo(
+        pool: &PgPool,
+        convo_id: &str,
+        current_epoch: i32,
+        auth_hex: &str,
+        members: &[(&str, &str)],
+    ) {
+        let now = chrono::Utc::now();
+        sqlx::query(
+            "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at) \
+             VALUES ($1, 'did:plc:creator', $2, $3, $3) \
+             ON CONFLICT (id) DO UPDATE SET current_epoch = $2",
+        )
+        .bind(convo_id)
+        .bind(current_epoch)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .expect("seed convo");
+
+        sqlx::query(
+            "INSERT INTO epoch_authenticators (convo_id, epoch, authenticator, recorded_at) \
+             VALUES ($1, $2, $3, NOW()) ON CONFLICT DO NOTHING",
+        )
+        .bind(convo_id)
+        .bind(current_epoch)
+        .bind(auth_hex)
+        .execute(pool)
+        .await
+        .expect("seed authenticator");
+
+        for (user_did, member_did) in members {
+            sqlx::query(
+                "INSERT INTO members (convo_id, member_did, user_did, joined_at) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (convo_id, member_did) DO UPDATE \
+                 SET user_did = EXCLUDED.user_did, left_at = NULL",
+            )
+            .bind(convo_id)
+            .bind(*member_did)
+            .bind(*user_did)
+            .bind(&now)
+            .execute(pool)
+            .await
+            .expect("seed member");
+        }
+    }
+
+    async fn cast_vote(
+        actor: &ractor::ActorRef<ConvoMessage>,
+        device_did: &str,
+        identity_did: &str,
+        auth: &str,
+    ) -> RecordResetVoteOutcome {
+        let (tx, rx) = oneshot::channel();
+        actor
+            .cast(ConvoMessage::RecordResetVote {
+                device_did: device_did.to_string(),
+                identity_did: identity_did.to_string(),
+                epoch_authenticator: auth.to_string(),
+                failure_type: "external_commit_exhausted".to_string(),
+                reply: tx,
+            })
+            .expect("send vote");
+        rx.await.expect("rx vote").expect("outcome ok")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres with A7 migration applied (TEST_DATABASE_URL)"]
+    async fn test_record_reset_vote_happy_path_3_member_2_votes() {
+        let pool = setup_test_db().await;
+        let convo_id = "test-a7-happy";
+        wipe_a7(&pool, convo_id).await;
+        let auth = "deadbeefc0de";
+        seed_a7_convo(
+            &pool,
+            convo_id,
+            5,
+            auth,
+            &[
+                ("did:plc:alice", "did:plc:alice#d1"),
+                ("did:plc:bob", "did:plc:bob#d1"),
+                ("did:plc:carol", "did:plc:carol#d1"),
+            ],
+        )
+        .await;
+        let args = ConvoActorArgs {
+            sse_state: Arc::new(SseState::new(1000)),
+            notification_service: None,
+            convo_id: convo_id.to_string(),
+            db_pool: pool.clone(),
+        };
+        let (actor, _h) = Actor::spawn(None, ConversationActor, args)
+            .await
+            .expect("spawn");
+
+        let o1 = cast_vote(&actor, "did:plc:alice#d1", "did:plc:alice", auth).await;
+        assert!(o1.recorded);
+        assert!(!o1.auto_reset_triggered);
+        assert_eq!(o1.per_did_vote_count, 1);
+        assert_eq!(o1.member_did_count, 3);
+
+        let o2 = cast_vote(&actor, "did:plc:bob#d1", "did:plc:bob", auth).await;
+        assert!(o2.recorded);
+        assert!(o2.auto_reset_triggered, "quorum 2/3 reached");
+        assert!(o2.new_group_id.is_some());
+        assert_eq!(o2.reset_count, Some(1));
+
+        let epoch: i32 = sqlx::query_scalar(
+            "SELECT current_epoch FROM conversations WHERE id = $1",
+        )
+        .bind(convo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch epoch");
+        assert_eq!(epoch, 0);
+
+        actor.stop(None);
+        wipe_a7(&pool, convo_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres with A7 migration applied (TEST_DATABASE_URL)"]
+    async fn test_record_reset_vote_stale_authenticator() {
+        let pool = setup_test_db().await;
+        let convo_id = "test-a7-stale";
+        wipe_a7(&pool, convo_id).await;
+        seed_a7_convo(
+            &pool,
+            convo_id,
+            100,
+            "a11ca11c",
+            &[
+                ("did:plc:alice", "did:plc:alice#d1"),
+                ("did:plc:bob", "did:plc:bob#d1"),
+                ("did:plc:carol", "did:plc:carol#d1"),
+            ],
+        )
+        .await;
+        let args = ConvoActorArgs {
+            sse_state: Arc::new(SseState::new(1000)),
+            notification_service: None,
+            convo_id: convo_id.to_string(),
+            db_pool: pool.clone(),
+        };
+        let (actor, _h) = Actor::spawn(None, ConversationActor, args)
+            .await
+            .expect("spawn");
+
+        let o = cast_vote(&actor, "did:plc:alice#d1", "did:plc:alice", "00d1fc11").await;
+        assert!(!o.recorded);
+        assert_eq!(o.reason.as_deref(), Some("stale_authenticator"));
+
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM reset_votes WHERE convo_id = $1")
+                .bind(convo_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count");
+        assert_eq!(count, 0);
+
+        actor.stop(None);
+        wipe_a7(&pool, convo_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres with A7 migration applied (TEST_DATABASE_URL)"]
+    async fn test_record_reset_vote_rate_limited() {
+        let pool = setup_test_db().await;
+        let convo_id = "test-a7-rl";
+        wipe_a7(&pool, convo_id).await;
+        let auth = "beeff00d";
+        seed_a7_convo(
+            &pool,
+            convo_id,
+            3,
+            auth,
+            &[
+                ("did:plc:alice", "did:plc:alice#d1"),
+                ("did:plc:alice", "did:plc:alice#d2"),
+                ("did:plc:bob", "did:plc:bob#d1"),
+            ],
+        )
+        .await;
+        let args = ConvoActorArgs {
+            sse_state: Arc::new(SseState::new(1000)),
+            notification_service: None,
+            convo_id: convo_id.to_string(),
+            db_pool: pool.clone(),
+        };
+        let (actor, _h) = Actor::spawn(None, ConversationActor, args)
+            .await
+            .expect("spawn");
+
+        let o1 = cast_vote(&actor, "did:plc:alice#d1", "did:plc:alice", auth).await;
+        assert!(o1.recorded);
+
+        let o2 = cast_vote(&actor, "did:plc:alice#d2", "did:plc:alice", auth).await;
+        assert!(!o2.recorded);
+        assert_eq!(o2.reason.as_deref(), Some("rate_limited"));
+
+        actor.stop(None);
+        wipe_a7(&pool, convo_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres with A7 migration applied (TEST_DATABASE_URL)"]
+    async fn test_record_reset_vote_circuit_breaker_trips() {
+        let pool = setup_test_db().await;
+        let convo_id = "test-a7-breaker";
+        wipe_a7(&pool, convo_id).await;
+        let auth = "facefeed";
+        seed_a7_convo(
+            &pool,
+            convo_id,
+            9,
+            auth,
+            &[
+                ("did:plc:alice", "did:plc:alice#d1"),
+                ("did:plc:bob", "did:plc:bob#d1"),
+            ],
+        )
+        .await;
+        for _ in 0..3 {
+            sqlx::query(
+                "INSERT INTO auto_reset_history \
+                    (convo_id, reset_triggered_at, triggered_by, new_group_id, \
+                     vote_count, member_count) \
+                 VALUES ($1, NOW() - INTERVAL '1 hour', 'system:auto_recovery', \
+                         $2, 2, 2)",
+            )
+            .bind(convo_id)
+            .bind(uuid::Uuid::new_v4().to_string())
+            .execute(&pool)
+            .await
+            .expect("seed history");
+        }
+        let args = ConvoActorArgs {
+            sse_state: Arc::new(SseState::new(1000)),
+            notification_service: None,
+            convo_id: convo_id.to_string(),
+            db_pool: pool.clone(),
+        };
+        let (actor, _h) = Actor::spawn(None, ConversationActor, args)
+            .await
+            .expect("spawn");
+
+        let _ = cast_vote(&actor, "did:plc:alice#d1", "did:plc:alice", auth).await;
+        let o = cast_vote(&actor, "did:plc:bob#d1", "did:plc:bob", auth).await;
+        assert_eq!(o.reason.as_deref(), Some("circuit_breaker"));
+        assert!(!o.auto_reset_triggered);
+
+        let disabled: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+            "SELECT auto_reset_disabled_at FROM conversations WHERE id = $1",
+        )
+        .bind(convo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch");
+        assert!(disabled.is_some());
+
+        actor.stop(None);
+        wipe_a7(&pool, convo_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres with A7 migration applied (TEST_DATABASE_URL)"]
+    async fn test_record_reset_vote_per_did_multi_device() {
+        let pool = setup_test_db().await;
+        let convo_id = "test-a7-multidev";
+        wipe_a7(&pool, convo_id).await;
+        let auth = "c0ffee42";
+        seed_a7_convo(
+            &pool,
+            convo_id,
+            7,
+            auth,
+            &[
+                ("did:plc:alice", "did:plc:alice#d1"),
+                ("did:plc:alice", "did:plc:alice#d2"),
+                ("did:plc:alice", "did:plc:alice#d3"),
+                ("did:plc:bob", "did:plc:bob#d1"),
+                ("did:plc:carol", "did:plc:carol#d1"),
+            ],
+        )
+        .await;
+        // Pre-seed all 3 of alice's devices as having voted (can't go through
+        // handler because per-identity rate limit would block devices 2 & 3).
+        for dev in &["d1", "d2", "d3"] {
+            sqlx::query(
+                "INSERT INTO reset_votes \
+                    (convo_id, device_did, identity_did, epoch_authenticator, \
+                     failure_type, voted_at, expires_at) \
+                 VALUES ($1, $2, 'did:plc:alice', $3, 'external_commit_exhausted', \
+                         NOW(), NOW() + INTERVAL '24 hours')",
+            )
+            .bind(convo_id)
+            .bind(format!("did:plc:alice#{}", dev))
+            .bind(auth)
+            .execute(&pool)
+            .await
+            .expect("seed alice vote");
+        }
+
+        let args = ConvoActorArgs {
+            sse_state: Arc::new(SseState::new(1000)),
+            notification_service: None,
+            convo_id: convo_id.to_string(),
+            db_pool: pool.clone(),
+        };
+        let (actor, _h) = Actor::spawn(None, ConversationActor, args)
+            .await
+            .expect("spawn");
+
+        // Trigger counter via alice d1 (upsert of existing vote). Counter
+        // should see alice as 1 identity-vote; bob/carol have voted nothing.
+        let o = cast_vote(&actor, "did:plc:alice#d1", "did:plc:alice", auth).await;
+        assert_eq!(
+            o.per_did_vote_count, 1,
+            "3 devices of alice == 1 identity-vote"
+        );
+        assert_eq!(o.member_did_count, 3);
+        assert!(!o.auto_reset_triggered, "1 of 3 below ceil(3*2/3)=2");
+
+        actor.stop(None);
+        wipe_a7(&pool, convo_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres with A7 migration applied (TEST_DATABASE_URL)"]
+    async fn test_record_reset_vote_partial_lockout_zero() {
+        let pool = setup_test_db().await;
+        let convo_id = "test-a7-partial";
+        wipe_a7(&pool, convo_id).await;
+        let auth = "b00dcafe";
+        seed_a7_convo(
+            &pool,
+            convo_id,
+            2,
+            auth,
+            &[
+                ("did:plc:alice", "did:plc:alice#d1"),
+                ("did:plc:alice", "did:plc:alice#d2"),
+                ("did:plc:alice", "did:plc:alice#d3"),
+                ("did:plc:bob", "did:plc:bob#d1"),
+            ],
+        )
+        .await;
+        // Only 2 of alice's 3 devices voted (d1, d2).
+        for dev in &["d1", "d2"] {
+            sqlx::query(
+                "INSERT INTO reset_votes \
+                    (convo_id, device_did, identity_did, epoch_authenticator, \
+                     failure_type, voted_at, expires_at) \
+                 VALUES ($1, $2, 'did:plc:alice', $3, 'external_commit_exhausted', \
+                         NOW(), NOW() + INTERVAL '24 hours')",
+            )
+            .bind(convo_id)
+            .bind(format!("did:plc:alice#{}", dev))
+            .bind(auth)
+            .execute(&pool)
+            .await
+            .expect("seed");
+        }
+
+        let args = ConvoActorArgs {
+            sse_state: Arc::new(SseState::new(1000)),
+            notification_service: None,
+            convo_id: convo_id.to_string(),
+            db_pool: pool.clone(),
+        };
+        let (actor, _h) = Actor::spawn(None, ConversationActor, args)
+            .await
+            .expect("spawn");
+
+        let o = cast_vote(&actor, "did:plc:bob#d1", "did:plc:bob", auth).await;
+        assert_eq!(
+            o.per_did_vote_count, 1,
+            "alice partial (2/3 devices) = 0; bob = 1; total 1"
+        );
+        assert_eq!(o.member_did_count, 2);
+        assert!(!o.auto_reset_triggered);
+
+        actor.stop(None);
+        wipe_a7(&pool, convo_id).await;
+    }
 }

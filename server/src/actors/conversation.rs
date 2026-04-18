@@ -5,7 +5,7 @@ use std::{collections::HashMap, sync::Arc};
 use tracing::{debug, error, info, warn};
 
 use super::broadcaster::BroadcasterPool;
-use super::messages::{ConvoMessage, KeyPackageHashEntry};
+use super::messages::{ConvoMessage, KeyPackageHashEntry, RecordResetVoteOutcome};
 use crate::notifications::NotificationService;
 use crate::realtime::{SseState, StreamEvent, StreamMessageView};
 use tokio::sync::mpsc;
@@ -264,6 +264,23 @@ impl Actor for ConversationActor {
             }
             ConvoMessage::GetEpoch { reply } => {
                 let _ = reply.send(state.current_epoch);
+            }
+            ConvoMessage::RecordResetVote {
+                device_did,
+                identity_did,
+                epoch_authenticator,
+                failure_type,
+                reply,
+            } => {
+                let result = state
+                    .handle_record_reset_vote(
+                        device_did,
+                        identity_did,
+                        epoch_authenticator,
+                        failure_type,
+                    )
+                    .await;
+                let _ = reply.send(result);
             }
             ConvoMessage::Shutdown => {
                 info!("ConversationActor shutting down");
@@ -960,6 +977,461 @@ impl ConversationActorState {
         );
 
         Ok(())
+    }
+
+    /// Records a quorum-reset vote from one device, with cryptographic proof of
+    /// the claimed stuck state (ADR-002 §A7.1). Returns the full outcome for the
+    /// HTTP layer to translate into a response body.
+    ///
+    /// # Pipeline
+    ///
+    /// 1. Validate the caller is still an active member (defense in depth —
+    ///    the HTTP handler also checks).
+    /// 2. Validate `epoch_authenticator` against `epoch_authenticators` for this
+    ///    conversation. Accept if the authenticator was recorded for one of the
+    ///    current epoch, current_epoch-1, or current_epoch-2, OR was recorded
+    ///    within the last 5 minutes (quiet-group window). Otherwise reject as
+    ///    `stale_authenticator`.
+    /// 3. Check per-DID 24h rate limit via `reset_votes.expires_at > NOW()`. On
+    ///    a second vote from the same `identity_did` within the window, reject
+    ///    as `rate_limited`.
+    /// 4. Upsert the vote into `reset_votes` (PK `(convo_id, device_did)`; a
+    ///    device may refresh its own vote but identity-level rate limit gates
+    ///    above).
+    /// 5. Check 30-minute cooldown on `conversations.last_reset_at`. If in
+    ///    cooldown, record the vote but return `auto_reset_triggered: false`.
+    /// 6. Check rolling 24h circuit breaker: if `auto_reset_history` has >=3
+    ///    rows with `reset_triggered_at > NOW() - '24h'`, set
+    ///    `auto_reset_disabled_at = NOW()` and return `reason: circuit_breaker`.
+    ///    (Also short-circuit on pre-existing `auto_reset_disabled_at`.)
+    /// 7. Compute per-DID vote count: a `user_did` contributes one vote iff
+    ///    every one of its active devices in the roster has filed a non-expired
+    ///    vote row AND every such row's `epoch_authenticator` is valid (which
+    ///    we already enforced at insert time — rejected votes never reach
+    ///    `reset_votes`).
+    /// 8. Compute `member_did_count` = distinct `user_did` values for active
+    ///    members (not soft-deleted).
+    /// 9. If `per_did_vote_count * 3 >= member_did_count * 2` (ceiling of 2/3),
+    ///    execute the auto-reset transaction atomically and emit a
+    ///    `GroupResetEvent` + `auto_reset_history` row.
+    async fn handle_record_reset_vote(
+        &mut self,
+        device_did: String,
+        identity_did: String,
+        epoch_authenticator: String,
+        failure_type: String,
+    ) -> anyhow::Result<RecordResetVoteOutcome> {
+        use anyhow::Context;
+
+        info!(
+            convo = %crate::crypto::redact_for_log(&self.convo_id),
+            device = %crate::crypto::redact_for_log(&device_did),
+            identity = %crate::crypto::redact_for_log(&identity_did),
+            failure_type = %failure_type,
+            "[actor:record_reset_vote] start"
+        );
+
+        // ── 1. Active-member check ────────────────────────────────────────
+        let is_member: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM members \
+             WHERE convo_id = $1 AND member_did = $2 AND left_at IS NULL)",
+        )
+        .bind(&self.convo_id)
+        .bind(&device_did)
+        .fetch_one(&self.db_pool)
+        .await
+        .context("membership check failed")?;
+        if !is_member {
+            return Ok(RecordResetVoteOutcome {
+                recorded: false,
+                reason: Some("not_member".to_string()),
+                per_did_vote_count: 0,
+                member_did_count: 0,
+                auto_reset_triggered: false,
+                new_group_id: None,
+                reset_count: None,
+            });
+        }
+
+        // ── 2. Validate epoch_authenticator ───────────────────────────────
+        //   Accept if it matches a row recorded in the last 3 epochs OR any row
+        //   recorded within the last 5 minutes (quiet-group window).
+        let current_epoch = self.current_epoch as i32;
+        let epoch_floor = current_epoch.saturating_sub(2);
+        let auth_valid: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM epoch_authenticators \
+             WHERE convo_id = $1 \
+             AND authenticator = $2 \
+             AND (epoch BETWEEN $3 AND $4 \
+                  OR recorded_at > NOW() - INTERVAL '5 minutes'))",
+        )
+        .bind(&self.convo_id)
+        .bind(&epoch_authenticator)
+        .bind(epoch_floor)
+        .bind(current_epoch)
+        .fetch_one(&self.db_pool)
+        .await
+        .context("epoch_authenticator lookup failed")?;
+
+        if !auth_valid {
+            warn!(
+                convo = %crate::crypto::redact_for_log(&self.convo_id),
+                "[actor:record_reset_vote] stale_authenticator"
+            );
+            return Ok(RecordResetVoteOutcome {
+                recorded: false,
+                reason: Some("stale_authenticator".to_string()),
+                per_did_vote_count: 0,
+                member_did_count: 0,
+                auto_reset_triggered: false,
+                new_group_id: None,
+                reset_count: None,
+            });
+        }
+
+        // ── 3. Per-identity 24h rate limit ────────────────────────────────
+        //   A DID may only vote once per 24h per conversation. We gate on
+        //   identity_did, not device_did, because every device of the same DID
+        //   is considered "one voter" under per-DID counting.
+        let has_recent_vote: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM reset_votes \
+             WHERE convo_id = $1 AND identity_did = $2 \
+             AND expires_at > NOW() AND device_did <> $3)",
+        )
+        .bind(&self.convo_id)
+        .bind(&identity_did)
+        .bind(&device_did)
+        .fetch_one(&self.db_pool)
+        .await
+        .context("rate-limit lookup failed")?;
+        if has_recent_vote {
+            // The DID has a live vote from a *different* device within 24h.
+            // We refuse the new device's vote rather than allowing per-device
+            // refresh to silently replace it — the 24h window is per-identity.
+            return Ok(RecordResetVoteOutcome {
+                recorded: false,
+                reason: Some("rate_limited".to_string()),
+                per_did_vote_count: 0,
+                member_did_count: 0,
+                auto_reset_triggered: false,
+                new_group_id: None,
+                reset_count: None,
+            });
+        }
+
+        // ── 4. Upsert the vote ────────────────────────────────────────────
+        sqlx::query(
+            "INSERT INTO reset_votes \
+                (convo_id, device_did, identity_did, epoch_authenticator, \
+                 failure_type, voted_at, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, NOW(), NOW() + INTERVAL '24 hours') \
+             ON CONFLICT (convo_id, device_did) DO UPDATE SET \
+                identity_did = EXCLUDED.identity_did, \
+                epoch_authenticator = EXCLUDED.epoch_authenticator, \
+                failure_type = EXCLUDED.failure_type, \
+                voted_at = NOW(), \
+                expires_at = NOW() + INTERVAL '24 hours'",
+        )
+        .bind(&self.convo_id)
+        .bind(&device_did)
+        .bind(&identity_did)
+        .bind(&epoch_authenticator)
+        .bind(&failure_type)
+        .execute(&self.db_pool)
+        .await
+        .context("failed to upsert reset_votes")?;
+
+        // ── 5. Compute per-DID vote count + member_did_count ──────────────
+        //   A user_did contributes iff every one of their active member_dids in
+        //   this conversation has a non-expired reset_votes row. We compare the
+        //   cardinality of the active device set to the cardinality of the voted
+        //   device subset per identity.
+        let member_did_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT COALESCE(user_did, member_did)) \
+             FROM members WHERE convo_id = $1 AND left_at IS NULL",
+        )
+        .bind(&self.convo_id)
+        .fetch_one(&self.db_pool)
+        .await
+        .context("member_did_count failed")?;
+
+        let per_did_vote_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM ( \
+                SELECT COALESCE(m.user_did, m.member_did) AS ident \
+                FROM members m \
+                WHERE m.convo_id = $1 AND m.left_at IS NULL \
+                GROUP BY COALESCE(m.user_did, m.member_did) \
+                HAVING COUNT(*) = COUNT(CASE WHEN EXISTS ( \
+                    SELECT 1 FROM reset_votes rv \
+                    WHERE rv.convo_id = m.convo_id \
+                    AND rv.device_did = m.member_did \
+                    AND rv.expires_at > NOW() \
+                    AND rv.voted_at > NOW() - INTERVAL '1 hour' \
+                ) THEN 1 END) \
+             ) t",
+        )
+        .bind(&self.convo_id)
+        .fetch_one(&self.db_pool)
+        .await
+        .context("per_did_vote_count failed")?;
+
+        info!(
+            convo = %crate::crypto::redact_for_log(&self.convo_id),
+            per_did_vote_count,
+            member_did_count,
+            "[actor:record_reset_vote] quorum check"
+        );
+
+        let base_outcome = RecordResetVoteOutcome {
+            recorded: true,
+            reason: None,
+            per_did_vote_count,
+            member_did_count,
+            auto_reset_triggered: false,
+            new_group_id: None,
+            reset_count: None,
+        };
+
+        // Quorum check: ceil(member_did_count * 2 / 3) votes required.
+        // Equivalent to per_did_vote_count * 3 >= member_did_count * 2.
+        if member_did_count == 0
+            || per_did_vote_count * 3 < member_did_count * 2
+        {
+            return Ok(base_outcome);
+        }
+
+        // ── 6. Cooldown check (30 minutes since last reset) ───────────────
+        let recent_reset: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM conversations \
+             WHERE id = $1 \
+             AND last_reset_at IS NOT NULL \
+             AND last_reset_at > NOW() - INTERVAL '30 minutes')",
+        )
+        .bind(&self.convo_id)
+        .fetch_one(&self.db_pool)
+        .await
+        .unwrap_or(false);
+        if recent_reset {
+            info!("[actor:record_reset_vote] cooldown active");
+            return Ok(base_outcome);
+        }
+
+        // ── 7. Circuit-breaker check ──────────────────────────────────────
+        //   (a) pre-existing manual/latch disable
+        let disabled: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM conversations \
+             WHERE id = $1 AND auto_reset_disabled_at IS NOT NULL)",
+        )
+        .bind(&self.convo_id)
+        .fetch_one(&self.db_pool)
+        .await
+        .unwrap_or(false);
+        if disabled {
+            warn!("[actor:record_reset_vote] auto_reset_disabled_at is set");
+            return Ok(RecordResetVoteOutcome {
+                reason: Some("circuit_breaker".to_string()),
+                ..base_outcome
+            });
+        }
+
+        //   (b) rolling 24h: if 3+ resets already in the last day, trip it now.
+        let recent_reset_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM auto_reset_history \
+             WHERE convo_id = $1 \
+             AND reset_triggered_at > NOW() - INTERVAL '24 hours'",
+        )
+        .bind(&self.convo_id)
+        .fetch_one(&self.db_pool)
+        .await
+        .unwrap_or(0);
+        if recent_reset_count >= 3 {
+            // Latch the breaker for administrative intervention.
+            if let Err(e) = sqlx::query(
+                "UPDATE conversations SET auto_reset_disabled_at = NOW() \
+                 WHERE id = $1 AND auto_reset_disabled_at IS NULL",
+            )
+            .bind(&self.convo_id)
+            .execute(&self.db_pool)
+            .await
+            {
+                error!("[actor:record_reset_vote] failed to latch breaker: {}", e);
+            }
+            // Emit SSE CircuitBreakerTrippedEvent for observability.
+            let tripped_at =
+                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            let cb_cursor = self
+                .sse_state
+                .cursor_gen
+                .next(&self.convo_id, "circuitBreakerTrippedEvent")
+                .await;
+            let cb_event = StreamEvent::CircuitBreakerTrippedEvent {
+                cursor: cb_cursor.clone(),
+                convo_id: self.convo_id.clone(),
+                reset_count: recent_reset_count as i32,
+                tripped_at,
+            };
+            if let Err(e) = crate::db::store_event(
+                &self.db_pool,
+                &cb_cursor,
+                &self.convo_id,
+                "circuitBreakerTrippedEvent",
+                None,
+            )
+            .await
+            {
+                error!("[actor:record_reset_vote] store cb event: {:?}", e);
+            }
+            if let Err(e) = self.sse_state.emit(&self.convo_id, cb_event).await {
+                error!("[actor:record_reset_vote] SSE emit cb: {}", e);
+            }
+
+            return Ok(RecordResetVoteOutcome {
+                reason: Some("circuit_breaker".to_string()),
+                ..base_outcome
+            });
+        }
+
+        // ── 8. Execute auto-reset ─────────────────────────────────────────
+        let new_group_id =
+            format!("{:032x}", uuid::Uuid::new_v4().as_u128());
+        let mut tx = self
+            .db_pool
+            .begin()
+            .await
+            .context("begin reset tx failed")?;
+
+        // Capture the current cipher_suite so the SSE GroupResetEvent can carry
+        // it forward — the prior handler emitted an empty string, which forced
+        // clients to special-case the auto-reset variant (audit Q2).
+        let cipher_suite: Option<String> =
+            sqlx::query_scalar("SELECT cipher_suite FROM conversations WHERE id = $1")
+                .bind(&self.convo_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .context("select cipher_suite failed")?;
+
+        let reset_count: Option<i32> = sqlx::query_scalar(
+            "UPDATE conversations SET \
+                group_id = $1, current_epoch = 0, \
+                group_info = NULL, group_info_epoch = NULL, \
+                group_info_updated_at = NULL, \
+                confirmation_tag = NULL, \
+                reset_count = reset_count + 1, \
+                last_reset_at = NOW(), \
+                last_reset_by = 'system:auto_recovery', \
+                updated_at = NOW() \
+             WHERE id = $2 \
+             RETURNING reset_count",
+        )
+        .bind(&new_group_id)
+        .bind(&self.convo_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .context("update conversations failed")?;
+
+        let reset_count = match reset_count {
+            Some(rc) => rc,
+            None => {
+                tx.rollback().await.ok();
+                return Ok(RecordResetVoteOutcome {
+                    reason: Some("convo_not_found".to_string()),
+                    ..base_outcome
+                });
+            }
+        };
+
+        sqlx::query("DELETE FROM welcome_messages WHERE convo_id = $1")
+            .bind(&self.convo_id)
+            .execute(&mut *tx)
+            .await
+            .context("delete welcome_messages failed")?;
+        sqlx::query("DELETE FROM pending_device_additions WHERE convo_id = $1")
+            .bind(&self.convo_id)
+            .execute(&mut *tx)
+            .await
+            .context("delete pending_device_additions failed")?;
+        // Clear the per-DID votes so the group starts with a clean slate after
+        // reset. The legacy `recovery_failures` table is dropped by migration
+        // 20260418_001 (see ADR-002 §D6), so no DELETE is needed for it.
+        sqlx::query("DELETE FROM reset_votes WHERE convo_id = $1")
+            .bind(&self.convo_id)
+            .execute(&mut *tx)
+            .await
+            .context("delete reset_votes failed")?;
+
+        sqlx::query(
+            "INSERT INTO auto_reset_history \
+                (convo_id, reset_triggered_at, triggered_by, new_group_id, \
+                 vote_count, member_count) \
+             VALUES ($1, NOW(), $2, $3, $4, $5)",
+        )
+        .bind(&self.convo_id)
+        .bind("system:auto_recovery")
+        .bind(&new_group_id)
+        .bind(per_did_vote_count as i32)
+        .bind(member_did_count as i32)
+        .execute(&mut *tx)
+        .await
+        .context("insert auto_reset_history failed")?;
+
+        tx.commit().await.context("commit reset tx failed")?;
+
+        // Reset in-memory state so the next SendMessage through this actor
+        // advances from epoch 0 rather than the stale pre-reset epoch.
+        self.current_epoch = 0;
+        self.unread_counts.clear();
+
+        // Emit SSE GroupResetEvent.
+        let cursor = self
+            .sse_state
+            .cursor_gen
+            .next(&self.convo_id, "groupResetEvent")
+            .await;
+        let event = StreamEvent::GroupResetEvent {
+            cursor: cursor.clone(),
+            convo_id: self.convo_id.clone(),
+            new_group_id: new_group_id.clone(),
+            reset_generation: reset_count,
+            reset_by: "system:auto_recovery".to_string(),
+            cipher_suite: cipher_suite.unwrap_or_default(),
+            reason: Some(
+                "Automatic recovery: quorum of members reported unrecoverable failure"
+                    .to_string(),
+            ),
+        };
+        if let Err(e) = crate::db::store_event(
+            &self.db_pool,
+            &cursor,
+            &self.convo_id,
+            "groupResetEvent",
+            None,
+        )
+        .await
+        {
+            error!("[actor:record_reset_vote] store GroupResetEvent: {:?}", e);
+        }
+        if let Err(e) = self.sse_state.emit(&self.convo_id, event).await {
+            error!("[actor:record_reset_vote] SSE emit GroupReset: {}", e);
+        }
+
+        info!(
+            convo = %crate::crypto::redact_for_log(&self.convo_id),
+            new_group_id = %crate::crypto::redact_for_log(&new_group_id),
+            reset_count,
+            per_did_vote_count,
+            member_did_count,
+            "[actor:record_reset_vote] auto-reset complete"
+        );
+
+        Ok(RecordResetVoteOutcome {
+            recorded: true,
+            reason: None,
+            per_did_vote_count,
+            member_did_count,
+            auto_reset_triggered: true,
+            new_group_id: Some(new_group_id),
+            reset_count: Some(reset_count),
+        })
     }
 }
 

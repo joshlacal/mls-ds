@@ -5,12 +5,14 @@
   "defs": {
     "main": {
       "type": "procedure",
-      "description": "Report that a client has exhausted all recovery attempts for a conversation. Any member may report. When >=50% of active members have reported within a 1-hour window, the server auto-resets the group.",
+      "description": "Report that a client has exhausted all recovery attempts for a conversation. Any member may report. When votes from at least ceil(2/3) of the active identity DIDs carry a valid epoch_authenticator within the 1-hour expiry window, the server auto-resets the group (see ADR-002).",
       "input": {
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["convoId"],
+          "required": [
+            "convoId"
+          ],
           "properties": {
             "convoId": {
               "type": "string",
@@ -20,7 +22,13 @@
               "type": "string",
               "description": "Type of failure that was exhausted",
               "default": "external_commit_exhausted",
-              "knownValues": ["external_commit_exhausted"]
+              "knownValues": [
+                "external_commit_exhausted"
+              ]
+            },
+            "epochAuthenticator": {
+              "type": "string",
+              "description": "Hex-encoded epoch_authenticator (RFC 9420 \u00a78.7) for the reporter's current epoch. Optional at the schema layer but REQUIRED for the report to count toward quorum auto-reset. Clients that omit this field will have their report accepted (HTTP 200) with reason=\"missing_authenticator\" but not counted."
             }
           }
         }
@@ -29,11 +37,16 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["recorded", "autoResetTriggered", "failureCount", "memberCount"],
+          "required": [
+            "recorded",
+            "autoResetTriggered",
+            "failureCount",
+            "memberCount"
+          ],
           "properties": {
             "recorded": {
               "type": "boolean",
-              "description": "Whether the failure report was recorded"
+              "description": "Whether the failure report was recorded as a counted quorum vote"
             },
             "autoResetTriggered": {
               "type": "boolean",
@@ -42,19 +55,46 @@
             "failureCount": {
               "type": "integer",
               "minimum": 0,
-              "description": "Number of members who have reported failures within the expiry window"
+              "description": "Number of distinct identity DIDs whose full active device set has filed valid votes within the expiry window"
             },
             "memberCount": {
               "type": "integer",
               "minimum": 0,
-              "description": "Total number of active members in the conversation"
+              "description": "Total number of distinct identity DIDs in the conversation's active member roster"
+            },
+            "reason": {
+              "type": "string",
+              "description": "Discriminator for why the vote was not counted (if any). Omitted on a successful vote.",
+              "knownValues": [
+                "stale_authenticator",
+                "missing_authenticator",
+                "rate_limited",
+                "circuit_breaker",
+                "not_member",
+                "convo_not_found"
+              ]
+            },
+            "newGroupId": {
+              "type": "string",
+              "description": "When autoResetTriggered is true, the new group_id assigned to the conversation. Clients can begin rejoining under this identifier immediately without polling."
+            },
+            "resetGeneration": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "When autoResetTriggered is true, the lifetime reset_count after this reset. Matches the resetGeneration on the GroupResetEvent SSE event for this same reset."
             }
           }
         }
       },
       "errors": [
-        {"name": "ConvoNotFound", "description": "Conversation not found"},
-        {"name": "NotMember", "description": "Caller is not a member of the conversation"}
+        {
+          "name": "ConvoNotFound",
+          "description": "Conversation not found"
+        },
+        {
+          "name": "NotMember",
+          "description": "Caller is not a member of the conversation"
+        }
       ]
     }
   }

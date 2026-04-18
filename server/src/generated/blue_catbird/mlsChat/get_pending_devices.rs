@@ -179,10 +179,10 @@ pub struct PendingDeviceAddition<'a> {
     pub created_at: jacquard_common::types::string::Datetime,
     #[serde(borrow)]
     pub device_id: jacquard_common::CowStr<'a>,
-    /// MLS Welcome message if available
+    /// Base64-encoded MLS Welcome message if available
     #[serde(skip_serializing_if = "std::option::Option::is_none")]
-    #[serde(default, with = "jacquard_common::opt_serde_bytes_helper")]
-    pub welcome: std::option::Option<bytes::Bytes>,
+    #[serde(borrow)]
+    pub welcome: std::option::Option<jacquard_common::CowStr<'a>>,
 }
 
 pub mod pending_device_addition_state {
@@ -195,51 +195,51 @@ pub mod pending_device_addition_state {
     }
     /// State trait tracking which required fields have been set
     pub trait State: sealed::Sealed {
-        type CreatedAt;
-        type DeviceId;
         type ConvoId;
+        type DeviceId;
+        type CreatedAt;
     }
     /// Empty state - all required fields are unset
     pub struct Empty(());
     impl sealed::Sealed for Empty {}
     impl State for Empty {
-        type CreatedAt = Unset;
-        type DeviceId = Unset;
         type ConvoId = Unset;
-    }
-    ///State transition - sets the `created_at` field to Set
-    pub struct SetCreatedAt<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetCreatedAt<S> {}
-    impl<S: State> State for SetCreatedAt<S> {
-        type CreatedAt = Set<members::created_at>;
-        type DeviceId = S::DeviceId;
-        type ConvoId = S::ConvoId;
-    }
-    ///State transition - sets the `device_id` field to Set
-    pub struct SetDeviceId<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetDeviceId<S> {}
-    impl<S: State> State for SetDeviceId<S> {
-        type CreatedAt = S::CreatedAt;
-        type DeviceId = Set<members::device_id>;
-        type ConvoId = S::ConvoId;
+        type DeviceId = Unset;
+        type CreatedAt = Unset;
     }
     ///State transition - sets the `convo_id` field to Set
     pub struct SetConvoId<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetConvoId<S> {}
     impl<S: State> State for SetConvoId<S> {
-        type CreatedAt = S::CreatedAt;
-        type DeviceId = S::DeviceId;
         type ConvoId = Set<members::convo_id>;
+        type DeviceId = S::DeviceId;
+        type CreatedAt = S::CreatedAt;
+    }
+    ///State transition - sets the `device_id` field to Set
+    pub struct SetDeviceId<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetDeviceId<S> {}
+    impl<S: State> State for SetDeviceId<S> {
+        type ConvoId = S::ConvoId;
+        type DeviceId = Set<members::device_id>;
+        type CreatedAt = S::CreatedAt;
+    }
+    ///State transition - sets the `created_at` field to Set
+    pub struct SetCreatedAt<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetCreatedAt<S> {}
+    impl<S: State> State for SetCreatedAt<S> {
+        type ConvoId = S::ConvoId;
+        type DeviceId = S::DeviceId;
+        type CreatedAt = Set<members::created_at>;
     }
     /// Marker types for field names
     #[allow(non_camel_case_types)]
     pub mod members {
-        ///Marker type for the `created_at` field
-        pub struct created_at(());
-        ///Marker type for the `device_id` field
-        pub struct device_id(());
         ///Marker type for the `convo_id` field
         pub struct convo_id(());
+        ///Marker type for the `device_id` field
+        pub struct device_id(());
+        ///Marker type for the `created_at` field
+        pub struct created_at(());
     }
 }
 
@@ -250,7 +250,7 @@ pub struct PendingDeviceAdditionBuilder<'a, S: pending_device_addition_state::St
         ::core::option::Option<jacquard_common::CowStr<'a>>,
         ::core::option::Option<jacquard_common::types::string::Datetime>,
         ::core::option::Option<jacquard_common::CowStr<'a>>,
-        ::core::option::Option<bytes::Bytes>,
+        ::core::option::Option<jacquard_common::CowStr<'a>>,
     ),
     _phantom: ::core::marker::PhantomData<&'a ()>,
 }
@@ -341,12 +341,15 @@ where
 
 impl<'a, S: pending_device_addition_state::State> PendingDeviceAdditionBuilder<'a, S> {
     /// Set the `welcome` field (optional)
-    pub fn welcome(mut self, value: impl Into<Option<bytes::Bytes>>) -> Self {
+    pub fn welcome(
+        mut self,
+        value: impl Into<Option<jacquard_common::CowStr<'a>>>,
+    ) -> Self {
         self.__unsafe_private_named.3 = value.into();
         self
     }
     /// Set the `welcome` field to an Option value (optional)
-    pub fn maybe_welcome(mut self, value: Option<bytes::Bytes>) -> Self {
+    pub fn maybe_welcome(mut self, value: Option<jacquard_common::CowStr<'a>>) -> Self {
         self.__unsafe_private_named.3 = value;
         self
     }
@@ -355,9 +358,9 @@ impl<'a, S: pending_device_addition_state::State> PendingDeviceAdditionBuilder<'
 impl<'a, S> PendingDeviceAdditionBuilder<'a, S>
 where
     S: pending_device_addition_state::State,
-    S::CreatedAt: pending_device_addition_state::IsSet,
-    S::DeviceId: pending_device_addition_state::IsSet,
     S::ConvoId: pending_device_addition_state::IsSet,
+    S::DeviceId: pending_device_addition_state::IsSet,
+    S::CreatedAt: pending_device_addition_state::IsSet,
 {
     /// Build the final struct
     pub fn build(self) -> PendingDeviceAddition<'a> {
@@ -519,10 +522,21 @@ fn lexicon_doc_blue_catbird_mlsChat_getPendingDevices() -> ::jacquard_lexicon::l
                         );
                         map.insert(
                             ::jacquard_common::smol_str::SmolStr::new_static("welcome"),
-                            ::jacquard_lexicon::lexicon::LexObjectProperty::Bytes(::jacquard_lexicon::lexicon::LexBytes {
-                                description: None,
-                                max_length: None,
+                            ::jacquard_lexicon::lexicon::LexObjectProperty::String(::jacquard_lexicon::lexicon::LexString {
+                                description: Some(
+                                    ::jacquard_common::CowStr::new_static(
+                                        "Base64-encoded MLS Welcome message if available",
+                                    ),
+                                ),
+                                format: None,
+                                default: None,
                                 min_length: None,
+                                max_length: None,
+                                min_graphemes: None,
+                                max_graphemes: None,
+                                r#enum: None,
+                                r#const: None,
+                                known_values: None,
                             }),
                         );
                         map

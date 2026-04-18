@@ -89,6 +89,27 @@ impl TestUser {
         buf
     }
 
+    /// Generic XRPC POST helper for tests that need to hit an endpoint
+    /// without a dedicated wrapper. Returns the raw [`reqwest::Response`] so
+    /// callers can inspect status + body.
+    pub async fn raw_post_xrpc(
+        &self,
+        nsid: &str,
+        body: &Value,
+    ) -> Result<reqwest::Response> {
+        let resp = self
+            .client
+            .inner
+            .client
+            .post(self.url(&format!("/xrpc/{}", nsid)))
+            .bearer_auth(self.token())
+            .json(body)
+            .send()
+            .await
+            .context(format!("{} request failed", nsid))?;
+        Ok(resp)
+    }
+
     // ── registerDevice ─────────────────────────────────────────────
 
     /// Register a device with real MLS key packages from the MLS engine.

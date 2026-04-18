@@ -6,11 +6,14 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tokio::sync::oneshot;
 use tracing::{error, info, warn};
 
 use crate::{
+    actors::{ActorRegistry, ConvoMessage},
     auth::AuthUser,
-    realtime::{sse::StreamEvent, SseState},
+    device_utils::parse_device_did,
+    realtime::SseState,
     storage::DbPool,
 };
 
@@ -25,6 +28,10 @@ const NSID: &str = "blue.catbird.mlsChat.reportRecoveryFailure";
 pub struct ReportRecoveryFailureRequest {
     pub convo_id: String,
     pub failure_type: Option<String>,
+    /// Hex-encoded RFC 9420 §8.7 `epoch_authenticator` for the reporter's
+    /// current epoch. Optional at the schema layer (old clients may omit)
+    /// but required for the vote to count toward quorum (see ADR-002 §A7.3).
+    pub epoch_authenticator: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -34,29 +41,36 @@ pub struct ReportRecoveryFailureOutput {
     pub auto_reset_triggered: bool,
     pub failure_count: i64,
     pub member_count: i64,
+    /// Discriminator for why the vote was rejected (if any), e.g.
+    /// `"stale_authenticator"`, `"missing_authenticator"`, `"rate_limited"`,
+    /// `"circuit_breaker"`, `"not_member"`, `"convo_not_found"`.
+    /// `None` on a successfully counted vote.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-/// Maximum auto-resets before circuit breaker trips.
-const CIRCUIT_BREAKER_MAX_RESETS: i32 = 3;
-
-// ---------------------------------------------------------------------------
-// Handler
+// Handler (thin dispatcher per ADR-002 §A7.1 — invariant E6)
 // ---------------------------------------------------------------------------
 
 /// Report that recovery has been exhausted for a conversation.
 ///
 /// POST /xrpc/blue.catbird.mlsChat.reportRecoveryFailure
 ///
-/// Any member may report. When >=50% of active members have reported
-/// (within a 1-hour expiry window), the server auto-resets the group.
-#[tracing::instrument(skip(pool, sse_state, auth_user, input))]
+/// Every DB write goes through `ActorRegistry::get_or_spawn(convo_id)` and the
+/// `ConvoMessage::RecordResetVote` variant. This handler only authenticates,
+/// resolves identity, dispatches, and translates the outcome into the wire
+/// response shape. No direct PgPool writes (E6).
+///
+/// Auto-reset policy (ADR-002 §D1-D5):
+/// - 67% (ceil of 2/3) of distinct identity DIDs must vote
+/// - Each vote must carry a recent valid `epoch_authenticator`
+/// - Per-DID 24h rate limit; 30-min cooldown; 3-in-24h circuit breaker
+#[tracing::instrument(skip(pool, registry, _sse_state, auth_user, input))]
 pub async fn report_recovery_failure(
     State(pool): State<DbPool>,
-    State(sse_state): State<Arc<SseState>>,
+    State(registry): State<Arc<ActorRegistry>>,
+    State(_sse_state): State<Arc<SseState>>,
     auth_user: AuthUser,
     Json(input): Json<ReportRecoveryFailureRequest>,
 ) -> Result<Response, StatusCode> {
@@ -65,296 +79,166 @@ pub async fn report_recovery_failure(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    let caller_did = &auth_user.did;
-    let convo_id = &input.convo_id;
+    let device_did = auth_user.did.clone();
+    let convo_id = input.convo_id.clone();
     let failure_type = input
         .failure_type
-        .as_deref()
-        .unwrap_or("external_commit_exhausted");
+        .clone()
+        .unwrap_or_else(|| "external_commit_exhausted".to_string());
 
     info!(
-        convo = %crate::crypto::redact_for_log(convo_id),
-        caller = %crate::crypto::redact_for_log(caller_did),
-        failure_type,
+        convo = %crate::crypto::redact_for_log(&convo_id),
+        caller = %crate::crypto::redact_for_log(&device_did),
+        failure_type = %failure_type,
+        has_authenticator = input.epoch_authenticator.is_some(),
         "[reportRecoveryFailure] start"
     );
 
-    // --- Verify caller is a member ---
+    // --- Resolve device_did → identity_did via the user#device convention.
+    // Multi-device DIDs look like `did:plc:user#device-uuid`; we split on '#'
+    // and use the user part as the identity DID. For single-device clients
+    // (no '#' suffix) parse_device_did returns the full DID as the user part.
+    let (identity_did, _device_id) = match parse_device_did(&device_did) {
+        Ok(pair) => pair,
+        Err(e) => {
+            warn!("[reportRecoveryFailure] invalid device DID: {}", e);
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    };
+
+    // --- Verify caller is a member (handler-side gate; actor double-checks).
     let is_member: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM members WHERE convo_id = $1 AND (user_did = $2 OR member_did = $2) AND left_at IS NULL)",
+        "SELECT EXISTS(SELECT 1 FROM members \
+         WHERE convo_id = $1 AND (user_did = $2 OR member_did = $3) AND left_at IS NULL)",
     )
-    .bind(convo_id)
-    .bind(caller_did)
+    .bind(&convo_id)
+    .bind(&identity_did)
+    .bind(&device_did)
     .fetch_one(&pool)
     .await
     .map_err(|e| {
         error!("[reportRecoveryFailure] membership check failed: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-
     if !is_member {
         warn!("[reportRecoveryFailure] caller is not a member");
         return Err(StatusCode::FORBIDDEN);
     }
 
-    // --- Upsert failure report ---
-    sqlx::query(
-        r#"INSERT INTO recovery_failures (convo_id, member_did, reported_at, failure_type)
-           VALUES ($1, $2, NOW(), $3)
-           ON CONFLICT (convo_id, member_did) DO UPDATE
-           SET reported_at = NOW(), failure_type = $3"#,
-    )
-    .bind(convo_id)
-    .bind(caller_did)
-    .bind(failure_type)
-    .execute(&pool)
-    .await
-    .map_err(|e| {
-        error!("[reportRecoveryFailure] upsert failed: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    // --- Count recent failures vs total members ---
-    let failure_count: i64 = sqlx::query_scalar(
-        r#"SELECT COUNT(*) FROM recovery_failures
-           WHERE convo_id = $1
-           AND reported_at > NOW() - INTERVAL '1 hour'"#,
-    )
-    .bind(convo_id)
-    .fetch_one(&pool)
-    .await
-    .map_err(|e| {
-        error!("[reportRecoveryFailure] count failures: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    let member_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM members WHERE convo_id = $1 AND left_at IS NULL")
-            .bind(convo_id)
-            .fetch_one(&pool)
-            .await
-            .map_err(|e| {
-                error!("[reportRecoveryFailure] count members: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-
-    info!(
-        convo = %crate::crypto::redact_for_log(convo_id),
-        failure_count,
-        member_count,
-        "[reportRecoveryFailure] quorum check"
-    );
-
-    let not_triggered = Json(ReportRecoveryFailureOutput {
-        recorded: true,
-        auto_reset_triggered: false,
-        failure_count,
-        member_count,
-    })
-    .into_response();
-
-    // --- Evaluate auto-reset policy: >=50% of members reported ---
-    if member_count == 0 || failure_count * 2 < member_count {
-        return Ok(not_triggered);
-    }
-
-    // --- Check cooldown: no auto-reset within 30 minutes ---
-    let recent_reset: bool = sqlx::query_scalar(
-        r#"SELECT EXISTS(
-            SELECT 1 FROM conversations
-            WHERE id = $1
-            AND last_reset_at IS NOT NULL
-            AND last_reset_at > NOW() - INTERVAL '30 minutes'
-        )"#,
-    )
-    .bind(convo_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap_or(false);
-
-    if recent_reset {
-        info!("[reportRecoveryFailure] cooldown active, skipping auto-reset");
-        return Ok(not_triggered);
-    }
-
-    // --- Check circuit breaker: auto_reset_disabled_at ---
-    let disabled: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM conversations WHERE id = $1 AND auto_reset_disabled_at IS NOT NULL)",
-    )
-    .bind(convo_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap_or(false);
-
-    if disabled {
-        warn!("[reportRecoveryFailure] circuit breaker active for conversation");
-        return Ok(not_triggered);
-    }
-
-    // --- Execute auto-reset ---
-    info!(
-        convo = %crate::crypto::redact_for_log(convo_id),
-        "[reportRecoveryFailure] threshold met, executing auto-reset"
-    );
-
-    let new_group_id = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
-
-    let mut tx = pool.begin().await.map_err(|e| {
-        error!("[reportRecoveryFailure] begin tx: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    // Reset the conversation
-    let reset_count: Option<i32> = sqlx::query_scalar(
-        r#"UPDATE conversations SET
-            group_id = $1, current_epoch = 0,
-            group_info = NULL, group_info_epoch = NULL,
-            group_info_updated_at = NULL,
-            confirmation_tag = NULL,
-            reset_count = reset_count + 1, last_reset_at = NOW(),
-            last_reset_by = 'system:auto_recovery',
-            updated_at = NOW()
-        WHERE id = $2
-        RETURNING reset_count"#,
-    )
-    .bind(&new_group_id)
-    .bind(convo_id)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|e| {
-        error!("[reportRecoveryFailure] update conversations: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    let reset_count = match reset_count {
-        Some(rc) => rc,
-        None => {
-            tx.rollback().await.ok();
-            return Err(StatusCode::NOT_FOUND);
+    // --- Missing-authenticator short-circuit (ADR §A7.3).
+    // A report without an authenticator is accepted with a reason telemetry
+    // marker but does NOT count toward quorum and does NOT consume the per-DID
+    // 24h rate-limit slot. This lets old clients roll over gracefully.
+    let epoch_authenticator = match input.epoch_authenticator.clone() {
+        Some(auth) if !auth.is_empty() => auth,
+        _ => {
+            info!(
+                convo = %crate::crypto::redact_for_log(&convo_id),
+                "[reportRecoveryFailure] missing_authenticator (old client)"
+            );
+            let (per_did_count, member_count) = count_votes_and_members(&pool, &convo_id).await;
+            return Ok(Json(ReportRecoveryFailureOutput {
+                recorded: false,
+                auto_reset_triggered: false,
+                failure_count: per_did_count,
+                member_count,
+                reason: Some("missing_authenticator".to_string()),
+            })
+            .into_response());
         }
     };
 
-    // Trip circuit breaker if we've hit the limit
-    if reset_count >= CIRCUIT_BREAKER_MAX_RESETS {
-        sqlx::query("UPDATE conversations SET auto_reset_disabled_at = NOW() WHERE id = $1")
-            .bind(convo_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| {
-                error!("[reportRecoveryFailure] trip circuit breaker: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-        warn!(
-            convo = %crate::crypto::redact_for_log(convo_id),
-            reset_count,
-            "[reportRecoveryFailure] circuit breaker tripped"
-        );
-
-        // Emit CircuitBreakerTrippedEvent via SSE
-        let tripped_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        let cb_cursor = sse_state
-            .cursor_gen
-            .next(convo_id, "circuitBreakerTrippedEvent")
-            .await;
-        let cb_event = StreamEvent::CircuitBreakerTrippedEvent {
-            cursor: cb_cursor.clone(),
-            convo_id: convo_id.clone(),
-            reset_count,
-            tripped_at,
-        };
-        if let Err(e) = crate::db::store_event(
-            &pool,
-            &cb_cursor,
-            convo_id,
-            "circuitBreakerTrippedEvent",
-            None,
-        )
-        .await
-        {
-            error!(
-                "[reportRecoveryFailure] store circuit breaker event: {:?}",
-                e
-            );
-        }
-        if let Err(e) = sse_state.emit(convo_id, cb_event).await {
-            error!("[reportRecoveryFailure] SSE emit circuit breaker: {}", e);
-        }
-    }
-
-    // Delete welcome messages
-    sqlx::query("DELETE FROM welcome_messages WHERE convo_id = $1")
-        .bind(convo_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| {
-            error!("[reportRecoveryFailure] delete welcome_messages: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    // Delete pending device additions
-    sqlx::query("DELETE FROM pending_device_additions WHERE convo_id = $1")
-        .bind(convo_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| {
-            error!(
-                "[reportRecoveryFailure] delete pending_device_additions: {}",
-                e
-            );
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    // Clear recovery failures for this conversation
-    sqlx::query("DELETE FROM recovery_failures WHERE convo_id = $1")
-        .bind(convo_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| {
-            error!("[reportRecoveryFailure] clear recovery_failures: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    tx.commit().await.map_err(|e| {
-        error!("[reportRecoveryFailure] commit tx: {}", e);
+    // --- Dispatch to the ConversationActor. All DB writes from here live
+    //     inside the actor; invariant E6 satisfied.
+    let actor_ref = registry.get_or_spawn(&convo_id).await.map_err(|e| {
+        error!("[reportRecoveryFailure] actor spawn failed: {:?}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
+    let (reply_tx, reply_rx) = oneshot::channel();
+    actor_ref
+        .send_message(ConvoMessage::RecordResetVote {
+            device_did: device_did.clone(),
+            identity_did: identity_did.clone(),
+            epoch_authenticator,
+            failure_type,
+            reply: reply_tx,
+        })
+        .map_err(|e| {
+            error!("[reportRecoveryFailure] actor send failed: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let outcome = reply_rx
+        .await
+        .map_err(|e| {
+            error!("[reportRecoveryFailure] actor reply dropped: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .map_err(|e| {
+            error!("[reportRecoveryFailure] actor handler error: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    // Convo-not-found is a 404 rather than a 200-with-reason — same shape as
+    // the old handler so rollout is transparent on the wire.
+    if outcome.reason.as_deref() == Some("convo_not_found") {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
     info!(
-        convo = %crate::crypto::redact_for_log(convo_id),
-        new_group_id = %crate::crypto::redact_for_log(&new_group_id),
-        reset_count,
-        "[reportRecoveryFailure] auto-reset complete"
+        convo = %crate::crypto::redact_for_log(&convo_id),
+        recorded = outcome.recorded,
+        auto_reset_triggered = outcome.auto_reset_triggered,
+        per_did_vote_count = outcome.per_did_vote_count,
+        member_did_count = outcome.member_did_count,
+        reason = ?outcome.reason,
+        "[reportRecoveryFailure] done"
     );
-
-    // --- Emit SSE GroupResetEvent ---
-    let cursor = sse_state.cursor_gen.next(convo_id, "groupResetEvent").await;
-
-    let event = StreamEvent::GroupResetEvent {
-        cursor: cursor.clone(),
-        convo_id: convo_id.clone(),
-        new_group_id: new_group_id.clone(),
-        reset_generation: reset_count,
-        reset_by: "system:auto_recovery".to_string(),
-        cipher_suite: String::new(),
-        reason: Some(
-            "Automatic recovery: quorum of members reported unrecoverable failure".to_string(),
-        ),
-    };
-
-    if let Err(e) = crate::db::store_event(&pool, &cursor, convo_id, "groupResetEvent", None).await
-    {
-        error!("[reportRecoveryFailure] store event: {:?}", e);
-    }
-
-    if let Err(e) = sse_state.emit(convo_id, event).await {
-        error!("[reportRecoveryFailure] SSE emit: {}", e);
-    }
 
     Ok(Json(ReportRecoveryFailureOutput {
-        recorded: true,
-        auto_reset_triggered: true,
-        failure_count,
-        member_count,
+        recorded: outcome.recorded,
+        auto_reset_triggered: outcome.auto_reset_triggered,
+        failure_count: outcome.per_did_vote_count,
+        member_count: outcome.member_did_count,
+        reason: outcome.reason,
     })
     .into_response())
+}
+
+/// Read-only helper for the missing_authenticator short-circuit. Matches the
+/// actor's counting logic but without writes. Best-effort — if either query
+/// fails we return zeros and let the response still be informative about the
+/// `missing_authenticator` status.
+async fn count_votes_and_members(pool: &DbPool, convo_id: &str) -> (i64, i64) {
+    let member_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(DISTINCT COALESCE(user_did, member_did)) \
+         FROM members WHERE convo_id = $1 AND left_at IS NULL",
+    )
+    .bind(convo_id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+
+    let per_did_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ( \
+            SELECT COALESCE(m.user_did, m.member_did) AS ident \
+            FROM members m \
+            WHERE m.convo_id = $1 AND m.left_at IS NULL \
+            GROUP BY COALESCE(m.user_did, m.member_did) \
+            HAVING COUNT(*) = COUNT(CASE WHEN EXISTS ( \
+                SELECT 1 FROM reset_votes rv \
+                WHERE rv.convo_id = m.convo_id \
+                AND rv.device_did = m.member_did \
+                AND rv.expires_at > NOW() \
+                AND rv.voted_at > NOW() - INTERVAL '1 hour' \
+            ) THEN 1 END) \
+         ) t",
+    )
+    .bind(convo_id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+
+    (per_did_count, member_count)
 }
