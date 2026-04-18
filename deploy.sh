@@ -62,11 +62,17 @@ echo
 # Must run before restart so the new binary boots against a correctly-shaped
 # schema. SKIP_MIGRATIONS=true in systemd env disables the startup check,
 # so this step is the only place migrations actually run.
+#
+# Bootstrap-first: mark historical 14-digit-format migrations as applied
+# (prod was seeded outside sqlx; _sqlx_migrations is missing those rows).
+# Idempotent — no-op after first successful run on each DB.
 echo -e "${YELLOW}[4/5] Running database migrations...${NC}"
 if ! command -v doppler &> /dev/null; then
     echo -e "${RED}ERROR: doppler CLI not found — cannot source DATABASE_URL${NC}"
     exit 1
 fi
+doppler run --project catbird-mls --config prd -- \
+    "$MLS_ROOT/server/scripts/bootstrap-sqlx-migrations.sh"
 doppler run --project catbird-mls --config prd -- \
     "$MLS_ROOT/server/scripts/run-migrations.sh"
 echo -e "${GREEN}✓ Migrations applied${NC}"
