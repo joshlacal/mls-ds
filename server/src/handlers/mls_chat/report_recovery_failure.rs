@@ -47,6 +47,15 @@ pub struct ReportRecoveryFailureOutput {
     /// `None` on a successfully counted vote.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// When `auto_reset_triggered` is true, the new group_id assigned.
+    /// Lets the caller rejoin under the new id without polling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_group_id: Option<String>,
+    /// When `auto_reset_triggered` is true, the lifetime reset_count after
+    /// this reset. Matches the `resetGeneration` on the SSE GroupResetEvent
+    /// for this same reset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset_generation: Option<i32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -143,6 +152,8 @@ pub async fn report_recovery_failure(
                 failure_count: per_did_count,
                 member_count,
                 reason: Some("missing_authenticator".to_string()),
+                new_group_id: None,
+                reset_generation: None,
             })
             .into_response());
         }
@@ -202,6 +213,8 @@ pub async fn report_recovery_failure(
         failure_count: outcome.per_did_vote_count,
         member_count: outcome.member_did_count,
         reason: outcome.reason,
+        new_group_id: outcome.new_group_id,
+        reset_generation: outcome.reset_count,
     })
     .into_response())
 }
