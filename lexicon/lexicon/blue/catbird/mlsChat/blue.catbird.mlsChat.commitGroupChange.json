@@ -75,6 +75,10 @@
               "type": "string",
               "maxLength": 64,
               "description": "Base64-encoded MLS confirmation tag from the client's post-commit group state."
+            },
+            "epochAuthenticator": {
+              "type": "string",
+              "description": "Hex-encoded epoch_authenticator (RFC 9420 §8.7) for the post-commit epoch. Optional. When present on an epoch-advancing action (addMembers, processExternalCommit, rejoin, commit, updateMetadata), the server records it in the epoch_authenticators table and uses it to validate future reportRecoveryFailure votes for quorum auto-reset (see ADR-002)."
             }
           }
         }

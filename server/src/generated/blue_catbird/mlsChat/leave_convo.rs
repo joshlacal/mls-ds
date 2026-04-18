@@ -18,10 +18,10 @@
 )]
 #[serde(rename_all = "camelCase")]
 pub struct LeaveConvo<'a> {
-    /// Optional MLS Commit message for the removal
+    /// Optional base64url-encoded MLS Commit message for the removal
     #[serde(skip_serializing_if = "std::option::Option::is_none")]
-    #[serde(default, with = "jacquard_common::opt_serde_bytes_helper")]
-    pub commit: std::option::Option<bytes::Bytes>,
+    #[serde(borrow)]
+    pub commit: std::option::Option<jacquard_common::CowStr<'a>>,
     /// Conversation identifier
     #[serde(borrow)]
     pub convo_id: jacquard_common::CowStr<'a>,

@@ -34,37 +34,37 @@ pub mod batch_error_state {
     }
     /// State trait tracking which required fields have been set
     pub trait State: sealed::Sealed {
-        type Error;
         type Index;
+        type Error;
     }
     /// Empty state - all required fields are unset
     pub struct Empty(());
     impl sealed::Sealed for Empty {}
     impl State for Empty {
-        type Error = Unset;
         type Index = Unset;
-    }
-    ///State transition - sets the `error` field to Set
-    pub struct SetError<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetError<S> {}
-    impl<S: State> State for SetError<S> {
-        type Error = Set<members::error>;
-        type Index = S::Index;
+        type Error = Unset;
     }
     ///State transition - sets the `index` field to Set
     pub struct SetIndex<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetIndex<S> {}
     impl<S: State> State for SetIndex<S> {
-        type Error = S::Error;
         type Index = Set<members::index>;
+        type Error = S::Error;
+    }
+    ///State transition - sets the `error` field to Set
+    pub struct SetError<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetError<S> {}
+    impl<S: State> State for SetError<S> {
+        type Index = S::Index;
+        type Error = Set<members::error>;
     }
     /// Marker types for field names
     #[allow(non_camel_case_types)]
     pub mod members {
-        ///Marker type for the `error` field
-        pub struct error(());
         ///Marker type for the `index` field
         pub struct index(());
+        ///Marker type for the `error` field
+        pub struct error(());
     }
 }
 
@@ -137,8 +137,8 @@ where
 impl<'a, S> BatchErrorBuilder<'a, S>
 where
     S: batch_error_state::State,
-    S::Error: batch_error_state::IsSet,
     S::Index: batch_error_state::IsSet,
+    S::Error: batch_error_state::IsSet,
 {
     /// Build the final struct
     pub fn build(self) -> BatchError<'a> {
@@ -285,10 +285,21 @@ fn lexicon_doc_blue_catbird_mlsChat_publishKeyPackages() -> ::jacquard_lexicon::
                             ::jacquard_common::smol_str::SmolStr::new_static(
                                 "keyPackage",
                             ),
-                            ::jacquard_lexicon::lexicon::LexObjectProperty::Bytes(::jacquard_lexicon::lexicon::LexBytes {
-                                description: None,
-                                max_length: None,
+                            ::jacquard_lexicon::lexicon::LexObjectProperty::String(::jacquard_lexicon::lexicon::LexString {
+                                description: Some(
+                                    ::jacquard_common::CowStr::new_static(
+                                        "Base64-encoded MLS key package",
+                                    ),
+                                ),
+                                format: None,
+                                default: None,
                                 min_length: None,
+                                max_length: Some(65536usize),
+                                min_graphemes: None,
+                                max_graphemes: None,
+                                r#enum: None,
+                                r#const: None,
+                                known_values: None,
                             }),
                         );
                         map
@@ -707,9 +718,9 @@ pub struct KeyPackageItem<'a> {
     pub cipher_suite: jacquard_common::CowStr<'a>,
     /// Expiration timestamp (required, max 90 days from now)
     pub expires: jacquard_common::types::string::Datetime,
-    /// MLS key package
-    #[serde(with = "jacquard_common::serde_bytes_helper")]
-    pub key_package: bytes::Bytes,
+    /// Base64-encoded MLS key package
+    #[serde(borrow)]
+    pub key_package: jacquard_common::CowStr<'a>,
 }
 
 pub mod key_package_item_state {
@@ -722,51 +733,51 @@ pub mod key_package_item_state {
     }
     /// State trait tracking which required fields have been set
     pub trait State: sealed::Sealed {
+        type CipherSuite;
         type Expires;
         type KeyPackage;
-        type CipherSuite;
     }
     /// Empty state - all required fields are unset
     pub struct Empty(());
     impl sealed::Sealed for Empty {}
     impl State for Empty {
+        type CipherSuite = Unset;
         type Expires = Unset;
         type KeyPackage = Unset;
-        type CipherSuite = Unset;
-    }
-    ///State transition - sets the `expires` field to Set
-    pub struct SetExpires<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetExpires<S> {}
-    impl<S: State> State for SetExpires<S> {
-        type Expires = Set<members::expires>;
-        type KeyPackage = S::KeyPackage;
-        type CipherSuite = S::CipherSuite;
-    }
-    ///State transition - sets the `key_package` field to Set
-    pub struct SetKeyPackage<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetKeyPackage<S> {}
-    impl<S: State> State for SetKeyPackage<S> {
-        type Expires = S::Expires;
-        type KeyPackage = Set<members::key_package>;
-        type CipherSuite = S::CipherSuite;
     }
     ///State transition - sets the `cipher_suite` field to Set
     pub struct SetCipherSuite<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetCipherSuite<S> {}
     impl<S: State> State for SetCipherSuite<S> {
+        type CipherSuite = Set<members::cipher_suite>;
         type Expires = S::Expires;
         type KeyPackage = S::KeyPackage;
-        type CipherSuite = Set<members::cipher_suite>;
+    }
+    ///State transition - sets the `expires` field to Set
+    pub struct SetExpires<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetExpires<S> {}
+    impl<S: State> State for SetExpires<S> {
+        type CipherSuite = S::CipherSuite;
+        type Expires = Set<members::expires>;
+        type KeyPackage = S::KeyPackage;
+    }
+    ///State transition - sets the `key_package` field to Set
+    pub struct SetKeyPackage<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetKeyPackage<S> {}
+    impl<S: State> State for SetKeyPackage<S> {
+        type CipherSuite = S::CipherSuite;
+        type Expires = S::Expires;
+        type KeyPackage = Set<members::key_package>;
     }
     /// Marker types for field names
     #[allow(non_camel_case_types)]
     pub mod members {
+        ///Marker type for the `cipher_suite` field
+        pub struct cipher_suite(());
         ///Marker type for the `expires` field
         pub struct expires(());
         ///Marker type for the `key_package` field
         pub struct key_package(());
-        ///Marker type for the `cipher_suite` field
-        pub struct cipher_suite(());
     }
 }
 
@@ -776,7 +787,7 @@ pub struct KeyPackageItemBuilder<'a, S: key_package_item_state::State> {
     __unsafe_private_named: (
         ::core::option::Option<jacquard_common::CowStr<'a>>,
         ::core::option::Option<jacquard_common::types::string::Datetime>,
-        ::core::option::Option<bytes::Bytes>,
+        ::core::option::Option<jacquard_common::CowStr<'a>>,
     ),
     _phantom: ::core::marker::PhantomData<&'a ()>,
 }
@@ -845,7 +856,7 @@ where
     /// Set the `keyPackage` field (required)
     pub fn key_package(
         mut self,
-        value: impl Into<bytes::Bytes>,
+        value: impl Into<jacquard_common::CowStr<'a>>,
     ) -> KeyPackageItemBuilder<'a, key_package_item_state::SetKeyPackage<S>> {
         self.__unsafe_private_named.2 = ::core::option::Option::Some(value.into());
         KeyPackageItemBuilder {
@@ -859,9 +870,9 @@ where
 impl<'a, S> KeyPackageItemBuilder<'a, S>
 where
     S: key_package_item_state::State,
+    S::CipherSuite: key_package_item_state::IsSet,
     S::Expires: key_package_item_state::IsSet,
     S::KeyPackage: key_package_item_state::IsSet,
-    S::CipherSuite: key_package_item_state::IsSet,
 {
     /// Build the final struct
     pub fn build(self) -> KeyPackageItem<'a> {
@@ -902,6 +913,19 @@ impl<'a> ::jacquard_lexicon::schema::LexiconSchema for KeyPackageItem<'a> {
     fn validate(
         &self,
     ) -> ::std::result::Result<(), ::jacquard_lexicon::validation::ConstraintError> {
+        {
+            let value = &self.key_package;
+            #[allow(unused_comparisons)]
+            if <str>::len(value.as_ref()) > 65536usize {
+                return Err(::jacquard_lexicon::validation::ConstraintError::MaxLength {
+                    path: ::jacquard_lexicon::validation::ValidationPath::from_field(
+                        "key_package",
+                    ),
+                    max: 65536usize,
+                    actual: <str>::len(value.as_ref()),
+                });
+            }
+        }
         Ok(())
     }
 }
@@ -936,49 +960,49 @@ pub mod key_package_stats_state {
     }
     /// State trait tracking which required fields have been set
     pub trait State: sealed::Sealed {
-        type Available;
         type Published;
+        type Available;
         type Expired;
     }
     /// Empty state - all required fields are unset
     pub struct Empty(());
     impl sealed::Sealed for Empty {}
     impl State for Empty {
-        type Available = Unset;
         type Published = Unset;
+        type Available = Unset;
         type Expired = Unset;
-    }
-    ///State transition - sets the `available` field to Set
-    pub struct SetAvailable<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetAvailable<S> {}
-    impl<S: State> State for SetAvailable<S> {
-        type Available = Set<members::available>;
-        type Published = S::Published;
-        type Expired = S::Expired;
     }
     ///State transition - sets the `published` field to Set
     pub struct SetPublished<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetPublished<S> {}
     impl<S: State> State for SetPublished<S> {
-        type Available = S::Available;
         type Published = Set<members::published>;
+        type Available = S::Available;
+        type Expired = S::Expired;
+    }
+    ///State transition - sets the `available` field to Set
+    pub struct SetAvailable<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetAvailable<S> {}
+    impl<S: State> State for SetAvailable<S> {
+        type Published = S::Published;
+        type Available = Set<members::available>;
         type Expired = S::Expired;
     }
     ///State transition - sets the `expired` field to Set
     pub struct SetExpired<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetExpired<S> {}
     impl<S: State> State for SetExpired<S> {
-        type Available = S::Available;
         type Published = S::Published;
+        type Available = S::Available;
         type Expired = Set<members::expired>;
     }
     /// Marker types for field names
     #[allow(non_camel_case_types)]
     pub mod members {
-        ///Marker type for the `available` field
-        pub struct available(());
         ///Marker type for the `published` field
         pub struct published(());
+        ///Marker type for the `available` field
+        pub struct available(());
         ///Marker type for the `expired` field
         pub struct expired(());
     }
@@ -1073,8 +1097,8 @@ where
 impl<'a, S> KeyPackageStatsBuilder<'a, S>
 where
     S: key_package_stats_state::State,
-    S::Available: key_package_stats_state::IsSet,
     S::Published: key_package_stats_state::IsSet,
+    S::Available: key_package_stats_state::IsSet,
     S::Expired: key_package_stats_state::IsSet,
 {
     /// Build the final struct

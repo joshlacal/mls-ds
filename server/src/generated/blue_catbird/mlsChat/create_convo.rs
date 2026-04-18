@@ -299,10 +299,21 @@ fn lexicon_doc_blue_catbird_mlsChat_createConvo() -> ::jacquard_lexicon::lexicon
                                         ::jacquard_common::smol_str::SmolStr::new_static(
                                             "welcomeMessage",
                                         ),
-                                        ::jacquard_lexicon::lexicon::LexObjectProperty::Bytes(::jacquard_lexicon::lexicon::LexBytes {
-                                            description: None,
-                                            max_length: None,
+                                        ::jacquard_lexicon::lexicon::LexObjectProperty::String(::jacquard_lexicon::lexicon::LexString {
+                                            description: Some(
+                                                ::jacquard_common::CowStr::new_static(
+                                                    "Base64url-encoded MLS Welcome message for ALL initial members",
+                                                ),
+                                            ),
+                                            format: None,
+                                            default: None,
                                             min_length: None,
+                                            max_length: None,
+                                            min_graphemes: None,
+                                            max_graphemes: None,
+                                            r#enum: None,
+                                            r#const: None,
+                                            known_values: None,
                                         }),
                                     );
                                     map
@@ -423,37 +434,37 @@ pub mod key_package_hash_entry_state {
     }
     /// State trait tracking which required fields have been set
     pub trait State: sealed::Sealed {
-        type Did;
         type Hash;
+        type Did;
     }
     /// Empty state - all required fields are unset
     pub struct Empty(());
     impl sealed::Sealed for Empty {}
     impl State for Empty {
-        type Did = Unset;
         type Hash = Unset;
-    }
-    ///State transition - sets the `did` field to Set
-    pub struct SetDid<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetDid<S> {}
-    impl<S: State> State for SetDid<S> {
-        type Did = Set<members::did>;
-        type Hash = S::Hash;
+        type Did = Unset;
     }
     ///State transition - sets the `hash` field to Set
     pub struct SetHash<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetHash<S> {}
     impl<S: State> State for SetHash<S> {
-        type Did = S::Did;
         type Hash = Set<members::hash>;
+        type Did = S::Did;
+    }
+    ///State transition - sets the `did` field to Set
+    pub struct SetDid<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetDid<S> {}
+    impl<S: State> State for SetDid<S> {
+        type Hash = S::Hash;
+        type Did = Set<members::did>;
     }
     /// Marker types for field names
     #[allow(non_camel_case_types)]
     pub mod members {
-        ///Marker type for the `did` field
-        pub struct did(());
         ///Marker type for the `hash` field
         pub struct hash(());
+        ///Marker type for the `did` field
+        pub struct did(());
     }
 }
 
@@ -526,8 +537,8 @@ where
 impl<'a, S> KeyPackageHashEntryBuilder<'a, S>
 where
     S: key_package_hash_entry_state::State,
-    S::Did: key_package_hash_entry_state::IsSet,
     S::Hash: key_package_hash_entry_state::IsSet,
+    S::Did: key_package_hash_entry_state::IsSet,
 {
     /// Build the final struct
     pub fn build(self) -> KeyPackageHashEntry<'a> {
@@ -620,10 +631,10 @@ pub struct CreateConvo<'a> {
     pub metadata: std::option::Option<
         crate::generated::blue_catbird::mlsChat::create_convo::MetadataInput<'a>,
     >,
-    /// MLS Welcome message for ALL initial members
+    /// Base64url-encoded MLS Welcome message for ALL initial members
     #[serde(skip_serializing_if = "std::option::Option::is_none")]
-    #[serde(default, with = "jacquard_common::opt_serde_bytes_helper")]
-    pub welcome_message: std::option::Option<bytes::Bytes>,
+    #[serde(borrow)]
+    pub welcome_message: std::option::Option<jacquard_common::CowStr<'a>>,
 }
 
 #[jacquard_derive::lexicon]
