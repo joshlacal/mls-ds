@@ -138,6 +138,29 @@ pub enum ConvoMessage {
     /// - `reply`: Channel to receive the current epoch number
     GetEpoch { reply: oneshot::Sender<u32> },
 
+    /// Records a recovery-failure vote from a device, with cryptographic proof
+    /// of the claimed stuck state (ADR-002 §A7).
+    ///
+    /// This is the only permitted path for recovery-failure reporting. Direct
+    /// PgPool writes to `reset_votes` / `recovery_failures` are forbidden per
+    /// invariant E6.
+    ///
+    /// # Fields
+    ///
+    /// - `device_did`: The authenticating device's DID (from `AuthUser`)
+    /// - `identity_did`: The user's MLS identity DID (resolved via `members.user_did`)
+    /// - `epoch_authenticator`: Hex-encoded RFC 9420 §8.7 authenticator for the
+    ///    reporter's current epoch
+    /// - `failure_type`: Categorical failure reason (e.g. `external_commit_exhausted`)
+    /// - `reply`: Channel to receive the vote-count + auto-reset decision
+    RecordResetVote {
+        device_did: String,
+        identity_did: String,
+        epoch_authenticator: String,
+        failure_type: String,
+        reply: oneshot::Sender<Result<RecordResetVoteOutcome>>,
+    },
+
     /// Signals the actor to shut down gracefully.
     ///
     /// The actor will complete any in-flight operations before stopping.
@@ -159,4 +182,40 @@ pub enum ConvoMessage {
 pub struct KeyPackageHashEntry {
     pub did: String,
     pub hash: String,
+}
+
+/// Outcome of a [`ConvoMessage::RecordResetVote`] operation (ADR-002 §A7.1).
+///
+/// Carries enough detail for the HTTP handler to produce a response body that
+/// preserves backward compatibility with the existing `reportRecoveryFailure`
+/// lexicon, plus a structured `reason` discriminator for telemetry and client
+/// retry logic.
+///
+/// # Reason values
+///
+/// - `None` (with `recorded: true`) — vote counted successfully
+/// - `Some("stale_authenticator")` — epoch_authenticator didn't match a recent
+///   known-good record; not counted, not rate-limited
+/// - `Some("missing_authenticator")` — client sent no authenticator (old client);
+///   not counted, not rate-limited
+/// - `Some("rate_limited")` — DID has already voted within the 24h window
+/// - `Some("circuit_breaker")` — conversation has hit the 3-per-24h reset cap;
+///   auto_reset_disabled_at is now set
+#[derive(Debug, Clone)]
+pub struct RecordResetVoteOutcome {
+    /// Whether the vote was persisted to `reset_votes` and will count toward quorum.
+    pub recorded: bool,
+    /// Discriminator for why the vote was rejected (if any), or `None` on success.
+    pub reason: Option<String>,
+    /// Count of distinct `identity_did`s whose entire active device set has filed
+    /// valid votes within the 1h expiry window.
+    pub per_did_vote_count: i64,
+    /// Count of distinct `identity_did`s in the conversation (active members).
+    pub member_did_count: i64,
+    /// Whether this vote tripped the quorum and caused an auto-reset.
+    pub auto_reset_triggered: bool,
+    /// If `auto_reset_triggered`, the new `group_id` assigned to the conversation.
+    pub new_group_id: Option<String>,
+    /// Lifetime reset count after the reset (cumulative, not rolling).
+    pub reset_count: Option<i32>,
 }
