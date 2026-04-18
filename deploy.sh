@@ -13,6 +13,11 @@
 
 set -euo pipefail
 
+# Source cargo env (not available in non-login shells on the deploy host)
+if [ -f "$HOME/.cargo/env" ]; then
+    source "$HOME/.cargo/env"
+fi
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
