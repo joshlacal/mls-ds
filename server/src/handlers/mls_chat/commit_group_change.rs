@@ -102,6 +102,57 @@ fn invalidate_welcome_response(rows_affected: u64) -> CommitGroupChangeOutput<'s
     }
 }
 
+/// ADR-002 §A7.4 — Persist the client-supplied `epoch_authenticator` for the
+/// post-commit epoch so future `reportRecoveryFailure` votes can be validated
+/// against a recent known-good authenticator.
+///
+/// Called from the four epoch-advancing branches (`addMembers`,
+/// `externalCommit`/`processExternalCommit`, `removeMember`, generic
+/// `commit`/`updateMetadata`). No-op when the client omits the field —
+/// pre-A7 clients stay functional, they just don't contribute to the
+/// authenticator pool (their reports will yield `missing_authenticator`).
+///
+/// The INSERT is idempotent on `(convo_id, epoch, authenticator)` so a
+/// client retrying with the same input doesn't error.
+async fn record_epoch_authenticator_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    convo_id: &str,
+    epoch: i32,
+    authenticator: &Option<jacquard_common::CowStr<'_>>,
+    branch: &str,
+) {
+    let Some(auth) = authenticator else {
+        return;
+    };
+    let auth_str: &str = auth.as_ref();
+    if auth_str.is_empty() {
+        return;
+    }
+
+    if let Err(e) = sqlx::query(
+        "INSERT INTO epoch_authenticators (convo_id, epoch, authenticator, recorded_at) \
+         VALUES ($1, $2, $3, NOW()) \
+         ON CONFLICT (convo_id, epoch, authenticator) DO NOTHING",
+    )
+    .bind(convo_id)
+    .bind(epoch)
+    .bind(auth_str)
+    .execute(&mut **tx)
+    .await
+    {
+        // Log but don't fail the commit — this is a best-effort audit insert;
+        // the authenticator store is advisory for quorum voting, not for the
+        // MLS protocol itself.
+        warn!(
+            convo_id = %crate::crypto::redact_for_log(convo_id),
+            branch,
+            epoch,
+            "failed to record epoch_authenticator: {}",
+            e
+        );
+    }
+}
+
 /// Consolidated group change handler
 /// POST /xrpc/blue.catbird.mlsChat.commitGroupChange
 ///
@@ -521,6 +572,16 @@ pub async fn commit_group_change(
                     error!("commitGroupChange: failed to store idempotency key: {}", e);
                 }
             }
+
+            // ── A7.4: record epoch_authenticator (if client sent one) ──
+            record_epoch_authenticator_tx(
+                &mut tx,
+                &convo_id,
+                new_epoch,
+                &input.epoch_authenticator,
+                "addMembers",
+            )
+            .await;
 
             // ── Commit transaction ─────────────────────────────────────
             tx.commit().await.map_err(|e| {
@@ -1130,6 +1191,16 @@ pub async fn commit_group_change(
                 }
             }
 
+            // ── A7.4: record epoch_authenticator (if client sent one) ──
+            record_epoch_authenticator_tx(
+                &mut tx,
+                &convo_id,
+                new_epoch,
+                &input.epoch_authenticator,
+                "externalCommit",
+            )
+            .await;
+
             // ── Commit transaction ─────────────────────────────────────
             tx.commit().await.map_err(|e| {
                 error!("externalCommit: failed to commit transaction: {}", e);
@@ -1573,6 +1644,31 @@ pub async fn commit_group_change(
                 internal_server_error("Failed to store GroupInfo")
             })?;
 
+            // ── A7.4: record epoch_authenticator (best-effort, no tx here) ──
+            if let Some(ref auth_hex) = input.epoch_authenticator {
+                let auth_str: &str = auth_hex.as_ref();
+                if !auth_str.is_empty() {
+                    let stored_epoch_i32 = mls_epoch.map(|e| e as i32).unwrap_or(0);
+                    if let Err(e) = sqlx::query(
+                        "INSERT INTO epoch_authenticators                             (convo_id, epoch, authenticator, recorded_at)                          VALUES ($1, $2, $3, NOW())                          ON CONFLICT (convo_id, epoch, authenticator) DO NOTHING",
+                    )
+                    .bind(&convo_id)
+                    .bind(stored_epoch_i32)
+                    .bind(auth_str)
+                    .execute(&pool)
+                    .await
+                    {
+                        warn!(
+                            convo_id = %crate::crypto::redact_for_log(&convo_id),
+                            branch = "updateGroupInfo",
+                            epoch = stored_epoch_i32,
+                            "failed to record epoch_authenticator: {}",
+                            e
+                        );
+                    }
+                }
+            }
+
             let stored_epoch = mls_epoch.unwrap_or(0);
             info!(
                 "✅ [v2.commitGroupChange] updateGroupInfo stored for convo {} mls_epoch={}",
@@ -1915,6 +2011,16 @@ pub async fn commit_group_change(
                 }
             }
 
+            // ── A7.4: record epoch_authenticator (if client sent one) ──
+            record_epoch_authenticator_tx(
+                &mut tx,
+                &convo_id,
+                new_epoch,
+                &input.epoch_authenticator,
+                "removeMember",
+            )
+            .await;
+
             // ── Commit transaction ─────────────────────────────────────
             tx.commit().await.map_err(|e| {
                 error!("removeMember: failed to commit transaction: {}", e);
@@ -2217,6 +2323,27 @@ pub async fn commit_group_change(
                     error!("commitGroupChange: failed to store idempotency key: {}", e);
                 }
             }
+
+            // ── A7.4: record epoch_authenticator (if client sent one) ──
+            record_epoch_authenticator_tx(
+                &mut tx,
+                &convo_id,
+                new_epoch,
+                &input.epoch_authenticator,
+                &action_name,
+            )
+            .await;
+
+            // ── A7.4: record epoch_authenticator (if client sent one) ──
+            // action_name is one of "commit" | "updateMetadata" for this branch.
+            record_epoch_authenticator_tx(
+                &mut tx,
+                &convo_id,
+                new_epoch,
+                &input.epoch_authenticator,
+                action_name,
+            )
+            .await;
 
             // ── Commit transaction ─────────────────────────────────────
             tx.commit().await.map_err(|e| {
