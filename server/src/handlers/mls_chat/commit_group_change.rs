@@ -2325,23 +2325,13 @@ pub async fn commit_group_change(
             }
 
             // ── A7.4: record epoch_authenticator (if client sent one) ──
-            record_epoch_authenticator_tx(
-                &mut tx,
-                &convo_id,
-                new_epoch,
-                &input.epoch_authenticator,
-                &action_name,
-            )
-            .await;
-
-            // ── A7.4: record epoch_authenticator (if client sent one) ──
             // action_name is one of "commit" | "updateMetadata" for this branch.
             record_epoch_authenticator_tx(
                 &mut tx,
                 &convo_id,
                 new_epoch,
                 &input.epoch_authenticator,
-                action_name,
+                &action_name,
             )
             .await;
 
