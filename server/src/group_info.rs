@@ -61,6 +61,34 @@ pub async fn get_group_info(
         if let (Some(info), Some(epoch), Some(updated_at)) =
             (r.group_info, r.group_info_epoch, r.group_info_updated_at)
         {
+            // Legacy-row migration: early versions of commitGroupChange's
+            // generated Input had `group_info: CowStr` (a plain base64 JSON
+            // string). When such an upload reached the raw-bytes DB column
+            // it was stored as UTF-8 of the base64 text instead of raw MLS
+            // bytes. Detect that shape and decode once before returning.
+            // A valid MLS GroupInfo starts with `0x00 0x01` (wire version);
+            // anything that is all-printable-ASCII and base64-decodes to
+            // bytes whose leading byte is `0x00` is a legacy blob.
+            let looks_raw = info.len() >= 2 && info[0] == 0x00 && info[1] == 0x01;
+            let info = if looks_raw {
+                info
+            } else if info.iter().all(|&b| b.is_ascii_graphic() || b == b'=') {
+                use base64::Engine;
+                match base64::engine::general_purpose::STANDARD.decode(&info) {
+                    Ok(decoded) if decoded.len() >= 2 && decoded[0] == 0x00 => {
+                        tracing::warn!(
+                            convo_id = %convo_id,
+                            legacy_len = info.len(),
+                            decoded_len = decoded.len(),
+                            "Decoded legacy base64-text GroupInfo on read"
+                        );
+                        decoded
+                    }
+                    _ => info,
+                }
+            } else {
+                info
+            };
             return Ok(Some((info, epoch, updated_at)));
         }
     }
