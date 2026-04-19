@@ -32,7 +32,12 @@
             "#typingEvent",
             "#newDeviceEvent",
             "#infoEvent",
-            "#treeChanged"
+            "#treeChanged",
+            "#groupResetEvent",
+            "#membershipChangeEvent",
+            "#readEvent",
+            "#groupInfoRefreshRequestedEvent",
+            "#readditionRequestedEvent"
           ]
         }
       }
@@ -156,7 +161,7 @@
       "properties": {
         "cursor": { "type": "string", "description": "Resume cursor" },
         "convoId": { "type": "string", "description": "Conversation identifier" },
-        "confirmationTag": { "type": "string", "maxLength": 64, "description": "Base64-encoded confirmation tag of the new canonical tree" },
+        "confirmationTag": { "type": "bytes", "description": "Confirmation tag of the new canonical tree" },
         "epoch": { "type": "integer", "description": "New epoch number" }
       }
     },
@@ -173,6 +178,65 @@
           "knownValues": ["heartbeat", "groupInfoRefreshRequested", "readditionRequested"]
         },
         "convoId": { "type": "string", "description": "Conversation ID (for groupInfoRefreshRequested, readditionRequested)" },
+        "requestedBy": { "type": "string", "format": "did", "description": "DID of the requester" }
+      }
+    },
+    "groupResetEvent": {
+      "type": "object",
+      "description": "The MLS group was reset and a new group was created for this conversation",
+      "required": ["cursor", "convoId", "newGroupId", "resetGeneration"],
+      "properties": {
+        "cursor": { "type": "string", "description": "Resume cursor" },
+        "convoId": { "type": "string", "description": "Conversation identifier" },
+        "newGroupId": { "type": "string", "description": "New MLS group ID after reset" },
+        "resetGeneration": { "type": "integer", "description": "Cumulative reset count for this conversation" },
+        "resetBy": { "type": "string", "format": "did", "description": "DID of the admin who initiated the reset" },
+        "reason": { "type": "string", "description": "Optional reason for the reset" }
+      }
+    },
+    "membershipChangeEvent": {
+      "type": "object",
+      "description": "A membership change occurred (joined, left, removed, kicked)",
+      "required": ["cursor", "convoId", "did", "action"],
+      "properties": {
+        "cursor": { "type": "string", "description": "Resume cursor" },
+        "convoId": { "type": "string", "description": "Conversation identifier" },
+        "did": { "type": "string", "format": "did", "description": "DID of the member involved" },
+        "action": {
+          "type": "string",
+          "description": "Type of membership change",
+          "knownValues": ["joined", "left", "removed", "kicked"]
+        }
+      }
+    },
+    "readEvent": {
+      "type": "object",
+      "description": "A read receipt or read frontier update",
+      "required": ["cursor", "convoId"],
+      "properties": {
+        "cursor": { "type": "string", "description": "Resume cursor" },
+        "convoId": { "type": "string", "description": "Conversation identifier" },
+        "did": { "type": "string", "format": "did", "description": "DID of the reader" },
+        "messageId": { "type": "string", "description": "Message ID that was read up to" }
+      }
+    },
+    "groupInfoRefreshRequestedEvent": {
+      "type": "object",
+      "description": "A GroupInfo refresh was requested for a conversation",
+      "required": ["cursor", "convoId"],
+      "properties": {
+        "cursor": { "type": "string", "description": "Resume cursor" },
+        "convoId": { "type": "string", "description": "Conversation identifier" },
+        "requestedBy": { "type": "string", "format": "did", "description": "DID of the requester" }
+      }
+    },
+    "readditionRequestedEvent": {
+      "type": "object",
+      "description": "A member re-addition was requested for a conversation",
+      "required": ["cursor", "convoId"],
+      "properties": {
+        "cursor": { "type": "string", "description": "Resume cursor" },
+        "convoId": { "type": "string", "description": "Conversation identifier" },
         "requestedBy": { "type": "string", "format": "did", "description": "DID of the requester" }
       }
     }

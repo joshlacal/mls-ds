@@ -39,8 +39,8 @@
               "maxLength": 999
             },
             "welcomeMessage": {
-              "type": "string",
-              "description": "Base64url-encoded MLS Welcome message for ALL initial members"
+              "type": "bytes",
+              "description": "MLS Welcome message for ALL initial members"
             },
             "keyPackageHashes": {
               "type": "array",

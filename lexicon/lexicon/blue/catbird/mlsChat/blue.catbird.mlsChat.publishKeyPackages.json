@@ -77,9 +77,8 @@
       "required": ["keyPackage", "cipherSuite", "expires"],
       "properties": {
         "keyPackage": {
-          "type": "string",
-          "description": "Base64-encoded MLS key package",
-          "maxLength": 65536
+          "type": "bytes",
+          "description": "MLS key package"
         },
         "cipherSuite": {
           "type": "string",

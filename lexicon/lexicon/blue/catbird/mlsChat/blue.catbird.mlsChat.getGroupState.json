@@ -27,8 +27,8 @@
           "type": "object",
           "properties": {
             "groupInfo": {
-              "type": "string",
-              "description": "Base64-encoded TLS-serialized GroupInfo (present when 'groupInfo' included)"
+              "type": "bytes",
+              "description": "TLS-serialized GroupInfo (present when 'groupInfo' included)"
             },
             "epoch": {
               "type": "integer",
@@ -36,8 +36,8 @@
               "description": "Current MLS epoch number (present when 'epoch' included)"
             },
             "welcome": {
-              "type": "string",
-              "description": "Base64-encoded pending MLS Welcome message (present when 'welcome' included and a Welcome exists)"
+              "type": "bytes",
+              "description": "Pending MLS Welcome message (present when 'welcome' included and a Welcome exists)"
             },
             "expiresAt": {
               "type": "string",

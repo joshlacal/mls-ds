@@ -48,8 +48,8 @@
         "deviceId": { "type": "string" },
         "createdAt": { "type": "string", "format": "datetime" },
         "welcome": {
-          "type": "string",
-          "description": "Base64-encoded MLS Welcome message if available"
+          "type": "bytes",
+          "description": "MLS Welcome message if available"
         }
       }
     }
