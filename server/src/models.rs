@@ -88,17 +88,15 @@ impl Conversation {
 
         let reset_generation = self.reset_count.unwrap_or(0);
 
-        // Build extra_data with reset-related fields
+        // `resetGeneration` is a top-level field on ConvoView (set below); do NOT
+        // also insert it into extra_data or the wire JSON will contain the key
+        // twice and strict parsers (serde, kotlinx.serialization) will reject it.
         let mut extra = std::collections::BTreeMap::new();
         extra.insert(
             jacquard_common::smol_str::SmolStr::new("currentGroupId"),
             jacquard_common::types::value::Data::String(
                 jacquard_common::types::string::AtprotoStr::String(current_group_id.clone().into()),
             ),
-        );
-        extra.insert(
-            jacquard_common::smol_str::SmolStr::new("resetGeneration"),
-            jacquard_common::types::value::Data::Integer(reset_generation as i64),
         );
 
         let view = ConvoView {
