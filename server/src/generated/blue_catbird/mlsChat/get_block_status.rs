@@ -38,50 +38,50 @@ pub mod block_relationship_state {
     /// State trait tracking which required fields have been set
     pub trait State: sealed::Sealed {
         type BlockedDid;
-        type CreatedAt;
         type BlockerDid;
+        type CreatedAt;
     }
     /// Empty state - all required fields are unset
     pub struct Empty(());
     impl sealed::Sealed for Empty {}
     impl State for Empty {
         type BlockedDid = Unset;
-        type CreatedAt = Unset;
         type BlockerDid = Unset;
+        type CreatedAt = Unset;
     }
     ///State transition - sets the `blocked_did` field to Set
     pub struct SetBlockedDid<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetBlockedDid<S> {}
     impl<S: State> State for SetBlockedDid<S> {
         type BlockedDid = Set<members::blocked_did>;
+        type BlockerDid = S::BlockerDid;
         type CreatedAt = S::CreatedAt;
-        type BlockerDid = S::BlockerDid;
-    }
-    ///State transition - sets the `created_at` field to Set
-    pub struct SetCreatedAt<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetCreatedAt<S> {}
-    impl<S: State> State for SetCreatedAt<S> {
-        type BlockedDid = S::BlockedDid;
-        type CreatedAt = Set<members::created_at>;
-        type BlockerDid = S::BlockerDid;
     }
     ///State transition - sets the `blocker_did` field to Set
     pub struct SetBlockerDid<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetBlockerDid<S> {}
     impl<S: State> State for SetBlockerDid<S> {
         type BlockedDid = S::BlockedDid;
-        type CreatedAt = S::CreatedAt;
         type BlockerDid = Set<members::blocker_did>;
+        type CreatedAt = S::CreatedAt;
+    }
+    ///State transition - sets the `created_at` field to Set
+    pub struct SetCreatedAt<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetCreatedAt<S> {}
+    impl<S: State> State for SetCreatedAt<S> {
+        type BlockedDid = S::BlockedDid;
+        type BlockerDid = S::BlockerDid;
+        type CreatedAt = Set<members::created_at>;
     }
     /// Marker types for field names
     #[allow(non_camel_case_types)]
     pub mod members {
         ///Marker type for the `blocked_did` field
         pub struct blocked_did(());
-        ///Marker type for the `created_at` field
-        pub struct created_at(());
         ///Marker type for the `blocker_did` field
         pub struct blocker_did(());
+        ///Marker type for the `created_at` field
+        pub struct created_at(());
     }
 }
 
@@ -195,8 +195,8 @@ impl<'a, S> BlockRelationshipBuilder<'a, S>
 where
     S: block_relationship_state::State,
     S::BlockedDid: block_relationship_state::IsSet,
-    S::CreatedAt: block_relationship_state::IsSet,
     S::BlockerDid: block_relationship_state::IsSet,
+    S::CreatedAt: block_relationship_state::IsSet,
 {
     /// Build the final struct
     pub fn build(self) -> BlockRelationship<'a> {
@@ -484,49 +484,49 @@ pub mod conversation_block_status_state {
     }
     /// State trait tracking which required fields have been set
     pub trait State: sealed::Sealed {
-        type HasConflicts;
         type MemberCount;
+        type HasConflicts;
         type ConvoId;
     }
     /// Empty state - all required fields are unset
     pub struct Empty(());
     impl sealed::Sealed for Empty {}
     impl State for Empty {
-        type HasConflicts = Unset;
         type MemberCount = Unset;
+        type HasConflicts = Unset;
         type ConvoId = Unset;
-    }
-    ///State transition - sets the `has_conflicts` field to Set
-    pub struct SetHasConflicts<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetHasConflicts<S> {}
-    impl<S: State> State for SetHasConflicts<S> {
-        type HasConflicts = Set<members::has_conflicts>;
-        type MemberCount = S::MemberCount;
-        type ConvoId = S::ConvoId;
     }
     ///State transition - sets the `member_count` field to Set
     pub struct SetMemberCount<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetMemberCount<S> {}
     impl<S: State> State for SetMemberCount<S> {
-        type HasConflicts = S::HasConflicts;
         type MemberCount = Set<members::member_count>;
+        type HasConflicts = S::HasConflicts;
+        type ConvoId = S::ConvoId;
+    }
+    ///State transition - sets the `has_conflicts` field to Set
+    pub struct SetHasConflicts<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetHasConflicts<S> {}
+    impl<S: State> State for SetHasConflicts<S> {
+        type MemberCount = S::MemberCount;
+        type HasConflicts = Set<members::has_conflicts>;
         type ConvoId = S::ConvoId;
     }
     ///State transition - sets the `convo_id` field to Set
     pub struct SetConvoId<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetConvoId<S> {}
     impl<S: State> State for SetConvoId<S> {
-        type HasConflicts = S::HasConflicts;
         type MemberCount = S::MemberCount;
+        type HasConflicts = S::HasConflicts;
         type ConvoId = Set<members::convo_id>;
     }
     /// Marker types for field names
     #[allow(non_camel_case_types)]
     pub mod members {
-        ///Marker type for the `has_conflicts` field
-        pub struct has_conflicts(());
         ///Marker type for the `member_count` field
         pub struct member_count(());
+        ///Marker type for the `has_conflicts` field
+        pub struct has_conflicts(());
         ///Marker type for the `convo_id` field
         pub struct convo_id(());
     }
@@ -636,8 +636,8 @@ where
 impl<'a, S> ConversationBlockStatusBuilder<'a, S>
 where
     S: conversation_block_status_state::State,
-    S::HasConflicts: conversation_block_status_state::IsSet,
     S::MemberCount: conversation_block_status_state::IsSet,
+    S::HasConflicts: conversation_block_status_state::IsSet,
     S::ConvoId: conversation_block_status_state::IsSet,
 {
     /// Build the final struct

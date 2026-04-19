@@ -36,50 +36,50 @@ pub mod gap_info_state {
     /// State trait tracking which required fields have been set
     pub trait State: sealed::Sealed {
         type TotalMessages;
-        type MissingSeqs;
         type HasGaps;
+        type MissingSeqs;
     }
     /// Empty state - all required fields are unset
     pub struct Empty(());
     impl sealed::Sealed for Empty {}
     impl State for Empty {
         type TotalMessages = Unset;
-        type MissingSeqs = Unset;
         type HasGaps = Unset;
+        type MissingSeqs = Unset;
     }
     ///State transition - sets the `total_messages` field to Set
     pub struct SetTotalMessages<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetTotalMessages<S> {}
     impl<S: State> State for SetTotalMessages<S> {
         type TotalMessages = Set<members::total_messages>;
+        type HasGaps = S::HasGaps;
         type MissingSeqs = S::MissingSeqs;
-        type HasGaps = S::HasGaps;
-    }
-    ///State transition - sets the `missing_seqs` field to Set
-    pub struct SetMissingSeqs<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetMissingSeqs<S> {}
-    impl<S: State> State for SetMissingSeqs<S> {
-        type TotalMessages = S::TotalMessages;
-        type MissingSeqs = Set<members::missing_seqs>;
-        type HasGaps = S::HasGaps;
     }
     ///State transition - sets the `has_gaps` field to Set
     pub struct SetHasGaps<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetHasGaps<S> {}
     impl<S: State> State for SetHasGaps<S> {
         type TotalMessages = S::TotalMessages;
-        type MissingSeqs = S::MissingSeqs;
         type HasGaps = Set<members::has_gaps>;
+        type MissingSeqs = S::MissingSeqs;
+    }
+    ///State transition - sets the `missing_seqs` field to Set
+    pub struct SetMissingSeqs<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetMissingSeqs<S> {}
+    impl<S: State> State for SetMissingSeqs<S> {
+        type TotalMessages = S::TotalMessages;
+        type HasGaps = S::HasGaps;
+        type MissingSeqs = Set<members::missing_seqs>;
     }
     /// Marker types for field names
     #[allow(non_camel_case_types)]
     pub mod members {
         ///Marker type for the `total_messages` field
         pub struct total_messages(());
-        ///Marker type for the `missing_seqs` field
-        pub struct missing_seqs(());
         ///Marker type for the `has_gaps` field
         pub struct has_gaps(());
+        ///Marker type for the `missing_seqs` field
+        pub struct missing_seqs(());
     }
 }
 
@@ -173,8 +173,8 @@ impl<'a, S> GapInfoBuilder<'a, S>
 where
     S: gap_info_state::State,
     S::TotalMessages: gap_info_state::IsSet,
-    S::MissingSeqs: gap_info_state::IsSet,
     S::HasGaps: gap_info_state::IsSet,
+    S::MissingSeqs: gap_info_state::IsSet,
 {
     /// Build the final struct
     pub fn build(self) -> GapInfo<'a> {
@@ -309,6 +309,19 @@ fn lexicon_doc_blue_catbird_mlsChat_getMessages() -> ::jacquard_lexicon::lexicon
                                     }),
                                 );
                                 map.insert(
+                                    ::jacquard_common::smol_str::SmolStr::new_static(
+                                        "fromEpoch",
+                                    ),
+                                    ::jacquard_lexicon::lexicon::LexXrpcParametersProperty::Integer(::jacquard_lexicon::lexicon::LexInteger {
+                                        description: None,
+                                        default: None,
+                                        minimum: None,
+                                        maximum: None,
+                                        r#enum: None,
+                                        r#const: None,
+                                    }),
+                                );
+                                map.insert(
                                     ::jacquard_common::smol_str::SmolStr::new_static("limit"),
                                     ::jacquard_lexicon::lexicon::LexXrpcParametersProperty::Integer(::jacquard_lexicon::lexicon::LexInteger {
                                         description: None,
@@ -323,6 +336,17 @@ fn lexicon_doc_blue_catbird_mlsChat_getMessages() -> ::jacquard_lexicon::lexicon
                                     ::jacquard_common::smol_str::SmolStr::new_static(
                                         "sinceSeq",
                                     ),
+                                    ::jacquard_lexicon::lexicon::LexXrpcParametersProperty::Integer(::jacquard_lexicon::lexicon::LexInteger {
+                                        description: None,
+                                        default: None,
+                                        minimum: None,
+                                        maximum: None,
+                                        r#enum: None,
+                                        r#const: None,
+                                    }),
+                                );
+                                map.insert(
+                                    ::jacquard_common::smol_str::SmolStr::new_static("toEpoch"),
                                     ::jacquard_lexicon::lexicon::LexXrpcParametersProperty::Integer(::jacquard_lexicon::lexicon::LexInteger {
                                         description: None,
                                         default: None,
@@ -406,12 +430,18 @@ impl<'a> ::jacquard_lexicon::schema::LexiconSchema for GapInfo<'a> {
 pub struct GetMessages<'a> {
     #[serde(borrow)]
     pub convo_id: jacquard_common::CowStr<'a>,
+    ///(min: 0)
+    #[serde(skip_serializing_if = "std::option::Option::is_none")]
+    pub from_epoch: std::option::Option<i64>,
     ///(default: 50, min: 1, max: 100)
     #[serde(skip_serializing_if = "std::option::Option::is_none")]
     pub limit: std::option::Option<i64>,
     ///(min: 0)
     #[serde(skip_serializing_if = "std::option::Option::is_none")]
     pub since_seq: std::option::Option<i64>,
+    ///(min: 0)
+    #[serde(skip_serializing_if = "std::option::Option::is_none")]
+    pub to_epoch: std::option::Option<i64>,
     ///(default: "all")
     #[serde(skip_serializing_if = "std::option::Option::is_none")]
     #[serde(borrow)]
@@ -457,6 +487,8 @@ pub struct GetMessagesBuilder<'a, S: get_messages_state::State> {
         ::core::option::Option<jacquard_common::CowStr<'a>>,
         ::core::option::Option<i64>,
         ::core::option::Option<i64>,
+        ::core::option::Option<i64>,
+        ::core::option::Option<i64>,
         ::core::option::Option<jacquard_common::CowStr<'a>>,
     ),
     _phantom: ::core::marker::PhantomData<&'a ()>,
@@ -474,7 +506,7 @@ impl<'a> GetMessagesBuilder<'a, get_messages_state::Empty> {
     pub fn new() -> Self {
         GetMessagesBuilder {
             _phantom_state: ::core::marker::PhantomData,
-            __unsafe_private_named: (None, None, None, None),
+            __unsafe_private_named: (None, None, None, None, None, None),
             _phantom: ::core::marker::PhantomData,
         }
     }
@@ -500,14 +532,27 @@ where
 }
 
 impl<'a, S: get_messages_state::State> GetMessagesBuilder<'a, S> {
+    /// Set the `fromEpoch` field (optional)
+    pub fn from_epoch(mut self, value: impl Into<Option<i64>>) -> Self {
+        self.__unsafe_private_named.1 = value.into();
+        self
+    }
+    /// Set the `fromEpoch` field to an Option value (optional)
+    pub fn maybe_from_epoch(mut self, value: Option<i64>) -> Self {
+        self.__unsafe_private_named.1 = value;
+        self
+    }
+}
+
+impl<'a, S: get_messages_state::State> GetMessagesBuilder<'a, S> {
     /// Set the `limit` field (optional)
     pub fn limit(mut self, value: impl Into<Option<i64>>) -> Self {
-        self.__unsafe_private_named.1 = value.into();
+        self.__unsafe_private_named.2 = value.into();
         self
     }
     /// Set the `limit` field to an Option value (optional)
     pub fn maybe_limit(mut self, value: Option<i64>) -> Self {
-        self.__unsafe_private_named.1 = value;
+        self.__unsafe_private_named.2 = value;
         self
     }
 }
@@ -515,12 +560,25 @@ impl<'a, S: get_messages_state::State> GetMessagesBuilder<'a, S> {
 impl<'a, S: get_messages_state::State> GetMessagesBuilder<'a, S> {
     /// Set the `sinceSeq` field (optional)
     pub fn since_seq(mut self, value: impl Into<Option<i64>>) -> Self {
-        self.__unsafe_private_named.2 = value.into();
+        self.__unsafe_private_named.3 = value.into();
         self
     }
     /// Set the `sinceSeq` field to an Option value (optional)
     pub fn maybe_since_seq(mut self, value: Option<i64>) -> Self {
-        self.__unsafe_private_named.2 = value;
+        self.__unsafe_private_named.3 = value;
+        self
+    }
+}
+
+impl<'a, S: get_messages_state::State> GetMessagesBuilder<'a, S> {
+    /// Set the `toEpoch` field (optional)
+    pub fn to_epoch(mut self, value: impl Into<Option<i64>>) -> Self {
+        self.__unsafe_private_named.4 = value.into();
+        self
+    }
+    /// Set the `toEpoch` field to an Option value (optional)
+    pub fn maybe_to_epoch(mut self, value: Option<i64>) -> Self {
+        self.__unsafe_private_named.4 = value;
         self
     }
 }
@@ -531,12 +589,12 @@ impl<'a, S: get_messages_state::State> GetMessagesBuilder<'a, S> {
         mut self,
         value: impl Into<Option<jacquard_common::CowStr<'a>>>,
     ) -> Self {
-        self.__unsafe_private_named.3 = value.into();
+        self.__unsafe_private_named.5 = value.into();
         self
     }
     /// Set the `type` field to an Option value (optional)
     pub fn maybe_type(mut self, value: Option<jacquard_common::CowStr<'a>>) -> Self {
-        self.__unsafe_private_named.3 = value;
+        self.__unsafe_private_named.5 = value;
         self
     }
 }
@@ -550,9 +608,11 @@ where
     pub fn build(self) -> GetMessages<'a> {
         GetMessages {
             convo_id: self.__unsafe_private_named.0.unwrap(),
-            limit: self.__unsafe_private_named.1,
-            since_seq: self.__unsafe_private_named.2,
-            r#type: self.__unsafe_private_named.3,
+            from_epoch: self.__unsafe_private_named.1,
+            limit: self.__unsafe_private_named.2,
+            since_seq: self.__unsafe_private_named.3,
+            to_epoch: self.__unsafe_private_named.4,
+            r#type: self.__unsafe_private_named.5,
         }
     }
 }

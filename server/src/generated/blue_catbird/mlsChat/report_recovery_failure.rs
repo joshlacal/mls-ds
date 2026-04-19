@@ -53,15 +53,15 @@ pub struct ReportRecoveryFailureOutput<'a> {
     #[serde(skip_serializing_if = "std::option::Option::is_none")]
     #[serde(borrow)]
     pub new_group_id: std::option::Option<jacquard_common::CowStr<'a>>,
-    /// When autoResetTriggered is true, the lifetime reset_count after this reset. Matches the resetGeneration on the GroupResetEvent SSE event for this same reset.
-    #[serde(skip_serializing_if = "std::option::Option::is_none")]
-    pub reset_generation: std::option::Option<i64>,
     /// Discriminator for why the vote was not counted (if any). Omitted on a successful vote.
     #[serde(skip_serializing_if = "std::option::Option::is_none")]
     #[serde(borrow)]
     pub reason: std::option::Option<jacquard_common::CowStr<'a>>,
     /// Whether the failure report was recorded as a counted quorum vote
     pub recorded: bool,
+    /// When autoResetTriggered is true, the lifetime reset_count after this reset. Matches the resetGeneration on the GroupResetEvent SSE event for this same reset.
+    #[serde(skip_serializing_if = "std::option::Option::is_none")]
+    pub reset_generation: std::option::Option<i64>,
 }
 
 #[jacquard_derive::open_union]

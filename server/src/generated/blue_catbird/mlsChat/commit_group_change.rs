@@ -35,37 +35,37 @@ pub mod key_package_hash_entry_state {
     }
     /// State trait tracking which required fields have been set
     pub trait State: sealed::Sealed {
-        type Did;
         type Hash;
+        type Did;
     }
     /// Empty state - all required fields are unset
     pub struct Empty(());
     impl sealed::Sealed for Empty {}
     impl State for Empty {
-        type Did = Unset;
         type Hash = Unset;
-    }
-    ///State transition - sets the `did` field to Set
-    pub struct SetDid<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetDid<S> {}
-    impl<S: State> State for SetDid<S> {
-        type Did = Set<members::did>;
-        type Hash = S::Hash;
+        type Did = Unset;
     }
     ///State transition - sets the `hash` field to Set
     pub struct SetHash<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetHash<S> {}
     impl<S: State> State for SetHash<S> {
-        type Did = S::Did;
         type Hash = Set<members::hash>;
+        type Did = S::Did;
+    }
+    ///State transition - sets the `did` field to Set
+    pub struct SetDid<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetDid<S> {}
+    impl<S: State> State for SetDid<S> {
+        type Hash = S::Hash;
+        type Did = Set<members::did>;
     }
     /// Marker types for field names
     #[allow(non_camel_case_types)]
     pub mod members {
-        ///Marker type for the `did` field
-        pub struct did(());
         ///Marker type for the `hash` field
         pub struct hash(());
+        ///Marker type for the `did` field
+        pub struct did(());
     }
 }
 
@@ -138,8 +138,8 @@ where
 impl<'a, S> KeyPackageHashEntryBuilder<'a, S>
 where
     S: key_package_hash_entry_state::State,
-    S::Did: key_package_hash_entry_state::IsSet,
     S::Hash: key_package_hash_entry_state::IsSet,
+    S::Did: key_package_hash_entry_state::IsSet,
 {
     /// Build the final struct
     pub fn build(self) -> KeyPackageHashEntry<'a> {
@@ -277,42 +277,20 @@ fn lexicon_doc_blue_catbird_mlsChat_commitGroupChange() -> ::jacquard_lexicon::l
                                     );
                                     map.insert(
                                         ::jacquard_common::smol_str::SmolStr::new_static("commit"),
-                                        ::jacquard_lexicon::lexicon::LexObjectProperty::String(::jacquard_lexicon::lexicon::LexString {
-                                            description: Some(
-                                                ::jacquard_common::CowStr::new_static(
-                                                    "Base64url-encoded MLS Commit message (used by addMembers, processExternalCommit, rejoin)",
-                                                ),
-                                            ),
-                                            format: None,
-                                            default: None,
-                                            min_length: None,
+                                        ::jacquard_lexicon::lexicon::LexObjectProperty::Bytes(::jacquard_lexicon::lexicon::LexBytes {
+                                            description: None,
                                             max_length: None,
-                                            min_graphemes: None,
-                                            max_graphemes: None,
-                                            r#enum: None,
-                                            r#const: None,
-                                            known_values: None,
+                                            min_length: None,
                                         }),
                                     );
                                     map.insert(
                                         ::jacquard_common::smol_str::SmolStr::new_static(
                                             "confirmationTag",
                                         ),
-                                        ::jacquard_lexicon::lexicon::LexObjectProperty::String(::jacquard_lexicon::lexicon::LexString {
-                                            description: Some(
-                                                ::jacquard_common::CowStr::new_static(
-                                                    "Base64-encoded MLS confirmation tag from the client's post-commit group state.",
-                                                ),
-                                            ),
-                                            format: None,
-                                            default: None,
-                                            min_length: None,
+                                        ::jacquard_lexicon::lexicon::LexObjectProperty::Bytes(::jacquard_lexicon::lexicon::LexBytes {
+                                            description: None,
                                             max_length: Some(64usize),
-                                            min_graphemes: None,
-                                            max_graphemes: None,
-                                            r#enum: None,
-                                            r#const: None,
-                                            known_values: None,
+                                            min_length: None,
                                         }),
                                     );
                                     map.insert(
@@ -380,21 +358,10 @@ fn lexicon_doc_blue_catbird_mlsChat_commitGroupChange() -> ::jacquard_lexicon::l
                                         ::jacquard_common::smol_str::SmolStr::new_static(
                                             "groupInfo",
                                         ),
-                                        ::jacquard_lexicon::lexicon::LexObjectProperty::String(::jacquard_lexicon::lexicon::LexString {
-                                            description: Some(
-                                                ::jacquard_common::CowStr::new_static(
-                                                    "Base64-encoded GroupInfo to update after commit (used by processExternalCommit, addMembers)",
-                                                ),
-                                            ),
-                                            format: None,
-                                            default: None,
-                                            min_length: None,
+                                        ::jacquard_lexicon::lexicon::LexObjectProperty::Bytes(::jacquard_lexicon::lexicon::LexBytes {
+                                            description: None,
                                             max_length: None,
-                                            min_graphemes: None,
-                                            max_graphemes: None,
-                                            r#enum: None,
-                                            r#const: None,
-                                            known_values: None,
+                                            min_length: None,
                                         }),
                                     );
                                     map.insert(
@@ -489,21 +456,10 @@ fn lexicon_doc_blue_catbird_mlsChat_commitGroupChange() -> ::jacquard_lexicon::l
                                     );
                                     map.insert(
                                         ::jacquard_common::smol_str::SmolStr::new_static("welcome"),
-                                        ::jacquard_lexicon::lexicon::LexObjectProperty::String(::jacquard_lexicon::lexicon::LexString {
-                                            description: Some(
-                                                ::jacquard_common::CowStr::new_static(
-                                                    "Base64url-encoded MLS Welcome message (used by addMembers, completePendingDeviceAddition)",
-                                                ),
-                                            ),
-                                            format: None,
-                                            default: None,
-                                            min_length: None,
+                                        ::jacquard_lexicon::lexicon::LexObjectProperty::Bytes(::jacquard_lexicon::lexicon::LexBytes {
+                                            description: None,
                                             max_length: None,
-                                            min_graphemes: None,
-                                            max_graphemes: None,
-                                            r#enum: None,
-                                            r#const: None,
-                                            known_values: None,
+                                            min_length: None,
                                         }),
                                     );
                                     map
@@ -761,14 +717,14 @@ pub struct CommitGroupChange<'a> {
     /// Membership action to perform
     #[serde(borrow)]
     pub action: jacquard_common::CowStr<'a>,
-    /// Base64url-encoded MLS Commit message (used by addMembers, processExternalCommit, rejoin)
+    /// MLS Commit message (used by addMembers, processExternalCommit, rejoin)
     #[serde(skip_serializing_if = "std::option::Option::is_none")]
-    #[serde(borrow)]
-    pub commit: std::option::Option<jacquard_common::CowStr<'a>>,
-    /// Base64-encoded MLS confirmation tag from the client's post-commit group state.
+    #[serde(default, with = "jacquard_common::opt_serde_bytes_helper")]
+    pub commit: std::option::Option<bytes::Bytes>,
+    /// MLS confirmation tag from the client's post-commit group state.
     #[serde(skip_serializing_if = "std::option::Option::is_none")]
-    #[serde(borrow)]
-    pub confirmation_tag: std::option::Option<jacquard_common::CowStr<'a>>,
+    #[serde(default, with = "jacquard_common::opt_serde_bytes_helper")]
+    pub confirmation_tag: std::option::Option<bytes::Bytes>,
     /// Conversation identifier
     #[serde(borrow)]
     pub convo_id: jacquard_common::CowStr<'a>,
@@ -780,10 +736,10 @@ pub struct CommitGroupChange<'a> {
     #[serde(skip_serializing_if = "std::option::Option::is_none")]
     #[serde(borrow)]
     pub epoch_authenticator: std::option::Option<jacquard_common::CowStr<'a>>,
-    /// Base64-encoded GroupInfo to update after commit (used by processExternalCommit, addMembers)
+    /// GroupInfo to update after commit (used by processExternalCommit, addMembers)
     #[serde(skip_serializing_if = "std::option::Option::is_none")]
-    #[serde(borrow)]
-    pub group_info: std::option::Option<jacquard_common::CowStr<'a>>,
+    #[serde(default, with = "jacquard_common::opt_serde_bytes_helper")]
+    pub group_info: std::option::Option<bytes::Bytes>,
     /// Client-generated UUID for idempotent retries
     #[serde(skip_serializing_if = "std::option::Option::is_none")]
     #[serde(borrow)]
@@ -806,10 +762,10 @@ pub struct CommitGroupChange<'a> {
     #[serde(skip_serializing_if = "std::option::Option::is_none")]
     #[serde(borrow)]
     pub pending_addition_id: std::option::Option<jacquard_common::CowStr<'a>>,
-    /// Base64url-encoded MLS Welcome message (used by addMembers, completePendingDeviceAddition)
+    /// MLS Welcome message (used by addMembers, completePendingDeviceAddition)
     #[serde(skip_serializing_if = "std::option::Option::is_none")]
-    #[serde(borrow)]
-    pub welcome: std::option::Option<jacquard_common::CowStr<'a>>,
+    #[serde(default, with = "jacquard_common::opt_serde_bytes_helper")]
+    pub welcome: std::option::Option<bytes::Bytes>,
 }
 
 #[jacquard_derive::lexicon]
@@ -832,10 +788,10 @@ pub struct CommitGroupChangeOutput<'a> {
             'a,
         >,
     >,
-    /// Base64-encoded confirmation tag of the new canonical tree state.
+    /// confirmation tag of the new canonical tree state.
     #[serde(skip_serializing_if = "std::option::Option::is_none")]
-    #[serde(borrow)]
-    pub confirmation_tag: std::option::Option<jacquard_common::CowStr<'a>>,
+    #[serde(default, with = "jacquard_common::opt_serde_bytes_helper")]
+    pub confirmation_tag: std::option::Option<bytes::Bytes>,
     /// New epoch number after the change (for addMembers, processExternalCommit, rejoin)
     #[serde(skip_serializing_if = "std::option::Option::is_none")]
     pub new_epoch: std::option::Option<i64>,
@@ -1083,127 +1039,127 @@ pub mod pending_device_addition_state {
     }
     /// State trait tracking which required fields have been set
     pub trait State: sealed::Sealed {
-        type ConvoId;
         type UserDid;
         type Id;
-        type DeviceId;
-        type Status;
-        type CreatedAt;
+        type ConvoId;
         type DeviceCredentialDid;
+        type CreatedAt;
+        type Status;
+        type DeviceId;
     }
     /// Empty state - all required fields are unset
     pub struct Empty(());
     impl sealed::Sealed for Empty {}
     impl State for Empty {
-        type ConvoId = Unset;
         type UserDid = Unset;
         type Id = Unset;
-        type DeviceId = Unset;
-        type Status = Unset;
-        type CreatedAt = Unset;
+        type ConvoId = Unset;
         type DeviceCredentialDid = Unset;
-    }
-    ///State transition - sets the `convo_id` field to Set
-    pub struct SetConvoId<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetConvoId<S> {}
-    impl<S: State> State for SetConvoId<S> {
-        type ConvoId = Set<members::convo_id>;
-        type UserDid = S::UserDid;
-        type Id = S::Id;
-        type DeviceId = S::DeviceId;
-        type Status = S::Status;
-        type CreatedAt = S::CreatedAt;
-        type DeviceCredentialDid = S::DeviceCredentialDid;
+        type CreatedAt = Unset;
+        type Status = Unset;
+        type DeviceId = Unset;
     }
     ///State transition - sets the `user_did` field to Set
     pub struct SetUserDid<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetUserDid<S> {}
     impl<S: State> State for SetUserDid<S> {
-        type ConvoId = S::ConvoId;
         type UserDid = Set<members::user_did>;
         type Id = S::Id;
-        type DeviceId = S::DeviceId;
-        type Status = S::Status;
-        type CreatedAt = S::CreatedAt;
+        type ConvoId = S::ConvoId;
         type DeviceCredentialDid = S::DeviceCredentialDid;
+        type CreatedAt = S::CreatedAt;
+        type Status = S::Status;
+        type DeviceId = S::DeviceId;
     }
     ///State transition - sets the `id` field to Set
     pub struct SetId<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetId<S> {}
     impl<S: State> State for SetId<S> {
-        type ConvoId = S::ConvoId;
         type UserDid = S::UserDid;
         type Id = Set<members::id>;
-        type DeviceId = S::DeviceId;
-        type Status = S::Status;
-        type CreatedAt = S::CreatedAt;
-        type DeviceCredentialDid = S::DeviceCredentialDid;
-    }
-    ///State transition - sets the `device_id` field to Set
-    pub struct SetDeviceId<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetDeviceId<S> {}
-    impl<S: State> State for SetDeviceId<S> {
         type ConvoId = S::ConvoId;
+        type DeviceCredentialDid = S::DeviceCredentialDid;
+        type CreatedAt = S::CreatedAt;
+        type Status = S::Status;
+        type DeviceId = S::DeviceId;
+    }
+    ///State transition - sets the `convo_id` field to Set
+    pub struct SetConvoId<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetConvoId<S> {}
+    impl<S: State> State for SetConvoId<S> {
         type UserDid = S::UserDid;
         type Id = S::Id;
-        type DeviceId = Set<members::device_id>;
-        type Status = S::Status;
+        type ConvoId = Set<members::convo_id>;
+        type DeviceCredentialDid = S::DeviceCredentialDid;
         type CreatedAt = S::CreatedAt;
-        type DeviceCredentialDid = S::DeviceCredentialDid;
-    }
-    ///State transition - sets the `status` field to Set
-    pub struct SetStatus<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetStatus<S> {}
-    impl<S: State> State for SetStatus<S> {
-        type ConvoId = S::ConvoId;
-        type UserDid = S::UserDid;
-        type Id = S::Id;
-        type DeviceId = S::DeviceId;
-        type Status = Set<members::status>;
-        type CreatedAt = S::CreatedAt;
-        type DeviceCredentialDid = S::DeviceCredentialDid;
-    }
-    ///State transition - sets the `created_at` field to Set
-    pub struct SetCreatedAt<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetCreatedAt<S> {}
-    impl<S: State> State for SetCreatedAt<S> {
-        type ConvoId = S::ConvoId;
-        type UserDid = S::UserDid;
-        type Id = S::Id;
-        type DeviceId = S::DeviceId;
         type Status = S::Status;
-        type CreatedAt = Set<members::created_at>;
-        type DeviceCredentialDid = S::DeviceCredentialDid;
+        type DeviceId = S::DeviceId;
     }
     ///State transition - sets the `device_credential_did` field to Set
     pub struct SetDeviceCredentialDid<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetDeviceCredentialDid<S> {}
     impl<S: State> State for SetDeviceCredentialDid<S> {
-        type ConvoId = S::ConvoId;
         type UserDid = S::UserDid;
         type Id = S::Id;
-        type DeviceId = S::DeviceId;
-        type Status = S::Status;
-        type CreatedAt = S::CreatedAt;
+        type ConvoId = S::ConvoId;
         type DeviceCredentialDid = Set<members::device_credential_did>;
+        type CreatedAt = S::CreatedAt;
+        type Status = S::Status;
+        type DeviceId = S::DeviceId;
+    }
+    ///State transition - sets the `created_at` field to Set
+    pub struct SetCreatedAt<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetCreatedAt<S> {}
+    impl<S: State> State for SetCreatedAt<S> {
+        type UserDid = S::UserDid;
+        type Id = S::Id;
+        type ConvoId = S::ConvoId;
+        type DeviceCredentialDid = S::DeviceCredentialDid;
+        type CreatedAt = Set<members::created_at>;
+        type Status = S::Status;
+        type DeviceId = S::DeviceId;
+    }
+    ///State transition - sets the `status` field to Set
+    pub struct SetStatus<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetStatus<S> {}
+    impl<S: State> State for SetStatus<S> {
+        type UserDid = S::UserDid;
+        type Id = S::Id;
+        type ConvoId = S::ConvoId;
+        type DeviceCredentialDid = S::DeviceCredentialDid;
+        type CreatedAt = S::CreatedAt;
+        type Status = Set<members::status>;
+        type DeviceId = S::DeviceId;
+    }
+    ///State transition - sets the `device_id` field to Set
+    pub struct SetDeviceId<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetDeviceId<S> {}
+    impl<S: State> State for SetDeviceId<S> {
+        type UserDid = S::UserDid;
+        type Id = S::Id;
+        type ConvoId = S::ConvoId;
+        type DeviceCredentialDid = S::DeviceCredentialDid;
+        type CreatedAt = S::CreatedAt;
+        type Status = S::Status;
+        type DeviceId = Set<members::device_id>;
     }
     /// Marker types for field names
     #[allow(non_camel_case_types)]
     pub mod members {
-        ///Marker type for the `convo_id` field
-        pub struct convo_id(());
         ///Marker type for the `user_did` field
         pub struct user_did(());
         ///Marker type for the `id` field
         pub struct id(());
-        ///Marker type for the `device_id` field
-        pub struct device_id(());
-        ///Marker type for the `status` field
-        pub struct status(());
-        ///Marker type for the `created_at` field
-        pub struct created_at(());
+        ///Marker type for the `convo_id` field
+        pub struct convo_id(());
         ///Marker type for the `device_credential_did` field
         pub struct device_credential_did(());
+        ///Marker type for the `created_at` field
+        pub struct created_at(());
+        ///Marker type for the `status` field
+        pub struct status(());
+        ///Marker type for the `device_id` field
+        pub struct device_id(());
     }
 }
 
@@ -1438,13 +1394,13 @@ where
 impl<'a, S> PendingDeviceAdditionBuilder<'a, S>
 where
     S: pending_device_addition_state::State,
-    S::ConvoId: pending_device_addition_state::IsSet,
     S::UserDid: pending_device_addition_state::IsSet,
     S::Id: pending_device_addition_state::IsSet,
-    S::DeviceId: pending_device_addition_state::IsSet,
-    S::Status: pending_device_addition_state::IsSet,
-    S::CreatedAt: pending_device_addition_state::IsSet,
+    S::ConvoId: pending_device_addition_state::IsSet,
     S::DeviceCredentialDid: pending_device_addition_state::IsSet,
+    S::CreatedAt: pending_device_addition_state::IsSet,
+    S::Status: pending_device_addition_state::IsSet,
+    S::DeviceId: pending_device_addition_state::IsSet,
 {
     /// Build the final struct
     pub fn build(self) -> PendingDeviceAddition<'a> {

@@ -22,9 +22,9 @@ pub struct KeyPackageItem<'a> {
     pub cipher_suite: jacquard_common::CowStr<'a>,
     /// Key package expiration time
     pub expires: jacquard_common::types::string::Datetime,
-    /// Base64-encoded MLS key package
-    #[serde(borrow)]
-    pub key_package: jacquard_common::CowStr<'a>,
+    /// MLS key package
+    #[serde(with = "jacquard_common::serde_bytes_helper")]
+    pub key_package: bytes::Bytes,
 }
 
 pub mod key_package_item_state {
@@ -37,49 +37,49 @@ pub mod key_package_item_state {
     }
     /// State trait tracking which required fields have been set
     pub trait State: sealed::Sealed {
-        type KeyPackage;
         type CipherSuite;
+        type KeyPackage;
         type Expires;
     }
     /// Empty state - all required fields are unset
     pub struct Empty(());
     impl sealed::Sealed for Empty {}
     impl State for Empty {
-        type KeyPackage = Unset;
         type CipherSuite = Unset;
+        type KeyPackage = Unset;
         type Expires = Unset;
-    }
-    ///State transition - sets the `key_package` field to Set
-    pub struct SetKeyPackage<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetKeyPackage<S> {}
-    impl<S: State> State for SetKeyPackage<S> {
-        type KeyPackage = Set<members::key_package>;
-        type CipherSuite = S::CipherSuite;
-        type Expires = S::Expires;
     }
     ///State transition - sets the `cipher_suite` field to Set
     pub struct SetCipherSuite<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetCipherSuite<S> {}
     impl<S: State> State for SetCipherSuite<S> {
-        type KeyPackage = S::KeyPackage;
         type CipherSuite = Set<members::cipher_suite>;
+        type KeyPackage = S::KeyPackage;
+        type Expires = S::Expires;
+    }
+    ///State transition - sets the `key_package` field to Set
+    pub struct SetKeyPackage<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetKeyPackage<S> {}
+    impl<S: State> State for SetKeyPackage<S> {
+        type CipherSuite = S::CipherSuite;
+        type KeyPackage = Set<members::key_package>;
         type Expires = S::Expires;
     }
     ///State transition - sets the `expires` field to Set
     pub struct SetExpires<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetExpires<S> {}
     impl<S: State> State for SetExpires<S> {
-        type KeyPackage = S::KeyPackage;
         type CipherSuite = S::CipherSuite;
+        type KeyPackage = S::KeyPackage;
         type Expires = Set<members::expires>;
     }
     /// Marker types for field names
     #[allow(non_camel_case_types)]
     pub mod members {
-        ///Marker type for the `key_package` field
-        pub struct key_package(());
         ///Marker type for the `cipher_suite` field
         pub struct cipher_suite(());
+        ///Marker type for the `key_package` field
+        pub struct key_package(());
         ///Marker type for the `expires` field
         pub struct expires(());
     }
@@ -91,7 +91,7 @@ pub struct KeyPackageItemBuilder<'a, S: key_package_item_state::State> {
     __unsafe_private_named: (
         ::core::option::Option<jacquard_common::CowStr<'a>>,
         ::core::option::Option<jacquard_common::types::string::Datetime>,
-        ::core::option::Option<jacquard_common::CowStr<'a>>,
+        ::core::option::Option<bytes::Bytes>,
     ),
     _phantom: ::core::marker::PhantomData<&'a ()>,
 }
@@ -160,7 +160,7 @@ where
     /// Set the `keyPackage` field (required)
     pub fn key_package(
         mut self,
-        value: impl Into<jacquard_common::CowStr<'a>>,
+        value: impl Into<bytes::Bytes>,
     ) -> KeyPackageItemBuilder<'a, key_package_item_state::SetKeyPackage<S>> {
         self.__unsafe_private_named.2 = ::core::option::Option::Some(value.into());
         KeyPackageItemBuilder {
@@ -174,8 +174,8 @@ where
 impl<'a, S> KeyPackageItemBuilder<'a, S>
 where
     S: key_package_item_state::State,
-    S::KeyPackage: key_package_item_state::IsSet,
     S::CipherSuite: key_package_item_state::IsSet,
+    S::KeyPackage: key_package_item_state::IsSet,
     S::Expires: key_package_item_state::IsSet,
 {
     /// Build the final struct
@@ -275,21 +275,10 @@ fn lexicon_doc_blue_catbird_mlsChat_registerDevice() -> ::jacquard_lexicon::lexi
                             ::jacquard_common::smol_str::SmolStr::new_static(
                                 "keyPackage",
                             ),
-                            ::jacquard_lexicon::lexicon::LexObjectProperty::String(::jacquard_lexicon::lexicon::LexString {
-                                description: Some(
-                                    ::jacquard_common::CowStr::new_static(
-                                        "Base64-encoded MLS key package",
-                                    ),
-                                ),
-                                format: None,
-                                default: None,
-                                min_length: None,
+                            ::jacquard_lexicon::lexicon::LexObjectProperty::Bytes(::jacquard_lexicon::lexicon::LexBytes {
+                                description: None,
                                 max_length: None,
-                                min_graphemes: None,
-                                max_graphemes: None,
-                                r#enum: None,
-                                r#const: None,
-                                known_values: None,
+                                min_length: None,
                             }),
                         );
                         map
@@ -455,21 +444,10 @@ fn lexicon_doc_blue_catbird_mlsChat_registerDevice() -> ::jacquard_lexicon::lexi
                         );
                         map.insert(
                             ::jacquard_common::smol_str::SmolStr::new_static("welcome"),
-                            ::jacquard_lexicon::lexicon::LexObjectProperty::String(::jacquard_lexicon::lexicon::LexString {
-                                description: Some(
-                                    ::jacquard_common::CowStr::new_static(
-                                        "Base64-encoded MLS Welcome message",
-                                    ),
-                                ),
-                                format: None,
-                                default: None,
-                                min_length: None,
+                            ::jacquard_lexicon::lexicon::LexObjectProperty::Bytes(::jacquard_lexicon::lexicon::LexBytes {
+                                description: None,
                                 max_length: None,
-                                min_graphemes: None,
-                                max_graphemes: None,
-                                r#enum: None,
-                                r#const: None,
-                                known_values: None,
+                                min_length: None,
                             }),
                         );
                         map
@@ -901,17 +879,156 @@ impl jacquard_common::xrpc::XrpcEndpoint for RegisterDeviceRequest {
     Clone,
     PartialEq,
     Eq,
-    jacquard_derive::IntoStatic,
-    Default
+    jacquard_derive::IntoStatic
 )]
 #[serde(rename_all = "camelCase")]
 pub struct WelcomeMessage<'a> {
     /// Conversation ID
     #[serde(borrow)]
     pub convo_id: jacquard_common::CowStr<'a>,
-    /// Base64-encoded MLS Welcome message
-    #[serde(borrow)]
-    pub welcome: jacquard_common::CowStr<'a>,
+    /// MLS Welcome message
+    #[serde(with = "jacquard_common::serde_bytes_helper")]
+    pub welcome: bytes::Bytes,
+}
+
+pub mod welcome_message_state {
+
+    pub use crate::builder_types::{Set, Unset, IsSet, IsUnset};
+    #[allow(unused)]
+    use ::core::marker::PhantomData;
+    mod sealed {
+        pub trait Sealed {}
+    }
+    /// State trait tracking which required fields have been set
+    pub trait State: sealed::Sealed {
+        type ConvoId;
+        type Welcome;
+    }
+    /// Empty state - all required fields are unset
+    pub struct Empty(());
+    impl sealed::Sealed for Empty {}
+    impl State for Empty {
+        type ConvoId = Unset;
+        type Welcome = Unset;
+    }
+    ///State transition - sets the `convo_id` field to Set
+    pub struct SetConvoId<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetConvoId<S> {}
+    impl<S: State> State for SetConvoId<S> {
+        type ConvoId = Set<members::convo_id>;
+        type Welcome = S::Welcome;
+    }
+    ///State transition - sets the `welcome` field to Set
+    pub struct SetWelcome<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetWelcome<S> {}
+    impl<S: State> State for SetWelcome<S> {
+        type ConvoId = S::ConvoId;
+        type Welcome = Set<members::welcome>;
+    }
+    /// Marker types for field names
+    #[allow(non_camel_case_types)]
+    pub mod members {
+        ///Marker type for the `convo_id` field
+        pub struct convo_id(());
+        ///Marker type for the `welcome` field
+        pub struct welcome(());
+    }
+}
+
+/// Builder for constructing an instance of this type
+pub struct WelcomeMessageBuilder<'a, S: welcome_message_state::State> {
+    _phantom_state: ::core::marker::PhantomData<fn() -> S>,
+    __unsafe_private_named: (
+        ::core::option::Option<jacquard_common::CowStr<'a>>,
+        ::core::option::Option<bytes::Bytes>,
+    ),
+    _phantom: ::core::marker::PhantomData<&'a ()>,
+}
+
+impl<'a> WelcomeMessage<'a> {
+    /// Create a new builder for this type
+    pub fn new() -> WelcomeMessageBuilder<'a, welcome_message_state::Empty> {
+        WelcomeMessageBuilder::new()
+    }
+}
+
+impl<'a> WelcomeMessageBuilder<'a, welcome_message_state::Empty> {
+    /// Create a new builder with all fields unset
+    pub fn new() -> Self {
+        WelcomeMessageBuilder {
+            _phantom_state: ::core::marker::PhantomData,
+            __unsafe_private_named: (None, None),
+            _phantom: ::core::marker::PhantomData,
+        }
+    }
+}
+
+impl<'a, S> WelcomeMessageBuilder<'a, S>
+where
+    S: welcome_message_state::State,
+    S::ConvoId: welcome_message_state::IsUnset,
+{
+    /// Set the `convoId` field (required)
+    pub fn convo_id(
+        mut self,
+        value: impl Into<jacquard_common::CowStr<'a>>,
+    ) -> WelcomeMessageBuilder<'a, welcome_message_state::SetConvoId<S>> {
+        self.__unsafe_private_named.0 = ::core::option::Option::Some(value.into());
+        WelcomeMessageBuilder {
+            _phantom_state: ::core::marker::PhantomData,
+            __unsafe_private_named: self.__unsafe_private_named,
+            _phantom: ::core::marker::PhantomData,
+        }
+    }
+}
+
+impl<'a, S> WelcomeMessageBuilder<'a, S>
+where
+    S: welcome_message_state::State,
+    S::Welcome: welcome_message_state::IsUnset,
+{
+    /// Set the `welcome` field (required)
+    pub fn welcome(
+        mut self,
+        value: impl Into<bytes::Bytes>,
+    ) -> WelcomeMessageBuilder<'a, welcome_message_state::SetWelcome<S>> {
+        self.__unsafe_private_named.1 = ::core::option::Option::Some(value.into());
+        WelcomeMessageBuilder {
+            _phantom_state: ::core::marker::PhantomData,
+            __unsafe_private_named: self.__unsafe_private_named,
+            _phantom: ::core::marker::PhantomData,
+        }
+    }
+}
+
+impl<'a, S> WelcomeMessageBuilder<'a, S>
+where
+    S: welcome_message_state::State,
+    S::ConvoId: welcome_message_state::IsSet,
+    S::Welcome: welcome_message_state::IsSet,
+{
+    /// Build the final struct
+    pub fn build(self) -> WelcomeMessage<'a> {
+        WelcomeMessage {
+            convo_id: self.__unsafe_private_named.0.unwrap(),
+            welcome: self.__unsafe_private_named.1.unwrap(),
+            extra_data: Default::default(),
+        }
+    }
+    /// Build the final struct with custom extra_data
+    pub fn build_with_data(
+        self,
+        extra_data: std::collections::BTreeMap<
+            jacquard_common::smol_str::SmolStr,
+            jacquard_common::types::value::Data<'a>,
+        >,
+    ) -> WelcomeMessage<'a> {
+        WelcomeMessage {
+            convo_id: self.__unsafe_private_named.0.unwrap(),
+            welcome: self.__unsafe_private_named.1.unwrap(),
+            extra_data: Some(extra_data),
+        }
+    }
 }
 
 impl<'a> ::jacquard_lexicon::schema::LexiconSchema for WelcomeMessage<'a> {

@@ -152,14 +152,14 @@ pub struct GetGroupStateOutput<'a> {
     /// When the GroupInfo becomes stale (typically 5 minutes)
     #[serde(skip_serializing_if = "std::option::Option::is_none")]
     pub expires_at: std::option::Option<jacquard_common::types::string::Datetime>,
-    /// Base64-encoded TLS-serialized GroupInfo (present when 'groupInfo' included)
+    /// TLS-serialized GroupInfo (present when 'groupInfo' included)
     #[serde(skip_serializing_if = "std::option::Option::is_none")]
-    #[serde(borrow)]
-    pub group_info: std::option::Option<jacquard_common::CowStr<'a>>,
-    /// Base64-encoded pending MLS Welcome message (present when 'welcome' included and a Welcome exists)
+    #[serde(default, with = "jacquard_common::opt_serde_bytes_helper")]
+    pub group_info: std::option::Option<bytes::Bytes>,
+    /// Pending MLS Welcome message (present when 'welcome' included and a Welcome exists)
     #[serde(skip_serializing_if = "std::option::Option::is_none")]
-    #[serde(borrow)]
-    pub welcome: std::option::Option<jacquard_common::CowStr<'a>>,
+    #[serde(default, with = "jacquard_common::opt_serde_bytes_helper")]
+    pub welcome: std::option::Option<bytes::Bytes>,
 }
 
 #[jacquard_derive::open_union]

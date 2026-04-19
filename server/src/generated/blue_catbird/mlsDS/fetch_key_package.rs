@@ -155,14 +155,13 @@ where
     Clone,
     PartialEq,
     Eq,
-    jacquard_derive::IntoStatic,
-    Default
+    jacquard_derive::IntoStatic
 )]
 #[serde(rename_all = "camelCase")]
 pub struct FetchKeyPackageOutput<'a> {
-    /// Base64-encoded MLS key package
-    #[serde(borrow)]
-    pub key_package: jacquard_common::CowStr<'a>,
+    /// MLS key package
+    #[serde(with = "jacquard_common::serde_bytes_helper")]
+    pub key_package: bytes::Bytes,
     /// Hash of the key package
     #[serde(borrow)]
     pub key_package_hash: jacquard_common::CowStr<'a>,

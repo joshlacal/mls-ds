@@ -37,37 +37,37 @@ pub mod transfer_sequencer_state {
     }
     /// State trait tracking which required fields have been set
     pub trait State: sealed::Sealed {
-        type NewSequencerTerm;
         type ConvoId;
+        type NewSequencerTerm;
     }
     /// Empty state - all required fields are unset
     pub struct Empty(());
     impl sealed::Sealed for Empty {}
     impl State for Empty {
-        type NewSequencerTerm = Unset;
         type ConvoId = Unset;
-    }
-    ///State transition - sets the `new_sequencer_term` field to Set
-    pub struct SetNewSequencerTerm<S: State = Empty>(PhantomData<fn() -> S>);
-    impl<S: State> sealed::Sealed for SetNewSequencerTerm<S> {}
-    impl<S: State> State for SetNewSequencerTerm<S> {
-        type NewSequencerTerm = Set<members::new_sequencer_term>;
-        type ConvoId = S::ConvoId;
+        type NewSequencerTerm = Unset;
     }
     ///State transition - sets the `convo_id` field to Set
     pub struct SetConvoId<S: State = Empty>(PhantomData<fn() -> S>);
     impl<S: State> sealed::Sealed for SetConvoId<S> {}
     impl<S: State> State for SetConvoId<S> {
-        type NewSequencerTerm = S::NewSequencerTerm;
         type ConvoId = Set<members::convo_id>;
+        type NewSequencerTerm = S::NewSequencerTerm;
+    }
+    ///State transition - sets the `new_sequencer_term` field to Set
+    pub struct SetNewSequencerTerm<S: State = Empty>(PhantomData<fn() -> S>);
+    impl<S: State> sealed::Sealed for SetNewSequencerTerm<S> {}
+    impl<S: State> State for SetNewSequencerTerm<S> {
+        type ConvoId = S::ConvoId;
+        type NewSequencerTerm = Set<members::new_sequencer_term>;
     }
     /// Marker types for field names
     #[allow(non_camel_case_types)]
     pub mod members {
-        ///Marker type for the `new_sequencer_term` field
-        pub struct new_sequencer_term(());
         ///Marker type for the `convo_id` field
         pub struct convo_id(());
+        ///Marker type for the `new_sequencer_term` field
+        pub struct new_sequencer_term(());
     }
 }
 
@@ -154,8 +154,8 @@ where
 impl<'a, S> TransferSequencerBuilder<'a, S>
 where
     S: transfer_sequencer_state::State,
-    S::NewSequencerTerm: transfer_sequencer_state::IsSet,
     S::ConvoId: transfer_sequencer_state::IsSet,
+    S::NewSequencerTerm: transfer_sequencer_state::IsSet,
 {
     /// Build the final struct
     pub fn build(self) -> TransferSequencer<'a> {

@@ -24,10 +24,10 @@ pub struct ResetGroup<'a> {
     /// Conversation identifier
     #[serde(borrow)]
     pub convo_id: jacquard_common::CowStr<'a>,
-    /// Optional base64-encoded MLS GroupInfo for the new group
+    /// Optional MLS GroupInfo for the new group
     #[serde(skip_serializing_if = "std::option::Option::is_none")]
-    #[serde(borrow)]
-    pub group_info: std::option::Option<jacquard_common::CowStr<'a>>,
+    #[serde(default, with = "jacquard_common::opt_serde_bytes_helper")]
+    pub group_info: std::option::Option<bytes::Bytes>,
     /// New MLS group identifier to replace the current one
     #[serde(borrow)]
     pub new_group_id: jacquard_common::CowStr<'a>,
