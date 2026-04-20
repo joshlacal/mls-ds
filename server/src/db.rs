@@ -1848,30 +1848,81 @@ pub async fn create_envelope(
 // Event Stream Operations (Realtime Events)
 // =============================================================================
 
-/// Store minimal event envelope (no full message content)
+/// Short event_type string (column value in `event_stream`) for a StreamEvent variant.
 ///
-/// Security: Only stores routing metadata. Clients fetch full message
-/// via getMessages and decrypt locally. This prevents metadata leakage
-/// from event stream storage.
+/// Matches the suffix of the `$type` tag emitted over the wire (e.g.
+/// `"messageEvent"` for `blue.catbird.mlsChat.subscribeEvents#messageEvent`).
+/// Used for filtering queries (`compact_cursors`, ad-hoc inspection) and to
+/// preserve backward compatibility with the `event_type` column that pre-dates
+/// the stored `$type` tag in the payload.
+pub fn stream_event_type_str(event: &crate::realtime::sse::StreamEvent) -> &'static str {
+    use crate::realtime::sse::StreamEvent;
+    match event {
+        StreamEvent::MessageEvent { .. } => "messageEvent",
+        StreamEvent::TypingEvent { .. } => "typingEvent",
+        StreamEvent::ReactionEvent { .. } => "reactionEvent",
+        StreamEvent::InfoEvent { .. } => "infoEvent",
+        StreamEvent::NewDeviceEvent { .. } => "newDeviceEvent",
+        StreamEvent::GroupInfoRefreshRequested { .. } => "groupInfoRefreshRequestedEvent",
+        StreamEvent::ReadditionRequested { .. } => "readditionRequestedEvent",
+        StreamEvent::TreeChanged { .. } => "treeChanged",
+        StreamEvent::MembershipChangeEvent { .. } => "membershipChangeEvent",
+        StreamEvent::GroupResetEvent { .. } => "groupResetEvent",
+        StreamEvent::CircuitBreakerTrippedEvent { .. } => "circuitBreakerTrippedEvent",
+    }
+}
+
+/// Extract the cursor (ULID) from a StreamEvent. Every variant carries one.
+fn stream_event_cursor(event: &crate::realtime::sse::StreamEvent) -> &str {
+    use crate::realtime::sse::StreamEvent;
+    match event {
+        StreamEvent::MessageEvent { cursor, .. } => cursor,
+        StreamEvent::TypingEvent { cursor, .. } => cursor,
+        StreamEvent::ReactionEvent { cursor, .. } => cursor,
+        StreamEvent::InfoEvent { cursor, .. } => cursor,
+        StreamEvent::NewDeviceEvent { cursor, .. } => cursor,
+        StreamEvent::GroupInfoRefreshRequested { cursor, .. } => cursor,
+        StreamEvent::ReadditionRequested { cursor, .. } => cursor,
+        StreamEvent::TreeChanged { cursor, .. } => cursor,
+        StreamEvent::MembershipChangeEvent { cursor, .. } => cursor,
+        StreamEvent::GroupResetEvent { cursor, .. } => cursor,
+        StreamEvent::CircuitBreakerTrippedEvent { cursor, .. } => cursor,
+    }
+}
+
+/// Store a full `StreamEvent` payload for cursor-based backfill.
+///
+/// As of task #40, the full event (including `$type` tag and variant fields)
+/// is serialized into the `payload` column so WebSocket backfill can
+/// reconstruct it uniformly via the existing `StreamEvent: Deserialize` impl —
+/// no per-variant match. Prior rows stored only `{cursor, convoId, messageId}`
+/// and fail deserialization on backfill — callers treat those as
+/// unreconstructible and skip them.
+///
+/// Backfill uses `to_string` → `from_str` rather than `from_value` because
+/// `jacquard_common::serde_bytes_helper` requires borrowed `&'de str` keys,
+/// which `from_value` cannot produce.
+///
+/// Security: `MessageEvent` ciphertext is included in the stored payload, but
+/// it is already encrypted end-to-end by MLS and is only accessible to
+/// authenticated members (SSE/WS are gated by `is_member`). This matches the
+/// existing `envelopes` table which also persists ciphertext for fanout.
 ///
 /// # Arguments
-/// * `cursor` - Event cursor (ULID) for ordering
-/// * `convo_id` - Conversation identifier
-/// * `event_type` - Type of event (messageEvent, reactionEvent, etc.)
-/// * `message_id` - Optional message ID for message events only
+/// * `pool` - Database pool
+/// * `convo_id` - Conversation identifier (used for the `convo_id` column and
+///   fanout filtering; `StreamEvent::InfoEvent` does not carry one in its
+///   payload, so we must pass it explicitly)
+/// * `event` - The full event to persist; `event_type` is derived from the
+///   variant and cursor is read from the event body
 pub async fn store_event(
     pool: &DbPool,
-    cursor: &str,
     convo_id: &str,
-    event_type: &str,
-    message_id: Option<&str>,
+    event: &crate::realtime::sse::StreamEvent,
 ) -> Result<()> {
-    // Store minimal envelope only - no ciphertext or metadata
-    let envelope = serde_json::json!({
-        "cursor": cursor,
-        "convoId": convo_id,
-        "messageId": message_id,
-    });
+    let cursor = stream_event_cursor(event);
+    let event_type = stream_event_type_str(event);
+    let payload = serde_json::to_value(event).context("Failed to serialize StreamEvent")?;
 
     sqlx::query(
         r#"
@@ -1882,7 +1933,7 @@ pub async fn store_event(
     .bind(cursor)
     .bind(convo_id)
     .bind(event_type)
-    .bind(envelope)
+    .bind(payload)
     .execute(pool)
     .await
     .context("Failed to store event")?;

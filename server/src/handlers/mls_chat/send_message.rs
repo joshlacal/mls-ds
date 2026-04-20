@@ -449,15 +449,7 @@ async fn handle_persistent(
         };
 
         // Store event for cursor-based replay
-        if let Err(e) = crate::db::store_event(
-            &pool_clone,
-            &cursor,
-            &convo_id_clone,
-            "messageEvent",
-            Some(&msg_id_clone),
-        )
-        .await
-        {
+        if let Err(e) = crate::db::store_event(&pool_clone, &convo_id_clone, &event).await {
             error!("❌ [v2.sendMessage:fanout] store event: {:?}", e);
             metrics::counter!("fanout_failures_total", 1, "stage" => "store_event");
         }

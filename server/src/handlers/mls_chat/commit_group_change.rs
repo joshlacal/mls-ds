@@ -797,14 +797,8 @@ pub async fn commit_group_change(
                         ephemeral: false,
                     };
 
-                    if let Err(e) = crate::db::store_event(
-                        &pool_clone,
-                        &cursor,
-                        &convo_id_clone,
-                        "messageEvent",
-                        Some(&msg_id_clone),
-                    )
-                    .await
+                    if let Err(e) =
+                        crate::db::store_event(&pool_clone, &convo_id_clone, &event).await
                     {
                         error!("addMembers: store event failed: {:?}", e);
                     }
@@ -824,10 +818,7 @@ pub async fn commit_group_change(
                     confirmation_tag: bytes::Bytes::from(tag_bytes.clone()),
                     epoch: new_epoch as i64,
                 };
-                if let Err(e) =
-                    crate::db::store_event(&pool, &tree_cursor, &convo_id, "treeChanged", None)
-                        .await
-                {
+                if let Err(e) = crate::db::store_event(&pool, &convo_id, &tree_event).await {
                     warn!("addMembers: store treeChanged event failed: {:?}", e);
                 }
                 if let Err(e) = sse_state.emit(&convo_id, tree_event).await {
@@ -1366,14 +1357,8 @@ pub async fn commit_group_change(
                         ephemeral: false,
                     };
 
-                    if let Err(e) = crate::db::store_event(
-                        &pool_clone,
-                        &cursor,
-                        &convo_id_clone,
-                        "messageEvent",
-                        Some(&msg_id_clone),
-                    )
-                    .await
+                    if let Err(e) =
+                        crate::db::store_event(&pool_clone, &convo_id_clone, &event).await
                     {
                         error!("externalCommit: store event failed: {:?}", e);
                     }
@@ -1393,10 +1378,7 @@ pub async fn commit_group_change(
                     confirmation_tag: bytes::Bytes::from(tag_bytes.clone()),
                     epoch: new_epoch as i64,
                 };
-                if let Err(e) =
-                    crate::db::store_event(&pool, &tree_cursor, &convo_id, "treeChanged", None)
-                        .await
-                {
+                if let Err(e) = crate::db::store_event(&pool, &convo_id, &tree_event).await {
                     warn!("externalCommit: store treeChanged event failed: {:?}", e);
                 }
                 if let Err(e) = sse_state.emit(&convo_id, tree_event).await {
@@ -2201,14 +2183,8 @@ pub async fn commit_group_change(
                         ephemeral: false,
                     };
 
-                    if let Err(e) = crate::db::store_event(
-                        &pool_clone,
-                        &cursor,
-                        &convo_id_clone,
-                        "messageEvent",
-                        Some(&msg_id_clone),
-                    )
-                    .await
+                    if let Err(e) =
+                        crate::db::store_event(&pool_clone, &convo_id_clone, &event).await
                     {
                         error!("removeMember: store event failed: {:?}", e);
                     }
@@ -2523,14 +2499,8 @@ pub async fn commit_group_change(
                         ephemeral: false,
                     };
 
-                    if let Err(e) = crate::db::store_event(
-                        &pool_clone,
-                        &cursor,
-                        &convo_id_clone,
-                        "messageEvent",
-                        Some(&msg_id_clone),
-                    )
-                    .await
+                    if let Err(e) =
+                        crate::db::store_event(&pool_clone, &convo_id_clone, &event).await
                     {
                         error!("{}: store event failed: {:?}", action_for_log, e);
                     }

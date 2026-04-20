@@ -886,4 +886,145 @@ mod tests {
             json
         );
     }
+
+    /// Round-trip every `StreamEvent` variant through
+    /// `serde_json::to_value` → `from_value`.
+    ///
+    /// This is the exact path WS/SSE backfill reconstruction takes after
+    /// task #40 persisted full event payloads in `event_stream.payload`.
+    /// A regression here means a new variant (or a changed field) would
+    /// silently drop on replay — clients reconnecting with a cursor would
+    /// miss the event. The pure round-trip catches it at `cargo test --lib`.
+    #[test]
+    fn test_stream_event_roundtrip_all_variants() {
+        let variants = vec![
+            StreamEvent::MessageEvent {
+                cursor: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+                message: test_message_view("m-rt"),
+                ephemeral: false,
+            },
+            StreamEvent::TypingEvent {
+                cursor: "01ARZ3NDEKTSV4RRFFQ69G5FB1".into(),
+                convo_id: "c1".into(),
+                did: "did:plc:alice".into(),
+                is_typing: true,
+            },
+            StreamEvent::ReactionEvent {
+                cursor: "01ARZ3NDEKTSV4RRFFQ69G5FB2".into(),
+                convo_id: "c1".into(),
+                did: "did:plc:alice".into(),
+                message_id: "m-rt".into(),
+                reaction: "👍".into(),
+                action: "add".into(),
+            },
+            StreamEvent::InfoEvent {
+                cursor: "01ARZ3NDEKTSV4RRFFQ69G5FB3".into(),
+                info: "hi".into(),
+            },
+            StreamEvent::NewDeviceEvent {
+                cursor: "01ARZ3NDEKTSV4RRFFQ69G5FB4".into(),
+                convo_id: "c1".into(),
+                user_did: "did:plc:alice".into(),
+                device_id: "dev-1".into(),
+                device_name: Some("phone".into()),
+                device_credential_did: "did:key:abc".into(),
+                pending_addition_id: "pa-1".into(),
+            },
+            StreamEvent::GroupInfoRefreshRequested {
+                cursor: "01ARZ3NDEKTSV4RRFFQ69G5FB5".into(),
+                convo_id: "c1".into(),
+                requested_by: "did:plc:alice".into(),
+                requested_at: "2026-04-20T00:00:00.000Z".into(),
+            },
+            StreamEvent::ReadditionRequested {
+                cursor: "01ARZ3NDEKTSV4RRFFQ69G5FB6".into(),
+                convo_id: "c1".into(),
+                requested_by: "did:plc:alice".into(),
+                requested_at: "2026-04-20T00:00:00.000Z".into(),
+            },
+            StreamEvent::TreeChanged {
+                cursor: "01ARZ3NDEKTSV4RRFFQ69G5FB7".into(),
+                convo_id: "c1".into(),
+                confirmation_tag: bytes::Bytes::from(vec![0xDEu8, 0xAD, 0xBE, 0xEF]),
+                epoch: 42,
+            },
+            StreamEvent::MembershipChangeEvent {
+                cursor: "01ARZ3NDEKTSV4RRFFQ69G5FB8".into(),
+                convo_id: "c1".into(),
+                did: "did:plc:alice".into(),
+                action: "joined".into(),
+                actor: Some("did:plc:bob".into()),
+                reason: None,
+                epoch: 7,
+            },
+            StreamEvent::GroupResetEvent {
+                cursor: "01ARZ3NDEKTSV4RRFFQ69G5FB9".into(),
+                convo_id: "c1".into(),
+                new_group_id: "deadbeef".repeat(4),
+                reset_generation: 3,
+                reset_by: "did:plc:alice".into(),
+                cipher_suite: "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519".into(),
+                reason: Some("auto".into()),
+            },
+            StreamEvent::CircuitBreakerTrippedEvent {
+                cursor: "01ARZ3NDEKTSV4RRFFQ69G5FBA".into(),
+                convo_id: "c1".into(),
+                reset_count: 4,
+                tripped_at: "2026-04-20T00:00:00.000Z".into(),
+            },
+        ];
+
+        for original in variants {
+            let value = serde_json::to_value(&original)
+                .unwrap_or_else(|e| panic!("to_value failed for {:?}: {}", original, e));
+
+            // Every variant must carry a `$type` tag after serialization, so
+            // legacy (pre-migration) rows without `$type` are distinguishable
+            // and correctly skipped by the WS backfill.
+            assert!(
+                value.get("$type").is_some(),
+                "serialized event missing $type tag: {:?}",
+                value
+            );
+
+            // `from_value` cannot produce borrowed `&'de str` (it consumes its
+            // input), and `jacquard_common::serde_bytes_helper`'s visitor
+            // requires `&'de str` map keys. Round-trip via the JSON source
+            // string — this is also what the WS backfill path uses.
+            let json =
+                serde_json::to_string(&value).expect("to_string on round-trip value failed");
+            let round_tripped: StreamEvent = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("from_str failed for {:?}: {}", original, e));
+
+            // Re-serialize both and compare as JSON values to sidestep the
+            // fact that `MessageView` doesn't implement `PartialEq` directly.
+            let original_again = serde_json::to_value(&original).unwrap();
+            let round_again = serde_json::to_value(&round_tripped).unwrap();
+            assert_eq!(
+                original_again, round_again,
+                "round-trip diverged for variant {:?}",
+                original
+            );
+        }
+    }
+
+    /// Legacy event_stream rows (pre-task-40) stored only
+    /// `{cursor, convoId, messageId}` with no `$type` tag. Confirm they fail
+    /// deserialization so the WS backfill can skip them cleanly.
+    #[test]
+    fn test_legacy_payload_fails_deserialization() {
+        let legacy = serde_json::json!({
+            "cursor": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "convoId": "c1",
+            "messageId": "m1",
+        });
+
+        let json = serde_json::to_string(&legacy).unwrap();
+        let result: Result<StreamEvent, _> = serde_json::from_str(&json);
+        assert!(
+            result.is_err(),
+            "legacy envelope without $type should fail deserialization, got: {:?}",
+            result
+        );
+    }
 }

@@ -239,8 +239,7 @@ pub async fn reset_group(
     };
 
     // Store event for cursor-based replay
-    if let Err(e) = crate::db::store_event(&pool, &cursor, convo_id, "groupResetEvent", None).await
-    {
+    if let Err(e) = crate::db::store_event(&pool, convo_id, &event).await {
         error!("[resetGroup] store event: {:?}", e);
     }
 

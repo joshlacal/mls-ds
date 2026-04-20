@@ -655,9 +655,22 @@ async fn handle_socket(
 
 /// Backfill events from database starting after the given cursor (ULID).
 ///
-/// Reconstructs `StreamEvent` variants from stored event_stream rows. Message events
-/// are reconstructed by joining with the messages table; other event types are parsed
-/// from their stored JSON payloads.
+/// As of task #40, event_stream rows store the full `StreamEvent` payload
+/// (with `$type` tag and variant fields) so reconstruction is a single
+/// `serde_json::from_str` round-trip via the existing `Deserialize` impl —
+/// every variant is handled uniformly.
+///
+/// Two filters are applied to match the SSE backfill semantics
+/// (`subscribe_convo_events` in `realtime/sse.rs`):
+///
+/// 1. **Legacy rows are skipped**: pre-migration rows store only
+///    `{cursor, convoId, messageId}` with no `$type` tag. `from_value` errors
+///    and we silently skip them — clients that reconnect across the migration
+///    boundary lose events in that window, which is acceptable (one-time).
+/// 2. **App `MessageEvent`s are filtered out**: clients fetch application
+///    messages via `getMessages`. Only `commit`-type message events (needed
+///    for MLS state correctness) are replayed. Mirrors the SSE backfill
+///    query at `sse.rs:599-631` which joins `AND m.message_type = 'commit'`.
 async fn backfill_events(
     pool: &DbPool,
     convo_id: &str,
@@ -670,30 +683,34 @@ async fn backfill_events(
     let mut result = Vec::with_capacity(events.len());
 
     for (cursor, payload, _emitted_at) in events {
-        // Try to reconstruct the StreamEvent from the stored payload.
-        // Non-message events (reaction, typing, info, etc.) may have a $type tag.
-        // Message events have a minimal envelope with messageId — skip them here
-        // since clients fetch messages via getMessages and the SSE backfill handles
-        // commit replay separately.
-        let type_tag = payload.get("$type").and_then(|v| v.as_str());
-
-        let event = match type_tag {
-            Some("blue.catbird.mlsChat.subscribeEvents#infoEvent") => payload
-                .get("info")
-                .and_then(|v| v.as_str())
-                .map(|info| StreamEvent::InfoEvent {
-                    cursor: cursor.clone(),
-                    info: info.to_string(),
-                }),
-            _ => {
-                // Skip message events and unknown types
-                None
-            }
+        // Round-trip via `to_string` → `from_str` instead of `from_value`.
+        // `from_value` consumes its input and cannot produce borrowed `&'de str`,
+        // which the `jacquard_common::serde_bytes_helper` visitor requires for
+        // `{"$bytes": "..."}` map keys. `from_str` operates against the JSON
+        // source text and supports zero-copy borrows.
+        let Ok(json) = serde_json::to_string(&payload) else {
+            continue;
+        };
+        let Ok(event) = serde_json::from_str::<StreamEvent>(&json) else {
+            // Legacy row without `$type` (or a genuinely malformed payload);
+            // unreconstructible — skip.
+            continue;
         };
 
-        if let Some(evt) = event {
-            result.push((evt, cursor));
+        // Filter app messages to match SSE backfill semantics: only
+        // commit-type messages are replayed on reconnect.
+        if let StreamEvent::MessageEvent { ref message, .. } = event {
+            let is_commit = message
+                .message_type
+                .as_deref()
+                .map(|mt| mt == "commit")
+                .unwrap_or(false);
+            if !is_commit {
+                continue;
+            }
         }
+
+        result.push((event, cursor));
     }
 
     Ok(result)

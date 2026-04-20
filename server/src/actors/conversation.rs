@@ -1270,14 +1270,8 @@ impl ConversationActorState {
                 reset_count: recent_reset_count as i32,
                 tripped_at,
             };
-            if let Err(e) = crate::db::store_event(
-                &self.db_pool,
-                &cb_cursor,
-                &self.convo_id,
-                "circuitBreakerTrippedEvent",
-                None,
-            )
-            .await
+            if let Err(e) =
+                crate::db::store_event(&self.db_pool, &self.convo_id, &cb_event).await
             {
                 error!("[actor:record_reset_vote] store cb event: {:?}", e);
             }
@@ -1399,15 +1393,7 @@ impl ConversationActorState {
                     .to_string(),
             ),
         };
-        if let Err(e) = crate::db::store_event(
-            &self.db_pool,
-            &cursor,
-            &self.convo_id,
-            "groupResetEvent",
-            None,
-        )
-        .await
-        {
+        if let Err(e) = crate::db::store_event(&self.db_pool, &self.convo_id, &event).await {
             error!("[actor:record_reset_vote] store GroupResetEvent: {:?}", e);
         }
         if let Err(e) = self.sse_state.emit(&self.convo_id, event).await {
@@ -1501,9 +1487,7 @@ async fn handle_notify_new_message(
     };
 
     if !is_ephemeral {
-        if let Err(e) =
-            crate::db::store_event(pool, &cursor, convo_id, "messageEvent", Some(msg_id)).await
-        {
+        if let Err(e) = crate::db::store_event(pool, convo_id, &event).await {
             error!("❌ [actor:worker] Failed to store event: {:?}", e);
         }
     }
@@ -1588,9 +1572,7 @@ async fn handle_notify_system_message(
                 ephemeral: false,
             };
 
-            if let Err(e) =
-                crate::db::store_event(pool, &cursor, convo_id, "messageEvent", Some(msg_id)).await
-            {
+            if let Err(e) = crate::db::store_event(pool, convo_id, &event).await {
                 error!("❌ [actor:worker] Failed to store system event: {:?}", e);
             }
 

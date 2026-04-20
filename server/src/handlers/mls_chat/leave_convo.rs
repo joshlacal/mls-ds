@@ -271,14 +271,8 @@ pub async fn leave_convo(
                             ephemeral: false,
                         };
 
-                        if let Err(e) = crate::db::store_event(
-                            &pool_clone,
-                            &cursor,
-                            &convo_id_clone,
-                            "messageEvent",
-                            Some(&msg_id_clone),
-                        )
-                        .await
+                        if let Err(e) =
+                            crate::db::store_event(&pool_clone, &convo_id_clone, &event).await
                         {
                             error!("❌ [leave_convo:fanout] store event: {:?}", e);
                         }
