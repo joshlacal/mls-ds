@@ -725,17 +725,13 @@ pub async fn commit_group_change(
                 });
             }
 
-            let add_conf_tag_b64 = add_confirmation_tag
-                .as_ref()
-                .map(|t| base64::engine::general_purpose::STANDARD.encode(t));
-
             // ── Emit treeChanged event so other clients detect divergence ──
-            if let Some(ref tag_b64) = add_conf_tag_b64 {
+            if let Some(ref tag_bytes) = add_confirmation_tag {
                 let tree_cursor = sse_state.cursor_gen.next(&convo_id, "treeChanged").await;
                 let tree_event = StreamEvent::TreeChanged {
                     cursor: tree_cursor.clone(),
                     convo_id: convo_id.clone(),
-                    confirmation_tag: tag_b64.clone(),
+                    confirmation_tag: bytes::Bytes::from(tag_bytes.clone()),
                     epoch: new_epoch as i64,
                 };
                 if let Err(e) =
@@ -1291,17 +1287,13 @@ pub async fn commit_group_change(
                 });
             }
 
-            let ec_conf_tag_b64 = ec_confirmation_tag
-                .as_ref()
-                .map(|t| base64::engine::general_purpose::STANDARD.encode(t));
-
             // ── Emit treeChanged event so other clients detect divergence ──
-            if let Some(ref tag_b64) = ec_conf_tag_b64 {
+            if let Some(ref tag_bytes) = ec_confirmation_tag {
                 let tree_cursor = sse_state.cursor_gen.next(&convo_id, "treeChanged").await;
                 let tree_event = StreamEvent::TreeChanged {
                     cursor: tree_cursor.clone(),
                     convo_id: convo_id.clone(),
-                    confirmation_tag: tag_b64.clone(),
+                    confirmation_tag: bytes::Bytes::from(tag_bytes.clone()),
                     epoch: new_epoch as i64,
                 };
                 if let Err(e) =

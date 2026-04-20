@@ -679,7 +679,7 @@ mod tests {
                 StreamEvent::ReadditionRequested {
                     cursor: "c-readd".into(),
                     convo_id: "c1".into(),
-                    user_did: "did:x".into(),
+                    requested_by: "did:x".into(),
                     requested_at: now.to_rfc3339(),
                 },
             ),

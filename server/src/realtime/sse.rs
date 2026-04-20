@@ -65,8 +65,8 @@ pub enum StreamEvent {
         /// Target message ID
         #[serde(rename = "messageId")]
         message_id: String,
-        /// Emoji character (e.g. "👍")
-        emoji: String,
+        /// Emoji character (e.g. "👍") or short code
+        reaction: String,
         /// "add" or "remove"
         action: String,
     },
@@ -110,8 +110,8 @@ pub enum StreamEvent {
         #[serde(rename = "convoId")]
         convo_id: String,
         /// DID of the user requesting re-addition
-        #[serde(rename = "userDid")]
-        user_did: String,
+        #[serde(rename = "requestedBy")]
+        requested_by: String,
         #[serde(rename = "requestedAt")]
         requested_at: String,
     },
@@ -122,8 +122,11 @@ pub enum StreamEvent {
         cursor: String,
         #[serde(rename = "convoId")]
         convo_id: String,
-        #[serde(rename = "confirmationTag")]
-        confirmation_tag: String,
+        #[serde(
+            rename = "confirmationTag",
+            with = "jacquard_common::serde_bytes_helper"
+        )]
+        confirmation_tag: bytes::Bytes,
         epoch: i64,
     },
     /// Event indicating a member joined, left, or was removed from the conversation
@@ -215,7 +218,7 @@ impl<'de> serde::Deserialize<'de> for StreamEvent {
                 did: String,
                 #[serde(rename = "messageId")]
                 message_id: String,
-                emoji: String,
+                reaction: String,
                 action: String,
             },
             #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#infoEvent")]
@@ -253,8 +256,8 @@ impl<'de> serde::Deserialize<'de> for StreamEvent {
                 cursor: String,
                 #[serde(rename = "convoId")]
                 convo_id: String,
-                #[serde(rename = "userDid")]
-                user_did: String,
+                #[serde(rename = "requestedBy")]
+                requested_by: String,
                 #[serde(rename = "requestedAt")]
                 requested_at: String,
             },
@@ -263,8 +266,11 @@ impl<'de> serde::Deserialize<'de> for StreamEvent {
                 cursor: String,
                 #[serde(rename = "convoId")]
                 convo_id: String,
-                #[serde(rename = "confirmationTag")]
-                confirmation_tag: String,
+                #[serde(
+                    rename = "confirmationTag",
+                    with = "jacquard_common::serde_bytes_helper"
+                )]
+                confirmation_tag: bytes::Bytes,
                 epoch: i64,
             },
             #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#membershipChangeEvent")]
@@ -355,14 +361,14 @@ impl<'de> serde::Deserialize<'de> for StreamEvent {
                 convo_id,
                 did,
                 message_id,
-                emoji,
+                reaction,
                 action,
             } => StreamEvent::ReactionEvent {
                 cursor,
                 convo_id,
                 did,
                 message_id,
-                emoji,
+                reaction,
                 action,
             },
             RawStreamEvent::InfoEvent { cursor, info } => StreamEvent::InfoEvent { cursor, info },
@@ -397,12 +403,12 @@ impl<'de> serde::Deserialize<'de> for StreamEvent {
             RawStreamEvent::ReadditionRequested {
                 cursor,
                 convo_id,
-                user_did,
+                requested_by,
                 requested_at,
             } => StreamEvent::ReadditionRequested {
                 cursor,
                 convo_id,
-                user_did,
+                requested_by,
                 requested_at,
             },
             RawStreamEvent::TreeChanged {
