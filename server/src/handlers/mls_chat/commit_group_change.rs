@@ -1911,23 +1911,6 @@ pub async fn commit_group_change(
 
             let now = chrono::Utc::now();
 
-            // ── Mark removed members as left ───────────────────────────
-            for member_did in member_dids {
-                let member_did_str = crate::sqlx_jacquard::did_to_string(member_did);
-                sqlx::query(
-                    "UPDATE members SET left_at = $3 WHERE convo_id = $1 AND (user_did = $2 OR member_did = $2) AND left_at IS NULL",
-                )
-                .bind(&convo_id)
-                .bind(&member_did_str)
-                .bind(&now)
-                .execute(&pool)
-                .await
-                .map_err(|e| {
-                    error!("removeMember: failed to mark member as left: {}", e);
-                    internal_server_error("Failed to remove member")
-                })?;
-            }
-
             // ── Fetch current epoch for CAS ───────────────────────────
             let current_epoch = crate::db::get_current_epoch(&pool, &convo_id)
                 .await
@@ -1936,7 +1919,14 @@ pub async fn commit_group_change(
                     internal_server_error("Failed to get current epoch")
                 })?;
 
-            // ── Begin transaction: CAS epoch + commit + idempotency ───
+            // ── Begin transaction: CAS epoch + soft-delete + commit + idempotency ───
+            //
+            // ATOMICITY INVARIANT (task #37): `UPDATE members SET left_at`
+            // must live INSIDE this tx, AFTER the CAS succeeds. Previously the
+            // soft-delete ran on `&pool` BEFORE the tx began, so if the CAS
+            // lost (concurrent commit), the members were booted server-side
+            // while the commit was rejected — admin saw 409, member was gone
+            // from `members`, epoch unchanged → server inconsistent.
             let mut tx = pool.begin().await.map_err(|e| {
                 error!("removeMember: failed to begin transaction: {}", e);
                 internal_server_error("Failed to begin transaction")
@@ -1955,9 +1945,29 @@ pub async fn commit_group_change(
                 Some(epoch) => epoch,
                 None => {
                     warn!("removeMember: epoch CAS failed (concurrent commit), returning 409");
+                    // tx is dropped → rollback. Soft-delete (below) now lives
+                    // inside this tx, so rollback undoes it automatically —
+                    // no soft-delete survives a lost CAS.
                     return Err(conflict("Conversation epoch advanced concurrently"));
                 }
             };
+
+            // ── Mark removed members as left (INSIDE tx, after CAS) ────
+            for member_did in member_dids {
+                let member_did_str = crate::sqlx_jacquard::did_to_string(member_did);
+                sqlx::query(
+                    "UPDATE members SET left_at = $3 WHERE convo_id = $1 AND (user_did = $2 OR member_did = $2) AND left_at IS NULL",
+                )
+                .bind(&convo_id)
+                .bind(&member_did_str)
+                .bind(&now)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    error!("removeMember: failed to mark member as left: {}", e);
+                    internal_server_error("Failed to remove member")
+                })?;
+            }
 
             // ── GroupInfo: keep existing (stale is better than absent) ─
             warn!(
