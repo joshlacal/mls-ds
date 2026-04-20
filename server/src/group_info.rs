@@ -2,6 +2,42 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use sqlx::{FromRow, PgPool};
 
+/// Legacy-row migration helper: older server builds accepted MLS wire bytes
+/// wrapped as a JSON string (`CowStr`) and stored the UTF-8 of the base64
+/// text into a `bytea` column. New readers expect raw bytes; serve such rows
+/// transparently by detecting the ASCII+base64 shape and decoding once.
+///
+/// A real MLS wire blob starts with `0x00 0x01` (wire-format version 1);
+/// if the first two bytes match, we pass through untouched. Otherwise, if
+/// the payload is entirely printable ASCII (base64 alphabet + '=' padding)
+/// and base64-decodes to bytes whose leading byte is `0x00`, we treat it
+/// as a legacy row and emit the decoded form.
+///
+/// `label` is just a diagnostic string ("GroupInfo", "ciphertext", etc.)
+/// for the `warn!` log when a legacy row is detected.
+pub fn decode_legacy_if_needed(bytes: Vec<u8>, label: &str) -> Vec<u8> {
+    let looks_raw = bytes.len() >= 2 && bytes[0] == 0x00 && bytes[1] == 0x01;
+    if looks_raw {
+        return bytes;
+    }
+    if !bytes.iter().all(|&b| b.is_ascii_graphic() || b == b'=') {
+        return bytes;
+    }
+    use base64::Engine;
+    match base64::engine::general_purpose::STANDARD.decode(&bytes) {
+        Ok(decoded) if decoded.len() >= 2 && decoded[0] == 0x00 => {
+            tracing::warn!(
+                label = %label,
+                legacy_len = bytes.len(),
+                decoded_len = decoded.len(),
+                "Decoded legacy base64-text blob on read"
+            );
+            decoded
+        }
+        _ => bytes,
+    }
+}
+
 /// Minimum valid GroupInfo size in bytes
 /// A valid MLS GroupInfo with ratchet tree extension must be at least ~100 bytes
 /// for the base structure (protocol version, cipher suite, group ID, epoch, etc.)
@@ -61,34 +97,7 @@ pub async fn get_group_info(
         if let (Some(info), Some(epoch), Some(updated_at)) =
             (r.group_info, r.group_info_epoch, r.group_info_updated_at)
         {
-            // Legacy-row migration: early versions of commitGroupChange's
-            // generated Input had `group_info: CowStr` (a plain base64 JSON
-            // string). When such an upload reached the raw-bytes DB column
-            // it was stored as UTF-8 of the base64 text instead of raw MLS
-            // bytes. Detect that shape and decode once before returning.
-            // A valid MLS GroupInfo starts with `0x00 0x01` (wire version);
-            // anything that is all-printable-ASCII and base64-decodes to
-            // bytes whose leading byte is `0x00` is a legacy blob.
-            let looks_raw = info.len() >= 2 && info[0] == 0x00 && info[1] == 0x01;
-            let info = if looks_raw {
-                info
-            } else if info.iter().all(|&b| b.is_ascii_graphic() || b == b'=') {
-                use base64::Engine;
-                match base64::engine::general_purpose::STANDARD.decode(&info) {
-                    Ok(decoded) if decoded.len() >= 2 && decoded[0] == 0x00 => {
-                        tracing::warn!(
-                            convo_id = %convo_id,
-                            legacy_len = info.len(),
-                            decoded_len = decoded.len(),
-                            "Decoded legacy base64-text GroupInfo on read"
-                        );
-                        decoded
-                    }
-                    _ => info,
-                }
-            } else {
-                info
-            };
+            let info = decode_legacy_if_needed(info, &format!("GroupInfo[{convo_id}]"));
             return Ok(Some((info, epoch, updated_at)));
         }
     }

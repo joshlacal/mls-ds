@@ -632,6 +632,15 @@ pub async fn subscribe_convo_events(
                         continue;
                     };
 
+                    // Legacy-row migration (see group_info::decode_legacy_if_needed):
+                    // some older commit rows are stored as base64 text of the MLS
+                    // wire bytes. Serving those as-is breaks every client because
+                    // `MessageView::ciphertext` is raw bytes on the wire.
+                    let ciphertext = crate::group_info::decode_legacy_if_needed(
+                        ciphertext,
+                        &format!("commit-ciphertext[{}]", message_id),
+                    );
+
                     let message_view: StreamMessageView =
                         crate::generated::blue_catbird::mlsChat::MessageView {
                             id: message_id.into(),

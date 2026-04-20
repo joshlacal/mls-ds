@@ -6,7 +6,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use jacquard_axum::ExtractXrpc;
 use sqlx::FromRow;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     auth::AuthUser,
@@ -228,10 +228,15 @@ async fn fetch_app_messages(
                 jacquard_common::smol_str::SmolStr::new("resetGeneration"),
                 jacquard_common::types::value::Data::Integer(m.reset_generation as i64),
             );
+            // Same legacy-row migration as fetch_commits below.
+            let ct = crate::group_info::decode_legacy_if_needed(
+                m.ciphertext,
+                &format!("message-ciphertext[{}]", m.id),
+            );
             MessageView {
                 id: m.id.into(),
                 convo_id: m.convo_id.into(),
-                ciphertext: bytes::Bytes::from(m.ciphertext),
+                ciphertext: bytes::Bytes::from(ct),
                 epoch: m.epoch,
                 seq: m.seq,
                 created_at: crate::sqlx_jacquard::chrono_to_datetime(m.created_at),
@@ -302,7 +307,22 @@ async fn fetch_commits(
         current_epoch as i64
     };
 
+    // `from_epoch == to_epoch + 1` (or higher) is the legitimate "caught up"
+    // state — clients request `fromEpoch = localEpoch + 1` and hit this case
+    // whenever they're already synced. Returning 400 forces every caught-up
+    // client into a pointless error-backoff loop. Short-circuit with an
+    // empty list instead; the CAS-authoritative `current_epoch` comes from
+    // `conversations.current_epoch` above, so no race.
     if from_epoch > to_epoch {
+        debug!(
+            "[v2.getMessages] Client caught up (from={} > to={}), returning empty",
+            from_epoch, to_epoch
+        );
+        return Ok(Vec::new());
+    }
+    // Keep the 400 path only for genuinely pathological requests where the
+    // caller supplied an explicit `toEpoch` below `fromEpoch`.
+    if to_epoch < 0 {
         warn!(
             "❌ [v2.getMessages] Invalid epoch range: {} to {}",
             from_epoch, to_epoch
@@ -346,10 +366,17 @@ async fn fetch_commits(
                 jacquard_common::smol_str::SmolStr::new("resetGeneration"),
                 jacquard_common::types::value::Data::Integer(c.reset_generation as i64),
             );
+            // Legacy-row migration: some pre-regen commits were stored as
+            // base64 text (UTF-8 of the base64 alphabet) in the bytea column.
+            // Detect and decode before emitting so clients see raw MLS wire.
+            let ct = crate::group_info::decode_legacy_if_needed(
+                c.ciphertext,
+                &format!("commit-ciphertext[{}]", c.id),
+            );
             MessageView {
                 id: c.id.into(),
                 convo_id: c.convo_id.into(),
-                ciphertext: bytes::Bytes::from(c.ciphertext),
+                ciphertext: bytes::Bytes::from(ct),
                 epoch: c.epoch,
                 seq: c.seq,
                 created_at: crate::sqlx_jacquard::chrono_to_datetime(c.created_at),
