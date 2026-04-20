@@ -1,4 +1,4 @@
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use tracing::{debug, warn};
 
 use super::receipt::{ReceiptSigner, SequencerReceipt};
@@ -70,8 +70,21 @@ impl Sequencer {
     ///
     /// `commit_ciphertext` is the raw commit data used to produce a receipt
     /// when a `ReceiptSigner` is configured.
+    ///
+    /// TASK #36: the CAS now runs on the caller's `&mut Transaction`. All three
+    /// CAS predicates (`convo_id`, `current_epoch`, `sequencer_term`) evaluate
+    /// on the same connection and same tx as the caller's subsequent
+    /// `commits` + `messages` inserts. A crash or rollback after the CAS
+    /// advance but before the caller's commit now atomically undoes the epoch
+    /// advance — no orphan epochs from the federation path.
+    ///
+    /// Callers must `tx.commit()` themselves after this returns
+    /// `CommitResult::Accepted`. Returning `Conflict` or `TermStale` does NOT
+    /// release the tx; caller decides whether to roll back (typical) or
+    /// continue with compensating state in the same tx.
     pub async fn submit_commit(
         &self,
+        tx: &mut Transaction<'_, Postgres>,
         convo_id: &str,
         current_epoch: i32,
         proposed_epoch: i32,
@@ -87,7 +100,9 @@ impl Sequencer {
             });
         }
 
-        // CAS: atomically advance the epoch only if it still matches
+        // CAS: atomically advance the epoch only if it still matches.
+        // Runs on the caller's tx (task #36) so epoch advance + caller's
+        // commit-row + message-row inserts are one atomic unit.
         let result = sqlx::query(
             "UPDATE conversations SET current_epoch = $2, updated_at = NOW() \
         WHERE id = $1 AND current_epoch = $3 AND sequencer_term = $4",
@@ -96,7 +111,7 @@ impl Sequencer {
         .bind(proposed_epoch)
         .bind(current_epoch)
         .bind(sequencer_term as i64)
-        .execute(&self.pool)
+        .execute(&mut **tx)
         .await?;
 
         if result.rows_affected() == 1 {
@@ -110,16 +125,19 @@ impl Sequencer {
             });
         }
 
-        // Either epoch moved or term moved — fetch current values.
+        // Either epoch moved or term moved — fetch current values on the
+        // same tx so we see the same snapshot the CAS just lost against.
+        // (Reading on &self.pool would race: a different concurrent commit
+        // could have advanced again between our CAS and the read.)
         let current = sqlx::query_as::<_, (Option<i32>, Option<i64>)>(
             "SELECT current_epoch, sequencer_term FROM conversations WHERE id = $1",
         )
         .bind(convo_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut **tx)
         .await?;
 
         match current {
-            Some((Some(actual_epoch), Some(actual_term)))
+            Some((Some(_actual_epoch), Some(actual_term)))
                 if actual_term.max(0) as u64 != sequencer_term =>
             {
                 let current_term = actual_term.max(0) as u64;

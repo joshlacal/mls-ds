@@ -135,22 +135,24 @@ pub async fn submit_commit(
             });
         }
 
-        // Submit the commit for CAS ordering
-        let commit_data_bytes = commit.commit_data.as_ref();
-        // Wrap the post-CAS inserts in a single transaction so the commit is
-        // visible to BOTH read paths (federation reads `commits`, clients read
-        // `messages WHERE message_type='commit'`). Without the `messages` row,
-        // a client that sees the epoch advance via SSE/GroupInfo has no commit
-        // to fetch via `getMessages?type=commit&fromEpoch=N+1` and stalls
-        // permanently — an orphan epoch from the client's POV.
+        // Submit the commit for CAS ordering.
         //
-        // NOTE: `sequencer.submit_commit` still CAS-advances `current_epoch`
-        // on its own pool handle; this txn only covers the post-advance
-        // inserts. A crash between the CAS and this commit could still orphan
-        // the epoch. Pushing the CAS into this txn is tracked in TODO.md.
+        // TASK #36: the sequencer CAS runs INSIDE this tx. All three CAS
+        // predicates (`convo_id`, `current_epoch`, `sequencer_term`) evaluate
+        // on the same connection as the `commits` + `messages` inserts below.
+        // A crash or rollback between the CAS and `tx.commit()` atomically
+        // undoes the epoch advance — no orphan epochs on the federation path.
+        // This is the federation-path completion of the task #18 orphan-epoch
+        // fixes on the non-federation (mlsChat.commitGroupChange) path.
+        //
+        // Both `commits` (federation read path) and `messages` (client read
+        // path) rows are now tied to the CAS: either all three land together
+        // or none do.
+        let commit_data_bytes = commit.commit_data.as_ref();
         let mut tx = pool.begin().await.map_err(FederationError::Database)?;
         let result = sequencer
             .submit_commit(
+                &mut tx,
                 convo_id,
                 epoch,
                 proposed_epoch,
