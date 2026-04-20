@@ -34,39 +34,119 @@ struct XrpcErrorBody {
     message: String,
 }
 
-pub struct XrpcError(StatusCode, &'static str, String);
+/// Structured body for CAS-failure 409s, matching the shape already produced by
+/// `send_message.rs` on epoch mismatch (task #41). Clients that already parse
+/// `serverEpoch` from the send-path 409 get instant epoch-resync here too —
+/// no extra `getGroupState` round-trip required.
+#[derive(Serialize)]
+struct EpochConflictBody {
+    error: &'static str,
+    message: String,
+    #[serde(rename = "serverEpoch")]
+    server_epoch: i32,
+    #[serde(rename = "serverSequencerTerm", skip_serializing_if = "Option::is_none")]
+    server_sequencer_term: Option<i64>,
+    #[serde(rename = "expectedEpoch")]
+    expected_epoch: i32,
+}
+
+pub enum XrpcError {
+    /// Plain error: status + error-name + message.
+    Plain(StatusCode, &'static str, String),
+    /// 409 epoch-conflict with structured body (task #41).
+    EpochConflict(EpochConflictBody),
+}
+
+impl XrpcError {
+    /// Back-compat constructor used throughout the file: `XrpcError(status, name, msg)`.
+    /// Kept as a function-style ctor so existing `XrpcError(StatusCode::..., ..., ...)`
+    /// call sites (e.g. rate-limit 429 at line 794) continue to compile unchanged.
+    #[allow(non_snake_case)]
+    pub fn new(status: StatusCode, error: &'static str, message: String) -> Self {
+        XrpcError::Plain(status, error, message)
+    }
+}
+
+// Tuple-struct-style invocation used by existing call sites
+// (e.g. `XrpcError(StatusCode::TOO_MANY_REQUESTS, "RateLimited", msg)`).
+// Rust doesn't allow adding a tuple-struct pattern to an enum directly, so we
+// provide this as a `From` impl would collide — instead we reshape the one
+// non-helper call site below. All helper call sites (`bad_request`, `conflict`,
+// etc.) continue to work via the helpers below.
 
 impl IntoResponse for XrpcError {
     fn into_response(self) -> Response {
-        (
-            self.0,
-            Json(XrpcErrorBody {
-                error: self.1,
-                message: self.2,
-            }),
-        )
-            .into_response()
+        match self {
+            XrpcError::Plain(status, error, message) => (
+                status,
+                Json(XrpcErrorBody { error, message }),
+            )
+                .into_response(),
+            XrpcError::EpochConflict(body) => {
+                (StatusCode::CONFLICT, Json(body)).into_response()
+            }
+        }
     }
 }
 
 fn bad_request(message: impl Into<String>) -> XrpcError {
-    XrpcError(StatusCode::BAD_REQUEST, "InvalidRequest", message.into())
+    XrpcError::Plain(StatusCode::BAD_REQUEST, "InvalidRequest", message.into())
 }
 
 fn auth_required(message: impl Into<String>) -> XrpcError {
-    XrpcError(StatusCode::UNAUTHORIZED, "AuthRequired", message.into())
+    XrpcError::Plain(StatusCode::UNAUTHORIZED, "AuthRequired", message.into())
 }
 
 fn forbidden(message: impl Into<String>) -> XrpcError {
-    XrpcError(StatusCode::FORBIDDEN, "Forbidden", message.into())
+    XrpcError::Plain(StatusCode::FORBIDDEN, "Forbidden", message.into())
 }
 
 fn conflict(message: impl Into<String>) -> XrpcError {
-    XrpcError(StatusCode::CONFLICT, "Conflict", message.into())
+    XrpcError::Plain(StatusCode::CONFLICT, "Conflict", message.into())
+}
+
+/// Structured 409 with `serverEpoch` + `expectedEpoch` so clients can resync
+/// without a follow-up `getGroupState` call. Mirrors `send_message.rs`'s
+/// `EpochMismatch` body shape (task #41).
+///
+/// `expected_epoch` is the `current_epoch` the caller just read for its CAS
+/// attempt; the server value is fetched fresh from `conversations` since CAS
+/// lost — some other commit advanced the row between read and write.
+async fn conflict_with_epoch(
+    pool: &sqlx::PgPool,
+    convo_id: &str,
+    expected_epoch: i32,
+    message: impl Into<String>,
+) -> XrpcError {
+    // Fetch the current server epoch + sequencer_term after CAS failure.
+    // Non-fatal on query error — fall back to echoing `expected_epoch` so the
+    // client still sees a structured body (just without the authoritative
+    // server value).
+    let row: Option<(Option<i32>, Option<i64>)> = sqlx::query_as(
+        "SELECT current_epoch, sequencer_term FROM conversations WHERE id = $1",
+    )
+    .bind(convo_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+
+    let (server_epoch, server_sequencer_term) = match row {
+        Some((Some(ep), term)) => (ep, term),
+        _ => (expected_epoch, None),
+    };
+
+    XrpcError::EpochConflict(EpochConflictBody {
+        error: "EpochMismatch",
+        message: message.into(),
+        server_epoch,
+        server_sequencer_term,
+        expected_epoch,
+    })
 }
 
 fn internal_server_error(message: impl Into<String>) -> XrpcError {
-    XrpcError(
+    XrpcError::Plain(
         StatusCode::INTERNAL_SERVER_ERROR,
         "InternalServerError",
         message.into(),
@@ -451,7 +531,17 @@ pub async fn commit_group_change(
                 Some(epoch) => epoch,
                 None => {
                     warn!("addMembers: epoch CAS failed (concurrent commit), returning 409");
-                    return Err(conflict("Conversation epoch advanced concurrently"));
+                    // Roll back the tx first so its connection is released,
+                    // then fetch authoritative server state for the 409 body.
+                    // `conflict_with_epoch` reads on `&pool` (separate conn).
+                    drop(tx);
+                    return Err(conflict_with_epoch(
+                        &pool,
+                        &convo_id,
+                        current_epoch,
+                        "Conversation epoch advanced concurrently",
+                    )
+                    .await);
                 }
             };
 
@@ -787,7 +877,7 @@ pub async fn commit_group_change(
                             elapsed.num_seconds(),
                             crate::crypto::redact_for_log(&convo_id)
                         );
-                        return Err(XrpcError(
+                        return Err(XrpcError::Plain(
                             StatusCode::TOO_MANY_REQUESTS,
                             "RateLimited",
                             format!("Another external commit was accepted recently. Retry after {} seconds.", retry_after),
@@ -1080,7 +1170,14 @@ pub async fn commit_group_change(
                 Some(epoch) => epoch,
                 None => {
                     warn!("externalCommit: epoch CAS failed (concurrent commit), returning 409");
-                    return Err(conflict("Conversation epoch advanced concurrently"));
+                    drop(tx);
+                    return Err(conflict_with_epoch(
+                        &pool,
+                        &convo_id,
+                        current_epoch,
+                        "Conversation epoch advanced concurrently",
+                    )
+                    .await);
                 }
             };
 
@@ -1945,10 +2042,19 @@ pub async fn commit_group_change(
                 Some(epoch) => epoch,
                 None => {
                     warn!("removeMember: epoch CAS failed (concurrent commit), returning 409");
-                    // tx is dropped → rollback. Soft-delete (below) now lives
-                    // inside this tx, so rollback undoes it automatically —
-                    // no soft-delete survives a lost CAS.
-                    return Err(conflict("Conversation epoch advanced concurrently"));
+                    // tx drop → rollback. Soft-delete (below) lives inside
+                    // this tx, so rollback undoes it automatically — no
+                    // soft-delete survives a lost CAS (task #37).
+                    // Fetch authoritative server state for structured 409
+                    // body (task #41).
+                    drop(tx);
+                    return Err(conflict_with_epoch(
+                        &pool,
+                        &convo_id,
+                        current_epoch,
+                        "Conversation epoch advanced concurrently",
+                    )
+                    .await);
                 }
             };
 
@@ -2278,7 +2384,14 @@ pub async fn commit_group_change(
                         "{}: epoch CAS failed (concurrent commit), returning 409",
                         action_name
                     );
-                    return Err(conflict("Conversation epoch advanced concurrently"));
+                    drop(tx);
+                    return Err(conflict_with_epoch(
+                        &pool,
+                        &convo_id,
+                        current_epoch,
+                        "Conversation epoch advanced concurrently",
+                    )
+                    .await);
                 }
             };
 
@@ -2577,6 +2690,61 @@ mod tests {
     fn xrpc_error_sets_json_content_type() {
         let response = bad_request("Missing commit").into_response();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+    }
+
+    /// Task #41: the structured 409 body must carry `serverEpoch`,
+    /// `serverSequencerTerm` (optional), and `expectedEpoch` so clients can
+    /// resync without a follow-up `getGroupState` call. Matches the shape
+    /// produced by `send_message.rs` on epoch mismatch.
+    #[test]
+    fn epoch_conflict_body_serializes_with_server_epoch_fields() {
+        let body = EpochConflictBody {
+            error: "EpochMismatch",
+            message: "Conversation epoch advanced concurrently".into(),
+            server_epoch: 42,
+            server_sequencer_term: Some(7),
+            expected_epoch: 41,
+        };
+        let json = serde_json::to_value(&body).expect("serialize");
+        assert_eq!(json["error"], "EpochMismatch");
+        assert_eq!(json["serverEpoch"], 42);
+        assert_eq!(json["serverSequencerTerm"], 7);
+        assert_eq!(json["expectedEpoch"], 41);
+        assert_eq!(json["message"], "Conversation epoch advanced concurrently");
+    }
+
+    /// When `sequencer_term` is NULL in the DB (non-federated convo), the
+    /// field must be omitted from the body — we advertised the `skip_serializing_if`
+    /// contract to clients.
+    #[test]
+    fn epoch_conflict_body_omits_null_sequencer_term() {
+        let body = EpochConflictBody {
+            error: "EpochMismatch",
+            message: "x".into(),
+            server_epoch: 5,
+            server_sequencer_term: None,
+            expected_epoch: 4,
+        };
+        let json = serde_json::to_value(&body).expect("serialize");
+        assert!(json.get("serverSequencerTerm").is_none());
+    }
+
+    /// Sanity: the structured 409 must produce StatusCode::CONFLICT.
+    #[test]
+    fn epoch_conflict_into_response_is_409() {
+        let err = XrpcError::EpochConflict(EpochConflictBody {
+            error: "EpochMismatch",
+            message: "x".into(),
+            server_epoch: 1,
+            server_sequencer_term: None,
+            expected_epoch: 0,
+        });
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
         assert_eq!(
             response.headers().get(header::CONTENT_TYPE).unwrap(),
             "application/json"
