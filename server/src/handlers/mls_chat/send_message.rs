@@ -408,12 +408,44 @@ async fn handle_persistent(
         store_epoch
     );
 
-    // --- Spawn async fan-out (SSE, push, federation) ---
+    // --- SSE: synchronously enqueue on the per-convo FIFO queue ---
+    //
+    // Task #39: the enqueue must be synchronous (no `tokio::spawn`) so the
+    // hand-off order matches the DB commit order. The consumer task drains
+    // per-convo in order, performing store_event + broadcast send atomically.
+    let cursor = sse_state
+        .cursor_gen
+        .next(&convo_id, "messageEvent")
+        .await;
+
+    let sse_message_view: StreamMessageView =
+        crate::generated::blue_catbird::mlsChat::MessageView {
+            id: row_id.clone().into(),
+            convo_id: convo_id.clone().into(),
+            ciphertext: bytes::Bytes::from(ciphertext_vec.clone()),
+            epoch: store_epoch,
+            seq,
+            created_at: crate::sqlx_jacquard::chrono_to_datetime(now),
+            message_type: Some("app".into()),
+            extra_data: Default::default(),
+        }
+        .into();
+
+    let sse_event = StreamEvent::MessageEvent {
+        cursor: cursor.clone(),
+        message: sse_message_view,
+        ephemeral: false,
+    };
+
+    sse_state.enqueue_with_store(&convo_id, pool.clone(), sse_event);
+
+    // --- Spawn async fan-out (push, federation) ---
+    // Push/federation are NOT order-sensitive at the per-convo level, so
+    // they remain in a detached spawn. Only the SSE store+emit path needs
+    // the FIFO queue (task #39).
     let pool_clone = pool.clone();
     let convo_id_clone = convo_id.clone();
     let msg_id_clone = row_id.clone();
-    let sse_state_clone = sse_state.clone();
-    let ciphertext_for_sse = ciphertext_vec.clone();
     let ciphertext_for_push = ciphertext_vec;
     let sender_did_clone = auth_user.did.clone();
     let epoch_for_sse = store_epoch;
@@ -422,42 +454,6 @@ async fn handle_persistent(
 
     tokio::spawn(async move {
         let fanout_start = std::time::Instant::now();
-
-        // SSE event
-        let cursor = sse_state_clone
-            .cursor_gen
-            .next(&convo_id_clone, "messageEvent")
-            .await;
-
-        let message_view: StreamMessageView =
-            crate::generated::blue_catbird::mlsChat::MessageView {
-                id: msg_id_clone.clone().into(),
-                convo_id: convo_id_clone.clone().into(),
-                ciphertext: bytes::Bytes::from(ciphertext_for_sse),
-                epoch: epoch_for_sse,
-                seq,
-                created_at: crate::sqlx_jacquard::chrono_to_datetime(now),
-                message_type: Some("app".into()),
-                extra_data: Default::default(),
-            }
-            .into();
-
-        let event = StreamEvent::MessageEvent {
-            cursor: cursor.clone(),
-            message: message_view,
-            ephemeral: false,
-        };
-
-        // Store event for cursor-based replay
-        if let Err(e) = crate::db::store_event(&pool_clone, &convo_id_clone, &event).await {
-            error!("❌ [v2.sendMessage:fanout] store event: {:?}", e);
-            metrics::counter!("fanout_failures_total", 1, "stage" => "store_event");
-        }
-
-        if let Err(e) = sse_state_clone.emit(&convo_id_clone, event).await {
-            error!("❌ [v2.sendMessage:fanout] SSE emit: {}", e);
-            metrics::counter!("fanout_failures_total", 1, "stage" => "sse_emit");
-        }
 
         // Push notifications
         if let Some(ns) = notification_service.as_ref() {

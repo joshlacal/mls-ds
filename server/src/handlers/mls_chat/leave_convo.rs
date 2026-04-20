@@ -191,101 +191,74 @@ pub async fn leave_convo(
                 seq, new_epoch
             );
 
-            // Fan out commit to all members (async)
-            let pool_clone = pool.clone();
-            let convo_id_clone = convo_id.clone();
-            let msg_id_clone = msg_id.clone();
-            let sse_state_clone = sse_state.clone();
-
-            tokio::spawn(async move {
-                let members_result = sqlx::query_as::<_, (String,)>(
-                    "SELECT member_did FROM members WHERE convo_id = $1 AND left_at IS NULL",
-                )
-                .bind(&convo_id_clone)
-                .fetch_all(&pool_clone)
+            // ── Enqueue commit messageEvent on per-convo FIFO queue (task #39) ──
+            // Synchronous enqueue so order matches the DB commit order above.
+            let commit_cursor = sse_state
+                .cursor_gen
+                .next(&convo_id, "messageEvent")
                 .await;
 
-                match members_result {
-                    Ok(members) => {
-                        for (member_did,) in &members {
-                            let envelope_id = uuid::Uuid::new_v4().to_string();
-                            if let Err(e) = sqlx::query(
-                                "INSERT INTO envelopes (id, convo_id, recipient_did, message_id, created_at) VALUES ($1, $2, $3, $4, NOW()) ON CONFLICT (recipient_did, message_id) DO NOTHING",
-                            )
-                            .bind(&envelope_id)
-                            .bind(&convo_id_clone)
-                            .bind(member_did)
-                            .bind(&msg_id_clone)
-                            .execute(&pool_clone)
-                            .await
-                            {
-                                error!("❌ [leave_convo:fanout] envelope insert: {:?}", e);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("❌ [leave_convo:fanout] Failed to get members: {:?}", e);
-                    }
+            let commit_message_view: StreamMessageView =
+                crate::generated::blue_catbird::mlsChat::MessageView {
+                    id: msg_id.clone().into(),
+                    convo_id: convo_id.clone().into(),
+                    ciphertext: bytes::Bytes::from(commit_bytes.clone()),
+                    epoch: new_epoch as i64,
+                    seq,
+                    created_at: crate::sqlx_jacquard::chrono_to_datetime(now),
+                    // NOTE: legacy code emitted "app" here, but this is a
+                    // commit; preserving original wire compatibility for now.
+                    message_type: Some("app".into()),
+                    extra_data: Default::default(),
                 }
+                .into();
 
-                // SSE event
-                let cursor = sse_state_clone
-                    .cursor_gen
-                    .next(&convo_id_clone, "messageEvent")
+            let commit_event = crate::realtime::StreamEvent::MessageEvent {
+                cursor: commit_cursor.clone(),
+                message: commit_message_view,
+                ephemeral: false,
+            };
+
+            sse_state.enqueue_with_store(&convo_id, pool.clone(), commit_event);
+
+            // ── Envelope fanout (non-order-sensitive, detached) ──
+            {
+                let pool_clone = pool.clone();
+                let convo_id_clone = convo_id.clone();
+                let msg_id_clone = msg_id.clone();
+
+                tokio::spawn(async move {
+                    let members_result = sqlx::query_as::<_, (String,)>(
+                        "SELECT member_did FROM members WHERE convo_id = $1 AND left_at IS NULL",
+                    )
+                    .bind(&convo_id_clone)
+                    .fetch_all(&pool_clone)
                     .await;
 
-                let message_result = sqlx::query_as::<
-                    _,
-                    (
-                        String,
-                        Option<Vec<u8>>,
-                        i32,
-                        i64,
-                        chrono::DateTime<chrono::Utc>,
-                    ),
-                >(
-                    "SELECT id, ciphertext, epoch, seq, created_at FROM messages WHERE id = $1",
-                )
-                .bind(&msg_id_clone)
-                .fetch_one(&pool_clone)
-                .await;
-
-                match message_result {
-                    Ok((id, ciphertext, epoch, seq, created_at)) => {
-                        let message_view: StreamMessageView =
-                            crate::generated::blue_catbird::mlsChat::MessageView {
-                                id: id.into(),
-                                convo_id: convo_id_clone.clone().into(),
-                                ciphertext: bytes::Bytes::from(ciphertext.unwrap_or_default()),
-                                epoch: epoch as i64,
-                                seq,
-                                created_at: crate::sqlx_jacquard::chrono_to_datetime(created_at),
-                                message_type: Some("app".into()),
-                                extra_data: Default::default(),
+                    match members_result {
+                        Ok(members) => {
+                            for (member_did,) in &members {
+                                let envelope_id = uuid::Uuid::new_v4().to_string();
+                                if let Err(e) = sqlx::query(
+                                    "INSERT INTO envelopes (id, convo_id, recipient_did, message_id, created_at) VALUES ($1, $2, $3, $4, NOW()) ON CONFLICT (recipient_did, message_id) DO NOTHING",
+                                )
+                                .bind(&envelope_id)
+                                .bind(&convo_id_clone)
+                                .bind(member_did)
+                                .bind(&msg_id_clone)
+                                .execute(&pool_clone)
+                                .await
+                                {
+                                    error!("❌ [leave_convo:fanout] envelope insert: {:?}", e);
+                                }
                             }
-                            .into();
-
-                        let event = crate::realtime::StreamEvent::MessageEvent {
-                            cursor: cursor.clone(),
-                            message: message_view,
-                            ephemeral: false,
-                        };
-
-                        if let Err(e) =
-                            crate::db::store_event(&pool_clone, &convo_id_clone, &event).await
-                        {
-                            error!("❌ [leave_convo:fanout] store event: {:?}", e);
                         }
-
-                        if let Err(e) = sse_state_clone.emit(&convo_id_clone, event).await {
-                            error!("❌ [leave_convo:fanout] SSE emit: {}", e);
+                        Err(e) => {
+                            error!("❌ [leave_convo:fanout] Failed to get members: {:?}", e);
                         }
                     }
-                    Err(e) => {
-                        error!("❌ [leave_convo:fanout] fetch message: {:?}", e);
-                    }
-                }
-            });
+                });
+            }
         }
 
         // Mark member as left

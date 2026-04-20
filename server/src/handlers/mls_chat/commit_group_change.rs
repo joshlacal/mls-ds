@@ -733,18 +733,55 @@ pub async fn commit_group_change(
                 }
             }
 
-            // ── Broadcast commit via SSE/WebSocket ───────────────────
-            // Without this, connected clients miss epoch-advancing commits
-            // and fail to decrypt subsequent messages at the new epoch.
+            // ── Enqueue commit messageEvent on per-convo FIFO queue (task #39) ──
+            // The enqueue MUST be synchronous so its order matches the DB
+            // tx.commit() order above. Envelope fanout stays in a detached
+            // spawn (non-ordering-sensitive).
+            let commit_cursor =
+                sse_state.cursor_gen.next(&convo_id, "messageEvent").await;
+
+            let commit_message_view: crate::realtime::StreamMessageView =
+                crate::generated::blue_catbird::mlsChat::MessageView {
+                    id: msg_id.clone().into(),
+                    convo_id: convo_id.clone().into(),
+                    ciphertext: bytes::Bytes::from(commit_bytes.clone()),
+                    epoch: new_epoch as i64,
+                    seq,
+                    created_at: crate::sqlx_jacquard::chrono_to_datetime(now),
+                    message_type: Some("commit".into()),
+                    extra_data: Default::default(),
+                }
+                .into();
+
+            let commit_event = crate::realtime::StreamEvent::MessageEvent {
+                cursor: commit_cursor.clone(),
+                message: commit_message_view,
+                ephemeral: false,
+            };
+
+            sse_state.enqueue_with_store(&convo_id, pool.clone(), commit_event);
+
+            // ── Emit treeChanged event so other clients detect divergence ──
+            // Also via the per-convo queue so it strictly follows the commit
+            // messageEvent above.
+            if let Some(ref tag_bytes) = add_confirmation_tag {
+                let tree_cursor = sse_state.cursor_gen.next(&convo_id, "treeChanged").await;
+                let tree_event = StreamEvent::TreeChanged {
+                    cursor: tree_cursor.clone(),
+                    convo_id: convo_id.clone(),
+                    confirmation_tag: bytes::Bytes::from(tag_bytes.clone()),
+                    epoch: new_epoch as i64,
+                };
+                sse_state.enqueue_with_store(&convo_id, pool.clone(), tree_event);
+            }
+
+            // ── Envelope fanout (still best-effort, non-order-sensitive) ──
             {
                 let pool_clone = pool.clone();
-                let sse_state_clone = sse_state.clone();
                 let convo_id_clone = convo_id.clone();
                 let msg_id_clone = msg_id.clone();
-                let commit_bytes_clone = commit_bytes.clone();
 
                 tokio::spawn(async move {
-                    // Fan-out envelopes so clients pick up the commit via getMessages
                     let members_result = sqlx::query_scalar::<_, String>(
                         "SELECT member_did FROM members WHERE convo_id = $1 AND left_at IS NULL",
                     )
@@ -771,59 +808,7 @@ pub async fn commit_group_change(
                             }
                         }
                     }
-
-                    // Emit SSE event so WebSocket subscribers see the commit immediately
-                    let cursor = sse_state_clone
-                        .cursor_gen
-                        .next(&convo_id_clone, "messageEvent")
-                        .await;
-
-                    let message_view: crate::realtime::StreamMessageView =
-                        crate::generated::blue_catbird::mlsChat::MessageView {
-                            id: msg_id_clone.clone().into(),
-                            convo_id: convo_id_clone.clone().into(),
-                            ciphertext: bytes::Bytes::from(commit_bytes_clone),
-                            epoch: new_epoch as i64,
-                            seq,
-                            created_at: crate::sqlx_jacquard::chrono_to_datetime(now),
-                            message_type: Some("commit".into()),
-                            extra_data: Default::default(),
-                        }
-                        .into();
-
-                    let event = crate::realtime::StreamEvent::MessageEvent {
-                        cursor: cursor.clone(),
-                        message: message_view,
-                        ephemeral: false,
-                    };
-
-                    if let Err(e) =
-                        crate::db::store_event(&pool_clone, &convo_id_clone, &event).await
-                    {
-                        error!("addMembers: store event failed: {:?}", e);
-                    }
-
-                    if let Err(e) = sse_state_clone.emit(&convo_id_clone, event).await {
-                        error!("addMembers: SSE emit failed: {}", e);
-                    }
                 });
-            }
-
-            // ── Emit treeChanged event so other clients detect divergence ──
-            if let Some(ref tag_bytes) = add_confirmation_tag {
-                let tree_cursor = sse_state.cursor_gen.next(&convo_id, "treeChanged").await;
-                let tree_event = StreamEvent::TreeChanged {
-                    cursor: tree_cursor.clone(),
-                    convo_id: convo_id.clone(),
-                    confirmation_tag: bytes::Bytes::from(tag_bytes.clone()),
-                    epoch: new_epoch as i64,
-                };
-                if let Err(e) = crate::db::store_event(&pool, &convo_id, &tree_event).await {
-                    warn!("addMembers: store treeChanged event failed: {:?}", e);
-                }
-                if let Err(e) = sse_state.emit(&convo_id, tree_event).await {
-                    warn!("addMembers: SSE treeChanged emit failed: {}", e);
-                }
             }
 
             info!(
@@ -1297,13 +1282,48 @@ pub async fn commit_group_change(
                 internal_server_error("Failed to commit transaction")
             })?;
 
-            // ── Broadcast commit via SSE/WebSocket ───────────────────
+            // ── Enqueue commit messageEvent on per-convo FIFO queue (task #39) ──
+            let commit_cursor =
+                sse_state.cursor_gen.next(&convo_id, "messageEvent").await;
+
+            let commit_message_view: crate::realtime::StreamMessageView =
+                crate::generated::blue_catbird::mlsChat::MessageView {
+                    id: msg_id.clone().into(),
+                    convo_id: convo_id.clone().into(),
+                    ciphertext: bytes::Bytes::from(commit_bytes.clone()),
+                    epoch: new_epoch as i64,
+                    seq,
+                    created_at: crate::sqlx_jacquard::chrono_to_datetime(now),
+                    message_type: Some("commit".into()),
+                    extra_data: Default::default(),
+                }
+                .into();
+
+            let commit_event = crate::realtime::StreamEvent::MessageEvent {
+                cursor: commit_cursor.clone(),
+                message: commit_message_view,
+                ephemeral: false,
+            };
+
+            sse_state.enqueue_with_store(&convo_id, pool.clone(), commit_event);
+
+            // ── Emit treeChanged event so other clients detect divergence ──
+            if let Some(ref tag_bytes) = ec_confirmation_tag {
+                let tree_cursor = sse_state.cursor_gen.next(&convo_id, "treeChanged").await;
+                let tree_event = StreamEvent::TreeChanged {
+                    cursor: tree_cursor.clone(),
+                    convo_id: convo_id.clone(),
+                    confirmation_tag: bytes::Bytes::from(tag_bytes.clone()),
+                    epoch: new_epoch as i64,
+                };
+                sse_state.enqueue_with_store(&convo_id, pool.clone(), tree_event);
+            }
+
+            // ── Envelope fanout (non-order-sensitive) ──
             {
                 let pool_clone = pool.clone();
-                let sse_state_clone = sse_state.clone();
                 let convo_id_clone = convo_id.clone();
                 let msg_id_clone = msg_id.clone();
-                let commit_bytes_clone = commit_bytes.clone();
 
                 tokio::spawn(async move {
                     let members_result = sqlx::query_scalar::<_, String>(
@@ -1332,58 +1352,7 @@ pub async fn commit_group_change(
                             }
                         }
                     }
-
-                    let cursor = sse_state_clone
-                        .cursor_gen
-                        .next(&convo_id_clone, "messageEvent")
-                        .await;
-
-                    let message_view: crate::realtime::StreamMessageView =
-                        crate::generated::blue_catbird::mlsChat::MessageView {
-                            id: msg_id_clone.clone().into(),
-                            convo_id: convo_id_clone.clone().into(),
-                            ciphertext: bytes::Bytes::from(commit_bytes_clone),
-                            epoch: new_epoch as i64,
-                            seq,
-                            created_at: crate::sqlx_jacquard::chrono_to_datetime(now),
-                            message_type: Some("commit".into()),
-                            extra_data: Default::default(),
-                        }
-                        .into();
-
-                    let event = crate::realtime::StreamEvent::MessageEvent {
-                        cursor: cursor.clone(),
-                        message: message_view,
-                        ephemeral: false,
-                    };
-
-                    if let Err(e) =
-                        crate::db::store_event(&pool_clone, &convo_id_clone, &event).await
-                    {
-                        error!("externalCommit: store event failed: {:?}", e);
-                    }
-
-                    if let Err(e) = sse_state_clone.emit(&convo_id_clone, event).await {
-                        error!("externalCommit: SSE emit failed: {}", e);
-                    }
                 });
-            }
-
-            // ── Emit treeChanged event so other clients detect divergence ──
-            if let Some(ref tag_bytes) = ec_confirmation_tag {
-                let tree_cursor = sse_state.cursor_gen.next(&convo_id, "treeChanged").await;
-                let tree_event = StreamEvent::TreeChanged {
-                    cursor: tree_cursor.clone(),
-                    convo_id: convo_id.clone(),
-                    confirmation_tag: bytes::Bytes::from(tag_bytes.clone()),
-                    epoch: new_epoch as i64,
-                };
-                if let Err(e) = crate::db::store_event(&pool, &convo_id, &tree_event).await {
-                    warn!("externalCommit: store treeChanged event failed: {:?}", e);
-                }
-                if let Err(e) = sse_state.emit(&convo_id, tree_event).await {
-                    warn!("externalCommit: SSE treeChanged emit failed: {}", e);
-                }
             }
 
             info!(
@@ -2123,13 +2092,36 @@ pub async fn commit_group_change(
                 internal_server_error("Failed to commit transaction")
             })?;
 
-            // ── Broadcast commit via SSE/WebSocket ───────────────────
+            // ── Enqueue commit messageEvent on per-convo FIFO queue (task #39) ──
+            let commit_cursor =
+                sse_state.cursor_gen.next(&convo_id, "messageEvent").await;
+
+            let commit_message_view: crate::realtime::StreamMessageView =
+                crate::generated::blue_catbird::mlsChat::MessageView {
+                    id: msg_id.clone().into(),
+                    convo_id: convo_id.clone().into(),
+                    ciphertext: bytes::Bytes::from(commit_bytes.clone()),
+                    epoch: new_epoch as i64,
+                    seq,
+                    created_at: crate::sqlx_jacquard::chrono_to_datetime(now),
+                    message_type: Some("commit".into()),
+                    extra_data: Default::default(),
+                }
+                .into();
+
+            let commit_event = crate::realtime::StreamEvent::MessageEvent {
+                cursor: commit_cursor.clone(),
+                message: commit_message_view,
+                ephemeral: false,
+            };
+
+            sse_state.enqueue_with_store(&convo_id, pool.clone(), commit_event);
+
+            // ── Envelope fanout (non-order-sensitive) ──
             {
                 let pool_clone = pool.clone();
-                let sse_state_clone = sse_state.clone();
                 let convo_id_clone = convo_id.clone();
                 let msg_id_clone = msg_id.clone();
-                let commit_bytes_clone = commit_bytes.clone();
 
                 tokio::spawn(async move {
                     let members_result = sqlx::query_scalar::<_, String>(
@@ -2157,40 +2149,6 @@ pub async fn commit_group_change(
                                 error!("removeMember: envelope fanout failed: {:?}", e);
                             }
                         }
-                    }
-
-                    let cursor = sse_state_clone
-                        .cursor_gen
-                        .next(&convo_id_clone, "messageEvent")
-                        .await;
-
-                    let message_view: crate::realtime::StreamMessageView =
-                        crate::generated::blue_catbird::mlsChat::MessageView {
-                            id: msg_id_clone.clone().into(),
-                            convo_id: convo_id_clone.clone().into(),
-                            ciphertext: bytes::Bytes::from(commit_bytes_clone),
-                            epoch: new_epoch as i64,
-                            seq,
-                            created_at: crate::sqlx_jacquard::chrono_to_datetime(now),
-                            message_type: Some("commit".into()),
-                            extra_data: Default::default(),
-                        }
-                        .into();
-
-                    let event = crate::realtime::StreamEvent::MessageEvent {
-                        cursor: cursor.clone(),
-                        message: message_view,
-                        ephemeral: false,
-                    };
-
-                    if let Err(e) =
-                        crate::db::store_event(&pool_clone, &convo_id_clone, &event).await
-                    {
-                        error!("removeMember: store event failed: {:?}", e);
-                    }
-
-                    if let Err(e) = sse_state_clone.emit(&convo_id_clone, event).await {
-                        error!("removeMember: SSE emit failed: {}", e);
                     }
                 });
             }
@@ -2438,13 +2396,36 @@ pub async fn commit_group_change(
                 internal_server_error("Failed to commit transaction")
             })?;
 
-            // ── Broadcast commit via SSE/WebSocket ───────────────────
+            // ── Enqueue commit messageEvent on per-convo FIFO queue (task #39) ──
+            let commit_cursor =
+                sse_state.cursor_gen.next(&convo_id, "messageEvent").await;
+
+            let commit_message_view: crate::realtime::StreamMessageView =
+                crate::generated::blue_catbird::mlsChat::MessageView {
+                    id: msg_id.clone().into(),
+                    convo_id: convo_id.clone().into(),
+                    ciphertext: bytes::Bytes::from(commit_bytes.clone()),
+                    epoch: new_epoch as i64,
+                    seq,
+                    created_at: crate::sqlx_jacquard::chrono_to_datetime(now),
+                    message_type: Some("commit".into()),
+                    extra_data: Default::default(),
+                }
+                .into();
+
+            let commit_event = crate::realtime::StreamEvent::MessageEvent {
+                cursor: commit_cursor.clone(),
+                message: commit_message_view,
+                ephemeral: false,
+            };
+
+            sse_state.enqueue_with_store(&convo_id, pool.clone(), commit_event);
+
+            // ── Envelope fanout (non-order-sensitive) ──
             {
                 let pool_clone = pool.clone();
-                let sse_state_clone = sse_state.clone();
                 let convo_id_clone = convo_id.clone();
                 let msg_id_clone = msg_id.clone();
-                let commit_bytes_clone = commit_bytes.clone();
                 let action_for_log = action_name.clone();
 
                 tokio::spawn(async move {
@@ -2473,40 +2454,6 @@ pub async fn commit_group_change(
                                 error!("{}: envelope fanout failed: {:?}", action_for_log, e);
                             }
                         }
-                    }
-
-                    let cursor = sse_state_clone
-                        .cursor_gen
-                        .next(&convo_id_clone, "messageEvent")
-                        .await;
-
-                    let message_view: crate::realtime::StreamMessageView =
-                        crate::generated::blue_catbird::mlsChat::MessageView {
-                            id: msg_id_clone.clone().into(),
-                            convo_id: convo_id_clone.clone().into(),
-                            ciphertext: bytes::Bytes::from(commit_bytes_clone),
-                            epoch: new_epoch as i64,
-                            seq,
-                            created_at: crate::sqlx_jacquard::chrono_to_datetime(now),
-                            message_type: Some("commit".into()),
-                            extra_data: Default::default(),
-                        }
-                        .into();
-
-                    let event = crate::realtime::StreamEvent::MessageEvent {
-                        cursor: cursor.clone(),
-                        message: message_view,
-                        ephemeral: false,
-                    };
-
-                    if let Err(e) =
-                        crate::db::store_event(&pool_clone, &convo_id_clone, &event).await
-                    {
-                        error!("{}: store event failed: {:?}", action_for_log, e);
-                    }
-
-                    if let Err(e) = sse_state_clone.emit(&convo_id_clone, event).await {
-                        error!("{}: SSE emit failed: {}", action_for_log, e);
                     }
                 });
             }

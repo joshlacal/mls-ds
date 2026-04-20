@@ -6,6 +6,7 @@ use axum::{
         IntoResponse, Sse,
     },
 };
+use dashmap::DashMap;
 use futures::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -14,7 +15,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{error, info, warn};
 
 use crate::{
@@ -471,6 +472,29 @@ impl<'de> serde::Deserialize<'de> for StreamEvent {
     }
 }
 
+/// Optional DB `event_stream` write to perform **before** the broadcast send,
+/// inside the per-convo consumer task. Keeping the store co-located with the
+/// emit on the same FIFO queue preserves the "DB insert → broadcast" ordering
+/// that clients rely on (otherwise a commit at epoch N+1 can overtake an app
+/// message at epoch N, and subscribers drop old-epoch secrets before decoding
+/// the older message).
+///
+/// After task #40, the event itself carries all of cursor, event_type, and
+/// message_id — `store_event` derives them internally from the typed
+/// `StreamEvent`. Only the DB pool is needed here; the convo_id is captured
+/// by the consumer task's closure.
+#[derive(Debug)]
+pub(crate) struct StoreEventArgs {
+    pub pool: DbPool,
+}
+
+/// One unit of work on the per-convo FIFO queue.
+#[derive(Debug)]
+pub(crate) struct EmitJob {
+    pub event: StreamEvent,
+    pub store: Option<StoreEventArgs>,
+}
+
 /// Shared state for SSE connections
 pub struct SseState {
     /// Cursor generator for monotonic ULIDs
@@ -479,6 +503,16 @@ pub struct SseState {
     pub channels: Arc<RwLock<HashMap<String, broadcast::Sender<StreamEvent>>>>,
     /// Max events buffered per stream before backpressure
     pub buffer_size: usize,
+    /// Per-convo FIFO fanout queue. Each conversation has a dedicated consumer
+    /// task that drains a single-producer-order-preserving mpsc channel,
+    /// performing `store_event` and then the broadcast `send` in that order.
+    /// This preserves DB-insert ordering through the emit path even when
+    /// multiple handlers produce events concurrently for the same convo.
+    ///
+    /// IMPORTANT: enqueue at call sites MUST be synchronous (not wrapped in a
+    /// `tokio::spawn`) — otherwise two events committed in order A, B can be
+    /// enqueued in order B, A and the whole purpose of this queue is lost.
+    pub(crate) emit_queue: Arc<DashMap<String, mpsc::UnboundedSender<EmitJob>>>,
 }
 
 impl SseState {
@@ -487,6 +521,7 @@ impl SseState {
             cursor_gen: CursorGenerator::new(),
             channels: Arc::new(RwLock::new(HashMap::new())),
             buffer_size,
+            emit_queue: Arc::new(DashMap::new()),
         }
     }
 
@@ -506,19 +541,161 @@ impl SseState {
             .clone()
     }
 
-    /// Emit event to all subscribers of a conversation
-    /// Returns Ok if event was sent OR if there were no subscribers (non-fatal)
-    pub async fn emit(&self, convo_id: &str, event: StreamEvent) -> Result<(), String> {
-        let tx = self.get_channel(convo_id).await;
-        match tx.send(event) {
-            Ok(_) => Ok(()),
-            Err(_) => {
-                // No active receivers is not an error - it just means no one is listening
-                // This is expected when members are offline or haven't connected SSE yet
-                Ok(())
+    /// Synchronously enqueue a job on the per-convo FIFO queue.
+    ///
+    /// Lazily spawns the consumer task on first use for a given convo.
+    /// This function MUST NOT await and MUST be called synchronously
+    /// (no wrapping `tokio::spawn`) at the emission site: the whole point
+    /// is that the enqueue order matches the DB commit order.
+    fn enqueue_job(&self, convo_id: &str, job: EmitJob) {
+        use dashmap::mapref::entry::Entry;
+
+        let sender = match self.emit_queue.entry(convo_id.to_string()) {
+            Entry::Occupied(o) => o.get().clone(),
+            Entry::Vacant(v) => {
+                let (tx, rx) = mpsc::unbounded_channel::<EmitJob>();
+                let channels = self.channels.clone();
+                let buffer_size = self.buffer_size;
+                let queue_ref = self.emit_queue.clone();
+                let convo_id_owned = convo_id.to_string();
+                tokio::spawn(consume_emit_queue(
+                    channels,
+                    buffer_size,
+                    queue_ref,
+                    convo_id_owned,
+                    rx,
+                ));
+                v.insert(tx).clone()
             }
+        };
+
+        if sender.send(job).is_err() {
+            // Consumer dropped — extremely rare (only if the task panicked).
+            // Drop the entry so the next call respawns.
+            warn!(
+                convo = %crate::crypto::redact_for_log(convo_id),
+                "Per-convo emit queue consumer dropped; resetting slot"
+            );
+            self.emit_queue.remove(convo_id);
         }
     }
+
+    /// Synchronously enqueue a broadcast event on the per-convo FIFO queue.
+    ///
+    /// No DB write is performed — use this for ephemeral or non-persisted
+    /// events (typing, info, etc.) or when `store_event` has already been
+    /// handled elsewhere.
+    pub fn enqueue(&self, convo_id: &str, event: StreamEvent) {
+        self.enqueue_job(
+            convo_id,
+            EmitJob {
+                event,
+                store: None,
+            },
+        );
+    }
+
+    /// Synchronously enqueue a `store_event` + broadcast pair on the per-convo
+    /// FIFO queue. The consumer task performs the DB insert **before** the
+    /// broadcast send, co-located on the same task so ordering is preserved
+    /// across concurrent emissions for the same convo.
+    ///
+    /// The event's cursor, event_type, and message_id are derived from the
+    /// `StreamEvent` itself (see `crate::db::store_event` and
+    /// `crate::db::stream_event_type_str`) — callers only supply the pool.
+    pub fn enqueue_with_store(&self, convo_id: &str, pool: DbPool, event: StreamEvent) {
+        self.enqueue_job(
+            convo_id,
+            EmitJob {
+                event,
+                store: Some(StoreEventArgs { pool }),
+            },
+        );
+    }
+
+    /// Emit event to all subscribers of a conversation.
+    ///
+    /// Backwards-compatible wrapper around the per-convo FIFO queue: the event
+    /// is handed off synchronously to the consumer task for this convo, which
+    /// performs the broadcast send in order. The returned future resolves
+    /// immediately once the job is enqueued — it does not await broadcast
+    /// delivery.
+    ///
+    /// Returns Ok in all non-panic cases: broadcast channels with no
+    /// subscribers are treated as non-fatal (expected when members are
+    /// offline).
+    pub async fn emit(&self, convo_id: &str, event: StreamEvent) -> Result<(), String> {
+        self.enqueue(convo_id, event);
+        Ok(())
+    }
+}
+
+/// Consumer task body for a per-convo FIFO emit queue.
+///
+/// Drains the mpsc receiver in order, performing the optional DB
+/// `store_event` **before** the broadcast `send` to preserve the invariant
+/// that subscribers see events in the same order they were committed to the
+/// database.
+async fn consume_emit_queue(
+    channels: Arc<RwLock<HashMap<String, broadcast::Sender<StreamEvent>>>>,
+    buffer_size: usize,
+    queue_ref: Arc<DashMap<String, mpsc::UnboundedSender<EmitJob>>>,
+    convo_id: String,
+    mut rx: mpsc::UnboundedReceiver<EmitJob>,
+) {
+    while let Some(job) = rx.recv().await {
+        // 1. Persist event_stream row (if requested). This must happen
+        //    BEFORE the broadcast send so that late subscribers replaying
+        //    from a cursor cannot observe a broadcast whose DB row does
+        //    not yet exist.
+        if let Some(store) = job.store.as_ref() {
+            // Task #40: store_event now takes (pool, convo_id, &StreamEvent)
+            // and derives event_type / cursor / message_id from the event.
+            let event_type = crate::db::stream_event_type_str(&job.event);
+            if let Err(e) =
+                crate::db::store_event(&store.pool, &convo_id, &job.event).await
+            {
+                error!(
+                    convo = %crate::crypto::redact_for_log(&convo_id),
+                    event_type,
+                    error = ?e,
+                    "per-convo emit queue: store_event failed"
+                );
+                // Continue to broadcast anyway — cursor is already allocated
+                // and dropping the event would look like silent data loss.
+            }
+        }
+
+        // 2. Broadcast to SSE/WS subscribers. Lazy-create the channel using
+        //    the same code path as `get_channel` to share the map.
+        let tx = {
+            let mut chans = channels.write().await;
+            chans
+                .entry(convo_id.clone())
+                .or_insert_with(|| {
+                    let (tx, _rx) = broadcast::channel(buffer_size);
+                    info!(
+                        convo = %crate::crypto::redact_for_log(&convo_id),
+                        "Created new broadcast channel (via emit queue)"
+                    );
+                    tx
+                })
+                .clone()
+        };
+
+        // Broadcast errors here only indicate "no active subscribers" — which
+        // is expected when all members are offline. Not a real failure.
+        let _ = tx.send(job.event);
+    }
+
+    // Receiver closed — the sender half was dropped (e.g. SseState being
+    // torn down). Remove ourselves from the map so a later recreation would
+    // spawn a fresh task.
+    queue_ref.remove(&convo_id);
+    info!(
+        convo = %crate::crypto::redact_for_log(&convo_id),
+        "per-convo emit queue consumer exited"
+    );
 }
 
 /// SSE handler for subscribeConvoEvents
@@ -1026,5 +1203,141 @@ mod tests {
             "legacy envelope without $type should fail deserialization, got: {:?}",
             result
         );
+    }
+    /// Task #39: the per-convo emit queue must preserve synchronous enqueue
+    /// order through the broadcast channel, even if multiple producers race
+    /// to call `enqueue` concurrently.
+    ///
+    /// This test simulates the DB-tx-serialized producer pattern: a single
+    /// caller enqueues a known order of events; we then verify the subscriber
+    /// sees them in that exact order.
+    #[tokio::test]
+    async fn test_per_convo_fifo_ordering_single_producer() {
+        let state = Arc::new(SseState::new(1000));
+        // Subscribe BEFORE enqueuing so the broadcast receiver captures all
+        // events. We create the broadcast channel up-front so the consumer
+        // task, when lazily spawned on first enqueue, reuses the same sender.
+        let tx = state.get_channel("convo-fifo").await;
+        let mut rx = tx.subscribe();
+
+        // Enqueue 100 events in strict order.
+        for i in 0..100 {
+            let event = StreamEvent::InfoEvent {
+                cursor: ulid::Ulid::new().to_string(),
+                info: format!("evt-{:03}", i),
+            };
+            state.enqueue("convo-fifo", event);
+        }
+
+        // Drain the receiver. The consumer task needs a moment to spawn and
+        // process; use a timeout per recv.
+        let mut observed = Vec::with_capacity(100);
+        for _ in 0..100 {
+            let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("timed out waiting for broadcast event")
+                .expect("broadcast recv error");
+            if let StreamEvent::InfoEvent { info, .. } = event {
+                observed.push(info);
+            } else {
+                panic!("unexpected event variant");
+            }
+        }
+
+        let expected: Vec<String> = (0..100).map(|i| format!("evt-{:03}", i)).collect();
+        assert_eq!(
+            observed, expected,
+            "per-convo queue must preserve enqueue order"
+        );
+    }
+
+    /// Task #39: different convos must fan out independently. One slow convo's
+    /// consumer task must NOT block another convo's consumer.
+    #[tokio::test]
+    async fn test_per_convo_queues_are_independent() {
+        let state = Arc::new(SseState::new(1000));
+
+        let tx_a = state.get_channel("convo-a").await;
+        let tx_b = state.get_channel("convo-b").await;
+        let mut rx_a = tx_a.subscribe();
+        let mut rx_b = tx_b.subscribe();
+
+        // Interleave enqueues across two convos.
+        for i in 0..10 {
+            state.enqueue(
+                "convo-a",
+                StreamEvent::InfoEvent {
+                    cursor: ulid::Ulid::new().to_string(),
+                    info: format!("a-{:02}", i),
+                },
+            );
+            state.enqueue(
+                "convo-b",
+                StreamEvent::InfoEvent {
+                    cursor: ulid::Ulid::new().to_string(),
+                    info: format!("b-{:02}", i),
+                },
+            );
+        }
+
+        // Each convo must see its own events in order, with no cross-contamination.
+        for i in 0..10 {
+            let ev = tokio::time::timeout(Duration::from_secs(2), rx_a.recv())
+                .await
+                .expect("timed out on convo-a")
+                .expect("rx_a recv error");
+            if let StreamEvent::InfoEvent { info, .. } = ev {
+                assert_eq!(info, format!("a-{:02}", i));
+            } else {
+                panic!("unexpected variant on convo-a");
+            }
+
+            let ev = tokio::time::timeout(Duration::from_secs(2), rx_b.recv())
+                .await
+                .expect("timed out on convo-b")
+                .expect("rx_b recv error");
+            if let StreamEvent::InfoEvent { info, .. } = ev {
+                assert_eq!(info, format!("b-{:02}", i));
+            } else {
+                panic!("unexpected variant on convo-b");
+            }
+        }
+
+        // Queues for the two convos must be distinct DashMap entries.
+        assert!(state.emit_queue.contains_key("convo-a"));
+        assert!(state.emit_queue.contains_key("convo-b"));
+    }
+
+    /// Sanity: the backwards-compatible async `emit` delegates to the queue.
+    #[tokio::test]
+    async fn test_emit_delegates_to_per_convo_queue() {
+        let state = Arc::new(SseState::new(1000));
+        let tx = state.get_channel("convo-compat").await;
+        let mut rx = tx.subscribe();
+
+        for i in 0..5 {
+            state
+                .emit(
+                    "convo-compat",
+                    StreamEvent::InfoEvent {
+                        cursor: ulid::Ulid::new().to_string(),
+                        info: format!("compat-{i}"),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        for i in 0..5 {
+            let ev = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("timed out")
+                .expect("recv err");
+            if let StreamEvent::InfoEvent { info, .. } = ev {
+                assert_eq!(info, format!("compat-{i}"));
+            } else {
+                panic!("unexpected variant");
+            }
+        }
     }
 }
