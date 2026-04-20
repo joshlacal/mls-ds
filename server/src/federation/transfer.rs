@@ -302,10 +302,18 @@ impl SequencerTransfer {
             });
         }
 
-        // 3. CAS: only take over if the sequencer is still who we expect
+        // 3. CAS: only take over if the sequencer is still who we expect.
+        //
+        // `current_epoch` MUST NOT advance here. Bumping it without also
+        // writing a commit row (to `messages` and `commits`) orphans the MLS
+        // epoch: clients learn about the advance via SSE/GroupInfo but cannot
+        // fetch a commit to catch their local MLS state up to it. Fencing is
+        // handled by `sequencer_term` alone — the CAS below already rejects
+        // concurrent takeovers. Epoch advances must only ever originate from
+        // an actual MLS commit landing in `submit_commit` / `commit_group_change`.
         let updated: Option<(i32, i64)> = sqlx::query_as(
             "UPDATE conversations \
-             SET sequencer_ds = $2, current_epoch = current_epoch + 1, sequencer_term = sequencer_term + 1, updated_at = NOW() \
+             SET sequencer_ds = $2, sequencer_term = sequencer_term + 1, updated_at = NOW() \
              WHERE id = $1 AND (sequencer_ds = $3 OR sequencer_ds IS NULL) AND sequencer_term = $4 \
              RETURNING current_epoch, sequencer_term",
         )

@@ -137,6 +137,18 @@ pub async fn submit_commit(
 
         // Submit the commit for CAS ordering
         let commit_data_bytes = commit.commit_data.as_ref();
+        // Wrap the post-CAS inserts in a single transaction so the commit is
+        // visible to BOTH read paths (federation reads `commits`, clients read
+        // `messages WHERE message_type='commit'`). Without the `messages` row,
+        // a client that sees the epoch advance via SSE/GroupInfo has no commit
+        // to fetch via `getMessages?type=commit&fromEpoch=N+1` and stalls
+        // permanently — an orphan epoch from the client's POV.
+        //
+        // NOTE: `sequencer.submit_commit` still CAS-advances `current_epoch`
+        // on its own pool handle; this txn only covers the post-advance
+        // inserts. A crash between the CAS and this commit could still orphan
+        // the epoch. Pushing the CAS into this txn is tracked in TODO.md.
+        let mut tx = pool.begin().await.map_err(FederationError::Database)?;
         let result = sequencer
             .submit_commit(
                 convo_id,
@@ -153,7 +165,7 @@ pub async fn submit_commit(
                 assigned_epoch,
                 receipt,
             } => {
-                // Store the commit data
+                // Store the commit data (federation read path: `commits` table)
                 sqlx::query(
                     "INSERT INTO commits (convo_id, epoch, commit_data, sender_ds_did, created_at) \
                      VALUES ($1, $2, $3, $4, NOW()) \
@@ -163,9 +175,40 @@ pub async fn submit_commit(
                 .bind(assigned_epoch)
                 .bind(commit.commit_data.as_ref())
                 .bind(&requester_ds)
-                .execute(&pool)
+                .execute(&mut *tx)
                 .await
                 .map_err(FederationError::Database)?;
+
+                // Mirror into `messages` so client `getMessages?type=commit`
+                // can walk this commit when catching up from a lower epoch.
+                // See handlers/mls_chat/get_messages.rs — the client catchup
+                // path reads only the `messages` table.
+                let msg_id = uuid::Uuid::new_v4().to_string();
+                let seq: i64 = sqlx::query_scalar(
+                    "SELECT CAST(COALESCE(MAX(seq), 0) + 1 AS BIGINT) \
+                       FROM messages WHERE convo_id = $1",
+                )
+                .bind(convo_id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(FederationError::Database)?;
+
+                sqlx::query(
+                    "INSERT INTO messages (id, convo_id, sender_did, message_type, epoch, seq, ciphertext, created_at) \
+                     VALUES ($1, $2, $3, 'commit', $4, $5, $6, NOW()) \
+                     ON CONFLICT (convo_id, seq) DO NOTHING",
+                )
+                .bind(&msg_id)
+                .bind(convo_id)
+                .bind(Option::<&str>::None) // sender_did NULL — PRIV-001
+                .bind(assigned_epoch)
+                .bind(seq)
+                .bind(commit.commit_data.as_ref())
+                .execute(&mut *tx)
+                .await
+                .map_err(FederationError::Database)?;
+
+                tx.commit().await.map_err(FederationError::Database)?;
 
                 debug!(
                     convo = %redact_for_log(convo_id),
