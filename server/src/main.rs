@@ -812,7 +812,18 @@ async fn main() -> anyhow::Result<()> {
         )
         .with_state(app_state.clone());
 
-    let app = base_router.merge(mls_chat_router).merge(ds_router);
+    // Final outermost layer: ensure every response has a Content-Type header.
+    // Handlers that return bare `StatusCode::X` (120+ call sites across the mls_chat
+    // handlers) produce empty-body, header-less responses. Clients like Petrel's
+    // generated XRPC layer validate Content-Type and throw on empty headers before
+    // they can inspect the status code. Applying this to the merged app covers all
+    // three sub-routers without having to patch every handler.
+    let app = base_router
+        .merge(mls_chat_router)
+        .merge(ds_router)
+        .layer(axum::middleware::from_fn(
+            middleware::response_content_type::response_content_type_middleware,
+        ));
 
     let port = std::env::var("SERVER_PORT")
         .unwrap_or_else(|_| "8080".to_string())
