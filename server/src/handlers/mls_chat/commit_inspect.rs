@@ -17,6 +17,7 @@ use tls_codec::Deserialize as _;
 pub struct CommitShape {
     pub wire_format: WireFormat,
     pub content_type: ContentType,
+    pub epoch: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -46,6 +47,7 @@ pub fn inspect_commit_shape(bytes: &[u8]) -> Result<CommitShape, CommitInspectEr
     Ok(CommitShape {
         wire_format: protocol_msg.wire_format(),
         content_type,
+        epoch: protocol_msg.epoch().as_u64(),
     })
 }
 

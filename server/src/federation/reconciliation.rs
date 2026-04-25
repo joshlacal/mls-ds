@@ -319,13 +319,22 @@ async fn apply_remote_events(
     events: &[RemoteEvent],
 ) -> Result<(), sqlx::Error> {
     for event in events {
+        let wire_epoch = if event.message_type == "commit" {
+            crate::handlers::mls_chat::commit_inspect::inspect_commit_shape(&event.ciphertext)
+                .ok()
+                .map(|shape| shape.epoch as i64)
+        } else {
+            None
+        };
+
         sqlx::query(
             "INSERT INTO messages \
-                (id, convo_id, sender_did, message_type, epoch, seq, ciphertext, padded_size, created_at, msg_id) \
-             VALUES ($1, $2, NULL, $3, $4, $5, $6, $7, $8, $9) \
+                (id, convo_id, sender_did, message_type, epoch, wire_epoch, seq, ciphertext, padded_size, created_at, msg_id) \
+             VALUES ($1, $2, NULL, $3, $4, $5, $6, $7, $8, $9, $10) \
              ON CONFLICT (id) DO UPDATE SET \
                 message_type = EXCLUDED.message_type, \
                 epoch = EXCLUDED.epoch, \
+                wire_epoch = EXCLUDED.wire_epoch, \
                 seq = EXCLUDED.seq, \
                 ciphertext = EXCLUDED.ciphertext, \
                 padded_size = EXCLUDED.padded_size, \
@@ -336,6 +345,7 @@ async fn apply_remote_events(
         .bind(convo_id)
         .bind(&event.message_type)
         .bind(event.epoch)
+        .bind(wire_epoch)
         .bind(event.seq)
         .bind(&event.ciphertext)
         .bind(event.padded_size)

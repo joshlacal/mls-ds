@@ -129,6 +129,21 @@ pub async fn leave_convo(
 
         if let Some(ref commit) = input.commit {
             let commit_bytes = commit.to_vec();
+            let commit_shape =
+                super::commit_inspect::inspect_commit_shape(&commit_bytes).map_err(|e| {
+                    warn!("leave_convo: invalid commit framing: {}", e);
+                    StatusCode::BAD_REQUEST
+                })?;
+            if commit_shape.epoch != current_epoch as u64 {
+                warn!(
+                    "leave_convo: stale commit wire_epoch={} current_epoch={} for convo {}",
+                    commit_shape.epoch,
+                    current_epoch,
+                    crate::crypto::redact_for_log(&convo_id)
+                );
+                return Err(StatusCode::CONFLICT);
+            }
+            let commit_wire_epoch = commit_shape.epoch as i64;
 
             let msg_id = uuid::Uuid::new_v4().to_string();
 
@@ -164,12 +179,13 @@ pub async fn leave_convo(
             })?;
 
             sqlx::query(
-                "INSERT INTO messages (id, convo_id, sender_did, message_type, epoch, seq, ciphertext, created_at) VALUES ($1, $2, $3, 'commit', $4, $5, $6, $7)",
+                "INSERT INTO messages (id, convo_id, sender_did, message_type, epoch, wire_epoch, seq, ciphertext, created_at) VALUES ($1, $2, $3, 'commit', $4, $5, $6, $7, $8)",
             )
             .bind(&msg_id)
             .bind(&convo_id)
             .bind(Option::<&str>::None) // sender_did intentionally NULL — PRIV-001
             .bind(advanced_epoch)
+            .bind(commit_wire_epoch)
             .bind(seq)
             .bind(&commit_bytes)
             .bind(&now)
@@ -193,10 +209,7 @@ pub async fn leave_convo(
 
             // ── Enqueue commit messageEvent on per-convo FIFO queue (task #39) ──
             // Synchronous enqueue so order matches the DB commit order above.
-            let commit_cursor = sse_state
-                .cursor_gen
-                .next(&convo_id, "messageEvent")
-                .await;
+            let commit_cursor = sse_state.cursor_gen.next(&convo_id, "messageEvent").await;
 
             let commit_message_view: StreamMessageView =
                 crate::generated::blue_catbird::mlsChat::MessageView {

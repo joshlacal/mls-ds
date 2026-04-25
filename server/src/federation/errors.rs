@@ -53,6 +53,9 @@ pub enum FederationError {
     #[error("Invalid proof for sequencer transfer")]
     InvalidProof,
 
+    #[error("Invalid commit framing: {reason}")]
+    InvalidCommitFraming { reason: String },
+
     #[error("Configuration error: {reason}")]
     ConfigError { reason: String },
 
@@ -95,7 +98,7 @@ impl FederationError {
             Self::CommitConflict { .. } | Self::TermStale { .. } => StatusCode::CONFLICT,
             Self::NotSequencer { .. } => StatusCode::FORBIDDEN,
             Self::AuthFailed { .. } => StatusCode::UNAUTHORIZED,
-            Self::InvalidProof => StatusCode::BAD_REQUEST,
+            Self::InvalidProof | Self::InvalidCommitFraming { .. } => StatusCode::BAD_REQUEST,
             Self::DsUnreachable { .. } | Self::ResolutionFailed { .. } | Self::Http(_) => {
                 StatusCode::BAD_GATEWAY
             }
@@ -126,6 +129,7 @@ impl FederationError {
             Self::RecipientNotFound { .. } => "RecipientNotFound",
             Self::NoKeyPackagesAvailable { .. } => "NoKeyPackagesAvailable",
             Self::InvalidProof => "InvalidProof",
+            Self::InvalidCommitFraming { .. } => "InvalidCommitFraming",
             Self::ConfigError { .. } => "ConfigError",
             Self::OutboundQueuePeerCapExceeded { .. }
             | Self::OutboundQueueConvoPeerCapExceeded { .. } => "QueueCapacityExceeded",
@@ -144,7 +148,9 @@ impl FederationError {
             Self::RemoteError { status, .. } if *status == 429 => "rate_limited",
             Self::OutboundQueuePeerCapExceeded { .. }
             | Self::OutboundQueueConvoPeerCapExceeded { .. } => "queue_capacity_exceeded",
-            Self::Json(_) | Self::InvalidProof => "invalid_payload",
+            Self::Json(_) | Self::InvalidProof | Self::InvalidCommitFraming { .. } => {
+                "invalid_payload"
+            }
             _ => "conflict",
         }
     }

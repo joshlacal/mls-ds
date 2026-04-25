@@ -149,6 +149,18 @@ pub async fn submit_commit(
         // path) rows are now tied to the CAS: either all three land together
         // or none do.
         let commit_data_bytes = commit.commit_data.as_ref();
+        let commit_shape =
+            crate::handlers::mls_chat::commit_inspect::inspect_commit_shape(commit_data_bytes)
+                .map_err(|e| FederationError::InvalidCommitFraming {
+                    reason: e.to_string(),
+                })?;
+        if commit_shape.epoch != epoch as u64 {
+            return Err(FederationError::CommitConflict {
+                convo_id: convo_id.to_string(),
+                current_epoch: epoch,
+            });
+        }
+        let commit_wire_epoch = commit_shape.epoch as i64;
         let mut tx = pool.begin().await.map_err(FederationError::Database)?;
         let result = sequencer
             .submit_commit(
@@ -196,14 +208,15 @@ pub async fn submit_commit(
                 .map_err(FederationError::Database)?;
 
                 sqlx::query(
-                    "INSERT INTO messages (id, convo_id, sender_did, message_type, epoch, seq, ciphertext, created_at) \
-                     VALUES ($1, $2, $3, 'commit', $4, $5, $6, NOW()) \
+                    "INSERT INTO messages (id, convo_id, sender_did, message_type, epoch, wire_epoch, seq, ciphertext, created_at) \
+                     VALUES ($1, $2, $3, 'commit', $4, $5, $6, $7, NOW()) \
                      ON CONFLICT (convo_id, seq) DO NOTHING",
                 )
                 .bind(&msg_id)
                 .bind(convo_id)
                 .bind(Option::<&str>::None) // sender_did NULL — PRIV-001
                 .bind(assigned_epoch)
+                .bind(commit_wire_epoch)
                 .bind(seq)
                 .bind(commit.commit_data.as_ref())
                 .execute(&mut *tx)

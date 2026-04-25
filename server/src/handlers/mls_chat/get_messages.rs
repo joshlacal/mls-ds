@@ -29,6 +29,8 @@ struct MessageRow {
     convo_id: String,
     message_type: String,
     epoch: i64,
+    #[sqlx(default)]
+    wire_epoch: Option<i64>,
     seq: i64,
     ciphertext: Vec<u8>,
     created_at: DateTime<Utc>,
@@ -333,21 +335,30 @@ async fn fetch_commits(
     // Cap commit fetches to prevent massive payloads.
     // Clients that are very far behind should rejoin via External Commit instead.
     const MAX_COMMITS: i64 = 50;
+    // API callers still use post-advance epoch bounds (`localEpoch + 1`).
+    // MLS commit ciphertext is authored at the pre-advance wire epoch, so shift
+    // the bounds down while preserving the public response epoch for clients.
+    let wire_from_epoch = from_epoch.saturating_sub(1);
+    let wire_to_epoch = to_epoch.saturating_sub(1);
 
     let commits = sqlx::query_as::<_, MessageRow>(
         r#"
         SELECT id, convo_id, 'commit' as message_type,
                CAST(epoch AS BIGINT) as epoch, CAST(seq AS BIGINT) as seq,
+               CAST(COALESCE(wire_epoch, GREATEST(epoch - 1, 0)) AS BIGINT) as wire_epoch,
                ciphertext, created_at, COALESCE(reset_generation, 0) as reset_generation
         FROM messages
-        WHERE convo_id = $1 AND message_type = 'commit' AND epoch >= $2 AND epoch <= $3
-        ORDER BY epoch ASC, seq ASC
+        WHERE convo_id = $1
+          AND message_type = 'commit'
+          AND COALESCE(wire_epoch, GREATEST(epoch - 1, 0)) >= $2
+          AND COALESCE(wire_epoch, GREATEST(epoch - 1, 0)) <= $3
+        ORDER BY COALESCE(wire_epoch, GREATEST(epoch - 1, 0)) ASC, seq ASC
         LIMIT $4
         "#,
     )
     .bind(convo_id)
-    .bind(from_epoch)
-    .bind(to_epoch)
+    .bind(wire_from_epoch)
+    .bind(wire_to_epoch)
     .bind(MAX_COMMITS)
     .fetch_all(pool)
     .await
@@ -366,6 +377,12 @@ async fn fetch_commits(
                 jacquard_common::smol_str::SmolStr::new("resetGeneration"),
                 jacquard_common::types::value::Data::Integer(c.reset_generation as i64),
             );
+            if let Some(wire_epoch) = c.wire_epoch {
+                extra.insert(
+                    jacquard_common::smol_str::SmolStr::new("wireEpoch"),
+                    jacquard_common::types::value::Data::Integer(wire_epoch),
+                );
+            }
             // Legacy-row migration: some pre-regen commits were stored as
             // base64 text (UTF-8 of the base64 alphabet) in the bytea column.
             // Detect and decode before emitting so clients see raw MLS wire.

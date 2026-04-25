@@ -4,7 +4,6 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use base64::Engine;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sqlx::FromRow;
@@ -44,7 +43,10 @@ struct EpochConflictBody {
     message: String,
     #[serde(rename = "serverEpoch")]
     server_epoch: i32,
-    #[serde(rename = "serverSequencerTerm", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "serverSequencerTerm",
+        skip_serializing_if = "Option::is_none"
+    )]
     server_sequencer_term: Option<i64>,
     #[serde(rename = "expectedEpoch")]
     expected_epoch: i32,
@@ -77,14 +79,10 @@ impl XrpcError {
 impl IntoResponse for XrpcError {
     fn into_response(self) -> Response {
         match self {
-            XrpcError::Plain(status, error, message) => (
-                status,
-                Json(XrpcErrorBody { error, message }),
-            )
-                .into_response(),
-            XrpcError::EpochConflict(body) => {
-                (StatusCode::CONFLICT, Json(body)).into_response()
+            XrpcError::Plain(status, error, message) => {
+                (status, Json(XrpcErrorBody { error, message })).into_response()
             }
+            XrpcError::EpochConflict(body) => (StatusCode::CONFLICT, Json(body)).into_response(),
         }
     }
 }
@@ -122,14 +120,13 @@ async fn conflict_with_epoch(
     // Non-fatal on query error — fall back to echoing `expected_epoch` so the
     // client still sees a structured body (just without the authoritative
     // server value).
-    let row: Option<(Option<i32>, Option<i64>)> = sqlx::query_as(
-        "SELECT current_epoch, sequencer_term FROM conversations WHERE id = $1",
-    )
-    .bind(convo_id)
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten();
+    let row: Option<(Option<i32>, Option<i64>)> =
+        sqlx::query_as("SELECT current_epoch, sequencer_term FROM conversations WHERE id = $1")
+            .bind(convo_id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
 
     let (server_epoch, server_sequencer_term) = match row {
         Some((Some(ep), term)) => (ep, term),
@@ -151,6 +148,22 @@ fn internal_server_error(message: impl Into<String>) -> XrpcError {
         "InternalServerError",
         message.into(),
     )
+}
+
+fn inspect_commit_for_action(
+    action_name: &str,
+    commit_bytes: &[u8],
+    convo_id: &str,
+) -> Result<super::commit_inspect::CommitShape, XrpcError> {
+    super::commit_inspect::inspect_commit_shape(commit_bytes).map_err(|e| {
+        warn!(
+            "{}: rejected — framing invalid ({}) for convo {}",
+            action_name,
+            e,
+            crate::crypto::redact_for_log(convo_id)
+        );
+        bad_request(format!("Invalid commit framing: {e}"))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -319,6 +332,8 @@ pub async fn commit_group_change(
                 warn!("addMembers: missing commit");
                 bad_request("Missing commit")
             })?;
+            let commit_shape = inspect_commit_for_action("addMembers", commit_bytes, &convo_id)?;
+            let commit_wire_epoch = commit_shape.epoch as i64;
             let member_dids = input.member_dids.as_ref().ok_or_else(|| {
                 warn!("addMembers: missing member_dids");
                 bad_request("Missing memberDids")
@@ -483,6 +498,21 @@ pub async fn commit_group_change(
                     error!(convo_id = %crate::crypto::redact_for_log(&convo_id), "addMembers: failed to get current epoch: {}", e);
                     internal_server_error("Failed to get current epoch")
                 })?;
+            if commit_shape.epoch != current_epoch as u64 {
+                warn!(
+                    "addMembers: stale commit wire_epoch={} current_epoch={} for convo {}",
+                    commit_shape.epoch,
+                    current_epoch,
+                    crate::crypto::redact_for_log(&convo_id)
+                );
+                return Err(conflict_with_epoch(
+                    &pool,
+                    &convo_id,
+                    current_epoch,
+                    "Commit was authored from a stale MLS epoch",
+                )
+                .await);
+            }
 
             // ── Begin transaction: members + CAS epoch + commit + welcomes + idempotency ──
             let mut tx = pool.begin().await.map_err(|e| {
@@ -610,12 +640,13 @@ pub async fn commit_group_change(
             })?;
 
             let msg_result = sqlx::query(
-                "INSERT INTO messages (id, convo_id, sender_did, message_type, epoch, seq, ciphertext, created_at) VALUES ($1, $2, $3, 'commit', $4, $5, $6, $7)",
+                "INSERT INTO messages (id, convo_id, sender_did, message_type, epoch, wire_epoch, seq, ciphertext, created_at) VALUES ($1, $2, $3, 'commit', $4, $5, $6, $7, $8)",
             )
             .bind(&msg_id)
             .bind(&convo_id)
             .bind(Option::<&str>::None)
             .bind(new_epoch)
+            .bind(commit_wire_epoch)
             .bind(seq)
             .bind(&commit_bytes[..])
             .bind(&now)
@@ -737,8 +768,7 @@ pub async fn commit_group_change(
             // The enqueue MUST be synchronous so its order matches the DB
             // tx.commit() order above. Envelope fanout stays in a detached
             // spawn (non-ordering-sensitive).
-            let commit_cursor =
-                sse_state.cursor_gen.next(&convo_id, "messageEvent").await;
+            let commit_cursor = sse_state.cursor_gen.next(&convo_id, "messageEvent").await;
 
             let commit_message_view: crate::realtime::StreamMessageView =
                 crate::generated::blue_catbird::mlsChat::MessageView {
@@ -900,6 +930,9 @@ pub async fn commit_group_change(
                 warn!("externalCommit: missing commit");
                 bad_request("Missing commit")
             })?;
+            let commit_shape =
+                inspect_commit_for_action("externalCommit", commit_bytes, &convo_id)?;
+            let commit_wire_epoch = commit_shape.epoch as i64;
 
             // ── Verify caller is a current or self-left member (NOT admin-removed) ──
             let (caller_did, _) = parse_device_did(&auth_user.did).map_err(|e| {
@@ -1108,6 +1141,21 @@ pub async fn commit_group_change(
                     error!("externalCommit: failed to get current epoch: {}", e);
                     internal_server_error("Failed to get current epoch")
                 })?;
+            if commit_shape.epoch != current_epoch as u64 {
+                warn!(
+                    "externalCommit: stale commit wire_epoch={} current_epoch={} for convo {}",
+                    commit_shape.epoch,
+                    current_epoch,
+                    crate::crypto::redact_for_log(&convo_id)
+                );
+                return Err(conflict_with_epoch(
+                    &pool,
+                    &convo_id,
+                    current_epoch,
+                    "Commit was authored from a stale MLS epoch",
+                )
+                .await);
+            }
 
             // ── Begin transaction: reactivate + epoch heal + commit + idempotency ──
             let mut tx = pool.begin().await.map_err(|e| {
@@ -1236,12 +1284,13 @@ pub async fn commit_group_change(
             })?;
 
             sqlx::query(
-                "INSERT INTO messages (id, convo_id, sender_did, message_type, epoch, seq, ciphertext, created_at) VALUES ($1, $2, $3, 'commit', $4, $5, $6, $7)",
+                "INSERT INTO messages (id, convo_id, sender_did, message_type, epoch, wire_epoch, seq, ciphertext, created_at) VALUES ($1, $2, $3, 'commit', $4, $5, $6, $7, $8)",
             )
             .bind(&msg_id)
             .bind(&convo_id)
             .bind(Option::<&str>::None)
             .bind(new_epoch)
+            .bind(commit_wire_epoch)
             .bind(seq)
             .bind(&commit_bytes[..])
             .bind(&now)
@@ -1283,8 +1332,7 @@ pub async fn commit_group_change(
             })?;
 
             // ── Enqueue commit messageEvent on per-convo FIFO queue (task #39) ──
-            let commit_cursor =
-                sse_state.cursor_gen.next(&convo_id, "messageEvent").await;
+            let commit_cursor = sse_state.cursor_gen.next(&convo_id, "messageEvent").await;
 
             let commit_message_view: crate::realtime::StreamMessageView =
                 crate::generated::blue_catbird::mlsChat::MessageView {
@@ -1932,6 +1980,8 @@ pub async fn commit_group_change(
                 warn!("removeMember: missing commit");
                 bad_request("Missing commit")
             })?;
+            let commit_shape = inspect_commit_for_action("removeMember", commit_bytes, &convo_id)?;
+            let commit_wire_epoch = commit_shape.epoch as i64;
             let member_dids = input.member_dids.as_ref().ok_or_else(|| {
                 warn!("removeMember: missing member_dids");
                 bad_request("Missing memberDids")
@@ -1966,6 +2016,21 @@ pub async fn commit_group_change(
                     error!("removeMember: failed to get current epoch: {}", e);
                     internal_server_error("Failed to get current epoch")
                 })?;
+            if commit_shape.epoch != current_epoch as u64 {
+                warn!(
+                    "removeMember: stale commit wire_epoch={} current_epoch={} for convo {}",
+                    commit_shape.epoch,
+                    current_epoch,
+                    crate::crypto::redact_for_log(&convo_id)
+                );
+                return Err(conflict_with_epoch(
+                    &pool,
+                    &convo_id,
+                    current_epoch,
+                    "Commit was authored from a stale MLS epoch",
+                )
+                .await);
+            }
 
             // ── Begin transaction: CAS epoch + soft-delete + commit + idempotency ───
             //
@@ -2046,12 +2111,13 @@ pub async fn commit_group_change(
             })?;
 
             sqlx::query(
-                "INSERT INTO messages (id, convo_id, sender_did, message_type, epoch, seq, ciphertext, created_at) VALUES ($1, $2, $3, 'commit', $4, $5, $6, $7)",
+                "INSERT INTO messages (id, convo_id, sender_did, message_type, epoch, wire_epoch, seq, ciphertext, created_at) VALUES ($1, $2, $3, 'commit', $4, $5, $6, $7, $8)",
             )
             .bind(&msg_id)
             .bind(&convo_id)
             .bind(Option::<&str>::None)
             .bind(new_epoch)
+            .bind(commit_wire_epoch)
             .bind(seq)
             .bind(&commit_bytes[..])
             .bind(&now)
@@ -2093,8 +2159,7 @@ pub async fn commit_group_change(
             })?;
 
             // ── Enqueue commit messageEvent on per-convo FIFO queue (task #39) ──
-            let commit_cursor =
-                sse_state.cursor_gen.next(&convo_id, "messageEvent").await;
+            let commit_cursor = sse_state.cursor_gen.next(&convo_id, "messageEvent").await;
 
             let commit_message_view: crate::realtime::StreamMessageView =
                 crate::generated::blue_catbird::mlsChat::MessageView {
@@ -2239,20 +2304,23 @@ pub async fn commit_group_change(
             // PURE_CIPHERTEXT_WIRE_FORMAT_POLICY means we can't inspect proposal
             // bodies, so we gate on surface markers + framing well-formedness.
             let welcome_present = input.welcome.is_some();
-            let member_dids_nonempty =
-                input.member_dids.as_ref().is_some_and(|v| !v.is_empty());
-            match super::commit_inspect::enforce_non_add_action_contract(
+            let member_dids_nonempty = input.member_dids.as_ref().is_some_and(|v| !v.is_empty());
+            let commit_shape = match super::commit_inspect::enforce_non_add_action_contract(
                 welcome_present,
                 member_dids_nonempty,
                 commit_bytes,
             ) {
-                Ok(shape) => info!(
-                    "{}: framing OK (wire={:?}, ct={:?}) convo {}",
-                    action_name,
-                    shape.wire_format,
-                    shape.content_type,
-                    crate::crypto::redact_for_log(&convo_id)
-                ),
+                Ok(shape) => {
+                    info!(
+                        "{}: framing OK (wire={:?}, ct={:?}, epoch={}) convo {}",
+                        action_name,
+                        shape.wire_format,
+                        shape.content_type,
+                        shape.epoch,
+                        crate::crypto::redact_for_log(&convo_id)
+                    );
+                    shape
+                }
                 Err(super::commit_inspect::CommitActionContractError::WelcomeSet) => {
                     warn!(
                         "{}: rejected — welcome set under non-addMembers action (caller {}, convo {})",
@@ -2284,7 +2352,8 @@ pub async fn commit_group_change(
                     );
                     return Err(bad_request(format!("Invalid commit framing: {e}")));
                 }
-            }
+            };
+            let commit_wire_epoch = commit_shape.epoch as i64;
 
             let now = chrono::Utc::now();
 
@@ -2295,6 +2364,22 @@ pub async fn commit_group_change(
                     error!("{}: failed to get current epoch: {}", action_name, e);
                     internal_server_error("Failed to get current epoch")
                 })?;
+            if commit_shape.epoch != current_epoch as u64 {
+                warn!(
+                    "{}: stale commit wire_epoch={} current_epoch={} for convo {}",
+                    action_name,
+                    commit_shape.epoch,
+                    current_epoch,
+                    crate::crypto::redact_for_log(&convo_id)
+                );
+                return Err(conflict_with_epoch(
+                    &pool,
+                    &convo_id,
+                    current_epoch,
+                    "Commit was authored from a stale MLS epoch",
+                )
+                .await);
+            }
 
             // ── Begin transaction: CAS epoch + commit + idempotency ───
             let mut tx = pool.begin().await.map_err(|e| {
@@ -2349,12 +2434,13 @@ pub async fn commit_group_change(
             })?;
 
             sqlx::query(
-                "INSERT INTO messages (id, convo_id, sender_did, message_type, epoch, seq, ciphertext, created_at) VALUES ($1, $2, $3, 'commit', $4, $5, $6, $7)",
+                "INSERT INTO messages (id, convo_id, sender_did, message_type, epoch, wire_epoch, seq, ciphertext, created_at) VALUES ($1, $2, $3, 'commit', $4, $5, $6, $7, $8)",
             )
             .bind(&msg_id)
             .bind(&convo_id)
             .bind(Option::<&str>::None)
             .bind(new_epoch)
+            .bind(commit_wire_epoch)
             .bind(seq)
             .bind(&commit_bytes[..])
             .bind(&now)
@@ -2397,8 +2483,7 @@ pub async fn commit_group_change(
             })?;
 
             // ── Enqueue commit messageEvent on per-convo FIFO queue (task #39) ──
-            let commit_cursor =
-                sse_state.cursor_gen.next(&convo_id, "messageEvent").await;
+            let commit_cursor = sse_state.cursor_gen.next(&convo_id, "messageEvent").await;
 
             let commit_message_view: crate::realtime::StreamMessageView =
                 crate::generated::blue_catbird::mlsChat::MessageView {
