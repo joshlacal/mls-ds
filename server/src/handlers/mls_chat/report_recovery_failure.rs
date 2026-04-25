@@ -32,6 +32,16 @@ pub struct ReportRecoveryFailureRequest {
     /// current epoch. Optional at the schema layer (old clients may omit)
     /// but required for the vote to count toward quorum (see ADR-002 §A7.3).
     pub epoch_authenticator: Option<String>,
+    /// Per ADR-008 D1: `"local_state_loss"` (Mode A) vs
+    /// `"group_state_unrecoverable"` (Mode B). Only Mode B SHOULD count
+    /// toward server-side quorum auto-reset; Mode A reports indicate the
+    /// client should self-heal via §6.6 / §8.4 instead of triggering a
+    /// global reset. Plumbed through to `ConvoMessage::RecordResetVote`
+    /// and persisted in `reset_votes.failure_mode`. Quorum filtering by
+    /// mode is gated by the `ENFORCE_FAILURE_MODE_QUORUM` env var (default
+    /// `false` during interim deployment so older clients without the
+    /// field aren't silenced; flip to `true` once D1 ships everywhere).
+    pub failure_mode: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -94,11 +104,30 @@ pub async fn report_recovery_failure(
         .failure_type
         .clone()
         .unwrap_or_else(|| "external_commit_exhausted".to_string());
+    // ADR-008 D1: validate `failureMode` is one of the known values; unknown
+    // values are treated as `None` (forward-compat for future modes). Empty
+    // strings collapse to `None` so old clients are indistinguishable from
+    // unset.
+    let failure_mode: Option<String> = input.failure_mode.clone().and_then(|m| {
+        if m.is_empty() {
+            None
+        } else if m == "local_state_loss" || m == "group_state_unrecoverable" {
+            Some(m)
+        } else {
+            warn!(
+                convo = %crate::crypto::redact_for_log(&convo_id),
+                failure_mode = %m,
+                "[reportRecoveryFailure] unknown failureMode (treating as None)"
+            );
+            None
+        }
+    });
 
     info!(
         convo = %crate::crypto::redact_for_log(&convo_id),
         caller = %crate::crypto::redact_for_log(&device_did),
         failure_type = %failure_type,
+        failure_mode = ?failure_mode,
         has_authenticator = input.epoch_authenticator.is_some(),
         "[reportRecoveryFailure] start"
     );
@@ -173,6 +202,7 @@ pub async fn report_recovery_failure(
             identity_did: identity_did.clone(),
             epoch_authenticator,
             failure_type,
+            failure_mode,
             reply: reply_tx,
         })
         .map_err(|e| {

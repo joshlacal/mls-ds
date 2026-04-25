@@ -270,6 +270,7 @@ impl Actor for ConversationActor {
                 identity_did,
                 epoch_authenticator,
                 failure_type,
+                failure_mode,
                 reply,
             } => {
                 let result = state
@@ -278,6 +279,7 @@ impl Actor for ConversationActor {
                         identity_did,
                         epoch_authenticator,
                         failure_type,
+                        failure_mode,
                     )
                     .await;
                 let _ = reply.send(result);
@@ -373,6 +375,18 @@ impl ConversationActorState {
 
         // Process commit if provided (capture msg_id for later fanout)
         let commit_msg_id = if let Some(commit_bytes) = commit {
+            let commit_shape =
+                crate::handlers::mls_chat::commit_inspect::inspect_commit_shape(&commit_bytes)
+                    .context("Invalid commit framing")?;
+            if commit_shape.epoch != self.current_epoch as u64 {
+                anyhow::bail!(
+                    "Stale commit for convo {}: wire_epoch {} != current_epoch {}",
+                    self.convo_id,
+                    commit_shape.epoch,
+                    self.current_epoch
+                );
+            }
+            let commit_wire_epoch = commit_shape.epoch as i64;
             let msg_id = uuid::Uuid::new_v4().to_string();
             let advanced_epoch = crate::db::try_advance_conversation_epoch_tx(
                 &mut tx,
@@ -400,12 +414,13 @@ impl ConversationActorState {
 
             // Insert commit message with sequence number
             sqlx::query(
-                "INSERT INTO messages (id, convo_id, sender_did, message_type, epoch, seq, ciphertext, created_at) VALUES ($1, $2, $3, 'commit', $4, $5, $6, $7)"
+                "INSERT INTO messages (id, convo_id, sender_did, message_type, epoch, wire_epoch, seq, ciphertext, created_at) VALUES ($1, $2, $3, 'commit', $4, $5, $6, $7, $8)"
             )
             .bind(&msg_id)
             .bind(&self.convo_id)
             .bind(Option::<&str>::None) // sender_did intentionally NULL — PRIV-001 (docs/PRIVACY.md)
             .bind(advanced_epoch)
+            .bind(commit_wire_epoch)
             .bind(seq)
             .bind(&commit_bytes)
             .bind(&now)
@@ -576,6 +591,18 @@ impl ConversationActorState {
 
         // Process commit if provided (capture msg_id for later fanout)
         let commit_msg_id = if let Some(commit_bytes) = commit {
+            let commit_shape =
+                crate::handlers::mls_chat::commit_inspect::inspect_commit_shape(&commit_bytes)
+                    .context("Invalid commit framing")?;
+            if commit_shape.epoch != self.current_epoch as u64 {
+                anyhow::bail!(
+                    "Stale commit for convo {}: wire_epoch {} != current_epoch {}",
+                    self.convo_id,
+                    commit_shape.epoch,
+                    self.current_epoch
+                );
+            }
+            let commit_wire_epoch = commit_shape.epoch as i64;
             let msg_id = uuid::Uuid::new_v4().to_string();
             let advanced_epoch = crate::db::try_advance_conversation_epoch_tx(
                 &mut tx,
@@ -603,12 +630,13 @@ impl ConversationActorState {
 
             // Insert commit message with sequence number
             sqlx::query(
-                "INSERT INTO messages (id, convo_id, sender_did, message_type, epoch, seq, ciphertext, created_at) VALUES ($1, $2, $3, 'commit', $4, $5, $6, $7)"
+                "INSERT INTO messages (id, convo_id, sender_did, message_type, epoch, wire_epoch, seq, ciphertext, created_at) VALUES ($1, $2, $3, 'commit', $4, $5, $6, $7, $8)"
             )
             .bind(&msg_id)
             .bind(&self.convo_id)
             .bind(Option::<&str>::None) // sender_did intentionally NULL — PRIV-001 (docs/PRIVACY.md)
             .bind(advanced_epoch)
+            .bind(commit_wire_epoch)
             .bind(seq)
             .bind(&commit_bytes)
             .bind(&now)
@@ -1020,6 +1048,7 @@ impl ConversationActorState {
         identity_did: String,
         epoch_authenticator: String,
         failure_type: String,
+        failure_mode: Option<String>,
     ) -> anyhow::Result<RecordResetVoteOutcome> {
         use anyhow::Context;
 
@@ -1028,6 +1057,7 @@ impl ConversationActorState {
             device = %crate::crypto::redact_for_log(&device_did),
             identity = %crate::crypto::redact_for_log(&identity_did),
             failure_type = %failure_type,
+            failure_mode = ?failure_mode,
             "[actor:record_reset_vote] start"
         );
 
@@ -1120,15 +1150,18 @@ impl ConversationActorState {
         }
 
         // ── 4. Upsert the vote ────────────────────────────────────────────
+        // ADR-008 D1 (spec §8.6.1): persist `failure_mode` so quorum counting
+        // can filter Mode A votes when `ENFORCE_FAILURE_MODE_QUORUM` is on.
         sqlx::query(
             "INSERT INTO reset_votes \
                 (convo_id, device_did, identity_did, epoch_authenticator, \
-                 failure_type, voted_at, expires_at) \
-             VALUES ($1, $2, $3, $4, $5, NOW(), NOW() + INTERVAL '24 hours') \
+                 failure_type, failure_mode, voted_at, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW() + INTERVAL '24 hours') \
              ON CONFLICT (convo_id, device_did) DO UPDATE SET \
                 identity_did = EXCLUDED.identity_did, \
                 epoch_authenticator = EXCLUDED.epoch_authenticator, \
                 failure_type = EXCLUDED.failure_type, \
+                failure_mode = EXCLUDED.failure_mode, \
                 voted_at = NOW(), \
                 expires_at = NOW() + INTERVAL '24 hours'",
         )
@@ -1137,6 +1170,7 @@ impl ConversationActorState {
         .bind(&identity_did)
         .bind(&epoch_authenticator)
         .bind(&failure_type)
+        .bind(&failure_mode)
         .execute(&self.db_pool)
         .await
         .context("failed to upsert reset_votes")?;
@@ -1155,7 +1189,22 @@ impl ConversationActorState {
         .await
         .context("member_did_count failed")?;
 
-        let per_did_vote_count: i64 = sqlx::query_scalar(
+        // ADR-008 D1 (spec §8.6.1): when `ENFORCE_FAILURE_MODE_QUORUM=true`,
+        // only votes with `failure_mode = 'group_state_unrecoverable'` (Mode B)
+        // are counted toward quorum. Mode A and NULL are excluded
+        // (NULL→`local_state_loss` per spec). Default (false) is the interim
+        // posture: count every valid vote regardless of `failure_mode` so
+        // older clients without the field are not silenced. Operators flip
+        // the flag once D1 is shipped on every client.
+        let enforce_failure_mode = std::env::var("ENFORCE_FAILURE_MODE_QUORUM")
+            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+            .unwrap_or(false);
+        let mode_filter = if enforce_failure_mode {
+            "AND rv.failure_mode = 'group_state_unrecoverable' "
+        } else {
+            ""
+        };
+        let per_did_vote_sql = format!(
             "SELECT COUNT(*) FROM ( \
                 SELECT COALESCE(m.user_did, m.member_did) AS ident \
                 FROM members m \
@@ -1167,18 +1216,22 @@ impl ConversationActorState {
                     AND rv.device_did = m.member_did \
                     AND rv.expires_at > NOW() \
                     AND rv.voted_at > NOW() - INTERVAL '1 hour' \
+                    {mode_filter}\
                 ) THEN 1 END) \
              ) t",
-        )
-        .bind(&self.convo_id)
-        .fetch_one(&self.db_pool)
-        .await
-        .context("per_did_vote_count failed")?;
+            mode_filter = mode_filter
+        );
+        let per_did_vote_count: i64 = sqlx::query_scalar(&per_did_vote_sql)
+            .bind(&self.convo_id)
+            .fetch_one(&self.db_pool)
+            .await
+            .context("per_did_vote_count failed")?;
 
         info!(
             convo = %crate::crypto::redact_for_log(&self.convo_id),
             per_did_vote_count,
             member_did_count,
+            enforce_failure_mode,
             "[actor:record_reset_vote] quorum check"
         );
 
@@ -1286,6 +1339,26 @@ impl ConversationActorState {
         }
 
         // ── 8. Execute auto-reset ─────────────────────────────────────────
+        //
+        // ⚠ TRUSTED-DS V0 IMPLEMENTATION ⚠
+        //
+        // This path swaps `group_id` and emits `GroupResetEvent` based purely
+        // on quorum + cooldown + circuit-breaker checks. There is no
+        // bootstrapper-candidate set, no `ResetContinuation` proof, and no
+        // verification that joining clients are routed into the legitimate
+        // continuation group rather than a DS-fabricated one. See ADR-008
+        // (`docs/program/decisions/ADR-008-auto-reset-protocol-binding.md`)
+        // §D2 (continuation proof) and §D3 (two-phase prepare/bootstrap/
+        // finalize) for what this needs to grow before it can be safely
+        // enabled outside a deployment where the DS is fully trusted by
+        // every client (Catbird's current single-DS posture).
+        //
+        // DO NOT enable this code path for federation, self-hosted DS,
+        // multi-DS routing, or any deployment where clients can't assume the
+        // DS is honest about quorum decisions. The cryptographic boundary
+        // from RFC 9750 §5.2 holds (DS can't read group plaintext) but the
+        // *membership* boundary of the post-reset group is whatever the DS
+        // routes clients into — that's what D2/D3 close.
         let new_group_id =
             format!("{:032x}", uuid::Uuid::new_v4().as_u128());
         let mut tx = self

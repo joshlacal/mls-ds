@@ -505,6 +505,10 @@ mod conversation_tests {
                 identity_did: identity_did.to_string(),
                 epoch_authenticator: auth.to_string(),
                 failure_type: "external_commit_exhausted".to_string(),
+                // ADR-008 D1: tests pre-date the field; leaving as None
+                // exercises the interim-grace path (counts toward quorum
+                // when ENFORCE_FAILURE_MODE_QUORUM is unset/false).
+                failure_mode: None,
                 reply: tx,
             })
             .expect("send vote");

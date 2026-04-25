@@ -152,12 +152,18 @@ pub enum ConvoMessage {
     /// - `epoch_authenticator`: Hex-encoded RFC 9420 §8.7 authenticator for the
     ///    reporter's current epoch
     /// - `failure_type`: Categorical failure reason (e.g. `external_commit_exhausted`)
+    /// - `failure_mode`: ADR-008 D1 classification — `Some("local_state_loss")` (Mode A,
+    ///    self-heal, SHOULD NOT count toward quorum), `Some("group_state_unrecoverable")`
+    ///    (Mode B, counts toward quorum), or `None` (old client). When the
+    ///    `ENFORCE_FAILURE_MODE_QUORUM` env var is true, only Mode B votes are counted.
+    ///    Default behavior (false): all votes count regardless of mode. See spec §8.6.1.
     /// - `reply`: Channel to receive the vote-count + auto-reset decision
     RecordResetVote {
         device_did: String,
         identity_did: String,
         epoch_authenticator: String,
         failure_type: String,
+        failure_mode: Option<String>,
         reply: oneshot::Sender<Result<RecordResetVoteOutcome>>,
     },
 
