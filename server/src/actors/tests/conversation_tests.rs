@@ -84,6 +84,7 @@ mod conversation_tests {
             notification_service: None,
             convo_id: convo_id.to_string(),
             db_pool: pool.clone(),
+            quorum_config: crate::config::QuorumConfig::default(),
         };
 
         let (actor_ref, _handle) = Actor::spawn(None, ConversationActor, args)
@@ -178,6 +179,7 @@ mod conversation_tests {
             notification_service: None,
             convo_id: convo_id.to_string(),
             db_pool: pool.clone(),
+            quorum_config: crate::config::QuorumConfig::default(),
         };
 
         let (actor_ref, _handle) = Actor::spawn(None, ConversationActor, args)
@@ -234,6 +236,7 @@ mod conversation_tests {
             notification_service: None,
             convo_id: convo_id.to_string(),
             db_pool: pool.clone(),
+            quorum_config: crate::config::QuorumConfig::default(),
         };
 
         let (actor_ref, _handle) = Actor::spawn(None, ConversationActor, args)
@@ -290,6 +293,7 @@ mod conversation_tests {
             notification_service: None,
             convo_id: convo_id.to_string(),
             db_pool: pool.clone(),
+            quorum_config: crate::config::QuorumConfig::default(),
         };
 
         let (actor_ref, _handle) = Actor::spawn(None, ConversationActor, args)
@@ -349,6 +353,7 @@ mod conversation_tests {
             notification_service: None,
             convo_id: convo_id.to_string(),
             db_pool: pool.clone(),
+            quorum_config: crate::config::QuorumConfig::default(),
         };
 
         let (actor_ref, _handle) = Actor::spawn(None, ConversationActor, args)
@@ -539,6 +544,7 @@ mod conversation_tests {
             notification_service: None,
             convo_id: convo_id.to_string(),
             db_pool: pool.clone(),
+            quorum_config: crate::config::QuorumConfig::default(),
         };
         let (actor, _h) = Actor::spawn(None, ConversationActor, args)
             .await
@@ -592,6 +598,7 @@ mod conversation_tests {
             notification_service: None,
             convo_id: convo_id.to_string(),
             db_pool: pool.clone(),
+            quorum_config: crate::config::QuorumConfig::default(),
         };
         let (actor, _h) = Actor::spawn(None, ConversationActor, args)
             .await
@@ -637,6 +644,7 @@ mod conversation_tests {
             notification_service: None,
             convo_id: convo_id.to_string(),
             db_pool: pool.clone(),
+            quorum_config: crate::config::QuorumConfig::default(),
         };
         let (actor, _h) = Actor::spawn(None, ConversationActor, args)
             .await
@@ -690,6 +698,7 @@ mod conversation_tests {
             notification_service: None,
             convo_id: convo_id.to_string(),
             db_pool: pool.clone(),
+            quorum_config: crate::config::QuorumConfig::default(),
         };
         let (actor, _h) = Actor::spawn(None, ConversationActor, args)
             .await
@@ -757,6 +766,7 @@ mod conversation_tests {
             notification_service: None,
             convo_id: convo_id.to_string(),
             db_pool: pool.clone(),
+            quorum_config: crate::config::QuorumConfig::default(),
         };
         let (actor, _h) = Actor::spawn(None, ConversationActor, args)
             .await
@@ -818,6 +828,7 @@ mod conversation_tests {
             notification_service: None,
             convo_id: convo_id.to_string(),
             db_pool: pool.clone(),
+            quorum_config: crate::config::QuorumConfig::default(),
         };
         let (actor, _h) = Actor::spawn(None, ConversationActor, args)
             .await

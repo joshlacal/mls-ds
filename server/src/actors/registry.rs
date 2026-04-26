@@ -10,6 +10,7 @@ use super::directory::{
 };
 use super::messages::ConvoMessage;
 use super::supervisor::{GroupSupervisor, GroupSupervisorMessage};
+use crate::config::QuorumConfig;
 use crate::realtime::SseState;
 
 pub struct ActorRegistry {
@@ -19,6 +20,10 @@ pub struct ActorRegistry {
     db_pool: PgPool,
     sse_state: Arc<SseState>,
     notification_service: Option<Arc<crate::notifications::NotificationService>>,
+    /// ADR-008 D1 (Phase 2): per-process quorum knobs, snapshotted from env at
+    /// startup. Each spawned `ConversationActor` receives a clone via
+    /// `ConvoActorArgs::quorum_config`.
+    quorum_config: QuorumConfig,
 }
 
 impl ActorRegistry {
@@ -35,6 +40,7 @@ impl ActorRegistry {
             db_pool,
             sse_state,
             notification_service,
+            quorum_config: QuorumConfig::from_env(),
         }
     }
 
@@ -54,6 +60,7 @@ impl ActorRegistry {
             db_pool: self.db_pool.clone(),
             sse_state: self.sse_state.clone(),
             notification_service: self.notification_service.clone(),
+            quorum_config: self.quorum_config.clone(),
         };
 
         let actor_ref = ractor::call!(
@@ -275,6 +282,7 @@ impl Clone for ActorRegistry {
             db_pool: self.db_pool.clone(),
             sse_state: self.sse_state.clone(),
             notification_service: self.notification_service.clone(),
+            quorum_config: self.quorum_config.clone(),
         }
     }
 }

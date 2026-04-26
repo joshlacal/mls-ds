@@ -6,6 +6,7 @@ use tracing::{debug, error, info, warn};
 
 use super::broadcaster::BroadcasterPool;
 use super::messages::{ConvoMessage, KeyPackageHashEntry, RecordResetVoteOutcome};
+use crate::config::QuorumConfig;
 use crate::notifications::NotificationService;
 use crate::realtime::{SseState, StreamEvent, StreamMessageView};
 use tokio::sync::mpsc;
@@ -66,6 +67,10 @@ pub struct ConvoActorArgs {
     pub db_pool: PgPool,
     pub sse_state: Arc<SseState>,
     pub notification_service: Option<Arc<NotificationService>>,
+    /// ADR-008 D1 (Phase 2): per-actor copy of the quorum knobs so tests can
+    /// inject overrides without racing on process-global env vars. Production
+    /// callers (registry/supervisor) populate via `QuorumConfig::from_env`.
+    pub quorum_config: QuorumConfig,
 }
 
 /// Represents a background job to be processed sequentially by the actor's worker.
@@ -204,6 +209,7 @@ impl Actor for ConversationActor {
             sse_state: args.sse_state,
             side_effect_tx: tx,
             broadcaster_pool,
+            quorum_config: args.quorum_config,
         })
     }
 
@@ -320,6 +326,10 @@ pub struct ConversationActorState {
     sse_state: Arc<SseState>,
     side_effect_tx: mpsc::Sender<SideEffectJob>,
     broadcaster_pool: BroadcasterPool,
+    /// ADR-008 D1 (Phase 2): quorum knobs. Snapshotted at spawn time from
+    /// `ConvoActorArgs::quorum_config` so tests can inject without racing on
+    /// process-global env vars.
+    quorum_config: QuorumConfig,
 }
 
 impl ConversationActorState {
@@ -1209,21 +1219,21 @@ impl ConversationActorState {
         .await
         .context("member_did_count failed")?;
 
-        // ADR-008 D1 (spec §8.6.1): when `ENFORCE_FAILURE_MODE_QUORUM=true`,
-        // only votes with `failure_mode = 'group_state_unrecoverable'` (Mode B)
-        // are counted toward quorum. Mode A and NULL are excluded
-        // (NULL→`local_state_loss` per spec). Default (false) is the interim
-        // posture: count every valid vote regardless of `failure_mode` so
-        // older clients without the field are not silenced. Operators flip
-        // the flag once D1 is shipped on every client.
-        let enforce_failure_mode = std::env::var("ENFORCE_FAILURE_MODE_QUORUM")
-            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-            .unwrap_or(false);
+        // ADR-008 D1 (spec §8.6.1 + Phase 2 design §"Server-Side Changes"):
+        // when `enforce_failure_mode = true`, only votes with
+        // `failure_mode = 'group_state_unrecoverable'` (Mode B) are counted
+        // toward quorum. Mode A (`local_state_loss`) and NULL are excluded
+        // (NULL → `local_state_loss` per spec). When false, every valid vote
+        // counts regardless of `failure_mode` (interim posture; flipped on by
+        // default in Phase 2 — see `QuorumConfig::default`).
+        let enforce_failure_mode = self.quorum_config.enforce_failure_mode;
         let mode_filter = if enforce_failure_mode {
             "AND rv.failure_mode = 'group_state_unrecoverable' "
         } else {
             ""
         };
+        // QUORUM_WINDOW_SECS bounds how stale a vote may be and still count.
+        let window_secs = self.quorum_config.window_secs as i64;
         let per_did_vote_sql = format!(
             "SELECT COUNT(*) FROM ( \
                 SELECT COALESCE(m.user_did, m.member_did) AS ident \
@@ -1235,7 +1245,7 @@ impl ConversationActorState {
                     WHERE rv.convo_id = m.convo_id \
                     AND rv.device_did = m.member_did \
                     AND rv.expires_at > NOW() \
-                    AND rv.voted_at > NOW() - INTERVAL '1 hour' \
+                    AND rv.voted_at > NOW() - make_interval(secs => $2) \
                     {mode_filter}\
                 ) THEN 1 END) \
              ) t",
@@ -1243,13 +1253,17 @@ impl ConversationActorState {
         );
         let per_did_vote_count: i64 = sqlx::query_scalar(&per_did_vote_sql)
             .bind(&self.convo_id)
+            .bind(window_secs)
             .fetch_one(&self.db_pool)
             .await
             .context("per_did_vote_count failed")?;
 
-        // ceil(member_did_count * 2 / 3) — matches the auto-reset gate at
-        // step 8: per_did_vote_count * 3 >= member_did_count * 2.
-        let quorum_threshold: i64 = (member_did_count * 2 + 2) / 3;
+        // ADR-008 D1 (Phase 2): per-conversation quorum is computed from
+        // `QuorumConfig::required_for`:
+        //   - 1:1 (member_did_count == 2): `quorum_threshold_dm` (default 1).
+        //   - groups (member_did_count >= 3): max(group_min, ceil(n*group_pct)).
+        // For singletons (<2) we treat quorum as impossible.
+        let quorum_threshold: i64 = self.quorum_config.required_for(member_did_count);
         info!(
             convo_id = %crate::crypto::redact_for_log(&self.convo_id),
             voter_did = %crate::crypto::redact_for_log(&device_did),
@@ -1272,20 +1286,21 @@ impl ConversationActorState {
             reset_count: None,
         };
 
-        // Quorum check: ceil(member_did_count * 2 / 3) votes required.
-        // Equivalent to per_did_vote_count * 3 >= member_did_count * 2.
-        if member_did_count == 0
-            || per_did_vote_count * 3 < member_did_count * 2
-        {
+        // Quorum check.
+        if quorum_threshold == 0 || per_did_vote_count < quorum_threshold {
             return Ok(base_outcome);
         }
 
-        // ── 6. Cooldown check (30 minutes since last reset) ───────────────
+        // ── 6. Rate-limit gate (MIN_RESET_GAP_SECS, spec default 3600s) ───
+        // Per Phase 2 design: a single conversation cannot be auto-reset more
+        // often than once per `MIN_RESET_GAP_SECS` (1 hour) regardless of
+        // quorum. Implemented inline at the spec's value — no new env knob
+        // in this stage; admin/test overrides may follow if needed.
         let recent_reset: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM conversations \
              WHERE id = $1 \
              AND last_reset_at IS NOT NULL \
-             AND last_reset_at > NOW() - INTERVAL '30 minutes')",
+             AND last_reset_at > NOW() - INTERVAL '1 hour')",
         )
         .bind(&self.convo_id)
         .fetch_one(&self.db_pool)
@@ -1412,7 +1427,7 @@ impl ConversationActorState {
                 confirmation_tag = NULL, \
                 reset_count = reset_count + 1, \
                 last_reset_at = NOW(), \
-                last_reset_by = 'system:auto_recovery', \
+                last_reset_by = 'system:client_quorum', \
                 updated_at = NOW() \
              WHERE id = $2 \
              RETURNING reset_count",
@@ -1460,7 +1475,7 @@ impl ConversationActorState {
              VALUES ($1, NOW(), $2, $3, $4, $5)",
         )
         .bind(&self.convo_id)
-        .bind("system:auto_recovery")
+        .bind("system:client_quorum")
         .bind(&new_group_id)
         .bind(per_did_vote_count as i32)
         .bind(member_did_count as i32)
@@ -1486,7 +1501,7 @@ impl ConversationActorState {
             convo_id: self.convo_id.clone(),
             new_group_id: new_group_id.clone(),
             reset_generation: reset_count,
-            reset_by: "system:auto_recovery".to_string(),
+            reset_by: "system:client_quorum".to_string(),
             cipher_suite: cipher_suite.unwrap_or_default(),
             reason: Some(
                 "Automatic recovery: quorum of members reported unrecoverable failure"
