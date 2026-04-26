@@ -15,8 +15,8 @@ pub mod group_info;
 pub mod handlers;
 pub mod health;
 pub mod identity;
-// pub mod jobs;  // Temporarily disabled - requires new DB schema
 pub mod jacquard_json;
+pub mod jobs;
 pub mod metrics;
 pub mod middleware;
 pub mod models;

@@ -1,3 +1,4 @@
+pub mod auto_detect_failed_groups;
 pub mod blob_cleanup;
 pub mod compact_cursors;
 pub mod data_compaction;

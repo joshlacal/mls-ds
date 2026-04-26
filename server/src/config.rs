@@ -92,6 +92,117 @@ impl QuorumConfig {
     }
 }
 
+/// Phase 2 (Stage 4) — server-side sweep configuration.
+///
+/// Drives [`crate::jobs::auto_detect_failed_groups::run_failed_group_sweep`].
+/// The sweep periodically scans `conversations` for groups whose commit-health
+/// metrics indicate operational death (high recent 409 count, no successful
+/// commit for an hour, large gap between current_epoch and group_info_epoch)
+/// and dispatches `ConvoMessage::TriggerSystemReset` to the responsible
+/// actor.
+///
+/// All values come from environment variables with the names documented on
+/// each field; missing/invalid values fall back to the defaults set in
+/// [`SweepConfig::default`], which match the spec § "Configuration & Thresholds".
+#[derive(Clone, Debug, PartialEq)]
+pub struct SweepConfig {
+    /// `SWEEP_INTERVAL_SECS` — how often the sweep loop runs (default 300 = 5 min).
+    pub sweep_interval_secs: u64,
+    /// `MAX_ECOMMIT_STALENESS_EPOCHS` — minimum gap between
+    /// `current_epoch` and `group_info_epoch` before a convo is considered
+    /// stale (default 200).
+    pub max_ecommit_staleness_epochs: i64,
+    /// `MIN_QUIET_PERIOD_SECS` — minimum seconds since
+    /// `last_successful_commit_at` (default 3600 = 1 h).
+    pub min_quiet_period_secs: i64,
+    /// `MIN_409_THRESHOLD` — minimum value of `recent_commit_409_count`
+    /// (default 10).
+    pub min_409_threshold: i32,
+    /// `RECENT_409_WINDOW_SECS` — `last_commit_409_at` must be within this
+    /// window for the failure to count as "current" (default 1800 = 30 min).
+    pub recent_409_window_secs: i64,
+    /// `MIN_RESET_GAP_SECS` — refuse to sweep-reset a convo whose
+    /// `last_reset_at` is more recent than this (default 3600 = 1 h).
+    pub min_reset_gap_secs: i64,
+    /// `MODE_A_EXCLUSION_WINDOW_SECS` — if a Mode A (`local_state_loss`)
+    /// reset_vote was recorded for the convo within this window, defer to
+    /// the client-quorum path (default 300 = 5 min).
+    pub mode_a_exclusion_window_secs: i64,
+}
+
+impl Default for SweepConfig {
+    fn default() -> Self {
+        Self {
+            sweep_interval_secs: 300,
+            max_ecommit_staleness_epochs: 200,
+            min_quiet_period_secs: 3600,
+            min_409_threshold: 10,
+            recent_409_window_secs: 1800,
+            min_reset_gap_secs: 3600,
+            mode_a_exclusion_window_secs: 300,
+        }
+    }
+}
+
+impl SweepConfig {
+    /// Read the sweep config from process environment, applying defaults for
+    /// any missing/invalid value. Each variable matches the name documented
+    /// on the corresponding field.
+    pub fn from_env() -> Self {
+        let defaults = Self::default();
+        Self {
+            sweep_interval_secs: parse_env_u64("SWEEP_INTERVAL_SECS", defaults.sweep_interval_secs),
+            max_ecommit_staleness_epochs: parse_env_i64_positive(
+                "MAX_ECOMMIT_STALENESS_EPOCHS",
+                defaults.max_ecommit_staleness_epochs,
+            ),
+            min_quiet_period_secs: parse_env_i64_positive(
+                "MIN_QUIET_PERIOD_SECS",
+                defaults.min_quiet_period_secs,
+            ),
+            min_409_threshold: parse_env_i32_positive(
+                "MIN_409_THRESHOLD",
+                defaults.min_409_threshold,
+            ),
+            recent_409_window_secs: parse_env_i64_positive(
+                "RECENT_409_WINDOW_SECS",
+                defaults.recent_409_window_secs,
+            ),
+            min_reset_gap_secs: parse_env_i64_positive(
+                "MIN_RESET_GAP_SECS",
+                defaults.min_reset_gap_secs,
+            ),
+            mode_a_exclusion_window_secs: parse_env_i64_positive(
+                "MODE_A_EXCLUSION_WINDOW_SECS",
+                defaults.mode_a_exclusion_window_secs,
+            ),
+        }
+    }
+
+    /// Test-only constructor returning the spec defaults verbatim. Lets test
+    /// authors construct a `SweepConfig` without depending on env state.
+    /// Not gated on `cfg(test)` so integration tests in `tests/` can call it.
+    pub fn test_defaults() -> Self {
+        Self::default()
+    }
+}
+
+fn parse_env_i64_positive(name: &str, default: i64) -> i64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
+fn parse_env_i32_positive(name: &str, default: i32) -> i32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
 fn parse_env_f64(name: &str, default: f64) -> f64 {
     std::env::var(name)
         .ok()
