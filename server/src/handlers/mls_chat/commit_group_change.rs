@@ -505,6 +505,16 @@ pub async fn commit_group_change(
                     current_epoch,
                     crate::crypto::redact_for_log(&convo_id)
                 );
+                // Phase 2 (auto-reset): record 409 for sweep-trigger health
+                // counter. Pool-level UPDATE; failure must NEVER mask the
+                // 409 response.
+                if let Err(e) = crate::db::record_commit_409(&pool, &convo_id).await {
+                    warn!(
+                        error = ?e,
+                        convo_id = %crate::crypto::redact_for_log(&convo_id),
+                        "addMembers: failed to record commit 409 (non-fatal)"
+                    );
+                }
                 return Err(conflict_with_epoch(
                     &pool,
                     &convo_id,
@@ -565,6 +575,16 @@ pub async fn commit_group_change(
                     // then fetch authoritative server state for the 409 body.
                     // `conflict_with_epoch` reads on `&pool` (separate conn).
                     drop(tx);
+                    // Phase 2 (auto-reset): record 409 on a separate
+                    // pool-borrowed conn (the failed tx is gone). Failure
+                    // must NEVER mask the 409 response.
+                    if let Err(e) = crate::db::record_commit_409(&pool, &convo_id).await {
+                        warn!(
+                            error = ?e,
+                            convo_id = %crate::crypto::redact_for_log(&convo_id),
+                            "addMembers: failed to record commit 409 (non-fatal)"
+                        );
+                    }
                     return Err(conflict_with_epoch(
                         &pool,
                         &convo_id,
@@ -712,6 +732,17 @@ pub async fn commit_group_change(
                 "addMembers",
             )
             .await;
+
+            // ── Phase 2 (auto-reset): record commit-health success ─────
+            // Bundled into the wrapping tx so atomicity matches the epoch
+            // CAS — if any downstream step rolls back, the health flag does
+            // too.
+            crate::db::mark_commit_success_tx(&mut tx, &convo_id)
+                .await
+                .map_err(|e| {
+                    error!("addMembers: failed to mark commit success: {}", e);
+                    internal_server_error("Failed to mark commit success")
+                })?;
 
             // ── Commit transaction ─────────────────────────────────────
             tx.commit().await.map_err(|e| {
@@ -1148,6 +1179,16 @@ pub async fn commit_group_change(
                     current_epoch,
                     crate::crypto::redact_for_log(&convo_id)
                 );
+                // Phase 2 (auto-reset): record 409 for sweep-trigger health
+                // counter. Pool-level UPDATE; failure must NEVER mask the
+                // 409 response.
+                if let Err(e) = crate::db::record_commit_409(&pool, &convo_id).await {
+                    warn!(
+                        error = ?e,
+                        convo_id = %crate::crypto::redact_for_log(&convo_id),
+                        "externalCommit: failed to record commit 409 (non-fatal)"
+                    );
+                }
                 return Err(conflict_with_epoch(
                     &pool,
                     &convo_id,
@@ -1195,6 +1236,16 @@ pub async fn commit_group_change(
                 None => {
                     warn!("externalCommit: epoch CAS failed (concurrent commit), returning 409");
                     drop(tx);
+                    // Phase 2 (auto-reset): record 409 on a separate
+                    // pool-borrowed conn (the failed tx is gone). Failure
+                    // must NEVER mask the 409 response.
+                    if let Err(e) = crate::db::record_commit_409(&pool, &convo_id).await {
+                        warn!(
+                            error = ?e,
+                            convo_id = %crate::crypto::redact_for_log(&convo_id),
+                            "externalCommit: failed to record commit 409 (non-fatal)"
+                        );
+                    }
                     return Err(conflict_with_epoch(
                         &pool,
                         &convo_id,
@@ -1324,6 +1375,17 @@ pub async fn commit_group_change(
                 "externalCommit",
             )
             .await;
+
+            // ── Phase 2 (auto-reset): record commit-health success ─────
+            // Bundled into the wrapping tx so atomicity matches the epoch
+            // CAS — if any downstream step rolls back, the health flag does
+            // too.
+            crate::db::mark_commit_success_tx(&mut tx, &convo_id)
+                .await
+                .map_err(|e| {
+                    error!("externalCommit: failed to mark commit success: {}", e);
+                    internal_server_error("Failed to mark commit success")
+                })?;
 
             // ── Commit transaction ─────────────────────────────────────
             tx.commit().await.map_err(|e| {
@@ -2023,6 +2085,16 @@ pub async fn commit_group_change(
                     current_epoch,
                     crate::crypto::redact_for_log(&convo_id)
                 );
+                // Phase 2 (auto-reset): record 409 for sweep-trigger health
+                // counter. Pool-level UPDATE; failure must NEVER mask the
+                // 409 response.
+                if let Err(e) = crate::db::record_commit_409(&pool, &convo_id).await {
+                    warn!(
+                        error = ?e,
+                        convo_id = %crate::crypto::redact_for_log(&convo_id),
+                        "removeMember: failed to record commit 409 (non-fatal)"
+                    );
+                }
                 return Err(conflict_with_epoch(
                     &pool,
                     &convo_id,
@@ -2064,6 +2136,16 @@ pub async fn commit_group_change(
                     // Fetch authoritative server state for structured 409
                     // body (task #41).
                     drop(tx);
+                    // Phase 2 (auto-reset): record 409 on a separate
+                    // pool-borrowed conn (the failed tx is gone). Failure
+                    // must NEVER mask the 409 response.
+                    if let Err(e) = crate::db::record_commit_409(&pool, &convo_id).await {
+                        warn!(
+                            error = ?e,
+                            convo_id = %crate::crypto::redact_for_log(&convo_id),
+                            "removeMember: failed to record commit 409 (non-fatal)"
+                        );
+                    }
                     return Err(conflict_with_epoch(
                         &pool,
                         &convo_id,
@@ -2151,6 +2233,17 @@ pub async fn commit_group_change(
                 "removeMember",
             )
             .await;
+
+            // ── Phase 2 (auto-reset): record commit-health success ─────
+            // Bundled into the wrapping tx so atomicity matches the epoch
+            // CAS — if any downstream step rolls back, the health flag does
+            // too.
+            crate::db::mark_commit_success_tx(&mut tx, &convo_id)
+                .await
+                .map_err(|e| {
+                    error!("removeMember: failed to mark commit success: {}", e);
+                    internal_server_error("Failed to mark commit success")
+                })?;
 
             // ── Commit transaction ─────────────────────────────────────
             tx.commit().await.map_err(|e| {
@@ -2372,6 +2465,17 @@ pub async fn commit_group_change(
                     current_epoch,
                     crate::crypto::redact_for_log(&convo_id)
                 );
+                // Phase 2 (auto-reset): record 409 for sweep-trigger health
+                // counter. Pool-level UPDATE; failure must NEVER mask the
+                // 409 response.
+                if let Err(e) = crate::db::record_commit_409(&pool, &convo_id).await {
+                    warn!(
+                        error = ?e,
+                        action = %action_name,
+                        convo_id = %crate::crypto::redact_for_log(&convo_id),
+                        "failed to record commit 409 (non-fatal)"
+                    );
+                }
                 return Err(conflict_with_epoch(
                     &pool,
                     &convo_id,
@@ -2404,6 +2508,17 @@ pub async fn commit_group_change(
                         action_name
                     );
                     drop(tx);
+                    // Phase 2 (auto-reset): record 409 on a separate
+                    // pool-borrowed conn (the failed tx is gone). Failure
+                    // must NEVER mask the 409 response.
+                    if let Err(e) = crate::db::record_commit_409(&pool, &convo_id).await {
+                        warn!(
+                            error = ?e,
+                            action = %action_name,
+                            convo_id = %crate::crypto::redact_for_log(&convo_id),
+                            "failed to record commit 409 (non-fatal)"
+                        );
+                    }
                     return Err(conflict_with_epoch(
                         &pool,
                         &convo_id,
@@ -2475,6 +2590,17 @@ pub async fn commit_group_change(
                 &action_name,
             )
             .await;
+
+            // ── Phase 2 (auto-reset): record commit-health success ─────
+            // Bundled into the wrapping tx so atomicity matches the epoch
+            // CAS — if any downstream step rolls back, the health flag does
+            // too.
+            crate::db::mark_commit_success_tx(&mut tx, &convo_id)
+                .await
+                .map_err(|e| {
+                    error!("{}: failed to mark commit success: {}", action_name, e);
+                    internal_server_error("Failed to mark commit success")
+                })?;
 
             // ── Commit transaction ─────────────────────────────────────
             tx.commit().await.map_err(|e| {

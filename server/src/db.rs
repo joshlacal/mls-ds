@@ -217,6 +217,60 @@ pub async fn try_advance_conversation_epoch_tx(
     Ok(advanced_epoch)
 }
 
+/// Phase 2 (auto-reset): record that a `commitGroupChange` accepted a commit
+/// for this conversation. Bundled into the same transaction as the epoch CAS
+/// so the success-flag and the epoch advance are atomic — if the wrapping tx
+/// rolls back, the health counters do not lie.
+///
+/// Sets `last_successful_commit_at = NOW()` and zeroes
+/// `recent_commit_409_count`. Spec §Schema-Changes / §Server-Side-Changes.
+pub async fn mark_commit_success_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    convo_id: &str,
+) -> Result<()> {
+    sqlx::query(
+        r#"UPDATE conversations
+           SET last_successful_commit_at = NOW(),
+               recent_commit_409_count = 0
+           WHERE id = $1"#,
+    )
+    .bind(convo_id)
+    .execute(&mut **tx)
+    .await
+    .context("Failed to mark commit success on conversation")?;
+
+    Ok(())
+}
+
+/// Phase 2 (auto-reset): record that a `commitGroupChange` returned a 409
+/// (EpochMismatch / CAS-failure / stale wire-epoch) for this conversation.
+/// Bumps `recent_commit_409_count` and refreshes `last_commit_409_at`.
+///
+/// MUST be called on a `&PgPool`, NEVER on the failed transaction — the tx
+/// has already been rolled back by `drop(tx)` (CAS-failure path) or never
+/// opened (stale-wire-epoch path), and we want the counter UPDATE to be
+/// independently committed even though the commit was rejected.
+///
+/// Counter-update failures are non-fatal: the 409 response to the client is
+/// the contract; instrumentation must never mask it. Caller should use
+/// `let _ = ... .map_err(|e| tracing::warn!(...))` semantics — this function
+/// returns `Result` so the caller can choose, but the warn-and-discard
+/// pattern is strongly recommended.
+pub async fn record_commit_409(pool: &DbPool, convo_id: &str) -> Result<()> {
+    sqlx::query(
+        r#"UPDATE conversations
+           SET recent_commit_409_count = recent_commit_409_count + 1,
+               last_commit_409_at = NOW()
+           WHERE id = $1"#,
+    )
+    .bind(convo_id)
+    .execute(pool)
+    .await
+    .context("Failed to record commit 409 on conversation")?;
+
+    Ok(())
+}
+
 /// Get current epoch for a conversation
 pub async fn get_current_epoch(pool: &DbPool, convo_id: &str) -> Result<i32> {
     let epoch =
