@@ -3,6 +3,7 @@ pub mod atproto_bytes;
 pub mod auth;
 pub mod blob_store;
 pub mod block_sync;
+pub mod config;
 pub mod crypto;
 pub mod db;
 pub mod device_utils;
