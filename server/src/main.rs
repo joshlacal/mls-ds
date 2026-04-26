@@ -576,6 +576,7 @@ async fn main() -> anyhow::Result<()> {
     // All endpoints use IntoRouter for type-safe routing from lexicon-generated types.
     use catbird_server::generated::blue_catbird::mlsChat::{
         check_blocks::CheckBlocksRequest, commit_group_change::CommitGroupChangeRequest,
+        bootstrap_reset_group::BootstrapResetGroupRequest,
         create_convo::CreateConvoRequest, delete_blob::DeleteBlobRequest,
         get_blob_usage::GetBlobUsageRequest, get_block_status::GetBlockStatusRequest,
         get_convo_settings::GetConvoSettingsRequest, get_convos::GetConvosRequest,
@@ -618,6 +619,9 @@ async fn main() -> anyhow::Result<()> {
         // Conversations & Messaging
         .merge(CreateConvoRequest::into_router(
             handlers::mls_chat::create_convo,
+        ))
+        .merge(BootstrapResetGroupRequest::into_router(
+            handlers::mls_chat::bootstrap_reset_group::bootstrap_reset_group,
         ))
         .merge(GetConvosRequest::into_router(
             handlers::mls_chat::get_convos,
