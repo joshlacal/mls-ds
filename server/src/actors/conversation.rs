@@ -290,6 +290,15 @@ impl Actor for ConversationActor {
                     .await;
                 let _ = reply.send(result);
             }
+            ConvoMessage::TriggerSystemReset {
+                reason,
+                staleness_epochs,
+                quiet_duration_secs,
+            } => {
+                state
+                    .handle_trigger_system_reset(reason, staleness_epochs, quiet_duration_secs)
+                    .await;
+            }
             ConvoMessage::Shutdown => {
                 info!("ConversationActor shutting down");
                 state.broadcaster_pool.shutdown();
@@ -1365,9 +1374,7 @@ impl ConversationActorState {
                 reset_count: recent_reset_count as i32,
                 tripped_at,
             };
-            if let Err(e) =
-                crate::db::store_event(&self.db_pool, &self.convo_id, &cb_event).await
-            {
+            if let Err(e) = crate::db::store_event(&self.db_pool, &self.convo_id, &cb_event).await {
                 error!("[actor:record_reset_vote] store cb event: {:?}", e);
             }
             if let Err(e) = self.sse_state.emit(&self.convo_id, cb_event).await {
@@ -1380,38 +1387,231 @@ impl ConversationActorState {
             });
         }
 
-        // ── 8. Execute auto-reset ─────────────────────────────────────────
-        //
-        // ⚠ TRUSTED-DS V0 IMPLEMENTATION ⚠
-        //
-        // This path swaps `group_id` and emits `GroupResetEvent` based purely
-        // on quorum + cooldown + circuit-breaker checks. There is no
-        // bootstrapper-candidate set, no `ResetContinuation` proof, and no
-        // verification that joining clients are routed into the legitimate
-        // continuation group rather than a DS-fabricated one. See ADR-008
-        // (`docs/program/decisions/ADR-008-auto-reset-protocol-binding.md`)
-        // §D2 (continuation proof) and §D3 (two-phase prepare/bootstrap/
-        // finalize) for what this needs to grow before it can be safely
-        // enabled outside a deployment where the DS is fully trusted by
-        // every client (Catbird's current single-DS posture).
-        //
-        // DO NOT enable this code path for federation, self-hosted DS,
-        // multi-DS routing, or any deployment where clients can't assume the
-        // DS is honest about quorum decisions. The cryptographic boundary
-        // from RFC 9750 §5.2 holds (DS can't read group plaintext) but the
-        // *membership* boundary of the post-reset group is whatever the DS
-        // routes clients into — that's what D2/D3 close.
-        let new_group_id =
-            format!("{:032x}", uuid::Uuid::new_v4().as_u128());
+        // ── 8. Execute auto-reset via the shared helper ───────────────────
+        let reset_outcome = self
+            .do_reset_group(
+                "system:client_quorum",
+                "Automatic recovery: quorum of members reported unrecoverable failure",
+                None,
+                None,
+            )
+            .await?;
+        let (new_group_id, reset_count) = match reset_outcome {
+            Some(v) => v,
+            None => {
+                return Ok(RecordResetVoteOutcome {
+                    reason: Some("convo_not_found".to_string()),
+                    ..base_outcome
+                });
+            }
+        };
+
+        // Quorum-path-specific structured log retains the
+        // `triggering_voter_count` field for operator correlation.
+        let rolling_24h_reset_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM auto_reset_history \
+             WHERE convo_id = $1 \
+             AND reset_triggered_at > NOW() - INTERVAL '24 hours'",
+        )
+        .bind(&self.convo_id)
+        .fetch_one(&self.db_pool)
+        .await
+        .unwrap_or(0);
+        info!(
+            convo_id = %crate::crypto::redact_for_log(&self.convo_id),
+            new_group_id = %crate::crypto::redact_for_log(&new_group_id),
+            reset_generation = reset_count,
+            member_count = member_did_count,
+            triggering_voter_count = per_did_vote_count,
+            rolling_24h_reset_count,
+            "A7 auto-reset fired"
+        );
+        info!(
+            convo = %crate::crypto::redact_for_log(&self.convo_id),
+            new_group_id = %crate::crypto::redact_for_log(&new_group_id),
+            reset_count,
+            per_did_vote_count,
+            member_did_count,
+            "[actor:record_reset_vote] auto-reset complete"
+        );
+
+        // Augment auto_reset_history with the vote/member counts (the helper
+        // wrote 0/0 placeholders since it has no quorum-specific knowledge).
+        if let Err(e) = sqlx::query(
+            "UPDATE auto_reset_history \
+             SET vote_count = $1, member_count = $2 \
+             WHERE id = ( \
+                 SELECT id FROM auto_reset_history \
+                 WHERE convo_id = $3 \
+                 ORDER BY id DESC LIMIT 1 \
+             )",
+        )
+        .bind(per_did_vote_count as i32)
+        .bind(member_did_count as i32)
+        .bind(&self.convo_id)
+        .execute(&self.db_pool)
+        .await
+        {
+            error!(
+                "[actor:record_reset_vote] failed to backfill vote/member counts: {}",
+                e
+            );
+        }
+
+        Ok(RecordResetVoteOutcome {
+            recorded: true,
+            reason: None,
+            per_did_vote_count,
+            member_did_count,
+            auto_reset_triggered: true,
+            new_group_id: Some(new_group_id),
+            reset_count: Some(reset_count),
+        })
+    }
+
+    /// Server-sweep handler (Phase 2 §"Detection Design → Path B").
+    ///
+    /// Bypasses quorum because the sweep query has objectively observed the
+    /// group is dead. Still respects the per-conversation circuit breaker
+    /// (`auto_reset_disabled_at`) and the 1h reset rate limit (`last_reset_at`).
+    async fn handle_trigger_system_reset(
+        &mut self,
+        reason: String,
+        staleness_epochs: i64,
+        quiet_duration_secs: i64,
+    ) {
+        let convo_id = self.convo_id.clone();
+        info!(
+            convo_id = %crate::crypto::redact_for_log(&convo_id),
+            reason = %reason,
+            staleness_epochs,
+            quiet_duration_secs,
+            "system-triggered reset fired"
+        );
+
+        // Cooldown gate (defense in depth — sweep query also filters).
+        let recent_reset: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM conversations \
+             WHERE id = $1 \
+             AND last_reset_at IS NOT NULL \
+             AND last_reset_at > NOW() - INTERVAL '1 hour')",
+        )
+        .bind(&convo_id)
+        .fetch_one(&self.db_pool)
+        .await
+        .unwrap_or(false);
+        if recent_reset {
+            warn!(
+                convo_id = %crate::crypto::redact_for_log(&convo_id),
+                "[actor:trigger_system_reset] cooldown active — skipping"
+            );
+            return;
+        }
+
+        // Circuit breaker gate.
+        let disabled: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM conversations \
+             WHERE id = $1 AND auto_reset_disabled_at IS NOT NULL)",
+        )
+        .bind(&convo_id)
+        .fetch_one(&self.db_pool)
+        .await
+        .unwrap_or(false);
+        if disabled {
+            warn!(
+                convo_id = %crate::crypto::redact_for_log(&convo_id),
+                "[actor:trigger_system_reset] auto_reset_disabled_at set — skipping"
+            );
+            return;
+        }
+
+        let last_reset_by = format!("system:{}", reason);
+        let event_reason = format!(
+            "Automatic recovery: server sweep observed staleness ({} epochs, {} s quiet)",
+            staleness_epochs, quiet_duration_secs
+        );
+
+        match self
+            .do_reset_group(
+                &last_reset_by,
+                &event_reason,
+                Some(staleness_epochs),
+                Some(quiet_duration_secs),
+            )
+            .await
+        {
+            Ok(Some((new_group_id, reset_count))) => {
+                let rolling_24h_reset_count: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM auto_reset_history \
+                     WHERE convo_id = $1 \
+                     AND reset_triggered_at > NOW() - INTERVAL '24 hours'",
+                )
+                .bind(&convo_id)
+                .fetch_one(&self.db_pool)
+                .await
+                .unwrap_or(0);
+                info!(
+                    convo_id = %crate::crypto::redact_for_log(&convo_id),
+                    new_group_id = %crate::crypto::redact_for_log(&new_group_id),
+                    reset_generation = reset_count,
+                    last_reset_by = %last_reset_by,
+                    staleness_epochs,
+                    quiet_duration_secs,
+                    rolling_24h_reset_count,
+                    "system-reset complete"
+                );
+            }
+            Ok(None) => {
+                warn!(
+                    convo_id = %crate::crypto::redact_for_log(&convo_id),
+                    "[actor:trigger_system_reset] convo_not_found"
+                );
+            }
+            Err(e) => {
+                error!(
+                    convo_id = %crate::crypto::redact_for_log(&convo_id),
+                    error = %e,
+                    "[actor:trigger_system_reset] reset failed"
+                );
+            }
+        }
+    }
+
+    /// Shared reset-execution helper. Used by BOTH the quorum path
+    /// (`handle_record_reset_vote`) and the server-sweep path
+    /// (`handle_trigger_system_reset`).
+    ///
+    /// Performs the atomic group_id rotation, clears welcome/pending/vote rows,
+    /// inserts an `auto_reset_history` row, commits, then emits the
+    /// `GroupResetEvent` (SSE + persisted). Caller is responsible for any
+    /// path-specific structured logging beyond what `do_reset_group` emits.
+    ///
+    /// ⚠ TRUSTED-DS V0 IMPLEMENTATION ⚠
+    /// See ADR-008 §D2 / §D3 for the bootstrapper-candidate / continuation-
+    /// proof work that this needs before it's safe under federation or
+    /// multi-DS routing.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Some((new_group_id, reset_count)))` on success.
+    /// - `Ok(None)` if the conversations row vanished mid-flight.
+    /// - `Err(_)` on database error.
+    async fn do_reset_group(
+        &mut self,
+        last_reset_by: &str,
+        event_reason: &str,
+        _staleness_epochs: Option<i64>,
+        _quiet_duration_secs: Option<i64>,
+    ) -> anyhow::Result<Option<(String, i32)>> {
+        use anyhow::Context;
+
+        let new_group_id = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
         let mut tx = self
             .db_pool
             .begin()
             .await
             .context("begin reset tx failed")?;
 
-        // Capture the current cipher_suite so the SSE GroupResetEvent can carry
-        // it forward — the prior handler emitted an empty string, which forced
-        // clients to special-case the auto-reset variant (audit Q2).
         let cipher_suite: Option<String> =
             sqlx::query_scalar("SELECT cipher_suite FROM conversations WHERE id = $1")
                 .bind(&self.convo_id)
@@ -1427,13 +1627,14 @@ impl ConversationActorState {
                 confirmation_tag = NULL, \
                 reset_count = reset_count + 1, \
                 last_reset_at = NOW(), \
-                last_reset_by = 'system:client_quorum', \
+                last_reset_by = $3, \
                 updated_at = NOW() \
              WHERE id = $2 \
              RETURNING reset_count",
         )
         .bind(&new_group_id)
         .bind(&self.convo_id)
+        .bind(last_reset_by)
         .fetch_optional(&mut *tx)
         .await
         .context("update conversations failed")?;
@@ -1442,10 +1643,7 @@ impl ConversationActorState {
             Some(rc) => rc,
             None => {
                 tx.rollback().await.ok();
-                return Ok(RecordResetVoteOutcome {
-                    reason: Some("convo_not_found".to_string()),
-                    ..base_outcome
-                });
+                return Ok(None);
             }
         };
 
@@ -1459,9 +1657,6 @@ impl ConversationActorState {
             .execute(&mut *tx)
             .await
             .context("delete pending_device_additions failed")?;
-        // Clear the per-DID votes so the group starts with a clean slate after
-        // reset. The legacy `recovery_failures` table is dropped by migration
-        // 20260418_001 (see ADR-002 §D6), so no DELETE is needed for it.
         sqlx::query("DELETE FROM reset_votes WHERE convo_id = $1")
             .bind(&self.convo_id)
             .execute(&mut *tx)
@@ -1475,10 +1670,10 @@ impl ConversationActorState {
              VALUES ($1, NOW(), $2, $3, $4, $5)",
         )
         .bind(&self.convo_id)
-        .bind("system:client_quorum")
+        .bind(last_reset_by)
         .bind(&new_group_id)
-        .bind(per_did_vote_count as i32)
-        .bind(member_did_count as i32)
+        .bind(0_i32)
+        .bind(0_i32)
         .execute(&mut *tx)
         .await
         .context("insert auto_reset_history failed")?;
@@ -1501,71 +1696,26 @@ impl ConversationActorState {
             convo_id: self.convo_id.clone(),
             new_group_id: new_group_id.clone(),
             reset_generation: reset_count,
-            reset_by: "system:client_quorum".to_string(),
+            reset_by: last_reset_by.to_string(),
             cipher_suite: cipher_suite.unwrap_or_default(),
-            reason: Some(
-                "Automatic recovery: quorum of members reported unrecoverable failure"
-                    .to_string(),
-            ),
+            reason: Some(event_reason.to_string()),
         };
         if let Err(e) = crate::db::store_event(&self.db_pool, &self.convo_id, &event).await {
-            error!("[actor:record_reset_vote] store GroupResetEvent: {:?}", e);
+            error!("[actor:do_reset_group] store GroupResetEvent: {:?}", e);
         }
         if let Err(e) = self.sse_state.emit(&self.convo_id, event).await {
-            error!("[actor:record_reset_vote] SSE emit GroupReset: {}", e);
+            error!("[actor:do_reset_group] SSE emit GroupReset: {}", e);
         }
 
-        // Rolling 24h count for the structured "A7 auto-reset fired" log so
-        // operators can correlate firings with the circuit-breaker trip
-        // threshold (3 in 24h latches the breaker).
-        let rolling_24h_reset_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM auto_reset_history \
-             WHERE convo_id = $1 \
-             AND reset_triggered_at > NOW() - INTERVAL '24 hours'",
-        )
-        .bind(&self.convo_id)
-        .fetch_one(&self.db_pool)
-        .await
-        .unwrap_or(0);
-
-        info!(
-            convo_id = %crate::crypto::redact_for_log(&self.convo_id),
-            new_group_id = %crate::crypto::redact_for_log(&new_group_id),
-            reset_generation = reset_count,
-            member_count = member_did_count,
-            triggering_voter_count = per_did_vote_count,
-            rolling_24h_reset_count,
-            "A7 auto-reset fired"
-        );
-
         // Spec invariant: post-reset rows must have group_info=NULL until a
-        // bootstrapResetGroup call populates it. This log lets operators catch
-        // any regression where the reset transaction accidentally writes a
-        // non-null group_info.
+        // bootstrapResetGroup call populates it.
         info!(
             convo_id = %crate::crypto::redact_for_log(&self.convo_id),
             group_info_present = false,
             "A7 post-reset state"
         );
 
-        info!(
-            convo = %crate::crypto::redact_for_log(&self.convo_id),
-            new_group_id = %crate::crypto::redact_for_log(&new_group_id),
-            reset_count,
-            per_did_vote_count,
-            member_did_count,
-            "[actor:record_reset_vote] auto-reset complete"
-        );
-
-        Ok(RecordResetVoteOutcome {
-            recorded: true,
-            reason: None,
-            per_did_vote_count,
-            member_did_count,
-            auto_reset_triggered: true,
-            new_group_id: Some(new_group_id),
-            reset_count: Some(reset_count),
-        })
+        Ok(Some((new_group_id, reset_count)))
     }
 }
 

@@ -167,6 +167,31 @@ pub enum ConvoMessage {
         reply: oneshot::Sender<Result<RecordResetVoteOutcome>>,
     },
 
+    /// Server-observed sweep trigger (Phase 2 §"Detection Design → Path B").
+    ///
+    /// Dispatched by the `auto_detect_failed_groups` sweep worker when a
+    /// conversation matches all server-side staleness conditions (high
+    /// recent_commit_409_count, stale last_successful_commit_at, large
+    /// gap between current_epoch and group_info_epoch, no Mode A reports
+    /// in the exclusion window). Bypasses quorum because the server has
+    /// objectively observed the group is dead, but still respects the
+    /// per-conversation circuit breaker (`auto_reset_disabled_at`) and
+    /// rate limit (`MIN_RESET_GAP_SECS`).
+    ///
+    /// # Fields
+    ///
+    /// - `reason`: Trigger source label (e.g. `"server_sweep"`). Combined with
+    ///   `"system:"` prefix to form `last_reset_by`.
+    /// - `staleness_epochs`: Observed delta between `current_epoch` and
+    ///   `group_info_epoch` at sweep time, for telemetry.
+    /// - `quiet_duration_secs`: Observed seconds since `last_successful_commit_at`,
+    ///   for telemetry.
+    TriggerSystemReset {
+        reason: String,
+        staleness_epochs: i64,
+        quiet_duration_secs: i64,
+    },
+
     /// Signals the actor to shut down gracefully.
     ///
     /// The actor will complete any in-flight operations before stopping.
