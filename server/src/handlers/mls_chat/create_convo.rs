@@ -268,18 +268,41 @@ async fn handle_create_convo(
         (None, None)
     };
 
-    // ── Idempotency check (group_id is the primary key) ──────────────────
-    // Check if conversation already exists with this group_id
-    let existing: Option<String> = sqlx::query_scalar("SELECT id FROM conversations WHERE id = $1")
-        .bind(&convo_id)
-        .fetch_optional(&pool)
-        .await
-        .map_err(|e| {
-            error!("❌ [v2.createConvo] idempotency check: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        })?;
+    // ── Idempotency / first-responder race check ────────────────────────
+    // Fetch the existing creator (if any) so we can distinguish:
+    //   - same caller → legitimate retry within the idempotency window (200)
+    //   - different caller → first-responder race loss; the winner already
+    //     bound this groupId to their conversation. Returning 200 here would
+    //     silently desync MLS state. Return 409 ConvoAlreadyExists so the
+    //     loser knows to fall back to receiving the Welcome.
+    let existing_creator_did: Option<String> = sqlx::query_scalar(
+        "SELECT creator_did FROM conversations WHERE id = $1",
+    )
+    .bind(&convo_id)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|e| {
+        error!("❌ [v2.createConvo] idempotency check: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+    })?;
 
-    if existing.is_some() {
+    if let Some(ref existing_creator) = existing_creator_did {
+        if existing_creator != &auth_user.did {
+            warn!(
+                convo = %crate::crypto::redact_for_log(&convo_id),
+                caller = %crate::crypto::redact_for_log(&auth_user.did),
+                existing_creator = %crate::crypto::redact_for_log(existing_creator),
+                "[v2.createConvo] race-loss: convo already exists, created by different DID"
+            );
+            return Err((
+                StatusCode::CONFLICT,
+                Json(LexCreateConvoError::ConvoAlreadyExists(Some(
+                    "Conversation already exists at this groupId, created by a different DID".into(),
+                ))),
+            )
+                .into_response());
+        }
+
         tracing::debug!("📍 [v2.createConvo] Idempotency: returning existing conversation");
 
         // Fetch existing members
