@@ -108,6 +108,12 @@ pub async fn handle(
 
     if !is_member {
         warn!("[bootstrapResetGroup] caller is not a member");
+        info!(
+            convo_id = %crate::crypto::redact_for_log(&original_convo_id),
+            new_group_id = %crate::crypto::redact_for_log(&new_group_id),
+            caller_did = %crate::crypto::redact_for_log(&caller_did),
+            "bootstrap_403_not_member"
+        );
         return Err((
             StatusCode::FORBIDDEN,
             Json(LexBootstrapResetGroupError::NotMember(Some(
@@ -147,6 +153,12 @@ pub async fn handle(
             warn!(
                 "[bootstrapResetGroup] target row not found (originalConvoId, newGroupId mismatch)"
             );
+            info!(
+                convo_id = %crate::crypto::redact_for_log(&original_convo_id),
+                new_group_id = %crate::crypto::redact_for_log(&new_group_id),
+                caller_did = %crate::crypto::redact_for_log(&caller_did),
+                "bootstrap_404_not_found"
+            );
             return Err((
                 StatusCode::NOT_FOUND,
                 Json(LexBootstrapResetGroupError::BootstrapTargetNotFound(Some(
@@ -161,6 +173,12 @@ pub async fn handle(
         tx.rollback().await.ok();
         warn!(
             "[bootstrapResetGroup] race-loss: group_info already populated by another caller"
+        );
+        info!(
+            convo_id = %crate::crypto::redact_for_log(&original_convo_id),
+            new_group_id = %crate::crypto::redact_for_log(&new_group_id),
+            caller_did = %crate::crypto::redact_for_log(&caller_did),
+            "bootstrap_409_already_bootstrapped"
         );
         return Err((
             StatusCode::CONFLICT,
@@ -393,6 +411,24 @@ pub async fn handle(
         description: None,
         extra_data: Default::default(),
     });
+
+    let welcome_count = if input.welcome_message.is_some() {
+        input
+            .key_package_hashes
+            .as_ref()
+            .map(|h| h.len())
+            .unwrap_or(members_typed.len())
+    } else {
+        0
+    };
+    info!(
+        convo_id = %crate::crypto::redact_for_log(&original_convo_id),
+        new_group_id = %crate::crypto::redact_for_log(&new_group_id),
+        caller_did = %crate::crypto::redact_for_log(&caller_did),
+        welcome_count,
+        member_count = members_typed.len(),
+        "bootstrap_succeeded"
+    );
 
     info!(
         convo = %crate::crypto::redact_for_log(&original_convo_id),

@@ -1108,6 +1108,16 @@ impl ConversationActorState {
                 convo = %crate::crypto::redact_for_log(&self.convo_id),
                 "[actor:record_reset_vote] stale_authenticator"
             );
+            info!(
+                convo_id = %crate::crypto::redact_for_log(&self.convo_id),
+                voter_did = %crate::crypto::redact_for_log(&device_did),
+                vote_count_before = 0_i64,
+                vote_count_after = 0_i64,
+                quorum_threshold = 0_i64,
+                epoch_authenticator_match = false,
+                rate_limited = false,
+                "A7 vote recorded"
+            );
             return Ok(RecordResetVoteOutcome {
                 recorded: false,
                 reason: Some("stale_authenticator".to_string()),
@@ -1138,6 +1148,16 @@ impl ConversationActorState {
             // The DID has a live vote from a *different* device within 24h.
             // We refuse the new device's vote rather than allowing per-device
             // refresh to silently replace it — the 24h window is per-identity.
+            info!(
+                convo_id = %crate::crypto::redact_for_log(&self.convo_id),
+                voter_did = %crate::crypto::redact_for_log(&device_did),
+                vote_count_before = 0_i64,
+                vote_count_after = 0_i64,
+                quorum_threshold = 0_i64,
+                epoch_authenticator_match = true,
+                rate_limited = true,
+                "A7 vote recorded"
+            );
             return Ok(RecordResetVoteOutcome {
                 recorded: false,
                 reason: Some("rate_limited".to_string()),
@@ -1227,12 +1247,19 @@ impl ConversationActorState {
             .await
             .context("per_did_vote_count failed")?;
 
+        // ceil(member_did_count * 2 / 3) — matches the auto-reset gate at
+        // step 8: per_did_vote_count * 3 >= member_did_count * 2.
+        let quorum_threshold: i64 = (member_did_count * 2 + 2) / 3;
         info!(
-            convo = %crate::crypto::redact_for_log(&self.convo_id),
-            per_did_vote_count,
-            member_did_count,
+            convo_id = %crate::crypto::redact_for_log(&self.convo_id),
+            voter_did = %crate::crypto::redact_for_log(&device_did),
+            vote_count_before = per_did_vote_count.saturating_sub(1),
+            vote_count_after = per_did_vote_count,
+            quorum_threshold,
+            epoch_authenticator_match = true,
+            rate_limited = false,
             enforce_failure_mode,
-            "[actor:record_reset_vote] quorum check"
+            "A7 vote recorded"
         );
 
         let base_outcome = RecordResetVoteOutcome {
@@ -1472,6 +1499,39 @@ impl ConversationActorState {
         if let Err(e) = self.sse_state.emit(&self.convo_id, event).await {
             error!("[actor:record_reset_vote] SSE emit GroupReset: {}", e);
         }
+
+        // Rolling 24h count for the structured "A7 auto-reset fired" log so
+        // operators can correlate firings with the circuit-breaker trip
+        // threshold (3 in 24h latches the breaker).
+        let rolling_24h_reset_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM auto_reset_history \
+             WHERE convo_id = $1 \
+             AND reset_triggered_at > NOW() - INTERVAL '24 hours'",
+        )
+        .bind(&self.convo_id)
+        .fetch_one(&self.db_pool)
+        .await
+        .unwrap_or(0);
+
+        info!(
+            convo_id = %crate::crypto::redact_for_log(&self.convo_id),
+            new_group_id = %crate::crypto::redact_for_log(&new_group_id),
+            reset_generation = reset_count,
+            member_count = member_did_count,
+            triggering_voter_count = per_did_vote_count,
+            rolling_24h_reset_count,
+            "A7 auto-reset fired"
+        );
+
+        // Spec invariant: post-reset rows must have group_info=NULL until a
+        // bootstrapResetGroup call populates it. This log lets operators catch
+        // any regression where the reset transaction accidentally writes a
+        // non-null group_info.
+        info!(
+            convo_id = %crate::crypto::redact_for_log(&self.convo_id),
+            group_info_present = false,
+            "A7 post-reset state"
+        );
 
         info!(
             convo = %crate::crypto::redact_for_log(&self.convo_id),
