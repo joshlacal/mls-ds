@@ -510,14 +510,27 @@ mod conversation_tests {
                 identity_did: identity_did.to_string(),
                 epoch_authenticator: auth.to_string(),
                 failure_type: "external_commit_exhausted".to_string(),
-                // ADR-008 D1: tests pre-date the field; leaving as None
-                // exercises the interim-grace path (counts toward quorum
-                // when ENFORCE_FAILURE_MODE_QUORUM is unset/false).
-                failure_mode: None,
+                // ADR-008 D1 / Phase 2: defaults flipped to
+                // `enforce_failure_mode = true`, so every vote in these
+                // tests carries Mode B (`group_state_unrecoverable`) so
+                // it actually counts toward quorum. The dedicated Mode A
+                // exclusion test lives in
+                // `tests/quorum_reset_threshold.rs` (Stage 2 Task 4).
+                failure_mode: Some("group_state_unrecoverable".to_string()),
                 reply: tx,
             })
             .expect("send vote");
         rx.await.expect("rx vote").expect("outcome ok")
+    }
+
+    /// Legacy A7 tests pre-date Phase 2's `dm = 1` threshold. For DM-shaped
+    /// fixtures they expect TWO votes to trigger reset. Use this helper to
+    /// keep the test's intent without bending production defaults.
+    fn legacy_a7_quorum_config() -> crate::config::QuorumConfig {
+        crate::config::QuorumConfig {
+            dm: 2,
+            ..crate::config::QuorumConfig::default()
+        }
     }
 
     #[tokio::test]
@@ -698,7 +711,11 @@ mod conversation_tests {
             notification_service: None,
             convo_id: convo_id.to_string(),
             db_pool: pool.clone(),
-            quorum_config: crate::config::QuorumConfig::default(),
+            // 2-member fixture: under Phase 2 default `dm = 1` the first
+            // vote would already meet quorum and the breaker would never
+            // see a second one. Override `dm` so the test still reaches
+            // the 2-vote shape it was written against.
+            quorum_config: legacy_a7_quorum_config(),
         };
         let (actor, _h) = Actor::spawn(None, ConversationActor, args)
             .await
@@ -745,12 +762,15 @@ mod conversation_tests {
         .await;
         // Pre-seed all 3 of alice's devices as having voted (can't go through
         // handler because per-identity rate limit would block devices 2 & 3).
+        // ADR-008 D1 / Phase 2: include `failure_mode` so the rows count
+        // toward quorum under the now-default `enforce_failure_mode = true`.
         for dev in &["d1", "d2", "d3"] {
             sqlx::query(
                 "INSERT INTO reset_votes \
                     (convo_id, device_did, identity_did, epoch_authenticator, \
-                     failure_type, voted_at, expires_at) \
+                     failure_type, failure_mode, voted_at, expires_at) \
                  VALUES ($1, $2, 'did:plc:alice', $3, 'external_commit_exhausted', \
+                         'group_state_unrecoverable', \
                          NOW(), NOW() + INTERVAL '24 hours')",
             )
             .bind(convo_id)
@@ -807,12 +827,15 @@ mod conversation_tests {
         )
         .await;
         // Only 2 of alice's 3 devices voted (d1, d2).
+        // ADR-008 D1 / Phase 2: include `failure_mode` so the rows count
+        // toward quorum under the now-default `enforce_failure_mode = true`.
         for dev in &["d1", "d2"] {
             sqlx::query(
                 "INSERT INTO reset_votes \
                     (convo_id, device_did, identity_did, epoch_authenticator, \
-                     failure_type, voted_at, expires_at) \
+                     failure_type, failure_mode, voted_at, expires_at) \
                  VALUES ($1, $2, 'did:plc:alice', $3, 'external_commit_exhausted', \
+                         'group_state_unrecoverable', \
                          NOW(), NOW() + INTERVAL '24 hours')",
             )
             .bind(convo_id)
@@ -828,7 +851,12 @@ mod conversation_tests {
             notification_service: None,
             convo_id: convo_id.to_string(),
             db_pool: pool.clone(),
-            quorum_config: crate::config::QuorumConfig::default(),
+            // 2-identity (DM) fixture with intentional partial-lockout
+            // semantics — under Phase 2 default `dm = 1`, bob's single
+            // vote would already meet quorum and the assertion
+            // `!auto_reset_triggered` would fail. Override `dm` so the
+            // legacy 2-vote shape still applies.
+            quorum_config: legacy_a7_quorum_config(),
         };
         let (actor, _h) = Actor::spawn(None, ConversationActor, args)
             .await

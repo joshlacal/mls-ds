@@ -38,9 +38,10 @@ pub struct ReportRecoveryFailureRequest {
     /// client should self-heal via §6.6 / §8.4 instead of triggering a
     /// global reset. Plumbed through to `ConvoMessage::RecordResetVote`
     /// and persisted in `reset_votes.failure_mode`. Quorum filtering by
-    /// mode is gated by the `ENFORCE_FAILURE_MODE_QUORUM` env var (default
-    /// `false` during interim deployment so older clients without the
-    /// field aren't silenced; flip to `true` once D1 ships everywhere).
+    /// mode is gated by the `ENFORCE_FAILURE_MODE_QUORUM` env var (Phase 2
+    /// default `true` — see `crate::config::QuorumConfig`). Operators can
+    /// flip back to `false` for an interim deployment where some clients
+    /// haven't yet shipped D1 if needed.
     pub failure_mode: Option<String>,
 }
 
