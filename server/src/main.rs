@@ -12,7 +12,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 // Import from library crate instead of re-declaring modules
 use catbird_server::{
-    actors, auth, blob_store, block_sync, crypto, db, fanout, federation, handlers, health,
+    actors, auth, blob_store, block_sync, config, crypto, db, fanout, federation, handlers, health,
     metrics, middleware, models, realtime, storage, util,
 };
 
@@ -199,6 +199,25 @@ async fn main() -> anyhow::Result<()> {
         notification_service.clone(),
     ));
     tracing::info!("Actor registry initialized");
+
+    // Phase 2 (Stage 4) — server-side sweep that auto-resets operationally
+    // dead conversations even when no client is online to vote (Path B).
+    // Cooldown + circuit-breaker gates are enforced both in the sweep query
+    // and inside the actor's `TriggerSystemReset` handler (defense in depth).
+    {
+        let sweep_cfg = config::SweepConfig::from_env();
+        let sweep_pool = db_pool.clone();
+        let sweep_registry = actor_registry.clone();
+        tokio::spawn(async move {
+            jobs::auto_detect_failed_groups::run_failed_group_sweep(
+                sweep_pool,
+                sweep_registry,
+                sweep_cfg,
+            )
+            .await;
+        });
+        tracing::info!("spawned auto_detect_failed_groups sweep worker");
+    }
 
     // Spawn idempotency cache cleanup worker
     let cleanup_pool = db_pool.clone();
@@ -575,12 +594,11 @@ async fn main() -> anyhow::Result<()> {
     // mlsChat consolidated endpoints (PDSS federation prep)
     // All endpoints use IntoRouter for type-safe routing from lexicon-generated types.
     use catbird_server::generated::blue_catbird::mlsChat::{
-        check_blocks::CheckBlocksRequest, commit_group_change::CommitGroupChangeRequest,
-        bootstrap_reset_group::BootstrapResetGroupRequest,
-        create_convo::CreateConvoRequest, delete_blob::DeleteBlobRequest,
-        get_blob_usage::GetBlobUsageRequest, get_block_status::GetBlockStatusRequest,
-        get_convo_settings::GetConvoSettingsRequest, get_convos::GetConvosRequest,
-        get_group_state::GetGroupStateRequest,
+        bootstrap_reset_group::BootstrapResetGroupRequest, check_blocks::CheckBlocksRequest,
+        commit_group_change::CommitGroupChangeRequest, create_convo::CreateConvoRequest,
+        delete_blob::DeleteBlobRequest, get_blob_usage::GetBlobUsageRequest,
+        get_block_status::GetBlockStatusRequest, get_convo_settings::GetConvoSettingsRequest,
+        get_convos::GetConvosRequest, get_group_state::GetGroupStateRequest,
         get_key_package_status::GetKeyPackageStatusRequest,
         get_key_packages::GetKeyPackagesRequest, get_messages::GetMessagesRequest,
         get_pending_devices::GetPendingDevicesRequest,
