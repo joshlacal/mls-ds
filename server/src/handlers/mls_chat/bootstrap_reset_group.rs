@@ -343,15 +343,20 @@ pub async fn handle(
     // ── Build the response ConvoView from the now-bootstrapped row ──────
     // Read post-commit so the view reflects the persisted state, including
     // anything other transactions wrote concurrently to non-locked columns.
+    //
+    // NOTE: `conversations` has no `last_message_at` column (only `created_at`
+    // / `updated_at`); compute it from the messages table instead so the
+    // response sorts correctly. Earlier code SELECTed a phantom column and
+    // 500'd post-commit, causing iOS to treat the actual successful bootstrap
+    // as a failure.
     let row: (
-        String,                // creator_did
-        Option<String>,        // name
-        String,                // cipher_suite_persisted
-        DateTime<Utc>,         // created_at
-        Option<DateTime<Utc>>, // last_message_at
-        Option<i32>,           // reset_count
+        String,         // creator_did
+        Option<String>, // name
+        String,         // cipher_suite_persisted
+        DateTime<Utc>,  // created_at
+        i32,            // reset_count (NOT NULL DEFAULT 0)
     ) = sqlx::query_as(
-        "SELECT creator_did, name, cipher_suite, created_at, last_message_at, reset_count \
+        "SELECT creator_did, name, cipher_suite, created_at, reset_count \
          FROM conversations WHERE id = $1",
     )
     .bind(&original_convo_id)
@@ -362,14 +367,17 @@ pub async fn handle(
         StatusCode::INTERNAL_SERVER_ERROR.into_response()
     })?;
 
-    let (
-        creator_did_persisted,
-        name,
-        cipher_suite_persisted,
-        created_at,
-        last_message_at,
-        reset_count,
-    ) = row;
+    let last_message_at: Option<DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT MAX(created_at) FROM messages WHERE convo_id = $1",
+    )
+    .bind(&original_convo_id)
+    .fetch_optional(&pool)
+    .await
+    .ok()
+    .flatten()
+    .flatten();
+
+    let (creator_did_persisted, name, cipher_suite_persisted, created_at, reset_count) = row;
 
     let member_rows: Vec<(
         String,
@@ -456,7 +464,7 @@ pub async fn handle(
             last_message_at: last_message_at.map(chrono_to_datetime),
             metadata,
             confirmation_tag: None,
-            reset_generation: reset_count.map(|c| c as i64),
+            reset_generation: Some(reset_count as i64),
             extra_data: Default::default(),
         },
         extra_data: Default::default(),
