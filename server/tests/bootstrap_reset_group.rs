@@ -291,10 +291,11 @@ async fn bootstrap_handle_updates_row_and_returns_view() {
     );
 
     // Inspect the persisted row directly to confirm UPDATE side effects.
+    // current_epoch is INT4 in the schema — must decode as i32 to satisfy sqlx.
     let (group_info_persisted, group_info_epoch, current_epoch_persisted, cipher_suite_persisted): (
         Option<Vec<u8>>,
         Option<i32>,
-        i64,
+        i32,
         Option<String>,
     ) = sqlx::query_as(
         "SELECT group_info, group_info_epoch, current_epoch, cipher_suite FROM conversations WHERE id = $1",
