@@ -222,8 +222,15 @@ pub async fn try_advance_conversation_epoch_tx(
 /// so the success-flag and the epoch advance are atomic — if the wrapping tx
 /// rolls back, the health counters do not lie.
 ///
-/// Sets `last_successful_commit_at = NOW()` and zeroes
-/// `recent_commit_409_count`. Spec §Schema-Changes / §Server-Side-Changes.
+/// Sets `last_successful_commit_at = NOW()` and zeroes BOTH health
+/// counters: `recent_commit_409_count` (Phase 2 B5) AND
+/// `recent_groupinfo_404_count` (Phase 2 B10). A successful commit
+/// implies GroupInfo was rebuilt at the new epoch, so any prior
+/// "GroupInfo missing" 404s are no longer relevant — leaving the 404
+/// counter set after a successful commit would let stale historical
+/// failures keep tripping the sweep.
+///
+/// Spec §Schema-Changes / §Server-Side-Changes.
 pub async fn mark_commit_success_tx(
     tx: &mut Transaction<'_, Postgres>,
     convo_id: &str,
@@ -231,7 +238,8 @@ pub async fn mark_commit_success_tx(
     sqlx::query(
         r#"UPDATE conversations
            SET last_successful_commit_at = NOW(),
-               recent_commit_409_count = 0
+               recent_commit_409_count = 0,
+               recent_groupinfo_404_count = 0
            WHERE id = $1"#,
     )
     .bind(convo_id)
@@ -288,6 +296,52 @@ pub async fn record_commit_409(pool: &DbPool, convo_id: &str) -> Result<CommitHe
     .fetch_one(pool)
     .await
     .context("Failed to record commit 409 on conversation")
+}
+
+/// Phase 2 B10: snapshot returned by [`record_groupinfo_404`]. Same
+/// shape as [`CommitHealthSnapshot`] but tracks the GroupInfo-missing
+/// failure mode (clients hitting `getGroupInfo → 404` without ever
+/// reaching `commitGroupChange → 409`). Used by the parallel inline
+/// trigger path
+/// (`jobs::auto_detect_failed_groups::record_groupinfo_404_with_inline_trigger`).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct GroupInfoHealthSnapshot {
+    /// Post-bump value of `recent_groupinfo_404_count` for this convo.
+    pub recent_groupinfo_404_count: i32,
+    /// Most recent system/admin reset timestamp; same gate semantics as
+    /// `CommitHealthSnapshot`.
+    pub last_reset_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Circuit-breaker; same semantics as `CommitHealthSnapshot`.
+    pub auto_reset_disabled_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Phase 2 B10: record that the `get_group_state` handler returned 404
+/// `GroupInfoUnavailable` for this conversation. Bumps
+/// `recent_groupinfo_404_count` and refreshes `last_groupinfo_404_at`,
+/// returning the post-bump snapshot so the caller can evaluate the
+/// B10 inline-trigger predicate without a second SELECT.
+///
+/// Same non-fatal contract as [`record_commit_409`]: counter-update
+/// failures must NEVER mask the 404 response to the client.
+///
+/// Reset path: counters are zeroed inside `do_reset_group` (post-reset
+/// state expects 404s until bootstrap lands; we don't want to retrigger
+/// the sweep on those expected 404s).
+pub async fn record_groupinfo_404(
+    pool: &DbPool,
+    convo_id: &str,
+) -> Result<GroupInfoHealthSnapshot> {
+    sqlx::query_as::<_, GroupInfoHealthSnapshot>(
+        r#"UPDATE conversations
+           SET recent_groupinfo_404_count = recent_groupinfo_404_count + 1,
+               last_groupinfo_404_at = NOW()
+           WHERE id = $1
+           RETURNING recent_groupinfo_404_count, last_reset_at, auto_reset_disabled_at"#,
+    )
+    .bind(convo_id)
+    .fetch_one(pool)
+    .await
+    .context("Failed to record GroupInfo 404 on conversation")
 }
 
 /// Get current epoch for a conversation

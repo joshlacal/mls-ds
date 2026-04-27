@@ -128,6 +128,22 @@ pub struct SweepConfig {
     /// reset_vote was recorded for the convo within this window, defer to
     /// the client-quorum path (default 300 = 5 min).
     pub mode_a_exclusion_window_secs: i64,
+    /// Phase 2 B10: minimum value of `recent_groupinfo_404_count` (default
+    /// 5). Used by the SECOND sweep predicate that catches the
+    /// "GroupInfo missing" failure mode — convos broken in the way that
+    /// keeps clients stuck at `getGroupInfo → 404`, never reaching
+    /// `commitGroupChange → 409`. Without this trigger, such convos are
+    /// invisible to the original 409-only sweep no matter how long they
+    /// stay broken. Default tuned slightly higher than `min_409_threshold`
+    /// because get_group_state is called more frequently per recovery
+    /// attempt than commitGroupChange.
+    pub min_groupinfo_404_threshold: i32,
+    /// Phase 2 B10: window (seconds) within which `last_groupinfo_404_at`
+    /// must fall for the GroupInfo-missing predicate to qualify a convo
+    /// (default 1800 = 30 min). Same recency-check semantics as
+    /// `recent_409_window_secs` — prevents the sweep from chasing
+    /// historical lifetime accumulation on convos that recovered.
+    pub recent_groupinfo_404_window_secs: i64,
 }
 
 impl Default for SweepConfig {
@@ -140,6 +156,8 @@ impl Default for SweepConfig {
             recent_409_window_secs: 1800,
             min_reset_gap_secs: 3600,
             mode_a_exclusion_window_secs: 300,
+            min_groupinfo_404_threshold: 5,
+            recent_groupinfo_404_window_secs: 1800,
         }
     }
 }
@@ -175,6 +193,14 @@ impl SweepConfig {
             mode_a_exclusion_window_secs: parse_env_i64_positive(
                 "MODE_A_EXCLUSION_WINDOW_SECS",
                 defaults.mode_a_exclusion_window_secs,
+            ),
+            min_groupinfo_404_threshold: parse_env_i32_positive(
+                "MIN_GROUPINFO_404_THRESHOLD",
+                defaults.min_groupinfo_404_threshold,
+            ),
+            recent_groupinfo_404_window_secs: parse_env_i64_positive(
+                "RECENT_GROUPINFO_404_WINDOW_SECS",
+                defaults.recent_groupinfo_404_window_secs,
             ),
         }
     }
@@ -215,6 +241,14 @@ pub struct InlineTriggerConfig {
     /// — but cuts wasted actor-mailbox traffic during a sustained 409 burst
     /// after a successful auto-reset.
     pub reset_cooldown_secs: i64,
+    /// Phase 2 B10: `INLINE_GROUPINFO_404_THRESHOLD` — minimum value of
+    /// `recent_groupinfo_404_count` after a single 404-bump that triggers
+    /// an inline `TriggerSystemReset` dispatch (default 3). Mirrors
+    /// `min_409_threshold` for the GroupInfo-missing failure mode that the
+    /// 409-only inline path can't see (clients stuck at `getGroupInfo →
+    /// 404` never reach `commitGroupChange`). Same actor-side idempotency
+    /// (cooldown + circuit breaker) makes repeated dispatches safe.
+    pub min_groupinfo_404_threshold: i32,
 }
 
 impl Default for InlineTriggerConfig {
@@ -222,6 +256,7 @@ impl Default for InlineTriggerConfig {
         Self {
             min_409_threshold: 3,
             reset_cooldown_secs: 3600,
+            min_groupinfo_404_threshold: 3,
         }
     }
 }
@@ -239,6 +274,10 @@ impl InlineTriggerConfig {
             reset_cooldown_secs: parse_env_i64_positive(
                 "INLINE_TRIGGER_RESET_COOLDOWN_SECS",
                 defaults.reset_cooldown_secs,
+            ),
+            min_groupinfo_404_threshold: parse_env_i32_positive(
+                "INLINE_GROUPINFO_404_THRESHOLD",
+                defaults.min_groupinfo_404_threshold,
             ),
         }
     }

@@ -231,7 +231,8 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(
         min_409_threshold = inline_trigger_cfg.min_409_threshold,
         reset_cooldown_secs = inline_trigger_cfg.reset_cooldown_secs,
-        "inline-trigger config loaded (Phase 2 B5)"
+        min_groupinfo_404_threshold = inline_trigger_cfg.min_groupinfo_404_threshold,
+        "inline-trigger config loaded (Phase 2 B5 + B10)"
     );
 
     // Spawn idempotency cache cleanup worker

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use axum::{
     extract::State,
     http::StatusCode,
@@ -5,10 +7,12 @@ use axum::{
     Json,
 };
 use jacquard_axum::ExtractXrpc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::{
+    actors::ActorRegistry,
     auth::AuthUser,
+    config::InlineTriggerConfig,
     generated::blue_catbird::mlsChat::get_group_state::{
         GetGroupStateError, GetGroupStateOutput, GetGroupStateRequest,
     },
@@ -79,9 +83,16 @@ fn is_row_not_found(error: &anyhow::Error) -> bool {
 /// GET /xrpc/blue.catbird.mlsChat.getGroupState?convoId=xxx&include=groupInfo,welcome,epoch
 ///
 /// Consolidates: getGroupInfo, getEpoch, getWelcome, invalidateWelcome
-#[tracing::instrument(skip(pool, auth_user))]
+#[tracing::instrument(skip(
+    pool,
+    actor_registry,
+    inline_trigger_cfg,
+    auth_user
+))]
 pub async fn get_group_state(
     State(pool): State<DbPool>,
+    State(actor_registry): State<Arc<ActorRegistry>>,
+    State(inline_trigger_cfg): State<Arc<InlineTriggerConfig>>,
     auth_user: AuthUser,
     ExtractXrpc(params): ExtractXrpc<GetGroupStateRequest>,
 ) -> Result<Json<GetGroupStateOutput<'static>>, GetGroupStateContractError> {
@@ -198,6 +209,26 @@ pub async fn get_group_state(
                 ));
             }
             Ok(None) => {
+                // Phase 2 B10: bump the GroupInfo-404 counter and let the
+                // inline-trigger evaluator decide whether to fast-path a
+                // TriggerSystemReset. Failures are non-fatal — the 404
+                // response to the client is the contract; instrumentation
+                // must NEVER mask it. The periodic sweep
+                // (`sweep_groupinfo_404_once`) remains as a safety net.
+                if let Err(e) = crate::jobs::auto_detect_failed_groups::record_groupinfo_404_with_inline_trigger(
+                    &pool,
+                    &actor_registry,
+                    convo_id,
+                    &inline_trigger_cfg,
+                )
+                .await
+                {
+                    warn!(
+                        convo_id = %crate::crypto::redact_for_log(convo_id),
+                        error = %e,
+                        "Failed to record GroupInfo 404 (non-fatal — 404 response still returned)"
+                    );
+                }
                 return Err(GetGroupStateContractError::group_info_unavailable(
                     StatusCode::NOT_FOUND,
                     "GroupInfo not yet generated for this conversation",

@@ -25,7 +25,7 @@ use tracing::{error, info, warn};
 // below work identically in both compilation contexts.
 use crate::actors::{ActorRegistry, ConvoMessage};
 use crate::config::{InlineTriggerConfig, SweepConfig};
-use crate::db::{self, CommitHealthSnapshot, DbPool};
+use crate::db::{self, CommitHealthSnapshot, DbPool, GroupInfoHealthSnapshot};
 
 /// One row emitted by the sweep query — the minimum fields the actor
 /// dispatch needs for telemetry.
@@ -36,6 +36,19 @@ struct StaleConvoRow {
     group_info_epoch: Option<i32>,
     last_successful_commit_at: Option<chrono::DateTime<chrono::Utc>>,
     recent_commit_409_count: i32,
+}
+
+/// Phase 2 B10: row emitted by the GroupInfo-missing sweep. Different
+/// shape from `StaleConvoRow` because the failure signal here is
+/// `recent_groupinfo_404_count` rather than 409 count, and the convo's
+/// epoch fields are not necessarily diagnostic — what matters is that
+/// `group_info` is NULL and clients are still trying.
+#[derive(Debug, sqlx::FromRow)]
+struct GroupInfoMissingRow {
+    id: String,
+    recent_groupinfo_404_count: i32,
+    current_epoch: Option<i32>,
+    group_info_epoch: Option<i32>,
 }
 
 /// Spawn-and-loop entry point. Used from `main.rs`.
@@ -53,22 +66,39 @@ pub async fn run_failed_group_sweep(pool: PgPool, registry: Arc<ActorRegistry>, 
         recent_409_window_secs = cfg.recent_409_window_secs,
         min_reset_gap_secs = cfg.min_reset_gap_secs,
         mode_a_exclusion_window_secs = cfg.mode_a_exclusion_window_secs,
+        min_groupinfo_404_threshold = cfg.min_groupinfo_404_threshold,
+        recent_groupinfo_404_window_secs = cfg.recent_groupinfo_404_window_secs,
         "Starting auto_detect_failed_groups sweep worker (Phase 2 Path B)"
     );
 
     loop {
         ticker.tick().await;
-        match sweep_once(&pool, &registry, &cfg).await {
-            Ok(0) => {
-                // Nothing to do — common case, kept at debug to avoid log spam.
-                tracing::debug!("sweep tick: no stale groups");
-            }
-            Ok(n) => {
-                info!(dispatched = n, "sweep tick: dispatched system-resets");
-            }
+        // Run both sweep modes per tick. Idempotency in the actor's
+        // handle_trigger_system_reset (cooldown + circuit breaker) keeps
+        // the rare overlap case (a convo qualifying under BOTH 409 and
+        // 404 predicates simultaneously) safe.
+        let n_409 = match sweep_once(&pool, &registry, &cfg).await {
+            Ok(n) => n,
             Err(e) => {
-                error!(error = %e, "sweep tick failed");
+                error!(error = %e, "sweep tick failed (409 mode)");
+                0
             }
+        };
+        let n_404 = match sweep_groupinfo_404_once(&pool, &registry, &cfg).await {
+            Ok(n) => n,
+            Err(e) => {
+                error!(error = %e, "sweep tick failed (groupinfo-404 mode)");
+                0
+            }
+        };
+        match n_409 + n_404 {
+            0 => tracing::debug!("sweep tick: no stale groups"),
+            total => info!(
+                dispatched_total = total,
+                dispatched_409 = n_409,
+                dispatched_groupinfo_404 = n_404,
+                "sweep tick: dispatched system-resets"
+            ),
         }
     }
 }
@@ -174,6 +204,113 @@ pub async fn sweep_once(
                 convo_id = %crate::crypto::redact_for_log(&row.id),
                 error = %e,
                 "sweep: actor cast failed"
+            );
+            continue;
+        }
+
+        dispatched += 1;
+    }
+
+    Ok(dispatched)
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Phase 2 (B10) — second sweep mode for the GroupInfo-missing failure.
+// ──────────────────────────────────────────────────────────────────────
+
+/// Single sweep iteration for the "GroupInfo missing + clients trying"
+/// failure mode. Returns the number of `TriggerSystemReset` messages
+/// dispatched.
+///
+/// Mirrors [`sweep_once`] but keys off `recent_groupinfo_404_count` and
+/// `last_groupinfo_404_at` instead of the 409 columns. Required because
+/// the original 409-only sweep is blind to convos that get stuck at
+/// `getGroupInfo → 404` in the External Commit pre-flight — clients
+/// never reach `commitGroupChange`, so the 409 counter never moves and
+/// the original sweep's `recent_commit_409_count > threshold` predicate
+/// never fires.
+///
+/// Predicates:
+///   1. `auto_reset_disabled_at IS NULL` — circuit breaker not tripped
+///   2. `group_info IS NULL` — the actual failure signal (no GroupInfo
+///      to serve clients). The partial index
+///      `idx_conversations_groupinfo_404_sweep` is conditioned on this;
+///      keeping it here ensures the planner uses the index.
+///   3. `recent_groupinfo_404_count > min_groupinfo_404_threshold`
+///   4. `last_groupinfo_404_at IS NOT NULL` AND within
+///      `recent_groupinfo_404_window_secs`
+///   5. `last_reset_at IS NULL OR > min_reset_gap_secs ago` — same gap
+///      gate as the 409 sweep (don't pile resets on a recently-reset
+///      convo that hasn't had time to bootstrap)
+///   6. NOT EXISTS recent Mode A reset_vote — same Mode A exclusion as
+///      the 409 sweep
+pub async fn sweep_groupinfo_404_once(
+    pool: &PgPool,
+    registry: &Arc<ActorRegistry>,
+    cfg: &SweepConfig,
+) -> anyhow::Result<usize> {
+    let rows: Vec<GroupInfoMissingRow> = sqlx::query_as::<_, GroupInfoMissingRow>(
+        "SELECT c.id, c.recent_groupinfo_404_count, c.current_epoch, c.group_info_epoch \
+         FROM conversations c \
+         WHERE c.auto_reset_disabled_at IS NULL \
+           AND c.group_info IS NULL \
+           AND c.recent_groupinfo_404_count > $1 \
+           AND c.last_groupinfo_404_at IS NOT NULL \
+           AND NOW() - c.last_groupinfo_404_at < make_interval(secs => $2) \
+           AND (c.last_reset_at IS NULL \
+                OR NOW() - c.last_reset_at > make_interval(secs => $3)) \
+           AND NOT EXISTS ( \
+                SELECT 1 FROM reset_votes rv \
+                WHERE rv.convo_id = c.id \
+                  AND rv.failure_mode = 'local_state_loss' \
+                  AND rv.voted_at > NOW() - make_interval(secs => $4) \
+           ) \
+         LIMIT 50",
+    )
+    .bind(cfg.min_groupinfo_404_threshold)
+    .bind(cfg.recent_groupinfo_404_window_secs as f64)
+    .bind(cfg.min_reset_gap_secs as f64)
+    .bind(cfg.mode_a_exclusion_window_secs as f64)
+    .fetch_all(pool)
+    .await?;
+
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    let mut dispatched = 0usize;
+    for row in rows {
+        let staleness_epochs =
+            (row.current_epoch.unwrap_or(0) as i64) - (row.group_info_epoch.unwrap_or(0) as i64);
+
+        let actor_ref = match registry.get_or_spawn(&row.id).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(
+                    convo_id = %crate::crypto::redact_for_log(&row.id),
+                    error = %e,
+                    "sweep(groupinfo-404): failed to spawn actor — skipping convo"
+                );
+                continue;
+            }
+        };
+
+        info!(
+            convo_id = %crate::crypto::redact_for_log(&row.id),
+            staleness_epochs,
+            count_404 = row.recent_groupinfo_404_count,
+            "sweep(groupinfo-404): dispatching TriggerSystemReset"
+        );
+
+        if let Err(e) = actor_ref.cast(ConvoMessage::TriggerSystemReset {
+            reason: "server_sweep_groupinfo_missing".to_string(),
+            staleness_epochs,
+            quiet_duration_secs: 0,
+        }) {
+            warn!(
+                convo_id = %crate::crypto::redact_for_log(&row.id),
+                error = %e,
+                "sweep(groupinfo-404): actor cast failed"
             );
             continue;
         }
@@ -320,6 +457,118 @@ pub async fn record_commit_409_with_inline_trigger(
     Ok(())
 }
 
+// ──────────────────────────────────────────────────────────────────────
+// Phase 2 (B10) — event-driven inline trigger for GroupInfo-404 path.
+// ──────────────────────────────────────────────────────────────────────
+
+/// Mirror of [`evaluate_inline_trigger`] for the GroupInfo-404 inline
+/// path. Same gate matrix (circuit breaker → threshold → cooldown), but
+/// keys off `recent_groupinfo_404_count` and the dedicated
+/// `min_groupinfo_404_threshold` field on [`InlineTriggerConfig`].
+///
+/// Kept as a separate function (rather than a generic helper) so the
+/// telemetry and prod debugging stay sharp — when something fires (or
+/// doesn't) you know exactly which failure mode produced the decision.
+pub fn evaluate_inline_groupinfo_404_trigger(
+    snapshot: &GroupInfoHealthSnapshot,
+    cfg: &InlineTriggerConfig,
+    now: chrono::DateTime<chrono::Utc>,
+) -> InlineTriggerDecision {
+    if snapshot.auto_reset_disabled_at.is_some() {
+        return InlineTriggerDecision::CircuitBreakerTripped;
+    }
+    if snapshot.recent_groupinfo_404_count < cfg.min_groupinfo_404_threshold {
+        return InlineTriggerDecision::BelowThreshold {
+            count: snapshot.recent_groupinfo_404_count,
+            threshold: cfg.min_groupinfo_404_threshold,
+        };
+    }
+    if let Some(last_reset) = snapshot.last_reset_at {
+        let cooldown = chrono::Duration::seconds(cfg.reset_cooldown_secs);
+        if now - last_reset < cooldown {
+            return InlineTriggerDecision::ResetCooldownActive;
+        }
+    }
+    InlineTriggerDecision::Dispatch
+}
+
+/// Bump the convo's GroupInfo-404 counter AND, on the same code path,
+/// evaluate the inline-trigger predicate. Mirror of
+/// [`record_commit_409_with_inline_trigger`] for the GroupInfo-missing
+/// failure mode.
+///
+/// On `InlineTriggerDecision::Dispatch`, casts
+/// `ConvoMessage::TriggerSystemReset { reason: "inline_groupinfo_404_threshold" }`.
+/// All idempotency invariants from the 409 path apply — actor handler
+/// re-checks cooldown + circuit breaker, so duplicate dispatches during
+/// a sustained 404 burst are safe.
+///
+/// Counter-update failures propagate as `Err`; actor dispatch failures
+/// are logged and swallowed (sweep will retry on next tick).
+pub async fn record_groupinfo_404_with_inline_trigger(
+    pool: &DbPool,
+    registry: &Arc<ActorRegistry>,
+    convo_id: &str,
+    cfg: &InlineTriggerConfig,
+) -> anyhow::Result<()> {
+    let snapshot = db::record_groupinfo_404(pool, convo_id).await?;
+
+    match evaluate_inline_groupinfo_404_trigger(&snapshot, cfg, chrono::Utc::now()) {
+        InlineTriggerDecision::Dispatch => {
+            info!(
+                convo_id = %crate::crypto::redact_for_log(convo_id),
+                count_404 = snapshot.recent_groupinfo_404_count,
+                threshold = cfg.min_groupinfo_404_threshold,
+                "inline-trigger(groupinfo-404): dispatching TriggerSystemReset"
+            );
+            let actor_ref = match registry.get_or_spawn(convo_id).await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(
+                        convo_id = %crate::crypto::redact_for_log(convo_id),
+                        error = %e,
+                        "inline-trigger(groupinfo-404): failed to spawn actor — skipping (sweep will catch on next tick)"
+                    );
+                    return Ok(());
+                }
+            };
+            if let Err(e) = actor_ref.cast(ConvoMessage::TriggerSystemReset {
+                reason: "inline_groupinfo_404_threshold".to_string(),
+                staleness_epochs: 0,
+                quiet_duration_secs: 0,
+            }) {
+                warn!(
+                    convo_id = %crate::crypto::redact_for_log(convo_id),
+                    error = %e,
+                    "inline-trigger(groupinfo-404): actor cast failed — non-fatal, sweep will retry"
+                );
+            }
+        }
+        InlineTriggerDecision::BelowThreshold { count, threshold } => {
+            tracing::debug!(
+                convo_id = %crate::crypto::redact_for_log(convo_id),
+                count,
+                threshold,
+                "inline-trigger(groupinfo-404): below threshold — counter bumped only"
+            );
+        }
+        InlineTriggerDecision::CircuitBreakerTripped => {
+            tracing::debug!(
+                convo_id = %crate::crypto::redact_for_log(convo_id),
+                "inline-trigger(groupinfo-404): auto_reset_disabled_at set — skipping"
+            );
+        }
+        InlineTriggerDecision::ResetCooldownActive => {
+            tracing::debug!(
+                convo_id = %crate::crypto::redact_for_log(convo_id),
+                "inline-trigger(groupinfo-404): recent reset cooldown active — skipping"
+            );
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod inline_trigger_tests {
     use super::*;
@@ -341,10 +590,27 @@ mod inline_trigger_tests {
         }
     }
 
+    fn snap_404(
+        count: i32,
+        last_reset: Option<chrono::DateTime<chrono::Utc>>,
+        disabled: bool,
+    ) -> GroupInfoHealthSnapshot {
+        GroupInfoHealthSnapshot {
+            recent_groupinfo_404_count: count,
+            last_reset_at: last_reset,
+            auto_reset_disabled_at: if disabled {
+                Some(chrono::Utc::now())
+            } else {
+                None
+            },
+        }
+    }
+
     fn cfg(threshold: i32, cooldown: i64) -> InlineTriggerConfig {
         InlineTriggerConfig {
             min_409_threshold: threshold,
             reset_cooldown_secs: cooldown,
+            min_groupinfo_404_threshold: threshold,
         }
     }
 
@@ -421,6 +687,82 @@ mod inline_trigger_tests {
         let c = cfg(3, 3600);
         assert_eq!(
             evaluate_inline_trigger(&s, &c, now),
+            InlineTriggerDecision::Dispatch
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Phase 2 (B10) — GroupInfo-404 inline trigger evaluator tests.
+    // Same gate matrix as the 409 path; tests mirror the cases above.
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn groupinfo_404_dispatches_when_threshold_crossed_and_no_gates() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 26, 18, 0, 0).unwrap();
+        let s = snap_404(3, None, false);
+        let c = cfg(3, 3600);
+        assert_eq!(
+            evaluate_inline_groupinfo_404_trigger(&s, &c, now),
+            InlineTriggerDecision::Dispatch
+        );
+    }
+
+    #[test]
+    fn groupinfo_404_does_not_dispatch_below_threshold() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 26, 18, 0, 0).unwrap();
+        let s = snap_404(2, None, false);
+        let c = cfg(3, 3600);
+        assert_eq!(
+            evaluate_inline_groupinfo_404_trigger(&s, &c, now),
+            InlineTriggerDecision::BelowThreshold {
+                count: 2,
+                threshold: 3
+            }
+        );
+    }
+
+    #[test]
+    fn groupinfo_404_does_not_dispatch_when_circuit_breaker_tripped() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 26, 18, 0, 0).unwrap();
+        let s = snap_404(1000, None, true);
+        let c = cfg(3, 3600);
+        assert_eq!(
+            evaluate_inline_groupinfo_404_trigger(&s, &c, now),
+            InlineTriggerDecision::CircuitBreakerTripped
+        );
+    }
+
+    #[test]
+    fn groupinfo_404_does_not_dispatch_within_reset_cooldown() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 26, 18, 0, 0).unwrap();
+        let last_reset = now - chrono::Duration::minutes(30);
+        let s = snap_404(10, Some(last_reset), false);
+        let c = cfg(3, 3600);
+        assert_eq!(
+            evaluate_inline_groupinfo_404_trigger(&s, &c, now),
+            InlineTriggerDecision::ResetCooldownActive
+        );
+    }
+
+    #[test]
+    fn groupinfo_404_dispatches_when_reset_cooldown_expired() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 26, 18, 0, 0).unwrap();
+        let last_reset = now - chrono::Duration::minutes(90);
+        let s = snap_404(10, Some(last_reset), false);
+        let c = cfg(3, 3600);
+        assert_eq!(
+            evaluate_inline_groupinfo_404_trigger(&s, &c, now),
+            InlineTriggerDecision::Dispatch
+        );
+    }
+
+    #[test]
+    fn groupinfo_404_dispatches_when_no_prior_reset_recorded() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 26, 18, 0, 0).unwrap();
+        let s = snap_404(5, None, false);
+        let c = cfg(3, 3600);
+        assert_eq!(
+            evaluate_inline_groupinfo_404_trigger(&s, &c, now),
             InlineTriggerDecision::Dispatch
         );
     }

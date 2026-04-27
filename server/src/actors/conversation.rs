@@ -1660,6 +1660,8 @@ impl ConversationActorState {
                 reset_count = reset_count + 1, \
                 last_reset_at = NOW(), \
                 last_reset_by = $3, \
+                recent_commit_409_count = 0, \
+                recent_groupinfo_404_count = 0, \
                 updated_at = NOW() \
              WHERE id = $2 \
              RETURNING reset_count",
