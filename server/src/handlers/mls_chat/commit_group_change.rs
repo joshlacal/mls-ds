@@ -259,11 +259,20 @@ async fn record_epoch_authenticator_tx(
 /// POST /xrpc/blue.catbird.mlsChat.commitGroupChange
 ///
 /// Consolidates: addMembers, processExternalCommit, rejoin, readdition, listPending, claimPending
-#[tracing::instrument(skip(pool, sse_state, _actor_registry, block_sync, auth_user, input))]
+#[tracing::instrument(skip(
+    pool,
+    sse_state,
+    actor_registry,
+    inline_trigger_cfg,
+    block_sync,
+    auth_user,
+    input
+))]
 pub async fn commit_group_change(
     State(pool): State<DbPool>,
     State(sse_state): State<Arc<SseState>>,
-    State(_actor_registry): State<Arc<ActorRegistry>>,
+    State(actor_registry): State<Arc<ActorRegistry>>,
+    State(inline_trigger_cfg): State<Arc<crate::config::InlineTriggerConfig>>,
     State(block_sync): State<Arc<BlockSyncService>>,
     auth_user: AuthUser,
     ExtractXrpc(input): ExtractXrpc<CommitGroupChangeRequest>,
@@ -508,7 +517,15 @@ pub async fn commit_group_change(
                 // Phase 2 (auto-reset): record 409 for sweep-trigger health
                 // counter. Pool-level UPDATE; failure must NEVER mask the
                 // 409 response.
-                if let Err(e) = crate::db::record_commit_409(&pool, &convo_id).await {
+                if let Err(e) =
+                    crate::jobs::auto_detect_failed_groups::record_commit_409_with_inline_trigger(
+                        &pool,
+                        &actor_registry,
+                        &convo_id,
+                        &inline_trigger_cfg,
+                    )
+                    .await
+                {
                     warn!(
                         error = ?e,
                         convo_id = %crate::crypto::redact_for_log(&convo_id),
@@ -578,7 +595,7 @@ pub async fn commit_group_change(
                     // Phase 2 (auto-reset): record 409 on a separate
                     // pool-borrowed conn (the failed tx is gone). Failure
                     // must NEVER mask the 409 response.
-                    if let Err(e) = crate::db::record_commit_409(&pool, &convo_id).await {
+                    if let Err(e) = crate::jobs::auto_detect_failed_groups::record_commit_409_with_inline_trigger(&pool, &actor_registry, &convo_id, &inline_trigger_cfg).await {
                         warn!(
                             error = ?e,
                             convo_id = %crate::crypto::redact_for_log(&convo_id),
@@ -1182,7 +1199,15 @@ pub async fn commit_group_change(
                 // Phase 2 (auto-reset): record 409 for sweep-trigger health
                 // counter. Pool-level UPDATE; failure must NEVER mask the
                 // 409 response.
-                if let Err(e) = crate::db::record_commit_409(&pool, &convo_id).await {
+                if let Err(e) =
+                    crate::jobs::auto_detect_failed_groups::record_commit_409_with_inline_trigger(
+                        &pool,
+                        &actor_registry,
+                        &convo_id,
+                        &inline_trigger_cfg,
+                    )
+                    .await
+                {
                     warn!(
                         error = ?e,
                         convo_id = %crate::crypto::redact_for_log(&convo_id),
@@ -1239,7 +1264,7 @@ pub async fn commit_group_change(
                     // Phase 2 (auto-reset): record 409 on a separate
                     // pool-borrowed conn (the failed tx is gone). Failure
                     // must NEVER mask the 409 response.
-                    if let Err(e) = crate::db::record_commit_409(&pool, &convo_id).await {
+                    if let Err(e) = crate::jobs::auto_detect_failed_groups::record_commit_409_with_inline_trigger(&pool, &actor_registry, &convo_id, &inline_trigger_cfg).await {
                         warn!(
                             error = ?e,
                             convo_id = %crate::crypto::redact_for_log(&convo_id),
@@ -2088,7 +2113,15 @@ pub async fn commit_group_change(
                 // Phase 2 (auto-reset): record 409 for sweep-trigger health
                 // counter. Pool-level UPDATE; failure must NEVER mask the
                 // 409 response.
-                if let Err(e) = crate::db::record_commit_409(&pool, &convo_id).await {
+                if let Err(e) =
+                    crate::jobs::auto_detect_failed_groups::record_commit_409_with_inline_trigger(
+                        &pool,
+                        &actor_registry,
+                        &convo_id,
+                        &inline_trigger_cfg,
+                    )
+                    .await
+                {
                     warn!(
                         error = ?e,
                         convo_id = %crate::crypto::redact_for_log(&convo_id),
@@ -2139,7 +2172,7 @@ pub async fn commit_group_change(
                     // Phase 2 (auto-reset): record 409 on a separate
                     // pool-borrowed conn (the failed tx is gone). Failure
                     // must NEVER mask the 409 response.
-                    if let Err(e) = crate::db::record_commit_409(&pool, &convo_id).await {
+                    if let Err(e) = crate::jobs::auto_detect_failed_groups::record_commit_409_with_inline_trigger(&pool, &actor_registry, &convo_id, &inline_trigger_cfg).await {
                         warn!(
                             error = ?e,
                             convo_id = %crate::crypto::redact_for_log(&convo_id),
@@ -2468,7 +2501,15 @@ pub async fn commit_group_change(
                 // Phase 2 (auto-reset): record 409 for sweep-trigger health
                 // counter. Pool-level UPDATE; failure must NEVER mask the
                 // 409 response.
-                if let Err(e) = crate::db::record_commit_409(&pool, &convo_id).await {
+                if let Err(e) =
+                    crate::jobs::auto_detect_failed_groups::record_commit_409_with_inline_trigger(
+                        &pool,
+                        &actor_registry,
+                        &convo_id,
+                        &inline_trigger_cfg,
+                    )
+                    .await
+                {
                     warn!(
                         error = ?e,
                         action = %action_name,
@@ -2511,7 +2552,7 @@ pub async fn commit_group_change(
                     // Phase 2 (auto-reset): record 409 on a separate
                     // pool-borrowed conn (the failed tx is gone). Failure
                     // must NEVER mask the 409 response.
-                    if let Err(e) = crate::db::record_commit_409(&pool, &convo_id).await {
+                    if let Err(e) = crate::jobs::auto_detect_failed_groups::record_commit_409_with_inline_trigger(&pool, &actor_registry, &convo_id, &inline_trigger_cfg).await {
                         warn!(
                             error = ?e,
                             action = %action_name,

@@ -171,9 +171,7 @@ pub async fn handle(
 
     if existing_group_info.is_some() {
         tx.rollback().await.ok();
-        warn!(
-            "[bootstrapResetGroup] race-loss: group_info already populated by another caller"
-        );
+        warn!("[bootstrapResetGroup] race-loss: group_info already populated by another caller");
         info!(
             convo_id = %crate::crypto::redact_for_log(&original_convo_id),
             new_group_id = %crate::crypto::redact_for_log(&new_group_id),
@@ -344,12 +342,12 @@ pub async fn handle(
     // Read post-commit so the view reflects the persisted state, including
     // anything other transactions wrote concurrently to non-locked columns.
     let row: (
-        String,            // creator_did
-        Option<String>,    // name
-        String,            // cipher_suite_persisted
-        DateTime<Utc>,     // created_at
+        String,                // creator_did
+        Option<String>,        // name
+        String,                // cipher_suite_persisted
+        DateTime<Utc>,         // created_at
         Option<DateTime<Utc>>, // last_message_at
-        Option<i32>,       // reset_count
+        Option<i32>,           // reset_count
     ) = sqlx::query_as(
         "SELECT creator_did, name, cipher_suite, created_at, last_message_at, reset_count \
          FROM conversations WHERE id = $1",
@@ -362,7 +360,14 @@ pub async fn handle(
         StatusCode::INTERNAL_SERVER_ERROR.into_response()
     })?;
 
-    let (creator_did_persisted, name, cipher_suite_persisted, created_at, last_message_at, reset_count) = row;
+    let (
+        creator_did_persisted,
+        name,
+        cipher_suite_persisted,
+        created_at,
+        last_message_at,
+        reset_count,
+    ) = row;
 
     let member_rows: Vec<(
         String,

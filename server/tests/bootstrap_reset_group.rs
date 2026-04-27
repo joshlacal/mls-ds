@@ -139,14 +139,13 @@ async fn classify(
     }
 
     // 2. Target row + sentinel
-    let target: Option<(Option<Vec<u8>>,)> = sqlx::query_as(
-        "SELECT group_info FROM conversations WHERE id = $1 AND group_id = $2",
-    )
-    .bind(convo_id)
-    .bind(new_group_id)
-    .fetch_optional(pool)
-    .await
-    .expect("target lookup");
+    let target: Option<(Option<Vec<u8>>,)> =
+        sqlx::query_as("SELECT group_info FROM conversations WHERE id = $1 AND group_id = $2")
+            .bind(convo_id)
+            .bind(new_group_id)
+            .fetch_optional(pool)
+            .await
+            .expect("target lookup");
 
     match target {
         None => BootstrapClassification::TargetNotFound,
@@ -285,7 +284,11 @@ async fn bootstrap_handle_updates_row_and_returns_view() {
     };
 
     let result = bootstrap_handle(pool.clone(), test_auth_user(ALICE), &input).await;
-    assert!(result.is_ok(), "bootstrap_handle should succeed; err = {:?}", result.as_ref().err().map(|_| "Response"));
+    assert!(
+        result.is_ok(),
+        "bootstrap_handle should succeed; err = {:?}",
+        result.as_ref().err().map(|_| "Response")
+    );
 
     // Inspect the persisted row directly to confirm UPDATE side effects.
     let (group_info_persisted, group_info_epoch, current_epoch_persisted, cipher_suite_persisted): (
@@ -306,8 +309,15 @@ async fn bootstrap_handle_updates_row_and_returns_view() {
         Some(group_info_payload.as_ref()),
         "group_info column must reflect the input bytes"
     );
-    assert_eq!(group_info_epoch, Some(1), "group_info_epoch must be set to 1");
-    assert_eq!(current_epoch_persisted, 1, "current_epoch must advance from 0 to 1");
+    assert_eq!(
+        group_info_epoch,
+        Some(1),
+        "group_info_epoch must be set to 1"
+    );
+    assert_eq!(
+        current_epoch_persisted, 1,
+        "current_epoch must advance from 0 to 1"
+    );
     assert_eq!(
         cipher_suite_persisted.as_deref(),
         Some("MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519"),

@@ -127,12 +127,7 @@ pub async fn request_failover(
                 new_epoch,
                 new_term,
             );
-            return Ok(Json(make_output(
-                self_did,
-                &convo_id,
-                new_epoch,
-                new_term,
-            )));
+            return Ok(Json(make_output(self_did, &convo_id, new_epoch, new_term)));
         }
     };
 

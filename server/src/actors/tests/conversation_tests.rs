@@ -575,13 +575,12 @@ mod conversation_tests {
         assert!(o2.new_group_id.is_some());
         assert_eq!(o2.reset_count, Some(1));
 
-        let epoch: i32 = sqlx::query_scalar(
-            "SELECT current_epoch FROM conversations WHERE id = $1",
-        )
-        .bind(convo_id)
-        .fetch_one(&pool)
-        .await
-        .expect("fetch epoch");
+        let epoch: i32 =
+            sqlx::query_scalar("SELECT current_epoch FROM conversations WHERE id = $1")
+                .bind(convo_id)
+                .fetch_one(&pool)
+                .await
+                .expect("fetch epoch");
         assert_eq!(epoch, 0);
 
         actor.stop(None);
@@ -621,12 +620,11 @@ mod conversation_tests {
         assert!(!o.recorded);
         assert_eq!(o.reason.as_deref(), Some("stale_authenticator"));
 
-        let count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM reset_votes WHERE convo_id = $1")
-                .bind(convo_id)
-                .fetch_one(&pool)
-                .await
-                .expect("count");
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM reset_votes WHERE convo_id = $1")
+            .bind(convo_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count");
         assert_eq!(count, 0);
 
         actor.stop(None);
@@ -726,13 +724,12 @@ mod conversation_tests {
         assert_eq!(o.reason.as_deref(), Some("circuit_breaker"));
         assert!(!o.auto_reset_triggered);
 
-        let disabled: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
-            "SELECT auto_reset_disabled_at FROM conversations WHERE id = $1",
-        )
-        .bind(convo_id)
-        .fetch_one(&pool)
-        .await
-        .expect("fetch");
+        let disabled: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT auto_reset_disabled_at FROM conversations WHERE id = $1")
+                .bind(convo_id)
+                .fetch_one(&pool)
+                .await
+                .expect("fetch");
         assert!(disabled.is_some());
 
         actor.stop(None);

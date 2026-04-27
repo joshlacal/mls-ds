@@ -98,16 +98,15 @@ pub async fn reset_group(
     // --- Validate newGroupId not already in use ---
     // Return the owning convoId alongside the error so clients can distinguish
     // "my own retry" from "genuinely conflicting group id".
-    let conflicting_convo_id: Option<String> = sqlx::query_scalar(
-        "SELECT id FROM conversations WHERE group_id = $1 LIMIT 1",
-    )
-    .bind(new_group_id)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|e| {
-        error!("[resetGroup] group_id uniqueness check failed: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let conflicting_convo_id: Option<String> =
+        sqlx::query_scalar("SELECT id FROM conversations WHERE group_id = $1 LIMIT 1")
+            .bind(new_group_id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| {
+                error!("[resetGroup] group_id uniqueness check failed: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
     if let Some(existing_convo_id) = conflicting_convo_id {
         warn!("[resetGroup] newGroupId already in use");

@@ -242,9 +242,29 @@ pub async fn mark_commit_success_tx(
     Ok(())
 }
 
+/// Snapshot of the post-bump health counters returned by
+/// [`record_commit_409`]. Used by the inline trigger path
+/// (Phase 2 B5 — `jobs::auto_detect_failed_groups::maybe_trigger_inline_reset`)
+/// to evaluate the trigger predicate without a second round-trip.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct CommitHealthSnapshot {
+    /// Post-bump value of `recent_commit_409_count` for this convo.
+    pub recent_commit_409_count: i32,
+    /// Most recent system/admin reset timestamp, if any. NULL means the
+    /// convo has never been reset and the inline trigger's reset-cooldown
+    /// gate is satisfied trivially.
+    pub last_reset_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// If non-NULL, the per-convo circuit breaker has tripped and no
+    /// further auto-reset attempts (inline OR sweep) should fire — the
+    /// caller MUST short-circuit the trigger evaluation.
+    pub auto_reset_disabled_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// Phase 2 (auto-reset): record that a `commitGroupChange` returned a 409
 /// (EpochMismatch / CAS-failure / stale wire-epoch) for this conversation.
-/// Bumps `recent_commit_409_count` and refreshes `last_commit_409_at`.
+/// Bumps `recent_commit_409_count` and refreshes `last_commit_409_at`,
+/// returning the post-bump health snapshot so the caller can evaluate the
+/// B5 inline-trigger predicate without a second SELECT.
 ///
 /// MUST be called on a `&PgPool`, NEVER on the failed transaction — the tx
 /// has already been rolled back by `drop(tx)` (CAS-failure path) or never
@@ -256,19 +276,18 @@ pub async fn mark_commit_success_tx(
 /// `let _ = ... .map_err(|e| tracing::warn!(...))` semantics — this function
 /// returns `Result` so the caller can choose, but the warn-and-discard
 /// pattern is strongly recommended.
-pub async fn record_commit_409(pool: &DbPool, convo_id: &str) -> Result<()> {
-    sqlx::query(
+pub async fn record_commit_409(pool: &DbPool, convo_id: &str) -> Result<CommitHealthSnapshot> {
+    sqlx::query_as::<_, CommitHealthSnapshot>(
         r#"UPDATE conversations
            SET recent_commit_409_count = recent_commit_409_count + 1,
                last_commit_409_at = NOW()
-           WHERE id = $1"#,
+           WHERE id = $1
+           RETURNING recent_commit_409_count, last_reset_at, auto_reset_disabled_at"#,
     )
     .bind(convo_id)
-    .execute(pool)
+    .fetch_one(pool)
     .await
-    .context("Failed to record commit 409 on conversation")?;
-
-    Ok(())
+    .context("Failed to record commit 409 on conversation")
 }
 
 /// Get current epoch for a conversation

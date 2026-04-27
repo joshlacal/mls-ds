@@ -187,6 +187,68 @@ impl SweepConfig {
     }
 }
 
+/// Phase 2 (B5) — event-driven inline trigger configuration.
+///
+/// Drives the post-409 fast path in
+/// `crate::jobs::auto_detect_failed_groups::record_commit_409_with_inline_trigger`.
+/// Detection latency from this path is ~one DB round-trip — independent of
+/// `SweepConfig::sweep_interval_secs` — so the threshold can be tighter than
+/// the sweep's `min_409_threshold` without inflating risk: the actor's own
+/// cooldown gate (`last_reset_at < 1h`) and circuit breaker
+/// (`auto_reset_disabled_at`) idempotently reject duplicate dispatches.
+///
+/// The sweep stays running as a safety net for convos that crossed the
+/// inline threshold while the actor was unreachable, server was restarting,
+/// or pre-existing rows that already crossed before this code shipped.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InlineTriggerConfig {
+    /// `INLINE_409_THRESHOLD` — minimum value of `recent_commit_409_count`
+    /// after a single 409-bump that triggers an inline `TriggerSystemReset`
+    /// dispatch (default 3). Tighter than `SweepConfig::min_409_threshold`
+    /// because inline fires *during* a failure burst and we want sub-second
+    /// detection. Idempotency guarantees in the actor handler make repeated
+    /// dispatches safe.
+    pub min_409_threshold: i32,
+    /// `INLINE_TRIGGER_RESET_COOLDOWN_SECS` — refuse to inline-dispatch on a
+    /// convo whose `last_reset_at` is more recent than this (default 3600 = 1
+    /// h). Defense in depth — actor handler also enforces a 1h cooldown gate
+    /// — but cuts wasted actor-mailbox traffic during a sustained 409 burst
+    /// after a successful auto-reset.
+    pub reset_cooldown_secs: i64,
+}
+
+impl Default for InlineTriggerConfig {
+    fn default() -> Self {
+        Self {
+            min_409_threshold: 3,
+            reset_cooldown_secs: 3600,
+        }
+    }
+}
+
+impl InlineTriggerConfig {
+    /// Read the inline-trigger config from process environment, applying
+    /// defaults for any missing/invalid value.
+    pub fn from_env() -> Self {
+        let defaults = Self::default();
+        Self {
+            min_409_threshold: parse_env_i32_positive(
+                "INLINE_409_THRESHOLD",
+                defaults.min_409_threshold,
+            ),
+            reset_cooldown_secs: parse_env_i64_positive(
+                "INLINE_TRIGGER_RESET_COOLDOWN_SECS",
+                defaults.reset_cooldown_secs,
+            ),
+        }
+    }
+
+    /// Test-only constructor returning the spec defaults verbatim.
+    pub fn test_defaults() -> Self {
+        Self::default()
+    }
+}
+
 fn parse_env_i64_positive(name: &str, default: i64) -> i64 {
     std::env::var(name)
         .ok()

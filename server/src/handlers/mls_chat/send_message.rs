@@ -413,10 +413,7 @@ async fn handle_persistent(
     // Task #39: the enqueue must be synchronous (no `tokio::spawn`) so the
     // hand-off order matches the DB commit order. The consumer task drains
     // per-convo in order, performing store_event + broadcast send atomically.
-    let cursor = sse_state
-        .cursor_gen
-        .next(&convo_id, "messageEvent")
-        .await;
+    let cursor = sse_state.cursor_gen.next(&convo_id, "messageEvent").await;
 
     let sse_message_view: StreamMessageView =
         crate::generated::blue_catbird::mlsChat::MessageView {

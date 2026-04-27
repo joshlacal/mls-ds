@@ -27,6 +27,11 @@ struct AppState {
     db_pool: PgPool,
     sse_state: Arc<realtime::SseState>,
     actor_registry: Arc<actors::ActorRegistry>,
+    /// Phase 2 (B5) — config for the inline 409-burst trigger that bypasses
+    /// the periodic sweep's poll latency. Wrapped in Arc so the handler can
+    /// extract it via `State<Arc<InlineTriggerConfig>>` without cloning the
+    /// struct on every request.
+    inline_trigger_cfg: Arc<config::InlineTriggerConfig>,
     notification_service: Option<Arc<catbird_server::notifications::NotificationService>>,
     block_sync: Arc<block_sync::BlockSyncService>,
     // Federation
@@ -218,6 +223,16 @@ async fn main() -> anyhow::Result<()> {
         });
         tracing::info!("spawned auto_detect_failed_groups sweep worker");
     }
+
+    // Phase 2 (B5) — inline trigger config, read once at startup. Stored on
+    // AppState so handlers can extract it via Axum `State<Arc<InlineTriggerConfig>>`
+    // without re-reading the env on every request.
+    let inline_trigger_cfg = Arc::new(config::InlineTriggerConfig::from_env());
+    tracing::info!(
+        min_409_threshold = inline_trigger_cfg.min_409_threshold,
+        reset_cooldown_secs = inline_trigger_cfg.reset_cooldown_secs,
+        "inline-trigger config loaded (Phase 2 B5)"
+    );
 
     // Spawn idempotency cache cleanup worker
     let cleanup_pool = db_pool.clone();
@@ -457,6 +472,7 @@ async fn main() -> anyhow::Result<()> {
         db_pool: db_pool.clone(),
         sse_state,
         actor_registry,
+        inline_trigger_cfg,
         notification_service,
         block_sync: block_sync_service,
         federation_config: fed_config.clone(),

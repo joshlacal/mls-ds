@@ -586,13 +586,7 @@ impl SseState {
     /// events (typing, info, etc.) or when `store_event` has already been
     /// handled elsewhere.
     pub fn enqueue(&self, convo_id: &str, event: StreamEvent) {
-        self.enqueue_job(
-            convo_id,
-            EmitJob {
-                event,
-                store: None,
-            },
-        );
+        self.enqueue_job(convo_id, EmitJob { event, store: None });
     }
 
     /// Synchronously enqueue a `store_event` + broadcast pair on the per-convo
@@ -652,9 +646,7 @@ async fn consume_emit_queue(
             // Task #40: store_event now takes (pool, convo_id, &StreamEvent)
             // and derives event_type / cursor / message_id from the event.
             let event_type = crate::db::stream_event_type_str(&job.event);
-            if let Err(e) =
-                crate::db::store_event(&store.pool, &convo_id, &job.event).await
-            {
+            if let Err(e) = crate::db::store_event(&store.pool, &convo_id, &job.event).await {
                 error!(
                     convo = %crate::crypto::redact_for_log(&convo_id),
                     event_type,
@@ -1168,8 +1160,7 @@ mod tests {
             // input), and `jacquard_common::serde_bytes_helper`'s visitor
             // requires `&'de str` map keys. Round-trip via the JSON source
             // string — this is also what the WS backfill path uses.
-            let json =
-                serde_json::to_string(&value).expect("to_string on round-trip value failed");
+            let json = serde_json::to_string(&value).expect("to_string on round-trip value failed");
             let round_tripped: StreamEvent = serde_json::from_str(&json)
                 .unwrap_or_else(|e| panic!("from_str failed for {:?}: {}", original, e));
 

@@ -82,10 +82,7 @@ pub async fn get_key_packages(
                 {
                     Ok(rows) => rows,
                     Err(db_err) => {
-                        error!(
-                            "getKeyPackages: block fallback DB query failed: {}",
-                            db_err
-                        );
+                        error!("getKeyPackages: block fallback DB query failed: {}", db_err);
                         return Err(StatusCode::INTERNAL_SERVER_ERROR);
                     }
                 }

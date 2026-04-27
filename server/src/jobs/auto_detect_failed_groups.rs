@@ -24,7 +24,8 @@ use tracing::{error, info, warn};
 // them in main.rs to make `crate::actors` etc. resolve), so the imports
 // below work identically in both compilation contexts.
 use crate::actors::{ActorRegistry, ConvoMessage};
-use crate::config::SweepConfig;
+use crate::config::{InlineTriggerConfig, SweepConfig};
+use crate::db::{self, CommitHealthSnapshot, DbPool};
 
 /// One row emitted by the sweep query — the minimum fields the actor
 /// dispatch needs for telemetry.
@@ -82,15 +83,21 @@ pub async fn sweep_once(
     registry: &Arc<ActorRegistry>,
     cfg: &SweepConfig,
 ) -> anyhow::Result<usize> {
-    // The 7 conditions of the spec's Path B query:
+    // The 8 conditions of the spec's Path B query:
     //   1. auto_reset_disabled_at IS NULL          (circuit-breaker not tripped)
-    //   2. last_successful_commit_at IS NOT NULL   (we've seen at least one commit)
-    //   3. epoch staleness > max_ecommit_staleness_epochs
-    //   4. quiet duration > min_quiet_period_secs
-    //   5. recent_commit_409_count > min_409_threshold
-    //   6. last_commit_409_at IS NOT NULL AND within recent_409_window_secs
-    //   7. last_reset_at IS NULL OR older than min_reset_gap_secs
-    //   8. NOT EXISTS recent Mode A reset_vote   (Mode A exclusion window)
+    //   2. last_successful_commit_at IS NULL OR quiet duration > min_quiet_period_secs
+    //      (B3: NULL means we never saw a successful commit since the Phase 2
+    //       schema landed — those convos are the most broken, not the
+    //       least; predicate must INCLUDE them, not exclude them)
+    //   3. ABS(epoch staleness) > max_ecommit_staleness_epochs
+    //      (B4: catches both `current_epoch >> group_info_epoch` (clients ran
+    //       ahead via External Commits) AND `group_info_epoch >> current_epoch`
+    //       (fresh GroupInfo published but commits never landed) — both are
+    //       genuinely-broken states worth resetting)
+    //   4. recent_commit_409_count > min_409_threshold
+    //   5. last_commit_409_at IS NOT NULL AND within recent_409_window_secs
+    //   6. last_reset_at IS NULL OR older than min_reset_gap_secs
+    //   7. NOT EXISTS recent Mode A reset_vote   (Mode A exclusion window)
     //
     // `LIMIT 50` keeps a single tick from monopolising the actor mailbox if a
     // mass-failure event lights up many convos at once.
@@ -99,9 +106,9 @@ pub async fn sweep_once(
                 c.last_successful_commit_at, c.recent_commit_409_count \
          FROM conversations c \
          WHERE c.auto_reset_disabled_at IS NULL \
-           AND c.last_successful_commit_at IS NOT NULL \
-           AND (c.current_epoch - COALESCE(c.group_info_epoch, 0)) > $1 \
-           AND NOW() - c.last_successful_commit_at > make_interval(secs => $2) \
+           AND ABS(c.current_epoch - COALESCE(c.group_info_epoch, 0)) > $1 \
+           AND (c.last_successful_commit_at IS NULL \
+                OR NOW() - c.last_successful_commit_at > make_interval(secs => $2)) \
            AND c.recent_commit_409_count > $3 \
            AND c.last_commit_409_at IS NOT NULL \
            AND NOW() - c.last_commit_409_at < make_interval(secs => $4) \
@@ -175,4 +182,246 @@ pub async fn sweep_once(
     }
 
     Ok(dispatched)
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Phase 2 (B5) — event-driven inline trigger.
+// ──────────────────────────────────────────────────────────────────────
+
+/// Decision returned by [`evaluate_inline_trigger`]. Surfacing the reason
+/// (rather than a bare bool) lets the caller log *why* a snapshot did or
+/// didn't dispatch — invaluable for prod debugging.
+#[derive(Debug, PartialEq)]
+pub enum InlineTriggerDecision {
+    /// Cross the inline threshold AND none of the gates rejected → dispatch.
+    Dispatch,
+    /// `recent_commit_409_count` is below `min_409_threshold`.
+    BelowThreshold { count: i32, threshold: i32 },
+    /// `auto_reset_disabled_at` is set — circuit breaker tripped.
+    CircuitBreakerTripped,
+    /// `last_reset_at` is more recent than `reset_cooldown_secs`.
+    ResetCooldownActive,
+}
+
+/// Pure predicate evaluator for the B5 inline trigger.
+///
+/// Decoupled from any DB or actor I/O so unit tests can exercise the
+/// decision matrix without standing up sqlx or ractor. The caller composes:
+///   1. Bump the counter via [`crate::db::record_commit_409`].
+///   2. Pass the returned snapshot to this function.
+///   3. If the result is [`InlineTriggerDecision::Dispatch`], cast
+///      `ConvoMessage::TriggerSystemReset` to the convo's actor.
+///
+/// `now` is parameterised (rather than calling `Utc::now()` internally) so
+/// tests can pin time without `tokio::time::pause` setup. Production
+/// callers in [`record_commit_409_with_inline_trigger`] always pass
+/// `chrono::Utc::now()`.
+pub fn evaluate_inline_trigger(
+    snapshot: &CommitHealthSnapshot,
+    cfg: &InlineTriggerConfig,
+    now: chrono::DateTime<chrono::Utc>,
+) -> InlineTriggerDecision {
+    if snapshot.auto_reset_disabled_at.is_some() {
+        return InlineTriggerDecision::CircuitBreakerTripped;
+    }
+    if snapshot.recent_commit_409_count < cfg.min_409_threshold {
+        return InlineTriggerDecision::BelowThreshold {
+            count: snapshot.recent_commit_409_count,
+            threshold: cfg.min_409_threshold,
+        };
+    }
+    if let Some(last_reset) = snapshot.last_reset_at {
+        let cooldown = chrono::Duration::seconds(cfg.reset_cooldown_secs);
+        if now - last_reset < cooldown {
+            return InlineTriggerDecision::ResetCooldownActive;
+        }
+    }
+    InlineTriggerDecision::Dispatch
+}
+
+/// Bump the convo's 409 counter AND, on the same code path, evaluate the
+/// inline-trigger predicate. If satisfied, immediately dispatch
+/// `ConvoMessage::TriggerSystemReset { reason: "inline_409_threshold" }`
+/// to the convo's actor — eliminating the up-to-`SWEEP_INTERVAL_SECS`
+/// detection latency the periodic sweep would otherwise impose.
+///
+/// Failures of the underlying counter UPDATE propagate as `Err`. Failures
+/// of the actor dispatch are logged but do NOT propagate — a missed inline
+/// dispatch will be retried on the next 409, and the periodic sweep
+/// remains as a safety net regardless. The 409 response to the client is
+/// the contract; instrumentation must never mask it (callers should still
+/// `let _ = ... .map_err(|e| warn!(...))` the returned `Result`).
+///
+/// Idempotency: the actor's `handle_trigger_system_reset` enforces both
+/// the per-convo `last_reset_at < 1h` cooldown and the
+/// `auto_reset_disabled_at` circuit breaker. Repeated dispatches during a
+/// 409 burst are therefore safe — the actor short-circuits each one.
+pub async fn record_commit_409_with_inline_trigger(
+    pool: &DbPool,
+    registry: &Arc<ActorRegistry>,
+    convo_id: &str,
+    cfg: &InlineTriggerConfig,
+) -> anyhow::Result<()> {
+    let snapshot = db::record_commit_409(pool, convo_id).await?;
+
+    match evaluate_inline_trigger(&snapshot, cfg, chrono::Utc::now()) {
+        InlineTriggerDecision::Dispatch => {
+            info!(
+                convo_id = %crate::crypto::redact_for_log(convo_id),
+                count_409 = snapshot.recent_commit_409_count,
+                threshold = cfg.min_409_threshold,
+                "inline-trigger: dispatching TriggerSystemReset"
+            );
+            let actor_ref = match registry.get_or_spawn(convo_id).await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(
+                        convo_id = %crate::crypto::redact_for_log(convo_id),
+                        error = %e,
+                        "inline-trigger: failed to spawn actor — skipping (sweep will catch on next tick)"
+                    );
+                    return Ok(());
+                }
+            };
+            if let Err(e) = actor_ref.cast(ConvoMessage::TriggerSystemReset {
+                reason: "inline_409_threshold".to_string(),
+                staleness_epochs: 0,
+                quiet_duration_secs: 0,
+            }) {
+                warn!(
+                    convo_id = %crate::crypto::redact_for_log(convo_id),
+                    error = %e,
+                    "inline-trigger: actor cast failed — non-fatal, sweep will retry"
+                );
+            }
+        }
+        InlineTriggerDecision::BelowThreshold { count, threshold } => {
+            tracing::debug!(
+                convo_id = %crate::crypto::redact_for_log(convo_id),
+                count,
+                threshold,
+                "inline-trigger: below threshold — counter bumped only"
+            );
+        }
+        InlineTriggerDecision::CircuitBreakerTripped => {
+            tracing::debug!(
+                convo_id = %crate::crypto::redact_for_log(convo_id),
+                "inline-trigger: auto_reset_disabled_at set — skipping"
+            );
+        }
+        InlineTriggerDecision::ResetCooldownActive => {
+            tracing::debug!(
+                convo_id = %crate::crypto::redact_for_log(convo_id),
+                "inline-trigger: recent reset cooldown active — skipping"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod inline_trigger_tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+
+    fn snap(
+        count: i32,
+        last_reset: Option<chrono::DateTime<chrono::Utc>>,
+        disabled: bool,
+    ) -> CommitHealthSnapshot {
+        CommitHealthSnapshot {
+            recent_commit_409_count: count,
+            last_reset_at: last_reset,
+            auto_reset_disabled_at: if disabled {
+                Some(chrono::Utc::now())
+            } else {
+                None
+            },
+        }
+    }
+
+    fn cfg(threshold: i32, cooldown: i64) -> InlineTriggerConfig {
+        InlineTriggerConfig {
+            min_409_threshold: threshold,
+            reset_cooldown_secs: cooldown,
+        }
+    }
+
+    #[test]
+    fn dispatches_when_threshold_crossed_and_no_gates() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 26, 18, 0, 0).unwrap();
+        let s = snap(3, None, false);
+        let c = cfg(3, 3600);
+        assert_eq!(
+            evaluate_inline_trigger(&s, &c, now),
+            InlineTriggerDecision::Dispatch
+        );
+    }
+
+    #[test]
+    fn does_not_dispatch_below_threshold() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 26, 18, 0, 0).unwrap();
+        let s = snap(2, None, false);
+        let c = cfg(3, 3600);
+        assert_eq!(
+            evaluate_inline_trigger(&s, &c, now),
+            InlineTriggerDecision::BelowThreshold {
+                count: 2,
+                threshold: 3
+            }
+        );
+    }
+
+    #[test]
+    fn does_not_dispatch_when_circuit_breaker_tripped() {
+        // Circuit breaker takes precedence over threshold check — even a
+        // count of 1000 must not dispatch when the convo is disabled.
+        let now = Utc.with_ymd_and_hms(2026, 4, 26, 18, 0, 0).unwrap();
+        let s = snap(1000, None, true);
+        let c = cfg(3, 3600);
+        assert_eq!(
+            evaluate_inline_trigger(&s, &c, now),
+            InlineTriggerDecision::CircuitBreakerTripped
+        );
+    }
+
+    #[test]
+    fn does_not_dispatch_within_reset_cooldown() {
+        // Reset 30 min ago, cooldown is 1h — must skip.
+        let now = Utc.with_ymd_and_hms(2026, 4, 26, 18, 0, 0).unwrap();
+        let last_reset = now - chrono::Duration::minutes(30);
+        let s = snap(10, Some(last_reset), false);
+        let c = cfg(3, 3600);
+        assert_eq!(
+            evaluate_inline_trigger(&s, &c, now),
+            InlineTriggerDecision::ResetCooldownActive
+        );
+    }
+
+    #[test]
+    fn dispatches_when_reset_cooldown_expired() {
+        // Reset 90 min ago, cooldown is 1h — eligible again.
+        let now = Utc.with_ymd_and_hms(2026, 4, 26, 18, 0, 0).unwrap();
+        let last_reset = now - chrono::Duration::minutes(90);
+        let s = snap(10, Some(last_reset), false);
+        let c = cfg(3, 3600);
+        assert_eq!(
+            evaluate_inline_trigger(&s, &c, now),
+            InlineTriggerDecision::Dispatch
+        );
+    }
+
+    #[test]
+    fn dispatches_when_no_prior_reset_recorded() {
+        // last_reset_at = NULL is the steady-state for never-reset convos.
+        // Must not be conflated with "recently reset".
+        let now = Utc.with_ymd_and_hms(2026, 4, 26, 18, 0, 0).unwrap();
+        let s = snap(5, None, false);
+        let c = cfg(3, 3600);
+        assert_eq!(
+            evaluate_inline_trigger(&s, &c, now),
+            InlineTriggerDecision::Dispatch
+        );
+    }
 }

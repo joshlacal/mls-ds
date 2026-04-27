@@ -136,8 +136,7 @@ mod tests {
 
     #[test]
     fn action_contract_rejects_malformed_commit_bytes() {
-        let err =
-            enforce_non_add_action_contract(false, false, &vec![0xFFu8; 64]).unwrap_err();
+        let err = enforce_non_add_action_contract(false, false, &vec![0xFFu8; 64]).unwrap_err();
         assert!(matches!(
             err,
             CommitActionContractError::BadFraming(CommitInspectError::Decode(_))

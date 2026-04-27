@@ -24,7 +24,7 @@
 
 use catbird_server::actors::{ConversationActor, ConvoActorArgs, ConvoMessage};
 use catbird_server::config::QuorumConfig;
-use catbird_server::db::{DbConfig, init_db};
+use catbird_server::db::{init_db, DbConfig};
 use catbird_server::realtime::SseState;
 use ractor::{Actor, ActorRef};
 use sqlx::PgPool;
