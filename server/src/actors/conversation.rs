@@ -11,6 +11,30 @@ use crate::notifications::NotificationService;
 use crate::realtime::{SseState, StreamEvent, StreamMessageView};
 use tokio::sync::mpsc;
 
+/// Service DID used as `last_reset_by` for system-initiated auto-resets
+/// (Path A quorum + Path B sweep). Read from `SERVICE_DID` env once at first
+/// access and cached; the fragment (`#atproto_mls`) is stripped because the
+/// `groupResetEvent.resetBy` lexicon field is typed `format: "did"` and the
+/// Petrel Swift validator rejects DIDs with fragments.
+///
+/// Phase 2 B6: previously these paths emitted `"system:server_sweep"` /
+/// `"system:client_quorum"` here, which iOS rejected as `invalidURI` —
+/// the WS handler treated the decode failure as a connection error and
+/// reconnected, causing an infinite replay loop where the convo never
+/// transitioned out of its broken state despite the server-side reset
+/// completing successfully. The reason field already carries the
+/// "sweep" vs "quorum" discriminator for ops audit.
+fn system_reset_did() -> &'static str {
+    static DID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DID.get_or_init(|| {
+        let raw = std::env::var("SERVICE_DID")
+            .unwrap_or_else(|_| "did:web:mlschat.catbird.blue".to_string());
+        // Strip `#fragment` — DID format validation in clients is stricter
+        // than the AT Protocol spec; safest is to emit a base DID.
+        raw.split('#').next().unwrap_or(&raw).to_string()
+    })
+}
+
 /// Manages state for a single conversation, ensuring sequential processing
 /// of all epoch-modifying operations to prevent race conditions.
 ///
@@ -1388,10 +1412,13 @@ impl ConversationActorState {
         }
 
         // ── 8. Execute auto-reset via the shared helper ───────────────────
+        // Phase 2 B6: use service DID (not "system:client_quorum") so the
+        // emitted groupResetEvent.resetBy passes iOS lexicon DID validation.
+        // Reason field carries the trigger semantic for ops audit.
         let reset_outcome = self
             .do_reset_group(
-                "system:client_quorum",
-                "Automatic recovery: quorum of members reported unrecoverable failure",
+                system_reset_did(),
+                "Automatic recovery: quorum of members reported unrecoverable failure [trigger=client_quorum]",
                 None,
                 None,
             )
@@ -1525,10 +1552,15 @@ impl ConversationActorState {
             return;
         }
 
-        let last_reset_by = format!("system:{}", reason);
+        // Phase 2 B6: use the service DID (not "system:<reason>") so the
+        // resulting `groupResetEvent.resetBy` passes lexicon DID validation
+        // on iOS. The `reason` field below preserves the sweep-vs-quorum
+        // semantic (`reason` here is a free-form string from the sweep
+        // dispatcher, e.g. "inline_409_threshold" or "server_sweep").
+        let last_reset_by = system_reset_did().to_string();
         let event_reason = format!(
-            "Automatic recovery: server sweep observed staleness ({} epochs, {} s quiet)",
-            staleness_epochs, quiet_duration_secs
+            "Automatic recovery: server sweep observed staleness ({} epochs, {} s quiet) [trigger={}]",
+            staleness_epochs, quiet_duration_secs, reason
         );
 
         match self
