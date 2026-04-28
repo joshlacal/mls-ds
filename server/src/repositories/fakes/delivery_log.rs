@@ -1,4 +1,11 @@
 //! In-memory fake for `DeliveryLogRepository`. Test-only.
+//!
+//! Mirrors the Phase 2 Postgres semantics:
+//! - `append` is idempotent on
+//!   `(conversation_id, sender_did, sender_device_id, idempotency_key)`.
+//!   Duplicate retries return the existing event.
+//! - `seq` is monotonic per conversation, starts at 1 (matches Postgres
+//!   semantics post-backfill: backfill seeds seq=0, first real event = 1).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -21,11 +28,38 @@ impl InMemoryDeliveryLogRepository {
     }
 }
 
+fn idempotency_match(
+    e: &DeliveryEvent,
+    sender_did: &Option<String>,
+    sender_device_id: &Option<String>,
+    idempotency_key: &Option<String>,
+) -> bool {
+    e.sender_did == *sender_did
+        && e.sender_device_id == *sender_device_id
+        && e.idempotency_key == *idempotency_key
+}
+
 #[async_trait]
 impl DeliveryLogRepository for InMemoryDeliveryLogRepository {
     async fn append(&self, event: NewDeliveryEvent) -> RepositoryResult<DeliveryEvent> {
         let mut guard = self.inner.lock().expect("fake log mutex poisoned");
         let log = guard.entry(event.conversation_id.clone()).or_default();
+
+        // Idempotency check: if an event with the same tuple already
+        // exists, return it.
+        if event.idempotency_key.is_some() {
+            if let Some(existing) = log.iter().find(|e| {
+                idempotency_match(
+                    e,
+                    &event.sender_did,
+                    &event.sender_device_id,
+                    &event.idempotency_key,
+                )
+            }) {
+                return Ok(existing.clone());
+            }
+        }
+
         let next_seq = log.last().map_or(0, |e| e.seq) + 1;
         let id = if event.id.is_empty() {
             Uuid::new_v4().to_string()
@@ -66,17 +100,17 @@ impl DeliveryLogRepository for InMemoryDeliveryLogRepository {
         let guard = self.inner.lock().expect("fake log mutex poisoned");
         let mut out = Vec::new();
         for log in guard.values() {
-            for e in log
-                .iter()
-                .filter(|e| {
-                    e.crypto_session_id.as_deref() == Some(crypto_session_id) && e.seq >= from_seq
-                })
-                .take(limit)
-            {
+            for e in log.iter().filter(|e| {
+                e.crypto_session_id.as_deref() == Some(crypto_session_id) && e.seq >= from_seq
+            }) {
+                if out.len() >= limit {
+                    break;
+                }
                 out.push(e.clone());
             }
         }
         out.sort_by_key(|e| e.seq);
+        out.truncate(limit);
         Ok(out)
     }
 }

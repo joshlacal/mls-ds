@@ -1,9 +1,16 @@
 //! In-memory fake for `CryptoSessionRepository`. Test-only.
+//!
+//! Mirrors the Phase 2 Postgres semantics:
+//! - `create` is idempotent on `(conversation_id, generation)` and returns
+//!   the existing row on conflict (instead of allocating a new id).
+//! - `mark_superseded` is idempotent — calling it twice on the same row is
+//!   a no-op rather than an error.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use uuid::Uuid;
 
 use crate::models::{CryptoSession, NewCryptoSession};
 use crate::repositories::{CryptoSessionRepository, RepositoryResult};
@@ -19,15 +26,16 @@ impl InMemoryCryptoSessionRepository {
         Self::default()
     }
 
-    /// Test-only helper to insert a session directly. Phase 2's `create` will
-    /// supersede this with a real path.
+    /// Test-only helper to insert a session directly. Bypasses tie-break
+    /// idempotency — useful for seeding fixtures.
     pub fn insert(&self, session: CryptoSession) {
         let mut guard = self.inner.lock().expect("fake repo mutex poisoned");
         guard.insert(session.id.clone(), session);
     }
 
-    /// Test-only helper to mark a session superseded without going through
-    /// the trait method (which still returns `NotImplemented` until Phase 2).
+    /// Test-only helper to mark a session superseded. Phase 2's trait
+    /// `mark_superseded` does the same thing; this exists so legacy tests
+    /// that supplied an explicit timestamp continue to work.
     pub fn mark_superseded_for_test(
         &self,
         id: &str,
@@ -36,8 +44,13 @@ impl InMemoryCryptoSessionRepository {
     ) {
         let mut guard = self.inner.lock().expect("fake repo mutex poisoned");
         if let Some(s) = guard.get_mut(id) {
-            s.state = "superseded".to_string();
-            s.superseded_at = Some(when);
+            if matches!(
+                s.state.as_str(),
+                "active" | "superseding" | "reset_requested"
+            ) {
+                s.state = "superseded".to_string();
+                s.superseded_at = Some(when);
+            }
         }
         if let Some(s) = guard.get_mut(superseded_by_id) {
             s.supersedes_id = Some(id.to_string());
@@ -67,9 +80,30 @@ impl CryptoSessionRepository for InMemoryCryptoSessionRepository {
     }
 
     async fn create(&self, session: NewCryptoSession) -> RepositoryResult<CryptoSession> {
+        let mut guard = self.inner.lock().expect("fake repo mutex poisoned");
+
+        // Idempotency on (conversation_id, generation) — mirror the Postgres
+        // UNIQUE constraint. If a session with this key already exists,
+        // return it instead of inserting.
+        if let Some(existing) = guard.values().find(|s| {
+            s.conversation_id == session.conversation_id && s.generation == session.generation
+        }) {
+            return Ok(existing.clone());
+        }
+
+        let id = if session.id.is_empty() {
+            Uuid::new_v4().to_string()
+        } else {
+            session.id
+        };
         let now = chrono::Utc::now();
+        let activated_at = if session.state == "active" {
+            Some(now)
+        } else {
+            None
+        };
         let row = CryptoSession {
-            id: session.id,
+            id: id.clone(),
             conversation_id: session.conversation_id,
             generation: session.generation,
             mls_group_id: session.mls_group_id,
@@ -82,12 +116,11 @@ impl CryptoSessionRepository for InMemoryCryptoSessionRepository {
             group_info_updated_at: None,
             created_by_did: session.created_by_did,
             created_at: now,
-            activated_at: Some(now),
+            activated_at,
             superseded_at: None,
             supersedes_id: session.supersedes_id,
         };
-        let mut guard = self.inner.lock().expect("fake repo mutex poisoned");
-        guard.insert(row.id.clone(), row.clone());
+        guard.insert(id, row.clone());
         Ok(row)
     }
 
