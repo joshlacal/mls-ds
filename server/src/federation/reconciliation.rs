@@ -17,8 +17,16 @@ const EVENTS_NSID: &str = "blue.catbird.mlsDS.getConvoEvents";
 const HEALTH_CHECK_NSID: &str = "blue.catbird.mlsDS.healthCheck";
 const EVENTS_PAGE_LIMIT: i64 = 500;
 
+/// Decoded `getConvoDigest` response from a peer DS.
+///
+/// `convo_id` and `generated_at` are deserialized for shape validation and
+/// future audit logging but currently unused in the reconciliation algorithm,
+/// which keys off `(epoch, last_seq, digest_sha256)`. Keeping the fields
+/// avoids a re-emit if/when we add cross-DS digest staleness checks.
+/// TODO(phase-2.5-cleanup): wire `generated_at` into staleness rejection or drop.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 struct RemoteConvoDigest {
     convo_id: String,
     sequencer_ds_did: String,
@@ -30,8 +38,15 @@ struct RemoteConvoDigest {
     generated_at: DateTime<Utc>,
 }
 
+/// Decoded `getConvoEvents` response from a peer DS.
+///
+/// `convo_id` and `from_seq_exclusive` are echoed back by the peer for the
+/// caller's benefit; the reconciliation loop already tracks the requested
+/// range, so they're inspected for Debug/log purposes only.
+/// TODO(phase-2.5-cleanup): assert echoed values match the request, or drop.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 struct RemoteConvoEvents {
     convo_id: String,
     from_seq_exclusive: i64,

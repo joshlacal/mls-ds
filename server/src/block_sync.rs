@@ -86,7 +86,11 @@ struct RecordEntry {
 /// The value of an app.bsky.graph.block record
 #[derive(Debug, Deserialize)]
 struct BlockValue {
+    /// `$type` discriminator. Decoded for shape validation but not consulted
+    /// by the BlockSync logic — the type is enforced via the listRecords URL.
+    /// TODO(phase-2.5-cleanup): assert it equals `app.bsky.graph.block` or drop.
     #[serde(rename = "$type")]
+    #[allow(dead_code)]
     record_type: Option<String>,
     subject: String,
     #[serde(rename = "createdAt")]

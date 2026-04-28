@@ -223,6 +223,10 @@ pub struct Service {
 #[derive(Debug, Clone)]
 pub struct CachedDidDoc {
     doc: DidDocument,
+    /// Insertion timestamp. Currently only consumed via Debug; kept as a future
+    /// hook for staleness assertions and cache-introspection logging.
+    /// TODO(phase-2.5-cleanup): wire into `/health/auth-cache` diagnostics or remove.
+    #[allow(dead_code)]
     cached_at: DateTime<Utc>,
 }
 
@@ -240,6 +244,11 @@ pub struct AuthMiddleware {
     rate_limiters:
         Arc<moka::sync::Cache<String, Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>>>,
     http_client: reqwest::Client,
+    /// Stored TTL value used to construct `did_cache` (moka's `time_to_live`).
+    /// Not read after construction today, but useful for diagnostics endpoints
+    /// and future on-demand TTL reconfiguration without rebuilding the cache.
+    /// TODO(phase-2.5-cleanup): expose via diagnostics or drop the field.
+    #[allow(dead_code)]
     cache_ttl_seconds: u64,
     rate_limit_quota: Quota,
     did_host_allowlist: Option<Vec<String>>,

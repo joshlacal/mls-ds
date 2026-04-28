@@ -1,23 +1,41 @@
-// Pre-existing clippy noise batched for transitional acceptance under
-// `cargo clippy -- -D warnings` in CI. None of these are correctness bugs; all
-// reflect pre-existing patterns in this codebase that need a separate audit
-// pass to refactor properly.
+// Crate-level clippy allows still load-bearing under
+// `cargo clippy -- -D warnings`.
 //
-// TODO(phase-2.5-cleanup): per-category audit and remove these allows:
-//   - too_many_arguments / type_complexity: factor handler tuples into structs
-//   - dead_code: confirm each "never read" field is actually wired or remove
-//   - should_implement_trait: review custom from_str impls vs FromStr
-//   - deprecated (GenericArray): upgrade sha2 → generic-array 1.x
-//   - doc-* lints: fix markdown indentation in rustdoc comments
+// `chore/ci-cleanup` (Apr 2026) removed the following blanket allows after
+// the underlying violations were either fixed at the call site or scoped to
+// per-struct / per-field allows: `dead_code`, `unused_imports`,
+// `clippy::large_enum_variant`, `clippy::doc_overindented_list_items`,
+// `clippy::doc_lazy_continuation`. Re-adding any of those at the crate level
+// requires justification — fix the violation or add the narrowest local
+// allow.
+//
+// Surviving allows. Each has a concrete follow-up; do not remove without
+// fixing the underlying issues:
+//
+//   - `clippy::too_many_arguments` — 7 functions in `handlers::mls_chat`
+//     and the federation outbound path exceed the 7-arg default. Refactor
+//     groups stable bundles (auth context, db pool + conversation id,
+//     idempotency keys) into request structs. Tracked as
+//     TODO(phase-2.5-cleanup-too-many-args).
+//   - `clippy::type_complexity` — 10 sites use deeply nested generic types
+//     (`Arc<Mutex<HashMap<String, Box<dyn Fn(...) -> Result<...>>>>>`-shaped).
+//     Fix per-site: introduce a `type` alias or a thin newtype. Tracked as
+//     TODO(phase-2.5-cleanup-type-aliases).
+//   - `clippy::should_implement_trait` — 3 inherent `from_str` methods on
+//     state-machine enums (`TrustLevel`, `CryptoSessionState`, etc.).
+//     Migrating to `impl FromStr` is mechanical but breaks every inherent
+//     call site, so it ships in its own PR. Tracked as
+//     TODO(phase-2.5-cleanup-fromstr).
+//   - `deprecated` — 4 callers of
+//     `sha2::digest::generic_array::GenericArray::from_slice`, deprecated in
+//     generic-array 0.14 (still in tree via `sha2 0.10`). The replacement is
+//     `<&[u8]>::try_into` or `GenericArray::from_slice` from generic-array
+//     1.x, which lands when we bump to `sha2 = "0.11"`. Tracked as
+//     TODO(phase-2.5-cleanup-genericarray).
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::type_complexity)]
-#![allow(clippy::doc_overindented_list_items)]
-#![allow(clippy::doc_lazy_continuation)]
 #![allow(clippy::should_implement_trait)]
-#![allow(clippy::large_enum_variant)]
 #![allow(deprecated)]
-#![allow(dead_code)]
-#![allow(unused_imports)]
 
 pub mod actors;
 pub mod atproto_bytes;

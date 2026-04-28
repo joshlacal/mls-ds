@@ -1,21 +1,27 @@
-// Mirror the lib.rs crate-level allows for the bin target — clippy treats them
-// as separate compilation units. See lib.rs for rationale and Phase 2.5 cleanup TODO.
+// Mirror the surviving lib.rs crate-level allows for the bin target —
+// clippy treats them as separate compilation units. See lib.rs for the full
+// rationale (each entry has a concrete TODO(phase-2.5-cleanup-*) follow-up).
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::type_complexity)]
-#![allow(clippy::doc_overindented_list_items)]
-#![allow(clippy::doc_lazy_continuation)]
 #![allow(clippy::should_implement_trait)]
-#![allow(clippy::large_enum_variant)]
 #![allow(deprecated)]
+// `dead_code` is load-bearing in the bin namespace because main.rs declares
+// `mod device_utils;` and `mod jobs;` which both duplicate the same source
+// files compiled into `lib.rs`. The bin-local copies expose the same items
+// but call only a subset (e.g. `parse_device_did` is only used by lib-side
+// handlers). Removing this allow requires either deleting the duplicate
+// `mod` declarations and routing main.rs through `catbird_server::*` (deep
+// refactor, breaks the bin/lib seam) or splitting the workers into a
+// bin-only crate.
+// TODO(phase-2.5-cleanup-bin-lib-dedup): collapse the bin/lib module
+// duplication so this allow can be retired.
 #![allow(dead_code)]
-#![allow(unused_imports)]
 
 use axum::{
     extract::{DefaultBodyLimit, FromRef},
     routing::{any, get, post},
     Router,
 };
-use jacquard_axum::IntoRouter;
 use sqlx::PgPool;
 use std::{net::SocketAddr, sync::Arc};
 use tokio::time::{interval, Duration};
@@ -24,8 +30,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 // Import from library crate instead of re-declaring modules
 use catbird_server::{
-    actors, auth, blob_store, block_sync, config, crypto, db, fanout, federation, handlers, health,
-    metrics, middleware, models, realtime, storage, util, workers,
+    actors, auth, blob_store, block_sync, config, crypto, db, federation, handlers, health,
+    metrics, middleware, models, realtime, workers,
 };
 
 // These modules are only in main.rs (not in lib.rs)

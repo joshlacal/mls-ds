@@ -1812,6 +1812,7 @@ impl ConversationActorState {
     /// - `Ok(Some((new_group_id, reset_count)))` on success.
     /// - `Ok(None)` if the conversations row vanished mid-flight.
     /// - `Err(_)` on database error.
+    ///
     /// Phase 2 §2.2 — `RequestCryptoSessionReset` handler.
     ///
     /// Opens a single Postgres tx, dispatches to
