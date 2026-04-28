@@ -38,7 +38,7 @@ struct XrpcErrorBody {
 /// `serverEpoch` from the send-path 409 get instant epoch-resync here too —
 /// no extra `getGroupState` round-trip required.
 #[derive(Serialize)]
-struct EpochConflictBody {
+pub struct EpochConflictBody {
     error: &'static str,
     message: String,
     #[serde(rename = "serverEpoch")]
@@ -563,7 +563,7 @@ pub async fn commit_group_change(
                 )
                 .bind(&convo_id)
                 .bind(member_did_str)
-                .bind(&now)
+                .bind(now)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| {
@@ -689,7 +689,7 @@ pub async fn commit_group_change(
             .bind(commit_wire_epoch)
             .bind(seq)
             .bind(&commit_bytes[..])
-            .bind(&now)
+            .bind(now)
             .execute(&mut *tx)
             .await
             .map_err(|e| {
@@ -715,7 +715,7 @@ pub async fn commit_group_change(
                 .bind(member_did_str)
                 .bind(&welcome_bytes[..])
                 .bind::<Option<Vec<u8>>>(None)
-                .bind(&now)
+                .bind(now)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| {
@@ -825,14 +825,13 @@ pub async fn commit_group_change(
                 crate::generated::blue_catbird::mlsChat::MessageView {
                     id: msg_id.clone().into(),
                     convo_id: convo_id.clone().into(),
-                    ciphertext: bytes::Bytes::from(commit_bytes.clone()),
+                    ciphertext: commit_bytes.clone(),
                     epoch: new_epoch as i64,
                     seq,
                     created_at: crate::sqlx_jacquard::chrono_to_datetime(now),
                     message_type: Some("commit".into()),
                     extra_data: Default::default(),
-                }
-                .into();
+                };
 
             let commit_event = crate::realtime::StreamEvent::MessageEvent {
                 cursor: commit_cursor.clone(),
@@ -1389,7 +1388,7 @@ pub async fn commit_group_change(
             .bind(commit_wire_epoch)
             .bind(seq)
             .bind(&commit_bytes[..])
-            .bind(&now)
+            .bind(now)
             .execute(&mut *tx)
             .await
             .map_err(|e| {
@@ -1445,14 +1444,13 @@ pub async fn commit_group_change(
                 crate::generated::blue_catbird::mlsChat::MessageView {
                     id: msg_id.clone().into(),
                     convo_id: convo_id.clone().into(),
-                    ciphertext: bytes::Bytes::from(commit_bytes.clone()),
+                    ciphertext: commit_bytes.clone(),
                     epoch: new_epoch as i64,
                     seq,
                     created_at: crate::sqlx_jacquard::chrono_to_datetime(now),
                     message_type: Some("commit".into()),
                     extra_data: Default::default(),
-                }
-                .into();
+                };
 
             let commit_event = crate::realtime::StreamEvent::MessageEvent {
                 cursor: commit_cursor.clone(),
@@ -2223,7 +2221,7 @@ pub async fn commit_group_change(
                 )
                 .bind(&convo_id)
                 .bind(&member_did_str)
-                .bind(&now)
+                .bind(now)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| {
@@ -2261,7 +2259,7 @@ pub async fn commit_group_change(
             .bind(commit_wire_epoch)
             .bind(seq)
             .bind(&commit_bytes[..])
-            .bind(&now)
+            .bind(now)
             .execute(&mut *tx)
             .await
             .map_err(|e| {
@@ -2317,14 +2315,13 @@ pub async fn commit_group_change(
                 crate::generated::blue_catbird::mlsChat::MessageView {
                     id: msg_id.clone().into(),
                     convo_id: convo_id.clone().into(),
-                    ciphertext: bytes::Bytes::from(commit_bytes.clone()),
+                    ciphertext: commit_bytes.clone(),
                     epoch: new_epoch as i64,
                     seq,
                     created_at: crate::sqlx_jacquard::chrono_to_datetime(now),
                     message_type: Some("commit".into()),
                     extra_data: Default::default(),
-                }
-                .into();
+                };
 
             let commit_event = crate::realtime::StreamEvent::MessageEvent {
                 cursor: commit_cursor.clone(),
@@ -2628,7 +2625,7 @@ pub async fn commit_group_change(
             .bind(commit_wire_epoch)
             .bind(seq)
             .bind(&commit_bytes[..])
-            .bind(&now)
+            .bind(now)
             .execute(&mut *tx)
             .await
             .map_err(|e| {
@@ -2685,14 +2682,13 @@ pub async fn commit_group_change(
                 crate::generated::blue_catbird::mlsChat::MessageView {
                     id: msg_id.clone().into(),
                     convo_id: convo_id.clone().into(),
-                    ciphertext: bytes::Bytes::from(commit_bytes.clone()),
+                    ciphertext: commit_bytes.clone(),
                     epoch: new_epoch as i64,
                     seq,
                     created_at: crate::sqlx_jacquard::chrono_to_datetime(now),
                     message_type: Some("commit".into()),
                     extra_data: Default::default(),
-                }
-                .into();
+                };
 
             let commit_event = crate::realtime::StreamEvent::MessageEvent {
                 cursor: commit_cursor.clone(),

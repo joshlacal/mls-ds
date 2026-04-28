@@ -1067,7 +1067,7 @@ async fn handle_complete_pending_addition(
                         crate::crypto::redact_for_log(pending_addition_id),
                         claimed_by
                             .as_deref()
-                            .map(|d| crate::crypto::redact_for_log(d))
+                            .map(crate::crypto::redact_for_log)
                             .unwrap_or_else(|| "unknown".to_string()),
                         crate::crypto::redact_for_log(&user_did)
                     );

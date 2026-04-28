@@ -826,8 +826,7 @@ pub async fn subscribe_convo_events(
                             created_at: crate::sqlx_jacquard::chrono_to_datetime(created_at),
                             message_type: Some("commit".into()),
                             extra_data: Default::default(),
-                        }
-                        .into();
+                        };
 
                     let event = StreamEvent::MessageEvent {
                         cursor: cursor.clone(),
@@ -866,7 +865,7 @@ pub async fn subscribe_convo_events(
     let replay_stream = stream::iter(
         replay_sse_events
             .into_iter()
-            .map(|evt| Ok::<Event, Infallible>(evt)),
+            .map(Ok::<Event, Infallible>),
     );
 
     // Create live event stream

@@ -148,7 +148,7 @@ pub async fn get_key_packages(
         let mut rows = match claim_available_key_packages(
             &pool,
             did.as_ref(),
-            input.cipher_suite.as_deref().map(|s| s.as_ref()),
+            input.cipher_suite.as_deref(),
             /* last_resort = */ false,
         )
         .await
@@ -173,7 +173,7 @@ pub async fn get_key_packages(
             match claim_available_key_packages(
                 &pool,
                 did.as_ref(),
-                input.cipher_suite.as_deref().map(|s| s.as_ref()),
+                input.cipher_suite.as_deref(),
                 /* last_resort = */ true,
             )
             .await

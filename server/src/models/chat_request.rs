@@ -114,7 +114,7 @@ impl ChatRequest {
     pub fn conversation_id(&self) -> Option<&str> {
         self.accepted_convo_id
             .as_deref()
-            .or_else(|| self.group_id.as_deref())
+            .or(self.group_id.as_deref())
     }
 }
 

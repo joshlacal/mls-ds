@@ -4,7 +4,6 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use base64::Engine;
 use chrono::{DateTime, Utc};
 use jacquard_axum::ExtractXrpc;
 use std::sync::Arc;
@@ -396,7 +395,7 @@ async fn handle_create_convo(
     )
     .bind(&convo_id)
     .bind(&auth_user.did)
-    .bind(&now)
+    .bind(now)
     .bind(&name)
     .bind(input.cipher_suite.as_ref())
     .execute(&pool)
@@ -414,7 +413,7 @@ async fn handle_create_convo(
     .bind(&convo_id)
     .bind(&auth_user.did)
     .bind(&auth_user.did)
-    .bind(&now)
+    .bind(now)
     .execute(&pool)
     .await
     .map_err(|e| {
@@ -454,7 +453,7 @@ async fn handle_create_convo(
             .bind(&convo_id)
             .bind(&member_did_str)
             .bind(&member_did_str)
-            .bind(&now)
+            .bind(now)
             .execute(&pool)
             .await
             .map_err(|e| {
@@ -591,7 +590,7 @@ async fn handle_create_convo(
                 .bind(member_did_str)
                 .bind(&welcome_data)
                 .bind::<Option<Vec<u8>>>(None)
-                .bind(&now)
+                .bind(now)
                 .execute(&pool)
                 .await
                 .map_err(|e| {
@@ -612,7 +611,7 @@ async fn handle_create_convo(
                     .bind(member_did_str)
                     .bind(&welcome_data)
                     .bind(Some(hash))
-                    .bind(&now)
+                    .bind(now)
                     .execute(&pool)
                     .await
                     .map_err(|e| {

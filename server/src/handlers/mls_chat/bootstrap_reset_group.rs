@@ -404,7 +404,7 @@ pub async fn handle(
                 .bind(&recipient)
                 .bind(welcome)
                 .bind(Some(hash_bytes))
-                .bind(&now)
+                .bind(now)
                 .execute(&pool)
                 .await
                 {
@@ -443,7 +443,7 @@ pub async fn handle(
                 .bind(&original_convo_id)
                 .bind(&recipient)
                 .bind(welcome)
-                .bind(&now)
+                .bind(now)
                 .execute(&pool)
                 .await
                 {

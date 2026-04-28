@@ -145,7 +145,7 @@ pub async fn get_group_metadata_blob(
         None => {
             warn!(
                 "❌ [getGroupMetadataBlob] Blob not found: locator={:?} group={}",
-                effective_locator.map(|l| crate::crypto::redact_for_log(l)),
+                effective_locator.map(crate::crypto::redact_for_log),
                 crate::crypto::redact_for_log(&params.group_id)
             );
             Err(StatusCode::NOT_FOUND)

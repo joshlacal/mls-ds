@@ -159,7 +159,7 @@ async fn handle_persistent(
     // --- Validate padded_size bucket ---
     let valid_buckets = [512, 1024, 2048, 4096, 8192];
     let is_valid_bucket = valid_buckets.contains(&padded_size)
-        || (padded_size > 8192 && padded_size <= 10 * 1024 * 1024 && padded_size % 8192 == 0);
+        || (padded_size > 8192 && padded_size <= 10 * 1024 * 1024 && padded_size.is_multiple_of(8192));
     if !is_valid_bucket {
         error!("❌ [v2.sendMessage] Invalid paddedSize: {}", padded_size);
         return Err(StatusCode::BAD_REQUEST);
@@ -385,8 +385,8 @@ async fn handle_persistent(
     .bind(store_epoch)
     .bind(seq)
     .bind(&ciphertext_vec)
-    .bind(&now)
-    .bind(&expires_at)
+    .bind(now)
+    .bind(expires_at)
     .bind(&msg_id)
     .bind(padded_size as i64)
     .bind(received_bucket_ts)
@@ -458,8 +458,7 @@ async fn handle_persistent(
             created_at: crate::sqlx_jacquard::chrono_to_datetime(now),
             message_type: Some("app".into()),
             extra_data: Default::default(),
-        }
-        .into();
+        };
 
     let sse_event = StreamEvent::MessageEvent {
         cursor: cursor.clone(),

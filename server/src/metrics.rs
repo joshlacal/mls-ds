@@ -6,6 +6,12 @@ pub struct MetricsRecorder {
     handle: PrometheusHandle,
 }
 
+impl Default for MetricsRecorder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MetricsRecorder {
     pub fn new() -> Self {
         let handle = PrometheusBuilder::new()

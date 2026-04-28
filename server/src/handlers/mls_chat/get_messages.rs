@@ -68,7 +68,7 @@ pub async fn get_messages(
     let did = &auth_user.did;
     let message_type = params.r#type.as_deref().unwrap_or("all");
     let convo_id = params.convo_id.to_string();
-    let limit = params.limit.unwrap_or(50).max(1).min(100);
+    let limit = params.limit.unwrap_or(50).clamp(1, 100);
     let since_seq = params.since_seq;
 
     if convo_id.is_empty() {

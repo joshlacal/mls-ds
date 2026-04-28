@@ -54,7 +54,7 @@ pub async fn get_subscription_ticket(
 
     // Clients depend on endpoint to establish WebSocket connections — fail loudly if invalid.
     let endpoint = match jacquard_common::types::string::Uri::new_owned(&v1_output.endpoint) {
-        Ok(uri) => Some(uri.into()),
+        Ok(uri) => Some(uri),
         Err(e) => {
             tracing::error!(
                 endpoint = %v1_output.endpoint,

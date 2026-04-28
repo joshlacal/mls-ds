@@ -159,7 +159,7 @@ impl SequencerTransfer {
         .map_err(TransferError::Database)?;
 
         match row {
-            None => return Err(TransferError::ConversationNotFound(convo_id.to_string())),
+            None => Err(TransferError::ConversationNotFound(convo_id.to_string())),
             Some((seq_ds, epoch, current_term_raw)) => {
                 if let Some(ref ds) = seq_ds {
                     if canonical_did(ds) != canonical_did(from_sequencer_did) {
@@ -213,11 +213,11 @@ impl SequencerTransfer {
                     "Accepted sequencer transfer"
                 );
 
-                return Ok(TransferResult::Accepted {
+                Ok(TransferResult::Accepted {
                     convo_id: convo_id.to_string(),
                     new_epoch: epoch.unwrap_or(0),
                     new_sequencer_term,
-                });
+                })
             }
         }
     }

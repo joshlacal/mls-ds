@@ -509,7 +509,7 @@ impl ConversationActorState {
             .bind(commit_wire_epoch)
             .bind(seq)
             .bind(&commit_bytes)
-            .bind(&now)
+            .bind(now)
             .execute(&mut *tx)
             .await
             .context("Failed to insert commit message")?;
@@ -550,7 +550,7 @@ impl ConversationActorState {
             )
             .bind(&self.convo_id)
             .bind(target_did)
-            .bind(&now)
+            .bind(now)
             .execute(&mut *tx)
             .await
             .context(format!("Failed to add member {}", target_did))?;
@@ -599,7 +599,7 @@ impl ConversationActorState {
                 .bind(target_did)
                 .bind(&welcome_data)
                 .bind::<Option<Vec<u8>>>(key_package_hash)
-                .bind(&now)
+                .bind(now)
                 .execute(&mut *tx)
                 .await
                 .context(format!("Failed to store welcome message for {}", target_did))?;
@@ -725,7 +725,7 @@ impl ConversationActorState {
             .bind(commit_wire_epoch)
             .bind(seq)
             .bind(&commit_bytes)
-            .bind(&now)
+            .bind(now)
             .execute(&mut *tx)
             .await
             .context("Failed to insert commit message")?;
@@ -746,7 +746,7 @@ impl ConversationActorState {
 
         // Mark member as left (soft delete with left_at timestamp)
         sqlx::query("UPDATE members SET left_at = $1 WHERE convo_id = $2 AND member_did = $3")
-            .bind(&now)
+            .bind(now)
             .bind(&self.convo_id)
             .bind(&member_did)
             .execute(&mut *tx)
@@ -911,8 +911,8 @@ impl ConversationActorState {
         .bind(epoch)
         .bind(seq)
         .bind(&ciphertext)
-        .bind(&now)
-        .bind(&expires_at)
+        .bind(now)
+        .bind(expires_at)
         .bind(&msg_id)
         .bind(padded_size)
         .bind(received_bucket_ts)
@@ -997,13 +997,13 @@ impl ConversationActorState {
                 // In multi-device mode, we exclude all devices where user_did matches sender_did
                 for (member_did, user_did) in members {
                     let is_sender_device =
-                        user_did.as_ref().map_or(false, |uid| uid == &sender_did);
+                        user_did.as_ref() == Some(&sender_did);
                     if !is_sender_device {
                         let count = self.unread_counts.entry(member_did.clone()).or_insert(0);
                         *count += 1;
 
                         // Optional: flush to database every N increments (e.g., every 10 messages)
-                        if *count % 10 == 0 {
+                        if (*count).is_multiple_of(10) {
                             if let Err(e) = sqlx::query(
                                 "UPDATE members SET unread_count = unread_count + 10 WHERE convo_id = $1 AND member_did = $2"
                             )
@@ -1989,7 +1989,7 @@ async fn handle_notify_new_message(
     convo_id: &str,
     msg_id: &str,
     sender_did: &str,
-    ciphertext: &Vec<u8>,
+    ciphertext: &[u8],
     seq: i64,
     epoch: i64,
     is_ephemeral: bool,
@@ -2035,8 +2035,7 @@ async fn handle_notify_new_message(
         created_at: crate::sqlx_jacquard::chrono_to_datetime(chrono::Utc::now()),
         message_type: Some("app".into()),
         extra_data: Default::default(),
-    }
-    .into();
+    };
 
     let event = StreamEvent::MessageEvent {
         cursor: cursor.clone(),

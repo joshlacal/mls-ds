@@ -39,7 +39,7 @@ impl FederatedBackend {
     .fetch_optional(&self.pool)
     .await?;
 
-        Ok(ds_did.flatten().map_or(true, |did| {
+        Ok(ds_did.flatten().is_none_or(|did| {
             canonical_did(&did) == canonical_did(&self.self_did)
         }))
     }

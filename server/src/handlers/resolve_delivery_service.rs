@@ -66,12 +66,12 @@ pub async fn resolve(
     let supported_cipher_suites = ds_endpoint.supported_cipher_suites.map(|suites| {
         suites
             .into_iter()
-            .map(|s| jacquard_common::CowStr::from(s))
+            .map(jacquard_common::CowStr::from)
             .collect()
     });
 
     debug!(
-        user_did = %crate::crypto::redact_for_log(&user_did),
+        user_did = %crate::crypto::redact_for_log(user_did),
         endpoint = %crate::crypto::redact_for_log(&ds_endpoint.endpoint),
         "Resolved delivery service"
     );

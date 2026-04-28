@@ -61,7 +61,7 @@ pub async fn report_spam_post(
     .bind(&auth_user.did)
     .bind(reported_did)
     .bind(reason)
-    .bind(&now)
+    .bind(now)
     .execute(&pool)
     .await;
 
