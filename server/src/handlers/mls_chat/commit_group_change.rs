@@ -1299,6 +1299,20 @@ pub async fn commit_group_change(
             }
 
             // ── Update conversations.group_id from GroupInfo ─────────
+            //
+            // TODO(post-#12 audit): This is the external-commit observer.
+            // It fires when a rejoining client's GroupInfo carries a
+            // different mls_group_id than what the server has stored —
+            // i.e., the client is catching up to a prior reset. After
+            // Phase 2 §2.3 made `ActivateCryptoSession` the authoritative
+            // writer of `conversations.group_id`, by the time external
+            // commit reaches here the server's group_id should ALREADY
+            // match what GroupInfo says. This UPDATE becomes redundant
+            // (no-op write of the same value) at best and arguably should
+            // be replaced with an assertion. Audit + remove once Phase 2
+            // soak data confirms the chokepoint covers every path that
+            // can rotate group_id. NOT funneled in #10 because the
+            // observer is not itself a reset path.
             if let Some(ref new_gid) = mls_group_id {
                 sqlx::query("UPDATE conversations SET group_id = $1 WHERE id = $2")
                     .bind(new_gid)
