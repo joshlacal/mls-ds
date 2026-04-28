@@ -131,6 +131,9 @@ make restore BACKUP=/path/to/backup.sql.gz
   - `YYYYMMDD_description.sql` — single migration per day. Version = `YYYYMMDD`. Examples: `20260427_recovery_failures.sql`, `20260428_groupinfo_404_health_columns.sql`.
   - `YYYYMMDDNNNNNN_description.sql` — multiple migrations per day. Version = full 14-digit integer. Examples: `20251125000001_opt_in_table.sql`, `20260429000001_crypto_sessions_and_delivery_events.sql`. Use this format whenever you might need a second migration on the same calendar day.
 - **Never use** `YYYYMMDD_NN_description.sql` (date + short suffix + description). The short suffix is consumed by the description, leaving multiple migrations colliding on the date version.
+- **Never rename a migration that has been applied to a DB.** sqlx tracks each version's checksum in `_sqlx_migrations`; renaming the file desyncs filename ↔ DB and triggers either "previously applied but has been modified" (if the file still parses to the same version with different content) or "previously applied but is missing in the resolved migrations" (if the version no longer exists on disk). If a rename is unavoidable, also `UPDATE _sqlx_migrations` to match.
+- **`sqlx migrate info` must be run from `mls-ds/server/`** (where `migrations/` lives), not from the mls-ds repo root, otherwise it errors with "No such file or directory."
+- **Verifying migration checksums against `_sqlx_migrations`**: sqlx hashes raw file bytes with SHA-384. Use `openssl dgst -sha384 <path/to/migration.sql>` on the file path directly. Avoid `echo -n "$(cat file)" | openssl dgst -sha384` — shell command substitution strips trailing newlines, producing a different hash than sqlx records.
 - Schema evolution: `title` → `name` column (migration 002)
 - Added `group_id` column for MLS group identifiers (migration 005)
 - When adding new columns, use `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`
