@@ -281,6 +281,13 @@ async fn insert_event(
 ///
 /// Idempotent on `idempotency_key`. Steps:
 ///
+/// 0. **Phase 2.5 §7 R1 Mitigation #1**: enforce the caller allowlist
+///    for NULL-binding Requests. When `expected_new_mls_group_id IS
+///    None`, the trigger MUST be one of `QuorumVote | SystemSweep |
+///    InlineCommit409 | InlineGroupInfo404`. `Admin` and `Bootstrap`
+///    are rejected with an error. This is the load-bearing gate that
+///    prevents a future caller (or a bug) from emitting an unbound
+///    Request that any member could race-bootstrap into.
 /// 1. If a `crypto_session_reset_requested` event with this idempotency_key
 ///    already exists, reconstruct and return its `ResetRequest`.
 /// 2. If the session is already in `reset_requested`, apply the
@@ -288,11 +295,16 @@ async fn insert_event(
 ///    with an error if a prior request bound a different group id.
 /// 3. UPDATE the active crypto_session to `state = 'reset_requested'`
 ///    (no-op if already in `reset_requested` or `superseding`).
-/// 4. APPEND a `crypto_session_reset_requested` event referencing the
+/// 4. **Phase 2.5 §7 R1 Mitigation #3**: snapshot the active member
+///    DID list into `payload_json.allowed_responders`. This is keyed
+///    off membership at Request time; activations later check the
+///    activator's DID is in this snapshot. Membership changes between
+///    Request and Activate do NOT alter the allowlist.
+/// 5. APPEND a `crypto_session_reset_requested` event referencing the
 ///    active session, with `payload_json` containing the request body,
-///    the freshly-allocated `request_id`, and the (optional)
+///    the freshly-allocated `request_id`, the (optional)
 ///    `expected_new_mls_group_id` binding for activation-time
-///    enforcement.
+///    enforcement, and the `allowed_responders` snapshot.
 pub(crate) async fn request_crypto_session_reset_tx(
     tx: &mut Transaction<'_, Postgres>,
     conversation_id: &str,
@@ -302,6 +314,26 @@ pub(crate) async fn request_crypto_session_reset_tx(
     idempotency_key: &str,
     expected_new_mls_group_id: Option<&str>,
 ) -> Result<ResetRequest> {
+    // Phase 2.5 §7 R1 Mitigation #1: caller allowlist for NULL-binding
+    // Requests. This is the FIRST check — even before idempotency
+    // lookup — so a forbidden trigger never reaches the persistence
+    // layer.
+    if expected_new_mls_group_id.is_none() && !trigger.permits_null_binding() {
+        debug_assert!(
+            trigger.permits_null_binding(),
+            "ResetTrigger::{trigger:?} attempted to emit a NULL-binding \
+             Request — only QuorumVote, SystemSweep, InlineCommit409, \
+             InlineGroupInfo404 are permitted. See Phase 2.5 §7 R1 #1."
+        );
+        return Err(anyhow!(
+            "Phase 2.5 R1 mitigation #1: trigger `{}` may not emit a \
+             RequestCryptoSessionReset with expected_new_mls_group_id = None. \
+             Direct callers (Admin, Bootstrap) must always supply Some(_); \
+             only indirect triggers (QuorumVote, SystemSweep, \
+             InlineCommit409, InlineGroupInfo404) may pass None.",
+            trigger.as_str()
+        ));
+    }
     // Idempotent replay: a prior call from this caller with the same
     // idempotency_key resolves to the same ResetRequest. The transition
     // matrix below only applies to NEW Requests (different
@@ -390,12 +422,44 @@ pub(crate) async fn request_crypto_session_reset_tx(
     .await
     .context("mark current session reset_requested")?;
 
+    // Phase 2.5 §7 R1 Mitigation #3: snapshot the active member DID
+    // list. This is the load-bearing auth check for NULL-binding
+    // Requests. The activation handler at `activate_crypto_session_tx`
+    // reads this list and rejects activators not in it. Snapshotting
+    // at Request time (rather than at activation) means a member who
+    // leaves between Request and Activate cannot fraudulently bootstrap.
+    //
+    // We use `COALESCE(user_did, member_did)` to yield the IDENTITY
+    // DID for multi-device clients (member_did may carry a per-device
+    // DID like `did:plc:user#device-uuid`). The activator-side check
+    // parses incoming `initiator_did` via `parse_device_did` to extract
+    // the identity DID and matches against this list. This mirrors the
+    // existing membership check pattern at
+    // `bootstrap_reset_group.rs:142` and
+    // `report_recovery_failure.rs:149-156`.
+    let allowed_responders: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT COALESCE(user_did, member_did) \
+         FROM members \
+         WHERE convo_id = $1 AND left_at IS NULL",
+    )
+    .bind(conversation_id)
+    .fetch_all(&mut **tx)
+    .await
+    .context("snapshot allowed_responders for crypto_session_reset_requested")?;
+
     let request_id = Uuid::new_v4().to_string();
     let payload = json!({
         "request_id": request_id,
         "trigger": trigger.as_str(),
         "reason": reason,
         "expected_new_mls_group_id": expected_new_mls_group_id,
+        // Phase 2.5 §7 R1 Mitigation #3: snapshot of permitted
+        // activators at Request time. Empty array would mean "no one
+        // can activate" — caller paths that emit Requests on
+        // memberless conversations should not exist in practice, but
+        // the activation handler treats empty/missing as "reject all
+        // NULL-binding activators" for defense-in-depth.
+        "allowed_responders": allowed_responders,
     });
 
     let seq = allocate_seq(tx, conversation_id).await?;
@@ -533,12 +597,24 @@ pub(crate) async fn activate_crypto_session_tx(
     // and the upstream Request bound an `expected_new_mls_group_id`, the
     // activator's `new_mls_group_id` MUST match. This is the auth-bypass
     // gate Codex P1 had two parts of (state was the first; this is the
-    // second). NULL `expected_new_mls_group_id` means no pre-binding —
-    // any caller's `new_mls_group_id` is accepted (post-#12 elected-
-    // client-flow placeholder).
+    // second).
+    //
+    // Phase 2.5 §7 R1 Mitigation #2 (activation-time auth): when
+    // `expected_new_mls_group_id IS NULL` on the prior Request (i.e.
+    // an indirect-trigger Request via QuorumVote / SystemSweep /
+    // Inline*), the activator's DID MUST be in the
+    // `payload_json.allowed_responders` snapshot taken at Request
+    // time. This is the load-bearing R1 gate — without it, any
+    // attacker who can submit `bootstrap_reset_group` could win the
+    // tie-break for a NULL-binding Request and seize control of the
+    // conversation.
+    //
+    // Both fields are read in a single SELECT so the snapshot is
+    // atomic — there is no window where one half of the auth answer
+    // is stale relative to the other.
     if prior.state == "reset_requested" {
-        let expected: Option<Option<String>> = sqlx::query_scalar(
-            "SELECT payload_json->>'expected_new_mls_group_id' \
+        let request_payload: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT payload_json \
              FROM delivery_events \
              WHERE conversation_id = $1 \
                AND crypto_session_id = $2 \
@@ -550,18 +626,100 @@ pub(crate) async fn activate_crypto_session_tx(
         .bind(&prior.id)
         .fetch_optional(&mut **tx)
         .await
-        .context("read prior reset_requested expected_new_mls_group_id")?;
+        .context("read prior reset_requested payload_json")?;
 
-        if let Some(Some(bound)) = expected {
-            if bound != new_mls_group_id {
-                return Err(anyhow!(
-                    "expected_new_mls_group_id mismatch: \
-                     upstream Request bound `{bound}`, but activation \
-                     submitted `{new_mls_group_id}`. The pre-bound claim \
-                     from the original requester is authoritative; \
-                     bootstrap with the matching mls_group_id or wait \
-                     for the prior request to time out."
-                ));
+        let payload = request_payload
+            .ok_or_else(|| anyhow!(
+                "prior session is `reset_requested` but no \
+                 crypto_session_reset_requested event found for it; \
+                 inconsistent state — cannot authorize activation."
+            ))?;
+
+        let bound: Option<&str> = payload
+            .get("expected_new_mls_group_id")
+            .and_then(|v| v.as_str());
+
+        match bound {
+            Some(bound) => {
+                if bound != new_mls_group_id {
+                    return Err(anyhow!(
+                        "expected_new_mls_group_id mismatch: \
+                         upstream Request bound `{bound}`, but activation \
+                         submitted `{new_mls_group_id}`. The pre-bound claim \
+                         from the original requester is authoritative; \
+                         bootstrap with the matching mls_group_id or wait \
+                         for the prior request to time out."
+                    ));
+                }
+            }
+            None => {
+                // Phase 2.5 §7 R1 Mitigation #2: NULL binding requires
+                // responder allowlist enforcement. Reject if the
+                // allowlist is missing/empty (defense-in-depth: no
+                // legitimate code path emits a NULL-binding Request
+                // without the allowlist post-Phase-2.5 Stage 1).
+                let allowed_responders: Vec<String> = payload
+                    .get("allowed_responders")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                if allowed_responders.is_empty() {
+                    return Err(anyhow!(
+                        "Phase 2.5 R1 mitigation #2: NULL-binding \
+                         Request has empty/missing allowed_responders — \
+                         refusing activation. This indicates either a \
+                         pre-Phase-2.5 Request (legacy NULL-binding \
+                         emit, no allowlist) or a snapshot-time \
+                         membership query that returned zero rows. In \
+                         either case the activation cannot be \
+                         authorized."
+                    ));
+                }
+
+                // Resolve activator's identity DID. `initiator_did`
+                // arrives as whatever the handler passed — for multi-
+                // device clients this may be `did:plc:user#device-id`.
+                // Extract the user-part to match against the
+                // `COALESCE(user_did, member_did)` snapshot stored at
+                // Request time.
+                let activator_identity_did: String = match initiator_did
+                    .split_once('#')
+                {
+                    Some((user_part, _device_part)) if !user_part.is_empty() => {
+                        user_part.to_string()
+                    }
+                    _ => initiator_did.to_string(),
+                };
+
+                // Accept either the parsed identity DID or the raw
+                // initiator_did. The snapshot uses
+                // `COALESCE(user_did, member_did)` which yields
+                // identity DID for multi-device rows but for legacy
+                // single-device rows where user_did IS NULL it yields
+                // member_did (which IS the device DID).
+                let allowed = allowed_responders.iter().any(|d| {
+                    d == &activator_identity_did || d == initiator_did
+                });
+
+                if !allowed {
+                    return Err(anyhow!(
+                        "Phase 2.5 R1 mitigation #2: activator DID \
+                         `{}` (identity `{}`) is not in the \
+                         allowed_responders snapshot for this NULL-\
+                         binding Request. Refusing activation. The \
+                         responder allowlist was snapshotted at \
+                         Request time and does not include this DID; \
+                         either you were not a member when the reset \
+                         was requested, or you have left and rejoined \
+                         since.",
+                        initiator_did, activator_identity_did
+                    ));
+                }
             }
         }
     }
