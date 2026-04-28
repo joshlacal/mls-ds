@@ -1478,7 +1478,38 @@ impl ConversationActorState {
             });
         }
 
-        // ── 8. Execute auto-reset via the shared helper ───────────────────
+        // ── 8. Phase 2.5 §5 Stage 1 — dual-emit RequestCryptoSessionReset ──
+        // Emit the chokepoint Request + SSE resetRequestedEvent BEFORE the
+        // legacy do_reset_group runs. Stage 1 keeps both paths active so
+        // unmodified clients still see the legacy GroupResetEvent. Stage 3
+        // retires do_reset_group; only the chokepoint path remains.
+        //
+        // Idempotency key: `req-quorum:{convo_id}:{reset_count}` — keyed off
+        // the pre-reset generation so retries during the same threshold-
+        // crossing window converge to one Request event. After do_reset_group
+        // increments reset_count the key naturally rotates.
+        let pre_reset_count: i32 = sqlx::query_scalar(
+            "SELECT reset_count FROM conversations WHERE id = $1",
+        )
+        .bind(&self.convo_id)
+        .fetch_optional(&self.db_pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+        let quorum_idempotency_key = format!(
+            "req-quorum:{}:{}",
+            self.convo_id, pre_reset_count
+        );
+        self.dual_emit_reset_requested(
+            ResetTrigger::QuorumVote,
+            system_reset_did(),
+            "Phase 2.5 indirect-trigger Request: client quorum reached",
+            &quorum_idempotency_key,
+        )
+        .await;
+
+        // ── 8b. Execute auto-reset via the shared helper ──────────────────
         // Phase 2 B6: use service DID (not "system:client_quorum") so the
         // emitted groupResetEvent.resetBy passes iOS lexicon DID validation.
         // Reason field carries the trigger semantic for ops audit.
@@ -1629,6 +1660,48 @@ impl ConversationActorState {
             "Automatic recovery: server sweep observed staleness ({} epochs, {} s quiet) [trigger={}]",
             staleness_epochs, quiet_duration_secs, reason
         );
+
+        // Phase 2.5 §5 Stage 1 — dual-emit RequestCryptoSessionReset BEFORE
+        // legacy do_reset_group. The `reason` string discriminates the
+        // sweep / inline-409 / inline-404 cases; map to the typed
+        // ResetTrigger variant so the chokepoint allowlist (R1 #1) and
+        // audit log readers see a stable enum.
+        let trigger_kind = match reason.as_str() {
+            "inline_409_threshold" => ResetTrigger::InlineCommit409,
+            "inline_groupinfo_404_threshold" => ResetTrigger::InlineGroupInfo404,
+            // Both sweep modes (server_sweep, server_sweep_groupinfo_missing)
+            // and any unknown reason fall back to SystemSweep — they are
+            // observationally indistinguishable from the chokepoint's
+            // perspective.
+            _ => ResetTrigger::SystemSweep,
+        };
+        // Idempotency-key shape per Phase 2.5 plan §3:
+        //   Sweep / inline: req-{trigger}:{convo}:{reset_count}.
+        // Keying off pre-reset reset_count makes retries during the
+        // same threshold-crossing converge to one Request event; the
+        // key naturally rotates after a successful reset.
+        let pre_reset_count: i32 = sqlx::query_scalar(
+            "SELECT reset_count FROM conversations WHERE id = $1",
+        )
+        .bind(&convo_id)
+        .fetch_optional(&self.db_pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+        let trigger_idempotency_key = format!(
+            "req-{}:{}:{}",
+            trigger_kind.as_str(),
+            convo_id,
+            pre_reset_count
+        );
+        self.dual_emit_reset_requested(
+            trigger_kind,
+            &last_reset_by,
+            &event_reason,
+            &trigger_idempotency_key,
+        )
+        .await;
 
         match self
             .do_reset_group(
@@ -1858,6 +1931,218 @@ impl ConversationActorState {
         );
 
         Ok(outcome.session)
+    }
+
+    /// Phase 2.5 §5 Stage 1 — dual-emit `RequestCryptoSessionReset` for
+    /// indirect callers that today still mint via `do_reset_group`.
+    ///
+    /// Indirect callers (quorum vote, system sweep, inline 409, inline
+    /// 404) cast `TriggerSystemReset` / call `do_reset_group` because
+    /// they don't have MLS material in hand at trigger time. Phase 2.5
+    /// adds a parallel path: BEFORE `do_reset_group` runs, emit a
+    /// `crypto_session_reset_requested` delivery event with
+    /// `expected_new_mls_group_id = None` and broadcast a
+    /// `resetRequestedEvent` SSE event to subscribed clients. An elected
+    /// client may respond by submitting new MLS material via the
+    /// existing `bootstrap_reset_group` / `commit_group_change`
+    /// endpoints, which route to `ActivateCryptoSession` and tie-break
+    /// via the `UNIQUE (conversation_id, generation)` constraint.
+    ///
+    /// Stage 1 keeps the legacy `do_reset_group` path running so
+    /// unmodified clients still see `groupResetEvent` and reconnect
+    /// behavior is unchanged. The dual-emit is the on-ramp; Stage 3
+    /// retires the legacy path once telemetry shows zero clients depend
+    /// on it.
+    ///
+    /// **Errors are logged, not returned**: if dual-emit fails, the
+    /// caller still proceeds to legacy `do_reset_group`. The Phase 2.5
+    /// path is opt-in for clients; a missing Request is a degraded
+    /// telemetry signal, not a correctness break.
+    ///
+    /// **Feature flag**: `EMIT_RESET_REQUESTED_EVENT` env var (default
+    /// `true`). When `false`, the SSE broadcast is skipped — but the
+    /// chokepoint Request still runs and the `crypto_session_reset_
+    /// requested` delivery event is still persisted. The flag isolates
+    /// client-rollout impact from server-side rotation correctness.
+    async fn dual_emit_reset_requested(
+        &self,
+        trigger: ResetTrigger,
+        initiator_did: &str,
+        reason: &str,
+        idempotency_key: &str,
+    ) {
+        use anyhow::Context;
+
+        let mut tx = match self
+            .db_pool
+            .begin()
+            .await
+            .context("dual_emit_reset_requested begin tx")
+        {
+            Ok(t) => t,
+            Err(e) => {
+                error!(
+                    convo_id = %crate::crypto::redact_for_log(&self.convo_id),
+                    trigger = %trigger.as_str(),
+                    error = %e,
+                    "[dual_emit_reset_requested] begin tx failed; \
+                     legacy do_reset_group path will still fire"
+                );
+                return;
+            }
+        };
+
+        let request = match super::reset_chokepoint::request_crypto_session_reset_tx(
+            &mut tx,
+            &self.convo_id,
+            trigger,
+            initiator_did,
+            reason,
+            idempotency_key,
+            None, // expected_new_mls_group_id — indirect triggers don't know yet
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx.rollback().await;
+                warn!(
+                    convo_id = %crate::crypto::redact_for_log(&self.convo_id),
+                    trigger = %trigger.as_str(),
+                    idempotency_key = %idempotency_key,
+                    error = %e,
+                    "[dual_emit_reset_requested] chokepoint Request failed; \
+                     legacy do_reset_group path will still fire"
+                );
+                return;
+            }
+        };
+
+        if let Err(e) = tx.commit().await {
+            error!(
+                convo_id = %crate::crypto::redact_for_log(&self.convo_id),
+                trigger = %trigger.as_str(),
+                error = %e,
+                "[dual_emit_reset_requested] commit tx failed; \
+                 legacy do_reset_group path will still fire"
+            );
+            return;
+        }
+
+        info!(
+            convo_id = %crate::crypto::redact_for_log(&self.convo_id),
+            request_id = %request.request_id,
+            trigger = %trigger.as_str(),
+            phase_2_5_path = "dual_emit",
+            "[dual_emit_reset_requested] crypto_session_reset_requested persisted"
+        );
+
+        // Look up additional context fields for the SSE event payload.
+        // Done in a single SELECT post-commit so failures here only
+        // suppress the SSE broadcast — the persisted Request event is
+        // already durable.
+        let session_info: Result<(String, i32), sqlx::Error> = sqlx::query_as(
+            "SELECT cs.id, cs.generation \
+             FROM crypto_sessions cs \
+             WHERE cs.conversation_id = $1 \
+               AND cs.state = 'reset_requested' \
+             ORDER BY cs.generation DESC \
+             LIMIT 1",
+        )
+        .bind(&self.convo_id)
+        .fetch_one(&self.db_pool)
+        .await;
+
+        let (crypto_session_id, generation) = match session_info {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(
+                    convo_id = %crate::crypto::redact_for_log(&self.convo_id),
+                    error = %e,
+                    "[dual_emit_reset_requested] failed to read session info \
+                     for SSE payload; skipping broadcast"
+                );
+                return;
+            }
+        };
+
+        let request_event_id: Result<String, sqlx::Error> = sqlx::query_scalar(
+            "SELECT id FROM delivery_events \
+             WHERE conversation_id = $1 \
+               AND crypto_session_id = $2 \
+               AND event_type = 'crypto_session_reset_requested' \
+               AND idempotency_key = $3 \
+             LIMIT 1",
+        )
+        .bind(&self.convo_id)
+        .bind(&crypto_session_id)
+        .bind(idempotency_key)
+        .fetch_one(&self.db_pool)
+        .await;
+
+        let request_event_id = match request_event_id {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    convo_id = %crate::crypto::redact_for_log(&self.convo_id),
+                    error = %e,
+                    "[dual_emit_reset_requested] failed to read \
+                     request_event_id; skipping SSE broadcast"
+                );
+                return;
+            }
+        };
+
+        // Phase 2.5 §7 R2 mitigation: operator-side env-var gate. When
+        // `EMIT_RESET_REQUESTED_EVENT=false`, the chokepoint Request is
+        // still persisted (above), but no SSE event is broadcast.
+        // Operators flip this off on a per-incident basis if a client-
+        // side bug surfaces in handling resetRequestedEvent.
+        let emit_flag = std::env::var("EMIT_RESET_REQUESTED_EVENT")
+            .map(|v| v != "false" && v != "0")
+            .unwrap_or(true);
+        if !emit_flag {
+            info!(
+                convo_id = %crate::crypto::redact_for_log(&self.convo_id),
+                request_id = %request.request_id,
+                "[dual_emit_reset_requested] EMIT_RESET_REQUESTED_EVENT=false \
+                 — Request persisted, SSE broadcast suppressed"
+            );
+            return;
+        }
+
+        let cursor = self
+            .sse_state
+            .cursor_gen
+            .next(&self.convo_id, "resetRequestedEvent")
+            .await;
+        let event = StreamEvent::ResetRequestedEvent {
+            cursor,
+            convo_id: self.convo_id.clone(),
+            crypto_session_id,
+            generation,
+            trigger: trigger.as_str().to_string(),
+            request_event_id,
+            expected_new_mls_group_id: None,
+            reason: Some(reason.to_string()),
+            requested_at: chrono::Utc::now()
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        };
+
+        if let Err(e) = crate::db::store_event(&self.db_pool, &self.convo_id, &event).await {
+            error!(
+                convo_id = %crate::crypto::redact_for_log(&self.convo_id),
+                error = ?e,
+                "[dual_emit_reset_requested] store_event failed"
+            );
+        }
+        if let Err(e) = self.sse_state.emit(&self.convo_id, event).await {
+            error!(
+                convo_id = %crate::crypto::redact_for_log(&self.convo_id),
+                error = %e,
+                "[dual_emit_reset_requested] SSE emit failed"
+            );
+        }
     }
 
     // TODO(post-#12): funnel through RequestCryptoSessionReset once the
