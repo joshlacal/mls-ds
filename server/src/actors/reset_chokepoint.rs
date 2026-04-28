@@ -595,6 +595,12 @@ pub(crate) async fn activate_crypto_session_tx(
 
     // 7. INSERT pending_welcomes for the WINNING candidate. Map
     //    WelcomeEnvelope.recipient_did -> DB column target_did.
+    //
+    // Loser-path safety: the "this candidate is the active winner"
+    // property is implicit in the control flow — losers return
+    // `ActivationResult::Lost` at step 3 above and never reach this
+    // block. No runtime `state = 'active'` guard is needed here, and
+    // the absence of one saves a per-welcome SELECT.
     for w in welcomes {
         let id = Uuid::new_v4().to_string();
         sqlx::query(
