@@ -440,7 +440,7 @@ async fn handle_create_convo(
     .bind(&convo_id)
     .bind(input.cipher_suite.as_ref())
     .bind(&auth_user.did)
-    .bind(&now)
+    .bind(now)
     .fetch_one(&mut *tx)
     .await
     .map_err(|e| {
@@ -475,7 +475,7 @@ async fn handle_create_convo(
     .bind(&convo_id)
     .bind(&crypto_session_id)
     .bind(format!("create:{}", convo_id))
-    .bind(&now)
+    .bind(now)
     .execute(&mut *tx)
     .await
     .map_err(|e| {
