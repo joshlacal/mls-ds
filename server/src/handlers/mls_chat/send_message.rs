@@ -209,7 +209,26 @@ async fn handle_persistent(
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
-    let server_epoch: i64 = crypto_session.last_observed_epoch as i64;
+    // TODO(phase 4): switch back to `crypto_session.last_observed_epoch`
+    // once `try_advance_conversation_epoch_tx` (db.rs) advances both
+    // `conversations.current_epoch` AND the active session's
+    // `crypto_sessions.last_observed_epoch` in the same tx. As shipped,
+    // commit-acceptance only bumps `conversations.current_epoch`, so
+    // reading `last_observed_epoch` here would be stale after the first
+    // accepted commit and trigger spurious TreeStateDiverged conflicts
+    // (`client_epoch > server_epoch`). The other CryptoSession fields
+    // (confirmation_tag, generation) are not touched by epoch advance,
+    // so they continue to read from `crypto_session` safely.
+    let server_epoch: i64 =
+        sqlx::query_scalar("SELECT current_epoch FROM conversations WHERE id = $1")
+            .bind(&convo_id)
+            .fetch_one(&pool)
+            .await
+            .map(|e: i32| e as i64)
+            .map_err(|e| {
+                error!("❌ [v2.sendMessage] Failed to fetch current epoch: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
     let stored_confirmation_tag = crypto_session.last_confirmation_tag.clone();
     let reset_count: i32 = crypto_session.generation;
 
