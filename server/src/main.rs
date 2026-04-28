@@ -8,6 +8,7 @@
 #![allow(clippy::large_enum_variant)]
 #![allow(deprecated)]
 #![allow(dead_code)]
+#![allow(unused_imports)]
 
 use axum::{
     extract::{DefaultBodyLimit, FromRef},
