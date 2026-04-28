@@ -81,35 +81,68 @@ pub async fn fetch_key_package(
             });
         }
 
-        // Consume one key package (atomically claim via CTE).
-        let row = sqlx::query_as::<_, (Vec<u8>, String)>(
-            "WITH claimed AS ( \
-               SELECT id, key_package, key_package_hash \
-               FROM key_packages \
-               WHERE owner_did = $1 \
-                 AND consumed_at IS NULL \
-                 AND expires_at > NOW() \
-               ORDER BY created_at ASC \
-               LIMIT 1 \
-               FOR UPDATE SKIP LOCKED \
-             ) \
-             UPDATE key_packages \
-             SET consumed_at = NOW(), \
-                 consumed_for_convo_id = $2, \
-                 reserved_at = NULL, \
-                 reserved_by_convo = NULL \
-             FROM claimed \
-             WHERE key_packages.id = claimed.id \
-             RETURNING claimed.key_package, claimed.key_package_hash",
-        )
-        .bind(recipient_did)
-        .bind(convo_id)
-        .fetch_optional(&pool)
-        .await
-        .map_err(FederationError::Database)?;
+        // Atomic claim: state='available' -> 'claimed'. The inner SELECT uses
+        // FOR UPDATE SKIP LOCKED so concurrent federation requests don't
+        // contend on the same row, and the outer UPDATE re-checks
+        // `state = 'available'` so the transition is the atomic gate.
+        // Try regular pool first, then fall through to last-resort.
+        let claim_one = |last_resort: bool| {
+            let lr_pred = if last_resort {
+                "AND key_packages.is_last_resort = true"
+            } else {
+                "AND key_packages.is_last_resort = false"
+            };
+            let sql = format!(
+                "WITH claimed AS ( \
+                   SELECT id, key_package, key_package_hash \
+                   FROM key_packages \
+                   WHERE owner_did = $1 \
+                     AND state = 'available' \
+                     AND expires_at > NOW() \
+                     {lr} \
+                   ORDER BY created_at ASC \
+                   LIMIT 1 \
+                   FOR UPDATE SKIP LOCKED \
+                 ) \
+                 UPDATE key_packages \
+                 SET state = 'claimed', \
+                     consumed_at = NOW(), \
+                     consumed_for_convo_id = $2 \
+                 FROM claimed \
+                 WHERE key_packages.id = claimed.id \
+                   AND key_packages.state = 'available' \
+                   {lr} \
+                 RETURNING claimed.key_package, claimed.key_package_hash",
+                lr = lr_pred,
+            );
+            let pool = pool.clone();
+            let recipient = recipient_did.clone();
+            let convo = convo_id.to_string();
+            async move {
+                sqlx::query_as::<_, (Vec<u8>, String)>(&sql)
+                    .bind(&recipient)
+                    .bind(&convo)
+                    .fetch_optional(&pool)
+                    .await
+            }
+        };
+
+        let row = claim_one(false).await.map_err(FederationError::Database)?;
+
+        let row = match row {
+            Some(r) => Some(r),
+            None => {
+                let lr_row = claim_one(true).await.map_err(FederationError::Database)?;
+                if lr_row.is_some() {
+                    crate::metrics::record_key_package_last_resort_use();
+                }
+                lr_row
+            }
+        };
 
         match row {
             Some((key_package_data, key_package_hash)) => {
+                crate::metrics::record_key_package_claim("claimed");
                 debug!(
                     recipient = %redact_for_log(recipient_did),
                     key_package_hash = %redact_for_log(&key_package_hash),
@@ -126,6 +159,8 @@ pub async fn fetch_key_package(
                 })))
             }
             None => {
+                crate::metrics::record_key_package_claim("no_match");
+                crate::metrics::record_key_package_exhaustion();
                 warn!(
                     recipient = %redact_for_log(recipient_did),
                     "No available key packages for federation request"
