@@ -59,9 +59,30 @@ pub(crate) struct ActivationOutcome {
     pub cipher_suite: Option<String>,
 }
 
-/// Read the most-recent active crypto_session for a conversation, with a
-/// row lock so the activate path serializes against concurrent supersedes.
-async fn read_active_session_for_update(
+/// Result of [`activate_crypto_session_tx`]. Both variants are committed
+/// — the loser variant intentionally persists the `failed` crypto_sessions
+/// row and the `crypto_session_candidate_rejected` delivery_event for
+/// audit trail. Caller decides how to surface `Lost` to its caller
+/// (typically as an error at the actor message boundary).
+#[derive(Debug)]
+pub(crate) enum ActivationResult {
+    /// Candidate won the tie-break, was activated.
+    Won(ActivationOutcome),
+    /// Candidate lost the tie-break. Audit row persisted in tx; caller
+    /// MUST still commit so the audit trail survives.
+    Lost {
+        attempted_generation: i32,
+        proposed_mls_group_id: String,
+    },
+}
+
+/// Read the latest non-superseded crypto_session for a conversation, with
+/// a row lock. Accepts `'active'`, `'reset_requested'`, or `'superseding'`
+/// — the request-reset and activate paths both need to find the
+/// "current generation" row even when reset has already been requested
+/// (idempotent re-request) or activation is mid-flight (concurrent
+/// candidate observation).
+async fn read_current_session_for_update(
     tx: &mut Transaction<'_, Postgres>,
     conversation_id: &str,
 ) -> Result<Option<CryptoSession>> {
@@ -88,13 +109,16 @@ async fn read_active_session_for_update(
          group_info_epoch, group_info_updated_at, created_by_did, created_at, \
          activated_at, superseded_at \
          FROM crypto_sessions \
-         WHERE conversation_id = $1 AND state = 'active' \
+         WHERE conversation_id = $1 \
+           AND state IN ('active', 'reset_requested', 'superseding') \
+         ORDER BY generation DESC \
+         LIMIT 1 \
          FOR UPDATE",
     )
     .bind(conversation_id)
     .fetch_optional(&mut **tx)
     .await
-    .context("read_active_session_for_update")?;
+    .context("read_current_session_for_update")?;
 
     Ok(row.map(|r| CryptoSession {
         id: r.0,
@@ -246,19 +270,23 @@ pub(crate) async fn request_crypto_session_reset_tx(
         });
     }
 
-    let active = read_active_session_for_update(tx, conversation_id)
+    let current = read_current_session_for_update(tx, conversation_id)
         .await?
-        .ok_or_else(|| anyhow!("no active crypto_session for {conversation_id}"))?;
+        .ok_or_else(|| anyhow!("no non-superseded crypto_session for {conversation_id}"))?;
 
+    // Idempotent transition: only flip 'active' → 'reset_requested'.
+    // If the row is already in 'reset_requested' or 'superseding', the
+    // UPDATE matches zero rows; we still emit the event below so the
+    // delivery_events log preserves both request idempotency_keys.
     sqlx::query(
         "UPDATE crypto_sessions \
          SET state = 'reset_requested' \
          WHERE id = $1 AND state = 'active'",
     )
-    .bind(&active.id)
+    .bind(&current.id)
     .execute(&mut **tx)
     .await
-    .context("mark active session reset_requested")?;
+    .context("mark current session reset_requested")?;
 
     let request_id = Uuid::new_v4().to_string();
     let payload = json!({
@@ -272,10 +300,10 @@ pub(crate) async fn request_crypto_session_reset_tx(
         tx,
         conversation_id,
         seq,
-        Some(&active.id),
+        Some(&current.id),
         "crypto_session_reset_requested",
         Some(initiator_did),
-        Some(&active.mls_group_id),
+        Some(&current.mls_group_id),
         Some(idempotency_key),
         payload,
     )
@@ -331,7 +359,7 @@ pub(crate) async fn activate_crypto_session_tx(
     welcomes: &[WelcomeEnvelope],
     initiator_did: &str,
     idempotency_key: &str,
-) -> Result<ActivationOutcome> {
+) -> Result<ActivationResult> {
     // 1. Idempotency check on the activation event.
     if let Some((_event_id, _payload_json, cs_id)) = find_existing_event(
         tx,
@@ -350,17 +378,48 @@ pub(crate) async fn activate_crypto_session_tx(
         })?;
         let cipher_suite = session.cipher_suite.clone();
         let generation = session.generation;
-        return Ok(ActivationOutcome {
+        return Ok(ActivationResult::Won(ActivationOutcome {
             session,
             generation,
             cipher_suite,
+        }));
+    }
+
+    // Idempotent replay of the loser path: a prior call with the same
+    // idempotency_key was rejected. Return the same `Lost` outcome so the
+    // caller's tx commits cleanly without re-INSERTing audit rows.
+    if let Some((_event_id, payload_json, _cs_id)) = find_existing_event(
+        tx,
+        conversation_id,
+        initiator_did,
+        idempotency_key,
+        "crypto_session_candidate_rejected",
+    )
+    .await?
+    {
+        let attempted_generation = payload_json
+            .as_ref()
+            .and_then(|p| p.get("winning_generation"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or_default() as i32;
+        let proposed_mls_group_id = payload_json
+            .as_ref()
+            .and_then(|p| p.get("proposed_mls_group_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(new_mls_group_id)
+            .to_string();
+        return Ok(ActivationResult::Lost {
+            attempted_generation,
+            proposed_mls_group_id,
         });
     }
 
-    // 2. Read prior active session under row lock.
-    let prior = read_active_session_for_update(tx, conversation_id)
+    // 2. Read latest non-superseded session under row lock. Accepts
+    //    'active', 'reset_requested', or 'superseding' — the activate
+    //    path always supersedes whatever is current.
+    let prior = read_current_session_for_update(tx, conversation_id)
         .await?
-        .ok_or_else(|| anyhow!("no active crypto_session for {conversation_id}"))?;
+        .ok_or_else(|| anyhow!("no current crypto_session for {conversation_id}"))?;
     let next_generation = prior.generation + 1;
     let cipher_suite = prior.cipher_suite.clone();
     let new_session_id = Uuid::new_v4().to_string();
@@ -435,9 +494,13 @@ pub(crate) async fn activate_crypto_session_tx(
         )
         .await?;
 
-        return Err(anyhow!(
-            "ActivateCryptoSession tie-break lost: another candidate already won generation {next_generation}"
-        ));
+        // Audit row + event are persisted; caller commits the tx so the
+        // tie-break loss survives. Caller decides how to surface to client
+        // (typically as an error at the actor message boundary).
+        return Ok(ActivationResult::Lost {
+            attempted_generation: next_generation,
+            proposed_mls_group_id: new_mls_group_id.to_string(),
+        });
     }
 
     // 4. Mark prior session superseded.
@@ -577,11 +640,11 @@ pub(crate) async fn activate_crypto_session_tx(
         .await?
         .ok_or_else(|| anyhow!("inserted crypto_session {new_session_id} not found post-INSERT"))?;
 
-    Ok(ActivationOutcome {
+    Ok(ActivationResult::Won(ActivationOutcome {
         session,
         generation: next_generation,
         cipher_suite,
-    })
+    }))
 }
 
 /// Helper used by the idempotent-replay path to reconstruct the

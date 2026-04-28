@@ -1759,7 +1759,7 @@ impl ConversationActorState {
             .begin()
             .await
             .context("begin ActivateCryptoSession tx")?;
-        let outcome = super::reset_chokepoint::activate_crypto_session_tx(
+        let result = super::reset_chokepoint::activate_crypto_session_tx(
             &mut tx,
             &self.convo_id,
             reset_request_id.as_deref(),
@@ -1771,9 +1771,31 @@ impl ConversationActorState {
             &idempotency_key,
         )
         .await?;
+        // Always commit, even on tie-break loss — the chokepoint persists
+        // a `failed` crypto_sessions row + `crypto_session_candidate_rejected`
+        // delivery_event for audit, and rolling back would discard them.
         tx.commit()
             .await
             .context("commit ActivateCryptoSession tx")?;
+
+        let outcome = match result {
+            super::reset_chokepoint::ActivationResult::Won(o) => o,
+            super::reset_chokepoint::ActivationResult::Lost {
+                attempted_generation,
+                proposed_mls_group_id,
+            } => {
+                info!(
+                    convo_id = %crate::crypto::redact_for_log(&self.convo_id),
+                    attempted_generation,
+                    proposed_mls_group_id = %crate::crypto::redact_for_log(&proposed_mls_group_id),
+                    trigger = %trigger.as_str(),
+                    "crypto_session_candidate_rejected (tie-break loss persisted)"
+                );
+                return Err(anyhow::anyhow!(
+                    "ActivateCryptoSession tie-break lost: another candidate won generation {attempted_generation}"
+                ));
+            }
+        };
 
         // Post-commit in-memory reset. Per plan §2.2 step 10: update epoch
         // for the new session; DO NOT clear `unread_counts` — those are
