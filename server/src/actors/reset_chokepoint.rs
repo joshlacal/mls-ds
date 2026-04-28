@@ -628,12 +628,13 @@ pub(crate) async fn activate_crypto_session_tx(
         .await
         .context("read prior reset_requested payload_json")?;
 
-        let payload = request_payload
-            .ok_or_else(|| anyhow!(
+        let payload = request_payload.ok_or_else(|| {
+            anyhow!(
                 "prior session is `reset_requested` but no \
                  crypto_session_reset_requested event found for it; \
                  inconsistent state — cannot authorize activation."
-            ))?;
+            )
+        })?;
 
         let bound: Option<&str> = payload
             .get("expected_new_mls_group_id")
@@ -687,9 +688,7 @@ pub(crate) async fn activate_crypto_session_tx(
                 // Extract the user-part to match against the
                 // `COALESCE(user_did, member_did)` snapshot stored at
                 // Request time.
-                let activator_identity_did: String = match initiator_did
-                    .split_once('#')
-                {
+                let activator_identity_did: String = match initiator_did.split_once('#') {
                     Some((user_part, _device_part)) if !user_part.is_empty() => {
                         user_part.to_string()
                     }
@@ -702,9 +701,9 @@ pub(crate) async fn activate_crypto_session_tx(
                 // identity DID for multi-device rows but for legacy
                 // single-device rows where user_did IS NULL it yields
                 // member_did (which IS the device DID).
-                let allowed = allowed_responders.iter().any(|d| {
-                    d == &activator_identity_did || d == initiator_did
-                });
+                let allowed = allowed_responders
+                    .iter()
+                    .any(|d| d == &activator_identity_did || d == initiator_did);
 
                 if !allowed {
                     return Err(anyhow!(
@@ -717,7 +716,8 @@ pub(crate) async fn activate_crypto_session_tx(
                          either you were not a member when the reset \
                          was requested, or you have left and rejoined \
                          since.",
-                        initiator_did, activator_identity_did
+                        initiator_did,
+                        activator_identity_did
                     ));
                 }
             }

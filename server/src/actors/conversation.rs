@@ -1488,19 +1488,15 @@ impl ConversationActorState {
         // the pre-reset generation so retries during the same threshold-
         // crossing window converge to one Request event. After do_reset_group
         // increments reset_count the key naturally rotates.
-        let pre_reset_count: i32 = sqlx::query_scalar(
-            "SELECT reset_count FROM conversations WHERE id = $1",
-        )
-        .bind(&self.convo_id)
-        .fetch_optional(&self.db_pool)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or(0);
-        let quorum_idempotency_key = format!(
-            "req-quorum:{}:{}",
-            self.convo_id, pre_reset_count
-        );
+        let pre_reset_count: i32 =
+            sqlx::query_scalar("SELECT reset_count FROM conversations WHERE id = $1")
+                .bind(&self.convo_id)
+                .fetch_optional(&self.db_pool)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or(0);
+        let quorum_idempotency_key = format!("req-quorum:{}:{}", self.convo_id, pre_reset_count);
         self.dual_emit_reset_requested(
             ResetTrigger::QuorumVote,
             system_reset_did(),
@@ -1680,15 +1676,14 @@ impl ConversationActorState {
         // Keying off pre-reset reset_count makes retries during the
         // same threshold-crossing converge to one Request event; the
         // key naturally rotates after a successful reset.
-        let pre_reset_count: i32 = sqlx::query_scalar(
-            "SELECT reset_count FROM conversations WHERE id = $1",
-        )
-        .bind(&convo_id)
-        .fetch_optional(&self.db_pool)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or(0);
+        let pre_reset_count: i32 =
+            sqlx::query_scalar("SELECT reset_count FROM conversations WHERE id = $1")
+                .bind(&convo_id)
+                .fetch_optional(&self.db_pool)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or(0);
         let trigger_idempotency_key = format!(
             "req-{}:{}:{}",
             trigger_kind.as_str(),
@@ -2125,8 +2120,7 @@ impl ConversationActorState {
             request_event_id,
             expected_new_mls_group_id: None,
             reason: Some(reason.to_string()),
-            requested_at: chrono::Utc::now()
-                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            requested_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         };
 
         if let Err(e) = crate::db::store_event(&self.db_pool, &self.convo_id, &event).await {
@@ -2253,7 +2247,8 @@ impl ConversationActorState {
         .context("read prior crypto_session for legacy do_reset_group rotation")?;
 
         let new_crypto_session_id = uuid::Uuid::new_v4().to_string();
-        let prior_session_id_opt: Option<String> = prior_session.as_ref().map(|(id, _g)| id.clone());
+        let prior_session_id_opt: Option<String> =
+            prior_session.as_ref().map(|(id, _g)| id.clone());
 
         sqlx::query(
             "INSERT INTO crypto_sessions ( \
@@ -2296,14 +2291,12 @@ impl ConversationActorState {
         // The earlier UPDATE conversations clause set the legacy MLS
         // columns but predates the Phase-2 pointer column, so this is
         // a separate UPDATE.
-        sqlx::query(
-            "UPDATE conversations SET active_crypto_session_id = $1 WHERE id = $2",
-        )
-        .bind(&new_crypto_session_id)
-        .bind(&self.convo_id)
-        .execute(&mut *tx)
-        .await
-        .context("UPDATE conversations.active_crypto_session_id in legacy do_reset_group")?;
+        sqlx::query("UPDATE conversations SET active_crypto_session_id = $1 WHERE id = $2")
+            .bind(&new_crypto_session_id)
+            .bind(&self.convo_id)
+            .execute(&mut *tx)
+            .await
+            .context("UPDATE conversations.active_crypto_session_id in legacy do_reset_group")?;
 
         sqlx::query("DELETE FROM welcome_messages WHERE convo_id = $1")
             .bind(&self.convo_id)

@@ -81,21 +81,16 @@ async fn wipe(pool: &PgPool, convo_id: &str) {
             .await;
         // delivery_events uses `conversation_id`, not `convo_id`.
         if *table == "delivery_events" {
-            let _ = sqlx::query(&format!(
-                "DELETE FROM {} WHERE conversation_id = $1",
-                table
-            ))
-            .bind(convo_id)
-            .execute(pool)
-            .await;
+            let _ = sqlx::query(&format!("DELETE FROM {} WHERE conversation_id = $1", table))
+                .bind(convo_id)
+                .execute(pool)
+                .await;
         }
     }
-    let _ = sqlx::query(
-        "UPDATE conversations SET active_crypto_session_id = NULL WHERE id = $1",
-    )
-    .bind(convo_id)
-    .execute(pool)
-    .await;
+    let _ = sqlx::query("UPDATE conversations SET active_crypto_session_id = NULL WHERE id = $1")
+        .bind(convo_id)
+        .execute(pool)
+        .await;
     let _ = sqlx::query("DELETE FROM crypto_sessions WHERE conversation_id = $1")
         .bind(convo_id)
         .execute(pool)
@@ -202,8 +197,13 @@ async fn r1_e1_admin_null_binding_rejected_at_request() {
     let pool = setup_test_db().await;
     let convo_id = "p2_5-r1-e1-admin-null";
     wipe(&pool, convo_id).await;
-    seed_convo_with_members(&pool, convo_id, "e1grp00000000000000000000000000", &[ALICE, BOB])
-        .await;
+    seed_convo_with_members(
+        &pool,
+        convo_id,
+        "e1grp00000000000000000000000000",
+        &[ALICE, BOB],
+    )
+    .await;
 
     let actor = spawn_actor(&pool, convo_id).await;
 
@@ -241,7 +241,10 @@ async fn r1_e1_admin_null_binding_rejected_at_request() {
     .fetch_one(&pool)
     .await
     .expect("count events");
-    assert_eq!(count, 0, "no Request event must be persisted on R1 #1 reject");
+    assert_eq!(
+        count, 0,
+        "no Request event must be persisted on R1 #1 reject"
+    );
 
     wipe(&pool, convo_id).await;
 }
@@ -256,8 +259,13 @@ async fn r1_e2_non_member_bootstrap_rejected() {
     let pool = setup_test_db().await;
     let convo_id = "p2_5-r1-e2-non-member";
     wipe(&pool, convo_id).await;
-    seed_convo_with_members(&pool, convo_id, "e2grp00000000000000000000000000", &[ALICE, BOB])
-        .await;
+    seed_convo_with_members(
+        &pool,
+        convo_id,
+        "e2grp00000000000000000000000000",
+        &[ALICE, BOB],
+    )
+    .await;
 
     let actor = spawn_actor(&pool, convo_id).await;
 
@@ -329,8 +337,13 @@ async fn r1_e3_current_member_bootstrap_accepted() {
     let pool = setup_test_db().await;
     let convo_id = "p2_5-r1-e3-member-ok";
     wipe(&pool, convo_id).await;
-    seed_convo_with_members(&pool, convo_id, "e3grp00000000000000000000000000", &[ALICE, BOB])
-        .await;
+    seed_convo_with_members(
+        &pool,
+        convo_id,
+        "e3grp00000000000000000000000000",
+        &[ALICE, BOB],
+    )
+    .await;
 
     let actor = spawn_actor(&pool, convo_id).await;
 
@@ -372,12 +385,15 @@ async fn r1_e3_current_member_bootstrap_accepted() {
 }
 
 // =========================================================================
-// E4 — R1 Mitigation #3 hardened: snapshot-at-Request-time means a member
-// who LEFT between Request and Activate is rejected.
+// E4 — R1 Mitigation #3 hardened: snapshot-at-Request-time means a NEW
+// joiner who was added BETWEEN Request and Activate is NOT in the
+// allowlist and is rejected. (The plan's original E4 conflated this
+// with the HTTP-handler membership gate; the chokepoint test cleanly
+// isolates the snapshot semantics by exercising the new-joiner case.)
 // =========================================================================
 #[tokio::test]
 #[ignore = "requires TEST_DATABASE_URL"]
-async fn r1_e4_member_left_after_request_rejected() {
+async fn r1_e4_post_request_joiner_rejected() {
     let pool = setup_test_db().await;
     let convo_id = "p2_5-r1-e4-leaver";
     wipe(&pool, convo_id).await;
@@ -472,8 +488,13 @@ async fn r1_e5_idempotent_request_collapses() {
     let pool = setup_test_db().await;
     let convo_id = "p2_5-r1-e5-idempotent";
     wipe(&pool, convo_id).await;
-    seed_convo_with_members(&pool, convo_id, "e5grp00000000000000000000000000", &[ALICE, BOB])
-        .await;
+    seed_convo_with_members(
+        &pool,
+        convo_id,
+        "e5grp00000000000000000000000000",
+        &[ALICE, BOB],
+    )
+    .await;
 
     let actor = spawn_actor(&pool, convo_id).await;
     let key = format!("test-e5:{convo_id}");
@@ -534,8 +555,13 @@ async fn r1_e6_race_first_wins_second_lost() {
     let pool = setup_test_db().await;
     let convo_id = "p2_5-r1-e6-race";
     wipe(&pool, convo_id).await;
-    seed_convo_with_members(&pool, convo_id, "e6grp00000000000000000000000000", &[ALICE, BOB])
-        .await;
+    seed_convo_with_members(
+        &pool,
+        convo_id,
+        "e6grp00000000000000000000000000",
+        &[ALICE, BOB],
+    )
+    .await;
 
     let actor = spawn_actor(&pool, convo_id).await;
 
@@ -591,10 +617,7 @@ async fn r1_e6_race_first_wins_second_lost() {
         })
         .expect("send Activate 2");
     let r2 = act2_rx.await.expect("reply 2");
-    assert!(
-        r2.is_err(),
-        "second activator must lose tie-break"
-    );
+    assert!(r2.is_err(), "second activator must lose tie-break");
 
     let active_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM crypto_sessions \
@@ -838,9 +861,7 @@ async fn inline_trigger_dual_emit_and_b6_1_member_count() {
     .fetch_one(&pool)
     .await
     .expect("allowed_responders");
-    let allowed_list = allowed
-        .as_array()
-        .expect("allowed_responders is an array");
+    let allowed_list = allowed.as_array().expect("allowed_responders is an array");
     assert_eq!(
         allowed_list.len(),
         3,
