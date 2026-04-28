@@ -126,7 +126,11 @@ make restore BACKUP=/path/to/backup.sql.gz
 5. Validated `AuthUser` is passed to handlers via Axum extractor
 
 **Database Schema Migration Pattern:**
-- Sequential SQL files: `YYYYMMDD_NNN_description.sql`
+- Sequential SQL files: prefix MUST be a unique integer; sqlx parses everything before the **first underscore** as the migration version. So `20260429_001_*` and `20260429_002_*` BOTH parse to version `20260429` (collision: "migration was previously applied but has been modified").
+- **Two valid filename formats:**
+  - `YYYYMMDD_description.sql` — single migration per day. Version = `YYYYMMDD`. Examples: `20260427_recovery_failures.sql`, `20260428_groupinfo_404_health_columns.sql`.
+  - `YYYYMMDDNNNNNN_description.sql` — multiple migrations per day. Version = full 14-digit integer. Examples: `20251125000001_opt_in_table.sql`, `20260429000001_crypto_sessions_and_delivery_events.sql`. Use this format whenever you might need a second migration on the same calendar day.
+- **Never use** `YYYYMMDD_NN_description.sql` (date + short suffix + description). The short suffix is consumed by the description, leaving multiple migrations colliding on the date version.
 - Schema evolution: `title` → `name` column (migration 002)
 - Added `group_id` column for MLS group identifiers (migration 005)
 - When adding new columns, use `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`
