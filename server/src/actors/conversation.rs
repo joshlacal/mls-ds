@@ -1780,6 +1780,24 @@ impl ConversationActorState {
 
         let outcome = match result {
             super::reset_chokepoint::ActivationResult::Won(o) => o,
+            super::reset_chokepoint::ActivationResult::CachedReplay(o) => {
+                // bug_016 (ultrareview): retry of a prior idempotent
+                // activation. The session is fully persisted from the
+                // first call; we MUST NOT re-emit SSE GroupResetEvent or
+                // re-clobber `self.current_epoch` (which may have already
+                // advanced via subsequent commits). Just return the
+                // cached session to the caller — handler still gets the
+                // same response shape, but the actor side effects from
+                // the original Won path don't repeat.
+                info!(
+                    convo_id = %crate::crypto::redact_for_log(&self.convo_id),
+                    new_session_id = %o.session.id,
+                    generation = o.generation,
+                    trigger = %trigger.as_str(),
+                    "ActivateCryptoSession cached replay (no side effects re-fired)"
+                );
+                return Ok(o.session);
+            }
             super::reset_chokepoint::ActivationResult::Lost {
                 attempted_generation,
                 proposed_mls_group_id,

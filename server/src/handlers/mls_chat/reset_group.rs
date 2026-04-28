@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use tracing::{error, info, warn};
-use uuid::Uuid;
 
 use crate::{
     actors::{ActorRegistry, ConvoMessage, ResetTrigger, WelcomeEnvelope},
@@ -218,8 +217,23 @@ pub async fn reset_group(
 
     // --- Phase 2 §2.2 admin direct flow: Request + Activate back-to-back.
     //     Idempotency keys are namespaced per the contract documented in
-    //     ConvoMessage::RequestCryptoSessionReset (req-reset / activate). ---
-    let request_id_uuid = Uuid::new_v4().to_string();
+    //     ConvoMessage::RequestCryptoSessionReset (req-reset / activate).
+    //
+    //     bug_015 (ultrareview): the prior code generated a fresh UUID
+    //     per HTTP request, so two retries from the same caller (e.g.
+    //     because the response was lost in transit) would each get
+    //     unique idempotency_keys → each emits its own Request and
+    //     Activate → generation explodes (one per retry). The right
+    //     idempotency anchor is the (convo_id, new_group_id) tuple,
+    //     mirroring the bootstrap_reset_group convention so retries
+    //     converge on the same chokepoint events.
+    //
+    //     Mismatch: pre-Phase 2 reset_group did accept an idempotency_key
+    //     in the request payload but the lexicon doesn't currently
+    //     surface it (see ResetGroupRequest above). Use the deterministic
+    //     (convo, group) key for now; if/when the lexicon adds an
+    //     explicit field, prefer that over the derived form.
+    let request_id_uuid = format!("{}-{}", convo_id, new_group_id);
 
     let (req_tx, req_rx) = oneshot::channel();
     actor_ref

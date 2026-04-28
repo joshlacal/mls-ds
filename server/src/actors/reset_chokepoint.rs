@@ -125,15 +125,27 @@ pub(crate) struct ActivationOutcome {
     pub cipher_suite: Option<String>,
 }
 
-/// Result of [`activate_crypto_session_tx`]. Both variants are committed
-/// — the loser variant intentionally persists the `failed` crypto_sessions
-/// row and the `crypto_session_candidate_rejected` delivery_event for
-/// audit trail. Caller decides how to surface `Lost` to its caller
-/// (typically as an error at the actor message boundary).
+/// Result of [`activate_crypto_session_tx`]. All variants are committed
+/// — the loser variant intentionally persists the
+/// `crypto_session_candidate_rejected` delivery_event for audit trail.
+/// Caller decides how to surface `Lost` to its caller (typically as an
+/// error at the actor message boundary).
 #[derive(Debug)]
 pub(crate) enum ActivationResult {
-    /// Candidate won the tie-break, was activated.
+    /// Candidate won the tie-break THIS tx and was activated. Caller MUST
+    /// run post-commit side effects (in-memory state reset, SSE emission).
     Won(ActivationOutcome),
+    /// Idempotent replay: this idempotency_key already won in a prior tx.
+    /// The session is fully persisted; caller MUST NOT re-emit SSE or
+    /// re-clobber actor in-memory state. The session may even be
+    /// `superseded` by a later activation — the replay path doesn't
+    /// distinguish "current winner" from "former winner."
+    ///
+    /// bug_016 (ultrareview): the prior code returned `Won` for both
+    /// fresh activations and replays, which let stale retries re-emit
+    /// SSE GroupResetEvent and reset the actor's `current_epoch` after a
+    /// later commit had already advanced it.
+    CachedReplay(ActivationOutcome),
     /// Candidate lost the tie-break. Audit row persisted in tx; caller
     /// MUST still commit so the audit trail survives.
     Lost {
@@ -418,7 +430,12 @@ pub(crate) async fn activate_crypto_session_tx(
         })?;
         let cipher_suite = session.cipher_suite.clone();
         let generation = session.generation;
-        return Ok(ActivationResult::Won(ActivationOutcome {
+        // bug_016 (ultrareview): mark this as a replay so the caller
+        // skips post-commit side effects. The session may already have
+        // been superseded by a later activation (a replay arriving after
+        // the normal "won and superseded" sequence is legitimate but
+        // its post-commit work would clobber the actor's current state).
+        return Ok(ActivationResult::CachedReplay(ActivationOutcome {
             session,
             generation,
             cipher_suite,
