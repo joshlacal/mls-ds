@@ -254,42 +254,91 @@ pub async fn handle(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         })?;
 
+    // ── Auth precondition: conversation must be in `reset_requested` ─────
+    //
+    // Bootstrap is the activator half of the two-phase reset. An upstream
+    // caller (admin via reset_group(no material), quorum, sweep) must have
+    // already issued `RequestCryptoSessionReset` and moved the active
+    // crypto_session into `state='reset_requested'`. If not, bootstrap
+    // would be acting as its own requester — which (a) breaks the audit
+    // trail (no upstream `crypto_session_reset_requested` event) and
+    // (b) lets any active member force a group_id rotation at will, which
+    // is the authorization bypass Codex flagged.
+    //
+    // Implementation: peek the active crypto_session for this convo; reject
+    // unless `state='reset_requested'`. Do this BEFORE involving the actor
+    // so unauthorized callers don't even spawn the actor / consume tx
+    // resources.
+    let current_state: Option<String> = sqlx::query_scalar(
+        "SELECT state FROM crypto_sessions \
+         WHERE conversation_id = $1 \
+           AND state IN ('active', 'reset_requested', 'superseding') \
+         ORDER BY generation DESC \
+         LIMIT 1",
+    )
+    .bind(&original_convo_id)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|e| {
+        error!("[bootstrapResetGroup] state precondition lookup: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+    })?;
+
+    match current_state.as_deref() {
+        Some("reset_requested") => {
+            // Authorized: an upstream caller has already requested a reset
+            // and we're providing the material to activate.
+        }
+        Some(other) => {
+            warn!(
+                convo_id = %crate::crypto::redact_for_log(&original_convo_id),
+                new_group_id = %crate::crypto::redact_for_log(&new_group_id),
+                caller_did = %crate::crypto::redact_for_log(&caller_did),
+                state = %other,
+                "bootstrap_409_no_pending_reset"
+            );
+            return Err((
+                StatusCode::CONFLICT,
+                Json(LexBootstrapResetGroupError::AlreadyBootstrapped(Some(
+                    "Conversation is not in a pending-reset state. Either an upstream reset request hasn't been issued, or another caller already activated. Fall back to receiving the Welcome from the winner.".into(),
+                ))),
+            )
+                .into_response());
+        }
+        None => {
+            error!(
+                "[bootstrapResetGroup] no active/reset_requested/superseding crypto_session for convo {}",
+                crate::crypto::redact_for_log(&original_convo_id)
+            );
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(LexBootstrapResetGroupError::BootstrapTargetNotFound(Some(
+                    "No current crypto_session found for this conversation.".into(),
+                ))),
+            )
+                .into_response());
+        }
+    };
+
     // Idempotency-key namespace: `(original_convo_id, new_group_id)` is
     // the natural per-bootstrap-attempt identity. Use a deterministic
     // string form so retries from the same caller resolve to the same
     // chokepoint events. Format matches the convention from #9
     // (req-reset:<uuid-or-id> / activate:<uuid-or-id>).
+    //
+    // Bootstrap is purely an activator now (no self-issued Request), so
+    // we only emit the `activate:` key. The upstream Request that put
+    // the session into `reset_requested` carries its own `req-reset:` key
+    // in delivery_events; correlation across the audit log is via
+    // (conversation_id, generation, event_type) tuple lookup at query
+    // time. `reset_request_id: None` in the message — we don't need to
+    // inline the upstream id here.
     let request_id_uuid = format!("{}-{}", original_convo_id, new_group_id);
-
-    let (req_tx, req_rx) = oneshot::channel();
-    actor_ref
-        .send_message(ConvoMessage::RequestCryptoSessionReset {
-            trigger: ResetTrigger::Bootstrap,
-            initiator_did: caller_did.clone(),
-            reason: "bootstrap_reset_group".to_string(),
-            idempotency_key: format!("req-reset:{}", request_id_uuid),
-            reply: req_tx,
-        })
-        .map_err(|_| {
-            error!("[bootstrapResetGroup] failed to send Request to actor");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        })?;
-
-    let reset_request = req_rx
-        .await
-        .map_err(|_| {
-            error!("[bootstrapResetGroup] Request channel closed");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        })?
-        .map_err(|e| {
-            error!("[bootstrapResetGroup] Request handler failed: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        })?;
 
     let (act_tx, act_rx) = oneshot::channel();
     actor_ref
         .send_message(ConvoMessage::ActivateCryptoSession {
-            reset_request_id: Some(reset_request.request_id.clone()),
+            reset_request_id: None,
             trigger: ResetTrigger::Bootstrap,
             new_mls_group_id: new_group_id.clone(),
             new_group_info: Some(group_info_bytes.clone()),
