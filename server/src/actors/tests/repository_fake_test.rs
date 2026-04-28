@@ -4,9 +4,7 @@
 use chrono::{TimeZone, Utc};
 
 use crate::models::{CryptoSession, NewCryptoSession, NewDeliveryEvent};
-use crate::repositories::fakes::{
-    InMemoryCryptoSessionRepository, InMemoryDeliveryLogRepository,
-};
+use crate::repositories::fakes::{InMemoryCryptoSessionRepository, InMemoryDeliveryLogRepository};
 use crate::repositories::{CryptoSessionRepository, DeliveryLogRepository, RepositoryError};
 
 fn sample_session(id: &str, convo_id: &str, mls_group_id: &str, generation: i32) -> CryptoSession {
@@ -126,11 +124,7 @@ async fn fake_create_via_trait_yields_active_session() {
     assert_eq!(created.id, "session-5");
     assert_eq!(created.state, "active");
 
-    let active = repo
-        .get_active("convo-5")
-        .await
-        .unwrap()
-        .expect("present");
+    let active = repo.get_active("convo-5").await.unwrap().expect("present");
     assert_eq!(active.id, "session-5");
 }
 
@@ -187,10 +181,7 @@ async fn fake_delivery_log_appends_with_monotonic_seq() {
     assert_eq!(event_a.seq, 1);
     assert_eq!(event_b.seq, 2);
 
-    let range = log
-        .read_range_by_session("session-1", 0, 10)
-        .await
-        .unwrap();
+    let range = log.read_range_by_session("session-1", 0, 10).await.unwrap();
     assert_eq!(range.len(), 2);
     assert_eq!(range[0].idempotency_key.as_deref(), Some("idem-a"));
     assert_eq!(range[1].idempotency_key.as_deref(), Some("idem-b"));
@@ -203,5 +194,8 @@ async fn postgres_delivery_log_append_returns_not_implemented() {
     // `append` is expected to return RepositoryError::NotImplemented for the
     // Postgres impl. Reflect that intent here via a type-level check that
     // pattern-matches the error variant exists.
-    let _ = matches!(RepositoryError::NotImplemented, RepositoryError::NotImplemented);
+    let _ = matches!(
+        RepositoryError::NotImplemented,
+        RepositoryError::NotImplemented
+    );
 }

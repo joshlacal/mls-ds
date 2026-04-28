@@ -28,11 +28,7 @@ pub trait CryptoSessionRepository: Send + Sync {
     async fn create(&self, session: NewCryptoSession) -> RepositoryResult<CryptoSession>;
 
     /// Mark `id` as superseded by `superseded_by_id`.
-    async fn mark_superseded(
-        &self,
-        id: &str,
-        superseded_by_id: &str,
-    ) -> RepositoryResult<()>;
+    async fn mark_superseded(&self, id: &str, superseded_by_id: &str) -> RepositoryResult<()>;
 }
 
 pub struct PostgresCryptoSessionRepository {
@@ -177,11 +173,7 @@ impl CryptoSessionRepository for PostgresCryptoSessionRepository {
         Err(RepositoryError::NotImplemented)
     }
 
-    async fn mark_superseded(
-        &self,
-        _id: &str,
-        _superseded_by_id: &str,
-    ) -> RepositoryResult<()> {
+    async fn mark_superseded(&self, _id: &str, _superseded_by_id: &str) -> RepositoryResult<()> {
         Err(RepositoryError::NotImplemented)
     }
 }

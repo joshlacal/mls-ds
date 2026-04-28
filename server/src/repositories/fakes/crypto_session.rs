@@ -91,11 +91,7 @@ impl CryptoSessionRepository for InMemoryCryptoSessionRepository {
         Ok(row)
     }
 
-    async fn mark_superseded(
-        &self,
-        id: &str,
-        superseded_by_id: &str,
-    ) -> RepositoryResult<()> {
+    async fn mark_superseded(&self, id: &str, superseded_by_id: &str) -> RepositoryResult<()> {
         self.mark_superseded_for_test(id, superseded_by_id, chrono::Utc::now());
         Ok(())
     }
