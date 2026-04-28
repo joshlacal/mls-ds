@@ -44,10 +44,7 @@ impl InMemoryCryptoSessionRepository {
     ) {
         let mut guard = self.inner.lock().expect("fake repo mutex poisoned");
         if let Some(s) = guard.get_mut(id) {
-            if matches!(
-                s.state.as_str(),
-                "active" | "superseding" | "reset_requested"
-            ) {
+            if matches!(s.state.as_str(), "active" | "superseding") {
                 s.state = "superseded".to_string();
                 s.superseded_at = Some(when);
             }

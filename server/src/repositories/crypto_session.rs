@@ -264,15 +264,15 @@ impl CryptoSessionRepository for PostgresCryptoSessionRepository {
     }
 
     async fn mark_superseded(&self, id: &str, superseded_by_id: &str) -> RepositoryResult<()> {
-        // Idempotent: only transitions from active/superseding/reset_requested.
-        // If already superseded, this is a no-op (zero rows affected, no error).
+        // Idempotent: only transitions from active/superseding (per plan
+        // §Phase 2.4). If already superseded, zero rows affected — no error.
         sqlx::query(
             "UPDATE crypto_sessions \
              SET state = 'superseded', \
                  superseded_at = NOW(), \
                  superseded_by_id = $2 \
              WHERE id = $1 \
-               AND state IN ('active', 'superseding', 'reset_requested')",
+               AND state IN ('active', 'superseding')",
         )
         .bind(id)
         .bind(superseded_by_id)
