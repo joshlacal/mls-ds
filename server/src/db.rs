@@ -2013,6 +2013,7 @@ pub fn stream_event_type_str(event: &crate::realtime::sse::StreamEvent) -> &'sta
         StreamEvent::MembershipChangeEvent { .. } => "membershipChangeEvent",
         StreamEvent::GroupResetEvent { .. } => "groupResetEvent",
         StreamEvent::CircuitBreakerTrippedEvent { .. } => "circuitBreakerTrippedEvent",
+        StreamEvent::ResetRequestedEvent { .. } => "resetRequestedEvent",
     }
 }
 
@@ -2031,6 +2032,7 @@ fn stream_event_cursor(event: &crate::realtime::sse::StreamEvent) -> &str {
         StreamEvent::MembershipChangeEvent { cursor, .. } => cursor,
         StreamEvent::GroupResetEvent { cursor, .. } => cursor,
         StreamEvent::CircuitBreakerTrippedEvent { cursor, .. } => cursor,
+        StreamEvent::ResetRequestedEvent { cursor, .. } => cursor,
     }
 }
 
