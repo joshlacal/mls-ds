@@ -1,6 +1,8 @@
 use anyhow::Result;
 use tokio::sync::oneshot;
 
+use crate::models::CryptoSession;
+
 /// Messages that can be sent to a [`ConversationActor`].
 ///
 /// These messages define the protocol for interacting with conversation actors.
@@ -192,11 +194,143 @@ pub enum ConvoMessage {
         quiet_duration_secs: i64,
     },
 
+    /// Phase 2 §2.2 — request that the conversation's current crypto_session
+    /// be marked `reset_requested`, signalling clients that a repair is needed.
+    ///
+    /// Server cannot self-heal: it has no MLS group material. This message
+    /// only marks state and emits a `crypto_session_reset_requested` event.
+    /// Activation happens later when a client submits material via
+    /// [`ConvoMessage::ActivateCryptoSession`].
+    ///
+    /// Idempotency: dedupes on `idempotency_key` against `delivery_events`.
+    /// A duplicate retry returns the existing [`ResetRequest`] unchanged.
+    ///
+    /// **Idempotency-key namespacing**: callers MUST use distinct keys for
+    /// request vs activate operations even from the same DID. The
+    /// underlying UNIQUE on `(conversation_id, sender_did, sender_device_id,
+    /// idempotency_key)` is shared across all event types, so reusing a
+    /// key across operations produces a constraint violation, not a clean
+    /// idempotency response. Recommended convention:
+    /// `"req-reset:<uuid>"` for this variant; `"activate:<uuid>"` for
+    /// [`Self::ActivateCryptoSession`].
+    ///
+    /// # Fields
+    ///
+    /// - `trigger`: which subsystem initiated the request
+    /// - `initiator_did`: DID that triggered the request
+    /// - `reason`: human-readable reason for the request (audit trail)
+    /// - `idempotency_key`: unique-per-retry key for the request
+    /// - `reply`: channel to receive the [`ResetRequest`]
+    RequestCryptoSessionReset {
+        trigger: ResetTrigger,
+        initiator_did: String,
+        reason: String,
+        idempotency_key: String,
+        reply: oneshot::Sender<Result<ResetRequest>>,
+    },
+
+    /// Phase 2 §2.2 — activate a candidate crypto_session: a client has
+    /// produced new MLS group material and is asking the server to mark it
+    /// active.
+    ///
+    /// Tie-break: the `crypto_sessions UNIQUE (conversation_id, generation)`
+    /// constraint serializes concurrent candidates. First INSERT with the
+    /// next generation wins; later candidates are marked `failed` with a
+    /// `crypto_session_candidate_rejected` event and their welcomes are NOT
+    /// stored as pending.
+    ///
+    /// Idempotency: dedupes on `idempotency_key` against `delivery_events`.
+    /// Duplicate retries return the same [`CryptoSession`]. Tie-break losers
+    /// also persist their rejection event keyed on `idempotency_key`, so a
+    /// retry of a losing key resolves to the same `Lost` outcome (surfaced
+    /// to the caller as an error at the actor message boundary).
+    ///
+    /// **Idempotency-key namespacing**: callers MUST use distinct keys
+    /// across request vs activate operations from the same DID. See
+    /// [`Self::RequestCryptoSessionReset`] for the rationale.
+    ///
+    /// # Fields
+    ///
+    /// - `reset_request_id`: links to a prior [`ResetRequest`]; `None` for
+    ///   admin/bootstrap direct flows where there is no prior request
+    /// - `trigger`: which subsystem produced the candidate
+    /// - `new_mls_group_id`: hex-encoded MLS group identifier of the candidate
+    /// - `new_group_info`: serialized GroupInfo for external commit joins
+    /// - `welcomes`: pending welcomes to insert if this candidate wins
+    /// - `initiator_did`: DID that produced the material
+    /// - `idempotency_key`: unique-per-retry key for the activation
+    /// - `reply`: channel to receive the activated [`CryptoSession`]
+    ActivateCryptoSession {
+        reset_request_id: Option<String>,
+        trigger: ResetTrigger,
+        new_mls_group_id: String,
+        new_group_info: Option<Vec<u8>>,
+        welcomes: Vec<WelcomeEnvelope>,
+        initiator_did: String,
+        idempotency_key: String,
+        reply: oneshot::Sender<Result<CryptoSession>>,
+    },
+
     /// Signals the actor to shut down gracefully.
     ///
     /// The actor will complete any in-flight operations before stopping.
     /// This is a fire-and-forget message.
     Shutdown,
+}
+
+/// Subsystem that originated a crypto_session reset.
+///
+/// Used both for [`ConvoMessage::RequestCryptoSessionReset`] and
+/// [`ConvoMessage::ActivateCryptoSession`] so audit log readers can
+/// correlate the two halves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetTrigger {
+    /// HTTP `reset_group.rs` admin call.
+    Admin,
+    /// Quorum vote from `RecordResetVote` reaching threshold.
+    QuorumVote,
+    /// Server sweep from `auto_detect_failed_groups` job.
+    SystemSweep,
+    /// `bootstrap_reset_group.rs` initial group bootstrap.
+    Bootstrap,
+}
+
+impl ResetTrigger {
+    /// String form persisted to the `delivery_events.payload_json` for audit.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ResetTrigger::Admin => "admin",
+            ResetTrigger::QuorumVote => "quorum_vote",
+            ResetTrigger::SystemSweep => "system_sweep",
+            ResetTrigger::Bootstrap => "bootstrap",
+        }
+    }
+}
+
+/// Returned from [`ConvoMessage::RequestCryptoSessionReset`] to the caller.
+///
+/// The `request_id` ties this request to a later
+/// [`ConvoMessage::ActivateCryptoSession`] via its `reset_request_id` field.
+#[derive(Debug, Clone)]
+pub struct ResetRequest {
+    pub request_id: String,
+    pub conversation_id: String,
+    pub initiator_did: String,
+    pub reason: String,
+}
+
+/// MLS Welcome to deliver to a specific recipient device, queued to
+/// `pending_welcomes` if the carrying candidate wins activation.
+///
+/// **Naming**: `recipient_did` is the in-memory field name; the persisted
+/// column on `pending_welcomes` is `target_did` (legacy schema). Mapping
+/// happens at the SQL boundary — see `activate_crypto_session_tx`.
+#[derive(Debug, Clone)]
+pub struct WelcomeEnvelope {
+    pub recipient_did: String,
+    pub recipient_device_id: Option<String>,
+    pub welcome_data: Vec<u8>,
+    pub key_package_hash: Option<String>,
 }
 
 /// Associates a DID with its corresponding key package hash.

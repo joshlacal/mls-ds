@@ -5,7 +5,10 @@ use std::{collections::HashMap, sync::Arc};
 use tracing::{debug, error, info, warn};
 
 use super::broadcaster::BroadcasterPool;
-use super::messages::{ConvoMessage, KeyPackageHashEntry, RecordResetVoteOutcome};
+use super::messages::{
+    ConvoMessage, KeyPackageHashEntry, RecordResetVoteOutcome, ResetRequest, ResetTrigger,
+    WelcomeEnvelope,
+};
 use crate::config::QuorumConfig;
 use crate::notifications::NotificationService;
 use crate::realtime::{SseState, StreamEvent, StreamMessageView};
@@ -322,6 +325,46 @@ impl Actor for ConversationActor {
                 state
                     .handle_trigger_system_reset(reason, staleness_epochs, quiet_duration_secs)
                     .await;
+            }
+            ConvoMessage::RequestCryptoSessionReset {
+                trigger,
+                initiator_did,
+                reason,
+                idempotency_key,
+                reply,
+            } => {
+                let result = state
+                    .handle_request_crypto_session_reset(
+                        trigger,
+                        initiator_did,
+                        reason,
+                        idempotency_key,
+                    )
+                    .await;
+                let _ = reply.send(result);
+            }
+            ConvoMessage::ActivateCryptoSession {
+                reset_request_id,
+                trigger,
+                new_mls_group_id,
+                new_group_info,
+                welcomes,
+                initiator_did,
+                idempotency_key,
+                reply,
+            } => {
+                let result = state
+                    .handle_activate_crypto_session(
+                        reset_request_id,
+                        trigger,
+                        new_mls_group_id,
+                        new_group_info,
+                        welcomes,
+                        initiator_did,
+                        idempotency_key,
+                    )
+                    .await;
+                let _ = reply.send(result);
             }
             ConvoMessage::Shutdown => {
                 info!("ConversationActor shutting down");
@@ -1651,6 +1694,169 @@ impl ConversationActorState {
     /// - `Ok(Some((new_group_id, reset_count)))` on success.
     /// - `Ok(None)` if the conversations row vanished mid-flight.
     /// - `Err(_)` on database error.
+    /// Phase 2 §2.2 — `RequestCryptoSessionReset` handler.
+    ///
+    /// Opens a single Postgres tx, dispatches to
+    /// [`super::reset_chokepoint::request_crypto_session_reset_tx`], commits.
+    /// Idempotent on `idempotency_key`; safe to retry.
+    async fn handle_request_crypto_session_reset(
+        &mut self,
+        trigger: ResetTrigger,
+        initiator_did: String,
+        reason: String,
+        idempotency_key: String,
+    ) -> anyhow::Result<ResetRequest> {
+        use anyhow::Context;
+        let mut tx = self
+            .db_pool
+            .begin()
+            .await
+            .context("begin RequestCryptoSessionReset tx")?;
+        let result = super::reset_chokepoint::request_crypto_session_reset_tx(
+            &mut tx,
+            &self.convo_id,
+            trigger,
+            &initiator_did,
+            &reason,
+            &idempotency_key,
+        )
+        .await?;
+        tx.commit()
+            .await
+            .context("commit RequestCryptoSessionReset tx")?;
+
+        info!(
+            convo_id = %crate::crypto::redact_for_log(&self.convo_id),
+            request_id = %result.request_id,
+            trigger = %trigger.as_str(),
+            "crypto_session_reset_requested"
+        );
+
+        Ok(result)
+    }
+
+    /// Phase 2 §2.2 — `ActivateCryptoSession` handler.
+    ///
+    /// Single-tx core in
+    /// [`super::reset_chokepoint::activate_crypto_session_tx`]; this method
+    /// commits, then handles the post-commit concerns: in-memory state
+    /// reset (preserving `unread_counts` per spec §2.2 step 10) and SSE
+    /// `GroupResetEvent` emission.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_activate_crypto_session(
+        &mut self,
+        reset_request_id: Option<String>,
+        trigger: ResetTrigger,
+        new_mls_group_id: String,
+        new_group_info: Option<Vec<u8>>,
+        welcomes: Vec<WelcomeEnvelope>,
+        initiator_did: String,
+        idempotency_key: String,
+    ) -> anyhow::Result<crate::models::CryptoSession> {
+        use anyhow::Context;
+        let mut tx = self
+            .db_pool
+            .begin()
+            .await
+            .context("begin ActivateCryptoSession tx")?;
+        let result = super::reset_chokepoint::activate_crypto_session_tx(
+            &mut tx,
+            &self.convo_id,
+            reset_request_id.as_deref(),
+            trigger,
+            &new_mls_group_id,
+            new_group_info.as_deref(),
+            &welcomes,
+            &initiator_did,
+            &idempotency_key,
+        )
+        .await?;
+        // Always commit, even on tie-break loss — the chokepoint persists
+        // a `failed` crypto_sessions row + `crypto_session_candidate_rejected`
+        // delivery_event for audit, and rolling back would discard them.
+        tx.commit()
+            .await
+            .context("commit ActivateCryptoSession tx")?;
+
+        let outcome = match result {
+            super::reset_chokepoint::ActivationResult::Won(o) => o,
+            super::reset_chokepoint::ActivationResult::Lost {
+                attempted_generation,
+                proposed_mls_group_id,
+            } => {
+                info!(
+                    convo_id = %crate::crypto::redact_for_log(&self.convo_id),
+                    attempted_generation,
+                    proposed_mls_group_id = %crate::crypto::redact_for_log(&proposed_mls_group_id),
+                    trigger = %trigger.as_str(),
+                    "crypto_session_candidate_rejected (tie-break loss persisted)"
+                );
+                return Err(anyhow::anyhow!(
+                    "ActivateCryptoSession tie-break lost: another candidate won generation {attempted_generation}"
+                ));
+            }
+        };
+
+        // Post-commit in-memory reset. Per plan §2.2 step 10: update epoch
+        // for the new session; DO NOT clear `unread_counts` — those are
+        // app data, not crypto state.
+        self.current_epoch = 0;
+
+        // Emit SSE GroupResetEvent matching `do_reset_group`'s shape so
+        // existing clients see the same event surface during compat window.
+        let cursor = self
+            .sse_state
+            .cursor_gen
+            .next(&self.convo_id, "groupResetEvent")
+            .await;
+        let event = crate::realtime::sse::StreamEvent::GroupResetEvent {
+            cursor: cursor.clone(),
+            convo_id: self.convo_id.clone(),
+            new_group_id: new_mls_group_id.clone(),
+            reset_generation: outcome.generation,
+            reset_by: initiator_did.clone(),
+            cipher_suite: outcome.cipher_suite.unwrap_or_default(),
+            reason: Some(format!("crypto_session_activated:{}", trigger.as_str())),
+        };
+        if let Err(e) = crate::db::store_event(&self.db_pool, &self.convo_id, &event).await {
+            error!(
+                "[actor:activate_crypto_session] store GroupResetEvent: {:?}",
+                e
+            );
+        }
+        if let Err(e) = self.sse_state.emit(&self.convo_id, event).await {
+            error!(
+                "[actor:activate_crypto_session] SSE emit GroupReset: {}",
+                e
+            );
+        }
+
+        info!(
+            convo_id = %crate::crypto::redact_for_log(&self.convo_id),
+            new_session_id = %outcome.session.id,
+            generation = outcome.generation,
+            trigger = %trigger.as_str(),
+            "crypto_session_activated"
+        );
+
+        Ok(outcome.session)
+    }
+
+    // TODO(post-#12): funnel through RequestCryptoSessionReset once the
+    // elected-client flow ships. This legacy path stays wired to its
+    // existing callers (handle_record_reset_vote quorum, handle_trigger_
+    // system_reset sweep) until #12 lands a way for clients to respond
+    // to a request-only reset. Funneling earlier would either (a) break
+    // the API shape of report_recovery_failure (new_group_id: None)
+    // or (b) leave indirect-trigger conversations unable to rotate
+    // their group_id server-side, since neither path has client
+    // material at trigger time. Direct/admin/bootstrap flows funnel
+    // through ActivateCryptoSession in `reset_chokepoint.rs` already.
+    //
+    // This is also the only legacy site still clearing `unread_counts`
+    // on reset (line 1933 below). The new chokepoint preserves them
+    // per plan §2.2 step 10. Behavior converges when this method is
+    // retired.
     async fn do_reset_group(
         &mut self,
         last_reset_by: &str,
