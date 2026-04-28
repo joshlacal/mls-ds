@@ -5,7 +5,10 @@ use std::{collections::HashMap, sync::Arc};
 use tracing::{debug, error, info, warn};
 
 use super::broadcaster::BroadcasterPool;
-use super::messages::{ConvoMessage, KeyPackageHashEntry, RecordResetVoteOutcome};
+use super::messages::{
+    ConvoMessage, KeyPackageHashEntry, RecordResetVoteOutcome, ResetRequest, ResetTrigger,
+    WelcomeEnvelope,
+};
 use crate::config::QuorumConfig;
 use crate::notifications::NotificationService;
 use crate::realtime::{SseState, StreamEvent, StreamMessageView};
@@ -322,6 +325,46 @@ impl Actor for ConversationActor {
                 state
                     .handle_trigger_system_reset(reason, staleness_epochs, quiet_duration_secs)
                     .await;
+            }
+            ConvoMessage::RequestCryptoSessionReset {
+                trigger,
+                initiator_did,
+                reason,
+                idempotency_key,
+                reply,
+            } => {
+                let result = state
+                    .handle_request_crypto_session_reset(
+                        trigger,
+                        initiator_did,
+                        reason,
+                        idempotency_key,
+                    )
+                    .await;
+                let _ = reply.send(result);
+            }
+            ConvoMessage::ActivateCryptoSession {
+                reset_request_id,
+                trigger,
+                new_mls_group_id,
+                new_group_info,
+                welcomes,
+                initiator_did,
+                idempotency_key,
+                reply,
+            } => {
+                let result = state
+                    .handle_activate_crypto_session(
+                        reset_request_id,
+                        trigger,
+                        new_mls_group_id,
+                        new_group_info,
+                        welcomes,
+                        initiator_did,
+                        idempotency_key,
+                    )
+                    .await;
+                let _ = reply.send(result);
             }
             ConvoMessage::Shutdown => {
                 info!("ConversationActor shutting down");
@@ -1651,6 +1694,37 @@ impl ConversationActorState {
     /// - `Ok(Some((new_group_id, reset_count)))` on success.
     /// - `Ok(None)` if the conversations row vanished mid-flight.
     /// - `Err(_)` on database error.
+    /// Phase 2 §2.2 — `RequestCryptoSessionReset` handler stub.
+    ///
+    /// Will be implemented in a follow-up commit. Currently unreachable —
+    /// no caller sends this variant yet, so panicking is safe scaffolding.
+    async fn handle_request_crypto_session_reset(
+        &mut self,
+        _trigger: ResetTrigger,
+        _initiator_did: String,
+        _reason: String,
+        _idempotency_key: String,
+    ) -> anyhow::Result<ResetRequest> {
+        unimplemented!("RequestCryptoSessionReset handler — wired in next commit")
+    }
+
+    /// Phase 2 §2.2 — `ActivateCryptoSession` handler stub.
+    ///
+    /// Will be implemented in a follow-up commit. Currently unreachable —
+    /// no caller sends this variant yet, so panicking is safe scaffolding.
+    async fn handle_activate_crypto_session(
+        &mut self,
+        _reset_request_id: Option<String>,
+        _trigger: ResetTrigger,
+        _new_mls_group_id: String,
+        _new_group_info: Option<Vec<u8>>,
+        _welcomes: Vec<WelcomeEnvelope>,
+        _initiator_did: String,
+        _idempotency_key: String,
+    ) -> anyhow::Result<crate::models::CryptoSession> {
+        unimplemented!("ActivateCryptoSession handler — wired in next commit")
+    }
+
     async fn do_reset_group(
         &mut self,
         last_reset_by: &str,
