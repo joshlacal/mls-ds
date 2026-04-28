@@ -27,6 +27,35 @@ use crate::{
 
 const NSID: &str = "blue.catbird.mlsChat.bootstrapResetGroup";
 
+/// Wire-compat shim: post-bootstrap epoch returned to clients.
+///
+/// TODO(phase-2.5-cleanup): remove this shim once `activate_crypto_session_tx`
+/// processes the bootstrap commit in-tx (advancing `last_observed_epoch`
+/// from 0 → 1 atomically with crypto_session creation). At that point
+/// chokepoint storage state will match wire state without override.
+///
+/// **Background**: pre-Phase-2 bootstrap wrote `current_epoch=1` directly
+/// to the conversations row because the bootstrap commit IS the first
+/// epoch advance for the new MLS group. The Phase 2 chokepoint
+/// (`reset_chokepoint::activate_crypto_session_tx`) represents the
+/// activation point as "session active, no commits observed yet" and
+/// stores `last_observed_epoch=0`. That's architecturally pure — the
+/// server hasn't observed the commit's wire bytes — but it would change
+/// `BootstrapResetGroupOutput.convo.epoch` from 1 to 0, breaking pre-
+/// Phase-2 clients that depend on `epoch == 1` after a successful
+/// bootstrap.
+///
+/// **Resolution path**: a future Phase 2.5 task will fold the bootstrap
+/// commit observation into the chokepoint tx (e.g. accept the commit
+/// envelope alongside the GroupInfo and append a `commit_observed`
+/// delivery_event that bumps `last_observed_epoch` to 1 inline). At
+/// that point: delete this constant and the override below; let
+/// `outcome.session.last_observed_epoch + 1` flow through.
+///
+/// **Deletion criterion**: `last_observed_epoch == 1` post-activation
+/// in `crypto_sessions` for at least one full client release cycle.
+pub(crate) const BOOTSTRAP_WIRE_COMPAT_EPOCH: i32 = 1;
+
 /// Complete a post-reset conversation by submitting MLS group material.
 ///
 /// POST /xrpc/blue.catbird.mlsChat.bootstrapResetGroup
@@ -506,13 +535,19 @@ pub async fn handle(
         "[bootstrapResetGroup] complete"
     );
 
+    // Wire-compat shim: chokepoint stores `last_observed_epoch=0` (server
+    // has not yet observed a commit envelope), but pre-Phase-2 clients
+    // expect `convo.epoch == 1` after bootstrap. See
+    // `BOOTSTRAP_WIRE_COMPAT_EPOCH` docstring for the resolution path.
+    let response_epoch: i32 = BOOTSTRAP_WIRE_COMPAT_EPOCH;
+
     Ok(BootstrapResetGroupOutput {
         convo: ConvoView {
             conversation_id: original_convo_id.clone().into(),
             group_id: new_group_id.into(),
             creator: string_to_did(&creator_did_persisted),
             members: members_typed,
-            epoch: 1,
+            epoch: response_epoch as i64,
             cipher_suite: cipher_suite_persisted.into(),
             created_at: chrono_to_datetime(created_at),
             last_message_at: last_message_at.map(chrono_to_datetime),
@@ -523,4 +558,27 @@ pub async fn handle(
         },
         extra_data: Default::default(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BOOTSTRAP_WIRE_COMPAT_EPOCH;
+
+    /// Phase 2.5 cleanup gate: pin the wire-compat epoch value at 1.
+    ///
+    /// The chokepoint stores `last_observed_epoch=0` after activation; this
+    /// constant overrides the wire value to 1 so pre-Phase-2 clients reading
+    /// `BootstrapResetGroupOutput.convo.epoch` see the same value as before
+    /// the funnel landed. If a future change "fixes" this to 0 by deleting
+    /// the constant, that's a wire-semantic break for those clients —
+    /// surface it as a test failure here, then reconcile with the Phase 2.5
+    /// plan before proceeding.
+    #[test]
+    fn bootstrap_wire_compat_epoch_is_one() {
+        assert_eq!(
+            BOOTSTRAP_WIRE_COMPAT_EPOCH, 1,
+            "wire-compat shim must return epoch=1 to pre-Phase-2 clients; \
+             see TODO(phase-2.5-cleanup) docstring for the resolution path"
+        );
+    }
 }
