@@ -325,6 +325,28 @@ pub async fn sweep_groupinfo_404_once(
 // Phase 2 (B5) — event-driven inline trigger.
 // ──────────────────────────────────────────────────────────────────────
 
+/// Hardcoded cooldown for the cascading-recovery guard.
+///
+/// Independent of `InlineTriggerConfig::reset_cooldown_secs` (config-driven,
+/// default 1h). This shorter window is deliberately defense-in-depth: it
+/// gates on the *combination* of `group_info IS NULL` + a recent
+/// `last_reset_at`, which together signal "a reset attempt fired, GroupInfo
+/// was cleared, and a client has not yet bootstrapped a replacement". 15
+/// minutes is empirically long enough for a healthy bootstrap roundtrip
+/// (sub-second under normal conditions) and short enough not to delay
+/// recovery if bootstrap genuinely failed and a fresh reset is warranted.
+///
+/// Production conversation `3153f1a2...` cascade root cause: after a
+/// reset attempt, `group_info` goes NULL while bootstrap is awaited. The
+/// 404 inline trigger then immediately fires again on the same NULL,
+/// looping. This constant provides the localized hot-patch fix on top of
+/// the existing `reset_cooldown_secs` config gate (which fires only on
+/// resets that *successfully* updated `last_reset_at` — true today, but
+/// the in-flight architectural redesign per #12 will produce a path
+/// where reset attempts can update `last_reset_at` without immediately
+/// republishing GroupInfo, making this gate the durable safety net).
+const CASCADING_RECOVERY_COOLDOWN_SECS: i64 = 15 * 60;
+
 /// Decision returned by [`evaluate_inline_trigger`]. Surfacing the reason
 /// (rather than a bare bool) lets the caller log *why* a snapshot did or
 /// didn't dispatch — invaluable for prod debugging.
@@ -338,6 +360,12 @@ pub enum InlineTriggerDecision {
     CircuitBreakerTripped,
     /// `last_reset_at` is more recent than `reset_cooldown_secs`.
     ResetCooldownActive,
+    /// Cascading-recovery cooldown: `group_info IS NULL` AND
+    /// `last_reset_at` is within [`CASCADING_RECOVERY_COOLDOWN_SECS`].
+    /// Signals "a reset attempt is still mid-flight (awaiting client
+    /// bootstrap)"; firing again here would restart the loop rather than
+    /// progress recovery.
+    CascadingRecoveryCooldown,
 }
 
 /// Pure predicate evaluator for the B5 inline trigger.
@@ -366,6 +394,19 @@ pub fn evaluate_inline_trigger(
             count: snapshot.recent_commit_409_count,
             threshold: cfg.min_409_threshold,
         };
+    }
+    // Cascading-recovery guard: skip if a reset attempt is mid-flight
+    // (group_info cleared, bootstrap not yet activated, last_reset_at
+    // within the hardcoded 15m window). Defense-in-depth on top of the
+    // config-driven `reset_cooldown_secs` gate below — fires earlier
+    // and only on the cascading-loop signature, not all recent resets.
+    if snapshot.group_info_is_null {
+        if let Some(last_reset) = snapshot.last_reset_at {
+            let cooldown = chrono::Duration::seconds(CASCADING_RECOVERY_COOLDOWN_SECS);
+            if now - last_reset < cooldown {
+                return InlineTriggerDecision::CascadingRecoveryCooldown;
+            }
+        }
     }
     if let Some(last_reset) = snapshot.last_reset_at {
         let cooldown = chrono::Duration::seconds(cfg.reset_cooldown_secs);
@@ -452,6 +493,14 @@ pub async fn record_commit_409_with_inline_trigger(
                 "inline-trigger: recent reset cooldown active — skipping"
             );
         }
+        InlineTriggerDecision::CascadingRecoveryCooldown => {
+            warn!(
+                convo_id = %crate::crypto::redact_for_log(convo_id),
+                count_409 = snapshot.recent_commit_409_count,
+                cascading_cooldown_secs = CASCADING_RECOVERY_COOLDOWN_SECS,
+                "inline-trigger: group_info NULL with recent reset — cascading-recovery cooldown active, skipping"
+            );
+        }
     }
 
     Ok(())
@@ -482,6 +531,18 @@ pub fn evaluate_inline_groupinfo_404_trigger(
             count: snapshot.recent_groupinfo_404_count,
             threshold: cfg.min_groupinfo_404_threshold,
         };
+    }
+    // Cascading-recovery guard: see [`evaluate_inline_trigger`] for
+    // rationale. For the 404 path this is the *primary* loop trap —
+    // production conv `3153f1a2...` cascade was driven entirely by
+    // 404-on-NULL re-firing this trigger.
+    if snapshot.group_info_is_null {
+        if let Some(last_reset) = snapshot.last_reset_at {
+            let cooldown = chrono::Duration::seconds(CASCADING_RECOVERY_COOLDOWN_SECS);
+            if now - last_reset < cooldown {
+                return InlineTriggerDecision::CascadingRecoveryCooldown;
+            }
+        }
     }
     if let Some(last_reset) = snapshot.last_reset_at {
         let cooldown = chrono::Duration::seconds(cfg.reset_cooldown_secs);
@@ -564,6 +625,14 @@ pub async fn record_groupinfo_404_with_inline_trigger(
                 "inline-trigger(groupinfo-404): recent reset cooldown active — skipping"
             );
         }
+        InlineTriggerDecision::CascadingRecoveryCooldown => {
+            warn!(
+                convo_id = %crate::crypto::redact_for_log(convo_id),
+                count_404 = snapshot.recent_groupinfo_404_count,
+                cascading_cooldown_secs = CASCADING_RECOVERY_COOLDOWN_SECS,
+                "inline-trigger(groupinfo-404): group_info NULL with recent reset — cascading-recovery cooldown active, skipping"
+            );
+        }
     }
 
     Ok(())
@@ -579,6 +648,18 @@ mod inline_trigger_tests {
         last_reset: Option<chrono::DateTime<chrono::Utc>>,
         disabled: bool,
     ) -> CommitHealthSnapshot {
+        snap_with_groupinfo(count, last_reset, disabled, false)
+    }
+
+    /// Variant with explicit `group_info_is_null` for cascading-recovery
+    /// guard tests. Default helper [`snap`] passes `false` so the
+    /// pre-existing case matrix is unaffected.
+    fn snap_with_groupinfo(
+        count: i32,
+        last_reset: Option<chrono::DateTime<chrono::Utc>>,
+        disabled: bool,
+        group_info_is_null: bool,
+    ) -> CommitHealthSnapshot {
         CommitHealthSnapshot {
             recent_commit_409_count: count,
             last_reset_at: last_reset,
@@ -587,6 +668,7 @@ mod inline_trigger_tests {
             } else {
                 None
             },
+            group_info_is_null,
         }
     }
 
@@ -594,6 +676,18 @@ mod inline_trigger_tests {
         count: i32,
         last_reset: Option<chrono::DateTime<chrono::Utc>>,
         disabled: bool,
+    ) -> GroupInfoHealthSnapshot {
+        // 404 path's loop trap is on `group_info IS NULL` — default helper
+        // matches the production failure mode. Tests that need the
+        // bootstrapped (group_info NOT NULL) state set `group_info_is_null=false`.
+        snap_404_with_groupinfo(count, last_reset, disabled, true)
+    }
+
+    fn snap_404_with_groupinfo(
+        count: i32,
+        last_reset: Option<chrono::DateTime<chrono::Utc>>,
+        disabled: bool,
+        group_info_is_null: bool,
     ) -> GroupInfoHealthSnapshot {
         GroupInfoHealthSnapshot {
             recent_groupinfo_404_count: count,
@@ -603,6 +697,7 @@ mod inline_trigger_tests {
             } else {
                 None
             },
+            group_info_is_null,
         }
     }
 
@@ -761,6 +856,107 @@ mod inline_trigger_tests {
         let now = Utc.with_ymd_and_hms(2026, 4, 26, 18, 0, 0).unwrap();
         let s = snap_404(5, None, false);
         let c = cfg(3, 3600);
+        assert_eq!(
+            evaluate_inline_groupinfo_404_trigger(&s, &c, now),
+            InlineTriggerDecision::Dispatch
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Hotfix: cascading-recovery cooldown tests.
+    //
+    // Reproduces the prod conv `3153f1a2...` failure mode: after a reset
+    // attempt, group_info goes NULL while bootstrap is awaited. The 404
+    // (or 409) inline trigger then fires *again* on that NULL — looping.
+    // Gate test: with group_info_is_null && last_reset<15m ago, decision
+    // MUST be CascadingRecoveryCooldown, NOT Dispatch.
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn cascading_recovery_cooldown_blocks_409_dispatch_when_group_info_null_recently_reset() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 26, 18, 0, 0).unwrap();
+        // Reset 5 min ago — well inside the 15m cascading cooldown but
+        // well outside the 1h reset_cooldown_secs gate (so without the
+        // new guard, ResetCooldownActive *would* still gate via the
+        // legacy path; we'd see ResetCooldownActive, not Dispatch.
+        // The point of the test is the *specific* decision variant: a
+        // future change to lower `reset_cooldown_secs` to 0 must still
+        // be guarded by this hotfix on the cascading signature.).
+        let last_reset = now - chrono::Duration::minutes(5);
+        let s = snap_with_groupinfo(10, Some(last_reset), false, true);
+        let c = cfg(3, 0); // intentionally 0 — proves we don't depend on legacy
+        assert_eq!(
+            evaluate_inline_trigger(&s, &c, now),
+            InlineTriggerDecision::CascadingRecoveryCooldown
+        );
+    }
+
+    #[test]
+    fn cascading_recovery_cooldown_does_not_block_when_group_info_present() {
+        // Same recency, but group_info populated → cascading guard sees
+        // a healthy bootstrap landed, hands off to legacy gates.
+        let now = Utc.with_ymd_and_hms(2026, 4, 26, 18, 0, 0).unwrap();
+        let last_reset = now - chrono::Duration::minutes(5);
+        let s = snap_with_groupinfo(10, Some(last_reset), false, false);
+        let c = cfg(3, 0);
+        assert_eq!(
+            evaluate_inline_trigger(&s, &c, now),
+            InlineTriggerDecision::Dispatch
+        );
+    }
+
+    #[test]
+    fn cascading_recovery_cooldown_expires_after_15_minutes() {
+        // 16 min after last_reset, cascading guard releases. Legacy
+        // reset_cooldown_secs=0 means the path falls through to
+        // Dispatch.
+        let now = Utc.with_ymd_and_hms(2026, 4, 26, 18, 0, 0).unwrap();
+        let last_reset = now - chrono::Duration::minutes(16);
+        let s = snap_with_groupinfo(10, Some(last_reset), false, true);
+        let c = cfg(3, 0);
+        assert_eq!(
+            evaluate_inline_trigger(&s, &c, now),
+            InlineTriggerDecision::Dispatch
+        );
+    }
+
+    #[test]
+    fn groupinfo_404_cascading_recovery_cooldown_blocks_dispatch() {
+        // Mirror of the 409 case for the GroupInfo-404 inline path.
+        // Default snap_404 already sets group_info_is_null=true (the
+        // production failure mode for this trigger).
+        let now = Utc.with_ymd_and_hms(2026, 4, 26, 18, 0, 0).unwrap();
+        let last_reset = now - chrono::Duration::minutes(5);
+        let s = snap_404(10, Some(last_reset), false);
+        let c = cfg(3, 0);
+        assert_eq!(
+            evaluate_inline_groupinfo_404_trigger(&s, &c, now),
+            InlineTriggerDecision::CascadingRecoveryCooldown
+        );
+    }
+
+    #[test]
+    fn groupinfo_404_cascading_recovery_cooldown_releases_after_window() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 26, 18, 0, 0).unwrap();
+        let last_reset = now - chrono::Duration::minutes(16);
+        let s = snap_404(10, Some(last_reset), false);
+        let c = cfg(3, 0);
+        assert_eq!(
+            evaluate_inline_groupinfo_404_trigger(&s, &c, now),
+            InlineTriggerDecision::Dispatch
+        );
+    }
+
+    #[test]
+    fn groupinfo_404_cascading_recovery_cooldown_skips_when_group_info_present() {
+        // After bootstrap lands, group_info_is_null=false → cascading guard
+        // is a no-op even within the 15m window. This shouldn't happen on
+        // the 404 path in practice (404 implies NULL), but the symmetric
+        // logic guards against future schema/order-of-operations changes.
+        let now = Utc.with_ymd_and_hms(2026, 4, 26, 18, 0, 0).unwrap();
+        let last_reset = now - chrono::Duration::minutes(5);
+        let s = snap_404_with_groupinfo(10, Some(last_reset), false, false);
+        let c = cfg(3, 0);
         assert_eq!(
             evaluate_inline_groupinfo_404_trigger(&s, &c, now),
             InlineTriggerDecision::Dispatch

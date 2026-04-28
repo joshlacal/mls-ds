@@ -1944,16 +1944,25 @@ impl ConversationActorState {
             .await
             .context("delete reset_votes failed")?;
 
+        // Hotfix: fill member_count from the active members roster on
+        // INSERT so the system-trigger path (sweep, inline 409, inline
+        // 404) doesn't write `member_count=0` rows. The quorum path
+        // (`handle_record_reset_vote`) UPDATEs member_count post-insert
+        // with its own measurement; either source produces the same
+        // count for active members because both filter on `left_at IS
+        // NULL`. vote_count remains 0 here — system triggers bypass
+        // quorum, so 0 is the correct semantic value, not a placeholder.
         sqlx::query(
             "INSERT INTO auto_reset_history \
                 (convo_id, reset_triggered_at, triggered_by, new_group_id, \
                  vote_count, member_count) \
-             VALUES ($1, NOW(), $2, $3, $4, $5)",
+             VALUES ($1, NOW(), $2, $3, $4, \
+                 (SELECT COUNT(*)::int FROM members \
+                  WHERE convo_id = $1 AND left_at IS NULL))",
         )
         .bind(&self.convo_id)
         .bind(last_reset_by)
         .bind(&new_group_id)
-        .bind(0_i32)
         .bind(0_i32)
         .execute(&mut *tx)
         .await

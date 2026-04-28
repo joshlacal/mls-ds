@@ -266,6 +266,14 @@ pub struct CommitHealthSnapshot {
     /// further auto-reset attempts (inline OR sweep) should fire — the
     /// caller MUST short-circuit the trigger evaluation.
     pub auto_reset_disabled_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// True iff the conversation's `group_info` column is currently NULL.
+    /// This is the "mid-reset / awaiting bootstrap" signal: a prior reset
+    /// attempt has cleared GroupInfo and a client has not yet activated a
+    /// replacement crypto_session. The inline trigger MUST treat
+    /// (group_info_is_null && recent last_reset_at) as cooldown to avoid
+    /// the cascading-recovery loop observed on prod conversation
+    /// `3153f1a2...` (see PR `hotfix/inline-trigger-cooldown`).
+    pub group_info_is_null: bool,
 }
 
 /// Phase 2 (auto-reset): record that a `commitGroupChange` returned a 409
@@ -290,7 +298,8 @@ pub async fn record_commit_409(pool: &DbPool, convo_id: &str) -> Result<CommitHe
            SET recent_commit_409_count = recent_commit_409_count + 1,
                last_commit_409_at = NOW()
            WHERE id = $1
-           RETURNING recent_commit_409_count, last_reset_at, auto_reset_disabled_at"#,
+           RETURNING recent_commit_409_count, last_reset_at, auto_reset_disabled_at,
+                     (group_info IS NULL) AS group_info_is_null"#,
     )
     .bind(convo_id)
     .fetch_one(pool)
@@ -313,6 +322,13 @@ pub struct GroupInfoHealthSnapshot {
     pub last_reset_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Circuit-breaker; same semantics as `CommitHealthSnapshot`.
     pub auto_reset_disabled_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// True iff `group_info` is currently NULL. For the 404 inline path
+    /// this is tautologically true at the moment a 404 was recorded
+    /// (clients only hit `getGroupInfo → 404` when the row is NULL), but
+    /// the explicit gate keeps the `cascading-recovery` guard symmetric
+    /// with the 409 path and robust against any future reorder of
+    /// counter-bump vs `do_reset_group` writes.
+    pub group_info_is_null: bool,
 }
 
 /// Phase 2 B10: record that the `get_group_state` handler returned 404
@@ -336,7 +352,8 @@ pub async fn record_groupinfo_404(
            SET recent_groupinfo_404_count = recent_groupinfo_404_count + 1,
                last_groupinfo_404_at = NOW()
            WHERE id = $1
-           RETURNING recent_groupinfo_404_count, last_reset_at, auto_reset_disabled_at"#,
+           RETURNING recent_groupinfo_404_count, last_reset_at, auto_reset_disabled_at,
+                     (group_info IS NULL) AS group_info_is_null"#,
     )
     .bind(convo_id)
     .fetch_one(pool)
