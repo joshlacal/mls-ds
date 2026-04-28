@@ -175,7 +175,12 @@ async fn create_is_idempotent_on_conversation_generation_pair() {
     // Second insert with same (conversation_id, generation) but a different
     // id — should return the first row's id, not allocate a new one.
     let second = repo
-        .create(new_session("session-A2", "convo-A", "mls-group-A-different", 0))
+        .create(new_session(
+            "session-A2",
+            "convo-A",
+            "mls-group-A-different",
+            0,
+        ))
         .await
         .expect("second create");
 
@@ -265,13 +270,9 @@ async fn delivery_log_seq_is_per_conversation() {
 async fn delivery_log_read_range_respects_from_seq_and_limit() {
     let log = InMemoryDeliveryLogRepository::new();
     for n in 0..5 {
-        log.append(new_event(
-            "convo-range",
-            "session-range",
-            &format!("k-{n}"),
-        ))
-        .await
-        .unwrap();
+        log.append(new_event("convo-range", "session-range", &format!("k-{n}")))
+            .await
+            .unwrap();
     }
 
     // Skip the first event by from_seq=2, limit to 2.

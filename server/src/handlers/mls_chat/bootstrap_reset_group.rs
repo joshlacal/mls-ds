@@ -499,15 +499,14 @@ pub async fn handle(
         StatusCode::INTERNAL_SERVER_ERROR.into_response()
     })?;
 
-    let last_message_at: Option<DateTime<Utc>> = sqlx::query_scalar(
-        "SELECT MAX(created_at) FROM messages WHERE convo_id = $1",
-    )
-    .bind(&original_convo_id)
-    .fetch_optional(&pool)
-    .await
-    .ok()
-    .flatten()
-    .flatten();
+    let last_message_at: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT MAX(created_at) FROM messages WHERE convo_id = $1")
+            .bind(&original_convo_id)
+            .fetch_optional(&pool)
+            .await
+            .ok()
+            .flatten()
+            .flatten();
 
     let (creator_did_persisted, name, cipher_suite_persisted, created_at, reset_count) = row;
 

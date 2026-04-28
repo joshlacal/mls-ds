@@ -162,7 +162,11 @@ async fn test_concurrent_claim_exactly_one_winner() {
     // The winner returns exactly the row we inserted; the loser returns zero
     // rows (the no_match outcome the handler would translate into a metric
     // increment + "missing" entry).
-    let (winner_rows, loser_rows) = if a_won { (res_a, res_b) } else { (res_b, res_a) };
+    let (winner_rows, loser_rows) = if a_won {
+        (res_a, res_b)
+    } else {
+        (res_b, res_a)
+    };
     assert_eq!(winner_rows.len(), 1);
     assert_eq!(winner_rows[0].0, owner_did);
     assert_eq!(winner_rows[0].1, cipher_suite);

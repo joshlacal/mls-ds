@@ -185,17 +185,9 @@ async fn test_message_operations() {
 
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-    let msg2 = create_message(
-        &pool,
-        &convo.id,
-        "msg-bob-1",
-        vec![5, 6, 7, 8],
-        0,
-        4,
-        None,
-    )
-    .await
-    .expect("Failed to create message 2");
+    let msg2 = create_message(&pool, &convo.id, "msg-bob-1", vec![5, 6, 7, 8], 0, 4, None)
+        .await
+        .expect("Failed to create message 2");
 
     // Get message
     let fetched = get_message(&pool, &msg1.id)

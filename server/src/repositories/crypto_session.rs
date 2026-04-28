@@ -47,22 +47,22 @@ impl PostgresCryptoSessionRepository {
 
 /// Tuple of `crypto_sessions` columns in canonical order for `query_as`.
 type CryptoSessionRow = (
-    String,                                       // id
-    String,                                       // conversation_id
-    i32,                                          // generation
-    String,                                       // mls_group_id
-    String,                                       // state
-    Option<String>,                               // supersedes_id
-    Option<String>,                               // cipher_suite
-    i32,                                          // last_observed_epoch
-    Option<Vec<u8>>,                              // last_confirmation_tag
-    Option<Vec<u8>>,                              // group_info
-    Option<i32>,                                  // group_info_epoch
-    Option<chrono::DateTime<chrono::Utc>>,        // group_info_updated_at
-    Option<String>,                               // created_by_did
-    chrono::DateTime<chrono::Utc>,                // created_at
-    Option<chrono::DateTime<chrono::Utc>>,        // activated_at
-    Option<chrono::DateTime<chrono::Utc>>,        // superseded_at
+    String,                                // id
+    String,                                // conversation_id
+    i32,                                   // generation
+    String,                                // mls_group_id
+    String,                                // state
+    Option<String>,                        // supersedes_id
+    Option<String>,                        // cipher_suite
+    i32,                                   // last_observed_epoch
+    Option<Vec<u8>>,                       // last_confirmation_tag
+    Option<Vec<u8>>,                       // group_info
+    Option<i32>,                           // group_info_epoch
+    Option<chrono::DateTime<chrono::Utc>>, // group_info_updated_at
+    Option<String>,                        // created_by_did
+    chrono::DateTime<chrono::Utc>,         // created_at
+    Option<chrono::DateTime<chrono::Utc>>, // activated_at
+    Option<chrono::DateTime<chrono::Utc>>, // superseded_at
 );
 
 const SELECT_CRYPTO_SESSION_COLS: &str = "id, conversation_id, generation, mls_group_id, state, \
@@ -94,16 +94,16 @@ fn row_to_session(r: CryptoSessionRow) -> CryptoSession {
 /// Type for the legacy `conversations` projection used during the compat window.
 type LegacyConversationRow = (
     String,                                // id
-    Option<String>,                        // group_id (NOT NULL post-20260405 but typed as Option for safety)
-    String,                                // creator_did
-    i32,                                   // current_epoch
-    Option<Vec<u8>>,                       // confirmation_tag
-    Option<i32>,                           // reset_count
-    Option<String>,                        // cipher_suite
-    Option<Vec<u8>>,                       // group_info
-    Option<i32>,                           // group_info_epoch
+    Option<String>, // group_id (NOT NULL post-20260405 but typed as Option for safety)
+    String,         // creator_did
+    i32,            // current_epoch
+    Option<Vec<u8>>, // confirmation_tag
+    Option<i32>,    // reset_count
+    Option<String>, // cipher_suite
+    Option<Vec<u8>>, // group_info
+    Option<i32>,    // group_info_epoch
     Option<chrono::DateTime<chrono::Utc>>, // group_info_updated_at
-    chrono::DateTime<chrono::Utc>,         // created_at
+    chrono::DateTime<chrono::Utc>, // created_at
 );
 
 const SELECT_LEGACY_COLS: &str = "id, group_id, creator_did, current_epoch, confirmation_tag, \

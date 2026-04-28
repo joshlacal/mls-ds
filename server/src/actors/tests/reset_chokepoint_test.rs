@@ -11,9 +11,7 @@
 //! See `repository_fake_test.rs` for the trait-level idempotency
 //! contracts that the chokepoint relies on.
 
-use crate::actors::messages::{
-    ConvoMessage, ResetRequest, ResetTrigger, WelcomeEnvelope,
-};
+use crate::actors::messages::{ConvoMessage, ResetRequest, ResetTrigger, WelcomeEnvelope};
 
 #[test]
 fn reset_trigger_str_repr_round_trips_all_variants() {

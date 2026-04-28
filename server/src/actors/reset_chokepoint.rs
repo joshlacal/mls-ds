@@ -212,10 +212,7 @@ async fn find_existing_event(
 /// `pg_advisory_xact_lock(int8)`. The earlier 32-bit `hashtext()` form
 /// raised collision risk because the per-conversation key space was only
 /// ~4B; the 64-bit form has effectively no collision concern at our scale.
-async fn allocate_seq(
-    tx: &mut Transaction<'_, Postgres>,
-    conversation_id: &str,
-) -> Result<i64> {
+async fn allocate_seq(tx: &mut Transaction<'_, Postgres>, conversation_id: &str) -> Result<i64> {
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(conversation_id)
         .execute(&mut **tx)

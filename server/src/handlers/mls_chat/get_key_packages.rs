@@ -286,7 +286,8 @@ pub(crate) async fn claim_available_key_packages(
         cs = cs_predicate,
     );
 
-    let mut q = sqlx::query_as::<_, (String, String, Vec<u8>, Option<String>)>(&sql).bind(owner_did);
+    let mut q =
+        sqlx::query_as::<_, (String, String, Vec<u8>, Option<String>)>(&sql).bind(owner_did);
     if let Some(cs) = cipher_suite {
         q = q.bind(cs);
     }

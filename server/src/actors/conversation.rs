@@ -1825,10 +1825,7 @@ impl ConversationActorState {
             );
         }
         if let Err(e) = self.sse_state.emit(&self.convo_id, event).await {
-            error!(
-                "[actor:activate_crypto_session] SSE emit GroupReset: {}",
-                e
-            );
+            error!("[actor:activate_crypto_session] SSE emit GroupReset: {}", e);
         }
 
         info!(
