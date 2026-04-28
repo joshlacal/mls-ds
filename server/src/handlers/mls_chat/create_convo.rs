@@ -386,8 +386,30 @@ async fn handle_create_convo(
         });
     }
 
-    // ── Create conversation ──────────────────────────────────────────────
+    // ── Create conversation + seed crypto_session ────────────────────────
+    //
+    // bug_003 (ultrareview): the chokepoint and the read paths assume a
+    // crypto_sessions row exists for every conversation. The migration
+    // backfills one per existing convo, but createConvo wasn't seeding
+    // for new ones — every post-Phase-2 createConvo would land a
+    // conversation with `active_crypto_session_id IS NULL` and the
+    // chokepoint's read_current_session_for_update would return None,
+    // so resetGroup 500'd and bootstrapResetGroup 404'd on every new
+    // convo.
+    //
+    // Fix: wrap the conversations INSERT, crypto_sessions INSERT,
+    // active_crypto_session_id UPDATE, and crypto_session_created
+    // delivery_event APPEND in a single tx. Match the migration
+    // backfill shape: state='active', generation=0, mls_group_id=
+    // convo_id (createConvo's group_id is the same as the convo id),
+    // last_observed_epoch=1 (matching conversations.current_epoch=1
+    // which represents "group exists at MLS epoch 1 post-creation").
     tracing::debug!("📍 [v2.createConvo] creating conversation in database");
+
+    let mut tx = pool.begin().await.map_err(|e| {
+        error!("❌ [v2.createConvo] Failed to begin tx: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+    })?;
 
     sqlx::query(
         "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at, name, cipher_suite, sequencer_ds, is_remote, group_id)
@@ -398,10 +420,76 @@ async fn handle_create_convo(
     .bind(now)
     .bind(&name)
     .bind(input.cipher_suite.as_ref())
-    .execute(&pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| {
         error!("❌ [v2.createConvo] Failed to create conversation: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+    })?;
+
+    // crypto_sessions seed: generation=0 active session for this convo.
+    let crypto_session_id: String = sqlx::query_scalar(
+        "INSERT INTO crypto_sessions ( \
+            id, conversation_id, generation, mls_group_id, state, \
+            cipher_suite, last_observed_epoch, created_by_did, \
+            created_at, activated_at \
+         ) VALUES (gen_random_uuid()::TEXT, $1, 0, $1, 'active', \
+                   $2, 1, $3, $4, $4) \
+         RETURNING id",
+    )
+    .bind(&convo_id)
+    .bind(input.cipher_suite.as_ref())
+    .bind(&auth_user.did)
+    .bind(&now)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| {
+        error!("❌ [v2.createConvo] Failed to seed crypto_session: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+    })?;
+
+    sqlx::query(
+        "UPDATE conversations SET active_crypto_session_id = $1 WHERE id = $2",
+    )
+    .bind(&crypto_session_id)
+    .bind(&convo_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| {
+        error!(
+            "❌ [v2.createConvo] Failed to set active_crypto_session_id: {}",
+            e
+        );
+        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+    })?;
+
+    // crypto_session_created delivery event at seq=0 (matches the migration
+    // backfill's per-conversation seed event). idempotency_key keeps
+    // re-runs of createConvo safe in case the lexicon-level idempotency
+    // ever permits it.
+    sqlx::query(
+        "INSERT INTO delivery_events ( \
+            id, conversation_id, seq, crypto_session_id, event_type, \
+            mls_group_id, mls_epoch, idempotency_key, created_at \
+         ) VALUES (gen_random_uuid()::TEXT, $1, 0, $2, \
+                   'crypto_session_created', $1, 1, $3, $4)",
+    )
+    .bind(&convo_id)
+    .bind(&crypto_session_id)
+    .bind(format!("create:{}", convo_id))
+    .bind(&now)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| {
+        error!(
+            "❌ [v2.createConvo] Failed to seed crypto_session_created event: {}",
+            e
+        );
+        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+    })?;
+
+    tx.commit().await.map_err(|e| {
+        error!("❌ [v2.createConvo] Failed to commit createConvo tx: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR.into_response()
     })?;
 

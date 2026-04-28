@@ -14,7 +14,6 @@ use crate::{
         get_messages::{GetMessagesOutput, GetMessagesRequest},
         MessageView,
     },
-    repositories::{CryptoSessionRepository, PostgresCryptoSessionRepository},
     storage::DbPool,
 };
 
@@ -291,23 +290,32 @@ async fn fetch_commits(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    // Determine end epoch — go through CryptoSession projection.
+    // Determine end epoch.
+    //
+    // TODO(phase 4): switch back to `crypto_session.last_observed_epoch`
+    // once `try_advance_conversation_epoch_tx` (db.rs) advances both
+    // `conversations.current_epoch` AND
+    // `crypto_sessions.last_observed_epoch` in the same tx. Until then
+    // `last_observed_epoch` is stale after every accepted commit
+    // (merged_bug_001 from ultrareview).
     let to_epoch = if let Some(to) = to_epoch {
         to
     } else {
-        let crypto_session_repo = PostgresCryptoSessionRepository::new(pool.clone());
-        let session = crypto_session_repo
-            .get_active(convo_id)
-            .await
-            .map_err(|e| {
-                error!("❌ [v2.getMessages] Failed to fetch crypto session: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?
-            .ok_or_else(|| {
-                error!("❌ [v2.getMessages] Conversation not found");
-                StatusCode::NOT_FOUND
-            })?;
-        session.last_observed_epoch as i64
+        let current_epoch: i32 = sqlx::query_scalar(
+            "SELECT current_epoch FROM conversations WHERE id = $1",
+        )
+        .bind(convo_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| {
+            error!("❌ [v2.getMessages] Failed to fetch current epoch: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or_else(|| {
+            error!("❌ [v2.getMessages] Conversation not found");
+            StatusCode::NOT_FOUND
+        })?;
+        current_epoch as i64
     };
 
     // `from_epoch == to_epoch + 1` (or higher) is the legitimate "caught up"

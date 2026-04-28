@@ -125,15 +125,27 @@ pub(crate) struct ActivationOutcome {
     pub cipher_suite: Option<String>,
 }
 
-/// Result of [`activate_crypto_session_tx`]. Both variants are committed
-/// — the loser variant intentionally persists the `failed` crypto_sessions
-/// row and the `crypto_session_candidate_rejected` delivery_event for
-/// audit trail. Caller decides how to surface `Lost` to its caller
-/// (typically as an error at the actor message boundary).
+/// Result of [`activate_crypto_session_tx`]. All variants are committed
+/// — the loser variant intentionally persists the
+/// `crypto_session_candidate_rejected` delivery_event for audit trail.
+/// Caller decides how to surface `Lost` to its caller (typically as an
+/// error at the actor message boundary).
 #[derive(Debug)]
 pub(crate) enum ActivationResult {
-    /// Candidate won the tie-break, was activated.
+    /// Candidate won the tie-break THIS tx and was activated. Caller MUST
+    /// run post-commit side effects (in-memory state reset, SSE emission).
     Won(ActivationOutcome),
+    /// Idempotent replay: this idempotency_key already won in a prior tx.
+    /// The session is fully persisted; caller MUST NOT re-emit SSE or
+    /// re-clobber actor in-memory state. The session may even be
+    /// `superseded` by a later activation — the replay path doesn't
+    /// distinguish "current winner" from "former winner."
+    ///
+    /// bug_016 (ultrareview): the prior code returned `Won` for both
+    /// fresh activations and replays, which let stale retries re-emit
+    /// SSE GroupResetEvent and reset the actor's `current_epoch` after a
+    /// later commit had already advanced it.
+    CachedReplay(ActivationOutcome),
     /// Candidate lost the tie-break. Audit row persisted in tx; caller
     /// MUST still commit so the audit trail survives.
     Lost {
@@ -271,11 +283,16 @@ async fn insert_event(
 ///
 /// 1. If a `crypto_session_reset_requested` event with this idempotency_key
 ///    already exists, reconstruct and return its `ResetRequest`.
-/// 2. UPDATE the active crypto_session to `state = 'reset_requested'`
+/// 2. If the session is already in `reset_requested`, apply the
+///    `expected_new_mls_group_id` transition matrix (bug_010). Reject
+///    with an error if a prior request bound a different group id.
+/// 3. UPDATE the active crypto_session to `state = 'reset_requested'`
 ///    (no-op if already in `reset_requested` or `superseding`).
-/// 3. APPEND a `crypto_session_reset_requested` event referencing the
-///    active session, with `payload_json` containing the request body and
-///    the freshly-allocated `request_id`.
+/// 4. APPEND a `crypto_session_reset_requested` event referencing the
+///    active session, with `payload_json` containing the request body,
+///    the freshly-allocated `request_id`, and the (optional)
+///    `expected_new_mls_group_id` binding for activation-time
+///    enforcement.
 pub(crate) async fn request_crypto_session_reset_tx(
     tx: &mut Transaction<'_, Postgres>,
     conversation_id: &str,
@@ -283,7 +300,12 @@ pub(crate) async fn request_crypto_session_reset_tx(
     initiator_did: &str,
     reason: &str,
     idempotency_key: &str,
+    expected_new_mls_group_id: Option<&str>,
 ) -> Result<ResetRequest> {
+    // Idempotent replay: a prior call from this caller with the same
+    // idempotency_key resolves to the same ResetRequest. The transition
+    // matrix below only applies to NEW Requests (different
+    // idempotency_key) on a session already in `reset_requested`.
     if let Some((_event_id, payload_json, _cs_id)) = find_existing_event(
         tx,
         conversation_id,
@@ -311,7 +333,50 @@ pub(crate) async fn request_crypto_session_reset_tx(
         .await?
         .ok_or_else(|| anyhow!("no non-superseded crypto_session for {conversation_id}"))?;
 
-    // Idempotent transition: only flip 'active' → 'reset_requested'.
+    // bug_010 (ultrareview): expected_new_mls_group_id transition matrix
+    // when the session is already in `reset_requested`. Look at the most
+    // recent crypto_session_reset_requested event for this session and
+    // apply:
+    //   existing NULL + new NULL          → no-op (idempotent re-request)
+    //   existing NULL + new Some(X)       → upgrade the binding
+    //   existing Some(X) + new Some(X)    → no-op (same target re-claim)
+    //   existing Some(X) + new Some(Y), X≠Y → REJECT (conflicting claim)
+    //   existing Some(X) + new NULL       → no-op (NULL doesn't weaken)
+    if current.state == "reset_requested" {
+        let existing_expected: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT payload_json->>'expected_new_mls_group_id' \
+             FROM delivery_events \
+             WHERE conversation_id = $1 \
+               AND crypto_session_id = $2 \
+               AND event_type = 'crypto_session_reset_requested' \
+             ORDER BY seq DESC \
+             LIMIT 1",
+        )
+        .bind(conversation_id)
+        .bind(&current.id)
+        .fetch_optional(&mut **tx)
+        .await
+        .context("read prior reset_requested expected_new_mls_group_id")?;
+
+        let prior_expected: Option<String> = existing_expected.flatten();
+        match (prior_expected.as_deref(), expected_new_mls_group_id) {
+            // existing Some(X) + new Some(Y), X≠Y → REJECT
+            (Some(prior), Some(new)) if prior != new => {
+                return Err(anyhow!(
+                    "expected_new_mls_group_id binding conflict: \
+                     prior request claimed `{prior}`, new request claims `{new}`. \
+                     The earlier admin's claim is binding until activation \
+                     resolves; either submit material matching the prior \
+                     claim or wait for the prior request to time out."
+                ));
+            }
+            // All other cases pass through; the existing event remains
+            // authoritative on the binding (or NULL stays NULL).
+            _ => {}
+        }
+    }
+
+    // Idempotent state transition: only flip 'active' → 'reset_requested'.
     // If the row is already in 'reset_requested' or 'superseding', the
     // UPDATE matches zero rows; we still emit the event below so the
     // delivery_events log preserves both request idempotency_keys.
@@ -330,6 +395,7 @@ pub(crate) async fn request_crypto_session_reset_tx(
         "request_id": request_id,
         "trigger": trigger.as_str(),
         "reason": reason,
+        "expected_new_mls_group_id": expected_new_mls_group_id,
     });
 
     let seq = allocate_seq(tx, conversation_id).await?;
@@ -415,7 +481,12 @@ pub(crate) async fn activate_crypto_session_tx(
         })?;
         let cipher_suite = session.cipher_suite.clone();
         let generation = session.generation;
-        return Ok(ActivationResult::Won(ActivationOutcome {
+        // bug_016 (ultrareview): mark this as a replay so the caller
+        // skips post-commit side effects. The session may already have
+        // been superseded by a later activation (a replay arriving after
+        // the normal "won and superseded" sequence is legitimate but
+        // its post-commit work would clobber the actor's current state).
+        return Ok(ActivationResult::CachedReplay(ActivationOutcome {
             session,
             generation,
             cipher_suite,
@@ -457,12 +528,71 @@ pub(crate) async fn activate_crypto_session_tx(
     let prior = read_current_session_for_update(tx, conversation_id)
         .await?
         .ok_or_else(|| anyhow!("no current crypto_session for {conversation_id}"))?;
+
+    // bug_010 (ultrareview): if the prior session is in `reset_requested`
+    // and the upstream Request bound an `expected_new_mls_group_id`, the
+    // activator's `new_mls_group_id` MUST match. This is the auth-bypass
+    // gate Codex P1 had two parts of (state was the first; this is the
+    // second). NULL `expected_new_mls_group_id` means no pre-binding —
+    // any caller's `new_mls_group_id` is accepted (post-#12 elected-
+    // client-flow placeholder).
+    if prior.state == "reset_requested" {
+        let expected: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT payload_json->>'expected_new_mls_group_id' \
+             FROM delivery_events \
+             WHERE conversation_id = $1 \
+               AND crypto_session_id = $2 \
+               AND event_type = 'crypto_session_reset_requested' \
+             ORDER BY seq DESC \
+             LIMIT 1",
+        )
+        .bind(conversation_id)
+        .bind(&prior.id)
+        .fetch_optional(&mut **tx)
+        .await
+        .context("read prior reset_requested expected_new_mls_group_id")?;
+
+        if let Some(Some(bound)) = expected {
+            if bound != new_mls_group_id {
+                return Err(anyhow!(
+                    "expected_new_mls_group_id mismatch: \
+                     upstream Request bound `{bound}`, but activation \
+                     submitted `{new_mls_group_id}`. The pre-bound claim \
+                     from the original requester is authoritative; \
+                     bootstrap with the matching mls_group_id or wait \
+                     for the prior request to time out."
+                ));
+            }
+        }
+    }
+
     let next_generation = prior.generation + 1;
     let cipher_suite = prior.cipher_suite.clone();
     let new_session_id = Uuid::new_v4().to_string();
 
     // 3. Tie-break INSERT.
-    let inserted: Option<(String,)> = sqlx::query_as(
+    //
+    // merged_bug_004 (ultrareview): the crypto_sessions table has THREE
+    // unique constraints that an activation INSERT can violate:
+    //   (a) UNIQUE (conversation_id, generation) — the tie-break primary
+    //   (b) UNIQUE (mls_group_id) — collides if another row owns the id
+    //   (c) idx_crypto_sessions_one_active_per_convo partial index —
+    //       collides if a state='active' row already exists for the convo
+    //
+    // The prior code used `ON CONFLICT (conversation_id, generation) DO
+    // NOTHING` which only catches (a). (b) and (c) would raise SQLSTATE
+    // 23505 and abort the whole tx.
+    //
+    // Solution: open a SAVEPOINT around the INSERT, attempt it without
+    // any ON CONFLICT clause, and on 23505 ROLLBACK to the savepoint
+    // before continuing the loser-path inserts. RELEASE the savepoint on
+    // success. This treats all three unique-violations as Lost uniformly.
+    sqlx::query("SAVEPOINT activate_insert")
+        .execute(&mut **tx)
+        .await
+        .context("SAVEPOINT activate_insert")?;
+
+    let insert_result: Result<(String,), sqlx::Error> = sqlx::query_as(
         "INSERT INTO crypto_sessions ( \
             id, conversation_id, generation, mls_group_id, state, supersedes_id, \
             cipher_suite, last_observed_epoch, group_info, group_info_epoch, \
@@ -471,7 +601,6 @@ pub(crate) async fn activate_crypto_session_tx(
                    CASE WHEN $7 IS NULL THEN NULL ELSE 0 END, \
                    CASE WHEN $7 IS NULL THEN NULL ELSE NOW() END, \
                    $8, NOW(), NOW()) \
-         ON CONFLICT (conversation_id, generation) DO NOTHING \
          RETURNING id",
     )
     .bind(&new_session_id)
@@ -482,9 +611,40 @@ pub(crate) async fn activate_crypto_session_tx(
     .bind(&cipher_suite)
     .bind(new_group_info)
     .bind(initiator_did)
-    .fetch_optional(&mut **tx)
-    .await
-    .context("INSERT new crypto_session")?;
+    .fetch_one(&mut **tx)
+    .await;
+
+    let inserted: Option<(String,)> = match insert_result {
+        Ok(row) => {
+            // Winner: release the savepoint to fold its writes into the
+            // outer tx.
+            sqlx::query("RELEASE SAVEPOINT activate_insert")
+                .execute(&mut **tx)
+                .await
+                .context("RELEASE SAVEPOINT activate_insert")?;
+            Some(row)
+        }
+        Err(sqlx::Error::Database(ref db_err))
+            if db_err.code().as_deref() == Some("23505") =>
+        {
+            // Loser: roll back the failed INSERT so the outer tx can
+            // continue with the candidate-rejected event APPEND below.
+            sqlx::query("ROLLBACK TO SAVEPOINT activate_insert")
+                .execute(&mut **tx)
+                .await
+                .context("ROLLBACK TO SAVEPOINT activate_insert")?;
+            None
+        }
+        Err(e) => {
+            // Non-unique-violation error: still need to rollback the
+            // savepoint before the outer tx unwinds, but propagate the
+            // error to the caller.
+            let _ = sqlx::query("ROLLBACK TO SAVEPOINT activate_insert")
+                .execute(&mut **tx)
+                .await;
+            return Err(anyhow!("INSERT new crypto_session: {e}"));
+        }
+    };
 
     if inserted.is_none() {
         // Tie-break loss: another candidate has already won this
@@ -535,12 +695,21 @@ pub(crate) async fn activate_crypto_session_tx(
     }
 
     // 4. Mark prior session superseded.
+    //
+    // Bug 002 (ultrareview): include `reset_requested` in the valid prior
+    // states. The Request → Activate happy path leaves the prior session
+    // in `reset_requested` (set by `request_crypto_session_reset_tx`), so
+    // the supersede UPDATE here MUST cover that state or the prior row
+    // never transitions out and a row leaks per reset. The
+    // `read_current_session_for_update` filter above already returns
+    // rows in any of (active, reset_requested, superseding); the WHERE
+    // here must mirror that set.
     sqlx::query(
         "UPDATE crypto_sessions \
          SET state = 'superseded', \
              superseded_at = NOW(), \
              superseded_by_id = $2 \
-         WHERE id = $1 AND state IN ('active', 'superseding')",
+         WHERE id = $1 AND state IN ('active', 'reset_requested', 'superseding')",
     )
     .bind(&prior.id)
     .bind(&new_session_id)
@@ -637,10 +806,17 @@ pub(crate) async fn activate_crypto_session_tx(
     // multi-VALUES round-trip rather than N separate INSERTs. For typical
     // group sizes (10–50 members) this turns 50 round-trips into 1.
     if !welcomes.is_empty() {
+        // bug_009 (ultrareview): bind WelcomeEnvelope.key_package_hash to
+        // the new pending_welcomes.key_package_hash column. Previously
+        // collected and silently discarded because no column existed —
+        // currently masked by the legacy welcome_messages dual-write,
+        // becomes data loss when that's dropped (TODO(phase-2.5-cleanup)
+        // referenced by handler).
         let mut qb = sqlx::QueryBuilder::<Postgres>::new(
             "INSERT INTO pending_welcomes ( \
                 id, convo_id, target_did, welcome_message, created_by_did, \
-                crypto_session_id, generation, commit_event_id, recipient_device_id \
+                crypto_session_id, generation, commit_event_id, \
+                recipient_device_id, key_package_hash \
              ) ",
         );
         qb.push_values(welcomes.iter(), |mut b, w| {
@@ -652,7 +828,8 @@ pub(crate) async fn activate_crypto_session_tx(
                 .push_bind(&new_session_id)
                 .push_bind(next_generation)
                 .push_bind(&activated_event_id)
-                .push_bind(&w.recipient_device_id);
+                .push_bind(&w.recipient_device_id)
+                .push_bind(&w.key_package_hash);
         });
         qb.build()
             .execute(&mut **tx)

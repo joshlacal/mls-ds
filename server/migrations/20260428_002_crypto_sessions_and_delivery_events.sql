@@ -171,7 +171,15 @@ ALTER TABLE pending_welcomes
     ADD COLUMN IF NOT EXISTS crypto_session_id TEXT REFERENCES crypto_sessions(id),
     ADD COLUMN IF NOT EXISTS generation INTEGER,
     ADD COLUMN IF NOT EXISTS commit_event_id TEXT REFERENCES delivery_events(id),
-    ADD COLUMN IF NOT EXISTS recipient_device_id TEXT;
+    ADD COLUMN IF NOT EXISTS recipient_device_id TEXT,
+    -- bug_009 (ultrareview): WelcomeEnvelope carries `key_package_hash`
+    -- but the column was missing on pending_welcomes, so the binding
+    -- was silently dropped. Currently masked by the legacy
+    -- welcome_messages dual-write which DOES have the column; becomes
+    -- data-loss when the legacy write is dropped. Hash is hex-encoded
+    -- (TEXT) to match `key_packages.key_package_hash` and the chokepoint's
+    -- WelcomeEnvelope shape.
+    ADD COLUMN IF NOT EXISTS key_package_hash TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_pending_welcomes_session
     ON pending_welcomes(crypto_session_id, target_did, recipient_device_id);
@@ -180,6 +188,8 @@ COMMENT ON COLUMN pending_welcomes.crypto_session_id IS
     'Phase 2: binds the welcome to a specific crypto_session generation. Welcomes for losing reset candidates are rejected on activation (reference to a `failed` row).';
 COMMENT ON COLUMN pending_welcomes.recipient_device_id IS
     'Phase 2: device identifier for multi-device routing. Disambiguates pending welcomes for the same target_did across devices.';
+COMMENT ON COLUMN pending_welcomes.key_package_hash IS
+    'Phase 2 (bug_009): hex-encoded hash of the recipient device''s consumed key package. Required for the eventual replacement of welcome_messages with pending_welcomes as the canonical distribution table.';
 
 -- =============================================================================
 -- Backfill: one crypto_session per conversation, one delivery_event marker

@@ -61,6 +61,7 @@ async fn convo_message_request_reset_constructs_with_oneshot() {
         initiator_did: "did:plc:admin".to_string(),
         reason: "spec test".to_string(),
         idempotency_key: "test-key-1".to_string(),
+        expected_new_mls_group_id: Some("mls-group-XYZ".to_string()),
         reply: tx,
     };
     // The variant is constructed; pattern-match to verify destructuring.
@@ -70,12 +71,17 @@ async fn convo_message_request_reset_constructs_with_oneshot() {
             initiator_did,
             reason,
             idempotency_key,
+            expected_new_mls_group_id,
             ..
         } => {
             assert_eq!(trigger, ResetTrigger::Admin);
             assert_eq!(initiator_did, "did:plc:admin");
             assert_eq!(reason, "spec test");
             assert_eq!(idempotency_key, "test-key-1");
+            assert_eq!(
+                expected_new_mls_group_id.as_deref(),
+                Some("mls-group-XYZ")
+            );
         }
         _ => panic!("expected RequestCryptoSessionReset"),
     }

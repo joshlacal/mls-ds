@@ -209,16 +209,21 @@ async fn handle_persistent(
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
-    // TODO(phase 4): switch back to `crypto_session.last_observed_epoch`
-    // once `try_advance_conversation_epoch_tx` (db.rs) advances both
-    // `conversations.current_epoch` AND the active session's
-    // `crypto_sessions.last_observed_epoch` in the same tx. As shipped,
-    // commit-acceptance only bumps `conversations.current_epoch`, so
-    // reading `last_observed_epoch` here would be stale after the first
-    // accepted commit and trigger spurious TreeStateDiverged conflicts
-    // (`client_epoch > server_epoch`). The other CryptoSession fields
-    // (confirmation_tag, generation) are not touched by epoch advance,
-    // so they continue to read from `crypto_session` safely.
+    // TODO(phase 4): switch back to crypto_session reads once
+    // commit-acceptance dual-writes the corresponding crypto_sessions
+    // columns alongside the conversations columns. As shipped, the
+    // commit-acceptance path (try_advance_conversation_epoch_tx +
+    // commit_group_change.rs) updates `conversations.current_epoch`
+    // and `conversations.confirmation_tag` but NOT
+    // `crypto_sessions.last_observed_epoch` /
+    // `crypto_sessions.last_confirmation_tag`. Reading from
+    // crypto_session here would be stale on both fields after the
+    // first accepted commit (merged_bug_001 from ultrareview corrected
+    // the original PR review #20 fix, which incorrectly assumed
+    // confirmation_tag was untouched by epoch advance).
+    //
+    // `generation` (a.k.a. `reset_count`) IS only mutated through the
+    // chokepoint, so reading it from `crypto_session` remains safe.
     let server_epoch: i64 =
         sqlx::query_scalar("SELECT current_epoch FROM conversations WHERE id = $1")
             .bind(&convo_id)
@@ -229,7 +234,19 @@ async fn handle_persistent(
                 error!("❌ [v2.sendMessage] Failed to fetch current epoch: {}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
-    let stored_confirmation_tag = crypto_session.last_confirmation_tag.clone();
+    let stored_confirmation_tag: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT confirmation_tag FROM conversations WHERE id = $1",
+    )
+    .bind(&convo_id)
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| {
+        error!(
+            "❌ [v2.sendMessage] Failed to fetch confirmation_tag: {}",
+            e
+        );
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     let reset_count: i32 = crypto_session.generation;
 
     // --- Validate confirmation tag (if client sent one) ---
