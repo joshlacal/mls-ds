@@ -264,15 +264,25 @@ impl CryptoSessionRepository for PostgresCryptoSessionRepository {
     }
 
     async fn mark_superseded(&self, id: &str, superseded_by_id: &str) -> RepositoryResult<()> {
-        // Idempotent: only transitions from active/superseding (per plan
-        // §Phase 2.4). If already superseded, zero rows affected — no error.
+        // Idempotent: transitions from any non-terminal state — `active`
+        // (no reset request), `reset_requested` (Request fired but no
+        // candidate yet), or `superseding` (candidate accepted, transition
+        // in flight). If already `superseded`/`failed`/`archived`, zero
+        // rows affected and the call is a no-op (no error).
+        //
+        // Bug 002 (ultrareview): the prior filter `('active', 'superseding')`
+        // missed the `reset_requested` case, so every successful reset
+        // (Request → Activate happy path) left an orphaned row in
+        // `reset_requested` state forever. The active session pointer
+        // moves correctly but the prior row never transitions out, leaking
+        // a row per reset.
         sqlx::query(
             "UPDATE crypto_sessions \
              SET state = 'superseded', \
                  superseded_at = NOW(), \
                  superseded_by_id = $2 \
              WHERE id = $1 \
-               AND state IN ('active', 'superseding')",
+               AND state IN ('active', 'reset_requested', 'superseding')",
         )
         .bind(id)
         .bind(superseded_by_id)

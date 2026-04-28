@@ -465,7 +465,28 @@ pub(crate) async fn activate_crypto_session_tx(
     let new_session_id = Uuid::new_v4().to_string();
 
     // 3. Tie-break INSERT.
-    let inserted: Option<(String,)> = sqlx::query_as(
+    //
+    // merged_bug_004 (ultrareview): the crypto_sessions table has THREE
+    // unique constraints that an activation INSERT can violate:
+    //   (a) UNIQUE (conversation_id, generation) — the tie-break primary
+    //   (b) UNIQUE (mls_group_id) — collides if another row owns the id
+    //   (c) idx_crypto_sessions_one_active_per_convo partial index —
+    //       collides if a state='active' row already exists for the convo
+    //
+    // The prior code used `ON CONFLICT (conversation_id, generation) DO
+    // NOTHING` which only catches (a). (b) and (c) would raise SQLSTATE
+    // 23505 and abort the whole tx.
+    //
+    // Solution: open a SAVEPOINT around the INSERT, attempt it without
+    // any ON CONFLICT clause, and on 23505 ROLLBACK to the savepoint
+    // before continuing the loser-path inserts. RELEASE the savepoint on
+    // success. This treats all three unique-violations as Lost uniformly.
+    sqlx::query("SAVEPOINT activate_insert")
+        .execute(&mut **tx)
+        .await
+        .context("SAVEPOINT activate_insert")?;
+
+    let insert_result: Result<(String,), sqlx::Error> = sqlx::query_as(
         "INSERT INTO crypto_sessions ( \
             id, conversation_id, generation, mls_group_id, state, supersedes_id, \
             cipher_suite, last_observed_epoch, group_info, group_info_epoch, \
@@ -474,7 +495,6 @@ pub(crate) async fn activate_crypto_session_tx(
                    CASE WHEN $7 IS NULL THEN NULL ELSE 0 END, \
                    CASE WHEN $7 IS NULL THEN NULL ELSE NOW() END, \
                    $8, NOW(), NOW()) \
-         ON CONFLICT (conversation_id, generation) DO NOTHING \
          RETURNING id",
     )
     .bind(&new_session_id)
@@ -485,9 +505,40 @@ pub(crate) async fn activate_crypto_session_tx(
     .bind(&cipher_suite)
     .bind(new_group_info)
     .bind(initiator_did)
-    .fetch_optional(&mut **tx)
-    .await
-    .context("INSERT new crypto_session")?;
+    .fetch_one(&mut **tx)
+    .await;
+
+    let inserted: Option<(String,)> = match insert_result {
+        Ok(row) => {
+            // Winner: release the savepoint to fold its writes into the
+            // outer tx.
+            sqlx::query("RELEASE SAVEPOINT activate_insert")
+                .execute(&mut **tx)
+                .await
+                .context("RELEASE SAVEPOINT activate_insert")?;
+            Some(row)
+        }
+        Err(sqlx::Error::Database(ref db_err))
+            if db_err.code().as_deref() == Some("23505") =>
+        {
+            // Loser: roll back the failed INSERT so the outer tx can
+            // continue with the candidate-rejected event APPEND below.
+            sqlx::query("ROLLBACK TO SAVEPOINT activate_insert")
+                .execute(&mut **tx)
+                .await
+                .context("ROLLBACK TO SAVEPOINT activate_insert")?;
+            None
+        }
+        Err(e) => {
+            // Non-unique-violation error: still need to rollback the
+            // savepoint before the outer tx unwinds, but propagate the
+            // error to the caller.
+            let _ = sqlx::query("ROLLBACK TO SAVEPOINT activate_insert")
+                .execute(&mut **tx)
+                .await;
+            return Err(anyhow!("INSERT new crypto_session: {e}"));
+        }
+    };
 
     if inserted.is_none() {
         // Tie-break loss: another candidate has already won this
@@ -538,12 +589,21 @@ pub(crate) async fn activate_crypto_session_tx(
     }
 
     // 4. Mark prior session superseded.
+    //
+    // Bug 002 (ultrareview): include `reset_requested` in the valid prior
+    // states. The Request → Activate happy path leaves the prior session
+    // in `reset_requested` (set by `request_crypto_session_reset_tx`), so
+    // the supersede UPDATE here MUST cover that state or the prior row
+    // never transitions out and a row leaks per reset. The
+    // `read_current_session_for_update` filter above already returns
+    // rows in any of (active, reset_requested, superseding); the WHERE
+    // here must mirror that set.
     sqlx::query(
         "UPDATE crypto_sessions \
          SET state = 'superseded', \
              superseded_at = NOW(), \
              superseded_by_id = $2 \
-         WHERE id = $1 AND state IN ('active', 'superseding')",
+         WHERE id = $1 AND state IN ('active', 'reset_requested', 'superseding')",
     )
     .bind(&prior.id)
     .bind(&new_session_id)
