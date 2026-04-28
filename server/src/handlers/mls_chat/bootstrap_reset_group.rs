@@ -134,6 +134,9 @@ pub async fn handle(
     // matches but group_info IS NOT NULL, the bootstrap already happened.
     // current_epoch is INT4 in the schema; decode as i32 (every other reader
     // — db.rs, models.rs, federation, mls_auth, actors — uses i32 too).
+    // TODO(phase 4): route via CryptoSessionRepository — needs a transactional
+    // surface (FOR UPDATE inside &mut Transaction); the Phase 1 trait takes
+    // PgPool. Migrate when ConversationActor takes the repo by ctor.
     let target_row: Option<(Option<Vec<u8>>, i32)> = sqlx::query_as(
         "SELECT group_info, current_epoch FROM conversations \
          WHERE id = $1 AND group_id = $2 \

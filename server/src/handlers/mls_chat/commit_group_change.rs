@@ -311,6 +311,9 @@ pub async fn commit_group_change(
                 .unwrap_or(false);
 
                 if already {
+                    // TODO(phase 4): route via CryptoSessionRepository — idempotency-hit
+                    // fallback in addMembers; migrate when ConversationActor takes the
+                    // repo by ctor.
                     let current_epoch: Option<i32> =
                         sqlx::query_scalar("SELECT current_epoch FROM conversations WHERE id = $1")
                             .bind(&convo_id)
@@ -952,6 +955,9 @@ pub async fn commit_group_change(
                 .unwrap_or(false);
 
                 if already {
+                    // TODO(phase 4): route via CryptoSessionRepository — idempotency-hit
+                    // fallback in externalCommit; migrate when ConversationActor takes
+                    // the repo by ctor.
                     let current_epoch: Option<i32> =
                         sqlx::query_scalar("SELECT current_epoch FROM conversations WHERE id = $1")
                             .bind(&convo_id)
@@ -1755,6 +1761,9 @@ pub async fn commit_group_change(
 
             // CAS protection: reject stale GroupInfo uploads
             if let Some(mls_epoch) = mls_epoch {
+                // TODO(phase 4): route via CryptoSessionRepository — CAS guard for
+                // stale GroupInfo upload; migrate when ConversationActor takes the
+                // repo by ctor.
                 let current_server_epoch: i32 =
                     sqlx::query_scalar("SELECT current_epoch FROM conversations WHERE id = $1")
                         .bind(&convo_id)
@@ -2041,6 +2050,9 @@ pub async fn commit_group_change(
                 .unwrap_or(false);
 
                 if already {
+                    // TODO(phase 4): route via CryptoSessionRepository — idempotency-hit
+                    // fallback in removeMember; migrate when ConversationActor takes the
+                    // repo by ctor.
                     let current_epoch: Option<i32> =
                         sqlx::query_scalar("SELECT current_epoch FROM conversations WHERE id = $1")
                             .bind(&convo_id)
@@ -2378,6 +2390,9 @@ pub async fn commit_group_change(
                 .unwrap_or(false);
 
                 if already {
+                    // TODO(phase 4): route via CryptoSessionRepository — generic
+                    // idempotency-hit fallback; migrate when ConversationActor takes
+                    // the repo by ctor.
                     let current_epoch: Option<i32> =
                         sqlx::query_scalar("SELECT current_epoch FROM conversations WHERE id = $1")
                             .bind(&convo_id)
