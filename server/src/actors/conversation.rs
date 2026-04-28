@@ -1928,6 +1928,98 @@ impl ConversationActorState {
             }
         };
 
+        // Phase 2.5 §5 Stage 1 generation-invariant patch (R4): INSERT a
+        // parallel crypto_sessions row mirroring the rotation. Without
+        // this, any conversation that goes through legacy do_reset_group
+        // followed by a Phase-2.5 chokepoint reset would compute
+        // `next_generation = prev.generation + 1` from the stale prior
+        // (the row before this legacy reset), producing a UNIQUE
+        // violation on `(conversation_id, generation)` at the chokepoint.
+        // Removed in Stage 3 when do_reset_group itself is retired.
+        //
+        // Steps:
+        //   1. Read current active (or reset_requested, after dual-emit
+        //      from indirect-trigger Request) crypto_session row to get
+        //      `prior.id` for supersedes_id link.
+        //   2. INSERT new crypto_sessions row at generation = reset_count
+        //      (post-UPDATE value), state='active'. Mirrors the
+        //      activation-tx INSERT shape from
+        //      `reset_chokepoint::activate_crypto_session_tx`.
+        //   3. UPDATE prior session state='superseded' covering
+        //      ('active', 'reset_requested', 'superseding') so the
+        //      dual-emit Phase-2.5 path (which leaves the prior in
+        //      'reset_requested') is also handled.
+        //   4. UPDATE conversations.active_crypto_session_id pointer.
+        //
+        // No delivery_events emitted from here — the legacy SSE
+        // GroupResetEvent emission below is the audit signal. Stage 3
+        // moves all rotation events into the chokepoint.
+        let prior_session: Option<(String, i32)> = sqlx::query_as(
+            "SELECT id, generation FROM crypto_sessions \
+             WHERE conversation_id = $1 \
+               AND state IN ('active', 'reset_requested', 'superseding') \
+             ORDER BY generation DESC \
+             LIMIT 1 \
+             FOR UPDATE",
+        )
+        .bind(&self.convo_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .context("read prior crypto_session for legacy do_reset_group rotation")?;
+
+        let new_crypto_session_id = uuid::Uuid::new_v4().to_string();
+        let prior_session_id_opt: Option<String> = prior_session.as_ref().map(|(id, _g)| id.clone());
+
+        sqlx::query(
+            "INSERT INTO crypto_sessions ( \
+                id, conversation_id, generation, mls_group_id, state, \
+                supersedes_id, cipher_suite, last_observed_epoch, \
+                created_by_did, created_at, activated_at \
+             ) VALUES ($1, $2, $3, $4, 'active', $5, $6, 0, $7, NOW(), NOW())",
+        )
+        .bind(&new_crypto_session_id)
+        .bind(&self.convo_id)
+        .bind(reset_count)
+        .bind(&new_group_id)
+        .bind(prior_session_id_opt.as_deref())
+        .bind(cipher_suite.as_deref())
+        .bind(last_reset_by)
+        .execute(&mut *tx)
+        .await
+        .context(
+            "INSERT new crypto_session for legacy do_reset_group rotation \
+             (Phase 2.5 generation-invariant patch)",
+        )?;
+
+        if let Some((prior_id, _prior_gen)) = prior_session.as_ref() {
+            sqlx::query(
+                "UPDATE crypto_sessions \
+                 SET state = 'superseded', \
+                     superseded_at = NOW(), \
+                     superseded_by_id = $2 \
+                 WHERE id = $1 \
+                   AND state IN ('active', 'reset_requested', 'superseding')",
+            )
+            .bind(prior_id)
+            .bind(&new_crypto_session_id)
+            .execute(&mut *tx)
+            .await
+            .context("supersede prior crypto_session in legacy do_reset_group")?;
+        }
+
+        // Forward the conversations.active_crypto_session_id pointer.
+        // The earlier UPDATE conversations clause set the legacy MLS
+        // columns but predates the Phase-2 pointer column, so this is
+        // a separate UPDATE.
+        sqlx::query(
+            "UPDATE conversations SET active_crypto_session_id = $1 WHERE id = $2",
+        )
+        .bind(&new_crypto_session_id)
+        .bind(&self.convo_id)
+        .execute(&mut *tx)
+        .await
+        .context("UPDATE conversations.active_crypto_session_id in legacy do_reset_group")?;
+
         sqlx::query("DELETE FROM welcome_messages WHERE convo_id = $1")
             .bind(&self.convo_id)
             .execute(&mut *tx)
