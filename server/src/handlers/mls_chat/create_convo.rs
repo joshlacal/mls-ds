@@ -480,15 +480,17 @@ async fn handle_create_convo(
     }
 
     // ── Store Welcome message ────────────────────────────────────────────
-    if let Some(ref welcome_b64) = input.welcome_message {
+    if let Some(ref welcome_bytes) = input.welcome_message {
         info!("📍 [v2.createConvo] Processing Welcome message...");
 
-        let welcome_data = base64::engine::general_purpose::STANDARD
-            .decode(&**welcome_b64)
-            .map_err(|e| {
-                warn!("❌ [v2.createConvo] Invalid base64 welcome: {}", e);
-                StatusCode::BAD_REQUEST.into_response()
-            })?;
+        // Jacquard generates `welcome_message: Option<bytes::Bytes>` from the
+        // lexicon `bytes` type — already raw bytes. The earlier handler
+        // base64-decoded these (legacy from when ATProto bytes were
+        // wire-encoded as base64 strings), which made every createConvo
+        // request 400 with "Invalid base64 welcome: 6-bit remainder" once
+        // Jacquard switched to raw bytes via the `$bytes` JSON envelope.
+        // Mirror what `bootstrap_reset_group.rs:192` does.
+        let welcome_data: Vec<u8> = welcome_bytes.to_vec();
 
         info!(
             "📨 [v2.createConvo] Welcome message for convo {}: {} bytes",

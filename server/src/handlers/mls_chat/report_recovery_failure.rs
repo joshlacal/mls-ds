@@ -164,30 +164,45 @@ pub async fn report_recovery_failure(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    // --- Missing-authenticator short-circuit (ADR §A7.3).
-    // A report without an authenticator is accepted with a reason telemetry
-    // marker but does NOT count toward quorum and does NOT consume the per-DID
-    // 24h rate-limit slot. This lets old clients roll over gracefully.
-    let epoch_authenticator = match input.epoch_authenticator.clone() {
-        Some(auth) if !auth.is_empty() => auth,
-        _ => {
-            info!(
-                convo = %crate::crypto::redact_for_log(&convo_id),
-                "[reportRecoveryFailure] missing_authenticator (old client)"
-            );
-            let (per_did_count, member_count) = count_votes_and_members(&pool, &convo_id).await;
-            return Ok(Json(ReportRecoveryFailureOutput {
-                recorded: false,
-                auto_reset_triggered: false,
-                failure_count: per_did_count,
-                member_count,
-                reason: Some("missing_authenticator".to_string()),
-                new_group_id: None,
-                reset_generation: None,
-            })
-            .into_response());
-        }
-    };
+    // --- Missing-authenticator handling (ADR §A7.3 + 2026-04-28 relaxation).
+    //
+    // Original behavior: short-circuit with `missing_authenticator` reason; do
+    // not record a vote. This was intended for "old clients without §A7
+    // support" graceful rollover. But it also blocks legitimate
+    // local-state-loss reports — when a member's group state is genuinely
+    // gone (e.g. SQLCipher reset, reinstall, or `getGroupInfo` 404 leaving
+    // External Commit with no path forward), the client CANNOT compute an
+    // authenticator (no group state → no `MLSContext.epochAuthenticator`),
+    // and the convo silently stays stuck forever.
+    //
+    // New behavior: dispatch to the actor with the sentinel empty-string
+    // authenticator. The actor's `record_reset_vote` recognizes the sentinel
+    // and skips the cryptographic-validation step. The vote IS recorded with
+    // the sentinel value (the schema's `epoch_authenticator TEXT NOT NULL`
+    // accepts empty string — no migration needed). The existing ADR-008 D1
+    // quorum filter still ensures only Mode B (`group_state_unrecoverable`)
+    // votes count toward auto-reset, so Mode A no-auth reports become
+    // telemetry as before — but Mode B no-auth reports now CAN trigger reset
+    // for 1:1 convos and contribute toward quorum for groups, which is the
+    // entire point of having a Mode B / unrecoverable category.
+    //
+    // Anti-spoof relies on:
+    //   1. authenticated DID + membership check (lines 149-165 above),
+    //   2. per-DID 24h rate limit + identity-based quorum aggregation
+    //      (actor steps 3 + 5).
+    let epoch_authenticator = input
+        .epoch_authenticator
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default();
+
+    if epoch_authenticator.is_empty() {
+        info!(
+            convo = %crate::crypto::redact_for_log(&convo_id),
+            failure_mode = ?failure_mode,
+            "[reportRecoveryFailure] missing_authenticator — dispatching with sentinel (Mode A=telemetry only, Mode B=counts toward quorum per ADR-008 D1)"
+        );
+    }
 
     // --- Dispatch to the ConversationActor. All DB writes from here live
     //     inside the actor; invariant E6 satisfied.

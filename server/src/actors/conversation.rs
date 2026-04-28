@@ -1129,47 +1129,70 @@ impl ConversationActorState {
         // ── 2. Validate epoch_authenticator ───────────────────────────────
         //   Accept if it matches a row recorded in the last 3 epochs OR any row
         //   recorded within the last 5 minutes (quiet-group window).
-        let current_epoch = self.current_epoch as i32;
-        let epoch_floor = current_epoch.saturating_sub(2);
-        let auth_valid: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM epoch_authenticators \
-             WHERE convo_id = $1 \
-             AND authenticator = $2 \
-             AND (epoch BETWEEN $3 AND $4 \
-                  OR recorded_at > NOW() - INTERVAL '5 minutes'))",
-        )
-        .bind(&self.convo_id)
-        .bind(&epoch_authenticator)
-        .bind(epoch_floor)
-        .bind(current_epoch)
-        .fetch_one(&self.db_pool)
-        .await
-        .context("epoch_authenticator lookup failed")?;
+        //
+        //   Sentinel `""` (empty string) means the reporting client lost its
+        //   group state entirely and cannot compute an authenticator. The
+        //   handler at `report_recovery_failure.rs` substitutes empty for
+        //   missing on dispatch (2026-04-28 relaxation). We skip the
+        //   cryptographic check in this case — anti-spoof devolves to the
+        //   authenticated DID + membership gate (step 1 above) plus the
+        //   per-DID rate-limit (step 3 below) plus Mode B quorum filtering
+        //   (step 5 below). Mode A no-auth votes still get recorded but
+        //   the D1 filter excludes them from auto-reset (telemetry only);
+        //   Mode B no-auth votes count toward quorum, which is the only
+        //   path to recovery when local state is gone AND the server's
+        //   GroupInfo is missing (the trifecta).
+        let no_auth_sentinel = epoch_authenticator.is_empty();
+        if !no_auth_sentinel {
+            let current_epoch = self.current_epoch as i32;
+            let epoch_floor = current_epoch.saturating_sub(2);
+            let auth_valid: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM epoch_authenticators \
+                 WHERE convo_id = $1 \
+                 AND authenticator = $2 \
+                 AND (epoch BETWEEN $3 AND $4 \
+                      OR recorded_at > NOW() - INTERVAL '5 minutes'))",
+            )
+            .bind(&self.convo_id)
+            .bind(&epoch_authenticator)
+            .bind(epoch_floor)
+            .bind(current_epoch)
+            .fetch_one(&self.db_pool)
+            .await
+            .context("epoch_authenticator lookup failed")?;
 
-        if !auth_valid {
-            warn!(
-                convo = %crate::crypto::redact_for_log(&self.convo_id),
-                "[actor:record_reset_vote] stale_authenticator"
-            );
+            if !auth_valid {
+                warn!(
+                    convo = %crate::crypto::redact_for_log(&self.convo_id),
+                    "[actor:record_reset_vote] stale_authenticator"
+                );
+                info!(
+                    convo_id = %crate::crypto::redact_for_log(&self.convo_id),
+                    voter_did = %crate::crypto::redact_for_log(&device_did),
+                    vote_count_before = 0_i64,
+                    vote_count_after = 0_i64,
+                    quorum_threshold = 0_i64,
+                    epoch_authenticator_match = false,
+                    rate_limited = false,
+                    "A7 vote recorded"
+                );
+                return Ok(RecordResetVoteOutcome {
+                    recorded: false,
+                    reason: Some("stale_authenticator".to_string()),
+                    per_did_vote_count: 0,
+                    member_did_count: 0,
+                    auto_reset_triggered: false,
+                    new_group_id: None,
+                    reset_count: None,
+                });
+            }
+        } else {
             info!(
-                convo_id = %crate::crypto::redact_for_log(&self.convo_id),
+                convo = %crate::crypto::redact_for_log(&self.convo_id),
                 voter_did = %crate::crypto::redact_for_log(&device_did),
-                vote_count_before = 0_i64,
-                vote_count_after = 0_i64,
-                quorum_threshold = 0_i64,
-                epoch_authenticator_match = false,
-                rate_limited = false,
-                "A7 vote recorded"
+                failure_mode = ?failure_mode,
+                "[actor:record_reset_vote] no-auth sentinel — skipping authenticator validation"
             );
-            return Ok(RecordResetVoteOutcome {
-                recorded: false,
-                reason: Some("stale_authenticator".to_string()),
-                per_did_vote_count: 0,
-                member_did_count: 0,
-                auto_reset_triggered: false,
-                new_group_id: None,
-                reset_count: None,
-            });
         }
 
         // ── 3. Per-identity 24h rate limit ────────────────────────────────
