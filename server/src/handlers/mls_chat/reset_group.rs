@@ -40,9 +40,26 @@ pub struct ResetGroupRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ResetGroupOutput {
     pub success: bool,
-    pub new_group_id: String,
-    pub reset_generation: i32,
-    pub new_epoch: i64,
+    /// Set on the with-material (activation) path; absent on request-only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_group_id: Option<String>,
+    /// Set on the with-material (activation) path; absent on request-only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset_generation: Option<i32>,
+    /// Set on the with-material (activation) path; absent on request-only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_epoch: Option<i64>,
+    /// Set on the request-only path. Identifier of the
+    /// `crypto_session_reset_requested` audit event, returned to the
+    /// admin caller so they can correlate the request with the future
+    /// activation that an elected client will perform.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset_request_id: Option<String>,
+    /// Set on the request-only path. Indicates whether activation has
+    /// been deferred to a client via the `crypto_session_reset_requested`
+    /// SSE event flow.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub awaiting_client_activation: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -111,56 +128,57 @@ pub async fn reset_group(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    // --- Validate newGroupId not already in use ---
-    let conflicting_convo_id: Option<String> =
-        sqlx::query_scalar("SELECT id FROM conversations WHERE group_id = $1 LIMIT 1")
-            .bind(&new_group_id)
-            .fetch_optional(&pool)
-            .await
-            .map_err(|e| {
-                error!("[resetGroup] group_id uniqueness check failed: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-
-    if let Some(existing_convo_id) = conflicting_convo_id {
-        warn!("[resetGroup] newGroupId already in use");
-        return Ok((
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": "GroupIdAlreadyExists",
-                "message": "The new group ID is already in use by another conversation",
-                "conflictingGroupId": new_group_id,
-                "conflictingConvoId": existing_convo_id
-            })),
-        )
-            .into_response());
-    }
-
-    // --- Decode inline group_info (REQUIRED post-Phase 2). ---
-    let group_info_bytes: Vec<u8> = match input.group_info.as_ref() {
-        Some(gi_b64) => {
-            use base64::Engine;
+    // --- Decode optional inline group_info ---
+    //
+    // Two valid shapes per plan §2.3:
+    //   - Material present (groupInfo decoded): full chokepoint flow
+    //     (Request + Activate back-to-back). Validate newGroupId is not
+    //     already in use before claiming it.
+    //   - Material absent: request-only flow. Emit
+    //     `RequestCryptoSessionReset` and return `request_id` to the
+    //     caller; an elected client subsequently activates via
+    //     `bootstrapResetGroup`. NewGroupId uniqueness check is skipped
+    //     here — the eventual activator will attempt to claim it.
+    let group_info_bytes: Option<Vec<u8>> = if let Some(gi_b64) = input.group_info.as_ref() {
+        use base64::Engine;
+        Some(
             base64::engine::general_purpose::STANDARD
                 .decode(gi_b64)
                 .map_err(|e| {
                     warn!("[resetGroup] invalid base64 groupInfo: {}", e);
                     StatusCode::BAD_REQUEST
-                })?
-        }
-        None => {
-            warn!(
-                "[resetGroup] missing inline groupInfo — legacy two-step reset flow is deprecated"
-            );
+                })?,
+        )
+    } else {
+        None
+    };
+
+    if group_info_bytes.is_some() {
+        // --- Validate newGroupId not already in use (with-material path) ---
+        let conflicting_convo_id: Option<String> =
+            sqlx::query_scalar("SELECT id FROM conversations WHERE group_id = $1 LIMIT 1")
+                .bind(&new_group_id)
+                .fetch_optional(&pool)
+                .await
+                .map_err(|e| {
+                    error!("[resetGroup] group_id uniqueness check failed: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+
+        if let Some(existing_convo_id) = conflicting_convo_id {
+            warn!("[resetGroup] newGroupId already in use");
             return Ok((
-                StatusCode::BAD_REQUEST,
+                StatusCode::CONFLICT,
                 Json(serde_json::json!({
-                    "error": "MissingGroupInfo",
-                    "message": "resetGroup now requires inline groupInfo. Two-step reset is deprecated; either supply groupInfo here or call bootstrapResetGroup directly with material.",
+                    "error": "GroupIdAlreadyExists",
+                    "message": "The new group ID is already in use by another conversation",
+                    "conflictingGroupId": new_group_id,
+                    "conflictingConvoId": existing_convo_id
                 })),
             )
                 .into_response());
         }
-    };
+    }
 
     // --- Optional clear-circuit-breaker side-effect ---
     //
@@ -231,49 +249,73 @@ pub async fn reset_group(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    let (act_tx, act_rx) = oneshot::channel();
-    actor_ref
-        .send_message(ConvoMessage::ActivateCryptoSession {
-            reset_request_id: Some(reset_request.request_id.clone()),
-            trigger: ResetTrigger::Admin,
-            new_mls_group_id: new_group_id.clone(),
-            new_group_info: Some(group_info_bytes),
-            // Admin reset doesn't carry pending welcomes inline — the admin
-            // is rotating the group_id, not adding members in the same call.
-            welcomes: Vec::<WelcomeEnvelope>::new(),
-            initiator_did: caller_did.clone(),
-            idempotency_key: format!("activate:{}", request_id_uuid),
-            reply: act_tx,
+    // --- Activation step is conditional on material presence ---
+    if let Some(gi_bytes) = group_info_bytes {
+        // With-material flow: send ActivateCryptoSession back-to-back.
+        let (act_tx, act_rx) = oneshot::channel();
+        actor_ref
+            .send_message(ConvoMessage::ActivateCryptoSession {
+                reset_request_id: Some(reset_request.request_id.clone()),
+                trigger: ResetTrigger::Admin,
+                new_mls_group_id: new_group_id.clone(),
+                new_group_info: Some(gi_bytes),
+                // Admin reset doesn't carry pending welcomes inline — the
+                // admin is rotating the group_id, not adding members.
+                welcomes: Vec::<WelcomeEnvelope>::new(),
+                initiator_did: caller_did.clone(),
+                idempotency_key: format!("activate:{}", request_id_uuid),
+                reply: act_tx,
+            })
+            .map_err(|_| {
+                error!("[resetGroup] failed to send Activate to actor");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        let session = act_rx
+            .await
+            .map_err(|_| {
+                error!("[resetGroup] Activate channel closed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .map_err(|e| {
+                error!("[resetGroup] Activate handler failed: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        info!(
+            convo = %crate::crypto::redact_for_log(&convo_id),
+            new_group_id = %crate::crypto::redact_for_log(&new_group_id),
+            new_session_id = %session.id,
+            reset_generation = session.generation,
+            "[resetGroup] complete (with-material flow)"
+        );
+
+        Ok(Json(ResetGroupOutput {
+            success: true,
+            new_group_id: Some(new_group_id),
+            reset_generation: Some(session.generation),
+            new_epoch: Some(session.last_observed_epoch as i64),
+            reset_request_id: None,
+            awaiting_client_activation: None,
         })
-        .map_err(|_| {
-            error!("[resetGroup] failed to send Activate to actor");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        .into_response())
+    } else {
+        // Request-only flow: an elected client will activate later via
+        // bootstrapResetGroup. Per plan §2.3 admin-no-material variant.
+        info!(
+            convo = %crate::crypto::redact_for_log(&convo_id),
+            request_id = %reset_request.request_id,
+            "[resetGroup] complete (request-only flow; awaiting client activation)"
+        );
 
-    let session = act_rx
-        .await
-        .map_err(|_| {
-            error!("[resetGroup] Activate channel closed");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?
-        .map_err(|e| {
-            error!("[resetGroup] Activate handler failed: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    info!(
-        convo = %crate::crypto::redact_for_log(&convo_id),
-        new_group_id = %crate::crypto::redact_for_log(&new_group_id),
-        new_session_id = %session.id,
-        reset_generation = session.generation,
-        "[resetGroup] complete"
-    );
-
-    Ok(Json(ResetGroupOutput {
-        success: true,
-        new_group_id,
-        reset_generation: session.generation,
-        new_epoch: session.last_observed_epoch as i64,
-    })
-    .into_response())
+        Ok(Json(ResetGroupOutput {
+            success: true,
+            new_group_id: None,
+            reset_generation: None,
+            new_epoch: None,
+            reset_request_id: Some(reset_request.request_id),
+            awaiting_client_activation: Some(true),
+        })
+        .into_response())
+    }
 }
