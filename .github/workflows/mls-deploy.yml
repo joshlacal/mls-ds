@@ -93,6 +93,17 @@ jobs:
         run: |
           cargo audit --deny warnings
 
+      - name: Install sqlx-cli
+        run: |
+          cargo install sqlx-cli --no-default-features --features postgres --locked
+
+      - name: Run migrations
+        working-directory: ./server
+        env:
+          DATABASE_URL: postgresql://catbird_test:test_password@localhost:5432/catbird_test
+        run: |
+          sqlx migrate run
+
       - name: Run tests
         working-directory: ./server
         env:
@@ -106,7 +117,7 @@ jobs:
         env:
           DATABASE_URL: postgresql://catbird_test:test_password@localhost:5432/catbird_test
         run: |
-          cargo test --test integration_test
+          cargo test --tests
 
   build:
     name: Build and Push Docker Image
