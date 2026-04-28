@@ -59,30 +59,100 @@ async fn cleanup(pool: &PgPool, convo_id: &str) {
         .await;
 }
 
-/// Sets up a post-auto-reset conversation: the row exists with
-/// id = originalConvoId, group_id = newGroupId, group_info = NULL,
-/// current_epoch = 0, and the member roster preserved.
+/// Sets up a post-reset-Request conversation in the new Phase 2 state
+/// machine (bug_007 from ultrareview): the conversation exists, its
+/// active crypto_session is in `state='reset_requested'`, and a
+/// `crypto_session_reset_requested` event has been emitted with
+/// `expected_new_mls_group_id = NEW_GROUP_ID` so a bootstrap call with
+/// matching material clears the auth precondition.
+///
+/// Pre-Phase-2 the helper instead pre-rotated `conversations.group_id`
+/// to NEW_GROUP_ID and left `group_info = NULL`. The new chokepoint
+/// owns group_id rotation at activation time; the prior shape would
+/// fail the chokepoint's `read_current_session_for_update` lookup
+/// because no crypto_sessions row was seeded.
 async fn setup_post_reset_convo(pool: &PgPool, members: &[&str]) {
     let now = Utc::now();
+
+    // Conversation exists with `group_id = ORIGINAL_CONVO_ID` (the
+    // pre-reset value, mirroring createConvo's seed). active_crypto_
+    // session_id is set after we INSERT the crypto_sessions row.
     sqlx::query(
         "INSERT INTO conversations \
             (id, creator_did, current_epoch, created_at, updated_at, cipher_suite, is_remote, \
              group_id, group_info, last_reset_at, reset_count) \
-         VALUES ($1, $2, 0, $3, $3, $4, false, $5, NULL, $3, 1) \
+         VALUES ($1, $2, 1, $3, $3, $4, false, $1, NULL, $3, 0) \
          ON CONFLICT (id) DO UPDATE SET \
-            group_id = EXCLUDED.group_id, \
+            group_id = $1, \
             group_info = NULL, \
-            current_epoch = 0, \
-            last_reset_at = EXCLUDED.last_reset_at",
+            current_epoch = 1, \
+            last_reset_at = EXCLUDED.last_reset_at, \
+            reset_count = 0",
     )
     .bind(ORIGINAL_CONVO_ID)
     .bind(members[0])
     .bind(&now)
     .bind("MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519")
-    .bind(NEW_GROUP_ID)
     .execute(pool)
     .await
     .expect("setup conversations row");
+
+    // Seed crypto_sessions row in `state='reset_requested'`. Mirrors
+    // what `createConvo` (bug_003 fix) seeds for new convos, plus the
+    // chokepoint's `request_crypto_session_reset_tx` having flipped
+    // state from 'active' to 'reset_requested'.
+    let crypto_session_id: String = sqlx::query_scalar(
+        "INSERT INTO crypto_sessions ( \
+            id, conversation_id, generation, mls_group_id, state, \
+            cipher_suite, last_observed_epoch, created_by_did, \
+            created_at, activated_at \
+         ) VALUES (gen_random_uuid()::TEXT, $1, 0, $1, 'reset_requested', \
+                   $2, 1, $3, $4, $4) \
+         ON CONFLICT (mls_group_id) DO UPDATE SET state = 'reset_requested' \
+         RETURNING id",
+    )
+    .bind(ORIGINAL_CONVO_ID)
+    .bind("MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519")
+    .bind(members[0])
+    .bind(&now)
+    .fetch_one(pool)
+    .await
+    .expect("setup crypto_sessions row");
+
+    sqlx::query("UPDATE conversations SET active_crypto_session_id = $1 WHERE id = $2")
+        .bind(&crypto_session_id)
+        .bind(ORIGINAL_CONVO_ID)
+        .execute(pool)
+        .await
+        .expect("link conversations.active_crypto_session_id");
+
+    // Emit crypto_session_reset_requested event with the expected
+    // new_mls_group_id binding so bootstrap's auth gate (bug_010 from
+    // ultrareview) accepts the bootstrap when it submits NEW_GROUP_ID.
+    sqlx::query(
+        "INSERT INTO delivery_events ( \
+            id, conversation_id, seq, crypto_session_id, event_type, \
+            sender_did, mls_group_id, idempotency_key, payload_json, \
+            created_at \
+         ) VALUES (gen_random_uuid()::TEXT, $1, 1, $2, \
+                   'crypto_session_reset_requested', $3, $1, \
+                   $4, $5, $6) \
+         ON CONFLICT (conversation_id, seq) DO NOTHING",
+    )
+    .bind(ORIGINAL_CONVO_ID)
+    .bind(&crypto_session_id)
+    .bind(members[0])
+    .bind(format!("test-setup-req-reset:{}", ORIGINAL_CONVO_ID))
+    .bind(serde_json::json!({
+        "request_id": "test-request-id",
+        "trigger": "admin",
+        "reason": "test setup",
+        "expected_new_mls_group_id": NEW_GROUP_ID,
+    }))
+    .bind(&now)
+    .execute(pool)
+    .await
+    .expect("setup crypto_session_reset_requested event");
 
     for member in members {
         sqlx::query(
@@ -100,16 +170,18 @@ async fn setup_post_reset_convo(pool: &PgPool, members: &[&str]) {
     }
 }
 
-/// Mirrors the discrimination logic the handler runs. The boundary captured
-/// here is: lookup target by (id, group_id), gate on caller membership, and
-/// detect race-loss via group_info presence.
+/// Mirrors the discrimination logic the Phase-2 chokepoint runs at the
+/// bootstrap auth gate. Captures: membership gate, current crypto_session
+/// state, and expected_new_mls_group_id binding (bug_010).
 #[derive(Debug, PartialEq, Eq)]
 enum BootstrapClassification {
-    /// Caller is a member, target row exists with group_info NULL — proceed.
+    /// Caller is a member, current session is in `reset_requested`, AND
+    /// either the binding is NULL or it matches the supplied new_group_id.
     Proceed,
-    /// Caller is a member but target was already bootstrapped (race-loss).
+    /// Caller is a member but the convo is not in a pending-reset state,
+    /// OR the binding mismatches (bug_010 auth gate firing).
     AlreadyBootstrapped,
-    /// (id, group_id) pair has no matching row.
+    /// No conversation row found (or no current crypto_session for it).
     TargetNotFound,
     /// Caller is not in the existing roster.
     NotMember,
@@ -121,7 +193,7 @@ async fn classify(
     new_group_id: &str,
     caller_did: &str,
 ) -> BootstrapClassification {
-    // 1. Membership gate
+    // 1. Membership gate.
     let is_member: bool = sqlx::query_scalar(
         "SELECT EXISTS(\
             SELECT 1 FROM members \
@@ -138,19 +210,41 @@ async fn classify(
         return BootstrapClassification::NotMember;
     }
 
-    // 2. Target row + sentinel
-    let target: Option<(Option<Vec<u8>>,)> =
-        sqlx::query_as("SELECT group_info FROM conversations WHERE id = $1 AND group_id = $2")
-            .bind(convo_id)
-            .bind(new_group_id)
-            .fetch_optional(pool)
-            .await
-            .expect("target lookup");
+    // 2. Current crypto_session for the conversation. The Phase 2
+    // bootstrap auth gate requires `state='reset_requested'` (an
+    // upstream Request must have been issued).
+    let session: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT cs.state, de.payload_json->>'expected_new_mls_group_id' \
+         FROM crypto_sessions cs \
+         LEFT JOIN LATERAL ( \
+            SELECT payload_json FROM delivery_events \
+            WHERE conversation_id = cs.conversation_id \
+              AND crypto_session_id = cs.id \
+              AND event_type = 'crypto_session_reset_requested' \
+            ORDER BY seq DESC LIMIT 1 \
+         ) de ON true \
+         WHERE cs.conversation_id = $1 \
+           AND cs.state IN ('active', 'reset_requested', 'superseding') \
+         ORDER BY cs.generation DESC \
+         LIMIT 1",
+    )
+    .bind(convo_id)
+    .fetch_optional(pool)
+    .await
+    .expect("crypto_session lookup");
 
-    match target {
+    match session {
         None => BootstrapClassification::TargetNotFound,
-        Some((Some(_),)) => BootstrapClassification::AlreadyBootstrapped,
-        Some((None,)) => BootstrapClassification::Proceed,
+        Some((state, expected)) if state == "reset_requested" => {
+            // bug_010 auth gate: if a binding exists, it MUST match.
+            match expected.as_deref() {
+                Some(bound) if bound != new_group_id => {
+                    BootstrapClassification::AlreadyBootstrapped
+                }
+                _ => BootstrapClassification::Proceed,
+            }
+        }
+        Some(_) => BootstrapClassification::AlreadyBootstrapped,
     }
 }
 
@@ -171,17 +265,18 @@ async fn bootstrap_member_finds_proceed_state() {
 }
 
 #[tokio::test]
-async fn bootstrap_race_loss_when_group_info_already_populated() {
+async fn bootstrap_race_loss_when_session_already_superseded() {
     let pool = setup_test_db().await;
     cleanup(&pool, ORIGINAL_CONVO_ID).await;
     setup_post_reset_convo(&pool, &[ALICE, BOB]).await;
 
-    // Simulate the race winner having already bootstrapped: populate group_info.
+    // Simulate the race winner having already activated: transition the
+    // current crypto_session from `reset_requested` to `superseded` (the
+    // chokepoint's normal post-activation state for the prior session).
     sqlx::query(
-        "UPDATE conversations SET group_info = $1, group_info_epoch = 1, current_epoch = 1 \
-         WHERE id = $2",
+        "UPDATE crypto_sessions SET state = 'superseded', superseded_at = NOW() \
+         WHERE conversation_id = $1 AND state = 'reset_requested'",
     )
-    .bind(b"\x01\x02\x03\x04winner-group-info".as_slice())
     .bind(ORIGINAL_CONVO_ID)
     .execute(&pool)
     .await
@@ -190,8 +285,35 @@ async fn bootstrap_race_loss_when_group_info_already_populated() {
     let result = classify(&pool, ORIGINAL_CONVO_ID, NEW_GROUP_ID, BOB).await;
     assert_eq!(
         result,
+        BootstrapClassification::TargetNotFound,
+        "bob (member, but no current non-superseded session) must be told the bootstrap window has closed"
+    );
+
+    cleanup(&pool, ORIGINAL_CONVO_ID).await;
+}
+
+#[tokio::test]
+async fn bootstrap_classify_rejects_mismatched_new_group_id() {
+    // bug_010 auth gate: when the upstream Request bound an
+    // expected_new_mls_group_id, a bootstrap call with a different
+    // mls_group_id must fail the auth gate.
+    let pool = setup_test_db().await;
+    cleanup(&pool, ORIGINAL_CONVO_ID).await;
+    setup_post_reset_convo(&pool, &[ALICE, BOB]).await;
+
+    // Helper seeded `expected_new_mls_group_id = NEW_GROUP_ID`.
+    // Caller submits a different id → AlreadyBootstrapped (binding mismatch).
+    let result = classify(
+        &pool,
+        ORIGINAL_CONVO_ID,
+        "wrong-group-id-attacker-supplied",
+        ALICE,
+    )
+    .await;
+    assert_eq!(
+        result,
         BootstrapClassification::AlreadyBootstrapped,
-        "bob (member, but row already has group_info) must be told he lost the race"
+        "alice submitting a non-matching new_group_id must be rejected by the bug_010 auth gate"
     );
 
     cleanup(&pool, ORIGINAL_CONVO_ID).await;
