@@ -1,3 +1,4 @@
+use catbird_server::realtime::SseState;
 use chrono::Utc;
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -143,10 +144,15 @@ async fn simulate_send_message_via_actor(
         .map_err(|e| format!("Failed to get actor: {}", e))?;
 
     let (tx, rx) = oneshot::channel();
+    let padded_size = ciphertext.len() as i64;
     actor_ref
         .send_message(catbird_server::actors::ConvoMessage::SendMessage {
             sender_did: sender_did.to_string(),
             ciphertext,
+            msg_id: uuid::Uuid::new_v4().to_string(),
+            epoch: 0,
+            padded_size,
+            idempotency_key: None,
             reply: tx,
         })
         .map_err(|e| format!("Failed to send message: {:?}", e))?;
@@ -202,7 +208,11 @@ async fn test_concurrent_add_members_no_duplicate_epochs() {
     std::env::set_var("ENABLE_ACTOR_SYSTEM", "true");
 
     // Create actor registry
-    let actor_registry = Arc::new(catbird_server::actors::ActorRegistry::new(pool.clone()));
+    let actor_registry = Arc::new(catbird_server::actors::ActorRegistry::new(
+        pool.clone(),
+        Arc::new(SseState::new(1000)),
+        None,
+    ));
 
     // Barrier to synchronize all tasks to start simultaneously
     let barrier = Arc::new(Barrier::new(10));
@@ -312,7 +322,11 @@ async fn test_concurrent_send_and_read_unread_count_consistency() {
     // Enable actor system
     std::env::set_var("ENABLE_ACTOR_SYSTEM", "true");
 
-    let actor_registry = Arc::new(catbird_server::actors::ActorRegistry::new(pool.clone()));
+    let actor_registry = Arc::new(catbird_server::actors::ActorRegistry::new(
+        pool.clone(),
+        Arc::new(SseState::new(1000)),
+        None,
+    ));
 
     // Spawn sender task: send 50 messages
     let sender_registry = actor_registry.clone();
@@ -405,7 +419,11 @@ async fn test_message_sequence_numbers_sequential() {
     // Enable actor system
     std::env::set_var("ENABLE_ACTOR_SYSTEM", "true");
 
-    let actor_registry = Arc::new(catbird_server::actors::ActorRegistry::new(pool.clone()));
+    let actor_registry = Arc::new(catbird_server::actors::ActorRegistry::new(
+        pool.clone(),
+        Arc::new(SseState::new(1000)),
+        None,
+    ));
 
     // Send 20 messages concurrently
     let barrier = Arc::new(Barrier::new(20));
@@ -494,7 +512,11 @@ async fn test_out_of_order_commits_prevented() {
     // Enable actor system
     std::env::set_var("ENABLE_ACTOR_SYSTEM", "true");
 
-    let actor_registry = Arc::new(catbird_server::actors::ActorRegistry::new(pool.clone()));
+    let actor_registry = Arc::new(catbird_server::actors::ActorRegistry::new(
+        pool.clone(),
+        Arc::new(SseState::new(1000)),
+        None,
+    ));
 
     // Send 5 commits with artificially delayed submission to simulate clock skew
     let mut handles = vec![];
@@ -585,7 +607,11 @@ async fn test_mixed_operations_no_race_conditions() {
     // Enable actor system
     std::env::set_var("ENABLE_ACTOR_SYSTEM", "true");
 
-    let actor_registry = Arc::new(catbird_server::actors::ActorRegistry::new(pool.clone()));
+    let actor_registry = Arc::new(catbird_server::actors::ActorRegistry::new(
+        pool.clone(),
+        Arc::new(SseState::new(1000)),
+        None,
+    ));
 
     // Mixed operations: add members AND send messages concurrently
     let mut add_handles = vec![];
