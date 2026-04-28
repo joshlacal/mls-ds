@@ -9,6 +9,7 @@ use crate::{
     generated::blue_catbird::mlsChat::request_failover::{
         RequestFailover, RequestFailoverOutput, RequestFailoverRequest,
     },
+    repositories::{CryptoSessionRepository, PostgresCryptoSessionRepository},
     storage::DbPool,
 };
 
@@ -73,9 +74,9 @@ pub async fn request_failover(
     // Verify caller is a member of the conversation
     crate::auth::verify_is_member(&pool, &convo_id, &auth_user.did).await?;
 
-    // Fetch current sequencer and epoch
-    let row = sqlx::query_as::<_, (Option<String>, Option<i32>, Option<i64>)>(
-        "SELECT sequencer_ds, current_epoch, sequencer_term FROM conversations WHERE id = $1",
+    // Fetch current sequencer (federation) and epoch (via CryptoSession projection)
+    let row = sqlx::query_as::<_, (Option<String>, Option<i64>)>(
+        "SELECT sequencer_ds, sequencer_term FROM conversations WHERE id = $1",
     )
     .bind(&convo_id)
     .fetch_optional(&pool)
@@ -85,12 +86,22 @@ pub async fn request_failover(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let (sequencer_ds, current_epoch, current_term_raw) = match row {
+    let (sequencer_ds, current_term_raw) = match row {
         Some(r) => r,
         None => return Err(StatusCode::NOT_FOUND),
     };
 
-    let epoch = current_epoch.unwrap_or(0);
+    let crypto_session_repo = PostgresCryptoSessionRepository::new(pool.clone());
+    let crypto_session = crypto_session_repo
+        .get_active(&convo_id)
+        .await
+        .map_err(|e| {
+            error!("Failed to fetch crypto session: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let epoch = crypto_session.last_observed_epoch;
     let sequencer_term = current_term_raw.unwrap_or(0).max(0) as u64;
     let self_did = &fed_config.self_did;
 

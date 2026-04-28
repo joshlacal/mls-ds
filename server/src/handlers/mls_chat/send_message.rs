@@ -17,6 +17,7 @@ use crate::{
     generated::blue_catbird::mlsChat::send_message::{SendMessageOutput, SendMessageRequest},
     notifications::NotificationService,
     realtime::{SseState, StreamEvent, StreamMessageView},
+    repositories::{CryptoSessionRepository, PostgresCryptoSessionRepository},
     storage::DbPool,
 };
 
@@ -182,22 +183,35 @@ async fn handle_persistent(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    // --- Fetch conversation epoch, sequencer term, confirmation tag, and reset_count ---
-    let (server_epoch, server_sequencer_term, stored_confirmation_tag, reset_count): (i64, i64, Option<Vec<u8>>, i32) = sqlx::query_as(
-        "SELECT CAST(current_epoch AS BIGINT), CAST(COALESCE(sequencer_term, 0) AS BIGINT), confirmation_tag, COALESCE(reset_count, 0) \
-         FROM conversations WHERE id = $1",
-    )
-    .bind(&convo_id)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|e| {
-        error!("❌ [v2.sendMessage] Failed to fetch conversation: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?
-    .ok_or_else(|| {
-        error!("❌ [v2.sendMessage] Conversation not found");
-        StatusCode::NOT_FOUND
-    })?;
+    // --- Fetch active CryptoSession (epoch, confirmation_tag, generation) ---
+    // Phase 1: project from `conversations`. `sequencer_term` is a federation
+    // concern, not MLS metadata, so it stays as a separate scalar query.
+    let crypto_session_repo = PostgresCryptoSessionRepository::new(pool.clone());
+    let crypto_session = crypto_session_repo
+        .get_active(&convo_id)
+        .await
+        .map_err(|e| {
+            error!("❌ [v2.sendMessage] Failed to fetch crypto session: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or_else(|| {
+            error!("❌ [v2.sendMessage] Conversation not found");
+            StatusCode::NOT_FOUND
+        })?;
+
+    let server_sequencer_term: i64 =
+        sqlx::query_scalar("SELECT COALESCE(sequencer_term, 0) FROM conversations WHERE id = $1")
+            .bind(&convo_id)
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| {
+                error!("❌ [v2.sendMessage] Failed to fetch sequencer term: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+    let server_epoch: i64 = crypto_session.last_observed_epoch as i64;
+    let stored_confirmation_tag = crypto_session.last_confirmation_tag.clone();
+    let reset_count: i32 = crypto_session.generation;
 
     // --- Validate confirmation tag (if client sent one) ---
     if let Some(ref client_tag) = input.confirmation_tag {
