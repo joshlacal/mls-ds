@@ -66,6 +66,9 @@ jobs:
         with:
           workspaces: server
 
+      - name: Install ripgrep (required by static policy lint scripts)
+        run: sudo apt-get install -y ripgrep
+
       - name: Run linting
         working-directory: ./server
         run: |
@@ -95,9 +98,6 @@ jobs:
         working-directory: ./server
         run: |
           cargo audit --deny warnings
-
-      - name: Install ripgrep (for federation static policy lint)
-        run: sudo apt-get install -y ripgrep
 
       - name: Install sqlx-cli
         run: |
