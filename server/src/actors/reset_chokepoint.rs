@@ -48,10 +48,69 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::json;
-use sqlx::{Postgres, Transaction};
+use sqlx::{FromRow, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::models::CryptoSession;
+
+/// Row shape for `crypto_sessions` SELECT queries in this module.
+///
+/// Switched from a 16-tuple `query_as::<_, (T0, T1, ..., T15)>` form to a
+/// derived FromRow struct: the tuple form is at sqlx's hard limit of 16
+/// columns, so adding any new column to `crypto_sessions` would require
+/// either truncating the SELECT (data loss) or hitting a compile error
+/// against an unimplemented FromRow trait. The struct form scales
+/// indefinitely.
+#[derive(FromRow)]
+struct CryptoSessionRow {
+    id: String,
+    conversation_id: String,
+    generation: i32,
+    mls_group_id: String,
+    state: String,
+    supersedes_id: Option<String>,
+    cipher_suite: Option<String>,
+    last_observed_epoch: i32,
+    last_confirmation_tag: Option<Vec<u8>>,
+    group_info: Option<Vec<u8>>,
+    group_info_epoch: Option<i32>,
+    group_info_updated_at: Option<DateTime<Utc>>,
+    created_by_did: Option<String>,
+    created_at: DateTime<Utc>,
+    activated_at: Option<DateTime<Utc>>,
+    superseded_at: Option<DateTime<Utc>>,
+}
+
+impl From<CryptoSessionRow> for CryptoSession {
+    fn from(r: CryptoSessionRow) -> Self {
+        CryptoSession {
+            id: r.id,
+            conversation_id: r.conversation_id,
+            generation: r.generation,
+            mls_group_id: r.mls_group_id,
+            state: r.state,
+            supersedes_id: r.supersedes_id,
+            cipher_suite: r.cipher_suite,
+            last_observed_epoch: r.last_observed_epoch,
+            last_confirmation_tag: r.last_confirmation_tag,
+            group_info: r.group_info,
+            group_info_epoch: r.group_info_epoch,
+            group_info_updated_at: r.group_info_updated_at,
+            created_by_did: r.created_by_did,
+            created_at: r.created_at,
+            activated_at: r.activated_at,
+            superseded_at: r.superseded_at,
+        }
+    }
+}
+
+/// Canonical SELECT column list for `CryptoSessionRow`. Order MUST match
+/// the FromRow struct field order.
+const SELECT_CRYPTO_SESSION_COLS_FOR_TX: &str =
+    "id, conversation_id, generation, mls_group_id, state, supersedes_id, \
+     cipher_suite, last_observed_epoch, last_confirmation_tag, group_info, \
+     group_info_epoch, group_info_updated_at, created_by_did, created_at, \
+     activated_at, superseded_at";
 
 use super::messages::{ResetRequest, ResetTrigger, WelcomeEnvelope};
 
@@ -93,58 +152,21 @@ async fn read_current_session_for_update(
     tx: &mut Transaction<'_, Postgres>,
     conversation_id: &str,
 ) -> Result<Option<CryptoSession>> {
-    let row: Option<(
-        String,
-        String,
-        i32,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        i32,
-        Option<Vec<u8>>,
-        Option<Vec<u8>>,
-        Option<i32>,
-        Option<DateTime<Utc>>,
-        Option<String>,
-        DateTime<Utc>,
-        Option<DateTime<Utc>>,
-        Option<DateTime<Utc>>,
-    )> = sqlx::query_as(
-        "SELECT id, conversation_id, generation, mls_group_id, state, supersedes_id, \
-         cipher_suite, last_observed_epoch, last_confirmation_tag, group_info, \
-         group_info_epoch, group_info_updated_at, created_by_did, created_at, \
-         activated_at, superseded_at \
+    let row: Option<CryptoSessionRow> = sqlx::query_as(&format!(
+        "SELECT {SELECT_CRYPTO_SESSION_COLS_FOR_TX} \
          FROM crypto_sessions \
          WHERE conversation_id = $1 \
            AND state IN ('active', 'reset_requested', 'superseding') \
          ORDER BY generation DESC \
          LIMIT 1 \
-         FOR UPDATE",
-    )
+         FOR UPDATE"
+    ))
     .bind(conversation_id)
     .fetch_optional(&mut **tx)
     .await
     .context("read_current_session_for_update")?;
 
-    Ok(row.map(|r| CryptoSession {
-        id: r.0,
-        conversation_id: r.1,
-        generation: r.2,
-        mls_group_id: r.3,
-        state: r.4,
-        supersedes_id: r.5,
-        cipher_suite: r.6,
-        last_observed_epoch: r.7,
-        last_confirmation_tag: r.8,
-        group_info: r.9,
-        group_info_epoch: r.10,
-        group_info_updated_at: r.11,
-        created_by_did: r.12,
-        created_at: r.13,
-        activated_at: r.14,
-        superseded_at: r.15,
-    }))
+    Ok(row.map(CryptoSession::from))
 }
 
 /// Look up an existing delivery_event by idempotency tuple. Used by both
@@ -613,26 +635,32 @@ pub(crate) async fn activate_crypto_session_tx(
     // `ActivationResult::Lost` at step 3 above and never reach this
     // block. No runtime `state = 'active'` guard is needed here, and
     // the absence of one saves a per-welcome SELECT.
-    for w in welcomes {
-        let id = Uuid::new_v4().to_string();
-        sqlx::query(
+    //
+    // Bulk insert via QueryBuilder::push_values to send a single
+    // multi-VALUES round-trip rather than N separate INSERTs. For typical
+    // group sizes (10–50 members) this turns 50 round-trips into 1.
+    if !welcomes.is_empty() {
+        let mut qb = sqlx::QueryBuilder::<Postgres>::new(
             "INSERT INTO pending_welcomes ( \
                 id, convo_id, target_did, welcome_message, created_by_did, \
                 crypto_session_id, generation, commit_event_id, recipient_device_id \
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
-        )
-        .bind(&id)
-        .bind(conversation_id)
-        .bind(&w.recipient_did)
-        .bind(&w.welcome_data)
-        .bind(initiator_did)
-        .bind(&new_session_id)
-        .bind(next_generation)
-        .bind(&activated_event_id)
-        .bind(&w.recipient_device_id)
-        .execute(&mut **tx)
-        .await
-        .context("INSERT pending_welcome")?;
+             ) ",
+        );
+        qb.push_values(welcomes.iter(), |mut b, w| {
+            b.push_bind(Uuid::new_v4().to_string())
+                .push_bind(conversation_id)
+                .push_bind(&w.recipient_did)
+                .push_bind(&w.welcome_data)
+                .push_bind(initiator_did)
+                .push_bind(&new_session_id)
+                .push_bind(next_generation)
+                .push_bind(&activated_event_id)
+                .push_bind(&w.recipient_device_id);
+        });
+        qb.build()
+            .execute(&mut **tx)
+            .await
+            .context("bulk INSERT pending_welcomes")?;
     }
 
     // 8. Housekeeping: clear stale reset/quorum/welcome state for the
@@ -671,51 +699,14 @@ async fn fetch_session_by_id(
     tx: &mut Transaction<'_, Postgres>,
     id: &str,
 ) -> Result<Option<CryptoSession>> {
-    let row: Option<(
-        String,
-        String,
-        i32,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        i32,
-        Option<Vec<u8>>,
-        Option<Vec<u8>>,
-        Option<i32>,
-        Option<DateTime<Utc>>,
-        Option<String>,
-        DateTime<Utc>,
-        Option<DateTime<Utc>>,
-        Option<DateTime<Utc>>,
-    )> = sqlx::query_as(
-        "SELECT id, conversation_id, generation, mls_group_id, state, supersedes_id, \
-         cipher_suite, last_observed_epoch, last_confirmation_tag, group_info, \
-         group_info_epoch, group_info_updated_at, created_by_did, created_at, \
-         activated_at, superseded_at \
-         FROM crypto_sessions WHERE id = $1",
-    )
+    let row: Option<CryptoSessionRow> = sqlx::query_as(&format!(
+        "SELECT {SELECT_CRYPTO_SESSION_COLS_FOR_TX} \
+         FROM crypto_sessions WHERE id = $1"
+    ))
     .bind(id)
     .fetch_optional(&mut **tx)
     .await
     .context("fetch_session_by_id")?;
 
-    Ok(row.map(|r| CryptoSession {
-        id: r.0,
-        conversation_id: r.1,
-        generation: r.2,
-        mls_group_id: r.3,
-        state: r.4,
-        supersedes_id: r.5,
-        cipher_suite: r.6,
-        last_observed_epoch: r.7,
-        last_confirmation_tag: r.8,
-        group_info: r.9,
-        group_info_epoch: r.10,
-        group_info_updated_at: r.11,
-        created_by_did: r.12,
-        created_at: r.13,
-        activated_at: r.14,
-        superseded_at: r.15,
-    }))
+    Ok(row.map(CryptoSession::from))
 }
