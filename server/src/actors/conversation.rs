@@ -1694,35 +1694,130 @@ impl ConversationActorState {
     /// - `Ok(Some((new_group_id, reset_count)))` on success.
     /// - `Ok(None)` if the conversations row vanished mid-flight.
     /// - `Err(_)` on database error.
-    /// Phase 2 §2.2 — `RequestCryptoSessionReset` handler stub.
+    /// Phase 2 §2.2 — `RequestCryptoSessionReset` handler.
     ///
-    /// Will be implemented in a follow-up commit. Currently unreachable —
-    /// no caller sends this variant yet, so panicking is safe scaffolding.
+    /// Opens a single Postgres tx, dispatches to
+    /// [`super::reset_chokepoint::request_crypto_session_reset_tx`], commits.
+    /// Idempotent on `idempotency_key`; safe to retry.
     async fn handle_request_crypto_session_reset(
         &mut self,
-        _trigger: ResetTrigger,
-        _initiator_did: String,
-        _reason: String,
-        _idempotency_key: String,
+        trigger: ResetTrigger,
+        initiator_did: String,
+        reason: String,
+        idempotency_key: String,
     ) -> anyhow::Result<ResetRequest> {
-        unimplemented!("RequestCryptoSessionReset handler — wired in next commit")
+        use anyhow::Context;
+        let mut tx = self
+            .db_pool
+            .begin()
+            .await
+            .context("begin RequestCryptoSessionReset tx")?;
+        let result = super::reset_chokepoint::request_crypto_session_reset_tx(
+            &mut tx,
+            &self.convo_id,
+            trigger,
+            &initiator_did,
+            &reason,
+            &idempotency_key,
+        )
+        .await?;
+        tx.commit()
+            .await
+            .context("commit RequestCryptoSessionReset tx")?;
+
+        info!(
+            convo_id = %crate::crypto::redact_for_log(&self.convo_id),
+            request_id = %result.request_id,
+            trigger = %trigger.as_str(),
+            "crypto_session_reset_requested"
+        );
+
+        Ok(result)
     }
 
-    /// Phase 2 §2.2 — `ActivateCryptoSession` handler stub.
+    /// Phase 2 §2.2 — `ActivateCryptoSession` handler.
     ///
-    /// Will be implemented in a follow-up commit. Currently unreachable —
-    /// no caller sends this variant yet, so panicking is safe scaffolding.
+    /// Single-tx core in
+    /// [`super::reset_chokepoint::activate_crypto_session_tx`]; this method
+    /// commits, then handles the post-commit concerns: in-memory state
+    /// reset (preserving `unread_counts` per spec §2.2 step 10) and SSE
+    /// `GroupResetEvent` emission.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_activate_crypto_session(
         &mut self,
-        _reset_request_id: Option<String>,
-        _trigger: ResetTrigger,
-        _new_mls_group_id: String,
-        _new_group_info: Option<Vec<u8>>,
-        _welcomes: Vec<WelcomeEnvelope>,
-        _initiator_did: String,
-        _idempotency_key: String,
+        reset_request_id: Option<String>,
+        trigger: ResetTrigger,
+        new_mls_group_id: String,
+        new_group_info: Option<Vec<u8>>,
+        welcomes: Vec<WelcomeEnvelope>,
+        initiator_did: String,
+        idempotency_key: String,
     ) -> anyhow::Result<crate::models::CryptoSession> {
-        unimplemented!("ActivateCryptoSession handler — wired in next commit")
+        use anyhow::Context;
+        let mut tx = self
+            .db_pool
+            .begin()
+            .await
+            .context("begin ActivateCryptoSession tx")?;
+        let outcome = super::reset_chokepoint::activate_crypto_session_tx(
+            &mut tx,
+            &self.convo_id,
+            reset_request_id.as_deref(),
+            trigger,
+            &new_mls_group_id,
+            new_group_info.as_deref(),
+            &welcomes,
+            &initiator_did,
+            &idempotency_key,
+        )
+        .await?;
+        tx.commit()
+            .await
+            .context("commit ActivateCryptoSession tx")?;
+
+        // Post-commit in-memory reset. Per plan §2.2 step 10: update epoch
+        // for the new session; DO NOT clear `unread_counts` — those are
+        // app data, not crypto state.
+        self.current_epoch = 0;
+
+        // Emit SSE GroupResetEvent matching `do_reset_group`'s shape so
+        // existing clients see the same event surface during compat window.
+        let cursor = self
+            .sse_state
+            .cursor_gen
+            .next(&self.convo_id, "groupResetEvent")
+            .await;
+        let event = crate::realtime::sse::StreamEvent::GroupResetEvent {
+            cursor: cursor.clone(),
+            convo_id: self.convo_id.clone(),
+            new_group_id: new_mls_group_id.clone(),
+            reset_generation: outcome.generation,
+            reset_by: initiator_did.clone(),
+            cipher_suite: outcome.cipher_suite.unwrap_or_default(),
+            reason: Some(format!("crypto_session_activated:{}", trigger.as_str())),
+        };
+        if let Err(e) = crate::db::store_event(&self.db_pool, &self.convo_id, &event).await {
+            error!(
+                "[actor:activate_crypto_session] store GroupResetEvent: {:?}",
+                e
+            );
+        }
+        if let Err(e) = self.sse_state.emit(&self.convo_id, event).await {
+            error!(
+                "[actor:activate_crypto_session] SSE emit GroupReset: {}",
+                e
+            );
+        }
+
+        info!(
+            convo_id = %crate::crypto::redact_for_log(&self.convo_id),
+            new_session_id = %outcome.session.id,
+            generation = outcome.generation,
+            trigger = %trigger.as_str(),
+            "crypto_session_activated"
+        );
+
+        Ok(outcome.session)
     }
 
     async fn do_reset_group(

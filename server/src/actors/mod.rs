@@ -3,6 +3,7 @@ mod conversation;
 mod directory;
 mod messages;
 mod registry;
+mod reset_chokepoint;
 mod supervisor;
 
 pub use conversation::{ConversationActor, ConvoActorArgs};
