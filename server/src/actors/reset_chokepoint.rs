@@ -26,8 +26,15 @@
 //! `crypto_sessions UNIQUE (conversation_id, generation)` is the
 //! serialization point. `INSERT ... ON CONFLICT DO NOTHING` with a
 //! post-INSERT row count check distinguishes winners from losers.
-//! Losers get a `failed` row + `crypto_session_candidate_rejected` event
-//! and an error returned to the caller; their welcomes are NOT stored.
+//! Losers get a `crypto_session_candidate_rejected` delivery_event
+//! (with `crypto_session_id=NULL`; correlation to the winner is via
+//! `(conversation_id, generation, state='active')`) and an error
+//! returned to the caller; their welcomes are NOT stored. We
+//! deliberately do NOT INSERT a parallel `failed` crypto_sessions row
+//! because the loser proposed an `mls_group_id` the winner already
+//! owns — colliding on that UNIQUE would either need a synthetic id
+//! (polluting the address space) or accept a stale `failed_id` that
+//! breaks the delivery_events FK.
 //!
 //! # Compatibility-window legacy column sync
 //!
@@ -461,30 +468,24 @@ pub(crate) async fn activate_crypto_session_tx(
     .context("INSERT new crypto_session")?;
 
     if inserted.is_none() {
-        // Tie-break loss: another candidate won this generation. Persist
-        // a `failed` row keyed by a different mls_group_id (the one we
-        // proposed) so audit trail is preserved, then append a
-        // candidate_rejected event and return error. Welcomes for losing
-        // candidates are NOT stored.
-        let failed_id = Uuid::new_v4().to_string();
-        sqlx::query(
-            "INSERT INTO crypto_sessions ( \
-                id, conversation_id, generation, mls_group_id, state, supersedes_id, \
-                cipher_suite, last_observed_epoch, created_by_did, created_at \
-             ) VALUES ($1, $2, $3, $4, 'failed', $5, $6, 0, $7, NOW()) \
-             ON CONFLICT (mls_group_id) DO NOTHING",
-        )
-        .bind(&failed_id)
-        .bind(conversation_id)
-        .bind(next_generation)
-        .bind(new_mls_group_id)
-        .bind(&prior.id)
-        .bind(&cipher_suite)
-        .bind(initiator_did)
-        .execute(&mut **tx)
-        .await
-        .context("INSERT failed candidate row")?;
-
+        // Tie-break loss: another candidate has already won this
+        // generation (and owns `new_mls_group_id` at state='active' OR
+        // owns the `(conversation_id, generation)` slot at any state).
+        //
+        // Audit-trail design: we do NOT INSERT a parallel `failed` row,
+        // because doing so would either (a) collide on the
+        // `mls_group_id UNIQUE` constraint (the winner already owns
+        // that id; ON CONFLICT DO NOTHING leaves us with a non-existent
+        // `failed_id` that the subsequent FK on delivery_events would
+        // reject), or (b) require us to invent a different mls_group_id
+        // for the loser, polluting the address space. Instead, we
+        // append the `crypto_session_candidate_rejected` event with
+        // `crypto_session_id = NULL` (the column is nullable). The
+        // payload_json carries the proposed mls_group_id, the
+        // attempted generation, and the trigger so audit-log readers
+        // can correlate to the winner via `(conversation_id,
+        // generation, state='active')`. Welcomes for losing candidates
+        // are NOT stored.
         let payload = json!({
             "trigger": trigger.as_str(),
             "reason": "tie_break_loss",
@@ -496,7 +497,7 @@ pub(crate) async fn activate_crypto_session_tx(
             tx,
             conversation_id,
             seq,
-            Some(&failed_id),
+            None, // no failed-row to FK to; correlate via payload_json
             "crypto_session_candidate_rejected",
             Some(initiator_did),
             Some(new_mls_group_id),
@@ -505,7 +506,7 @@ pub(crate) async fn activate_crypto_session_tx(
         )
         .await?;
 
-        // Audit row + event are persisted; caller commits the tx so the
+        // Audit event is persisted; caller commits the tx so the
         // tie-break loss survives. Caller decides how to surface to client
         // (typically as an error at the actor message boundary).
         return Ok(ActivationResult::Lost {

@@ -154,10 +154,14 @@ impl DeliveryLogRepository for PostgresDeliveryLogRepository {
         .fetch_one(&mut *tx)
         .await?;
 
-        // Insert. The UNIQUE on (conversation_id, sender_did, sender_device_id,
-        // idempotency_key) is a defense-in-depth against the idempotency
-        // check above missing a concurrent retry; if the conflict triggers,
-        // we re-fetch the conflicting row.
+        // Insert. The partial unique index `idx_delivery_events_idempotency`
+        // gives NULL-aware equality on (conversation_id, sender_did,
+        // sender_device_id, idempotency_key) so retries with NULL
+        // sender_did/sender_device_id collide as expected. We target it by
+        // name; the index's WHERE clause (`idempotency_key IS NOT NULL`)
+        // means rows without an idempotency_key bypass the conflict path
+        // entirely and are inserted unconditionally — matching the
+        // "best-effort dedupe" intent.
         let inserted: Option<DeliveryEventRow> = sqlx::query_as(&format!(
             "INSERT INTO delivery_events ( \
                 id, conversation_id, seq, crypto_session_id, event_type, \
@@ -167,7 +171,12 @@ impl DeliveryLogRepository for PostgresDeliveryLogRepository {
                 received_via, federation_trace_id \
              ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, \
                 $13, $14, $15, $16, $17, $18) \
-             ON CONFLICT (conversation_id, sender_did, sender_device_id, idempotency_key) \
+             ON CONFLICT ( \
+                conversation_id, \
+                COALESCE(sender_did, ''), \
+                COALESCE(sender_device_id, ''), \
+                idempotency_key \
+             ) WHERE idempotency_key IS NOT NULL \
              DO NOTHING \
              RETURNING {SELECT_DELIVERY_EVENT_COLS}"
         ))
