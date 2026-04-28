@@ -70,7 +70,7 @@ jobs:
         working-directory: ./server
         run: |
           cargo fmt -- --check
-          cargo clippy -- -D warnings
+          cargo clippy --lib --bins -- -D warnings
 
       - name: Install cargo-audit
         working-directory: ./server
