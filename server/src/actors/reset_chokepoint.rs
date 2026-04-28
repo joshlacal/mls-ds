@@ -717,10 +717,17 @@ pub(crate) async fn activate_crypto_session_tx(
     // multi-VALUES round-trip rather than N separate INSERTs. For typical
     // group sizes (10–50 members) this turns 50 round-trips into 1.
     if !welcomes.is_empty() {
+        // bug_009 (ultrareview): bind WelcomeEnvelope.key_package_hash to
+        // the new pending_welcomes.key_package_hash column. Previously
+        // collected and silently discarded because no column existed —
+        // currently masked by the legacy welcome_messages dual-write,
+        // becomes data loss when that's dropped (TODO(phase-2.5-cleanup)
+        // referenced by handler).
         let mut qb = sqlx::QueryBuilder::<Postgres>::new(
             "INSERT INTO pending_welcomes ( \
                 id, convo_id, target_did, welcome_message, created_by_did, \
-                crypto_session_id, generation, commit_event_id, recipient_device_id \
+                crypto_session_id, generation, commit_event_id, \
+                recipient_device_id, key_package_hash \
              ) ",
         );
         qb.push_values(welcomes.iter(), |mut b, w| {
@@ -732,7 +739,8 @@ pub(crate) async fn activate_crypto_session_tx(
                 .push_bind(&new_session_id)
                 .push_bind(next_generation)
                 .push_bind(&activated_event_id)
-                .push_bind(&w.recipient_device_id);
+                .push_bind(&w.recipient_device_id)
+                .push_bind(&w.key_package_hash);
         });
         qb.build()
             .execute(&mut **tx)
