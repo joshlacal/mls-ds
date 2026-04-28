@@ -789,7 +789,7 @@ pub async fn detect_message_gaps(pool: &DbPool, convo_id: &str) -> Result<GapInf
     };
 
     // Check if there are gaps by comparing expected range with actual count
-    let expected_count = max_seq - min_seq + 1 ;
+    let expected_count = max_seq - min_seq + 1;
     if expected_count == total_messages {
         // No gaps
         return Ok(GapInfo {

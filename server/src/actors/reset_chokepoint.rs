@@ -624,9 +624,7 @@ pub(crate) async fn activate_crypto_session_tx(
                 .context("RELEASE SAVEPOINT activate_insert")?;
             Some(row)
         }
-        Err(sqlx::Error::Database(ref db_err))
-            if db_err.code().as_deref() == Some("23505") =>
-        {
+        Err(sqlx::Error::Database(ref db_err)) if db_err.code().as_deref() == Some("23505") => {
             // Loser: roll back the failed INSERT so the outer tx can
             // continue with the candidate-rejected event APPEND below.
             sqlx::query("ROLLBACK TO SAVEPOINT activate_insert")

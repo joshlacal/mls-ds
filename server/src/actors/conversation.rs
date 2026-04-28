@@ -998,8 +998,7 @@ impl ConversationActorState {
                 // Increment in-memory counter for all members except sender's devices
                 // In multi-device mode, we exclude all devices where user_did matches sender_did
                 for (member_did, user_did) in members {
-                    let is_sender_device =
-                        user_did.as_ref() == Some(&sender_did);
+                    let is_sender_device = user_did.as_ref() == Some(&sender_did);
                     if !is_sender_device {
                         let count = self.unread_counts.entry(member_did.clone()).or_insert(0);
                         *count += 1;

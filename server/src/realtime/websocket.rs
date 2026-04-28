@@ -537,8 +537,7 @@ async fn handle_socket(
 
                     // Convert StreamEvent to WebSocket message
                     let mut sender_guard = sender_clone.lock().await;
-                    if let Err(e) = send_event(&mut sender_guard, &event, seq, frame_format).await
-                    {
+                    if let Err(e) = send_event(&mut sender_guard, &event, seq, frame_format).await {
                         error!("Failed to send event for {}: {}", convo_id, e);
                         break;
                     }

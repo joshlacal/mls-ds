@@ -448,20 +448,18 @@ async fn handle_create_convo(
         StatusCode::INTERNAL_SERVER_ERROR.into_response()
     })?;
 
-    sqlx::query(
-        "UPDATE conversations SET active_crypto_session_id = $1 WHERE id = $2",
-    )
-    .bind(&crypto_session_id)
-    .bind(&convo_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| {
-        error!(
-            "❌ [v2.createConvo] Failed to set active_crypto_session_id: {}",
-            e
-        );
-        StatusCode::INTERNAL_SERVER_ERROR.into_response()
-    })?;
+    sqlx::query("UPDATE conversations SET active_crypto_session_id = $1 WHERE id = $2")
+        .bind(&crypto_session_id)
+        .bind(&convo_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            error!(
+                "❌ [v2.createConvo] Failed to set active_crypto_session_id: {}",
+                e
+            );
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        })?;
 
     // crypto_session_created delivery event at seq=0 (matches the migration
     // backfill's per-conversation seed event). idempotency_key keeps

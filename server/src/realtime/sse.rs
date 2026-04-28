@@ -862,11 +862,7 @@ pub async fn subscribe_convo_events(
         }
     }
 
-    let replay_stream = stream::iter(
-        replay_sse_events
-            .into_iter()
-            .map(Ok::<Event, Infallible>),
-    );
+    let replay_stream = stream::iter(replay_sse_events.into_iter().map(Ok::<Event, Infallible>));
 
     // Create live event stream
     let live_stream = stream::unfold(

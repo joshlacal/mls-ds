@@ -159,7 +159,9 @@ async fn handle_persistent(
     // --- Validate padded_size bucket ---
     let valid_buckets = [512, 1024, 2048, 4096, 8192];
     let is_valid_bucket = valid_buckets.contains(&padded_size)
-        || (padded_size > 8192 && padded_size <= 10 * 1024 * 1024 && padded_size.is_multiple_of(8192));
+        || (padded_size > 8192
+            && padded_size <= 10 * 1024 * 1024
+            && padded_size.is_multiple_of(8192));
     if !is_valid_bucket {
         error!("❌ [v2.sendMessage] Invalid paddedSize: {}", padded_size);
         return Err(StatusCode::BAD_REQUEST);
@@ -234,19 +236,18 @@ async fn handle_persistent(
                 error!("❌ [v2.sendMessage] Failed to fetch current epoch: {}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
-    let stored_confirmation_tag: Option<Vec<u8>> = sqlx::query_scalar(
-        "SELECT confirmation_tag FROM conversations WHERE id = $1",
-    )
-    .bind(&convo_id)
-    .fetch_one(&pool)
-    .await
-    .map_err(|e| {
-        error!(
-            "❌ [v2.sendMessage] Failed to fetch confirmation_tag: {}",
-            e
-        );
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let stored_confirmation_tag: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT confirmation_tag FROM conversations WHERE id = $1")
+            .bind(&convo_id)
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| {
+                error!(
+                    "❌ [v2.sendMessage] Failed to fetch confirmation_tag: {}",
+                    e
+                );
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
     let reset_count: i32 = crypto_session.generation;
 
     // --- Validate confirmation tag (if client sent one) ---

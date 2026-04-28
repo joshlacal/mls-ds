@@ -301,20 +301,19 @@ async fn fetch_commits(
     let to_epoch = if let Some(to) = to_epoch {
         to
     } else {
-        let current_epoch: i32 = sqlx::query_scalar(
-            "SELECT current_epoch FROM conversations WHERE id = $1",
-        )
-        .bind(convo_id)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| {
-            error!("❌ [v2.getMessages] Failed to fetch current epoch: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?
-        .ok_or_else(|| {
-            error!("❌ [v2.getMessages] Conversation not found");
-            StatusCode::NOT_FOUND
-        })?;
+        let current_epoch: i32 =
+            sqlx::query_scalar("SELECT current_epoch FROM conversations WHERE id = $1")
+                .bind(convo_id)
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| {
+                    error!("❌ [v2.getMessages] Failed to fetch current epoch: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?
+                .ok_or_else(|| {
+                    error!("❌ [v2.getMessages] Conversation not found");
+                    StatusCode::NOT_FOUND
+                })?;
         current_epoch as i64
     };
 

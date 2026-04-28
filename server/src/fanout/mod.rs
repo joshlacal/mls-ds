@@ -52,12 +52,10 @@ impl MailboxFactory {
 }
 
 /// Configuration for mailbox backends
-#[derive(Clone)]
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct MailboxConfig {
     // Reserved for future use
 }
-
 
 #[cfg(test)]
 mod tests {

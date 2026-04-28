@@ -371,11 +371,7 @@ impl AuthMiddleware {
                     .decode(&jwk.x)
                     .map_err(|e| AuthError::InvalidToken(format!("bad jwk.x: {}", e)))?;
                 let y = URL_SAFE_NO_PAD
-                    .decode(
-                        jwk.y
-                            .as_ref()
-                            .ok_or(AuthError::MissingVerificationMethod)?,
-                    )
+                    .decode(jwk.y.as_ref().ok_or(AuthError::MissingVerificationMethod)?)
                     .map_err(|e| AuthError::InvalidToken(format!("bad jwk.y: {}", e)))?;
                 let ep = EncodedPoint::from_affine_coordinates(
                     p256::FieldBytes::from_slice(&x),
@@ -454,11 +450,7 @@ impl AuthMiddleware {
                 .decode(&jwk.x)
                 .map_err(|e| AuthError::InvalidToken(format!("bad jwk.x: {}", e)))?;
             let y = URL_SAFE_NO_PAD
-                .decode(
-                    jwk.y
-                        .as_ref()
-                        .ok_or(AuthError::MissingVerificationMethod)?,
-                )
+                .decode(jwk.y.as_ref().ok_or(AuthError::MissingVerificationMethod)?)
                 .map_err(|e| AuthError::InvalidToken(format!("bad jwk.y: {}", e)))?;
 
             // Uncompressed point: 0x04 || x || y
@@ -882,15 +874,14 @@ pub fn enforce_standard(claims: &AtProtoClaims, endpoint_nsid: &str) -> Result<(
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
         .unwrap_or(true);
 
-    if enforce_jti
-        && claims.jti.is_none() {
-            tracing::warn!(
-                iss = %crate::crypto::redact_for_log(&claims.iss),
-                endpoint = endpoint_nsid,
-                "Missing jti claim when ENFORCE_JTI is enabled"
-            );
-            return Err(AuthError::MissingJti);
-        }
+    if enforce_jti && claims.jti.is_none() {
+        tracing::warn!(
+            iss = %crate::crypto::redact_for_log(&claims.iss),
+            endpoint = endpoint_nsid,
+            "Missing jti claim when ENFORCE_JTI is enabled"
+        );
+        return Err(AuthError::MissingJti);
+    }
     Ok(())
 }
 

@@ -78,10 +78,7 @@ async fn convo_message_request_reset_constructs_with_oneshot() {
             assert_eq!(initiator_did, "did:plc:admin");
             assert_eq!(reason, "spec test");
             assert_eq!(idempotency_key, "test-key-1");
-            assert_eq!(
-                expected_new_mls_group_id.as_deref(),
-                Some("mls-group-XYZ")
-            );
+            assert_eq!(expected_new_mls_group_id.as_deref(), Some("mls-group-XYZ"));
         }
         _ => panic!("expected RequestCryptoSessionReset"),
     }

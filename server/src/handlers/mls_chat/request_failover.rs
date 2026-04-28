@@ -96,17 +96,15 @@ pub async fn request_failover(
     // in the same tx. Until then `last_observed_epoch` is stale after
     // every accepted commit (see merged_bug_001 from ultrareview;
     // mirrors the send_message.rs:212 revert from PR review #20).
-    let epoch: i32 = sqlx::query_scalar(
-        "SELECT current_epoch FROM conversations WHERE id = $1",
-    )
-    .bind(&convo_id)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|e| {
-        error!("Failed to fetch current epoch: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?
-    .ok_or(StatusCode::NOT_FOUND)?;
+    let epoch: i32 = sqlx::query_scalar("SELECT current_epoch FROM conversations WHERE id = $1")
+        .bind(&convo_id)
+        .fetch_optional(&pool)
+        .await
+        .map_err(|e| {
+            error!("Failed to fetch current epoch: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or(StatusCode::NOT_FOUND)?;
     let sequencer_term = current_term_raw.unwrap_or(0).max(0) as u64;
     let self_did = &fed_config.self_did;
 
