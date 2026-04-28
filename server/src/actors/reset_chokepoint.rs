@@ -286,11 +286,16 @@ async fn insert_event(
 ///
 /// 1. If a `crypto_session_reset_requested` event with this idempotency_key
 ///    already exists, reconstruct and return its `ResetRequest`.
-/// 2. UPDATE the active crypto_session to `state = 'reset_requested'`
+/// 2. If the session is already in `reset_requested`, apply the
+///    `expected_new_mls_group_id` transition matrix (bug_010). Reject
+///    with an error if a prior request bound a different group id.
+/// 3. UPDATE the active crypto_session to `state = 'reset_requested'`
 ///    (no-op if already in `reset_requested` or `superseding`).
-/// 3. APPEND a `crypto_session_reset_requested` event referencing the
-///    active session, with `payload_json` containing the request body and
-///    the freshly-allocated `request_id`.
+/// 4. APPEND a `crypto_session_reset_requested` event referencing the
+///    active session, with `payload_json` containing the request body,
+///    the freshly-allocated `request_id`, and the (optional)
+///    `expected_new_mls_group_id` binding for activation-time
+///    enforcement.
 pub(crate) async fn request_crypto_session_reset_tx(
     tx: &mut Transaction<'_, Postgres>,
     conversation_id: &str,
@@ -298,7 +303,12 @@ pub(crate) async fn request_crypto_session_reset_tx(
     initiator_did: &str,
     reason: &str,
     idempotency_key: &str,
+    expected_new_mls_group_id: Option<&str>,
 ) -> Result<ResetRequest> {
+    // Idempotent replay: a prior call from this caller with the same
+    // idempotency_key resolves to the same ResetRequest. The transition
+    // matrix below only applies to NEW Requests (different
+    // idempotency_key) on a session already in `reset_requested`.
     if let Some((_event_id, payload_json, _cs_id)) = find_existing_event(
         tx,
         conversation_id,
@@ -326,7 +336,50 @@ pub(crate) async fn request_crypto_session_reset_tx(
         .await?
         .ok_or_else(|| anyhow!("no non-superseded crypto_session for {conversation_id}"))?;
 
-    // Idempotent transition: only flip 'active' → 'reset_requested'.
+    // bug_010 (ultrareview): expected_new_mls_group_id transition matrix
+    // when the session is already in `reset_requested`. Look at the most
+    // recent crypto_session_reset_requested event for this session and
+    // apply:
+    //   existing NULL + new NULL          → no-op (idempotent re-request)
+    //   existing NULL + new Some(X)       → upgrade the binding
+    //   existing Some(X) + new Some(X)    → no-op (same target re-claim)
+    //   existing Some(X) + new Some(Y), X≠Y → REJECT (conflicting claim)
+    //   existing Some(X) + new NULL       → no-op (NULL doesn't weaken)
+    if current.state == "reset_requested" {
+        let existing_expected: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT payload_json->>'expected_new_mls_group_id' \
+             FROM delivery_events \
+             WHERE conversation_id = $1 \
+               AND crypto_session_id = $2 \
+               AND event_type = 'crypto_session_reset_requested' \
+             ORDER BY seq DESC \
+             LIMIT 1",
+        )
+        .bind(conversation_id)
+        .bind(&current.id)
+        .fetch_optional(&mut **tx)
+        .await
+        .context("read prior reset_requested expected_new_mls_group_id")?;
+
+        let prior_expected: Option<String> = existing_expected.flatten();
+        match (prior_expected.as_deref(), expected_new_mls_group_id) {
+            // existing Some(X) + new Some(Y), X≠Y → REJECT
+            (Some(prior), Some(new)) if prior != new => {
+                return Err(anyhow!(
+                    "expected_new_mls_group_id binding conflict: \
+                     prior request claimed `{prior}`, new request claims `{new}`. \
+                     The earlier admin's claim is binding until activation \
+                     resolves; either submit material matching the prior \
+                     claim or wait for the prior request to time out."
+                ));
+            }
+            // All other cases pass through; the existing event remains
+            // authoritative on the binding (or NULL stays NULL).
+            _ => {}
+        }
+    }
+
+    // Idempotent state transition: only flip 'active' → 'reset_requested'.
     // If the row is already in 'reset_requested' or 'superseding', the
     // UPDATE matches zero rows; we still emit the event below so the
     // delivery_events log preserves both request idempotency_keys.
@@ -345,6 +398,7 @@ pub(crate) async fn request_crypto_session_reset_tx(
         "request_id": request_id,
         "trigger": trigger.as_str(),
         "reason": reason,
+        "expected_new_mls_group_id": expected_new_mls_group_id,
     });
 
     let seq = allocate_seq(tx, conversation_id).await?;
@@ -477,6 +531,44 @@ pub(crate) async fn activate_crypto_session_tx(
     let prior = read_current_session_for_update(tx, conversation_id)
         .await?
         .ok_or_else(|| anyhow!("no current crypto_session for {conversation_id}"))?;
+
+    // bug_010 (ultrareview): if the prior session is in `reset_requested`
+    // and the upstream Request bound an `expected_new_mls_group_id`, the
+    // activator's `new_mls_group_id` MUST match. This is the auth-bypass
+    // gate Codex P1 had two parts of (state was the first; this is the
+    // second). NULL `expected_new_mls_group_id` means no pre-binding —
+    // any caller's `new_mls_group_id` is accepted (post-#12 elected-
+    // client-flow placeholder).
+    if prior.state == "reset_requested" {
+        let expected: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT payload_json->>'expected_new_mls_group_id' \
+             FROM delivery_events \
+             WHERE conversation_id = $1 \
+               AND crypto_session_id = $2 \
+               AND event_type = 'crypto_session_reset_requested' \
+             ORDER BY seq DESC \
+             LIMIT 1",
+        )
+        .bind(conversation_id)
+        .bind(&prior.id)
+        .fetch_optional(&mut **tx)
+        .await
+        .context("read prior reset_requested expected_new_mls_group_id")?;
+
+        if let Some(Some(bound)) = expected {
+            if bound != new_mls_group_id {
+                return Err(anyhow!(
+                    "expected_new_mls_group_id mismatch: \
+                     upstream Request bound `{bound}`, but activation \
+                     submitted `{new_mls_group_id}`. The pre-bound claim \
+                     from the original requester is authoritative; \
+                     bootstrap with the matching mls_group_id or wait \
+                     for the prior request to time out."
+                ));
+            }
+        }
+    }
+
     let next_generation = prior.generation + 1;
     let cipher_suite = prior.cipher_suite.clone();
     let new_session_id = Uuid::new_v4().to_string();

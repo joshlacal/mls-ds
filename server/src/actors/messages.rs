@@ -220,12 +220,21 @@ pub enum ConvoMessage {
     /// - `initiator_did`: DID that triggered the request
     /// - `reason`: human-readable reason for the request (audit trail)
     /// - `idempotency_key`: unique-per-retry key for the request
+    /// - `expected_new_mls_group_id`: bug_010 (ultrareview) — the
+    ///   `mls_group_id` the requester expects the eventual activator to
+    ///   submit. When `Some(_)`, the chokepoint persists this in the
+    ///   `crypto_session_reset_requested` event payload and rejects
+    ///   activation if the activator's `new_mls_group_id` doesn't
+    ///   match. When `None`, no pre-binding (post-#12 elected-client
+    ///   flow placeholder; quorum/sweep also pass `None` since they
+    ///   don't know the id yet).
     /// - `reply`: channel to receive the [`ResetRequest`]
     RequestCryptoSessionReset {
         trigger: ResetTrigger,
         initiator_did: String,
         reason: String,
         idempotency_key: String,
+        expected_new_mls_group_id: Option<String>,
         reply: oneshot::Sender<Result<ResetRequest>>,
     },
 

@@ -245,6 +245,14 @@ pub async fn reset_group(
                 .clone()
                 .unwrap_or_else(|| "admin_reset".to_string()),
             idempotency_key: format!("req-reset:{}", request_id_uuid),
+            // bug_010 (ultrareview): admin reset binds the new_group_id
+            // up-front so the activation half (whether back-to-back here
+            // for with-material flow, or later via bootstrap for
+            // request-only flow) can validate the activator's
+            // mls_group_id matches what the admin claimed. Prevents the
+            // auth bypass where any active member could race with their
+            // own newGroupId.
+            expected_new_mls_group_id: Some(new_group_id.clone()),
             reply: req_tx,
         })
         .map_err(|_| {

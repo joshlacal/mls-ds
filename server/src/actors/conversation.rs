@@ -331,6 +331,7 @@ impl Actor for ConversationActor {
                 initiator_did,
                 reason,
                 idempotency_key,
+                expected_new_mls_group_id,
                 reply,
             } => {
                 let result = state
@@ -339,6 +340,7 @@ impl Actor for ConversationActor {
                         initiator_did,
                         reason,
                         idempotency_key,
+                        expected_new_mls_group_id,
                     )
                     .await;
                 let _ = reply.send(result);
@@ -1705,6 +1707,7 @@ impl ConversationActorState {
         initiator_did: String,
         reason: String,
         idempotency_key: String,
+        expected_new_mls_group_id: Option<String>,
     ) -> anyhow::Result<ResetRequest> {
         use anyhow::Context;
         let mut tx = self
@@ -1719,6 +1722,7 @@ impl ConversationActorState {
             &initiator_did,
             &reason,
             &idempotency_key,
+            expected_new_mls_group_id.as_deref(),
         )
         .await?;
         tx.commit()
