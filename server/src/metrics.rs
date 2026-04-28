@@ -6,6 +6,12 @@ pub struct MetricsRecorder {
     handle: PrometheusHandle,
 }
 
+impl Default for MetricsRecorder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MetricsRecorder {
     pub fn new() -> Self {
         let handle = PrometheusBuilder::new()
@@ -137,6 +143,20 @@ impl MetricsRecorder {
         metrics::describe_counter!(
             "fanout_failures_total",
             "Total number of fan-out failures by stage"
+        );
+
+        // Key package safety metrics
+        metrics::describe_counter!(
+            "key_package_claim_total",
+            "Total number of key package claim attempts, labeled by state_after (claimed | no_match)"
+        );
+        metrics::describe_counter!(
+            "key_package_exhaustion_total",
+            "Total number of times a claim found no available key packages for the requested DID"
+        );
+        metrics::describe_counter!(
+            "key_package_last_resort_use_total",
+            "Total number of times a last-resort key package was claimed because no regular available rows existed"
         );
 
         Self { handle }
@@ -424,4 +444,34 @@ pub fn record_epoch_increment(_convo_id: &str, duration: Duration) {
 #[allow(dead_code)]
 pub fn record_epoch_conflict(_convo_id: &str) {
     metrics::counter!("epoch_conflicts_total", 1);
+}
+
+// ============================================================================
+// Key Package Safety Metrics
+// ============================================================================
+
+/// Record a key-package claim outcome.
+/// `state_after` is one of "claimed" (atomic transition succeeded) or
+/// "no_match" (the row was already claimed/expired/revoked or no `available`
+/// row existed for the request).
+#[allow(dead_code)]
+pub fn record_key_package_claim(state_after: &'static str) {
+    metrics::counter!(
+        "key_package_claim_total",
+        1,
+        "state_after" => state_after
+    );
+}
+
+/// Record an exhaustion event — a claim was attempted for a DID that has zero
+/// `available` key packages (regular or last-resort).
+#[allow(dead_code)]
+pub fn record_key_package_exhaustion() {
+    metrics::counter!("key_package_exhaustion_total", 1);
+}
+
+/// Record that the claim path fell through to a last-resort key package.
+#[allow(dead_code)]
+pub fn record_key_package_last_resort_use() {
+    metrics::counter!("key_package_last_resort_use_total", 1);
 }

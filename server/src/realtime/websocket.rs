@@ -238,7 +238,7 @@ pub async fn subscribe_convo_events(
 
     info!(
         user = %crate::crypto::redact_for_log(&user_did),
-        convo = convo_id.as_deref().map(|c| crate::crypto::redact_for_log(c)).unwrap_or_default(),
+        convo = convo_id.as_deref().map(crate::crypto::redact_for_log).unwrap_or_default(),
         cursor = ?query.cursor,
         connections = CONNECTION_TRACKER.count(&user_did),
         "WebSocket subscription request validated"
@@ -372,7 +372,7 @@ async fn handle_socket(
                                 seq += 1;
                                 let mut sender_guard = sender.lock().await;
                                 if let Err(e) =
-                                    send_event(&mut *sender_guard, &event, seq, frame_format).await
+                                    send_event(&mut sender_guard, &event, seq, frame_format).await
                                 {
                                     error!("Failed to send backfill event: {}", e);
                                     return;
@@ -383,7 +383,7 @@ async fn handle_socket(
                             error!("Failed to backfill events: {}", e);
                             let mut sender_guard = sender.lock().await;
                             let _ = send_error(
-                                &mut *sender_guard,
+                                &mut sender_guard,
                                 "BackfillFailed",
                                 Some(&e),
                                 frame_format,
@@ -438,7 +438,7 @@ async fn handle_socket(
                 error!("Failed to list conversations for global sub: {}", e);
                 let mut sender_guard = sender.lock().await;
                 let _ = send_error(
-                    &mut *sender_guard,
+                    &mut sender_guard,
                     "InternalError",
                     Some("Failed to list conversations"),
                     frame_format,
@@ -537,8 +537,7 @@ async fn handle_socket(
 
                     // Convert StreamEvent to WebSocket message
                     let mut sender_guard = sender_clone.lock().await;
-                    if let Err(e) = send_event(&mut *sender_guard, &event, seq, frame_format).await
-                    {
+                    if let Err(e) = send_event(&mut sender_guard, &event, seq, frame_format).await {
                         error!("Failed to send event for {}: {}", convo_id, e);
                         break;
                     }

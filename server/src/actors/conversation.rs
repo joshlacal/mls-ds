@@ -5,7 +5,10 @@ use std::{collections::HashMap, sync::Arc};
 use tracing::{debug, error, info, warn};
 
 use super::broadcaster::BroadcasterPool;
-use super::messages::{ConvoMessage, KeyPackageHashEntry, RecordResetVoteOutcome};
+use super::messages::{
+    ConvoMessage, KeyPackageHashEntry, RecordResetVoteOutcome, ResetRequest, ResetTrigger,
+    WelcomeEnvelope,
+};
 use crate::config::QuorumConfig;
 use crate::notifications::NotificationService;
 use crate::realtime::{SseState, StreamEvent, StreamMessageView};
@@ -323,6 +326,48 @@ impl Actor for ConversationActor {
                     .handle_trigger_system_reset(reason, staleness_epochs, quiet_duration_secs)
                     .await;
             }
+            ConvoMessage::RequestCryptoSessionReset {
+                trigger,
+                initiator_did,
+                reason,
+                idempotency_key,
+                expected_new_mls_group_id,
+                reply,
+            } => {
+                let result = state
+                    .handle_request_crypto_session_reset(
+                        trigger,
+                        initiator_did,
+                        reason,
+                        idempotency_key,
+                        expected_new_mls_group_id,
+                    )
+                    .await;
+                let _ = reply.send(result);
+            }
+            ConvoMessage::ActivateCryptoSession {
+                reset_request_id,
+                trigger,
+                new_mls_group_id,
+                new_group_info,
+                welcomes,
+                initiator_did,
+                idempotency_key,
+                reply,
+            } => {
+                let result = state
+                    .handle_activate_crypto_session(
+                        reset_request_id,
+                        trigger,
+                        new_mls_group_id,
+                        new_group_info,
+                        welcomes,
+                        initiator_did,
+                        idempotency_key,
+                    )
+                    .await;
+                let _ = reply.send(result);
+            }
             ConvoMessage::Shutdown => {
                 info!("ConversationActor shutting down");
                 state.broadcaster_pool.shutdown();
@@ -466,7 +511,7 @@ impl ConversationActorState {
             .bind(commit_wire_epoch)
             .bind(seq)
             .bind(&commit_bytes)
-            .bind(&now)
+            .bind(now)
             .execute(&mut *tx)
             .await
             .context("Failed to insert commit message")?;
@@ -507,7 +552,7 @@ impl ConversationActorState {
             )
             .bind(&self.convo_id)
             .bind(target_did)
-            .bind(&now)
+            .bind(now)
             .execute(&mut *tx)
             .await
             .context(format!("Failed to add member {}", target_did))?;
@@ -556,7 +601,7 @@ impl ConversationActorState {
                 .bind(target_did)
                 .bind(&welcome_data)
                 .bind::<Option<Vec<u8>>>(key_package_hash)
-                .bind(&now)
+                .bind(now)
                 .execute(&mut *tx)
                 .await
                 .context(format!("Failed to store welcome message for {}", target_did))?;
@@ -682,7 +727,7 @@ impl ConversationActorState {
             .bind(commit_wire_epoch)
             .bind(seq)
             .bind(&commit_bytes)
-            .bind(&now)
+            .bind(now)
             .execute(&mut *tx)
             .await
             .context("Failed to insert commit message")?;
@@ -703,7 +748,7 @@ impl ConversationActorState {
 
         // Mark member as left (soft delete with left_at timestamp)
         sqlx::query("UPDATE members SET left_at = $1 WHERE convo_id = $2 AND member_did = $3")
-            .bind(&now)
+            .bind(now)
             .bind(&self.convo_id)
             .bind(&member_did)
             .execute(&mut *tx)
@@ -868,8 +913,8 @@ impl ConversationActorState {
         .bind(epoch)
         .bind(seq)
         .bind(&ciphertext)
-        .bind(&now)
-        .bind(&expires_at)
+        .bind(now)
+        .bind(expires_at)
         .bind(&msg_id)
         .bind(padded_size)
         .bind(received_bucket_ts)
@@ -953,14 +998,13 @@ impl ConversationActorState {
                 // Increment in-memory counter for all members except sender's devices
                 // In multi-device mode, we exclude all devices where user_did matches sender_did
                 for (member_did, user_did) in members {
-                    let is_sender_device =
-                        user_did.as_ref().map_or(false, |uid| uid == &sender_did);
+                    let is_sender_device = user_did.as_ref() == Some(&sender_did);
                     if !is_sender_device {
                         let count = self.unread_counts.entry(member_did.clone()).or_insert(0);
                         *count += 1;
 
                         // Optional: flush to database every N increments (e.g., every 10 messages)
-                        if *count % 10 == 0 {
+                        if (*count).is_multiple_of(10) {
                             if let Err(e) = sqlx::query(
                                 "UPDATE members SET unread_count = unread_count + 10 WHERE convo_id = $1 AND member_did = $2"
                             )
@@ -1651,6 +1695,186 @@ impl ConversationActorState {
     /// - `Ok(Some((new_group_id, reset_count)))` on success.
     /// - `Ok(None)` if the conversations row vanished mid-flight.
     /// - `Err(_)` on database error.
+    /// Phase 2 §2.2 — `RequestCryptoSessionReset` handler.
+    ///
+    /// Opens a single Postgres tx, dispatches to
+    /// [`super::reset_chokepoint::request_crypto_session_reset_tx`], commits.
+    /// Idempotent on `idempotency_key`; safe to retry.
+    async fn handle_request_crypto_session_reset(
+        &mut self,
+        trigger: ResetTrigger,
+        initiator_did: String,
+        reason: String,
+        idempotency_key: String,
+        expected_new_mls_group_id: Option<String>,
+    ) -> anyhow::Result<ResetRequest> {
+        use anyhow::Context;
+        let mut tx = self
+            .db_pool
+            .begin()
+            .await
+            .context("begin RequestCryptoSessionReset tx")?;
+        let result = super::reset_chokepoint::request_crypto_session_reset_tx(
+            &mut tx,
+            &self.convo_id,
+            trigger,
+            &initiator_did,
+            &reason,
+            &idempotency_key,
+            expected_new_mls_group_id.as_deref(),
+        )
+        .await?;
+        tx.commit()
+            .await
+            .context("commit RequestCryptoSessionReset tx")?;
+
+        info!(
+            convo_id = %crate::crypto::redact_for_log(&self.convo_id),
+            request_id = %result.request_id,
+            trigger = %trigger.as_str(),
+            "crypto_session_reset_requested"
+        );
+
+        Ok(result)
+    }
+
+    /// Phase 2 §2.2 — `ActivateCryptoSession` handler.
+    ///
+    /// Single-tx core in
+    /// [`super::reset_chokepoint::activate_crypto_session_tx`]; this method
+    /// commits, then handles the post-commit concerns: in-memory state
+    /// reset (preserving `unread_counts` per spec §2.2 step 10) and SSE
+    /// `GroupResetEvent` emission.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_activate_crypto_session(
+        &mut self,
+        reset_request_id: Option<String>,
+        trigger: ResetTrigger,
+        new_mls_group_id: String,
+        new_group_info: Option<Vec<u8>>,
+        welcomes: Vec<WelcomeEnvelope>,
+        initiator_did: String,
+        idempotency_key: String,
+    ) -> anyhow::Result<crate::models::CryptoSession> {
+        use anyhow::Context;
+        let mut tx = self
+            .db_pool
+            .begin()
+            .await
+            .context("begin ActivateCryptoSession tx")?;
+        let result = super::reset_chokepoint::activate_crypto_session_tx(
+            &mut tx,
+            &self.convo_id,
+            reset_request_id.as_deref(),
+            trigger,
+            &new_mls_group_id,
+            new_group_info.as_deref(),
+            &welcomes,
+            &initiator_did,
+            &idempotency_key,
+        )
+        .await?;
+        // Always commit, even on tie-break loss — the chokepoint persists
+        // a `failed` crypto_sessions row + `crypto_session_candidate_rejected`
+        // delivery_event for audit, and rolling back would discard them.
+        tx.commit()
+            .await
+            .context("commit ActivateCryptoSession tx")?;
+
+        let outcome = match result {
+            super::reset_chokepoint::ActivationResult::Won(o) => o,
+            super::reset_chokepoint::ActivationResult::CachedReplay(o) => {
+                // bug_016 (ultrareview): retry of a prior idempotent
+                // activation. The session is fully persisted from the
+                // first call; we MUST NOT re-emit SSE GroupResetEvent or
+                // re-clobber `self.current_epoch` (which may have already
+                // advanced via subsequent commits). Just return the
+                // cached session to the caller — handler still gets the
+                // same response shape, but the actor side effects from
+                // the original Won path don't repeat.
+                info!(
+                    convo_id = %crate::crypto::redact_for_log(&self.convo_id),
+                    new_session_id = %o.session.id,
+                    generation = o.generation,
+                    trigger = %trigger.as_str(),
+                    "ActivateCryptoSession cached replay (no side effects re-fired)"
+                );
+                return Ok(o.session);
+            }
+            super::reset_chokepoint::ActivationResult::Lost {
+                attempted_generation,
+                proposed_mls_group_id,
+            } => {
+                info!(
+                    convo_id = %crate::crypto::redact_for_log(&self.convo_id),
+                    attempted_generation,
+                    proposed_mls_group_id = %crate::crypto::redact_for_log(&proposed_mls_group_id),
+                    trigger = %trigger.as_str(),
+                    "crypto_session_candidate_rejected (tie-break loss persisted)"
+                );
+                return Err(anyhow::anyhow!(
+                    "ActivateCryptoSession tie-break lost: another candidate won generation {attempted_generation}"
+                ));
+            }
+        };
+
+        // Post-commit in-memory reset. Per plan §2.2 step 10: update epoch
+        // for the new session; DO NOT clear `unread_counts` — those are
+        // app data, not crypto state.
+        self.current_epoch = 0;
+
+        // Emit SSE GroupResetEvent matching `do_reset_group`'s shape so
+        // existing clients see the same event surface during compat window.
+        let cursor = self
+            .sse_state
+            .cursor_gen
+            .next(&self.convo_id, "groupResetEvent")
+            .await;
+        let event = crate::realtime::sse::StreamEvent::GroupResetEvent {
+            cursor: cursor.clone(),
+            convo_id: self.convo_id.clone(),
+            new_group_id: new_mls_group_id.clone(),
+            reset_generation: outcome.generation,
+            reset_by: initiator_did.clone(),
+            cipher_suite: outcome.cipher_suite.unwrap_or_default(),
+            reason: Some(format!("crypto_session_activated:{}", trigger.as_str())),
+        };
+        if let Err(e) = crate::db::store_event(&self.db_pool, &self.convo_id, &event).await {
+            error!(
+                "[actor:activate_crypto_session] store GroupResetEvent: {:?}",
+                e
+            );
+        }
+        if let Err(e) = self.sse_state.emit(&self.convo_id, event).await {
+            error!("[actor:activate_crypto_session] SSE emit GroupReset: {}", e);
+        }
+
+        info!(
+            convo_id = %crate::crypto::redact_for_log(&self.convo_id),
+            new_session_id = %outcome.session.id,
+            generation = outcome.generation,
+            trigger = %trigger.as_str(),
+            "crypto_session_activated"
+        );
+
+        Ok(outcome.session)
+    }
+
+    // TODO(post-#12): funnel through RequestCryptoSessionReset once the
+    // elected-client flow ships. This legacy path stays wired to its
+    // existing callers (handle_record_reset_vote quorum, handle_trigger_
+    // system_reset sweep) until #12 lands a way for clients to respond
+    // to a request-only reset. Funneling earlier would either (a) break
+    // the API shape of report_recovery_failure (new_group_id: None)
+    // or (b) leave indirect-trigger conversations unable to rotate
+    // their group_id server-side, since neither path has client
+    // material at trigger time. Direct/admin/bootstrap flows funnel
+    // through ActivateCryptoSession in `reset_chokepoint.rs` already.
+    //
+    // This is also the only legacy site still clearing `unread_counts`
+    // on reset (line 1933 below). The new chokepoint preserves them
+    // per plan §2.2 step 10. Behavior converges when this method is
+    // retired.
     async fn do_reset_group(
         &mut self,
         last_reset_by: &str,
@@ -1786,7 +2010,7 @@ async fn handle_notify_new_message(
     convo_id: &str,
     msg_id: &str,
     sender_did: &str,
-    ciphertext: &Vec<u8>,
+    ciphertext: &[u8],
     seq: i64,
     epoch: i64,
     is_ephemeral: bool,
@@ -1826,14 +2050,13 @@ async fn handle_notify_new_message(
     let message_view: StreamMessageView = crate::generated::blue_catbird::mlsChat::MessageView {
         id: msg_id.to_string().into(),
         convo_id: convo_id.to_string().into(),
-        ciphertext: bytes::Bytes::from(ciphertext.clone()),
+        ciphertext: bytes::Bytes::from(ciphertext.to_vec()),
         epoch,
         seq,
         created_at: crate::sqlx_jacquard::chrono_to_datetime(chrono::Utc::now()),
         message_type: Some("app".into()),
         extra_data: Default::default(),
-    }
-    .into();
+    };
 
     let event = StreamEvent::MessageEvent {
         cursor: cursor.clone(),

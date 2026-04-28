@@ -1,4 +1,4 @@
-///! Shared error types for MLS server handlers
+//! Shared error types for MLS server handlers
 use std::fmt;
 
 #[derive(Debug)]

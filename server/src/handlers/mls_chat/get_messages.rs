@@ -67,7 +67,7 @@ pub async fn get_messages(
     let did = &auth_user.did;
     let message_type = params.r#type.as_deref().unwrap_or("all");
     let convo_id = params.convo_id.to_string();
-    let limit = params.limit.unwrap_or(50).max(1).min(100);
+    let limit = params.limit.unwrap_or(50).clamp(1, 100);
     let since_seq = params.since_seq;
 
     if convo_id.is_empty() {
@@ -290,21 +290,29 @@ async fn fetch_commits(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    // Determine end epoch
+    // Determine end epoch.
+    //
+    // TODO(phase 4): switch back to `crypto_session.last_observed_epoch`
+    // once `try_advance_conversation_epoch_tx` (db.rs) advances both
+    // `conversations.current_epoch` AND
+    // `crypto_sessions.last_observed_epoch` in the same tx. Until then
+    // `last_observed_epoch` is stale after every accepted commit
+    // (merged_bug_001 from ultrareview).
     let to_epoch = if let Some(to) = to_epoch {
         to
     } else {
         let current_epoch: i32 =
             sqlx::query_scalar("SELECT current_epoch FROM conversations WHERE id = $1")
                 .bind(convo_id)
-                .fetch_one(pool)
+                .fetch_optional(pool)
                 .await
                 .map_err(|e| {
                     error!("❌ [v2.getMessages] Failed to fetch current epoch: {}", e);
-                    match e {
-                        sqlx::Error::RowNotFound => StatusCode::NOT_FOUND,
-                        _ => StatusCode::INTERNAL_SERVER_ERROR,
-                    }
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?
+                .ok_or_else(|| {
+                    error!("❌ [v2.getMessages] Conversation not found");
+                    StatusCode::NOT_FOUND
                 })?;
         current_epoch as i64
     };

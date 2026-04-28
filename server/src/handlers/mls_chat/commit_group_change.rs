@@ -38,7 +38,7 @@ struct XrpcErrorBody {
 /// `serverEpoch` from the send-path 409 get instant epoch-resync here too —
 /// no extra `getGroupState` round-trip required.
 #[derive(Serialize)]
-struct EpochConflictBody {
+pub struct EpochConflictBody {
     error: &'static str,
     message: String,
     #[serde(rename = "serverEpoch")]
@@ -311,6 +311,9 @@ pub async fn commit_group_change(
                 .unwrap_or(false);
 
                 if already {
+                    // TODO(phase 4): route via CryptoSessionRepository — idempotency-hit
+                    // fallback in addMembers; migrate when ConversationActor takes the
+                    // repo by ctor.
                     let current_epoch: Option<i32> =
                         sqlx::query_scalar("SELECT current_epoch FROM conversations WHERE id = $1")
                             .bind(&convo_id)
@@ -560,7 +563,7 @@ pub async fn commit_group_change(
                 )
                 .bind(&convo_id)
                 .bind(member_did_str)
-                .bind(&now)
+                .bind(now)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| {
@@ -686,7 +689,7 @@ pub async fn commit_group_change(
             .bind(commit_wire_epoch)
             .bind(seq)
             .bind(&commit_bytes[..])
-            .bind(&now)
+            .bind(now)
             .execute(&mut *tx)
             .await
             .map_err(|e| {
@@ -712,7 +715,7 @@ pub async fn commit_group_change(
                 .bind(member_did_str)
                 .bind(&welcome_bytes[..])
                 .bind::<Option<Vec<u8>>>(None)
-                .bind(&now)
+                .bind(now)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| {
@@ -822,14 +825,13 @@ pub async fn commit_group_change(
                 crate::generated::blue_catbird::mlsChat::MessageView {
                     id: msg_id.clone().into(),
                     convo_id: convo_id.clone().into(),
-                    ciphertext: bytes::Bytes::from(commit_bytes.clone()),
+                    ciphertext: commit_bytes.clone(),
                     epoch: new_epoch as i64,
                     seq,
                     created_at: crate::sqlx_jacquard::chrono_to_datetime(now),
                     message_type: Some("commit".into()),
                     extra_data: Default::default(),
-                }
-                .into();
+                };
 
             let commit_event = crate::realtime::StreamEvent::MessageEvent {
                 cursor: commit_cursor.clone(),
@@ -952,6 +954,9 @@ pub async fn commit_group_change(
                 .unwrap_or(false);
 
                 if already {
+                    // TODO(phase 4): route via CryptoSessionRepository — idempotency-hit
+                    // fallback in externalCommit; migrate when ConversationActor takes
+                    // the repo by ctor.
                     let current_epoch: Option<i32> =
                         sqlx::query_scalar("SELECT current_epoch FROM conversations WHERE id = $1")
                             .bind(&convo_id)
@@ -1293,6 +1298,20 @@ pub async fn commit_group_change(
             }
 
             // ── Update conversations.group_id from GroupInfo ─────────
+            //
+            // TODO(post-#12 audit): This is the external-commit observer.
+            // It fires when a rejoining client's GroupInfo carries a
+            // different mls_group_id than what the server has stored —
+            // i.e., the client is catching up to a prior reset. After
+            // Phase 2 §2.3 made `ActivateCryptoSession` the authoritative
+            // writer of `conversations.group_id`, by the time external
+            // commit reaches here the server's group_id should ALREADY
+            // match what GroupInfo says. This UPDATE becomes redundant
+            // (no-op write of the same value) at best and arguably should
+            // be replaced with an assertion. Audit + remove once Phase 2
+            // soak data confirms the chokepoint covers every path that
+            // can rotate group_id. NOT funneled in #10 because the
+            // observer is not itself a reset path.
             if let Some(ref new_gid) = mls_group_id {
                 sqlx::query("UPDATE conversations SET group_id = $1 WHERE id = $2")
                     .bind(new_gid)
@@ -1369,7 +1388,7 @@ pub async fn commit_group_change(
             .bind(commit_wire_epoch)
             .bind(seq)
             .bind(&commit_bytes[..])
-            .bind(&now)
+            .bind(now)
             .execute(&mut *tx)
             .await
             .map_err(|e| {
@@ -1425,14 +1444,13 @@ pub async fn commit_group_change(
                 crate::generated::blue_catbird::mlsChat::MessageView {
                     id: msg_id.clone().into(),
                     convo_id: convo_id.clone().into(),
-                    ciphertext: bytes::Bytes::from(commit_bytes.clone()),
+                    ciphertext: commit_bytes.clone(),
                     epoch: new_epoch as i64,
                     seq,
                     created_at: crate::sqlx_jacquard::chrono_to_datetime(now),
                     message_type: Some("commit".into()),
                     extra_data: Default::default(),
-                }
-                .into();
+                };
 
             let commit_event = crate::realtime::StreamEvent::MessageEvent {
                 cursor: commit_cursor.clone(),
@@ -1755,6 +1773,9 @@ pub async fn commit_group_change(
 
             // CAS protection: reject stale GroupInfo uploads
             if let Some(mls_epoch) = mls_epoch {
+                // TODO(phase 4): route via CryptoSessionRepository — CAS guard for
+                // stale GroupInfo upload; migrate when ConversationActor takes the
+                // repo by ctor.
                 let current_server_epoch: i32 =
                     sqlx::query_scalar("SELECT current_epoch FROM conversations WHERE id = $1")
                         .bind(&convo_id)
@@ -2041,6 +2062,9 @@ pub async fn commit_group_change(
                 .unwrap_or(false);
 
                 if already {
+                    // TODO(phase 4): route via CryptoSessionRepository — idempotency-hit
+                    // fallback in removeMember; migrate when ConversationActor takes the
+                    // repo by ctor.
                     let current_epoch: Option<i32> =
                         sqlx::query_scalar("SELECT current_epoch FROM conversations WHERE id = $1")
                             .bind(&convo_id)
@@ -2197,7 +2221,7 @@ pub async fn commit_group_change(
                 )
                 .bind(&convo_id)
                 .bind(&member_did_str)
-                .bind(&now)
+                .bind(now)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| {
@@ -2235,7 +2259,7 @@ pub async fn commit_group_change(
             .bind(commit_wire_epoch)
             .bind(seq)
             .bind(&commit_bytes[..])
-            .bind(&now)
+            .bind(now)
             .execute(&mut *tx)
             .await
             .map_err(|e| {
@@ -2291,14 +2315,13 @@ pub async fn commit_group_change(
                 crate::generated::blue_catbird::mlsChat::MessageView {
                     id: msg_id.clone().into(),
                     convo_id: convo_id.clone().into(),
-                    ciphertext: bytes::Bytes::from(commit_bytes.clone()),
+                    ciphertext: commit_bytes.clone(),
                     epoch: new_epoch as i64,
                     seq,
                     created_at: crate::sqlx_jacquard::chrono_to_datetime(now),
                     message_type: Some("commit".into()),
                     extra_data: Default::default(),
-                }
-                .into();
+                };
 
             let commit_event = crate::realtime::StreamEvent::MessageEvent {
                 cursor: commit_cursor.clone(),
@@ -2378,6 +2401,9 @@ pub async fn commit_group_change(
                 .unwrap_or(false);
 
                 if already {
+                    // TODO(phase 4): route via CryptoSessionRepository — generic
+                    // idempotency-hit fallback; migrate when ConversationActor takes
+                    // the repo by ctor.
                     let current_epoch: Option<i32> =
                         sqlx::query_scalar("SELECT current_epoch FROM conversations WHERE id = $1")
                             .bind(&convo_id)
@@ -2599,7 +2625,7 @@ pub async fn commit_group_change(
             .bind(commit_wire_epoch)
             .bind(seq)
             .bind(&commit_bytes[..])
-            .bind(&now)
+            .bind(now)
             .execute(&mut *tx)
             .await
             .map_err(|e| {
@@ -2656,14 +2682,13 @@ pub async fn commit_group_change(
                 crate::generated::blue_catbird::mlsChat::MessageView {
                     id: msg_id.clone().into(),
                     convo_id: convo_id.clone().into(),
-                    ciphertext: bytes::Bytes::from(commit_bytes.clone()),
+                    ciphertext: commit_bytes.clone(),
                     epoch: new_epoch as i64,
                     seq,
                     created_at: crate::sqlx_jacquard::chrono_to_datetime(now),
                     message_type: Some("commit".into()),
                     extra_data: Default::default(),
-                }
-                .into();
+                };
 
             let commit_event = crate::realtime::StreamEvent::MessageEvent {
                 cursor: commit_cursor.clone(),

@@ -613,8 +613,8 @@ pub async fn create_message(
     .bind(epoch)
     .bind(seq)
     .bind(&ciphertext)
-    .bind(&now)
-    .bind(&expires_at)
+    .bind(now)
+    .bind(expires_at)
     .bind(msg_id)
     .bind(padded_size)
     .bind(received_bucket_ts)
@@ -789,7 +789,7 @@ pub async fn detect_message_gaps(pool: &DbPool, convo_id: &str) -> Result<GapInf
     };
 
     // Check if there are gaps by comparing expected range with actual count
-    let expected_count = (max_seq - min_seq + 1) as i64;
+    let expected_count = max_seq - min_seq + 1;
     if expected_count == total_messages {
         // No gaps
         return Ok(GapInfo {
@@ -2508,7 +2508,7 @@ pub async fn store_sequencer_receipt(pool: &DbPool, receipt: &SequencerReceipt) 
     )
     .bind(&receipt.convo_id)
     .bind(receipt.epoch)
-    .bind(receipt.sequencer_term as i64)
+    .bind(receipt.sequencer_term)
     .bind(&receipt.commit_hash)
     .bind(&receipt.sequencer_did)
     .bind(receipt.issued_at)

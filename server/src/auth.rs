@@ -361,7 +361,7 @@ impl AuthMiddleware {
                     .public_key_jwk
                     .as_ref()
                     .ok_or(AuthError::MissingVerificationMethod)?;
-                if jwk.kty != "EC" || jwk.crv.to_ascii_uppercase() != "P-256" {
+                if jwk.kty != "EC" || !jwk.crv.eq_ignore_ascii_case("P-256") {
                     return Err(AuthError::UnsupportedKeyType(format!(
                         "Expected EC P-256, got {} {}",
                         jwk.kty, jwk.crv
@@ -371,11 +371,7 @@ impl AuthMiddleware {
                     .decode(&jwk.x)
                     .map_err(|e| AuthError::InvalidToken(format!("bad jwk.x: {}", e)))?;
                 let y = URL_SAFE_NO_PAD
-                    .decode(
-                        jwk.y
-                            .as_ref()
-                            .ok_or_else(|| AuthError::MissingVerificationMethod)?,
-                    )
+                    .decode(jwk.y.as_ref().ok_or(AuthError::MissingVerificationMethod)?)
                     .map_err(|e| AuthError::InvalidToken(format!("bad jwk.y: {}", e)))?;
                 let ep = EncodedPoint::from_affine_coordinates(
                     p256::FieldBytes::from_slice(&x),
@@ -454,11 +450,7 @@ impl AuthMiddleware {
                 .decode(&jwk.x)
                 .map_err(|e| AuthError::InvalidToken(format!("bad jwk.x: {}", e)))?;
             let y = URL_SAFE_NO_PAD
-                .decode(
-                    jwk.y
-                        .as_ref()
-                        .ok_or_else(|| AuthError::MissingVerificationMethod)?,
-                )
+                .decode(jwk.y.as_ref().ok_or(AuthError::MissingVerificationMethod)?)
                 .map_err(|e| AuthError::InvalidToken(format!("bad jwk.y: {}", e)))?;
 
             // Uncompressed point: 0x04 || x || y
@@ -668,7 +660,7 @@ pub fn extract_p256_key(did_doc: &DidDocument) -> Option<p256::ecdsa::VerifyingK
     for vm in &did_doc.verification_method {
         // Try JWK first
         if let Some(ref jwk) = vm.public_key_jwk {
-            if jwk.kty == "EC" && jwk.crv.to_ascii_uppercase() == "P-256" {
+            if jwk.kty == "EC" && jwk.crv.eq_ignore_ascii_case("P-256") {
                 let x = URL_SAFE_NO_PAD.decode(&jwk.x).ok()?;
                 let y = URL_SAFE_NO_PAD.decode(jwk.y.as_ref()?).ok()?;
                 let ep = EncodedPoint::from_affine_coordinates(
@@ -713,7 +705,7 @@ static JTI_CACHE: Lazy<moka::sync::Cache<String, ()>> = Lazy::new(|| {
         .build()
 });
 
-static AUTH_MIDDLEWARE: Lazy<AuthMiddleware> = Lazy::new(|| AuthMiddleware::new());
+static AUTH_MIDDLEWARE: Lazy<AuthMiddleware> = Lazy::new(AuthMiddleware::new);
 
 fn truthy(var: &str) -> bool {
     matches!(var, "1" | "true" | "TRUE" | "yes" | "YES")
@@ -852,7 +844,6 @@ async fn validate_resolved_host_is_public(host: &str, port: u16) -> Result<(), A
 
 /// Enforce optional lxm and jti-claim presence.
 /// Replay uniqueness must be enforced with `enforce_standard_with_replay_store`.
-
 pub fn enforce_standard(claims: &AtProtoClaims, endpoint_nsid: &str) -> Result<(), AuthError> {
     tracing::debug!(
         iss = %crate::crypto::redact_for_log(&claims.iss),
@@ -883,15 +874,13 @@ pub fn enforce_standard(claims: &AtProtoClaims, endpoint_nsid: &str) -> Result<(
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
         .unwrap_or(true);
 
-    if enforce_jti {
-        if claims.jti.is_none() {
-            tracing::warn!(
-                iss = %crate::crypto::redact_for_log(&claims.iss),
-                endpoint = endpoint_nsid,
-                "Missing jti claim when ENFORCE_JTI is enabled"
-            );
-            return Err(AuthError::MissingJti);
-        }
+    if enforce_jti && claims.jti.is_none() {
+        tracing::warn!(
+            iss = %crate::crypto::redact_for_log(&claims.iss),
+            endpoint = endpoint_nsid,
+            "Missing jti claim when ENFORCE_JTI is enabled"
+        );
+        return Err(AuthError::MissingJti);
     }
     Ok(())
 }

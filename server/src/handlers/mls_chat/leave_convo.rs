@@ -188,7 +188,7 @@ pub async fn leave_convo(
             .bind(commit_wire_epoch)
             .bind(seq)
             .bind(&commit_bytes)
-            .bind(&now)
+            .bind(now)
             .execute(&mut *db_tx)
             .await
             .map_err(|e| {
@@ -223,8 +223,7 @@ pub async fn leave_convo(
                     // commit; preserving original wire compatibility for now.
                     message_type: Some("app".into()),
                     extra_data: Default::default(),
-                }
-                .into();
+                };
 
             let commit_event = crate::realtime::StreamEvent::MessageEvent {
                 cursor: commit_cursor.clone(),
@@ -278,7 +277,7 @@ pub async fn leave_convo(
         let rows_affected = sqlx::query(
             "UPDATE members SET left_at = $1, needs_rejoin = false, rejoin_requested_at = NULL WHERE convo_id = $2 AND (member_did = $3 OR user_did = $3) AND left_at IS NULL",
         )
-        .bind(&now)
+        .bind(now)
         .bind(&convo_id)
         .bind(&target_did)
         .execute(&pool)

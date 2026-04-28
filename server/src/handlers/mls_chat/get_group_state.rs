@@ -83,12 +83,7 @@ fn is_row_not_found(error: &anyhow::Error) -> bool {
 /// GET /xrpc/blue.catbird.mlsChat.getGroupState?convoId=xxx&include=groupInfo,welcome,epoch
 ///
 /// Consolidates: getGroupInfo, getEpoch, getWelcome, invalidateWelcome
-#[tracing::instrument(skip(
-    pool,
-    actor_registry,
-    inline_trigger_cfg,
-    auth_user
-))]
+#[tracing::instrument(skip(pool, actor_registry, inline_trigger_cfg, auth_user))]
 pub async fn get_group_state(
     State(pool): State<DbPool>,
     State(actor_registry): State<Arc<ActorRegistry>>,

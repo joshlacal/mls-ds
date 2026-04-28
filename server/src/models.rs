@@ -55,6 +55,34 @@ pub struct Conversation {
 }
 
 impl Conversation {
+    /// Project this `Conversation`'s MLS-related columns into a `CryptoSession`.
+    ///
+    /// Phase 1 read-only projection. Note: `group_info`, `group_info_epoch`,
+    /// and `group_info_updated_at` are not on the `Conversation` struct (they
+    /// live on the table but are accessed via separate queries), so they are
+    /// returned as `None` here. Handlers that need them go through
+    /// `CryptoSessionRepository::get_active`.
+    pub fn active_crypto_session(&self) -> CryptoSession {
+        CryptoSession {
+            id: self.id.clone(),
+            conversation_id: self.id.clone(),
+            generation: self.reset_count.unwrap_or(0),
+            mls_group_id: self.group_id.clone().unwrap_or_else(|| self.id.clone()),
+            state: "active".to_string(),
+            cipher_suite: self.cipher_suite.clone(),
+            last_observed_epoch: self.current_epoch,
+            last_confirmation_tag: self.confirmation_tag.clone(),
+            group_info: None,
+            group_info_epoch: None,
+            group_info_updated_at: None,
+            created_by_did: Some(self.creator_did.clone()),
+            created_at: self.created_at,
+            activated_at: None,
+            superseded_at: None,
+            supersedes_id: None,
+        }
+    }
+
     /// Convert to API ConvoView with members
     ///
     /// # Errors
@@ -119,6 +147,114 @@ impl Conversation {
         };
         Ok(view.into_static())
     }
+}
+
+// =============================================================================
+// CryptoSession — one MLS group generation (Phase 1: read-only projection over
+// `conversations` MLS columns). Phase 2 introduces a real `crypto_sessions`
+// table; this struct is the seam.
+// =============================================================================
+
+/// One MLS group generation. Server-side public observable metadata only —
+/// the server is not the cryptographic authority on group state, clients are.
+///
+/// Phase 1: projected from existing `conversations` columns. Phase 2: backed
+/// by a dedicated `crypto_sessions` table with an explicit state machine and
+/// supersession pointers.
+#[derive(Debug, Clone, FromRow)]
+pub struct CryptoSession {
+    /// Opaque session id. Phase 1 mirrors `conversation_id`; Phase 2 makes
+    /// this an independent UUID.
+    pub id: String,
+    pub conversation_id: String,
+    pub generation: i32,
+    pub mls_group_id: String,
+    /// One of: pending, active, reset_requested, superseding, superseded,
+    /// failed, archived. Phase 1 always returns "active" — there is no
+    /// state column on the legacy schema yet.
+    pub state: String,
+    pub cipher_suite: Option<String>,
+    pub last_observed_epoch: i32,
+    pub last_confirmation_tag: Option<Vec<u8>>,
+    pub group_info: Option<Vec<u8>>,
+    pub group_info_epoch: Option<i32>,
+    pub group_info_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub created_by_did: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub activated_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub superseded_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub supersedes_id: Option<String>,
+}
+
+/// New crypto session candidate, used by Phase 2 `CryptoSessionRepository::create`.
+/// Phase 1: no callers; the type is here so the trait surface compiles.
+#[derive(Debug, Clone)]
+pub struct NewCryptoSession {
+    pub id: String,
+    pub conversation_id: String,
+    pub generation: i32,
+    pub mls_group_id: String,
+    pub state: String,
+    pub cipher_suite: Option<String>,
+    pub last_observed_epoch: i32,
+    pub last_confirmation_tag: Option<Vec<u8>>,
+    pub group_info: Option<Vec<u8>>,
+    pub group_info_epoch: Option<i32>,
+    pub created_by_did: Option<String>,
+    pub supersedes_id: Option<String>,
+}
+
+// =============================================================================
+// DeliveryEvent — server's source-of-truth append-only log. Phase 1: domain
+// type only, no persistence adapter. Phase 2: backed by `delivery_events`.
+// =============================================================================
+
+/// One row in the server's append-only delivery log. Carries provenance fields
+/// for future federation; populated as available, NULL otherwise.
+#[derive(Debug, Clone)]
+pub struct DeliveryEvent {
+    pub id: String,
+    pub conversation_id: String,
+    pub seq: i64,
+    pub crypto_session_id: Option<String>,
+    pub event_type: String,
+    pub sender_did: Option<String>,
+    pub sender_device_id: Option<String>,
+    pub mls_group_id: Option<String>,
+    pub mls_epoch: Option<i64>,
+    pub idempotency_key: Option<String>,
+    pub payload: Option<Vec<u8>>,
+    pub payload_json: Option<serde_json::Value>,
+    pub origin_service_did: Option<String>,
+    pub home_service_did: Option<String>,
+    pub remote_event_id: Option<String>,
+    pub auth_issuer_did: Option<String>,
+    pub received_via: Option<String>,
+    pub federation_trace_id: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// New delivery event to append. Used by Phase 2 `DeliveryLogRepository::append`.
+/// Phase 1: no callers; the type is here so the trait surface compiles.
+#[derive(Debug, Clone)]
+pub struct NewDeliveryEvent {
+    pub id: String,
+    pub conversation_id: String,
+    pub crypto_session_id: Option<String>,
+    pub event_type: String,
+    pub sender_did: Option<String>,
+    pub sender_device_id: Option<String>,
+    pub mls_group_id: Option<String>,
+    pub mls_epoch: Option<i64>,
+    pub idempotency_key: Option<String>,
+    pub payload: Option<Vec<u8>>,
+    pub payload_json: Option<serde_json::Value>,
+    pub origin_service_did: Option<String>,
+    pub home_service_did: Option<String>,
+    pub remote_event_id: Option<String>,
+    pub auth_issuer_did: Option<String>,
+    pub received_via: Option<String>,
+    pub federation_trace_id: Option<String>,
 }
 
 /// Database representation of a membership

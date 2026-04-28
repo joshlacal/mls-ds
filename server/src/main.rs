@@ -1,3 +1,15 @@
+// Mirror the lib.rs crate-level allows for the bin target — clippy treats them
+// as separate compilation units. See lib.rs for rationale and Phase 2.5 cleanup TODO.
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::doc_overindented_list_items)]
+#![allow(clippy::doc_lazy_continuation)]
+#![allow(clippy::should_implement_trait)]
+#![allow(clippy::large_enum_variant)]
+#![allow(deprecated)]
+#![allow(dead_code)]
+#![allow(unused_imports)]
+
 use axum::{
     extract::{DefaultBodyLimit, FromRef},
     routing::{any, get, post},

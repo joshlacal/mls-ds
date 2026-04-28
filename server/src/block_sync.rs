@@ -11,7 +11,7 @@ use moka::future::Cache;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{identity::did_web_document_url, storage::DbPool};
 
@@ -382,7 +382,7 @@ impl BlockSyncService {
             )
             .bind(&block.blocker_did)
             .bind(&block.blocked_did)
-            .bind(&now)
+            .bind(now)
             .execute(&mut *tx)
             .await
             .map_err(|e| BlockSyncError::DatabaseError(e.to_string()))?;

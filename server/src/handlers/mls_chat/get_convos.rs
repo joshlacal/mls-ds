@@ -213,7 +213,7 @@ async fn handle_pending(
     limit: Option<i64>,
     status: &str,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let limit = limit.unwrap_or(50).max(1).min(100);
+    let limit = limit.unwrap_or(50).clamp(1, 100);
 
     match status {
         "pending" | "accepted" | "declined" | "blocked" | "expired" => {}

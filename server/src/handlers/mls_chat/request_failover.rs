@@ -73,9 +73,9 @@ pub async fn request_failover(
     // Verify caller is a member of the conversation
     crate::auth::verify_is_member(&pool, &convo_id, &auth_user.did).await?;
 
-    // Fetch current sequencer and epoch
-    let row = sqlx::query_as::<_, (Option<String>, Option<i32>, Option<i64>)>(
-        "SELECT sequencer_ds, current_epoch, sequencer_term FROM conversations WHERE id = $1",
+    // Fetch current sequencer (federation) and epoch (via CryptoSession projection)
+    let row = sqlx::query_as::<_, (Option<String>, Option<i64>)>(
+        "SELECT sequencer_ds, sequencer_term FROM conversations WHERE id = $1",
     )
     .bind(&convo_id)
     .fetch_optional(&pool)
@@ -85,12 +85,26 @@ pub async fn request_failover(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let (sequencer_ds, current_epoch, current_term_raw) = match row {
+    let (sequencer_ds, current_term_raw) = match row {
         Some(r) => r,
         None => return Err(StatusCode::NOT_FOUND),
     };
 
-    let epoch = current_epoch.unwrap_or(0);
+    // TODO(phase 4): read epoch from `crypto_sessions.last_observed_epoch`
+    // once `try_advance_conversation_epoch_tx` (db.rs) advances both
+    // `conversations.current_epoch` AND `crypto_sessions.last_observed_epoch`
+    // in the same tx. Until then `last_observed_epoch` is stale after
+    // every accepted commit (see merged_bug_001 from ultrareview;
+    // mirrors the send_message.rs:212 revert from PR review #20).
+    let epoch: i32 = sqlx::query_scalar("SELECT current_epoch FROM conversations WHERE id = $1")
+        .bind(&convo_id)
+        .fetch_optional(&pool)
+        .await
+        .map_err(|e| {
+            error!("Failed to fetch current epoch: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or(StatusCode::NOT_FOUND)?;
     let sequencer_term = current_term_raw.unwrap_or(0).max(0) as u64;
     let self_did = &fed_config.self_did;
 

@@ -17,6 +17,7 @@ use crate::{
     generated::blue_catbird::mlsChat::send_message::{SendMessageOutput, SendMessageRequest},
     notifications::NotificationService,
     realtime::{SseState, StreamEvent, StreamMessageView},
+    repositories::{CryptoSessionRepository, PostgresCryptoSessionRepository},
     storage::DbPool,
 };
 
@@ -158,7 +159,9 @@ async fn handle_persistent(
     // --- Validate padded_size bucket ---
     let valid_buckets = [512, 1024, 2048, 4096, 8192];
     let is_valid_bucket = valid_buckets.contains(&padded_size)
-        || (padded_size > 8192 && padded_size <= 10 * 1024 * 1024 && padded_size % 8192 == 0);
+        || (padded_size > 8192
+            && padded_size <= 10 * 1024 * 1024
+            && padded_size.is_multiple_of(8192));
     if !is_valid_bucket {
         error!("❌ [v2.sendMessage] Invalid paddedSize: {}", padded_size);
         return Err(StatusCode::BAD_REQUEST);
@@ -182,22 +185,70 @@ async fn handle_persistent(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    // --- Fetch conversation epoch, sequencer term, confirmation tag, and reset_count ---
-    let (server_epoch, server_sequencer_term, stored_confirmation_tag, reset_count): (i64, i64, Option<Vec<u8>>, i32) = sqlx::query_as(
-        "SELECT CAST(current_epoch AS BIGINT), CAST(COALESCE(sequencer_term, 0) AS BIGINT), confirmation_tag, COALESCE(reset_count, 0) \
-         FROM conversations WHERE id = $1",
-    )
-    .bind(&convo_id)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|e| {
-        error!("❌ [v2.sendMessage] Failed to fetch conversation: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?
-    .ok_or_else(|| {
-        error!("❌ [v2.sendMessage] Conversation not found");
-        StatusCode::NOT_FOUND
-    })?;
+    // --- Fetch active CryptoSession (epoch, confirmation_tag, generation) ---
+    // Phase 1: project from `conversations`. `sequencer_term` is a federation
+    // concern, not MLS metadata, so it stays as a separate scalar query.
+    let crypto_session_repo = PostgresCryptoSessionRepository::new(pool.clone());
+    let crypto_session = crypto_session_repo
+        .get_active(&convo_id)
+        .await
+        .map_err(|e| {
+            error!("❌ [v2.sendMessage] Failed to fetch crypto session: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or_else(|| {
+            error!("❌ [v2.sendMessage] Conversation not found");
+            StatusCode::NOT_FOUND
+        })?;
+
+    let server_sequencer_term: i64 =
+        sqlx::query_scalar("SELECT COALESCE(sequencer_term, 0) FROM conversations WHERE id = $1")
+            .bind(&convo_id)
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| {
+                error!("❌ [v2.sendMessage] Failed to fetch sequencer term: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+    // TODO(phase 4): switch back to crypto_session reads once
+    // commit-acceptance dual-writes the corresponding crypto_sessions
+    // columns alongside the conversations columns. As shipped, the
+    // commit-acceptance path (try_advance_conversation_epoch_tx +
+    // commit_group_change.rs) updates `conversations.current_epoch`
+    // and `conversations.confirmation_tag` but NOT
+    // `crypto_sessions.last_observed_epoch` /
+    // `crypto_sessions.last_confirmation_tag`. Reading from
+    // crypto_session here would be stale on both fields after the
+    // first accepted commit (merged_bug_001 from ultrareview corrected
+    // the original PR review #20 fix, which incorrectly assumed
+    // confirmation_tag was untouched by epoch advance).
+    //
+    // `generation` (a.k.a. `reset_count`) IS only mutated through the
+    // chokepoint, so reading it from `crypto_session` remains safe.
+    let server_epoch: i64 =
+        sqlx::query_scalar("SELECT current_epoch FROM conversations WHERE id = $1")
+            .bind(&convo_id)
+            .fetch_one(&pool)
+            .await
+            .map(|e: i32| e as i64)
+            .map_err(|e| {
+                error!("❌ [v2.sendMessage] Failed to fetch current epoch: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    let stored_confirmation_tag: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT confirmation_tag FROM conversations WHERE id = $1")
+            .bind(&convo_id)
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| {
+                error!(
+                    "❌ [v2.sendMessage] Failed to fetch confirmation_tag: {}",
+                    e
+                );
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    let reset_count: i32 = crypto_session.generation;
 
     // --- Validate confirmation tag (if client sent one) ---
     if let Some(ref client_tag) = input.confirmation_tag {
@@ -352,8 +403,8 @@ async fn handle_persistent(
     .bind(store_epoch)
     .bind(seq)
     .bind(&ciphertext_vec)
-    .bind(&now)
-    .bind(&expires_at)
+    .bind(now)
+    .bind(expires_at)
     .bind(&msg_id)
     .bind(padded_size as i64)
     .bind(received_bucket_ts)
@@ -425,8 +476,7 @@ async fn handle_persistent(
             created_at: crate::sqlx_jacquard::chrono_to_datetime(now),
             message_type: Some("app".into()),
             extra_data: Default::default(),
-        }
-        .into();
+        };
 
     let sse_event = StreamEvent::MessageEvent {
         cursor: cursor.clone(),

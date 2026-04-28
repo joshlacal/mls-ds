@@ -39,7 +39,7 @@ async fn test_conversation_crud() {
         .expect("Failed to create conversation");
 
     assert_eq!(convo.creator_did, "did:plc:creator123");
-    assert_eq!(convo.title, Some("Test Chat".to_string()));
+    assert_eq!(convo.name, Some("Test Chat".to_string()));
     assert_eq!(convo.current_epoch, 0);
 
     // Read
@@ -174,10 +174,10 @@ async fn test_message_operations() {
     let msg1 = create_message(
         &pool,
         &convo.id,
-        "did:plc:alice",
+        "msg-alice-1",
         vec![1, 2, 3, 4],
         0,
-        None,
+        4,
         None,
     )
     .await
@@ -185,17 +185,9 @@ async fn test_message_operations() {
 
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-    let msg2 = create_message(
-        &pool,
-        &convo.id,
-        "did:plc:bob",
-        vec![5, 6, 7, 8],
-        0,
-        None,
-        None,
-    )
-    .await
-    .expect("Failed to create message 2");
+    let msg2 = create_message(&pool, &convo.id, "msg-bob-1", vec![5, 6, 7, 8], 0, 4, None)
+        .await
+        .expect("Failed to create message 2");
 
     // Get message
     let fetched = get_message(&pool, &msg1.id)
@@ -204,34 +196,35 @@ async fn test_message_operations() {
         .expect("Message not found");
 
     assert_eq!(fetched.ciphertext, vec![1, 2, 3, 4]);
-    assert_eq!(fetched.sender_did, "did:plc:alice");
+    // sender_did is intentionally stored as NULL for privacy; clients
+    // derive sender identity from decrypted MLS content.
+    assert_eq!(fetched.sender_did, None);
 
-    // List messages
-    let messages = list_messages(&pool, &convo.id, 10, None)
+    // List messages (current API: ASC by epoch/seq)
+    let messages = list_messages(&pool, &convo.id, None, 10)
         .await
         .expect("Failed to list messages");
 
     assert_eq!(messages.len(), 2);
-    assert_eq!(messages[0].id, msg2.id); // Most recent first
+    assert_eq!(messages[0].id, msg1.id); // Oldest first under ASC ordering
 
     // List with pagination
-    let page1 = list_messages(&pool, &convo.id, 1, None)
+    let page1 = list_messages(&pool, &convo.id, None, 1)
         .await
         .expect("Failed to list messages");
 
     assert_eq!(page1.len(), 1);
-    assert_eq!(page1[0].id, msg2.id);
+    assert_eq!(page1[0].id, msg1.id);
 
-    let page2 = list_messages(&pool, &convo.id, 1, Some(msg2.created_at))
+    let page2 = list_messages(&pool, &convo.id, Some(msg2.created_at), 1)
         .await
         .expect("Failed to list messages");
 
     assert_eq!(page2.len(), 1);
     assert_eq!(page2[0].id, msg1.id);
 
-    // List since time
-    let since = msg1.created_at;
-    let recent = list_messages_since(&pool, &convo.id, since)
+    // List since seq (replaces removed list_messages_since which keyed on time)
+    let recent = list_messages_since_seq(&pool, &convo.id, msg1.seq, 10)
         .await
         .expect("Failed to list messages since");
 
@@ -380,7 +373,7 @@ async fn test_transaction_conversation_with_members() {
     .await
     .expect("Failed to create conversation with members");
 
-    assert_eq!(convo.title, Some("Team Chat".to_string()));
+    assert_eq!(convo.name, Some("Team Chat".to_string()));
 
     // Verify all members were added
     let members = list_members(&pool, &convo.id)
@@ -471,10 +464,10 @@ async fn test_concurrent_operations() {
             create_message(
                 &pool_clone,
                 &convo_id,
-                &format!("did:plc:user{}", i),
+                &format!("concurrent-msg-{}", i),
                 vec![i as u8],
                 0,
-                None,
+                1,
                 None,
             )
             .await

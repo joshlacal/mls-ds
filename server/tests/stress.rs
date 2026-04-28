@@ -2,6 +2,7 @@
 // Run manually with: cargo test --test stress -- --ignored
 
 use catbird_server::actors::{ActorRegistry, ConvoMessage, KeyPackageHashEntry};
+use catbird_server::realtime::SseState;
 use sqlx::PgPool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -98,7 +99,11 @@ async fn test_1000_conversations_concurrent() {
     println!("\n=== Stress Test: 1000 Conversations, 100 Messages Each ===\n");
 
     let pool = setup_test_db().await;
-    let registry = Arc::new(ActorRegistry::new(pool.clone()));
+    let registry = Arc::new(ActorRegistry::new(
+        pool.clone(),
+        Arc::new(SseState::new(1000)),
+        None,
+    ));
 
     let num_conversations = 1000;
     let messages_per_conversation = 100;
@@ -143,6 +148,10 @@ async fn test_1000_conversations_concurrent() {
                     .cast(ConvoMessage::SendMessage {
                         sender_did: "did:plc:stress-test".to_string(),
                         ciphertext: vec![msg_idx as u8; 100], // 100 byte messages
+                        msg_id: format!("stress-msg-{}-{}", convo_id, msg_idx),
+                        epoch: 0,
+                        padded_size: 100,
+                        idempotency_key: None,
                         reply: tx,
                     })
                     .expect("Failed to send message");
@@ -220,7 +229,11 @@ async fn test_sustained_load() {
     println!("\n=== Stress Test: Sustained Load (100 req/sec for 10 minutes) ===\n");
 
     let pool = setup_test_db().await;
-    let registry = Arc::new(ActorRegistry::new(pool.clone()));
+    let registry = Arc::new(ActorRegistry::new(
+        pool.clone(),
+        Arc::new(SseState::new(1000)),
+        None,
+    ));
 
     let target_rps = 100; // Requests per second
     let duration_seconds = 60 * 10; // 10 minutes
@@ -275,6 +288,10 @@ async fn test_sustained_load() {
         if let Err(_) = actor.cast(ConvoMessage::SendMessage {
             sender_did: "did:plc:sustained-test".to_string(),
             ciphertext: vec![0u8; 100],
+            msg_id: format!("sustained-msg-{}", total_messages),
+            epoch: 0,
+            padded_size: 100,
+            idempotency_key: None,
             reply: tx,
         }) {
             error_count += 1;
@@ -361,7 +378,11 @@ async fn test_actor_restart_under_load() {
     println!("\n=== Stress Test: Actor Restart Under Load ===\n");
 
     let pool = setup_test_db().await;
-    let registry = Arc::new(ActorRegistry::new(pool.clone()));
+    let registry = Arc::new(ActorRegistry::new(
+        pool.clone(),
+        Arc::new(SseState::new(1000)),
+        None,
+    ));
 
     let num_conversations = 100;
     let messages_per_convo = 50;
@@ -417,6 +438,10 @@ async fn test_actor_restart_under_load() {
                 if let Err(_) = actor.cast(ConvoMessage::SendMessage {
                     sender_did: "did:plc:restart-test".to_string(),
                     ciphertext: vec![msg_idx as u8; 50],
+                    msg_id: format!("restart-msg-{}-{}", convo_id, msg_idx),
+                    epoch: 0,
+                    padded_size: 50,
+                    idempotency_key: None,
                     reply: tx,
                 }) {
                     errors += 1;

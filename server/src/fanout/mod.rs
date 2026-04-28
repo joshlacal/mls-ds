@@ -52,15 +52,9 @@ impl MailboxFactory {
 }
 
 /// Configuration for mailbox backends
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct MailboxConfig {
     // Reserved for future use
-}
-
-impl Default for MailboxConfig {
-    fn default() -> Self {
-        Self {}
-    }
 }
 
 #[cfg(test)]

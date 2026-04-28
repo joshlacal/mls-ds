@@ -1,4 +1,3 @@
-use anyhow::Result;
 use sqlx::PgPool;
 use std::time::Duration;
 use tokio::time::interval;
