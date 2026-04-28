@@ -317,14 +317,12 @@ pub(crate) async fn request_crypto_session_reset_tx(
     // Phase 2.5 §7 R1 Mitigation #1: caller allowlist for NULL-binding
     // Requests. This is the FIRST check — even before idempotency
     // lookup — so a forbidden trigger never reaches the persistence
-    // layer.
+    // layer. The check returns a typed Err; we deliberately do NOT
+    // debug_assert! here because (a) the error path is itself the test
+    // surface, and (b) a panic would crash the actor and drop the
+    // reply oneshot channel, surfacing as RecvError to the caller
+    // instead of the typed rejection clients should observe.
     if expected_new_mls_group_id.is_none() && !trigger.permits_null_binding() {
-        debug_assert!(
-            trigger.permits_null_binding(),
-            "ResetTrigger::{trigger:?} attempted to emit a NULL-binding \
-             Request — only QuorumVote, SystemSweep, InlineCommit409, \
-             InlineGroupInfo404 are permitted. See Phase 2.5 §7 R1 #1."
-        );
         return Err(anyhow!(
             "Phase 2.5 R1 mitigation #1: trigger `{}` may not emit a \
              RequestCryptoSessionReset with expected_new_mls_group_id = None. \
