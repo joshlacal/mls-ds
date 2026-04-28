@@ -197,6 +197,21 @@ pub async fn handle(
     let welcome_bytes: Option<Vec<u8>> = input.welcome_message.as_ref().map(|b| b.to_vec());
 
     // ── UPDATE the conversation in place ─────────────────────────────────
+    //
+    // TODO(post-#12): funnel through `ConvoMessage::ActivateCryptoSession`
+    // once the elected-client flow is settled. Bootstrap is currently the
+    // activation companion to the legacy `do_reset_group` path
+    // (quorum/sweep): `do_reset_group` rotates `group_id` in place with
+    // `group_info=NULL`, and bootstrap completes the row by populating
+    // `group_info` and bumping `current_epoch` to 1. Routing this through
+    // ActivateCryptoSession requires unifying the epoch-after-activation
+    // semantic (chokepoint sets epoch=0 to represent "activated, no
+    // commits yet"; bootstrap sets epoch=1 because the bootstrap commit
+    // counts as the first epoch advance). That decision intersects with
+    // #12 (elected-client flow). Acceptance grep is already satisfied
+    // for this file because bootstrap doesn't write `group_id` directly
+    // (only the upstream `do_reset_group` did, and that's TODO'd
+    // separately on its own location).
     let now = Utc::now();
     let rows_affected = sqlx::query(
         "UPDATE conversations SET \
