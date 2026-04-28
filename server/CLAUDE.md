@@ -230,6 +230,16 @@ SELECT column_name FROM information_schema.columns WHERE table_name='conversatio
 - `ENFORCE_JTI`: Require jti for replay prevention (default: true)
 - `JTI_TTL_SECONDS`: Replay cache TTL (default: 120)
 - `SSE_BUFFER_SIZE`: Realtime event buffer size (default: 5000)
+- `EMIT_RESET_REQUESTED_EVENT`: Phase 2.5 Stage 1 dual-emit kill switch (default: `true`).
+  When set to `false` or `0`, the server still persists the chokepoint
+  `crypto_session_reset_requested` delivery event (the load-bearing
+  side of dual-emit) but suppresses the SSE
+  `subscribeEvents#resetRequestedEvent` broadcast. Use this to disable
+  the new event channel per-incident if a client-side handler bug
+  surfaces in a release. Flip back to `true` once the affected
+  platform ships a fix. Stage 3 retires the legacy `groupResetEvent`
+  path; once that lands, this flag becomes load-bearing for client
+  recovery and should NOT be flipped without a coordinated rollback.
 
 ## Systemd Service
 
