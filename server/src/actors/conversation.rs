@@ -2029,7 +2029,7 @@ async fn handle_notify_new_message(
     let message_view: StreamMessageView = crate::generated::blue_catbird::mlsChat::MessageView {
         id: msg_id.to_string().into(),
         convo_id: convo_id.to_string().into(),
-        ciphertext: bytes::Bytes::from(ciphertext.clone()),
+        ciphertext: bytes::Bytes::from(ciphertext.to_vec()),
         epoch,
         seq,
         created_at: crate::sqlx_jacquard::chrono_to_datetime(chrono::Utc::now()),
