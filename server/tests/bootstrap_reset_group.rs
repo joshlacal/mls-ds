@@ -244,10 +244,22 @@ async fn bootstrap_target_not_found_when_group_id_overwritten() {
 // above only verify the read-side discrimination).
 // ─────────────────────────────────────────────────────────────────────────────
 
+use catbird_server::actors::ActorRegistry;
 use catbird_server::auth::{AtProtoClaims, AuthUser};
 use catbird_server::generated::blue_catbird::mlsChat::bootstrap_reset_group::BootstrapResetGroup;
 use catbird_server::handlers::mls_chat::bootstrap_reset_group::handle as bootstrap_handle;
+use catbird_server::realtime::SseState;
 use catbird_server::sqlx_jacquard::string_to_did;
+use std::sync::Arc;
+
+/// Build a minimal ActorRegistry for tests that drive `handle()` directly.
+fn test_registry(pool: &PgPool) -> Arc<ActorRegistry> {
+    Arc::new(ActorRegistry::new(
+        pool.clone(),
+        Arc::new(SseState::new(1000)),
+        None,
+    ))
+}
 
 fn test_auth_user(did: &str) -> AuthUser {
     AuthUser {
@@ -283,7 +295,13 @@ async fn bootstrap_handle_updates_row_and_returns_view() {
         extra_data: Default::default(),
     };
 
-    let result = bootstrap_handle(pool.clone(), test_auth_user(ALICE), &input).await;
+    let result = bootstrap_handle(
+        pool.clone(),
+        test_registry(&pool),
+        test_auth_user(ALICE),
+        &input,
+    )
+    .await;
     assert!(
         result.is_ok(),
         "bootstrap_handle should succeed; err = {:?}",
@@ -353,7 +371,13 @@ async fn bootstrap_handle_with_welcome_inserts_per_recipient_envelopes() {
         extra_data: Default::default(),
     };
 
-    let result = bootstrap_handle(pool.clone(), test_auth_user(ALICE), &input).await;
+    let result = bootstrap_handle(
+        pool.clone(),
+        test_registry(&pool),
+        test_auth_user(ALICE),
+        &input,
+    )
+    .await;
     assert!(result.is_ok());
 
     let recipients: Vec<String> = sqlx::query_scalar(

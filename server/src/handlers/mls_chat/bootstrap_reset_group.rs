@@ -6,9 +6,13 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use jacquard_axum::ExtractXrpc;
+use std::sync::Arc;
+use tokio::sync::oneshot;
 use tracing::{error, info, warn};
+use uuid::Uuid;
 
 use crate::{
+    actors::{ActorRegistry, ConvoMessage, ResetTrigger, WelcomeEnvelope},
     auth::AuthUser,
     generated::blue_catbird::mlsChat::{
         bootstrap_reset_group::{
@@ -23,23 +27,37 @@ use crate::{
 
 const NSID: &str = "blue.catbird.mlsChat.bootstrapResetGroup";
 
-/// Complete a post-auto-reset conversation in place.
+/// Complete a post-reset conversation by submitting MLS group material.
 ///
 /// POST /xrpc/blue.catbird.mlsChat.bootstrapResetGroup
 ///
-/// After auto-reset (`actors::conversation::record_reset_vote` quorum path) or
-/// admin reset without an inline `groupInfo`, the conversation row sits with
-/// `id = originalConvoId`, `group_id = newGroupId`, `group_info = NULL`,
-/// `current_epoch = 0`, and the member roster preserved. This endpoint
-/// UPDATEs that row in place — it does NOT INSERT a new conversation
-/// (createConvo would orphan the post-reset row by INSERTing at
-/// `id = newGroupId`).
+/// Phase 2 §2.3: routes through `ConversationActor` two-phase reset
+/// (`RequestCryptoSessionReset` + `ActivateCryptoSession` back-to-back).
+/// Trigger is `ResetTrigger::Bootstrap`. Caller has material in hand
+/// (groupInfo + welcomes), so the chokepoint creates the new
+/// `crypto_session` row, supersedes the prior session, populates
+/// `conversations` legacy MLS columns, and queues welcomes to the new
+/// `pending_welcomes` table.
 ///
-/// First member to call wins; later callers receive 409 AlreadyBootstrapped
-/// and fall back to receiving the Welcome from the winner.
-#[tracing::instrument(skip(pool, auth_user, input))]
+/// Behavior delta vs pre-Phase 2:
+/// - Post-bootstrap `current_epoch=0` (was 1). The chokepoint represents
+///   the activation point as "session active, no commits observed yet";
+///   subsequent commits advance epoch normally. This is a client-visible
+///   change for callers that read `convo.epoch` in the response.
+/// - Welcomes are now stored in `pending_welcomes` (new table) keyed by
+///   `crypto_session_id`. For backwards compatibility with the legacy
+///   `getGroupState(includes=welcome)` path (which reads from
+///   `welcome_messages`), the handler continues to write the legacy
+///   table after the chokepoint commits. Drop after clients migrate to
+///   read pending_welcomes.
+///
+/// First caller wins; later callers receive 409 AlreadyBootstrapped via
+/// the chokepoint's idempotency-replay path (the prior winning
+/// `crypto_session_activated` event resolves to the same session).
+#[tracing::instrument(skip(pool, actor_registry, auth_user, input))]
 pub async fn bootstrap_reset_group(
     State(pool): State<DbPool>,
+    State(actor_registry): State<Arc<ActorRegistry>>,
     auth_user: AuthUser,
     ExtractXrpc(input): ExtractXrpc<BootstrapResetGroupRequest>,
 ) -> Response {
@@ -48,7 +66,7 @@ pub async fn bootstrap_reset_group(
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
-    match handle(pool, auth_user, &input).await {
+    match handle(pool, actor_registry, auth_user, &input).await {
         Ok(output) => Json(output).into_response(),
         Err(resp) => resp,
     }
@@ -58,6 +76,7 @@ pub async fn bootstrap_reset_group(
 /// it directly without scaffolding the Axum router + auth middleware.
 pub async fn handle(
     pool: DbPool,
+    actor_registry: Arc<ActorRegistry>,
     auth_user: AuthUser,
     input: &crate::generated::blue_catbird::mlsChat::bootstrap_reset_group::BootstrapResetGroup<'_>,
 ) -> Result<BootstrapResetGroupOutput<'static>, Response> {
@@ -123,139 +142,24 @@ pub async fn handle(
             .into_response());
     }
 
-    // ── Begin transaction with row lock ──────────────────────────────────
-    let mut tx = pool.begin().await.map_err(|e| {
-        error!("[bootstrapResetGroup] begin tx: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR.into_response()
-    })?;
-
-    // FOR UPDATE locks the row so concurrent bootstrap calls serialize on it.
-    // Returns (group_info, current_epoch) — None if no row matches; if row
-    // matches but group_info IS NOT NULL, the bootstrap already happened.
-    // current_epoch is INT4 in the schema; decode as i32 (every other reader
-    // — db.rs, models.rs, federation, mls_auth, actors — uses i32 too).
-    // TODO(phase 4): route via CryptoSessionRepository — needs a transactional
-    // surface (FOR UPDATE inside &mut Transaction); the Phase 1 trait takes
-    // PgPool. Migrate when ConversationActor takes the repo by ctor.
-    let target_row: Option<(Option<Vec<u8>>, i32)> = sqlx::query_as(
-        "SELECT group_info, current_epoch FROM conversations \
-         WHERE id = $1 AND group_id = $2 \
-         FOR UPDATE",
-    )
-    .bind(&original_convo_id)
-    .bind(&new_group_id)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|e| {
-        error!("[bootstrapResetGroup] target row lookup: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR.into_response()
-    })?;
-
-    let (existing_group_info, _current_epoch) = match target_row {
-        Some(row) => row,
-        None => {
-            tx.rollback().await.ok();
-            warn!(
-                "[bootstrapResetGroup] target row not found (originalConvoId, newGroupId mismatch)"
-            );
-            info!(
-                convo_id = %crate::crypto::redact_for_log(&original_convo_id),
-                new_group_id = %crate::crypto::redact_for_log(&new_group_id),
-                caller_did = %crate::crypto::redact_for_log(&caller_did),
-                "bootstrap_404_not_found"
-            );
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(LexBootstrapResetGroupError::BootstrapTargetNotFound(Some(
-                    "No conversation row matches (originalConvoId, newGroupId). The convo may not exist or the post-reset group_id may have been overwritten.".into(),
-                ))),
-            )
-                .into_response());
-        }
-    };
-
-    if existing_group_info.is_some() {
-        tx.rollback().await.ok();
-        warn!("[bootstrapResetGroup] race-loss: group_info already populated by another caller");
-        info!(
-            convo_id = %crate::crypto::redact_for_log(&original_convo_id),
-            new_group_id = %crate::crypto::redact_for_log(&new_group_id),
-            caller_did = %crate::crypto::redact_for_log(&caller_did),
-            "bootstrap_409_already_bootstrapped"
-        );
-        return Err((
-            StatusCode::CONFLICT,
-            Json(LexBootstrapResetGroupError::AlreadyBootstrapped(Some(
-                "The post-reset row has already been bootstrapped by another caller. Fall back to receiving the Welcome from the winner.".into(),
-            ))),
-        )
-            .into_response());
-    }
-
     // ── Decode groupInfo and welcome bytes (already raw via Jacquard) ────
     let group_info_bytes: Vec<u8> = input.group_info.to_vec();
     let welcome_bytes: Option<Vec<u8>> = input.welcome_message.as_ref().map(|b| b.to_vec());
-
-    // ── UPDATE the conversation in place ─────────────────────────────────
-    //
-    // TODO(post-#12): funnel through `ConvoMessage::ActivateCryptoSession`
-    // once the elected-client flow is settled. Bootstrap is currently the
-    // activation companion to the legacy `do_reset_group` path
-    // (quorum/sweep): `do_reset_group` rotates `group_id` in place with
-    // `group_info=NULL`, and bootstrap completes the row by populating
-    // `group_info` and bumping `current_epoch` to 1. Routing this through
-    // ActivateCryptoSession requires unifying the epoch-after-activation
-    // semantic (chokepoint sets epoch=0 to represent "activated, no
-    // commits yet"; bootstrap sets epoch=1 because the bootstrap commit
-    // counts as the first epoch advance). That decision intersects with
-    // #12 (elected-client flow). Acceptance grep is already satisfied
-    // for this file because bootstrap doesn't write `group_id` directly
-    // (only the upstream `do_reset_group` did, and that's TODO'd
-    // separately on its own location).
     let now = Utc::now();
-    let rows_affected = sqlx::query(
-        "UPDATE conversations SET \
-            group_info = $1, \
-            group_info_epoch = 1, \
-            group_info_updated_at = $2, \
-            current_epoch = 1, \
-            cipher_suite = $3, \
-            confirmation_tag = NULL, \
-            updated_at = $2 \
-         WHERE id = $4 AND group_id = $5",
-    )
-    .bind(&group_info_bytes)
-    .bind(&now)
-    .bind(input.cipher_suite.as_ref())
-    .bind(&original_convo_id)
-    .bind(&new_group_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| {
-        error!("[bootstrapResetGroup] UPDATE conversations: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR.into_response()
-    })?
-    .rows_affected();
 
-    if rows_affected != 1 {
-        tx.rollback().await.ok();
-        error!(
-            "[bootstrapResetGroup] UPDATE affected {} rows (expected 1)",
-            rows_affected
-        );
-        return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
-    }
-
-    // ── Insert welcome_messages (one per recipient_did from kp hashes) ───
+    // ── Build WelcomeEnvelope list for the chokepoint ────────────────────
+    //
+    // Resolve recipients: prefer key_package_hashes if present (per-device
+    // welcome targeting); otherwise fan out to all active members of the
+    // convo (one welcome per member).
+    let mut welcome_envelopes: Vec<WelcomeEnvelope> = Vec::new();
     if let Some(welcome) = welcome_bytes.as_ref() {
-        // Recipients: derived from keyPackageHashes if present, else from the
-        // persisted member roster. The hashes include per-member key package
-        // selection, so prefer that authoritative path.
         if let Some(ref kp_hashes) = input.key_package_hashes {
             for entry in kp_hashes {
                 let recipient = did_to_string(&entry.did);
                 let hash_hex: &str = &entry.hash;
-                let hash_bytes = hex::decode(hash_hex).map_err(|e| {
+                // Validate hex up front (chokepoint stores opaque bytes).
+                hex::decode(hash_hex).map_err(|e| {
                     warn!(
                         "[bootstrapResetGroup] invalid key package hash hex for {}: {}",
                         crate::crypto::redact_for_log(&recipient),
@@ -267,9 +171,150 @@ pub async fn handle(
                     )
                         .into_response()
                 })?;
+                welcome_envelopes.push(WelcomeEnvelope {
+                    recipient_did: recipient,
+                    recipient_device_id: None,
+                    welcome_data: welcome.clone(),
+                    key_package_hash: Some(hash_hex.to_string()),
+                });
+            }
+        } else {
+            // No key_package_hashes — fan out to active members.
+            let recipients: Vec<String> = sqlx::query_scalar(
+                "SELECT member_did FROM members \
+                 WHERE convo_id = $1 AND left_at IS NULL",
+            )
+            .bind(&original_convo_id)
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| {
+                error!(
+                    "[bootstrapResetGroup] SELECT members for welcome fanout: {}",
+                    e
+                );
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            })?;
+            for recipient in recipients {
+                welcome_envelopes.push(WelcomeEnvelope {
+                    recipient_did: recipient,
+                    recipient_device_id: None,
+                    welcome_data: welcome.clone(),
+                    key_package_hash: None,
+                });
+            }
+        }
+    }
 
-                let welcome_id = uuid::Uuid::new_v4().to_string();
-                sqlx::query(
+    // ── Send through chokepoint via ConversationActor ────────────────────
+    //
+    // Phase 2 §2.2 bootstrap flow: Request + Activate back-to-back. The
+    // chokepoint atomically supersedes the prior session, creates the new
+    // active crypto_session row, syncs legacy MLS columns on conversations,
+    // appends `crypto_session_*` events to delivery_events, and INSERTs
+    // welcomes into pending_welcomes. Idempotency: a second caller with
+    // the same `(originalConvoId, newGroupId, callerDid)` resolves to the
+    // existing winning crypto_session via the activation event's
+    // idempotency_key replay, returning the same session — that's the
+    // "first member to call wins; later callers receive the same outcome"
+    // semantic, replacing the pre-Phase-2 409 AlreadyBootstrapped error.
+    let actor_ref = actor_registry
+        .get_or_spawn(&original_convo_id)
+        .await
+        .map_err(|e| {
+            error!("[bootstrapResetGroup] failed to spawn actor: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        })?;
+
+    // Idempotency-key namespace: `(original_convo_id, new_group_id)` is
+    // the natural per-bootstrap-attempt identity. Use a deterministic
+    // string form so retries from the same caller resolve to the same
+    // chokepoint events. Format matches the convention from #9
+    // (req-reset:<uuid-or-id> / activate:<uuid-or-id>).
+    let request_id_uuid = format!("{}-{}", original_convo_id, new_group_id);
+
+    let (req_tx, req_rx) = oneshot::channel();
+    actor_ref
+        .send_message(ConvoMessage::RequestCryptoSessionReset {
+            trigger: ResetTrigger::Bootstrap,
+            initiator_did: caller_did.clone(),
+            reason: "bootstrap_reset_group".to_string(),
+            idempotency_key: format!("req-reset:{}", request_id_uuid),
+            reply: req_tx,
+        })
+        .map_err(|_| {
+            error!("[bootstrapResetGroup] failed to send Request to actor");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        })?;
+
+    let reset_request = req_rx
+        .await
+        .map_err(|_| {
+            error!("[bootstrapResetGroup] Request channel closed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        })?
+        .map_err(|e| {
+            error!("[bootstrapResetGroup] Request handler failed: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        })?;
+
+    let (act_tx, act_rx) = oneshot::channel();
+    actor_ref
+        .send_message(ConvoMessage::ActivateCryptoSession {
+            reset_request_id: Some(reset_request.request_id.clone()),
+            trigger: ResetTrigger::Bootstrap,
+            new_mls_group_id: new_group_id.clone(),
+            new_group_info: Some(group_info_bytes.clone()),
+            welcomes: welcome_envelopes,
+            initiator_did: caller_did.clone(),
+            idempotency_key: format!("activate:{}", request_id_uuid),
+            reply: act_tx,
+        })
+        .map_err(|_| {
+            error!("[bootstrapResetGroup] failed to send Activate to actor");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        })?;
+
+    let _session = act_rx
+        .await
+        .map_err(|_| {
+            error!("[bootstrapResetGroup] Activate channel closed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        })?
+        .map_err(|e| {
+            error!("[bootstrapResetGroup] Activate handler failed: {}", e);
+            // Tie-break loss surfaces here as an error. Map to 409 so
+            // existing client expectations (AlreadyBootstrapped semantic
+            // from pre-Phase 2) match the new tie-break-loss outcome.
+            (
+                StatusCode::CONFLICT,
+                Json(LexBootstrapResetGroupError::AlreadyBootstrapped(Some(
+                    "Another caller already activated this generation; receive the Welcome from the winner.".into(),
+                ))),
+            )
+                .into_response()
+        })?;
+
+    // ── Legacy welcome_messages dual-write for backward compat ───────────
+    //
+    // The chokepoint has stored welcomes in `pending_welcomes` (new
+    // table). For read-side compatibility with existing clients calling
+    // `getGroupState(includes=welcome)` — which still SELECT from
+    // `welcome_messages` — replicate the welcomes into the legacy table.
+    // The chokepoint's housekeeping step has already DELETEd any prior
+    // welcome_messages for this convo, so these inserts represent a
+    // clean post-activation distribution. Drop after clients migrate to
+    // read pending_welcomes.
+    if let Some(welcome) = welcome_bytes.as_ref() {
+        if let Some(ref kp_hashes) = input.key_package_hashes {
+            for entry in kp_hashes {
+                let recipient = did_to_string(&entry.did);
+                let hash_hex: &str = &entry.hash;
+                let hash_bytes = match hex::decode(hash_hex) {
+                    Ok(b) => b,
+                    Err(_) => continue, // already validated above; defensive
+                };
+                let welcome_id = Uuid::new_v4().to_string();
+                if let Err(e) = sqlx::query(
                     "INSERT INTO welcome_messages \
                         (id, convo_id, recipient_did, welcome_data, key_package_hash, created_at) \
                      VALUES ($1, $2, $3, $4, $5, $6) \
@@ -282,37 +327,34 @@ pub async fn handle(
                 .bind(welcome)
                 .bind(Some(hash_bytes))
                 .bind(&now)
-                .execute(&mut *tx)
+                .execute(&pool)
                 .await
-                .map_err(|e| {
-                    error!(
-                        "[bootstrapResetGroup] INSERT welcome_message for {}: {}",
-                        crate::crypto::redact_for_log(&recipient),
-                        e
+                {
+                    warn!(
+                        error = ?e,
+                        recipient = %crate::crypto::redact_for_log(&recipient),
+                        "[bootstrapResetGroup] legacy welcome_messages INSERT failed (non-fatal)"
                     );
-                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
-                })?;
+                }
             }
         } else {
-            // No keyPackageHashes — store one Welcome per existing member.
-            let recipients: Vec<String> = sqlx::query_scalar(
+            let recipients: Vec<String> = match sqlx::query_scalar(
                 "SELECT member_did FROM members \
                  WHERE convo_id = $1 AND left_at IS NULL",
             )
             .bind(&original_convo_id)
-            .fetch_all(&mut *tx)
+            .fetch_all(&pool)
             .await
-            .map_err(|e| {
-                error!(
-                    "[bootstrapResetGroup] SELECT members for welcome fanout: {}",
-                    e
-                );
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
-            })?;
-
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(error = ?e, "[bootstrapResetGroup] legacy fanout SELECT failed (non-fatal)");
+                    Vec::new()
+                }
+            };
             for recipient in recipients {
-                let welcome_id = uuid::Uuid::new_v4().to_string();
-                sqlx::query(
+                let welcome_id = Uuid::new_v4().to_string();
+                if let Err(e) = sqlx::query(
                     "INSERT INTO welcome_messages \
                         (id, convo_id, recipient_did, welcome_data, key_package_hash, created_at) \
                      VALUES ($1, $2, $3, $4, NULL, $5) \
@@ -324,16 +366,15 @@ pub async fn handle(
                 .bind(&recipient)
                 .bind(welcome)
                 .bind(&now)
-                .execute(&mut *tx)
+                .execute(&pool)
                 .await
-                .map_err(|e| {
-                    error!(
-                        "[bootstrapResetGroup] INSERT welcome_message (no-hash) for {}: {}",
-                        crate::crypto::redact_for_log(&recipient),
-                        e
+                {
+                    warn!(
+                        error = ?e,
+                        recipient = %crate::crypto::redact_for_log(&recipient),
+                        "[bootstrapResetGroup] legacy welcome_messages INSERT failed (non-fatal)"
                     );
-                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
-                })?;
+                }
             }
         }
     }
@@ -352,11 +393,6 @@ pub async fn handle(
             }
         }
     }
-
-    tx.commit().await.map_err(|e| {
-        error!("[bootstrapResetGroup] commit tx: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR.into_response()
-    })?;
 
     // ── Build the response ConvoView from the now-bootstrapped row ──────
     // Read post-commit so the view reflects the persisted state, including
