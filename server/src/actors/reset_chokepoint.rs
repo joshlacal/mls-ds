@@ -143,8 +143,12 @@ async fn read_current_session_for_update(
 /// Look up an existing delivery_event by idempotency tuple. Used by both
 /// handler entry paths to short-circuit retries.
 ///
-/// Note: we key on (conversation_id, sender_did, idempotency_key) and use
-/// `IS NOT DISTINCT FROM` so NULL sender_device_id matches NULL.
+/// **UNIQUE-mirroring**: the chokepoint inserts events via [`insert_event`]
+/// which leaves `sender_device_id` NULL. The `delivery_events` UNIQUE
+/// constraint covers `(conversation_id, sender_did, sender_device_id,
+/// idempotency_key)`, so this filter must explicitly match NULL device_id
+/// — otherwise a row inserted by another path with the same idempotency
+/// key but a non-NULL device_id would false-positive here.
 async fn find_existing_event(
     tx: &mut Transaction<'_, Postgres>,
     conversation_id: &str,
@@ -156,6 +160,7 @@ async fn find_existing_event(
         "SELECT id, payload_json, crypto_session_id FROM delivery_events \
          WHERE conversation_id = $1 \
            AND sender_did IS NOT DISTINCT FROM $2 \
+           AND sender_device_id IS NULL \
            AND idempotency_key = $3 \
            AND event_type = $4",
     )
@@ -172,11 +177,17 @@ async fn find_existing_event(
 
 /// Allocate the next per-conversation `seq` under a transaction-scoped
 /// advisory lock so concurrent appends to the same conversation cannot race.
+///
+/// Lock-key derivation: `hashtextextended(conversation_id, 0)` returns a
+/// signed 64-bit hash, used directly with the single-arg
+/// `pg_advisory_xact_lock(int8)`. The earlier 32-bit `hashtext()` form
+/// raised collision risk because the per-conversation key space was only
+/// ~4B; the 64-bit form has effectively no collision concern at our scale.
 async fn allocate_seq(
     tx: &mut Transaction<'_, Postgres>,
     conversation_id: &str,
 ) -> Result<i64> {
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(conversation_id)
         .execute(&mut **tx)
         .await

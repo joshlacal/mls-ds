@@ -109,9 +109,12 @@ impl DeliveryLogRepository for PostgresDeliveryLogRepository {
         // conversations remain fully parallel — and auto-releases on commit.
         let mut tx = self.pool.begin().await?;
 
-        // Per-conversation advisory lock. Hash to fit into bigint (advisory
-        // locks take an int8). hashtext() is stable across server restarts.
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+        // Per-conversation advisory lock. `hashtextextended` returns a
+        // signed 64-bit hash that fits the single-arg int8 form of
+        // `pg_advisory_xact_lock`, giving the full bigint key space (the
+        // earlier 32-bit `hashtext` form had material collision risk
+        // across the conversation namespace).
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(&event.conversation_id)
             .execute(&mut *tx)
             .await?;

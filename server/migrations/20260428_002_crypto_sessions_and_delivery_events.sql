@@ -23,6 +23,17 @@
 -- handlers for no protocol benefit.
 
 -- =============================================================================
+-- Required extensions. The greenfield schema already loads these (idempotent
+-- on re-run), but we re-declare here so this migration is self-contained
+-- when applied on databases that don't carry the greenfield baseline (e.g.
+-- a partial test DB or one restored from a slimmer snapshot). The backfill
+-- below depends on uuid_generate_v5() from uuid-ossp.
+-- =============================================================================
+
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- =============================================================================
 -- crypto_sessions: one MLS group generation, server-side public metadata only.
 -- =============================================================================
 
