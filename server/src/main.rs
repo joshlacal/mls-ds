@@ -283,6 +283,16 @@ async fn main() -> anyhow::Result<()> {
     });
     tracing::info!("Delivery ACKs cleanup worker started");
 
+    // Phase 2.5 §7 R3 — backstop reminder worker for stuck reset_requested
+    // sessions. Re-broadcasts `crypto_session_reset_requested` at 1h/6h/24h
+    // when no client has activated; emits an admin-alert log on exhaustion.
+    let reset_reminder_pool = db_pool.clone();
+    let reset_reminder_sse = sse_state.clone();
+    tokio::spawn(async move {
+        jobs::run_reset_reminder_worker(reset_reminder_pool, reset_reminder_sse).await;
+    });
+    tracing::info!("Reset-reminder worker started (Phase 2.5 §7 R3)");
+
     // Spawn rate limiter cleanup worker (clean up stale buckets every 5 minutes)
     tokio::spawn(async move {
         let mut interval_timer = interval(Duration::from_secs(300)); // Every 5 minutes
