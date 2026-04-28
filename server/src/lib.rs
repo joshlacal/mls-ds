@@ -22,6 +22,7 @@ pub mod middleware;
 pub mod models;
 pub mod notifications;
 pub mod realtime;
+pub mod repositories;
 pub mod storage;
 pub mod util;
 
