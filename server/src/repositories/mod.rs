@@ -1,11 +1,10 @@
 //! Repository abstractions for the crypto-session architecture.
 //!
-//! Phase 1: trait + Postgres reads against legacy columns; writes return
-//! `RepositoryError::NotImplemented` until Phase 2 introduces the
-//! `crypto_sessions` and `delivery_events` tables.
-//!
-//! These traits exist so Phase 4 actor split can use fakes; Phase 1 does not
-//! plumb them into `ConversationActor`.
+//! Phase 2: traits backed by Postgres reads/writes against the new
+//! `crypto_sessions` and `delivery_events` tables. Reads on
+//! `CryptoSessionRepository` fall back to legacy `conversations` MLS
+//! columns during the compatibility window and emit a counter so the
+//! cleanup migration can be telemetry-gated.
 
 pub mod crypto_session;
 pub mod delivery_log;
@@ -16,10 +15,12 @@ pub use delivery_log::{DeliveryLogRepository, PostgresDeliveryLogRepository};
 
 use thiserror::Error;
 
-/// Repository-level errors. Phase 1 keeps these narrow; Phase 2 may extend.
+/// Repository-level errors.
 #[derive(Debug, Error)]
 pub enum RepositoryError {
-    #[error("not implemented until Phase 2 schema migration")]
+    /// Reserved for future operations not yet plumbed through. No Phase 2
+    /// path returns this; it is kept on the surface for forward compat.
+    #[error("not implemented")]
     NotImplemented,
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
