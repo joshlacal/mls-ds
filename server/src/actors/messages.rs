@@ -205,6 +205,15 @@ pub enum ConvoMessage {
     /// Idempotency: dedupes on `idempotency_key` against `delivery_events`.
     /// A duplicate retry returns the existing [`ResetRequest`] unchanged.
     ///
+    /// **Idempotency-key namespacing**: callers MUST use distinct keys for
+    /// request vs activate operations even from the same DID. The
+    /// underlying UNIQUE on `(conversation_id, sender_did, sender_device_id,
+    /// idempotency_key)` is shared across all event types, so reusing a
+    /// key across operations produces a constraint violation, not a clean
+    /// idempotency response. Recommended convention:
+    /// `"req-reset:<uuid>"` for this variant; `"activate:<uuid>"` for
+    /// [`Self::ActivateCryptoSession`].
+    ///
     /// # Fields
     ///
     /// - `trigger`: which subsystem initiated the request
@@ -231,7 +240,14 @@ pub enum ConvoMessage {
     /// stored as pending.
     ///
     /// Idempotency: dedupes on `idempotency_key` against `delivery_events`.
-    /// Duplicate retries return the same [`CryptoSession`].
+    /// Duplicate retries return the same [`CryptoSession`]. Tie-break losers
+    /// also persist their rejection event keyed on `idempotency_key`, so a
+    /// retry of a losing key resolves to the same `Lost` outcome (surfaced
+    /// to the caller as an error at the actor message boundary).
+    ///
+    /// **Idempotency-key namespacing**: callers MUST use distinct keys
+    /// across request vs activate operations from the same DID. See
+    /// [`Self::RequestCryptoSessionReset`] for the rationale.
     ///
     /// # Fields
     ///
