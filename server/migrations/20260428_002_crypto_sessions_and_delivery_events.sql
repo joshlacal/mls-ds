@@ -23,6 +23,17 @@
 -- handlers for no protocol benefit.
 
 -- =============================================================================
+-- Required extensions. The greenfield schema already loads these (idempotent
+-- on re-run), but we re-declare here so this migration is self-contained
+-- when applied on databases that don't carry the greenfield baseline (e.g.
+-- a partial test DB or one restored from a slimmer snapshot). The backfill
+-- below depends on uuid_generate_v5() from uuid-ossp.
+-- =============================================================================
+
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- =============================================================================
 -- crypto_sessions: one MLS group generation, server-side public metadata only.
 -- =============================================================================
 
@@ -100,14 +111,32 @@ CREATE TABLE IF NOT EXISTS delivery_events (
     received_via TEXT,
     federation_trace_id TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (conversation_id, seq),
-    UNIQUE (conversation_id, sender_did, sender_device_id, idempotency_key)
+    UNIQUE (conversation_id, seq)
 );
 
 CREATE INDEX IF NOT EXISTS idx_delivery_events_session
     ON delivery_events(crypto_session_id);
 CREATE INDEX IF NOT EXISTS idx_delivery_events_emitted
     ON delivery_events(created_at);
+
+-- Idempotency UNIQUE on (conversation_id, sender_did, sender_device_id,
+-- idempotency_key) needs NULL-equality semantics: under a plain UNIQUE
+-- constraint Postgres treats NULLs as distinct, so two rows with the
+-- same idempotency_key but NULL sender_did/sender_device_id (the chokepoint
+-- emit shape — see reset_chokepoint::insert_event) would NOT collide and
+-- the retry-dedup contract would silently break. Use a partial unique
+-- index over COALESCE-coerced columns instead, which gives NULL-aware
+-- equality. The WHERE filter only enforces idempotency when the caller
+-- actually supplies a key (idempotency_key IS NOT NULL); rows without
+-- one bypass the constraint, matching the "best-effort dedupe" intent.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_events_idempotency
+    ON delivery_events (
+        conversation_id,
+        COALESCE(sender_did, ''),
+        COALESCE(sender_device_id, ''),
+        idempotency_key
+    )
+    WHERE idempotency_key IS NOT NULL;
 
 COMMENT ON TABLE delivery_events IS
     'Phase 2: server source-of-truth append-only log. Per-conversation seq is monotonic and gap-free within a single conversation. Lifecycle via retention, not cascade.';
