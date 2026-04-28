@@ -6,11 +6,13 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tokio::sync::oneshot;
 use tracing::{error, info, warn};
+use uuid::Uuid;
 
 use crate::{
+    actors::{ActorRegistry, ConvoMessage, ResetTrigger, WelcomeEnvelope},
     auth::AuthUser,
-    realtime::{sse::StreamEvent, SseState},
     storage::DbPool,
 };
 
@@ -51,13 +53,27 @@ pub struct ResetGroupOutput {
 ///
 /// POST /xrpc/blue.catbird.mlsChat.resetGroup
 ///
-/// Only admins may reset a group. This increments `reset_count`, swaps the
-/// `group_id`, resets `current_epoch` to 0, and deletes welcome messages and
-/// pending device additions for the conversation.
-#[tracing::instrument(skip(pool, sse_state, auth_user, input))]
+/// Phase 2 §2.3: routes through `ConversationActor` two-phase reset rather
+/// than writing the conversations row directly. Admin call, so trigger is
+/// `ResetTrigger::Admin`.
+///
+/// Required path: caller MUST supply `groupInfo` inline. The legacy
+/// "two-step" flow (call resetGroup with no groupInfo, then call
+/// bootstrapResetGroup later) is deprecated as of Phase 2 — that flow
+/// pre-rotated `conversations.group_id` outside the chokepoint, which
+/// the new architecture forbids. Callers without inline material should
+/// instead invoke `bootstrapResetGroup` directly with material in hand
+/// (it now serves as the activation entry point).
+///
+/// Only admins may reset a group. Activation through the chokepoint
+/// increments `reset_count` (the new generation), rotates `group_id`,
+/// resets `current_epoch` to 0, supersedes the prior `crypto_session`,
+/// emits `crypto_session_reset_requested` + `crypto_session_activated`
+/// events, and stores any pending welcomes keyed to the new session.
+#[tracing::instrument(skip(pool, actor_registry, auth_user, input))]
 pub async fn reset_group(
     State(pool): State<DbPool>,
-    State(sse_state): State<Arc<SseState>>,
+    State(actor_registry): State<Arc<ActorRegistry>>,
     auth_user: AuthUser,
     Json(input): Json<ResetGroupRequest>,
 ) -> Result<Response, StatusCode> {
@@ -66,13 +82,13 @@ pub async fn reset_group(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    let caller_did = &auth_user.did;
-    let convo_id = &input.convo_id;
-    let new_group_id = &input.new_group_id;
+    let caller_did = auth_user.did.clone();
+    let convo_id = input.convo_id.clone();
+    let new_group_id = input.new_group_id.clone();
 
     info!(
-        convo = %crate::crypto::redact_for_log(convo_id),
-        caller = %crate::crypto::redact_for_log(caller_did),
+        convo = %crate::crypto::redact_for_log(&convo_id),
+        caller = %crate::crypto::redact_for_log(&caller_did),
         "[resetGroup] start"
     );
 
@@ -80,8 +96,8 @@ pub async fn reset_group(
     let is_admin: bool = sqlx::query_scalar(
         "SELECT COALESCE(is_admin, false) FROM members WHERE convo_id = $1 AND (user_did = $2 OR member_did = $2) AND left_at IS NULL LIMIT 1",
     )
-    .bind(convo_id)
-    .bind(caller_did)
+    .bind(&convo_id)
+    .bind(&caller_did)
     .fetch_optional(&pool)
     .await
     .map_err(|e| {
@@ -96,11 +112,9 @@ pub async fn reset_group(
     }
 
     // --- Validate newGroupId not already in use ---
-    // Return the owning convoId alongside the error so clients can distinguish
-    // "my own retry" from "genuinely conflicting group id".
     let conflicting_convo_id: Option<String> =
         sqlx::query_scalar("SELECT id FROM conversations WHERE group_id = $1 LIMIT 1")
-            .bind(new_group_id)
+            .bind(&new_group_id)
             .fetch_optional(&pool)
             .await
             .map_err(|e| {
@@ -122,136 +136,144 @@ pub async fn reset_group(
             .into_response());
     }
 
-    // --- Decode optional group_info ---
-    let group_info_bytes: Option<Vec<u8>> = if let Some(ref gi_b64) = input.group_info {
-        use base64::Engine;
-        Some(
+    // --- Decode inline group_info (REQUIRED post-Phase 2). ---
+    let group_info_bytes: Vec<u8> = match input.group_info.as_ref() {
+        Some(gi_b64) => {
+            use base64::Engine;
             base64::engine::general_purpose::STANDARD
                 .decode(gi_b64)
                 .map_err(|e| {
                     warn!("[resetGroup] invalid base64 groupInfo: {}", e);
                     StatusCode::BAD_REQUEST
-                })?,
-        )
-    } else {
-        None
-    };
-
-    // --- Begin transaction ---
-    let mut tx = pool.begin().await.map_err(|e| {
-        error!("[resetGroup] begin tx: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    // Update conversation
-    // When clearCircuitBreaker is true: reset_count = 0, auto_reset_disabled_at = NULL
-    // Otherwise: increment reset_count normally
-    let reset_count: Option<i32> = sqlx::query_scalar(
-        r#"UPDATE conversations SET
-            group_id = $1, current_epoch = 0,
-            group_info = $2, group_info_epoch = CASE WHEN $2 IS NOT NULL THEN 0 ELSE NULL END,
-            group_info_updated_at = CASE WHEN $2 IS NOT NULL THEN NOW() ELSE NULL END,
-            confirmation_tag = NULL, cipher_suite = $3,
-            reset_count = CASE WHEN $6 THEN 0 ELSE reset_count + 1 END,
-            auto_reset_disabled_at = CASE WHEN $6 THEN NULL ELSE auto_reset_disabled_at END,
-            last_reset_at = NOW(), last_reset_by = $4,
-            updated_at = NOW()
-        WHERE id = $5
-        RETURNING reset_count"#,
-    )
-    .bind(new_group_id)
-    .bind(&group_info_bytes)
-    .bind(&input.cipher_suite)
-    .bind(caller_did)
-    .bind(convo_id)
-    .bind(input.clear_circuit_breaker)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|e| {
-        error!("[resetGroup] update conversations: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    let reset_count = match reset_count {
-        Some(rc) => rc,
+                })?
+        }
         None => {
-            tx.rollback().await.ok();
             warn!(
-                "[resetGroup] conversation not found: {}",
-                crate::crypto::redact_for_log(convo_id)
+                "[resetGroup] missing inline groupInfo — legacy two-step reset flow is deprecated"
             );
-            return Err(StatusCode::NOT_FOUND);
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "MissingGroupInfo",
+                    "message": "resetGroup now requires inline groupInfo. Two-step reset is deprecated; either supply groupInfo here or call bootstrapResetGroup directly with material.",
+                })),
+            )
+                .into_response());
         }
     };
 
-    // Delete old welcome messages
-    sqlx::query("DELETE FROM welcome_messages WHERE convo_id = $1")
-        .bind(convo_id)
-        .execute(&mut *tx)
+    // --- Optional clear-circuit-breaker side-effect ---
+    //
+    // Pre-Phase 2 the same UPDATE that rotated group_id also flipped
+    // auto_reset_disabled_at to NULL when this flag was set. The new
+    // chokepoint doesn't know about the breaker (app-layer concern), so
+    // we issue a separate UPDATE before invoking the chokepoint. Best-
+    // effort: if this fails we still proceed with the reset.
+    if input.clear_circuit_breaker {
+        if let Err(e) = sqlx::query(
+            "UPDATE conversations SET \
+                auto_reset_disabled_at = NULL, \
+                updated_at = NOW() \
+             WHERE id = $1",
+        )
+        .bind(&convo_id)
+        .execute(&pool)
         .await
-        .map_err(|e| {
-            error!("[resetGroup] delete welcome_messages: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        {
+            warn!(
+                error = ?e,
+                "[resetGroup] failed to clear circuit breaker (non-fatal)"
+            );
+        } else {
+            info!(
+                convo = %crate::crypto::redact_for_log(&convo_id),
+                "[resetGroup] circuit breaker cleared"
+            );
+        }
+    }
 
-    // Delete pending device additions
-    sqlx::query("DELETE FROM pending_device_additions WHERE convo_id = $1")
-        .bind(convo_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| {
-            error!("[resetGroup] delete pending_device_additions: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    // Commit transaction
-    tx.commit().await.map_err(|e| {
-        error!("[resetGroup] commit tx: {}", e);
+    // --- Get or spawn the conversation actor ---
+    let actor_ref = actor_registry.get_or_spawn(&convo_id).await.map_err(|e| {
+        error!("[resetGroup] failed to spawn actor: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    if input.clear_circuit_breaker {
-        info!(
-            convo = %crate::crypto::redact_for_log(convo_id),
-            "[resetGroup] circuit breaker cleared, reset_count zeroed"
-        );
-    }
+    // --- Phase 2 §2.2 admin direct flow: Request + Activate back-to-back.
+    //     Idempotency keys are namespaced per the contract documented in
+    //     ConvoMessage::RequestCryptoSessionReset (req-reset / activate). ---
+    let request_id_uuid = Uuid::new_v4().to_string();
+
+    let (req_tx, req_rx) = oneshot::channel();
+    actor_ref
+        .send_message(ConvoMessage::RequestCryptoSessionReset {
+            trigger: ResetTrigger::Admin,
+            initiator_did: caller_did.clone(),
+            reason: input
+                .reason
+                .clone()
+                .unwrap_or_else(|| "admin_reset".to_string()),
+            idempotency_key: format!("req-reset:{}", request_id_uuid),
+            reply: req_tx,
+        })
+        .map_err(|_| {
+            error!("[resetGroup] failed to send Request to actor");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let reset_request = req_rx
+        .await
+        .map_err(|_| {
+            error!("[resetGroup] Request channel closed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .map_err(|e| {
+            error!("[resetGroup] Request handler failed: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let (act_tx, act_rx) = oneshot::channel();
+    actor_ref
+        .send_message(ConvoMessage::ActivateCryptoSession {
+            reset_request_id: Some(reset_request.request_id.clone()),
+            trigger: ResetTrigger::Admin,
+            new_mls_group_id: new_group_id.clone(),
+            new_group_info: Some(group_info_bytes),
+            // Admin reset doesn't carry pending welcomes inline — the admin
+            // is rotating the group_id, not adding members in the same call.
+            welcomes: Vec::<WelcomeEnvelope>::new(),
+            initiator_did: caller_did.clone(),
+            idempotency_key: format!("activate:{}", request_id_uuid),
+            reply: act_tx,
+        })
+        .map_err(|_| {
+            error!("[resetGroup] failed to send Activate to actor");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let session = act_rx
+        .await
+        .map_err(|_| {
+            error!("[resetGroup] Activate channel closed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .map_err(|e| {
+            error!("[resetGroup] Activate handler failed: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     info!(
-        convo = %crate::crypto::redact_for_log(convo_id),
-        new_group_id = %crate::crypto::redact_for_log(new_group_id),
-        reset_count = reset_count,
+        convo = %crate::crypto::redact_for_log(&convo_id),
+        new_group_id = %crate::crypto::redact_for_log(&new_group_id),
+        new_session_id = %session.id,
+        reset_generation = session.generation,
         "[resetGroup] complete"
     );
 
-    // --- Emit SSE GroupResetEvent ---
-    let cursor = sse_state.cursor_gen.next(convo_id, "groupResetEvent").await;
-
-    let event = StreamEvent::GroupResetEvent {
-        cursor: cursor.clone(),
-        convo_id: convo_id.clone(),
-        new_group_id: new_group_id.clone(),
-        reset_generation: reset_count,
-        reset_by: caller_did.clone(),
-        cipher_suite: input.cipher_suite.clone(),
-        reason: input.reason.clone(),
-    };
-
-    // Store event for cursor-based replay
-    if let Err(e) = crate::db::store_event(&pool, convo_id, &event).await {
-        error!("[resetGroup] store event: {:?}", e);
-    }
-
-    if let Err(e) = sse_state.emit(convo_id, event).await {
-        error!("[resetGroup] SSE emit: {}", e);
-    }
-
-    // --- Return response ---
     Ok(Json(ResetGroupOutput {
         success: true,
-        new_group_id: new_group_id.clone(),
-        reset_generation: reset_count,
-        new_epoch: 0,
+        new_group_id,
+        reset_generation: session.generation,
+        new_epoch: session.last_observed_epoch as i64,
     })
     .into_response())
 }

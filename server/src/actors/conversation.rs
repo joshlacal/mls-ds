@@ -1842,6 +1842,21 @@ impl ConversationActorState {
         Ok(outcome.session)
     }
 
+    // TODO(post-#12): funnel through RequestCryptoSessionReset once the
+    // elected-client flow ships. This legacy path stays wired to its
+    // existing callers (handle_record_reset_vote quorum, handle_trigger_
+    // system_reset sweep) until #12 lands a way for clients to respond
+    // to a request-only reset. Funneling earlier would either (a) break
+    // the API shape of report_recovery_failure (new_group_id: None)
+    // or (b) leave indirect-trigger conversations unable to rotate
+    // their group_id server-side, since neither path has client
+    // material at trigger time. Direct/admin/bootstrap flows funnel
+    // through ActivateCryptoSession in `reset_chokepoint.rs` already.
+    //
+    // This is also the only legacy site still clearing `unread_counts`
+    // on reset (line 1933 below). The new chokepoint preserves them
+    // per plan §2.2 step 10. Behavior converges when this method is
+    // retired.
     async fn do_reset_group(
         &mut self,
         last_reset_by: &str,
