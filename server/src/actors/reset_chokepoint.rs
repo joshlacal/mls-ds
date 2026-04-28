@@ -308,6 +308,107 @@ async fn insert_event(
     Ok(id)
 }
 
+/// Phase 3 — write durable outbox rows for fanout in the SAME tx as the
+/// originating `delivery_events` INSERT.
+///
+/// One `notification_outbox` row is inserted per active member (the
+/// in-memory `side_effect_tx` channel was lost on SIGKILL between
+/// commit and broadcast; durable rows survive). One `federation_outbox`
+/// row is inserted per distinct peer service DID (members.ds_did) for
+/// federated conversations; non-federated conversations produce zero.
+///
+/// Returns `(notification_count, federation_count)` for logging.
+///
+/// `event_payload_json` is the JSON serialized representation of the
+/// event payload — embedded in `notification_outbox.payload` so the
+/// worker can replay without a delivery_events join. Federation rows
+/// store the same payload by default.
+async fn enqueue_outbox_for_event(
+    tx: &mut Transaction<'_, Postgres>,
+    conversation_id: &str,
+    delivery_event_id: &str,
+    event_payload_json: &serde_json::Value,
+) -> Result<(usize, usize)> {
+    // 1. Look up active members. Same query shape as the chokepoint's
+    //    `allowed_responders` snapshot, but we keep both `member_did`
+    //    (per-device) for SSE/push targeting AND `ds_did` (federation
+    //    routing peer; NULL for local).
+    //
+    // member_did is the SSE subscription key (per-device). ds_did is
+    // the federation peer DID; NULL means the recipient lives on this
+    // local DS (no federation row needed).
+    let members: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT member_did, COALESCE(user_did, member_did) AS user_or_member_did, ds_did \
+         FROM members \
+         WHERE convo_id = $1 AND left_at IS NULL",
+    )
+    .bind(conversation_id)
+    .fetch_all(&mut **tx)
+    .await
+    .context("snapshot active members for outbox enqueue")?;
+
+    // Serialize once; the JSON column accepts a binary blob via BYTEA.
+    let payload_bytes =
+        serde_json::to_vec(event_payload_json).context("serialize event payload for outbox")?;
+
+    // 2. Notification rows — one per active member device. `kind='sse'`
+    //    is the only currently-wired channel (push/websocket are
+    //    follow-ups).
+    if !members.is_empty() {
+        let mut qb = sqlx::QueryBuilder::<Postgres>::new(
+            "INSERT INTO notification_outbox (\
+                id, conversation_id, delivery_event_id, recipient_did, \
+                recipient_device_id, kind, payload, status \
+             ) ",
+        );
+        qb.push_values(members.iter(), |mut b, (member_did, _user_did, _ds_did)| {
+            b.push_bind(Uuid::new_v4().to_string())
+                .push_bind(conversation_id)
+                .push_bind(delivery_event_id)
+                .push_bind(member_did)
+                .push_bind(Option::<String>::None)
+                .push_bind("sse")
+                .push_bind(&payload_bytes)
+                .push_bind("pending");
+        });
+        qb.build()
+            .execute(&mut **tx)
+            .await
+            .context("bulk INSERT notification_outbox")?;
+    }
+
+    // 3. Federation rows — one per DISTINCT non-local peer DS DID. A
+    //    non-federated conversation has all members with
+    //    `ds_did IS NULL`; in that case we insert zero rows.
+    let federation_targets: std::collections::BTreeSet<String> = members
+        .iter()
+        .filter_map(|(_member_did, _user_did, ds_did)| ds_did.clone())
+        .collect();
+
+    if !federation_targets.is_empty() {
+        let mut qb = sqlx::QueryBuilder::<Postgres>::new(
+            "INSERT INTO federation_outbox (\
+                id, conversation_id, delivery_event_id, target_service_did, \
+                payload, status \
+             ) ",
+        );
+        qb.push_values(federation_targets.iter(), |mut b, target_did| {
+            b.push_bind(Uuid::new_v4().to_string())
+                .push_bind(conversation_id)
+                .push_bind(delivery_event_id)
+                .push_bind(target_did)
+                .push_bind(&payload_bytes)
+                .push_bind("pending");
+        });
+        qb.build()
+            .execute(&mut **tx)
+            .await
+            .context("bulk INSERT federation_outbox")?;
+    }
+
+    Ok((members.len(), federation_targets.len()))
+}
+
 /// Phase 2 §2.2 — handle `RequestCryptoSessionReset` inside an open tx.
 ///
 /// Idempotent on `idempotency_key`. Steps:
@@ -576,9 +677,25 @@ pub(crate) async fn request_crypto_session_reset_tx(
         Some(initiator_did),
         Some(&current.mls_group_id),
         Some(idempotency_key),
-        payload,
+        payload.clone(),
     )
     .await?;
+
+    // Phase 3 — durable outbox enqueue. Same Postgres tx as the
+    // delivery_event INSERT above; rolled back as a unit if the outer tx
+    // aborts. Workers drain these on the next tick (or after restart if
+    // the server is SIGKILLed before the per-convo SSE broadcast fires).
+    let (n_count, f_count) =
+        enqueue_outbox_for_event(tx, conversation_id, &request_event_id, &payload)
+            .await
+            .context("enqueue outbox rows for crypto_session_reset_requested")?;
+    tracing::debug!(
+        conversation_id,
+        event_id = %request_event_id,
+        notification_rows = n_count,
+        federation_rows = f_count,
+        "outbox: enqueued for crypto_session_reset_requested"
+    );
 
     Ok(ResetRequestOutcome {
         request: ResetRequest {
@@ -1051,7 +1168,7 @@ pub(crate) async fn activate_crypto_session_tx(
         "new_generation": next_generation,
     });
     let supersede_seq = allocate_seq(tx, conversation_id).await?;
-    insert_event(
+    let supersede_event_id = insert_event(
         tx,
         conversation_id,
         supersede_seq,
@@ -1060,7 +1177,7 @@ pub(crate) async fn activate_crypto_session_tx(
         Some(initiator_did),
         Some(&prior.mls_group_id),
         None,
-        supersede_payload,
+        supersede_payload.clone(),
     )
     .await?;
 
@@ -1081,9 +1198,31 @@ pub(crate) async fn activate_crypto_session_tx(
         Some(initiator_did),
         Some(new_mls_group_id),
         Some(idempotency_key),
-        activated_payload,
+        activated_payload.clone(),
     )
     .await?;
+
+    // Phase 3 — durable outbox enqueue for both the supersede AND
+    // activated events. Same Postgres tx as the delivery_event INSERTs
+    // above; rolled back as a unit if the outer tx aborts. Workers
+    // drain these on the next tick (or after restart if the server is
+    // SIGKILLed before the per-convo SSE broadcast fires).
+    let (n_super, f_super) =
+        enqueue_outbox_for_event(tx, conversation_id, &supersede_event_id, &supersede_payload)
+            .await
+            .context("enqueue outbox rows for crypto_session_superseded")?;
+    let (n_act, f_act) =
+        enqueue_outbox_for_event(tx, conversation_id, &activated_event_id, &activated_payload)
+            .await
+            .context("enqueue outbox rows for crypto_session_activated")?;
+    tracing::debug!(
+        conversation_id,
+        supersede_event_id = %supersede_event_id,
+        activated_event_id = %activated_event_id,
+        notification_rows = n_super + n_act,
+        federation_rows = f_super + f_act,
+        "outbox: enqueued for crypto_session_superseded + crypto_session_activated"
+    );
 
     // 7. INSERT pending_welcomes for the WINNING candidate. Map
     //    WelcomeEnvelope.recipient_did -> DB column target_did.

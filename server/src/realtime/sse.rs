@@ -656,6 +656,24 @@ impl SseState {
     /// No DB write is performed — use this for ephemeral or non-persisted
     /// events (typing, info, etc.) or when `store_event` has already been
     /// handled elsewhere.
+    ///
+    /// # Phase 3 — durable outbox interaction
+    ///
+    /// This is the **best-effort, low-latency** broadcast path. For
+    /// events that originated from the chokepoint
+    /// (`reset_chokepoint::{request_crypto_session_reset_tx,
+    /// activate_crypto_session_tx}`), the chokepoint additionally writes
+    /// a `notification_outbox` row in the same Postgres tx as the
+    /// `delivery_events` insert. The outbox is the **durable** shadow:
+    /// connected subscribers receive the broadcast immediately via this
+    /// in-memory path; reconnecting subscribers backfill from
+    /// `event_stream` via cursor; if the server SIGKILLs between commit
+    /// and broadcast, the outbox worker drains the row on restart.
+    ///
+    /// Both paths are intentionally redundant — see
+    /// `workers/notification_outbox.rs` for the dispatch contract
+    /// (`kind='sse'` is a no-op-on-success because the connected
+    /// subscriber path already served the intent).
     pub fn enqueue(&self, convo_id: &str, event: StreamEvent) {
         self.enqueue_job(convo_id, EmitJob { event, store: None });
     }
