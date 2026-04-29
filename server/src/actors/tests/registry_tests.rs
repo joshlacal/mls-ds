@@ -65,8 +65,8 @@ mod registry_tests {
         let now = chrono::Utc::now();
 
         sqlx::query(
-            "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at)
-             VALUES ($1, $2, 0, $3, $3)
+            "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at, group_id)
+             VALUES ($1, $2, 0, $3, $3, $1)
              ON CONFLICT (id) DO NOTHING",
         )
         .bind(convo_id)

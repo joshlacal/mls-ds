@@ -22,6 +22,8 @@ use crate::models::CryptoSession;
 /// # Examples
 ///
 /// ```no_run
+/// use catbird_server::actors::ConvoMessage;
+/// use ractor::ActorRef;
 /// use tokio::sync::oneshot;
 ///
 /// # async fn example(actor_ref: &ActorRef<ConvoMessage>) -> anyhow::Result<()> {

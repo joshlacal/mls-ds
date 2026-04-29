@@ -121,6 +121,13 @@ mod tests {
     struct TestOptionalStruct {
         #[serde(with = "crate::atproto_bytes::option")]
         #[serde(skip_serializing_if = "Option::is_none")]
+        // The `option` module's deserializer is invoked when the field is
+        // present (including null); for a fully-missing field, serde looks
+        // for `Default`. Without `#[serde(default)]` the test for
+        // missing-field handling failed with `missing field "data"`. Adding
+        // `default` matches the behavior the test expects and aligns with
+        // the production lexicons that emit `data` only when populated.
+        #[serde(default)]
         data: Option<Vec<u8>>,
     }
 

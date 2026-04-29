@@ -8,6 +8,8 @@
 /// # Examples
 ///
 /// ```
+/// use catbird_server::device_utils::parse_device_did;
+///
 /// let (user, device) = parse_device_did("did:plc:josh#abc-123").unwrap();
 /// assert_eq!(user, "did:plc:josh");
 /// assert_eq!(device, "abc-123");
@@ -37,6 +39,8 @@ pub fn parse_device_did(device_did: &str) -> Result<(String, String), String> {
 /// # Examples
 ///
 /// ```
+/// use catbird_server::device_utils::construct_device_did;
+///
 /// let mls_did = construct_device_did("did:plc:josh", "abc-123");
 /// assert_eq!(mls_did, "did:plc:josh#abc-123");
 /// ```

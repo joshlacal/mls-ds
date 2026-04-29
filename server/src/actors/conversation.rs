@@ -85,6 +85,7 @@ fn emit_reset_requested_event() -> bool {
 /// # Examples
 ///
 /// ```no_run
+/// use catbird_server::actors::{ActorRegistry, ConvoMessage};
 /// use tokio::sync::oneshot;
 ///
 /// # async fn example(registry: &ActorRegistry) -> anyhow::Result<()> {
