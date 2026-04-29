@@ -643,7 +643,10 @@ mod self_heal_db_tests {
         .await
         .expect("fetch post-self-heal row");
         let (post_id, post_gen, post_mls_group_id, post_group_info, post_state) = row;
-        assert_eq!(post_id, orphan_id, "id MUST be preserved (same row UPDATEd)");
+        assert_eq!(
+            post_id, orphan_id,
+            "id MUST be preserved (same row UPDATEd)"
+        );
         assert_eq!(post_gen, 25, "generation MUST be preserved");
         assert_eq!(
             post_mls_group_id, new_mls_group_id,
@@ -751,13 +754,12 @@ mod self_heal_db_tests {
 
         // The orphan row's group_info must NOT have been clobbered by
         // the loser path.
-        let final_group_info: Option<Vec<u8>> = sqlx::query_scalar(
-            "SELECT group_info FROM crypto_sessions WHERE id = $1",
-        )
-        .bind(&orphan_id)
-        .fetch_one(&pool)
-        .await
-        .expect("re-read group_info");
+        let final_group_info: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT group_info FROM crypto_sessions WHERE id = $1")
+                .bind(&orphan_id)
+                .fetch_one(&pool)
+                .await
+                .expect("re-read group_info");
         assert_eq!(
             final_group_info.expect("still populated"),
             new_group_info,
@@ -920,8 +922,7 @@ mod self_heal_db_tests {
         assert_eq!(pw_rows.len(), 1, "exactly one Welcome must survive");
         assert_eq!(pw_rows[0].0, "did:plc:alice");
         assert_eq!(
-            pw_rows[0].1,
-            b"recipient-fresh-welcome",
+            pw_rows[0].1, b"recipient-fresh-welcome",
             "stale admin Welcome bytes MUST be replaced by the recipient's fresh Welcome"
         );
 
