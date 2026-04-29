@@ -181,6 +181,12 @@ struct EnqueueOutboxOutcome {
 /// in-memory broadcast; reconnecting subscribers backfill the same row
 /// from `event_stream` keyed by cursor. `None` on idempotent-replay or
 /// `(Some, None)` short-circuit paths where no new event is emitted.
+// `request_event_id` and `sse_cursor` are retained for the `Debug` derive
+// (they show up in tracing spans + audit logs) but are not currently consumed
+// by any caller. TODO(phase-2.5-cleanup-reset-outcome): consume in the
+// follow-up SSE replay-dedupe refactor or drop in favor of a struct-less
+// emit path.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct ResetRequestOutcome {
     /// Caller-facing reset request descriptor.
@@ -223,6 +229,10 @@ pub(crate) struct ResetRequestOutcome {
 /// broadcast row matches the persisted backfill row exactly. `None`
 /// for the `CachedReplay` path where no new event_stream row was
 /// written.
+// `cipher_suite` and `sse_cursor` are retained for the `Debug` derive
+// (audit logs) but not directly consumed. TODO(phase-2.5-cleanup-reset-outcome):
+// consume or drop alongside `ResetRequestOutcome`.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct ActivationOutcome {
     pub session: CryptoSession,

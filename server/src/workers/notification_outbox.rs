@@ -55,6 +55,11 @@ use super::{mark_done, record_failure, try_reclaim, CLAIM_BATCH_SIZE, POLL_INTER
 
 const TABLE_NAME: &str = "notification_outbox";
 
+// `recipient_device_id` is hydrated from FromRow + surfaces in `Debug`
+// (audit logs) but isn't consumed yet — the dispatch path is per-DID. TODO
+// (phase-3-federation-wire): wire device-targeted dispatch and drop the
+// allow.
+#[allow(dead_code)]
 #[derive(Debug, Clone, FromRow)]
 struct NotificationOutboxRow {
     id: String,

@@ -98,18 +98,18 @@ pub async fn run_reset_reminder_worker(pool: PgPool, sse_state: Arc<SseState>) {
 ///      in `reset_requested` (sessions that activated have left this
 ///      state and the row is now stale).
 ///   3. **Per row**:
-///        a. Look up the original `crypto_session_reset_requested` event
-///           payload.
-///        b. INSERT a fresh `crypto_session_reset_requested`
-///           delivery_event with `idempotency_key = reset-reminder:{cs}:{n}`
-///           and the SAME `payload_json` so re-broadcast clients see an
-///           identical Request shape.
-///        c. Persist + broadcast `StreamEvent::ResetRequestedEvent`
-///           (gated by `EMIT_RESET_REQUESTED_EVENT`).
-///        d. UPDATE `reset_reminder_state`: bump `attempt_count`,
-///           advance `next_attempt_at`, set `last_attempt_at`. If the
-///           bumped count exceeds the bounded retry length, set
-///           `escalated_at` and log an admin-alert.
+///      a. Look up the original `crypto_session_reset_requested` event
+///      payload.
+///      b. INSERT a fresh `crypto_session_reset_requested`
+///      delivery_event with `idempotency_key = reset-reminder:{cs}:{n}`
+///      and the SAME `payload_json` so re-broadcast clients see an
+///      identical Request shape.
+///      c. Persist + broadcast `StreamEvent::ResetRequestedEvent`
+///      (gated by `EMIT_RESET_REQUESTED_EVENT`).
+///      d. UPDATE `reset_reminder_state`: bump `attempt_count`,
+///      advance `next_attempt_at`, set `last_attempt_at`. If the
+///      bumped count exceeds the bounded retry length, set
+///      `escalated_at` and log an admin-alert.
 pub async fn reminder_tick(pool: &PgPool, sse_state: &Arc<SseState>) -> anyhow::Result<()> {
     bootstrap_pending_state(pool).await?;
 

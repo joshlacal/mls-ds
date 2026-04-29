@@ -7,13 +7,13 @@
 //!      in the past.
 //!   2. Run one tick of `reset_reminder::reminder_tick`.
 //!   3. Assert that:
-//!        - A NEW `delivery_events` row exists with `event_type =
-//!          'crypto_session_reset_requested'` AND
-//!          `idempotency_key = 'reset-reminder:{cs_id}:1'`.
-//!        - `reset_reminder_state.attempt_count = 1`,
-//!          `last_attempt_at IS NOT NULL`, and `next_attempt_at` is
-//!          shifted ~6h into the future (the second backoff interval).
-//!        - `escalated_at IS NULL` (only one attempt so far).
+//!      - A NEW `delivery_events` row exists with `event_type =
+//!        'crypto_session_reset_requested'` AND
+//!        `idempotency_key = 'reset-reminder:{cs_id}:1'`.
+//!      - `reset_reminder_state.attempt_count = 1`,
+//!        `last_attempt_at IS NOT NULL`, and `next_attempt_at` is
+//!        shifted ~6h into the future (the second backoff interval).
+//!      - `escalated_at IS NULL` (only one attempt so far).
 //!
 //! Test mirrors the gating pattern used in
 //! `tests/sweep_finds_stale_convos.rs`: `#[ignore =
@@ -240,6 +240,7 @@ async fn r3_stuck_session_reminder_after_one_hour() {
     );
 
     // Assertion 2: state row updated.
+    #[allow(clippy::type_complexity)]
     let state: (
         i32,
         Option<chrono::DateTime<chrono::Utc>>,
