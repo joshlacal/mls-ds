@@ -25,7 +25,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 // Import from library crate instead of re-declaring modules
 use catbird_server::{
     actors, auth, blob_store, block_sync, config, crypto, db, fanout, federation, handlers, health,
-    metrics, middleware, models, realtime, storage, util,
+    metrics, middleware, models, realtime, storage, util, workers,
 };
 
 // These modules are only in main.rs (not in lib.rs)
@@ -292,6 +292,21 @@ async fn main() -> anyhow::Result<()> {
         jobs::run_reset_reminder_worker(reset_reminder_pool, reset_reminder_sse).await;
     });
     tracing::info!("Reset-reminder worker started (Phase 2.5 §7 R3)");
+
+    // Phase 3 — durable outbox workers. Drain rows that the chokepoint
+    // wrote in the same Postgres tx as `delivery_events`, surviving a
+    // SIGKILL between commit and broadcast send.
+    let federation_outbox_pool = db_pool.clone();
+    tokio::spawn(async move {
+        workers::run_federation_outbox_worker(federation_outbox_pool).await;
+    });
+    tracing::info!("Federation outbox worker started (Phase 3)");
+
+    let notification_outbox_pool = db_pool.clone();
+    tokio::spawn(async move {
+        workers::run_notification_outbox_worker(notification_outbox_pool).await;
+    });
+    tracing::info!("Notification outbox worker started (Phase 3)");
 
     // Spawn rate limiter cleanup worker (clean up stale buckets every 5 minutes)
     tokio::spawn(async move {

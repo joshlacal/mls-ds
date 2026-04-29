@@ -114,6 +114,53 @@ const SELECT_CRYPTO_SESSION_COLS_FOR_TX: &str =
 
 use super::messages::{ResetRequest, ResetTrigger, WelcomeEnvelope};
 
+/// Phase 3 codex P1 fix — caller's intent for the in-tx SSE
+/// `event_stream` row that the chokepoint persists alongside the
+/// `delivery_events` and outbox INSERTs. The chokepoint constructs the
+/// final `StreamEvent` (filling in the cursor, generation, cipher_suite,
+/// and other fields it owns) so the caller doesn't need a pre-chokepoint
+/// DB read for values the chokepoint already holds. The constructed
+/// event is returned in `ResetRequestOutcome` / `ActivationOutcome` for
+/// the caller's live `sse_state.emit` path.
+///
+/// `None` (i.e. caller passes nothing) is the opt-out: skip the
+/// event_stream INSERT entirely. Used by direct callers
+/// (`handle_request_crypto_session_reset`) and by the kill-switch path
+/// (`EMIT_RESET_REQUESTED_EVENT=false`).
+#[derive(Debug, Clone)]
+pub(crate) enum SseEventKind {
+    /// Phase 2.5 indirect-trigger broadcast for clients that an MLS
+    /// rotation has been requested. Persisted as
+    /// `subscribeEvents#resetRequestedEvent` in event_stream.
+    ResetRequested {
+        /// Free-form human-readable reason. Mirrors the same field on
+        /// the SSE event payload.
+        reason: String,
+    },
+    /// Activation broadcast — clients learn the rotation has landed
+    /// and the new group_id is in effect. Persisted as
+    /// `subscribeEvents#groupResetEvent` (matching `do_reset_group`'s
+    /// shape during the compatibility window).
+    GroupReset,
+}
+
+/// Outcome of [`enqueue_outbox_for_event`].
+///
+/// Phase 3 codex P1 fix: in addition to the (notification_count,
+/// federation_count) tally previously returned as a tuple, we now also
+/// surface the SSE cursor that the chokepoint allocated when writing
+/// the in-tx `event_stream` row, plus the modified `StreamEvent`
+/// (cursor field rewritten in-place) so the caller can broadcast the
+/// SAME event (no double-construction). Both fields are `None` when
+/// no `sse_event` was supplied.
+#[derive(Debug)]
+struct EnqueueOutboxOutcome {
+    notification_count: usize,
+    federation_count: usize,
+    sse_cursor: Option<String>,
+    sse_event: Option<crate::realtime::sse::StreamEvent>,
+}
+
 /// Outcome of [`request_crypto_session_reset_tx`].
 ///
 /// Carries both the [`ResetRequest`] handed back to direct callers AND
@@ -127,6 +174,13 @@ use super::messages::{ResetRequest, ResetTrigger, WelcomeEnvelope};
 /// All four fields are populated from values the chokepoint already
 /// holds in-tx, regardless of which exit path runs (idempotent replay,
 /// no-op `(Some, None)` short-circuit, or the new-Request happy path).
+///
+/// Phase 3 codex P1 fix — `sse_cursor` is the pre-allocated ULID for
+/// the durable `event_stream` row written by the chokepoint in-tx.
+/// Callers use this cursor to construct a `StreamEvent` for the live
+/// in-memory broadcast; reconnecting subscribers backfill the same row
+/// from `event_stream` keyed by cursor. `None` on idempotent-replay or
+/// `(Some, None)` short-circuit paths where no new event is emitted.
 #[derive(Debug)]
 pub(crate) struct ResetRequestOutcome {
     /// Caller-facing reset request descriptor.
@@ -143,17 +197,42 @@ pub(crate) struct ResetRequestOutcome {
     /// SSE: the `request_event_id` field of the broadcast event so
     /// clients can correlate to the persisted audit row.
     pub request_event_id: String,
+    /// Pre-allocated SSE cursor for this Request, written into
+    /// `event_stream` in-tx. `None` for replay/no-op exit paths where
+    /// no new event row was written. Caller uses this on the live
+    /// `sse_state.emit` path so the broadcast cursor matches the
+    /// persisted backfill row exactly (subscriber dedupe via the
+    /// `replayed_cursors` HashSet relies on bit-equal cursor strings).
+    pub sse_cursor: Option<String>,
+    /// The `StreamEvent` (with cursor field rewritten to `sse_cursor`)
+    /// that was persisted by the chokepoint in-tx. The caller passes
+    /// this directly to `sse_state.emit` for the live broadcast — no
+    /// reconstruction needed. `None` when `sse_cursor` is `None`.
+    pub sse_event: Option<crate::realtime::sse::StreamEvent>,
 }
 
 /// Outcome of [`activate_crypto_session_tx`].
 ///
 /// On success, holds the activated session and the SSE-relevant fields the
 /// caller will use to emit `GroupResetEvent` after committing the tx.
+///
+/// Phase 3 codex P1 fix — `sse_cursor` is the pre-allocated ULID for
+/// the durable `event_stream` row written by the chokepoint in-tx for
+/// the activation's SSE `groupResetEvent`. The live `sse_state.emit`
+/// path MUST use this cursor (rather than minting a new one) so the
+/// broadcast row matches the persisted backfill row exactly. `None`
+/// for the `CachedReplay` path where no new event_stream row was
+/// written.
 #[derive(Debug)]
 pub(crate) struct ActivationOutcome {
     pub session: CryptoSession,
     pub generation: i32,
     pub cipher_suite: Option<String>,
+    pub sse_cursor: Option<String>,
+    /// The `StreamEvent` (with cursor field rewritten to `sse_cursor`)
+    /// persisted by the chokepoint in-tx. Caller passes directly to
+    /// `sse_state.emit`. `None` when `sse_cursor` is `None`.
+    pub sse_event: Option<crate::realtime::sse::StreamEvent>,
 }
 
 /// Result of [`activate_crypto_session_tx`]. All variants are committed
@@ -308,6 +387,201 @@ async fn insert_event(
     Ok(id)
 }
 
+/// Phase 3 — write durable outbox rows for fanout in the SAME tx as the
+/// originating `delivery_events` INSERT.
+///
+/// One `notification_outbox` row is inserted per active member (the
+/// in-memory `side_effect_tx` channel was lost on SIGKILL between
+/// commit and broadcast; durable rows survive). One `federation_outbox`
+/// row is inserted per distinct peer service DID (members.ds_did) for
+/// federated conversations; non-federated conversations produce zero.
+///
+/// Returns `(notification_count, federation_count)` for logging.
+///
+/// `event_payload_json` is the JSON serialized representation of the
+/// event payload — embedded in `notification_outbox.payload` so the
+/// worker can replay without a delivery_events join. Federation rows
+/// store the same payload by default.
+///
+/// # Phase 3 codex P1 fix — also persist the SSE event_stream row in-tx.
+///
+/// Prior to this fix, the chokepoint wrote the outbox row in-tx but
+/// the `store_event` (event_stream INSERT) ran POST-commit alongside
+/// `sse_state.emit`. A SIGKILL between `delivery_events.commit()` and
+/// `store_event` left the outbox row claiming "pending", and the
+/// notification worker's `kind='sse'` dispatch returned `Ok(())`
+/// without persisting anything — silently transitioning the row to
+/// `done`. Reconnecting clients (cursor-replay path) saw nothing for
+/// the missed event.
+///
+/// The fix moves `store_event` into the chokepoint tx. The caller
+/// supplies a pre-built `sse_event` (full `StreamEvent` with `$type`
+/// tag); the chokepoint allocates a ULID cursor, sets it on the
+/// event, and inserts the matching `event_stream` row in the same tx
+/// as the `delivery_events` and outbox INSERTs. After commit, the
+/// caller's live `sse_state.emit` path uses the SAME cursor so live
+/// subscribers and reconnecting cursor-replay subscribers see the
+/// event exactly once via the existing `replayed_cursors` dedupe.
+///
+/// Returns the cursor allocated for the event_stream row when an
+/// `sse_event` was provided — the caller threads it through the live
+/// emit path. `None` when the chokepoint is invoked from a path that
+/// doesn't ship an SSE event (none today, but kept optional so
+/// future call sites can opt out without losing the outbox row).
+async fn enqueue_outbox_for_event(
+    tx: &mut Transaction<'_, Postgres>,
+    conversation_id: &str,
+    delivery_event_id: &str,
+    event_payload_json: &serde_json::Value,
+    sse_event: Option<crate::realtime::sse::StreamEvent>,
+) -> Result<EnqueueOutboxOutcome> {
+    // 1. Look up active members. Same query shape as the chokepoint's
+    //    `allowed_responders` snapshot, but we keep both `member_did`
+    //    (per-device) for SSE/push targeting AND `ds_did` (federation
+    //    routing peer; NULL for local).
+    //
+    // member_did is the SSE subscription key (per-device). ds_did is
+    // the federation peer DID; NULL means the recipient lives on this
+    // local DS (no federation row needed).
+    let members: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT member_did, COALESCE(user_did, member_did) AS user_or_member_did, ds_did \
+         FROM members \
+         WHERE convo_id = $1 AND left_at IS NULL",
+    )
+    .bind(conversation_id)
+    .fetch_all(&mut **tx)
+    .await
+    .context("snapshot active members for outbox enqueue")?;
+
+    // Serialize once; the JSON column accepts a binary blob via BYTEA.
+    let payload_bytes =
+        serde_json::to_vec(event_payload_json).context("serialize event payload for outbox")?;
+
+    // 2. Notification rows — one per active member device.
+    //
+    //    Scope decision (Phase 3, Option B): we deliberately ONLY write
+    //    `kind='sse'` rows here. The `notification_outbox.kind` column
+    //    schema permits `'push'` and `'websocket'` for forward
+    //    compatibility, but no row of those kinds is enqueued by this
+    //    chokepoint — those dispatchers (APNs/FCM, websocket fanout) are
+    //    not yet wired into mls-ds and are tracked as separate plans.
+    //
+    //    Writing rows we cannot drain would either be a lie (worker
+    //    silently marks `done`) or block the queue (worker errs forever).
+    //    Skipping the write keeps the outbox honest. The worker has a
+    //    belt-and-suspenders guard
+    //    (`workers/notification_outbox.rs::dispatch`) that errs loudly if
+    //    a `'push'`/`'websocket'` row appears via legacy data or manual
+    //    INSERT, so we won't silently drop work even if this invariant is
+    //    breached.
+    if !members.is_empty() {
+        let mut qb = sqlx::QueryBuilder::<Postgres>::new(
+            "INSERT INTO notification_outbox (\
+                id, conversation_id, delivery_event_id, recipient_did, \
+                recipient_device_id, kind, payload, status \
+             ) ",
+        );
+        qb.push_values(members.iter(), |mut b, (member_did, _user_did, _ds_did)| {
+            b.push_bind(Uuid::new_v4().to_string())
+                .push_bind(conversation_id)
+                .push_bind(delivery_event_id)
+                .push_bind(member_did)
+                .push_bind(Option::<String>::None)
+                .push_bind("sse")
+                .push_bind(&payload_bytes)
+                .push_bind("pending");
+        });
+        qb.build()
+            .execute(&mut **tx)
+            .await
+            .context("bulk INSERT notification_outbox")?;
+    }
+
+    // 3. Federation rows — one per DISTINCT non-local peer DS DID. A
+    //    non-federated conversation has all members with
+    //    `ds_did IS NULL`; in that case we insert zero rows.
+    let federation_targets: std::collections::BTreeSet<String> = members
+        .iter()
+        .filter_map(|(_member_did, _user_did, ds_did)| ds_did.clone())
+        .collect();
+
+    if !federation_targets.is_empty() {
+        let mut qb = sqlx::QueryBuilder::<Postgres>::new(
+            "INSERT INTO federation_outbox (\
+                id, conversation_id, delivery_event_id, target_service_did, \
+                payload, status \
+             ) ",
+        );
+        qb.push_values(federation_targets.iter(), |mut b, target_did| {
+            b.push_bind(Uuid::new_v4().to_string())
+                .push_bind(conversation_id)
+                .push_bind(delivery_event_id)
+                .push_bind(target_did)
+                .push_bind(&payload_bytes)
+                .push_bind("pending");
+        });
+        qb.build()
+            .execute(&mut **tx)
+            .await
+            .context("bulk INSERT federation_outbox")?;
+    }
+
+    // 4. Phase 3 codex P1 fix — persist the SSE `event_stream` row in
+    //    the SAME tx as the delivery_event + outbox INSERTs above. This
+    //    closes the SIGKILL-between-commit-and-fanout window by moving
+    //    the durability anchor for SSE upstream of the worker dispatch.
+    //
+    //    The caller supplies a fully-formed `StreamEvent` (with `$type`
+    //    tag and variant fields); we allocate a fresh ULID cursor,
+    //    overwrite the cursor field on the event via the
+    //    `set_stream_event_cursor` helper (matches every variant),
+    //    INSERT the matching `event_stream` row with the SAME cursor +
+    //    serialized payload, and return the modified event so the
+    //    caller can `sse_state.emit` it directly. The existing
+    //    `replayed_cursors` HashSet in
+    //    `realtime/sse.rs::subscribe_convo_events` dedupes the
+    //    backfill row against the live broadcast event by bit-equal
+    //    cursor strings.
+    //
+    //    Why ULID-in-tx is fine: `CursorGenerator` (realtime/cursor.rs)
+    //    enforces per-(convo, event_type) monotonicity within a single
+    //    process. ULIDs are sortable by timestamp_ms so a fresh
+    //    `Ulid::new()` collides with a concurrent in-process generator
+    //    only if their millisecond windows overlap AND the random
+    //    bits collide — astronomically unlikely. The cursor is unique
+    //    by event_stream PRIMARY KEY (id) anyway; a collision would
+    //    raise SQLSTATE 23505 and abort the chokepoint tx, surfacing
+    //    as a typed error rather than silent data loss.
+    let (sse_cursor, sse_event_with_cursor) = if let Some(mut event) = sse_event {
+        let cursor = ulid::Ulid::new().to_string();
+        crate::realtime::sse::set_stream_event_cursor(&mut event, cursor.clone());
+        let event_type = crate::db::stream_event_type_str(&event);
+        let payload_value = serde_json::to_value(&event)
+            .context("serialize StreamEvent for in-tx event_stream row")?;
+        sqlx::query(
+            "INSERT INTO event_stream (id, convo_id, event_type, payload, emitted_at) \
+             VALUES ($1, $2, $3, $4, NOW())",
+        )
+        .bind(&cursor)
+        .bind(conversation_id)
+        .bind(event_type)
+        .bind(&payload_value)
+        .execute(&mut **tx)
+        .await
+        .context("INSERT event_stream row in chokepoint tx")?;
+        (Some(cursor), Some(event))
+    } else {
+        (None, None)
+    };
+
+    Ok(EnqueueOutboxOutcome {
+        notification_count: members.len(),
+        federation_count: federation_targets.len(),
+        sse_cursor,
+        sse_event: sse_event_with_cursor,
+    })
+}
+
 /// Phase 2 §2.2 — handle `RequestCryptoSessionReset` inside an open tx.
 ///
 /// Idempotent on `idempotency_key`. Steps:
@@ -356,6 +630,7 @@ pub(crate) async fn request_crypto_session_reset_tx(
     reason: &str,
     idempotency_key: &str,
     expected_new_mls_group_id: Option<&str>,
+    sse_intent: Option<SseEventKind>,
 ) -> Result<ResetRequestOutcome> {
     // Phase 2.5 §7 R1 Mitigation #1: caller allowlist for NULL-binding
     // Requests. This is the FIRST check — even before idempotency
@@ -413,6 +688,14 @@ pub(crate) async fn request_crypto_session_reset_tx(
             crypto_session_id: cs_id,
             generation,
             request_event_id: event_id,
+            // Idempotent replay: a prior call already wrote the
+            // event_stream row (with its own cursor) and emitted the
+            // live SSE broadcast. The current call MUST NOT re-emit;
+            // returning `None` here signals the caller to skip
+            // sse_state.emit on the replay path. Reconnecting clients
+            // backfill the prior event_stream row by cursor.
+            sse_cursor: None,
+            sse_event: None,
         });
     }
 
@@ -502,6 +785,11 @@ pub(crate) async fn request_crypto_session_reset_tx(
                         crypto_session_id: current.id.clone(),
                         generation: current.generation,
                         request_event_id: prior_event_id,
+                        // A1 short-circuit: prior bound event remains
+                        // authoritative; no new event_stream row is
+                        // written and no SSE re-emit is wanted.
+                        sse_cursor: None,
+                        sse_event: None,
                     });
                 }
                 // All other cases pass through; the existing event remains
@@ -576,9 +864,68 @@ pub(crate) async fn request_crypto_session_reset_tx(
         Some(initiator_did),
         Some(&current.mls_group_id),
         Some(idempotency_key),
-        payload,
+        payload.clone(),
     )
     .await?;
+
+    // Phase 3 — durable outbox enqueue. Same Postgres tx as the
+    // delivery_event INSERT above; rolled back as a unit if the outer tx
+    // aborts. Workers drain these on the next tick (or after restart if
+    // the server is SIGKILLed before the per-convo SSE broadcast fires).
+    //
+    // codex P1 fix: when `sse_intent` is provided, build the matching
+    // `StreamEvent` in-tx with values the chokepoint owns
+    // (request_event_id, crypto_session_id, generation), persist the
+    // event_stream row inside `enqueue_outbox_for_event`, and return
+    // the cursor so the caller's live SSE emit reuses the same cursor.
+    // The existing `replayed_cursors` HashSet in
+    // `realtime/sse.rs::subscribe_convo_events` dedupes the backfill
+    // row against the live broadcast event by bit-equal cursor
+    // strings.
+    let sse_event = sse_intent.map(|kind| match kind {
+        SseEventKind::ResetRequested { reason: ev_reason } => {
+            crate::realtime::sse::StreamEvent::ResetRequestedEvent {
+                // Placeholder cursor — overwritten by `enqueue_outbox_for_event`
+                // before INSERT and before being returned to the caller.
+                cursor: String::new(),
+                convo_id: conversation_id.to_string(),
+                crypto_session_id: current.id.clone(),
+                generation: current.generation,
+                trigger: trigger.as_str().to_string(),
+                request_event_id: request_event_id.clone(),
+                expected_new_mls_group_id: expected_new_mls_group_id.map(str::to_string),
+                reason: Some(ev_reason),
+                requested_at: chrono::Utc::now()
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            }
+        }
+        // GroupReset is for activations only; constructing one here is
+        // a programming error. We err loudly rather than silently
+        // emitting the wrong shape.
+        SseEventKind::GroupReset => {
+            // Will surface as a typed error in the chokepoint result —
+            // construct a placeholder InfoEvent that the
+            // enqueue_outbox_for_event call below will return as the
+            // cursor; the caller's `Err` mapping covers this.
+            unreachable!(
+                "SseEventKind::GroupReset must not be supplied to \
+                 request_crypto_session_reset_tx; use \
+                 SseEventKind::ResetRequested instead"
+            )
+        }
+    });
+    let outbox =
+        enqueue_outbox_for_event(tx, conversation_id, &request_event_id, &payload, sse_event)
+            .await
+            .context("enqueue outbox rows for crypto_session_reset_requested")?;
+    tracing::debug!(
+        conversation_id,
+        event_id = %request_event_id,
+        notification_rows = outbox.notification_count,
+        federation_rows = outbox.federation_count,
+        sse_cursor = ?outbox.sse_cursor.as_deref(),
+        "outbox: enqueued for crypto_session_reset_requested"
+    );
 
     Ok(ResetRequestOutcome {
         request: ResetRequest {
@@ -590,6 +937,8 @@ pub(crate) async fn request_crypto_session_reset_tx(
         crypto_session_id: current.id.clone(),
         generation: current.generation,
         request_event_id,
+        sse_cursor: outbox.sse_cursor,
+        sse_event: outbox.sse_event,
     })
 }
 
@@ -635,6 +984,7 @@ pub(crate) async fn activate_crypto_session_tx(
     welcomes: &[WelcomeEnvelope],
     initiator_did: &str,
     idempotency_key: &str,
+    sse_intent: Option<SseEventKind>,
 ) -> Result<ActivationResult> {
     // 1. Idempotency check on the activation event.
     if let Some((_event_id, _payload_json, cs_id)) = find_existing_event(
@@ -663,6 +1013,11 @@ pub(crate) async fn activate_crypto_session_tx(
             session,
             generation,
             cipher_suite,
+            // Idempotent replay: prior call already persisted the
+            // event_stream row + emitted live SSE; no re-emit on this
+            // call.
+            sse_cursor: None,
+            sse_event: None,
         }));
     }
 
@@ -1051,7 +1406,7 @@ pub(crate) async fn activate_crypto_session_tx(
         "new_generation": next_generation,
     });
     let supersede_seq = allocate_seq(tx, conversation_id).await?;
-    insert_event(
+    let supersede_event_id = insert_event(
         tx,
         conversation_id,
         supersede_seq,
@@ -1060,7 +1415,7 @@ pub(crate) async fn activate_crypto_session_tx(
         Some(initiator_did),
         Some(&prior.mls_group_id),
         None,
-        supersede_payload,
+        supersede_payload.clone(),
     )
     .await?;
 
@@ -1081,9 +1436,71 @@ pub(crate) async fn activate_crypto_session_tx(
         Some(initiator_did),
         Some(new_mls_group_id),
         Some(idempotency_key),
-        activated_payload,
+        activated_payload.clone(),
     )
     .await?;
+
+    // Phase 3 — durable outbox enqueue for both the supersede AND
+    // activated events. Same Postgres tx as the delivery_event INSERTs
+    // above; rolled back as a unit if the outer tx aborts. Workers
+    // drain these on the next tick (or after restart if the server is
+    // SIGKILLed before the per-convo SSE broadcast fires).
+    //
+    // codex P1 fix: only the `crypto_session_activated` event has an
+    // associated SSE `groupResetEvent` for client UX (see
+    // `actors/conversation.rs::handle_activate_crypto_session` post-
+    // commit emit). The `crypto_session_superseded` event is purely
+    // audit-trail; no SSE row is written for it. So we pass
+    // `sse_event=None` on the supersede enqueue and pass the caller-
+    // provided intent (matched into a fresh `GroupResetEvent`) on the
+    // activated enqueue.
+    let outbox_super = enqueue_outbox_for_event(
+        tx,
+        conversation_id,
+        &supersede_event_id,
+        &supersede_payload,
+        None,
+    )
+    .await
+    .context("enqueue outbox rows for crypto_session_superseded")?;
+
+    let activation_sse_event = sse_intent.map(|kind| match kind {
+        SseEventKind::GroupReset => crate::realtime::sse::StreamEvent::GroupResetEvent {
+            // Placeholder cursor — overwritten by
+            // `enqueue_outbox_for_event` before INSERT.
+            cursor: String::new(),
+            convo_id: conversation_id.to_string(),
+            new_group_id: new_mls_group_id.to_string(),
+            reset_generation: next_generation,
+            reset_by: initiator_did.to_string(),
+            cipher_suite: cipher_suite.clone().unwrap_or_default(),
+            reason: Some(format!("crypto_session_activated:{}", trigger.as_str())),
+        },
+        SseEventKind::ResetRequested { .. } => unreachable!(
+            "SseEventKind::ResetRequested must not be supplied to \
+             activate_crypto_session_tx; use SseEventKind::GroupReset instead"
+        ),
+    });
+    let outbox_act = enqueue_outbox_for_event(
+        tx,
+        conversation_id,
+        &activated_event_id,
+        &activated_payload,
+        activation_sse_event,
+    )
+    .await
+    .context("enqueue outbox rows for crypto_session_activated")?;
+    tracing::debug!(
+        conversation_id,
+        supersede_event_id = %supersede_event_id,
+        activated_event_id = %activated_event_id,
+        notification_rows = outbox_super.notification_count + outbox_act.notification_count,
+        federation_rows = outbox_super.federation_count + outbox_act.federation_count,
+        sse_cursor = ?outbox_act.sse_cursor.as_deref(),
+        "outbox: enqueued for crypto_session_superseded + crypto_session_activated"
+    );
+    let activation_sse_cursor = outbox_act.sse_cursor;
+    let activation_sse_event = outbox_act.sse_event;
 
     // 7. INSERT pending_welcomes for the WINNING candidate. Map
     //    WelcomeEnvelope.recipient_did -> DB column target_did.
@@ -1156,6 +1573,8 @@ pub(crate) async fn activate_crypto_session_tx(
         session,
         generation: next_generation,
         cipher_suite,
+        sse_cursor: activation_sse_cursor,
+        sse_event: activation_sse_event,
     }))
 }
 

@@ -1839,6 +1839,12 @@ impl ConversationActorState {
             &reason,
             &idempotency_key,
             expected_new_mls_group_id.as_deref(),
+            // Direct callers (Admin, Bootstrap via the message API) do
+            // NOT broadcast a `ResetRequestedEvent` SSE — that's only
+            // emitted by the indirect-trigger `dual_emit_reset_requested`
+            // path. Pass `None` so the chokepoint skips the in-tx
+            // event_stream insert.
+            None,
         )
         .await?;
         tx.commit()
@@ -1893,6 +1899,14 @@ impl ConversationActorState {
             &welcomes,
             &initiator_did,
             &idempotency_key,
+            // codex P1 fix: ask the chokepoint to persist a
+            // `groupResetEvent` event_stream row in-tx so reconnecting
+            // SSE clients (cursor replay) and the live broadcast both
+            // see the SAME cursor. The pre-fix code did `store_event`
+            // post-commit, leaving a SIGKILL window where the row was
+            // claimed `done` by the worker without anything reaching
+            // event_stream.
+            Some(super::reset_chokepoint::SseEventKind::GroupReset),
         )
         .await?;
         // Always commit, even on tie-break loss — the chokepoint persists
@@ -1944,30 +1958,28 @@ impl ConversationActorState {
         // app data, not crypto state.
         self.current_epoch = 0;
 
-        // Emit SSE GroupResetEvent matching `do_reset_group`'s shape so
-        // existing clients see the same event surface during compat window.
-        let cursor = self
-            .sse_state
-            .cursor_gen
-            .next(&self.convo_id, "groupResetEvent")
-            .await;
-        let event = crate::realtime::sse::StreamEvent::GroupResetEvent {
-            cursor: cursor.clone(),
-            convo_id: self.convo_id.clone(),
-            new_group_id: new_mls_group_id.clone(),
-            reset_generation: outcome.generation,
-            reset_by: initiator_did.clone(),
-            cipher_suite: outcome.cipher_suite.unwrap_or_default(),
-            reason: Some(format!("crypto_session_activated:{}", trigger.as_str())),
-        };
-        if let Err(e) = crate::db::store_event(&self.db_pool, &self.convo_id, &event).await {
+        // codex P1 fix: chokepoint persisted the `groupResetEvent`
+        // event_stream row in-tx. We just broadcast the SAME event
+        // (with the chokepoint-allocated cursor) for the in-memory
+        // fanout; reconnecting subscribers see the same row via
+        // cursor-replay, deduped by the `replayed_cursors` HashSet
+        // in subscribe_convo_events.
+        if let Some(event) = outcome.sse_event.clone() {
+            if let Err(e) = self.sse_state.emit(&self.convo_id, event).await {
+                error!("[actor:activate_crypto_session] SSE emit GroupReset: {}", e);
+            }
+        } else {
+            // Defense-in-depth: if the chokepoint returned no event
+            // despite us asking for `SseEventKind::GroupReset`, that's
+            // a bug in the chokepoint contract — log loudly so it's
+            // visible in ops, but don't synthesize a fallback (which
+            // would clobber the in-tx row's cursor and break the
+            // dedupe invariant).
             error!(
-                "[actor:activate_crypto_session] store GroupResetEvent: {:?}",
-                e
+                convo_id = %crate::crypto::redact_for_log(&self.convo_id),
+                "[actor:activate_crypto_session] chokepoint did not return \
+                 sse_event despite SseEventKind::GroupReset — live broadcast skipped"
             );
-        }
-        if let Err(e) = self.sse_state.emit(&self.convo_id, event).await {
-            error!("[actor:activate_crypto_session] SSE emit GroupReset: {}", e);
         }
 
         info!(
@@ -2046,6 +2058,27 @@ impl ConversationActorState {
         // to gather `(crypto_session_id, generation, request_event_id)`
         // for the SSE payload — two extra round-trips. The chokepoint
         // now returns these in-tx via `ResetRequestOutcome`.
+        //
+        // Phase 3 codex P1 fix: when `EMIT_RESET_REQUESTED_EVENT=true`
+        // (the default), pass a `SseEventKind::ResetRequested` intent
+        // so the chokepoint persists the matching `event_stream` row
+        // INSIDE the same tx as the delivery_event. Live broadcast
+        // post-commit uses the event the chokepoint returns (cursor
+        // already populated). The env-var kill-switch path passes
+        // `None` so neither the in-tx event_stream row nor the live
+        // broadcast happens — the chokepoint Request itself still
+        // persists, matching Phase 2.5 §7 R2 semantics.
+        //
+        // Phase 2.5 review-fix G4: env-var read cached via OnceLock;
+        // see `emit_reset_requested_event` doc-comment.
+        let sse_intent = if emit_reset_requested_event() {
+            Some(super::reset_chokepoint::SseEventKind::ResetRequested {
+                reason: reason.to_string(),
+            })
+        } else {
+            None
+        };
+
         let outcome = match super::reset_chokepoint::request_crypto_session_reset_tx(
             &mut tx,
             &self.convo_id,
@@ -2054,6 +2087,7 @@ impl ConversationActorState {
             reason,
             idempotency_key,
             None, // expected_new_mls_group_id — indirect triggers don't know yet
+            sse_intent,
         )
         .await
         {
@@ -2093,53 +2127,26 @@ impl ConversationActorState {
             "[dual_emit_reset_requested] crypto_session_reset_requested persisted"
         );
 
-        // Phase 2.5 §7 R2 mitigation: operator-side env-var gate. When
-        // `EMIT_RESET_REQUESTED_EVENT=false`, the chokepoint Request is
-        // still persisted (above), but no SSE event is broadcast.
-        // Operators flip this off on a per-incident basis if a client-
-        // side bug surfaces in handling resetRequestedEvent.
-        //
-        // Phase 2.5 review-fix G4: cached via OnceLock so we don't pay
-        // a `std::env::var` lookup (string allocation + locking) on
-        // every reset event. Trade-off: a flip of the env var requires
-        // a service restart; this is documented in `server/CLAUDE.md`
-        // and aligns with the operator runbook (the kill-switch use
-        // case is "an incident is in progress, restart the service
-        // with the flag set").
-        if !emit_reset_requested_event() {
+        // codex P1 fix: chokepoint persisted the event_stream row in-tx
+        // when an `SseEventKind::ResetRequested` intent was supplied.
+        // Take that returned event (cursor populated) and broadcast.
+        // When the kill-switch suppressed the broadcast, `outcome.sse_event`
+        // is `None` and we skip the broadcast — Request was still
+        // persisted, matching the prior behavior.
+        let Some(event) = outcome.sse_event else {
+            // Either kill-switch is on (emit_reset_requested_event() ==
+            // false above) or the chokepoint hit an idempotent-replay /
+            // short-circuit path. In all of these the prior call
+            // already drove the broadcast, so we MUST NOT re-emit.
             info!(
                 convo_id = %crate::crypto::redact_for_log(&self.convo_id),
                 request_id = %outcome.request.request_id,
-                "[dual_emit_reset_requested] EMIT_RESET_REQUESTED_EVENT=false \
-                 — Request persisted, SSE broadcast suppressed"
+                "[dual_emit_reset_requested] no sse_event returned \
+                 (kill-switch or idempotent replay) — broadcast suppressed"
             );
             return;
-        }
-
-        let cursor = self
-            .sse_state
-            .cursor_gen
-            .next(&self.convo_id, "resetRequestedEvent")
-            .await;
-        let event = StreamEvent::ResetRequestedEvent {
-            cursor,
-            convo_id: self.convo_id.clone(),
-            crypto_session_id: outcome.crypto_session_id,
-            generation: outcome.generation,
-            trigger: trigger.as_str().to_string(),
-            request_event_id: outcome.request_event_id,
-            expected_new_mls_group_id: None,
-            reason: Some(reason.to_string()),
-            requested_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         };
 
-        if let Err(e) = crate::db::store_event(&self.db_pool, &self.convo_id, &event).await {
-            error!(
-                convo_id = %crate::crypto::redact_for_log(&self.convo_id),
-                error = ?e,
-                "[dual_emit_reset_requested] store_event failed"
-            );
-        }
         if let Err(e) = self.sse_state.emit(&self.convo_id, event).await {
             error!(
                 convo_id = %crate::crypto::redact_for_log(&self.convo_id),
