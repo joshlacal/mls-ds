@@ -145,6 +145,31 @@ async fn repair_2026_04_migration_versions(pool: &DbPool) -> Result<()> {
 
     let mut total_updated: u64 = 0;
     for (legacy_version, new_version, new_description) in repairs {
+        // bootstrap-sqlx-migrations.sh runs before this repair in deploy.sh
+        // and may have inserted a row at the new 14-digit version (with a
+        // freshly-computed checksum) because the renamed filename matches
+        // its 14-digit-format pattern. If that row exists AND the legacy
+        // row also exists, drop the bootstrap row first — the subsequent
+        // UPDATE preserves the legacy row's original applied checksum +
+        // installed_on timestamp by mutating it in place. If only the new
+        // row exists (already-repaired DB), the EXISTS clause is false and
+        // this DELETE is a no-op; the UPDATE then matches zero rows.
+        sqlx::query(
+            "DELETE FROM _sqlx_migrations \
+             WHERE version = $1 \
+               AND EXISTS (SELECT 1 FROM _sqlx_migrations WHERE version = $2)",
+        )
+        .bind(new_version)
+        .bind(legacy_version)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to drop bootstrap-inserted _sqlx_migrations row for new version {}",
+                new_version
+            )
+        })?;
+
         let result = sqlx::query(
             "UPDATE _sqlx_migrations \
              SET version = $1, description = $2 \
