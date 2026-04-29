@@ -1,6 +1,6 @@
 use axum::{extract::State, http::StatusCode, Json};
 use jacquard_axum::ExtractXrpc;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
@@ -134,82 +134,104 @@ pub async fn get_key_packages(
     let mut key_packages: Vec<KeyPackageRef<'static>> = Vec::new();
     let mut missing: Vec<String> = Vec::new();
 
-    for did in &filtered_dids {
-        // Atomic per-device claim. The inner SELECT picks one available
-        // (non-last-resort) row per device_id bucket using
-        // FOR UPDATE SKIP LOCKED — concurrent claimants get disjoint rows.
-        // The outer UPDATE re-checks `state = 'available'` so the transition
-        // available -> claimed is the atomic gate.
-        //
-        // Returns raw bytea — Jacquard's `Bytes` JSON serializer base64-encodes at the
-        // wire boundary. Returning `encode(... , 'base64')` here produced a second
-        // base64 layer, so iOS FFI received ASCII base64 text as raw KP bytes and
-        // failed `tls_deserialize_bytes`.
-        let mut rows = match claim_available_key_packages(
+    // Atomic bulk claim. One SQL round-trip claims one available
+    // (non-last-resort) row per (DID, device_id bucket) for every DID in the
+    // request. The inner SELECT uses `DISTINCT ON (owner_did,
+    // COALESCE(device_id, ''))` and `FOR UPDATE SKIP LOCKED` — concurrent
+    // claimants get disjoint rows. The outer UPDATE re-checks
+    // `state = 'available'` so the available -> claimed transition is the
+    // atomic gate.
+    //
+    // Returns raw bytea — Jacquard's `Bytes` JSON serializer base64-encodes
+    // at the wire boundary. Returning `encode(... , 'base64')` here produced
+    // a second base64 layer, so iOS FFI received ASCII base64 text as raw KP
+    // bytes and failed `tls_deserialize_bytes`.
+    let did_strs: Vec<&str> = filtered_dids.iter().map(|d| d.as_ref()).collect();
+    let claimed_rows = match claim_available_key_packages_bulk(
+        &pool,
+        &did_strs,
+        input.cipher_suite.as_deref(),
+        /* last_resort = */ false,
+    )
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            error!("Bulk key-package claim failed: {}", e);
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+
+    // Group claimed rows by DID. Any DID absent from the result set has zero
+    // regular rows claimable and falls through to the last-resort pool.
+    let mut rows_by_did: HashMap<String, Vec<(String, String, Vec<u8>, Option<String>)>> =
+        HashMap::new();
+    for row in claimed_rows {
+        rows_by_did.entry(row.0.clone()).or_default().push(row);
+    }
+
+    // Last-resort fallback: identify DIDs with zero regular rows and run a
+    // single bulk claim restricted to those DIDs against the last-resort
+    // pool. Last-resort packages are still single-use here (state ->
+    // claimed) — true "reusable last-resort" semantics are deferred to the
+    // dedicated key-package plan.
+    let unmatched_dids: Vec<&str> = did_strs
+        .iter()
+        .copied()
+        .filter(|d| !rows_by_did.contains_key(*d))
+        .collect();
+    if !unmatched_dids.is_empty() {
+        match claim_available_key_packages_bulk(
             &pool,
-            did.as_ref(),
+            &unmatched_dids,
             input.cipher_suite.as_deref(),
-            /* last_resort = */ false,
+            /* last_resort = */ true,
         )
         .await
         {
-            Ok(rows) => rows,
-            Err(e) => {
-                error!(
-                    "Failed to fetch key packages for h:{}: {}",
-                    &crate::crypto::hash_for_log(did.as_ref()),
-                    e
-                );
-                missing.push(did.as_ref().to_string());
-                continue;
-            }
-        };
-
-        // Last-resort fallback: if no regular available row was claimable for
-        // this DID, try the last-resort pool. Last-resort packages are still
-        // single-use here (state -> claimed) — true "reusable last-resort"
-        // semantics are deferred to the dedicated key-package plan.
-        if rows.is_empty() {
-            match claim_available_key_packages(
-                &pool,
-                did.as_ref(),
-                input.cipher_suite.as_deref(),
-                /* last_resort = */ true,
-            )
-            .await
-            {
-                Ok(lr_rows) => {
-                    if !lr_rows.is_empty() {
+            Ok(lr_rows) => {
+                if !lr_rows.is_empty() {
+                    let mut lr_dids: HashSet<String> = HashSet::new();
+                    for row in lr_rows {
+                        lr_dids.insert(row.0.clone());
+                        rows_by_did.entry(row.0.clone()).or_default().push(row);
+                    }
+                    // One increment per DID that received a last-resort
+                    // claim — preserves per-DID metric semantics from the
+                    // pre-bulk loop.
+                    for _ in 0..lr_dids.len() {
                         crate::metrics::record_key_package_last_resort_use();
-                        rows = lr_rows;
                     }
                 }
-                Err(e) => {
-                    warn!(
-                        "Last-resort key-package fallback failed for h:{}: {}",
-                        &crate::crypto::hash_for_log(did.as_ref()),
-                        e
-                    );
-                }
+            }
+            Err(e) => {
+                warn!("Last-resort key-package bulk fallback failed: {}", e);
             }
         }
+    }
 
-        if rows.is_empty() {
-            crate::metrics::record_key_package_claim("no_match");
-            crate::metrics::record_key_package_exhaustion();
-            missing.push(did.as_ref().to_string());
-            continue;
-        }
-
-        for (owner_did, cipher_suite, kp_bytes, kp_hash) in rows {
-            crate::metrics::record_key_package_claim("claimed");
-            key_packages.push(KeyPackageRef {
-                did: crate::sqlx_jacquard::string_to_did(&owner_did),
-                cipher_suite: cipher_suite.into(),
-                key_package: kp_bytes.into(),
-                key_package_hash: kp_hash.map(Into::into),
-                extra_data: Default::default(),
-            });
+    // Emit per-DID claim/no_match metrics + assemble response in the
+    // requested DID order so the response is deterministic.
+    for did in &filtered_dids {
+        let did_str = did.as_ref();
+        match rows_by_did.remove(did_str) {
+            Some(rows) if !rows.is_empty() => {
+                for (owner_did, cipher_suite, kp_bytes, kp_hash) in rows {
+                    crate::metrics::record_key_package_claim("claimed");
+                    key_packages.push(KeyPackageRef {
+                        did: crate::sqlx_jacquard::string_to_did(&owner_did),
+                        cipher_suite: cipher_suite.into(),
+                        key_package: kp_bytes.into(),
+                        key_package_hash: kp_hash.map(Into::into),
+                        extra_data: Default::default(),
+                    });
+                }
+            }
+            _ => {
+                crate::metrics::record_key_package_claim("no_match");
+                crate::metrics::record_key_package_exhaustion();
+                missing.push(did_str.to_string());
+            }
         }
     }
 
@@ -238,23 +260,34 @@ pub async fn get_key_packages(
     }))
 }
 
-/// Atomically claim one available key package per `device_id` bucket for a DID.
+/// Atomically claim one available key package per `(owner_did, device_id)`
+/// bucket for the supplied set of DIDs in a single SQL round-trip.
 ///
 /// Returns rows of `(owner_did, cipher_suite, key_package, key_package_hash)`
-/// for each successfully claimed package. The transition `state='available' ->
-/// state='claimed'` is the atomic gate; concurrent callers see disjoint rows
-/// because the inner SELECT uses `FOR UPDATE SKIP LOCKED`.
+/// for each successfully claimed package — one row per (DID, device_id)
+/// bucket where an available row existed. The transition
+/// `state='available' -> state='claimed'` is the atomic gate; concurrent
+/// callers see disjoint rows because the inner SELECT uses
+/// `FOR UPDATE SKIP LOCKED`.
+///
+/// Replaces the previous per-DID helper that issued N round-trips for N
+/// requested DIDs (PR review #23 follow-up). Per-device dedupe is preserved
+/// via `DISTINCT ON (owner_did, COALESCE(device_id, ''))`.
 ///
 /// `last_resort = false` filters to regular packages; `last_resort = true`
 /// claims from the last-resort pool only. Last-resort packages are still
 /// transitioned to `claimed` here — single-use semantics — pending the
 /// dedicated key-package plan.
-pub(crate) async fn claim_available_key_packages(
+pub async fn claim_available_key_packages_bulk(
     pool: &DbPool,
-    owner_did: &str,
+    owner_dids: &[&str],
     cipher_suite: Option<&str>,
     last_resort: bool,
 ) -> Result<Vec<(String, String, Vec<u8>, Option<String>)>, sqlx::Error> {
+    if owner_dids.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let lr_predicate = if last_resort {
         "AND is_last_resort = true"
     } else {
@@ -270,14 +303,14 @@ pub(crate) async fn claim_available_key_packages(
         "UPDATE key_packages
          SET state = 'claimed', consumed_at = NOW()
          WHERE id IN (
-           SELECT DISTINCT ON (COALESCE(device_id, '')) id
+           SELECT DISTINCT ON (owner_did, COALESCE(device_id, '')) id
            FROM key_packages
-           WHERE owner_did = $1
+           WHERE owner_did = ANY($1::text[])
              AND state = 'available'
              AND expires_at > NOW()
              {lr}
              {cs}
-           ORDER BY COALESCE(device_id, ''), created_at ASC
+           ORDER BY owner_did, COALESCE(device_id, ''), created_at ASC
            FOR UPDATE SKIP LOCKED
          )
          AND state = 'available'
@@ -286,8 +319,10 @@ pub(crate) async fn claim_available_key_packages(
         cs = cs_predicate,
     );
 
+    // Bind the borrowed slice directly — sqlx maps `&[&str]` to Postgres
+    // `text[]` without an intermediate `Vec<String>` allocation.
     let mut q =
-        sqlx::query_as::<_, (String, String, Vec<u8>, Option<String>)>(&sql).bind(owner_did);
+        sqlx::query_as::<_, (String, String, Vec<u8>, Option<String>)>(&sql).bind(owner_dids);
     if let Some(cs) = cipher_suite {
         q = q.bind(cs);
     }
