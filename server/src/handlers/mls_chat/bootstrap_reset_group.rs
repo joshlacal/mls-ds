@@ -6,6 +6,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use jacquard_axum::ExtractXrpc;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use tracing::{error, info, warn};
@@ -307,15 +308,17 @@ pub async fn handle(
     let path = match precondition.as_ref() {
         Some((state, _)) if state == "reset_requested" => Path::Activate,
         Some((state, gi_null)) if state == "active" && *gi_null => {
-            // SERVER F #68 self-heal precondition. Welcomes for OTHER
-            // members are required so the recipient's bootstrap heals
-            // the conversation for everyone, not just themselves.
-            // The handler validates `welcome_message.is_some()` below
-            // when constructing welcome_envelopes; an empty fanout
-            // would still produce a valid (but incomplete) self-heal.
-            // We let it through — partial self-heal is better than no
-            // self-heal, and the missing recipients can later issue
-            // their own self-heal once they discover the inconsistency.
+            // SERVER F #68 self-heal precondition. The actual welcome-
+            // fanout completeness check runs INSIDE the `Path::SelfHeal`
+            // dispatch arm below (after `welcome_envelopes` is built)
+            // so partial-fanout requests fail fast with a 400 before
+            // hitting the chokepoint. Strand-by-incomplete-bootstrap
+            // is the failure mode being prevented: once a self-healer
+            // wins with welcomes for only a subset of active members,
+            // the omitted members' own self-heal calls would be
+            // rejected by the chokepoint precondition (group_info now
+            // populated), permanently stranding them until the next
+            // reset cycle.
             info!(
                 convo_id = %crate::crypto::redact_for_log(&original_convo_id),
                 new_group_id = %crate::crypto::redact_for_log(&new_group_id),
@@ -408,6 +411,93 @@ pub async fn handle(
                 })?;
         }
         Path::SelfHeal => {
+            // SERVER F #68: validate welcome-fanout completeness BEFORE
+            // dispatching to the chokepoint. Strand-by-incomplete-
+            // bootstrap is the failure mode: if a self-healer wins
+            // the tie-break with welcomes for only a subset of active
+            // members, the omitted recipients can never recover via
+            // their own self-heal because the chokepoint precondition
+            // (state='active' AND group_info IS NULL) no longer holds
+            // — group_info is now populated by the partial winner.
+            // Those recipients are stranded until the next reset cycle.
+            //
+            // Required: `welcome_envelopes` covers every active member
+            // EXCEPT the caller (who already has the new group state
+            // locally because they're submitting the bootstrap material).
+            //
+            // NOTE: this check is intentionally placed inline (not as
+            // a Lexicon-typed error) because `BootstrapResetGroupError`
+            // does not currently expose an `InvalidWelcomeFanout`
+            // variant. Adding one would require a Lexicon revision +
+            // codegen across catbird-atproto, Petrel, and the Kotlin
+            // bindings; deferred to follow-up work. Raw 400 with a
+            // JSON body describing the shape is acceptable for now —
+            // the handler is new (just landed) so no client depends
+            // on the response shape yet.
+            let active_members: Vec<String> = sqlx::query_scalar(
+                "SELECT member_did FROM members \
+                 WHERE convo_id = $1 AND left_at IS NULL",
+            )
+            .bind(&original_convo_id)
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| {
+                error!(
+                    "[bootstrapResetGroup] active-member SELECT for fanout validation: {}",
+                    e
+                );
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            })?;
+
+            let expected_recipients: BTreeSet<&str> = active_members
+                .iter()
+                .map(|d| d.as_str())
+                .filter(|d| *d != caller_did.as_str())
+                .collect();
+            let provided_recipients: BTreeSet<&str> = welcome_envelopes
+                .iter()
+                .map(|w| w.recipient_did.as_str())
+                .collect();
+            let missing: Vec<&str> = expected_recipients
+                .difference(&provided_recipients)
+                .copied()
+                .collect();
+
+            if !missing.is_empty() {
+                // Logs are redacted (journald may aggregate into less-
+                // trusted destinations). Wire body returns raw DIDs:
+                // the caller is an authenticated member of this convo
+                // and already has roster visibility via `getConvos`,
+                // so disclosure inside the response is acceptable —
+                // and necessary, since the client developer needs to
+                // know which recipients they forgot.
+                let missing_redacted: Vec<String> = missing
+                    .iter()
+                    .map(|d| crate::crypto::redact_for_log(d))
+                    .collect();
+                warn!(
+                    convo_id = %crate::crypto::redact_for_log(&original_convo_id),
+                    new_group_id = %crate::crypto::redact_for_log(&new_group_id),
+                    caller_did = %crate::crypto::redact_for_log(&caller_did),
+                    missing_count = missing.len(),
+                    expected_count = expected_recipients.len(),
+                    provided_count = provided_recipients.len(),
+                    missing = ?missing_redacted,
+                    "bootstrap_self_heal_invalid_welcome_fanout"
+                );
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "InvalidWelcomeFanout",
+                        "message": format!(
+                            "Self-heal requires welcomes for all active non-initiator members; missing: {:?}",
+                            missing
+                        ),
+                    })),
+                )
+                    .into_response());
+            }
+
             // SERVER F #68: send `SelfHealOrphanSession`. The chokepoint
             // UPDATEs the orphan row in place; idempotency-key namespace
             // is `selfheal:` to keep this distinct from any prior or
