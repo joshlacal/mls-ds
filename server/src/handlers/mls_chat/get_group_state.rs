@@ -7,6 +7,7 @@ use axum::{
     Json,
 };
 use jacquard_axum::ExtractXrpc;
+use serde::Serialize;
 use tracing::{error, info, warn};
 
 use crate::{
@@ -22,11 +23,27 @@ use crate::{
 
 const NSID: &str = "blue.catbird.mlsChat.getGroupState";
 
+/// Body shape coordinated with SERVER A (`commitGroupChange::GroupResetBody`)
+/// so CLIENT D's parser handles both call sites with one branch. Kept
+/// status=404 for backwards-compat with clients that only inspect the
+/// status code; new clients detect the reset via the structured body.
+#[derive(Debug, Serialize)]
+pub struct GroupResetBody {
+    error: &'static str,
+    message: String,
+    #[serde(rename = "convoId")]
+    convo_id: String,
+}
+
 #[derive(Debug)]
 pub enum GetGroupStateContractError {
     Structured {
         status: StatusCode,
         error: GetGroupStateError<'static>,
+    },
+    GroupReset {
+        status: StatusCode,
+        body: GroupResetBody,
     },
     Generic(StatusCode),
 }
@@ -36,6 +53,7 @@ impl GetGroupStateContractError {
     fn status_code(&self) -> StatusCode {
         match self {
             Self::Structured { status, .. } => *status,
+            Self::GroupReset { status, .. } => *status,
             Self::Generic(status) => *status,
         }
     }
@@ -60,12 +78,27 @@ impl GetGroupStateContractError {
             error: GetGroupStateError::GroupInfoUnavailable(Some(message.into())),
         }
     }
+
+    /// 404 with structured body. Status stays 404 for backwards-compat with
+    /// existing clients that branch on status code only — new clients
+    /// inspect the body's `error` field to detect a reset.
+    fn group_reset(convo_id: &str, message: impl Into<String>) -> Self {
+        Self::GroupReset {
+            status: StatusCode::NOT_FOUND,
+            body: GroupResetBody {
+                error: "GroupReset",
+                message: message.into(),
+                convo_id: convo_id.to_string(),
+            },
+        }
+    }
 }
 
 impl IntoResponse for GetGroupStateContractError {
     fn into_response(self) -> Response {
         match self {
             Self::Structured { status, error } => (status, Json(error)).into_response(),
+            Self::GroupReset { status, body } => (status, Json(body)).into_response(),
             Self::Generic(status) => status.into_response(),
         }
     }
@@ -224,6 +257,60 @@ pub async fn get_group_state(
                         "Failed to record GroupInfo 404 (non-fatal — 404 response still returned)"
                     );
                 }
+
+                // Differentiate genuine "no GroupInfo yet" from "session was
+                // reset and GroupInfo cleared" so clients can route to
+                // bootstrap-recovery instead of retrying. The conversation
+                // row already exists (we checked above) — the question is
+                // whether the active crypto session is mid-reset or has had
+                // its GroupInfo cleared post-reset.
+                let session_state: Option<(
+                    String,
+                    Option<i32>,
+                    chrono::DateTime<chrono::Utc>,
+                )> = sqlx::query_as(
+                    "SELECT state, group_info_epoch, created_at \
+                     FROM crypto_sessions \
+                     WHERE conversation_id = $1 \
+                     ORDER BY \
+                       CASE state \
+                         WHEN 'active' THEN 0 \
+                         WHEN 'reset_requested' THEN 1 \
+                         WHEN 'superseding' THEN 2 \
+                         ELSE 3 \
+                       END, \
+                       created_at DESC \
+                     LIMIT 1",
+                )
+                .bind(convo_id)
+                .fetch_optional(&pool)
+                .await
+                .ok()
+                .flatten();
+
+                if let Some((state, group_info_epoch, created_at)) = session_state {
+                    let is_reset_state = state == "reset_requested" || state == "superseding";
+                    let was_set = group_info_epoch.is_some();
+                    let is_recent = (chrono::Utc::now() - created_at).num_seconds() < 30;
+                    let cleared_active = state == "active" && (was_set || is_recent);
+
+                    if is_reset_state || cleared_active {
+                        tracing::warn!(
+                            target: "getgroupstate_reset",
+                            convo_id = %crate::crypto::redact_for_log(convo_id),
+                            session_state = %state,
+                            had_group_info_epoch = was_set,
+                            session_age_secs = (chrono::Utc::now() - created_at).num_seconds(),
+                            outcome = "reset",
+                            "GroupInfo unavailable due to reset — returning typed groupReset"
+                        );
+                        return Err(GetGroupStateContractError::group_reset(
+                            convo_id,
+                            "Conversation was reset; client must bootstrap-recover",
+                        ));
+                    }
+                }
+
                 return Err(GetGroupStateContractError::group_info_unavailable(
                     StatusCode::NOT_FOUND,
                     "GroupInfo not yet generated for this conversation",
