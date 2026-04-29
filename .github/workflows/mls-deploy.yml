@@ -173,7 +173,14 @@ jobs:
       - name: Run tests
         working-directory: ./server
         env:
+          # Tests look for TEST_DATABASE_URL (with fallback to localhost:5433
+          # which matches the dev compose stack). CI's Postgres service
+          # listens on 5432, so route both DATABASE_URL and TEST_DATABASE_URL
+          # to it. Without TEST_DATABASE_URL, the 9 DB-required tests in
+          # db::tests / actors::tests fall back to no-creds localhost which
+          # surfaces as `password authentication failed for user "runner"`.
           DATABASE_URL: postgresql://catbird:test_password@localhost:5432/catbird
+          TEST_DATABASE_URL: postgresql://catbird:test_password@localhost:5432/catbird
           RUST_LOG: debug
         run: |
           cargo test --all-features
@@ -182,6 +189,7 @@ jobs:
         working-directory: ./server
         env:
           DATABASE_URL: postgresql://catbird:test_password@localhost:5432/catbird
+          TEST_DATABASE_URL: postgresql://catbird:test_password@localhost:5432/catbird
         run: |
           cargo test --tests
 
