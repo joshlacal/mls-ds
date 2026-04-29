@@ -105,16 +105,58 @@ jobs:
         # repo root so cargo-audit can find it. Pre-existing bug — fixed
         # alongside SERVER A/B/C CI green-up.
         #
-        # Ignored advisories (transitive deps, no direct fix path):
-        # - RUSTSEC-2025-0134: rustls-pemfile unmaintained (pulled in by `a2`
-        #   APNS client). Track upstream a2 release that drops this dep.
-        # - RUSTSEC-2026-0002: lru `IterMut` unsound (pulled in by aws-sdk-s3
-        #   internal cache). Not exercised by our usage; aws-sdk-s3 update
-        #   pending.
+        # Ignored advisories (transitive deps, no direct fix path).
+        # See PR opening this audit fix for the full before/after table.
+        #
+        # ── Group 1: awaits sqlx 0.8 upgrade (tracked separately) ────────
+        # sqlx 0.7.4 transitively pulls vulnerable rustls 0.21 / rustls-webpki
+        # 0.101.7 / rustls-pemfile 1.0.4 / paste. Upgrade to sqlx 0.8 is a
+        # dedicated PR (breaking changes: GAT trait redesign, Encode->Result,
+        # Migration struct fields, integer overflow behavior).
+        # - RUSTSEC-2024-0363: sqlx Binary Protocol Misinterpretation
+        # - RUSTSEC-2024-0436: paste unmaintained (via sqlx-macros)
+        #
+        # ── Group 2: awaits a2 release dropping rustls 0.22 ──────────────
+        # a2 0.10.0 (latest) pulls rustls 0.22.4 / rustls-webpki 0.102.8 /
+        # rustls-pemfile 2.2.0. RUSTSEC IDs below also overlap with sqlx
+        # path; cargo-audit dedupes by ID so one ignore covers both sources.
+        # - RUSTSEC-2025-0134: rustls-pemfile unmaintained (a2 + sqlx paths)
+        # - RUSTSEC-2026-0049: rustls-webpki CRL Distribution Point logic
+        # - RUSTSEC-2026-0098: rustls-webpki URI name constraints
+        # - RUSTSEC-2026-0099: rustls-webpki wildcard name constraints
+        # - RUSTSEC-2026-0104: rustls-webpki CRL parsing panic
+        #
+        # ── Group 3: awaits openmls_libcrux_crypto 0.3.x patch ───────────
+        # openmls_libcrux_crypto 0.3.1 (latest) internally pins old libcrux
+        # subcrate versions. Required for post-quantum XWing cipher suite
+        # support; cannot be removed. catbird-mls peer repo has the same
+        # pinning so no version-skew coordination required.
+        # - RUSTSEC-2026-0073: libcrux-poly1305 panic (=0.0.4 hard pin)
+        # - RUSTSEC-2026-0075: libcrux-ed25519 all-zero key gen on RNG fail
+        #
+        # ── Group 4: pure unmaintained / no fix path ─────────────────────
+        # - RUSTSEC-2023-0071: rsa Marvin Attack — "No fixed upgrade is
+        #   available!" per RustSec. Pulled by jose-jwk via jacquard.
+        # - RUSTSEC-2023-0089: atomic-polyfill unmaintained (heapless/postcard
+        #   transitive via jacquard).
+        # - RUSTSEC-2024-0370: proc-macro-error unmaintained (langtag/jacquard).
+        # - RUSTSEC-2026-0002: lru IterMut unsound (aws-sdk-s3 internal
+        #   cache). Not exercised by our usage.
         run: |
           cargo audit \
             --deny warnings \
+            --ignore RUSTSEC-2024-0363 \
+            --ignore RUSTSEC-2024-0436 \
             --ignore RUSTSEC-2025-0134 \
+            --ignore RUSTSEC-2026-0049 \
+            --ignore RUSTSEC-2026-0098 \
+            --ignore RUSTSEC-2026-0099 \
+            --ignore RUSTSEC-2026-0104 \
+            --ignore RUSTSEC-2026-0073 \
+            --ignore RUSTSEC-2026-0075 \
+            --ignore RUSTSEC-2023-0071 \
+            --ignore RUSTSEC-2023-0089 \
+            --ignore RUSTSEC-2024-0370 \
             --ignore RUSTSEC-2026-0002
 
       - name: Install sqlx-cli
