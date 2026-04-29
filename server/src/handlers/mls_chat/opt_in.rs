@@ -177,7 +177,11 @@ pub async fn opt_in_post(
                             .execute(&pool)
                             .await
                             {
-                                debug!("Failed to upsert user for {}: {}", did, e);
+                                debug!(
+                                    did = %crate::crypto::redact_for_log(did),
+                                    error = %e,
+                                    "Failed to upsert user from auto-opt-in"
+                                );
                             }
 
                             if let Err(e) = sqlx::query(
@@ -189,7 +193,11 @@ pub async fn opt_in_post(
                             .execute(&pool)
                             .await
                             {
-                                debug!("Failed to auto-insert opt_in for {}: {}", did, e);
+                                debug!(
+                                    did = %crate::crypto::redact_for_log(did),
+                                    error = %e,
+                                    "Failed to auto-insert opt_in"
+                                );
                             }
 
                             info!(did = %crate::crypto::redact_for_log(did), "Auto-opted in user from PDS device records");

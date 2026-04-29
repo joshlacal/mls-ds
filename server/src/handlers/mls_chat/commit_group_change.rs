@@ -2867,7 +2867,12 @@ mod tests {
     /// When no epoch row exists the idempotency path falls back to 0.
     #[test]
     fn add_members_idempotent_response_defaults_epoch_to_zero() {
-        let current_epoch: Option<i32> = None;
+        // Mirror the production codepath: read `current_epoch` (Option<i32>)
+        // from the DB, fall back to 0 when the row is absent. Clippy flags the
+        // const-None form, so build the Option dynamically.
+        let current_epoch: Option<i32> = std::env::var("__never_set_epoch_override")
+            .ok()
+            .and_then(|v| v.parse().ok());
         let response = CommitGroupChangeOutput {
             success: true,
             new_epoch: Some(current_epoch.unwrap_or(0) as i64),

@@ -117,12 +117,9 @@ mod tests {
     use super::*;
     use chrono::Duration as ChronoDuration;
 
-    #[tokio::test]
-    async fn test_mark_inactive_devices() {
-        // This would need a test database setup
-        // For now, just verify the SQL logic is correct by inspection
-        assert!(true);
-    }
+    // Placeholder removed: `assert!(true)` was a compile-only smoke test.
+    // Real DB-backed coverage of `run_mark_inactive_devices_worker` belongs
+    // in an integration test once the worker is wired into main.
 
     #[test]
     fn test_cutoff_calculation() {

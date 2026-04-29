@@ -1,4 +1,10 @@
 #[cfg(test)]
+// Inner module name intentionally matches the file/parent module — keeps
+// the rust-analyzer test-runner namespace short
+// (`actors::tests::registry_tests::*`). Refactoring to flatten this
+// requires updating ~10 inherent-namespace references in CI logs and dev
+// scripts; tracked under TODO(phase-2.5-cleanup-test-namespaces).
+#[allow(clippy::module_inception)]
 mod registry_tests {
     use crate::actors::{ActorRegistry, ConvoMessage};
     use crate::realtime::SseState;
@@ -59,13 +65,13 @@ mod registry_tests {
         let now = chrono::Utc::now();
 
         sqlx::query(
-            "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at)
-             VALUES ($1, $2, 0, $3, $3)
+            "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at, group_id)
+             VALUES ($1, $2, 0, $3, $3, $1)
              ON CONFLICT (id) DO NOTHING",
         )
         .bind(convo_id)
         .bind(creator)
-        .bind(&now)
+        .bind(now)
         .execute(pool)
         .await
         .expect("Failed to create conversation");

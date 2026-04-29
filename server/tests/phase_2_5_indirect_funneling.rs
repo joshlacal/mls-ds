@@ -7,14 +7,14 @@
 //!   - **R1 exploit attempts**:
 //!     E1: `Admin` trigger with NULL binding → request rejected.
 //!     E2: Non-member submits bootstrap on NULL-binding Request →
-//!         activation rejected.
+//!     activation rejected.
 //!     E3: Current member submits → activation accepted.
 //!     E4: Member who left between Request and Activate → activation
-//!         rejected (responder allowlist snapshotted at Request time).
+//!     rejected (responder allowlist snapshotted at Request time).
 //!     E5: Two indirect Requests with same idempotency_key → exactly
-//!         one Request event.
+//!     one Request event.
 //!     E6: Two distinct activators race; both in allowlist → first
-//!         wins via UNIQUE generation, second sees Lost.
+//!     wins via UNIQUE generation, second sees Lost.
 //!   - **Inline-trigger end-to-end**: TriggerSystemReset with
 //!     inline_groupinfo_404_threshold reason produces both legacy
 //!     groupResetEvent AND new resetRequestedEvent, plus a member_count

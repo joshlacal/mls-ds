@@ -666,9 +666,15 @@ async fn handle_typing(
 mod tests {
     use super::MAX_EPOCH_DRIFT;
 
+    // Compile-time guard: the bounds are constants, so we evaluate them in a
+    // const block. If `MAX_EPOCH_DRIFT` is ever set to 0 or above the sanity
+    // ceiling, the test target fails to build (the const block panics during
+    // monomorphization).
     #[test]
     fn max_epoch_drift_is_reasonable() {
-        assert!(MAX_EPOCH_DRIFT > 0);
-        assert!(MAX_EPOCH_DRIFT <= 10_000);
+        const _: () = {
+            assert!(MAX_EPOCH_DRIFT > 0);
+            assert!(MAX_EPOCH_DRIFT <= 10_000);
+        };
     }
 }

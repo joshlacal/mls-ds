@@ -491,6 +491,44 @@ pub async fn rate_limit_middleware(request: Request, next: Next) -> Result<Respo
     }
 }
 
+fn parse_ip_from_header(headers: &HeaderMap, name: &str) -> Option<IpAddr> {
+    headers
+        .get(name)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .and_then(|value| value.parse::<IpAddr>().ok())
+}
+
+fn is_trusted_proxy(ip: IpAddr, trusted_cidrs: &[IpNet]) -> bool {
+    !trusted_cidrs.is_empty() && trusted_cidrs.iter().any(|cidr| cidr.contains(&ip))
+}
+
+fn extract_client_ip_with_trusted(request: &Request, trusted_cidrs: &[IpNet]) -> String {
+    let peer_ip = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip());
+
+    if let Some(source_ip) = peer_ip {
+        if is_trusted_proxy(source_ip, trusted_cidrs) {
+            if let Some(ip) = parse_ip_from_header(request.headers(), "cf-connecting-ip")
+                .or_else(|| parse_ip_from_header(request.headers(), "x-forwarded-for"))
+                .or_else(|| parse_ip_from_header(request.headers(), "x-real-ip"))
+            {
+                return ip.to_string();
+            }
+        }
+        return source_ip.to_string();
+    }
+
+    "unknown".to_string()
+}
+
+fn extract_client_ip(request: &Request) -> String {
+    extract_client_ip_with_trusted(request, &TRUSTED_PROXY_CIDRS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -604,42 +642,4 @@ mod tests {
             "198.51.100.20"
         );
     }
-}
-
-fn parse_ip_from_header(headers: &HeaderMap, name: &str) -> Option<IpAddr> {
-    headers
-        .get(name)
-        .and_then(|h| h.to_str().ok())
-        .and_then(|value| value.split(',').next())
-        .map(str::trim)
-        .and_then(|value| value.parse::<IpAddr>().ok())
-}
-
-fn is_trusted_proxy(ip: IpAddr, trusted_cidrs: &[IpNet]) -> bool {
-    !trusted_cidrs.is_empty() && trusted_cidrs.iter().any(|cidr| cidr.contains(&ip))
-}
-
-fn extract_client_ip_with_trusted(request: &Request, trusted_cidrs: &[IpNet]) -> String {
-    let peer_ip = request
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|ci| ci.0.ip());
-
-    if let Some(source_ip) = peer_ip {
-        if is_trusted_proxy(source_ip, trusted_cidrs) {
-            if let Some(ip) = parse_ip_from_header(request.headers(), "cf-connecting-ip")
-                .or_else(|| parse_ip_from_header(request.headers(), "x-forwarded-for"))
-                .or_else(|| parse_ip_from_header(request.headers(), "x-real-ip"))
-            {
-                return ip.to_string();
-            }
-        }
-        return source_ip.to_string();
-    }
-
-    "unknown".to_string()
-}
-
-fn extract_client_ip(request: &Request) -> String {
-    extract_client_ip_with_trusted(request, &TRUSTED_PROXY_CIDRS)
 }

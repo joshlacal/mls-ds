@@ -571,7 +571,10 @@ async fn handle_update_group_info(
         || VerifiableGroupInfo::tls_deserialize(&mut &*gi_slice).is_ok();
 
     if !valid {
-        error!(convo_id = %convo_id, "Invalid MLS GroupInfo structure");
+        error!(
+            convo_id = %crate::crypto::redact_for_log(convo_id),
+            "Invalid MLS GroupInfo structure"
+        );
         return (StatusCode::BAD_REQUEST, "Invalid MLS GroupInfo structure").into_response();
     }
 
@@ -579,7 +582,7 @@ async fn handle_update_group_info(
     if let Ok(Some((_, existing_epoch, _))) = get_group_info(pool, convo_id).await {
         if epoch as i32 <= existing_epoch {
             warn!(
-                convo_id = %convo_id,
+                convo_id = %crate::crypto::redact_for_log(convo_id),
                 new_epoch = epoch,
                 existing_epoch = existing_epoch,
                 "Rejecting GroupInfo with non-increasing epoch"
@@ -594,7 +597,11 @@ async fn handle_update_group_info(
 
     // Store
     if let Err(e) = store_group_info(pool, convo_id, gi_slice, epoch as i32).await {
-        error!(convo_id = %convo_id, error = %e, "Failed to store GroupInfo");
+        error!(
+            convo_id = %crate::crypto::redact_for_log(convo_id),
+            error = %e,
+            "Failed to store GroupInfo"
+        );
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 

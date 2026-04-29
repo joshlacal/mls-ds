@@ -422,7 +422,17 @@ fn validate_endpoint_url_with_policy(
                 reason: format!("Blocked private address: {host}"),
             });
         }
-        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        // IPv6 hosts are returned by `host_str()` as bracketed
+        // strings (e.g. `[::1]`), which do NOT parse as
+        // `std::net::IpAddr`. Use `parsed.host()` to access the typed
+        // host enum and inspect the IP variant directly. Without this
+        // path, `https://[::1]` slips through the SSRF check.
+        let typed_ip: Option<std::net::IpAddr> = match parsed.host() {
+            Some(url::Host::Ipv4(v4)) => Some(std::net::IpAddr::V4(v4)),
+            Some(url::Host::Ipv6(v6)) => Some(std::net::IpAddr::V6(v6)),
+            _ => host.parse::<std::net::IpAddr>().ok(),
+        };
+        if let Some(ip) = typed_ip {
             if is_private_ip(&ip) {
                 return Err(FederationError::ResolutionFailed {
                     did: String::new(),
