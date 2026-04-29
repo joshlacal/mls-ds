@@ -1842,10 +1842,22 @@ pub(crate) async fn self_heal_orphan_session_tx(
     }
 
     // 6. UPDATE conversations legacy MLS columns. Same shape as
-    //    activate_crypto_session_tx step 5, but reset_count is NOT
-    //    advanced — generation is preserved across self-heal. The
-    //    active_crypto_session_id pointer is unchanged (we updated the
-    //    same row's id-keyed slot).
+    //    activate_crypto_session_tx step 5, with two deliberate deltas:
+    //
+    //      * `reset_count` is NOT advanced — generation is preserved
+    //        across self-heal (same crypto_sessions row id+generation).
+    //      * `active_crypto_session_id` is unchanged (we updated the
+    //        same row's id-keyed slot, no new id to point at).
+    //
+    //    `last_reset_at` and `last_reset_by` ARE updated to NOW() and
+    //    `initiator_did` respectively. Rationale: the orphan row's
+    //    `last_reset_at` was set by `do_reset_group` potentially hours
+    //    or days ago (4b2cdbaa: gen 25 from prior reset). UI consumers
+    //    of `last_reset_at` ("Group was reset on X") should see the
+    //    timestamp of the cycle that actually completed crypto, not the
+    //    abandoned attempt. `last_reset_by` shifts attribution from the
+    //    system DID (set by do_reset_group) to the recipient who
+    //    completed the cycle — matching the activate path's semantics.
     sqlx::query(
         "UPDATE conversations SET \
             group_id = $1, \
@@ -1854,13 +1866,16 @@ pub(crate) async fn self_heal_orphan_session_tx(
             group_info_epoch = 0, \
             group_info_updated_at = NOW(), \
             confirmation_tag = NULL, \
+            last_reset_at = NOW(), \
+            last_reset_by = $3, \
             recent_commit_409_count = 0, \
             recent_groupinfo_404_count = 0, \
             updated_at = NOW() \
-         WHERE id = $3",
+         WHERE id = $4",
     )
     .bind(new_mls_group_id)
     .bind(new_group_info)
+    .bind(initiator_did)
     .bind(conversation_id)
     .execute(&mut **tx)
     .await
