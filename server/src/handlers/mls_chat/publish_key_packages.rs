@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 use axum::{
     extract::State,
@@ -14,9 +14,10 @@ use crate::{
     auth::AuthUser,
     device_utils::parse_device_did,
     generated::blue_catbird::mlsChat::publish_key_packages::{
-        BatchError, KeyPackageStats, PublishKeyPackagesOutput, PublishKeyPackagesRequest,
-        PublishResult, SyncResult,
+        BatchError, KeyPackageStats, PublishKeyPackages, PublishKeyPackagesOutput,
+        PublishKeyPackagesRequest, PublishResult, ReplenishResult, SyncResult,
     },
+    notifications::NotificationService,
     storage::DbPool,
 };
 
@@ -649,16 +650,183 @@ async fn handle_sync(
     })
 }
 
+/// Handle "requestReplenish" action — ask target peer devices to upload fresh key packages.
+async fn handle_request_replenish(
+    pool: &DbPool,
+    notification_service: Option<Arc<NotificationService>>,
+    input: &PublishKeyPackages<'_>,
+    requester_did: &str,
+) -> Result<ReplenishResult<'static>, StatusCode> {
+    let Some(target_dids) = input.target_dids.as_ref() else {
+        warn!("requestReplenish action requires targetDids");
+        return Err(StatusCode::BAD_REQUEST);
+    };
+
+    if target_dids.is_empty() || target_dids.len() > 100 {
+        warn!(
+            "requestReplenish targetDids length out of range: {}",
+            target_dids.len()
+        );
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let mut seen = HashSet::new();
+    let mut targets: Vec<String> = target_dids
+        .iter()
+        .map(|did| did.to_string())
+        .filter(|did| seen.insert(did.clone()))
+        .collect();
+    let requested_target_count = targets.len();
+
+    let convo_id = input
+        .convo_id
+        .as_ref()
+        .map(|value| value.as_ref().trim())
+        .filter(|value| !value.is_empty());
+
+    if let Some(convo_id) = convo_id {
+        let requester_is_member: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM members
+                WHERE convo_id = $1
+                  AND (user_did = $2 OR member_did = $2)
+                  AND left_at IS NULL
+            )",
+        )
+        .bind(convo_id)
+        .bind(requester_did)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| {
+            error!(
+                "requestReplenish: failed to verify requester membership for {}: {}",
+                convo_id, e
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        if !requester_is_member {
+            warn!(
+                "requestReplenish: requester {} is not an active member of {}",
+                requester_did, convo_id
+            );
+            return Err(StatusCode::FORBIDDEN);
+        }
+
+        let active_targets: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT COALESCE(user_did, member_did)
+             FROM members
+             WHERE convo_id = $1
+               AND COALESCE(user_did, member_did) = ANY($2)
+               AND left_at IS NULL",
+        )
+        .bind(convo_id)
+        .bind(&targets)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| {
+            error!(
+                "requestReplenish: failed to filter target membership for {}: {}",
+                convo_id, e
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        let active_set: HashSet<String> = active_targets.into_iter().collect();
+        let before_filter = targets.len();
+        targets.retain(|did| active_set.contains(did));
+        if targets.len() != before_filter {
+            warn!(
+                "requestReplenish: filtered {} non-member target(s) for {}",
+                before_filter - targets.len(),
+                convo_id
+            );
+        }
+    }
+
+    if targets.is_empty() {
+        return Ok(ReplenishResult {
+            requested: true,
+            target_count: requested_target_count as i64,
+            device_count: 0,
+            delivered_count: 0,
+            extra_data: Default::default(),
+        });
+    }
+
+    let devices: Vec<(String, String)> = sqlx::query_as(
+        "SELECT user_did, push_token
+         FROM devices
+         WHERE user_did = ANY($1)
+           AND push_token IS NOT NULL
+           AND push_token <> ''
+         ORDER BY user_did, last_seen_at DESC",
+    )
+    .bind(&targets)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| {
+        error!("requestReplenish: failed to query target devices: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let device_count = devices.len();
+    let mut delivered_count = 0i64;
+    let requested_at = Utc::now().to_rfc3339();
+    let reason = input
+        .reason
+        .as_ref()
+        .map(|value| value.as_ref())
+        .filter(|value| !value.is_empty());
+
+    if let Some(notification_service) = notification_service {
+        if notification_service.can_send_pushes() {
+            for (target_did, push_token) in devices {
+                match notification_service
+                    .notify_key_package_replenish_request(
+                        &push_token,
+                        &target_did,
+                        requester_did,
+                        &requested_at,
+                        reason,
+                        convo_id,
+                    )
+                    .await
+                {
+                    Ok(()) => delivered_count += 1,
+                    Err(e) => warn!(
+                        "requestReplenish: failed to notify {} device: {}",
+                        target_did, e
+                    ),
+                }
+            }
+        } else {
+            info!("requestReplenish: push notification service disabled");
+        }
+    } else {
+        info!("requestReplenish: notification service unavailable");
+    }
+
+    Ok(ReplenishResult {
+        requested: true,
+        target_count: requested_target_count as i64,
+        device_count: device_count as i64,
+        delivered_count,
+        extra_data: Default::default(),
+    })
+}
+
 // ─── POST handler ───
 
 /// Consolidated key package management endpoint (POST)
 /// POST /xrpc/blue.catbird.mlsChat.publishKeyPackages
 ///
-/// All actions return `{ stats: KeyPackageStats, syncResult?, publishResult? }`
+/// All actions return `{ stats: KeyPackageStats, syncResult?, publishResult?, replenishResult? }`
 /// per the lexicon output schema.
-#[tracing::instrument(skip(pool, headers, auth_user, input))]
+#[tracing::instrument(skip(pool, notification_service, headers, auth_user, input))]
 pub async fn publish_key_packages_post(
     State(pool): State<DbPool>,
+    State(notification_service): State<Option<Arc<NotificationService>>>,
     headers: HeaderMap,
     auth_user: AuthUser,
     ExtractXrpc(input): ExtractXrpc<PublishKeyPackagesRequest>,
@@ -711,6 +879,7 @@ pub async fn publish_key_packages_post(
                 stats,
                 publish_result: Some(publish_result),
                 sync_result: None,
+                replenish_result: None,
                 extra_data: Default::default(),
             }))
         }
@@ -723,6 +892,7 @@ pub async fn publish_key_packages_post(
                 stats,
                 publish_result: Some(publish_result),
                 sync_result: None,
+                replenish_result: None,
                 extra_data: Default::default(),
             }))
         }
@@ -735,6 +905,7 @@ pub async fn publish_key_packages_post(
                 stats,
                 publish_result: None,
                 sync_result: Some(sync_result),
+                replenish_result: None,
                 extra_data: Default::default(),
             }))
         }
@@ -745,6 +916,20 @@ pub async fn publish_key_packages_post(
                 stats,
                 publish_result: None,
                 sync_result: None,
+                replenish_result: None,
+                extra_data: Default::default(),
+            }))
+        }
+
+        "requestReplenish" => {
+            let replenish_result =
+                handle_request_replenish(&pool, notification_service, &input, &user_did).await?;
+            let stats = build_stats(&pool, &did).await?;
+            Ok(Json(PublishKeyPackagesOutput {
+                stats,
+                publish_result: None,
+                sync_result: None,
+                replenish_result: Some(replenish_result),
                 extra_data: Default::default(),
             }))
         }
