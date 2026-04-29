@@ -267,12 +267,17 @@ pub async fn get_key_packages(
 /// for each successfully claimed package — one row per (DID, device_id)
 /// bucket where an available row existed. The transition
 /// `state='available' -> state='claimed'` is the atomic gate; concurrent
-/// callers see disjoint rows because the inner SELECT uses
-/// `FOR UPDATE SKIP LOCKED`.
+/// callers see disjoint rows because the row-pick CTE uses
+/// `FOR UPDATE OF kp SKIP LOCKED`.
 ///
 /// Replaces the previous per-DID helper that issued N round-trips for N
 /// requested DIDs (PR review #23 follow-up). Per-device dedupe is preserved
-/// via `DISTINCT ON (owner_did, COALESCE(device_id, ''))`.
+/// via `ROW_NUMBER() OVER (PARTITION BY owner_did, COALESCE(device_id, ''))`
+/// rather than `DISTINCT ON`, because Postgres rejects
+/// `SELECT DISTINCT ON ... FOR UPDATE` at parse time
+/// (`ERROR: FOR UPDATE is not allowed with DISTINCT clause`). The previous
+/// shape was a server-wide regression: every `getKeyPackages` call returned
+/// 500 in production.
 ///
 /// `last_resort = false` filters to regular packages; `last_resort = true`
 /// claims from the last-resort pool only. Last-resort packages are still
@@ -299,21 +304,45 @@ pub async fn claim_available_key_packages_bulk(
         ""
     };
 
+    // Two-stage CTE:
+    //   `candidates` ranks rows per (owner_did, device-bucket) by created_at;
+    //   `locked`     re-selects rank-1 rows joined back to `key_packages`
+    //                with `FOR UPDATE OF kp SKIP LOCKED` so concurrent
+    //                claimants get disjoint rows. The outer UPDATE re-checks
+    //                `state = 'available'` so the available -> claimed
+    //                transition is the atomic gate.
+    //
+    // We cannot use the simpler `SELECT DISTINCT ON ... FOR UPDATE` shape:
+    // Postgres rejects it (`FOR UPDATE is not allowed with DISTINCT clause`),
+    // and that prior shape returned 500 for every call. `FOR UPDATE` cannot
+    // attach directly to a CTE name, hence the JOIN against `key_packages`
+    // aliased as `kp` — the `OF kp` qualifier locks the underlying base-table
+    // rows, which is what we want.
     let sql = format!(
-        "UPDATE key_packages
-         SET state = 'claimed', consumed_at = NOW()
-         WHERE id IN (
-           SELECT DISTINCT ON (owner_did, COALESCE(device_id, '')) id
-           FROM key_packages
-           WHERE owner_did = ANY($1::text[])
-             AND state = 'available'
-             AND expires_at > NOW()
-             {lr}
-             {cs}
-           ORDER BY owner_did, COALESCE(device_id, ''), created_at ASC
-           FOR UPDATE SKIP LOCKED
+        "WITH candidates AS (
+             SELECT id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY owner_did, COALESCE(device_id, '')
+                        ORDER BY created_at ASC
+                    ) AS rn
+             FROM key_packages
+             WHERE owner_did = ANY($1::text[])
+               AND state = 'available'
+               AND expires_at > NOW()
+               {lr}
+               {cs}
+         ),
+         locked AS (
+             SELECT c.id
+             FROM candidates c
+             JOIN key_packages kp ON kp.id = c.id
+             WHERE c.rn = 1
+             FOR UPDATE OF kp SKIP LOCKED
          )
-         AND state = 'available'
+         UPDATE key_packages
+         SET state = 'claimed', consumed_at = NOW()
+         WHERE id IN (SELECT id FROM locked)
+           AND state = 'available'
          RETURNING owner_did, cipher_suite, key_package, key_package_hash",
         lr = lr_predicate,
         cs = cs_predicate,

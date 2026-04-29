@@ -83,36 +83,23 @@ async fn cleanup(pool: &PgPool, owner_did: &str) {
         .await;
 }
 
-/// Direct copy of the atomic claim SQL emitted by the
-/// `claim_available_key_packages` helper in
-/// `handlers/mls_chat/get_key_packages.rs`. We invoke the SQL directly here
-/// rather than calling the handler to keep the test focused on the
-/// atomicity invariant.
+/// Calls the production claim helper directly. Previously this test inlined
+/// a hand-copied SQL string of the helper's body; that copy drifted when the
+/// helper was rewritten to fix a `DISTINCT ON ... FOR UPDATE` regression and
+/// would have started silently testing dead SQL. Routing through the real
+/// helper keeps the race-test invariant pinned to whatever shape the helper
+/// emits today.
 async fn try_claim_one(
     pool: &PgPool,
     owner_did: &str,
     cipher_suite: &str,
 ) -> sqlx::Result<Vec<(String, String, Vec<u8>, Option<String>)>> {
-    sqlx::query_as::<_, (String, String, Vec<u8>, Option<String>)>(
-        "UPDATE key_packages \
-         SET state = 'claimed', consumed_at = NOW() \
-         WHERE id IN ( \
-           SELECT DISTINCT ON (COALESCE(device_id, '')) id \
-           FROM key_packages \
-           WHERE owner_did = $1 \
-             AND state = 'available' \
-             AND expires_at > NOW() \
-             AND is_last_resort = false \
-             AND cipher_suite = $2 \
-           ORDER BY COALESCE(device_id, ''), created_at ASC \
-           FOR UPDATE SKIP LOCKED \
-         ) \
-         AND state = 'available' \
-         RETURNING owner_did, cipher_suite, key_package, key_package_hash",
+    catbird_server::handlers::mls_chat::get_key_packages::claim_available_key_packages_bulk(
+        pool,
+        &[owner_did],
+        Some(cipher_suite),
+        /* last_resort = */ false,
     )
-    .bind(owner_did)
-    .bind(cipher_suite)
-    .fetch_all(pool)
     .await
 }
 

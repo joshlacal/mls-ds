@@ -332,3 +332,110 @@ async fn test_bulk_claim_emits_one_statement_per_call() {
 
     cleanup(&pool, &dids).await;
 }
+
+/// Regression for the production-blocking `getKeyPackages` 500.
+///
+/// The prior bulk SQL used `SELECT DISTINCT ON ... FOR UPDATE SKIP LOCKED`,
+/// which Postgres rejects at parse time with
+/// `ERROR: FOR UPDATE is not allowed with DISTINCT clause`. Every call
+/// returned 500, blocking Phase 2.5 first-responder bootstrap recovery.
+///
+/// This test pre-seeds 3 DIDs × 2 device buckets × 3 available rows each (18
+/// rows total) and asserts the bulk claim returns exactly 6 rows — one per
+/// (DID, device_id) bucket. The single biggest behavioural symptom of a
+/// regression to the broken SQL would be an `Err(...)` here.
+#[tokio::test]
+async fn test_bulk_claim_smoke_distinct_for_update_regression() {
+    let pool = setup_test_db().await;
+    let cipher_suite = "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519";
+
+    let run_id = Uuid::new_v4();
+    let dids: Vec<String> = (0..3)
+        .map(|i| format!("did:plc:test-distinct-{}-{}", run_id, i))
+        .collect();
+    let buckets = ["dev-A", "dev-B"];
+
+    for did in &dids {
+        ensure_user(&pool, did).await;
+        for bucket in &buckets {
+            // 3 available rows per (DID, bucket) — dedupe must collapse to 1.
+            for _ in 0..3 {
+                insert_key_package(&pool, did, cipher_suite, Some(bucket), false).await;
+                tokio::time::sleep(StdDuration::from_millis(2)).await;
+            }
+        }
+    }
+
+    let did_strs: Vec<&str> = dids.iter().map(String::as_str).collect();
+    let rows = claim_available_key_packages_bulk(&pool, &did_strs, Some(cipher_suite), false)
+        .await
+        .expect(
+            "bulk claim must not return an Err — \
+             a regression to `DISTINCT ON ... FOR UPDATE SKIP LOCKED` \
+             trips Postgres parse error 'FOR UPDATE is not allowed with \
+             DISTINCT clause' which is exactly the production 500.",
+        );
+
+    assert_eq!(
+        rows.len(),
+        dids.len() * buckets.len(),
+        "expected one claimed row per (DID, device_id) bucket; got {}",
+        rows.len()
+    );
+
+    // Per-DID dedupe shape: each DID owns exactly one row per bucket.
+    let mut seen: HashMap<(String, String), usize> = HashMap::new();
+    for (owner_did, _cs, _kp, _hash) in &rows {
+        // We don't have device_id in the RETURNING shape, so we just bucket
+        // by owner_did and assert the per-DID count is 2 (one per bucket).
+        *seen.entry((owner_did.clone(), String::new())).or_default() += 1;
+    }
+    for did in &dids {
+        let count = seen
+            .get(&(did.clone(), String::new()))
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(
+            count, 2,
+            "DID {} should have one row per device bucket (=2); got {}",
+            did, count
+        );
+    }
+
+    cleanup(&pool, &dids).await;
+}
+
+/// `device_id IS NULL` rows must collapse to a single bucket via
+/// `COALESCE(device_id, '')`. Pre-existing test_bulk_claim_matches_per_did_loop
+/// covers the single-NULL-row case (did_1); this asserts the dedupe with
+/// MULTIPLE NULL-device rows owned by the same DID — the bucket must collapse
+/// regardless of how many NULL-device rows are seeded.
+#[tokio::test]
+async fn test_bulk_claim_null_device_id_dedupe() {
+    let pool = setup_test_db().await;
+    let cipher_suite = "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519";
+
+    let run_id = Uuid::new_v4();
+    let did = format!("did:plc:test-nulldev-{}", run_id);
+    ensure_user(&pool, &did).await;
+
+    // 4 rows with device_id = NULL on the same DID — all collapse to one bucket.
+    for _ in 0..4 {
+        insert_key_package(&pool, &did, cipher_suite, None, false).await;
+        tokio::time::sleep(StdDuration::from_millis(2)).await;
+    }
+
+    let rows = claim_available_key_packages_bulk(&pool, &[did.as_str()], Some(cipher_suite), false)
+        .await
+        .expect("bulk claim with NULL device_id");
+
+    assert_eq!(
+        rows.len(),
+        1,
+        "4 rows × NULL device_id × same DID must collapse to 1 claimed row \
+         via COALESCE(device_id, ''); got {}",
+        rows.len()
+    );
+
+    cleanup(&pool, &[did]).await;
+}
