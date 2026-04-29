@@ -196,6 +196,10 @@ jobs:
   build:
     name: Build and Push Docker Image
     needs: test
+    # Skip on pull_request events: PR refs produce malformed Docker tags
+    # like `mls-server:-<sha>` (empty branch + dash + sha) and the build
+    # job is meant for push-to-main/staging deploys, not PR validation.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
