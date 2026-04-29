@@ -33,19 +33,23 @@ struct XrpcErrorBody {
     message: String,
 }
 
-/// Structured body for `GroupReset` errors. Returned when an active crypto
-/// session is in `reset_requested`/`superseding`, or when the session row
-/// exists but its cached GroupInfo has been cleared post-reset. Clients
-/// route to bootstrap-recovery on this typed body rather than retrying.
+/// Structured body for `groupReset` errors. Locked contract with CLIENT D —
+/// the wire shape MUST match across SERVER A (`commitGroupChange
+/// refreshGroupInfo`) and SERVER B (`getGroupState`):
 ///
-/// Shape coordinated with CLIENT D so a single parser handles both the
-/// commitGroupChange and getGroupState variants.
+///   {"error":"groupReset","message":"<text>","convoId":"<convo>","newCryptoSessionId":<id-or-null>}
+///
+/// HTTP status: 410 Gone. `newCryptoSessionId` is the id of the currently-
+/// active `crypto_sessions` row (the session clients should bootstrap into),
+/// or null if the conversation is mid-reset and no active row exists.
 #[derive(Serialize)]
 pub struct GroupResetBody {
     error: &'static str,
     message: String,
     #[serde(rename = "convoId")]
     convo_id: String,
+    #[serde(rename = "newCryptoSessionId")]
+    new_crypto_session_id: Option<String>,
 }
 
 /// Structured body for CAS-failure 409s, matching the shape already produced by
@@ -107,11 +111,16 @@ impl IntoResponse for XrpcError {
     }
 }
 
-fn group_reset_error(convo_id: &str, message: impl Into<String>) -> XrpcError {
+fn group_reset_error(
+    convo_id: &str,
+    message: impl Into<String>,
+    new_crypto_session_id: Option<String>,
+) -> XrpcError {
     XrpcError::GroupReset(GroupResetBody {
-        error: "GroupReset",
+        error: "groupReset",
         message: message.into(),
         convo_id: convo_id.to_string(),
+        new_crypto_session_id,
     })
 }
 
@@ -2823,15 +2832,17 @@ pub async fn commit_group_change(
                 return Err(bad_request("Not a member of this conversation"));
             }
 
-            // Inspect the active crypto session so we can route reset/superseding
-            // conversations to bootstrap-recovery instead of letting clients
-            // spin in a refresh→getGroupState retry loop. We can't mint
-            // fresh GroupInfo server-side (per RFC 9750 the server is
-            // delivery, not authority) — so when the active session has lost
-            // its cached GroupInfo *after* having one, the only recovery is
-            // a fresh bootstrap.
-            let active_session: Option<(String, Option<Vec<u8>>, Option<i32>)> = sqlx::query_as(
-                "SELECT state, group_info, group_info_epoch \
+            // Inspect the active crypto session. Per the locked contract with
+            // CLIENT D: any active session with NULL group_info — regardless
+            // of age — is a reset signal. The 4b2cdbaa diagnostic showed
+            // gen 24 sat at active+NULL for 50+ minutes, so a "settling
+            // window" carve-out would never have fired. Sessions in
+            // `reset_requested`/`superseding` also signal reset. Per RFC 9750
+            // we cannot mint server-side GroupInfo — clients are the only
+            // signing authority; the typed error routes them to
+            // bootstrap-recovery.
+            let active_session: Option<(String, Option<Vec<u8>>)> = sqlx::query_as(
+                "SELECT id, group_info \
                  FROM crypto_sessions \
                  WHERE conversation_id = $1 AND state = 'active'",
             )
@@ -2843,8 +2854,9 @@ pub async fn commit_group_change(
                 internal_server_error("Database error")
             })?;
 
-            // Also surface if the conversation is in mid-reset state (no
-            // 'active' row, just `reset_requested` / `superseding`).
+            // If no active row, surface whether a reset is mid-flight so we
+            // can emit a typed groupReset (clients should bootstrap-recover,
+            // not retry against a phantom session).
             let reset_in_flight: Option<(String,)> = if active_session.is_none() {
                 sqlx::query_as(
                     "SELECT state FROM crypto_sessions \
@@ -2867,48 +2879,41 @@ pub async fn commit_group_change(
             };
 
             match (active_session.as_ref(), reset_in_flight.as_ref()) {
-                // Active session present → check group_info shape.
-                (Some((session_state, group_info, group_info_epoch)), _) => {
-                    let has_group_info = group_info.is_some();
-                    let has_been_set = group_info_epoch.is_some();
-
-                    if !has_group_info && has_been_set {
-                        // group_info was cleared post-reset but the session
-                        // is still 'active' — this is the cleared-somehow
-                        // case. Clients must bootstrap-recover.
-                        tracing::info!(
-                            target: "groupinfo_refresh",
-                            action = "refreshGroupInfo",
-                            convo_id = %convo_redacted,
-                            active_session_state = %session_state,
-                            outcome = "group_reset_cleared_group_info",
-                            "active session has NULL group_info despite prior epoch — routing client to bootstrap-recovery"
-                        );
-                        return Err(group_reset_error(
-                            &convo_id,
-                            "GroupInfo cleared post-reset; client must bootstrap-recover",
-                        ));
-                    }
-
-                    // Fresh-group case (no group_info ever generated) and
-                    // already-fresh case (group_info present) both fall
-                    // through to the legacy SSE-emit + 200 path so the
-                    // existing recovery handshake keeps working.
+                // Active session with NULL group_info — reset signal.
+                // newCryptoSessionId echoes back the active id so clients can
+                // bootstrap into the right successor.
+                (Some((active_id, None)), _) => {
                     tracing::info!(
                         target: "groupinfo_refresh",
                         action = "refreshGroupInfo",
                         convo_id = %convo_redacted,
-                        active_session_state = %session_state,
-                        has_group_info,
-                        outcome = if has_group_info {
-                            "active_with_group_info"
-                        } else {
-                            "active_no_group_info_yet"
-                        },
-                        "emitting GroupInfoRefreshRequested SSE for active session"
+                        active_session_state = "active",
+                        new_crypto_session_id = %active_id,
+                        outcome = "group_reset_active_null_group_info",
+                        "active session has NULL group_info — routing client to bootstrap-recovery"
+                    );
+                    return Err(group_reset_error(
+                        &convo_id,
+                        "GroupInfo unavailable for active session; client must bootstrap-recover",
+                        Some(active_id.clone()),
+                    ));
+                }
+                // Active session with group_info — fall through to the
+                // legacy SSE-emit + 200 happy path so other clients can
+                // re-publish via the existing recovery handshake.
+                (Some((active_id, Some(_))), _) => {
+                    tracing::info!(
+                        target: "groupinfo_refresh",
+                        action = "refreshGroupInfo",
+                        convo_id = %convo_redacted,
+                        active_session_state = "active",
+                        active_session_id = %active_id,
+                        outcome = "active_with_group_info",
+                        "emitting GroupInfoRefreshRequested SSE for active session with cached GroupInfo"
                     );
                 }
-                // No active session, but a reset is in flight.
+                // No active session, reset mid-flight. newCryptoSessionId is
+                // null since the successor doesn't exist yet.
                 (None, Some((reset_state,))) => {
                     tracing::info!(
                         target: "groupinfo_refresh",
@@ -2921,12 +2926,12 @@ pub async fn commit_group_change(
                     return Err(group_reset_error(
                         &convo_id,
                         "Conversation is being reset; client must bootstrap-recover",
+                        None,
                     ));
                 }
-                // No crypto_sessions row at all (legacy compat: pre-Phase-2
-                // conversations may not have a row yet). Fall through to
-                // the legacy SSE-emit + 200 path; the legacy fallback in
-                // `CryptoSessionRepository::get_active` handles reads.
+                // No crypto_sessions row at all (pre-Phase-2 legacy convo).
+                // Fall through to legacy SSE-emit path; the repository's
+                // legacy fallback path handles reads.
                 (None, None) => {
                     tracing::info!(
                         target: "groupinfo_refresh",

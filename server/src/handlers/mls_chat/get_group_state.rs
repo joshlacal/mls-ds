@@ -24,15 +24,22 @@ use crate::{
 const NSID: &str = "blue.catbird.mlsChat.getGroupState";
 
 /// Body shape coordinated with SERVER A (`commitGroupChange::GroupResetBody`)
-/// so CLIENT D's parser handles both call sites with one branch. Kept
-/// status=404 for backwards-compat with clients that only inspect the
-/// status code; new clients detect the reset via the structured body.
+/// — locked contract with CLIENT D. Wire shape:
+///
+///   {"error":"groupReset","message":"<text>","convoId":"<convo>","newCryptoSessionId":<id-or-null>}
+///
+/// HTTP status: **410 Gone**. `newCryptoSessionId` carries the id of the
+/// currently-active `crypto_sessions` row so clients can bootstrap into
+/// the right successor; null when the conversation is mid-reset and no
+/// active row exists yet.
 #[derive(Debug, Serialize)]
 pub struct GroupResetBody {
     error: &'static str,
     message: String,
     #[serde(rename = "convoId")]
     convo_id: String,
+    #[serde(rename = "newCryptoSessionId")]
+    new_crypto_session_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -79,16 +86,23 @@ impl GetGroupStateContractError {
         }
     }
 
-    /// 404 with structured body. Status stays 404 for backwards-compat with
-    /// existing clients that branch on status code only — new clients
-    /// inspect the body's `error` field to detect a reset.
-    fn group_reset(convo_id: &str, message: impl Into<String>) -> Self {
+    /// 410 Gone with structured `groupReset` body — locked contract with
+    /// CLIENT D. The "infinite-retry on 404" was the bug being fixed, so
+    /// there's no backwards-compat to preserve here; clients that don't
+    /// understand 410 will surface it as an error and stop hammering the
+    /// server, which is also acceptable.
+    fn group_reset(
+        convo_id: &str,
+        message: impl Into<String>,
+        new_crypto_session_id: Option<String>,
+    ) -> Self {
         Self::GroupReset {
-            status: StatusCode::NOT_FOUND,
+            status: StatusCode::GONE,
             body: GroupResetBody {
-                error: "GroupReset",
+                error: "groupReset",
                 message: message.into(),
                 convo_id: convo_id.to_string(),
+                new_crypto_session_id,
             },
         }
     }
@@ -260,27 +274,20 @@ pub async fn get_group_state(
 
                 // Differentiate genuine "no GroupInfo yet" from "session was
                 // reset and GroupInfo cleared" so clients can route to
-                // bootstrap-recovery instead of retrying. The conversation
-                // row already exists (we checked above) — the question is
-                // whether the active crypto session is mid-reset or has had
-                // its GroupInfo cleared post-reset.
-                let session_state: Option<(
-                    String,
-                    Option<i32>,
-                    chrono::DateTime<chrono::Utc>,
-                )> = sqlx::query_as(
-                    "SELECT state, group_info_epoch, created_at \
+                // bootstrap-recovery instead of retrying. Per the locked
+                // contract with CLIENT D and the 4b2cdbaa diagnostic
+                // (gen 24 sat at active+NULL for 50+ minutes): any active
+                // session with NULL group_info is a reset signal regardless
+                // of age. A `reset_requested`/`superseding` row without an
+                // active sibling is also reset.
+                //
+                // newCryptoSessionId carries the active session's id so
+                // clients can bootstrap into the right successor; null
+                // when no active row exists during mid-reset.
+                let active_session: Option<(String, Option<Vec<u8>>)> = sqlx::query_as(
+                    "SELECT id, group_info \
                      FROM crypto_sessions \
-                     WHERE conversation_id = $1 \
-                     ORDER BY \
-                       CASE state \
-                         WHEN 'active' THEN 0 \
-                         WHEN 'reset_requested' THEN 1 \
-                         WHEN 'superseding' THEN 2 \
-                         ELSE 3 \
-                       END, \
-                       created_at DESC \
-                     LIMIT 1",
+                     WHERE conversation_id = $1 AND state = 'active'",
                 )
                 .bind(convo_id)
                 .fetch_optional(&pool)
@@ -288,27 +295,60 @@ pub async fn get_group_state(
                 .ok()
                 .flatten();
 
-                if let Some((state, group_info_epoch, created_at)) = session_state {
-                    let is_reset_state = state == "reset_requested" || state == "superseding";
-                    let was_set = group_info_epoch.is_some();
-                    let is_recent = (chrono::Utc::now() - created_at).num_seconds() < 30;
-                    let cleared_active = state == "active" && (was_set || is_recent);
+                let mid_reset: Option<(String,)> = if active_session.is_none() {
+                    sqlx::query_as(
+                        "SELECT state FROM crypto_sessions \
+                         WHERE conversation_id = $1 \
+                           AND state IN ('reset_requested', 'superseding') \
+                         ORDER BY created_at DESC LIMIT 1",
+                    )
+                    .bind(convo_id)
+                    .fetch_optional(&pool)
+                    .await
+                    .ok()
+                    .flatten()
+                } else {
+                    None
+                };
 
-                    if is_reset_state || cleared_active {
+                match (active_session.as_ref(), mid_reset.as_ref()) {
+                    // Active + NULL group_info → reset; emit successor id.
+                    (Some((active_id, None)), _) => {
                         tracing::warn!(
                             target: "getgroupstate_reset",
                             convo_id = %crate::crypto::redact_for_log(convo_id),
-                            session_state = %state,
-                            had_group_info_epoch = was_set,
-                            session_age_secs = (chrono::Utc::now() - created_at).num_seconds(),
-                            outcome = "reset",
-                            "GroupInfo unavailable due to reset — returning typed groupReset"
+                            session_state = "active",
+                            new_crypto_session_id = %active_id,
+                            outcome = "reset_active_null_group_info",
+                            "active session has NULL group_info — returning groupReset"
                         );
                         return Err(GetGroupStateContractError::group_reset(
                             convo_id,
-                            "Conversation was reset; client must bootstrap-recover",
+                            "GroupInfo unavailable for active session; client must bootstrap-recover",
+                            Some(active_id.clone()),
                         ));
                     }
+                    // Mid-reset with no active row → emit null successor.
+                    (None, Some((reset_state,))) => {
+                        tracing::warn!(
+                            target: "getgroupstate_reset",
+                            convo_id = %crate::crypto::redact_for_log(convo_id),
+                            session_state = %reset_state,
+                            outcome = "reset_in_flight",
+                            "no active session — reset in flight; returning groupReset"
+                        );
+                        return Err(GetGroupStateContractError::group_reset(
+                            convo_id,
+                            "Conversation is being reset; client must bootstrap-recover",
+                            None,
+                        ));
+                    }
+                    // Active + group_info present, OR no crypto_sessions row
+                    // at all (legacy convo): fall through to legacy
+                    // GroupInfoUnavailable. The Some-with-group_info case
+                    // shouldn't reach here (get_group_info would have
+                    // returned Some), but it's harmless if it does.
+                    _ => {}
                 }
 
                 return Err(GetGroupStateContractError::group_info_unavailable(
@@ -389,32 +429,64 @@ mod tests {
             .status_code(),
             StatusCode::SERVICE_UNAVAILABLE
         );
-        // SERVER B: groupReset preserves 404 status (backwards-compat) but
-        // emits a structured body with `error: "GroupReset"`.
+        // SERVER B: groupReset returns 410 Gone with the locked contract body.
         assert_eq!(
-            GetGroupStateContractError::group_reset("convo-1", "reset").status_code(),
-            StatusCode::NOT_FOUND
+            GetGroupStateContractError::group_reset("convo-1", "reset", None).status_code(),
+            StatusCode::GONE
         );
     }
 
     #[tokio::test]
-    async fn group_reset_response_carries_typed_error_body() {
-        let response =
-            GetGroupStateContractError::group_reset("convo-xyz", "Conversation was reset")
-                .into_response();
+    async fn group_reset_response_carries_locked_contract_body() {
+        let response = GetGroupStateContractError::group_reset(
+            "convo-xyz",
+            "Conversation was reset",
+            Some("session-abc".to_string()),
+        )
+        .into_response();
 
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::GONE);
 
         let body_bytes = to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("response body");
         let body_json: serde_json::Value =
             serde_json::from_slice(&body_bytes).expect("valid JSON body");
-        assert_eq!(body_json.get("error").and_then(|v| v.as_str()), Some("GroupReset"));
+        // Lowercase `groupReset` per locked contract — must NOT regress to
+        // PascalCase `GroupReset`, CLIENT D matches the literal string.
+        assert_eq!(
+            body_json.get("error").and_then(|v| v.as_str()),
+            Some("groupReset")
+        );
         assert_eq!(
             body_json.get("convoId").and_then(|v| v.as_str()),
             Some("convo-xyz")
         );
+        assert_eq!(
+            body_json.get("newCryptoSessionId").and_then(|v| v.as_str()),
+            Some("session-abc")
+        );
+    }
+
+    #[tokio::test]
+    async fn group_reset_response_emits_null_successor_when_mid_reset() {
+        let response = GetGroupStateContractError::group_reset(
+            "convo-mid-reset",
+            "Conversation is being reset",
+            None,
+        )
+        .into_response();
+
+        let body_bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let body_json: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("valid JSON body");
+        // `newCryptoSessionId` MUST be present and explicitly null when no
+        // successor exists yet — the field is part of the locked contract,
+        // never absent.
+        assert!(body_json.get("newCryptoSessionId").is_some());
+        assert!(body_json["newCryptoSessionId"].is_null());
     }
 
     #[test]
