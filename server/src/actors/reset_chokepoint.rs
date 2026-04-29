@@ -351,9 +351,23 @@ async fn enqueue_outbox_for_event(
     let payload_bytes =
         serde_json::to_vec(event_payload_json).context("serialize event payload for outbox")?;
 
-    // 2. Notification rows — one per active member device. `kind='sse'`
-    //    is the only currently-wired channel (push/websocket are
-    //    follow-ups).
+    // 2. Notification rows — one per active member device.
+    //
+    //    Scope decision (Phase 3, Option B): we deliberately ONLY write
+    //    `kind='sse'` rows here. The `notification_outbox.kind` column
+    //    schema permits `'push'` and `'websocket'` for forward
+    //    compatibility, but no row of those kinds is enqueued by this
+    //    chokepoint — those dispatchers (APNs/FCM, websocket fanout) are
+    //    not yet wired into mls-ds and are tracked as separate plans.
+    //
+    //    Writing rows we cannot drain would either be a lie (worker
+    //    silently marks `done`) or block the queue (worker errs forever).
+    //    Skipping the write keeps the outbox honest. The worker has a
+    //    belt-and-suspenders guard
+    //    (`workers/notification_outbox.rs::dispatch`) that errs loudly if
+    //    a `'push'`/`'websocket'` row appears via legacy data or manual
+    //    INSERT, so we won't silently drop work even if this invariant is
+    //    breached.
     if !members.is_empty() {
         let mut qb = sqlx::QueryBuilder::<Postgres>::new(
             "INSERT INTO notification_outbox (\

@@ -180,9 +180,15 @@ async fn claim_due_rows(
 /// makes it here, the per-convo queue has had its chance and the row
 /// represents intent that's already been served by either path.
 ///
-/// For `kind='push'` / `kind='websocket'`: not yet implemented; logs a
-/// warning and marks `done` so we don't block the queue. Real dispatch
-/// hooks here in a follow-up. TODO(phase-3-push-wire).
+/// For `kind='push'` / `kind='websocket'`: NOT supported. The chokepoint
+/// (`actors/reset_chokepoint.rs::enqueue_outbox_for_event`) deliberately
+/// only writes `kind='sse'` rows in Phase 3 — APNs/FCM and websocket
+/// fanout are out of scope. This branch errs loudly to ensure that if
+/// such a row appears via legacy data, manual INSERT, or a future
+/// regression, the worker fails instead of silently marking it `done`.
+/// Returning `Err` routes through `record_failure`, which logs a warning
+/// per attempt and eventually transitions the row to `dead` — visible in
+/// ops queries rather than a silent drop.
 async fn dispatch(row: &NotificationOutboxRow) -> anyhow::Result<()> {
     debug!(
         row_id = %row.id,
@@ -202,19 +208,87 @@ async fn dispatch(row: &NotificationOutboxRow) -> anyhow::Result<()> {
             Ok(())
         }
         "push" | "websocket" => {
-            // Stub: TODO(phase-3-push-wire). Returning Ok(()) keeps the
-            // worker draining and avoids the row going `dead`. When the
-            // real dispatcher is wired, errors propagate up and trigger
-            // backoff naturally.
-            warn!(
-                row_id = %row.id,
-                kind = %row.kind,
-                "notification_outbox: kind not yet wired; marking done"
-            );
-            Ok(())
+            // Belt-and-suspenders: chokepoint never writes these in
+            // Phase 3. If we see one, it's legacy/manual — fail loudly
+            // rather than silently mark `done`. See chokepoint scope
+            // comment for the rationale.
+            anyhow::bail!(
+                "notification kind '{}' is not wired (chokepoint should not be writing this); \
+                 will not silently mark done — see actors/reset_chokepoint.rs \
+                 enqueue_outbox_for_event scope comment",
+                row.kind
+            )
         }
         other => {
             anyhow::bail!("unknown notification kind: {other}")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn fake_row(kind: &str) -> NotificationOutboxRow {
+        NotificationOutboxRow {
+            id: "row-1".to_string(),
+            conversation_id: "convo-1".to_string(),
+            delivery_event_id: "evt-1".to_string(),
+            recipient_did: "did:plc:test".to_string(),
+            recipient_device_id: None,
+            kind: kind.to_string(),
+            payload: Some(b"{}".to_vec()),
+            attempts: 0,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_sse_is_ok() {
+        let row = fake_row("sse");
+        let result = dispatch(&row).await;
+        assert!(
+            result.is_ok(),
+            "sse kind should succeed (no-op-on-success): {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_push_errors_loudly() {
+        // Phase 3 contract: chokepoint never writes push rows; if one
+        // appears (legacy data, manual INSERT), the worker MUST err
+        // rather than silently mark `done`.
+        let row = fake_row("push");
+        let result = dispatch(&row).await;
+        let err = result.expect_err("push kind must err — silent done is the bug we are fixing");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not wired"),
+            "error message should explain the kind isn't wired, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_websocket_errors_loudly() {
+        let row = fake_row("websocket");
+        let result = dispatch(&row).await;
+        let err =
+            result.expect_err("websocket kind must err — silent done is the bug we are fixing");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not wired"),
+            "error message should explain the kind isn't wired, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_unknown_kind_errors() {
+        let row = fake_row("not-a-real-kind");
+        let result = dispatch(&row).await;
+        assert!(
+            result.is_err(),
+            "unknown kinds should err (forward-compat against schema drift)"
+        );
     }
 }
