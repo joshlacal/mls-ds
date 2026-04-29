@@ -101,9 +101,21 @@ jobs:
           ./server/scripts/check_deploy_policy.sh
 
       - name: Cargo audit
-        working-directory: ./server
+        # Cargo.lock lives at the workspace root, not in ./server. Run from
+        # repo root so cargo-audit can find it. Pre-existing bug — fixed
+        # alongside SERVER A/B/C CI green-up.
+        #
+        # Ignored advisories (transitive deps, no direct fix path):
+        # - RUSTSEC-2025-0134: rustls-pemfile unmaintained (pulled in by `a2`
+        #   APNS client). Track upstream a2 release that drops this dep.
+        # - RUSTSEC-2026-0002: lru `IterMut` unsound (pulled in by aws-sdk-s3
+        #   internal cache). Not exercised by our usage; aws-sdk-s3 update
+        #   pending.
         run: |
-          cargo audit --deny warnings
+          cargo audit \
+            --deny warnings \
+            --ignore RUSTSEC-2025-0134 \
+            --ignore RUSTSEC-2026-0002
 
       - name: Install sqlx-cli
         run: |

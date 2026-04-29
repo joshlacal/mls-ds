@@ -8,6 +8,7 @@ pub mod get_pending_devices;
 pub mod list_devices;
 pub mod publish_key_packages;
 pub mod register_device;
+pub mod register_device_token;
 pub mod remove_device;
 
 // Conversations & Messaging
@@ -61,6 +62,7 @@ pub use get_pending_devices::get_pending_devices;
 pub use list_devices::list_devices;
 pub use publish_key_packages::publish_key_packages_post;
 pub use register_device::register_device_post;
+pub use register_device_token::register_device_token;
 pub use remove_device::remove_device;
 
 // Re-exports: Conversations & Messaging
