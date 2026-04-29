@@ -191,15 +191,15 @@ pub async fn get_key_packages(
         {
             Ok(lr_rows) => {
                 if !lr_rows.is_empty() {
-                    let mut lr_by_did: HashMap<String, usize> = HashMap::new();
+                    let mut lr_dids: HashSet<String> = HashSet::new();
                     for row in lr_rows {
-                        *lr_by_did.entry(row.0.clone()).or_insert(0) += 1;
+                        lr_dids.insert(row.0.clone());
                         rows_by_did.entry(row.0.clone()).or_default().push(row);
                     }
                     // One increment per DID that received a last-resort
                     // claim — preserves per-DID metric semantics from the
                     // pre-bulk loop.
-                    for _ in 0..lr_by_did.len() {
+                    for _ in 0..lr_dids.len() {
                         crate::metrics::record_key_package_last_resort_use();
                     }
                 }
@@ -319,11 +319,10 @@ pub async fn claim_available_key_packages_bulk(
         cs = cs_predicate,
     );
 
-    // Bind a `Vec<String>` for `text[]` — sqlx maps `&[String]` -> Postgres
-    // text array. Convert the borrowed slice once.
-    let owner_dids_owned: Vec<String> = owner_dids.iter().map(|s| s.to_string()).collect();
-    let mut q = sqlx::query_as::<_, (String, String, Vec<u8>, Option<String>)>(&sql)
-        .bind(&owner_dids_owned);
+    // Bind the borrowed slice directly — sqlx maps `&[&str]` to Postgres
+    // `text[]` without an intermediate `Vec<String>` allocation.
+    let mut q =
+        sqlx::query_as::<_, (String, String, Vec<u8>, Option<String>)>(&sql).bind(owner_dids);
     if let Some(cs) = cipher_suite {
         q = q.bind(cs);
     }
