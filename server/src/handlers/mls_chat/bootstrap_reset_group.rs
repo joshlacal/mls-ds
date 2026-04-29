@@ -365,7 +365,14 @@ pub async fn handle(
     // the same caller hits both flows on different conversations.
     let request_id_uuid = format!("{}-{}", original_convo_id, new_group_id);
 
-    match path {
+    // SERVER M (#75): the chokepoint reply carries the activated/self-healed
+    // `crypto_session`. We surface its `generation` to the response so iOS
+    // can seed `pendingResetGeneration` on bootstrap success and short-circuit
+    // historical SSE replay events whose `gen` is now stale (otherwise
+    // `handleGroupReset` would call `deleteGroup` on the just-bootstrapped
+    // group). Captured into the outer scope so the post-match output builder
+    // can read it from either dispatch arm.
+    let session_generation: i32 = match path {
         Path::Activate => {
             // Standard activator: send `ActivateCryptoSession`. Upstream
             // Request that put the session into `reset_requested` carries
@@ -390,7 +397,7 @@ pub async fn handle(
                     StatusCode::INTERNAL_SERVER_ERROR.into_response()
                 })?;
 
-            let _session = act_rx
+            let session = act_rx
                 .await
                 .map_err(|_| {
                     error!("[bootstrapResetGroup] Activate channel closed");
@@ -409,6 +416,7 @@ pub async fn handle(
                     )
                         .into_response()
                 })?;
+            session.generation
         }
         Path::SelfHeal => {
             // SERVER F #68: validate welcome-fanout completeness BEFORE
@@ -517,7 +525,7 @@ pub async fn handle(
                     StatusCode::INTERNAL_SERVER_ERROR.into_response()
                 })?;
 
-            let _session = sh_rx
+            let session = sh_rx
                 .await
                 .map_err(|_| {
                     error!("[bootstrapResetGroup] SelfHeal channel closed");
@@ -533,8 +541,13 @@ pub async fn handle(
                     )
                         .into_response()
                 })?;
+            // Self-heal preserves the prior session's generation (no +1).
+            // This is the value clients should seed `pendingResetGeneration`
+            // with so future SSE replay events for the same generation are
+            // recognized as the current state, not a stale reset notice.
+            session.generation
         }
-    }
+    };
 
     // ── Legacy welcome_messages dual-write for backward compat ───────────
     //
@@ -768,6 +781,13 @@ pub async fn handle(
             reset_generation: Some(reset_count as i64),
             extra_data: Default::default(),
         },
+        // SERVER M (#75): expose `crypto_session.generation` so iOS can seed
+        // `pendingResetGeneration` on bootstrap success. Distinct from
+        // `convo.reset_generation` (which is `conversations.reset_count`,
+        // a separate counter); this is the session-level identity used by
+        // clients to recognize SSE replay events for the now-current state.
+        // See also: lexicon `output.generation` (optional for wire-compat).
+        generation: Some(session_generation as i64),
         extra_data: Default::default(),
     })
 }
