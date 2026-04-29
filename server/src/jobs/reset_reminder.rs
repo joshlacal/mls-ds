@@ -160,6 +160,11 @@ struct DueRow {
     /// row's mls_group_id column (audit consistency with the original
     /// Request, which set it to `current.mls_group_id`).
     mls_group_id: String,
+    /// Original Request's `created_at` timestamp from `delivery_events`.
+    /// Re-emitted SSE reminders carry this ORIGINAL timestamp (not
+    /// `Utc::now()`) so clients can compute reset-age from the moment
+    /// the reset was first requested rather than each reminder ping.
+    requested_at: DateTime<Utc>,
 }
 
 /// Step 2 of `reminder_tick`. Picks rows whose timer has elapsed AND whose
@@ -173,7 +178,8 @@ async fn fetch_due_rows(pool: &PgPool) -> anyhow::Result<Vec<DueRow>> {
                 de.crypto_session_id,
                 de.id AS request_event_id,
                 de.payload_json AS request_payload,
-                de.sender_did
+                de.sender_did,
+                de.created_at AS requested_at
             FROM delivery_events de
             WHERE de.event_type = 'crypto_session_reset_requested'
               AND de.crypto_session_id IS NOT NULL
@@ -191,7 +197,8 @@ async fn fetch_due_rows(pool: &PgPool) -> anyhow::Result<Vec<DueRow>> {
             o.request_payload,
             o.sender_did,
             cs.generation,
-            cs.mls_group_id
+            cs.mls_group_id,
+            o.requested_at
         FROM reset_reminder_state rrs
         JOIN crypto_sessions cs ON cs.id = rrs.crypto_session_id
         JOIN original o ON o.crypto_session_id = rrs.crypto_session_id
@@ -422,7 +429,13 @@ async fn process_due_row(
         request_event_id: row.request_event_id.clone(),
         expected_new_mls_group_id,
         reason: reason_str,
-        requested_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        // Preserve the ORIGINAL request's `requested_at` so re-emitted
+        // reminders are distinguishable from the first ping. Clients
+        // compute reset-age from this timestamp; using `Utc::now()`
+        // would make every reminder look like a freshly-issued reset.
+        requested_at: row
+            .requested_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
     };
 
     if let Err(e) = crate::db::store_event(pool, &row.conversation_id, &event).await {
