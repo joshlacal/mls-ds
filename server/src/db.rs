@@ -843,7 +843,7 @@ pub async fn list_messages(
             SELECT id, convo_id, sender_did, message_type, CAST(epoch AS BIGINT), CAST(seq AS BIGINT), ciphertext, created_at, expires_at
             FROM messages
             WHERE convo_id = $1 AND created_at < $2 AND (expires_at IS NULL OR expires_at > NOW())
-            ORDER BY epoch ASC, seq ASC
+            ORDER BY seq ASC
             LIMIT $3
             "#,
         )
@@ -858,7 +858,7 @@ pub async fn list_messages(
             SELECT id, convo_id, sender_did, message_type, CAST(epoch AS BIGINT), CAST(seq AS BIGINT), ciphertext, created_at, expires_at
             FROM messages
             WHERE convo_id = $1 AND (expires_at IS NULL OR expires_at > NOW())
-            ORDER BY epoch ASC, seq ASC
+            ORDER BY seq ASC
             LIMIT $2
             "#,
         )
@@ -884,7 +884,7 @@ pub async fn list_messages_since_seq(
         SELECT id, convo_id, sender_did, message_type, CAST(epoch AS BIGINT), CAST(seq AS BIGINT), ciphertext, created_at, expires_at
         FROM messages
         WHERE convo_id = $1 AND seq > $2 AND (expires_at IS NULL OR expires_at > NOW())
-        ORDER BY epoch ASC, seq ASC
+        ORDER BY seq ASC
         LIMIT $3
         "#,
     )

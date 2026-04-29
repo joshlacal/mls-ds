@@ -115,7 +115,7 @@ pub async fn get_messages(
                 fetch_app_messages(&pool, did, &convo_id, since_seq, limit).await?;
             let commits = fetch_commits(&pool, did, &convo_id, from_epoch, to_epoch).await?;
             messages.extend(commits);
-            messages.sort_by(|a, b| a.epoch.cmp(&b.epoch).then(a.seq.cmp(&b.seq)));
+            messages.sort_by(|a, b| a.seq.cmp(&b.seq));
             Ok(Json(GetMessagesOutput {
                 messages,
                 last_seq,
@@ -169,7 +169,7 @@ async fn fetch_app_messages(
                    ciphertext, created_at, COALESCE(reset_generation, 0) as reset_generation
             FROM messages
             WHERE convo_id = $1 AND seq > $2 AND (expires_at IS NULL OR expires_at > NOW())
-            ORDER BY epoch ASC, seq ASC
+            ORDER BY seq ASC
             LIMIT $3
             "#,
         )
@@ -188,13 +188,16 @@ async fn fetch_app_messages(
     } else {
         sqlx::query_as::<_, MessageRow>(
             r#"
-            SELECT id, convo_id, message_type,
-                   CAST(epoch AS BIGINT) as epoch, CAST(seq AS BIGINT) as seq,
-                   ciphertext, created_at, COALESCE(reset_generation, 0) as reset_generation
-            FROM messages
-            WHERE convo_id = $1 AND (expires_at IS NULL OR expires_at > NOW())
-            ORDER BY seq DESC
-            LIMIT $2
+            SELECT * FROM (
+                SELECT id, convo_id, message_type,
+                       CAST(epoch AS BIGINT) as epoch, CAST(seq AS BIGINT) as seq,
+                       ciphertext, created_at, COALESCE(reset_generation, 0) as reset_generation
+                FROM messages
+                WHERE convo_id = $1 AND (expires_at IS NULL OR expires_at > NOW())
+                ORDER BY seq DESC
+                LIMIT $2
+            ) recent_messages
+            ORDER BY seq ASC
             "#,
         )
         .bind(convo_id)

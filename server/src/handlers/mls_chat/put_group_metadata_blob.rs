@@ -23,6 +23,10 @@ const MAX_METADATA_BLOB_SIZE: usize = 1_048_576;
 pub struct PutGroupMetadataBlobParams {
     pub blob_locator: String,
     pub group_id: String,
+    pub convo_id: Option<String>,
+    pub reset_generation: Option<i64>,
+    pub metadata_version: Option<i64>,
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -60,21 +64,56 @@ pub async fn put_group_metadata_blob(
     let data = body.to_vec();
     let size = data.len();
 
-    // Verify caller is a member of the group
-    let convo_id: Option<String> =
-        sqlx::query_scalar("SELECT id FROM conversations WHERE group_id = $1")
+    let kind = params.kind.as_deref().unwrap_or("metadata");
+    if !matches!(kind, "metadata" | "avatar") {
+        warn!("❌ [putGroupMetadataBlob] Invalid blob kind: {}", kind);
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    if matches!(params.metadata_version, Some(v) if v < 1) {
+        warn!("❌ [putGroupMetadataBlob] Invalid metadata_version");
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    if matches!(params.reset_generation, Some(v) if v < 0) {
+        warn!("❌ [putGroupMetadataBlob] Invalid reset_generation");
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Verify caller is a member of the stable conversation. Older clients only
+    // send groupId, so derive convoId from the current group in that case.
+    let conversation_row: Option<(String, i32)> = match params.convo_id.as_deref() {
+        Some(convo_id) => {
+            sqlx::query_as(
+                "SELECT id, COALESCE(reset_count, 0) \
+                 FROM conversations \
+                 WHERE id = $1 AND group_id = $2",
+            )
+            .bind(convo_id)
             .bind(group_id)
             .fetch_optional(&pool)
             .await
-            .map_err(|e| {
-                error!(
-                    "❌ [putGroupMetadataBlob] Failed to look up conversation for group: {}",
-                    e
-                );
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+        }
+        None => {
+            sqlx::query_as(
+                "SELECT id, COALESCE(reset_count, 0) \
+                 FROM conversations \
+                 WHERE group_id = $1",
+            )
+            .bind(group_id)
+            .fetch_optional(&pool)
+            .await
+        }
+    }
+    .map_err(|e| {
+        error!(
+            "❌ [putGroupMetadataBlob] Failed to look up conversation for metadata blob: {}",
+            e
+        );
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
-    let convo_id = match convo_id {
+    let (convo_id, server_generation) = match conversation_row {
         Some(id) => id,
         None => {
             warn!(
@@ -148,6 +187,32 @@ pub async fn put_group_metadata_blob(
     })?;
 
     if let Some(existing_size) = existing {
+        if let Err(e) = sqlx::query(
+            "UPDATE group_metadata_blobs \
+             SET convo_id = COALESCE(convo_id, $2), \
+                 reset_generation = COALESCE(reset_generation, $3), \
+                 metadata_version = COALESCE(metadata_version, $4), \
+                 kind = COALESCE(kind, $5) \
+             WHERE blob_locator = $1",
+        )
+        .bind(blob_locator)
+        .bind(&convo_id)
+        .bind(
+            params
+                .reset_generation
+                .map(|v| v as i32)
+                .or(Some(server_generation)),
+        )
+        .bind(params.metadata_version)
+        .bind(kind)
+        .execute(&pool)
+        .await
+        {
+            warn!(
+                "⚠️ [putGroupMetadataBlob] Failed to backfill existing blob scope: {}",
+                e
+            );
+        }
         return Ok(Json(PutGroupMetadataBlobOutput {
             blob_locator: blob_locator.clone(),
             size: existing_size as i64,
@@ -156,11 +221,16 @@ pub async fn put_group_metadata_blob(
 
     // Insert blob directly into the database
     sqlx::query(
-        "INSERT INTO group_metadata_blobs (blob_locator, group_id, owner_did, data, size) \
-         VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO group_metadata_blobs \
+            (blob_locator, group_id, convo_id, reset_generation, metadata_version, kind, owner_did, data, size) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
     )
     .bind(blob_locator)
     .bind(group_id)
+    .bind(&convo_id)
+    .bind(params.reset_generation.map(|v| v as i32).unwrap_or(server_generation))
+    .bind(params.metadata_version)
+    .bind(kind)
     .bind(owner_did)
     .bind(&data)
     .bind(size as i32)
