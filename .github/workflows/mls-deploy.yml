@@ -73,7 +73,13 @@ jobs:
         working-directory: ./server
         run: |
           cargo fmt -- --check
-          cargo clippy --lib --bins -- -D warnings
+          # --all-targets covers tests/benches/examples in addition to
+          # --lib --bins. The narrower scope was a chore/ci-cleanup-era
+          # transitional shim while pre-existing clippy warnings in test
+          # code were being cleaned up; that work landed in chore/ci-cleanup.
+          # Don't drop back to --lib --bins without a concrete reason; it
+          # hides real lint regressions in the test suite.
+          cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Install cargo-audit
         working-directory: ./server

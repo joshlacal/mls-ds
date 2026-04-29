@@ -25,7 +25,7 @@ forbid_pattern() {
   fi
 }
 
-require_pattern "$GREENFIELD" 'CREATE TABLE idempotency_cache' "Missing idempotency_cache in greenfield schema"
+require_pattern "$GREENFIELD" 'CREATE TABLE\s+(IF NOT EXISTS\s+)?idempotency_cache' "Missing idempotency_cache in greenfield schema"
 require_pattern "$GREENFIELD" 'PRIMARY KEY\s*\(\s*caller_did\s*,\s*endpoint\s*,\s*key\s*\)' \
   "Greenfield schema must scope idempotency_cache by caller_did + endpoint + key"
 forbid_pattern "$GREENFIELD" 'PRIMARY KEY\s*\(\s*key\s*\)' \
