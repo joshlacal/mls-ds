@@ -1,6 +1,12 @@
 #[cfg(test)]
+// Inner module name intentionally matches the file/parent module — keeps
+// the rust-analyzer test-runner namespace short
+// (`actors::tests::conversation_tests::*`). Refactoring to flatten this
+// requires updating ~30 inherent-namespace references in CI logs and dev
+// scripts; tracked under TODO(phase-2.5-cleanup-test-namespaces).
+#[allow(clippy::module_inception)]
 mod conversation_tests {
-    use crate::actors::{ConversationActor, ConvoActorArgs, ConvoMessage, KeyPackageHashEntry};
+    use crate::actors::{ConversationActor, ConvoActorArgs, ConvoMessage};
     use crate::realtime::SseState;
     use ractor::Actor;
     use sqlx::PgPool;
@@ -65,7 +71,7 @@ mod conversation_tests {
         )
         .bind(convo_id)
         .bind(creator)
-        .bind(&now)
+        .bind(now)
         .execute(pool)
         .await
         .expect("Failed to create conversation");
@@ -167,7 +173,7 @@ mod conversation_tests {
             )
             .bind(convo_id)
             .bind(member)
-            .bind(&now)
+            .bind(now)
             .execute(&pool)
             .await
             .expect("Failed to add member");
@@ -342,7 +348,7 @@ mod conversation_tests {
         )
         .bind(convo_id)
         .bind("did:plc:alice")
-        .bind(&chrono::Utc::now())
+        .bind(chrono::Utc::now())
         .execute(&pool)
         .await
         .expect("Failed to add alice");
@@ -464,7 +470,7 @@ mod conversation_tests {
         )
         .bind(convo_id)
         .bind(current_epoch)
-        .bind(&now)
+        .bind(now)
         .execute(pool)
         .await
         .expect("seed convo");
@@ -490,7 +496,7 @@ mod conversation_tests {
             .bind(convo_id)
             .bind(*member_did)
             .bind(*user_did)
-            .bind(&now)
+            .bind(now)
             .execute(pool)
             .await
             .expect("seed member");

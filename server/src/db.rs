@@ -1741,168 +1741,6 @@ pub async fn health_check(pool: &DbPool) -> Result<bool> {
     Ok(true)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    async fn setup_test_db() -> DbPool {
-        let config = DbConfig {
-            database_url: std::env::var("TEST_DATABASE_URL")
-                .unwrap_or_else(|_| "postgres://localhost/catbird_test".to_string()),
-            max_connections: 5,
-            min_connections: 1,
-            acquire_timeout: Duration::from_secs(10),
-            idle_timeout: Duration::from_secs(60),
-        };
-
-        init_db(config)
-            .await
-            .expect("Failed to initialize test database")
-    }
-
-    #[tokio::test]
-    async fn test_create_and_get_conversation() {
-        let pool = setup_test_db().await;
-
-        let conversation =
-            create_conversation(&pool, "did:plc:test123", Some("Test Convo".to_string()))
-                .await
-                .expect("Failed to create conversation");
-
-        assert_eq!(conversation.creator_did, "did:plc:test123");
-        assert_eq!(conversation.name, Some("Test Convo".to_string()));
-
-        let fetched = get_conversation(&pool, &conversation.id)
-            .await
-            .expect("Failed to get conversation")
-            .expect("Conversation not found");
-
-        assert_eq!(fetched.id, conversation.id);
-    }
-
-    #[tokio::test]
-    async fn test_member_operations() {
-        let pool = setup_test_db().await;
-
-        let conversation = create_conversation(&pool, "did:plc:creator", None)
-            .await
-            .expect("Failed to create conversation");
-
-        add_member(&pool, &conversation.id, "did:plc:member1")
-            .await
-            .expect("Failed to add member");
-
-        let is_member_result = is_member(&pool, "did:plc:member1", &conversation.id)
-            .await
-            .expect("Failed to check membership");
-
-        assert!(is_member_result);
-
-        let members = list_members(&pool, &conversation.id)
-            .await
-            .expect("Failed to list members");
-
-        assert_eq!(members.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_message_operations() {
-        let pool = setup_test_db().await;
-
-        let conversation = create_conversation(&pool, "did:plc:creator", None)
-            .await
-            .expect("Failed to create conversation");
-
-        let message = create_message(
-            &pool,
-            &conversation.id,
-            "msg-test-1",
-            vec![1, 2, 3, 4],
-            0,
-            512,
-            None,
-        )
-        .await
-        .expect("Failed to create message");
-
-        let fetched = get_message(&pool, &message.id)
-            .await
-            .expect("Failed to get message")
-            .expect("Message not found");
-
-        assert_eq!(fetched.id, message.id);
-        assert_eq!(fetched.ciphertext, vec![1, 2, 3, 4]);
-    }
-
-    #[tokio::test]
-    async fn test_key_package_operations() {
-        let pool = setup_test_db().await;
-
-        let expires_at = Utc::now() + chrono::Duration::hours(24);
-        let key_data = vec![5, 6, 7, 8];
-
-        store_key_package(
-            &pool,
-            "did:plc:user",
-            "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
-            key_data.clone(),
-            expires_at,
-        )
-        .await
-        .expect("Failed to store key package");
-
-        let fetched = get_key_package(
-            &pool,
-            "did:plc:user",
-            "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
-        )
-        .await
-        .expect("Failed to get key package")
-        .expect("Key package not found");
-
-        assert_eq!(fetched.key_data, key_data);
-
-        consume_key_package(
-            &pool,
-            "did:plc:user",
-            "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
-            &key_data,
-        )
-        .await
-        .expect("Failed to consume key package");
-
-        let consumed = get_key_package(
-            &pool,
-            "did:plc:user",
-            "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
-        )
-        .await
-        .expect("Failed to get key package");
-
-        assert!(consumed.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_transaction() {
-        let pool = setup_test_db().await;
-
-        let conversation = create_conversation_with_members(
-            &pool,
-            "did:plc:creator",
-            Some("Group Chat".to_string()),
-            vec!["did:plc:member1".to_string(), "did:plc:member2".to_string()],
-        )
-        .await
-        .expect("Failed to create conversation with members");
-
-        let members = list_members(&pool, &conversation.id)
-            .await
-            .expect("Failed to list members");
-
-        assert_eq!(members.len(), 2);
-    }
-}
-
 // =============================================================================
 // Cursor Operations (Hybrid Messaging)
 // =============================================================================
@@ -2571,4 +2409,166 @@ pub async fn get_sequencer_receipts(
         .await
     };
     receipts.context("Failed to fetch sequencer receipts")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn setup_test_db() -> DbPool {
+        let config = DbConfig {
+            database_url: std::env::var("TEST_DATABASE_URL")
+                .unwrap_or_else(|_| "postgres://localhost/catbird_test".to_string()),
+            max_connections: 5,
+            min_connections: 1,
+            acquire_timeout: Duration::from_secs(10),
+            idle_timeout: Duration::from_secs(60),
+        };
+
+        init_db(config)
+            .await
+            .expect("Failed to initialize test database")
+    }
+
+    #[tokio::test]
+    async fn test_create_and_get_conversation() {
+        let pool = setup_test_db().await;
+
+        let conversation =
+            create_conversation(&pool, "did:plc:test123", Some("Test Convo".to_string()))
+                .await
+                .expect("Failed to create conversation");
+
+        assert_eq!(conversation.creator_did, "did:plc:test123");
+        assert_eq!(conversation.name, Some("Test Convo".to_string()));
+
+        let fetched = get_conversation(&pool, &conversation.id)
+            .await
+            .expect("Failed to get conversation")
+            .expect("Conversation not found");
+
+        assert_eq!(fetched.id, conversation.id);
+    }
+
+    #[tokio::test]
+    async fn test_member_operations() {
+        let pool = setup_test_db().await;
+
+        let conversation = create_conversation(&pool, "did:plc:creator", None)
+            .await
+            .expect("Failed to create conversation");
+
+        add_member(&pool, &conversation.id, "did:plc:member1")
+            .await
+            .expect("Failed to add member");
+
+        let is_member_result = is_member(&pool, "did:plc:member1", &conversation.id)
+            .await
+            .expect("Failed to check membership");
+
+        assert!(is_member_result);
+
+        let members = list_members(&pool, &conversation.id)
+            .await
+            .expect("Failed to list members");
+
+        assert_eq!(members.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_message_operations() {
+        let pool = setup_test_db().await;
+
+        let conversation = create_conversation(&pool, "did:plc:creator", None)
+            .await
+            .expect("Failed to create conversation");
+
+        let message = create_message(
+            &pool,
+            &conversation.id,
+            "msg-test-1",
+            vec![1, 2, 3, 4],
+            0,
+            512,
+            None,
+        )
+        .await
+        .expect("Failed to create message");
+
+        let fetched = get_message(&pool, &message.id)
+            .await
+            .expect("Failed to get message")
+            .expect("Message not found");
+
+        assert_eq!(fetched.id, message.id);
+        assert_eq!(fetched.ciphertext, vec![1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn test_key_package_operations() {
+        let pool = setup_test_db().await;
+
+        let expires_at = Utc::now() + chrono::Duration::hours(24);
+        let key_data = vec![5, 6, 7, 8];
+
+        store_key_package(
+            &pool,
+            "did:plc:user",
+            "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+            key_data.clone(),
+            expires_at,
+        )
+        .await
+        .expect("Failed to store key package");
+
+        let fetched = get_key_package(
+            &pool,
+            "did:plc:user",
+            "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+        )
+        .await
+        .expect("Failed to get key package")
+        .expect("Key package not found");
+
+        assert_eq!(fetched.key_data, key_data);
+
+        consume_key_package(
+            &pool,
+            "did:plc:user",
+            "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+            &key_data,
+        )
+        .await
+        .expect("Failed to consume key package");
+
+        let consumed = get_key_package(
+            &pool,
+            "did:plc:user",
+            "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+        )
+        .await
+        .expect("Failed to get key package");
+
+        assert!(consumed.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_transaction() {
+        let pool = setup_test_db().await;
+
+        let conversation = create_conversation_with_members(
+            &pool,
+            "did:plc:creator",
+            Some("Group Chat".to_string()),
+            vec!["did:plc:member1".to_string(), "did:plc:member2".to_string()],
+        )
+        .await
+        .expect("Failed to create conversation with members");
+
+        let members = list_members(&pool, &conversation.id)
+            .await
+            .expect("Failed to list members");
+
+        assert_eq!(members.len(), 2);
+    }
 }

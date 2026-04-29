@@ -60,7 +60,7 @@ async fn create_test_convo(pool: &PgPool, convo_id: &str, creator: &str) {
     )
     .bind(convo_id)
     .bind(creator)
-    .bind(&now)
+    .bind(now)
     .execute(pool)
     .await
     .expect("Failed to create conversation");
@@ -72,7 +72,7 @@ async fn create_test_convo(pool: &PgPool, convo_id: &str, creator: &str) {
     )
     .bind(convo_id)
     .bind(creator)
-    .bind(&now)
+    .bind(now)
     .execute(pool)
     .await
     .expect("Failed to add creator as member");
@@ -87,7 +87,7 @@ async fn add_member_db(pool: &PgPool, convo_id: &str, member_did: &str) {
     )
     .bind(convo_id)
     .bind(member_did)
-    .bind(&now)
+    .bind(now)
     .execute(pool)
     .await
     .expect("Failed to add member");

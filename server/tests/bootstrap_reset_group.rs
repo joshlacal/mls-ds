@@ -91,7 +91,7 @@ async fn setup_post_reset_convo(pool: &PgPool, members: &[&str]) {
     )
     .bind(ORIGINAL_CONVO_ID)
     .bind(members[0])
-    .bind(&now)
+    .bind(now)
     .bind("MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519")
     .execute(pool)
     .await
@@ -114,7 +114,7 @@ async fn setup_post_reset_convo(pool: &PgPool, members: &[&str]) {
     .bind(ORIGINAL_CONVO_ID)
     .bind("MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519")
     .bind(members[0])
-    .bind(&now)
+    .bind(now)
     .fetch_one(pool)
     .await
     .expect("setup crypto_sessions row");
@@ -149,7 +149,7 @@ async fn setup_post_reset_convo(pool: &PgPool, members: &[&str]) {
         "reason": "test setup",
         "expected_new_mls_group_id": NEW_GROUP_ID,
     }))
-    .bind(&now)
+    .bind(now)
     .execute(pool)
     .await
     .expect("setup crypto_session_reset_requested event");
@@ -162,7 +162,7 @@ async fn setup_post_reset_convo(pool: &PgPool, members: &[&str]) {
         )
         .bind(ORIGINAL_CONVO_ID)
         .bind(member)
-        .bind(&now)
+        .bind(now)
         .bind(member == &members[0])
         .execute(pool)
         .await

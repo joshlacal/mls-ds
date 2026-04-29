@@ -102,7 +102,6 @@ pub async fn get_conversation_epoch(convo_id: &str, db: &PgPool) -> Result<i32> 
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     // Note: Integration tests should be in tests/ directory
     // These are unit tests for helper functions

@@ -1,7 +1,7 @@
 // Stress tests for load testing the actor system
 // Run manually with: cargo test --test stress -- --ignored
 
-use catbird_server::actors::{ActorRegistry, ConvoMessage, KeyPackageHashEntry};
+use catbird_server::actors::{ActorRegistry, ConvoMessage};
 use catbird_server::realtime::SseState;
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -65,7 +65,7 @@ async fn create_test_convo(pool: &PgPool, convo_id: &str, creator: &str) {
     )
     .bind(convo_id)
     .bind(creator)
-    .bind(&now)
+    .bind(now)
     .execute(pool)
     .await
     .expect("Failed to create conversation");
@@ -78,7 +78,7 @@ async fn create_test_convo(pool: &PgPool, convo_id: &str, creator: &str) {
     )
     .bind(convo_id)
     .bind(creator)
-    .bind(&now)
+    .bind(now)
     .execute(pool)
     .await
     .expect("Failed to add creator as member");
@@ -285,15 +285,18 @@ async fn test_sustained_load() {
         // Send message
         let msg_start = Instant::now();
         let (tx, rx) = oneshot::channel();
-        if let Err(_) = actor.cast(ConvoMessage::SendMessage {
-            sender_did: "did:plc:sustained-test".to_string(),
-            ciphertext: vec![0u8; 100],
-            msg_id: format!("sustained-msg-{}", total_messages),
-            epoch: 0,
-            padded_size: 100,
-            idempotency_key: None,
-            reply: tx,
-        }) {
+        if actor
+            .cast(ConvoMessage::SendMessage {
+                sender_did: "did:plc:sustained-test".to_string(),
+                ciphertext: vec![0u8; 100],
+                msg_id: format!("sustained-msg-{}", total_messages),
+                epoch: 0,
+                padded_size: 100,
+                idempotency_key: None,
+                reply: tx,
+            })
+            .is_err()
+        {
             error_count += 1;
             continue;
         }
@@ -435,15 +438,18 @@ async fn test_actor_restart_under_load() {
 
                 // Send message
                 let (tx, rx) = oneshot::channel();
-                if let Err(_) = actor.cast(ConvoMessage::SendMessage {
-                    sender_did: "did:plc:restart-test".to_string(),
-                    ciphertext: vec![msg_idx as u8; 50],
-                    msg_id: format!("restart-msg-{}-{}", convo_id, msg_idx),
-                    epoch: 0,
-                    padded_size: 50,
-                    idempotency_key: None,
-                    reply: tx,
-                }) {
+                if actor
+                    .cast(ConvoMessage::SendMessage {
+                        sender_did: "did:plc:restart-test".to_string(),
+                        ciphertext: vec![msg_idx as u8; 50],
+                        msg_id: format!("restart-msg-{}-{}", convo_id, msg_idx),
+                        epoch: 0,
+                        padded_size: 50,
+                        idempotency_key: None,
+                        reply: tx,
+                    })
+                    .is_err()
+                {
                     errors += 1;
                     continue;
                 }
@@ -478,7 +484,7 @@ async fn test_actor_restart_under_load() {
 
     // Verify actors can be restarted
     let expected_messages = num_conversations * messages_per_convo;
-    let killed_messages = (num_conversations * kill_percentage / 100) * 1; // 1 message lost per killed actor
+    let killed_messages = num_conversations * kill_percentage / 100; // 1 message lost per killed actor
     let min_expected =
         expected_messages - killed_messages - (num_conversations * kill_percentage / 100);
 

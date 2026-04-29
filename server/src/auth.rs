@@ -1219,6 +1219,4 @@ pub async fn verify_is_moderator_or_admin(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-}
+mod tests {}

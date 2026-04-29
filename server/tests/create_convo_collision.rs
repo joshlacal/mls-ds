@@ -65,7 +65,7 @@ async fn insert_test_convo(pool: &PgPool, convo_id: &str, creator_did: &str) {
     )
     .bind(convo_id)
     .bind(creator_did)
-    .bind(&now)
+    .bind(now)
     .bind("MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519")
     .execute(pool)
     .await

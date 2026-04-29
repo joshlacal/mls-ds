@@ -41,7 +41,7 @@ fn update_metadata_with_member_dids_is_rejected() {
 #[test]
 fn commit_action_with_malformed_bytes_is_rejected() {
     // 64 bytes of 0xFF won't decode as any MlsMessageIn variant.
-    let err = enforce_non_add_action_contract(false, false, &vec![0xFFu8; 64]).unwrap_err();
+    let err = enforce_non_add_action_contract(false, false, &[0xFFu8; 64]).unwrap_err();
     assert!(matches!(
         err,
         CommitActionContractError::BadFraming(CommitInspectError::Decode(_))

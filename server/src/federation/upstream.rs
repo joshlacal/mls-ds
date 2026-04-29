@@ -563,8 +563,7 @@ mod tests {
                 created_at: crate::sqlx_jacquard::chrono_to_datetime(chrono::Utc::now()),
                 message_type: Some("app".into()),
                 extra_data: Default::default(),
-            }
-            .into(),
+            },
             ephemeral: false,
         };
         assert_eq!(extract_cursor(&event), Some("01ABC".into()));
@@ -626,8 +625,7 @@ mod tests {
                 created_at: crate::sqlx_jacquard::chrono_to_datetime(now),
                 message_type: Some("app".into()),
                 extra_data: Default::default(),
-            }
-            .into();
+            };
 
         let variants: Vec<(&str, StreamEvent)> = vec![
             (
