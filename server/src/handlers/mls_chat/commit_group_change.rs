@@ -2868,10 +2868,7 @@ pub async fn commit_group_change(
                 .fetch_optional(&pool)
                 .await
                 .map_err(|e| {
-                    error!(
-                        "refreshGroupInfo: DB error querying reset state: {}",
-                        e
-                    );
+                    error!("refreshGroupInfo: DB error querying reset state: {}", e);
                     internal_server_error("Database error")
                 })?
             } else {
