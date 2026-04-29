@@ -5,33 +5,46 @@
 //! one "this delivery event must be observed by recipient X via channel
 //! Y" job (where Y = `kind`: 'sse' | 'push' | 'websocket').
 //!
-//! ## SSE refactor stance (also documented in PR body)
+//! ## SSE durability contract (post codex P1 fix)
 //!
-//! Two design options were considered:
+//! The chokepoint
+//! ([`crate::actors::reset_chokepoint::enqueue_outbox_for_event`])
+//! writes THREE rows in the SAME Postgres tx as the originating
+//! `delivery_events` INSERT:
 //!
-//! 1. **Outbox-only** — replace the in-memory `side_effect_tx`/per-convo
-//!    FIFO entirely; SSE subscribers wake on outbox rows transitioning to
-//!    `in_flight`. Pros: single source of truth, no dual-write. Cons:
-//!    adds Postgres polling latency to the hot path (5s by default —
-//!    measurably worse than the current sub-100ms broadcast).
+//!  1. one `notification_outbox` row per active member (this worker
+//!     drains them — for `kind='sse'`, see below),
+//!  2. zero or more `federation_outbox` rows for distinct peer DSes,
+//!  3. **one `event_stream` row** carrying the full `StreamEvent` JSON
+//!     and the canonical SSE cursor. This is the durability anchor for
+//!     SSE clients: connected subscribers see it via the in-memory
+//!     broadcast (cursor matches), reconnecting subscribers see it via
+//!     cursor-replay through `subscribe_convo_events` /
+//!     WebSocket backfill.
 //!
-//! 2. **Hybrid: in-memory broadcast (best-effort) + outbox row
-//!    (durable)** — ship both. The chokepoint writes the outbox row in
-//!    its tx (load-bearing for crash recovery), and the existing
-//!    per-convo emit queue continues to fire SSE broadcasts to connected
-//!    subscribers post-commit (low-latency happy path). Reconnecting
-//!    subscribers backfill from `event_stream` via the existing cursor
-//!    path; the outbox worker drains rows that no live subscriber
-//!    consumed.
+//! Because (3) lands in the same tx as the `delivery_events` row, a
+//! SIGKILL anywhere between commit and the live broadcast leaves the
+//! `event_stream` row durable — reconnecting clients get the event via
+//! cursor-replay. The `notification_outbox` row in (1) is now an
+//! audit/observability artifact for the SSE channel; the worker's
+//! `kind='sse'` dispatch is a true no-op-on-success because the
+//! durability work happened in-tx upstream.
 //!
-//! We chose option 2. The chokepoint already writes an `event_stream`
-//! row alongside `delivery_events`, so SSE backfill on reconnect already
-//! works. The outbox worker's job for `kind='sse'` is therefore a
-//! no-op-on-success: log + mark `done`. The durable row exists so a
-//! crash *between* `delivery_events.commit()` and the per-convo emit
-//! queue draining doesn't lose the broadcast intent. Push/websocket
-//! kinds, if/when added, drive their respective dispatchers from the
-//! same loop.
+//! ## Why we still write the `notification_outbox` row
+//!
+//! The row is the per-recipient observability artifact:
+//!  - "did delivery event E reach recipient R via channel SSE?" is one
+//!    row in the outbox, not a join through `event_stream`.
+//!  - Future per-recipient retries (e.g. push, websocket) will share
+//!    this surface; deleting the SSE row would force a schema split.
+//!  - Ops queries tail the outbox to spot offline / lagging members
+//!    without touching the noisier `event_stream` table.
+//!
+//! ## Push / websocket kinds
+//!
+//! Not wired in Phase 3 — the chokepoint never enqueues them. The
+//! belt-and-suspenders guard below (`dispatch`) errs loudly if such a
+//! row appears via legacy data or a future regression.
 
 use chrono::{DateTime, Utc};
 use sqlx::{FromRow, PgPool};
@@ -173,12 +186,28 @@ async fn claim_due_rows(
 
 /// Dispatch one notification outbox row.
 ///
-/// For `kind='sse'`: a no-op-on-success. Connected subscribers already
-/// got the broadcast via the in-memory per-convo queue; reconnecting
-/// subscribers backfill from `event_stream`. The durable row's purpose
-/// is to survive a SIGKILL between commit and broadcast — once a row
-/// makes it here, the per-convo queue has had its chance and the row
-/// represents intent that's already been served by either path.
+/// For `kind='sse'`: a no-op-on-success. The chokepoint
+/// (`actors/reset_chokepoint.rs::enqueue_outbox_for_event`) wrote both
+/// the `notification_outbox` row AND a matching `event_stream` row in
+/// the SAME Postgres tx as the `delivery_events` INSERT. The
+/// `event_stream` row is what reconnecting subscribers replay via
+/// cursor (`subscribe_convo_events` / WS backfill), and live
+/// subscribers see the same event via the in-memory broadcast emitted
+/// post-commit using the SAME cursor. The `notification_outbox` row is
+/// per-recipient observability — once we reach this dispatcher both
+/// the durability anchor (event_stream) and any live broadcast have
+/// already been served. Marking `done` is correct.
+///
+/// **Why this is not the bug Codex P1 flagged**: pre-fix, the
+/// chokepoint only wrote the outbox row in-tx and the
+/// `event_stream` write happened POST-commit alongside the live
+/// broadcast. A SIGKILL between commit and post-commit work left the
+/// outbox row claiming "pending"; this dispatcher then marked it
+/// `done` without anything reaching `event_stream`, silently dropping
+/// the message. The fix moved the `event_stream` write into the same
+/// tx as the outbox row INSERT — see `enqueue_outbox_for_event` and
+/// the `set_stream_event_cursor` path. Now this branch is a true
+/// no-op-on-success because the durability work happened upstream.
 ///
 /// For `kind='push'` / `kind='websocket'`: NOT supported. The chokepoint
 /// (`actors/reset_chokepoint.rs::enqueue_outbox_for_event`) deliberately
@@ -201,10 +230,9 @@ async fn dispatch(row: &NotificationOutboxRow) -> anyhow::Result<()> {
     );
     match row.kind.as_str() {
         "sse" => {
-            // The in-memory broadcast already happened (best-effort,
-            // post-commit, in the per-convo emit queue). The outbox row
-            // is the durability anchor; once we reach this dispatcher
-            // the row's purpose has been fulfilled.
+            // codex P1 fix: durability + live broadcast both happened
+            // upstream in the chokepoint tx. This is a true no-op-on-
+            // success — see fn doc-comment for the contract.
             Ok(())
         }
         "push" | "websocket" => {

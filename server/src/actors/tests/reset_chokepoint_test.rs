@@ -328,6 +328,9 @@ mod outbox_db_tests {
                 "test reset for outbox tx coupling",
                 &format!("chokepoint-outbox-{}", Uuid::new_v4()),
                 None,
+                // codex P1 fix: opt out of in-tx event_stream insert
+                // for this test — it asserts outbox row counts only.
+                None,
             )
             .await
             .expect("chokepoint request");

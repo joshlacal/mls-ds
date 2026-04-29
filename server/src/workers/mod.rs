@@ -86,6 +86,20 @@ pub const CLAIM_BATCH_SIZE: i64 = 100;
 
 /// Compute the backoff delay for the Nth attempt: `2^attempts * BACKOFF_BASE`,
 /// capped at `BACKOFF_CAP`. Pure function for unit-testability.
+///
+/// **`attempts` is the pre-increment counter** — i.e. the value of
+/// `outbox_row.attempts` BEFORE this failed attempt is recorded. So:
+///
+///   - First failure (row was at `attempts=0`): pass `0`, get `5s`
+///     (2^0 * 5).
+///   - Second failure (row was at `attempts=1`): pass `1`, get `10s`.
+///   - Third failure (row was at `attempts=2`): pass `2`, get `20s`.
+///   - …and so on through the schedule documented on `BACKOFF_BASE`.
+///
+/// codex P2 fix: prior to this doc-comment, `record_failure` passed
+/// `new_attempts = attempts + 1` here, shifting the whole curve one
+/// step later (first failure → 10s instead of 5s). Always pass the
+/// pre-increment value.
 pub fn compute_backoff(attempts: i32) -> Duration {
     let base = BACKOFF_BASE.as_secs();
     // 2^attempts saturates very quickly; bail out at 30 to avoid u64 overflow.
@@ -123,7 +137,13 @@ async fn reclaim_stuck_in_flight(pool: &PgPool, table: &str) -> Result<u64, sqlx
 /// the next worker tick after `next_attempt_at`). The `attempts`
 /// counter is incremented and `last_error` records the error message
 /// even on the retry path, so the failure trail is preserved.
-async fn record_failure(
+///
+/// `pub` (rather than module-private) so the durable-outbox
+/// integration test in `tests/durable_outbox_test.rs` can verify the
+/// codex-P2 backoff regression directly without re-implementing the
+/// retry SQL — see `record_failure_pre_increment_backoff_curve` in
+/// that file.
+pub async fn record_failure(
     pool: &PgPool,
     table: &str,
     row_id: &str,
@@ -137,10 +157,16 @@ async fn record_failure(
         .map(|d| d > MAX_LIFETIME)
         .unwrap_or(false);
 
+    // codex P2 fix: pass the PRE-increment `attempts` to
+    // compute_backoff. A row with `attempts=0` (first failure) MUST
+    // get `2^0 * 5s = 5s`, not `2^1 * 5s = 10s`. Pre-fix, this passed
+    // `new_attempts = attempts + 1`, which shifted the entire schedule
+    // one step later (first failure 10s instead of 5s, second 20s
+    // instead of 10s, etc.).
+    let next_attempt_at = compute_backoff(attempts);
     let new_attempts = attempts + 1;
     let dead = new_attempts >= MAX_ATTEMPTS || lifetime_exceeded;
-    let backoff = compute_backoff(new_attempts);
-    let backoff_secs = backoff.as_secs() as i64;
+    let backoff_secs = next_attempt_at.as_secs() as i64;
 
     // Retry semantics: the claim query filters `status = 'pending'`,
     // so flipping a transient failure to 'pending' (with a backoff

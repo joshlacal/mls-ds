@@ -16,7 +16,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{broadcast, mpsc, RwLock};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     auth::AuthUser,
@@ -211,6 +211,35 @@ pub enum StreamEvent {
 /// Helper for `skip_serializing_if` on the `ephemeral` field.
 pub fn is_false(v: &bool) -> bool {
     !(*v)
+}
+
+/// Mutate the `cursor` field of any `StreamEvent` variant in-place.
+///
+/// Phase 3 codex P1 fix — used by
+/// `actors/reset_chokepoint::enqueue_outbox_for_event` to assign the
+/// in-tx allocated ULID to a caller-supplied event before persisting.
+/// The chokepoint then returns the modified event so the caller's
+/// live `sse_state.emit` path can broadcast the SAME cursor (subscriber
+/// dedupe via `replayed_cursors` HashSet relies on bit-equal cursors).
+///
+/// Every variant carries a `cursor: String` field; this helper exists
+/// so callers don't have to enumerate the variants again. Update this
+/// function if you add a new `StreamEvent` variant.
+pub fn set_stream_event_cursor(event: &mut StreamEvent, new_cursor: String) {
+    match event {
+        StreamEvent::MessageEvent { cursor, .. } => *cursor = new_cursor,
+        StreamEvent::TypingEvent { cursor, .. } => *cursor = new_cursor,
+        StreamEvent::ReactionEvent { cursor, .. } => *cursor = new_cursor,
+        StreamEvent::InfoEvent { cursor, .. } => *cursor = new_cursor,
+        StreamEvent::NewDeviceEvent { cursor, .. } => *cursor = new_cursor,
+        StreamEvent::GroupInfoRefreshRequested { cursor, .. } => *cursor = new_cursor,
+        StreamEvent::ReadditionRequested { cursor, .. } => *cursor = new_cursor,
+        StreamEvent::TreeChanged { cursor, .. } => *cursor = new_cursor,
+        StreamEvent::MembershipChangeEvent { cursor, .. } => *cursor = new_cursor,
+        StreamEvent::GroupResetEvent { cursor, .. } => *cursor = new_cursor,
+        StreamEvent::CircuitBreakerTrippedEvent { cursor, .. } => *cursor = new_cursor,
+        StreamEvent::ResetRequestedEvent { cursor, .. } => *cursor = new_cursor,
+    }
 }
 
 /// Manual `Deserialize` for `StreamEvent`.
@@ -939,6 +968,90 @@ pub async fn subscribe_convo_events(
                     convo = %crate::crypto::redact_for_log(&convo_id),
                     error = ?e,
                     "Failed to backfill commit messages"
+                );
+            }
+        }
+
+        // Phase 3 codex P1 fix — also backfill non-messageEvent
+        // event_stream rows so reconnecting clients see
+        // `resetRequestedEvent` / `groupResetEvent` /
+        // `treeChanged` / etc. that the chokepoint persisted in-tx.
+        // Mirrors `realtime/websocket.rs::backfill_events`: read every
+        // row > cursor, deserialize via the existing
+        // `StreamEvent: Deserialize` impl (which also catches legacy
+        // pre-task-40 rows without `$type` and silently skips them).
+        //
+        // Filtering rules:
+        //   - `messageEvent` rows are skipped here — covered by the
+        //     commit-replay query above (which joins `messages` to
+        //     filter app vs commit). Letting them through here would
+        //     duplicate events (one without joined message_type, one
+        //     with).
+        //   - All other event_types pass through.
+        //
+        // Schema: event_stream.payload is JSONB; serde_json::from_value
+        // can't borrow `&'de str` for `serde_bytes_helper` so we
+        // round-trip via to_string + from_str (same as WS backfill).
+        let other_rows = sqlx::query_as::<_, (String, serde_json::Value, String)>(
+            r#"
+            SELECT id, payload, event_type
+            FROM event_stream
+            WHERE convo_id = $1
+              AND id > $2
+              AND event_type <> 'messageEvent'
+            ORDER BY id ASC
+            LIMIT 1000
+            "#,
+        )
+        .bind(&convo_id)
+        .bind(resume_cur)
+        .fetch_all(&pool)
+        .await;
+
+        match other_rows {
+            Ok(rows) => {
+                for (cursor, payload, event_type) in rows {
+                    let Ok(json) = serde_json::to_string(&payload) else {
+                        continue;
+                    };
+                    let event: StreamEvent = match serde_json::from_str(&json) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            // Legacy row without `$type`, or genuinely
+                            // malformed — log + skip. Never panic on
+                            // backfill.
+                            debug!(
+                                convo = %crate::crypto::redact_for_log(&convo_id),
+                                cursor = %cursor,
+                                event_type = %event_type,
+                                error = ?e,
+                                "skipping unreconstructible event_stream row \
+                                 during SSE backfill"
+                            );
+                            continue;
+                        }
+                    };
+                    let serialized = match serde_json::to_string(&event) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            error!(
+                                convo = %crate::crypto::redact_for_log(&convo_id),
+                                cursor = %cursor,
+                                event_type = %event_type,
+                                error = ?e,
+                                "failed to re-serialize event for SSE replay"
+                            );
+                            continue;
+                        }
+                    };
+                    replay_items.push((cursor, serialized));
+                }
+            }
+            Err(e) => {
+                warn!(
+                    convo = %crate::crypto::redact_for_log(&convo_id),
+                    error = ?e,
+                    "Failed to backfill non-message event_stream rows"
                 );
             }
         }

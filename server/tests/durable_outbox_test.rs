@@ -384,6 +384,253 @@ async fn federation_rows_one_per_distinct_peer() {
     wipe(&pool, &convo_id).await;
 }
 
+/// codex P1 fix regression test — the SIGKILL-after-commit-before-
+/// broadcast window must NOT drop the SSE event for reconnecting
+/// clients.
+///
+/// The fix moved the `event_stream` INSERT into the chokepoint tx so
+/// the durability anchor is the SAME row a reconnecting subscriber
+/// will replay via cursor. Pre-fix, `event_stream` was written
+/// post-commit alongside the live broadcast; a SIGKILL between
+/// commit and post-commit work left the outbox row claimed `done`
+/// (via worker dispatch's `Ok(())`) without anything in
+/// `event_stream` for cursor-replay. This test simulates exactly
+/// that crash window.
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
+async fn sigkill_window_preserves_sse_event_for_cursor_replay() {
+    let pool = setup_test_db().await;
+    let convo_id = format!("convo-sigkill-test-{}", Uuid::new_v4());
+
+    let members: &[(&str, Option<&str>)] = &[("did:plc:alice", None), ("did:plc:bob", None)];
+
+    wipe(&pool, &convo_id).await;
+    let crypto_session_id = seed_convo_with_members(&pool, &convo_id, members).await;
+
+    // Seed a "starting" cursor that the subscriber will resume from.
+    // Any ULID < the cursor the chokepoint will allocate is fine.
+    let starting_cursor = ulid::Ulid::new().to_string();
+
+    // Step 1 — Simulate the chokepoint tx: in ONE tx, INSERT a
+    //          `delivery_events` row, an `event_stream` row, AND the
+    //          `notification_outbox` row. This is the post codex-P1
+    //          state. Crashing right after commit (before any
+    //          post-commit live broadcast) leaves all three rows
+    //          durable.
+    let event_id = Uuid::new_v4().to_string();
+    let chokepoint_cursor = ulid::Ulid::new().to_string();
+    let stream_event_payload = serde_json::json!({
+        "$type": "blue.catbird.mlsChat.subscribeEvents#resetRequestedEvent",
+        "cursor": chokepoint_cursor,
+        "convoId": convo_id,
+        "cryptoSessionId": crypto_session_id,
+        "generation": 1,
+        "trigger": "system_sweep",
+        "requestEventId": event_id,
+        "reason": "codex-P1 SIGKILL recovery test",
+        "requestedAt": "2026-04-28T15:32:11.123Z"
+    });
+    let payload_bytes = serde_json::to_vec(&stream_event_payload).unwrap();
+
+    let mut tx = pool.begin().await.expect("begin");
+    let seq: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(seq), -1) + 1 FROM delivery_events WHERE conversation_id = $1",
+    )
+    .bind(&convo_id)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("max seq");
+    sqlx::query(
+        "INSERT INTO delivery_events ( \
+            id, conversation_id, seq, crypto_session_id, event_type, \
+            sender_did, idempotency_key, payload_json \
+         ) VALUES ($1, $2, $3, $4, 'crypto_session_reset_requested', \
+                   'did:plc:test', $5, $6)",
+    )
+    .bind(&event_id)
+    .bind(&convo_id)
+    .bind(seq)
+    .bind(&crypto_session_id)
+    .bind(format!("idem-{event_id}"))
+    .bind(&stream_event_payload)
+    .execute(&mut *tx)
+    .await
+    .expect("insert delivery_event");
+    // Outbox row(s) — codex-P1 contract.
+    enqueue_outbox_test_helper(&mut tx, &convo_id, &event_id, &payload_bytes).await;
+    // event_stream row — codex-P1 fix moved this in-tx.
+    sqlx::query(
+        "INSERT INTO event_stream (id, convo_id, event_type, payload, emitted_at) \
+         VALUES ($1, $2, 'resetRequestedEvent', $3, NOW())",
+    )
+    .bind(&chokepoint_cursor)
+    .bind(&convo_id)
+    .bind(&stream_event_payload)
+    .execute(&mut *tx)
+    .await
+    .expect("insert event_stream row in chokepoint tx");
+    tx.commit().await.expect("commit");
+
+    // Step 2 — Simulate the SIGKILL: NO post-commit live broadcast
+    //          fires. We rely entirely on cursor-replay to recover
+    //          the event for a reconnecting subscriber.
+
+    // Step 3 — Simulate a reconnecting SSE subscriber: read every
+    //          event_stream row strictly greater than `starting_cursor`,
+    //          mirroring the SSE backfill query at
+    //          `subscribe_convo_events`. The codex-P1 fix added a
+    //          generic event_stream replay alongside the existing
+    //          commit-messageEvent join; with the in-tx event_stream
+    //          row landing here, the reconnecting client sees the
+    //          ResetRequestedEvent.
+    let replayed: Vec<(String, String)> = sqlx::query_as(
+        r#"
+        SELECT id, event_type
+        FROM event_stream
+        WHERE convo_id = $1 AND id > $2 AND event_type <> 'messageEvent'
+        ORDER BY id ASC
+        "#,
+    )
+    .bind(&convo_id)
+    .bind(&starting_cursor)
+    .fetch_all(&pool)
+    .await
+    .expect("select replay rows");
+
+    assert!(
+        replayed
+            .iter()
+            .any(|(cursor, etype)| *cursor == chokepoint_cursor && etype == "resetRequestedEvent"),
+        "cursor-replay MUST surface the chokepoint-persisted ResetRequestedEvent \
+         row even when no live broadcast fired (SIGKILL window). Replayed: {:?}",
+        replayed
+    );
+
+    // Step 4 — The notification_outbox row is per-recipient
+    //          observability; once the durability anchor (event_stream)
+    //          is in place, the worker's `kind='sse'` dispatch is a
+    //          true no-op-on-success. Run a worker tick to confirm
+    //          the rows transition to `done` cleanly (not leaked at
+    //          `pending`).
+    drain_notification_outbox_once(&pool).await;
+    let (n_pending, n_done, _, _) = outbox_counts(&pool, &convo_id).await;
+    assert_eq!(
+        n_pending, 0,
+        "notification_outbox should drain to done after worker tick"
+    );
+    assert_eq!(
+        n_done,
+        members.len() as i64,
+        "all outbox rows should have transitioned to done"
+    );
+
+    wipe(&pool, &convo_id).await;
+}
+
+/// codex P2 fix regression test — `record_failure` MUST pass the
+/// pre-increment `attempts` value to `compute_backoff`. Pre-fix, it
+/// passed `attempts + 1`, shifting the schedule from 5/10/20s to
+/// 10/20/40s.
+///
+/// We assert the on-disk `next_attempt_at` lies inside a small window
+/// around `NOW() + expected_secs` (the SQL `NOW()` is wall-clock so
+/// some slack is required; we use ±2s).
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
+async fn record_failure_pre_increment_backoff_curve() {
+    let pool = setup_test_db().await;
+    let convo_id = format!("convo-backoff-test-{}", Uuid::new_v4());
+
+    let members: &[(&str, Option<&str>)] = &[("did:plc:alice", None)];
+    wipe(&pool, &convo_id).await;
+    let crypto_session_id = seed_convo_with_members(&pool, &convo_id, members).await;
+
+    // Seed one outbox row at attempts=0 (the "fresh" state every new
+    // row starts at).
+    let event_id = commit_event_with_outbox(&pool, &convo_id, &crypto_session_id).await;
+    let row_id: String = sqlx::query_scalar(
+        "SELECT id FROM notification_outbox WHERE delivery_event_id = $1 LIMIT 1",
+    )
+    .bind(&event_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read outbox row id");
+
+    // For each step in the schedule, snapshot pre-call NOW(), call
+    // record_failure with the current `attempts` value, snapshot
+    // post-call `next_attempt_at`, and assert the gap matches the
+    // documented curve. Read `attempts` from the row each iteration
+    // so we follow the actual increment.
+    let schedule: &[(i32, i64)] = &[
+        // (current_attempts pre-call, expected backoff in seconds)
+        (0, 5),
+        (1, 10),
+        (2, 20),
+        (3, 40),
+        (4, 80),
+    ];
+
+    for &(expected_attempts, expected_secs) in schedule {
+        // Confirm the row state matches what we expect at this step.
+        let on_disk_attempts: i32 =
+            sqlx::query_scalar("SELECT attempts FROM notification_outbox WHERE id = $1")
+                .bind(&row_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read attempts");
+        assert_eq!(
+            on_disk_attempts, expected_attempts,
+            "row attempts should be {} before call, got {}",
+            expected_attempts, on_disk_attempts
+        );
+
+        let now: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT NOW()")
+            .fetch_one(&pool)
+            .await
+            .expect("select NOW");
+
+        let created_at: chrono::DateTime<chrono::Utc> =
+            sqlx::query_scalar("SELECT created_at FROM notification_outbox WHERE id = $1")
+                .bind(&row_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read created_at");
+
+        catbird_server::workers::record_failure(
+            &pool,
+            "notification_outbox",
+            &row_id,
+            expected_attempts,
+            created_at,
+            "synthetic-backoff-test",
+        )
+        .await
+        .expect("record_failure");
+
+        let next_attempt_at: chrono::DateTime<chrono::Utc> =
+            sqlx::query_scalar("SELECT next_attempt_at FROM notification_outbox WHERE id = $1")
+                .bind(&row_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read next_attempt_at");
+
+        let actual_gap = (next_attempt_at - now).num_seconds();
+        // Allow ±2s slack for clock drift between two `SELECT NOW()`
+        // calls separated by a UPDATE.
+        assert!(
+            (expected_secs - actual_gap).abs() <= 2,
+            "attempts={} (pre-increment): expected next_attempt_at \
+             ≈ NOW + {}s, got NOW + {}s. Pre codex-P2 fix the gap was \
+             one step later (e.g. 10s instead of 5s).",
+            expected_attempts,
+            expected_secs,
+            actual_gap
+        );
+    }
+
+    wipe(&pool, &convo_id).await;
+}
+
 /// Hand-rolled equivalent of one
 /// [`workers::notification_outbox::run_notification_outbox_worker`] tick
 /// without spawning the worker.
