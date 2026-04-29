@@ -2883,7 +2883,7 @@ pub async fn commit_group_change(
                     tracing::info!(
                         target: "groupinfo_refresh",
                         action = "refreshGroupInfo",
-                        convo_id = %convo_redacted,
+                        convo_id = %crate::crypto::redact_for_log(&convo_id),
                         active_session_state = "active",
                         new_crypto_session_id = %active_id,
                         outcome = "group_reset_active_null_group_info",
@@ -2902,7 +2902,7 @@ pub async fn commit_group_change(
                     tracing::info!(
                         target: "groupinfo_refresh",
                         action = "refreshGroupInfo",
-                        convo_id = %convo_redacted,
+                        convo_id = %crate::crypto::redact_for_log(&convo_id),
                         active_session_state = "active",
                         active_session_id = %active_id,
                         outcome = "active_with_group_info",
@@ -2915,7 +2915,7 @@ pub async fn commit_group_change(
                     tracing::info!(
                         target: "groupinfo_refresh",
                         action = "refreshGroupInfo",
-                        convo_id = %convo_redacted,
+                        convo_id = %crate::crypto::redact_for_log(&convo_id),
                         active_session_state = %reset_state,
                         outcome = "group_reset_in_flight",
                         "no active session — reset in flight; routing client to bootstrap-recovery"
@@ -2933,7 +2933,7 @@ pub async fn commit_group_change(
                     tracing::info!(
                         target: "groupinfo_refresh",
                         action = "refreshGroupInfo",
-                        convo_id = %convo_redacted,
+                        convo_id = %crate::crypto::redact_for_log(&convo_id),
                         outcome = "no_crypto_session_legacy",
                         "no crypto_sessions row — falling back to legacy SSE-emit path"
                     );
