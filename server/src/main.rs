@@ -676,6 +676,15 @@ async fn main() -> anyhow::Result<()> {
         .merge(RegisterDeviceRequest::into_router(
             handlers::mls_chat::register_device_post,
         ))
+        // Compat shim: legacy registerDeviceToken endpoint. Folded into
+        // registerDevice (action=updateToken) but old iOS Petrel-generated
+        // code still calls the retired NSID. Route handler updates the
+        // push_token on the existing device row so push delivery keeps
+        // working until clients update.
+        .route(
+            "/xrpc/blue.catbird.mlsChat.registerDeviceToken",
+            post(handlers::mls_chat::register_device_token),
+        )
         .merge(PublishKeyPackagesRequest::into_router(
             handlers::mls_chat::publish_key_packages_post,
         ))
