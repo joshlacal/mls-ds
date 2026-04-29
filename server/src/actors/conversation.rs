@@ -391,6 +391,25 @@ impl Actor for ConversationActor {
                     .await;
                 let _ = reply.send(result);
             }
+            ConvoMessage::SelfHealOrphanSession {
+                new_mls_group_id,
+                new_group_info,
+                welcomes,
+                initiator_did,
+                idempotency_key,
+                reply,
+            } => {
+                let result = state
+                    .handle_self_heal_orphan_session(
+                        new_mls_group_id,
+                        new_group_info,
+                        welcomes,
+                        initiator_did,
+                        idempotency_key,
+                    )
+                    .await;
+                let _ = reply.send(result);
+            }
             ConvoMessage::Shutdown => {
                 info!("ConversationActor shutting down");
                 state.broadcaster_pool.shutdown();
@@ -1990,6 +2009,117 @@ impl ConversationActorState {
             generation = outcome.generation,
             trigger = %trigger.as_str(),
             "crypto_session_activated"
+        );
+
+        Ok(outcome.session)
+    }
+
+    /// SERVER F (#68) — handle `SelfHealOrphanSession`.
+    ///
+    /// Self-heals a `state='active', group_info IS NULL` orphan row
+    /// created by the legacy `do_reset_group` path (Phase 2.5 Stage 1)
+    /// when the indirect-funneling flow runs without a follow-up admin
+    /// `update_group_info`.
+    ///
+    /// The single-tx core lives in
+    /// [`super::reset_chokepoint::self_heal_orphan_session_tx`]; this
+    /// method commits, then handles post-commit concerns (in-memory
+    /// state reset for the actor and live SSE broadcast for the
+    /// `groupResetEvent` that subscribed clients consume via the
+    /// CLIENT L #67 wire path).
+    async fn handle_self_heal_orphan_session(
+        &mut self,
+        new_mls_group_id: String,
+        new_group_info: Vec<u8>,
+        welcomes: Vec<WelcomeEnvelope>,
+        initiator_did: String,
+        idempotency_key: String,
+    ) -> anyhow::Result<crate::models::CryptoSession> {
+        use anyhow::Context;
+        let mut tx = self
+            .db_pool
+            .begin()
+            .await
+            .context("begin SelfHealOrphanSession tx")?;
+        let result = super::reset_chokepoint::self_heal_orphan_session_tx(
+            &mut tx,
+            &self.convo_id,
+            &new_mls_group_id,
+            &new_group_info,
+            &welcomes,
+            &initiator_did,
+            &idempotency_key,
+            // Mirror activate_crypto_session: ask the chokepoint to
+            // persist a `groupResetEvent` event_stream row in-tx so the
+            // OTHER active members (who didn't win the self-heal race)
+            // see the reset broadcast and trigger their own bootstrap
+            // recovery via CLIENT L #67. The recipient who won the race
+            // will dedupe the live broadcast against their own UPDATE
+            // outcome via the SSE replayed_cursors set.
+            Some(super::reset_chokepoint::SseEventKind::GroupReset),
+        )
+        .await?;
+        tx.commit()
+            .await
+            .context("commit SelfHealOrphanSession tx")?;
+
+        let outcome = match result {
+            super::reset_chokepoint::ActivationResult::Won(o) => o,
+            super::reset_chokepoint::ActivationResult::CachedReplay(o) => {
+                info!(
+                    convo_id = %crate::crypto::redact_for_log(&self.convo_id),
+                    self_healed_session_id = %o.session.id,
+                    generation = o.generation,
+                    "SelfHealOrphanSession cached replay (no side effects re-fired)"
+                );
+                return Ok(o.session);
+            }
+            super::reset_chokepoint::ActivationResult::Lost {
+                attempted_generation,
+                proposed_mls_group_id,
+            } => {
+                info!(
+                    convo_id = %crate::crypto::redact_for_log(&self.convo_id),
+                    attempted_generation,
+                    proposed_mls_group_id = %crate::crypto::redact_for_log(&proposed_mls_group_id),
+                    "self_heal_tie_break_loss (another responder/admin populated group_info first)"
+                );
+                return Err(anyhow::anyhow!(
+                    "SelfHealOrphanSession tie-break lost: another responder \
+                     (or a tardy admin update_group_info) populated \
+                     group_info first; receive the Welcome from the winner"
+                ));
+            }
+        };
+
+        // Post-commit in-memory reset. Same shape as
+        // handle_activate_crypto_session, including preserving
+        // unread_counts (per Phase 2 §2.2 step 10 — those are app
+        // data, not crypto state).
+        self.current_epoch = 0;
+
+        if let Some(event) = outcome.sse_event.clone() {
+            if let Err(e) = self.sse_state.emit(&self.convo_id, event).await {
+                error!(
+                    "[actor:self_heal_orphan_session] SSE emit GroupReset: {}",
+                    e
+                );
+            }
+        } else {
+            error!(
+                convo_id = %crate::crypto::redact_for_log(&self.convo_id),
+                "[actor:self_heal_orphan_session] chokepoint did not return \
+                 sse_event despite SseEventKind::GroupReset — live broadcast skipped"
+            );
+        }
+
+        info!(
+            convo_id = %crate::crypto::redact_for_log(&self.convo_id),
+            self_healed_session_id = %outcome.session.id,
+            generation = outcome.generation,
+            initiator_did = %crate::crypto::redact_for_log(&initiator_did),
+            new_mls_group_id = %crate::crypto::redact_for_log(&new_mls_group_id),
+            "crypto_session_self_healed"
         );
 
         Ok(outcome.session)

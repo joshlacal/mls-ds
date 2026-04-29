@@ -1605,3 +1605,458 @@ async fn fetch_session_by_id(
 
     Ok(row.map(CryptoSession::from))
 }
+
+/// SERVER F (#68) — self-heal an orphan `state='active', group_info IS NULL`
+/// crypto_session row in place.
+///
+/// # Why a sibling function instead of overloading `activate_crypto_session_tx`
+///
+/// `activate_crypto_session_tx` carries a pile of invariants that don't
+/// apply here:
+///
+///   * generation always advances (`prior.generation + 1`)
+///   * INSERT-with-savepoint tie-break on `(conversation_id, generation)`
+///     UNIQUE plus `idx_crypto_sessions_one_active_per_convo`
+///   * R1 #2 `allowed_responders` allowlist when prior is `reset_requested`
+///   * `crypto_session_superseded` + `crypto_session_activated` event pair
+///
+/// Self-heal preserves the existing row identity (same `id`, same
+/// `generation`, no supersede), so threading it through the activation tx
+/// would fork every step. A sibling function reads as "added a parallel
+/// path" rather than "rewired a load-bearing one."
+///
+/// # Tie-break (the only auth gate beyond handler `is_member`)
+///
+/// `UPDATE crypto_sessions SET ... WHERE id = $1 AND state = 'active'
+/// AND group_info IS NULL` — the WHERE clause is the load-bearing
+/// idempotency primitive. PostgreSQL row-level locking serializes
+/// concurrent self-healers; whichever commits first sets `group_info IS
+/// NOT NULL`, the second's UPDATE matches zero rows and we return
+/// [`ActivationResult::Lost`]. The handler maps `Lost` to 409
+/// `AlreadyBootstrapped`, matching the existing tie-break-loss surface
+/// in `bootstrap_reset_group.rs`.
+///
+/// Tardy admin race: if the admin's `update_group_info` lands first
+/// (sets `crypto_sessions.group_info` directly via #60-paired write),
+/// the recipient's UPDATE sees `group_info IS NOT NULL` and falls into
+/// the 409 path. If admin lands AFTER the recipient (fastest case in
+/// production), the admin's `update_group_info` writes to
+/// `conversations.group_info` (a separate column on a separate table);
+/// `crypto_sessions.group_info` is already populated by the recipient.
+/// This produces a brief inconsistency between the two tables that
+/// resolves on the next legitimate `update_group_info` call. Documented
+/// in the SERVER F PR body.
+///
+/// # Authorization (intentionally NOT R1 #2)
+///
+/// There is no upstream `crypto_session_reset_requested` event with an
+/// `allowed_responders` snapshot. By design — the user has explicitly
+/// rejected manual healing for conversation 4b2cdbaa and the design
+/// intent is autonomous self-heal: any active member can race to be the
+/// first-responder. The handler's `is_member` check (canonical
+/// `members WHERE convo_id = $1 AND ... AND left_at IS NULL`) is the
+/// ONLY auth gate for this path.
+///
+/// # Steps
+///
+/// 1. **Idempotency check** on `crypto_session_self_healed` event (replay
+///    of a prior winning self-heal returns the cached session).
+/// 2. **Idempotency check** on `crypto_session_candidate_rejected` event
+///    (replay of a prior losing self-heal returns the same `Lost`).
+/// 3. **Read the orphan row** for update — must be the latest non-
+///    superseded session in `state='active'`. State≠active is an
+///    `Err` (caller bug, wrong handler routing); `group_info IS NOT
+///    NULL` is the race-loss case and is handled at step 4 below by
+///    the UPDATE-WHERE-zero-rows branch (NOT here, so the loser path
+///    has a clean audit trail via `crypto_session_candidate_rejected`).
+/// 4. **UPDATE the orphan row in place** — `mls_group_id` swapped to the
+///    recipient's, `group_info` set, `last_observed_epoch=0`,
+///    `group_info_epoch=0`, `group_info_updated_at=NOW()`,
+///    `activated_at=NOW()`, `created_by_did=initiator_did`. The
+///    `WHERE state = 'active' AND group_info IS NULL` clause is the
+///    SOLE load-bearing tie-break. Zero-row UPDATE → emit
+///    `crypto_session_candidate_rejected`, return `Lost`. **Every
+///    destructive write below this point is gated behind the
+///    rows_affected==1 winner branch** so a losing tx cannot persist
+///    a DELETE that clobbers the winner's pending_welcomes.
+/// 5. **DELETE pre-existing pending_welcomes** keyed on the orphan
+///    session id — these would be admin-attempt welcomes for a
+///    different `mls_group_id` and must not coexist with the
+///    recipient's fresh welcomes. Winner-only.
+/// 6. **UPDATE conversations** legacy MLS columns to mirror — same shape
+///    as `activate_crypto_session_tx` step 5, but `reset_count` stays
+///    UNCHANGED (no generation advance). Winner-only.
+/// 7. **APPEND `crypto_session_self_healed` event** with provenance
+///    (`initiator_did = recipient`, `trigger = SelfHealFirstResponder`,
+///    `crypto_session_id = orphan_id`). Winner-only.
+/// 8. **INSERT pending_welcomes** for the recipient's Welcomes.
+///    Winner-only. Must follow event INSERT — `commit_event_id` FKs
+///    on the just-inserted self_healed event.
+/// 9. **enqueue outbox + event_stream** via `enqueue_outbox_for_event`,
+///    pass `SseEventKind::GroupReset` so subscribed clients get the
+///    standard `groupResetEvent` SSE broadcast (CLIENT L's #67 wire path).
+/// 10. **Housekeeping** — same DELETEs as `activate_crypto_session_tx`
+///     (welcome_messages, pending_device_additions, reset_votes) for the
+///     orphan session id. Winner-only.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn self_heal_orphan_session_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    conversation_id: &str,
+    new_mls_group_id: &str,
+    new_group_info: &[u8],
+    welcomes: &[WelcomeEnvelope],
+    initiator_did: &str,
+    idempotency_key: &str,
+    sse_intent: Option<SseEventKind>,
+) -> Result<ActivationResult> {
+    // 1. Idempotency check on the self-heal event.
+    if let Some((_event_id, _payload_json, cs_id)) = find_existing_event(
+        tx,
+        conversation_id,
+        initiator_did,
+        idempotency_key,
+        "crypto_session_self_healed",
+    )
+    .await?
+    {
+        let cs_id = cs_id.ok_or_else(|| {
+            anyhow!("existing crypto_session_self_healed event missing crypto_session_id")
+        })?;
+        let session = fetch_session_by_id(tx, &cs_id).await?.ok_or_else(|| {
+            anyhow!("idempotent replay: crypto_session {cs_id} from prior tx not found")
+        })?;
+        let cipher_suite = session.cipher_suite.clone();
+        let generation = session.generation;
+        return Ok(ActivationResult::CachedReplay(ActivationOutcome {
+            session,
+            generation,
+            cipher_suite,
+            sse_cursor: None,
+            sse_event: None,
+        }));
+    }
+
+    // 2. Idempotent replay of the loser path.
+    if let Some((_event_id, payload_json, _cs_id)) = find_existing_event(
+        tx,
+        conversation_id,
+        initiator_did,
+        idempotency_key,
+        "crypto_session_candidate_rejected",
+    )
+    .await?
+    {
+        let attempted_generation = payload_json
+            .as_ref()
+            .and_then(|p| p.get("attempted_generation"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or_default() as i32;
+        let proposed_mls_group_id = payload_json
+            .as_ref()
+            .and_then(|p| p.get("proposed_mls_group_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(new_mls_group_id)
+            .to_string();
+        return Ok(ActivationResult::Lost {
+            attempted_generation,
+            proposed_mls_group_id,
+        });
+    }
+
+    // 3. Read the orphan row for update. Must be state='active'. We use
+    //    FOR UPDATE so concurrent self-healers serialize on the row
+    //    lock — the second one will see the first's UPDATE-applied
+    //    state when it acquires the lock and its UPDATE WHERE clause
+    //    will match zero rows.
+    //
+    //    NOTE: we deliberately do NOT reject `group_info IS NOT NULL`
+    //    at this precondition. The UPDATE-tie-break (step 4) is the
+    //    SOLE load-bearing gate — gi-populated callers will reach
+    //    `rows_affected == 0` and return Lost via the candidate_rejected
+    //    audit row. Rejecting here would short-circuit the loser path
+    //    with a bare Err that has no audit trail. State≠active stays an
+    //    Err — that's a true anomaly (caller routed to the wrong
+    //    handler), not a race-loss.
+    let prior = read_current_session_for_update(tx, conversation_id)
+        .await?
+        .ok_or_else(|| anyhow!("no current crypto_session for {conversation_id}"))?;
+
+    if prior.state != "active" {
+        return Err(anyhow!(
+            "self-heal precondition failed: latest crypto_session for {conversation_id} \
+             is state={}, expected state='active'. The handler's precondition SELECT \
+             should have rejected this before reaching the chokepoint.",
+            prior.state
+        ));
+    }
+
+    let orphan_session_id = prior.id.clone();
+    let preserved_generation = prior.generation;
+    let cipher_suite = prior.cipher_suite.clone();
+
+    // 4. UPDATE in place — the WHERE clause is the SOLE load-bearing
+    //    tie-break. Two simultaneous self-healers serialize on the row
+    //    lock; the second sees `group_info IS NOT NULL` and matches
+    //    zero rows. **Every destructive write below this point only
+    //    runs on the winner path** (post `rows_affected == 1` branch)
+    //    so a losing tx cannot persist a DELETE that clobbers the
+    //    winner's pending_welcomes.
+    //
+    //    `activated_at = NOW()` and `created_by_did = $4` mirror
+    //    `activate_crypto_session_tx` step 4 audit attribution: the
+    //    orphan row was originally created by `do_reset_group` with
+    //    `created_by_did = system DID`; the recipient who actually
+    //    completes the cycle takes over attribution. `activated_at`
+    //    refresh ensures the audit timestamp reflects the cycle that
+    //    actually produced functional MLS state.
+    let update_result = sqlx::query(
+        "UPDATE crypto_sessions SET \
+            mls_group_id = $1, \
+            group_info = $2, \
+            group_info_epoch = 0, \
+            group_info_updated_at = NOW(), \
+            last_observed_epoch = 0, \
+            last_confirmation_tag = NULL, \
+            activated_at = NOW(), \
+            created_by_did = $4 \
+         WHERE id = $3 AND state = 'active' AND group_info IS NULL",
+    )
+    .bind(new_mls_group_id)
+    .bind(new_group_info)
+    .bind(&orphan_session_id)
+    .bind(initiator_did)
+    .execute(&mut **tx)
+    .await
+    .context("UPDATE crypto_session self-heal in place")?;
+
+    if update_result.rows_affected() == 0 {
+        // Tie-break loss: another self-healer (or a tardy admin
+        // update_group_info) populated group_info between our SELECT
+        // FOR UPDATE and our UPDATE. Persist a candidate_rejected event
+        // for audit, return Lost. **No DELETE, no INSERT, no other
+        // destructive writes** — the loser tx must be a pure read +
+        // single audit-event write so committing it does not affect
+        // the winner's persisted state.
+        let payload = json!({
+            "trigger": ResetTrigger::SelfHealFirstResponder.as_str(),
+            "reason": "self_heal_tie_break_loss",
+            "proposed_mls_group_id": new_mls_group_id,
+            "attempted_generation": preserved_generation,
+            "orphan_session_id": orphan_session_id,
+        });
+        let seq = allocate_seq(tx, conversation_id).await?;
+        insert_event(
+            tx,
+            conversation_id,
+            seq,
+            None,
+            "crypto_session_candidate_rejected",
+            Some(initiator_did),
+            Some(new_mls_group_id),
+            Some(idempotency_key),
+            payload,
+        )
+        .await?;
+        return Ok(ActivationResult::Lost {
+            attempted_generation: preserved_generation,
+            proposed_mls_group_id: new_mls_group_id.to_string(),
+        });
+    }
+
+    // ── WINNER PATH ──────────────────────────────────────────────────
+    // From here on, every write is gated behind `rows_affected == 1`
+    // above. The tie-break UPDATE has already populated `group_info`
+    // and swapped `mls_group_id` on the orphan row; subsequent destructive
+    // writes (DELETE pending_welcomes, INSERT pending_welcomes,
+    // housekeeping DELETEs) only run for the winning self-healer.
+
+    // 5. DELETE any pre-existing pending_welcomes for this orphan session.
+    //    These would be admin-attempt welcomes from a failed prior
+    //    `update_group_info` and must not coexist with the recipient's
+    //    fresh welcomes (their key_package targets differ; the admin
+    //    Welcome bytes belong to a different mls_group_id and won't
+    //    decrypt for the recipient's group). Safe to run here because
+    //    we've already won the tie-break — a losing tx would have
+    //    returned via the rows_affected==0 branch above without
+    //    reaching this DELETE.
+    sqlx::query("DELETE FROM pending_welcomes WHERE crypto_session_id = $1")
+        .bind(&orphan_session_id)
+        .execute(&mut **tx)
+        .await
+        .context("DELETE stale pending_welcomes for orphan session")?;
+
+    // 6. UPDATE conversations legacy MLS columns. Same shape as
+    //    activate_crypto_session_tx step 5, with two deliberate deltas:
+    //
+    //      * `reset_count` is NOT advanced — generation is preserved
+    //        across self-heal (same crypto_sessions row id+generation).
+    //      * `active_crypto_session_id` is unchanged (we updated the
+    //        same row's id-keyed slot, no new id to point at).
+    //
+    //    `last_reset_at` and `last_reset_by` ARE updated to NOW() and
+    //    `initiator_did` respectively. Rationale: the orphan row's
+    //    `last_reset_at` was set by `do_reset_group` potentially hours
+    //    or days ago (4b2cdbaa: gen 25 from prior reset). UI consumers
+    //    of `last_reset_at` ("Group was reset on X") should see the
+    //    timestamp of the cycle that actually completed crypto, not the
+    //    abandoned attempt. `last_reset_by` shifts attribution from the
+    //    system DID (set by do_reset_group) to the recipient who
+    //    completed the cycle — matching the activate path's semantics.
+    sqlx::query(
+        "UPDATE conversations SET \
+            group_id = $1, \
+            current_epoch = 0, \
+            group_info = $2, \
+            group_info_epoch = 0, \
+            group_info_updated_at = NOW(), \
+            confirmation_tag = NULL, \
+            last_reset_at = NOW(), \
+            last_reset_by = $3, \
+            recent_commit_409_count = 0, \
+            recent_groupinfo_404_count = 0, \
+            updated_at = NOW() \
+         WHERE id = $4",
+    )
+    .bind(new_mls_group_id)
+    .bind(new_group_info)
+    .bind(initiator_did)
+    .bind(conversation_id)
+    .execute(&mut **tx)
+    .await
+    .context("UPDATE conversations legacy column sync (self-heal)")?;
+
+    // 7. APPEND crypto_session_self_healed event. Distinct event_type
+    //    from `crypto_session_activated` so audit-log readers can tell
+    //    the two-phase reset apart from the orphan-row self-heal.
+    let payload = json!({
+        "trigger": ResetTrigger::SelfHealFirstResponder.as_str(),
+        "new_mls_group_id": new_mls_group_id,
+        "generation": preserved_generation,
+        "orphan_session_id": orphan_session_id,
+    });
+    let seq = allocate_seq(tx, conversation_id).await?;
+    let self_healed_event_id = insert_event(
+        tx,
+        conversation_id,
+        seq,
+        Some(&orphan_session_id),
+        "crypto_session_self_healed",
+        Some(initiator_did),
+        Some(new_mls_group_id),
+        Some(idempotency_key),
+        payload.clone(),
+    )
+    .await?;
+
+    // 8. INSERT pending_welcomes bound to the orphan session.
+    if !welcomes.is_empty() {
+        let mut qb = sqlx::QueryBuilder::<Postgres>::new(
+            "INSERT INTO pending_welcomes ( \
+                id, convo_id, target_did, welcome_message, created_by_did, \
+                crypto_session_id, generation, commit_event_id, \
+                recipient_device_id, key_package_hash \
+             ) ",
+        );
+        qb.push_values(welcomes.iter(), |mut b, w| {
+            b.push_bind(Uuid::new_v4().to_string())
+                .push_bind(conversation_id)
+                .push_bind(&w.recipient_did)
+                .push_bind(&w.welcome_data)
+                .push_bind(initiator_did)
+                .push_bind(&orphan_session_id)
+                .push_bind(preserved_generation)
+                .push_bind(&self_healed_event_id)
+                .push_bind(&w.recipient_device_id)
+                .push_bind(&w.key_package_hash);
+        });
+        qb.build()
+            .execute(&mut **tx)
+            .await
+            .context("bulk INSERT pending_welcomes (self-heal)")?;
+    }
+
+    // 9. Outbox + event_stream enqueue. We map SelfHealFirstResponder to
+    //    a `groupResetEvent` SSE broadcast so CLIENT L's #67 wire path
+    //    (recipient watches for groupReset, calls bootstrap on 410)
+    //    triggers cleanly for the OTHER members. The recipient who just
+    //    self-healed will dedupe via the SSE `replayed_cursors` HashSet
+    //    keyed on the chokepoint-allocated cursor.
+    let self_heal_sse_event = sse_intent.map(|kind| match kind {
+        SseEventKind::GroupReset => crate::realtime::sse::StreamEvent::GroupResetEvent {
+            cursor: String::new(),
+            convo_id: conversation_id.to_string(),
+            new_group_id: new_mls_group_id.to_string(),
+            reset_generation: preserved_generation,
+            reset_by: initiator_did.to_string(),
+            cipher_suite: cipher_suite.clone().unwrap_or_default(),
+            reason: Some(format!(
+                "crypto_session_self_healed:{}",
+                ResetTrigger::SelfHealFirstResponder.as_str()
+            )),
+        },
+        SseEventKind::ResetRequested { .. } => unreachable!(
+            "SseEventKind::ResetRequested must not be supplied to \
+             self_heal_orphan_session_tx; use SseEventKind::GroupReset instead"
+        ),
+    });
+    let outbox_outcome = enqueue_outbox_for_event(
+        tx,
+        conversation_id,
+        &self_healed_event_id,
+        &payload,
+        self_heal_sse_event,
+    )
+    .await
+    .context("enqueue outbox rows for crypto_session_self_healed")?;
+
+    tracing::debug!(
+        conversation_id,
+        self_healed_event_id = %self_healed_event_id,
+        orphan_session_id = %orphan_session_id,
+        notification_rows = outbox_outcome.notification_count,
+        federation_rows = outbox_outcome.federation_count,
+        sse_cursor = ?outbox_outcome.sse_cursor.as_deref(),
+        "outbox: enqueued for crypto_session_self_healed"
+    );
+
+    let self_heal_sse_cursor = outbox_outcome.sse_cursor;
+    let self_heal_sse_event = outbox_outcome.sse_event;
+
+    // 10. Housekeeping. Mirror activate_crypto_session_tx step 8 for
+    //     leftover state from any prior failed admin attempt.
+    sqlx::query("DELETE FROM welcome_messages WHERE convo_id = $1")
+        .bind(conversation_id)
+        .execute(&mut **tx)
+        .await
+        .context("DELETE welcome_messages (self-heal)")?;
+    sqlx::query("DELETE FROM pending_device_additions WHERE convo_id = $1")
+        .bind(conversation_id)
+        .execute(&mut **tx)
+        .await
+        .context("DELETE pending_device_additions (self-heal)")?;
+    sqlx::query("DELETE FROM reset_votes WHERE convo_id = $1")
+        .bind(conversation_id)
+        .execute(&mut **tx)
+        .await
+        .context("DELETE reset_votes (self-heal)")?;
+
+    // Build the post-update CryptoSession for the caller. We re-read so
+    // the response carries the persisted state including the new
+    // group_info, mls_group_id, and timestamps.
+    let session = fetch_session_by_id(tx, &orphan_session_id)
+        .await?
+        .ok_or_else(|| {
+            anyhow!(
+                "self-heal: orphan session {orphan_session_id} disappeared \
+                 between UPDATE and re-read"
+            )
+        })?;
+
+    Ok(ActivationResult::Won(ActivationOutcome {
+        session,
+        generation: preserved_generation,
+        cipher_suite,
+        sse_cursor: self_heal_sse_cursor,
+        sse_event: self_heal_sse_event,
+    }))
+}

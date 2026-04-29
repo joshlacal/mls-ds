@@ -530,3 +530,215 @@ async fn bootstrap_handle_with_welcome_inserts_per_recipient_envelopes() {
 
     cleanup(&pool, ORIGINAL_CONVO_ID).await;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SERVER F #68 self-heal path: validate welcome-fanout completeness in handler.
+//
+// PR #12 review-fix-2 (chatgpt-codex-connector): partial-fanout self-heal
+// strands omitted recipients permanently. The handler must reject any
+// self-heal request whose `welcome_envelopes` does not cover every active
+// non-initiator member with HTTP 400 + `InvalidWelcomeFanout` BEFORE
+// dispatching to the chokepoint.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const SELFHEAL_CONVO_ID: &str = "convo-bootstrap-selfheal-test-0001";
+const SELFHEAL_NEW_GROUP_ID: &str = "feedfacedeadbeef9999888877776666";
+
+/// Seed a conversation with an orphan `state='active', group_info IS NULL`
+/// crypto_session row — the legacy `do_reset_group` indirect-funneling
+/// shape that triggers SERVER F #68's self-heal precondition. Active
+/// roster: ALICE (will be initiator), BOB, CHARLIE.
+async fn setup_selfheal_orphan_convo(pool: &PgPool) {
+    let now = Utc::now();
+    let orphan_mls_group_id = format!("mls-orphan-{}", uuid::Uuid::new_v4());
+
+    sqlx::query(
+        "INSERT INTO conversations \
+            (id, creator_did, current_epoch, created_at, updated_at, cipher_suite, \
+             is_remote, group_id, group_info, reset_count) \
+         VALUES ($1, $2, 0, $3, $3, $4, false, $5, NULL, 0) \
+         ON CONFLICT (id) DO UPDATE SET \
+            group_id = EXCLUDED.group_id, group_info = NULL, \
+            current_epoch = 0, reset_count = 0",
+    )
+    .bind(SELFHEAL_CONVO_ID)
+    .bind(ALICE)
+    .bind(now)
+    .bind("MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519")
+    .bind(&orphan_mls_group_id)
+    .execute(pool)
+    .await
+    .expect("seed conversation");
+
+    let crypto_session_id: String = sqlx::query_scalar(
+        "INSERT INTO crypto_sessions ( \
+            id, conversation_id, generation, mls_group_id, state, \
+            cipher_suite, last_observed_epoch, group_info, group_info_epoch, \
+            group_info_updated_at, created_by_did, created_at, activated_at \
+         ) VALUES (gen_random_uuid()::TEXT, $1, 25, $2, 'active', \
+                   $3, 0, NULL, NULL, NULL, $4, $5, $5) \
+         ON CONFLICT (mls_group_id) DO UPDATE SET state = 'active', group_info = NULL \
+         RETURNING id",
+    )
+    .bind(SELFHEAL_CONVO_ID)
+    .bind(&orphan_mls_group_id)
+    .bind("MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519")
+    .bind("did:web:mlschat.catbird.blue")
+    .bind(now)
+    .fetch_one(pool)
+    .await
+    .expect("seed orphan crypto_sessions row");
+
+    sqlx::query("UPDATE conversations SET active_crypto_session_id = $1 WHERE id = $2")
+        .bind(&crypto_session_id)
+        .bind(SELFHEAL_CONVO_ID)
+        .execute(pool)
+        .await
+        .expect("link active_crypto_session_id");
+
+    // Seed 3 active members: ALICE (initiator), BOB, CHARLIE.
+    for did in &[ALICE, BOB, CHARLIE] {
+        sqlx::query(
+            "INSERT INTO members (convo_id, member_did, user_did, joined_at, is_admin) \
+             VALUES ($1, $2, $2, $3, true) \
+             ON CONFLICT (convo_id, member_did) DO NOTHING",
+        )
+        .bind(SELFHEAL_CONVO_ID)
+        .bind(*did)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("seed members row");
+    }
+}
+
+async fn cleanup_selfheal(pool: &PgPool) {
+    let _ = sqlx::query("DELETE FROM pending_welcomes WHERE convo_id = $1")
+        .bind(SELFHEAL_CONVO_ID)
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM delivery_events WHERE conversation_id = $1")
+        .bind(SELFHEAL_CONVO_ID)
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM crypto_sessions WHERE conversation_id = $1")
+        .bind(SELFHEAL_CONVO_ID)
+        .execute(pool)
+        .await;
+    cleanup(pool, SELFHEAL_CONVO_ID).await;
+}
+
+/// PR #12 review-fix-2: a recipient that submits self-heal with welcomes
+/// for only 1 of 3 non-initiator members must be rejected by the handler
+/// with HTTP 400 + `InvalidWelcomeFanout` BEFORE the chokepoint runs. If
+/// the partial-fanout call were accepted, the omitted members would be
+/// permanently stranded — their own self-heal calls would fail the
+/// chokepoint precondition (group_info now populated) and they'd hit
+/// 409 AlreadyBootstrapped indefinitely.
+#[tokio::test]
+#[ignore = "fixture isolation: shared convo/group IDs cause cross-test interference"]
+async fn bootstrap_self_heal_rejects_partial_welcome_fanout() {
+    let pool = setup_test_db().await;
+    cleanup_selfheal(&pool).await;
+    setup_selfheal_orphan_convo(&pool).await;
+
+    // ALICE is the initiator. Active non-initiator members are
+    // {BOB, CHARLIE}. Submit welcomes covering only BOB → handler
+    // must return 400 with `InvalidWelcomeFanout` because CHARLIE
+    // is missing.
+    use catbird_server::generated::blue_catbird::mlsChat::bootstrap_reset_group::KeyPackageHashEntry;
+    let bob_kp_hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let input = BootstrapResetGroup {
+        original_convo_id: SELFHEAL_CONVO_ID.into(),
+        new_group_id: SELFHEAL_NEW_GROUP_ID.into(),
+        cipher_suite: "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519".into(),
+        group_info: bytes::Bytes::from_static(b"selfheal-group-info"),
+        members: vec![
+            string_to_did(ALICE),
+            string_to_did(BOB),
+            string_to_did(CHARLIE),
+        ],
+        welcome_message: Some(bytes::Bytes::from_static(b"selfheal-welcome-bytes")),
+        key_package_hashes: Some(vec![KeyPackageHashEntry {
+            did: string_to_did(BOB),
+            hash: bob_kp_hash.into(),
+            extra_data: Default::default(),
+        }]),
+        current_epoch: Some(1),
+        extra_data: Default::default(),
+    };
+
+    let result = bootstrap_handle(
+        pool.clone(),
+        test_registry(&pool),
+        test_auth_user(ALICE),
+        &input,
+    )
+    .await;
+
+    let response = match result {
+        Ok(_) => panic!(
+            "partial welcome-fanout self-heal MUST be rejected; got Ok response. \
+             This is the PR #12 review-fix-2 invariant — strand-by-incomplete-bootstrap \
+             must be prevented at the handler before chokepoint dispatch."
+        ),
+        Err(resp) => resp,
+    };
+
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::BAD_REQUEST,
+        "partial welcome-fanout must produce 400 Bad Request"
+    );
+
+    // Body should be JSON with `error: "InvalidWelcomeFanout"`. Use
+    // axum's body collection helpers (the response body is `BoxBody`).
+    let body_bytes = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .expect("read response body");
+    let body_json: serde_json::Value =
+        serde_json::from_slice(&body_bytes).expect("response body is valid JSON");
+    assert_eq!(
+        body_json["error"], "InvalidWelcomeFanout",
+        "body must carry InvalidWelcomeFanout discriminator"
+    );
+    let message = body_json["message"]
+        .as_str()
+        .expect("message field present");
+    assert!(
+        message.contains("missing"),
+        "message must indicate which DIDs are missing; got: {}",
+        message
+    );
+
+    // The chokepoint must NEVER have been invoked: the orphan row's
+    // group_info MUST still be NULL post-rejection.
+    let post_call_group_info: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT group_info FROM crypto_sessions WHERE conversation_id = $1")
+            .bind(SELFHEAL_CONVO_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("re-read group_info after rejected handler call");
+    assert!(
+        post_call_group_info.is_none(),
+        "orphan group_info MUST still be NULL — handler must reject \
+         partial fanout BEFORE the chokepoint runs"
+    );
+
+    // No self-healed event should have been emitted either.
+    let self_healed_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM delivery_events \
+         WHERE conversation_id = $1 \
+           AND event_type = 'crypto_session_self_healed'",
+    )
+    .bind(SELFHEAL_CONVO_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("count self-healed events");
+    assert_eq!(
+        self_healed_count, 0,
+        "chokepoint must NOT emit a self-healed event when the handler rejects"
+    );
+
+    cleanup_selfheal(&pool).await;
+}
