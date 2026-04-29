@@ -9,8 +9,14 @@
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
--- Grant privileges
-GRANT ALL PRIVILEGES ON DATABASE catbird TO catbird;
+-- NOTE: privilege grants belong in DBA setup, not in application migrations.
+-- A previous version had:
+--     GRANT ALL PRIVILEGES ON DATABASE catbird TO catbird;
+-- which (a) hardcoded production database/role names so CI's `catbird_test`
+-- database failed migrations, and (b) required the connecting role to hold
+-- GRANT permission on the target DB. The grant is redundant in any setup
+-- where the connecting role already owns the schema — production has held
+-- it since day 1. Removed; provision via deploy scripts instead.
 
 -- =============================================================================
 -- Users Table (minimal - AT Protocol identity)
