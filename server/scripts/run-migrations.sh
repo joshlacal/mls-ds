@@ -26,6 +26,22 @@ if ! command -v sqlx &> /dev/null; then
     cargo install sqlx-cli --no-default-features --features postgres
 fi
 
+# Apply the 2026-04 migration-version repair (chore/ci-cleanup) BEFORE
+# running sqlx. The repair UPDATEs the `version` column in
+# `_sqlx_migrations` for any rows still using the legacy `YYYYMMDD_NNN_*`
+# version numbers; on a DB that's already been migrated under the new
+# 14-digit names, every UPDATE is a no-op.
+#
+# Without this step, `sqlx migrate run` errors with
+#   "migration 20260403 was previously applied but is missing in the
+#    resolved migrations"
+# on any production DB that predates the rename.
+REPAIR_SCRIPT="$SCRIPT_DIR/repair-2026-04-migration-versions.sql"
+if [ -f "$REPAIR_SCRIPT" ]; then
+    echo "Applying _sqlx_migrations version repair (idempotent) ..."
+    psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$REPAIR_SCRIPT" >/dev/null
+fi
+
 # Run migrations
 cd "$PROJECT_DIR"
 sqlx migrate run --database-url "$DATABASE_URL"
