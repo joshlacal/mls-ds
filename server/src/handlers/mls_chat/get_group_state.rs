@@ -389,6 +389,32 @@ mod tests {
             .status_code(),
             StatusCode::SERVICE_UNAVAILABLE
         );
+        // SERVER B: groupReset preserves 404 status (backwards-compat) but
+        // emits a structured body with `error: "GroupReset"`.
+        assert_eq!(
+            GetGroupStateContractError::group_reset("convo-1", "reset").status_code(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn group_reset_response_carries_typed_error_body() {
+        let response =
+            GetGroupStateContractError::group_reset("convo-xyz", "Conversation was reset")
+                .into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let body_bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let body_json: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("valid JSON body");
+        assert_eq!(body_json.get("error").and_then(|v| v.as_str()), Some("GroupReset"));
+        assert_eq!(
+            body_json.get("convoId").and_then(|v| v.as_str()),
+            Some("convo-xyz")
+        );
     }
 
     #[test]

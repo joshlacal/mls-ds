@@ -19,7 +19,7 @@ use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
-use crate::{auth::AuthUser, storage::DbPool};
+use crate::{auth::AuthUser, device_utils::parse_device_did, storage::DbPool};
 
 const NSID: &str = "blue.catbird.mlsChat.registerDeviceToken";
 
@@ -64,6 +64,16 @@ pub async fn register_device_token(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    // Caller's JWT may carry either the bare user DID or a device-DID
+    // (`did:plc:user#device-uuid`) depending on the client's age. The
+    // `devices.user_did` column stores the bare DID, so normalize both
+    // forms before the lookup. parse_device_did splits a device-DID and
+    // returns Err for a plain DID — fall back to the raw value in that
+    // case.
+    let user_did = parse_device_did(&auth_user.did)
+        .map(|(u, _)| u)
+        .unwrap_or_else(|_| auth_user.did.clone());
+
     let rows_affected = sqlx::query(
         r#"UPDATE devices
            SET push_token = $3,
@@ -71,7 +81,7 @@ pub async fn register_device_token(
                last_seen_at = NOW()
            WHERE user_did = $1 AND device_id = $2"#,
     )
-    .bind(&auth_user.did)
+    .bind(&user_did)
     .bind(&input.device_id)
     .bind(&input.push_token)
     .execute(&pool)
