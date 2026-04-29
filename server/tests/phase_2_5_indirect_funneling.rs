@@ -871,6 +871,316 @@ async fn inline_trigger_dual_emit_and_b6_1_member_count() {
     wipe(&pool, convo_id).await;
 }
 
+// =========================================================================
+// E7 — A1 review-fix exploit: the `(Some(X), None)` transition no longer
+// downgrades the prior binding. Without this fix, an admin Request with
+// `expected_new_mls_group_id = Some(X)` followed by an indirect-trigger
+// Request with `None` would write a NEW reset_requested event whose
+// `payload_json.expected_new_mls_group_id` is `null`. The activation
+// handler reads `ORDER BY seq DESC LIMIT 1`, so the new NULL row would
+// shadow the prior `Some(X)` binding — and any current member could
+// race-bootstrap a NULL-binding Request with attacker-controlled `Y`
+// instead of the admin's `X`.
+//
+// The fix at `reset_chokepoint.rs::request_crypto_session_reset_tx`
+// short-circuits on `(Some(X), None)` and returns the prior outcome
+// without writing a new event. The prior `Some(X)` binding remains
+// the most-recent row; activation against `Y` is rejected with the
+// existing "expected_new_mls_group_id mismatch" error.
+//
+// IMPORTANT: each Request uses a DIFFERENT idempotency_key, otherwise
+// the idempotency-cache short-circuit fires before the bug_010
+// transition matrix and we'd be testing the wrong code path.
+// =========================================================================
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
+async fn r1_e7_some_then_none_does_not_downgrade_binding() {
+    let pool = setup_test_db().await;
+    let convo_id = "p2_5-r1-e7-some-then-none";
+    wipe(&pool, convo_id).await;
+    seed_convo_with_members(
+        &pool,
+        convo_id,
+        "e7grp00000000000000000000000000",
+        &[ALICE, BOB],
+    )
+    .await;
+
+    let actor = spawn_actor(&pool, convo_id).await;
+
+    // Step 1: admin Request with Some(X). Distinct idempotency_key.
+    let admin_target = "e7admintarget00000000000000000000".to_string();
+    let (req1_tx, req1_rx) = oneshot::channel();
+    actor
+        .send_message(ConvoMessage::RequestCryptoSessionReset {
+            trigger: ResetTrigger::Admin,
+            initiator_did: ALICE.to_string(),
+            reason: "e7 admin binding".to_string(),
+            idempotency_key: format!("test-e7-admin:{convo_id}"),
+            expected_new_mls_group_id: Some(admin_target.clone()),
+            reply: req1_tx,
+        })
+        .expect("send admin Request");
+    let _admin_request = req1_rx.await.expect("reply 1").expect("admin Request OK");
+
+    // Step 2: indirect-trigger Request with None. DIFFERENT
+    // idempotency_key — must hit the bug_010 transition matrix, not
+    // the idempotency cache. Should short-circuit and reuse event 1.
+    let (req2_tx, req2_rx) = oneshot::channel();
+    actor
+        .send_message(ConvoMessage::RequestCryptoSessionReset {
+            trigger: ResetTrigger::QuorumVote,
+            initiator_did: ALICE.to_string(),
+            reason: "e7 quorum None binding".to_string(),
+            idempotency_key: format!("test-e7-quorum:{convo_id}"),
+            expected_new_mls_group_id: None,
+            reply: req2_tx,
+        })
+        .expect("send quorum Request");
+    let _quorum_request = req2_rx.await.expect("reply 2").expect("quorum Request OK");
+
+    // Verify: exactly ONE crypto_session_reset_requested event in the
+    // log (the admin's; the quorum no-op short-circuit added nothing).
+    let event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM delivery_events \
+         WHERE conversation_id = $1 \
+           AND event_type = 'crypto_session_reset_requested'",
+    )
+    .bind(convo_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(
+        event_count, 1,
+        "A1: (Some, None) must short-circuit; \
+         exactly one Request event after admin+quorum"
+    );
+
+    // Verify: the most-recent (only) Request event still binds Some(X).
+    let bound: Option<String> = sqlx::query_scalar(
+        "SELECT payload_json->>'expected_new_mls_group_id' \
+         FROM delivery_events \
+         WHERE conversation_id = $1 \
+           AND event_type = 'crypto_session_reset_requested' \
+         ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(convo_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read bound");
+    assert_eq!(
+        bound.as_deref(),
+        Some(admin_target.as_str()),
+        "A1: prior Some(X) binding must remain authoritative; \
+         (Some, None) must NOT write a new NULL row"
+    );
+
+    // Step 3: attacker (current member) tries to activate with Y.
+    // The activation handler at `activate_crypto_session_tx` reads
+    // payload_json ORDER BY seq DESC LIMIT 1 → reads the admin's row
+    // → bound is Some(X) → mismatch with Y → REJECT.
+    let attacker_target = "e7attackergroupy00000000000000000".to_string();
+    let (act_tx, act_rx) = oneshot::channel();
+    actor
+        .send_message(ConvoMessage::ActivateCryptoSession {
+            reset_request_id: None,
+            trigger: ResetTrigger::Bootstrap,
+            new_mls_group_id: attacker_target,
+            new_group_info: Some(vec![0xE7]),
+            welcomes: vec![],
+            // BOB is a current member, so R1 #2 allowlist alone wouldn't
+            // stop this attack on a downgraded NULL binding. The defense
+            // is the prior `Some(X)` binding remaining authoritative.
+            initiator_did: BOB.to_string(),
+            idempotency_key: format!("act-e7-attacker:{convo_id}"),
+            reply: act_tx,
+        })
+        .expect("send Activate");
+    let result = act_rx.await.expect("reply act");
+    let err =
+        result.expect_err("A1: attacker must be rejected because admin's Some(X) binding stuck");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("expected_new_mls_group_id mismatch"),
+        "A1: rejection must reference binding-mismatch (not allowlist); \
+         got: {msg}"
+    );
+
+    wipe(&pool, convo_id).await;
+}
+
+// =========================================================================
+// E8 — Multi-device DID split (advisor-flagged): when a member's
+// `member_did` carries a `#device-id` suffix and `user_did` is the bare
+// identity DID, the snapshot at Request time stores the IDENTITY DID
+// via `COALESCE(user_did, member_did)`. The activator may submit with
+// the per-device DID; the chokepoint must split on `#`, extract the
+// user-part, and successfully match against the identity-DID snapshot.
+//
+// This exercises `reset_chokepoint.rs:689-694` (the `split_once('#')`
+// extraction) which had no dedicated test before.
+// =========================================================================
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL"]
+async fn r1_e8_multi_device_did_split_in_allowlist() {
+    let pool = setup_test_db().await;
+    let convo_id = "p2_5-r1-e8-multi-device";
+    wipe(&pool, convo_id).await;
+
+    // Inline seed (bypassing seed_convo_with_members) so we can give
+    // ALICE a per-device member_did with a `#` fragment while keeping
+    // user_did as the bare identity DID.
+    let alice_identity = "did:plc:p2_5_e8_alice000000000000000";
+    let alice_device = format!("{alice_identity}#device-1");
+    let bob_identity = "did:plc:p2_5_e8_bob00000000000000000000";
+    let now = chrono::Utc::now();
+
+    sqlx::query(
+        "INSERT INTO conversations \
+            (id, creator_did, current_epoch, created_at, updated_at, cipher_suite, \
+             is_remote, group_id, group_info, reset_count) \
+         VALUES ($1, $2, 0, $3, $3, $4, false, $5, $6, 0) \
+         ON CONFLICT (id) DO UPDATE SET \
+             group_id = EXCLUDED.group_id, \
+             group_info = EXCLUDED.group_info, \
+             current_epoch = 0, \
+             reset_count = 0, last_reset_at = NULL, last_reset_by = NULL, \
+             auto_reset_disabled_at = NULL",
+    )
+    .bind(convo_id)
+    .bind(alice_identity)
+    .bind(now)
+    .bind("MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519")
+    .bind("e8grp00000000000000000000000000")
+    .bind(b"placeholder groupinfo".to_vec())
+    .execute(&pool)
+    .await
+    .expect("seed convo");
+
+    let session_id: String = sqlx::query_scalar(
+        "INSERT INTO crypto_sessions ( \
+            id, conversation_id, generation, mls_group_id, state, \
+            cipher_suite, last_observed_epoch, created_by_did, \
+            created_at, activated_at \
+         ) VALUES (gen_random_uuid()::TEXT, $1, 0, $2, 'active', $3, 0, $4, $5, $5) \
+         RETURNING id",
+    )
+    .bind(convo_id)
+    .bind("e8grp00000000000000000000000000")
+    .bind("MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519")
+    .bind(alice_identity)
+    .bind(now)
+    .fetch_one(&pool)
+    .await
+    .expect("seed crypto_session");
+
+    sqlx::query("UPDATE conversations SET active_crypto_session_id = $1 WHERE id = $2")
+        .bind(&session_id)
+        .bind(convo_id)
+        .execute(&pool)
+        .await
+        .expect("link active_crypto_session_id");
+
+    // ALICE: per-device member_did, identity user_did. The snapshot
+    // stores user_did via COALESCE.
+    sqlx::query(
+        "INSERT INTO members (convo_id, member_did, user_did, joined_at, is_admin) \
+         VALUES ($1, $2, $3, $4, true) \
+         ON CONFLICT (convo_id, member_did) DO NOTHING",
+    )
+    .bind(convo_id)
+    .bind(&alice_device)
+    .bind(alice_identity)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("insert ALICE multi-device");
+
+    // BOB: standard single-device row (member_did == user_did).
+    sqlx::query(
+        "INSERT INTO members (convo_id, member_did, user_did, joined_at, is_admin) \
+         VALUES ($1, $2, $2, $3, false) \
+         ON CONFLICT (convo_id, member_did) DO NOTHING",
+    )
+    .bind(convo_id)
+    .bind(bob_identity)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("insert BOB");
+
+    let actor = spawn_actor(&pool, convo_id).await;
+
+    // Step 1: indirect Request snapshots ALICE's identity DID (not the
+    // device-suffixed one) into allowed_responders.
+    let (req_tx, req_rx) = oneshot::channel();
+    actor
+        .send_message(ConvoMessage::RequestCryptoSessionReset {
+            trigger: ResetTrigger::QuorumVote,
+            initiator_did: alice_identity.to_string(),
+            reason: "e8 multi-device snapshot".to_string(),
+            idempotency_key: format!("test-e8:{convo_id}"),
+            expected_new_mls_group_id: None,
+            reply: req_tx,
+        })
+        .expect("send Request");
+    let _ = req_rx.await.expect("reply").expect("Request OK");
+
+    // Verify the snapshot stored the bare identity DID (COALESCE on
+    // user_did wins for ALICE; bob_identity passes through for BOB).
+    let allowed: serde_json::Value = sqlx::query_scalar(
+        "SELECT payload_json->'allowed_responders' FROM delivery_events \
+         WHERE conversation_id = $1 \
+           AND event_type = 'crypto_session_reset_requested' \
+         LIMIT 1",
+    )
+    .bind(convo_id)
+    .fetch_one(&pool)
+    .await
+    .expect("allowed_responders");
+    let allowed_strs: Vec<String> = allowed
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect();
+    assert!(
+        allowed_strs.contains(&alice_identity.to_string()),
+        "snapshot must contain ALICE's identity DID via COALESCE; got: {:?}",
+        allowed_strs
+    );
+    assert!(
+        !allowed_strs.contains(&alice_device),
+        "snapshot must NOT contain the device-suffixed DID; got: {:?}",
+        allowed_strs
+    );
+
+    // Step 2: ALICE activates using her per-device DID. The chokepoint
+    // must `split_once('#')` to extract `did:plc:p2_5_e8_alice...`,
+    // match against the snapshot, and accept activation.
+    let (act_tx, act_rx) = oneshot::channel();
+    actor
+        .send_message(ConvoMessage::ActivateCryptoSession {
+            reset_request_id: None,
+            trigger: ResetTrigger::Bootstrap,
+            new_mls_group_id: "e8newgrp0000000000000000000000000".to_string(),
+            new_group_info: Some(vec![0xE8]),
+            welcomes: vec![],
+            initiator_did: alice_device.clone(),
+            idempotency_key: format!("act-e8:{convo_id}"),
+            reply: act_tx,
+        })
+        .expect("send Activate");
+    let session = act_rx
+        .await
+        .expect("reply")
+        .expect("multi-device DID must resolve to identity DID and pass allowlist");
+    assert_eq!(session.state, "active");
+    assert_eq!(session.generation, 1);
+
+    wipe(&pool, convo_id).await;
+}
+
 // Dummy use of WelcomeEnvelope so the import isn't unused.
 #[allow(dead_code)]
 fn _ensure_welcome_envelope_import() -> WelcomeEnvelope {
