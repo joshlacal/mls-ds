@@ -254,23 +254,33 @@ pub async fn handle(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         })?;
 
-    // ── Auth precondition: conversation must be in `reset_requested` ─────
+    // ── Auth precondition: state-driven dispatch ─────────────────────────
     //
-    // Bootstrap is the activator half of the two-phase reset. An upstream
-    // caller (admin via reset_group(no material), quorum, sweep) must have
-    // already issued `RequestCryptoSessionReset` and moved the active
-    // crypto_session into `state='reset_requested'`. If not, bootstrap
-    // would be acting as its own requester — which (a) breaks the audit
-    // trail (no upstream `crypto_session_reset_requested` event) and
-    // (b) lets any active member force a group_id rotation at will, which
-    // is the authorization bypass Codex flagged.
+    // Bootstrap is the activator side of the two-phase reset. The
+    // permitted preconditions are:
     //
-    // Implementation: peek the active crypto_session for this convo; reject
-    // unless `state='reset_requested'`. Do this BEFORE involving the actor
-    // so unauthorized callers don't even spawn the actor / consume tx
-    // resources.
-    let current_state: Option<String> = sqlx::query_scalar(
-        "SELECT state FROM crypto_sessions \
+    //   (a) `state='reset_requested'` — the standard activator path. An
+    //       upstream caller (admin via reset_group(no material), quorum,
+    //       sweep) issued `RequestCryptoSessionReset` and we're providing
+    //       the MLS material to activate.
+    //
+    //   (b) **SERVER F (#68)**: `state='active' AND group_info IS NULL` —
+    //       self-heal first-responder path. The legacy `do_reset_group`
+    //       (Phase 2.5 Stage 1) creates such "orphan" rows when the
+    //       indirect-funneling flow runs without an admin follow-up. Any
+    //       active member can race to be the first-responder bootstrap;
+    //       the chokepoint UPDATE-tie-break (`WHERE group_info IS NULL`)
+    //       serializes concurrent self-healers so the audit trail
+    //       remains coherent.
+    //
+    // Anything else returns 409 (the standard auth-bypass guard Codex
+    // flagged in the original review).
+    //
+    // Single SELECT carries both the state and a `gi_null` discriminator
+    // so the dispatch is one round-trip.
+    let precondition: Option<(String, bool)> = sqlx::query_as(
+        "SELECT state, group_info IS NULL AS gi_null \
+         FROM crypto_sessions \
          WHERE conversation_id = $1 \
            AND state IN ('active', 'reset_requested', 'superseding') \
          ORDER BY generation DESC \
@@ -284,23 +294,49 @@ pub async fn handle(
         StatusCode::INTERNAL_SERVER_ERROR.into_response()
     })?;
 
-    match current_state.as_deref() {
-        Some("reset_requested") => {
-            // Authorized: an upstream caller has already requested a reset
-            // and we're providing the material to activate.
+    /// Internal dispatch tag for the activator path.
+    enum Path {
+        /// Standard activator — `state='reset_requested'`. Routes to
+        /// `ActivateCryptoSession` actor message.
+        Activate,
+        /// SERVER F self-heal — `state='active' AND group_info IS NULL`.
+        /// Routes to `SelfHealOrphanSession` actor message.
+        SelfHeal,
+    }
+
+    let path = match precondition.as_ref() {
+        Some((state, _)) if state == "reset_requested" => Path::Activate,
+        Some((state, gi_null)) if state == "active" && *gi_null => {
+            // SERVER F #68 self-heal precondition. Welcomes for OTHER
+            // members are required so the recipient's bootstrap heals
+            // the conversation for everyone, not just themselves.
+            // The handler validates `welcome_message.is_some()` below
+            // when constructing welcome_envelopes; an empty fanout
+            // would still produce a valid (but incomplete) self-heal.
+            // We let it through — partial self-heal is better than no
+            // self-heal, and the missing recipients can later issue
+            // their own self-heal once they discover the inconsistency.
+            info!(
+                convo_id = %crate::crypto::redact_for_log(&original_convo_id),
+                new_group_id = %crate::crypto::redact_for_log(&new_group_id),
+                caller_did = %crate::crypto::redact_for_log(&caller_did),
+                "bootstrap_self_heal_path"
+            );
+            Path::SelfHeal
         }
-        Some(other) => {
+        Some((state, gi_null)) => {
             warn!(
                 convo_id = %crate::crypto::redact_for_log(&original_convo_id),
                 new_group_id = %crate::crypto::redact_for_log(&new_group_id),
                 caller_did = %crate::crypto::redact_for_log(&caller_did),
-                state = %other,
-                "bootstrap_409_no_pending_reset"
+                state = %state,
+                gi_null = %gi_null,
+                "bootstrap_409_state_mismatch"
             );
             return Err((
                 StatusCode::CONFLICT,
                 Json(LexBootstrapResetGroupError::AlreadyBootstrapped(Some(
-                    "Conversation is not in a pending-reset state. Either an upstream reset request hasn't been issued, or another caller already activated. Fall back to receiving the Welcome from the winner.".into(),
+                    "Conversation is not in a pending-reset state and is not eligible for first-responder self-heal. Either an upstream reset request hasn't been issued, group_info is already populated, or another caller already activated. Fall back to receiving the Welcome from the winner.".into(),
                 ))),
             )
                 .into_response());
@@ -321,56 +357,94 @@ pub async fn handle(
     };
 
     // Idempotency-key namespace: `(original_convo_id, new_group_id)` is
-    // the natural per-bootstrap-attempt identity. Use a deterministic
-    // string form so retries from the same caller resolve to the same
-    // chokepoint events. Format matches the convention from #9
-    // (req-reset:<uuid-or-id> / activate:<uuid-or-id>).
-    //
-    // Bootstrap is purely an activator now (no self-issued Request), so
-    // we only emit the `activate:` key. The upstream Request that put
-    // the session into `reset_requested` carries its own `req-reset:` key
-    // in delivery_events; correlation across the audit log is via
-    // (conversation_id, generation, event_type) tuple lookup at query
-    // time. `reset_request_id: None` in the message — we don't need to
-    // inline the upstream id here.
+    // the natural per-bootstrap-attempt identity. Different namespaces
+    // for activate vs self-heal prevent accidental cross-path replay if
+    // the same caller hits both flows on different conversations.
     let request_id_uuid = format!("{}-{}", original_convo_id, new_group_id);
 
-    let (act_tx, act_rx) = oneshot::channel();
-    actor_ref
-        .send_message(ConvoMessage::ActivateCryptoSession {
-            reset_request_id: None,
-            trigger: ResetTrigger::Bootstrap,
-            new_mls_group_id: new_group_id.clone(),
-            new_group_info: Some(group_info_bytes.clone()),
-            welcomes: welcome_envelopes,
-            initiator_did: caller_did.clone(),
-            idempotency_key: format!("activate:{}", request_id_uuid),
-            reply: act_tx,
-        })
-        .map_err(|_| {
-            error!("[bootstrapResetGroup] failed to send Activate to actor");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        })?;
+    match path {
+        Path::Activate => {
+            // Standard activator: send `ActivateCryptoSession`. Upstream
+            // Request that put the session into `reset_requested` carries
+            // its own `req-reset:` key in delivery_events; correlation
+            // across the audit log is via (conversation_id, generation,
+            // event_type) tuple lookup at query time. `reset_request_id:
+            // None` — we don't need to inline the upstream id here.
+            let (act_tx, act_rx) = oneshot::channel();
+            actor_ref
+                .send_message(ConvoMessage::ActivateCryptoSession {
+                    reset_request_id: None,
+                    trigger: ResetTrigger::Bootstrap,
+                    new_mls_group_id: new_group_id.clone(),
+                    new_group_info: Some(group_info_bytes.clone()),
+                    welcomes: welcome_envelopes,
+                    initiator_did: caller_did.clone(),
+                    idempotency_key: format!("activate:{}", request_id_uuid),
+                    reply: act_tx,
+                })
+                .map_err(|_| {
+                    error!("[bootstrapResetGroup] failed to send Activate to actor");
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                })?;
 
-    let _session = act_rx
-        .await
-        .map_err(|_| {
-            error!("[bootstrapResetGroup] Activate channel closed");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        })?
-        .map_err(|e| {
-            error!("[bootstrapResetGroup] Activate handler failed: {}", e);
-            // Tie-break loss surfaces here as an error. Map to 409 so
-            // existing client expectations (AlreadyBootstrapped semantic
-            // from pre-Phase 2) match the new tie-break-loss outcome.
-            (
-                StatusCode::CONFLICT,
-                Json(LexBootstrapResetGroupError::AlreadyBootstrapped(Some(
-                    "Another caller already activated this generation; receive the Welcome from the winner.".into(),
-                ))),
-            )
-                .into_response()
-        })?;
+            let _session = act_rx
+                .await
+                .map_err(|_| {
+                    error!("[bootstrapResetGroup] Activate channel closed");
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                })?
+                .map_err(|e| {
+                    error!("[bootstrapResetGroup] Activate handler failed: {}", e);
+                    // Tie-break loss surfaces here as an error. Map to 409 so
+                    // existing client expectations (AlreadyBootstrapped semantic
+                    // from pre-Phase 2) match the new tie-break-loss outcome.
+                    (
+                        StatusCode::CONFLICT,
+                        Json(LexBootstrapResetGroupError::AlreadyBootstrapped(Some(
+                            "Another caller already activated this generation; receive the Welcome from the winner.".into(),
+                        ))),
+                    )
+                        .into_response()
+                })?;
+        }
+        Path::SelfHeal => {
+            // SERVER F #68: send `SelfHealOrphanSession`. The chokepoint
+            // UPDATEs the orphan row in place; idempotency-key namespace
+            // is `selfheal:` to keep this distinct from any prior or
+            // future `activate:` retries on the same convo.
+            let (sh_tx, sh_rx) = oneshot::channel();
+            actor_ref
+                .send_message(ConvoMessage::SelfHealOrphanSession {
+                    new_mls_group_id: new_group_id.clone(),
+                    new_group_info: group_info_bytes.clone(),
+                    welcomes: welcome_envelopes,
+                    initiator_did: caller_did.clone(),
+                    idempotency_key: format!("selfheal:{}", request_id_uuid),
+                    reply: sh_tx,
+                })
+                .map_err(|_| {
+                    error!("[bootstrapResetGroup] failed to send SelfHeal to actor");
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                })?;
+
+            let _session = sh_rx
+                .await
+                .map_err(|_| {
+                    error!("[bootstrapResetGroup] SelfHeal channel closed");
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                })?
+                .map_err(|e| {
+                    error!("[bootstrapResetGroup] SelfHeal handler failed: {}", e);
+                    (
+                        StatusCode::CONFLICT,
+                        Json(LexBootstrapResetGroupError::AlreadyBootstrapped(Some(
+                            "Another responder already self-healed this conversation, or a tardy admin populated group_info first; receive the Welcome from the winner.".into(),
+                        ))),
+                    )
+                        .into_response()
+                })?;
+        }
+    }
 
     // ── Legacy welcome_messages dual-write for backward compat ───────────
     //

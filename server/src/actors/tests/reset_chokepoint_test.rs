@@ -27,6 +27,14 @@ fn reset_trigger_str_repr_round_trips_all_variants() {
         ResetTrigger::InlineGroupInfo404.as_str(),
         "inline_groupinfo_404"
     );
+    // SERVER F (#68) audit-log discriminator. Distinct from
+    // `bootstrap` so audit-log readers can tell apart the standard
+    // two-phase activator from the orphan-row first-responder
+    // self-heal path.
+    assert_eq!(
+        ResetTrigger::SelfHealFirstResponder.as_str(),
+        "self_heal_first_responder"
+    );
 }
 
 #[test]
@@ -58,6 +66,17 @@ fn reset_trigger_null_binding_allowlist() {
     assert!(
         ResetTrigger::InlineGroupInfo404.permits_null_binding(),
         "InlineGroupInfo404 must permit NULL-binding"
+    );
+    // SERVER F (#68): SelfHealFirstResponder never goes through the
+    // RequestCryptoSessionReset path — it goes direct via
+    // SelfHealOrphanSession to UPDATE the orphan row in place. There
+    // is no upstream Request with `expected_new_mls_group_id = None`
+    // to bind, so this trigger MUST NOT be in the null-binding
+    // allowlist.
+    assert!(
+        !ResetTrigger::SelfHealFirstResponder.permits_null_binding(),
+        "SelfHealFirstResponder must not emit NULL-binding Requests \
+         (it bypasses the Request phase entirely)"
     );
 }
 
@@ -382,6 +401,528 @@ mod outbox_db_tests {
             event_id_count, 3,
             "every notification_outbox row must reference the delivery_event \
              via delivery_event_id"
+        );
+
+        wipe(&pool, &convo_id).await;
+    }
+}
+
+// =============================================================================
+// SERVER F (#68) — self-heal orphan crypto_session row.
+//
+// Acceptance test for `self_heal_orphan_session_tx`. Seeds a conversation
+// with a `state='active', group_info IS NULL` row (the orphan condition
+// produced by the legacy do_reset_group indirect-funneling flow when no
+// admin follow-up arrives) and asserts:
+//
+//   (a) The chokepoint UPDATEs the row in place — same `id`, same
+//       `generation`, mls_group_id swapped to recipient's, group_info
+//       populated.
+//   (b) A `crypto_session_self_healed` event is appended to delivery_events
+//       referencing the same crypto_session_id (the orphan row's id).
+//   (c) Welcomes are bound to the orphan session_id via pending_welcomes.
+//   (d) A second concurrent submitter sees the UPDATE-WHERE clause match
+//       zero rows and returns `Lost` → handler maps to 409.
+//
+// Mirrors `chokepoint_request_writes_outbox_rows_same_tx` shape:
+// `#[ignore]` so it only runs with `TEST_DATABASE_URL` set.
+// =============================================================================
+
+#[cfg(test)]
+mod self_heal_db_tests {
+    use crate::actors::messages::WelcomeEnvelope;
+    use crate::actors::reset_chokepoint::{self_heal_orphan_session_tx, ActivationResult};
+    use crate::db::{init_db, DbConfig};
+    use sqlx::PgPool;
+    use std::time::Duration;
+    use uuid::Uuid;
+
+    async fn setup_test_db() -> PgPool {
+        let database_url = std::env::var("TEST_DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://catbird:changeme@localhost:5433/catbird".to_string());
+
+        let config = DbConfig {
+            database_url,
+            max_connections: 4,
+            min_connections: 1,
+            acquire_timeout: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(600),
+        };
+
+        init_db(config)
+            .await
+            .expect("Failed to initialize test database")
+    }
+
+    async fn wipe(pool: &PgPool, convo_id: &str) {
+        for table in &[
+            "notification_outbox",
+            "federation_outbox",
+            "pending_welcomes",
+            "delivery_events",
+            "crypto_sessions",
+        ] {
+            let _ = sqlx::query(&format!("DELETE FROM {table} WHERE conversation_id = $1"))
+                .bind(convo_id)
+                .execute(pool)
+                .await;
+        }
+        let _ = sqlx::query("DELETE FROM members WHERE convo_id = $1")
+            .bind(convo_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM conversations WHERE id = $1")
+            .bind(convo_id)
+            .execute(pool)
+            .await;
+    }
+
+    /// Seed a conversation with an orphan `state='active', group_info IS
+    /// NULL` crypto_session row. Returns `(orphan_session_id,
+    /// orphan_mls_group_id)` so the test can assert id-preservation
+    /// semantics post-self-heal.
+    async fn seed_orphan(pool: &PgPool, convo_id: &str) -> (String, String) {
+        let now = chrono::Utc::now();
+        let cs_id = Uuid::new_v4().to_string();
+        // The orphan's mls_group_id is the seed value from
+        // do_reset_group; the recipient's bootstrap will replace it.
+        let orphan_mls_group_id = format!("mls-orphan-{}", Uuid::new_v4());
+
+        sqlx::query(
+            "INSERT INTO conversations \
+                (id, creator_did, current_epoch, created_at, updated_at, cipher_suite, \
+                 is_remote, group_id, group_info, active_crypto_session_id, reset_count) \
+             VALUES ($1, 'did:plc:creator', 0, $2, $2, $3, false, $4, NULL, $5, 25)",
+        )
+        .bind(convo_id)
+        .bind(now)
+        .bind("MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519")
+        .bind(&orphan_mls_group_id)
+        .bind(&cs_id)
+        .execute(pool)
+        .await
+        .expect("seed conversation");
+
+        // The orphan row: state='active' AND group_info IS NULL. This is
+        // the production shape from `do_reset_group:2272-2291` (Phase
+        // 2.5 Stage 1 indirect-funneling flow).
+        sqlx::query(
+            "INSERT INTO crypto_sessions \
+                (id, conversation_id, generation, mls_group_id, state, \
+                 cipher_suite, last_observed_epoch, group_info, group_info_epoch, \
+                 group_info_updated_at, created_by_did, \
+                 created_at, activated_at) \
+             VALUES ($1, $2, 25, $3, 'active', $4, 0, NULL, NULL, NULL, \
+                     'did:web:mlschat.catbird.blue', $5, $5)",
+        )
+        .bind(&cs_id)
+        .bind(convo_id)
+        .bind(&orphan_mls_group_id)
+        .bind("MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519")
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("seed orphan crypto_session");
+
+        // Seed a crypto_session_created event so allocate_seq lands at
+        // a stable starting point for the self-heal event.
+        sqlx::query(
+            "INSERT INTO delivery_events \
+                (id, conversation_id, seq, crypto_session_id, event_type, \
+                 mls_group_id, mls_epoch, idempotency_key, created_at) \
+             VALUES (gen_random_uuid()::TEXT, $1, 0, $2, \
+                     'crypto_session_created', $3, 1, $4, $5)",
+        )
+        .bind(convo_id)
+        .bind(&cs_id)
+        .bind(&orphan_mls_group_id)
+        .bind(format!("seed-orphan:{convo_id}"))
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("seed delivery_event");
+
+        // Active members: 4 members like 4b2cdbaa (recipient + 3 others).
+        for did in &[
+            "did:plc:recipient",
+            "did:plc:alice",
+            "did:plc:bob",
+            "did:plc:carol",
+        ] {
+            sqlx::query(
+                "INSERT INTO members \
+                    (convo_id, member_did, user_did, joined_at, is_admin, ds_did) \
+                 VALUES ($1, $2, $2, $3, true, NULL)",
+            )
+            .bind(convo_id)
+            .bind(*did)
+            .bind(now)
+            .execute(pool)
+            .await
+            .expect("seed member");
+        }
+
+        (cs_id, orphan_mls_group_id)
+    }
+
+    /// SERVER F (#68) acceptance test: the chokepoint UPDATEs the orphan
+    /// row in place, populates group_info, swaps mls_group_id, and
+    /// distributes Welcomes via pending_welcomes — all in the same tx.
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL"]
+    async fn self_heal_chokepoint_updates_orphan_row_in_place() {
+        let pool = setup_test_db().await;
+        let convo_id = format!("convo-self-heal-{}", Uuid::new_v4());
+        wipe(&pool, &convo_id).await;
+        let (orphan_id, orphan_mls_group_id) = seed_orphan(&pool, &convo_id).await;
+
+        // Recipient submits a NEW mls_group_id and group_info bytes plus
+        // Welcomes for the other 3 members.
+        let new_mls_group_id = format!("mls-recipient-{}", Uuid::new_v4());
+        let new_group_info = b"recipient-fresh-group-info-bytes".to_vec();
+        let welcomes = vec![
+            WelcomeEnvelope {
+                recipient_did: "did:plc:alice".to_string(),
+                recipient_device_id: None,
+                welcome_data: b"welcome-for-alice".to_vec(),
+                key_package_hash: None,
+            },
+            WelcomeEnvelope {
+                recipient_did: "did:plc:bob".to_string(),
+                recipient_device_id: None,
+                welcome_data: b"welcome-for-bob".to_vec(),
+                key_package_hash: None,
+            },
+            WelcomeEnvelope {
+                recipient_did: "did:plc:carol".to_string(),
+                recipient_device_id: None,
+                welcome_data: b"welcome-for-carol".to_vec(),
+                key_package_hash: None,
+            },
+        ];
+
+        let idempotency_key = format!("selfheal:{}-{}", convo_id, new_mls_group_id);
+
+        // Drive the chokepoint directly.
+        let outcome = {
+            let mut tx = pool.begin().await.expect("begin");
+            let result = self_heal_orphan_session_tx(
+                &mut tx,
+                &convo_id,
+                &new_mls_group_id,
+                &new_group_info,
+                &welcomes,
+                "did:plc:recipient",
+                &idempotency_key,
+                None, // skip in-tx event_stream insert for this test
+            )
+            .await
+            .expect("self-heal chokepoint");
+            tx.commit().await.expect("commit");
+            result
+        };
+
+        // (a) Outcome variant: Won.
+        let won = match outcome {
+            ActivationResult::Won(o) => o,
+            other => panic!("expected Won, got {:?}", other),
+        };
+        // Generation preserved (no advance).
+        assert_eq!(
+            won.generation, 25,
+            "self-heal must preserve generation, not advance it"
+        );
+
+        // (a) Row UPDATEd in place — same id, generation unchanged.
+        let row: (String, i32, String, Option<Vec<u8>>, String) = sqlx::query_as(
+            "SELECT id, generation, mls_group_id, group_info, state \
+             FROM crypto_sessions WHERE conversation_id = $1",
+        )
+        .bind(&convo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch post-self-heal row");
+        let (post_id, post_gen, post_mls_group_id, post_group_info, post_state) = row;
+        assert_eq!(post_id, orphan_id, "id MUST be preserved (same row UPDATEd)");
+        assert_eq!(post_gen, 25, "generation MUST be preserved");
+        assert_eq!(
+            post_mls_group_id, new_mls_group_id,
+            "mls_group_id MUST be swapped to recipient's"
+        );
+        assert_ne!(
+            post_mls_group_id, orphan_mls_group_id,
+            "orphan mls_group_id MUST be replaced"
+        );
+        assert!(post_group_info.is_some(), "group_info MUST be populated");
+        assert_eq!(post_group_info.unwrap(), new_group_info);
+        assert_eq!(post_state, "active", "state MUST remain 'active'");
+
+        // (b) crypto_session_self_healed event written referencing the
+        // orphan session id.
+        let event_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM delivery_events \
+             WHERE conversation_id = $1 \
+               AND event_type = 'crypto_session_self_healed' \
+               AND crypto_session_id = $2",
+        )
+        .bind(&convo_id)
+        .bind(&orphan_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count self-healed event");
+        assert_eq!(
+            event_count, 1,
+            "exactly one crypto_session_self_healed event must reference the orphan session id"
+        );
+
+        // (c) Welcomes distributed via pending_welcomes, bound to the
+        // orphan session id.
+        let pw_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pending_welcomes \
+             WHERE convo_id = $1 AND crypto_session_id = $2",
+        )
+        .bind(&convo_id)
+        .bind(&orphan_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count pending_welcomes");
+        assert_eq!(
+            pw_count, 3,
+            "pending_welcomes rows must be inserted for each non-self member"
+        );
+
+        // (d) A second submitter with a different idempotency_key but
+        // facing the same convo sees `group_info IS NOT NULL` and the
+        // UPDATE WHERE matches zero rows → returns Lost. We use a
+        // distinct caller_did so the find_existing_event idempotency
+        // path doesn't short-circuit.
+        let second_mls_group_id = format!("mls-second-{}", Uuid::new_v4());
+        let second_idempotency_key = format!("selfheal:{}-{}", convo_id, second_mls_group_id);
+        let second_outcome = {
+            let mut tx = pool.begin().await.expect("begin second");
+            let result = self_heal_orphan_session_tx(
+                &mut tx,
+                &convo_id,
+                &second_mls_group_id,
+                b"second-group-info",
+                &[],
+                "did:plc:alice", // different caller for distinct idempotency
+                &second_idempotency_key,
+                None,
+            )
+            .await
+            .expect("second self-heal chokepoint");
+            tx.commit().await.expect("commit second");
+            result
+        };
+        match second_outcome {
+            ActivationResult::Lost {
+                attempted_generation,
+                ..
+            } => {
+                assert_eq!(
+                    attempted_generation, 25,
+                    "Lost must reference the preserved orphan generation"
+                );
+            }
+            other => panic!(
+                "expected second submitter to return Lost (group_info already populated), \
+                 got {:?}",
+                other
+            ),
+        }
+
+        // Audit: the loser's candidate_rejected event is persisted.
+        let rejected_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM delivery_events \
+             WHERE conversation_id = $1 \
+               AND event_type = 'crypto_session_candidate_rejected' \
+               AND idempotency_key = $2",
+        )
+        .bind(&convo_id)
+        .bind(&second_idempotency_key)
+        .fetch_one(&pool)
+        .await
+        .expect("count rejected");
+        assert_eq!(
+            rejected_count, 1,
+            "second submitter's candidate_rejected event must be persisted for audit"
+        );
+
+        // The orphan row's group_info must NOT have been clobbered by
+        // the loser path.
+        let final_group_info: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT group_info FROM crypto_sessions WHERE id = $1",
+        )
+        .bind(&orphan_id)
+        .fetch_one(&pool)
+        .await
+        .expect("re-read group_info");
+        assert_eq!(
+            final_group_info.expect("still populated"),
+            new_group_info,
+            "orphan row's group_info must remain the FIRST writer's bytes"
+        );
+
+        wipe(&pool, &convo_id).await;
+    }
+
+    /// Idempotent replay: a retry with the same idempotency_key returns
+    /// `CachedReplay` rather than a second UPDATE attempt. This is the
+    /// safety net for client-side retries where the recipient's first
+    /// call succeeded but the response was lost in transit.
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL"]
+    async fn self_heal_chokepoint_idempotent_replay() {
+        let pool = setup_test_db().await;
+        let convo_id = format!("convo-self-heal-replay-{}", Uuid::new_v4());
+        wipe(&pool, &convo_id).await;
+        let (orphan_id, _) = seed_orphan(&pool, &convo_id).await;
+
+        let new_mls_group_id = format!("mls-recipient-{}", Uuid::new_v4());
+        let new_group_info = b"recipient-fresh-group-info".to_vec();
+        let idempotency_key = format!("selfheal:{}-{}", convo_id, new_mls_group_id);
+
+        // First call: Won.
+        {
+            let mut tx = pool.begin().await.expect("begin");
+            let result = self_heal_orphan_session_tx(
+                &mut tx,
+                &convo_id,
+                &new_mls_group_id,
+                &new_group_info,
+                &[],
+                "did:plc:recipient",
+                &idempotency_key,
+                None,
+            )
+            .await
+            .expect("first self-heal");
+            tx.commit().await.expect("commit");
+            assert!(matches!(result, ActivationResult::Won(_)));
+        }
+
+        // Second call with SAME idempotency_key: CachedReplay — same
+        // session, no second UPDATE.
+        let replay_outcome = {
+            let mut tx = pool.begin().await.expect("begin replay");
+            let result = self_heal_orphan_session_tx(
+                &mut tx,
+                &convo_id,
+                &new_mls_group_id,
+                &new_group_info,
+                &[],
+                "did:plc:recipient",
+                &idempotency_key,
+                None,
+            )
+            .await
+            .expect("replay self-heal");
+            tx.commit().await.expect("commit replay");
+            result
+        };
+        match replay_outcome {
+            ActivationResult::CachedReplay(o) => {
+                assert_eq!(o.session.id, orphan_id, "replay must return same session");
+                assert_eq!(o.generation, 25);
+            }
+            other => panic!("expected CachedReplay, got {:?}", other),
+        }
+
+        // Exactly one self-healed event — replay does NOT re-emit.
+        let event_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM delivery_events \
+             WHERE conversation_id = $1 \
+               AND event_type = 'crypto_session_self_healed'",
+        )
+        .bind(&convo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+        assert_eq!(
+            event_count, 1,
+            "idempotent replay MUST NOT append a second self-healed event"
+        );
+
+        wipe(&pool, &convo_id).await;
+    }
+
+    /// Pre-existing pending_welcomes from a failed admin attempt are
+    /// DELETEd before the recipient's fresh INSERT. Without this, stale
+    /// admin-attempt welcomes (bound to the SAME session_id but with
+    /// admin's mls_group_id, which won't decrypt for the recipient's
+    /// new MLS group) would leak forward and get redelivered to
+    /// confused recipients.
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL"]
+    async fn self_heal_clears_stale_pending_welcomes() {
+        let pool = setup_test_db().await;
+        let convo_id = format!("convo-self-heal-stale-pw-{}", Uuid::new_v4());
+        wipe(&pool, &convo_id).await;
+        let (orphan_id, _) = seed_orphan(&pool, &convo_id).await;
+
+        // Inject a stale pending_welcomes row tied to the orphan
+        // session (e.g. from an admin attempt that ran the chokepoint
+        // up to step 7 then failed before completing).
+        sqlx::query(
+            "INSERT INTO pending_welcomes ( \
+                id, convo_id, target_did, welcome_message, created_by_did, \
+                crypto_session_id, generation, recipient_device_id \
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, NULL)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&convo_id)
+        .bind("did:plc:alice")
+        .bind(b"stale-admin-attempt-welcome".to_vec())
+        .bind("did:plc:admin")
+        .bind(&orphan_id)
+        .bind(25_i32)
+        .execute(&pool)
+        .await
+        .expect("inject stale pending_welcomes");
+
+        let new_mls_group_id = format!("mls-recipient-{}", Uuid::new_v4());
+        let welcomes = vec![WelcomeEnvelope {
+            recipient_did: "did:plc:alice".to_string(),
+            recipient_device_id: None,
+            welcome_data: b"recipient-fresh-welcome".to_vec(),
+            key_package_hash: None,
+        }];
+        let idempotency_key = format!("selfheal:{}-{}", convo_id, new_mls_group_id);
+
+        {
+            let mut tx = pool.begin().await.expect("begin");
+            self_heal_orphan_session_tx(
+                &mut tx,
+                &convo_id,
+                &new_mls_group_id,
+                b"new-group-info",
+                &welcomes,
+                "did:plc:recipient",
+                &idempotency_key,
+                None,
+            )
+            .await
+            .expect("self-heal");
+            tx.commit().await.expect("commit");
+        }
+
+        // Verify only the recipient's fresh Welcome remains; the stale
+        // admin-attempt Welcome is gone.
+        let pw_rows: Vec<(String, Vec<u8>)> = sqlx::query_as(
+            "SELECT target_did, welcome_message \
+             FROM pending_welcomes WHERE crypto_session_id = $1",
+        )
+        .bind(&orphan_id)
+        .fetch_all(&pool)
+        .await
+        .expect("fetch pending_welcomes");
+        assert_eq!(pw_rows.len(), 1, "exactly one Welcome must survive");
+        assert_eq!(pw_rows[0].0, "did:plc:alice");
+        assert_eq!(
+            pw_rows[0].1,
+            b"recipient-fresh-welcome",
+            "stale admin Welcome bytes MUST be replaced by the recipient's fresh Welcome"
         );
 
         wipe(&pool, &convo_id).await;

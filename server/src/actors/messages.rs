@@ -282,6 +282,45 @@ pub enum ConvoMessage {
         reply: oneshot::Sender<Result<CryptoSession>>,
     },
 
+    /// SERVER F (#68): self-heal an orphan `state='active', group_info IS NULL`
+    /// crypto_sessions row by populating it in place with fresh MLS material.
+    ///
+    /// The legacy `do_reset_group` path (Phase 2.5 Stage 1) creates such
+    /// rows when the indirect-funneling flow runs without an admin
+    /// follow-up `update_group_info`. To prevent the conversation getting
+    /// permanently stuck, any active member can race to be the
+    /// "first-responder bootstrap" via the `bootstrap_reset_group` handler.
+    ///
+    /// Tie-break is via UPDATE row count (`UPDATE ... WHERE group_info IS
+    /// NULL`); first writer wins, second writer matches zero rows and
+    /// receives `Lost`. Authorization is the handler's `is_member` check —
+    /// there is no upstream `RequestCryptoSessionReset` event with an
+    /// `allowed_responders` snapshot, by design (the recipient is racing
+    /// to heal, no quorum/admin is gating).
+    ///
+    /// Generation is preserved (no `prior.generation + 1`); the
+    /// `crypto_sessions.id` is preserved so existing FKs from
+    /// `delivery_events`, `pending_welcomes`, and the conversations
+    /// pointer remain valid.
+    ///
+    /// # Fields
+    ///
+    /// - `new_mls_group_id`: replaces the orphan row's seed value
+    /// - `new_group_info`: fresh GroupInfo bytes (REQUIRED — self-heal
+    ///   without material is meaningless)
+    /// - `welcomes`: per-recipient Welcomes for the other active members
+    /// - `initiator_did`: recipient's DID (the first-responder bootstrapper)
+    /// - `idempotency_key`: unique-per-retry key, namespaced `selfheal:`
+    /// - `reply`: channel to receive the activated [`CryptoSession`]
+    SelfHealOrphanSession {
+        new_mls_group_id: String,
+        new_group_info: Vec<u8>,
+        welcomes: Vec<WelcomeEnvelope>,
+        initiator_did: String,
+        idempotency_key: String,
+        reply: oneshot::Sender<Result<CryptoSession>>,
+    },
+
     /// Signals the actor to shut down gracefully.
     ///
     /// The actor will complete any in-flight operations before stopping.
@@ -318,6 +357,21 @@ pub enum ResetTrigger {
     /// Phase 2.5 inline trigger: `recent_groupinfo_404_count` crossed
     /// threshold via `record_groupinfo_404_with_inline_trigger`.
     InlineGroupInfo404,
+    /// SERVER F (#68): a recipient races to be the first-responder
+    /// bootstrapper for an "orphan" `state='active' AND group_info IS NULL`
+    /// crypto_sessions row. The legacy `do_reset_group` path (Phase 2.5
+    /// Stage 1, retiring in #33) creates such rows via the indirect-
+    /// funneling flow when no admin follows up with `update_group_info`;
+    /// this trigger lets any active member self-heal the conversation by
+    /// supplying fresh MLS material.
+    ///
+    /// Distinct from `Bootstrap` (which means "admin/explicit bootstrap
+    /// on a `reset_requested` row") so audit-log readers see the
+    /// provenance. Never goes through the `RequestCryptoSessionReset`
+    /// path — only through `SelfHealOrphanSession` via
+    /// `bootstrap_reset_group` handler. Therefore NOT in
+    /// `permits_null_binding()`: there is no upstream Request to bind.
+    SelfHealFirstResponder,
 }
 
 impl ResetTrigger {
@@ -330,6 +384,7 @@ impl ResetTrigger {
             ResetTrigger::Bootstrap => "bootstrap",
             ResetTrigger::InlineCommit409 => "inline_commit_409",
             ResetTrigger::InlineGroupInfo404 => "inline_groupinfo_404",
+            ResetTrigger::SelfHealFirstResponder => "self_heal_first_responder",
         }
     }
 
