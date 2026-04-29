@@ -511,6 +511,7 @@ fn extract_cursor(event: &StreamEvent) -> Option<String> {
         | StreamEvent::MembershipChangeEvent { cursor, .. }
         | StreamEvent::GroupResetEvent { cursor, .. }
         | StreamEvent::CircuitBreakerTrippedEvent { cursor, .. }
+        | StreamEvent::ResetRequestedEvent { cursor, .. }
         | StreamEvent::InfoEvent { cursor, .. } => Some(cursor.clone()),
     }
 }

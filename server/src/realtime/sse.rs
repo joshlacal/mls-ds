@@ -174,6 +174,38 @@ pub enum StreamEvent {
         #[serde(rename = "trippedAt")]
         tripped_at: String,
     },
+    /// Phase 2.5 §2 — indirect-flow trigger has emitted a
+    /// `crypto_session_reset_requested` delivery event. Active members
+    /// of the conversation are invited to respond by submitting new
+    /// MLS group material via `bootstrap_reset_group` /
+    /// `commit_group_change`. First commit wins via the
+    /// `UNIQUE (conversation_id, generation)` constraint.
+    ///
+    /// Stage 1 ships this alongside the legacy `GroupResetEvent` (dual-
+    /// emit) so unmodified clients are unaffected.
+    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#resetRequestedEvent")]
+    ResetRequestedEvent {
+        cursor: String,
+        #[serde(rename = "convoId")]
+        convo_id: String,
+        #[serde(rename = "cryptoSessionId")]
+        crypto_session_id: String,
+        generation: i32,
+        /// Stable string id from `ResetTrigger::as_str()`; mapped to
+        /// the lexicon's `knownValues` enumeration.
+        trigger: String,
+        #[serde(rename = "requestEventId")]
+        request_event_id: String,
+        #[serde(
+            rename = "expectedNewMlsGroupId",
+            skip_serializing_if = "Option::is_none"
+        )]
+        expected_new_mls_group_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        #[serde(rename = "requestedAt")]
+        requested_at: String,
+    },
 }
 
 /// Helper for `skip_serializing_if` on the `ephemeral` field.
@@ -309,6 +341,24 @@ impl<'de> serde::Deserialize<'de> for StreamEvent {
                 reset_count: i32,
                 #[serde(rename = "trippedAt")]
                 tripped_at: String,
+            },
+            #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#resetRequestedEvent")]
+            ResetRequestedEvent {
+                cursor: String,
+                #[serde(rename = "convoId")]
+                convo_id: String,
+                #[serde(rename = "cryptoSessionId")]
+                crypto_session_id: String,
+                generation: i32,
+                trigger: String,
+                #[serde(rename = "requestEventId")]
+                request_event_id: String,
+                #[serde(rename = "expectedNewMlsGroupId", default)]
+                expected_new_mls_group_id: Option<String>,
+                #[serde(default)]
+                reason: Option<String>,
+                #[serde(rename = "requestedAt")]
+                requested_at: String,
             },
         }
 
@@ -467,6 +517,27 @@ impl<'de> serde::Deserialize<'de> for StreamEvent {
                 convo_id,
                 reset_count,
                 tripped_at,
+            },
+            RawStreamEvent::ResetRequestedEvent {
+                cursor,
+                convo_id,
+                crypto_session_id,
+                generation,
+                trigger,
+                request_event_id,
+                expected_new_mls_group_id,
+                reason,
+                requested_at,
+            } => StreamEvent::ResetRequestedEvent {
+                cursor,
+                convo_id,
+                crypto_session_id,
+                generation,
+                trigger,
+                request_event_id,
+                expected_new_mls_group_id,
+                reason,
+                requested_at,
             },
         })
     }
@@ -887,6 +958,7 @@ pub async fn subscribe_convo_events(
                                     StreamEvent::MembershipChangeEvent { cursor, .. } => cursor,
                                     StreamEvent::GroupResetEvent { cursor, .. } => cursor,
                                     StreamEvent::CircuitBreakerTrippedEvent { cursor, .. } => cursor,
+                                    StreamEvent::ResetRequestedEvent { cursor, .. } => cursor,
                                 };
 
                                 // Filter based on resume cursor
@@ -1135,6 +1207,17 @@ mod tests {
                 convo_id: "c1".into(),
                 reset_count: 4,
                 tripped_at: "2026-04-20T00:00:00.000Z".into(),
+            },
+            StreamEvent::ResetRequestedEvent {
+                cursor: "01ARZ3NDEKTSV4RRFFQ69G5FBB".into(),
+                convo_id: "c1".into(),
+                crypto_session_id: "cs-prior-uuid".into(),
+                generation: 17,
+                trigger: "quorum_vote".into(),
+                request_event_id: "req-evt-uuid".into(),
+                expected_new_mls_group_id: None,
+                reason: Some("quorum reached".into()),
+                requested_at: "2026-04-28T15:32:11.123Z".into(),
             },
         ];
 

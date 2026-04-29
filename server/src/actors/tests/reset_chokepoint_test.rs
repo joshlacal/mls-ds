@@ -22,6 +22,43 @@ fn reset_trigger_str_repr_round_trips_all_variants() {
     assert_eq!(ResetTrigger::QuorumVote.as_str(), "quorum_vote");
     assert_eq!(ResetTrigger::SystemSweep.as_str(), "system_sweep");
     assert_eq!(ResetTrigger::Bootstrap.as_str(), "bootstrap");
+    assert_eq!(ResetTrigger::InlineCommit409.as_str(), "inline_commit_409");
+    assert_eq!(
+        ResetTrigger::InlineGroupInfo404.as_str(),
+        "inline_groupinfo_404"
+    );
+}
+
+#[test]
+fn reset_trigger_null_binding_allowlist() {
+    // Phase 2.5 §7 R1 Mitigation #1: only indirect callers may emit
+    // a RequestCryptoSessionReset with expected_new_mls_group_id =
+    // None. Direct callers (Admin, Bootstrap) MUST always supply
+    // Some(_).
+    assert!(
+        !ResetTrigger::Admin.permits_null_binding(),
+        "Admin must not emit NULL-binding Requests"
+    );
+    assert!(
+        !ResetTrigger::Bootstrap.permits_null_binding(),
+        "Bootstrap must not emit NULL-binding Requests"
+    );
+    assert!(
+        ResetTrigger::QuorumVote.permits_null_binding(),
+        "QuorumVote must permit NULL-binding"
+    );
+    assert!(
+        ResetTrigger::SystemSweep.permits_null_binding(),
+        "SystemSweep must permit NULL-binding"
+    );
+    assert!(
+        ResetTrigger::InlineCommit409.permits_null_binding(),
+        "InlineCommit409 must permit NULL-binding"
+    );
+    assert!(
+        ResetTrigger::InlineGroupInfo404.permits_null_binding(),
+        "InlineGroupInfo404 must permit NULL-binding"
+    );
 }
 
 #[test]

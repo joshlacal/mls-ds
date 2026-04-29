@@ -230,6 +230,28 @@ SELECT column_name FROM information_schema.columns WHERE table_name='conversatio
 - `ENFORCE_JTI`: Require jti for replay prevention (default: true)
 - `JTI_TTL_SECONDS`: Replay cache TTL (default: 120)
 - `SSE_BUFFER_SIZE`: Realtime event buffer size (default: 5000)
+- `EMIT_RESET_REQUESTED_EVENT`: Phase 2.5 Stage 1 dual-emit kill switch (default: `true`).
+  When set to `false` or `0`, the server still persists the chokepoint
+  `crypto_session_reset_requested` delivery event (the load-bearing
+  side of dual-emit) but suppresses the SSE
+  `subscribeEvents#resetRequestedEvent` broadcast. Use this to disable
+  the new event channel per-incident if a client-side handler bug
+  surfaces in a release. Flip back to `true` once the affected
+  platform ships a fix. Stage 3 retires the legacy `groupResetEvent`
+  path; once that lands, this flag becomes load-bearing for client
+  recovery and should NOT be flipped without a coordinated rollback.
+
+  **Read-once semantics (review-fix G4)**: the value is read from the
+  process environment exactly once at first invocation of the helper
+  in `actors/conversation.rs::emit_reset_requested_event` and cached
+  in a `std::sync::OnceLock<bool>` for the process lifetime. Operators
+  flipping this flag on a running server MUST restart the
+  `catbird-mls-server` systemd unit for the change to take effect; an
+  in-place env update will NOT propagate. This trade-off keeps the
+  hot path (every reset event) free of `std::env::var` allocation +
+  locking, at the cost of needing a restart to flip the switch — which
+  matches the operator runbook for the kill-switch use case (an
+  incident is in progress, restart the service with the flag set).
 
 ## Systemd Service
 

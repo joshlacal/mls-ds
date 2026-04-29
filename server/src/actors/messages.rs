@@ -292,6 +292,14 @@ pub enum ConvoMessage {
 /// Used both for [`ConvoMessage::RequestCryptoSessionReset`] and
 /// [`ConvoMessage::ActivateCryptoSession`] so audit log readers can
 /// correlate the two halves.
+///
+/// # NULL-binding allowlist (Phase 2.5 §7 R1 Mitigation #1)
+///
+/// Only `QuorumVote`, `SystemSweep`, `InlineCommit409`, and
+/// `InlineGroupInfo404` may emit a `RequestCryptoSessionReset` with
+/// `expected_new_mls_group_id = None`. `Admin` and `Bootstrap` MUST
+/// always supply `Some(_)`. Enforced at request time in
+/// `request_crypto_session_reset_tx` via [`Self::permits_null_binding`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResetTrigger {
     /// HTTP `reset_group.rs` admin call.
@@ -302,6 +310,12 @@ pub enum ResetTrigger {
     SystemSweep,
     /// `bootstrap_reset_group.rs` initial group bootstrap.
     Bootstrap,
+    /// Phase 2.5 inline trigger: `recent_commit_409_count` crossed
+    /// threshold via `record_commit_409_with_inline_trigger`.
+    InlineCommit409,
+    /// Phase 2.5 inline trigger: `recent_groupinfo_404_count` crossed
+    /// threshold via `record_groupinfo_404_with_inline_trigger`.
+    InlineGroupInfo404,
 }
 
 impl ResetTrigger {
@@ -312,7 +326,34 @@ impl ResetTrigger {
             ResetTrigger::QuorumVote => "quorum_vote",
             ResetTrigger::SystemSweep => "system_sweep",
             ResetTrigger::Bootstrap => "bootstrap",
+            ResetTrigger::InlineCommit409 => "inline_commit_409",
+            ResetTrigger::InlineGroupInfo404 => "inline_groupinfo_404",
         }
+    }
+
+    /// Whether this trigger is permitted to emit a
+    /// `RequestCryptoSessionReset` with `expected_new_mls_group_id = None`.
+    ///
+    /// Phase 2.5 §7 R1 Mitigation #1. Indirect callers (quorum, sweep,
+    /// inline triggers) don't know the new group_id at trigger time —
+    /// they emit Requests with `None` and rely on an elected client
+    /// responding via `bootstrap_reset_group` / `commit_group_change`
+    /// to supply the material. The activation-time auth gate (R1 #3)
+    /// requires the activator's DID to be in `payload_json
+    /// .allowed_responders` snapshotted at Request time.
+    ///
+    /// `Admin` and `Bootstrap` are direct callers that MUST always
+    /// supply a concrete `expected_new_mls_group_id`. Allowing them to
+    /// pass `None` would let an admin emit an unbound Request that any
+    /// member could race-bootstrap into.
+    pub fn permits_null_binding(self) -> bool {
+        matches!(
+            self,
+            ResetTrigger::QuorumVote
+                | ResetTrigger::SystemSweep
+                | ResetTrigger::InlineCommit409
+                | ResetTrigger::InlineGroupInfo404
+        )
     }
 }
 
