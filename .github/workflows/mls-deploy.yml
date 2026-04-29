@@ -101,7 +101,9 @@ jobs:
           ./server/scripts/check_deploy_policy.sh
 
       - name: Cargo audit
-        working-directory: ./server
+        # Cargo.lock lives at the workspace root, not in ./server. Run from
+        # repo root so cargo-audit can find it. Pre-existing bug — fixed
+        # alongside SERVER A/B/C CI green-up.
         run: |
           cargo audit --deny warnings
 
