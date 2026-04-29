@@ -855,6 +855,14 @@ mod self_heal_db_tests {
     /// admin's mls_group_id, which won't decrypt for the recipient's
     /// new MLS group) would leak forward and get redelivered to
     /// confused recipients.
+    ///
+    /// Also covers the loser-path safety: after the winner commits
+    /// fresh pending_welcomes, a sequential second submitter (who
+    /// loses the UPDATE-WHERE-zero-rows tie-break) must NOT persist a
+    /// DELETE that clobbers the winner's welcomes. This is the PR #12
+    /// review-fix-1 invariant: every destructive write in the
+    /// chokepoint runs only on the winner's `rows_affected == 1`
+    /// branch, so the loser's tx has no DELETE to commit.
     #[tokio::test]
     #[ignore = "requires TEST_DATABASE_URL"]
     async fn self_heal_clears_stale_pending_welcomes() {
@@ -892,9 +900,10 @@ mod self_heal_db_tests {
         }];
         let idempotency_key = format!("selfheal:{}-{}", convo_id, new_mls_group_id);
 
+        // ── Phase 1: winner self-heals, displaces stale admin welcome ─
         {
             let mut tx = pool.begin().await.expect("begin");
-            self_heal_orphan_session_tx(
+            let result = self_heal_orphan_session_tx(
                 &mut tx,
                 &convo_id,
                 &new_mls_group_id,
@@ -905,8 +914,12 @@ mod self_heal_db_tests {
                 None,
             )
             .await
-            .expect("self-heal");
-            tx.commit().await.expect("commit");
+            .expect("self-heal winner");
+            tx.commit().await.expect("commit winner");
+            assert!(
+                matches!(result, ActivationResult::Won(_)),
+                "first self-heal must Win"
+            );
         }
 
         // Verify only the recipient's fresh Welcome remains; the stale
@@ -924,6 +937,142 @@ mod self_heal_db_tests {
         assert_eq!(
             pw_rows[0].1, b"recipient-fresh-welcome",
             "stale admin Welcome bytes MUST be replaced by the recipient's fresh Welcome"
+        );
+
+        // ── Phase 2: PR #12 review-fix-1 — the loser's tx must NOT
+        //    persist a DELETE that clobbers the winner's
+        //    pending_welcomes.
+        //
+        // Set up: a second submitter (different caller_did and
+        // idempotency_key, distinct from the winner's so the
+        // find_existing_event idempotency-replay paths don't short-
+        // circuit) calls the chokepoint AFTER the winner committed.
+        // The winner's UPDATE has populated `group_info`, so the
+        // loser's UPDATE-tie-break (`WHERE state='active' AND
+        // group_info IS NULL`) matches zero rows. The chokepoint must
+        // return `Lost` after emitting only a `candidate_rejected`
+        // audit event — no DELETE, no INSERT, no UPDATE conversations.
+        //
+        // Critically: even if the loser's caller commits the
+        // returned tx (Lost is `Ok(...)`, not Err — caller does NOT
+        // auto-rollback), the persisted pending_welcomes from the
+        // winner must remain unchanged. With the pre-fix code, the
+        // loser's pre-tie-break DELETE would have committed and
+        // wiped the winner's row.
+        //
+        // We use a loser welcome targeting a different DID
+        // (did:plc:bob) so we can prove a hypothetical loser-INSERT
+        // doesn't land either; the chokepoint should perform NO writes
+        // for the loser other than the audit event.
+        let loser_mls_group_id = format!("mls-loser-{}", Uuid::new_v4());
+        let loser_welcomes = vec![WelcomeEnvelope {
+            recipient_did: "did:plc:bob".to_string(),
+            recipient_device_id: None,
+            welcome_data: b"loser-bob-welcome".to_vec(),
+            key_package_hash: None,
+        }];
+        let loser_idempotency_key = format!("selfheal:{}-{}", convo_id, loser_mls_group_id);
+
+        let loser_outcome = {
+            let mut tx = pool.begin().await.expect("begin loser");
+            let result = self_heal_orphan_session_tx(
+                &mut tx,
+                &convo_id,
+                &loser_mls_group_id,
+                b"loser-group-info",
+                &loser_welcomes,
+                "did:plc:bob", // distinct caller_did from winner
+                &loser_idempotency_key,
+                None,
+            )
+            .await
+            .expect("self-heal loser chokepoint must return Ok(Lost), not Err");
+            tx.commit().await.expect("commit loser tx");
+            result
+        };
+        match loser_outcome {
+            ActivationResult::Lost {
+                attempted_generation,
+                ..
+            } => {
+                assert_eq!(
+                    attempted_generation, 25,
+                    "Lost must reference the preserved orphan generation"
+                );
+            }
+            other => panic!(
+                "expected loser to return Lost (group_info already populated), got {:?}",
+                other
+            ),
+        }
+
+        // Re-query pending_welcomes — winner's row MUST still be
+        // there; loser must NOT have committed a DELETE.
+        let pw_rows_after_loser: Vec<(String, Vec<u8>)> = sqlx::query_as(
+            "SELECT target_did, welcome_message \
+             FROM pending_welcomes WHERE crypto_session_id = $1 \
+             ORDER BY target_did",
+        )
+        .bind(&orphan_id)
+        .fetch_all(&pool)
+        .await
+        .expect("re-fetch pending_welcomes after loser commit");
+        assert_eq!(
+            pw_rows_after_loser.len(),
+            1,
+            "winner's pending_welcomes row MUST survive the loser's committed tx \
+             (PR #12 review-fix-1: loser must not persist a DELETE)"
+        );
+        assert_eq!(pw_rows_after_loser[0].0, "did:plc:alice");
+        assert_eq!(
+            pw_rows_after_loser[0].1, b"recipient-fresh-welcome",
+            "winner's welcome_message bytes MUST be intact (not replaced by loser's INSERT)"
+        );
+
+        // The loser also must NOT have written its own welcome
+        // (no INSERT in the loser branch).
+        let bob_welcome_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pending_welcomes \
+             WHERE crypto_session_id = $1 AND target_did = 'did:plc:bob'",
+        )
+        .bind(&orphan_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count bob welcomes");
+        assert_eq!(
+            bob_welcome_count, 0,
+            "loser branch must not INSERT pending_welcomes (no destructive writes \
+             on the rows_affected == 0 path)"
+        );
+
+        // The loser's audit event MUST be persisted for diagnostics.
+        let loser_audit_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM delivery_events \
+             WHERE conversation_id = $1 \
+               AND event_type = 'crypto_session_candidate_rejected' \
+               AND idempotency_key = $2",
+        )
+        .bind(&convo_id)
+        .bind(&loser_idempotency_key)
+        .fetch_one(&pool)
+        .await
+        .expect("count loser audit");
+        assert_eq!(
+            loser_audit_count, 1,
+            "loser must persist exactly one candidate_rejected audit event"
+        );
+
+        // The orphan row's group_info must still be the winner's bytes.
+        let final_group_info: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT group_info FROM crypto_sessions WHERE id = $1")
+                .bind(&orphan_id)
+                .fetch_one(&pool)
+                .await
+                .expect("re-read group_info after loser");
+        assert_eq!(
+            final_group_info.expect("still populated"),
+            b"new-group-info",
+            "winner's group_info bytes MUST remain (loser's UPDATE matched 0 rows)"
         );
 
         wipe(&pool, &convo_id).await;

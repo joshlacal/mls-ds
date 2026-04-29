@@ -1664,31 +1664,40 @@ async fn fetch_session_by_id(
 /// 2. **Idempotency check** on `crypto_session_candidate_rejected` event
 ///    (replay of a prior losing self-heal returns the same `Lost`).
 /// 3. **Read the orphan row** for update — must be the latest non-
-///    superseded session in `state='active'` with `group_info IS NULL`.
-///    Anything else is an error (`BootstrapTargetNotFound`-equivalent
-///    handled at the handler level via the precondition SELECT).
-/// 4. **DELETE pre-existing pending_welcomes** keyed on the orphan
-///    session id — these would be admin-attempt welcomes for a different
-///    `mls_group_id` and must not coexist with the recipient's fresh
-///    welcomes.
-/// 5. **UPDATE the orphan row in place** — `mls_group_id` swapped to the
+///    superseded session in `state='active'`. State≠active is an
+///    `Err` (caller bug, wrong handler routing); `group_info IS NOT
+///    NULL` is the race-loss case and is handled at step 4 below by
+///    the UPDATE-WHERE-zero-rows branch (NOT here, so the loser path
+///    has a clean audit trail via `crypto_session_candidate_rejected`).
+/// 4. **UPDATE the orphan row in place** — `mls_group_id` swapped to the
 ///    recipient's, `group_info` set, `last_observed_epoch=0`,
-///    `group_info_epoch=0`, `group_info_updated_at=NOW()`. The `WHERE
-///    state = 'active' AND group_info IS NULL` clause is the tie-break.
-///    Zero-row UPDATE → `Lost`.
+///    `group_info_epoch=0`, `group_info_updated_at=NOW()`,
+///    `activated_at=NOW()`, `created_by_did=initiator_did`. The
+///    `WHERE state = 'active' AND group_info IS NULL` clause is the
+///    SOLE load-bearing tie-break. Zero-row UPDATE → emit
+///    `crypto_session_candidate_rejected`, return `Lost`. **Every
+///    destructive write below this point is gated behind the
+///    rows_affected==1 winner branch** so a losing tx cannot persist
+///    a DELETE that clobbers the winner's pending_welcomes.
+/// 5. **DELETE pre-existing pending_welcomes** keyed on the orphan
+///    session id — these would be admin-attempt welcomes for a
+///    different `mls_group_id` and must not coexist with the
+///    recipient's fresh welcomes. Winner-only.
 /// 6. **UPDATE conversations** legacy MLS columns to mirror — same shape
 ///    as `activate_crypto_session_tx` step 5, but `reset_count` stays
-///    UNCHANGED (no generation advance).
+///    UNCHANGED (no generation advance). Winner-only.
 /// 7. **APPEND `crypto_session_self_healed` event** with provenance
 ///    (`initiator_did = recipient`, `trigger = SelfHealFirstResponder`,
-///    `crypto_session_id = orphan_id`).
+///    `crypto_session_id = orphan_id`). Winner-only.
 /// 8. **INSERT pending_welcomes** for the recipient's Welcomes.
+///    Winner-only. Must follow event INSERT — `commit_event_id` FKs
+///    on the just-inserted self_healed event.
 /// 9. **enqueue outbox + event_stream** via `enqueue_outbox_for_event`,
 ///    pass `SseEventKind::GroupReset` so subscribed clients get the
 ///    standard `groupResetEvent` SSE broadcast (CLIENT L's #67 wire path).
 /// 10. **Housekeeping** — same DELETEs as `activate_crypto_session_tx`
 ///     (welcome_messages, pending_device_additions, reset_votes) for the
-///     orphan session id.
+///     orphan session id. Winner-only.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn self_heal_orphan_session_tx(
     tx: &mut Transaction<'_, Postgres>,
@@ -1754,23 +1763,30 @@ pub(crate) async fn self_heal_orphan_session_tx(
         });
     }
 
-    // 3. Read the orphan row for update. Must be state='active' AND
-    //    group_info IS NULL. We use FOR UPDATE so concurrent self-healers
-    //    serialize on the row lock — the second one will see the first's
-    //    UPDATE-applied state when it acquires the lock and its UPDATE
-    //    WHERE clause will match zero rows.
+    // 3. Read the orphan row for update. Must be state='active'. We use
+    //    FOR UPDATE so concurrent self-healers serialize on the row
+    //    lock — the second one will see the first's UPDATE-applied
+    //    state when it acquires the lock and its UPDATE WHERE clause
+    //    will match zero rows.
+    //
+    //    NOTE: we deliberately do NOT reject `group_info IS NOT NULL`
+    //    at this precondition. The UPDATE-tie-break (step 4) is the
+    //    SOLE load-bearing gate — gi-populated callers will reach
+    //    `rows_affected == 0` and return Lost via the candidate_rejected
+    //    audit row. Rejecting here would short-circuit the loser path
+    //    with a bare Err that has no audit trail. State≠active stays an
+    //    Err — that's a true anomaly (caller routed to the wrong
+    //    handler), not a race-loss.
     let prior = read_current_session_for_update(tx, conversation_id)
         .await?
         .ok_or_else(|| anyhow!("no current crypto_session for {conversation_id}"))?;
 
-    if prior.state != "active" || prior.group_info.is_some() {
+    if prior.state != "active" {
         return Err(anyhow!(
             "self-heal precondition failed: latest crypto_session for {conversation_id} \
-             is state={}, group_info_present={} — expected state='active' AND \
-             group_info IS NULL. The handler's precondition SELECT should have \
-             rejected this before reaching the chokepoint.",
-            prior.state,
-            prior.group_info.is_some()
+             is state={}, expected state='active'. The handler's precondition SELECT \
+             should have rejected this before reaching the chokepoint.",
+            prior.state
         ));
     }
 
@@ -1778,21 +1794,21 @@ pub(crate) async fn self_heal_orphan_session_tx(
     let preserved_generation = prior.generation;
     let cipher_suite = prior.cipher_suite.clone();
 
-    // 4. DELETE any pre-existing pending_welcomes for this orphan session
-    //    BEFORE the UPDATE-tie-break. These would be admin-attempt
-    //    welcomes from a failed prior `update_group_info` and must not
-    //    coexist with the recipient's fresh welcomes (their key_package
-    //    targets differ; the admin Welcome bytes belong to a different
-    //    mls_group_id and won't decrypt for the recipient's group).
-    sqlx::query("DELETE FROM pending_welcomes WHERE crypto_session_id = $1")
-        .bind(&orphan_session_id)
-        .execute(&mut **tx)
-        .await
-        .context("DELETE stale pending_welcomes for orphan session")?;
-
-    // 5. UPDATE in place — the WHERE clause is the load-bearing tie-break.
-    //    Two simultaneous self-healers serialize on the row lock; the
-    //    second sees `group_info IS NOT NULL` and matches zero rows.
+    // 4. UPDATE in place — the WHERE clause is the SOLE load-bearing
+    //    tie-break. Two simultaneous self-healers serialize on the row
+    //    lock; the second sees `group_info IS NOT NULL` and matches
+    //    zero rows. **Every destructive write below this point only
+    //    runs on the winner path** (post `rows_affected == 1` branch)
+    //    so a losing tx cannot persist a DELETE that clobbers the
+    //    winner's pending_welcomes.
+    //
+    //    `activated_at = NOW()` and `created_by_did = $4` mirror
+    //    `activate_crypto_session_tx` step 4 audit attribution: the
+    //    orphan row was originally created by `do_reset_group` with
+    //    `created_by_did = system DID`; the recipient who actually
+    //    completes the cycle takes over attribution. `activated_at`
+    //    refresh ensures the audit timestamp reflects the cycle that
+    //    actually produced functional MLS state.
     let update_result = sqlx::query(
         "UPDATE crypto_sessions SET \
             mls_group_id = $1, \
@@ -1800,12 +1816,15 @@ pub(crate) async fn self_heal_orphan_session_tx(
             group_info_epoch = 0, \
             group_info_updated_at = NOW(), \
             last_observed_epoch = 0, \
-            last_confirmation_tag = NULL \
+            last_confirmation_tag = NULL, \
+            activated_at = NOW(), \
+            created_by_did = $4 \
          WHERE id = $3 AND state = 'active' AND group_info IS NULL",
     )
     .bind(new_mls_group_id)
     .bind(new_group_info)
     .bind(&orphan_session_id)
+    .bind(initiator_did)
     .execute(&mut **tx)
     .await
     .context("UPDATE crypto_session self-heal in place")?;
@@ -1814,7 +1833,10 @@ pub(crate) async fn self_heal_orphan_session_tx(
         // Tie-break loss: another self-healer (or a tardy admin
         // update_group_info) populated group_info between our SELECT
         // FOR UPDATE and our UPDATE. Persist a candidate_rejected event
-        // for audit, return Lost.
+        // for audit, return Lost. **No DELETE, no INSERT, no other
+        // destructive writes** — the loser tx must be a pure read +
+        // single audit-event write so committing it does not affect
+        // the winner's persisted state.
         let payload = json!({
             "trigger": ResetTrigger::SelfHealFirstResponder.as_str(),
             "reason": "self_heal_tie_break_loss",
@@ -1840,6 +1862,28 @@ pub(crate) async fn self_heal_orphan_session_tx(
             proposed_mls_group_id: new_mls_group_id.to_string(),
         });
     }
+
+    // ── WINNER PATH ──────────────────────────────────────────────────
+    // From here on, every write is gated behind `rows_affected == 1`
+    // above. The tie-break UPDATE has already populated `group_info`
+    // and swapped `mls_group_id` on the orphan row; subsequent destructive
+    // writes (DELETE pending_welcomes, INSERT pending_welcomes,
+    // housekeeping DELETEs) only run for the winning self-healer.
+
+    // 5. DELETE any pre-existing pending_welcomes for this orphan session.
+    //    These would be admin-attempt welcomes from a failed prior
+    //    `update_group_info` and must not coexist with the recipient's
+    //    fresh welcomes (their key_package targets differ; the admin
+    //    Welcome bytes belong to a different mls_group_id and won't
+    //    decrypt for the recipient's group). Safe to run here because
+    //    we've already won the tie-break — a losing tx would have
+    //    returned via the rows_affected==0 branch above without
+    //    reaching this DELETE.
+    sqlx::query("DELETE FROM pending_welcomes WHERE crypto_session_id = $1")
+        .bind(&orphan_session_id)
+        .execute(&mut **tx)
+        .await
+        .context("DELETE stale pending_welcomes for orphan session")?;
 
     // 6. UPDATE conversations legacy MLS columns. Same shape as
     //    activate_crypto_session_tx step 5, with two deliberate deltas:
