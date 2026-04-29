@@ -61,11 +61,18 @@ rustversion = "1"
 bytes = "1"
 
 # HTTP client (for DID resolution)
-reqwest = { version = "0.11", features = ["json"] }
+reqwest = { version = "0.12", features = ["json"] }
 
 # S3-compatible blob storage (SeaweedFS)
-aws-sdk-s3 = "1"
-aws-config = { version = "1", features = ["behavior-version-latest"] }
+# Disable default features to avoid pulling legacy rustls 0.21 (vulnerable
+# rustls-webpki 0.101.7 path). default-https-client still provides modern
+# rustls 0.23 + aws-lc-rs via aws-smithy-runtime's default-https-client feature.
+# `rustls` is also explicitly enabled so a TLS provider is guaranteed to be
+# selected at runtime when default features are off (per gemini PR #13 review:
+# in some AWS SDK v1 configurations, default-https-client alone fails to wire
+# a connector and S3 init crashes only on first call). Defense-in-depth.
+aws-sdk-s3 = { version = "1", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio", "rustls"] }
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "credentials-process", "default-https-client", "rt-tokio", "sso", "rustls"] }
 
 # Caching and rate limiting
 moka = { version = "0.12", features = ["future", "sync"] }
@@ -95,7 +102,7 @@ a2 = "0.10"
 # Metrics
 metrics = "0.21"
 metrics-exporter-prometheus = "0.13"
-prometheus = "0.13"
+prometheus = "0.14"
 
 # WebSocket support for subscriptions
 tokio-tungstenite = "0.21"
