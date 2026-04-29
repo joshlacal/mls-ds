@@ -241,6 +241,18 @@ SELECT column_name FROM information_schema.columns WHERE table_name='conversatio
   path; once that lands, this flag becomes load-bearing for client
   recovery and should NOT be flipped without a coordinated rollback.
 
+  **Read-once semantics (review-fix G4)**: the value is read from the
+  process environment exactly once at first invocation of the helper
+  in `actors/conversation.rs::emit_reset_requested_event` and cached
+  in a `std::sync::OnceLock<bool>` for the process lifetime. Operators
+  flipping this flag on a running server MUST restart the
+  `catbird-mls-server` systemd unit for the change to take effect; an
+  in-place env update will NOT propagate. This trade-off keeps the
+  hot path (every reset event) free of `std::env::var` allocation +
+  locking, at the cost of needing a restart to flip the switch — which
+  matches the operator runbook for the kill-switch use case (an
+  incident is in progress, restart the service with the flag set).
+
 ## Systemd Service
 
 The server runs as a systemd service (`catbird-mls-server`).

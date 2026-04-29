@@ -114,6 +114,37 @@ const SELECT_CRYPTO_SESSION_COLS_FOR_TX: &str =
 
 use super::messages::{ResetRequest, ResetTrigger, WelcomeEnvelope};
 
+/// Outcome of [`request_crypto_session_reset_tx`].
+///
+/// Carries both the [`ResetRequest`] handed back to direct callers AND
+/// the chokepoint-internal metadata that the indirect-trigger
+/// `dual_emit_reset_requested` path needs to populate the SSE event
+/// payload without re-querying the database.
+///
+/// Phase 2.5 review-fix G3 — eliminates the two post-commit DB
+/// round-trips (`session_info` + `request_event_id`) the helper was
+/// previously doing in `conversation.rs::dual_emit_reset_requested`.
+/// All four fields are populated from values the chokepoint already
+/// holds in-tx, regardless of which exit path runs (idempotent replay,
+/// no-op `(Some, None)` short-circuit, or the new-Request happy path).
+#[derive(Debug)]
+pub(crate) struct ResetRequestOutcome {
+    /// Caller-facing reset request descriptor.
+    pub request: ResetRequest,
+    /// Id of the prior `crypto_sessions` row (state was `active` or
+    /// `reset_requested`). For SSE: this is the session that just
+    /// transitioned (or remained) in `reset_requested`; clients use it
+    /// to pin the event to a specific generation.
+    pub crypto_session_id: String,
+    /// Generation of `crypto_session_id`. Same value the SSE listener
+    /// surfaces.
+    pub generation: i32,
+    /// Id of the `delivery_events` row that records this Request. For
+    /// SSE: the `request_event_id` field of the broadcast event so
+    /// clients can correlate to the persisted audit row.
+    pub request_event_id: String,
+}
+
 /// Outcome of [`activate_crypto_session_tx`].
 ///
 /// On success, holds the activated session and the SSE-relevant fields the
@@ -289,10 +320,13 @@ async fn insert_event(
 ///    prevents a future caller (or a bug) from emitting an unbound
 ///    Request that any member could race-bootstrap into.
 /// 1. If a `crypto_session_reset_requested` event with this idempotency_key
-///    already exists, reconstruct and return its `ResetRequest`.
+///    already exists, reconstruct and return the existing
+///    `ResetRequestOutcome` (idempotent replay).
 /// 2. If the session is already in `reset_requested`, apply the
 ///    `expected_new_mls_group_id` transition matrix (bug_010). Reject
-///    with an error if a prior request bound a different group id.
+///    with an error if a prior request bound a different group id, or
+///    SHORT-CIRCUIT and reuse the prior event when the new Request
+///    weakens the binding (review-fix A1; see matrix below).
 /// 3. UPDATE the active crypto_session to `state = 'reset_requested'`
 ///    (no-op if already in `reset_requested` or `superseding`).
 /// 4. **Phase 2.5 §7 R1 Mitigation #3**: snapshot the active member
@@ -305,6 +339,15 @@ async fn insert_event(
 ///    the freshly-allocated `request_id`, the (optional)
 ///    `expected_new_mls_group_id` binding for activation-time
 ///    enforcement, and the `allowed_responders` snapshot.
+///
+/// # Returns
+///
+/// A [`ResetRequestOutcome`] populated from in-tx values. Carries the
+/// caller-facing `ResetRequest` plus chokepoint metadata
+/// (`crypto_session_id`, `generation`, `request_event_id`) the
+/// `dual_emit_reset_requested` indirect-trigger path needs for its SSE
+/// payload (review-fix G3 — eliminates two post-commit DB
+/// round-trips).
 pub(crate) async fn request_crypto_session_reset_tx(
     tx: &mut Transaction<'_, Postgres>,
     conversation_id: &str,
@@ -313,7 +356,7 @@ pub(crate) async fn request_crypto_session_reset_tx(
     reason: &str,
     idempotency_key: &str,
     expected_new_mls_group_id: Option<&str>,
-) -> Result<ResetRequest> {
+) -> Result<ResetRequestOutcome> {
     // Phase 2.5 §7 R1 Mitigation #1: caller allowlist for NULL-binding
     // Requests. This is the FIRST check — even before idempotency
     // lookup — so a forbidden trigger never reaches the persistence
@@ -333,10 +376,10 @@ pub(crate) async fn request_crypto_session_reset_tx(
         ));
     }
     // Idempotent replay: a prior call from this caller with the same
-    // idempotency_key resolves to the same ResetRequest. The transition
-    // matrix below only applies to NEW Requests (different
+    // idempotency_key resolves to the same ResetRequestOutcome. The
+    // transition matrix below only applies to NEW Requests (different
     // idempotency_key) on a session already in `reset_requested`.
-    if let Some((_event_id, payload_json, _cs_id)) = find_existing_event(
+    if let Some((event_id, payload_json, cs_id)) = find_existing_event(
         tx,
         conversation_id,
         initiator_did,
@@ -351,11 +394,25 @@ pub(crate) async fn request_crypto_session_reset_tx(
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("existing reset_requested event missing request_id"))?
             .to_string();
-        return Ok(ResetRequest {
-            request_id,
-            conversation_id: conversation_id.to_string(),
-            initiator_did: initiator_did.to_string(),
-            reason: reason.to_string(),
+        let cs_id = cs_id.ok_or_else(|| {
+            anyhow!("existing crypto_session_reset_requested event missing crypto_session_id")
+        })?;
+        let generation: i32 =
+            sqlx::query_scalar("SELECT generation FROM crypto_sessions WHERE id = $1")
+                .bind(&cs_id)
+                .fetch_one(&mut **tx)
+                .await
+                .context("read crypto_sessions.generation for idempotent replay outcome")?;
+        return Ok(ResetRequestOutcome {
+            request: ResetRequest {
+                request_id,
+                conversation_id: conversation_id.to_string(),
+                initiator_did: initiator_did.to_string(),
+                reason: reason.to_string(),
+            },
+            crypto_session_id: cs_id,
+            generation,
+            request_event_id: event_id,
         });
     }
 
@@ -372,37 +429,86 @@ pub(crate) async fn request_crypto_session_reset_tx(
     //   existing Some(X) + new Some(X)    → no-op (same target re-claim)
     //   existing Some(X) + new Some(Y), X≠Y → REJECT (conflicting claim)
     //   existing Some(X) + new NULL       → no-op (NULL doesn't weaken)
+    //
+    // Phase 2.5 review-fix A1 (advisor-flagged exploit path): the
+    // `(Some(X), None)` case previously fell through to the catch-all
+    // and a NEW `crypto_session_reset_requested` event was written with
+    // `payload_json.expected_new_mls_group_id = null`. The
+    // activation-time auth then read `ORDER BY seq DESC LIMIT 1` —
+    // most-recent-wins — and the prior `Some(X)` binding was silently
+    // downgraded to NULL, letting any current member race-bootstrap
+    // with attacker-controlled `Y` instead of admin's `X`.
+    //
+    // The doc above already says "no-op (NULL doesn't weaken)"; we now
+    // ENFORCE that by short-circuiting and returning the existing
+    // event's outcome (mirrors the idempotent-replay branch at
+    // :339-360 above). No new event is written; the prior `Some(X)`
+    // binding remains authoritative.
     if current.state == "reset_requested" {
-        let existing_expected: Option<Option<String>> = sqlx::query_scalar(
-            "SELECT payload_json->>'expected_new_mls_group_id' \
-             FROM delivery_events \
-             WHERE conversation_id = $1 \
-               AND crypto_session_id = $2 \
-               AND event_type = 'crypto_session_reset_requested' \
-             ORDER BY seq DESC \
-             LIMIT 1",
-        )
-        .bind(conversation_id)
-        .bind(&current.id)
-        .fetch_optional(&mut **tx)
-        .await
-        .context("read prior reset_requested expected_new_mls_group_id")?;
+        let existing_row: Option<(String, Option<String>, Option<serde_json::Value>)> =
+            sqlx::query_as(
+                "SELECT id, payload_json->>'expected_new_mls_group_id', payload_json \
+                 FROM delivery_events \
+                 WHERE conversation_id = $1 \
+                   AND crypto_session_id = $2 \
+                   AND event_type = 'crypto_session_reset_requested' \
+                 ORDER BY seq DESC \
+                 LIMIT 1",
+            )
+            .bind(conversation_id)
+            .bind(&current.id)
+            .fetch_optional(&mut **tx)
+            .await
+            .context("read prior reset_requested event for transition matrix")?;
 
-        let prior_expected: Option<String> = existing_expected.flatten();
-        match (prior_expected.as_deref(), expected_new_mls_group_id) {
-            // existing Some(X) + new Some(Y), X≠Y → REJECT
-            (Some(prior), Some(new)) if prior != new => {
-                return Err(anyhow!(
-                    "expected_new_mls_group_id binding conflict: \
-                     prior request claimed `{prior}`, new request claims `{new}`. \
-                     The earlier admin's claim is binding until activation \
-                     resolves; either submit material matching the prior \
-                     claim or wait for the prior request to time out."
-                ));
+        if let Some((prior_event_id, prior_expected, prior_payload)) = existing_row {
+            match (prior_expected.as_deref(), expected_new_mls_group_id) {
+                // existing Some(X) + new Some(Y), X≠Y → REJECT
+                (Some(prior), Some(new)) if prior != new => {
+                    return Err(anyhow!(
+                        "expected_new_mls_group_id binding conflict: \
+                         prior request claimed `{prior}`, new request claims `{new}`. \
+                         The earlier admin's claim is binding until activation \
+                         resolves; either submit material matching the prior \
+                         claim or wait for the prior request to time out."
+                    ));
+                }
+                // existing Some(X) + new None → no-op (NULL doesn't weaken).
+                // Phase 2.5 review-fix A1: short-circuit so the existing
+                // bound event remains the most-recent row in the audit
+                // log. Reconstruct the outcome from event 1 — same shape
+                // as idempotent-replay, just keyed off seq instead of
+                // idempotency_key.
+                (Some(_prior), None) => {
+                    let prior_request_id = prior_payload
+                        .as_ref()
+                        .and_then(|p| p.get("request_id"))
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "prior crypto_session_reset_requested event \
+                                 missing request_id; cannot reconstruct outcome \
+                                 for A1 (Some, None) short-circuit"
+                            )
+                        })?
+                        .to_string();
+                    return Ok(ResetRequestOutcome {
+                        request: ResetRequest {
+                            request_id: prior_request_id,
+                            conversation_id: conversation_id.to_string(),
+                            initiator_did: initiator_did.to_string(),
+                            reason: reason.to_string(),
+                        },
+                        crypto_session_id: current.id.clone(),
+                        generation: current.generation,
+                        request_event_id: prior_event_id,
+                    });
+                }
+                // All other cases pass through; the existing event remains
+                // authoritative on the binding (or NULL stays NULL via
+                // the new event's matching NULL).
+                _ => {}
             }
-            // All other cases pass through; the existing event remains
-            // authoritative on the binding (or NULL stays NULL).
-            _ => {}
         }
     }
 
@@ -461,7 +567,7 @@ pub(crate) async fn request_crypto_session_reset_tx(
     });
 
     let seq = allocate_seq(tx, conversation_id).await?;
-    insert_event(
+    let request_event_id = insert_event(
         tx,
         conversation_id,
         seq,
@@ -474,11 +580,16 @@ pub(crate) async fn request_crypto_session_reset_tx(
     )
     .await?;
 
-    Ok(ResetRequest {
-        request_id,
-        conversation_id: conversation_id.to_string(),
-        initiator_did: initiator_did.to_string(),
-        reason: reason.to_string(),
+    Ok(ResetRequestOutcome {
+        request: ResetRequest {
+            request_id,
+            conversation_id: conversation_id.to_string(),
+            initiator_did: initiator_did.to_string(),
+            reason: reason.to_string(),
+        },
+        crypto_session_id: current.id.clone(),
+        generation: current.generation,
+        request_event_id,
     })
 }
 
@@ -610,6 +721,33 @@ pub(crate) async fn activate_crypto_session_tx(
     // Both fields are read in a single SELECT so the snapshot is
     // atomic — there is no window where one half of the auth answer
     // is stale relative to the other.
+    //
+    // # Upstream active-membership audit (review-fix A2)
+    //
+    // The R1 #2 allowlist check below is downstream defense; the FIRST
+    // line of defense is each `ConvoMessage::ActivateCryptoSession`
+    // sender enforcing active-membership of the caller against
+    // `members WHERE convo_id = $1 AND (user_did = $2 OR member_did = $2)
+    // AND left_at IS NULL`. Audit (Apr 2026):
+    //
+    //   - `handlers/mls_chat/bootstrap_reset_group.rs` (lines 142-172):
+    //       enforces `is_member` via the canonical query above; returns
+    //       403 NotMember if absent. ✓ GATED.
+    //   - `handlers/mls_chat/reset_group.rs` (lines 112-128): enforces
+    //       `is_admin` (a STRICTER variant of the membership check —
+    //       admin implies an active row). ✓ GATED.
+    //   - `actors/conversation.rs::dual_emit_reset_requested`: this
+    //       sends `RequestCryptoSessionReset`, NOT `ActivateCryptoSession`,
+    //       so the activation gate doesn't apply. The Request side has
+    //       its own R1 #1 caller-allowlist (only the four indirect
+    //       triggers; see `permits_null_binding`).
+    //
+    // No other call sites send `ActivateCryptoSession`. New senders
+    // MUST add the active-membership gate before dispatching the
+    // message — the chokepoint's R1 #2 allowlist alone is NOT
+    // sufficient because it operates on the snapshot, not on the
+    // current member roster. A grep for `ConvoMessage::ActivateCryptoSession`
+    // outside this module is the correct verification surface.
     if prior.state == "reset_requested" {
         let request_payload: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT payload_json \

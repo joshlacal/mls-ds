@@ -38,6 +38,28 @@ fn system_reset_did() -> &'static str {
     })
 }
 
+/// Phase 2.5 §7 R2 mitigation: per-incident kill switch for the
+/// `subscribeEvents#resetRequestedEvent` SSE broadcast emitted by
+/// `dual_emit_reset_requested`.
+///
+/// Reads the `EMIT_RESET_REQUESTED_EVENT` env var ONCE at first
+/// invocation and caches the result for the process lifetime
+/// (review-fix G4: avoid the per-call `std::env::var` allocation +
+/// locking on every reset event). Default `true`; flip to `false` or
+/// `0` and restart the service to suppress the SSE broadcast for an
+/// incident.
+///
+/// The chokepoint Request still persists regardless — only the SSE
+/// fan-out is gated. See `server/CLAUDE.md` for the operator runbook.
+fn emit_reset_requested_event() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("EMIT_RESET_REQUESTED_EVENT")
+            .map(|v| !matches!(v.as_str(), "false" | "0"))
+            .unwrap_or(true)
+    })
+}
+
 /// Manages state for a single conversation, ensuring sequential processing
 /// of all epoch-modifying operations to prevent race conditions.
 ///
@@ -1488,14 +1510,29 @@ impl ConversationActorState {
         // the pre-reset generation so retries during the same threshold-
         // crossing window converge to one Request event. After do_reset_group
         // increments reset_count the key naturally rotates.
+        //
+        // Phase 2.5 review-fix G1: explicit error handling so a transient
+        // DB failure surfaces in logs instead of being silently squashed
+        // into `0`. A wrong key here doesn't break correctness (the
+        // chokepoint dedupes on the full row), but it can mask
+        // duplicate-Request audit signals.
         let pre_reset_count: i32 =
-            sqlx::query_scalar("SELECT reset_count FROM conversations WHERE id = $1")
+            match sqlx::query_scalar("SELECT reset_count FROM conversations WHERE id = $1")
                 .bind(&self.convo_id)
                 .fetch_optional(&self.db_pool)
                 .await
-                .ok()
-                .flatten()
-                .unwrap_or(0);
+            {
+                Ok(Some(c)) => c,
+                Ok(None) => 0,
+                Err(e) => {
+                    warn!(
+                        convo_id = %crate::crypto::redact_for_log(&self.convo_id),
+                        error = %e,
+                        "Failed to fetch reset_count for idempotency key; defaulting to 0"
+                    );
+                    0
+                }
+            };
         let quorum_idempotency_key = format!("req-quorum:{}:{}", self.convo_id, pre_reset_count);
         self.dual_emit_reset_requested(
             ResetTrigger::QuorumVote,
@@ -1676,14 +1713,26 @@ impl ConversationActorState {
         // Keying off pre-reset reset_count makes retries during the
         // same threshold-crossing converge to one Request event; the
         // key naturally rotates after a successful reset.
+        //
+        // Phase 2.5 review-fix G2: explicit error handling. See G1
+        // above for the matching change in the quorum path.
         let pre_reset_count: i32 =
-            sqlx::query_scalar("SELECT reset_count FROM conversations WHERE id = $1")
+            match sqlx::query_scalar("SELECT reset_count FROM conversations WHERE id = $1")
                 .bind(&convo_id)
                 .fetch_optional(&self.db_pool)
                 .await
-                .ok()
-                .flatten()
-                .unwrap_or(0);
+            {
+                Ok(Some(c)) => c,
+                Ok(None) => 0,
+                Err(e) => {
+                    warn!(
+                        convo_id = %crate::crypto::redact_for_log(&convo_id),
+                        error = %e,
+                        "Failed to fetch reset_count for idempotency key; defaulting to 0"
+                    );
+                    0
+                }
+            };
         let trigger_idempotency_key = format!(
             "req-{}:{}:{}",
             trigger_kind.as_str(),
@@ -1782,7 +1831,7 @@ impl ConversationActorState {
             .begin()
             .await
             .context("begin RequestCryptoSessionReset tx")?;
-        let result = super::reset_chokepoint::request_crypto_session_reset_tx(
+        let outcome = super::reset_chokepoint::request_crypto_session_reset_tx(
             &mut tx,
             &self.convo_id,
             trigger,
@@ -1798,12 +1847,16 @@ impl ConversationActorState {
 
         info!(
             convo_id = %crate::crypto::redact_for_log(&self.convo_id),
-            request_id = %result.request_id,
+            request_id = %outcome.request.request_id,
             trigger = %trigger.as_str(),
             "crypto_session_reset_requested"
         );
 
-        Ok(result)
+        // Direct callers (Admin, Bootstrap via the message API) only
+        // need the public `ResetRequest`; the `crypto_session_id` /
+        // `generation` / `request_event_id` fields of the outcome are
+        // for the `dual_emit_reset_requested` SSE-broadcast path.
+        Ok(outcome.request)
     }
 
     /// Phase 2 §2.2 — `ActivateCryptoSession` handler.
@@ -1987,7 +2040,13 @@ impl ConversationActorState {
             }
         };
 
-        let request = match super::reset_chokepoint::request_crypto_session_reset_tx(
+        // Phase 2.5 review-fix G3: capture the chokepoint outcome
+        // directly. Previously we returned just `ResetRequest` and then
+        // re-queried `crypto_sessions` + `delivery_events` post-commit
+        // to gather `(crypto_session_id, generation, request_event_id)`
+        // for the SSE payload — two extra round-trips. The chokepoint
+        // now returns these in-tx via `ResetRequestOutcome`.
+        let outcome = match super::reset_chokepoint::request_crypto_session_reset_tx(
             &mut tx,
             &self.convo_id,
             trigger,
@@ -1998,7 +2057,7 @@ impl ConversationActorState {
         )
         .await
         {
-            Ok(r) => r,
+            Ok(o) => o,
             Err(e) => {
                 let _ = tx.rollback().await;
                 warn!(
@@ -2026,80 +2085,31 @@ impl ConversationActorState {
 
         info!(
             convo_id = %crate::crypto::redact_for_log(&self.convo_id),
-            request_id = %request.request_id,
+            request_id = %outcome.request.request_id,
+            crypto_session_id = %crate::crypto::redact_for_log(&outcome.crypto_session_id),
+            generation = outcome.generation,
             trigger = %trigger.as_str(),
             phase_2_5_path = "dual_emit",
             "[dual_emit_reset_requested] crypto_session_reset_requested persisted"
         );
-
-        // Look up additional context fields for the SSE event payload.
-        // Done in a single SELECT post-commit so failures here only
-        // suppress the SSE broadcast — the persisted Request event is
-        // already durable.
-        let session_info: Result<(String, i32), sqlx::Error> = sqlx::query_as(
-            "SELECT cs.id, cs.generation \
-             FROM crypto_sessions cs \
-             WHERE cs.conversation_id = $1 \
-               AND cs.state = 'reset_requested' \
-             ORDER BY cs.generation DESC \
-             LIMIT 1",
-        )
-        .bind(&self.convo_id)
-        .fetch_one(&self.db_pool)
-        .await;
-
-        let (crypto_session_id, generation) = match session_info {
-            Ok(t) => t,
-            Err(e) => {
-                warn!(
-                    convo_id = %crate::crypto::redact_for_log(&self.convo_id),
-                    error = %e,
-                    "[dual_emit_reset_requested] failed to read session info \
-                     for SSE payload; skipping broadcast"
-                );
-                return;
-            }
-        };
-
-        let request_event_id: Result<String, sqlx::Error> = sqlx::query_scalar(
-            "SELECT id FROM delivery_events \
-             WHERE conversation_id = $1 \
-               AND crypto_session_id = $2 \
-               AND event_type = 'crypto_session_reset_requested' \
-               AND idempotency_key = $3 \
-             LIMIT 1",
-        )
-        .bind(&self.convo_id)
-        .bind(&crypto_session_id)
-        .bind(idempotency_key)
-        .fetch_one(&self.db_pool)
-        .await;
-
-        let request_event_id = match request_event_id {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(
-                    convo_id = %crate::crypto::redact_for_log(&self.convo_id),
-                    error = %e,
-                    "[dual_emit_reset_requested] failed to read \
-                     request_event_id; skipping SSE broadcast"
-                );
-                return;
-            }
-        };
 
         // Phase 2.5 §7 R2 mitigation: operator-side env-var gate. When
         // `EMIT_RESET_REQUESTED_EVENT=false`, the chokepoint Request is
         // still persisted (above), but no SSE event is broadcast.
         // Operators flip this off on a per-incident basis if a client-
         // side bug surfaces in handling resetRequestedEvent.
-        let emit_flag = std::env::var("EMIT_RESET_REQUESTED_EVENT")
-            .map(|v| v != "false" && v != "0")
-            .unwrap_or(true);
-        if !emit_flag {
+        //
+        // Phase 2.5 review-fix G4: cached via OnceLock so we don't pay
+        // a `std::env::var` lookup (string allocation + locking) on
+        // every reset event. Trade-off: a flip of the env var requires
+        // a service restart; this is documented in `server/CLAUDE.md`
+        // and aligns with the operator runbook (the kill-switch use
+        // case is "an incident is in progress, restart the service
+        // with the flag set").
+        if !emit_reset_requested_event() {
             info!(
                 convo_id = %crate::crypto::redact_for_log(&self.convo_id),
-                request_id = %request.request_id,
+                request_id = %outcome.request.request_id,
                 "[dual_emit_reset_requested] EMIT_RESET_REQUESTED_EVENT=false \
                  — Request persisted, SSE broadcast suppressed"
             );
@@ -2114,10 +2124,10 @@ impl ConversationActorState {
         let event = StreamEvent::ResetRequestedEvent {
             cursor,
             convo_id: self.convo_id.clone(),
-            crypto_session_id,
-            generation,
+            crypto_session_id: outcome.crypto_session_id,
+            generation: outcome.generation,
             trigger: trigger.as_str().to_string(),
-            request_event_id,
+            request_event_id: outcome.request_event_id,
             expected_new_mls_group_id: None,
             reason: Some(reason.to_string()),
             requested_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
