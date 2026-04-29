@@ -47,7 +47,20 @@ else
     exit 1
 fi
 
+# Cutover: any migration with version >= this number is "post-sqlx-cli-wiring"
+# and MUST be applied via `sqlx migrate run` (not bootstrapped). Bootstrap was
+# only ever needed for historical migrations applied via raw SQL before sqlx
+# was wired into the deploy pipeline. Without this gate, every NEW 14-digit
+# migration gets blanket-marked as applied (by this script, with a freshly-
+# computed checksum from the file) BEFORE its DDL has actually run, so
+# `sqlx migrate run` skips it and the schema diverges from `_sqlx_migrations`.
+# History: 2026-04-28 deploy of Phase 3 + R3 hit this; federation_outbox,
+# notification_outbox, reset_reminder_state were marked applied without DDL.
+# Cutover chosen as the first 20260429 migration (Phase 2 keystone migration).
+SQLX_CUTOVER_VERSION=20260429000000
+
 inserted=0
+skipped_post_cutover=0
 for f in "$MIGRATIONS_DIR"/*.sql; do
     filename=$(basename "$f" .sql)
 
@@ -58,6 +71,14 @@ for f in "$MIGRATIONS_DIR"/*.sql; do
     fi
 
     version="${BASH_REMATCH[1]}"
+
+    # Cutover gate — see comment above. Skip post-cutover migrations entirely
+    # so sqlx can run them properly.
+    if [ "$version" -ge "$SQLX_CUTOVER_VERSION" ]; then
+        skipped_post_cutover=$((skipped_post_cutover + 1))
+        continue
+    fi
+
     description_raw="${BASH_REMATCH[2]//_/ }"
     # Escape single quotes for SQL literal
     description="${description_raw//\'/\'\'}"
@@ -84,4 +105,8 @@ if [ "$inserted" -eq 0 ]; then
     echo "No historical migrations needed bootstrapping (all already tracked)"
 else
     echo "Bootstrapped $inserted historical migrations into _sqlx_migrations"
+fi
+
+if [ "$skipped_post_cutover" -gt 0 ]; then
+    echo "Skipped $skipped_post_cutover post-cutover migration(s) (>= ${SQLX_CUTOVER_VERSION}) — sqlx-cli will apply them"
 fi
