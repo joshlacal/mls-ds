@@ -39,8 +39,8 @@ jobs:
         image: postgres:15
         env:
           POSTGRES_PASSWORD: test_password
-          POSTGRES_USER: catbird_test
-          POSTGRES_DB: catbird_test
+          POSTGRES_USER: catbird
+          POSTGRES_DB: catbird
         options: >-
           --health-cmd pg_isready
           --health-interval 10s
@@ -166,14 +166,14 @@ jobs:
       - name: Run migrations
         working-directory: ./server
         env:
-          DATABASE_URL: postgresql://catbird_test:test_password@localhost:5432/catbird_test
+          DATABASE_URL: postgresql://catbird:test_password@localhost:5432/catbird
         run: |
           sqlx migrate run
 
       - name: Run tests
         working-directory: ./server
         env:
-          DATABASE_URL: postgresql://catbird_test:test_password@localhost:5432/catbird_test
+          DATABASE_URL: postgresql://catbird:test_password@localhost:5432/catbird
           RUST_LOG: debug
         run: |
           cargo test --all-features
@@ -181,7 +181,7 @@ jobs:
       - name: Run integration tests
         working-directory: ./server
         env:
-          DATABASE_URL: postgresql://catbird_test:test_password@localhost:5432/catbird_test
+          DATABASE_URL: postgresql://catbird:test_password@localhost:5432/catbird
         run: |
           cargo test --tests
 
