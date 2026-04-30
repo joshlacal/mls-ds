@@ -36,12 +36,11 @@ async fn test_conversation_crud() {
     cleanup_test_data(&pool).await;
 
     // Create
-    let convo = create_conversation(&pool, "did:plc:creator123", Some("Test Chat".to_string()))
+    let convo = create_conversation(&pool, "did:plc:creator123")
         .await
         .expect("Failed to create conversation");
 
     assert_eq!(convo.creator_did, "did:plc:creator123");
-    assert_eq!(convo.name, Some("Test Chat".to_string()));
     assert_eq!(convo.current_epoch, 0);
 
     // Read
@@ -84,7 +83,7 @@ async fn test_member_operations() {
     let pool = setup_test_db().await;
     cleanup_test_data(&pool).await;
 
-    let convo = create_conversation(&pool, "did:plc:creator", None)
+    let convo = create_conversation(&pool, "did:plc:creator")
         .await
         .expect("Failed to create conversation");
 
@@ -174,7 +173,7 @@ async fn test_message_operations() {
     let pool = setup_test_db().await;
     cleanup_test_data(&pool).await;
 
-    let convo = create_conversation(&pool, "did:plc:creator", None)
+    let convo = create_conversation(&pool, "did:plc:creator")
         .await
         .expect("Failed to create conversation");
 
@@ -380,7 +379,6 @@ async fn test_transaction_conversation_with_members() {
     let convo = create_conversation_with_members(
         &pool,
         "did:plc:creator",
-        Some("Team Chat".to_string()),
         vec![
             "did:plc:alice".to_string(),
             "did:plc:bob".to_string(),
@@ -389,8 +387,6 @@ async fn test_transaction_conversation_with_members() {
     )
     .await
     .expect("Failed to create conversation with members");
-
-    assert_eq!(convo.name, Some("Team Chat".to_string()));
 
     // Verify all members were added
     let members = list_members(&pool, &convo.id)
@@ -414,15 +410,15 @@ async fn test_list_conversations_for_user() {
     cleanup_test_data(&pool).await;
 
     // Create multiple conversations
-    let convo1 = create_conversation(&pool, "did:plc:creator", Some("Chat 1".to_string()))
+    let convo1 = create_conversation(&pool, "did:plc:creator")
         .await
         .expect("Failed to create convo 1");
 
-    let convo2 = create_conversation(&pool, "did:plc:creator", Some("Chat 2".to_string()))
+    let convo2 = create_conversation(&pool, "did:plc:creator")
         .await
         .expect("Failed to create convo 2");
 
-    let convo3 = create_conversation(&pool, "did:plc:other", Some("Chat 3".to_string()))
+    let convo3 = create_conversation(&pool, "did:plc:other")
         .await
         .expect("Failed to create convo 3");
 
@@ -474,7 +470,7 @@ async fn test_concurrent_operations() {
     let pool = setup_test_db().await;
     cleanup_test_data(&pool).await;
 
-    let convo = create_conversation(&pool, "did:plc:creator", None)
+    let convo = create_conversation(&pool, "did:plc:creator")
         .await
         .expect("Failed to create conversation");
 

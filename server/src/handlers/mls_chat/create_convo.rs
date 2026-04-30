@@ -16,7 +16,7 @@ use crate::{
         create_convo::{
             CreateConvoError as LexCreateConvoError, CreateConvoOutput, CreateConvoRequest,
         },
-        ConvoMetadata, ConvoView, MemberView,
+        ConvoView, MemberView,
     },
     sqlx_jacquard::{chrono_to_datetime, did_to_string, string_to_did},
     storage::DbPool,
@@ -254,18 +254,20 @@ async fn handle_create_convo(
         }
     }
 
-    // ── Conversation ID and metadata ─────────────────────────────────────
+    // ── Conversation ID ─────────────────────────────────────────────────
     let convo_id = input.group_id.to_string();
     let now = Utc::now();
 
-    let (name, description) = if let Some(ref meta) = input.metadata {
-        (
-            meta.name.as_deref().map(String::from),
-            meta.description.as_deref().map(String::from),
-        )
-    } else {
-        (None, None)
-    };
+    // Plaintext metadata (`input.metadata`) is intentionally ignored. Group
+    // metadata is server-blind: clients encrypt name/description/avatar via
+    // the `group_metadata_blobs` blob path. If a legacy client still sends
+    // `metadata`, log a warning and drop it.
+    if input.metadata.is_some() {
+        warn!(
+            convo = %crate::crypto::redact_for_log(&convo_id),
+            "[v2.createConvo] received legacy plaintext metadata; ignoring (encrypted blob path is authoritative)"
+        );
+    }
 
     // ── Idempotency / first-responder race check ────────────────────────
     // Fetch the existing creator (if any) so we can distinguish:
@@ -355,16 +357,6 @@ async fn handle_create_convo(
             )
             .collect();
 
-        let metadata = if name.is_some() || description.is_some() {
-            Some(ConvoMetadata {
-                name: name.map(|s| s.into()),
-                description: description.map(|s| s.into()),
-                extra_data: Default::default(),
-            })
-        } else {
-            None
-        };
-
         return Ok(CreateConvoOutput {
             convo: ConvoView {
                 conversation_id: convo_id.clone().into(),
@@ -375,7 +367,7 @@ async fn handle_create_convo(
                 cipher_suite: input.cipher_suite.as_ref().to_string().into(),
                 created_at: chrono_to_datetime(now),
                 last_message_at: None,
-                metadata,
+                metadata: None,
                 confirmation_tag: None,
                 reset_generation: Some(0),
                 extra_data: Default::default(),
@@ -412,13 +404,12 @@ async fn handle_create_convo(
     })?;
 
     sqlx::query(
-        "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at, name, cipher_suite, sequencer_ds, is_remote, group_id)
-         VALUES ($1, $2, 1, $3, $3, $4, $5, NULL, false, $1)",
+        "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at, cipher_suite, sequencer_ds, is_remote, group_id)
+         VALUES ($1, $2, 1, $3, $3, $4, NULL, false, $1)",
     )
     .bind(&convo_id)
     .bind(&auth_user.did)
     .bind(now)
-    .bind(&name)
     .bind(input.cipher_suite.as_ref())
     .execute(&mut *tx)
     .await
@@ -744,16 +735,6 @@ async fn handle_create_convo(
     );
 
     // ── Build response ───────────────────────────────────────────────────
-    let metadata = if name.is_some() || description.is_some() {
-        Some(ConvoMetadata {
-            name: name.map(|s| s.into()),
-            description: description.map(|s| s.into()),
-            extra_data: Default::default(),
-        })
-    } else {
-        None
-    };
-
     Ok(CreateConvoOutput {
         convo: ConvoView {
             conversation_id: convo_id.clone().into(),
@@ -764,7 +745,7 @@ async fn handle_create_convo(
             cipher_suite: input.cipher_suite.as_ref().to_string().into(),
             created_at: chrono_to_datetime(now),
             last_message_at: None,
-            metadata,
+            metadata: None,
             confirmation_tag: None,
             reset_generation: Some(0),
             extra_data: Default::default(),

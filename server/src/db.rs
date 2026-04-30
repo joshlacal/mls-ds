@@ -216,11 +216,12 @@ pub async fn init_db_default() -> Result<DbPool> {
 // =============================================================================
 
 /// Create a new conversation
-pub async fn create_conversation(
-    pool: &DbPool,
-    creator_did: &str,
-    title: Option<String>,
-) -> Result<Conversation> {
+///
+/// Legacy helper: not on the live createConvo path (handlers/mls_chat/create_convo.rs
+/// owns that). Kept for the unit tests under `mod tests` and for future scripted
+/// callers. Plaintext name/description/avatar are NOT persisted — group metadata
+/// lives in encrypted `group_metadata_blobs` rows.
+pub async fn create_conversation(pool: &DbPool, creator_did: &str) -> Result<Conversation> {
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
     // `conversations.group_id` is NOT NULL since migration
@@ -231,16 +232,15 @@ pub async fn create_conversation(
 
     let conversation = sqlx::query_as::<_, Conversation>(
         r#"
-        INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at, name, group_id)
-        VALUES ($1, $2, 0, $3, $4, $5, $6)
-        RETURNING id, creator_did, current_epoch, cipher_suite, created_at, updated_at, name
+        INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at, group_id)
+        VALUES ($1, $2, 0, $3, $4, $5)
+        RETURNING id, creator_did, current_epoch, cipher_suite, created_at, updated_at
         "#,
     )
     .bind(&id)
     .bind(creator_did)
     .bind(now)
     .bind(now)
-    .bind(title)
     .bind(&group_id)
     .fetch_one(pool)
     .await
@@ -253,7 +253,7 @@ pub async fn create_conversation(
 pub async fn get_conversation(pool: &DbPool, convo_id: &str) -> Result<Option<Conversation>> {
     let conversation = sqlx::query_as::<_, Conversation>(
         r#"
-        SELECT id, creator_did, current_epoch, cipher_suite, created_at, updated_at, name
+        SELECT id, creator_did, current_epoch, cipher_suite, created_at, updated_at
         FROM conversations
         WHERE id = $1
         "#,
@@ -279,7 +279,7 @@ pub async fn list_conversations(
 ) -> Result<Vec<Conversation>> {
     let conversations = sqlx::query_as::<_, Conversation>(
         r#"
-        SELECT c.id, c.creator_did, c.current_epoch, c.created_at, c.updated_at, c.name as title
+        SELECT c.id, c.creator_did, c.current_epoch, c.created_at, c.updated_at
         FROM conversations c
         INNER JOIN members m ON c.id = m.convo_id
         WHERE (m.member_did = $1 OR m.user_did = $1) AND m.left_at IS NULL
@@ -1810,10 +1810,13 @@ pub async fn begin_transaction(pool: &DbPool) -> Result<Transaction<'_, Postgres
 }
 
 /// Create a conversation with initial members in a transaction
+///
+/// Legacy helper: plaintext name/description are no longer persisted. Group
+/// metadata lives in encrypted `group_metadata_blobs` rows uploaded by the
+/// creating client immediately after this call.
 pub async fn create_conversation_with_members(
     pool: &DbPool,
     creator_did: &str,
-    title: Option<String>,
     member_dids: Vec<String>,
 ) -> Result<Conversation> {
     let mut tx = begin_transaction(pool).await?;
@@ -1824,16 +1827,15 @@ pub async fn create_conversation_with_members(
 
     let conversation = sqlx::query_as::<_, Conversation>(
         r#"
-        INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at, name)
-        VALUES ($1, $2, 0, $3, $4, $5)
-        RETURNING id, creator_did, current_epoch, created_at, name as title
+        INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at)
+        VALUES ($1, $2, 0, $3, $4)
+        RETURNING id, creator_did, current_epoch, created_at
         "#,
     )
     .bind(&id)
     .bind(creator_did)
     .bind(now)
     .bind(now)
-    .bind(&title)
     .fetch_one(&mut *tx)
     .await
     .context("Failed to create conversation")?;
@@ -2566,13 +2568,11 @@ mod tests {
     async fn test_create_and_get_conversation() {
         let pool = setup_test_db().await;
 
-        let conversation =
-            create_conversation(&pool, "did:plc:test123", Some("Test Convo".to_string()))
-                .await
-                .expect("Failed to create conversation");
+        let conversation = create_conversation(&pool, "did:plc:test123")
+            .await
+            .expect("Failed to create conversation");
 
         assert_eq!(conversation.creator_did, "did:plc:test123");
-        assert_eq!(conversation.name, Some("Test Convo".to_string()));
 
         let fetched = get_conversation(&pool, &conversation.id)
             .await
@@ -2591,7 +2591,7 @@ mod tests {
     async fn test_member_operations() {
         let pool = setup_test_db().await;
 
-        let conversation = create_conversation(&pool, "did:plc:creator", None)
+        let conversation = create_conversation(&pool, "did:plc:creator")
             .await
             .expect("Failed to create conversation");
 
@@ -2616,7 +2616,7 @@ mod tests {
     async fn test_message_operations() {
         let pool = setup_test_db().await;
 
-        let conversation = create_conversation(&pool, "did:plc:creator", None)
+        let conversation = create_conversation(&pool, "did:plc:creator")
             .await
             .expect("Failed to create conversation");
 
@@ -2706,7 +2706,6 @@ mod tests {
         let conversation = create_conversation_with_members(
             &pool,
             "did:plc:creator",
-            Some("Group Chat".to_string()),
             vec!["did:plc:member1".to_string(), "did:plc:member2".to_string()],
         )
         .await

@@ -23,12 +23,16 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 -- =============================================================================
 
 -- Conversations (MLS groups)
+--
+-- Group metadata (name / description / avatar) is server-blind: it lives in
+-- encrypted `group_metadata_blobs` rows, fetched via
+-- `blue.catbird.mlsChat.getGroupMetadataBlob` and decrypted client-side.
+-- Plaintext `name` / `description` columns were retired in migration
+-- `20260429000007_drop_plaintext_metadata.sql`.
 CREATE TABLE conversations (
     id TEXT PRIMARY KEY,
     creator_did TEXT NOT NULL,
     current_epoch INTEGER NOT NULL DEFAULT 0,
-    name TEXT,
-    description TEXT,
     group_id TEXT,
     cipher_suite TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -616,8 +620,7 @@ SELECT
     CASE
         WHEN i.max_uses IS NOT NULL THEN i.max_uses - i.uses_count
         ELSE NULL
-    END as remaining_uses,
-    c.name as conversation_name
+    END as remaining_uses
 FROM invites i
 JOIN conversations c ON i.convo_id = c.id
 WHERE i.revoked = false
@@ -629,7 +632,6 @@ COMMENT ON VIEW active_invites IS 'Shows all currently usable invites with remai
 CREATE OR REPLACE VIEW conversation_policy_summary AS
 SELECT
     c.id as convo_id,
-    c.name as conversation_name,
     c.creator_did,
     p.allow_external_commits,
     p.require_invite_for_join,
@@ -648,7 +650,7 @@ FROM conversations c
 LEFT JOIN conversation_policy p ON c.id = p.convo_id
 LEFT JOIN members m ON c.id = m.convo_id
 LEFT JOIN invites i ON c.id = i.convo_id
-GROUP BY c.id, c.name, c.creator_did, p.allow_external_commits, p.require_invite_for_join,
+GROUP BY c.id, c.creator_did, p.allow_external_commits, p.require_invite_for_join,
          p.allow_rejoin, p.rejoin_window_days, p.prevent_removing_last_admin, p.updated_at;
 
 COMMENT ON VIEW conversation_policy_summary IS 'Summary view of conversations with their policies and stats';

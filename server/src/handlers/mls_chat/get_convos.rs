@@ -126,7 +126,7 @@ async fn handle_all(
 
     for membership in memberships {
         let convo: Option<Conversation> = sqlx::query_as(
-            "SELECT id, creator_did, current_epoch, created_at, updated_at, name, cipher_suite, confirmation_tag, sequencer_ds, is_remote, group_id, reset_count FROM conversations WHERE id = $1",
+            "SELECT id, creator_did, current_epoch, created_at, updated_at, cipher_suite, confirmation_tag, sequencer_ds, is_remote, group_id, reset_count FROM conversations WHERE id = $1",
         )
         .bind(&membership.convo_id)
         .fetch_optional(pool)
@@ -398,7 +398,7 @@ async fn handle_expected(
 
     for membership in memberships {
         let convo: Option<Conversation> = sqlx::query_as(
-            "SELECT id, creator_did, current_epoch, created_at, updated_at, name, cipher_suite, confirmation_tag, sequencer_ds, is_remote, group_id, reset_count FROM conversations WHERE id = $1",
+            "SELECT id, creator_did, current_epoch, created_at, updated_at, cipher_suite, confirmation_tag, sequencer_ds, is_remote, group_id, reset_count FROM conversations WHERE id = $1",
         )
         .bind(&membership.convo_id)
         .fetch_optional(pool)

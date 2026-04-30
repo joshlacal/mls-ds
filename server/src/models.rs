@@ -14,8 +14,15 @@ pub use chat_request::{
 };
 
 // Re-export generated types for convenience
+//
+// NOTE: `ConvoMetadata` is no longer re-exported. Plaintext group metadata is
+// retired (Phase E of MLS metadata cutover); group name/description/avatar live
+// in encrypted `group_metadata_blobs` payloads and are decoded client-side via
+// the `getGroupMetadataBlob` endpoint. Stream C will remove the type from the
+// lexicon entirely; this re-export is dropped pre-emptively so handler code
+// can't construct it.
 pub use crate::generated::blue_catbird::mlsChat::{
-    ConvoMetadata, ConvoView, KeyPackageRef, MemberView, MessageView,
+    ConvoView, KeyPackageRef, MemberView, MessageView,
 };
 
 // Note: handler-specific types (AddMembers, LeaveConvo, etc.) are imported
@@ -35,7 +42,6 @@ pub struct Conversation {
     pub cipher_suite: Option<String>, // Optional in current schema
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
-    pub name: Option<String>, // From metadata
     // Tree divergence detection
     #[sqlx(default)]
     pub confirmation_tag: Option<Vec<u8>>,
@@ -93,16 +99,6 @@ impl Conversation {
     ) -> Result<ConvoView<'static>, String> {
         use jacquard_common::IntoStatic;
 
-        let metadata: Option<ConvoMetadata<'static>> = if self.name.is_some() {
-            Some(ConvoMetadata {
-                name: self.name.clone().map(|s| s.into()),
-                description: None,
-                extra_data: Default::default(),
-            })
-        } else {
-            None
-        };
-
         let creator = crate::sqlx_jacquard::try_string_to_did(&self.creator_did)
             .map_err(|e| format!("Invalid creator DID: {}", e))?;
 
@@ -140,7 +136,9 @@ impl Conversation {
                 .into(),
             created_at: crate::sqlx_jacquard::chrono_to_datetime(self.created_at),
             last_message_at: None,
-            metadata,
+            // Plaintext group metadata is server-blind; clients fetch the
+            // encrypted blob via `getGroupMetadataBlob` and decrypt locally.
+            metadata: None,
             confirmation_tag: conf_tag_b64.map(|s| s.into()),
             reset_generation: Some(reset_generation as i64),
             extra_data: Some(extra),

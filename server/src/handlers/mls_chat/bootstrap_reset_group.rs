@@ -20,7 +20,7 @@ use crate::{
             BootstrapResetGroupError as LexBootstrapResetGroupError, BootstrapResetGroupOutput,
             BootstrapResetGroupRequest,
         },
-        ConvoMetadata, ConvoView, MemberView,
+        ConvoView, MemberView,
     },
     sqlx_jacquard::{chrono_to_datetime, did_to_string, string_to_did},
     storage::DbPool,
@@ -659,13 +659,12 @@ pub async fn handle(
     // 500'd post-commit, causing iOS to treat the actual successful bootstrap
     // as a failure.
     let row: (
-        String,         // creator_did
-        Option<String>, // name
-        String,         // cipher_suite_persisted
-        DateTime<Utc>,  // created_at
-        i32,            // reset_count (NOT NULL DEFAULT 0)
+        String,        // creator_did
+        String,        // cipher_suite_persisted
+        DateTime<Utc>, // created_at
+        i32,           // reset_count (NOT NULL DEFAULT 0)
     ) = sqlx::query_as(
-        "SELECT creator_did, name, cipher_suite, created_at, reset_count \
+        "SELECT creator_did, cipher_suite, created_at, reset_count \
          FROM conversations WHERE id = $1",
     )
     .bind(&original_convo_id)
@@ -685,7 +684,7 @@ pub async fn handle(
             .flatten()
             .flatten();
 
-    let (creator_did_persisted, name, cipher_suite_persisted, created_at, reset_count) = row;
+    let (creator_did_persisted, cipher_suite_persisted, created_at, reset_count) = row;
 
     let member_rows: Vec<(
         String,
@@ -729,12 +728,6 @@ pub async fn handle(
         )
         .collect();
 
-    let metadata = name.as_ref().map(|n| ConvoMetadata {
-        name: Some(n.clone().into()),
-        description: None,
-        extra_data: Default::default(),
-    });
-
     let welcome_count = if input.welcome_message.is_some() {
         input
             .key_package_hashes
@@ -776,7 +769,10 @@ pub async fn handle(
             cipher_suite: cipher_suite_persisted.into(),
             created_at: chrono_to_datetime(created_at),
             last_message_at: last_message_at.map(chrono_to_datetime),
-            metadata,
+            // Plaintext metadata is server-blind; resetting client republishes
+            // the encrypted blob via `putGroupMetadataBlob` for the new
+            // generation (`reset_generation = reset_count`).
+            metadata: None,
             confirmation_tag: None,
             reset_generation: Some(reset_count as i64),
             extra_data: Default::default(),
