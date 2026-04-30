@@ -33,24 +33,22 @@ SQL_FILE=$(mktemp -t clear-db-fast.XXXXXX.sql)
 trap 'rm -f "$SQL_FILE"' EXIT
 
 cat > "$SQL_FILE" <<'SQL'
+-- Truncate every public-schema table EXCEPT `_sqlx_migrations` in a
+-- single TRUNCATE statement. CASCADE resolves FK dependencies in one
+-- shot — we don't need to disable triggers (which requires superuser).
 DO $$
 DECLARE
-    r RECORD;
+    table_list TEXT;
 BEGIN
-    -- Bypass FK trigger fan-out so order doesn't matter; CASCADE on
-    -- TRUNCATE then handles the dependency closure.
-    SET session_replication_role = 'replica';
+    SELECT string_agg(quote_ident(tablename), ', ')
+      INTO table_list
+      FROM pg_tables
+     WHERE schemaname = 'public'
+       AND tablename NOT IN ('_sqlx_migrations');
 
-    FOR r IN
-        SELECT tablename
-          FROM pg_tables
-         WHERE schemaname = 'public'
-           AND tablename NOT IN ('_sqlx_migrations')
-    LOOP
-        EXECUTE 'TRUNCATE TABLE ' || quote_ident(r.tablename) || ' CASCADE';
-    END LOOP;
-
-    SET session_replication_role = 'origin';
+    IF table_list IS NOT NULL THEN
+        EXECUTE 'TRUNCATE TABLE ' || table_list || ' CASCADE';
+    END IF;
 END
 $$;
 SQL
