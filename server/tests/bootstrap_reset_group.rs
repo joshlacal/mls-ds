@@ -427,6 +427,8 @@ async fn bootstrap_handle_updates_row_and_returns_view() {
         welcome_message: None,
         key_package_hashes: None,
         current_epoch: Some(1),
+        metadata_blob_locator: None,
+        metadata_version: None,
         extra_data: Default::default(),
     };
 
@@ -504,6 +506,8 @@ async fn bootstrap_handle_with_welcome_inserts_per_recipient_envelopes() {
         welcome_message: Some(welcome_payload.clone()),
         key_package_hashes: None,
         current_epoch: Some(1),
+        metadata_blob_locator: None,
+        metadata_version: None,
         extra_data: Default::default(),
     };
 
@@ -665,6 +669,8 @@ async fn bootstrap_self_heal_rejects_partial_welcome_fanout() {
             extra_data: Default::default(),
         }]),
         current_epoch: Some(1),
+        metadata_blob_locator: None,
+        metadata_version: None,
         extra_data: Default::default(),
     };
 
