@@ -318,12 +318,22 @@ pub async fn claim_available_key_packages_bulk(
     // attach directly to a CTE name, hence the JOIN against `key_packages`
     // aliased as `kp` — the `OF kp` qualifier locks the underlying base-table
     // rows, which is what we want.
+    //
+    // Selection policy: NEWEST KP first (`ORDER BY created_at DESC`).
+    // The freshest unconsumed KP on the server is the one most likely to
+    // still be present in the recipient's local OpenMLS storage — older
+    // KPs may have been evicted client-side (app reinstall, DB wipe,
+    // device rotation) without the server learning of it until the next
+    // `publishKeyPackages action=sync` round-trip. The 7-day TTL +
+    // periodic sync handle stale-deadwood cleanup; this ORDER BY
+    // optimizes the steady-state Welcome path. Previously this was
+    // `ASC` (FIFO) which actively preferred the most-likely-stale KP.
     let sql = format!(
         "WITH candidates AS (
              SELECT id,
                     ROW_NUMBER() OVER (
                         PARTITION BY owner_did, COALESCE(device_id, '')
-                        ORDER BY created_at ASC
+                        ORDER BY created_at DESC
                     ) AS rn
              FROM key_packages
              WHERE owner_did = ANY($1::text[])
