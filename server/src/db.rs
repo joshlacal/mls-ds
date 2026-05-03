@@ -382,6 +382,40 @@ pub async fn mark_commit_success_tx(
     Ok(())
 }
 
+/// Atomically replace the cached `GroupInfo` and bump `group_info_epoch`
+/// for a conversation. Caller is responsible for the transaction's
+/// commit or rollback — this only stages the UPDATE.
+///
+/// `confirmation_tag = None` writes SQL NULL (matches the existing
+/// inline SQL pattern in addMembers/externalCommit before this
+/// extraction — they bind `Option<Vec<u8>>` directly).
+///
+/// Used by every commit-producing action arm in `commitGroupChange`
+/// (addMembers, externalCommit, removeMember, and any
+/// claimPending/completePending arms that advance the epoch) so all
+/// paths share one canonical, transactional GroupInfo write.
+pub async fn store_group_info_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    convo_id: &str,
+    group_info_bytes: &[u8],
+    confirmation_tag: Option<&[u8]>,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"UPDATE conversations
+           SET group_info = $1,
+               group_info_epoch = COALESCE(group_info_epoch, 0) + 1,
+               group_info_updated_at = NOW(),
+               confirmation_tag = $3
+           WHERE id = $2"#,
+    )
+    .bind(group_info_bytes)
+    .bind(convo_id)
+    .bind(confirmation_tag)
+    .execute(&mut **tx)
+    .await
+    .map(|_| ())
+}
+
 /// Snapshot of the post-bump health counters returned by
 /// [`record_commit_409`]. Used by the inline trigger path
 /// (Phase 2 B5 — `jobs::auto_detect_failed_groups::maybe_trigger_inline_reset`)

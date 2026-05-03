@@ -664,7 +664,7 @@ pub async fn commit_group_change(
                 }
             }
 
-            // ── Store or invalidate GroupInfo ─────────────────────────
+            // ── Store or invalidate GroupInfo (uses shared helper) ─────
             if let Some(ref gi_bytes) = add_group_info_bytes {
                 // Do NOT rewrite `current_epoch` here. The CAS in try_advance
                 // (lines 462-468) already assigned it; overwriting with the
@@ -673,18 +673,12 @@ pub async fn commit_group_change(
                 // fetch GroupInfo at a different epoch than the last commit.
                 // Divergence between CAS and MLS epoch is logged but not
                 // fixed by a raw SET — see divergence warn! above.
-                sqlx::query(
-                    r#"UPDATE conversations
-                       SET group_info = $1,
-                           group_info_epoch = COALESCE(group_info_epoch, 0) + 1,
-                           group_info_updated_at = NOW(),
-                           confirmation_tag = $3
-                       WHERE id = $2"#,
+                crate::db::store_group_info_in_tx(
+                    &mut tx,
+                    &convo_id,
+                    gi_bytes,
+                    add_confirmation_tag.as_deref(),
                 )
-                .bind(gi_bytes)
-                .bind(&convo_id)
-                .bind(&add_confirmation_tag)
-                .execute(&mut *tx)
                 .await
                 .map_err(|e| {
                     error!("addMembers: failed to store GroupInfo: {}", e);
@@ -1365,25 +1359,19 @@ pub async fn commit_group_change(
                 );
             }
 
-            // ── Store or invalidate GroupInfo ─────────────────────────
+            // ── Store or invalidate GroupInfo (uses shared helper) ─────
             if let Some(ref gi_bytes) = group_info_bytes_opt {
                 // Do NOT rewrite `current_epoch` here. try_advance (logged as
                 // diverging at lines 1091-1100) already CAS-assigned the new
                 // epoch; binding the client-reported MLS post-commit epoch
                 // can land off-by-one from CAS+1 and desync from the
                 // `messages`/`commits` row inserted with `new_epoch`.
-                sqlx::query(
-                    r#"UPDATE conversations
-                       SET group_info = $1,
-                           group_info_epoch = COALESCE(group_info_epoch, 0) + 1,
-                           group_info_updated_at = NOW(),
-                           confirmation_tag = $3
-                       WHERE id = $2"#,
+                crate::db::store_group_info_in_tx(
+                    &mut tx,
+                    &convo_id,
+                    gi_bytes,
+                    ec_confirmation_tag.as_deref(),
                 )
-                .bind(gi_bytes)
-                .bind(&convo_id)
-                .bind(&ec_confirmation_tag)
-                .execute(&mut *tx)
                 .await
                 .map_err(|e| {
                     error!("externalCommit: failed to store GroupInfo: {}", e);
@@ -2155,6 +2143,46 @@ pub async fn commit_group_change(
                 return Err(forbidden("Not an admin of this conversation"));
             }
 
+            // ── Parse MLS epoch from GroupInfo if provided ──────────
+            let (rm_group_info_bytes, rm_mls_epoch) = if let Some(gi_bytes) = input.group_info.as_ref() {
+                let gi_slice: &[u8] = gi_bytes;
+                let epoch = {
+                    use openmls::messages::group_info::VerifiableGroupInfo;
+                    use openmls::prelude::{MlsMessageBodyIn, MlsMessageIn};
+
+                    let from_mls_msg = MlsMessageIn::tls_deserialize(&mut &*gi_slice)
+                        .ok()
+                        .and_then(|msg| match msg.extract() {
+                            MlsMessageBodyIn::GroupInfo(gi) => Some(gi.epoch().as_u64()),
+                            _ => None,
+                        });
+
+                    from_mls_msg.or_else(|| {
+                        VerifiableGroupInfo::tls_deserialize(&mut &*gi_slice)
+                            .ok()
+                            .map(|gi| gi.epoch().as_u64())
+                    })
+                };
+
+                if let Some(e) = epoch {
+                    info!(
+                        "removeMember: parsed MLS epoch {} from GroupInfo for convo {}",
+                        e,
+                        crate::crypto::redact_for_log(&convo_id)
+                    );
+                }
+
+                (Some(gi_bytes.to_vec()), epoch)
+            } else {
+                (None, None)
+            };
+
+            // ── Decode client-provided confirmation_tag ──────────
+            let rm_confirmation_tag: Option<Vec<u8>> = input
+                .confirmation_tag
+                .as_ref()
+                .map(|tag_bytes| tag_bytes.to_vec());
+
             let now = chrono::Utc::now();
 
             // ── Fetch current epoch for CAS ───────────────────────────
@@ -2267,11 +2295,41 @@ pub async fn commit_group_change(
                 })?;
             }
 
-            // ── GroupInfo: keep existing (stale is better than absent) ─
-            warn!(
-                "removeMember: no GroupInfo provided with commit for convo {} — keeping existing (may be stale)",
-                crate::crypto::redact_for_log(&convo_id)
-            );
+            // ── Store or invalidate GroupInfo (uses shared helper) ─────
+            if let Some(ref gi_bytes) = rm_group_info_bytes {
+                crate::db::store_group_info_in_tx(
+                    &mut tx,
+                    &convo_id,
+                    gi_bytes,
+                    rm_confirmation_tag.as_deref(),
+                )
+                .await
+                .map_err(|e| {
+                    error!("removeMember: failed to store GroupInfo: {}", e);
+                    internal_server_error("Failed to store GroupInfo")
+                })?;
+                info!(
+                    "removeMember: stored GroupInfo (mls_epoch={:?}, has_conf_tag={}) for convo {}",
+                    rm_mls_epoch,
+                    rm_confirmation_tag.is_some(),
+                    crate::crypto::redact_for_log(&convo_id)
+                );
+
+                if let Some(mls_epoch) = rm_mls_epoch {
+                    let mls_epoch_i32 = mls_epoch as i32;
+                    if mls_epoch_i32 != new_epoch {
+                        warn!(
+                            "removeMember: MLS epoch divergence — server epoch={}, MLS epoch={} for convo {}",
+                            new_epoch, mls_epoch_i32, crate::crypto::redact_for_log(&convo_id)
+                        );
+                    }
+                }
+            } else {
+                warn!(
+                    "removeMember: no GroupInfo provided with commit for convo {} — keeping existing (may be stale)",
+                    crate::crypto::redact_for_log(&convo_id)
+                );
+            }
 
             // ── Store commit message ───────────────────────────────────
             let msg_id = uuid::Uuid::new_v4().to_string();
