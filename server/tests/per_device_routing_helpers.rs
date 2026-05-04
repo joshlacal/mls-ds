@@ -67,6 +67,9 @@ mod common;
 // that's the RED state. If you're staring at a compile error pointing at
 // this `use`, that's the test working as designed.
 use catbird_server::db::store_welcomes_per_device_in_tx;
+// Task 7 will introduce this symbol — see the per-device-members section
+// at the bottom of this file. Today's import fails to compile (RED).
+use catbird_server::db::insert_members_per_device_in_tx;
 use catbird_server::generated::blue_catbird::mlsChat::bootstrap_reset_group::KeyPackageHashEntry;
 use catbird_server::sqlx_jacquard::string_to_did;
 use chrono::Utc;
@@ -107,6 +110,50 @@ fn make_kp_entry(did_str: &'static str, hash_hex: &'static str) -> KeyPackageHas
         hash: hash_hex.into(),
         extra_data: Default::default(),
     }
+}
+
+/// Seed a `users` row so the `key_packages.owner_did → users(did)` FK is
+/// satisfied. Idempotent across reruns (same DID).
+async fn seed_user(pool: &PgPool, did: &str) {
+    sqlx::query("INSERT INTO users (did) VALUES ($1) ON CONFLICT (did) DO NOTHING")
+        .bind(did)
+        .execute(pool)
+        .await
+        .expect("seed users row");
+}
+
+/// Seed a `key_packages` row that the per-device-members helper will look up
+/// via `(owner_did, key_package_hash)` to recover the device_id. `device_id`
+/// may be `None` to exercise the user-flat fallback path.
+///
+/// Note: `key_packages.key_package_hash` is `TEXT` (the hex string), NOT
+/// `BYTEA`. This is intentionally different from `welcome_messages.key_package_hash`
+/// which IS `BYTEA`. Task 7's lookup query MUST bind the hex string directly
+/// (i.e. `entry.hash`), not `hex::decode(&entry.hash)` — otherwise every
+/// lookup silently misses and the helper falls into the user-flat fallback
+/// path, which would make tests 1 and 3 fail with `device_id = NULL`.
+async fn seed_key_package(
+    pool: &PgPool,
+    owner_did: &str,
+    hash_hex: &str,
+    device_id: Option<&str>,
+) {
+    seed_user(pool, owner_did).await;
+    sqlx::query(
+        "INSERT INTO key_packages \
+            (id, owner_did, device_id, cipher_suite, key_package, key_package_hash, created_at, expires_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW() + INTERVAL '30 days') \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(owner_did)
+    .bind(device_id)
+    .bind(CIPHER_SUITE)
+    .bind::<&[u8]>(&[]) // dummy key_package bytes — content irrelevant to the lookup
+    .bind(hash_hex)
+    .execute(pool)
+    .await
+    .expect("seed key_packages row");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -298,6 +345,347 @@ async fn store_welcomes_per_device_empty_kp_hashes_writes_nothing() {
     assert_eq!(
         count, 0,
         "empty kp_hashes must produce zero welcome_messages rows"
+    );
+
+    common::cleanup(&pool, &convo_id).await;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//
+//                  insert_members_per_device_in_tx — RED
+//
+// Task 7 will introduce this helper. Today's import at the top of this file
+// fails to compile, which is the RED state.
+//
+// Helper signature Task 7 will land:
+//
+// ```ignore
+// pub async fn insert_members_per_device_in_tx<'a>(
+//     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+//     convo_id: &str,
+//     kp_hashes: &[KeyPackageHashEntry<'a>],
+//     joined_at: chrono::DateTime<chrono::Utc>,
+//     is_admin: bool,
+// ) -> sqlx::Result<()>
+// ```
+//
+// Behavior:
+//   - For each `KeyPackageHashEntry`:
+//       1. `user_did = did_to_string(&entry.did)` (jacquard `Did` rejects `#`,
+//          so this is the bare-form user DID).
+//       2. `hash_bytes = hex::decode(&entry.hash)`. On error, `continue`
+//          (defensive skip — same pattern as the welcomes helper).
+//       3. Lookup `device_id` via
+//          `SELECT device_id FROM key_packages WHERE owner_did = $1 AND key_package_hash = $2`.
+//          IMPORTANT: `key_packages.key_package_hash` is `TEXT` (hex string),
+//          so the second bind MUST be `&entry.hash` (the hex string), NOT
+//          `hash_bytes` (the decoded BYTEA). The decoded form is for
+//          `welcome_messages.key_package_hash` only.
+//       4. If `device_id = Some(d)`: `member_did = format!("{}#{}", user_did, d)`,
+//          store with `device_id = Some(d)`. Note: `members.member_did` is
+//          plain TEXT — we deliberately bypass jacquard's `#`-rejection by
+//          building the string here and storing it as TEXT.
+//       5. If `device_id = None` (kp_hash not in table OR null device_id):
+//          fall back to user-flat — `member_did = user_did`, `device_id = NULL`.
+//          This preserves the legacy behavior of the inline addMembers loop
+//          at `commit_group_change.rs:595-616`.
+//       6. INSERT into `members (convo_id, member_did, user_did, device_id, joined_at, is_admin)`
+//          with ON CONFLICT (convo_id, member_did) DO UPDATE SET
+//          left_at = NULL, needs_rejoin = false (mirrors the existing re-add
+//          pattern in addMembers).
+//   - Empty `kp_hashes` slice ⇒ no-op return Ok(()).
+//
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test 4 — happy path: per-device member rows when device_id is known
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `insert_members_per_device_in_tx` MUST insert one row per
+/// `KeyPackageHashEntry` into `members`, with each row carrying a
+/// `member_did` of the form `"{user_did}#{device_id}"`, the bare `user_did`
+/// in the `user_did` column, and the looked-up `device_id` populated. This
+/// is the per-device routing contract: each device has a unique MLS leaf,
+/// each leaf gets its own row, and SSE/push fan-out can target devices
+/// individually instead of flooding every active session for a given user.
+#[tokio::test]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL); RED until Task 7 lands the helper"]
+async fn insert_members_per_device_writes_one_row_per_kp_hash_with_device_id() {
+    let pool = common::setup_test_db().await;
+    let convo_id = format!("convo-perdev-mem-1-{}", Uuid::new_v4());
+    common::cleanup(&pool, &convo_id).await;
+    seed_convo(&pool, &convo_id).await;
+
+    // Bare-form DIDs (jacquard-valid). Per-test unique prefixes bound the
+    // blast radius of accumulated key_packages rows across reruns —
+    // there's no UNIQUE constraint on (owner_did, key_package_hash), so
+    // distinct DID prefixes per test prevent cross-test contamination.
+    let alice_did = "did:plc:perdev1aliceaaa";
+    let bob_did = "did:plc:perdev1bobbbbbbb";
+
+    // Three "devices" — Alice on devices a + b, Bob on device x.
+    let alice_a_hash_hex = "aa11";
+    let alice_b_hash_hex = "bb22";
+    let bob_a_hash_hex = "cc33";
+
+    seed_key_package(&pool, alice_did, alice_a_hash_hex, Some("device-a")).await;
+    seed_key_package(&pool, alice_did, alice_b_hash_hex, Some("device-b")).await;
+    seed_key_package(&pool, bob_did, bob_a_hash_hex, Some("device-x")).await;
+
+    let kp_hashes = vec![
+        make_kp_entry(alice_did, alice_a_hash_hex),
+        make_kp_entry(alice_did, alice_b_hash_hex),
+        make_kp_entry(bob_did, bob_a_hash_hex),
+    ];
+
+    {
+        let mut tx = pool.begin().await.expect("begin tx");
+        insert_members_per_device_in_tx(&mut tx, &convo_id, &kp_hashes, Utc::now(), false)
+            .await
+            .expect("helper returned error");
+        tx.commit().await.expect("commit tx");
+    }
+
+    let rows = sqlx::query(
+        "SELECT member_did, user_did, device_id, is_admin, left_at, needs_rejoin \
+         FROM members \
+         WHERE convo_id = $1 \
+         ORDER BY member_did",
+    )
+    .bind(&convo_id)
+    .fetch_all(&pool)
+    .await
+    .expect("fetch members rows");
+
+    assert_eq!(rows.len(), 3, "expected one row per kp_hash entry");
+
+    // Row 0: alice#device-a (sorts before alice#device-b lexicographically)
+    let r0_member: String = rows[0].get("member_did");
+    let r0_user: Option<String> = rows[0].get("user_did");
+    let r0_device: Option<String> = rows[0].get("device_id");
+    let r0_admin: bool = rows[0].get("is_admin");
+    let r0_left: Option<chrono::DateTime<Utc>> = rows[0].get("left_at");
+    let r0_rejoin: bool = rows[0].get("needs_rejoin");
+    assert_eq!(
+        r0_member,
+        format!("{}#{}", alice_did, "device-a"),
+        "member_did must be {{user_did}}#{{device_id}}"
+    );
+    assert_eq!(r0_user, Some(alice_did.to_string()));
+    assert_eq!(r0_device, Some("device-a".to_string()));
+    assert!(!r0_admin, "is_admin must be false (input)");
+    assert!(r0_left.is_none(), "fresh row left_at NULL");
+    assert!(!r0_rejoin, "fresh row needs_rejoin false");
+
+    // Row 1: alice#device-b
+    let r1_member: String = rows[1].get("member_did");
+    let r1_user: Option<String> = rows[1].get("user_did");
+    let r1_device: Option<String> = rows[1].get("device_id");
+    assert_eq!(r1_member, format!("{}#{}", alice_did, "device-b"));
+    assert_eq!(r1_user, Some(alice_did.to_string()));
+    assert_eq!(r1_device, Some("device-b".to_string()));
+
+    // Row 2: bob#device-x
+    let r2_member: String = rows[2].get("member_did");
+    let r2_user: Option<String> = rows[2].get("user_did");
+    let r2_device: Option<String> = rows[2].get("device_id");
+    assert_eq!(r2_member, format!("{}#{}", bob_did, "device-x"));
+    assert_eq!(r2_user, Some(bob_did.to_string()));
+    assert_eq!(r2_device, Some("device-x".to_string()));
+
+    common::cleanup(&pool, &convo_id).await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test 5 — fallback: user-flat row when device_id can't be resolved
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// When a `KeyPackageHashEntry`'s `(owner_did, key_package_hash)` does NOT
+/// match a `key_packages` row (legacy clients without device_id, or the
+/// kp_hash isn't in the table), the helper MUST fall back to user-flat
+/// semantics: `member_did = user_did`, `device_id = NULL`. This preserves
+/// the existing inline addMembers behavior at `commit_group_change.rs:595-616`,
+/// where the bare user DID is used both as `member_did` and `user_did`.
+///
+/// Without this fallback, legacy clients would simply not appear in the
+/// roster — a regression. The fallback path is the migration safety net.
+#[tokio::test]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL); RED until Task 7 lands the helper"]
+async fn insert_members_per_device_falls_back_to_user_flat_when_device_id_missing() {
+    let pool = common::setup_test_db().await;
+    let convo_id = format!("convo-perdev-mem-2-{}", Uuid::new_v4());
+    common::cleanup(&pool, &convo_id).await;
+    seed_convo(&pool, &convo_id).await;
+
+    let alice_did = "did:plc:perdev2alicedddd";
+
+    // Deliberately do NOT seed key_packages — the helper's lookup MUST miss
+    // and the fallback path MUST run. (We could alternatively seed with
+    // device_id = NULL; the contract is the same either way.)
+    let kp_hashes = vec![make_kp_entry(alice_did, "ddee")];
+
+    {
+        let mut tx = pool.begin().await.expect("begin tx");
+        insert_members_per_device_in_tx(&mut tx, &convo_id, &kp_hashes, Utc::now(), false)
+            .await
+            .expect("helper returned error");
+        tx.commit().await.expect("commit tx");
+    }
+
+    let row = sqlx::query(
+        "SELECT member_did, user_did, device_id FROM members WHERE convo_id = $1",
+    )
+    .bind(&convo_id)
+    .fetch_one(&pool)
+    .await
+    .expect("fetch members row");
+
+    let member: String = row.get("member_did");
+    let user: Option<String> = row.get("user_did");
+    let device: Option<String> = row.get("device_id");
+
+    assert_eq!(
+        member, alice_did,
+        "fallback MUST use the bare user-form DID as member_did"
+    );
+    assert_eq!(
+        user,
+        Some(alice_did.to_string()),
+        "user_did mirrors member_did in fallback (legacy parity)"
+    );
+    assert_eq!(
+        device, None,
+        "fallback MUST leave device_id NULL — there's no device to record"
+    );
+
+    common::cleanup(&pool, &convo_id).await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test 6 — re-add: ON CONFLICT clears `left_at` and `needs_rejoin`
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `insert_members_per_device_in_tx` MUST mirror the inline addMembers
+/// re-add behavior from `commit_group_change.rs:597-616`: ON CONFLICT
+/// `(convo_id, member_did)` DO UPDATE SET `left_at = NULL,
+/// needs_rejoin = false`. This is what makes "rejoin a group I previously
+/// left" idempotent — the second commit doesn't blow up on a primary-key
+/// violation, and the device row is reactivated rather than duplicated.
+///
+/// Without this clause, post-leave rejoins would error and the user would
+/// be stranded outside the group despite a valid Welcome.
+#[tokio::test]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL); RED until Task 7 lands the helper"]
+async fn insert_members_per_device_re_add_clears_left_at() {
+    let pool = common::setup_test_db().await;
+    let convo_id = format!("convo-perdev-mem-3-{}", Uuid::new_v4());
+    common::cleanup(&pool, &convo_id).await;
+    seed_convo(&pool, &convo_id).await;
+
+    let alice_did = "did:plc:perdev3alicefffff";
+    let hash_hex = "eeff";
+    seed_key_package(&pool, alice_did, hash_hex, Some("device-r")).await;
+
+    let kp_hashes = vec![make_kp_entry(alice_did, hash_hex)];
+
+    // First add — establishes the device row.
+    {
+        let mut tx = pool.begin().await.expect("begin tx");
+        insert_members_per_device_in_tx(&mut tx, &convo_id, &kp_hashes, Utc::now(), false)
+            .await
+            .expect("first insert returned error");
+        tx.commit().await.expect("commit first tx");
+    }
+
+    // Simulate the user leaving and being marked for rejoin.
+    sqlx::query(
+        "UPDATE members SET left_at = NOW(), needs_rejoin = true \
+         WHERE convo_id = $1 AND member_did = $2",
+    )
+    .bind(&convo_id)
+    .bind(format!("{}#{}", alice_did, "device-r"))
+    .execute(&pool)
+    .await
+    .expect("mark left/rejoin");
+
+    // Sanity: assert the simulated-leave UPDATE actually took effect, so
+    // the post-re-add assertion can't pass vacuously.
+    let pre = sqlx::query(
+        "SELECT left_at, needs_rejoin FROM members WHERE convo_id = $1",
+    )
+    .bind(&convo_id)
+    .fetch_one(&pool)
+    .await
+    .expect("pre-readback");
+    let pre_left: Option<chrono::DateTime<Utc>> = pre.get("left_at");
+    let pre_rejoin: bool = pre.get("needs_rejoin");
+    assert!(pre_left.is_some(), "sanity: simulated-leave must populate left_at");
+    assert!(pre_rejoin, "sanity: simulated-leave must set needs_rejoin");
+
+    // Re-add with the same kp_hashes — ON CONFLICT path.
+    {
+        let mut tx = pool.begin().await.expect("begin tx");
+        insert_members_per_device_in_tx(&mut tx, &convo_id, &kp_hashes, Utc::now(), false)
+            .await
+            .expect("re-add returned error");
+        tx.commit().await.expect("commit re-add tx");
+    }
+
+    let row = sqlx::query("SELECT left_at, needs_rejoin FROM members WHERE convo_id = $1")
+        .bind(&convo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("post-readback");
+    let left: Option<chrono::DateTime<Utc>> = row.get("left_at");
+    let rejoin: bool = row.get("needs_rejoin");
+    assert!(
+        left.is_none(),
+        "re-add MUST clear left_at via ON CONFLICT DO UPDATE"
+    );
+    assert!(
+        !rejoin,
+        "re-add MUST clear needs_rejoin via ON CONFLICT DO UPDATE"
+    );
+
+    common::cleanup(&pool, &convo_id).await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test 7 — empty kp_hashes is a no-op
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Empty `kp_hashes` slice ⇒ helper writes nothing and returns Ok. Mirrors
+/// the welcomes helper's empty-input contract: a commit with zero
+/// new-member proposals must NOT manufacture phantom roster rows. This
+/// matters because `commit_group_change` calls the per-device helpers
+/// unconditionally on the addMembers path; the no-op-on-empty contract is
+/// what lets the caller skip the kp_hashes-presence guard at the call site.
+#[tokio::test]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL); RED until Task 7 lands the helper"]
+async fn insert_members_per_device_empty_kp_hashes_writes_nothing() {
+    let pool = common::setup_test_db().await;
+    let convo_id = format!("convo-perdev-mem-4-{}", Uuid::new_v4());
+    common::cleanup(&pool, &convo_id).await;
+    seed_convo(&pool, &convo_id).await;
+
+    let empty: Vec<KeyPackageHashEntry<'static>> = Vec::new();
+
+    {
+        let mut tx = pool.begin().await.expect("begin tx");
+        insert_members_per_device_in_tx(&mut tx, &convo_id, &empty, Utc::now(), false)
+            .await
+            .expect("helper returned error on empty input — must be no-op Ok");
+        tx.commit().await.expect("commit tx");
+    }
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM members WHERE convo_id = $1")
+        .bind(&convo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count members rows");
+    assert_eq!(
+        count, 0,
+        "empty kp_hashes MUST produce zero members rows"
     );
 
     common::cleanup(&pool, &convo_id).await;
