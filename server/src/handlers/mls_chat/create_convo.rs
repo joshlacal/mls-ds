@@ -641,20 +641,78 @@ async fn handle_create_convo(
             all_member_dids.len()
         );
 
-        for member_did_str in all_member_dids.iter() {
-            let member_hashes: Vec<Vec<u8>> = input
-                .key_package_hashes
-                .as_ref()
-                .map(|hashes| {
-                    hashes
-                        .iter()
-                        .filter(|entry| did_to_string(&entry.did) == *member_did_str)
-                        .filter_map(|entry| hex::decode(&*entry.hash).ok())
-                        .collect()
-                })
-                .unwrap_or_default();
+        // ── Store welcome (per-device when kp_hashes provided; user-flat fallback otherwise) ──
+        // Mirrors Task 4's addMembers shape (commit 1284301): top-level conditional, single
+        // path through the per-device helper when kp_hashes are present, legacy user-flat path
+        // otherwise. The MLS welcome_bytes is itself a multi-recipient blob — each device
+        // decrypts only its own EncryptedGroupSecrets entry — so storing identical welcome_data
+        // across N rows is correct; per-device discrimination lives in key_package_hash. See
+        // docs/superpowers/plans/2026-05-04-mls-per-device-welcome-and-members-routing.md.
+        //
+        // Behavior delta vs the prior per-member loop: when kp_hashes is Some(non-empty) but
+        // does not include an entry for some `member_did`, that member no longer receives a
+        // user-flat fallback row. This is intentional and authorized by the plan ("you may
+        // consolidate to a single per-device path with fallback"): a member whose key package
+        // wasn't included in the inviter's Welcome cannot decrypt it anyway, so the omitted
+        // row was dead storage. The fallback path (kp_hashes None/empty) preserves the legacy
+        // every-member behavior unchanged.
+        //
+        // The helper requires `&mut Transaction`; the conversation-creation tx already
+        // committed at line ~480, so we open a fresh tx scoped to the welcome inserts.
+        let mut welcome_tx = pool.begin().await.map_err(|e| {
+            error!("❌ [v2.createConvo] Failed to begin welcome tx: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        })?;
 
-            if member_hashes.is_empty() {
+        let kp_hashes_for_welcomes = input.key_package_hashes.as_ref();
+        let used_per_device_path = match kp_hashes_for_welcomes {
+            Some(hashes) if !hashes.is_empty() => {
+                // Convert from create_convo::KeyPackageHashEntry to
+                // bootstrap_reset_group::KeyPackageHashEntry (helper's accepted type).
+                // jacquard generates nominally distinct types per lexicon module even
+                // though their fields are identical — see Task 3 (commit a60b8af) for
+                // context. The conversion is a mechanical field copy.
+                let converted: Vec<crate::generated::blue_catbird::mlsChat::bootstrap_reset_group::KeyPackageHashEntry> = hashes
+                    .iter()
+                    .map(|e| crate::generated::blue_catbird::mlsChat::bootstrap_reset_group::KeyPackageHashEntry {
+                        did: e.did.clone(),
+                        hash: e.hash.clone(),
+                        extra_data: Default::default(),
+                    })
+                    .collect();
+                let count = converted.len();
+                crate::db::store_welcomes_per_device_in_tx(
+                    &mut welcome_tx,
+                    &convo_id,
+                    &welcome_data,
+                    &converted,
+                    &auth_user.did,
+                )
+                .await
+                .map_err(|e| {
+                    error!(
+                        "❌ [v2.createConvo] failed to store per-device welcomes: {}",
+                        e
+                    );
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                })?;
+                info!(
+                    "createConvo: stored {} per-device welcome rows for convo {}",
+                    count,
+                    crate::crypto::redact_for_log(&convo_id)
+                );
+                true
+            }
+            _ => false,
+        };
+
+        // Legacy user-flat fallback: only runs when kp_hashes was None or empty.
+        if !used_per_device_path {
+            warn!(
+                "createConvo: key_package_hashes absent/empty — falling back to user-flat welcome storage for convo {}",
+                crate::crypto::redact_for_log(&convo_id)
+            );
+            for member_did_str in all_member_dids.iter() {
                 let welcome_id = uuid::Uuid::new_v4().to_string();
                 sqlx::query(
                     "INSERT INTO welcome_messages (id, convo_id, recipient_did, welcome_data, key_package_hash, created_at)
@@ -668,36 +726,19 @@ async fn handle_create_convo(
                 .bind(&welcome_data)
                 .bind::<Option<Vec<u8>>>(None)
                 .bind(now)
-                .execute(&pool)
+                .execute(&mut *welcome_tx)
                 .await
                 .map_err(|e| {
-                    error!("❌ [v2.createConvo] store welcome for {}: {}", crate::crypto::redact_for_log(member_did_str), e);
+                    error!("❌ [v2.createConvo] store user-flat welcome for {}: {}", crate::crypto::redact_for_log(member_did_str), e);
                     StatusCode::INTERNAL_SERVER_ERROR.into_response()
                 })?;
-            } else {
-                for hash in member_hashes {
-                    let welcome_id = uuid::Uuid::new_v4().to_string();
-                    sqlx::query(
-                        "INSERT INTO welcome_messages (id, convo_id, recipient_did, welcome_data, key_package_hash, created_at)
-                         VALUES ($1, $2, $3, $4, $5, $6)
-                         ON CONFLICT (convo_id, recipient_did, COALESCE(key_package_hash, '\\x00'::bytea)) WHERE consumed = false
-                         DO NOTHING",
-                    )
-                    .bind(&welcome_id)
-                    .bind(&convo_id)
-                    .bind(member_did_str)
-                    .bind(&welcome_data)
-                    .bind(Some(hash))
-                    .bind(now)
-                    .execute(&pool)
-                    .await
-                    .map_err(|e| {
-                        error!("❌ [v2.createConvo] store welcome for {}: {}", crate::crypto::redact_for_log(member_did_str), e);
-                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
-                    })?;
-                }
             }
         }
+
+        welcome_tx.commit().await.map_err(|e| {
+            error!("❌ [v2.createConvo] Failed to commit welcome tx: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        })?;
 
         // Mark key packages as consumed
         if let Some(ref kp_hashes) = input.key_package_hashes {
