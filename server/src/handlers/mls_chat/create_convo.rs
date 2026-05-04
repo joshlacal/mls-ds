@@ -482,22 +482,194 @@ async fn handle_create_convo(
         StatusCode::INTERNAL_SERVER_ERROR.into_response()
     })?;
 
-    // ── Add creator as admin member ──────────────────────────────────────
-    tracing::debug!("📍 [v2.createConvo] adding creator membership");
-    sqlx::query(
-        "INSERT INTO members (convo_id, member_did, user_did, joined_at, is_admin) VALUES ($1, $2, $3, $4, true)",
-    )
-    .bind(&convo_id)
-    .bind(&auth_user.did)
-    .bind(&auth_user.did)
-    .bind(now)
-    .execute(&pool)
-    .await
-    .map_err(|e| {
-        error!("❌ [v2.createConvo] Failed to add creator membership: {}", e);
+    // ── Add creator as admin member + initial members ──────────────────
+    // Per-device when kp_hashes provided; user-flat fallback otherwise.
+    // The kp_hashes path resolves device_id from key_packages and inserts
+    // member_did = "{user_did}#{device_id}" (Task 7 helper) so SSE/push
+    // fan-out can target individual devices instead of flooding every
+    // active session for a user. Mirrors Task 7's addMembers refactor
+    // (commit 110fcce) and Task 4's per-device welcome shape (commit
+    // 2b95378). See
+    // docs/superpowers/plans/2026-05-04-mls-per-device-welcome-and-members-routing.md.
+    //
+    // Behavior delta vs the prior two auto-commit inserts (admin at
+    // ~488, members loop at ~528): when kp_hashes is Some(non-empty) but
+    // does not include an entry for some member_did, that member no
+    // longer receives a user-flat row. Authorized by the plan ("you may
+    // consolidate to a single per-device path with fallback") — the
+    // omitted row is dead storage anyway since the MLS Welcome cannot
+    // decrypt for a recipient whose key package wasn't included by the
+    // creator. Fallback path (kp_hashes None/empty) preserves legacy
+    // every-member behavior unchanged.
+    //
+    // Atomicity improvement: today admin and members are two separate
+    // auto-commits on `&pool` (so a partial failure leaves an admin row
+    // without the members rows). The helper requires `&mut Transaction`,
+    // so we open a fresh `members_tx` scoped to both inserts and commit
+    // it before the welcome flow opens its own tx (the conversation tx
+    // already committed at ~480).
+    let mut members_tx = pool.begin().await.map_err(|e| {
+        error!("❌ [v2.createConvo] Failed to begin members tx: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR.into_response()
     })?;
 
+    let used_per_device_members_path = match input.key_package_hashes.as_ref() {
+        Some(hashes) if !hashes.is_empty() => {
+            // Convert from create_convo::KeyPackageHashEntry to
+            // bootstrap_reset_group::KeyPackageHashEntry (helper's accepted type).
+            // jacquard generates nominally distinct types per lexicon module even
+            // though their fields are identical — see Task 3 (commit a60b8af).
+            let converted: Vec<crate::generated::blue_catbird::mlsChat::bootstrap_reset_group::KeyPackageHashEntry> = hashes
+                .iter()
+                .map(|e| crate::generated::blue_catbird::mlsChat::bootstrap_reset_group::KeyPackageHashEntry {
+                    did: e.did.clone(),
+                    hash: e.hash.clone(),
+                    extra_data: Default::default(),
+                })
+                .collect();
+
+            // Partition kp_hashes into admin (creator's devices) and non-admin
+            // (everyone else's devices). The lexicon Did<'_> needs string conversion
+            // before equality with `auth_user.did`.
+            let (admin_entries, member_entries): (Vec<_>, Vec<_>) = converted
+                .into_iter()
+                .partition(|e| did_to_string(&e.did) == auth_user.did);
+
+            // Admin: one row per creator device when kp_hashes covers any of them.
+            // Fallback to legacy single-row admin insert when the creator omitted
+            // their own kp from kp_hashes (some clients only include invitee kps).
+            if !admin_entries.is_empty() {
+                let admin_count = admin_entries.len();
+                crate::db::insert_members_per_device_in_tx(
+                    &mut members_tx,
+                    &convo_id,
+                    &admin_entries,
+                    now,
+                    true,
+                )
+                .await
+                .map_err(|e| {
+                    error!(
+                        "❌ [v2.createConvo] failed to insert per-device admin: {}",
+                        e
+                    );
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                })?;
+                info!(
+                    "createConvo: inserted {} per-device admin rows for convo {}",
+                    admin_count,
+                    crate::crypto::redact_for_log(&convo_id)
+                );
+            } else {
+                // No admin kp in kp_hashes — preserve legacy single-row admin so
+                // the creator stays a member of the conversation regardless.
+                sqlx::query(
+                    "INSERT INTO members (convo_id, member_did, user_did, joined_at, is_admin) VALUES ($1, $2, $3, $4, true)",
+                )
+                .bind(&convo_id)
+                .bind(&auth_user.did)
+                .bind(&auth_user.did)
+                .bind(now)
+                .execute(&mut *members_tx)
+                .await
+                .map_err(|e| {
+                    error!(
+                        "❌ [v2.createConvo] Failed to add creator membership (legacy fallback): {}",
+                        e
+                    );
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                })?;
+                info!(
+                    "createConvo: kp_hashes had no entry for creator — wrote single user-flat admin row for convo {}",
+                    crate::crypto::redact_for_log(&convo_id)
+                );
+            }
+
+            // Non-admin members: one row per device.
+            if !member_entries.is_empty() {
+                let member_count = member_entries.len();
+                crate::db::insert_members_per_device_in_tx(
+                    &mut members_tx,
+                    &convo_id,
+                    &member_entries,
+                    now,
+                    false,
+                )
+                .await
+                .map_err(|e| {
+                    error!(
+                        "❌ [v2.createConvo] failed to insert per-device members: {}",
+                        e
+                    );
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                })?;
+                info!(
+                    "createConvo: inserted {} per-device member rows for convo {}",
+                    member_count,
+                    crate::crypto::redact_for_log(&convo_id)
+                );
+            }
+            true
+        }
+        _ => false,
+    };
+
+    if !used_per_device_members_path {
+        // Legacy user-flat fallback — kp_hashes was None or empty.
+        warn!(
+            "createConvo: key_package_hashes absent/empty — falling back to user-flat members storage for convo {}",
+            crate::crypto::redact_for_log(&convo_id)
+        );
+        tracing::debug!("📍 [v2.createConvo] adding creator membership (legacy)");
+        sqlx::query(
+            "INSERT INTO members (convo_id, member_did, user_did, joined_at, is_admin) VALUES ($1, $2, $3, $4, true)",
+        )
+        .bind(&convo_id)
+        .bind(&auth_user.did)
+        .bind(&auth_user.did)
+        .bind(now)
+        .execute(&mut *members_tx)
+        .await
+        .map_err(|e| {
+            error!("❌ [v2.createConvo] Failed to add creator membership: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        })?;
+
+        if let Some(ref initial_members) = input.initial_members {
+            tracing::debug!("📍 [v2.createConvo] adding initial members (legacy)");
+            for (idx, member_did) in initial_members.iter().enumerate() {
+                let member_did_str = did_to_string(member_did);
+
+                if member_did_str == auth_user.did {
+                    continue;
+                }
+
+                info!("📍 [v2.createConvo] Adding member {} (legacy)", idx + 1);
+                sqlx::query(
+                    "INSERT INTO members (convo_id, member_did, user_did, joined_at, is_admin) VALUES ($1, $2, $3, $4, false)",
+                )
+                .bind(&convo_id)
+                .bind(&member_did_str)
+                .bind(&member_did_str)
+                .bind(now)
+                .execute(&mut *members_tx)
+                .await
+                .map_err(|e| {
+                    error!("❌ [v2.createConvo] Failed to add member: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                })?;
+            }
+        }
+    }
+
+    members_tx.commit().await.map_err(|e| {
+        error!("❌ [v2.createConvo] Failed to commit members tx: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+    })?;
+
+    // Build MemberView list for the response unchanged (per-device storage is
+    // a server-side roster representation; the lexicon-level MemberView still
+    // models user-flat semantics with leaf_index ordering for now).
     let mut members_typed: Vec<MemberView<'static>> = vec![MemberView {
         did: string_to_did(&creator_did),
         user_did: string_to_did(&creator_did),
@@ -513,30 +685,13 @@ async fn handle_create_convo(
         extra_data: Default::default(),
     }];
 
-    // ── Add initial members ──────────────────────────────────────────────
     if let Some(ref initial_members) = input.initial_members {
-        tracing::debug!("📍 [v2.createConvo] adding initial members");
         for (idx, member_did) in initial_members.iter().enumerate() {
             let member_did_str = did_to_string(member_did);
 
             if member_did_str == auth_user.did {
                 continue;
             }
-
-            info!("📍 [v2.createConvo] Adding member {}", idx + 1);
-            sqlx::query(
-                "INSERT INTO members (convo_id, member_did, user_did, joined_at, is_admin) VALUES ($1, $2, $3, $4, false)",
-            )
-            .bind(&convo_id)
-            .bind(&member_did_str)
-            .bind(&member_did_str)
-            .bind(now)
-            .execute(&pool)
-            .await
-            .map_err(|e| {
-                error!("❌ [v2.createConvo] Failed to add member: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
-            })?;
 
             members_typed.push(MemberView {
                 did: string_to_did(&member_did_str),
