@@ -416,6 +416,70 @@ pub async fn store_group_info_in_tx(
     .map(|_| ())
 }
 
+/// Insert one `welcome_messages` row per `key_package_hash` entry,
+/// fanning out a single Welcome message to every recipient device of
+/// every recipient user.
+///
+/// Each row uses user-form `recipient_did` from the entry (the
+/// jacquard `Did<'a>` type rejects `#` so device-form DIDs aren't
+/// representable here); per-device discrimination lives in
+/// `key_package_hash`. The MLS `welcome_bytes` is a multi-recipient
+/// blob — each device decrypts only its own `EncryptedGroupSecrets`
+/// entry — so identical `welcome_data` across N rows is correct.
+///
+/// Mirrors the inline pattern at `bootstrap_reset_group.rs:563-594`,
+/// with one deliberate addition: this helper persists `created_by_did
+/// = sender_did` (audit-trail fix the per-device routing plan calls
+/// out). Hex-decode failures are skipped defensively (mirrors the
+/// inline `continue` at `bootstrap_reset_group.rs:569`). `kp_hashes`
+/// empty ⇒ no-op `Ok(())`.
+///
+/// Caller owns the transaction's commit/rollback — this only stages
+/// the per-row INSERTs.
+///
+/// Note: jacquard generates a separate `KeyPackageHashEntry` struct
+/// per lexicon module. This helper takes the
+/// `bootstrap_reset_group::KeyPackageHashEntry` form to match the
+/// test contract; call sites holding the `commit_group_change` form
+/// (e.g. `addMembers`, `processExternalCommit` arms) must convert at
+/// the boundary. A future refactor can hoist the helper to a trait if
+/// the duplication becomes onerous.
+pub async fn store_welcomes_per_device_in_tx<'a>(
+    tx: &mut Transaction<'_, Postgres>,
+    convo_id: &str,
+    welcome_bytes: &[u8],
+    kp_hashes: &[crate::generated::blue_catbird::mlsChat::bootstrap_reset_group::KeyPackageHashEntry<
+        'a,
+    >],
+    sender_did: &str,
+) -> sqlx::Result<()> {
+    for entry in kp_hashes {
+        let recipient = crate::sqlx_jacquard::did_to_string(&entry.did);
+        let hash_hex: &str = &entry.hash;
+        let hash_bytes = match hex::decode(hash_hex) {
+            Ok(b) => b,
+            Err(_) => continue, // Defensive: skip malformed hex (mirrors bootstrap_reset_group:569).
+        };
+        let welcome_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO welcome_messages \
+                (id, convo_id, recipient_did, welcome_data, key_package_hash, created_by_did, created_at, consumed) \
+             VALUES ($1, $2, $3, $4, $5, $6, NOW(), false) \
+             ON CONFLICT (convo_id, recipient_did, COALESCE(key_package_hash, '\\x00'::bytea)) WHERE consumed = false \
+             DO NOTHING",
+        )
+        .bind(&welcome_id)
+        .bind(convo_id)
+        .bind(&recipient)
+        .bind(welcome_bytes)
+        .bind(Some(hash_bytes))
+        .bind(sender_did)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
 /// Snapshot of the post-bump health counters returned by
 /// [`record_commit_409`]. Used by the inline trigger path
 /// (Phase 2 B5 — `jobs::auto_detect_failed_groups::maybe_trigger_inline_reset`)
