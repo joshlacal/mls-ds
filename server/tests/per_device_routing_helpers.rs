@@ -132,12 +132,7 @@ async fn seed_user(pool: &PgPool, did: &str) {
 /// (i.e. `entry.hash`), not `hex::decode(&entry.hash)` — otherwise every
 /// lookup silently misses and the helper falls into the user-flat fallback
 /// path, which would make tests 1 and 3 fail with `device_id = NULL`.
-async fn seed_key_package(
-    pool: &PgPool,
-    owner_did: &str,
-    hash_hex: &str,
-    device_id: Option<&str>,
-) {
+async fn seed_key_package(pool: &PgPool, owner_did: &str, hash_hex: &str, device_id: Option<&str>) {
     seed_user(pool, owner_did).await;
     sqlx::query(
         "INSERT INTO key_packages \
@@ -532,13 +527,12 @@ async fn insert_members_per_device_falls_back_to_user_flat_when_device_id_missin
         tx.commit().await.expect("commit tx");
     }
 
-    let row = sqlx::query(
-        "SELECT member_did, user_did, device_id FROM members WHERE convo_id = $1",
-    )
-    .bind(&convo_id)
-    .fetch_one(&pool)
-    .await
-    .expect("fetch members row");
+    let row =
+        sqlx::query("SELECT member_did, user_did, device_id FROM members WHERE convo_id = $1")
+            .bind(&convo_id)
+            .fetch_one(&pool)
+            .await
+            .expect("fetch members row");
 
     let member: String = row.get("member_did");
     let user: Option<String> = row.get("user_did");
@@ -610,16 +604,17 @@ async fn insert_members_per_device_re_add_clears_left_at() {
 
     // Sanity: assert the simulated-leave UPDATE actually took effect, so
     // the post-re-add assertion can't pass vacuously.
-    let pre = sqlx::query(
-        "SELECT left_at, needs_rejoin FROM members WHERE convo_id = $1",
-    )
-    .bind(&convo_id)
-    .fetch_one(&pool)
-    .await
-    .expect("pre-readback");
+    let pre = sqlx::query("SELECT left_at, needs_rejoin FROM members WHERE convo_id = $1")
+        .bind(&convo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("pre-readback");
     let pre_left: Option<chrono::DateTime<Utc>> = pre.get("left_at");
     let pre_rejoin: bool = pre.get("needs_rejoin");
-    assert!(pre_left.is_some(), "sanity: simulated-leave must populate left_at");
+    assert!(
+        pre_left.is_some(),
+        "sanity: simulated-leave must populate left_at"
+    );
     assert!(pre_rejoin, "sanity: simulated-leave must set needs_rejoin");
 
     // Re-add with the same kp_hashes — ON CONFLICT path.
@@ -683,10 +678,7 @@ async fn insert_members_per_device_empty_kp_hashes_writes_nothing() {
         .fetch_one(&pool)
         .await
         .expect("count members rows");
-    assert_eq!(
-        count, 0,
-        "empty kp_hashes MUST produce zero members rows"
-    );
+    assert_eq!(count, 0, "empty kp_hashes MUST produce zero members rows");
 
     common::cleanup(&pool, &convo_id).await;
 }
@@ -749,9 +741,15 @@ async fn per_device_welcome_findable_by_user_form_did() {
 
     {
         let mut tx = pool.begin().await.unwrap();
-        store_welcomes_per_device_in_tx(&mut tx, &convo_id, &welcome_bytes, &kp_hashes, "did:plc:senderxxxxx")
-            .await
-            .unwrap();
+        store_welcomes_per_device_in_tx(
+            &mut tx,
+            &convo_id,
+            &welcome_bytes,
+            &kp_hashes,
+            "did:plc:senderxxxxx",
+        )
+        .await
+        .unwrap();
         tx.commit().await.unwrap();
     }
 
@@ -762,13 +760,16 @@ async fn per_device_welcome_findable_by_user_form_did() {
          ORDER BY created_at DESC LIMIT 1",
     )
     .bind(&convo_id)
-    .bind(alice_did)  // user-form auth_user.did
+    .bind(alice_did) // user-form auth_user.did
     .fetch_optional(&pool)
     .await
     .unwrap();
 
     let (welcome_id, body) = row.expect("welcome should be findable by user-form recipient_did");
-    assert_eq!(body, welcome_bytes, "welcome_data should match what we stored");
+    assert_eq!(
+        body, welcome_bytes,
+        "welcome_data should match what we stored"
+    );
     assert!(!welcome_id.is_empty());
 
     // Sanity check: there are 2 rows, but LIMIT 1 returned one.

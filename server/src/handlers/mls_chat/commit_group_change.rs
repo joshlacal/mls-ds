@@ -614,11 +614,7 @@ pub async fn commit_group_change(
                         .collect();
                     let count = converted.len();
                     crate::db::insert_members_per_device_in_tx(
-                        &mut tx,
-                        &convo_id,
-                        &converted,
-                        now,
-                        false,
+                        &mut tx, &convo_id, &converted, now, false,
                     )
                     .await
                     .map_err(|e| {
@@ -810,7 +806,7 @@ pub async fn commit_group_change(
                     crate::db::store_welcomes_per_device_in_tx(
                         &mut tx,
                         &convo_id,
-                        &welcome_bytes,
+                        welcome_bytes,
                         &converted,
                         &caller_did,
                     )
@@ -2247,38 +2243,39 @@ pub async fn commit_group_change(
             }
 
             // ── Parse MLS epoch from GroupInfo if provided ──────────
-            let (rm_group_info_bytes, rm_mls_epoch) = if let Some(gi_bytes) = input.group_info.as_ref() {
-                let gi_slice: &[u8] = gi_bytes;
-                let epoch = {
-                    use openmls::messages::group_info::VerifiableGroupInfo;
-                    use openmls::prelude::{MlsMessageBodyIn, MlsMessageIn};
+            let (rm_group_info_bytes, rm_mls_epoch) =
+                if let Some(gi_bytes) = input.group_info.as_ref() {
+                    let gi_slice: &[u8] = gi_bytes;
+                    let epoch = {
+                        use openmls::messages::group_info::VerifiableGroupInfo;
+                        use openmls::prelude::{MlsMessageBodyIn, MlsMessageIn};
 
-                    let from_mls_msg = MlsMessageIn::tls_deserialize(&mut &*gi_slice)
-                        .ok()
-                        .and_then(|msg| match msg.extract() {
-                            MlsMessageBodyIn::GroupInfo(gi) => Some(gi.epoch().as_u64()),
-                            _ => None,
-                        });
-
-                    from_mls_msg.or_else(|| {
-                        VerifiableGroupInfo::tls_deserialize(&mut &*gi_slice)
+                        let from_mls_msg = MlsMessageIn::tls_deserialize(&mut &*gi_slice)
                             .ok()
-                            .map(|gi| gi.epoch().as_u64())
-                    })
+                            .and_then(|msg| match msg.extract() {
+                                MlsMessageBodyIn::GroupInfo(gi) => Some(gi.epoch().as_u64()),
+                                _ => None,
+                            });
+
+                        from_mls_msg.or_else(|| {
+                            VerifiableGroupInfo::tls_deserialize(&mut &*gi_slice)
+                                .ok()
+                                .map(|gi| gi.epoch().as_u64())
+                        })
+                    };
+
+                    if let Some(e) = epoch {
+                        info!(
+                            "removeMember: parsed MLS epoch {} from GroupInfo for convo {}",
+                            e,
+                            crate::crypto::redact_for_log(&convo_id)
+                        );
+                    }
+
+                    (Some(gi_bytes.to_vec()), epoch)
+                } else {
+                    (None, None)
                 };
-
-                if let Some(e) = epoch {
-                    info!(
-                        "removeMember: parsed MLS epoch {} from GroupInfo for convo {}",
-                        e,
-                        crate::crypto::redact_for_log(&convo_id)
-                    );
-                }
-
-                (Some(gi_bytes.to_vec()), epoch)
-            } else {
-                (None, None)
-            };
 
             // ── Decode client-provided confirmation_tag ──────────
             let rm_confirmation_tag: Option<Vec<u8>> = input
