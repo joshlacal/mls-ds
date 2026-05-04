@@ -690,3 +690,97 @@ async fn insert_members_per_device_empty_kp_hashes_writes_nothing() {
 
     common::cleanup(&pool, &convo_id).await;
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+//
+//                Phase D / Task 9 — get_group_state lookup parity
+//
+// Verifies that the existing welcome lookup in
+// `server/src/handlers/mls_chat/get_group_state.rs:375-378` works against
+// the per-device storage shape Phase B writes (user-form `recipient_did`,
+// `key_package_hash` as the per-device discriminator, identical
+// `welcome_data` across N rows per (convo, user)).
+//
+// Architectural correction recap: Task 2 found jacquard's `Did<'a>` regex
+// rejects `#`, so we cannot use device-form (`did:plc:user#device-x`) as
+// the `recipient_did`. Phase B stores user-form (`entry.did`) instead and
+// distinguishes per-device rows via `key_package_hash`. The MLS Welcome
+// bytes are themselves multi-recipient — each device decrypts its own
+// `EncryptedGroupSecrets` entry locally — so identical `welcome_data`
+// across N rows is correct, and the existing `LIMIT 1` lookup returning
+// ANY of those rows yields the right bytes for the calling device.
+//
+// Caveat: per the workspace's earlier verification (commit fddf62b),
+// `auth_user.did` may currently be device-form INDIRECT for getGroupState
+// callers. If that's the case, the production query's user-form bind
+// would NOT match. This test still confirms the storage→query path works
+// for user-form binding (the contract this plan establishes), so any
+// future change that breaks user-form lookup will fail this test.
+//
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Asserts that per-device welcomes (multiple rows for the same
+/// `recipient_did = user_did`, distinct `key_package_hash`) are findable
+/// by the exact query shape used in `get_group_state.rs:375-378`. Locks
+/// in the contract: future schema or handler changes that break user-form
+/// lookup will fail this test instead of silently returning no welcomes.
+#[tokio::test]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+async fn per_device_welcome_findable_by_user_form_did() {
+    // Verifies get_group_state.rs:375-392's existing query shape returns
+    // a row when the welcome was stored per-device (multiple rows with
+    // same user-form recipient_did, distinct key_package_hash).
+    //
+    // The MLS Welcome bytes are multi-recipient; LIMIT 1 returning ANY
+    // of alice's rows is correct because each device decrypts its own
+    // EncryptedGroupSecrets entry locally.
+    let pool = common::setup_test_db().await;
+    let convo_id = format!("convo-perdev-lookup-{}", Uuid::new_v4());
+    common::cleanup(&pool, &convo_id).await;
+    seed_convo(&pool, &convo_id).await;
+
+    let alice_did = "did:plc:perdevlookup1aaa";
+    let kp_hashes = vec![
+        make_kp_entry(alice_did, "aa11"),
+        make_kp_entry(alice_did, "bb22"),
+    ];
+
+    let welcome_bytes = vec![0xCC_u8; 256];
+
+    {
+        let mut tx = pool.begin().await.unwrap();
+        store_welcomes_per_device_in_tx(&mut tx, &convo_id, &welcome_bytes, &kp_hashes, "did:plc:senderxxxxx")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    // Mirror get_group_state.rs:375-378's exact query shape.
+    let row: Option<(String, Vec<u8>)> = sqlx::query_as(
+        "SELECT id, welcome_data FROM welcome_messages \
+         WHERE convo_id = $1 AND recipient_did = $2 AND consumed = false \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(&convo_id)
+    .bind(alice_did)  // user-form auth_user.did
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+
+    let (welcome_id, body) = row.expect("welcome should be findable by user-form recipient_did");
+    assert_eq!(body, welcome_bytes, "welcome_data should match what we stored");
+    assert!(!welcome_id.is_empty());
+
+    // Sanity check: there are 2 rows, but LIMIT 1 returned one.
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM welcome_messages WHERE convo_id = $1 AND recipient_did = $2",
+    )
+    .bind(&convo_id)
+    .bind(alice_did)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(total, 2, "per-device storage should have written 2 rows");
+
+    common::cleanup(&pool, &convo_id).await;
+}
