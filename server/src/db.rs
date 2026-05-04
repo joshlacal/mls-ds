@@ -480,6 +480,101 @@ pub async fn store_welcomes_per_device_in_tx<'a>(
     Ok(())
 }
 
+/// Insert one `members` row per `KeyPackageHashEntry` with per-device
+/// representation: `member_did = "{user_did}#{device_id}"` when the
+/// `(owner_did, key_package_hash)` lookup in `key_packages` resolves a
+/// `device_id`, otherwise falling back to user-flat semantics
+/// (`member_did = user_did`, `device_id = NULL`).
+///
+/// This mirrors the schema's per-device design documented in
+/// `migrations/20250101000000_greenfield_schema.sql:108-110`:
+/// `member_did` is the device-specific MLS identity, `user_did` is the
+/// bare DID linking devices belonging to the same user.
+///
+/// Lookup notes (the gotchas Task 6's tests pin down):
+///   - `key_packages.key_package_hash` is `TEXT` (hex string), NOT
+///     `BYTEA` like `welcome_messages.key_package_hash`. Bind
+///     `entry.hash` directly — don't `hex::decode`. Decoding gives you
+///     bytes the lookup can never match, silently shunting every row
+///     into the user-flat fallback.
+///   - There's no UNIQUE on `(owner_did, key_package_hash)` in
+///     `key_packages`, so the lookup adds `ORDER BY created_at DESC
+///     LIMIT 1` to keep the device_id deterministic across reruns.
+///   - `members.member_did` is plain `TEXT`, not jacquard's `Did<'a>`,
+///     so the `#`-bearing device-form DID is a legitimate column value
+///     even though `Did<'a>` rejects `#` at the type level.
+///
+/// ON CONFLICT clears `left_at` and `needs_rejoin`, mirroring the
+/// existing inline addMembers re-add pattern at
+/// `commit_group_change.rs:597-616` so post-leave rejoins are
+/// idempotent.
+///
+/// Empty `kp_hashes` slice ⇒ no-op `Ok(())` (consistent with the
+/// welcomes helper).
+///
+/// Caller owns the transaction's commit/rollback.
+///
+/// Note: jacquard generates a separate `KeyPackageHashEntry` struct
+/// per lexicon module — this helper takes the
+/// `bootstrap_reset_group::KeyPackageHashEntry` form to match the
+/// welcomes helper and Task 6's test contract; call sites holding the
+/// `commit_group_change` form (e.g. `addMembers`) convert at the
+/// boundary via a mechanical field copy (see Task 3 commit a60b8af).
+pub async fn insert_members_per_device_in_tx<'a>(
+    tx: &mut Transaction<'_, Postgres>,
+    convo_id: &str,
+    kp_hashes: &[crate::generated::blue_catbird::mlsChat::bootstrap_reset_group::KeyPackageHashEntry<
+        'a,
+    >],
+    joined_at: chrono::DateTime<chrono::Utc>,
+    is_admin: bool,
+) -> sqlx::Result<()> {
+    for entry in kp_hashes {
+        let user_did = crate::sqlx_jacquard::did_to_string(&entry.did);
+        let hash_hex: &str = &entry.hash;
+
+        // Look up device_id. `key_packages.key_package_hash` is TEXT (hex string),
+        // so bind `hash_hex` directly — DO NOT `hex::decode`. ORDER BY ... DESC
+        // LIMIT 1 keeps the result deterministic given there's no UNIQUE on
+        // (owner_did, key_package_hash). `query_scalar` over `Option<String>`
+        // returns Result<Option<Option<String>>> — outer is "row exists",
+        // inner is "value non-null"; flatten to a plain Option<String>.
+        let device_id_opt: Option<String> = sqlx::query_scalar(
+            "SELECT device_id FROM key_packages \
+             WHERE owner_did = $1 AND key_package_hash = $2 \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(&user_did)
+        .bind(hash_hex)
+        .fetch_optional(&mut **tx)
+        .await?
+        .flatten();
+
+        let member_did = match &device_id_opt {
+            Some(d) => format!("{}#{}", user_did, d),
+            None => user_did.clone(),
+        };
+
+        sqlx::query(
+            r#"INSERT INTO members
+                 (convo_id, member_did, user_did, device_id, joined_at, is_admin)
+               VALUES ($1, $2, $3, $4, $5, $6)
+               ON CONFLICT (convo_id, member_did) DO UPDATE SET
+                 left_at = NULL,
+                 needs_rejoin = false"#,
+        )
+        .bind(convo_id)
+        .bind(&member_did)
+        .bind(&user_did)
+        .bind(device_id_opt.as_deref())
+        .bind(joined_at)
+        .bind(is_admin)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
 /// Snapshot of the post-bump health counters returned by
 /// [`record_commit_409`]. Used by the inline trigger path
 /// (Phase 2 B5 — `jobs::auto_detect_failed_groups::maybe_trigger_inline_reset`)

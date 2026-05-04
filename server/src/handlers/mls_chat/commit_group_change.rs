@@ -588,31 +588,84 @@ pub async fn commit_group_change(
             })?;
 
             // ── Add members (inside transaction for atomicity with welcome) ──
+            // Per-device when kp_hashes is provided; user-flat fallback otherwise.
+            // The kp_hashes path resolves device_id from key_packages and inserts
+            // member_did = "{user_did}#{device_id}" so SSE/push fan-out can target
+            // individual devices instead of flooding every active session for a
+            // user. See docs/superpowers/plans/2026-05-04-mls-per-device-welcome-and-members-routing.md.
             let member_did_strings: Vec<String> = member_dids
                 .iter()
                 .map(|d| crate::sqlx_jacquard::did_to_string(d))
                 .collect();
-            for member_did_str in &member_did_strings {
-                let result = sqlx::query(
-                    r#"INSERT INTO members (convo_id, member_did, user_did, joined_at)
-                       VALUES ($1, $2, $2, $3)
-                       ON CONFLICT (convo_id, member_did) DO UPDATE SET left_at = NULL, needs_rejoin = false"#,
-                )
-                .bind(&convo_id)
-                .bind(member_did_str)
-                .bind(now)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| {
-                    error!(convo_id = %crate::crypto::redact_for_log(&convo_id), "addMembers: failed to insert member: {}", e);
-                    internal_server_error("Failed to insert member")
-                })?;
-                info!(
-                    "addMembers: inserted member {} into convo {}, rows_affected={}",
-                    crate::crypto::redact_for_log(member_did_str),
-                    crate::crypto::redact_for_log(&convo_id),
-                    result.rows_affected()
+
+            let used_per_device_members_path = match input.key_package_hashes.as_ref() {
+                Some(hashes) if !hashes.is_empty() => {
+                    // Convert from commit_group_change::KeyPackageHashEntry to
+                    // bootstrap_reset_group::KeyPackageHashEntry (helper's accepted type).
+                    // jacquard generates nominally distinct types per lexicon module even
+                    // though their fields are identical — see Task 3 (commit a60b8af).
+                    let converted: Vec<crate::generated::blue_catbird::mlsChat::bootstrap_reset_group::KeyPackageHashEntry> = hashes
+                        .iter()
+                        .map(|e| crate::generated::blue_catbird::mlsChat::bootstrap_reset_group::KeyPackageHashEntry {
+                            did: e.did.clone(),
+                            hash: e.hash.clone(),
+                            extra_data: Default::default(),
+                        })
+                        .collect();
+                    let count = converted.len();
+                    crate::db::insert_members_per_device_in_tx(
+                        &mut tx,
+                        &convo_id,
+                        &converted,
+                        now,
+                        false,
+                    )
+                    .await
+                    .map_err(|e| {
+                        error!(
+                            convo_id = %crate::crypto::redact_for_log(&convo_id),
+                            "addMembers: failed to insert per-device members: {}", e
+                        );
+                        internal_server_error("Failed to insert members")
+                    })?;
+                    info!(
+                        "addMembers: inserted {} per-device member rows into convo {}",
+                        count,
+                        crate::crypto::redact_for_log(&convo_id)
+                    );
+                    true
+                }
+                _ => false,
+            };
+
+            // Legacy user-flat fallback: only runs when kp_hashes was None or empty.
+            if !used_per_device_members_path {
+                warn!(
+                    "addMembers: key_package_hashes absent/empty — falling back to user-flat members storage for convo {}",
+                    crate::crypto::redact_for_log(&convo_id)
                 );
+                for member_did_str in &member_did_strings {
+                    let result = sqlx::query(
+                        r#"INSERT INTO members (convo_id, member_did, user_did, joined_at)
+                           VALUES ($1, $2, $2, $3)
+                           ON CONFLICT (convo_id, member_did) DO UPDATE SET left_at = NULL, needs_rejoin = false"#,
+                    )
+                    .bind(&convo_id)
+                    .bind(member_did_str)
+                    .bind(now)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| {
+                        error!(convo_id = %crate::crypto::redact_for_log(&convo_id), "addMembers: failed to insert legacy user-flat member: {}", e);
+                        internal_server_error("Failed to insert member")
+                    })?;
+                    info!(
+                        "addMembers: legacy user-flat member {} inserted into convo {}, rows_affected={}",
+                        crate::crypto::redact_for_log(member_did_str),
+                        crate::crypto::redact_for_log(&convo_id),
+                        result.rows_affected()
+                    );
+                }
             }
 
             // ── Advance epoch (CAS) ───────────────────────────────────
