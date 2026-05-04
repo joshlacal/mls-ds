@@ -19,42 +19,14 @@
 //! handler now uses, plus the equality check, to prove the discrimination is
 //! correct at the data layer the handler depends on.
 
-use catbird_server::db::*;
+mod common;
+
 use chrono::Utc;
 use sqlx::PgPool;
-use std::time::Duration;
 
 const ALICE: &str = "did:plc:alice4444444444444444444";
 const BOB: &str = "did:plc:bob44444444444444444444444";
 const TEST_GROUP_ID: &str = "deadbeefcafebabe1234567890abcdef";
-
-async fn setup_test_db() -> PgPool {
-    let database_url = std::env::var("TEST_DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://localhost/catbird_test".to_string());
-
-    let config = DbConfig {
-        database_url,
-        max_connections: 4,
-        min_connections: 1,
-        acquire_timeout: Duration::from_secs(30),
-        idle_timeout: Duration::from_secs(600),
-    };
-
-    init_db(config)
-        .await
-        .expect("Failed to initialize test database")
-}
-
-async fn cleanup(pool: &PgPool, convo_id: &str) {
-    let _ = sqlx::query("DELETE FROM members WHERE convo_id = $1")
-        .bind(convo_id)
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("DELETE FROM conversations WHERE id = $1")
-        .bind(convo_id)
-        .execute(pool)
-        .await;
-}
 
 async fn insert_test_convo(pool: &PgPool, convo_id: &str, creator_did: &str) {
     let now = Utc::now();
@@ -102,8 +74,8 @@ async fn classify_create_convo(
 #[tokio::test]
 #[ignore = "fixture isolation: shared TEST_GROUP_ID causes cross-test interference"]
 async fn create_convo_idempotent_retry_returns_ok_for_same_caller() {
-    let pool = setup_test_db().await;
-    cleanup(&pool, TEST_GROUP_ID).await;
+    let pool = common::setup_test_db().await;
+    common::cleanup(&pool, TEST_GROUP_ID).await;
     insert_test_convo(&pool, TEST_GROUP_ID, ALICE).await;
 
     let result = classify_create_convo(&pool, TEST_GROUP_ID, ALICE).await;
@@ -113,14 +85,14 @@ async fn create_convo_idempotent_retry_returns_ok_for_same_caller() {
         "alice creating same convo twice must be treated as idempotent retry"
     );
 
-    cleanup(&pool, TEST_GROUP_ID).await;
+    common::cleanup(&pool, TEST_GROUP_ID).await;
 }
 
 #[tokio::test]
 #[ignore = "fixture isolation: shared TEST_GROUP_ID causes cross-test interference"]
 async fn create_convo_collision_by_different_caller_returns_already_exists() {
-    let pool = setup_test_db().await;
-    cleanup(&pool, TEST_GROUP_ID).await;
+    let pool = common::setup_test_db().await;
+    common::cleanup(&pool, TEST_GROUP_ID).await;
     insert_test_convo(&pool, TEST_GROUP_ID, ALICE).await;
 
     let result = classify_create_convo(&pool, TEST_GROUP_ID, BOB).await;
@@ -130,14 +102,14 @@ async fn create_convo_collision_by_different_caller_returns_already_exists() {
         "bob creating after alice already won the race must be told the convo already exists"
     );
 
-    cleanup(&pool, TEST_GROUP_ID).await;
+    common::cleanup(&pool, TEST_GROUP_ID).await;
 }
 
 #[tokio::test]
 #[ignore = "fixture isolation: shared TEST_GROUP_ID causes cross-test interference"]
 async fn create_convo_no_existing_row_proceeds_to_create() {
-    let pool = setup_test_db().await;
-    cleanup(&pool, TEST_GROUP_ID).await;
+    let pool = common::setup_test_db().await;
+    common::cleanup(&pool, TEST_GROUP_ID).await;
 
     let result = classify_create_convo(&pool, TEST_GROUP_ID, ALICE).await;
     assert_eq!(

@@ -32,7 +32,6 @@ use catbird_server::actors::{
     ConversationActor, ConvoActorArgs, ConvoMessage, ResetTrigger, WelcomeEnvelope,
 };
 use catbird_server::config::QuorumConfig;
-use catbird_server::db::{init_db, DbConfig};
 use catbird_server::realtime::SseState;
 use ractor::{Actor, ActorRef};
 use sqlx::PgPool;
@@ -40,27 +39,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::oneshot;
 
+mod common;
+
 const ALICE: &str = "did:plc:p2_5_alice00000000000000000";
 const BOB: &str = "did:plc:p2_5_bob000000000000000000000";
 const CHARLIE: &str = "did:plc:p2_5_charlie00000000000000000";
 const MALLORY: &str = "did:plc:p2_5_mallory00000000000000000";
-
-async fn setup_test_db() -> PgPool {
-    let database_url = std::env::var("TEST_DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://localhost/catbird_test".to_string());
-
-    let config = DbConfig {
-        database_url,
-        max_connections: 4,
-        min_connections: 1,
-        acquire_timeout: Duration::from_secs(30),
-        idle_timeout: Duration::from_secs(600),
-    };
-
-    init_db(config)
-        .await
-        .expect("Failed to initialize test database")
-}
 
 async fn wipe(pool: &PgPool, convo_id: &str) {
     for table in &[
@@ -194,7 +178,7 @@ async fn spawn_actor(pool: &PgPool, convo_id: &str) -> ActorRef<ConvoMessage> {
 #[tokio::test]
 #[ignore = "requires TEST_DATABASE_URL"]
 async fn r1_e1_admin_null_binding_rejected_at_request() {
-    let pool = setup_test_db().await;
+    let pool = common::setup_test_db().await;
     let convo_id = "p2_5-r1-e1-admin-null";
     wipe(&pool, convo_id).await;
     seed_convo_with_members(
@@ -256,7 +240,7 @@ async fn r1_e1_admin_null_binding_rejected_at_request() {
 #[tokio::test]
 #[ignore = "requires TEST_DATABASE_URL"]
 async fn r1_e2_non_member_bootstrap_rejected() {
-    let pool = setup_test_db().await;
+    let pool = common::setup_test_db().await;
     let convo_id = "p2_5-r1-e2-non-member";
     wipe(&pool, convo_id).await;
     seed_convo_with_members(
@@ -334,7 +318,7 @@ async fn r1_e2_non_member_bootstrap_rejected() {
 #[tokio::test]
 #[ignore = "requires TEST_DATABASE_URL"]
 async fn r1_e3_current_member_bootstrap_accepted() {
-    let pool = setup_test_db().await;
+    let pool = common::setup_test_db().await;
     let convo_id = "p2_5-r1-e3-member-ok";
     wipe(&pool, convo_id).await;
     seed_convo_with_members(
@@ -394,7 +378,7 @@ async fn r1_e3_current_member_bootstrap_accepted() {
 #[tokio::test]
 #[ignore = "requires TEST_DATABASE_URL"]
 async fn r1_e4_post_request_joiner_rejected() {
-    let pool = setup_test_db().await;
+    let pool = common::setup_test_db().await;
     let convo_id = "p2_5-r1-e4-leaver";
     wipe(&pool, convo_id).await;
     seed_convo_with_members(
@@ -485,7 +469,7 @@ async fn r1_e4_post_request_joiner_rejected() {
 #[tokio::test]
 #[ignore = "requires TEST_DATABASE_URL"]
 async fn r1_e5_idempotent_request_collapses() {
-    let pool = setup_test_db().await;
+    let pool = common::setup_test_db().await;
     let convo_id = "p2_5-r1-e5-idempotent";
     wipe(&pool, convo_id).await;
     seed_convo_with_members(
@@ -552,7 +536,7 @@ async fn r1_e5_idempotent_request_collapses() {
 #[tokio::test]
 #[ignore = "requires TEST_DATABASE_URL"]
 async fn r1_e6_race_first_wins_second_lost() {
-    let pool = setup_test_db().await;
+    let pool = common::setup_test_db().await;
     let convo_id = "p2_5-r1-e6-race";
     wipe(&pool, convo_id).await;
     seed_convo_with_members(
@@ -653,7 +637,7 @@ async fn r1_e6_race_first_wins_second_lost() {
 #[tokio::test]
 #[ignore = "requires TEST_DATABASE_URL"]
 async fn generation_invariant_legacy_then_phase_2_5() {
-    let pool = setup_test_db().await;
+    let pool = common::setup_test_db().await;
     let convo_id = "p2_5-gen-invariant";
     wipe(&pool, convo_id).await;
     seed_convo_with_members(
@@ -795,7 +779,7 @@ async fn generation_invariant_legacy_then_phase_2_5() {
 #[tokio::test]
 #[ignore = "requires TEST_DATABASE_URL"]
 async fn inline_trigger_dual_emit_and_b6_1_member_count() {
-    let pool = setup_test_db().await;
+    let pool = common::setup_test_db().await;
     let convo_id = "p2_5-inline-dual-emit";
     wipe(&pool, convo_id).await;
     seed_convo_with_members(
@@ -895,7 +879,7 @@ async fn inline_trigger_dual_emit_and_b6_1_member_count() {
 #[tokio::test]
 #[ignore = "requires TEST_DATABASE_URL"]
 async fn r1_e7_some_then_none_does_not_downgrade_binding() {
-    let pool = setup_test_db().await;
+    let pool = common::setup_test_db().await;
     let convo_id = "p2_5-r1-e7-some-then-none";
     wipe(&pool, convo_id).await;
     seed_convo_with_members(
@@ -1023,7 +1007,7 @@ async fn r1_e7_some_then_none_does_not_downgrade_binding() {
 #[tokio::test]
 #[ignore = "requires TEST_DATABASE_URL"]
 async fn r1_e8_multi_device_did_split_in_allowlist() {
-    let pool = setup_test_db().await;
+    let pool = common::setup_test_db().await;
     let convo_id = "p2_5-r1-e8-multi-device";
     wipe(&pool, convo_id).await;
 

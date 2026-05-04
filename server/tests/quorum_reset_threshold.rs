@@ -22,34 +22,17 @@
 //!
 //! Plan: docs/superpowers/plans/2026-04-26-mls-auto-reset-phase2.md (Task 4)
 
+mod common;
+
 use catbird_server::actors::{ConversationActor, ConvoActorArgs, ConvoMessage};
 use catbird_server::config::QuorumConfig;
-use catbird_server::db::{init_db, DbConfig};
 use catbird_server::realtime::SseState;
 use ractor::{Actor, ActorRef};
 use sqlx::PgPool;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::oneshot;
 
 const AUTH: &str = "deadbeef00cafe";
-
-async fn setup_test_db() -> PgPool {
-    let database_url = std::env::var("TEST_DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://localhost/catbird_test".to_string());
-
-    let config = DbConfig {
-        database_url,
-        max_connections: 4,
-        min_connections: 1,
-        acquire_timeout: Duration::from_secs(30),
-        idle_timeout: Duration::from_secs(600),
-    };
-
-    init_db(config)
-        .await
-        .expect("Failed to initialize test database")
-}
 
 async fn wipe(pool: &PgPool, convo_id: &str) {
     for table in &[
@@ -188,7 +171,7 @@ async fn fetch_state(pool: &PgPool, convo_id: &str) -> ConvoState {
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL) with A7 + Phase 2 schema"]
 async fn two_mode_b_reports_on_5_member_group_trigger_reset_when_enforce_flag_true() {
-    let pool = setup_test_db().await;
+    let pool = common::setup_test_db().await;
     let convo_id = "test-quorum-5mem-2b";
     let initial_group_id = "initial0001000010000100001000010000";
     wipe(&pool, convo_id).await;
@@ -263,7 +246,7 @@ async fn two_mode_b_reports_on_5_member_group_trigger_reset_when_enforce_flag_tr
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL) with A7 + Phase 2 schema"]
 async fn mixed_mode_a_and_b_does_not_trigger_when_only_one_b() {
-    let pool = setup_test_db().await;
+    let pool = common::setup_test_db().await;
     let convo_id = "test-quorum-5mem-mix";
     let initial_group_id = "initial0002000020000200002000020000";
     wipe(&pool, convo_id).await;
@@ -335,7 +318,7 @@ async fn mixed_mode_a_and_b_does_not_trigger_when_only_one_b() {
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL) with A7 + Phase 2 schema"]
 async fn single_mode_b_in_dm_triggers_reset() {
-    let pool = setup_test_db().await;
+    let pool = common::setup_test_db().await;
     let convo_id = "test-quorum-dm-1b";
     let initial_group_id = "initial0003000030000300003000030000";
     wipe(&pool, convo_id).await;
@@ -386,7 +369,7 @@ async fn single_mode_b_in_dm_triggers_reset() {
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL) with A7 + Phase 2 schema"]
 async fn flag_disabled_counts_both_modes() {
-    let pool = setup_test_db().await;
+    let pool = common::setup_test_db().await;
     let convo_id = "test-quorum-5mem-disabled";
     let initial_group_id = "initial0004000040000400004000040000";
     wipe(&pool, convo_id).await;

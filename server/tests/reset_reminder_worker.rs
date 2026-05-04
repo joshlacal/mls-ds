@@ -25,31 +25,14 @@
 //!
 //! Plan: `docs/plans (phase-2-5-indirect-funneling.md)` §7 R3.
 
-use catbird_server::db::{init_db, DbConfig};
+mod common;
+
 use catbird_server::jobs::reset_reminder::reminder_tick;
 use catbird_server::realtime::SseState;
 use sqlx::PgPool;
 use std::sync::Arc;
-use std::time::Duration;
 
 const ALICE: &str = "did:plc:r3alice000000000000000000";
-
-async fn setup_test_db() -> PgPool {
-    let database_url = std::env::var("TEST_DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://localhost/catbird_test".to_string());
-
-    let config = DbConfig {
-        database_url,
-        max_connections: 4,
-        min_connections: 1,
-        acquire_timeout: Duration::from_secs(30),
-        idle_timeout: Duration::from_secs(600),
-    };
-
-    init_db(config)
-        .await
-        .expect("Failed to initialize test database")
-}
 
 /// Wipe rows for the test convo across all tables that reference it.
 /// `delivery_events` uses `conversation_id`; everything else under the
@@ -199,7 +182,7 @@ async fn seed_stuck_session(
 #[tokio::test]
 #[ignore = "requires TEST_DATABASE_URL"]
 async fn r3_stuck_session_reminder_after_one_hour() {
-    let pool = setup_test_db().await;
+    let pool = common::setup_test_db().await;
     let convo_id = "p2_5-r3-stuck-1h";
     wipe(&pool, convo_id).await;
 
