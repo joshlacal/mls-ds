@@ -732,32 +732,82 @@ pub async fn commit_group_change(
                 msg_result.rows_affected()
             );
 
-            // ── Store welcome for each new member ──────────────────────
-            for member_did_str in &member_did_strings {
-                let welcome_id = uuid::Uuid::new_v4().to_string();
-                let welcome_result = sqlx::query(
-                    r#"INSERT INTO welcome_messages (id, convo_id, recipient_did, welcome_data, key_package_hash, created_at)
-                       VALUES ($1, $2, $3, $4, $5, $6)
-                       ON CONFLICT (convo_id, recipient_did, COALESCE(key_package_hash, '\x00'::bytea)) WHERE consumed = false
-                       DO NOTHING"#,
-                )
-                .bind(&welcome_id)
-                .bind(&convo_id)
-                .bind(member_did_str)
-                .bind(&welcome_bytes[..])
-                .bind::<Option<Vec<u8>>>(None)
-                .bind(now)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| {
-                    error!("addMembers: failed to store welcome: {}", e);
-                    internal_server_error("Failed to store welcome")
-                })?;
-                info!(
-                    "addMembers: welcome stored for {}, rows_affected={}",
-                    crate::crypto::redact_for_log(member_did_str),
-                    welcome_result.rows_affected()
+            // ── Store welcome (per-device when kp_hashes provided; user-flat fallback otherwise) ──
+            // The MLS welcome_bytes is itself a multi-recipient blob — each device decrypts
+            // its own portion locally — so storing identical welcome_data across N rows is
+            // correct; the per-device discrimination lives in key_package_hash. See
+            // docs/superpowers/plans/2026-05-04-mls-per-device-welcome-and-members-routing.md.
+            let kp_hashes_for_welcomes = input.key_package_hashes.as_ref();
+            let used_per_device_path = match kp_hashes_for_welcomes {
+                Some(hashes) if !hashes.is_empty() => {
+                    // Convert from commit_group_change::KeyPackageHashEntry to
+                    // bootstrap_reset_group::KeyPackageHashEntry (helper's accepted type).
+                    // jacquard generates nominally distinct types per lexicon module even
+                    // though their fields are identical — see Task 3 (commit a60b8af) for
+                    // context. The conversion is a mechanical field copy.
+                    let converted: Vec<crate::generated::blue_catbird::mlsChat::bootstrap_reset_group::KeyPackageHashEntry> = hashes
+                        .iter()
+                        .map(|e| crate::generated::blue_catbird::mlsChat::bootstrap_reset_group::KeyPackageHashEntry {
+                            did: e.did.clone(),
+                            hash: e.hash.clone(),
+                            extra_data: Default::default(),
+                        })
+                        .collect();
+                    let count = converted.len();
+                    crate::db::store_welcomes_per_device_in_tx(
+                        &mut tx,
+                        &convo_id,
+                        &welcome_bytes,
+                        &converted,
+                        &caller_did,
+                    )
+                    .await
+                    .map_err(|e| {
+                        error!("addMembers: failed to store per-device welcomes: {}", e);
+                        internal_server_error("Failed to store welcomes")
+                    })?;
+                    info!(
+                        "addMembers: stored {} per-device welcome rows for convo {}",
+                        count,
+                        crate::crypto::redact_for_log(&convo_id)
+                    );
+                    true
+                }
+                _ => false,
+            };
+
+            // Legacy user-flat fallback: only runs when kp_hashes was None or empty.
+            if !used_per_device_path {
+                warn!(
+                    "addMembers: key_package_hashes absent/empty — falling back to user-flat welcome storage for convo {}",
+                    crate::crypto::redact_for_log(&convo_id)
                 );
+                for member_did_str in &member_did_strings {
+                    let welcome_id = uuid::Uuid::new_v4().to_string();
+                    let welcome_result = sqlx::query(
+                        r#"INSERT INTO welcome_messages (id, convo_id, recipient_did, welcome_data, key_package_hash, created_at)
+                           VALUES ($1, $2, $3, $4, $5, $6)
+                           ON CONFLICT (convo_id, recipient_did, COALESCE(key_package_hash, '\x00'::bytea)) WHERE consumed = false
+                           DO NOTHING"#,
+                    )
+                    .bind(&welcome_id)
+                    .bind(&convo_id)
+                    .bind(member_did_str)
+                    .bind(&welcome_bytes[..])
+                    .bind::<Option<Vec<u8>>>(None)
+                    .bind(now)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| {
+                        error!("addMembers: failed to store user-flat welcome: {}", e);
+                        internal_server_error("Failed to store welcome")
+                    })?;
+                    info!(
+                        "addMembers: legacy user-flat welcome stored for {}, rows_affected={}",
+                        crate::crypto::redact_for_log(member_did_str),
+                        welcome_result.rows_affected()
+                    );
+                }
             }
 
             // ── Store idempotency key ──────────────────────────────────
