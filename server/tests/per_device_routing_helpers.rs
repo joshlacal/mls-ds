@@ -785,3 +785,96 @@ async fn per_device_welcome_findable_by_user_form_did() {
 
     common::cleanup(&pool, &convo_id).await;
 }
+
+/// Companion to `per_device_welcome_findable_by_user_form_did`. Asserts the
+/// C1 fix in `get_group_state.rs:373-411`: when `auth_user.did` arrives as
+/// device-form (e.g. `did:plc:alice#deviceA`) but the welcome was stored
+/// with user-form `recipient_did` (which Phase B always does — jacquard's
+/// `Did<'a>` regex rejects '#'), the OR-clause on both forms in the
+/// retrieval SELECT MUST find the row.
+///
+/// Exercise: this test FAILS (returns None) without the OR-clause, and
+/// PASSES with it. The negative-control branch below confirms that
+/// device-form alone (single bind, no OR) misses — locking in the
+/// "OR-clause is what rescues device-form callers" contract.
+#[tokio::test]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+async fn per_device_welcome_findable_by_device_form_did() {
+    let pool = common::setup_test_db().await;
+    let convo_id = format!("convo-perdev-devform-{}", Uuid::new_v4());
+    common::cleanup(&pool, &convo_id).await;
+    seed_convo(&pool, &convo_id).await;
+
+    // user-form for storage (recipient_did goes in user-form per Phase B)
+    let alice_did_user = "did:plc:perdevdevform1aaa";
+    // device-form is what the C1 site MAY receive as `auth_user.did`
+    let alice_did_device = format!("{}#deviceA", alice_did_user);
+
+    // Single per-device row stored with user-form recipient_did.
+    let kp_hashes = vec![make_kp_entry(alice_did_user, "aa11")];
+    let welcome_bytes = vec![0xCC_u8; 256];
+
+    {
+        let mut tx = pool.begin().await.unwrap();
+        store_welcomes_per_device_in_tx(
+            &mut tx,
+            &convo_id,
+            &welcome_bytes,
+            &kp_hashes,
+            "did:plc:senderxxxxx",
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    // ── Positive case: mirror the FIXED get_group_state SQL (OR on both forms). ──
+    let user_form: String = match alice_did_device.split_once('#') {
+        Some((u, _)) => u.to_string(),
+        None => alice_did_device.clone(),
+    };
+
+    let row: Option<(String, Vec<u8>)> = sqlx::query_as(
+        "SELECT id, welcome_data FROM welcome_messages \
+         WHERE convo_id = $1 \
+           AND (recipient_did = $2 OR recipient_did = $3) \
+           AND consumed = false \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(&convo_id)
+    .bind(&alice_did_device)
+    .bind(&user_form)
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+
+    let (welcome_id, body) =
+        row.expect("device-form auth_user.did MUST find user-form recipient_did via OR-clause");
+    assert_eq!(
+        body, welcome_bytes,
+        "welcome_data must match what we stored"
+    );
+    assert!(!welcome_id.is_empty());
+
+    // ── Negative control: pre-fix SQL (single bind on device-form only). ──
+    // This must MISS, proving the OR-clause is load-bearing — without the
+    // user-form leg, the lookup returns None for device-form callers.
+    let pre_fix_row: Option<(String, Vec<u8>)> = sqlx::query_as(
+        "SELECT id, welcome_data FROM welcome_messages \
+         WHERE convo_id = $1 AND recipient_did = $2 AND consumed = false \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(&convo_id)
+    .bind(&alice_did_device)
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+
+    assert!(
+        pre_fix_row.is_none(),
+        "negative control: device-form-only bind MUST miss user-form-stored welcomes \
+         (this is the bug the OR-clause fixes)"
+    );
+
+    common::cleanup(&pool, &convo_id).await;
+}

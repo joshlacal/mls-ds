@@ -529,11 +529,25 @@ async fn handle_create_convo(
                 .collect();
 
             // Partition kp_hashes into admin (creator's devices) and non-admin
-            // (everyone else's devices). The lexicon Did<'_> needs string conversion
-            // before equality with `auth_user.did`.
+            // (everyone else's devices). The lexicon `Did<'_>` regex rejects
+            // '#', so `did_to_string(&e.did)` is always user-form. By contrast,
+            // `auth_user.did` may be device-form (e.g. "did:plc:alice#deviceA")
+            // for some callers — Task 1's verification was INDIRECT for the
+            // iOS issuance path. Comparing user-form to a raw device-form
+            // string would always be false, mis-classifying every creator
+            // device as a non-admin member.
+            //
+            // Defensive fix: derive the user-form half of `auth_user.did`
+            // first (split at '#' if present, else use the string verbatim)
+            // and partition against that. No-op when `auth_user.did` is
+            // already user-form; correct partitioning when it's device-form.
+            let caller_user_form: String = match auth_user.did.split_once('#') {
+                Some((user, _device)) => user.to_string(),
+                None => auth_user.did.clone(),
+            };
             let (admin_entries, member_entries): (Vec<_>, Vec<_>) = converted
                 .into_iter()
-                .partition(|e| did_to_string(&e.did) == auth_user.did);
+                .partition(|e| did_to_string(&e.did) == caller_user_form);
 
             // Admin: one row per creator device when kp_hashes covers any of them.
             // Fallback to legacy single-row admin insert when the creator omitted
@@ -563,12 +577,25 @@ async fn handle_create_convo(
             } else {
                 // No admin kp in kp_hashes — preserve legacy single-row admin so
                 // the creator stays a member of the conversation regardless.
+                //
+                // Defensive against device-form vs user-form ambiguity in
+                // `auth_user.did`: bind `member_did = auth_user.did` (preserving
+                // device-form when present so per-device fan-out can address it)
+                // but use `caller_user_form` for the `user_did` column, which
+                // canonically holds the user-form DID. ON CONFLICT clause
+                // makes this idempotent in case the per-device helper above
+                // also wrote a row keyed by the same `(convo_id, member_did)`.
                 sqlx::query(
-                    "INSERT INTO members (convo_id, member_did, user_did, joined_at, is_admin) VALUES ($1, $2, $3, $4, true)",
+                    "INSERT INTO members (convo_id, member_did, user_did, joined_at, is_admin) \
+                     VALUES ($1, $2, $3, $4, true) \
+                     ON CONFLICT (convo_id, member_did) DO UPDATE SET \
+                       is_admin = true, \
+                       left_at = NULL, \
+                       needs_rejoin = false",
                 )
                 .bind(&convo_id)
                 .bind(&auth_user.did)
-                .bind(&auth_user.did)
+                .bind(&caller_user_form)
                 .bind(now)
                 .execute(&mut *members_tx)
                 .await
@@ -621,17 +648,37 @@ async fn handle_create_convo(
             crate::crypto::redact_for_log(&convo_id)
         );
         tracing::debug!("📍 [v2.createConvo] adding creator membership (legacy)");
+
+        // Defensive against device-form vs user-form ambiguity in
+        // `auth_user.did` (mirrors the same fix in the per-device admin
+        // fallback above): bind `member_did = auth_user.did` verbatim but
+        // use the parsed user-form for the `user_did` column. ON CONFLICT
+        // makes the INSERT idempotent so a retry or a sibling per-device
+        // helper insert keyed on the same (convo_id, member_did) can't
+        // collide.
+        let caller_user_form: String = match auth_user.did.split_once('#') {
+            Some((user, _device)) => user.to_string(),
+            None => auth_user.did.clone(),
+        };
         sqlx::query(
-            "INSERT INTO members (convo_id, member_did, user_did, joined_at, is_admin) VALUES ($1, $2, $3, $4, true)",
+            "INSERT INTO members (convo_id, member_did, user_did, joined_at, is_admin) \
+             VALUES ($1, $2, $3, $4, true) \
+             ON CONFLICT (convo_id, member_did) DO UPDATE SET \
+               is_admin = true, \
+               left_at = NULL, \
+               needs_rejoin = false",
         )
         .bind(&convo_id)
         .bind(&auth_user.did)
-        .bind(&auth_user.did)
+        .bind(&caller_user_form)
         .bind(now)
         .execute(&mut *members_tx)
         .await
         .map_err(|e| {
-            error!("❌ [v2.createConvo] Failed to add creator membership: {}", e);
+            error!(
+                "❌ [v2.createConvo] Failed to add creator membership: {}",
+                e
+            );
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         })?;
 

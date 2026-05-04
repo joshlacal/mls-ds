@@ -372,13 +372,38 @@ pub async fn get_group_state(
 
     // Fetch welcome message
     if includes.contains(&"welcome") {
+        // Defensive against device-form vs user-form ambiguity in
+        // `auth_user.did`. Phase B (per-device welcome storage) writes
+        // `recipient_did` in user-form (e.g. "did:plc:alice") because
+        // jacquard's `Did<'a>` regex rejects '#'; per-device discrimination
+        // lives in `key_package_hash`. Task 1's verification of
+        // `auth_user.did` for getGroupState callers came back INDIRECT —
+        // server-side construction is strong evidence for user-form, but
+        // the iOS issuance path was not directly traced. If a device-form
+        // string ("did:plc:alice#deviceA") arrives here, a raw bind would
+        // miss the user-form-stored welcomes.
+        //
+        // Mitigation: derive the user-form half by splitting at '#' and
+        // bind BOTH forms. `split_once('#')` returns `None` for user-form
+        // input, so both binds collapse to the same string and the OR
+        // clause is a no-op for user-form callers. For device-form
+        // callers, the OR rescues the lookup.
+        let did_str = &auth_user.did;
+        let user_form_did: String = match did_str.split_once('#') {
+            Some((user, _device)) => user.to_string(),
+            None => did_str.clone(),
+        };
+
         let welcome_row: Option<(String, Vec<u8>)> = sqlx::query_as(
             "SELECT id, welcome_data FROM welcome_messages \
-             WHERE convo_id = $1 AND recipient_did = $2 AND consumed = false \
+             WHERE convo_id = $1 \
+               AND (recipient_did = $2 OR recipient_did = $3) \
+               AND consumed = false \
              ORDER BY created_at DESC LIMIT 1",
         )
         .bind(convo_id)
-        .bind(&auth_user.did)
+        .bind(did_str)
+        .bind(&user_form_did)
         .fetch_optional(&pool)
         .await
         .map_err(|e| {
