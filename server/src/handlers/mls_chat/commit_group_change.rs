@@ -588,31 +588,80 @@ pub async fn commit_group_change(
             })?;
 
             // ── Add members (inside transaction for atomicity with welcome) ──
+            // Per-device when kp_hashes is provided; user-flat fallback otherwise.
+            // The kp_hashes path resolves device_id from key_packages and inserts
+            // member_did = "{user_did}#{device_id}" so SSE/push fan-out can target
+            // individual devices instead of flooding every active session for a
+            // user. See docs/superpowers/plans/2026-05-04-mls-per-device-welcome-and-members-routing.md.
             let member_did_strings: Vec<String> = member_dids
                 .iter()
                 .map(|d| crate::sqlx_jacquard::did_to_string(d))
                 .collect();
-            for member_did_str in &member_did_strings {
-                let result = sqlx::query(
-                    r#"INSERT INTO members (convo_id, member_did, user_did, joined_at)
-                       VALUES ($1, $2, $2, $3)
-                       ON CONFLICT (convo_id, member_did) DO UPDATE SET left_at = NULL, needs_rejoin = false"#,
-                )
-                .bind(&convo_id)
-                .bind(member_did_str)
-                .bind(now)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| {
-                    error!(convo_id = %crate::crypto::redact_for_log(&convo_id), "addMembers: failed to insert member: {}", e);
-                    internal_server_error("Failed to insert member")
-                })?;
-                info!(
-                    "addMembers: inserted member {} into convo {}, rows_affected={}",
-                    crate::crypto::redact_for_log(member_did_str),
-                    crate::crypto::redact_for_log(&convo_id),
-                    result.rows_affected()
+
+            let used_per_device_members_path = match input.key_package_hashes.as_ref() {
+                Some(hashes) if !hashes.is_empty() => {
+                    // Convert from commit_group_change::KeyPackageHashEntry to
+                    // bootstrap_reset_group::KeyPackageHashEntry (helper's accepted type).
+                    // jacquard generates nominally distinct types per lexicon module even
+                    // though their fields are identical — see Task 3 (commit a60b8af).
+                    let converted: Vec<crate::generated::blue_catbird::mlsChat::bootstrap_reset_group::KeyPackageHashEntry> = hashes
+                        .iter()
+                        .map(|e| crate::generated::blue_catbird::mlsChat::bootstrap_reset_group::KeyPackageHashEntry {
+                            did: e.did.clone(),
+                            hash: e.hash.clone(),
+                            extra_data: Default::default(),
+                        })
+                        .collect();
+                    let count = converted.len();
+                    crate::db::insert_members_per_device_in_tx(
+                        &mut tx, &convo_id, &converted, now, false,
+                    )
+                    .await
+                    .map_err(|e| {
+                        error!(
+                            convo_id = %crate::crypto::redact_for_log(&convo_id),
+                            "addMembers: failed to insert per-device members: {}", e
+                        );
+                        internal_server_error("Failed to insert members")
+                    })?;
+                    info!(
+                        "addMembers: inserted {} per-device member rows into convo {}",
+                        count,
+                        crate::crypto::redact_for_log(&convo_id)
+                    );
+                    true
+                }
+                _ => false,
+            };
+
+            // Legacy user-flat fallback: only runs when kp_hashes was None or empty.
+            if !used_per_device_members_path {
+                warn!(
+                    "addMembers: key_package_hashes absent/empty — falling back to user-flat members storage for convo {}",
+                    crate::crypto::redact_for_log(&convo_id)
                 );
+                for member_did_str in &member_did_strings {
+                    let result = sqlx::query(
+                        r#"INSERT INTO members (convo_id, member_did, user_did, joined_at)
+                           VALUES ($1, $2, $2, $3)
+                           ON CONFLICT (convo_id, member_did) DO UPDATE SET left_at = NULL, needs_rejoin = false"#,
+                    )
+                    .bind(&convo_id)
+                    .bind(member_did_str)
+                    .bind(now)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| {
+                        error!(convo_id = %crate::crypto::redact_for_log(&convo_id), "addMembers: failed to insert legacy user-flat member: {}", e);
+                        internal_server_error("Failed to insert member")
+                    })?;
+                    info!(
+                        "addMembers: legacy user-flat member {} inserted into convo {}, rows_affected={}",
+                        crate::crypto::redact_for_log(member_did_str),
+                        crate::crypto::redact_for_log(&convo_id),
+                        result.rows_affected()
+                    );
+                }
             }
 
             // ── Advance epoch (CAS) ───────────────────────────────────
@@ -732,32 +781,82 @@ pub async fn commit_group_change(
                 msg_result.rows_affected()
             );
 
-            // ── Store welcome for each new member ──────────────────────
-            for member_did_str in &member_did_strings {
-                let welcome_id = uuid::Uuid::new_v4().to_string();
-                let welcome_result = sqlx::query(
-                    r#"INSERT INTO welcome_messages (id, convo_id, recipient_did, welcome_data, key_package_hash, created_at)
-                       VALUES ($1, $2, $3, $4, $5, $6)
-                       ON CONFLICT (convo_id, recipient_did, COALESCE(key_package_hash, '\x00'::bytea)) WHERE consumed = false
-                       DO NOTHING"#,
-                )
-                .bind(&welcome_id)
-                .bind(&convo_id)
-                .bind(member_did_str)
-                .bind(&welcome_bytes[..])
-                .bind::<Option<Vec<u8>>>(None)
-                .bind(now)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| {
-                    error!("addMembers: failed to store welcome: {}", e);
-                    internal_server_error("Failed to store welcome")
-                })?;
-                info!(
-                    "addMembers: welcome stored for {}, rows_affected={}",
-                    crate::crypto::redact_for_log(member_did_str),
-                    welcome_result.rows_affected()
+            // ── Store welcome (per-device when kp_hashes provided; user-flat fallback otherwise) ──
+            // The MLS welcome_bytes is itself a multi-recipient blob — each device decrypts
+            // its own portion locally — so storing identical welcome_data across N rows is
+            // correct; the per-device discrimination lives in key_package_hash. See
+            // docs/superpowers/plans/2026-05-04-mls-per-device-welcome-and-members-routing.md.
+            let kp_hashes_for_welcomes = input.key_package_hashes.as_ref();
+            let used_per_device_path = match kp_hashes_for_welcomes {
+                Some(hashes) if !hashes.is_empty() => {
+                    // Convert from commit_group_change::KeyPackageHashEntry to
+                    // bootstrap_reset_group::KeyPackageHashEntry (helper's accepted type).
+                    // jacquard generates nominally distinct types per lexicon module even
+                    // though their fields are identical — see Task 3 (commit a60b8af) for
+                    // context. The conversion is a mechanical field copy.
+                    let converted: Vec<crate::generated::blue_catbird::mlsChat::bootstrap_reset_group::KeyPackageHashEntry> = hashes
+                        .iter()
+                        .map(|e| crate::generated::blue_catbird::mlsChat::bootstrap_reset_group::KeyPackageHashEntry {
+                            did: e.did.clone(),
+                            hash: e.hash.clone(),
+                            extra_data: Default::default(),
+                        })
+                        .collect();
+                    let count = converted.len();
+                    crate::db::store_welcomes_per_device_in_tx(
+                        &mut tx,
+                        &convo_id,
+                        welcome_bytes,
+                        &converted,
+                        &caller_did,
+                    )
+                    .await
+                    .map_err(|e| {
+                        error!("addMembers: failed to store per-device welcomes: {}", e);
+                        internal_server_error("Failed to store welcomes")
+                    })?;
+                    info!(
+                        "addMembers: stored {} per-device welcome rows for convo {}",
+                        count,
+                        crate::crypto::redact_for_log(&convo_id)
+                    );
+                    true
+                }
+                _ => false,
+            };
+
+            // Legacy user-flat fallback: only runs when kp_hashes was None or empty.
+            if !used_per_device_path {
+                warn!(
+                    "addMembers: key_package_hashes absent/empty — falling back to user-flat welcome storage for convo {}",
+                    crate::crypto::redact_for_log(&convo_id)
                 );
+                for member_did_str in &member_did_strings {
+                    let welcome_id = uuid::Uuid::new_v4().to_string();
+                    let welcome_result = sqlx::query(
+                        r#"INSERT INTO welcome_messages (id, convo_id, recipient_did, welcome_data, key_package_hash, created_at)
+                           VALUES ($1, $2, $3, $4, $5, $6)
+                           ON CONFLICT (convo_id, recipient_did, COALESCE(key_package_hash, '\x00'::bytea)) WHERE consumed = false
+                           DO NOTHING"#,
+                    )
+                    .bind(&welcome_id)
+                    .bind(&convo_id)
+                    .bind(member_did_str)
+                    .bind(&welcome_bytes[..])
+                    .bind::<Option<Vec<u8>>>(None)
+                    .bind(now)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| {
+                        error!("addMembers: failed to store user-flat welcome: {}", e);
+                        internal_server_error("Failed to store welcome")
+                    })?;
+                    info!(
+                        "addMembers: legacy user-flat welcome stored for {}, rows_affected={}",
+                        crate::crypto::redact_for_log(member_did_str),
+                        welcome_result.rows_affected()
+                    );
+                }
             }
 
             // ── Store idempotency key ──────────────────────────────────
@@ -2144,38 +2243,39 @@ pub async fn commit_group_change(
             }
 
             // ── Parse MLS epoch from GroupInfo if provided ──────────
-            let (rm_group_info_bytes, rm_mls_epoch) = if let Some(gi_bytes) = input.group_info.as_ref() {
-                let gi_slice: &[u8] = gi_bytes;
-                let epoch = {
-                    use openmls::messages::group_info::VerifiableGroupInfo;
-                    use openmls::prelude::{MlsMessageBodyIn, MlsMessageIn};
+            let (rm_group_info_bytes, rm_mls_epoch) =
+                if let Some(gi_bytes) = input.group_info.as_ref() {
+                    let gi_slice: &[u8] = gi_bytes;
+                    let epoch = {
+                        use openmls::messages::group_info::VerifiableGroupInfo;
+                        use openmls::prelude::{MlsMessageBodyIn, MlsMessageIn};
 
-                    let from_mls_msg = MlsMessageIn::tls_deserialize(&mut &*gi_slice)
-                        .ok()
-                        .and_then(|msg| match msg.extract() {
-                            MlsMessageBodyIn::GroupInfo(gi) => Some(gi.epoch().as_u64()),
-                            _ => None,
-                        });
-
-                    from_mls_msg.or_else(|| {
-                        VerifiableGroupInfo::tls_deserialize(&mut &*gi_slice)
+                        let from_mls_msg = MlsMessageIn::tls_deserialize(&mut &*gi_slice)
                             .ok()
-                            .map(|gi| gi.epoch().as_u64())
-                    })
+                            .and_then(|msg| match msg.extract() {
+                                MlsMessageBodyIn::GroupInfo(gi) => Some(gi.epoch().as_u64()),
+                                _ => None,
+                            });
+
+                        from_mls_msg.or_else(|| {
+                            VerifiableGroupInfo::tls_deserialize(&mut &*gi_slice)
+                                .ok()
+                                .map(|gi| gi.epoch().as_u64())
+                        })
+                    };
+
+                    if let Some(e) = epoch {
+                        info!(
+                            "removeMember: parsed MLS epoch {} from GroupInfo for convo {}",
+                            e,
+                            crate::crypto::redact_for_log(&convo_id)
+                        );
+                    }
+
+                    (Some(gi_bytes.to_vec()), epoch)
+                } else {
+                    (None, None)
                 };
-
-                if let Some(e) = epoch {
-                    info!(
-                        "removeMember: parsed MLS epoch {} from GroupInfo for convo {}",
-                        e,
-                        crate::crypto::redact_for_log(&convo_id)
-                    );
-                }
-
-                (Some(gi_bytes.to_vec()), epoch)
-            } else {
-                (None, None)
-            };
 
             // ── Decode client-provided confirmation_tag ──────────
             let rm_confirmation_tag: Option<Vec<u8>> = input

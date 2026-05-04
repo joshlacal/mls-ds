@@ -482,22 +482,241 @@ async fn handle_create_convo(
         StatusCode::INTERNAL_SERVER_ERROR.into_response()
     })?;
 
-    // ── Add creator as admin member ──────────────────────────────────────
-    tracing::debug!("📍 [v2.createConvo] adding creator membership");
-    sqlx::query(
-        "INSERT INTO members (convo_id, member_did, user_did, joined_at, is_admin) VALUES ($1, $2, $3, $4, true)",
-    )
-    .bind(&convo_id)
-    .bind(&auth_user.did)
-    .bind(&auth_user.did)
-    .bind(now)
-    .execute(&pool)
-    .await
-    .map_err(|e| {
-        error!("❌ [v2.createConvo] Failed to add creator membership: {}", e);
+    // ── Add creator as admin member + initial members ──────────────────
+    // Per-device when kp_hashes provided; user-flat fallback otherwise.
+    // The kp_hashes path resolves device_id from key_packages and inserts
+    // member_did = "{user_did}#{device_id}" (Task 7 helper) so SSE/push
+    // fan-out can target individual devices instead of flooding every
+    // active session for a user. Mirrors Task 7's addMembers refactor
+    // (commit 110fcce) and Task 4's per-device welcome shape (commit
+    // 2b95378). See
+    // docs/superpowers/plans/2026-05-04-mls-per-device-welcome-and-members-routing.md.
+    //
+    // Behavior delta vs the prior two auto-commit inserts (admin at
+    // ~488, members loop at ~528): when kp_hashes is Some(non-empty) but
+    // does not include an entry for some member_did, that member no
+    // longer receives a user-flat row. Authorized by the plan ("you may
+    // consolidate to a single per-device path with fallback") — the
+    // omitted row is dead storage anyway since the MLS Welcome cannot
+    // decrypt for a recipient whose key package wasn't included by the
+    // creator. Fallback path (kp_hashes None/empty) preserves legacy
+    // every-member behavior unchanged.
+    //
+    // Atomicity improvement: today admin and members are two separate
+    // auto-commits on `&pool` (so a partial failure leaves an admin row
+    // without the members rows). The helper requires `&mut Transaction`,
+    // so we open a fresh `members_tx` scoped to both inserts and commit
+    // it before the welcome flow opens its own tx (the conversation tx
+    // already committed at ~480).
+    let mut members_tx = pool.begin().await.map_err(|e| {
+        error!("❌ [v2.createConvo] Failed to begin members tx: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR.into_response()
     })?;
 
+    let used_per_device_members_path = match input.key_package_hashes.as_ref() {
+        Some(hashes) if !hashes.is_empty() => {
+            // Convert from create_convo::KeyPackageHashEntry to
+            // bootstrap_reset_group::KeyPackageHashEntry (helper's accepted type).
+            // jacquard generates nominally distinct types per lexicon module even
+            // though their fields are identical — see Task 3 (commit a60b8af).
+            let converted: Vec<crate::generated::blue_catbird::mlsChat::bootstrap_reset_group::KeyPackageHashEntry> = hashes
+                .iter()
+                .map(|e| crate::generated::blue_catbird::mlsChat::bootstrap_reset_group::KeyPackageHashEntry {
+                    did: e.did.clone(),
+                    hash: e.hash.clone(),
+                    extra_data: Default::default(),
+                })
+                .collect();
+
+            // Partition kp_hashes into admin (creator's devices) and non-admin
+            // (everyone else's devices). The lexicon `Did<'_>` regex rejects
+            // '#', so `did_to_string(&e.did)` is always user-form. By contrast,
+            // `auth_user.did` may be device-form (e.g. "did:plc:alice#deviceA")
+            // for some callers — Task 1's verification was INDIRECT for the
+            // iOS issuance path. Comparing user-form to a raw device-form
+            // string would always be false, mis-classifying every creator
+            // device as a non-admin member.
+            //
+            // Defensive fix: derive the user-form half of `auth_user.did`
+            // first (split at '#' if present, else use the string verbatim)
+            // and partition against that. No-op when `auth_user.did` is
+            // already user-form; correct partitioning when it's device-form.
+            let caller_user_form: String = match auth_user.did.split_once('#') {
+                Some((user, _device)) => user.to_string(),
+                None => auth_user.did.clone(),
+            };
+            let (admin_entries, member_entries): (Vec<_>, Vec<_>) = converted
+                .into_iter()
+                .partition(|e| did_to_string(&e.did) == caller_user_form);
+
+            // Admin: one row per creator device when kp_hashes covers any of them.
+            // Fallback to legacy single-row admin insert when the creator omitted
+            // their own kp from kp_hashes (some clients only include invitee kps).
+            if !admin_entries.is_empty() {
+                let admin_count = admin_entries.len();
+                crate::db::insert_members_per_device_in_tx(
+                    &mut members_tx,
+                    &convo_id,
+                    &admin_entries,
+                    now,
+                    true,
+                )
+                .await
+                .map_err(|e| {
+                    error!(
+                        "❌ [v2.createConvo] failed to insert per-device admin: {}",
+                        e
+                    );
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                })?;
+                info!(
+                    "createConvo: inserted {} per-device admin rows for convo {}",
+                    admin_count,
+                    crate::crypto::redact_for_log(&convo_id)
+                );
+            } else {
+                // No admin kp in kp_hashes — preserve legacy single-row admin so
+                // the creator stays a member of the conversation regardless.
+                //
+                // Defensive against device-form vs user-form ambiguity in
+                // `auth_user.did`: bind `member_did = auth_user.did` (preserving
+                // device-form when present so per-device fan-out can address it)
+                // but use `caller_user_form` for the `user_did` column, which
+                // canonically holds the user-form DID. ON CONFLICT clause
+                // makes this idempotent in case the per-device helper above
+                // also wrote a row keyed by the same `(convo_id, member_did)`.
+                sqlx::query(
+                    "INSERT INTO members (convo_id, member_did, user_did, joined_at, is_admin) \
+                     VALUES ($1, $2, $3, $4, true) \
+                     ON CONFLICT (convo_id, member_did) DO UPDATE SET \
+                       is_admin = true, \
+                       left_at = NULL, \
+                       needs_rejoin = false",
+                )
+                .bind(&convo_id)
+                .bind(&auth_user.did)
+                .bind(&caller_user_form)
+                .bind(now)
+                .execute(&mut *members_tx)
+                .await
+                .map_err(|e| {
+                    error!(
+                        "❌ [v2.createConvo] Failed to add creator membership (legacy fallback): {}",
+                        e
+                    );
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                })?;
+                info!(
+                    "createConvo: kp_hashes had no entry for creator — wrote single user-flat admin row for convo {}",
+                    crate::crypto::redact_for_log(&convo_id)
+                );
+            }
+
+            // Non-admin members: one row per device.
+            if !member_entries.is_empty() {
+                let member_count = member_entries.len();
+                crate::db::insert_members_per_device_in_tx(
+                    &mut members_tx,
+                    &convo_id,
+                    &member_entries,
+                    now,
+                    false,
+                )
+                .await
+                .map_err(|e| {
+                    error!(
+                        "❌ [v2.createConvo] failed to insert per-device members: {}",
+                        e
+                    );
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                })?;
+                info!(
+                    "createConvo: inserted {} per-device member rows for convo {}",
+                    member_count,
+                    crate::crypto::redact_for_log(&convo_id)
+                );
+            }
+            true
+        }
+        _ => false,
+    };
+
+    if !used_per_device_members_path {
+        // Legacy user-flat fallback — kp_hashes was None or empty.
+        warn!(
+            "createConvo: key_package_hashes absent/empty — falling back to user-flat members storage for convo {}",
+            crate::crypto::redact_for_log(&convo_id)
+        );
+        tracing::debug!("📍 [v2.createConvo] adding creator membership (legacy)");
+
+        // Defensive against device-form vs user-form ambiguity in
+        // `auth_user.did` (mirrors the same fix in the per-device admin
+        // fallback above): bind `member_did = auth_user.did` verbatim but
+        // use the parsed user-form for the `user_did` column. ON CONFLICT
+        // makes the INSERT idempotent so a retry or a sibling per-device
+        // helper insert keyed on the same (convo_id, member_did) can't
+        // collide.
+        let caller_user_form: String = match auth_user.did.split_once('#') {
+            Some((user, _device)) => user.to_string(),
+            None => auth_user.did.clone(),
+        };
+        sqlx::query(
+            "INSERT INTO members (convo_id, member_did, user_did, joined_at, is_admin) \
+             VALUES ($1, $2, $3, $4, true) \
+             ON CONFLICT (convo_id, member_did) DO UPDATE SET \
+               is_admin = true, \
+               left_at = NULL, \
+               needs_rejoin = false",
+        )
+        .bind(&convo_id)
+        .bind(&auth_user.did)
+        .bind(&caller_user_form)
+        .bind(now)
+        .execute(&mut *members_tx)
+        .await
+        .map_err(|e| {
+            error!(
+                "❌ [v2.createConvo] Failed to add creator membership: {}",
+                e
+            );
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        })?;
+
+        if let Some(ref initial_members) = input.initial_members {
+            tracing::debug!("📍 [v2.createConvo] adding initial members (legacy)");
+            for (idx, member_did) in initial_members.iter().enumerate() {
+                let member_did_str = did_to_string(member_did);
+
+                if member_did_str == auth_user.did {
+                    continue;
+                }
+
+                info!("📍 [v2.createConvo] Adding member {} (legacy)", idx + 1);
+                sqlx::query(
+                    "INSERT INTO members (convo_id, member_did, user_did, joined_at, is_admin) VALUES ($1, $2, $3, $4, false)",
+                )
+                .bind(&convo_id)
+                .bind(&member_did_str)
+                .bind(&member_did_str)
+                .bind(now)
+                .execute(&mut *members_tx)
+                .await
+                .map_err(|e| {
+                    error!("❌ [v2.createConvo] Failed to add member: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                })?;
+            }
+        }
+    }
+
+    members_tx.commit().await.map_err(|e| {
+        error!("❌ [v2.createConvo] Failed to commit members tx: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+    })?;
+
+    // Build MemberView list for the response unchanged (per-device storage is
+    // a server-side roster representation; the lexicon-level MemberView still
+    // models user-flat semantics with leaf_index ordering for now).
     let mut members_typed: Vec<MemberView<'static>> = vec![MemberView {
         did: string_to_did(&creator_did),
         user_did: string_to_did(&creator_did),
@@ -513,30 +732,13 @@ async fn handle_create_convo(
         extra_data: Default::default(),
     }];
 
-    // ── Add initial members ──────────────────────────────────────────────
     if let Some(ref initial_members) = input.initial_members {
-        tracing::debug!("📍 [v2.createConvo] adding initial members");
         for (idx, member_did) in initial_members.iter().enumerate() {
             let member_did_str = did_to_string(member_did);
 
             if member_did_str == auth_user.did {
                 continue;
             }
-
-            info!("📍 [v2.createConvo] Adding member {}", idx + 1);
-            sqlx::query(
-                "INSERT INTO members (convo_id, member_did, user_did, joined_at, is_admin) VALUES ($1, $2, $3, $4, false)",
-            )
-            .bind(&convo_id)
-            .bind(&member_did_str)
-            .bind(&member_did_str)
-            .bind(now)
-            .execute(&pool)
-            .await
-            .map_err(|e| {
-                error!("❌ [v2.createConvo] Failed to add member: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
-            })?;
 
             members_typed.push(MemberView {
                 did: string_to_did(&member_did_str),
@@ -641,20 +843,78 @@ async fn handle_create_convo(
             all_member_dids.len()
         );
 
-        for member_did_str in all_member_dids.iter() {
-            let member_hashes: Vec<Vec<u8>> = input
-                .key_package_hashes
-                .as_ref()
-                .map(|hashes| {
-                    hashes
-                        .iter()
-                        .filter(|entry| did_to_string(&entry.did) == *member_did_str)
-                        .filter_map(|entry| hex::decode(&*entry.hash).ok())
-                        .collect()
-                })
-                .unwrap_or_default();
+        // ── Store welcome (per-device when kp_hashes provided; user-flat fallback otherwise) ──
+        // Mirrors Task 4's addMembers shape (commit 1284301): top-level conditional, single
+        // path through the per-device helper when kp_hashes are present, legacy user-flat path
+        // otherwise. The MLS welcome_bytes is itself a multi-recipient blob — each device
+        // decrypts only its own EncryptedGroupSecrets entry — so storing identical welcome_data
+        // across N rows is correct; per-device discrimination lives in key_package_hash. See
+        // docs/superpowers/plans/2026-05-04-mls-per-device-welcome-and-members-routing.md.
+        //
+        // Behavior delta vs the prior per-member loop: when kp_hashes is Some(non-empty) but
+        // does not include an entry for some `member_did`, that member no longer receives a
+        // user-flat fallback row. This is intentional and authorized by the plan ("you may
+        // consolidate to a single per-device path with fallback"): a member whose key package
+        // wasn't included in the inviter's Welcome cannot decrypt it anyway, so the omitted
+        // row was dead storage. The fallback path (kp_hashes None/empty) preserves the legacy
+        // every-member behavior unchanged.
+        //
+        // The helper requires `&mut Transaction`; the conversation-creation tx already
+        // committed at line ~480, so we open a fresh tx scoped to the welcome inserts.
+        let mut welcome_tx = pool.begin().await.map_err(|e| {
+            error!("❌ [v2.createConvo] Failed to begin welcome tx: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        })?;
 
-            if member_hashes.is_empty() {
+        let kp_hashes_for_welcomes = input.key_package_hashes.as_ref();
+        let used_per_device_path = match kp_hashes_for_welcomes {
+            Some(hashes) if !hashes.is_empty() => {
+                // Convert from create_convo::KeyPackageHashEntry to
+                // bootstrap_reset_group::KeyPackageHashEntry (helper's accepted type).
+                // jacquard generates nominally distinct types per lexicon module even
+                // though their fields are identical — see Task 3 (commit a60b8af) for
+                // context. The conversion is a mechanical field copy.
+                let converted: Vec<crate::generated::blue_catbird::mlsChat::bootstrap_reset_group::KeyPackageHashEntry> = hashes
+                    .iter()
+                    .map(|e| crate::generated::blue_catbird::mlsChat::bootstrap_reset_group::KeyPackageHashEntry {
+                        did: e.did.clone(),
+                        hash: e.hash.clone(),
+                        extra_data: Default::default(),
+                    })
+                    .collect();
+                let count = converted.len();
+                crate::db::store_welcomes_per_device_in_tx(
+                    &mut welcome_tx,
+                    &convo_id,
+                    &welcome_data,
+                    &converted,
+                    &auth_user.did,
+                )
+                .await
+                .map_err(|e| {
+                    error!(
+                        "❌ [v2.createConvo] failed to store per-device welcomes: {}",
+                        e
+                    );
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                })?;
+                info!(
+                    "createConvo: stored {} per-device welcome rows for convo {}",
+                    count,
+                    crate::crypto::redact_for_log(&convo_id)
+                );
+                true
+            }
+            _ => false,
+        };
+
+        // Legacy user-flat fallback: only runs when kp_hashes was None or empty.
+        if !used_per_device_path {
+            warn!(
+                "createConvo: key_package_hashes absent/empty — falling back to user-flat welcome storage for convo {}",
+                crate::crypto::redact_for_log(&convo_id)
+            );
+            for member_did_str in all_member_dids.iter() {
                 let welcome_id = uuid::Uuid::new_v4().to_string();
                 sqlx::query(
                     "INSERT INTO welcome_messages (id, convo_id, recipient_did, welcome_data, key_package_hash, created_at)
@@ -668,36 +928,19 @@ async fn handle_create_convo(
                 .bind(&welcome_data)
                 .bind::<Option<Vec<u8>>>(None)
                 .bind(now)
-                .execute(&pool)
+                .execute(&mut *welcome_tx)
                 .await
                 .map_err(|e| {
-                    error!("❌ [v2.createConvo] store welcome for {}: {}", crate::crypto::redact_for_log(member_did_str), e);
+                    error!("❌ [v2.createConvo] store user-flat welcome for {}: {}", crate::crypto::redact_for_log(member_did_str), e);
                     StatusCode::INTERNAL_SERVER_ERROR.into_response()
                 })?;
-            } else {
-                for hash in member_hashes {
-                    let welcome_id = uuid::Uuid::new_v4().to_string();
-                    sqlx::query(
-                        "INSERT INTO welcome_messages (id, convo_id, recipient_did, welcome_data, key_package_hash, created_at)
-                         VALUES ($1, $2, $3, $4, $5, $6)
-                         ON CONFLICT (convo_id, recipient_did, COALESCE(key_package_hash, '\\x00'::bytea)) WHERE consumed = false
-                         DO NOTHING",
-                    )
-                    .bind(&welcome_id)
-                    .bind(&convo_id)
-                    .bind(member_did_str)
-                    .bind(&welcome_data)
-                    .bind(Some(hash))
-                    .bind(now)
-                    .execute(&pool)
-                    .await
-                    .map_err(|e| {
-                        error!("❌ [v2.createConvo] store welcome for {}: {}", crate::crypto::redact_for_log(member_did_str), e);
-                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
-                    })?;
-                }
             }
         }
+
+        welcome_tx.commit().await.map_err(|e| {
+            error!("❌ [v2.createConvo] Failed to commit welcome tx: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        })?;
 
         // Mark key packages as consumed
         if let Some(ref kp_hashes) = input.key_package_hashes {

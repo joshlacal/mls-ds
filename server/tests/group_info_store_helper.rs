@@ -212,13 +212,11 @@ async fn store_group_info_in_tx_rolls_back_on_txn_abort() {
         tx.rollback().await.expect("rollback tx");
     }
 
-    let row = sqlx::query(
-        "SELECT group_info, group_info_epoch FROM conversations WHERE id = $1",
-    )
-    .bind(&convo_id)
-    .fetch_one(&pool)
-    .await
-    .expect("fetch convo row");
+    let row = sqlx::query("SELECT group_info, group_info_epoch FROM conversations WHERE id = $1")
+        .bind(&convo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch convo row");
 
     let stored_gi: Vec<u8> = row.get("group_info");
     let stored_epoch: i32 = row.get("group_info_epoch");
