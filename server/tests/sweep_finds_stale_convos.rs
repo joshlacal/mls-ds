@@ -17,31 +17,15 @@
 //!
 //! Plan: docs/superpowers/plans/2026-04-26-mls-auto-reset-phase2.md (Task 12)
 
+mod common;
+
 use catbird_server::actors::ActorRegistry;
 use catbird_server::config::SweepConfig;
-use catbird_server::db::{init_db, DbConfig};
 use catbird_server::jobs::auto_detect_failed_groups::sweep_once;
 use catbird_server::realtime::SseState;
 use sqlx::PgPool;
 use std::sync::Arc;
 use std::time::Duration;
-
-async fn setup_test_db() -> PgPool {
-    let database_url = std::env::var("TEST_DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://localhost/catbird_test".to_string());
-
-    let config = DbConfig {
-        database_url,
-        max_connections: 4,
-        min_connections: 1,
-        acquire_timeout: Duration::from_secs(30),
-        idle_timeout: Duration::from_secs(600),
-    };
-
-    init_db(config)
-        .await
-        .expect("Failed to initialize test database")
-}
 
 async fn wipe(pool: &PgPool, convo_id: &str) {
     for table in &[
@@ -138,7 +122,7 @@ fn make_registry(pool: &PgPool) -> Arc<ActorRegistry> {
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL) with A7 + Phase 2 schema"]
 async fn sweep_picks_up_convo_matching_all_conditions() {
-    let pool = setup_test_db().await;
+    let pool = common::setup_test_db().await;
     let convo_id = "test-sweep-all-conditions";
     let initial_group_id = "sweepall000100001000010000100001000";
     wipe(&pool, convo_id).await;
@@ -177,7 +161,7 @@ async fn sweep_picks_up_convo_matching_all_conditions() {
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL) with A7 + Phase 2 schema"]
 async fn sweep_skips_convo_with_recent_mode_a_report() {
-    let pool = setup_test_db().await;
+    let pool = common::setup_test_db().await;
     let convo_id = "test-sweep-mode-a-skip";
     let initial_group_id = "sweepmodea0001000010000100001000010";
     wipe(&pool, convo_id).await;
@@ -226,7 +210,7 @@ async fn sweep_skips_convo_with_recent_mode_a_report() {
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL) with A7 + Phase 2 schema"]
 async fn sweep_skips_convo_within_reset_cooldown() {
-    let pool = setup_test_db().await;
+    let pool = common::setup_test_db().await;
     let convo_id = "test-sweep-cooldown-skip";
     let initial_group_id = "sweepcd00010000100001000010000100001";
     wipe(&pool, convo_id).await;
@@ -261,7 +245,7 @@ async fn sweep_skips_convo_within_reset_cooldown() {
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL) with A7 + Phase 2 schema"]
 async fn sweep_skips_convo_with_tripped_circuit_breaker() {
-    let pool = setup_test_db().await;
+    let pool = common::setup_test_db().await;
     let convo_id = "test-sweep-breaker-skip";
     let initial_group_id = "sweepbrk00010000100001000010000100001";
     wipe(&pool, convo_id).await;

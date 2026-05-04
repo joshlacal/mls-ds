@@ -21,42 +21,15 @@
 //! Plan: docs/superpowers/plans/2026-04-26-mls-auto-reset-phase2.md
 //! (Stage 1, Task 2)
 
+mod common;
+
 use catbird_server::db::*;
 use chrono::Utc;
 use sqlx::PgPool;
-use std::time::Duration;
 
 const CREATOR: &str = "did:plc:health1111111111111111111";
 const CONVO_SUCCESS: &str = "convo-health-success-0001";
 const CONVO_409: &str = "convo-health-409-0001";
-
-async fn setup_test_db() -> PgPool {
-    let database_url = std::env::var("TEST_DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://localhost/catbird_test".to_string());
-
-    let config = DbConfig {
-        database_url,
-        max_connections: 4,
-        min_connections: 1,
-        acquire_timeout: Duration::from_secs(30),
-        idle_timeout: Duration::from_secs(600),
-    };
-
-    init_db(config)
-        .await
-        .expect("Failed to initialize test database")
-}
-
-async fn cleanup(pool: &PgPool, convo_id: &str) {
-    let _ = sqlx::query("DELETE FROM members WHERE convo_id = $1")
-        .bind(convo_id)
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("DELETE FROM conversations WHERE id = $1")
-        .bind(convo_id)
-        .execute(pool)
-        .await;
-}
 
 /// Insert a minimal `conversations` row sufficient for exercising the
 /// health-counter helpers. Mirrors the column set used by
@@ -123,8 +96,8 @@ async fn fetch_health(pool: &PgPool, convo_id: &str) -> HealthRow {
 #[tokio::test]
 #[ignore = "fixture isolation: shared group_id collides with idx_conversations_group_id_unique"]
 async fn successful_commit_sets_last_successful_commit_at_and_zeroes_409_count() {
-    let pool = setup_test_db().await;
-    cleanup(&pool, CONVO_SUCCESS).await;
+    let pool = common::setup_test_db().await;
+    common::cleanup(&pool, CONVO_SUCCESS).await;
     insert_convo_with_409_count(&pool, CONVO_SUCCESS, 5).await;
 
     // Sanity: the row is in the "currently failing" state we set up.
@@ -167,7 +140,7 @@ async fn successful_commit_sets_last_successful_commit_at_and_zeroes_409_count()
         "timestamp must not be in the future"
     );
 
-    cleanup(&pool, CONVO_SUCCESS).await;
+    common::cleanup(&pool, CONVO_SUCCESS).await;
 }
 
 /// Atomicity check: if the wrapping tx rolls back (mirroring a downstream
@@ -177,9 +150,9 @@ async fn successful_commit_sets_last_successful_commit_at_and_zeroes_409_count()
 #[tokio::test]
 #[ignore = "fixture isolation: shared group_id collides with idx_conversations_group_id_unique"]
 async fn mark_commit_success_rolls_back_when_wrapping_tx_aborts() {
-    let pool = setup_test_db().await;
+    let pool = common::setup_test_db().await;
     let convo_id = "convo-health-success-rollback-0001";
-    cleanup(&pool, convo_id).await;
+    common::cleanup(&pool, convo_id).await;
     insert_convo_with_409_count(&pool, convo_id, 7).await;
 
     let mut tx = pool.begin().await.expect("begin tx");
@@ -200,7 +173,7 @@ async fn mark_commit_success_rolls_back_when_wrapping_tx_aborts() {
         "last_successful_commit_at must NOT be set when the wrapping tx rolls back"
     );
 
-    cleanup(&pool, convo_id).await;
+    common::cleanup(&pool, convo_id).await;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -219,8 +192,8 @@ async fn mark_commit_success_rolls_back_when_wrapping_tx_aborts() {
 #[tokio::test]
 #[ignore = "fixture isolation: shared group_id collides with idx_conversations_group_id_unique"]
 async fn epoch_mismatch_409_increments_counter_and_sets_timestamp() {
-    let pool = setup_test_db().await;
-    cleanup(&pool, CONVO_409).await;
+    let pool = common::setup_test_db().await;
+    common::cleanup(&pool, CONVO_409).await;
     insert_convo_with_409_count(&pool, CONVO_409, 0).await;
 
     let pre = fetch_health(&pool, CONVO_409).await;
@@ -272,7 +245,7 @@ async fn epoch_mismatch_409_increments_counter_and_sets_timestamp() {
         "second 409 timestamp ({second_at}) must be ≥ first 409 timestamp ({first_at})"
     );
 
-    cleanup(&pool, CONVO_409).await;
+    common::cleanup(&pool, CONVO_409).await;
 }
 
 /// Independence check: a 409 recorded against one conversation MUST NOT
@@ -281,11 +254,11 @@ async fn epoch_mismatch_409_increments_counter_and_sets_timestamp() {
 #[tokio::test]
 #[ignore = "fixture isolation: shared group_id collides with idx_conversations_group_id_unique"]
 async fn record_commit_409_only_touches_target_convo() {
-    let pool = setup_test_db().await;
+    let pool = common::setup_test_db().await;
     let convo_a = "convo-health-409-isolation-a";
     let convo_b = "convo-health-409-isolation-b";
-    cleanup(&pool, convo_a).await;
-    cleanup(&pool, convo_b).await;
+    common::cleanup(&pool, convo_a).await;
+    common::cleanup(&pool, convo_b).await;
     insert_convo_with_409_count(&pool, convo_a, 0).await;
     insert_convo_with_409_count(&pool, convo_b, 3).await;
 
@@ -310,8 +283,8 @@ async fn record_commit_409_only_touches_target_convo() {
         "convo_b timestamp MUST be untouched by record_commit_409 on convo_a"
     );
 
-    cleanup(&pool, convo_a).await;
-    cleanup(&pool, convo_b).await;
+    common::cleanup(&pool, convo_a).await;
+    common::cleanup(&pool, convo_b).await;
 }
 
 /// Cross-path interaction: a successful commit AFTER a streak of 409s must
@@ -320,9 +293,9 @@ async fn record_commit_409_only_touches_target_convo() {
 #[tokio::test]
 #[ignore = "fixture isolation: shared group_id collides with idx_conversations_group_id_unique"]
 async fn success_after_409_streak_resets_counter() {
-    let pool = setup_test_db().await;
+    let pool = common::setup_test_db().await;
     let convo_id = "convo-health-success-after-409";
-    cleanup(&pool, convo_id).await;
+    common::cleanup(&pool, convo_id).await;
     insert_convo_with_409_count(&pool, convo_id, 0).await;
 
     // Three 409s in a row.
@@ -361,5 +334,5 @@ async fn success_after_409_streak_resets_counter() {
         "last_commit_409_at MUST be preserved across success (historical marker)"
     );
 
-    cleanup(&pool, convo_id).await;
+    common::cleanup(&pool, convo_id).await;
 }

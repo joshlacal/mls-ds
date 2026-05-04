@@ -20,31 +20,15 @@
 //!
 //! Plan: docs/superpowers/plans/2026-04-26-mls-auto-reset-phase2.md (Task 11)
 
+mod common;
+
 use catbird_server::actors::{ConversationActor, ConvoActorArgs, ConvoMessage};
 use catbird_server::config::QuorumConfig;
-use catbird_server::db::{init_db, DbConfig};
 use catbird_server::realtime::SseState;
 use ractor::{Actor, ActorRef};
 use sqlx::PgPool;
 use std::sync::Arc;
 use std::time::Duration;
-
-async fn setup_test_db() -> PgPool {
-    let database_url = std::env::var("TEST_DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://localhost/catbird_test".to_string());
-
-    let config = DbConfig {
-        database_url,
-        max_connections: 4,
-        min_connections: 1,
-        acquire_timeout: Duration::from_secs(30),
-        idle_timeout: Duration::from_secs(600),
-    };
-
-    init_db(config)
-        .await
-        .expect("Failed to initialize test database")
-}
 
 async fn wipe(pool: &PgPool, convo_id: &str) {
     for table in &[
@@ -134,7 +118,7 @@ async fn fetch_state(pool: &PgPool, convo_id: &str) -> ConvoState {
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL) with A7 + Phase 2 schema"]
 async fn trigger_system_reset_rotates_group_id_and_sets_marker() {
-    let pool = setup_test_db().await;
+    let pool = common::setup_test_db().await;
     let convo_id = "test-system-reset-rotate";
     let initial_group_id = "sysreset0001000010000100001000010000";
     wipe(&pool, convo_id).await;
@@ -183,7 +167,7 @@ async fn trigger_system_reset_rotates_group_id_and_sets_marker() {
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL) with A7 + Phase 2 schema"]
 async fn trigger_system_reset_respects_cooldown() {
-    let pool = setup_test_db().await;
+    let pool = common::setup_test_db().await;
     let convo_id = "test-system-reset-cooldown";
     let initial_group_id = "sysreset0002000020000200002000020000";
     wipe(&pool, convo_id).await;
@@ -235,7 +219,7 @@ async fn trigger_system_reset_respects_cooldown() {
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL) with A7 + Phase 2 schema"]
 async fn trigger_system_reset_respects_circuit_breaker() {
-    let pool = setup_test_db().await;
+    let pool = common::setup_test_db().await;
     let convo_id = "test-system-reset-breaker";
     let initial_group_id = "sysreset0003000030000300003000030000";
     wipe(&pool, convo_id).await;

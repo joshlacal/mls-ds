@@ -34,27 +34,10 @@
 //! Plan: docs/plans (let-me-look-at-abstract-castle.md), §Phase 3
 //! "Acceptance".
 
-use catbird_server::db::{init_db, DbConfig};
+mod common;
+
 use sqlx::{PgPool, Postgres, Transaction};
-use std::time::Duration;
 use uuid::Uuid;
-
-async fn setup_test_db() -> PgPool {
-    let database_url = std::env::var("TEST_DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://localhost/catbird_test".to_string());
-
-    let config = DbConfig {
-        database_url,
-        max_connections: 4,
-        min_connections: 1,
-        acquire_timeout: Duration::from_secs(30),
-        idle_timeout: Duration::from_secs(600),
-    };
-
-    init_db(config)
-        .await
-        .expect("Failed to initialize test database")
-}
 
 /// Wipe per-convo data from all tables this test inserts into.
 async fn wipe(pool: &PgPool, convo_id: &str) {
@@ -301,7 +284,7 @@ async fn outbox_counts(pool: &PgPool, convo_id: &str) -> (i64, i64, i64, i64) {
 #[tokio::test]
 #[ignore = "requires TEST_DATABASE_URL"]
 async fn outbox_rows_complete_after_simulated_crash() {
-    let pool = setup_test_db().await;
+    let pool = common::setup_test_db().await;
     let convo_id = format!("convo-outbox-test-{}", Uuid::new_v4());
 
     // Three local members + zero federation peers.
@@ -355,7 +338,7 @@ async fn outbox_rows_complete_after_simulated_crash() {
 #[tokio::test]
 #[ignore = "requires TEST_DATABASE_URL"]
 async fn federation_rows_one_per_distinct_peer() {
-    let pool = setup_test_db().await;
+    let pool = common::setup_test_db().await;
     let convo_id = format!("convo-fed-test-{}", Uuid::new_v4());
 
     // Two local members + two on peer-A, one on peer-B → expect 2 distinct
@@ -399,7 +382,7 @@ async fn federation_rows_one_per_distinct_peer() {
 #[tokio::test]
 #[ignore = "requires TEST_DATABASE_URL"]
 async fn sigkill_window_preserves_sse_event_for_cursor_replay() {
-    let pool = setup_test_db().await;
+    let pool = common::setup_test_db().await;
     let convo_id = format!("convo-sigkill-test-{}", Uuid::new_v4());
 
     let members: &[(&str, Option<&str>)] = &[("did:plc:alice", None), ("did:plc:bob", None)];
@@ -538,7 +521,7 @@ async fn sigkill_window_preserves_sse_event_for_cursor_replay() {
 #[tokio::test]
 #[ignore = "requires TEST_DATABASE_URL"]
 async fn record_failure_pre_increment_backoff_curve() {
-    let pool = setup_test_db().await;
+    let pool = common::setup_test_db().await;
     let convo_id = format!("convo-backoff-test-{}", Uuid::new_v4());
 
     let members: &[(&str, Option<&str>)] = &[("did:plc:alice", None)];

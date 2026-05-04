@@ -16,33 +16,16 @@
 //! `tests/create_convo_collision.rs`. Requires TEST_DATABASE_URL pointing at
 //! a Postgres with the catbird schema applied.
 
-use catbird_server::db::*;
+mod common;
+
 use chrono::Utc;
 use sqlx::PgPool;
-use std::time::Duration;
 
 const ALICE: &str = "did:plc:alice4444444444444444444";
 const BOB: &str = "did:plc:bob44444444444444444444444";
 const CHARLIE: &str = "did:plc:charlie444444444444444444";
 const ORIGINAL_CONVO_ID: &str = "convo-bootstrap-test-0001";
 const NEW_GROUP_ID: &str = "deadbeefcafebabe1234567890abcdef";
-
-async fn setup_test_db() -> PgPool {
-    let database_url = std::env::var("TEST_DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://localhost/catbird_test".to_string());
-
-    let config = DbConfig {
-        database_url,
-        max_connections: 4,
-        min_connections: 1,
-        acquire_timeout: Duration::from_secs(30),
-        idle_timeout: Duration::from_secs(600),
-    };
-
-    init_db(config)
-        .await
-        .expect("Failed to initialize test database")
-}
 
 async fn cleanup(pool: &PgPool, convo_id: &str) {
     let _ = sqlx::query("DELETE FROM welcome_messages WHERE convo_id = $1")
@@ -259,7 +242,7 @@ async fn classify(
 #[tokio::test]
 #[ignore = "fixture isolation: shared convo/group IDs cause cross-test interference"]
 async fn bootstrap_member_finds_proceed_state() {
-    let pool = setup_test_db().await;
+    let pool = common::setup_test_db().await;
     cleanup(&pool, ORIGINAL_CONVO_ID).await;
     setup_post_reset_convo(&pool, &[ALICE, BOB]).await;
 
@@ -276,7 +259,7 @@ async fn bootstrap_member_finds_proceed_state() {
 #[tokio::test]
 #[ignore = "fixture isolation: shared convo/group IDs cause cross-test interference"]
 async fn bootstrap_race_loss_when_session_already_superseded() {
-    let pool = setup_test_db().await;
+    let pool = common::setup_test_db().await;
     cleanup(&pool, ORIGINAL_CONVO_ID).await;
     setup_post_reset_convo(&pool, &[ALICE, BOB]).await;
 
@@ -307,7 +290,7 @@ async fn bootstrap_classify_rejects_mismatched_new_group_id() {
     // bug_010 auth gate: when the upstream Request bound an
     // expected_new_mls_group_id, a bootstrap call with a different
     // mls_group_id must fail the auth gate.
-    let pool = setup_test_db().await;
+    let pool = common::setup_test_db().await;
     cleanup(&pool, ORIGINAL_CONVO_ID).await;
     setup_post_reset_convo(&pool, &[ALICE, BOB]).await;
 
@@ -332,7 +315,7 @@ async fn bootstrap_classify_rejects_mismatched_new_group_id() {
 #[tokio::test]
 #[ignore = "fixture isolation: shared convo/group IDs cause cross-test interference"]
 async fn bootstrap_not_member_rejected() {
-    let pool = setup_test_db().await;
+    let pool = common::setup_test_db().await;
     cleanup(&pool, ORIGINAL_CONVO_ID).await;
     setup_post_reset_convo(&pool, &[ALICE, BOB]).await;
 
@@ -349,7 +332,7 @@ async fn bootstrap_not_member_rejected() {
 #[tokio::test]
 #[ignore = "fixture isolation: shared convo/group IDs cause cross-test interference"]
 async fn bootstrap_target_not_found_when_group_id_overwritten() {
-    let pool = setup_test_db().await;
+    let pool = common::setup_test_db().await;
     cleanup(&pool, ORIGINAL_CONVO_ID).await;
     setup_post_reset_convo(&pool, &[ALICE]).await;
 
@@ -413,7 +396,7 @@ fn test_auth_user(did: &str) -> AuthUser {
 #[tokio::test]
 #[ignore = "fixture isolation: shared convo/group IDs cause cross-test interference"]
 async fn bootstrap_handle_updates_row_and_returns_view() {
-    let pool = setup_test_db().await;
+    let pool = common::setup_test_db().await;
     cleanup(&pool, ORIGINAL_CONVO_ID).await;
     setup_post_reset_convo(&pool, &[ALICE, BOB]).await;
 
@@ -492,7 +475,7 @@ async fn bootstrap_handle_updates_row_and_returns_view() {
 #[tokio::test]
 #[ignore = "fixture isolation: shared convo/group IDs cause cross-test interference"]
 async fn bootstrap_handle_with_welcome_inserts_per_recipient_envelopes() {
-    let pool = setup_test_db().await;
+    let pool = common::setup_test_db().await;
     cleanup(&pool, ORIGINAL_CONVO_ID).await;
     setup_post_reset_convo(&pool, &[ALICE, BOB]).await;
 
@@ -642,7 +625,7 @@ async fn cleanup_selfheal(pool: &PgPool) {
 #[tokio::test]
 #[ignore = "fixture isolation: shared convo/group IDs cause cross-test interference"]
 async fn bootstrap_self_heal_rejects_partial_welcome_fanout() {
-    let pool = setup_test_db().await;
+    let pool = common::setup_test_db().await;
     cleanup_selfheal(&pool).await;
     setup_selfheal_orphan_convo(&pool).await;
 
