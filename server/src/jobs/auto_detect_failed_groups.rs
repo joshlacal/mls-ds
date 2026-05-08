@@ -366,6 +366,14 @@ pub enum InlineTriggerDecision {
     /// bootstrap)"; firing again here would restart the loop rather than
     /// progress recovery.
     CascadingRecoveryCooldown,
+    /// Convo is still in its initial bootstrap window — `group_info` has
+    /// NEVER been populated (`bootstrap_completed_at IS NULL`). The
+    /// creator's first commit hasn't landed yet. Firing a system reset
+    /// here would zombie the convo (state=active, group_info=NULL,
+    /// recovery cooldown engaged with nothing to repair) — the failure
+    /// mode reproduced on prod convo `3a610a64...` 2026-05-08. See
+    /// migration `20260508110000_inline_404_bootstrap_gate.sql`.
+    BootstrapWindow,
 }
 
 /// Pure predicate evaluator for the B5 inline trigger.
@@ -388,6 +396,14 @@ pub fn evaluate_inline_trigger(
 ) -> InlineTriggerDecision {
     if snapshot.auto_reset_disabled_at.is_some() {
         return InlineTriggerDecision::CircuitBreakerTripped;
+    }
+    // Bootstrap-window gate: skip the trigger entirely if the convo has
+    // never had a non-NULL group_info. Brand-new convos can't be
+    // auto-reset — they need their creator's first commit to land first.
+    // Evaluated before threshold/cooldown so even a sustained 409 burst
+    // during the create window can't trip a reset.
+    if !snapshot.bootstrap_completed {
+        return InlineTriggerDecision::BootstrapWindow;
     }
     if snapshot.recent_commit_409_count < cfg.min_409_threshold {
         return InlineTriggerDecision::BelowThreshold {
@@ -501,6 +517,13 @@ pub async fn record_commit_409_with_inline_trigger(
                 "inline-trigger: group_info NULL with recent reset — cascading-recovery cooldown active, skipping"
             );
         }
+        InlineTriggerDecision::BootstrapWindow => {
+            tracing::debug!(
+                convo_id = %crate::crypto::redact_for_log(convo_id),
+                count_409 = snapshot.recent_commit_409_count,
+                "inline-trigger: convo still in bootstrap window (group_info never populated) — skipping"
+            );
+        }
     }
 
     Ok(())
@@ -525,6 +548,14 @@ pub fn evaluate_inline_groupinfo_404_trigger(
 ) -> InlineTriggerDecision {
     if snapshot.auto_reset_disabled_at.is_some() {
         return InlineTriggerDecision::CircuitBreakerTripped;
+    }
+    // Bootstrap-window gate: skip if group_info has never been populated.
+    // This is the primary motivator for the gate — the 2026-05-08
+    // `3a610a64...` zombie convo was created by this exact path firing
+    // 4s after createConvo, before the creator's first commit landed.
+    // See migration `20260508110000_inline_404_bootstrap_gate.sql`.
+    if !snapshot.bootstrap_completed {
+        return InlineTriggerDecision::BootstrapWindow;
     }
     if snapshot.recent_groupinfo_404_count < cfg.min_groupinfo_404_threshold {
         return InlineTriggerDecision::BelowThreshold {
@@ -633,6 +664,13 @@ pub async fn record_groupinfo_404_with_inline_trigger(
                 "inline-trigger(groupinfo-404): group_info NULL with recent reset — cascading-recovery cooldown active, skipping"
             );
         }
+        InlineTriggerDecision::BootstrapWindow => {
+            tracing::debug!(
+                convo_id = %crate::crypto::redact_for_log(convo_id),
+                count_404 = snapshot.recent_groupinfo_404_count,
+                "inline-trigger(groupinfo-404): convo still in bootstrap window (group_info never populated) — skipping"
+            );
+        }
     }
 
     Ok(())
@@ -660,6 +698,10 @@ mod inline_trigger_tests {
         disabled: bool,
         group_info_is_null: bool,
     ) -> CommitHealthSnapshot {
+        // `bootstrap_completed: true` matches every prior test's implicit
+        // assumption: the convo has been past its create→first-commit
+        // window. Tests for the new bootstrap-gate use the dedicated
+        // `snap_bootstrap_window` fixture below.
         CommitHealthSnapshot {
             recent_commit_409_count: count,
             last_reset_at: last_reset,
@@ -669,6 +711,22 @@ mod inline_trigger_tests {
                 None
             },
             group_info_is_null,
+            bootstrap_completed: true,
+        }
+    }
+
+    /// Brand-new convo, group_info NEVER populated, no resets, no
+    /// circuit breaker — exactly the prod state at 2026-05-08
+    /// `3a610a64...` 4 seconds after createConvo. Inputs let us drive
+    /// arbitrarily many 409s/404s through the trigger to assert the gate
+    /// holds even under sustained pressure.
+    fn snap_bootstrap_window_409(count: i32) -> CommitHealthSnapshot {
+        CommitHealthSnapshot {
+            recent_commit_409_count: count,
+            last_reset_at: None,
+            auto_reset_disabled_at: None,
+            group_info_is_null: true,
+            bootstrap_completed: false,
         }
     }
 
@@ -689,6 +747,8 @@ mod inline_trigger_tests {
         disabled: bool,
         group_info_is_null: bool,
     ) -> GroupInfoHealthSnapshot {
+        // See `snap_with_groupinfo` for the `bootstrap_completed: true`
+        // rationale.
         GroupInfoHealthSnapshot {
             recent_groupinfo_404_count: count,
             last_reset_at: last_reset,
@@ -698,6 +758,18 @@ mod inline_trigger_tests {
                 None
             },
             group_info_is_null,
+            bootstrap_completed: true,
+        }
+    }
+
+    /// 404-side mirror of `snap_bootstrap_window_409`.
+    fn snap_bootstrap_window_404(count: i32) -> GroupInfoHealthSnapshot {
+        GroupInfoHealthSnapshot {
+            recent_groupinfo_404_count: count,
+            last_reset_at: None,
+            auto_reset_disabled_at: None,
+            group_info_is_null: true,
+            bootstrap_completed: false,
         }
     }
 
@@ -957,6 +1029,112 @@ mod inline_trigger_tests {
         let last_reset = now - chrono::Duration::minutes(5);
         let s = snap_404_with_groupinfo(10, Some(last_reset), false, false);
         let c = cfg(3, 0);
+        assert_eq!(
+            evaluate_inline_groupinfo_404_trigger(&s, &c, now),
+            InlineTriggerDecision::Dispatch
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Bootstrap-window gate (2026-05-08 fix for the `3a610a64...` zombie).
+    //
+    // A brand-new convo (group_info NEVER populated, no resets, no circuit
+    // breaker) must NEVER trip a system-triggered reset, no matter how
+    // many 409s/404s land during the create→first-commit window. These
+    // tests pin that contract for both inline trigger predicates so the
+    // bug can't silently regress.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn bootstrap_window_gates_409_trigger_above_threshold() {
+        let now = Utc.with_ymd_and_hms(2026, 5, 8, 13, 49, 31).unwrap();
+        // Way over the 3-threshold; would dispatch on a bootstrapped convo.
+        let s = snap_bootstrap_window_409(10);
+        let c = cfg(3, 3600);
+        assert_eq!(
+            evaluate_inline_trigger(&s, &c, now),
+            InlineTriggerDecision::BootstrapWindow,
+            "still-bootstrapping convo MUST NOT trigger reset on 409 burst"
+        );
+    }
+
+    #[test]
+    fn bootstrap_window_gates_404_trigger_above_threshold() {
+        // The exact prod failure mode: 3 consecutive getGroupInfo→404 on
+        // a freshly-created convo, 4 seconds after createConvo, before
+        // the creator's first commit lands. Pre-fix this dispatched a
+        // reset; post-fix it MUST return BootstrapWindow.
+        let now = Utc.with_ymd_and_hms(2026, 5, 8, 13, 49, 31).unwrap();
+        let s = snap_bootstrap_window_404(3);
+        let c = cfg(3, 3600);
+        assert_eq!(
+            evaluate_inline_groupinfo_404_trigger(&s, &c, now),
+            InlineTriggerDecision::BootstrapWindow,
+            "still-bootstrapping convo MUST NOT trigger reset on 404 burst — this is the 2026-05-08 prod regression"
+        );
+    }
+
+    #[test]
+    fn bootstrap_window_gate_takes_precedence_over_below_threshold() {
+        // A convo can be both still-bootstrapping AND below threshold. The
+        // bootstrap gate MUST return BootstrapWindow (the actionable
+        // signal) rather than BelowThreshold — otherwise telemetry would
+        // mask the bug.
+        let now = Utc.with_ymd_and_hms(2026, 5, 8, 13, 49, 28).unwrap();
+        let s_409 = snap_bootstrap_window_409(1);
+        let s_404 = snap_bootstrap_window_404(1);
+        let c = cfg(3, 3600);
+        assert_eq!(
+            evaluate_inline_trigger(&s_409, &c, now),
+            InlineTriggerDecision::BootstrapWindow
+        );
+        assert_eq!(
+            evaluate_inline_groupinfo_404_trigger(&s_404, &c, now),
+            InlineTriggerDecision::BootstrapWindow
+        );
+    }
+
+    #[test]
+    fn bootstrap_window_gate_still_yields_to_circuit_breaker() {
+        // Circuit breaker is the highest-priority signal: an operator
+        // explicitly disabled auto-reset for this convo. The bootstrap
+        // gate must come AFTER the circuit-breaker gate.
+        let now = Utc.with_ymd_and_hms(2026, 5, 8, 13, 49, 31).unwrap();
+        let s_409 = CommitHealthSnapshot {
+            recent_commit_409_count: 10,
+            last_reset_at: None,
+            auto_reset_disabled_at: Some(now),
+            group_info_is_null: true,
+            bootstrap_completed: false,
+        };
+        let s_404 = GroupInfoHealthSnapshot {
+            recent_groupinfo_404_count: 10,
+            last_reset_at: None,
+            auto_reset_disabled_at: Some(now),
+            group_info_is_null: true,
+            bootstrap_completed: false,
+        };
+        let c = cfg(3, 3600);
+        assert_eq!(
+            evaluate_inline_trigger(&s_409, &c, now),
+            InlineTriggerDecision::CircuitBreakerTripped
+        );
+        assert_eq!(
+            evaluate_inline_groupinfo_404_trigger(&s_404, &c, now),
+            InlineTriggerDecision::CircuitBreakerTripped
+        );
+    }
+
+    #[test]
+    fn post_bootstrap_404_above_threshold_still_dispatches() {
+        // Sanity: the gate ONLY suppresses the bootstrap-window case. A
+        // genuine post-bootstrap 404 burst (group was once live, lost its
+        // GroupInfo) must still dispatch the reset.
+        let now = Utc.with_ymd_and_hms(2026, 5, 8, 14, 0, 0).unwrap();
+        let s = snap_404_with_groupinfo(5, None, false, true);
+        // Default `snap_404_with_groupinfo` sets bootstrap_completed=true.
+        assert!(s.bootstrap_completed);
+        let c = cfg(3, 3600);
         assert_eq!(
             evaluate_inline_groupinfo_404_trigger(&s, &c, now),
             InlineTriggerDecision::Dispatch

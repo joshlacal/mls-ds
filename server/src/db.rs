@@ -400,11 +400,19 @@ pub async fn store_group_info_in_tx(
     group_info_bytes: &[u8],
     confirmation_tag: Option<&[u8]>,
 ) -> sqlx::Result<()> {
+    // `bootstrap_completed_at = COALESCE(bootstrap_completed_at, NOW())`
+    // makes the column sticky on the first non-NULL group_info write and
+    // a no-op for every subsequent commit. The reset path
+    // (actors/conversation.rs) deliberately does NOT touch this column,
+    // so even after group_info goes back to NULL the bit is preserved —
+    // signaling "this convo has been past its bootstrap window before"
+    // to the inline-404/409 trigger gates in jobs/auto_detect_failed_groups.
     sqlx::query(
         r#"UPDATE conversations
            SET group_info = $1,
                group_info_epoch = COALESCE(group_info_epoch, 0) + 1,
                group_info_updated_at = NOW(),
+               bootstrap_completed_at = COALESCE(bootstrap_completed_at, NOW()),
                confirmation_tag = $3
            WHERE id = $2"#,
     )
@@ -599,6 +607,15 @@ pub struct CommitHealthSnapshot {
     /// the cascading-recovery loop observed on prod conversation
     /// `3153f1a2...` (see PR `hotfix/inline-trigger-cooldown`).
     pub group_info_is_null: bool,
+    /// True iff the conversation has EVER had a non-NULL `group_info`
+    /// (i.e., the creator's first commit has landed at some point).
+    /// Sticky bit — preserved across resets. False during the
+    /// create-to-first-commit bootstrap window for newly-created convos;
+    /// the inline-409/404 triggers MUST skip dispatch when this is false
+    /// so a still-bootstrapping convo can't be auto-reset before its
+    /// first GroupInfo lands. See migration
+    /// `20260508110000_inline_404_bootstrap_gate.sql`.
+    pub bootstrap_completed: bool,
 }
 
 /// Phase 2 (auto-reset): record that a `commitGroupChange` returned a 409
@@ -624,7 +641,8 @@ pub async fn record_commit_409(pool: &DbPool, convo_id: &str) -> Result<CommitHe
                last_commit_409_at = NOW()
            WHERE id = $1
            RETURNING recent_commit_409_count, last_reset_at, auto_reset_disabled_at,
-                     (group_info IS NULL) AS group_info_is_null"#,
+                     (group_info IS NULL) AS group_info_is_null,
+                     (bootstrap_completed_at IS NOT NULL) AS bootstrap_completed"#,
     )
     .bind(convo_id)
     .fetch_one(pool)
@@ -654,6 +672,12 @@ pub struct GroupInfoHealthSnapshot {
     /// with the 409 path and robust against any future reorder of
     /// counter-bump vs `do_reset_group` writes.
     pub group_info_is_null: bool,
+    /// True iff the conversation has EVER had a non-NULL `group_info`
+    /// (sticky bit preserved across resets — see
+    /// `CommitHealthSnapshot::bootstrap_completed` for full rationale).
+    /// The inline-404 trigger MUST skip dispatch when false: a brand-new
+    /// convo whose creator hasn't committed yet can't be auto-reset.
+    pub bootstrap_completed: bool,
 }
 
 /// Phase 2 B10: record that the `get_group_state` handler returned 404
@@ -678,7 +702,8 @@ pub async fn record_groupinfo_404(
                last_groupinfo_404_at = NOW()
            WHERE id = $1
            RETURNING recent_groupinfo_404_count, last_reset_at, auto_reset_disabled_at,
-                     (group_info IS NULL) AS group_info_is_null"#,
+                     (group_info IS NULL) AS group_info_is_null,
+                     (bootstrap_completed_at IS NOT NULL) AS bootstrap_completed"#,
     )
     .bind(convo_id)
     .fetch_one(pool)
