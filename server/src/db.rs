@@ -686,6 +686,227 @@ pub async fn record_groupinfo_404(
     .context("Failed to record GroupInfo 404 on conversation")
 }
 
+// =============================================================================
+// Layer 1 Robustness Helpers (plan: ~/.claude/plans/rippling-greeting-whale.md)
+//
+// Three families of helpers added together because they're co-deployed:
+//
+//   1. KP-publish gate (§1.1): mirror the recovery-mode count query in
+//      handlers/mls_chat/publish_key_packages.rs:191-206 so the External
+//      Commit handler can reject devices with zero published key packages.
+//
+//   2. Per-(device, group) EC cooldown (§1.2) + EC audit log (§1.4):
+//      single `external_commit_audit` table with the cooldown query as a
+//      MAX(created_at) lookup. messages.sender_did is NULL for commits
+//      (PRIV-001) so we can't attribute via the existing tables.
+//
+//   3. Epoch-storm circuit breaker (§1.3): freeze counters live on the
+//      `conversations` row (frozen_until, epoch_advance_count_window_start,
+//      epoch_advance_count). Pure-logic `should_freeze` is unit-testable.
+// =============================================================================
+
+/// §1.1 — Returns the count of available, non-expired key packages owned by
+/// `user_did` and either matching `device_id` or with NULL `device_id`.
+/// Mirrors the recovery-mode count query in `publish_key_packages.rs:191-206`.
+pub async fn count_available_key_packages_for_device(
+    pool: &DbPool,
+    user_did: &str,
+    device_id: &str,
+) -> Result<i64> {
+    let row: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM key_packages
+         WHERE owner_did = $1
+           AND (device_id = $2 OR device_id IS NULL)
+           AND consumed_at IS NULL
+           AND expires_at > NOW()",
+    )
+    .bind(user_did)
+    .bind(device_id)
+    .fetch_one(pool)
+    .await
+    .context("Failed to count available key packages for device")?;
+    Ok(row.0)
+}
+
+/// §1.2 — Most recent ACCEPTED External Commit by (actor_device_id,
+/// convo_id) within the last `window_secs`. Returns None if `device_id` is
+/// empty or no row exists in the window. Reads from `external_commit_audit`
+/// where `rejection_reason IS NULL`.
+pub async fn last_external_commit_by_device(
+    pool: &DbPool,
+    convo_id: &str,
+    actor_device_id: &str,
+    window_secs: i64,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+    if actor_device_id.is_empty() {
+        return Ok(None);
+    }
+    let ts: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+        "SELECT MAX(created_at) FROM external_commit_audit
+         WHERE convo_id = $1
+           AND actor_device_id = $2
+           AND rejection_reason IS NULL
+           AND created_at > NOW() - make_interval(secs => $3::float8)",
+    )
+    .bind(convo_id)
+    .bind(actor_device_id)
+    .bind(window_secs as f64)
+    .fetch_one(pool)
+    .await
+    .context("Failed to look up last external commit by device")?;
+    Ok(ts)
+}
+
+/// §1.4 — Insert a row into `external_commit_audit`. Best-effort: callers
+/// should `warn!`-log on error and continue (audit failures must never
+/// mask the response). For accepted ECs pass `rejection_reason = None`;
+/// for rejections pass a stable machine-readable token
+/// (`NoKeyPackagesPublished`, `PerDeviceCooldown`, `GroupFrozen`,
+/// `EpochMismatch`, `RateLimited`).
+pub async fn record_external_commit_audit(
+    pool: &DbPool,
+    convo_id: &str,
+    actor_did: &str,
+    actor_device_id: Option<&str>,
+    epoch_before: i32,
+    epoch_after: i32,
+    rejection_reason: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO external_commit_audit
+            (convo_id, actor_did, actor_device_id, epoch_before, epoch_after, rejection_reason)
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(convo_id)
+    .bind(actor_did)
+    .bind(actor_device_id)
+    .bind(epoch_before)
+    .bind(epoch_after)
+    .bind(rejection_reason)
+    .execute(pool)
+    .await
+    .context("Failed to insert external_commit_audit row")?;
+    Ok(())
+}
+
+/// §1.3 — Snapshot returned by [`get_freeze_status`].
+#[derive(Debug, Clone, Copy)]
+pub struct FreezeStatus {
+    /// If `Some(ts)` and `ts > now`, the group is currently frozen.
+    pub frozen_until: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl FreezeStatus {
+    pub fn is_frozen_at(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        matches!(self.frozen_until, Some(t) if t > now)
+    }
+    /// Seconds remaining until thaw, or 0 if not frozen.
+    pub fn retry_after_secs_at(&self, now: chrono::DateTime<chrono::Utc>) -> i64 {
+        match self.frozen_until {
+            Some(t) if t > now => (t - now).num_seconds().max(1),
+            _ => 0,
+        }
+    }
+}
+
+/// §1.3 — Read the freeze columns. Cheap pre-flight check; returns the
+/// snapshot so the handler can format `Retry-After`.
+pub async fn get_freeze_status(pool: &DbPool, convo_id: &str) -> Result<FreezeStatus> {
+    let row: Option<(Option<chrono::DateTime<chrono::Utc>>,)> =
+        sqlx::query_as("SELECT frozen_until FROM conversations WHERE id = $1")
+            .bind(convo_id)
+            .fetch_optional(pool)
+            .await
+            .context("Failed to read freeze status")?;
+    Ok(FreezeStatus {
+        frozen_until: row.and_then(|(t,)| t),
+    })
+}
+
+/// §1.3 — Pure-logic decision: should we freeze this group given the
+/// current `count` after the about-to-commit increment, whether the window
+/// has rolled over, and the threshold? Extracted as pure logic so it's
+/// unit-testable without a DB.
+///
+/// The window rolls over when `now >= window_start + window`. After
+/// rollover the count is reset to 1 (this advance starts the new window)
+/// and freeze cannot trigger.
+pub fn should_freeze(
+    count_after_increment: i32,
+    window_start: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+    threshold: i32,
+    window: chrono::Duration,
+) -> bool {
+    let window_active = match window_start {
+        Some(start) => now < start + window,
+        None => false, // no prior window — this is the first advance
+    };
+    window_active && count_after_increment > threshold
+}
+
+/// §1.3 — Atomically increment `epoch_advance_count` (or reset to 1 if the
+/// window has rolled over) and, if the post-increment count breaches the
+/// threshold within the active window, set `frozen_until = NOW() +
+/// freeze_duration`. Bundled into the caller's transaction so it commits
+/// atomically with the epoch CAS.
+///
+/// Returns the resulting `frozen_until` value (whatever it is after this
+/// call — `Some(ts)` if newly frozen OR a pre-existing freeze, `None`
+/// otherwise).
+pub async fn bump_epoch_advance_and_maybe_freeze_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    convo_id: &str,
+    threshold: i32,
+    window_secs: i64,
+    freeze_secs: i64,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+    // Single SQL statement, race-safe under SERIALIZABLE/REPEATABLE READ
+    // because we already hold the row for write via the surrounding tx
+    // (mark_commit_success_tx + UPDATE chain).
+    //
+    // Logic:
+    //   if window_start IS NULL OR NOW() >= window_start + window
+    //     -> reset window: window_start = NOW(), count = 1
+    //   else
+    //     -> count = count + 1
+    //   if count > threshold AFTER increment AND window still active
+    //     -> frozen_until = NOW() + freeze
+    let row: Option<(Option<chrono::DateTime<chrono::Utc>>,)> = sqlx::query_as(
+        r#"UPDATE conversations
+           SET
+             epoch_advance_count_window_start = CASE
+               WHEN epoch_advance_count_window_start IS NULL
+                 OR NOW() >= epoch_advance_count_window_start + make_interval(secs => $2::float8)
+               THEN NOW()
+               ELSE epoch_advance_count_window_start
+             END,
+             epoch_advance_count = CASE
+               WHEN epoch_advance_count_window_start IS NULL
+                 OR NOW() >= epoch_advance_count_window_start + make_interval(secs => $2::float8)
+               THEN 1
+               ELSE epoch_advance_count + 1
+             END,
+             frozen_until = CASE
+               WHEN epoch_advance_count_window_start IS NOT NULL
+                 AND NOW() < epoch_advance_count_window_start + make_interval(secs => $2::float8)
+                 AND epoch_advance_count + 1 > $1
+               THEN NOW() + make_interval(secs => $3::float8)
+               ELSE frozen_until
+             END
+           WHERE id = $4
+           RETURNING frozen_until"#,
+    )
+    .bind(threshold)
+    .bind(window_secs as f64)
+    .bind(freeze_secs as f64)
+    .bind(convo_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .context("Failed to bump epoch_advance_count / set frozen_until")?;
+    Ok(row.and_then(|(t,)| t))
+}
+
 /// Get current epoch for a conversation
 pub async fn get_current_epoch(pool: &DbPool, convo_id: &str) -> Result<i32> {
     let epoch =

@@ -27,6 +27,17 @@ use crate::{
 
 const NSID: &str = "blue.catbird.mlsChat.commitGroupChange";
 
+// Layer 1 robustness tunables. Plan: ~/.claude/plans/rippling-greeting-whale.md
+// Per-(device, group) External Commit cooldown. The existing per-conversation
+// 30s rate limit (lines below) catches storms across all devices; this gate
+// catches one buggy device retrying on its own.
+const PER_DEVICE_EC_COOLDOWN_SECS: i64 = 60;
+// Epoch-storm circuit breaker. > N epoch advances in M seconds freezes the
+// group for FREEZE seconds; clients see HTTP 423 GroupFrozen until thaw.
+const EPOCH_STORM_WINDOW_SECS: i64 = 60;
+const EPOCH_STORM_THRESHOLD: i32 = 6;
+const EPOCH_STORM_FREEZE_SECS: i64 = 5 * 60;
+
 #[derive(Serialize)]
 struct XrpcErrorBody {
     error: &'static str,
@@ -71,6 +82,21 @@ pub struct EpochConflictBody {
     expected_epoch: i32,
 }
 
+/// Layer 1 §1.2: structured 429 body for the two External-Commit rate-limit
+/// paths (per-conversation 30s + per-(device,group) 60s). Wire shape locked
+/// via the lexicon `#rateLimitedBody` def so clients can parse
+/// `retryAfterSeconds` without scraping the message string.
+#[derive(Serialize)]
+pub struct RateLimitedBody {
+    error: &'static str,
+    message: String,
+    #[serde(rename = "retryAfterSeconds")]
+    retry_after_seconds: i64,
+    /// `"convo"` = existing per-conversation 30s limit. `"device-convo"` =
+    /// per-(device, group) 60s cooldown.
+    scope: &'static str,
+}
+
 pub enum XrpcError {
     /// Plain error: status + error-name + message.
     Plain(StatusCode, &'static str, String),
@@ -80,6 +106,9 @@ pub enum XrpcError {
     /// to signal that the active crypto session has been reset/cleared and
     /// the client must bootstrap-recover instead of retrying.
     GroupReset(GroupResetBody),
+    /// Layer 1 §1.2: 429 with structured `RateLimitedBody`. Sets
+    /// `Retry-After` header from `retry_after_seconds`.
+    RateLimited(RateLimitedBody),
 }
 
 impl XrpcError {
@@ -107,6 +136,15 @@ impl IntoResponse for XrpcError {
             }
             XrpcError::EpochConflict(body) => (StatusCode::CONFLICT, Json(body)).into_response(),
             XrpcError::GroupReset(body) => (StatusCode::GONE, Json(body)).into_response(),
+            XrpcError::RateLimited(body) => {
+                let retry = body.retry_after_seconds.max(0).to_string();
+                let mut resp = (StatusCode::TOO_MANY_REQUESTS, Json(body)).into_response();
+                if let Ok(val) = axum::http::HeaderValue::from_str(&retry) {
+                    resp.headers_mut()
+                        .insert(axum::http::header::RETRY_AFTER, val);
+                }
+                resp
+            }
         }
     }
 }
@@ -185,6 +223,80 @@ fn internal_server_error(message: impl Into<String>) -> XrpcError {
         "InternalServerError",
         message.into(),
     )
+}
+
+/// Layer 1 §1.3: pre-flight freeze check. Returns `Err(XrpcError)` with HTTP
+/// 423 `GroupFrozen` if the group has been frozen by the epoch-storm circuit
+/// breaker and the freeze hasn't expired. Best-effort: DB read errors are
+/// treated as "not frozen" (fail open) so a transient DB blip can't lock all
+/// commits.
+async fn check_group_frozen(pool: &sqlx::PgPool, convo_id: &str) -> Result<(), XrpcError> {
+    match crate::db::get_freeze_status(pool, convo_id).await {
+        Ok(status) => {
+            let now = chrono::Utc::now();
+            if status.is_frozen_at(now) {
+                let retry = status.retry_after_secs_at(now);
+                warn!(
+                    convo_id = %crate::crypto::redact_for_log(convo_id),
+                    retry_after_secs = retry,
+                    "commitGroupChange: rejected — group frozen by epoch-storm circuit breaker"
+                );
+                return Err(XrpcError::Plain(
+                    StatusCode::LOCKED,
+                    "GroupFrozen",
+                    format!(
+                        "Conversation is being repaired (epoch-storm circuit breaker). Retry after {retry} seconds."
+                    ),
+                ));
+            }
+            Ok(())
+        }
+        Err(e) => {
+            warn!(
+                error = ?e,
+                convo_id = %crate::crypto::redact_for_log(convo_id),
+                "commitGroupChange: freeze-status read failed (non-fatal, allowing commit)"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Layer 1 §1.4: best-effort External Commit audit insert. Logs a warning
+/// on failure and returns Ok regardless — audit-row failures must never
+/// mask the response we're already about to send.
+async fn audit_external_commit(
+    pool: &sqlx::PgPool,
+    convo_id: &str,
+    actor_did: &str,
+    actor_device_id: &str,
+    epoch_before: i32,
+    epoch_after: i32,
+    rejection_reason: Option<&'static str>,
+) {
+    let dev = if actor_device_id.is_empty() {
+        None
+    } else {
+        Some(actor_device_id)
+    };
+    if let Err(e) = crate::db::record_external_commit_audit(
+        pool,
+        convo_id,
+        actor_did,
+        dev,
+        epoch_before,
+        epoch_after,
+        rejection_reason,
+    )
+    .await
+    {
+        warn!(
+            error = ?e,
+            convo_id = %crate::crypto::redact_for_log(convo_id),
+            rejection_reason = ?rejection_reason,
+            "external_commit_audit insert failed (non-fatal)"
+        );
+    }
 }
 
 fn inspect_commit_for_action(
@@ -335,6 +447,11 @@ pub async fn commit_group_change(
                 "v2.commitGroupChange: addMembers for convo {}",
                 crate::crypto::redact_for_log(&convo_id)
             );
+
+            // ── Layer 1 §1.3: freeze check ─────────────────────────────
+            // If the epoch-storm circuit breaker has flipped the group to
+            // frozen, refuse all epoch-advancing actions until thaw.
+            check_group_frozen(&pool, &convo_id).await?;
 
             // ── Idempotency check ──────────────────────────────────────
             if let Some(ref idem_key) = input.idempotency_key {
@@ -1041,9 +1158,160 @@ pub async fn commit_group_change(
             let convo_id = input.convo_id.to_string();
             info!("v2.commitGroupChange: externalCommit for convo");
 
+            // ── Layer 1 robustness: parse caller identity early so all the
+            //    new gates below can attribute audit rows. The duplicate
+            //    parse later at the membership-check site is harmless and
+            //    kept to minimize blast radius on this branch. ─────────
+            let (gate_user_did, gate_device_id) = match parse_device_did(&auth_user.did) {
+                Ok(v) => v,
+                Err(e) => {
+                    error!("externalCommit: invalid DID format: {}", e);
+                    return Err(bad_request("Invalid DID format"));
+                }
+            };
+
+            // Snapshot current epoch ONCE for audit-row epoch_before fields
+            // on rejected paths. The real CAS reads its own epoch later.
+            let pre_gate_epoch: i32 =
+                sqlx::query_scalar("SELECT current_epoch FROM conversations WHERE id = $1")
+                    .bind(&convo_id)
+                    .fetch_optional(&pool)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0);
+
+            // ── Layer 1 §1.3: freeze check ─────────────────────────────
+            //    Cheap pre-flight — if the epoch-storm circuit breaker has
+            //    flipped the group to frozen, refuse all epoch-advancing
+            //    commits with HTTP 423 GroupFrozen until thaw.
+            if let Err(e) = check_group_frozen(&pool, &convo_id).await {
+                audit_external_commit(
+                    &pool,
+                    &convo_id,
+                    &gate_user_did,
+                    &gate_device_id,
+                    pre_gate_epoch,
+                    pre_gate_epoch,
+                    Some("GroupFrozen"),
+                )
+                .await;
+                return Err(e);
+            }
+
+            // ── Layer 1 §1.1: KP-publish gate ──────────────────────────
+            //    A device that External-Commits without published key
+            //    packages produces a "ghost" leaf node — the failure mode
+            //    that previously poisoned shared groups for healthy peers
+            //    (iOS auto-reset cascade). Skipped for legacy single-
+            //    device DIDs (empty device_id) where the existing per-
+            //    convo 30s limit is the safety net.
+            if !gate_device_id.is_empty() {
+                match crate::db::count_available_key_packages_for_device(
+                    &pool,
+                    &gate_user_did,
+                    &gate_device_id,
+                )
+                .await
+                {
+                    Ok(0) => {
+                        warn!(
+                            convo_id = %crate::crypto::redact_for_log(&convo_id),
+                            user_did = %crate::crypto::redact_for_log(&gate_user_did),
+                            device_id = %crate::crypto::redact_for_log(&gate_device_id),
+                            "externalCommit: rejected — device has 0 published key packages"
+                        );
+                        audit_external_commit(
+                            &pool,
+                            &convo_id,
+                            &gate_user_did,
+                            &gate_device_id,
+                            pre_gate_epoch,
+                            pre_gate_epoch,
+                            Some("NoKeyPackagesPublished"),
+                        )
+                        .await;
+                        return Err(XrpcError::Plain(
+                            StatusCode::PRECONDITION_FAILED,
+                            "NoKeyPackagesPublished",
+                            "Device must publish at least one key package before issuing an External Commit.".into(),
+                        ));
+                    }
+                    Ok(_) => {} // proceed
+                    Err(e) => {
+                        warn!(
+                            error = ?e,
+                            convo_id = %crate::crypto::redact_for_log(&convo_id),
+                            "externalCommit: KP-publish gate query failed (non-fatal, allowing)"
+                        );
+                    }
+                }
+            } else {
+                warn!(
+                    convo_id = %crate::crypto::redact_for_log(&convo_id),
+                    user_did = %crate::crypto::redact_for_log(&gate_user_did),
+                    "externalCommit: skipping KP-publish gate (legacy single-device DID, no device_id)"
+                );
+            }
+
+            // ── Layer 1 §1.2: per-(device, group) 60s cooldown ────────
+            //    Defense-in-depth above the existing per-convo 30s limit:
+            //    catches a single buggy device retrying on its own even if
+            //    other clients haven't EC'd recently.
+            if !gate_device_id.is_empty() {
+                match crate::db::last_external_commit_by_device(
+                    &pool,
+                    &convo_id,
+                    &gate_device_id,
+                    PER_DEVICE_EC_COOLDOWN_SECS,
+                )
+                .await
+                {
+                    Ok(Some(last_at)) => {
+                        let elapsed = chrono::Utc::now() - last_at;
+                        let retry = (PER_DEVICE_EC_COOLDOWN_SECS - elapsed.num_seconds()).max(1);
+                        warn!(
+                            convo_id = %crate::crypto::redact_for_log(&convo_id),
+                            device_id = %crate::crypto::redact_for_log(&gate_device_id),
+                            elapsed_s = elapsed.num_seconds(),
+                            retry_after_s = retry,
+                            "externalCommit: rejected — per-(device, group) 60s cooldown"
+                        );
+                        audit_external_commit(
+                            &pool,
+                            &convo_id,
+                            &gate_user_did,
+                            &gate_device_id,
+                            pre_gate_epoch,
+                            pre_gate_epoch,
+                            Some("PerDeviceCooldown"),
+                        )
+                        .await;
+                        return Err(XrpcError::RateLimited(RateLimitedBody {
+                            error: "RateLimited",
+                            message: format!(
+                                "This device just External-Committed on this conversation; retry after {retry} seconds."
+                            ),
+                            retry_after_seconds: retry,
+                            scope: "device-convo",
+                        }));
+                    }
+                    Ok(None) => {} // no recent EC from this device — proceed
+                    Err(e) => {
+                        warn!(
+                            error = ?e,
+                            convo_id = %crate::crypto::redact_for_log(&convo_id),
+                            "externalCommit: per-device cooldown query failed (non-fatal, allowing)"
+                        );
+                    }
+                }
+            }
+
             // ── Rate-limit: at most 1 external commit per 30s per conversation ──
-            // This is the server-side safety net to prevent epoch inflation spirals
-            // where multiple clients auto-repair via external commit in a feedback loop.
+            // Server-side safety net to prevent epoch inflation spirals
+            // where multiple clients auto-repair via external commit in a
+            // feedback loop. Layer 1 §1.4: also audits the rejection so
+            // forensic replay sees the storm.
             {
                 let last_external_commit: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
                     "SELECT MAX(created_at) FROM messages WHERE convo_id = $1 AND message_type = 'commit' AND created_at > NOW() - INTERVAL '30 seconds'"
@@ -1063,11 +1331,24 @@ pub async fn commit_group_change(
                             elapsed.num_seconds(),
                             crate::crypto::redact_for_log(&convo_id)
                         );
-                        return Err(XrpcError::Plain(
-                            StatusCode::TOO_MANY_REQUESTS,
-                            "RateLimited",
-                            format!("Another external commit was accepted recently. Retry after {} seconds.", retry_after),
-                        ));
+                        audit_external_commit(
+                            &pool,
+                            &convo_id,
+                            &gate_user_did,
+                            &gate_device_id,
+                            pre_gate_epoch,
+                            pre_gate_epoch,
+                            Some("RateLimited"),
+                        )
+                        .await;
+                        return Err(XrpcError::RateLimited(RateLimitedBody {
+                            error: "RateLimited",
+                            message: format!(
+                                "Another external commit was accepted recently. Retry after {retry_after} seconds."
+                            ),
+                            retry_after_seconds: retry_after,
+                            scope: "convo",
+                        }));
                     }
                 }
             }
@@ -1118,7 +1399,11 @@ pub async fn commit_group_change(
             let commit_wire_epoch = commit_shape.epoch as i64;
 
             // ── Verify caller is a current or self-left member (NOT admin-removed) ──
-            let (caller_did, _) = parse_device_did(&auth_user.did).map_err(|e| {
+            // Layer 1 §1.4: keep device_id around for the audit trail on
+            // both rejection paths and the success path (the early gate
+            // parse above already validated the format; this is a clone
+            // for clarity at the membership-check site).
+            let (caller_did, caller_device_id) = parse_device_did(&auth_user.did).map_err(|e| {
                 error!("externalCommit: invalid DID format: {}", e);
                 bad_request("Invalid DID format")
             })?;
@@ -1349,6 +1634,16 @@ pub async fn commit_group_change(
                         "externalCommit: failed to record commit 409 (non-fatal)"
                     );
                 }
+                audit_external_commit(
+                    &pool,
+                    &convo_id,
+                    &caller_did,
+                    &caller_device_id,
+                    current_epoch,
+                    current_epoch,
+                    Some("EpochMismatch"),
+                )
+                .await;
                 return Err(conflict_with_epoch(
                     &pool,
                     &convo_id,
@@ -1406,6 +1701,16 @@ pub async fn commit_group_change(
                             "externalCommit: failed to record commit 409 (non-fatal)"
                         );
                     }
+                    audit_external_commit(
+                        &pool,
+                        &convo_id,
+                        &caller_did,
+                        &caller_device_id,
+                        current_epoch,
+                        current_epoch,
+                        Some("EpochMismatch"),
+                    )
+                    .await;
                     return Err(conflict_with_epoch(
                         &pool,
                         &convo_id,
@@ -1555,11 +1860,45 @@ pub async fn commit_group_change(
                     internal_server_error("Failed to mark commit success")
                 })?;
 
+            // ── Layer 1 §1.3: epoch-advance counter + maybe freeze ─────
+            // Bundled into the same tx so the counter increments
+            // atomically with the epoch CAS. If we just advanced the
+            // epoch and the post-increment count breaches the threshold
+            // within the active window, this also sets `frozen_until`.
+            if let Err(e) = crate::db::bump_epoch_advance_and_maybe_freeze_tx(
+                &mut tx,
+                &convo_id,
+                EPOCH_STORM_THRESHOLD,
+                EPOCH_STORM_WINDOW_SECS,
+                EPOCH_STORM_FREEZE_SECS,
+            )
+            .await
+            {
+                error!(
+                    error = ?e,
+                    convo_id = %crate::crypto::redact_for_log(&convo_id),
+                    "externalCommit: failed to bump epoch_advance_count (rolling back)"
+                );
+                return Err(internal_server_error("Failed to update freeze counters"));
+            }
+
             // ── Commit transaction ─────────────────────────────────────
             tx.commit().await.map_err(|e| {
                 error!("externalCommit: failed to commit transaction: {}", e);
                 internal_server_error("Failed to commit transaction")
             })?;
+
+            // ── Layer 1 §1.4: audit row for accepted External Commit ───
+            audit_external_commit(
+                &pool,
+                &convo_id,
+                &caller_did,
+                &caller_device_id,
+                current_epoch,
+                new_epoch,
+                None,
+            )
+            .await;
 
             // ── Enqueue commit messageEvent on per-convo FIFO queue (task #39) ──
             let commit_cursor = sse_state.cursor_gen.next(&convo_id, "messageEvent").await;
@@ -2174,6 +2513,9 @@ pub async fn commit_group_change(
             let convo_id = input.convo_id.to_string();
             info!("v2.commitGroupChange: removeMember for convo");
 
+            // ── Layer 1 §1.3: freeze check ─────────────────────────────
+            check_group_frozen(&pool, &convo_id).await?;
+
             // ── Idempotency check ──────────────────────────────────────
             if let Some(ref idem_key) = input.idempotency_key {
                 let idem_key_str = idem_key.to_string();
@@ -2583,6 +2925,9 @@ pub async fn commit_group_change(
             let action_name = input.action.to_string();
             let convo_id = input.convo_id.to_string();
             info!("v2.commitGroupChange: {} for convo", action_name);
+
+            // ── Layer 1 §1.3: freeze check ─────────────────────────────
+            check_group_frozen(&pool, &convo_id).await?;
 
             // ── Idempotency check ──────────────────────────────────────
             if let Some(ref idem_key) = input.idempotency_key {

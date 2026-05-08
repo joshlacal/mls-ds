@@ -336,3 +336,109 @@ async fn success_after_409_streak_resets_counter() {
 
     common::cleanup(&pool, convo_id).await;
 }
+
+// =============================================================================
+// Layer 1 Robustness — Section 1.1 KP-publish gate (integration)
+// Plan: ~/.claude/plans/rippling-greeting-whale.md §Layer 1
+// =============================================================================
+
+/// `count_available_key_packages_for_device` MUST return 0 when the device
+/// has no available, non-expired key packages, and `>= 1` once a single
+/// matching row exists. This is the query backing the externalCommit
+/// pre-flight gate (§1.1).
+///
+/// Marked `#[ignore]` for the same fixture-isolation reason as the rest of
+/// this file — shared `convo_id` / `owner_did` constants risk collision
+/// against `idx_conversations_group_id_unique`. Run manually:
+///   `cargo test --test commit_group_change_health_counters -- --ignored`
+#[tokio::test]
+#[ignore = "fixture isolation: shared identifiers collide with unique indexes (consistent with rest of file)"]
+async fn kp_publish_gate_zero_for_unpublished_device() {
+    use catbird_server::db::count_available_key_packages_for_device;
+    let pool = common::setup_test_db().await;
+    let user_did = "did:plc:layer1kpgate0001";
+    let device_id = "device-layer1-001";
+    sqlx::query("DELETE FROM key_packages WHERE owner_did = $1")
+        .bind(user_did)
+        .execute(&pool)
+        .await
+        .ok();
+
+    let count_before = count_available_key_packages_for_device(&pool, user_did, device_id)
+        .await
+        .expect("count query");
+    assert_eq!(
+        count_before, 0,
+        "no KPs published yet — gate must observe count == 0"
+    );
+
+    // Insert one available, non-expired key package for this device.
+    let kp_hash = "deadbeefcafe1234";
+    sqlx::query(
+        "INSERT INTO key_packages
+            (owner_did, device_id, key_package_hash, key_package_data, cipher_suite, state, expires_at, created_at)
+         VALUES ($1, $2, $3, $4, $5, 'available', NOW() + INTERVAL '7 days', NOW())
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(user_did)
+    .bind(device_id)
+    .bind(kp_hash)
+    .bind(b"\x00\x01\x02\x03".as_slice())
+    .bind("MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519")
+    .execute(&pool)
+    .await
+    .expect("insert KP");
+
+    let count_after = count_available_key_packages_for_device(&pool, user_did, device_id)
+        .await
+        .expect("count query");
+    assert!(
+        count_after >= 1,
+        "after publishing 1 KP, gate must observe count >= 1 (got {count_after})"
+    );
+
+    sqlx::query("DELETE FROM key_packages WHERE owner_did = $1")
+        .bind(user_did)
+        .execute(&pool)
+        .await
+        .ok();
+}
+
+// =============================================================================
+// Layer 1 Robustness — Section 1.3 freeze threshold (pure logic)
+// =============================================================================
+
+/// `should_freeze` is the pure-logic decision for the epoch-storm circuit
+/// breaker. No DB needed — runs unconditionally.
+#[test]
+fn should_freeze_within_window_above_threshold() {
+    use catbird_server::db::should_freeze;
+    let now = Utc::now();
+    let window = chrono::Duration::seconds(60);
+    let window_start = Some(now - chrono::Duration::seconds(30)); // 30s into a 60s window
+
+    // Threshold = 6, count = 7 (post-increment) → freeze.
+    assert!(
+        should_freeze(7, window_start, now, 6, window),
+        "post-inc count > threshold within active window must freeze"
+    );
+
+    // count == threshold → must NOT freeze (strict > comparison).
+    assert!(
+        !should_freeze(6, window_start, now, 6, window),
+        "count == threshold must NOT freeze (strict >)"
+    );
+
+    // Window rolled over → never freeze regardless of count.
+    let stale_start = Some(now - chrono::Duration::seconds(120));
+    assert!(
+        !should_freeze(100, stale_start, now, 6, window),
+        "stale window must NOT freeze regardless of count"
+    );
+
+    // No prior window (None) → never freeze (this is the first advance).
+    assert!(
+        !should_freeze(100, None, now, 6, window),
+        "first-ever advance (window_start is None) must NOT freeze"
+    );
+}
