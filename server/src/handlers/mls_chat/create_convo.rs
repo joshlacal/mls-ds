@@ -24,6 +24,77 @@ use crate::{
 
 const NSID: &str = "blue.catbird.mlsChat.createConvo";
 
+fn bootstrap_epoch_for_create(has_welcome: bool) -> i32 {
+    if has_welcome {
+        1
+    } else {
+        0
+    }
+}
+
+fn validate_initial_members_have_welcome(
+    initial_members: Option<&[jacquard_common::types::string::Did<'_>]>,
+    creator_did: &str,
+    has_welcome: bool,
+) -> Result<(), String> {
+    if has_welcome {
+        return Ok(());
+    }
+
+    let creator_user_form = creator_did
+        .split_once('#')
+        .map(|(user, _device)| user)
+        .unwrap_or(creator_did);
+
+    let has_non_creator_initial_member = initial_members
+        .unwrap_or_default()
+        .iter()
+        .map(did_to_string)
+        .any(|did| did != creator_did && did != creator_user_form);
+
+    if has_non_creator_initial_member {
+        return Err(
+            "initialMembers that include another user require welcomeMessage bootstrap material"
+                .to_string(),
+        );
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bootstrap_epoch_is_zero_without_welcome() {
+        assert_eq!(bootstrap_epoch_for_create(false), 0);
+    }
+
+    #[test]
+    fn bootstrap_epoch_is_one_with_welcome() {
+        assert_eq!(bootstrap_epoch_for_create(true), 1);
+    }
+
+    #[test]
+    fn initial_non_creator_members_require_welcome() {
+        let members = vec![string_to_did("did:plc:bob")];
+
+        let err = validate_initial_members_have_welcome(Some(&members), "did:plc:alice", false)
+            .expect_err("non-creator initial members without Welcome must fail");
+
+        assert!(err.contains("welcomeMessage"));
+    }
+
+    #[test]
+    fn creator_only_initial_members_do_not_require_welcome() {
+        let members = vec![string_to_did("did:plc:alice")];
+
+        validate_initial_members_have_welcome(Some(&members), "did:plc:alice", false)
+            .expect("creator-only initial members are a no-op");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Handler (v2 – inline SQL, no v1 delegation)
 // ---------------------------------------------------------------------------
@@ -187,6 +258,21 @@ async fn handle_create_convo(
         }
     }
 
+    if let Err(message) = validate_initial_members_have_welcome(
+        input.initial_members.as_deref(),
+        &auth_user.did,
+        input.welcome_message.is_some(),
+    ) {
+        warn!("❌ [v2.createConvo] Malformed MLS bootstrap: {message}");
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(LexCreateConvoError::KeyPackageNotFound(Some(
+                message.into(),
+            ))),
+        )
+            .into_response());
+    }
+
     // ── Block detection ──────────────────────────────────────────────────
     let mut all_member_dids_for_block_check = vec![auth_user.did.clone()];
     if let Some(ref members) = input.initial_members {
@@ -257,6 +343,17 @@ async fn handle_create_convo(
     // ── Conversation ID ─────────────────────────────────────────────────
     let convo_id = input.group_id.to_string();
     let now = Utc::now();
+    let bootstrap_epoch = bootstrap_epoch_for_create(input.welcome_message.is_some());
+    if let Some(client_epoch) = input.current_epoch {
+        if client_epoch != bootstrap_epoch as i64 {
+            warn!(
+                client_epoch,
+                bootstrap_epoch,
+                convo = %crate::crypto::redact_for_log(&convo_id),
+                "[v2.createConvo] ignoring inconsistent client currentEpoch"
+            );
+        }
+    }
 
     // Plaintext metadata (`input.metadata`) is intentionally ignored. Group
     // metadata is server-blind: clients encrypt name/description/avatar via
@@ -357,13 +454,23 @@ async fn handle_create_convo(
             )
             .collect();
 
+        let existing_epoch: i32 =
+            sqlx::query_scalar("SELECT current_epoch FROM conversations WHERE id = $1")
+                .bind(&convo_id)
+                .fetch_one(&pool)
+                .await
+                .map_err(|e| {
+                    error!("❌ [v2.createConvo] fetch existing epoch: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                })?;
+
         return Ok(CreateConvoOutput {
             convo: ConvoView {
                 conversation_id: convo_id.clone().into(),
                 group_id: convo_id.into(),
                 creator: string_to_did(&creator_did),
                 members: members_typed,
-                epoch: 1,
+                epoch: existing_epoch as i64,
                 cipher_suite: input.cipher_suite.as_ref().to_string().into(),
                 created_at: chrono_to_datetime(now),
                 last_message_at: None,
@@ -393,9 +500,10 @@ async fn handle_create_convo(
     // active_crypto_session_id UPDATE, and crypto_session_created
     // delivery_event APPEND in a single tx. Match the migration
     // backfill shape: state='active', generation=0, mls_group_id=
-    // convo_id (createConvo's group_id is the same as the convo id),
-    // last_observed_epoch=1 (matching conversations.current_epoch=1
-    // which represents "group exists at MLS epoch 1 post-creation").
+    // convo_id (createConvo's group_id is the same as the convo id). Epoch is
+    // 1 only when Welcome material was supplied for an initial add commit;
+    // creator-only groups start at epoch 0 so their first real commit is not
+    // rejected as stale.
     tracing::debug!("📍 [v2.createConvo] creating conversation in database");
 
     let mut tx = pool.begin().await.map_err(|e| {
@@ -405,12 +513,13 @@ async fn handle_create_convo(
 
     sqlx::query(
         "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at, cipher_suite, sequencer_ds, is_remote, group_id)
-         VALUES ($1, $2, 1, $3, $3, $4, NULL, false, $1)",
+         VALUES ($1, $2, $5, $3, $3, $4, NULL, false, $1)",
     )
     .bind(&convo_id)
     .bind(&auth_user.did)
     .bind(now)
     .bind(input.cipher_suite.as_ref())
+    .bind(bootstrap_epoch)
     .execute(&mut *tx)
     .await
     .map_err(|e| {
@@ -425,13 +534,14 @@ async fn handle_create_convo(
             cipher_suite, last_observed_epoch, created_by_did, \
             created_at, activated_at \
          ) VALUES (gen_random_uuid()::TEXT, $1, 0, $1, 'active', \
-                   $2, 1, $3, $4, $4) \
+                   $2, $5, $3, $4, $4) \
          RETURNING id",
     )
     .bind(&convo_id)
     .bind(input.cipher_suite.as_ref())
     .bind(&auth_user.did)
     .bind(now)
+    .bind(bootstrap_epoch)
     .fetch_one(&mut *tx)
     .await
     .map_err(|e| {
@@ -461,12 +571,13 @@ async fn handle_create_convo(
             id, conversation_id, seq, crypto_session_id, event_type, \
             mls_group_id, mls_epoch, idempotency_key, created_at \
          ) VALUES (gen_random_uuid()::TEXT, $1, 0, $2, \
-                   'crypto_session_created', $1, 1, $3, $4)",
+                   'crypto_session_created', $1, $5, $3, $4)",
     )
     .bind(&convo_id)
     .bind(&crypto_session_id)
     .bind(format!("create:{}", convo_id))
     .bind(now)
+    .bind(bootstrap_epoch)
     .execute(&mut *tx)
     .await
     .map_err(|e| {
@@ -973,7 +1084,7 @@ async fn handle_create_convo(
     info!(
         convo = %crate::crypto::redact_for_log(&convo_id),
         member_count = members_typed.len(),
-        epoch = 1,
+        epoch = bootstrap_epoch,
         "✅ [v2.createConvo] complete"
     );
 
@@ -984,7 +1095,7 @@ async fn handle_create_convo(
             group_id: convo_id.into(),
             creator: string_to_did(&creator_did),
             members: members_typed,
-            epoch: 1,
+            epoch: bootstrap_epoch as i64,
             cipher_suite: input.cipher_suite.as_ref().to_string().into(),
             created_at: chrono_to_datetime(now),
             last_message_at: None,
