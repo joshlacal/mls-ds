@@ -355,16 +355,9 @@ async fn handle_create_convo(
         }
     }
 
-    // Plaintext metadata (`input.metadata`) is intentionally ignored. Group
-    // metadata is server-blind: clients encrypt name/description/avatar via
-    // the `group_metadata_blobs` blob path. If a legacy client still sends
-    // `metadata`, log a warning and drop it.
-    if input.metadata.is_some() {
-        warn!(
-            convo = %crate::crypto::redact_for_log(&convo_id),
-            "[v2.createConvo] received legacy plaintext metadata; ignoring (encrypted blob path is authoritative)"
-        );
-    }
+    // Plaintext metadata is no longer accepted by the createConvo schema.
+    // Group metadata is server-blind: clients encrypt name/description/avatar
+    // via the `group_metadata_blobs` blob path.
 
     // ── Idempotency / first-responder race check ────────────────────────
     // Fetch the existing creator (if any) so we can distinguish:
@@ -474,7 +467,6 @@ async fn handle_create_convo(
                 cipher_suite: input.cipher_suite.as_ref().to_string().into(),
                 created_at: chrono_to_datetime(now),
                 last_message_at: None,
-                metadata: None,
                 confirmation_tag: None,
                 reset_generation: Some(0),
                 extra_data: Default::default(),
@@ -1099,7 +1091,6 @@ async fn handle_create_convo(
             cipher_suite: input.cipher_suite.as_ref().to_string().into(),
             created_at: chrono_to_datetime(now),
             last_message_at: None,
-            metadata: None,
             confirmation_tag: None,
             reset_generation: Some(0),
             extra_data: Default::default(),

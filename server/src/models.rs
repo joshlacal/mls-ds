@@ -136,9 +136,6 @@ impl Conversation {
                 .into(),
             created_at: crate::sqlx_jacquard::chrono_to_datetime(self.created_at),
             last_message_at: None,
-            // Plaintext group metadata is server-blind; clients fetch the
-            // encrypted blob via `getGroupMetadataBlob` and decrypt locally.
-            metadata: None,
             confirmation_tag: conf_tag_b64.map(|s| s.into()),
             reset_generation: Some(reset_generation as i64),
             extra_data: Some(extra),

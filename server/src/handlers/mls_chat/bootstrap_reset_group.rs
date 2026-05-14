@@ -769,10 +769,6 @@ pub async fn handle(
             cipher_suite: cipher_suite_persisted.into(),
             created_at: chrono_to_datetime(created_at),
             last_message_at: last_message_at.map(chrono_to_datetime),
-            // Plaintext metadata is server-blind; resetting client republishes
-            // the encrypted blob via `putGroupMetadataBlob` for the new
-            // generation (`reset_generation = reset_count`).
-            metadata: None,
             confirmation_tag: None,
             reset_generation: Some(reset_count as i64),
             extra_data: Default::default(),
