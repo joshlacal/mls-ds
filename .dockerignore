@@ -1,0 +1,13 @@
+target/
+.git/
+.claude/
+.DS_Store
+.env
+.env.*
+!.env.example
+*.log
+*.db
+*.db-shm
+*.db-wal
+artifacts/
+e2e-tests/target/
