@@ -700,6 +700,25 @@ async fn main() -> anyhow::Result<()> {
         .merge(GetKeyPackagesRequest::into_router(
             handlers::mls_chat::get_key_packages,
         ))
+        // Phase B local compatibility routes. Generated Phase A Rust
+        // request types are not present in this checkout, so these use small
+        // serde JSON shims until lexicon codegen lands.
+        .route(
+            "/xrpc/blue.catbird.mlsChat.reconcileKeyPackages",
+            post(handlers::mls_chat::reconcile_key_packages),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsChat.invalidateKeyPackage",
+            post(handlers::mls_chat::invalidate_key_package),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsChat.reissueWelcome",
+            post(handlers::mls_chat::reissue_welcome),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsChat.reissueWelcomeRespond",
+            post(handlers::mls_chat::reissue_welcome_respond),
+        )
         .merge(RemoveDeviceRequest::into_router(
             handlers::mls_chat::remove_device,
         ))

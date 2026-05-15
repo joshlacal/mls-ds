@@ -34,6 +34,21 @@ pub fn parse_device_did(device_did: &str) -> Result<(String, String), String> {
     }
 }
 
+/// Hash a raw device ID into the opaque storage bucket used by key_packages.
+///
+/// The server stores key packages under a short stable bucket so per-device
+/// reconciliation can partition packages without using the raw device ID as the
+/// primary lookup key.
+pub fn bucket_device_id(user_did: &str, raw_device_id: &str) -> String {
+    let raw_device_id = raw_device_id.trim();
+    if raw_device_id.is_empty() {
+        String::new()
+    } else {
+        let bucket_input = format!("{}#{}", user_did, raw_device_id);
+        crate::crypto::sha256_hex(bucket_input.as_bytes())[..16].to_string()
+    }
+}
+
 /// Construct device MLS DID from user DID and device ID
 ///
 /// # Examples
@@ -98,6 +113,15 @@ mod tests {
 
         // Single-device mode
         assert_eq!(construct_device_did("did:plc:bob", ""), "did:plc:bob");
+    }
+
+    #[test]
+    fn test_bucket_device_id_matches_publish_key_packages_storage() {
+        assert_eq!(bucket_device_id("did:plc:bob", ""), "");
+        assert_eq!(
+            bucket_device_id("did:plc:alice", "device-1"),
+            crate::crypto::sha256_hex("did:plc:alice#device-1".as_bytes())[..16].to_string()
+        );
     }
 
     #[test]
