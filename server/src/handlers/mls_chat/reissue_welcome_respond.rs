@@ -43,16 +43,43 @@ pub async fn reissue_welcome_respond(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
+    let welcome_bytes = STANDARD.decode(&input.welcome_blob).map_err(|e| {
+        warn!("reissueWelcomeRespond: invalid base64 Welcome blob: {}", e);
+        StatusCode::BAD_REQUEST
+    })?;
+    if welcome_bytes.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let welcome_blob_id = Uuid::new_v4().to_string();
+    let responded_at = Utc::now();
+    let key_package_hash_bytes = match input.key_package_hash.as_deref() {
+        Some(hash) => {
+            let decoded = hex::decode(hash).map_err(|e| {
+                warn!("reissueWelcomeRespond: invalid keyPackageHash hex: {}", e);
+                StatusCode::BAD_REQUEST
+            })?;
+            Some(decoded)
+        }
+        None => None,
+    };
+
+    let mut tx = pool.begin().await.map_err(|e| {
+        error!("reissueWelcomeRespond: tx begin failed: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
     let row: Option<(String, String)> = sqlx::query_as(
         r#"
         SELECT rr.convo_id, rr.recipient_device_did
         FROM reissue_requests rr
         WHERE rr.id = $1
           AND rr.responded_at IS NULL
+        FOR UPDATE
         "#,
     )
     .bind(&input.request_id)
-    .fetch_optional(&pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|e| {
         error!("reissueWelcomeRespond: request lookup failed: {}", e);
@@ -76,7 +103,7 @@ pub async fn reissue_welcome_respond(
     )
     .bind(&convo_id)
     .bind(&auth_user.did)
-    .fetch_one(&pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| {
         error!("reissueWelcomeRespond: admin check failed: {}", e);
@@ -85,26 +112,6 @@ pub async fn reissue_welcome_respond(
     if !responder_is_admin {
         return Err(StatusCode::FORBIDDEN);
     }
-
-    let welcome_bytes = STANDARD.decode(&input.welcome_blob).map_err(|e| {
-        warn!("reissueWelcomeRespond: invalid base64 Welcome blob: {}", e);
-        StatusCode::BAD_REQUEST
-    })?;
-    if welcome_bytes.is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
-    let welcome_blob_id = Uuid::new_v4().to_string();
-    let responded_at = Utc::now();
-    let key_package_hash_bytes = input
-        .key_package_hash
-        .as_ref()
-        .and_then(|hash| hex::decode(hash).ok());
-
-    let mut tx = pool.begin().await.map_err(|e| {
-        error!("reissueWelcomeRespond: tx begin failed: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
 
     sqlx::query(
         r#"
@@ -127,12 +134,13 @@ pub async fn reissue_welcome_respond(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    sqlx::query(
+    let updated = sqlx::query(
         r#"
         UPDATE reissue_requests
         SET responded_at = $2,
             welcome_blob_id = $3
         WHERE id = $1
+          AND responded_at IS NULL
         "#,
     )
     .bind(&input.request_id)
@@ -144,6 +152,13 @@ pub async fn reissue_welcome_respond(
         error!("reissueWelcomeRespond: request update failed: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+    if updated.rows_affected() != 1 {
+        warn!(
+            "reissueWelcomeRespond: request {} was answered concurrently",
+            input.request_id
+        );
+        return Err(StatusCode::CONFLICT);
+    }
 
     tx.commit().await.map_err(|e| {
         error!("reissueWelcomeRespond: tx commit failed: {}", e);

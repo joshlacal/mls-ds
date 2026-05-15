@@ -69,6 +69,7 @@ pub async fn get_messages(
     let convo_id = params.convo_id.to_string();
     let limit = params.limit.unwrap_or(50).clamp(1, 100);
     let since_seq = params.since_seq;
+    let join_epoch = params.join_epoch;
 
     if convo_id.is_empty() {
         warn!("❌ [v2.getMessages] Empty convo_id");
@@ -90,13 +91,13 @@ pub async fn get_messages(
 
     match message_type {
         "app" => {
-            let (messages, last_seq) =
-                fetch_app_messages(&pool, did, &convo_id, since_seq, limit).await?;
+            let (messages, last_seq, suppressed_before_join) =
+                fetch_app_messages(&pool, did, &convo_id, since_seq, limit, join_epoch).await?;
             Ok(Json(GetMessagesOutput {
                 messages,
                 last_seq,
                 gap_info: None,
-                suppressed_before_join: None,
+                suppressed_before_join,
                 extra_data: Default::default(),
             }))
         }
@@ -113,8 +114,8 @@ pub async fn get_messages(
         }
 
         "all" => {
-            let (mut messages, last_seq) =
-                fetch_app_messages(&pool, did, &convo_id, since_seq, limit).await?;
+            let (mut messages, last_seq, suppressed_before_join) =
+                fetch_app_messages(&pool, did, &convo_id, since_seq, limit, join_epoch).await?;
             let commits = fetch_commits(&pool, did, &convo_id, from_epoch, to_epoch).await?;
             messages.extend(commits);
             messages.sort_by(|a, b| a.seq.cmp(&b.seq));
@@ -122,7 +123,7 @@ pub async fn get_messages(
                 messages,
                 last_seq,
                 gap_info: None,
-                suppressed_before_join: None,
+                suppressed_before_join,
                 extra_data: Default::default(),
             }))
         }
@@ -144,7 +145,8 @@ async fn fetch_app_messages(
     convo_id: &str,
     since_seq: Option<i64>,
     limit: i64,
-) -> Result<(Vec<MessageView<'static>>, Option<i64>), StatusCode> {
+    join_epoch: Option<i64>,
+) -> Result<(Vec<MessageView<'static>>, Option<i64>, Option<i64>), StatusCode> {
     // Check membership
     let is_member: Option<(i32,)> = sqlx::query_as(
         "SELECT 1 as v FROM members WHERE convo_id = $1 AND (user_did = $2 OR member_did = $2) AND left_at IS NULL LIMIT 1",
@@ -171,7 +173,11 @@ async fn fetch_app_messages(
                    CAST(epoch AS BIGINT) as epoch, CAST(seq AS BIGINT) as seq,
                    ciphertext, created_at, COALESCE(reset_generation, 0) as reset_generation
             FROM messages
-            WHERE convo_id = $1 AND seq > $2 AND (expires_at IS NULL OR expires_at > NOW())
+            WHERE convo_id = $1
+              AND message_type = 'app'
+              AND seq > $2
+              AND ($4::BIGINT IS NULL OR epoch >= $4)
+              AND (expires_at IS NULL OR expires_at > NOW())
             ORDER BY seq ASC
             LIMIT $3
             "#,
@@ -179,6 +185,7 @@ async fn fetch_app_messages(
         .bind(convo_id)
         .bind(since)
         .bind(limit)
+        .bind(join_epoch)
         .fetch_all(pool)
         .await
         .map_err(|e| {
@@ -196,7 +203,10 @@ async fn fetch_app_messages(
                        CAST(epoch AS BIGINT) as epoch, CAST(seq AS BIGINT) as seq,
                        ciphertext, created_at, COALESCE(reset_generation, 0) as reset_generation
                 FROM messages
-                WHERE convo_id = $1 AND (expires_at IS NULL OR expires_at > NOW())
+                WHERE convo_id = $1
+                  AND message_type = 'app'
+                  AND ($3::BIGINT IS NULL OR epoch >= $3)
+                  AND (expires_at IS NULL OR expires_at > NOW())
                 ORDER BY seq DESC
                 LIMIT $2
             ) recent_messages
@@ -205,6 +215,7 @@ async fn fetch_app_messages(
         )
         .bind(convo_id)
         .bind(limit)
+        .bind(join_epoch)
         .fetch_all(pool)
         .await
         .map_err(|e| {
@@ -227,6 +238,8 @@ async fn fetch_app_messages(
     })?;
 
     let last_seq = messages.last().map(|m| m.seq);
+    let suppressed_before_join =
+        count_suppressed_before_join(pool, convo_id, since_seq, join_epoch).await?;
 
     let message_views: Vec<MessageView<'static>> = messages
         .into_iter()
@@ -259,7 +272,61 @@ async fn fetch_app_messages(
         message_views.len()
     );
 
-    Ok((message_views, last_seq))
+    Ok((message_views, last_seq, suppressed_before_join))
+}
+
+async fn count_suppressed_before_join(
+    pool: &DbPool,
+    convo_id: &str,
+    since_seq: Option<i64>,
+    join_epoch: Option<i64>,
+) -> Result<Option<i64>, StatusCode> {
+    let Some(join_epoch) = join_epoch else {
+        return Ok(None);
+    };
+
+    let suppressed = if let Some(since) = since_seq {
+        sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)::BIGINT
+            FROM messages
+            WHERE convo_id = $1
+              AND message_type = 'app'
+              AND seq > $2
+              AND epoch < $3
+              AND (expires_at IS NULL OR expires_at > NOW())
+            "#,
+        )
+        .bind(convo_id)
+        .bind(since)
+        .bind(join_epoch)
+        .fetch_one(pool)
+        .await
+    } else {
+        sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)::BIGINT
+            FROM messages
+            WHERE convo_id = $1
+              AND message_type = 'app'
+              AND epoch < $2
+              AND (expires_at IS NULL OR expires_at > NOW())
+            "#,
+        )
+        .bind(convo_id)
+        .bind(join_epoch)
+        .fetch_one(pool)
+        .await
+    }
+    .map_err(|e| {
+        error!(
+            "❌ [v2.getMessages] Failed to count pre-join messages: {}",
+            e
+        );
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok(Some(suppressed))
 }
 
 // ---------------------------------------------------------------------------

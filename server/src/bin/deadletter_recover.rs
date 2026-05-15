@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use catbird_server::db;
 use serde_json::json;
 use sqlx::PgPool;
-use std::{env, time::Duration};
+use std::env;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,19 +172,33 @@ async fn recover_reset(pool: &PgPool, args: &Args) -> Result<serde_json::Value> 
         SET reset_count = $2,
             auto_reset_disabled_at = NULL,
             consecutive_reset_count = 0,
-            needs_rejoin = true,
-            rejoin_requested_at = NOW(),
-            rejoin_reason = COALESCE($3, 'deadletter_recover reset'),
             updated_at = NOW()
         WHERE id = $1
         "#,
     )
     .bind(&args.convo_id)
     .bind(reset_generation)
-    .bind(&args.reason)
     .execute(&mut *tx)
     .await
     .context("failed to update conversation reset marker")?;
+
+    let members_marked_for_rejoin = sqlx::query(
+        r#"
+        UPDATE members
+        SET needs_rejoin = true,
+            rejoin_requested_at = NOW(),
+            rejoin_attempts = 0,
+            last_rejoin_error = COALESCE($2, 'deadletter_recover reset')
+        WHERE convo_id = $1
+          AND left_at IS NULL
+        "#,
+    )
+    .bind(&args.convo_id)
+    .bind(&args.reason)
+    .execute(&mut *tx)
+    .await
+    .context("failed to mark active members for rejoin")?
+    .rows_affected();
 
     sqlx::query(
         r#"
@@ -217,7 +231,8 @@ async fn recover_reset(pool: &PgPool, args: &Args) -> Result<serde_json::Value> 
         "convoId": args.convo_id,
         "resetGeneration": reset_generation,
         "requestEventId": request_id,
-        "newGroupId": new_group_id
+        "newGroupId": new_group_id,
+        "membersMarkedForRejoin": members_marked_for_rejoin
     }))
 }
 
@@ -329,8 +344,6 @@ async fn recover_reissue_all(pool: &PgPool, args: &Args) -> Result<serde_json::V
     tx.commit()
         .await
         .context("failed to commit reissue-all tx")?;
-
-    tokio::time::sleep(Duration::from_millis(1)).await;
 
     Ok(json!({
         "success": true,
