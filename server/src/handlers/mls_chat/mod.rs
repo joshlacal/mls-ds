@@ -5,10 +5,14 @@
 pub mod get_key_package_status;
 pub mod get_key_packages;
 pub mod get_pending_devices;
+pub mod invalidate_key_package;
 pub mod list_devices;
 pub mod publish_key_packages;
+pub mod reconcile_key_packages;
 pub mod register_device;
 pub mod register_device_token;
+pub mod reissue_welcome;
+pub mod reissue_welcome_respond;
 pub mod remove_device;
 
 // Conversations & Messaging
@@ -59,10 +63,14 @@ pub mod request_failover;
 pub use get_key_package_status::get_key_package_status;
 pub use get_key_packages::get_key_packages;
 pub use get_pending_devices::get_pending_devices;
+pub use invalidate_key_package::invalidate_key_package;
 pub use list_devices::list_devices;
 pub use publish_key_packages::publish_key_packages_post;
+pub use reconcile_key_packages::reconcile_key_packages;
 pub use register_device::register_device_post;
 pub use register_device_token::register_device_token;
+pub use reissue_welcome::reissue_welcome;
+pub use reissue_welcome_respond::reissue_welcome_respond;
 pub use remove_device::remove_device;
 
 // Re-exports: Conversations & Messaging

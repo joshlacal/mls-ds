@@ -339,6 +339,7 @@ pub async fn claim_available_key_packages_bulk(
              WHERE owner_did = ANY($1::text[])
                AND state = 'available'
                AND expires_at > NOW()
+               AND dead_at IS NULL
                {lr}
                {cs}
          ),
