@@ -96,6 +96,7 @@ pub async fn get_messages(
                 messages,
                 last_seq,
                 gap_info: None,
+                suppressed_before_join: None,
                 extra_data: Default::default(),
             }))
         }
@@ -106,6 +107,7 @@ pub async fn get_messages(
                 messages,
                 last_seq: None,
                 gap_info: None,
+                suppressed_before_join: None,
                 extra_data: Default::default(),
             }))
         }
@@ -120,6 +122,7 @@ pub async fn get_messages(
                 messages,
                 last_seq,
                 gap_info: None,
+                suppressed_before_join: None,
                 extra_data: Default::default(),
             }))
         }
