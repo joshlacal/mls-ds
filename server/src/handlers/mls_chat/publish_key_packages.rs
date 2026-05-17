@@ -29,40 +29,131 @@ const MAX_UNCONSUMED_PER_USER: i64 = 100;
 const MAX_UPLOADS_PER_HOUR: i64 = 200;
 const RATE_LIMIT_WINDOW_HOURS: i64 = 1;
 
-/// Build the `stats` object matching the lexicon `#keyPackageStats` shape:
-/// `{ published, available, expired }`
-async fn build_stats(pool: &DbPool, did: &str) -> Result<KeyPackageStats<'static>, StatusCode> {
-    let (user_did, _) = parse_device_did(did).map_err(|e| {
-        error!("Invalid DID format for stats: {}", e);
-        StatusCode::BAD_REQUEST
+#[derive(Debug, Clone)]
+struct DeviceScope {
+    raw_device_id: String,
+    storage_device_id: String,
+    storage_candidates: Vec<String>,
+}
+
+async fn resolve_device_scope(
+    pool: &DbPool,
+    user_did: &str,
+    raw_device_id: &str,
+) -> Result<DeviceScope, StatusCode> {
+    let raw_device_id = raw_device_id.trim();
+    if raw_device_id.is_empty() {
+        return Ok(DeviceScope {
+            raw_device_id: String::new(),
+            storage_device_id: String::new(),
+            storage_candidates: Vec::new(),
+        });
+    }
+
+    let credential_did = format!("{}#{}", user_did, raw_device_id);
+    let canonical: Option<String> = sqlx::query_scalar(
+        "SELECT device_id FROM devices \
+         WHERE user_did = $1 \
+           AND (device_id = $2 OR device_uuid = $2 OR credential_did = $3) \
+         ORDER BY registered_at DESC \
+         LIMIT 1",
+    )
+    .bind(user_did)
+    .bind(raw_device_id)
+    .bind(&credential_did)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| {
+        error!(
+            "Failed to resolve device id for key package operation: {}",
+            e
+        );
+        StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let available: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM key_packages WHERE owner_did = $1 AND consumed_at IS NULL AND expires_at > NOW()",
-    )
-    .bind(&user_did)
-    .fetch_one(pool)
-    .await
+    let legacy_bucket = crate::device_utils::bucket_device_id(user_did, raw_device_id);
+    let storage_device_id = canonical.unwrap_or_else(|| raw_device_id.to_string());
+    let mut storage_candidates = vec![storage_device_id.clone(), raw_device_id.to_string()];
+    if !legacy_bucket.is_empty() {
+        storage_candidates.push(legacy_bucket);
+    }
+    storage_candidates.sort();
+    storage_candidates.dedup();
+
+    Ok(DeviceScope {
+        raw_device_id: raw_device_id.to_string(),
+        storage_device_id,
+        storage_candidates,
+    })
+}
+
+/// Build the `stats` object matching the lexicon `#keyPackageStats` shape:
+/// `{ published, available, expired }`
+async fn build_stats(
+    pool: &DbPool,
+    user_did: &str,
+    device_scope: Option<&DeviceScope>,
+) -> Result<KeyPackageStats<'static>, StatusCode> {
+    let candidates = device_scope
+        .map(|scope| scope.storage_candidates.as_slice())
+        .unwrap_or(&[]);
+
+    let available: i64 = if candidates.is_empty() {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM key_packages WHERE owner_did = $1 AND consumed_at IS NULL AND expires_at > NOW()",
+        )
+        .bind(user_did)
+        .fetch_one(pool)
+        .await
+    } else {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM key_packages WHERE owner_did = $1 AND device_id = ANY($2::text[]) AND consumed_at IS NULL AND expires_at > NOW()",
+        )
+        .bind(user_did)
+        .bind(candidates)
+        .fetch_one(pool)
+        .await
+    }
     .map_err(|e| {
         error!("Failed to count available key packages: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM key_packages WHERE owner_did = $1")
-        .bind(&user_did)
+    let total: i64 = if candidates.is_empty() {
+        sqlx::query_scalar("SELECT COUNT(*) FROM key_packages WHERE owner_did = $1")
+            .bind(user_did)
+            .fetch_one(pool)
+            .await
+    } else {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM key_packages WHERE owner_did = $1 AND device_id = ANY($2::text[])",
+        )
+        .bind(user_did)
+        .bind(candidates)
         .fetch_one(pool)
         .await
-        .map_err(|e| {
-            error!("Failed to count total key packages: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    }
+    .map_err(|e| {
+        error!("Failed to count total key packages: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
-    let expired: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM key_packages WHERE owner_did = $1 AND consumed_at IS NULL AND expires_at <= NOW()",
-    )
-    .bind(&user_did)
-    .fetch_one(pool)
-    .await
+    let expired: i64 = if candidates.is_empty() {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM key_packages WHERE owner_did = $1 AND consumed_at IS NULL AND expires_at <= NOW()",
+        )
+        .bind(user_did)
+        .fetch_one(pool)
+        .await
+    } else {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM key_packages WHERE owner_did = $1 AND device_id = ANY($2::text[]) AND consumed_at IS NULL AND expires_at <= NOW()",
+        )
+        .bind(user_did)
+        .bind(candidates)
+        .fetch_one(pool)
+        .await
+    }
     .map_err(|e| {
         error!("Failed to count expired key packages: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
@@ -160,7 +251,7 @@ async fn handle_publish_batch(
     headers: &HeaderMap,
     input: &crate::generated::blue_catbird::mlsChat::publish_key_packages::PublishKeyPackages<'_>,
     user_did: &str,
-    device_id: &str,
+    device_scope: &DeviceScope,
 ) -> Result<PublishResult<'static>, StatusCode> {
     let items = input.key_packages.as_ref().ok_or_else(|| {
         warn!("publishBatch action requires keyPackages");
@@ -181,22 +272,24 @@ async fn handle_publish_batch(
     }
 
     let now = Utc::now();
+    let device_id = device_scope.storage_device_id.as_str();
+    let device_candidates = &device_scope.storage_candidates;
     let recovery_mode_requested = headers
         .get(crate::middleware::rate_limit::RECOVERY_MODE_HEADER)
         .and_then(|v| v.to_str().ok())
         .map(|v| v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
-    let recovery_mode_verified = if recovery_mode_requested && !device_id.is_empty() {
+    let recovery_mode_verified = if recovery_mode_requested && !device_candidates.is_empty() {
         let available_for_device: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM key_packages
              WHERE owner_did = $1
-               AND (device_id = $2 OR device_id IS NULL)
+               AND device_id = ANY($2::text[])
                AND consumed_at IS NULL
                AND expires_at > $3",
         )
         .bind(user_did)
-        .bind(device_id)
+        .bind(device_candidates)
         .bind(now)
         .fetch_one(pool)
         .await
@@ -208,18 +301,18 @@ async fn handle_publish_batch(
         if available_for_device.0 == 0 {
             info!(
                 "Recovery mode verified for user {} on device {}",
-                user_did, device_id
+                user_did, device_scope.raw_device_id
             );
             true
         } else {
             warn!(
                 "Recovery mode requested but denied for user {} on device {} (available: {})",
-                user_did, device_id, available_for_device.0
+                user_did, device_scope.raw_device_id, available_for_device.0
             );
             false
         }
     } else {
-        if recovery_mode_requested && device_id.is_empty() {
+        if recovery_mode_requested && device_candidates.is_empty() {
             warn!("Recovery mode requested without device_id, applying normal limits");
         }
         false
@@ -231,11 +324,11 @@ async fn handle_publish_batch(
         sqlx::query_as(
             "SELECT COUNT(*) FROM key_packages
              WHERE owner_did = $1
-               AND (device_id = $2 OR device_id IS NULL)
+               AND device_id = ANY($2::text[])
                AND created_at > $3",
         )
         .bind(user_did)
-        .bind(device_id)
+        .bind(device_candidates)
         .bind(rate_limit_window)
         .fetch_one(pool)
         .await
@@ -271,12 +364,12 @@ async fn handle_publish_batch(
         sqlx::query_as(
             "SELECT COUNT(*) FROM key_packages
              WHERE owner_did = $1
-               AND (device_id = $2 OR device_id IS NULL)
+               AND device_id = ANY($2::text[])
                AND consumed_at IS NULL
                AND expires_at > $3",
         )
         .bind(user_did)
-        .bind(device_id)
+        .bind(device_candidates)
         .bind(now)
         .fetch_one(pool)
         .await
@@ -451,8 +544,7 @@ async fn handle_sync(
     pool: &DbPool,
     input: &crate::generated::blue_catbird::mlsChat::publish_key_packages::PublishKeyPackages<'_>,
     user_did: &str,
-    raw_device_id: &str,
-    bucketed_device_id: &str,
+    device_scope: &DeviceScope,
 ) -> Result<SyncResult<'static>, StatusCode> {
     let local_hashes_cow = input.local_hashes.as_ref().ok_or_else(|| {
         warn!("sync action requires localHashes");
@@ -460,7 +552,7 @@ async fn handle_sync(
     })?;
     let local_hashes: Vec<String> = local_hashes_cow.iter().map(|s| s.to_string()).collect();
 
-    if raw_device_id.trim().is_empty() || bucketed_device_id.trim().is_empty() {
+    if device_scope.raw_device_id.is_empty() || device_scope.storage_candidates.is_empty() {
         warn!("sync action requires deviceId");
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -468,7 +560,7 @@ async fn handle_sync(
     info!(
         "🔄 [sync] START - user has {} local hashes, device_id: {}",
         local_hashes.len(),
-        raw_device_id
+        device_scope.raw_device_id
     );
 
     // Get available server hashes for this device
@@ -477,15 +569,14 @@ async fn handle_sync(
     let server_hashes: Vec<String> = sqlx::query_scalar::<_, String>(
         r#"
         SELECT key_package_hash FROM key_packages
-        WHERE owner_did = $1 AND (device_id = $2 OR device_id = $3 OR device_id IS NULL)
-          AND consumed_at IS NULL AND expires_at > $4
-          AND (reserved_at IS NULL OR reserved_at < $5)
+        WHERE owner_did = $1 AND device_id = ANY($2::text[])
+          AND consumed_at IS NULL AND expires_at > $3
+          AND (reserved_at IS NULL OR reserved_at < $4)
         ORDER BY created_at DESC
         "#,
     )
     .bind(user_did)
-    .bind(bucketed_device_id)
-    .bind(raw_device_id)
+    .bind(&device_scope.storage_candidates)
     .bind(now)
     .bind(reservation_timeout)
     .fetch_all(pool)
@@ -498,7 +589,7 @@ async fn handle_sync(
     info!(
         "📊 [sync] Server has {} available key packages for device {}",
         server_hashes.len(),
-        raw_device_id
+        device_scope.raw_device_id
     );
 
     // Find orphaned: on server but not in local
@@ -513,7 +604,7 @@ async fn handle_sync(
     if orphaned_count == 0 {
         info!(
             "✅ [sync] No orphaned key packages found for device {}",
-            raw_device_id
+            device_scope.raw_device_id
         );
         let count = server_hashes.len() as i64;
         return Ok(SyncResult {
@@ -522,14 +613,14 @@ async fn handle_sync(
             orphaned_hashes: None,
             deleted_count: 0,
             remaining_available: Some(count),
-            device_id: raw_device_id.to_string().into(),
+            device_id: device_scope.raw_device_id.clone().into(),
             extra_data: Default::default(),
         });
     }
 
     warn!(
         "⚠️ [sync] Found {} orphaned key packages for device {}",
-        orphaned_count, raw_device_id
+        orphaned_count, device_scope.raw_device_id
     );
 
     // Delete orphaned packages (scoped to this device)
@@ -537,13 +628,12 @@ async fn handle_sync(
         let result = sqlx::query(
             r#"
             DELETE FROM key_packages
-            WHERE owner_did = $1 AND (device_id = $2 OR device_id = $3 OR device_id IS NULL)
-              AND key_package_hash = ANY($4) AND consumed_at IS NULL
+            WHERE owner_did = $1 AND device_id = ANY($2::text[])
+              AND key_package_hash = ANY($3::text[]) AND consumed_at IS NULL
             "#,
         )
         .bind(user_did)
-        .bind(bucketed_device_id)
-        .bind(raw_device_id)
+        .bind(&device_scope.storage_candidates)
         .bind(&orphaned_hashes)
         .execute(pool)
         .await
@@ -558,7 +648,7 @@ async fn handle_sync(
 
     info!(
         "🗑️ [sync] Deleted {} orphaned key packages for device {}",
-        deleted_count, raw_device_id
+        deleted_count, device_scope.raw_device_id
     );
 
     // Invalidate pending welcomes referencing deleted key packages
@@ -594,13 +684,12 @@ async fn handle_sync(
     let remaining: (i64,) = sqlx::query_as(
         r#"
         SELECT COUNT(*) FROM key_packages
-        WHERE owner_did = $1 AND (device_id = $2 OR device_id = $3 OR device_id IS NULL)
+        WHERE owner_did = $1 AND device_id = ANY($2::text[])
           AND consumed_at IS NULL AND expires_at > NOW()
         "#,
     )
     .bind(user_did)
-    .bind(bucketed_device_id)
-    .bind(raw_device_id)
+    .bind(&device_scope.storage_candidates)
     .fetch_one(pool)
     .await
     .map_err(|e| {
@@ -612,15 +701,14 @@ async fn handle_sync(
     let remaining_hashes: Vec<String> = sqlx::query_scalar::<_, String>(
         r#"
         SELECT key_package_hash FROM key_packages
-        WHERE owner_did = $1 AND (device_id = $2 OR device_id = $3 OR device_id IS NULL)
-          AND consumed_at IS NULL AND expires_at > $4
-          AND (reserved_at IS NULL OR reserved_at < $5)
+        WHERE owner_did = $1 AND device_id = ANY($2::text[])
+          AND consumed_at IS NULL AND expires_at > $3
+          AND (reserved_at IS NULL OR reserved_at < $4)
         ORDER BY created_at DESC
         "#,
     )
     .bind(user_did)
-    .bind(bucketed_device_id)
-    .bind(raw_device_id)
+    .bind(&device_scope.storage_candidates)
     .bind(now)
     .bind(reservation_timeout)
     .fetch_all(pool)
@@ -636,7 +724,7 @@ async fn handle_sync(
 
     info!(
         "✅ [sync] COMPLETE for device {} - deleted {}, {} remaining",
-        raw_device_id, deleted_count, remaining.0
+        device_scope.raw_device_id, deleted_count, remaining.0
     );
 
     Ok(SyncResult {
@@ -645,7 +733,7 @@ async fn handle_sync(
         orphaned_hashes: Some(orphaned_hashes.into_iter().map(|s| s.into()).collect()),
         deleted_count,
         remaining_available: Some(remaining.0),
-        device_id: raw_device_id.to_string().into(),
+        device_id: device_scope.raw_device_id.clone().into(),
         extra_data: Default::default(),
     })
 }
@@ -852,14 +940,8 @@ pub async fn publish_key_packages_post(
         }
     }
 
-    // Privacy: hash device_id into an opaque bucket so the server can partition
-    // key packages per device without learning actual device identifiers.
-    let device_id = if raw_device_id.is_empty() {
-        raw_device_id.clone()
-    } else {
-        let bucket_input = format!("{}#{}", user_did, raw_device_id);
-        crate::crypto::sha256_hex(bucket_input.as_bytes())[..16].to_string()
-    };
+    let device_scope = resolve_device_scope(&pool, &user_did, &raw_device_id).await?;
+    let storage_device_id = device_scope.storage_device_id.as_str();
 
     match input.action.as_ref() {
         "publish" => {
@@ -870,11 +952,11 @@ pub async fn publish_key_packages_post(
                 .unwrap_or(false)
             {
                 warn!("publish action received multiple key packages; handling as publishBatch");
-                handle_publish_batch(&pool, &headers, &input, &user_did, &device_id).await?
+                handle_publish_batch(&pool, &headers, &input, &user_did, &device_scope).await?
             } else {
-                handle_publish(&pool, &input, &user_did, &device_id).await?
+                handle_publish(&pool, &input, &user_did, storage_device_id).await?
             };
-            let stats = build_stats(&pool, &did).await?;
+            let stats = build_stats(&pool, &user_did, Some(&device_scope)).await?;
             Ok(Json(PublishKeyPackagesOutput {
                 stats,
                 publish_result: Some(publish_result),
@@ -886,8 +968,8 @@ pub async fn publish_key_packages_post(
 
         "publishBatch" => {
             let publish_result =
-                handle_publish_batch(&pool, &headers, &input, &user_did, &device_id).await?;
-            let stats = build_stats(&pool, &did).await?;
+                handle_publish_batch(&pool, &headers, &input, &user_did, &device_scope).await?;
+            let stats = build_stats(&pool, &user_did, Some(&device_scope)).await?;
             Ok(Json(PublishKeyPackagesOutput {
                 stats,
                 publish_result: Some(publish_result),
@@ -898,9 +980,8 @@ pub async fn publish_key_packages_post(
         }
 
         "sync" => {
-            let sync_result =
-                handle_sync(&pool, &input, &user_did, &raw_device_id, &device_id).await?;
-            let stats = build_stats(&pool, &did).await?;
+            let sync_result = handle_sync(&pool, &input, &user_did, &device_scope).await?;
+            let stats = build_stats(&pool, &user_did, Some(&device_scope)).await?;
             Ok(Json(PublishKeyPackagesOutput {
                 stats,
                 publish_result: None,
@@ -911,7 +992,7 @@ pub async fn publish_key_packages_post(
         }
 
         "stats" => {
-            let stats = build_stats(&pool, &did).await?;
+            let stats = build_stats(&pool, &user_did, Some(&device_scope)).await?;
             Ok(Json(PublishKeyPackagesOutput {
                 stats,
                 publish_result: None,
@@ -924,7 +1005,7 @@ pub async fn publish_key_packages_post(
         "requestReplenish" => {
             let replenish_result =
                 handle_request_replenish(&pool, notification_service, &input, &user_did).await?;
-            let stats = build_stats(&pool, &did).await?;
+            let stats = build_stats(&pool, &user_did, Some(&device_scope)).await?;
             Ok(Json(PublishKeyPackagesOutput {
                 stats,
                 publish_result: None,
