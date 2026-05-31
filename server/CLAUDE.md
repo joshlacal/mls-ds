@@ -201,7 +201,7 @@ SELECT column_name FROM information_schema.columns WHERE table_name='conversatio
 
 ### When Modifying Schema
 
-1. Create new migration file: `migrations/YYYYMMDD_NNN_description.sql`
+1. Create new migration file using a format from "Database Schema Migration Pattern" above: `YYYYMMDD_description.sql` (one migration that day) or `YYYYMMDDNNNNNN_description.sql` (14-digit, multiple per day). **Never** use `YYYYMMDD_NNN_description.sql` — the short numeric suffix collides on the date version.
 2. Use `IF NOT EXISTS` / `IF EXISTS` for idempotent migrations
 3. Test migration on fresh database AND existing database
 4. Update relevant handlers to use new columns
