@@ -36,8 +36,14 @@ const CONVO_409: &str = "convo-health-409-0001";
 /// `bootstrap_reset_group::setup_post_reset_convo`, plus an explicit
 /// non-zero `recent_commit_409_count` so the success-path zero-reset is
 /// observable.
+///
+/// `group_id` is derived from `convo_id` so each test's row is unique
+/// under `idx_conversations_group_id_unique` (the previous shared
+/// constant caused cross-test collisions whenever an earlier test
+/// panicked before its end-of-test cleanup ran).
 async fn insert_convo_with_409_count(pool: &PgPool, convo_id: &str, initial_409_count: i32) {
     let now = Utc::now();
+    let group_id = format!("gid-{convo_id}");
     sqlx::query(
         "INSERT INTO conversations \
             (id, creator_did, current_epoch, created_at, updated_at, cipher_suite, is_remote, \
@@ -52,7 +58,7 @@ async fn insert_convo_with_409_count(pool: &PgPool, convo_id: &str, initial_409_
     .bind(CREATOR)
     .bind(now)
     .bind("MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519")
-    .bind("aabbccddeeff00112233445566778899")
+    .bind(&group_id)
     .bind(initial_409_count)
     .execute(pool)
     .await
@@ -89,12 +95,11 @@ async fn fetch_health(pool: &PgPool, convo_id: &str) -> HealthRow {
 /// Why this matters: the Stage-4 sweep job uses `recent_commit_409_count`
 /// as a proxy for "currently failing". If we don't zero on success, a
 /// recovered conversation would still look operationally dead.
-// TODO(phase-2.5-cleanup-test-fixture-rot): same fixture isolation issue
-// as `bootstrap_reset_group.rs` — shared `group_id` constants cause unique
-// constraint violations when tests run concurrently against the same DB.
-// Held for a follow-up PR (per-test unique IDs).
+// Fixture isolation fixed (N14): `group_id` is now derived per-convo in
+// `insert_convo_with_409_count`, so tests no longer collide on
+// `idx_conversations_group_id_unique`.
 #[tokio::test]
-#[ignore = "fixture isolation: shared group_id collides with idx_conversations_group_id_unique"]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn successful_commit_sets_last_successful_commit_at_and_zeroes_409_count() {
     let pool = common::setup_test_db().await;
     common::cleanup(&pool, CONVO_SUCCESS).await;
@@ -148,7 +153,7 @@ async fn successful_commit_sets_last_successful_commit_at_and_zeroes_409_count()
 /// the success UPDATE), the health-counter mutation MUST also roll back.
 /// This is the "atomicity matters" requirement from the self-review.
 #[tokio::test]
-#[ignore = "fixture isolation: shared group_id collides with idx_conversations_group_id_unique"]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn mark_commit_success_rolls_back_when_wrapping_tx_aborts() {
     let pool = common::setup_test_db().await;
     let convo_id = "convo-health-success-rollback-0001";
@@ -190,7 +195,7 @@ async fn mark_commit_success_rolls_back_when_wrapping_tx_aborts() {
 /// requirement: "the 409-path UPDATE uses a separate connection from the
 /// pool".
 #[tokio::test]
-#[ignore = "fixture isolation: shared group_id collides with idx_conversations_group_id_unique"]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn epoch_mismatch_409_increments_counter_and_sets_timestamp() {
     let pool = common::setup_test_db().await;
     common::cleanup(&pool, CONVO_409).await;
@@ -252,7 +257,7 @@ async fn epoch_mismatch_409_increments_counter_and_sets_timestamp() {
 /// touch another conversation's counters. Catches regressions where someone
 /// drops the WHERE clause.
 #[tokio::test]
-#[ignore = "fixture isolation: shared group_id collides with idx_conversations_group_id_unique"]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn record_commit_409_only_touches_target_convo() {
     let pool = common::setup_test_db().await;
     let convo_a = "convo-health-409-isolation-a";
@@ -291,7 +296,7 @@ async fn record_commit_409_only_touches_target_convo() {
 /// reset the counter back to 0. This is the "recovery" signal the Stage-4
 /// sweep job depends on.
 #[tokio::test]
-#[ignore = "fixture isolation: shared group_id collides with idx_conversations_group_id_unique"]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn success_after_409_streak_resets_counter() {
     let pool = common::setup_test_db().await;
     let convo_id = "convo-health-success-after-409";
@@ -352,7 +357,7 @@ async fn success_after_409_streak_resets_counter() {
 /// against `idx_conversations_group_id_unique`. Run manually:
 ///   `cargo test --test commit_group_change_health_counters -- --ignored`
 #[tokio::test]
-#[ignore = "fixture isolation: shared identifiers collide with unique indexes (consistent with rest of file)"]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn kp_publish_gate_zero_for_unpublished_device() {
     use catbird_server::db::count_available_key_packages_for_device;
     let pool = common::setup_test_db().await;
@@ -363,6 +368,15 @@ async fn kp_publish_gate_zero_for_unpublished_device() {
         .execute(&pool)
         .await
         .ok();
+    // key_packages.owner_did has a FK to users(did) — seed the owner row.
+    sqlx::query(
+        "INSERT INTO users (did, created_at, last_seen_at) VALUES ($1, NOW(), NOW()) \
+         ON CONFLICT (did) DO NOTHING",
+    )
+    .bind(user_did)
+    .execute(&pool)
+    .await
+    .expect("seed users row");
 
     let count_before = count_available_key_packages_for_device(&pool, user_did, device_id)
         .await
@@ -373,13 +387,16 @@ async fn kp_publish_gate_zero_for_unpublished_device() {
     );
 
     // Insert one available, non-expired key package for this device.
+    // Column set mirrors tests/key_package_bulk_claim.rs (the schema column
+    // is `key_package`, and `id` is a required text PK with no default).
     let kp_hash = "deadbeefcafe1234";
     sqlx::query(
         "INSERT INTO key_packages
-            (owner_did, device_id, key_package_hash, key_package_data, cipher_suite, state, expires_at, created_at)
-         VALUES ($1, $2, $3, $4, $5, 'available', NOW() + INTERVAL '7 days', NOW())
+            (id, owner_did, device_id, key_package_hash, key_package, cipher_suite, state, expires_at, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, 'available', NOW() + INTERVAL '7 days', NOW())
          ON CONFLICT DO NOTHING",
     )
+    .bind("kp-layer1-gate-0001")
     .bind(user_did)
     .bind(device_id)
     .bind(kp_hash)

@@ -53,9 +53,11 @@ async fn cleanup_test_data(pool: &PgPool, convo_id: &str) {
 async fn create_test_convo(pool: &PgPool, convo_id: &str, creator: &str) {
     let now = Utc::now();
 
+    // `group_id` is NOT NULL (and unique) since 20260405100000_group_reset_support —
+    // derive it from the convo id, matching db::create_conversation's backfill rule.
     sqlx::query(
-        "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at)
-         VALUES ($1, $2, 0, $3, $3)
+        "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at, group_id)
+         VALUES ($1, $2, 0, $3, $3, $1)
          ON CONFLICT (id) DO NOTHING",
     )
     .bind(convo_id)
@@ -124,7 +126,7 @@ async fn simulate_add_members_via_actor(
     let new_epoch = rx
         .await
         .map_err(|_| "Actor channel closed unexpectedly".to_string())?
-        .map_err(|e| format!("Actor failed: {}", e))?;
+        .map_err(|e| format!("Actor failed: {:#}", e))?;
 
     Ok(new_epoch)
 }
@@ -159,7 +161,7 @@ async fn simulate_send_message_via_actor(
 
     rx.await
         .map_err(|_| "Actor channel closed unexpectedly".to_string())?
-        .map_err(|e| format!("Actor failed: {}", e))?;
+        .map_err(|e| format!("Actor failed: {:#}", e))?;
 
     Ok(())
 }
@@ -190,7 +192,14 @@ async fn simulate_get_messages(
 }
 
 #[tokio::test]
-#[ignore = "fixture rot: race-condition test infrastructure not realigned with current schema"]
+// Stale contract: this test drives `ConvoMessage::AddMembers` with `commit:
+// None` and asserts the server bumps the epoch once per add (1..=10). Since
+// the client-commit redesign, `handle_add_members` only advances the epoch
+// when real MLS commit bytes are supplied (`inspect_commit_shape` validates
+// framing + wire epoch); without a commit the epoch is intentionally
+// unchanged. Realigning needs a test-side MLS commit harness — same blocker
+// as `commit_add_proposal_gate.rs`.
+#[ignore = "stale contract: AddMembers without commit no longer advances epoch; needs test-side MLS commit harness"]
 async fn test_concurrent_add_members_no_duplicate_epochs() {
     // Skip if TEST_DATABASE_URL not set
     let Ok(_) = std::env::var("TEST_DATABASE_URL") else {
@@ -304,7 +313,7 @@ async fn test_concurrent_add_members_no_duplicate_epochs() {
 }
 
 #[tokio::test]
-#[ignore = "fixture rot: race-condition test infrastructure not realigned with current schema"]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn test_concurrent_send_and_read_unread_count_consistency() {
     // Skip if TEST_DATABASE_URL not set
     let Ok(_) = std::env::var("TEST_DATABASE_URL") else {
@@ -404,7 +413,19 @@ async fn test_concurrent_send_and_read_unread_count_consistency() {
 }
 
 #[tokio::test]
-#[ignore = "fixture rot: race-condition test infrastructure not realigned with current schema"]
+// RED — exposes a real server bug (N14): `ActorRegistry::
+// get_or_spawn_group_supervisor` double-checked locking races because a
+// freshly spawned actor still reports `ActorStatus::Starting` when the
+// post-spawn `Running` check runs, so every concurrent caller overwrites the
+// cached supervisor with its own. N concurrent first-touch callers get N
+// GroupSupervisors, each spawning its own ConversationActor for the same
+// convo — message sends are then NOT serialized per conversation and collide
+// on `messages_convo_seq_unique` (observed: 20 supervisors spawned for one
+// barrier of 20 sends). Production hits the same window on the first
+// concurrent burst after process start. Fix belongs in
+// `src/actors/registry.rs` (treat `Starting` as alive / hold spawn
+// exclusivity), out of scope for the N14 test-repair task.
+#[ignore = "RED: real server bug — ActorRegistry supervisor-spawn race spawns multiple ConversationActors per convo (duplicate seq); see comment"]
 async fn test_message_sequence_numbers_sequential() {
     // Skip if TEST_DATABASE_URL not set
     let Ok(_) = std::env::var("TEST_DATABASE_URL") else {
@@ -498,7 +519,10 @@ async fn test_message_sequence_numbers_sequential() {
 }
 
 #[tokio::test]
-#[ignore = "fixture rot: race-condition test infrastructure not realigned with current schema"]
+// Stale contract: same as `test_concurrent_add_members_no_duplicate_epochs`
+// — asserts epoch bumps from commit-less AddMembers, which the current
+// client-commit contract intentionally no longer does.
+#[ignore = "stale contract: AddMembers without commit no longer advances epoch; needs test-side MLS commit harness"]
 async fn test_out_of_order_commits_prevented() {
     // Skip if TEST_DATABASE_URL not set
     let Ok(_) = std::env::var("TEST_DATABASE_URL") else {
@@ -594,7 +618,9 @@ async fn test_out_of_order_commits_prevented() {
 }
 
 #[tokio::test]
-#[ignore = "fixture rot: race-condition test infrastructure not realigned with current schema"]
+// Stale contract: same family as above — expects a 'commit' messages row per
+// commit-less AddMembers, which the current contract no longer writes.
+#[ignore = "stale contract: AddMembers without commit writes no commit message; needs test-side MLS commit harness"]
 async fn test_mixed_operations_no_race_conditions() {
     // Skip if TEST_DATABASE_URL not set
     let Ok(_) = std::env::var("TEST_DATABASE_URL") else {

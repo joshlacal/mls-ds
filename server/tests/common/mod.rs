@@ -42,3 +42,40 @@ pub async fn cleanup(pool: &PgPool, convo_id: &str) {
         .execute(pool)
         .await;
 }
+
+/// Build real, validatable MLS KeyPackage bytes for `identity` (a bare DID).
+///
+/// `db::store_key_package` deserializes and validates uploaded key packages
+/// with OpenMLS (XWing ciphersuite via the libcrux provider) and enforces
+/// that the BasicCredential identity equals the bare owner DID — dummy byte
+/// fixtures are rejected. This generates the real thing.
+#[allow(dead_code)]
+pub fn generate_key_package_bytes(identity: &str) -> Vec<u8> {
+    use openmls::prelude::{tls_codec::Serialize as TlsSerialize, *};
+    use openmls_basic_credential::SignatureKeyPair;
+    use openmls_traits::OpenMlsProvider;
+
+    let provider = openmls_libcrux_crypto::Provider::new().expect("libcrux provider");
+    let ciphersuite = Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519;
+
+    let credential = BasicCredential::new(identity.as_bytes().to_vec());
+    let signature_keys =
+        SignatureKeyPair::new(ciphersuite.signature_algorithm()).expect("signature keypair");
+    signature_keys
+        .store(provider.storage())
+        .expect("store signature keys");
+
+    let credential_with_key = CredentialWithKey {
+        credential: credential.into(),
+        signature_key: signature_keys.to_public_vec().into(),
+    };
+
+    let bundle = KeyPackage::builder()
+        .build(ciphersuite, &provider, &signature_keys, credential_with_key)
+        .expect("build key package");
+
+    bundle
+        .key_package()
+        .tls_serialize_detached()
+        .expect("serialize key package")
+}

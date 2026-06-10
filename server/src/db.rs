@@ -279,7 +279,7 @@ pub async fn list_conversations(
 ) -> Result<Vec<Conversation>> {
     let conversations = sqlx::query_as::<_, Conversation>(
         r#"
-        SELECT c.id, c.creator_did, c.current_epoch, c.created_at, c.updated_at
+        SELECT c.id, c.creator_did, c.current_epoch, c.cipher_suite, c.created_at, c.updated_at
         FROM conversations c
         INNER JOIN members m ON c.id = m.convo_id
         WHERE (m.member_did = $1 OR m.user_did = $1) AND m.left_at IS NULL
@@ -967,9 +967,12 @@ pub async fn add_member(pool: &DbPool, convo_id: &str, member_did: &str) -> Resu
         r#"
         INSERT INTO members (convo_id, member_did, joined_at, unread_count)
         VALUES ($1, $2, $3, 0)
-        ON CONFLICT (convo_id, member_did) 
+        ON CONFLICT (convo_id, member_did)
         DO UPDATE SET left_at = NULL, joined_at = $3
-        RETURNING convo_id, member_did, joined_at, left_at, unread_count
+        RETURNING convo_id, member_did, user_did, device_id, device_name, joined_at, left_at,
+                  unread_count, last_read_at, is_admin, promoted_at, promoted_by_did,
+                  COALESCE(is_moderator, false) as is_moderator, leaf_index,
+                  needs_rejoin, rejoin_requested_at, rejoin_key_package_hash
         "#,
     )
     .bind(convo_id)
@@ -1029,7 +1032,10 @@ pub async fn is_member(pool: &DbPool, did: &str, convo_id: &str) -> Result<bool>
 pub async fn list_members(pool: &DbPool, convo_id: &str) -> Result<Vec<Membership>> {
     let members = sqlx::query_as::<_, Membership>(
         r#"
-        SELECT convo_id, member_did, joined_at, left_at, unread_count
+        SELECT convo_id, member_did, user_did, device_id, device_name, joined_at, left_at,
+               unread_count, last_read_at, is_admin, promoted_at, promoted_by_did,
+               COALESCE(is_moderator, false) as is_moderator, leaf_index,
+               needs_rejoin, rejoin_requested_at, rejoin_key_package_hash
         FROM members
         WHERE convo_id = $1 AND left_at IS NULL
         ORDER BY joined_at ASC
@@ -1051,7 +1057,10 @@ pub async fn get_membership(
 ) -> Result<Option<Membership>> {
     let membership = sqlx::query_as::<_, Membership>(
         r#"
-        SELECT convo_id, member_did, joined_at, left_at, unread_count
+        SELECT convo_id, member_did, user_did, device_id, device_name, joined_at, left_at,
+               unread_count, last_read_at, is_admin, promoted_at, promoted_by_did,
+               COALESCE(is_moderator, false) as is_moderator, leaf_index,
+               needs_rejoin, rejoin_requested_at, rejoin_key_package_hash
         FROM members
         WHERE convo_id = $1 AND member_did = $2
         "#,
@@ -2056,11 +2065,11 @@ pub async fn count_key_packages(pool: &DbPool, did: &str, cipher_suite: &str) ->
 
     let count = sqlx::query_scalar::<_, i64>(
         r#"
-        SELECT COUNT(*) 
-        FROM key_packages 
-        WHERE did = $1 
-          AND cipher_suite = $2 
-          AND consumed = false 
+        SELECT COUNT(*)
+        FROM key_packages
+        WHERE owner_did = $1
+          AND cipher_suite = $2
+          AND consumed_at IS NULL
           AND expires_at > $3
         "#,
     )
@@ -2263,18 +2272,23 @@ pub async fn create_conversation_with_members(
     // Create conversation
     let id = Uuid::new_v4().to_string();
     let now = Utc::now();
+    // `conversations.group_id` is NOT NULL since migration
+    // `20260405100000_group_reset_support.sql` — default it to the
+    // conversation id, matching `create_conversation` above.
+    let group_id = id.clone();
 
     let conversation = sqlx::query_as::<_, Conversation>(
         r#"
-        INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at)
-        VALUES ($1, $2, 0, $3, $4)
-        RETURNING id, creator_did, current_epoch, created_at
+        INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at, group_id)
+        VALUES ($1, $2, 0, $3, $4, $5)
+        RETURNING id, creator_did, current_epoch, cipher_suite, created_at, updated_at
         "#,
     )
     .bind(&id)
     .bind(creator_did)
     .bind(now)
     .bind(now)
+    .bind(&group_id)
     .fetch_one(&mut *tx)
     .await
     .context("Failed to create conversation")?;
@@ -3021,12 +3035,8 @@ mod tests {
         assert_eq!(fetched.id, conversation.id);
     }
 
-    // TODO(phase-2.5-cleanup-test-fixture-rot): `add_member` SELECT/RETURNING
-    // doesn't include `leaf_index`, but the `Member` struct expects it.
-    // Same root cause as `test_key_package_operations` and `test_transaction`.
-    // Pre-existing — fixture rot from schema evolution. Tracked separately.
     #[tokio::test]
-    #[ignore = "fixture rot: add_member RETURNING missing leaf_index column"]
+    #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
     async fn test_member_operations() {
         let pool = setup_test_db().await;
 
@@ -3080,17 +3090,47 @@ mod tests {
         assert_eq!(fetched.ciphertext, vec![1, 2, 3, 4]);
     }
 
-    // TODO(phase-2.5-cleanup-test-fixture-rot): key-package storage schema
-    // evolved (per-device columns, credential_did, etc.) but the test
-    // fixture still uses the legacy 4-arg `store_key_package` shape.
-    // Pre-existing — tracked separately.
+    /// Build real, validatable MLS KeyPackage bytes for `identity` — the
+    /// store path deserializes and validates uploads with OpenMLS, so dummy
+    /// byte fixtures are rejected. Mirrors
+    /// `tests/common::generate_key_package_bytes`.
+    fn generate_key_package_bytes(identity: &str) -> Vec<u8> {
+        use openmls::prelude::{tls_codec::Serialize as TlsSerialize, *};
+        use openmls_basic_credential::SignatureKeyPair;
+        use openmls_traits::OpenMlsProvider;
+
+        let provider = openmls_libcrux_crypto::Provider::new().expect("libcrux provider");
+        let ciphersuite = Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519;
+
+        let credential = BasicCredential::new(identity.as_bytes().to_vec());
+        let signature_keys =
+            SignatureKeyPair::new(ciphersuite.signature_algorithm()).expect("signature keypair");
+        signature_keys
+            .store(provider.storage())
+            .expect("store signature keys");
+
+        let credential_with_key = CredentialWithKey {
+            credential: credential.into(),
+            signature_key: signature_keys.to_public_vec().into(),
+        };
+
+        let bundle = KeyPackage::builder()
+            .build(ciphersuite, &provider, &signature_keys, credential_with_key)
+            .expect("build key package");
+
+        bundle
+            .key_package()
+            .tls_serialize_detached()
+            .expect("serialize key package")
+    }
+
     #[tokio::test]
-    #[ignore = "fixture rot: store_key_package signature changed; test calls legacy 4-arg form"]
+    #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
     async fn test_key_package_operations() {
         let pool = setup_test_db().await;
 
         let expires_at = Utc::now() + chrono::Duration::hours(24);
-        let key_data = vec![5, 6, 7, 8];
+        let key_data = generate_key_package_bytes("did:plc:user");
 
         store_key_package(
             &pool,
@@ -3133,12 +3173,8 @@ mod tests {
         assert!(consumed.is_none());
     }
 
-    // TODO(phase-2.5-cleanup-test-fixture-rot): `create_conversation_with_members`
-    // doesn't supply `group_id` (NOT NULL since 20260405100000_group_reset_support).
-    // Same fix as `create_conversation` — set `group_id = id` for legacy callers.
-    // Held for a follow-up PR so this CI cleanup doesn't bloat further.
     #[tokio::test]
-    #[ignore = "fixture rot: create_conversation_with_members missing group_id"]
+    #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
     async fn test_transaction() {
         let pool = setup_test_db().await;
 

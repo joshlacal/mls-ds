@@ -1,3 +1,5 @@
+mod common;
+
 use catbird_server::db::*;
 use chrono::Utc;
 use sqlx::PgPool;
@@ -27,11 +29,19 @@ async fn cleanup_test_data(pool: &PgPool) {
         .expect("Failed to cleanup test data");
 }
 
-// TODO(phase-2.5-cleanup-test-fixture-rot): pre-existing fixture rot —
-// shared constants and/or schema evolution. Per-test unique IDs needed.
+/// The fixture model of this file is a DB-global reset: every test starts by
+/// TRUNCATE-ing the shared tables via `cleanup_test_data`. That makes the
+/// tests mutually exclusive by construction — two tests running concurrently
+/// truncate each other's in-flight rows (this is the "shared IDs" fixture rot
+/// that kept the file `#[ignore]`d). Serialize them with a static lock so the
+/// file is correct under the default parallel test runner instead of relying
+/// on callers remembering `--test-threads=1`.
+static DB_FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test]
-#[ignore = "fixture rot: schema evolution + shared IDs"]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn test_conversation_crud() {
+    let _fixture_guard = DB_FIXTURE_LOCK.lock().await;
     let pool = setup_test_db().await;
     cleanup_test_data(&pool).await;
 
@@ -75,11 +85,10 @@ async fn test_conversation_crud() {
     assert!(deleted.is_none());
 }
 
-// TODO(phase-2.5-cleanup-test-fixture-rot): pre-existing fixture rot —
-// shared constants and/or schema evolution. Per-test unique IDs needed.
 #[tokio::test]
-#[ignore = "fixture rot: schema evolution + shared IDs"]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn test_member_operations() {
+    let _fixture_guard = DB_FIXTURE_LOCK.lock().await;
     let pool = setup_test_db().await;
     cleanup_test_data(&pool).await;
 
@@ -165,11 +174,10 @@ async fn test_member_operations() {
     assert_eq!(active_members.len(), 1);
 }
 
-// TODO(phase-2.5-cleanup-test-fixture-rot): pre-existing fixture rot —
-// shared constants and/or schema evolution. Per-test unique IDs needed.
 #[tokio::test]
-#[ignore = "fixture rot: schema evolution + shared IDs"]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn test_message_operations() {
+    let _fixture_guard = DB_FIXTURE_LOCK.lock().await;
     let pool = setup_test_db().await;
     cleanup_test_data(&pool).await;
 
@@ -257,18 +265,19 @@ async fn test_message_operations() {
     assert!(deleted.is_none());
 }
 
-// TODO(phase-2.5-cleanup-test-fixture-rot): pre-existing fixture rot —
-// shared constants and/or schema evolution. Per-test unique IDs needed.
 #[tokio::test]
-#[ignore = "fixture rot: schema evolution + shared IDs"]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn test_key_package_operations() {
+    let _fixture_guard = DB_FIXTURE_LOCK.lock().await;
     let pool = setup_test_db().await;
     cleanup_test_data(&pool).await;
 
     let cipher_suite = "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519";
     let expires_at = Utc::now() + chrono::Duration::hours(24);
-    let key_data1 = vec![1, 2, 3, 4];
-    let key_data2 = vec![5, 6, 7, 8];
+    // store_key_package validates real KeyPackage bytes (and binds the
+    // credential identity to the owner DID) — dummy bytes are rejected.
+    let key_data1 = common::generate_key_package_bytes("did:plc:alice");
+    let key_data2 = common::generate_key_package_bytes("did:plc:alice");
 
     // Store key packages
     store_key_package(
@@ -328,26 +337,39 @@ async fn test_key_package_operations() {
     assert_eq!(kp2.key_data, key_data2);
 }
 
-// TODO(phase-2.5-cleanup-test-fixture-rot): pre-existing fixture rot —
-// shared constants and/or schema evolution. Per-test unique IDs needed.
 #[tokio::test]
-#[ignore = "fixture rot: schema evolution + shared IDs"]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn test_expired_key_package_cleanup() {
+    let _fixture_guard = DB_FIXTURE_LOCK.lock().await;
     let pool = setup_test_db().await;
     cleanup_test_data(&pool).await;
 
     let cipher_suite = "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519";
     let expired = Utc::now() - chrono::Duration::hours(1);
     let valid = Utc::now() + chrono::Duration::hours(24);
+    let expired_bytes = common::generate_key_package_bytes("did:plc:bob");
+    let valid_bytes = common::generate_key_package_bytes("did:plc:bob");
 
     // Store expired and valid key packages
-    store_key_package(&pool, "did:plc:bob", cipher_suite, vec![1, 2], expired)
-        .await
-        .expect("Failed to store expired key package");
+    store_key_package(
+        &pool,
+        "did:plc:bob",
+        cipher_suite,
+        expired_bytes.clone(),
+        expired,
+    )
+    .await
+    .expect("Failed to store expired key package");
 
-    store_key_package(&pool, "did:plc:bob", cipher_suite, vec![3, 4], valid)
-        .await
-        .expect("Failed to store valid key package");
+    store_key_package(
+        &pool,
+        "did:plc:bob",
+        cipher_suite,
+        valid_bytes.clone(),
+        valid,
+    )
+    .await
+    .expect("Failed to store valid key package");
 
     // Expired key package should not be returned
     let kp = get_key_package(&pool, "did:plc:bob", cipher_suite)
@@ -355,7 +377,7 @@ async fn test_expired_key_package_cleanup() {
         .expect("Failed to get key package")
         .expect("Key package not found");
 
-    assert_eq!(kp.key_data, vec![3, 4]);
+    assert_eq!(kp.key_data, valid_bytes);
 
     // Clean up expired
     let deleted = delete_expired_key_packages(&pool)
@@ -367,11 +389,10 @@ async fn test_expired_key_package_cleanup() {
 
 // Blob operations have been removed - system is now text-only with PostgreSQL storage
 
-// TODO(phase-2.5-cleanup-test-fixture-rot): pre-existing fixture rot —
-// shared constants and/or schema evolution. Per-test unique IDs needed.
 #[tokio::test]
-#[ignore = "fixture rot: schema evolution + shared IDs"]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn test_transaction_conversation_with_members() {
+    let _fixture_guard = DB_FIXTURE_LOCK.lock().await;
     let pool = setup_test_db().await;
     cleanup_test_data(&pool).await;
 
@@ -401,11 +422,10 @@ async fn test_transaction_conversation_with_members() {
     assert!(member_dids.contains(&"did:plc:charlie"));
 }
 
-// TODO(phase-2.5-cleanup-test-fixture-rot): pre-existing fixture rot —
-// shared constants and/or schema evolution. Per-test unique IDs needed.
 #[tokio::test]
-#[ignore = "fixture rot: schema evolution + shared IDs"]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn test_list_conversations_for_user() {
+    let _fixture_guard = DB_FIXTURE_LOCK.lock().await;
     let pool = setup_test_db().await;
     cleanup_test_data(&pool).await;
 
@@ -455,6 +475,7 @@ async fn test_list_conversations_for_user() {
 
 #[tokio::test]
 async fn test_health_check() {
+    let _fixture_guard = DB_FIXTURE_LOCK.lock().await;
     let pool = setup_test_db().await;
 
     let healthy = health_check(&pool).await.expect("Health check failed");
@@ -462,11 +483,10 @@ async fn test_health_check() {
     assert!(healthy);
 }
 
-// TODO(phase-2.5-cleanup-test-fixture-rot): pre-existing fixture rot —
-// shared constants and/or schema evolution. Per-test unique IDs needed.
 #[tokio::test]
-#[ignore = "fixture rot: schema evolution + shared IDs"]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn test_concurrent_operations() {
+    let _fixture_guard = DB_FIXTURE_LOCK.lock().await;
     let pool = setup_test_db().await;
     cleanup_test_data(&pool).await;
 
@@ -474,22 +494,51 @@ async fn test_concurrent_operations() {
         .await
         .expect("Failed to create conversation");
 
-    // Concurrent message creation
+    // Concurrent message creation.
+    //
+    // `db::create_message` computes `seq` with a read-then-insert
+    // (MAX(seq)+1), so concurrent writers on the same convo can collide on
+    // the `messages_convo_seq_unique` constraint and get a clean error back.
+    // Production never hits this: message writes are serialized
+    // per-conversation by the ConversationActor (`actors/conversation.rs`),
+    // and this helper has no production call sites. The DB constraint is the
+    // integrity guarantee under test, so each task retries on a seq
+    // collision exactly as a concurrent caller would have to.
     let mut handles = vec![];
     for i in 0..10 {
         let pool_clone = pool.clone();
         let convo_id = convo.id.clone();
         let handle = tokio::spawn(async move {
-            create_message(
-                &pool_clone,
-                &convo_id,
-                &format!("concurrent-msg-{}", i),
-                vec![i as u8],
-                0,
-                1,
-                None,
-            )
-            .await
+            let mut last_err = None;
+            for _attempt in 0..32 {
+                match create_message(
+                    &pool_clone,
+                    &convo_id,
+                    &format!("concurrent-msg-{}", i),
+                    vec![i as u8],
+                    0,
+                    1,
+                    None,
+                )
+                .await
+                {
+                    Ok(msg) => return Ok(msg),
+                    Err(e) => {
+                        let is_seq_collision = e
+                            .downcast_ref::<sqlx::Error>()
+                            .and_then(|se| se.as_database_error())
+                            .and_then(|dbe| dbe.constraint())
+                            .map(|c| c == "messages_convo_seq_unique")
+                            .unwrap_or(false);
+                        if is_seq_collision {
+                            last_err = Some(e);
+                            continue;
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            Err(last_err.expect("retry loop exited without an error"))
         });
         handles.push(handle);
     }

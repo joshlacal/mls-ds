@@ -28,19 +28,54 @@ const ORIGINAL_CONVO_ID: &str = "convo-bootstrap-test-0001";
 const NEW_GROUP_ID: &str = "deadbeefcafebabe1234567890abcdef";
 
 async fn cleanup(pool: &PgPool, convo_id: &str) {
-    let _ = sqlx::query("DELETE FROM welcome_messages WHERE convo_id = $1")
-        .bind(convo_id)
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("DELETE FROM members WHERE convo_id = $1")
-        .bind(convo_id)
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("DELETE FROM conversations WHERE id = $1")
-        .bind(convo_id)
-        .execute(pool)
-        .await;
+    // The original cleanup only deleted welcome_messages/members/
+    // conversations and swallowed errors with `let _ =`. Schema evolution
+    // added FK chains WITHOUT `ON DELETE CASCADE` —
+    //   notification_outbox/federation_outbox/pending_welcomes →
+    //   delivery_events → conversations
+    // — so the conversations DELETE silently failed and stale
+    // conversation + crypto_sessions rows survived into the next run
+    // (classify() then saw `state='active'` leftovers and returned
+    // AlreadyBootstrapped). Scrub the chain leaf-first, and fail LOUDLY so
+    // future FK drift surfaces here instead of as downstream assert noise.
+    for (label, sql) in [
+        (
+            "notification_outbox",
+            "DELETE FROM notification_outbox WHERE delivery_event_id IN              (SELECT id FROM delivery_events WHERE conversation_id = $1)",
+        ),
+        (
+            "federation_outbox",
+            "DELETE FROM federation_outbox WHERE delivery_event_id IN              (SELECT id FROM delivery_events WHERE conversation_id = $1)",
+        ),
+        (
+            "pending_welcomes",
+            "DELETE FROM pending_welcomes WHERE convo_id = $1",
+        ),
+        (
+            "delivery_events",
+            "DELETE FROM delivery_events WHERE conversation_id = $1",
+        ),
+        (
+            "welcome_messages",
+            "DELETE FROM welcome_messages WHERE convo_id = $1",
+        ),
+        ("members", "DELETE FROM members WHERE convo_id = $1"),
+        ("conversations", "DELETE FROM conversations WHERE id = $1"),
+    ] {
+        sqlx::query(sql)
+            .bind(convo_id)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("cleanup: failed to delete {label}: {e}"));
+    }
 }
+
+/// Every test in this file stages the SAME conversation row
+/// (`ORIGINAL_CONVO_ID`) through `cleanup` + `setup_post_reset_convo`, so the
+/// tests are mutually exclusive by construction. Serialize them with a static
+/// lock (same pattern as `tests/db_tests.rs`) so they hold under the default
+/// parallel test runner.
+static FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Sets up a post-reset-Request conversation in the new Phase 2 state
 /// machine (bug_007 from ultrareview): the conversation exists, its
@@ -242,6 +277,7 @@ async fn classify(
 #[tokio::test]
 #[ignore = "fixture isolation: shared convo/group IDs cause cross-test interference"]
 async fn bootstrap_member_finds_proceed_state() {
+    let _fixture_guard = FIXTURE_LOCK.lock().await;
     let pool = common::setup_test_db().await;
     cleanup(&pool, ORIGINAL_CONVO_ID).await;
     setup_post_reset_convo(&pool, &[ALICE, BOB]).await;
@@ -259,6 +295,7 @@ async fn bootstrap_member_finds_proceed_state() {
 #[tokio::test]
 #[ignore = "fixture isolation: shared convo/group IDs cause cross-test interference"]
 async fn bootstrap_race_loss_when_session_already_superseded() {
+    let _fixture_guard = FIXTURE_LOCK.lock().await;
     let pool = common::setup_test_db().await;
     cleanup(&pool, ORIGINAL_CONVO_ID).await;
     setup_post_reset_convo(&pool, &[ALICE, BOB]).await;
@@ -287,6 +324,7 @@ async fn bootstrap_race_loss_when_session_already_superseded() {
 
 #[tokio::test]
 async fn bootstrap_classify_rejects_mismatched_new_group_id() {
+    let _fixture_guard = FIXTURE_LOCK.lock().await;
     // bug_010 auth gate: when the upstream Request bound an
     // expected_new_mls_group_id, a bootstrap call with a different
     // mls_group_id must fail the auth gate.
@@ -315,6 +353,7 @@ async fn bootstrap_classify_rejects_mismatched_new_group_id() {
 #[tokio::test]
 #[ignore = "fixture isolation: shared convo/group IDs cause cross-test interference"]
 async fn bootstrap_not_member_rejected() {
+    let _fixture_guard = FIXTURE_LOCK.lock().await;
     let pool = common::setup_test_db().await;
     cleanup(&pool, ORIGINAL_CONVO_ID).await;
     setup_post_reset_convo(&pool, &[ALICE, BOB]).await;
@@ -331,25 +370,28 @@ async fn bootstrap_not_member_rejected() {
 
 #[tokio::test]
 #[ignore = "fixture isolation: shared convo/group IDs cause cross-test interference"]
-async fn bootstrap_target_not_found_when_group_id_overwritten() {
+async fn bootstrap_proceeds_when_legacy_group_id_is_overwritten_but_reset_binding_matches() {
+    let _fixture_guard = FIXTURE_LOCK.lock().await;
     let pool = common::setup_test_db().await;
     cleanup(&pool, ORIGINAL_CONVO_ID).await;
     setup_post_reset_convo(&pool, &[ALICE]).await;
 
-    // Simulate a subsequent reset that overwrote group_id to a third value,
-    // making the original (id, NEW_GROUP_ID) pair no longer match anything.
+    // Phase 2 no longer authorizes bootstrap by matching the legacy
+    // conversations.group_id column. The reset binding lives on the current
+    // crypto_session + crypto_session_reset_requested event; a stale legacy
+    // group_id must not reject an otherwise valid bootstrap.
     sqlx::query("UPDATE conversations SET group_id = $1 WHERE id = $2")
         .bind("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         .bind(ORIGINAL_CONVO_ID)
         .execute(&pool)
         .await
-        .expect("simulate subsequent reset");
+        .expect("simulate stale legacy group_id");
 
     let result = classify(&pool, ORIGINAL_CONVO_ID, NEW_GROUP_ID, ALICE).await;
     assert_eq!(
         result,
-        BootstrapClassification::TargetNotFound,
-        "alice asking for a stale newGroupId must get BootstrapTargetNotFound, not Proceed"
+        BootstrapClassification::Proceed,
+        "alice must proceed when the reset event binding matches, even if legacy group_id is stale"
     );
 
     cleanup(&pool, ORIGINAL_CONVO_ID).await;
@@ -396,6 +438,7 @@ fn test_auth_user(did: &str) -> AuthUser {
 #[tokio::test]
 #[ignore = "fixture isolation: shared convo/group IDs cause cross-test interference"]
 async fn bootstrap_handle_updates_row_and_returns_view() {
+    let _fixture_guard = FIXTURE_LOCK.lock().await;
     let pool = common::setup_test_db().await;
     cleanup(&pool, ORIGINAL_CONVO_ID).await;
     setup_post_reset_convo(&pool, &[ALICE, BOB]).await;
@@ -450,12 +493,12 @@ async fn bootstrap_handle_updates_row_and_returns_view() {
     );
     assert_eq!(
         group_info_epoch,
-        Some(1),
-        "group_info_epoch must be set to 1"
+        Some(0),
+        "Phase 2 chokepoint persists last_observed_epoch=0; response epoch carries the wire-compat value"
     );
     assert_eq!(
-        current_epoch_persisted, 1,
-        "current_epoch must advance from 0 to 1"
+        current_epoch_persisted, 0,
+        "Phase 2 persists current_epoch=0 until a commit is observed; response epoch carries the wire-compat value"
     );
     assert_eq!(
         cipher_suite_persisted.as_deref(),
@@ -475,6 +518,7 @@ async fn bootstrap_handle_updates_row_and_returns_view() {
 #[tokio::test]
 #[ignore = "fixture isolation: shared convo/group IDs cause cross-test interference"]
 async fn bootstrap_handle_with_welcome_inserts_per_recipient_envelopes() {
+    let _fixture_guard = FIXTURE_LOCK.lock().await;
     let pool = common::setup_test_db().await;
     cleanup(&pool, ORIGINAL_CONVO_ID).await;
     setup_post_reset_convo(&pool, &[ALICE, BOB]).await;
@@ -625,6 +669,7 @@ async fn cleanup_selfheal(pool: &PgPool) {
 #[tokio::test]
 #[ignore = "fixture isolation: shared convo/group IDs cause cross-test interference"]
 async fn bootstrap_self_heal_rejects_partial_welcome_fanout() {
+    let _fixture_guard = FIXTURE_LOCK.lock().await;
     let pool = common::setup_test_db().await;
     cleanup_selfheal(&pool).await;
     setup_selfheal_orphan_convo(&pool).await;

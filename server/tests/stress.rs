@@ -58,9 +58,11 @@ async fn cleanup_test_data(pool: &PgPool, convo_id: &str) {
 async fn create_test_convo(pool: &PgPool, convo_id: &str, creator: &str) {
     let now = chrono::Utc::now();
 
+    // `group_id` is NOT NULL (and unique) since 20260405100000_group_reset_support —
+    // derive it from the convo id, matching db::create_conversation's backfill rule.
     sqlx::query(
-        "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at)
-         VALUES ($1, $2, 0, $3, $3)
+        "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at, group_id)
+         VALUES ($1, $2, 0, $3, $3, $1)
          ON CONFLICT (id) DO NOTHING",
     )
     .bind(convo_id)
