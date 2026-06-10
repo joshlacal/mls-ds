@@ -10,6 +10,9 @@ use crate::{
         GetKeyPackageStatusOutput, GetKeyPackageStatusRequest, KeyPackageHistoryItem,
         KeyPackageStats, KeyPackageStatusItem,
     },
+    handlers::mls_chat::get_key_packages::{
+        authorize_get_key_package_targets, GateKeyPackagesMode,
+    },
     storage::DbPool,
 };
 
@@ -36,6 +39,28 @@ pub async fn get_key_package_status(
         error!("Invalid device DID format: {}", e);
         StatusCode::BAD_REQUEST
     })?;
+
+    let (caller_did, _) = parse_device_did(&auth_user.did).map_err(|e| {
+        error!("Invalid caller device DID format: {}", e);
+        StatusCode::BAD_REQUEST
+    })?;
+    let mode = GateKeyPackagesMode::from_env();
+    let authz = authorize_get_key_package_status_target(&pool, &caller_did, &did, mode)
+        .await
+        .map_err(|e| {
+            error!("getKeyPackageStatus: authz query failed: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    if !authz.authorized {
+        warn!(
+            mode = mode.as_str(),
+            "getKeyPackageStatus: unauthorized target DID"
+        );
+        if !authz.allowed {
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
 
     let cipher_suite = input.cipher_suite.as_ref().map(|s| s.to_string());
     let limit = input.limit.unwrap_or(50).clamp(1, 100);
@@ -255,4 +280,26 @@ pub async fn get_key_package_status(
     }
 
     Ok(Json(output))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyPackageStatusAuthz {
+    pub authorized: bool,
+    pub allowed: bool,
+}
+
+pub async fn authorize_get_key_package_status_target(
+    pool: &DbPool,
+    caller_did: &str,
+    target_did: &str,
+    mode: GateKeyPackagesMode,
+) -> Result<KeyPackageStatusAuthz, sqlx::Error> {
+    let authorized_targets =
+        authorize_get_key_package_targets(pool, caller_did, &[target_did]).await?;
+    let authorized = authorized_targets.iter().any(|did| did == target_did);
+
+    Ok(KeyPackageStatusAuthz {
+        authorized,
+        allowed: authorized || mode == GateKeyPackagesMode::LogOnly,
+    })
 }

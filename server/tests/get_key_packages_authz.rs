@@ -5,7 +5,12 @@
 //! authorization helper directly so the rule is covered without depending on
 //! JWT signing or live PDS block-sync network calls.
 
-use catbird_server::handlers::mls_chat::get_key_packages::authorize_get_key_package_targets;
+use catbird_server::handlers::mls_chat::{
+    get_key_package_status::authorize_get_key_package_status_target,
+    get_key_packages::{
+        apply_key_package_target_authz, authorize_get_key_package_targets, GateKeyPackagesMode,
+    },
+};
 use chrono::{Duration, Utc};
 use sqlx::PgPool;
 use std::time::Duration as StdDuration;
@@ -111,6 +116,80 @@ async fn seed_pending_chat_request(pool: &PgPool, sender_did: &str, recipient_di
     .expect("insert pending chat request");
 }
 
+async fn seed_targeted_invite(pool: &PgPool, creator_did: &str, target_did: &str) -> String {
+    let convo_id = format!("ws1-invite-{}", Uuid::new_v4());
+    seed_conversation_with_members(pool, &convo_id, creator_did, &[(creator_did, None)]).await;
+
+    sqlx::query(
+        "INSERT INTO invites
+            (id, convo_id, created_by_did, target_did, psk_hash, created_at, expires_at)
+         VALUES ($1, $2, $3, $4, $5, NOW(), $6)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(&convo_id)
+    .bind(creator_did)
+    .bind(target_did)
+    .bind(format!("{:064x}", 1))
+    .bind(Utc::now() + Duration::days(1))
+    .execute(pool)
+    .await
+    .expect("insert targeted invite");
+
+    convo_id
+}
+
+#[test]
+fn key_package_gate_defaults_to_log_only_and_only_enforce_is_strict() {
+    assert_eq!(
+        GateKeyPackagesMode::from_env_value(None),
+        GateKeyPackagesMode::LogOnly
+    );
+    assert_eq!(
+        GateKeyPackagesMode::from_env_value(Some("")),
+        GateKeyPackagesMode::LogOnly
+    );
+    assert_eq!(
+        GateKeyPackagesMode::from_env_value(Some("log_only")),
+        GateKeyPackagesMode::LogOnly
+    );
+    assert_eq!(
+        GateKeyPackagesMode::from_env_value(Some("unexpected")),
+        GateKeyPackagesMode::LogOnly
+    );
+    assert_eq!(
+        GateKeyPackagesMode::from_env_value(Some("enforce")),
+        GateKeyPackagesMode::Enforce
+    );
+}
+
+#[test]
+fn log_only_keeps_first_contact_targets_but_enforce_denies_all_unauthorized() {
+    let requested = vec!["did:plc:first-contact-target".to_string()];
+    let authorized: Vec<String> = Vec::new();
+
+    let log_only =
+        apply_key_package_target_authz(&requested, &authorized, GateKeyPackagesMode::LogOnly)
+            .expect("log_only must preserve first-contact compatibility");
+    assert_eq!(log_only, requested);
+
+    let enforce =
+        apply_key_package_target_authz(&requested, &authorized, GateKeyPackagesMode::Enforce);
+    assert_eq!(enforce, Err(axum::http::StatusCode::FORBIDDEN));
+}
+
+#[test]
+fn enforce_denies_mixed_authorized_and_unauthorized_targets() {
+    let requested = vec![
+        "did:plc:authorized".to_string(),
+        "did:plc:unauthorized".to_string(),
+    ];
+    let authorized = vec!["did:plc:authorized".to_string()];
+
+    let enforce =
+        apply_key_package_target_authz(&requested, &authorized, GateKeyPackagesMode::Enforce);
+    assert_eq!(enforce, Err(axum::http::StatusCode::FORBIDDEN));
+}
+
 #[tokio::test]
 async fn non_member_without_pending_relationship_gets_no_authorized_targets() {
     let pool = setup_test_db().await;
@@ -127,6 +206,30 @@ async fn non_member_without_pending_relationship_gets_no_authorized_targets() {
     assert!(authorized.is_empty());
 
     cleanup(&pool, &[caller.as_str(), target.as_str()], &[]).await;
+}
+
+#[tokio::test]
+async fn targeted_invite_authorizes_target() {
+    let pool = setup_test_db().await;
+    let run_id = Uuid::new_v4();
+    let caller = format!("did:plc:ws1-caller-{run_id}");
+    let target = format!("did:plc:ws1-target-{run_id}");
+    ensure_user(&pool, &caller).await;
+    ensure_user(&pool, &target).await;
+    let convo_id = seed_targeted_invite(&pool, &caller, &target).await;
+
+    let authorized = authorize_get_key_package_targets(&pool, &caller, &[target.as_str()])
+        .await
+        .expect("authz query");
+
+    assert_eq!(authorized, vec![target.clone()]);
+
+    cleanup(
+        &pool,
+        &[caller.as_str(), target.as_str()],
+        &[convo_id.as_str()],
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -158,6 +261,46 @@ async fn shared_conversation_authorizes_target() {
         &[convo_id.as_str()],
     )
     .await;
+}
+
+#[tokio::test]
+async fn status_target_authz_logs_in_log_only_but_denies_count_oracle_in_enforce() {
+    let pool = setup_test_db().await;
+    let run_id = Uuid::new_v4();
+    let caller = format!("did:plc:ws1-caller-{run_id}");
+    let target = format!("did:plc:ws1-target-{run_id}");
+    ensure_user(&pool, &caller).await;
+    ensure_user(&pool, &target).await;
+
+    let log_only = authorize_get_key_package_status_target(
+        &pool,
+        &caller,
+        &target,
+        GateKeyPackagesMode::LogOnly,
+    )
+    .await
+    .expect("status authz query");
+    assert!(!log_only.authorized);
+    assert!(
+        log_only.allowed,
+        "log_only preserves compatibility but must still surface a WARN in the handler"
+    );
+
+    let enforce = authorize_get_key_package_status_target(
+        &pool,
+        &caller,
+        &target,
+        GateKeyPackagesMode::Enforce,
+    )
+    .await
+    .expect("status authz query");
+    assert!(!enforce.authorized);
+    assert!(
+        !enforce.allowed,
+        "status uses deny-on-any in enforce mode to avoid key-package count oracles"
+    );
+
+    cleanup(&pool, &[caller.as_str(), target.as_str()], &[]).await;
 }
 
 #[tokio::test]

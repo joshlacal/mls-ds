@@ -16,6 +16,33 @@ use crate::{
 };
 
 const NSID: &str = "blue.catbird.mlsChat.getKeyPackages";
+const GATE_KEY_PACKAGES_MODE_ENV: &str = "GATE_KEY_PACKAGES_MODE";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateKeyPackagesMode {
+    LogOnly,
+    Enforce,
+}
+
+impl GateKeyPackagesMode {
+    pub fn from_env() -> Self {
+        Self::from_env_value(std::env::var(GATE_KEY_PACKAGES_MODE_ENV).ok().as_deref())
+    }
+
+    pub fn from_env_value(value: Option<&str>) -> Self {
+        match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+            Some("enforce") => Self::Enforce,
+            _ => Self::LogOnly,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LogOnly => "log_only",
+            Self::Enforce => "enforce",
+        }
+    }
+}
 
 /// Fetch and consume key packages for the given DIDs.
 /// Returns one key package per device (identified by hashed device_id bucket)
@@ -131,37 +158,41 @@ pub async fn get_key_packages(
         }));
     }
 
-    let filtered_did_strs: Vec<&str> = filtered_dids.iter().map(|d| d.as_ref()).collect();
+    let filtered_did_strs: Vec<String> = filtered_dids
+        .iter()
+        .map(|d| d.as_ref().to_string())
+        .collect();
+    let filtered_did_refs: Vec<&str> = filtered_did_strs.iter().map(String::as_str).collect();
     let authorized_dids =
-        authorize_get_key_package_targets(&pool, &caller_did_str, &filtered_did_strs)
+        authorize_get_key_package_targets(&pool, &caller_did_str, &filtered_did_refs)
             .await
             .map_err(|e| {
                 error!("getKeyPackages: authz query failed: {}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
-    if authorized_dids.is_empty() {
-        warn!(
-            requested = filtered_dids.len(),
-            "getKeyPackages: denied unauthorized target set"
-        );
-        return Err(StatusCode::FORBIDDEN);
-    }
-
+    let mode = GateKeyPackagesMode::from_env();
     let authorized_set: HashSet<&str> = authorized_dids.iter().map(String::as_str).collect();
-    let filtered_count_before_authz = filtered_dids.len();
-    let filtered_dids: Vec<jacquard_common::types::string::Did<'static>> = filtered_dids
-        .into_iter()
-        .filter(|did| authorized_set.contains(did.as_ref()))
-        .collect();
-    let denied_count = filtered_count_before_authz.saturating_sub(filtered_dids.len());
+    let denied_count = filtered_did_strs
+        .iter()
+        .filter(|did| !authorized_set.contains(did.as_str()))
+        .count();
+
     if denied_count > 0 {
         warn!(
-            requested = filtered_count_before_authz,
+            requested = filtered_did_strs.len(),
             denied = denied_count,
-            "getKeyPackages: filtered unauthorized target DIDs"
+            mode = mode.as_str(),
+            "getKeyPackages: unauthorized target DIDs"
         );
     }
+
+    let filtered_did_strs =
+        apply_key_package_target_authz(&filtered_did_strs, &authorized_dids, mode)?;
+    let filtered_dids: Vec<jacquard_common::types::string::Did<'static>> = filtered_did_strs
+        .iter()
+        .map(|did| crate::sqlx_jacquard::string_to_did(did))
+        .collect();
 
     let mut key_packages: Vec<KeyPackageRef<'static>> = Vec::new();
     let mut missing: Vec<String> = Vec::new();
@@ -344,6 +375,33 @@ pub async fn authorize_get_key_package_targets(
     .bind(requested_dids)
     .fetch_all(pool)
     .await
+}
+
+pub fn apply_key_package_target_authz(
+    requested_dids: &[String],
+    authorized_dids: &[String],
+    mode: GateKeyPackagesMode,
+) -> Result<Vec<String>, StatusCode> {
+    if requested_dids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    match mode {
+        GateKeyPackagesMode::LogOnly => Ok(requested_dids.to_vec()),
+        GateKeyPackagesMode::Enforce => {
+            let authorized_set: HashSet<&str> =
+                authorized_dids.iter().map(String::as_str).collect();
+            let all_authorized = requested_dids
+                .iter()
+                .all(|did| authorized_set.contains(did.as_str()));
+
+            if all_authorized {
+                Ok(requested_dids.to_vec())
+            } else {
+                Err(StatusCode::FORBIDDEN)
+            }
+        }
+    }
 }
 
 /// Atomically claim one available key package per `(owner_did, device_id)`
