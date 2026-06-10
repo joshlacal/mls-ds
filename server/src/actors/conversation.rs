@@ -29,13 +29,33 @@ use tokio::sync::mpsc;
 /// "sweep" vs "quorum" discriminator for ops audit.
 fn system_reset_did() -> &'static str {
     static DID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    DID.get_or_init(|| {
-        let raw = std::env::var("SERVICE_DID")
-            .unwrap_or_else(|_| "did:web:mlschat.catbird.blue".to_string());
-        // Strip `#fragment` — DID format validation in clients is stricter
-        // than the AT Protocol spec; safest is to emit a base DID.
-        raw.split('#').next().unwrap_or(&raw).to_string()
-    })
+    DID.get_or_init(|| system_reset_did_from_env_value(std::env::var("SERVICE_DID")))
+}
+
+fn system_reset_did_from_env_value(raw: Result<String, std::env::VarError>) -> String {
+    let raw = raw.expect("SERVICE_DID must be configured for system reset attribution");
+    // Strip `#fragment` — DID format validation in clients is stricter
+    // than the AT Protocol spec; safest is to emit a base DID.
+    raw.split('#').next().unwrap_or(&raw).to_string()
+}
+
+#[cfg(test)]
+mod system_reset_did_tests {
+    use super::system_reset_did_from_env_value;
+
+    #[test]
+    fn system_reset_did_strips_service_fragment() {
+        assert_eq!(
+            system_reset_did_from_env_value(Ok("did:web:example.test#atproto_mls".to_string())),
+            "did:web:example.test"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "SERVICE_DID must be configured")]
+    fn system_reset_did_panics_when_service_did_is_missing() {
+        let _ = system_reset_did_from_env_value(Err(std::env::VarError::NotPresent));
+    }
 }
 
 /// Phase 2.5 §7 R2 mitigation: per-incident kill switch for the

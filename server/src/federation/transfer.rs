@@ -160,7 +160,7 @@ impl SequencerTransfer {
 
         match row {
             None => Err(TransferError::ConversationNotFound(convo_id.to_string())),
-            Some((seq_ds, epoch, current_term_raw)) => {
+            Some((seq_ds, _epoch, current_term_raw)) => {
                 if let Some(ref ds) = seq_ds {
                     if canonical_did(ds) != canonical_did(from_sequencer_did) {
                         warn!(
@@ -195,16 +195,33 @@ impl SequencerTransfer {
                     });
                 }
 
-                sqlx::query(
-                    "UPDATE conversations SET sequencer_ds = $2, sequencer_term = $3, updated_at = NOW() \
-                     WHERE id = $1",
+                let observed_sequencer = seq_ds.as_deref().map(canonical_did);
+                let updated: Option<(i32, i64)> = sqlx::query_as(
+                    "UPDATE conversations \
+                     SET sequencer_ds = $2, sequencer_term = $3, updated_at = NOW() \
+                     WHERE id = $1 \
+                       AND COALESCE(sequencer_term, 0) = $4 \
+                       AND ( \
+                            ($5::text IS NULL AND sequencer_ds IS NULL) \
+                         OR split_part(sequencer_ds, '#', 1) = $5 \
+                       ) \
+                     RETURNING current_epoch, sequencer_term",
                 )
                 .bind(convo_id)
                 .bind(&self.self_did)
                 .bind(new_sequencer_term as i64)
-                .execute(&self.pool)
+                .bind(current_term as i64)
+                .bind(observed_sequencer)
+                .fetch_optional(&self.pool)
                 .await
                 .map_err(TransferError::Database)?;
+
+                let Some((new_epoch, new_term_raw)) = updated else {
+                    return Err(TransferError::NotCurrentSequencer {
+                        convo_id: convo_id.to_string(),
+                        current_sequencer: "unknown (changed during transfer)".to_string(),
+                    });
+                };
 
                 info!(
                     convo_id,
@@ -215,8 +232,8 @@ impl SequencerTransfer {
 
                 Ok(TransferResult::Accepted {
                     convo_id: convo_id.to_string(),
-                    new_epoch: epoch.unwrap_or(0),
-                    new_sequencer_term,
+                    new_epoch,
+                    new_sequencer_term: new_term_raw.max(0) as u64,
                 })
             }
         }
