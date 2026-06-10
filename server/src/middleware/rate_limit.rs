@@ -283,6 +283,11 @@ fn get_endpoint_quota(endpoint: &str) -> (u32, Duration) {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(100) // High frequency messaging
+    } else if endpoint_name.contains("getKeyPackages") {
+        std::env::var("RATE_LIMIT_GET_KEY_PACKAGES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30) // Key-package claims are consumptive and enumerate device buckets
     } else if endpoint_name.contains("getMessages") || endpoint_name.contains("getConvos") {
         std::env::var("RATE_LIMIT_GET_MESSAGES")
             .ok()
@@ -601,6 +606,14 @@ mod tests {
             &headers,
             "/xrpc/blue.catbird.mlsChat.commitGroupChange"
         ));
+    }
+
+    #[test]
+    fn get_key_packages_has_dedicated_tight_quota() {
+        let (limit, window) = get_endpoint_quota("/xrpc/blue.catbird.mlsChat.getKeyPackages");
+
+        assert_eq!(limit, 30);
+        assert_eq!(window, Duration::from_secs(60));
     }
 
     #[test]

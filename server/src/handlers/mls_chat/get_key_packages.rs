@@ -131,16 +131,45 @@ pub async fn get_key_packages(
         }));
     }
 
+    let filtered_did_strs: Vec<&str> = filtered_dids.iter().map(|d| d.as_ref()).collect();
+    let authorized_dids =
+        authorize_get_key_package_targets(&pool, &caller_did_str, &filtered_did_strs)
+            .await
+            .map_err(|e| {
+                error!("getKeyPackages: authz query failed: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+    if authorized_dids.is_empty() {
+        warn!(
+            requested = filtered_dids.len(),
+            "getKeyPackages: denied unauthorized target set"
+        );
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let authorized_set: HashSet<&str> = authorized_dids.iter().map(String::as_str).collect();
+    let filtered_count_before_authz = filtered_dids.len();
+    let filtered_dids: Vec<jacquard_common::types::string::Did<'static>> = filtered_dids
+        .into_iter()
+        .filter(|did| authorized_set.contains(did.as_ref()))
+        .collect();
+    let denied_count = filtered_count_before_authz.saturating_sub(filtered_dids.len());
+    if denied_count > 0 {
+        warn!(
+            requested = filtered_count_before_authz,
+            denied = denied_count,
+            "getKeyPackages: filtered unauthorized target DIDs"
+        );
+    }
+
     let mut key_packages: Vec<KeyPackageRef<'static>> = Vec::new();
     let mut missing: Vec<String> = Vec::new();
 
-    // Atomic bulk claim. One SQL round-trip claims one available
+    // Atomic bulk claim. One SQL round-trip returns one representative
     // (non-last-resort) row per (DID, device_id bucket) for every DID in the
-    // request. The inner SELECT uses `DISTINCT ON (owner_did,
-    // COALESCE(device_id, ''))` and `FOR UPDATE SKIP LOCKED` — concurrent
-    // claimants get disjoint rows. The outer UPDATE re-checks
-    // `state = 'available'` so the available -> claimed transition is the
-    // atomic gate.
+    // request. The helper claims every available row in each selected bucket,
+    // so duplicate rows cannot be depleted one at a time by repeat callers.
     //
     // Returns raw bytea — Jacquard's `Bytes` JSON serializer base64-encodes
     // at the wire boundary. Returning `encode(... , 'base64')` here produced
@@ -260,6 +289,63 @@ pub async fn get_key_packages(
     }))
 }
 
+/// Return the subset of requested target DIDs the caller may fetch key packages for.
+pub async fn authorize_get_key_package_targets(
+    pool: &DbPool,
+    caller_did: &str,
+    requested_dids: &[&str],
+) -> Result<Vec<String>, sqlx::Error> {
+    if requested_dids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    sqlx::query_scalar::<_, String>(
+        r#"
+        WITH requested AS (
+            SELECT did, ord
+            FROM unnest($2::text[]) WITH ORDINALITY AS requested(did, ord)
+        )
+        SELECT r.did
+        FROM requested r
+        WHERE r.did = $1
+           OR EXISTS (
+                SELECT 1
+                FROM members caller
+                JOIN members target ON target.convo_id = caller.convo_id
+                WHERE (caller.user_did = $1 OR caller.member_did = $1)
+                  AND (target.user_did = r.did OR target.member_did = r.did)
+                  AND caller.left_at IS NULL
+                  AND target.left_at IS NULL
+           )
+           OR EXISTS (
+                SELECT 1
+                FROM chat_requests cr
+                WHERE ((cr.sender_did = $1 AND cr.recipient_did = r.did)
+                    OR (cr.recipient_did = $1 AND cr.sender_did = r.did))
+                  AND cr.status::text IN ('pending', 'accepted')
+                  AND cr.expires_at > NOW()
+           )
+           OR EXISTS (
+                SELECT 1
+                FROM invites i
+                JOIN members caller ON caller.convo_id = i.convo_id
+                WHERE (caller.user_did = $1 OR caller.member_did = $1)
+                  AND caller.left_at IS NULL
+                  AND i.target_did = r.did
+                  AND i.revoked = false
+                  AND (i.expires_at IS NULL OR i.expires_at > NOW())
+                  AND (i.max_uses IS NULL OR i.uses_count < i.max_uses)
+           )
+        GROUP BY r.did, r.ord
+        ORDER BY MIN(r.ord)
+        "#,
+    )
+    .bind(caller_did)
+    .bind(requested_dids)
+    .fetch_all(pool)
+    .await
+}
+
 /// Atomically claim one available key package per `(owner_did, device_id)`
 /// bucket for the supplied set of DIDs in a single SQL round-trip.
 ///
@@ -304,13 +390,14 @@ pub async fn claim_available_key_packages_bulk(
         ""
     };
 
-    // Two-stage CTE:
+    // Three-stage CTE:
     //   `candidates` ranks rows per (owner_did, device-bucket) by created_at;
-    //   `locked`     re-selects rank-1 rows joined back to `key_packages`
-    //                with `FOR UPDATE OF kp SKIP LOCKED` so concurrent
-    //                claimants get disjoint rows. The outer UPDATE re-checks
-    //                `state = 'available'` so the available -> claimed
-    //                transition is the atomic gate.
+    //   `selected`   locks the rank-1 representative row for each bucket;
+    //   `claimed`    claims every available row in each selected bucket.
+    //
+    // N23 requires bucket-wide claiming: returning one representative KP while
+    // leaving duplicate rows in the same `(owner_did, COALESCE(device_id, ''))`
+    // bucket available lets repeated calls deplete duplicates one at a time.
     //
     // We cannot use the simpler `SELECT DISTINCT ON ... FOR UPDATE` shape:
     // Postgres rejects it (`FOR UPDATE is not allowed with DISTINCT clause`),
@@ -331,6 +418,8 @@ pub async fn claim_available_key_packages_bulk(
     let sql = format!(
         "WITH candidates AS (
              SELECT id,
+                    owner_did,
+                    COALESCE(device_id, '') AS device_bucket,
                     ROW_NUMBER() OVER (
                         PARTITION BY owner_did, COALESCE(device_id, '')
                         ORDER BY created_at DESC
@@ -343,18 +432,30 @@ pub async fn claim_available_key_packages_bulk(
                {lr}
                {cs}
          ),
-         locked AS (
-             SELECT c.id
+         selected AS (
+             SELECT c.id, c.owner_did, c.device_bucket
              FROM candidates c
              JOIN key_packages kp ON kp.id = c.id
              WHERE c.rn = 1
              FOR UPDATE OF kp SKIP LOCKED
+         ),
+         claimed AS (
+             UPDATE key_packages kp
+             SET state = 'claimed', consumed_at = NOW()
+             FROM selected s
+             WHERE kp.owner_did = s.owner_did
+               AND COALESCE(kp.device_id, '') = s.device_bucket
+               AND kp.state = 'available'
+               AND kp.expires_at > NOW()
+               AND kp.dead_at IS NULL
+               {lr}
+               {cs}
+             RETURNING kp.id
          )
-         UPDATE key_packages
-         SET state = 'claimed', consumed_at = NOW()
-         WHERE id IN (SELECT id FROM locked)
-           AND state = 'available'
-         RETURNING owner_did, cipher_suite, key_package, key_package_hash",
+         SELECT kp.owner_did, kp.cipher_suite, kp.key_package, kp.key_package_hash
+         FROM selected s
+         JOIN claimed c ON c.id = s.id
+         JOIN key_packages kp ON kp.id = s.id",
         lr = lr_predicate,
         cs = cs_predicate,
     );
