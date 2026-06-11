@@ -70,31 +70,95 @@ impl DsResolver {
         &self.self_endpoint
     }
 
-    /// Resolve a user's DS endpoint. Cache-first, then repo record, then fallback.
+    /// Resolve a user's DS endpoint.
+    ///
+    /// Ordering (ADR-010 D2): self → fresh cache → `#atproto_mls` DID-document
+    /// service entry → legacy `blue.catbird.mlsChat.profile` repo record →
+    /// expired-cache degraded mode → default DS → not found.
+    ///
+    /// An unexpired cache row counts as "fresh resolution" (the TTL defines
+    /// freshness); expired rows are only consulted in degraded mode after all
+    /// live resolution paths have failed.
     pub async fn resolve(&self, user_did: &str) -> Result<DsEndpoint, FederationError> {
+        let (result, outcome) = self.resolve_with_outcome(user_did).await;
+        // D2 telemetry: exactly one structured event per resolution exit, with
+        // a stable `outcome` discriminator so E5 can set alert thresholds.
+        tracing::info!(
+            target: "federation::resolve",
+            did = %crate::crypto::redact_for_log(user_did),
+            outcome = outcome,
+            "DS resolution outcome"
+        );
+        metrics::counter!("ds_resolve_outcome_total", 1, "outcome" => outcome);
+        result
+    }
+
+    async fn resolve_with_outcome(
+        &self,
+        user_did: &str,
+    ) -> (Result<DsEndpoint, FederationError>, &'static str) {
         // Check if it's us
         if canonical_did(user_did) == canonical_did(&self.self_did) {
-            return Ok(DsEndpoint {
-                did: self.self_did.clone(),
-                endpoint: self.self_endpoint.clone(),
-                supported_cipher_suites: None,
-                federation_capabilities: Some(super::local_federation_capabilities()),
-            });
+            return (
+                Ok(DsEndpoint {
+                    did: self.self_did.clone(),
+                    endpoint: self.self_endpoint.clone(),
+                    supported_cipher_suites: None,
+                    federation_capabilities: Some(super::local_federation_capabilities()),
+                }),
+                "self",
+            );
         }
 
-        // Check cache
-        if let Some(cached) = self.get_cached(user_did).await? {
-            return Ok(cached);
+        // Fresh cache (TTL-bounded; an unexpired row counts as fresh
+        // resolution per ADR-010 D2/A2)
+        match self.get_cached(user_did).await {
+            Ok(Some(cached)) => return (Ok(cached), "cache_fresh"),
+            Ok(None) => {}
+            Err(e) => return (Err(e), "hard_failure"),
         }
 
-        // Resolve from repo record (blue.catbird.mlsChat.profile)
+        // `#atproto_mls` service entry in the user's DID document (ADR-010 D1)
+        match self.resolve_from_did_doc(user_did).await {
+            Ok(endpoint) => {
+                if let Err(e) = self.cache_endpoint(&endpoint).await {
+                    return (Err(e), "hard_failure");
+                }
+                return (Ok(endpoint), "did_doc");
+            }
+            Err(e) => {
+                debug!(did = %crate::crypto::redact_for_log(user_did), error = %e, "DID-document #atproto_mls resolution failed, trying profile record");
+            }
+        }
+
+        // Legacy fallback: repo record (blue.catbird.mlsChat.profile)
         match self.resolve_from_repo(user_did).await {
             Ok(endpoint) => {
-                self.cache_endpoint(&endpoint).await?;
-                return Ok(endpoint);
+                if let Err(e) = self.cache_endpoint(&endpoint).await {
+                    return (Err(e), "hard_failure");
+                }
+                return (Ok(endpoint), "profile_record");
             }
             Err(e) => {
                 debug!(did = %crate::crypto::redact_for_log(user_did), error = %e, "Repo resolution failed, trying fallback");
+            }
+        }
+
+        // Degraded mode (ADR-010 D2): all live resolution paths failed — fall
+        // back to an expired cache row if one exists. The row stays expired,
+        // so the next resolve attempt naturally retries live resolution.
+        match self.get_cached_any(user_did).await {
+            Ok(Some(cached)) => {
+                tracing::warn!(
+                    did = %crate::crypto::redact_for_log(user_did),
+                    endpoint = %cached.endpoint,
+                    "Live DS resolution failed; using expired cached endpoint (degraded mode)"
+                );
+                return (Ok(cached), "cache_stale_degraded");
+            }
+            Ok(None) => {}
+            Err(e) => {
+                debug!(did = %crate::crypto::redact_for_log(user_did), error = %e, "Expired-cache lookup failed");
             }
         }
 
@@ -105,17 +169,23 @@ impl DsResolver {
                 default_ds = default,
                 "Using default DS fallback"
             );
-            return Ok(DsEndpoint {
-                did: user_did.to_string(),
-                endpoint: default.clone(),
-                supported_cipher_suites: None,
-                federation_capabilities: None,
-            });
+            return (
+                Ok(DsEndpoint {
+                    did: user_did.to_string(),
+                    endpoint: default.clone(),
+                    supported_cipher_suites: None,
+                    federation_capabilities: None,
+                }),
+                "default_fallback",
+            );
         }
 
-        Err(FederationError::EndpointNotFound {
-            did: user_did.to_string(),
-        })
+        (
+            Err(FederationError::EndpointNotFound {
+                did: user_did.to_string(),
+            }),
+            "hard_failure",
+        )
     }
 
     /// Resolve multiple DIDs, returning a vec of (DID, result) pairs.
@@ -135,6 +205,26 @@ impl DsResolver {
         let row = sqlx::query_as::<_, (String, String, Option<String>)>(
             "SELECT did, endpoint, supported_cipher_suites \
        FROM ds_endpoints WHERE did = $1 AND expires_at > NOW()",
+        )
+        .bind(did)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|(did, endpoint, suites)| DsEndpoint {
+            did,
+            endpoint,
+            supported_cipher_suites: suites.and_then(|s| serde_json::from_str(&s).ok()),
+            federation_capabilities: None,
+        }))
+    }
+
+    /// Like [`Self::get_cached`], but ignores `expires_at`. Used only for the
+    /// degraded-mode fallback after all live resolution paths have failed
+    /// (ADR-010 D2).
+    async fn get_cached_any(&self, did: &str) -> Result<Option<DsEndpoint>, FederationError> {
+        let row = sqlx::query_as::<_, (String, String, Option<String>)>(
+            "SELECT did, endpoint, supported_cipher_suites \
+       FROM ds_endpoints WHERE did = $1",
         )
         .bind(did)
         .fetch_optional(&self.pool)
@@ -171,6 +261,43 @@ impl DsResolver {
     .await?;
 
         Ok(())
+    }
+
+    /// Resolve the user's DS endpoint from the `#atproto_mls` service entry in
+    /// their DID document (ADR-010 D1).
+    ///
+    /// The service entry must have type `AtprotoMLSDeliveryService` and an
+    /// HTTPS `serviceEndpoint` (origin/base URL; clients append
+    /// `/xrpc/<nsid>`). An `#atproto_mls` entry with the wrong `type` is
+    /// logged and treated as not found.
+    async fn resolve_from_did_doc(&self, user_did: &str) -> Result<DsEndpoint, FederationError> {
+        let doc = self.fetch_did_document(user_did).await?;
+
+        let endpoint = extract_service(&doc, "atproto_mls", Some("AtprotoMLSDeliveryService"))
+            .ok_or_else(|| FederationError::ResolutionFailed {
+                did: user_did.to_string(),
+                reason: "No #atproto_mls service in DID document".to_string(),
+            })?
+            .to_string();
+
+        self.validate_remote_url(&endpoint).await?;
+
+        // D1 rules 4-6: record the *base* DS DID (no fragment). The user's
+        // DID doc only carries the endpoint, so derive `did:web:<host>` for
+        // did:web-style deployments. Serving the DS DID document from mls-ds
+        // itself is ADR-010 Stage 4; non-did:web DSes are out of scope until
+        // then. When derivation fails (path components, non-HTTPS), fall back
+        // to keying the cache row by the *user* DID, exactly as the legacy
+        // profile-record path does.
+        let ds_did =
+            derive_ds_did_from_https_endpoint(&endpoint).unwrap_or_else(|| user_did.to_string());
+
+        Ok(DsEndpoint {
+            did: ds_did,
+            endpoint,
+            supported_cipher_suites: None,
+            federation_capabilities: None,
+        })
     }
 
     /// Resolve DS endpoint from the user's repo record (blue.catbird.mlsChat.profile).
@@ -244,6 +371,22 @@ impl DsResolver {
 
     /// Resolve a DID to its PDS endpoint via DID document.
     pub(crate) async fn resolve_did_to_pds(&self, did: &str) -> Result<String, FederationError> {
+        let doc = self.fetch_did_document(did).await?;
+
+        let endpoint = extract_service(&doc, "atproto_pds", None).ok_or_else(|| {
+            FederationError::ResolutionFailed {
+                did: did.to_string(),
+                reason: "No #atproto_pds service in DID document".to_string(),
+            }
+        })?;
+
+        self.validate_remote_url(endpoint).await?;
+        Ok(endpoint.to_string())
+    }
+
+    /// Fetch and parse a DID document (did:web or did:plc), with SSRF
+    /// validation of the document URL.
+    async fn fetch_did_document(&self, did: &str) -> Result<serde_json::Value, FederationError> {
         let did_doc_url = if did.starts_with("did:web:") {
             did_web_document_url(did).ok_or_else(|| FederationError::ResolutionFailed {
                 did: did.to_string(),
@@ -278,36 +421,12 @@ impl DsResolver {
             });
         }
 
-        let doc: serde_json::Value =
-            resp.json()
-                .await
-                .map_err(|e| FederationError::ResolutionFailed {
-                    did: did.to_string(),
-                    reason: format!("Invalid DID document JSON: {e}"),
-                })?;
-
-        let services = doc
-            .get("service")
-            .and_then(|s| s.as_array())
-            .ok_or_else(|| FederationError::ResolutionFailed {
+        resp.json()
+            .await
+            .map_err(|e| FederationError::ResolutionFailed {
                 did: did.to_string(),
-                reason: "No 'service' array in DID document".to_string(),
-            })?;
-
-        for svc in services {
-            let svc_id = svc.get("id").and_then(|v| v.as_str()).unwrap_or("");
-            if svc_id.ends_with("#atproto_pds") || svc_id == "#atproto_pds" {
-                if let Some(endpoint) = svc.get("serviceEndpoint").and_then(|v| v.as_str()) {
-                    self.validate_remote_url(endpoint).await?;
-                    return Ok(endpoint.to_string());
-                }
-            }
-        }
-
-        Err(FederationError::ResolutionFailed {
-            did: did.to_string(),
-            reason: "No #atproto_pds service in DID document".to_string(),
-        })
+                reason: format!("Invalid DID document JSON: {e}"),
+            })
     }
 
     /// Invalidate cache entry for a DID.
@@ -330,6 +449,66 @@ impl DsResolver {
     async fn validate_remote_url(&self, url_str: &str) -> Result<(), FederationError> {
         let parsed = validate_endpoint_url(url_str)?;
         validate_resolved_host_is_public(&parsed).await
+    }
+}
+
+/// Extract the `serviceEndpoint` of the DID-document service whose `id` is
+/// `#<fragment>` or `<did>#<fragment>` (suffix match, same semantics as the
+/// pre-existing `#atproto_pds` loop). When `required_type` is `Some`, the
+/// service's `type` must match exactly; a matching id with the wrong type is
+/// logged and treated as not found (ADR-010 D1 rule 2).
+fn extract_service<'a>(
+    doc: &'a serde_json::Value,
+    fragment: &str,
+    required_type: Option<&str>,
+) -> Option<&'a str> {
+    let services = doc.get("service")?.as_array()?;
+    let suffix = format!("#{fragment}");
+    for svc in services {
+        let svc_id = svc.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        if !svc_id.ends_with(&suffix) {
+            continue;
+        }
+        if let Some(required) = required_type {
+            let svc_type = svc.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if svc_type != required {
+                tracing::warn!(
+                    service_id = svc_id,
+                    service_type = svc_type,
+                    required_type = required,
+                    "DID document service entry has wrong type; treating as not found"
+                );
+                continue;
+            }
+        }
+        if let Some(endpoint) = svc.get("serviceEndpoint").and_then(|v| v.as_str()) {
+            return Some(endpoint);
+        }
+    }
+    None
+}
+
+/// Derive a `did:web` DID from an HTTPS DS endpoint (ADR-010 D1 rules 4-6).
+///
+/// `https://ds.example.com` → `did:web:ds.example.com`;
+/// `https://ds.example.com:8443` → `did:web:ds.example.com%3A8443` (did:web
+/// percent-encodes the port colon). Hosts are lowercased. Endpoints with path
+/// components or non-HTTPS schemes return `None` — the caller then falls back
+/// to legacy user-DID cache keying. Authoritative DS-DID discovery
+/// (`/.well-known/did.json` served by mls-ds) is ADR-010 Stage 4; non-did:web
+/// DSes are out of scope until then.
+fn derive_ds_did_from_https_endpoint(endpoint: &str) -> Option<String> {
+    let parsed = url::Url::parse(endpoint).ok()?;
+    if parsed.scheme() != "https" {
+        return None;
+    }
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    if !matches!(parsed.path(), "" | "/") {
+        return None;
+    }
+    match parsed.port() {
+        Some(port) => Some(format!("did:web:{host}%3A{port}")),
+        None => Some(format!("did:web:{host}")),
     }
 }
 
@@ -664,6 +843,316 @@ mod tests {
             Some(&PROFILE_COLLECTION.to_string())
         );
         assert_eq!(query.get("rkey"), Some(&PROFILE_RKEY.to_string()));
+    }
+
+    // -- extract_service tests --
+
+    fn doc_with_services(services: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "id": "did:plc:alice", "service": services })
+    }
+
+    #[test]
+    fn test_extract_service_relative_id() {
+        let doc = doc_with_services(serde_json::json!([
+            {
+                "id": "#atproto_mls",
+                "type": "AtprotoMLSDeliveryService",
+                "serviceEndpoint": "https://ds.example.com"
+            }
+        ]));
+        assert_eq!(
+            extract_service(&doc, "atproto_mls", Some("AtprotoMLSDeliveryService")),
+            Some("https://ds.example.com")
+        );
+    }
+
+    #[test]
+    fn test_extract_service_absolute_id() {
+        let doc = doc_with_services(serde_json::json!([
+            {
+                "id": "did:plc:alice#atproto_mls",
+                "type": "AtprotoMLSDeliveryService",
+                "serviceEndpoint": "https://ds.example.com"
+            }
+        ]));
+        assert_eq!(
+            extract_service(&doc, "atproto_mls", Some("AtprotoMLSDeliveryService")),
+            Some("https://ds.example.com")
+        );
+    }
+
+    #[test]
+    fn test_extract_service_wrong_type_skipped() {
+        let doc = doc_with_services(serde_json::json!([
+            {
+                "id": "#atproto_mls",
+                "type": "SomeOtherService",
+                "serviceEndpoint": "https://ds.example.com"
+            }
+        ]));
+        assert_eq!(
+            extract_service(&doc, "atproto_mls", Some("AtprotoMLSDeliveryService")),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extract_service_wrong_type_then_correct_entry() {
+        let doc = doc_with_services(serde_json::json!([
+            {
+                "id": "did:plc:alice#atproto_mls",
+                "type": "SomeOtherService",
+                "serviceEndpoint": "https://wrong.example.com"
+            },
+            {
+                "id": "#atproto_mls",
+                "type": "AtprotoMLSDeliveryService",
+                "serviceEndpoint": "https://right.example.com"
+            }
+        ]));
+        assert_eq!(
+            extract_service(&doc, "atproto_mls", Some("AtprotoMLSDeliveryService")),
+            Some("https://right.example.com")
+        );
+    }
+
+    #[test]
+    fn test_extract_service_missing_entry() {
+        let doc = doc_with_services(serde_json::json!([
+            {
+                "id": "#atproto_pds",
+                "type": "AtprotoPersonalDataServer",
+                "serviceEndpoint": "https://pds.example.com"
+            }
+        ]));
+        assert_eq!(
+            extract_service(&doc, "atproto_mls", Some("AtprotoMLSDeliveryService")),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extract_service_no_service_array() {
+        let doc = serde_json::json!({ "id": "did:plc:alice" });
+        assert_eq!(extract_service(&doc, "atproto_mls", None), None);
+    }
+
+    #[test]
+    fn test_extract_service_atproto_pds_without_type_check() {
+        // The refactored resolve_did_to_pds path: no type requirement,
+        // suffix-match id semantics preserved.
+        let doc = doc_with_services(serde_json::json!([
+            {
+                "id": "did:web:user.example.com#atproto_pds",
+                "type": "AtprotoPersonalDataServer",
+                "serviceEndpoint": "https://pds.example.com"
+            }
+        ]));
+        assert_eq!(
+            extract_service(&doc, "atproto_pds", None),
+            Some("https://pds.example.com")
+        );
+    }
+
+    // -- derive_ds_did_from_https_endpoint tests --
+
+    #[test]
+    fn test_derive_ds_did_simple_host() {
+        assert_eq!(
+            derive_ds_did_from_https_endpoint("https://ds.example.com"),
+            Some("did:web:ds.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_derive_ds_did_lowercases_host() {
+        assert_eq!(
+            derive_ds_did_from_https_endpoint("https://DS.Example.COM"),
+            Some("did:web:ds.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_derive_ds_did_encodes_port() {
+        assert_eq!(
+            derive_ds_did_from_https_endpoint("https://ds.example.com:8443"),
+            Some("did:web:ds.example.com%3A8443".to_string())
+        );
+    }
+
+    #[test]
+    fn test_derive_ds_did_rejects_path() {
+        assert_eq!(
+            derive_ds_did_from_https_endpoint("https://ds.example.com/mls"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_derive_ds_did_allows_bare_trailing_slash() {
+        assert_eq!(
+            derive_ds_did_from_https_endpoint("https://ds.example.com/"),
+            Some("did:web:ds.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_derive_ds_did_rejects_http() {
+        assert_eq!(
+            derive_ds_did_from_https_endpoint("http://ds.example.com"),
+            None
+        );
+    }
+
+    // -- resolve ordering tests --
+
+    #[tokio::test]
+    async fn test_resolve_self_outcome() {
+        // The self path never touches the pool, so a lazy (unconnected) pool
+        // is sufficient.
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgresql://localhost/nonexistent_resolver_test")
+            .expect("lazy pool");
+        let resolver = DsResolver::new(
+            pool,
+            reqwest::Client::new(),
+            "did:web:self.example.com".to_string(),
+            "https://self.example.com".to_string(),
+            None,
+            3600,
+        );
+        let (result, outcome) = resolver
+            .resolve_with_outcome("did:web:self.example.com")
+            .await;
+        assert_eq!(outcome, "self");
+        let endpoint = result.expect("self resolution succeeds");
+        assert_eq!(endpoint.endpoint, "https://self.example.com");
+        assert!(endpoint.federation_capabilities.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_fresh_cache_short_circuits() {
+        let Some(pool) = setup_cache_test_pool().await else {
+            eprintln!("Skipping cache test: TEST_DATABASE_URL not set");
+            return;
+        };
+
+        let resolver = DsResolver::new(
+            pool,
+            reqwest::Client::new(),
+            "did:web:self.example.com".to_string(),
+            "https://self.example.com".to_string(),
+            Some("https://default-ds.example.com".to_string()),
+            3600,
+        );
+
+        // did:key is an unsupported DID method: if the fresh-cache
+        // short-circuit failed, the live paths would error without touching
+        // the network, and we'd see a different outcome.
+        let did = format!("did:key:{}", Uuid::new_v4().as_simple());
+        resolver
+            .cache_endpoint(&DsEndpoint {
+                did: did.clone(),
+                endpoint: "https://cached-ds.example.com".to_string(),
+                supported_cipher_suites: None,
+                federation_capabilities: None,
+            })
+            .await
+            .expect("cache insert succeeds");
+
+        let (result, outcome) = resolver.resolve_with_outcome(&did).await;
+        assert_eq!(outcome, "cache_fresh");
+        assert_eq!(
+            result.expect("resolution succeeds").endpoint,
+            "https://cached-ds.example.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_expired_cache_degraded_after_live_failure() {
+        let Some(pool) = setup_cache_test_pool().await else {
+            eprintln!("Skipping cache test: TEST_DATABASE_URL not set");
+            return;
+        };
+
+        let resolver = DsResolver::new(
+            pool.clone(),
+            reqwest::Client::new(),
+            "did:web:self.example.com".to_string(),
+            "https://self.example.com".to_string(),
+            // default_ds is set: degraded mode must win over the default.
+            Some("https://default-ds.example.com".to_string()),
+            3600,
+        );
+
+        // Unsupported DID method → both live paths fail fast, offline.
+        let did = format!("did:key:{}", Uuid::new_v4().as_simple());
+        sqlx::query(
+            "INSERT INTO ds_endpoints (did, endpoint, supported_cipher_suites, resolved_at, expires_at) \
+             VALUES ($1, $2, NULL, NOW() - INTERVAL '2 hours', NOW() - INTERVAL '1 hour')",
+        )
+        .bind(&did)
+        .bind("https://stale-ds.example.com")
+        .execute(&pool)
+        .await
+        .expect("expired row insert succeeds");
+
+        let (result, outcome) = resolver.resolve_with_outcome(&did).await;
+        assert_eq!(outcome, "cache_stale_degraded");
+        assert_eq!(
+            result.expect("degraded resolution succeeds").endpoint,
+            "https://stale-ds.example.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_default_fallback_when_no_cache() {
+        let Some(pool) = setup_cache_test_pool().await else {
+            eprintln!("Skipping cache test: TEST_DATABASE_URL not set");
+            return;
+        };
+
+        let resolver = DsResolver::new(
+            pool,
+            reqwest::Client::new(),
+            "did:web:self.example.com".to_string(),
+            "https://self.example.com".to_string(),
+            Some("https://default-ds.example.com".to_string()),
+            3600,
+        );
+
+        let did = format!("did:key:{}", Uuid::new_v4().as_simple());
+        let (result, outcome) = resolver.resolve_with_outcome(&did).await;
+        assert_eq!(outcome, "default_fallback");
+        assert_eq!(
+            result.expect("default fallback succeeds").endpoint,
+            "https://default-ds.example.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_hard_failure_without_default() {
+        let Some(pool) = setup_cache_test_pool().await else {
+            eprintln!("Skipping cache test: TEST_DATABASE_URL not set");
+            return;
+        };
+
+        let resolver = DsResolver::new(
+            pool,
+            reqwest::Client::new(),
+            "did:web:self.example.com".to_string(),
+            "https://self.example.com".to_string(),
+            None,
+            3600,
+        );
+
+        let did = format!("did:key:{}", Uuid::new_v4().as_simple());
+        let (result, outcome) = resolver.resolve_with_outcome(&did).await;
+        assert_eq!(outcome, "hard_failure");
+        assert!(matches!(
+            result,
+            Err(FederationError::EndpointNotFound { .. })
+        ));
     }
 
     async fn setup_cache_test_pool() -> Option<PgPool> {

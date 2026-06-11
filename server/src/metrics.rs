@@ -138,6 +138,10 @@ impl MetricsRecorder {
             "federation_trust_transitions_total",
             "Total number of federation trust score transitions"
         );
+        metrics::describe_counter!(
+            "ds_resolve_outcome_total",
+            "Total number of DS resolution exits, labeled by outcome (self | cache_fresh | did_doc | profile_record | cache_stale_degraded | default_fallback | hard_failure)"
+        );
 
         // Fan-out failure metrics
         metrics::describe_counter!(
