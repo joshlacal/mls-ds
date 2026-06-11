@@ -283,10 +283,9 @@ impl FederationConfig {
         Self {
             enabled: enabled_from_env && mode.allows_remote_traffic(),
             mode,
-            self_did: std::env::var("SERVICE_DID")
-                .unwrap_or_else(|_| "did:web:mls.catbird.blue".to_string()),
-            self_endpoint: std::env::var("SELF_ENDPOINT")
-                .unwrap_or_else(|_| "https://mls.catbird.blue".to_string()),
+            // N31: fail-loudly identity — no hardcoded fallback DID/endpoint.
+            self_did: crate::identity::service_did(),
+            self_endpoint: crate::identity::self_endpoint(),
             signing_key_pem: std::env::var("SIGNING_KEY_PEM").ok(),
             default_ds_endpoint: std::env::var("DEFAULT_DS_ENDPOINT").ok(),
             endpoint_cache_ttl_secs: std::env::var("ENDPOINT_CACHE_TTL")

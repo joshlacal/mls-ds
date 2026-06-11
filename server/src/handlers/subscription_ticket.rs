@@ -82,14 +82,16 @@ pub async fn get_subscription_ticket(
         }
     }
 
-    // Get service DID from environment
-    let service_did =
-        std::env::var("SERVICE_DID").unwrap_or_else(|_| "did:web:mls.catbird.blue".to_string());
+    // N31: fail-loudly service identity — no hardcoded fallback DID.
+    let service_did = crate::identity::service_did();
 
-    // Get WebSocket endpoint from environment
-    let ws_endpoint = std::env::var("WEBSOCKET_ENDPOINT").unwrap_or_else(|_| {
-        "wss://mls.catbird.blue/xrpc/blue.catbird.mlsChat.subscribeEvents".to_string()
-    });
+    // WebSocket endpoint: explicit env var wins; otherwise derive from the
+    // (fail-loudly) self endpoint instead of a hardcoded host.
+    let ws_endpoint = std::env::var("WEBSOCKET_ENDPOINT")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| derive_ws_endpoint(&crate::identity::self_endpoint()));
 
     // Generate ticket with 30-second expiry
     let now = Utc::now();
@@ -150,6 +152,19 @@ pub async fn get_subscription_ticket(
         endpoint: ws_endpoint,
         expires_at: expires_at.to_rfc3339(),
     }))
+}
+
+/// Derive the `subscribeEvents` WebSocket URL from the HTTPS self endpoint.
+fn derive_ws_endpoint(self_endpoint: &str) -> String {
+    let base = self_endpoint.trim_end_matches('/');
+    let ws_base = if let Some(rest) = base.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = base.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else {
+        base.to_string()
+    };
+    format!("{ws_base}/xrpc/blue.catbird.mlsChat.subscribeEvents")
 }
 
 /// Generate a unique JTI (JWT ID) for replay prevention
@@ -223,6 +238,22 @@ mod tests {
 
         assert_eq!(verified.sub, claims.sub);
         assert_eq!(verified.convo_id, claims.convo_id);
+    }
+
+    #[test]
+    fn test_derive_ws_endpoint() {
+        assert_eq!(
+            derive_ws_endpoint("https://ds.example.test"),
+            "wss://ds.example.test/xrpc/blue.catbird.mlsChat.subscribeEvents"
+        );
+        assert_eq!(
+            derive_ws_endpoint("https://ds.example.test/"),
+            "wss://ds.example.test/xrpc/blue.catbird.mlsChat.subscribeEvents"
+        );
+        assert_eq!(
+            derive_ws_endpoint("http://localhost:3001"),
+            "ws://localhost:3001/xrpc/blue.catbird.mlsChat.subscribeEvents"
+        );
     }
 
     #[test]

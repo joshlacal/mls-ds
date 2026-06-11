@@ -118,16 +118,47 @@ impl SequencerTransfer {
             .max(0) as u64;
         let new_sequencer_term = current_term + 1;
 
-        sqlx::query(
-            "UPDATE conversations SET sequencer_ds = $2, sequencer_term = $3, updated_at = NOW() \
-             WHERE id = $1",
+        // N30: CAS-fence the handoff against the observed `(owner, term)` so a
+        // concurrent transfer/failover between our read above and this UPDATE
+        // cannot be silently overwritten. Mirrors `accept_transfer`'s fence:
+        // term equality + NULL-safe, fragment-stripped owner match, with
+        // RETURNING as the post-CAS source of truth.
+        let observed_sequencer = current
+            .as_ref()
+            .and_then(|(ds, _)| ds.as_deref())
+            .map(canonical_did);
+        let updated: Option<i64> = sqlx::query_scalar(
+            "UPDATE conversations \
+             SET sequencer_ds = $2, sequencer_term = $3, updated_at = NOW() \
+             WHERE id = $1 \
+               AND COALESCE(sequencer_term, 0) = $4 \
+               AND ( \
+                    ($5::text IS NULL AND sequencer_ds IS NULL) \
+                 OR split_part(sequencer_ds, '#', 1) = $5 \
+               ) \
+             RETURNING sequencer_term",
         )
         .bind(convo_id)
         .bind(new_sequencer_did)
         .bind(new_sequencer_term as i64)
-        .execute(&self.pool)
+        .bind(current_term as i64)
+        .bind(observed_sequencer)
+        .fetch_optional(&self.pool)
         .await
         .map_err(TransferError::Database)?;
+
+        let Some(new_term_raw) = updated else {
+            warn!(
+                convo_id,
+                new_sequencer = new_sequencer_did,
+                expected_term = current_term,
+                "Sequencer transfer initiation lost CAS race; owner/term changed concurrently"
+            );
+            return Err(TransferError::NotCurrentSequencer {
+                convo_id: convo_id.to_string(),
+                current_sequencer: "unknown (changed during transfer)".to_string(),
+            });
+        };
 
         info!(
             convo_id,
@@ -138,7 +169,7 @@ impl SequencerTransfer {
         Ok(TransferResult::Transferred {
             convo_id: convo_id.to_string(),
             new_sequencer_did: new_sequencer_did.to_string(),
-            new_sequencer_term,
+            new_sequencer_term: new_term_raw.max(0) as u64,
         })
     }
 

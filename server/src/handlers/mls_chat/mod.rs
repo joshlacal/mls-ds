@@ -6,6 +6,7 @@ pub mod get_key_package_status;
 pub mod get_key_packages;
 pub mod get_pending_devices;
 pub mod invalidate_key_package;
+pub mod key_package_enumeration;
 pub mod list_devices;
 pub mod publish_key_packages;
 pub mod reconcile_key_packages;

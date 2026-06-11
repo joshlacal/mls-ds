@@ -24,10 +24,8 @@ pub async fn fetch_key_package(
 
     let recipient_did = &query.recipient_did;
     let convo_id = &query.convo_id;
-    let self_did = canonical_did(
-        &std::env::var("SERVICE_DID").unwrap_or_else(|_| "did:web:mls.catbird.blue".to_string()),
-    )
-    .to_string();
+    // N31: fail-loudly service identity — no hardcoded fallback DID.
+    let self_did = crate::identity::service_did_base();
 
     let result: Result<Json<serde_json::Value>, FederationError> = async {
         // Greenfield strict mode: convoId is required and caller must be authorized for that convo.

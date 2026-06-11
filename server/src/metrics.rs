@@ -158,6 +158,10 @@ impl MetricsRecorder {
             "key_package_last_resort_use_total",
             "Total number of times a last-resort key package was claimed because no regular available rows existed"
         );
+        metrics::describe_counter!(
+            "key_package_enumeration_suspected_total",
+            "Total getKeyPackages calls flagged by the per-caller unique-target-DID cardinality detector (N26 detection half)"
+        );
 
         Self { handle }
     }
@@ -474,4 +478,12 @@ pub fn record_key_package_exhaustion() {
 #[allow(dead_code)]
 pub fn record_key_package_last_resort_use() {
     metrics::counter!("key_package_last_resort_use_total", 1);
+}
+
+/// Record a getKeyPackages call flagged by the enumeration detector (N26):
+/// the caller's unique-target-DID cardinality over the sliding window
+/// exceeded the configured threshold. Detection-only signal.
+#[allow(dead_code)]
+pub fn record_key_package_enumeration_suspected() {
+    metrics::counter!("key_package_enumeration_suspected_total", 1);
 }

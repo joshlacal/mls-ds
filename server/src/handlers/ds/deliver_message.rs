@@ -215,8 +215,8 @@ pub(super) async fn load_convo_sequencer_state_optional(
     .await
     .map_err(FederationError::Database)?;
 
-    let self_did =
-        std::env::var("SERVICE_DID").unwrap_or_else(|_| "did:web:mls.catbird.blue".to_string());
+    // N31: fail-loudly service identity — no hardcoded fallback DID.
+    let self_did = crate::identity::service_did();
     Ok(
         convo_row.map(|(sequencer_ds, current_term_raw)| ConvoSequencerState {
             expected_sequencer: canonical_did(&sequencer_ds.unwrap_or(self_did)).to_string(),

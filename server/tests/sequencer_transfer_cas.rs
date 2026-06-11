@@ -86,3 +86,80 @@ async fn accept_transfer_rejects_owner_change_between_read_and_update() {
 
     common::cleanup(&pool, &convo_id).await;
 }
+
+/// N30: `initiate_transfer` must carry the same `(owner, term)` CAS fence as
+/// `accept_transfer`. A failover (`assume_sequencer_role`) that lands between
+/// the initiating DS's read and its UPDATE must not be silently overwritten.
+#[tokio::test]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+async fn initiate_transfer_rejects_owner_change_between_read_and_update() {
+    let pool = common::setup_test_db().await;
+    let convo_id = format!("ws1-initiate-cas-{}", Uuid::new_v4());
+    let initiating_ds = format!("did:web:sequencer-init-{}.example", Uuid::new_v4());
+    let new_ds = format!("did:web:sequencer-new-{}.example", Uuid::new_v4());
+    let concurrent_ds = format!("did:web:sequencer-race-{}.example", Uuid::new_v4());
+
+    // We are the current sequencer at term 5 and want to hand off to new_ds.
+    seed_conversation(&pool, &convo_id, &initiating_ds, 5).await;
+
+    let mut tx = pool.begin().await.expect("begin locking tx");
+    sqlx::query("UPDATE conversations SET updated_at = updated_at WHERE id = $1")
+        .bind(&convo_id)
+        .execute(&mut *tx)
+        .await
+        .expect("lock conversation row");
+
+    let transfer = SequencerTransfer::new(pool.clone(), initiating_ds.clone());
+    let task_convo_id = convo_id.clone();
+    let task_new_ds = new_ds.clone();
+    let initiate_task = tokio::spawn(async move {
+        transfer
+            .initiate_transfer(&task_convo_id, &task_new_ds)
+            .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !initiate_task.is_finished(),
+        "initiate_transfer should be blocked behind the row lock before the race is committed"
+    );
+
+    // Concurrent failover: another DS takes over at term 6 while our UPDATE
+    // is blocked on the row lock.
+    sqlx::query(
+        "UPDATE conversations \
+         SET sequencer_ds = $2, sequencer_term = 6, updated_at = NOW() \
+         WHERE id = $1",
+    )
+    .bind(&convo_id)
+    .bind(&concurrent_ds)
+    .execute(&mut *tx)
+    .await
+    .expect("commit concurrent owner change");
+    tx.commit().await.expect("commit locking tx");
+
+    let result = tokio::time::timeout(Duration::from_secs(5), initiate_task)
+        .await
+        .expect("initiate_transfer completed")
+        .expect("initiate_transfer task joined");
+
+    assert!(
+        matches!(result, Err(TransferError::NotCurrentSequencer { .. })),
+        "initiate_transfer must reject a stale observed owner/term instead of overwriting it: {result:?}"
+    );
+
+    let (sequencer_ds, sequencer_term): (Option<String>, i64) =
+        sqlx::query_as("SELECT sequencer_ds, sequencer_term FROM conversations WHERE id = $1")
+            .bind(&convo_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read final conversation state");
+    assert_eq!(
+        sequencer_ds.as_deref(),
+        Some(concurrent_ds.as_str()),
+        "concurrent takeover must win; the fenced initiate_transfer must not clobber it"
+    );
+    assert_eq!(sequencer_term, 6);
+
+    common::cleanup(&pool, &convo_id).await;
+}

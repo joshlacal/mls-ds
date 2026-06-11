@@ -53,10 +53,8 @@ pub(super) async fn authorize_convo_read(
     convo_id: &str,
     requester_ds: &str,
 ) -> Result<ConvoAuthState, FederationError> {
-    let self_did = canonical_did(
-        &std::env::var("SERVICE_DID").unwrap_or_else(|_| "did:web:mls.catbird.blue".to_string()),
-    )
-    .to_string();
+    // N31: fail-loudly service identity — no hardcoded fallback DID.
+    let self_did = crate::identity::service_did_base();
     let row = sqlx::query_as::<_, (Option<String>, Option<i64>, Option<i64>, bool)>(
         "SELECT \
            c.sequencer_ds, \

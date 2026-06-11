@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use ractor::{Actor, ActorProcessingErr, ActorRef, ActorStatus, RpcReplyPort, SupervisionEvent};
+use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort, SupervisionEvent};
 use std::{collections::HashMap, time::Duration};
 use tracing::{debug, error, info, warn};
 
@@ -59,7 +59,11 @@ impl Actor for GroupSupervisor {
         match message {
             GroupSupervisorMessage::GetOrSpawnConversation(convo_id, args, reply) => {
                 if let Some(actor_ref) = state.conversations.get(&convo_id) {
-                    if actor_ref.get_status() == ActorStatus::Running {
+                    // N32: reuse any actor in an active lifecycle state.
+                    // `Running`-only treated a freshly spawned (`Starting`)
+                    // child as dead and spawned a duplicate ConversationActor
+                    // for the same convo (duplicate seq assignment).
+                    if super::registry::actor_status_is_alive(actor_ref.get_status()) {
                         let _ = reply.send(Ok(actor_ref.clone()));
                         return Ok(());
                     }

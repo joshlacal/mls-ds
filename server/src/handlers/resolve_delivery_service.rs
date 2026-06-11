@@ -27,10 +27,9 @@ pub async fn resolve(
 ) -> Result<Json<ResolveDeliveryServiceOutput<'static>>, FederationError> {
     let user_did = &query.did;
 
-    let self_did =
-        std::env::var("SERVICE_DID").unwrap_or_else(|_| "did:web:mls.catbird.blue".to_string());
-    let self_endpoint =
-        std::env::var("SELF_ENDPOINT").unwrap_or_else(|_| "https://mls.catbird.blue".to_string());
+    // N31: fail-loudly service identity — no hardcoded fallback DID/endpoint.
+    let self_did = crate::identity::service_did();
+    let self_endpoint = crate::identity::self_endpoint();
     let default_ds = std::env::var("DEFAULT_DS_ENDPOINT").ok();
     let cache_ttl: u64 = std::env::var("ENDPOINT_CACHE_TTL")
         .ok()

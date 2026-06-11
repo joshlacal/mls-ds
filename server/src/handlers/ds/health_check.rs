@@ -15,8 +15,8 @@ pub async fn health_check() -> Result<Json<serde_json::Value>, FederationError> 
         });
     }
 
-    let did =
-        std::env::var("SERVICE_DID").unwrap_or_else(|_| "did:web:mls.catbird.blue".to_string());
+    // N31: fail-loudly service identity — no hardcoded fallback DID.
+    let did = crate::identity::service_did();
 
     // Approximate uptime via process start (lazy_static would be cleaner,
     // but env-based is acceptable for Phase 1)

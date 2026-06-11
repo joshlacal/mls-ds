@@ -84,6 +84,26 @@ pub async fn get_key_packages(
 
     let requested_dids: Vec<String> = input.dids.iter().map(|d| d.to_string()).collect();
 
+    // ── N26 (detection half): enumeration signal ───────────────────────
+    // Track per-caller unique-target-DID cardinality over a sliding window,
+    // on the RAW requested list (pre block/authz filtering — what the caller
+    // asked for is the signal, not what they were given). Detection only:
+    // WARN + counter, never a block. The enforce flip is gated on production
+    // log observation (backlog N26).
+    let enum_detector = super::key_package_enumeration::EnumerationDetector::global();
+    if let Some(unique_targets) =
+        enum_detector.record(&caller_did_str, requested_dids.iter().map(String::as_str))
+    {
+        warn!(
+            caller = %crate::crypto::redact_for_log(&caller_did_str),
+            unique_targets,
+            threshold = enum_detector.threshold(),
+            window_secs = enum_detector.window_secs(),
+            "getKeyPackages: possible key-package enumeration — unique-target cardinality exceeded"
+        );
+        crate::metrics::record_key_package_enumeration_suspected();
+    }
+
     let mut participants: Vec<String> = requested_dids.clone();
     participants.push(caller_did_str.clone());
     participants.sort();

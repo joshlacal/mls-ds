@@ -413,19 +413,19 @@ async fn test_concurrent_send_and_read_unread_count_consistency() {
 }
 
 #[tokio::test]
-// RED — exposes a real server bug (N14): `ActorRegistry::
-// get_or_spawn_group_supervisor` double-checked locking races because a
-// freshly spawned actor still reports `ActorStatus::Starting` when the
-// post-spawn `Running` check runs, so every concurrent caller overwrites the
-// cached supervisor with its own. N concurrent first-touch callers get N
-// GroupSupervisors, each spawning its own ConversationActor for the same
-// convo — message sends are then NOT serialized per conversation and collide
-// on `messages_convo_seq_unique` (observed: 20 supervisors spawned for one
-// barrier of 20 sends). Production hits the same window on the first
-// concurrent burst after process start. Fix belongs in
-// `src/actors/registry.rs` (treat `Starting` as alive / hold spawn
-// exclusivity), out of scope for the N14 test-repair task.
-#[ignore = "RED: real server bug — ActorRegistry supervisor-spawn race spawns multiple ConversationActors per convo (duplicate seq); see comment"]
+// N32 regression guard (formerly known-RED, N14): `ActorRegistry::
+// get_or_spawn_group_supervisor` double-checked locking raced — a freshly
+// spawned supervisor still reported `ActorStatus::Starting` when the
+// post-spawn `Running` check ran, so every concurrent first-touch caller
+// spawned and cached its own GroupSupervisor; each spawned its own
+// ConversationActor for the same convo, and message sends collided on
+// `messages_convo_seq_unique` (observed: 20 supervisors for one barrier of
+// 20 sends). Fixed in `src/actors/registry.rs` (single-flight spawn mutex +
+// Starting/Running/Upgrading treated as alive) and
+// `src/actors/supervisor.rs` (same liveness rule for cached children).
+// This test drives 20 concurrent first-touch sends through one registry and
+// asserts strictly sequential seq 1..=20.
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn test_message_sequence_numbers_sequential() {
     // Skip if TEST_DATABASE_URL not set
     let Ok(_) = std::env::var("TEST_DATABASE_URL") else {

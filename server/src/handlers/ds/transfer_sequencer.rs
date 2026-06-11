@@ -42,8 +42,8 @@ pub async fn transfer_sequencer(
     let requester_ds = security.requester_ds.clone();
     let from_ds = requester_ds.as_str();
 
-    let self_did =
-        std::env::var("SERVICE_DID").unwrap_or_else(|_| "did:web:mls.catbird.blue".to_string());
+    // N31: fail-loudly service identity — no hardcoded fallback DID.
+    let self_did = crate::identity::service_did();
 
     let transfer_handler = SequencerTransfer::new(pool.clone(), self_did);
 

@@ -73,10 +73,8 @@ pub async fn submit_commit(
     let requester_ds = security.requester_ds.clone();
 
     // Determine our service DID for participant check
-    let self_did = canonical_did(
-        &std::env::var("SERVICE_DID").unwrap_or_else(|_| "did:web:mls.catbird.blue".to_string()),
-    )
-    .to_string();
+    // N31: fail-loudly service identity — no hardcoded fallback DID.
+    let self_did = crate::identity::service_did_base();
 
     let result: Result<Json<serde_json::Value>, FederationError> = async {
         let Some(sequencer_state) =
