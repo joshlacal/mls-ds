@@ -3234,8 +3234,6 @@ dependencies = [
 [[package]]
 name = "jacquard-lexicon"
 version = "0.9.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8411aff546569b0a1e0ef669bed2380cec1c00d48f02f3fcd57a71545321b3d8"
 dependencies = [
  "cid",
  "dashmap 6.1.0",
