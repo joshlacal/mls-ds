@@ -168,10 +168,18 @@ async fn handle_all(
                 })
                 .collect::<Result<Vec<_>, StatusCode>>()?;
 
-            let convo_view = c.to_convo_view(members).map_err(|e| {
-                error!("❌ [v2.getConvos] Failed to convert convo view: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+            let last_message_at = fetch_last_message_at(pool, &membership.convo_id).await?;
+
+            let convo_view = c
+                .to_convo_view_with_last_message_at(
+                    members,
+                    crate::identity::service_did_base_opt().as_deref(),
+                    last_message_at,
+                )
+                .map_err(|e| {
+                    error!("❌ [v2.getConvos] Failed to convert convo view: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
 
             convos.push(convo_view);
         }
@@ -188,6 +196,132 @@ async fn handle_all(
             extra_data: Default::default(),
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::{postgres::PgPoolOptions, PgPool};
+    use std::time::Duration;
+
+    async fn setup_test_db() -> PgPool {
+        let database_url = std::env::var("TEST_DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://localhost/catbird_test".to_string());
+
+        PgPoolOptions::new()
+            .max_connections(4)
+            .min_connections(1)
+            .acquire_timeout(Duration::from_secs(30))
+            .idle_timeout(Duration::from_secs(600))
+            .connect(&database_url)
+            .await
+            .expect("Failed to connect to test database")
+    }
+
+    async fn cleanup_test_convo(pool: &PgPool, convo_id: &str) {
+        let _ = sqlx::query("DELETE FROM messages WHERE convo_id = $1")
+            .bind(convo_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM members WHERE convo_id = $1")
+            .bind(convo_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM conversations WHERE id = $1")
+            .bind(convo_id)
+            .execute(pool)
+            .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+    async fn handle_all_projects_last_message_at_from_messages_table() {
+        let pool = setup_test_db().await;
+        let convo_id = format!("get-convos-last-message-at-{}", uuid::Uuid::new_v4());
+        let did = "did:plc:lastmessageattest";
+        let created_at = chrono::DateTime::parse_from_rfc3339("2026-06-14T10:00:00Z")
+            .expect("valid created_at")
+            .with_timezone(&Utc);
+        let older_message_at = chrono::DateTime::parse_from_rfc3339("2026-06-14T10:05:00Z")
+            .expect("valid older message time")
+            .with_timezone(&Utc);
+        let latest_message_at = chrono::DateTime::parse_from_rfc3339("2026-06-14T10:07:00Z")
+            .expect("valid latest message time")
+            .with_timezone(&Utc);
+
+        cleanup_test_convo(&pool, &convo_id).await;
+
+        sqlx::query(
+            "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at, cipher_suite, is_remote, group_id)
+             VALUES ($1, $2, 1, $3, $3, $4, false, $1)",
+        )
+        .bind(&convo_id)
+        .bind(did)
+        .bind(created_at)
+        .bind("MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519")
+        .execute(&pool)
+        .await
+        .expect("insert conversation");
+
+        sqlx::query(
+            "INSERT INTO members (convo_id, member_did, user_did, joined_at, is_admin)
+             VALUES ($1, $2, $2, $3, true)",
+        )
+        .bind(&convo_id)
+        .bind(did)
+        .bind(created_at)
+        .execute(&pool)
+        .await
+        .expect("insert member");
+
+        for (seq, id, created_at) in [
+            (1_i64, "older-message", older_message_at),
+            (2_i64, "latest-message", latest_message_at),
+        ] {
+            sqlx::query(
+                "INSERT INTO messages (id, convo_id, sender_did, message_type, epoch, wire_epoch, seq, ciphertext, msg_id, padded_size, created_at)
+                 VALUES ($1, $2, NULL, 'app', 1, 1, $3, $4, $5, 512, $6)",
+            )
+            .bind(format!("{convo_id}-{id}"))
+            .bind(&convo_id)
+            .bind(seq)
+            .bind(Vec::<u8>::from([0xCA, 0x7B, 0x1D]))
+            .bind(format!("{convo_id}-{id}-msg"))
+            .bind(created_at)
+            .execute(&pool)
+            .await
+            .expect("insert message");
+        }
+
+        let response = handle_all(&pool, did).await.expect("handle_all response");
+        let convo = response
+            .0
+            .conversations
+            .iter()
+            .find(|convo| convo.conversation_id.as_ref() == convo_id)
+            .expect("test conversation in getConvos response");
+
+        assert_eq!(
+            convo.last_message_at.as_ref().map(|dt| dt.as_str()),
+            Some("2026-06-14T10:07:00.000000Z")
+        );
+
+        cleanup_test_convo(&pool, &convo_id).await;
+    }
+}
+
+async fn fetch_last_message_at(
+    pool: &DbPool,
+    convo_id: &str,
+) -> Result<Option<DateTime<Utc>>, StatusCode> {
+    sqlx::query_scalar("SELECT MAX(created_at) FROM messages WHERE convo_id = $1")
+        .bind(convo_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| {
+            error!("❌ [v2.getConvos] Failed to fetch last_message_at: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -440,10 +574,18 @@ async fn handle_expected(
                 })
                 .collect::<Result<Vec<_>, StatusCode>>()?;
 
-            let convo_view = c.to_convo_view(members).map_err(|e| {
-                error!("❌ [v2.getConvos] Failed to convert convo view: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+            let last_message_at = fetch_last_message_at(pool, &membership.convo_id).await?;
+
+            let convo_view = c
+                .to_convo_view_with_last_message_at(
+                    members,
+                    crate::identity::service_did_base_opt().as_deref(),
+                    last_message_at,
+                )
+                .map_err(|e| {
+                    error!("❌ [v2.getConvos] Failed to convert convo view: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
 
             convos.push(convo_view);
         }

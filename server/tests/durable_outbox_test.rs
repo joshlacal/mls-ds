@@ -41,6 +41,11 @@ use uuid::Uuid;
 
 /// Wipe per-convo data from all tables this test inserts into.
 async fn wipe(pool: &PgPool, convo_id: &str) {
+    let _ = sqlx::query("UPDATE conversations SET active_crypto_session_id = NULL WHERE id = $1")
+        .bind(convo_id)
+        .execute(pool)
+        .await;
+
     for table in &[
         "notification_outbox",
         "federation_outbox",
@@ -78,14 +83,13 @@ async fn seed_convo_with_members(
         "INSERT INTO conversations \
             (id, creator_did, current_epoch, created_at, updated_at, cipher_suite, \
              is_remote, group_id, group_info, active_crypto_session_id) \
-         VALUES ($1, 'did:plc:creator', 0, $2, $2, $3, false, $4, $5, $6)",
+         VALUES ($1, 'did:plc:creator', 0, $2, $2, $3, false, $4, $5, NULL)",
     )
     .bind(convo_id)
     .bind(now)
     .bind("MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519")
     .bind(&mls_group_id)
     .bind(b"placeholder groupinfo".to_vec())
-    .bind(&crypto_session_id)
     .execute(pool)
     .await
     .expect("insert conversation");
@@ -104,6 +108,13 @@ async fn seed_convo_with_members(
     .execute(pool)
     .await
     .expect("insert crypto_session");
+
+    sqlx::query("UPDATE conversations SET active_crypto_session_id = $1 WHERE id = $2")
+        .bind(&crypto_session_id)
+        .bind(convo_id)
+        .execute(pool)
+        .await
+        .expect("activate crypto_session");
 
     for (did, ds_did) in member_dids {
         sqlx::query(

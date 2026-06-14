@@ -16,6 +16,7 @@
 //! with `#[ignore]` so they only run when a Postgres is available via
 //! `TEST_DATABASE_URL`. Run with:
 //!   TEST_DATABASE_URL=postgres://… \
+//!   SERVICE_DID=did:web:mls.test \
 //!     cargo test -p catbird-server --test system_reset_actor -- --ignored
 //!
 //! Plan: docs/superpowers/plans/2026-04-26-mls-auto-reset-phase2.md (Task 11)
@@ -29,6 +30,11 @@ use ractor::{Actor, ActorRef};
 use sqlx::PgPool;
 use std::sync::Arc;
 use std::time::Duration;
+
+fn expected_service_did() -> String {
+    std::env::var("SERVICE_DID")
+        .expect("SERVICE_DID must be set for system_reset_actor ignored tests")
+}
 
 async fn wipe(pool: &PgPool, convo_id: &str) {
     for table in &[
@@ -144,10 +150,11 @@ async fn trigger_system_reset_rotates_group_id_and_sets_marker() {
         Some(initial_group_id),
         "group_id must rotate"
     );
+    let service_did = expected_service_did();
     assert_eq!(
         post.last_reset_by.as_deref(),
-        Some("system:server_sweep"),
-        "last_reset_by must carry the system:<reason> marker"
+        Some(service_did.as_str()),
+        "last_reset_by must carry the configured service DID"
     );
     assert!(
         post.group_info.is_none(),

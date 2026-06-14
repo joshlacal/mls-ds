@@ -38,6 +38,11 @@
           "type": "integer",
           "minimum": 0,
           "description": "Number of times this conversation's MLS group has been reset. Absent or 0 means never reset."
+        },
+        "sequencerDid": {
+          "type": "string",
+          "format": "did",
+          "description": "Base DID of the delivery service currently acting as sequencer for this conversation. Clients append #atproto_mls when using ATProto proxy routing."
         }
       }
     },

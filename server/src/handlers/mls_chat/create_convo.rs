@@ -62,39 +62,6 @@ fn validate_initial_members_have_welcome(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn bootstrap_epoch_is_zero_without_welcome() {
-        assert_eq!(bootstrap_epoch_for_create(false), 0);
-    }
-
-    #[test]
-    fn bootstrap_epoch_is_one_with_welcome() {
-        assert_eq!(bootstrap_epoch_for_create(true), 1);
-    }
-
-    #[test]
-    fn initial_non_creator_members_require_welcome() {
-        let members = vec![string_to_did("did:plc:bob")];
-
-        let err = validate_initial_members_have_welcome(Some(&members), "did:plc:alice", false)
-            .expect_err("non-creator initial members without Welcome must fail");
-
-        assert!(err.contains("welcomeMessage"));
-    }
-
-    #[test]
-    fn creator_only_initial_members_do_not_require_welcome() {
-        let members = vec![string_to_did("did:plc:alice")];
-
-        validate_initial_members_have_welcome(Some(&members), "did:plc:alice", false)
-            .expect("creator-only initial members are a no-op");
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Handler (v2 – inline SQL, no v1 delegation)
 // ---------------------------------------------------------------------------
@@ -469,6 +436,11 @@ async fn handle_create_convo(
                 last_message_at: None,
                 confirmation_tag: None,
                 reset_generation: Some(0),
+                // ADR-010 D4 (rung 2): a convo created here is sequenced
+                // locally; rows keep sequencer_ds = NULL, the view
+                // materializes the local DS DID.
+                sequencer_did: crate::identity::service_did_base_opt()
+                    .and_then(|d| crate::sqlx_jacquard::try_string_to_did(&d).ok()),
                 extra_data: Default::default(),
             },
             invite_code: None,
@@ -1093,10 +1065,48 @@ async fn handle_create_convo(
             last_message_at: None,
             confirmation_tag: None,
             reset_generation: Some(0),
+            // ADR-010 D4 (rung 2): a convo created here is sequenced
+            // locally; rows keep sequencer_ds = NULL, the view materializes
+            // the local DS DID.
+            sequencer_did: crate::identity::service_did_base_opt()
+                .and_then(|d| crate::sqlx_jacquard::try_string_to_did(&d).ok()),
             extra_data: Default::default(),
         },
         invite_code: None,
         sequencer_ds: None,
         extra_data: Default::default(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bootstrap_epoch_is_zero_without_welcome() {
+        assert_eq!(bootstrap_epoch_for_create(false), 0);
+    }
+
+    #[test]
+    fn bootstrap_epoch_is_one_with_welcome() {
+        assert_eq!(bootstrap_epoch_for_create(true), 1);
+    }
+
+    #[test]
+    fn initial_non_creator_members_require_welcome() {
+        let members = vec![string_to_did("did:plc:bob")];
+
+        let err = validate_initial_members_have_welcome(Some(&members), "did:plc:alice", false)
+            .expect_err("non-creator initial members without Welcome must fail");
+
+        assert!(err.contains("welcomeMessage"));
+    }
+
+    #[test]
+    fn creator_only_initial_members_do_not_require_welcome() {
+        let members = vec![string_to_did("did:plc:alice")];
+
+        validate_initial_members_have_welcome(Some(&members), "did:plc:alice", false)
+            .expect("creator-only initial members are a no-op");
+    }
 }

@@ -771,6 +771,10 @@ pub async fn handle(
             last_message_at: last_message_at.map(chrono_to_datetime),
             confirmation_tag: None,
             reset_generation: Some(reset_count as i64),
+            // ADR-010 D4 (rung 2): bootstrap reset is a local-sequencer
+            // operation; materialize the local DS DID.
+            sequencer_did: crate::identity::service_did_base_opt()
+                .and_then(|d| crate::sqlx_jacquard::try_string_to_did(&d).ok()),
             extra_data: Default::default(),
         },
         // SERVER M (#75): expose `crypto_session.generation` so iOS can seed

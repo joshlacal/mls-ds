@@ -91,16 +91,54 @@ impl Conversation {
 
     /// Convert to API ConvoView with members
     ///
+    /// `local_ds_did` is this DS's own base DID
+    /// (`crate::identity::service_did_base_opt()`): a `NULL`
+    /// `conversations.sequencer_ds` means "this DS is the sequencer" and must
+    /// materialize as the local DS DID in `sequencerDid`, not be omitted
+    /// (ADR-010 D4 rules 1-2). Pass `None` only when `SERVICE_DID` is
+    /// unconfigured (dev/test), which omits the field (ambiguity A5).
+    ///
     /// # Errors
     /// Returns an error if the creator_did is not a valid DID string.
     pub fn to_convo_view(
         &self,
         members: Vec<MemberView<'static>>,
+        local_ds_did: Option<&str>,
+    ) -> Result<ConvoView<'static>, String> {
+        self.to_convo_view_with_last_message_at(members, local_ds_did, None)
+    }
+
+    /// Convert to API ConvoView with members and server-observed message activity.
+    pub fn to_convo_view_with_last_message_at(
+        &self,
+        members: Vec<MemberView<'static>>,
+        local_ds_did: Option<&str>,
+        last_message_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<ConvoView<'static>, String> {
         use jacquard_common::IntoStatic;
 
         let creator = crate::sqlx_jacquard::try_string_to_did(&self.creator_did)
             .map_err(|e| format!("Invalid creator DID: {}", e))?;
+
+        // ADR-010 D4 (WS-4 rung 2): NULL sequencer_ds == "sequenced locally".
+        // Defensively strip any `#fragment` (format: "did" fields must be
+        // base DIDs — see system_reset_did precedent) and warn + omit on an
+        // invalid stored value rather than failing the whole view.
+        let sequencer_did = self
+            .sequencer_ds
+            .as_deref()
+            .or(local_ds_did)
+            .map(crate::identity::canonical_did)
+            .and_then(|raw| match crate::sqlx_jacquard::try_string_to_did(raw) {
+                Ok(did) => Some(did),
+                Err(e) => {
+                    tracing::warn!(
+                        convo = %self.id,
+                        "invalid sequencer DID for convoView.sequencerDid; omitting field: {e}"
+                    );
+                    None
+                }
+            });
 
         let conf_tag_b64 = self.confirmation_tag.as_ref().map(|t| {
             use base64::Engine;
@@ -135,9 +173,12 @@ impl Conversation {
                 .unwrap_or_else(|| "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519".to_string())
                 .into(),
             created_at: crate::sqlx_jacquard::chrono_to_datetime(self.created_at),
-            last_message_at: None,
+            last_message_at: last_message_at.map(crate::sqlx_jacquard::chrono_to_datetime),
             confirmation_tag: conf_tag_b64.map(|s| s.into()),
             reset_generation: Some(reset_generation as i64),
+            // Top-level struct field ONLY — never also in extra_data (the
+            // duplicate-key hazard documented above for resetGeneration).
+            sequencer_did,
             extra_data: Some(extra),
         };
         Ok(view.into_static())
@@ -572,4 +613,123 @@ pub struct PendingWelcome {
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub expires_at: chrono::DateTime<chrono::Utc>,
     pub delivered: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Conversation;
+
+    fn test_conversation(sequencer_ds: Option<&str>) -> Conversation {
+        Conversation {
+            id: "convo-1".to_string(),
+            creator_did: "did:plc:creatorxyz".to_string(),
+            current_epoch: 4,
+            cipher_suite: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            confirmation_tag: None,
+            sequencer_ds: sequencer_ds.map(|s| s.to_string()),
+            is_remote: false,
+            group_id: None,
+            reset_count: Some(0),
+            auto_reset_disabled_at: None,
+        }
+    }
+
+    // ADR-010 D4 rules 1-2 (WS-4 rung 2): NULL sequencer_ds means "this DS"
+    // and must materialize as the local DS DID, not be omitted.
+    #[test]
+    fn to_convo_view_materializes_null_sequencer_as_local_ds_did() {
+        let view = test_conversation(None)
+            .to_convo_view(vec![], Some("did:web:local-ds.example"))
+            .expect("view");
+        assert_eq!(
+            view.sequencer_did.as_ref().map(|d| d.as_str()),
+            Some("did:web:local-ds.example")
+        );
+    }
+
+    #[test]
+    fn to_convo_view_passes_through_stored_sequencer() {
+        let view = test_conversation(Some("did:web:remote-ds.example"))
+            .to_convo_view(vec![], Some("did:web:local-ds.example"))
+            .expect("view");
+        assert_eq!(
+            view.sequencer_did.as_ref().map(|d| d.as_str()),
+            Some("did:web:remote-ds.example")
+        );
+    }
+
+    // format: "did" fields must be fragment-free base DIDs (A7); a stored
+    // fragment-bearing value is stripped defensively at projection time.
+    #[test]
+    fn to_convo_view_strips_fragment_from_stored_sequencer() {
+        let view = test_conversation(Some("did:web:remote-ds.example#atproto_mls"))
+            .to_convo_view(vec![], Some("did:web:local-ds.example"))
+            .expect("view");
+        assert_eq!(
+            view.sequencer_did.as_ref().map(|d| d.as_str()),
+            Some("did:web:remote-ds.example")
+        );
+    }
+
+    // Ambiguity A5: no SERVICE_DID configured and locally sequenced -> the
+    // optional field is omitted (skip_serializing_if), not an error.
+    #[test]
+    fn to_convo_view_omits_field_without_local_did() {
+        let view = test_conversation(None)
+            .to_convo_view(vec![], None)
+            .expect("view");
+        assert!(view.sequencer_did.is_none());
+        let json = serde_json::to_string(&view).expect("serialize");
+        assert!(
+            !json.contains("sequencerDid"),
+            "None sequencer_did must not serialize: {json}"
+        );
+    }
+
+    // A malformed stored sequencer_ds row must not break getConvos: warn+omit.
+    #[test]
+    fn to_convo_view_omits_invalid_stored_sequencer() {
+        let view = test_conversation(Some("not a did"))
+            .to_convo_view(vec![], Some("did:web:local-ds.example"))
+            .expect("view");
+        assert!(view.sequencer_did.is_none());
+    }
+
+    #[test]
+    fn to_convo_view_includes_last_message_at_when_supplied() {
+        let last_message_at = chrono::DateTime::parse_from_rfc3339("2026-06-14T07:29:00Z")
+            .expect("valid datetime")
+            .with_timezone(&chrono::Utc);
+
+        let view = test_conversation(None)
+            .to_convo_view_with_last_message_at(
+                vec![],
+                Some("did:web:local-ds.example"),
+                Some(last_message_at),
+            )
+            .expect("view");
+
+        assert_eq!(
+            view.last_message_at.as_ref().map(|dt| dt.as_str()),
+            Some("2026-06-14T07:29:00.000000Z")
+        );
+    }
+
+    // Regression for the extra_data duplicate-key hazard (models.rs comment):
+    // the wire JSON must contain `sequencerDid` exactly once.
+    #[test]
+    fn to_convo_view_serializes_sequencer_did_exactly_once() {
+        let view = test_conversation(Some("did:web:remote-ds.example"))
+            .to_convo_view(vec![], Some("did:web:local-ds.example"))
+            .expect("view");
+        let json = serde_json::to_string(&view).expect("serialize");
+        assert_eq!(
+            json.matches("\"sequencerDid\"").count(),
+            1,
+            "sequencerDid must appear exactly once in wire JSON: {json}"
+        );
+        assert!(json.contains("\"sequencerDid\":\"did:web:remote-ds.example\""));
+    }
 }

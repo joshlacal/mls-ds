@@ -10,9 +10,9 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Directory containing lexicon schemas
-    #[arg(short, long, default_value = "../lexicon")]
-    lexdir: PathBuf,
+    /// Directory containing lexicon schemas. May be repeated; later dirs overlay earlier dirs.
+    #[arg(short, long, value_name = "DIR", default_value = "../lexicon")]
+    lexdir: Vec<PathBuf>,
 
     /// Output directory for generated code
     #[arg(short, long, default_value = "../../catbird-atproto/src/generated")]
@@ -23,10 +23,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     println!("Generating Rust types from lexicons...");
-    println!("  Input:  {}", args.lexdir.display());
+    for lexdir in &args.lexdir {
+        println!("  Input:  {}", lexdir.display());
+    }
     println!("  Output: {}", args.outdir.display());
 
-    let normalized_lexdir = normalize_lexicon_dir(&args.lexdir)?;
+    let normalized_lexdir = normalize_lexicon_dirs(&args.lexdir)?;
     let corpus = LexiconCorpus::load_from_dir(normalized_lexdir.path())?;
     let codegen = CodeGenerator::new(&corpus, "crate::generated");
     codegen.write_to_disk(&args.outdir)?;
@@ -35,9 +37,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn normalize_lexicon_dir(lexdir: &Path) -> Result<tempfile::TempDir, Box<dyn std::error::Error>> {
+fn normalize_lexicon_dirs(
+    lexdirs: &[PathBuf],
+) -> Result<tempfile::TempDir, Box<dyn std::error::Error>> {
     let tempdir = tempfile::tempdir()?;
-    let normalized = copy_and_normalize_lexicons(lexdir, tempdir.path())?;
+    let mut normalized = 0usize;
+
+    for lexdir in lexdirs {
+        normalized += copy_and_normalize_lexicons(lexdir, tempdir.path())?;
+    }
 
     if normalized > 0 {
         println!("  Normalized {normalized} raw-byte XRPC body schema(s) for Jacquard");
@@ -54,8 +62,10 @@ fn copy_and_normalize_lexicons(
 
     let mut normalized = 0usize;
 
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
+    let mut entries = fs::read_dir(source)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.path());
+
+    for entry in entries {
         let source_path = entry.path();
         let destination_path = destination.join(entry.file_name());
         let file_type = entry.file_type()?;
@@ -70,10 +80,6 @@ fn copy_and_normalize_lexicons(
         }
 
         if source_path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-            if let Some(parent) = destination_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::copy(&source_path, &destination_path)?;
             continue;
         }
 
@@ -151,8 +157,10 @@ fn normalize_raw_byte_body_schema(body: &mut serde_json::Map<String, Value>) -> 
 
 #[cfg(test)]
 mod tests {
+    use super::normalize_lexicon_dirs;
     use super::normalize_raw_byte_xrpc_bodies;
     use serde_json::json;
+    use std::fs;
 
     #[test]
     fn strips_raw_byte_body_schemas() {
@@ -215,5 +223,37 @@ mod tests {
             lexicon["defs"]["main"]["output"]["schema"]["type"],
             "object"
         );
+    }
+
+    #[test]
+    fn later_lexicon_dirs_overlay_earlier_dirs() {
+        let reference = tempfile::tempdir().expect("reference tempdir");
+        let overlay = tempfile::tempdir().expect("overlay tempdir");
+
+        let relative = "blue/catbird/mlsChat/blue.catbird.mlsChat.example.json";
+        let reference_file = reference.path().join(relative);
+        let overlay_file = overlay.path().join(relative);
+        fs::create_dir_all(reference_file.parent().unwrap()).expect("reference dirs");
+        fs::create_dir_all(overlay_file.parent().unwrap()).expect("overlay dirs");
+
+        fs::write(
+            &reference_file,
+            r#"{"lexicon":1,"id":"blue.catbird.mlsChat.example","defs":{"main":{"type":"query","description":"reference"}}}"#,
+        )
+        .expect("write reference");
+        fs::write(
+            &overlay_file,
+            r#"{"lexicon":1,"id":"blue.catbird.mlsChat.example","defs":{"main":{"type":"query","description":"overlay"}}}"#,
+        )
+        .expect("write overlay");
+        fs::write(reference.path().join(".DS_Store"), "metadata").expect("write metadata");
+
+        let normalized =
+            normalize_lexicon_dirs(&[reference.path().to_path_buf(), overlay.path().to_path_buf()])
+                .expect("normalize lexicon dirs");
+
+        let output = fs::read_to_string(normalized.path().join(relative)).expect("read output");
+        assert!(output.contains("overlay"));
+        assert!(!normalized.path().join(".DS_Store").exists());
     }
 }

@@ -97,6 +97,16 @@ pub struct RateLimitedBody {
     scope: &'static str,
 }
 
+/// N29: structured 423 body for epoch-storm freezes. Mirrors
+/// `RateLimitedBody` for client backoff without text scraping.
+#[derive(Serialize)]
+pub struct GroupFrozenBody {
+    error: &'static str,
+    message: String,
+    #[serde(rename = "retryAfterSeconds")]
+    retry_after_seconds: i64,
+}
+
 pub enum XrpcError {
     /// Plain error: status + error-name + message.
     Plain(StatusCode, &'static str, String),
@@ -109,6 +119,8 @@ pub enum XrpcError {
     /// Layer 1 §1.2: 429 with structured `RateLimitedBody`. Sets
     /// `Retry-After` header from `retry_after_seconds`.
     RateLimited(RateLimitedBody),
+    /// N29: 423 with structured `GroupFrozenBody`. Sets `Retry-After`.
+    GroupFrozen(GroupFrozenBody),
 }
 
 impl XrpcError {
@@ -139,6 +151,15 @@ impl IntoResponse for XrpcError {
             XrpcError::RateLimited(body) => {
                 let retry = body.retry_after_seconds.max(0).to_string();
                 let mut resp = (StatusCode::TOO_MANY_REQUESTS, Json(body)).into_response();
+                if let Ok(val) = axum::http::HeaderValue::from_str(&retry) {
+                    resp.headers_mut()
+                        .insert(axum::http::header::RETRY_AFTER, val);
+                }
+                resp
+            }
+            XrpcError::GroupFrozen(body) => {
+                let retry = body.retry_after_seconds.max(0).to_string();
+                let mut resp = (StatusCode::LOCKED, Json(body)).into_response();
                 if let Ok(val) = axum::http::HeaderValue::from_str(&retry) {
                     resp.headers_mut()
                         .insert(axum::http::header::RETRY_AFTER, val);
@@ -225,6 +246,17 @@ fn internal_server_error(message: impl Into<String>) -> XrpcError {
     )
 }
 
+fn group_frozen_error(retry_after_seconds: i64) -> XrpcError {
+    let retry = retry_after_seconds.max(0);
+    XrpcError::GroupFrozen(GroupFrozenBody {
+        error: "GroupFrozen",
+        message: format!(
+            "Conversation is being repaired (epoch-storm circuit breaker). Retry after {retry} seconds."
+        ),
+        retry_after_seconds: retry,
+    })
+}
+
 /// Layer 1 §1.3: pre-flight freeze check. Returns `Err(XrpcError)` with HTTP
 /// 423 `GroupFrozen` if the group has been frozen by the epoch-storm circuit
 /// breaker and the freeze hasn't expired. Best-effort: DB read errors are
@@ -241,13 +273,7 @@ async fn check_group_frozen(pool: &sqlx::PgPool, convo_id: &str) -> Result<(), X
                     retry_after_secs = retry,
                     "commitGroupChange: rejected — group frozen by epoch-storm circuit breaker"
                 );
-                return Err(XrpcError::Plain(
-                    StatusCode::LOCKED,
-                    "GroupFrozen",
-                    format!(
-                        "Conversation is being repaired (epoch-storm circuit breaker). Retry after {retry} seconds."
-                    ),
-                ));
+                return Err(group_frozen_error(retry));
             }
             Ok(())
         }
@@ -3599,5 +3625,36 @@ mod tests {
             response.headers().get(header::CONTENT_TYPE).unwrap(),
             "application/json"
         );
+    }
+
+    /// N29: GroupFrozen must be machine-parseable like the existing
+    /// RateLimited body, so clients can back off without scraping text.
+    #[test]
+    fn group_frozen_body_serializes_retry_hint() {
+        let body = GroupFrozenBody {
+            error: "GroupFrozen",
+            message: "Conversation is being repaired".into(),
+            retry_after_seconds: 307,
+        };
+        let json = serde_json::to_value(&body).expect("serialize");
+        assert_eq!(json["error"], "GroupFrozen");
+        assert_eq!(json["retryAfterSeconds"], 307);
+        assert_eq!(json["message"], "Conversation is being repaired");
+    }
+
+    #[test]
+    fn group_frozen_into_response_is_423_with_retry_after() {
+        let err = XrpcError::GroupFrozen(GroupFrozenBody {
+            error: "GroupFrozen",
+            message: "x".into(),
+            retry_after_seconds: 42,
+        });
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::LOCKED);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "42");
     }
 }

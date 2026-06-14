@@ -185,7 +185,7 @@
         },
         {
           "name": "GroupFrozen",
-          "description": "Layer 1 robustness circuit breaker: the conversation has been temporarily frozen because the server detected an epoch-storm pattern (too many epoch advances within a short window). All epoch-advancing commits are rejected until the freeze auto-thaws. Returned as HTTP 423 Locked."
+          "description": "Layer 1 robustness circuit breaker: the conversation has been temporarily frozen because the server detected an epoch-storm pattern (too many epoch advances within a short window). All epoch-advancing commits are rejected until the freeze auto-thaws. Returned as HTTP 423 Locked with body shaped per #groupFrozenBody (retryAfterSeconds)."
         },
         {
           "name": "RateLimited",
@@ -215,6 +215,26 @@
           "type": "string",
           "description": "'convo' = per-conversation 30s limit. 'device-convo' = per-(device, group) 60s cooldown.",
           "knownValues": ["convo", "device-convo"]
+        }
+      }
+    },
+    "groupFrozenBody": {
+      "type": "object",
+      "description": "Structured 423 response body for GroupFrozen epoch-storm circuit-breaker rejections. Sent when the conversation is temporarily frozen and epoch-advancing operations should back off.",
+      "required": ["error", "message", "retryAfterSeconds"],
+      "properties": {
+        "error": {
+          "type": "string",
+          "description": "Always 'GroupFrozen'."
+        },
+        "message": {
+          "type": "string",
+          "description": "Human-readable explanation."
+        },
+        "retryAfterSeconds": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Seconds the client should wait before retrying. Mirrors the HTTP Retry-After header."
         }
       }
     },

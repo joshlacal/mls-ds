@@ -1529,6 +1529,122 @@ pub async fn store_key_package(
     store_key_package_with_device(pool, did, cipher_suite, key_data, expires_at, None, None).await
 }
 
+#[derive(Debug, Clone)]
+pub struct ValidatedKeyPackageBinding {
+    pub key_package_hash: String,
+    pub credential_identity: String,
+    pub leaf_signature_public_key: Vec<u8>,
+}
+
+fn validate_key_package_binding_sync(
+    did: &str,
+    key_data: &[u8],
+    expected_signature_public_key: Option<&[u8]>,
+) -> Result<ValidatedKeyPackageBinding> {
+    // Compute MLS-compliant hash_ref using OpenMLS.
+    use openmls::prelude::tls_codec::Deserialize;
+    use openmls::prelude::{KeyPackageIn, ProtocolVersion};
+
+    // Use libcrux crypto provider for post-quantum XWing cipher suite support.
+    let provider = openmls_libcrux_crypto::CryptoProvider::new()
+        .expect("Failed to initialize libcrux crypto provider");
+
+    // Deserialize and validate the key package.
+    let mut key_data_reader = key_data;
+    let kp_in = KeyPackageIn::tls_deserialize(&mut key_data_reader)
+        .context("Failed to deserialize key package")?;
+    let kp = kp_in
+        .validate(&provider, ProtocolVersion::default())
+        .context("Failed to validate key package")?;
+
+    // Extract and validate credential identity.
+    let credential = kp.leaf_node().credential();
+    let credential_identity = match credential.credential_type() {
+        openmls::credentials::CredentialType::Basic => {
+            let identity_bytes = credential.serialized_content();
+            String::from_utf8(identity_bytes.to_vec())
+                .context("Credential identity is not valid UTF-8")?
+        }
+        _ => {
+            bail!("Only BasicCredential is supported");
+        }
+    };
+
+    // Existing server policy is stricter than ADR-009's root-DID allowance:
+    // uploaded KPs must carry the bare owner DID, not a device fragment.
+    if credential_identity != did {
+        bail!(
+            "KeyPackage credential identity must be the bare user DID ({}), got {} instead. \
+             Device DIDs (with #device-id) are not allowed in MLS credentials.",
+            did,
+            credential_identity
+        );
+    }
+
+    let leaf_signature_public_key = kp.leaf_node().signature_key().as_slice().to_vec();
+    if let Some(expected) = expected_signature_public_key {
+        if leaf_signature_public_key.as_slice() != expected {
+            bail!("KeyPackage leaf signature public key does not match registered device key");
+        }
+    }
+
+    let hash_ref = kp
+        .hash_ref(&provider)
+        .context("Failed to compute hash_ref")?;
+    let key_package_hash = hex::encode(hash_ref.as_slice());
+
+    Ok(ValidatedKeyPackageBinding {
+        key_package_hash,
+        credential_identity,
+        leaf_signature_public_key,
+    })
+}
+
+pub async fn validate_key_package_binding(
+    did: &str,
+    key_data: &[u8],
+    expected_signature_public_key: Option<&[u8]>,
+) -> Result<ValidatedKeyPackageBinding> {
+    let parse_timeout_secs = std::env::var("KEY_PACKAGE_PARSE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(10);
+
+    let did_owned = did.to_string();
+    let key_data_for_parse = key_data.to_vec();
+    let expected_signature_public_key = expected_signature_public_key.map(|key| key.to_vec());
+    let _permit = KEY_PACKAGE_PARSE_LIMITER
+        .acquire()
+        .await
+        .context("Key package validation limiter closed")?;
+
+    let mut parse_task =
+        tokio::task::spawn_blocking(move || -> Result<ValidatedKeyPackageBinding> {
+            validate_key_package_binding_sync(
+                &did_owned,
+                &key_data_for_parse,
+                expected_signature_public_key.as_deref(),
+            )
+        });
+
+    match tokio::time::timeout(Duration::from_secs(parse_timeout_secs), &mut parse_task).await {
+        Ok(join_result) => join_result
+            .context("Key package validation task failed")?
+            .map_err(|e| {
+                tracing::error!("Key package validation detail: {:?}", e);
+                e
+            })
+            .context("Key package validation error"),
+        Err(_) => {
+            parse_task.abort();
+            bail!(
+                "Key package validation timed out after {}s",
+                parse_timeout_secs
+            );
+        }
+    }
+}
+
 /// Store a new key package with device information
 pub async fn store_key_package_with_device(
     pool: &DbPool,
@@ -1539,6 +1655,34 @@ pub async fn store_key_package_with_device(
     device_id: Option<String>,
     _credential_did: Option<String>, // Ignored - extracted from KeyPackage
 ) -> Result<KeyPackage> {
+    store_key_package_with_device_bound_to_signature(
+        pool,
+        did,
+        cipher_suite,
+        key_data,
+        expires_at,
+        device_id,
+        _credential_did,
+        None,
+    )
+    .await
+}
+
+/// Store a key package and, when provided, bind its MLS leaf signature key to
+/// the registered device key. This is the server-side ADR-009 hygiene gate for
+/// `registerDevice` and `publishKeyPackages`; clients still verify on fetch.
+pub async fn store_key_package_with_device_bound_to_signature(
+    pool: &DbPool,
+    did: &str,
+    cipher_suite: &str,
+    key_data: Vec<u8>,
+    expires_at: DateTime<Utc>,
+    device_id: Option<String>,
+    _credential_did: Option<String>, // Ignored - extracted from KeyPackage
+    expected_signature_public_key: Option<&[u8]>,
+) -> Result<KeyPackage> {
+    let binding =
+        validate_key_package_binding(did, &key_data, expected_signature_public_key).await?;
     let now = Utc::now();
     let id = Uuid::new_v4().to_string();
 
@@ -1557,90 +1701,6 @@ pub async fn store_key_package_with_device(
     .await
     .context("Failed to ensure user exists")?;
 
-    let parse_timeout_secs = std::env::var("KEY_PACKAGE_PARSE_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(10);
-
-    let did_owned = did.to_string();
-    let key_data_for_parse = key_data.clone();
-    let _permit = KEY_PACKAGE_PARSE_LIMITER
-        .acquire()
-        .await
-        .context("Key package validation limiter closed")?;
-
-    let mut parse_task = tokio::task::spawn_blocking(move || -> Result<(String, String)> {
-        // Compute MLS-compliant hash_ref using OpenMLS
-        use openmls::prelude::tls_codec::Deserialize;
-        use openmls::prelude::{KeyPackageIn, ProtocolVersion};
-
-        // Use libcrux crypto provider for post-quantum XWing cipher suite support
-        let provider = openmls_libcrux_crypto::CryptoProvider::new()
-            .expect("Failed to initialize libcrux crypto provider");
-
-        // Deserialize and validate the key package
-        let kp_in = KeyPackageIn::tls_deserialize(&mut key_data_for_parse.as_slice())
-            .context("Failed to deserialize key package")?;
-        let kp = kp_in
-            .validate(&provider, ProtocolVersion::default())
-            .context("Failed to validate key package")?;
-
-        // Extract and validate credential identity
-        let credential = kp.leaf_node().credential();
-        let credential_identity = match credential.credential_type() {
-            openmls::credentials::CredentialType::Basic => {
-                // Extract identity bytes from BasicCredential
-                let identity_bytes = credential.serialized_content();
-                String::from_utf8(identity_bytes.to_vec())
-                    .context("Credential identity is not valid UTF-8")?
-            }
-            _ => {
-                bail!("Only BasicCredential is supported");
-            }
-        };
-
-        // Validate that credential identity is the bare DID (owner_did)
-        // This enforces the "bare DID only" policy - no device DIDs allowed in MLS credentials
-        if credential_identity != did_owned {
-            bail!(
-                "KeyPackage credential identity must be the bare user DID ({}), got {} instead. \
-                     Device DIDs (with #device-id) are not allowed in MLS credentials.",
-                did_owned,
-                credential_identity
-            );
-        }
-
-        // Compute the MLS-defined hash reference
-        let hash_ref = kp
-            .hash_ref(&provider)
-            .context("Failed to compute hash_ref")?;
-        let key_package_hash = hex::encode(hash_ref.as_slice());
-
-        Ok((key_package_hash, credential_identity))
-    });
-
-    let (key_package_hash, credential_identity) = match tokio::time::timeout(
-        Duration::from_secs(parse_timeout_secs),
-        &mut parse_task,
-    )
-    .await
-    {
-        Ok(join_result) => join_result
-            .context("Key package validation task failed")?
-            .map_err(|e| {
-                tracing::error!("Key package validation detail: {:?}", e);
-                e
-            })
-            .context("Key package validation error")?,
-        Err(_) => {
-            parse_task.abort();
-            bail!(
-                "Key package validation timed out after {}s",
-                parse_timeout_secs
-            );
-        }
-    };
-
     // Store with the verified credential identity (not the client-provided one)
     let result = sqlx::query_as::<_, KeyPackage>(
         r#"
@@ -1653,11 +1713,11 @@ pub async fn store_key_package_with_device(
     .bind(did)
     .bind(cipher_suite)
     .bind(&key_data)
-    .bind(&key_package_hash)
+    .bind(&binding.key_package_hash)
     .bind(now)
     .bind(expires_at)
     .bind(device_id)
-    .bind(&credential_identity)  // Use verified identity from KeyPackage, not client param
+    .bind(&binding.credential_identity)  // Use verified identity from KeyPackage, not client param
     .fetch_one(pool)
     .await
     .context("Failed to store key package")?;
@@ -3122,6 +3182,75 @@ mod tests {
             .key_package()
             .tls_serialize_detached()
             .expect("serialize key package")
+    }
+
+    fn generate_key_package_bytes_and_signature_key(identity: &str) -> (Vec<u8>, Vec<u8>) {
+        use openmls::prelude::{tls_codec::Serialize as TlsSerialize, *};
+        use openmls_basic_credential::SignatureKeyPair;
+        use openmls_traits::OpenMlsProvider;
+
+        let provider = openmls_libcrux_crypto::Provider::new().expect("libcrux provider");
+        let ciphersuite = Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519;
+
+        let credential = BasicCredential::new(identity.as_bytes().to_vec());
+        let signature_keys =
+            SignatureKeyPair::new(ciphersuite.signature_algorithm()).expect("signature keypair");
+        signature_keys
+            .store(provider.storage())
+            .expect("store signature keys");
+
+        let signature_public_key = signature_keys.to_public_vec();
+        let credential_with_key = CredentialWithKey {
+            credential: credential.into(),
+            signature_key: signature_public_key.clone().into(),
+        };
+
+        let bundle = KeyPackage::builder()
+            .build(ciphersuite, &provider, &signature_keys, credential_with_key)
+            .expect("build key package");
+
+        (
+            bundle
+                .key_package()
+                .tls_serialize_detached()
+                .expect("serialize key package"),
+            signature_public_key,
+        )
+    }
+
+    #[test]
+    fn key_package_binding_rejects_leaf_signature_mismatch() {
+        let (key_data, package_signature_key) =
+            generate_key_package_bytes_and_signature_key("did:plc:bounduser");
+        let wrong_signature_key = vec![0x7b; package_signature_key.len()];
+
+        let err = validate_key_package_binding_sync(
+            "did:plc:bounduser",
+            &key_data,
+            Some(&wrong_signature_key),
+        )
+        .expect_err("mismatched registered device key must be rejected");
+
+        assert!(
+            format!("{err:#}").contains("leaf signature public key"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn key_package_binding_accepts_matching_leaf_signature() {
+        let (key_data, package_signature_key) =
+            generate_key_package_bytes_and_signature_key("did:plc:bounduser");
+
+        let binding = validate_key_package_binding_sync(
+            "did:plc:bounduser",
+            &key_data,
+            Some(&package_signature_key),
+        )
+        .expect("matching registered device key must be accepted");
+
+        assert_eq!(binding.credential_identity, "did:plc:bounduser");
+        assert_eq!(binding.leaf_signature_public_key, package_signature_key);
     }
 
     #[tokio::test]

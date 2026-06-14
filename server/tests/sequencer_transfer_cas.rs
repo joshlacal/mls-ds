@@ -163,3 +163,47 @@ async fn initiate_transfer_rejects_owner_change_between_read_and_update() {
 
     common::cleanup(&pool, &convo_id).await;
 }
+
+/// WS-4 rung 2 (ADR-010 D4): after a sequencer transfer is accepted, the
+/// conversation's API projection (`convoView.sequencerDid`) must report the
+/// NEW sequencer — not the previous owner and not the local default.
+#[tokio::test]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+async fn transferred_conversation_reports_new_sequencer_in_convo_view() {
+    use catbird_server::models::Conversation;
+
+    let pool = common::setup_test_db().await;
+    let convo_id = format!("ws4-rung2-transfer-view-{}", Uuid::new_v4());
+    let from_ds = format!("did:web:sequencer-from-{}.example", Uuid::new_v4());
+    let accepting_ds = format!("did:web:sequencer-accept-{}.example", Uuid::new_v4());
+    let local_ds = "did:web:local-ds.example";
+
+    seed_conversation(&pool, &convo_id, &from_ds, 5).await;
+
+    let transfer = SequencerTransfer::new(pool.clone(), accepting_ds.clone());
+    transfer
+        .accept_transfer(&convo_id, &from_ds, 6)
+        .await
+        .expect("accept_transfer succeeds without contention");
+
+    let convo: Conversation = sqlx::query_as(
+        "SELECT id, creator_did, current_epoch, created_at, updated_at, cipher_suite, \
+                confirmation_tag, sequencer_ds, is_remote, group_id, reset_count \
+         FROM conversations WHERE id = $1",
+    )
+    .bind(&convo_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load transferred conversation");
+
+    let view = convo
+        .to_convo_view(vec![], Some(local_ds))
+        .expect("to_convo_view");
+    assert_eq!(
+        view.sequencer_did.as_ref().map(|d| d.as_str()),
+        Some(accepting_ds.as_str()),
+        "convoView.sequencerDid must report the NEW sequencer after transfer"
+    );
+
+    common::cleanup(&pool, &convo_id).await;
+}

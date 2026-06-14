@@ -142,6 +142,32 @@ async fn handle_register(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    for (idx, kp) in input.key_packages.iter().enumerate() {
+        let key_data = kp.key_package.to_vec();
+        if key_data.is_empty() {
+            warn!("Empty key package at index {}", idx);
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        if *kp.expires.as_ref() <= Utc::now().fixed_offset() {
+            warn!("Key package {} has past expiration", idx);
+            return Err(StatusCode::BAD_REQUEST);
+        }
+
+        if let Err(e) = crate::db::validate_key_package_binding(
+            &user_did,
+            &key_data,
+            Some(&input.signature_public_key),
+        )
+        .await
+        {
+            warn!(
+                "Rejected key package {} during pre-registration validation: {:#}",
+                idx, e
+            );
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+
     let mut device_id = Uuid::new_v4().to_string();
     let now = Utc::now();
     let sig_key_hex = hex::encode(&input.signature_public_key);
@@ -393,7 +419,7 @@ async fn handle_register(
             continue;
         }
 
-        match crate::db::store_key_package_with_device(
+        match crate::db::store_key_package_with_device_bound_to_signature(
             pool,
             &user_did,
             kp.cipher_suite.as_ref(),
@@ -401,11 +427,18 @@ async fn handle_register(
             kp.expires.as_ref().with_timezone(&Utc),
             Some(device_id.clone()),
             None,
+            Some(&input.signature_public_key),
         )
         .await
         {
             Ok(_) => stored_count += 1,
-            Err(e) => error!("Failed to store key package {}: {}", idx, e),
+            Err(e) => {
+                warn!(
+                    "Rejected key package {} during device registration: {:#}",
+                    idx, e
+                );
+                return Err(StatusCode::BAD_REQUEST);
+            }
         }
     }
     info!(

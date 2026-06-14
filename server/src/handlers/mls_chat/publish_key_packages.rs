@@ -34,6 +34,7 @@ struct DeviceScope {
     raw_device_id: String,
     storage_device_id: String,
     storage_candidates: Vec<String>,
+    signature_public_key: Option<Vec<u8>>,
 }
 
 async fn resolve_device_scope(
@@ -47,12 +48,13 @@ async fn resolve_device_scope(
             raw_device_id: String::new(),
             storage_device_id: String::new(),
             storage_candidates: Vec::new(),
+            signature_public_key: None,
         });
     }
 
     let credential_did = format!("{}#{}", user_did, raw_device_id);
-    let canonical: Option<String> = sqlx::query_scalar(
-        "SELECT device_id FROM devices \
+    let canonical: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT device_id, signature_public_key FROM devices \
          WHERE user_did = $1 \
            AND (device_id = $2 OR device_uuid = $2 OR credential_did = $3) \
          ORDER BY registered_at DESC \
@@ -72,7 +74,27 @@ async fn resolve_device_scope(
     })?;
 
     let legacy_bucket = crate::device_utils::bucket_device_id(user_did, raw_device_id);
-    let storage_device_id = canonical.unwrap_or_else(|| raw_device_id.to_string());
+    let (storage_device_id, signature_public_key) =
+        if let Some((device_id, signature_public_key_hex)) = canonical {
+            let signature_public_key = match signature_public_key_hex
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                Some(value) => Some(hex::decode(value).map_err(|e| {
+                    error!(
+                        "Registered device signature_public_key is not valid hex for {}: {}",
+                        crate::crypto::hash_for_log(user_did),
+                        e
+                    );
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?),
+                None => None,
+            };
+            (device_id, signature_public_key)
+        } else {
+            (raw_device_id.to_string(), None)
+        };
     let mut storage_candidates = vec![storage_device_id.clone(), raw_device_id.to_string()];
     if !legacy_bucket.is_empty() {
         storage_candidates.push(legacy_bucket);
@@ -84,7 +106,19 @@ async fn resolve_device_scope(
         raw_device_id: raw_device_id.to_string(),
         storage_device_id,
         storage_candidates,
+        signature_public_key,
     })
+}
+
+fn map_key_package_store_error(e: anyhow::Error) -> StatusCode {
+    let detail = format!("{e:#}");
+    if detail.contains("Failed to store key package")
+        || detail.contains("Failed to ensure user exists")
+    {
+        StatusCode::INTERNAL_SERVER_ERROR
+    } else {
+        StatusCode::BAD_REQUEST
+    }
 }
 
 /// Build the `stats` object matching the lexicon `#keyPackageStats` shape:
@@ -177,6 +211,7 @@ async fn handle_publish(
     input: &crate::generated::blue_catbird::mlsChat::publish_key_packages::PublishKeyPackages<'_>,
     user_did: &str,
     device_id: &str,
+    expected_signature_public_key: &[u8],
 ) -> Result<PublishResult<'static>, StatusCode> {
     let items = input.key_packages.as_ref().ok_or_else(|| {
         warn!("publish action requires keyPackages");
@@ -220,7 +255,7 @@ async fn handle_publish(
         Some(device_id.to_string())
     };
 
-    crate::db::store_key_package_with_device(
+    crate::db::store_key_package_with_device_bound_to_signature(
         pool,
         user_did,
         item.cipher_suite.as_ref(),
@@ -228,11 +263,13 @@ async fn handle_publish(
         expires_dt.with_timezone(&Utc),
         dev,
         None,
+        Some(expected_signature_public_key),
     )
     .await
     .map_err(|e| {
-        error!("Failed to store key package: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
+        let status = map_key_package_store_error(e);
+        error!("Failed to store key package: status={}", status);
+        status
     })?;
 
     info!("Key package published successfully");
@@ -252,6 +289,7 @@ async fn handle_publish_batch(
     input: &crate::generated::blue_catbird::mlsChat::publish_key_packages::PublishKeyPackages<'_>,
     user_did: &str,
     device_scope: &DeviceScope,
+    expected_signature_public_key: &[u8],
 ) -> Result<PublishResult<'static>, StatusCode> {
     let items = input.key_packages.as_ref().ok_or_else(|| {
         warn!("publishBatch action requires keyPackages");
@@ -498,7 +536,7 @@ async fn handle_publish_batch(
             }
         }
 
-        match crate::db::store_key_package_with_device(
+        match crate::db::store_key_package_with_device_bound_to_signature(
             pool,
             user_did,
             item.cipher_suite.as_ref(),
@@ -506,15 +544,24 @@ async fn handle_publish_batch(
             item.expires.as_ref().with_timezone(&Utc),
             dev.clone(),
             None,
+            Some(expected_signature_public_key),
         )
         .await
         {
             Ok(_) => succeeded += 1,
             Err(e) => {
-                error!("Failed to store key package {}: {}", idx, e);
+                let status = map_key_package_store_error(e);
+                error!(
+                    "Failed to store key package {} during batch: status={}",
+                    idx, status
+                );
                 errors.push(BatchError {
                     index: idx as i64,
-                    error: format!("Database error: {}", e).into(),
+                    error: if status == StatusCode::BAD_REQUEST {
+                        "Key package credential binding failed".to_string().into()
+                    } else {
+                        "Database error".to_string().into()
+                    },
                     extra_data: Default::default(),
                 });
                 failed += 1;
@@ -945,6 +992,14 @@ pub async fn publish_key_packages_post(
 
     match input.action.as_ref() {
         "publish" => {
+            let Some(expected_signature_public_key) = device_scope.signature_public_key.as_deref()
+            else {
+                warn!(
+                    "publishKeyPackages: publish rejected because device {} is not registered with a signature key",
+                    device_scope.raw_device_id
+                );
+                return Err(StatusCode::FORBIDDEN);
+            };
             let publish_result = if input
                 .key_packages
                 .as_ref()
@@ -952,9 +1007,24 @@ pub async fn publish_key_packages_post(
                 .unwrap_or(false)
             {
                 warn!("publish action received multiple key packages; handling as publishBatch");
-                handle_publish_batch(&pool, &headers, &input, &user_did, &device_scope).await?
+                handle_publish_batch(
+                    &pool,
+                    &headers,
+                    &input,
+                    &user_did,
+                    &device_scope,
+                    expected_signature_public_key,
+                )
+                .await?
             } else {
-                handle_publish(&pool, &input, &user_did, storage_device_id).await?
+                handle_publish(
+                    &pool,
+                    &input,
+                    &user_did,
+                    storage_device_id,
+                    expected_signature_public_key,
+                )
+                .await?
             };
             let stats = build_stats(&pool, &user_did, Some(&device_scope)).await?;
             Ok(Json(PublishKeyPackagesOutput {
@@ -967,8 +1037,23 @@ pub async fn publish_key_packages_post(
         }
 
         "publishBatch" => {
-            let publish_result =
-                handle_publish_batch(&pool, &headers, &input, &user_did, &device_scope).await?;
+            let Some(expected_signature_public_key) = device_scope.signature_public_key.as_deref()
+            else {
+                warn!(
+                    "publishKeyPackages: publishBatch rejected because device {} is not registered with a signature key",
+                    device_scope.raw_device_id
+                );
+                return Err(StatusCode::FORBIDDEN);
+            };
+            let publish_result = handle_publish_batch(
+                &pool,
+                &headers,
+                &input,
+                &user_did,
+                &device_scope,
+                expected_signature_public_key,
+            )
+            .await?;
             let stats = build_stats(&pool, &user_did, Some(&device_scope)).await?;
             Ok(Json(PublishKeyPackagesOutput {
                 stats,

@@ -54,6 +54,20 @@ pub fn reconcile_hashes(
     (server_only, local_only, device_verified)
 }
 
+pub fn merge_reconcile_server_hashes(
+    available_hashes: &[String],
+    pending_welcome_hashes: &[String],
+) -> Vec<String> {
+    let mut merged: Vec<String> = available_hashes
+        .iter()
+        .chain(pending_welcome_hashes.iter())
+        .cloned()
+        .collect();
+    merged.sort();
+    merged.dedup();
+    merged
+}
+
 fn authorize_device(auth_did: &str, device_did: &str) -> Result<(String, String), StatusCode> {
     let (auth_owner_did, _) = parse_device_did(auth_did).map_err(|e| {
         warn!("reconcileKeyPackages: invalid auth DID: {}", e);
@@ -104,7 +118,7 @@ pub async fn reconcile_key_packages(
     }
     let bucketed_device_id = bucket_device_id(&owner_did, &raw_device_id);
 
-    let server_hashes: Vec<String> = sqlx::query_scalar(
+    let available_hashes: Vec<String> = sqlx::query_scalar(
         r#"
         SELECT key_package_hash
         FROM key_packages
@@ -126,6 +140,37 @@ pub async fn reconcile_key_packages(
         error!("reconcileKeyPackages: failed to fetch server hashes: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+
+    let pending_welcome_hashes: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT DISTINCT encode(wm.key_package_hash, 'hex')
+        FROM welcome_messages wm
+        JOIN key_packages kp
+          ON kp.owner_did = $1
+         AND kp.key_package_hash = encode(wm.key_package_hash, 'hex')
+        WHERE (wm.recipient_did = $1 OR wm.recipient_did = $4)
+          AND wm.consumed = false
+          AND wm.key_package_hash IS NOT NULL
+          AND (kp.device_id = $2 OR kp.device_id = $3 OR kp.device_id IS NULL)
+          AND kp.dead_at IS NULL
+        ORDER BY encode(wm.key_package_hash, 'hex')
+        "#,
+    )
+    .bind(&owner_did)
+    .bind(&bucketed_device_id)
+    .bind(&raw_device_id)
+    .bind(&device_did)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| {
+        error!(
+            "reconcileKeyPackages: failed to fetch pending welcome hashes: {}",
+            e
+        );
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let server_hashes = merge_reconcile_server_hashes(&available_hashes, &pending_welcome_hashes);
 
     let (server_only, local_only, device_verified) =
         reconcile_hashes(&server_hashes, &input.local_hashes);
@@ -166,7 +211,7 @@ pub async fn reconcile_key_packages(
 
 #[cfg(test)]
 mod tests {
-    use super::reconcile_hashes;
+    use super::{merge_reconcile_server_hashes, reconcile_hashes};
 
     #[test]
     fn reconcile_hashes_returns_bidirectional_diff() {
@@ -189,6 +234,25 @@ mod tests {
 
         assert!(server_only.is_empty());
         assert!(local_only.is_empty());
+        assert!(verified);
+    }
+
+    #[test]
+    fn pending_welcome_hashes_are_reconcile_known_hashes() {
+        let available = vec!["available-hash".to_string()];
+        let pending_welcome = vec!["consumed-welcome-hash".to_string()];
+        let server = merge_reconcile_server_hashes(&available, &pending_welcome);
+        let local = vec![
+            "available-hash".to_string(),
+            "consumed-welcome-hash".to_string(),
+        ];
+
+        let (_server_only, local_only, verified) = reconcile_hashes(&server, &local);
+
+        assert!(
+            local_only.is_empty(),
+            "a key package with an unconsumed Welcome must not be reported local-only"
+        );
         assert!(verified);
     }
 }

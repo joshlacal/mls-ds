@@ -77,7 +77,7 @@
             "sequencerDs": {
               "type": "string",
               "format": "did",
-              "description": "DID of the delivery service acting as sequencer for this conversation"
+              "description": "DID of the delivery service acting as sequencer for this conversation. Deprecated: read convo.sequencerDid instead."
             }
           }
         }

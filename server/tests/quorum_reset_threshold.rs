@@ -18,6 +18,7 @@
 //! including migration `20260418_001` (reset_votes/auto_reset_history) and
 //! `20260426_002` (commit-health columns). Run with:
 //!   TEST_DATABASE_URL=postgres://… \
+//!   SERVICE_DID=did:web:mls.test \
 //!     cargo test -p catbird-server --test quorum_reset_threshold -- --ignored
 //!
 //! Plan: docs/superpowers/plans/2026-04-26-mls-auto-reset-phase2.md (Task 4)
@@ -33,6 +34,11 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 
 const AUTH: &str = "deadbeef00cafe";
+
+fn expected_service_did() -> String {
+    std::env::var("SERVICE_DID")
+        .expect("SERVICE_DID must be set for quorum_reset_threshold ignored tests")
+}
 
 async fn wipe(pool: &PgPool, convo_id: &str) {
     for table in &[
@@ -229,9 +235,10 @@ async fn two_mode_b_reports_on_5_member_group_trigger_reset_when_enforce_flag_tr
         "group_id rotated in DB"
     );
     assert_ne!(state.group_id.as_deref(), Some(initial_group_id));
+    let service_did = expected_service_did();
     assert_eq!(
         state.last_reset_by.as_deref(),
-        Some("system:client_quorum"),
+        Some(service_did.as_str()),
         "Phase 2 marker"
     );
     assert_eq!(state.reset_count, Some(1));
@@ -357,7 +364,8 @@ async fn single_mode_b_in_dm_triggers_reset() {
 
     let state = fetch_state(&pool, convo_id).await;
     assert_ne!(state.group_id.as_deref(), Some(initial_group_id));
-    assert_eq!(state.last_reset_by.as_deref(), Some("system:client_quorum"));
+    let service_did = expected_service_did();
+    assert_eq!(state.last_reset_by.as_deref(), Some(service_did.as_str()));
 
     actor.stop(None);
     wipe(&pool, convo_id).await;
@@ -424,7 +432,8 @@ async fn flag_disabled_counts_both_modes() {
 
     let state = fetch_state(&pool, convo_id).await;
     assert_ne!(state.group_id.as_deref(), Some(initial_group_id));
-    assert_eq!(state.last_reset_by.as_deref(), Some("system:client_quorum"));
+    let service_did = expected_service_did();
+    assert_eq!(state.last_reset_by.as_deref(), Some(service_did.as_str()));
     assert_eq!(state.reset_count, Some(1));
 
     actor.stop(None);

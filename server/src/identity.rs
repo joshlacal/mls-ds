@@ -46,6 +46,36 @@ pub fn service_did_base() -> String {
     canonical_did(&service_did()).to_string()
 }
 
+/// Non-panicking variant of [`service_did_base`] for client-facing
+/// *projection* paths (ADR-010 D4 / WS-4 rung 2: `convoView.sequencerDid`).
+///
+/// Rung 2 exposes the sequencer DID for observability only — nothing routes
+/// on it yet — so a dev/test server without `SERVICE_DID` must omit the
+/// field (with a one-time warning) rather than fail `getConvos`/`createConvo`
+/// (ADR-010 ambiguity A5). Authz, federation, and ticket-issuance paths keep
+/// the fail-loudly [`service_did`] accessor (N31, WS-1.4). Once clients
+/// route on `sequencerDid` (WS-4 rung 3), revisit per D4 rule 2.
+pub fn service_did_base_opt() -> Option<String> {
+    service_did_base_opt_from_env_value(std::env::var("SERVICE_DID"))
+}
+
+fn service_did_base_opt_from_env_value(raw: Result<String, std::env::VarError>) -> Option<String> {
+    let value = raw
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    if value.is_none() {
+        static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+        WARN_ONCE.call_once(|| {
+            tracing::warn!(
+                "SERVICE_DID is unset/empty; convoView.sequencerDid will be omitted \
+                 (ADR-010 D4 rung-2 projection). Configure SERVICE_DID for production."
+            );
+        });
+    }
+    value.map(|v| canonical_did(&v).to_string())
+}
+
 /// Fail-loudly accessor for this DS's public HTTPS endpoint.
 ///
 /// Resolution order:
@@ -211,6 +241,28 @@ mod tests {
     fn self_endpoint_panics_when_unset_and_did_not_web() {
         let _ =
             self_endpoint_from_env_values(Err(std::env::VarError::NotPresent), "did:plc:abc123xyz");
+    }
+
+    #[test]
+    fn service_did_base_opt_strips_fragment_and_trims() {
+        assert_eq!(
+            service_did_base_opt_from_env_value(Ok(
+                " did:web:example.test#atproto_mls ".to_string()
+            )),
+            Some("did:web:example.test".to_string())
+        );
+    }
+
+    #[test]
+    fn service_did_base_opt_none_when_missing_or_empty() {
+        assert_eq!(
+            service_did_base_opt_from_env_value(Err(std::env::VarError::NotPresent)),
+            None
+        );
+        assert_eq!(
+            service_did_base_opt_from_env_value(Ok("   ".to_string())),
+            None
+        );
     }
 
     #[test]

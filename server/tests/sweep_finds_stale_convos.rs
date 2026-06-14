@@ -13,6 +13,7 @@
 //! Postgres is only required when explicitly requested via
 //! `TEST_DATABASE_URL`). Run with:
 //!   TEST_DATABASE_URL=postgres://… \
+//!   SERVICE_DID=did:web:mls.test \
 //!     cargo test -p catbird-server --test sweep_finds_stale_convos -- --ignored
 //!
 //! Plan: docs/superpowers/plans/2026-04-26-mls-auto-reset-phase2.md (Task 12)
@@ -26,6 +27,11 @@ use catbird_server::realtime::SseState;
 use sqlx::PgPool;
 use std::sync::Arc;
 use std::time::Duration;
+
+fn expected_service_did() -> String {
+    std::env::var("SERVICE_DID")
+        .expect("SERVICE_DID must be set for sweep_finds_stale_convos ignored tests")
+}
 
 async fn wipe(pool: &PgPool, convo_id: &str) {
     for table in &[
@@ -140,10 +146,11 @@ async fn sweep_picks_up_convo_matching_all_conditions() {
 
     let post_group_id = fetch_group_id(&pool, convo_id).await;
     let post_last_reset_by = fetch_last_reset_by(&pool, convo_id).await;
+    let service_did = expected_service_did();
     assert_eq!(
         post_last_reset_by.as_deref(),
-        Some("system:server_sweep"),
-        "last_reset_by must carry the system:server_sweep marker"
+        Some(service_did.as_str()),
+        "last_reset_by must carry the configured service DID"
     );
     assert_ne!(
         post_group_id.as_deref(),
