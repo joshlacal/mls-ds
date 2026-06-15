@@ -11,6 +11,7 @@ COPY --from=catbird-atproto / /catbird-atproto
 COPY Cargo.toml Cargo.lock* ./
 COPY server/Cargo.toml server/Cargo.toml
 COPY codegen/Cargo.toml codegen/Cargo.toml
+COPY vendor vendor
 RUN mkdir -p server/src codegen/src \
     && echo "fn main() {}" > server/src/main.rs \
     && echo "" > server/src/lib.rs \
