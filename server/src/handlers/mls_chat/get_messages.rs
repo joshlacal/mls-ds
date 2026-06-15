@@ -118,7 +118,7 @@ pub async fn get_messages(
                 fetch_app_messages(&pool, did, &convo_id, since_seq, limit, join_epoch).await?;
             let commits = fetch_commits(&pool, did, &convo_id, from_epoch, to_epoch).await?;
             messages.extend(commits);
-            messages.sort_by(|a, b| a.seq.cmp(&b.seq));
+            messages.sort_by_key(|message| message.seq);
             Ok(Json(GetMessagesOutput {
                 messages,
                 last_seq,
