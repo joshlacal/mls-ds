@@ -299,6 +299,7 @@ jobs:
     outputs:
       image-tag: ${{ steps.meta.outputs.tags }}
       image-digest: ${{ steps.build.outputs.digest }}
+      image_ref: ${{ steps.image_ref.outputs.ref }}
 
     steps:
       - name: Checkout code
@@ -348,10 +349,14 @@ jobs:
           # or separate matrix job before making multi-arch images required.
           platforms: linux/amd64
 
+      - name: Record immutable image reference
+        id: image_ref
+        run: echo "ref=${REGISTRY}/${IMAGE_NAME}@${{ steps.build.outputs.digest }}" >> "$GITHUB_OUTPUT"
+
       - name: Generate SBOM
         uses: anchore/sbom-action@f325610c9f50a54015d37c8d16cb3b0e2c8f4de0 # v0.18.0
         with:
-          image: ${{ steps.meta.outputs.tags }}
+          image: ${{ steps.image_ref.outputs.ref }}
           format: spdx-json
           output-file: sbom.spdx.json
 
@@ -366,6 +371,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     permissions:
+      contents: read
+      packages: read
       security-events: write
     
     steps:
@@ -375,7 +382,7 @@ jobs:
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@18f2510ee396bbf400402947e795f7e35b3cb404 # 0.30.0
         with:
-          image-ref: ${{ needs.build.outputs.image-tag }}
+          image-ref: ${{ needs.build.outputs.image_ref }}
           format: 'sarif'
           output: 'trivy-results.sarif'
 
@@ -407,14 +414,14 @@ jobs:
       - name: Deploy to staging
         env:
           KUBE_CONFIG: ${{ secrets.STAGING_KUBE_CONFIG }}
-          IMAGE_TAG: ${{ needs.build.outputs.image-tag }}
+          IMAGE_TAG: ${{ needs.build.outputs.image_ref }}
         run: |
           echo "$KUBE_CONFIG" | base64 -d > /tmp/kubeconfig
           export KUBECONFIG=/tmp/kubeconfig
           
           # Apply Kubernetes manifests
           kubectl set image deployment/mls-server \
-            mls-server=${{ needs.build.outputs.image-tag }} \
+            mls-server="${IMAGE_TAG}" \
             -n staging
           
           # Wait for rollout
@@ -441,7 +448,7 @@ jobs:
     name: Deploy to Production
     needs: [build, security-scan]
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production')
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production'
     environment:
       name: production
       url: https://mls.catbird.blue
@@ -467,14 +474,14 @@ jobs:
       - name: Deploy to production (Blue-Green)
         env:
           KUBE_CONFIG: ${{ secrets.PROD_KUBE_CONFIG }}
-          IMAGE_TAG: ${{ needs.build.outputs.image-tag }}
+          IMAGE_TAG: ${{ needs.build.outputs.image_ref }}
         run: |
           echo "$KUBE_CONFIG" | base64 -d > /tmp/kubeconfig
           export KUBECONFIG=/tmp/kubeconfig
           
           # Deploy to green environment
           kubectl set image deployment/mls-server-green \
-            mls-server=${{ needs.build.outputs.image-tag }} \
+            mls-server="${IMAGE_TAG}" \
             -n production
           
           # Wait for rollout
