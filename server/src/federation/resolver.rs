@@ -494,9 +494,9 @@ fn extract_service<'a>(
 /// `https://ds.example.com:8443` → `did:web:ds.example.com%3A8443` (did:web
 /// percent-encodes the port colon). Hosts are lowercased. Endpoints with path
 /// components or non-HTTPS schemes return `None` — the caller then falls back
-/// to legacy user-DID cache keying. Authoritative DS-DID discovery
-/// (`/.well-known/did.json` served by mls-ds) is ADR-010 Stage 4; non-did:web
-/// DSes are out of scope until then.
+/// to legacy user-DID cache keying. Authoritative DS-DID discovery from the
+/// mls-ds served well-known DID document is ADR-010 Stage 4; non-did:web DSes
+/// are out of scope until then.
 fn derive_ds_did_from_https_endpoint(endpoint: &str) -> Option<String> {
     let parsed = url::Url::parse(endpoint).ok()?;
     if parsed.scheme() != "https" {
