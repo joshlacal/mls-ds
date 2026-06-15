@@ -17,9 +17,11 @@
 // duplication so this allow can be retired.
 #![allow(dead_code)]
 
+#[cfg(debug_assertions)]
+use axum::routing::any;
 use axum::{
     extract::{DefaultBodyLimit, FromRef},
-    routing::{any, get, post},
+    routing::{get, post},
     Router,
 };
 use sqlx::PgPool;
@@ -600,7 +602,7 @@ async fn main() -> anyhow::Result<()> {
         Router::new()
     };
 
-    let mut base_router = Router::new()
+    let base_router = Router::new()
         // Health check endpoints
         .route("/health", get(health::health))
         .route("/health/live", get(health::liveness))
@@ -624,22 +626,26 @@ async fn main() -> anyhow::Result<()> {
     // ⚠️ SECURITY: Developer-only direct XRPC proxy - NEVER enable in production
     // This is gated with #[cfg(debug_assertions)] to prevent accidental production use
     #[cfg(debug_assertions)]
-    if matches!(
-        std::env::var("ENABLE_DIRECT_XRPC_PROXY").as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE")
-    ) {
-        let upstream = std::env::var("UPSTREAM_XRPC_BASE")
-            .unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
-        let proxy_state = xrpc_proxy::ProxyState {
-            client: reqwest::Client::new(),
-            base: upstream,
-        };
-        let proxy_router = Router::new()
-            .route("/xrpc/*rest", any(xrpc_proxy::proxy))
-            .with_state(proxy_state);
-        base_router = base_router.merge(proxy_router);
-        tracing::warn!("⚠️  ENABLE_DIRECT_XRPC_PROXY is enabled (DEBUG BUILD ONLY); forward-all /xrpc/* is active");
-    }
+    let base_router = {
+        let mut base_router = base_router;
+        if matches!(
+            std::env::var("ENABLE_DIRECT_XRPC_PROXY").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE")
+        ) {
+            let upstream = std::env::var("UPSTREAM_XRPC_BASE")
+                .unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
+            let proxy_state = xrpc_proxy::ProxyState {
+                client: reqwest::Client::new(),
+                base: upstream,
+            };
+            let proxy_router = Router::new()
+                .route("/xrpc/*rest", any(xrpc_proxy::proxy))
+                .with_state(proxy_state);
+            base_router = base_router.merge(proxy_router);
+            tracing::warn!("⚠️  ENABLE_DIRECT_XRPC_PROXY is enabled (DEBUG BUILD ONLY); forward-all /xrpc/* is active");
+        }
+        base_router
+    };
 
     // Refuse to start if proxy is requested in release mode
     #[cfg(not(debug_assertions))]
