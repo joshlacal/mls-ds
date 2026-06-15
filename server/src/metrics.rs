@@ -223,8 +223,72 @@ pub async fn metrics_handler(
         }
     }
 
-    let metrics = handle.render();
+    let metrics = render_prometheus_metrics(&handle);
     (StatusCode::OK, metrics).into_response()
+}
+
+fn render_prometheus_metrics(handle: &PrometheusHandle) -> String {
+    append_key_package_metric_baselines(handle.render())
+}
+
+fn append_key_package_metric_baselines(mut rendered: String) -> String {
+    append_counter_sample_if_missing(
+        &mut rendered,
+        "key_package_claim_total",
+        "Total number of key package claim attempts, labeled by state_after (claimed | no_match)",
+        "key_package_claim_total{state_after=\"claimed\"}",
+    );
+    append_counter_sample_if_missing(
+        &mut rendered,
+        "key_package_claim_total",
+        "Total number of key package claim attempts, labeled by state_after (claimed | no_match)",
+        "key_package_claim_total{state_after=\"no_match\"}",
+    );
+    append_counter_sample_if_missing(
+        &mut rendered,
+        "key_package_exhaustion_total",
+        "Total number of times a claim found no available key packages for the requested DID",
+        "key_package_exhaustion_total",
+    );
+    append_counter_sample_if_missing(
+        &mut rendered,
+        "key_package_last_resort_use_total",
+        "Total number of times a last-resort key package was claimed because no regular available rows existed",
+        "key_package_last_resort_use_total",
+    );
+    append_counter_sample_if_missing(
+        &mut rendered,
+        "key_package_enumeration_suspected_total",
+        "Total getKeyPackages calls flagged by the per-caller unique-target-DID cardinality detector (N26 detection half)",
+        "key_package_enumeration_suspected_total",
+    );
+    rendered
+}
+
+fn append_counter_sample_if_missing(
+    rendered: &mut String,
+    metric_name: &str,
+    help: &str,
+    sample_prefix: &str,
+) {
+    if rendered.lines().any(|line| {
+        !line.starts_with('#')
+            && line
+                .strip_prefix(sample_prefix)
+                .is_some_and(|suffix| suffix.starts_with(' '))
+    }) {
+        return;
+    }
+
+    if !rendered.ends_with('\n') && !rendered.is_empty() {
+        rendered.push('\n');
+    }
+    if !rendered.contains(&format!("# TYPE {metric_name} counter")) {
+        rendered.push_str(&format!("# HELP {metric_name} {help}\n"));
+        rendered.push_str(&format!("# TYPE {metric_name} counter\n"));
+    }
+    rendered.push_str(sample_prefix);
+    rendered.push_str(" 0\n");
 }
 
 /// Middleware to track HTTP request metrics
@@ -490,4 +554,36 @@ pub fn record_key_package_last_resort_use() {
 #[allow(dead_code)]
 pub fn record_key_package_enumeration_suspected() {
     metrics::counter!("key_package_enumeration_suspected_total", 1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MetricsRecorder;
+
+    #[test]
+    fn key_package_safety_metrics_are_visible_at_zero_baseline() {
+        let recorder = MetricsRecorder::new();
+        let rendered = super::render_prometheus_metrics(recorder.handle());
+
+        assert!(
+            rendered.contains("key_package_claim_total"),
+            "claim counter should be visible before the first claim event:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("state_after=\"claimed\""),
+            "claim counter should expose the claimed label baseline:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("state_after=\"no_match\""),
+            "claim counter should expose the no_match label baseline:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("key_package_exhaustion_total"),
+            "exhaustion counter should be visible before the first exhaustion event:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("key_package_enumeration_suspected_total"),
+            "enumeration counter should be visible before the first detector event:\n{rendered}"
+        );
+    }
 }
