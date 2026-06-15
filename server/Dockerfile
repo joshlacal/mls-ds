@@ -16,7 +16,8 @@ RUN mkdir -p server/src codegen/src \
     && echo "fn main() {}" > server/src/main.rs \
     && echo "" > server/src/lib.rs \
     && echo "fn main() {}" > codegen/src/main.rs \
-    && cargo build --release -p catbird-server 2>/dev/null || true \
+    && (cargo build --release -p catbird-server 2>/dev/null || true) \
+    && cargo clean --release -p catbird-server \
     && rm -rf server/src codegen/src
 
 # Copy source and build for real
