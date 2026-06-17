@@ -139,22 +139,26 @@ async fn seed_targeted_invite(pool: &PgPool, creator_did: &str, target_did: &str
 }
 
 #[test]
-fn key_package_gate_defaults_to_log_only_and_only_enforce_is_strict() {
+fn key_package_gate_defaults_to_enforce_and_only_log_only_values_disable_strict_mode() {
     assert_eq!(
         GateKeyPackagesMode::from_env_value(None),
-        GateKeyPackagesMode::LogOnly
+        GateKeyPackagesMode::Enforce
     );
     assert_eq!(
         GateKeyPackagesMode::from_env_value(Some("")),
-        GateKeyPackagesMode::LogOnly
+        GateKeyPackagesMode::Enforce
     );
     assert_eq!(
         GateKeyPackagesMode::from_env_value(Some("log_only")),
         GateKeyPackagesMode::LogOnly
     );
     assert_eq!(
-        GateKeyPackagesMode::from_env_value(Some("unexpected")),
+        GateKeyPackagesMode::from_env_value(Some("warn")),
         GateKeyPackagesMode::LogOnly
+    );
+    assert_eq!(
+        GateKeyPackagesMode::from_env_value(Some("unexpected")),
+        GateKeyPackagesMode::Enforce
     );
     assert_eq!(
         GateKeyPackagesMode::from_env_value(Some("enforce")),
