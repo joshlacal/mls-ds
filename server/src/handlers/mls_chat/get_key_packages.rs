@@ -102,7 +102,7 @@ pub async fn get_key_packages(
             "getKeyPackages: possible key-package enumeration — unique-target cardinality exceeded"
         );
         crate::metrics::record_key_package_enumeration_suspected();
-        
+
         let mode = GateKeyPackagesMode::from_env();
         if mode == GateKeyPackagesMode::Enforce {
             return Err(StatusCode::TOO_MANY_REQUESTS);
@@ -202,11 +202,13 @@ pub async fn get_key_packages(
         .iter()
         .filter(|did| !authorized_set.contains(did.as_str()))
         .count();
+    let first_contact_compat = is_single_first_contact_target(&filtered_did_strs, &authorized_dids);
 
     if denied_count > 0 {
         warn!(
             requested = filtered_did_strs.len(),
             denied = denied_count,
+            first_contact_compat,
             mode = mode.as_str(),
             "getKeyPackages: unauthorized target DIDs"
         );
@@ -422,11 +424,21 @@ pub fn apply_key_package_target_authz(
 
             if all_authorized {
                 Ok(requested_dids.to_vec())
+            } else if is_single_first_contact_target(requested_dids, authorized_dids) {
+                // Conversation creation has to fetch the recipient's first key
+                // package before any shared conversation, invite, or chat-request
+                // row exists. Keep this compatibility path single-target only so
+                // multi-DID probing still fails closed in enforce mode.
+                Ok(requested_dids.to_vec())
             } else {
                 Err(StatusCode::FORBIDDEN)
             }
         }
     }
+}
+
+fn is_single_first_contact_target(requested_dids: &[String], authorized_dids: &[String]) -> bool {
+    requested_dids.len() == 1 && authorized_dids.is_empty()
 }
 
 /// Atomically claim one available key package per `(owner_did, device_id)`

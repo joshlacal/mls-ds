@@ -167,7 +167,7 @@ fn key_package_gate_defaults_to_enforce_and_only_log_only_values_disable_strict_
 }
 
 #[test]
-fn log_only_keeps_first_contact_targets_but_enforce_denies_all_unauthorized() {
+fn enforce_allows_single_first_contact_target() {
     let requested = vec!["did:plc:first-contact-target".to_string()];
     let authorized: Vec<String> = Vec::new();
 
@@ -175,6 +175,20 @@ fn log_only_keeps_first_contact_targets_but_enforce_denies_all_unauthorized() {
         apply_key_package_target_authz(&requested, &authorized, GateKeyPackagesMode::LogOnly)
             .expect("log_only must preserve first-contact compatibility");
     assert_eq!(log_only, requested);
+
+    let enforce =
+        apply_key_package_target_authz(&requested, &authorized, GateKeyPackagesMode::Enforce)
+            .expect("enforce mode must allow a single first-contact key-package fetch");
+    assert_eq!(enforce, requested);
+}
+
+#[test]
+fn enforce_denies_multi_target_first_contact_enumeration() {
+    let requested = vec![
+        "did:plc:first-contact-a".to_string(),
+        "did:plc:first-contact-b".to_string(),
+    ];
+    let authorized: Vec<String> = Vec::new();
 
     let enforce =
         apply_key_package_target_authz(&requested, &authorized, GateKeyPackagesMode::Enforce);
