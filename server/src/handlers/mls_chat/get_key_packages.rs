@@ -31,8 +31,8 @@ impl GateKeyPackagesMode {
 
     pub fn from_env_value(value: Option<&str>) -> Self {
         match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-            Some("enforce") => Self::Enforce,
-            _ => Self::LogOnly,
+            Some("log_only") | Some("warn") => Self::LogOnly,
+            _ => Self::Enforce, // Enforce is now the default (N26 flip)
         }
     }
 
@@ -102,6 +102,11 @@ pub async fn get_key_packages(
             "getKeyPackages: possible key-package enumeration — unique-target cardinality exceeded"
         );
         crate::metrics::record_key_package_enumeration_suspected();
+        
+        let mode = GateKeyPackagesMode::from_env();
+        if mode == GateKeyPackagesMode::Enforce {
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
     }
 
     let mut participants: Vec<String> = requested_dids.clone();

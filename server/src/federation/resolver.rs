@@ -27,6 +27,7 @@ pub struct DsEndpoint {
 }
 
 /// Resolves a user's DID to their DS endpoint.
+#[derive(Debug)]
 pub struct DsResolver {
     pool: PgPool,
     http: reqwest::Client,
@@ -427,6 +428,72 @@ impl DsResolver {
                 did: did.to_string(),
                 reason: format!("Invalid DID document JSON: {e}"),
             })
+    }
+
+    /// Resolve authorized device keys for a DID via its PDS.
+    pub async fn resolve_authorized_device_keys(
+        &self,
+        did: &str,
+    ) -> Result<Vec<Vec<u8>>, FederationError> {
+        let pds_endpoint = self.resolve_did_to_pds(did).await?;
+
+        // Construct the listRecords request URL
+        let list_records_url = format!(
+            "{}/xrpc/com.atproto.repo.listRecords?repo={}&collection=blue.catbird.mlsChat.device",
+            pds_endpoint.trim_end_matches('/'),
+            did
+        );
+
+        let resp = self
+            .http
+            .get(&list_records_url)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|e| FederationError::ResolutionFailed {
+                did: did.to_string(),
+                reason: format!("PDS listRecords HTTP error: {}", e),
+            })?;
+
+        if !resp.status().is_success() {
+            return Err(FederationError::ResolutionFailed {
+                did: did.to_string(),
+                reason: format!("PDS listRecords returned status {}", resp.status()),
+            });
+        }
+
+        let body: serde_json::Value =
+            resp.json()
+                .await
+                .map_err(|e| FederationError::ResolutionFailed {
+                    did: did.to_string(),
+                    reason: format!("Invalid PDS listRecords JSON: {}", e),
+                })?;
+
+        let mut keys = Vec::new();
+        if let Some(records) = body.get("records").and_then(|v| v.as_array()) {
+            for record in records {
+                // Extract value.mlsSignaturePublicKey.$bytes
+                if let Some(bytes_b64) = record
+                    .get("value")
+                    .and_then(|v| v.get("mlsSignaturePublicKey"))
+                    .and_then(|v| v.get("$bytes"))
+                    .and_then(|v| v.as_str())
+                {
+                    use base64::{engine::general_purpose::STANDARD, Engine as _};
+                    // ATProto $bytes are typically standard base64 without padding, but let's handle standard decode
+                    if let Ok(key_bytes) = STANDARD.decode(bytes_b64) {
+                        keys.push(key_bytes);
+                    } else if let Ok(key_bytes) =
+                        base64::engine::general_purpose::STANDARD_NO_PAD.decode(bytes_b64)
+                    {
+                        keys.push(key_bytes);
+                    }
+                }
+            }
+        }
+
+        Ok(keys)
     }
 
     /// Invalidate cache entry for a DID.

@@ -958,10 +958,11 @@ async fn handle_request_replenish(
 ///
 /// All actions return `{ stats: KeyPackageStats, syncResult?, publishResult?, replenishResult? }`
 /// per the lexicon output schema.
-#[tracing::instrument(skip(pool, notification_service, headers, auth_user, input))]
+#[tracing::instrument(skip(pool, notification_service, resolver, headers, auth_user, input))]
 pub async fn publish_key_packages_post(
     State(pool): State<DbPool>,
     State(notification_service): State<Option<Arc<NotificationService>>>,
+    State(resolver): State<Arc<crate::federation::DsResolver>>,
     headers: HeaderMap,
     auth_user: AuthUser,
     ExtractXrpc(input): ExtractXrpc<PublishKeyPackagesRequest>,
@@ -989,6 +990,33 @@ pub async fn publish_key_packages_post(
 
     let device_scope = resolve_device_scope(&pool, &user_did, &raw_device_id).await?;
     let storage_device_id = device_scope.storage_device_id.as_str();
+
+    // N44 Device Record Authorization (Rollout Mode)
+    let enforce_auth = std::env::var("AUTHORIZATION_ROLLOUT_MODE")
+        .map(|s| s.eq_ignore_ascii_case("enforce"))
+        .unwrap_or(false);
+
+    if input.action.as_ref() == "publish" || input.action.as_ref() == "publishBatch" {
+        if let Some(expected_sig_key) = device_scope.signature_public_key.as_deref() {
+            match resolver.resolve_authorized_device_keys(&user_did).await {
+                Ok(keys) => {
+                    let is_authorized = keys.iter().any(|k| k.as_slice() == expected_sig_key);
+                    if !is_authorized {
+                        if enforce_auth {
+                            error!("N44 Enforcement: signature key for {} not found in device records (resolved {} keys). Rejecting.", user_did, keys.len());
+                            return Err(StatusCode::FORBIDDEN);
+                        } else {
+                            warn!("N44 Warn-only: signature key for {} not found in device records (resolved {} keys)", user_did, keys.len());
+                        }
+                    }
+                }
+                Err(e) => {
+                    // PDS resolution failure. In both warn and enforce, we allow to prevent PDS outages from breaking MLS publishing.
+                    warn!("N44 device records resolution failed for {}: {}", user_did, e);
+                }
+            }
+        }
+    }
 
     match input.action.as_ref() {
         "publish" => {
