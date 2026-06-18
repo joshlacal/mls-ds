@@ -203,7 +203,6 @@ CREATE TABLE IF NOT EXISTS welcome_messages (
     id TEXT PRIMARY KEY,
     convo_id TEXT NOT NULL,
     recipient_did TEXT NOT NULL,
-    recipient_device_id TEXT,
     welcome_data BYTEA NOT NULL,
     key_package_hash BYTEA,
     created_by_did TEXT,
@@ -215,9 +214,6 @@ CREATE TABLE IF NOT EXISTS welcome_messages (
 
 CREATE INDEX IF NOT EXISTS idx_welcome_messages_recipient ON welcome_messages(recipient_did, consumed);
 CREATE INDEX IF NOT EXISTS idx_welcome_messages_convo ON welcome_messages(convo_id);
-CREATE INDEX IF NOT EXISTS idx_welcome_messages_device_lookup
-ON welcome_messages(convo_id, recipient_did, recipient_device_id)
-WHERE consumed = false AND recipient_device_id IS NOT NULL;
 
 -- =============================================================================
 -- Rejoin Requests (auto-rejoin audit trail)
@@ -247,7 +243,6 @@ WHERE consumed = false;
 
 COMMENT ON TABLE welcome_messages IS 'MLS Welcome messages for joining or automatic rejoin after app deletion';
 COMMENT ON COLUMN welcome_messages.created_by_did IS 'DID of member who generated this Welcome (for automatic rejoin)';
-COMMENT ON COLUMN welcome_messages.recipient_device_id IS 'Device identifier resolved from the consumed KeyPackage at Welcome write time. NULL means legacy user-scoped Welcome row.';
 
 -- Pending automatic rejoin requests (server-orchestrated)
 CREATE TABLE IF NOT EXISTS pending_welcomes (
