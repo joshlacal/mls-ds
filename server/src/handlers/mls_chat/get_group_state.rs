@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use axum::{
-    Json,
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
+    Json,
 };
 use jacquard_axum::ExtractXrpc;
 use serde::Serialize;
@@ -220,7 +220,7 @@ pub async fn fetch_welcome_row_for_recipient(
                AND (recipient_did = $2 OR recipient_did = $3) \
                AND consumed = false \
                AND key_package_hash = ANY($4::bytea[]) \
-             ORDER BY created_at DESC LIMIT 1",
+             ORDER BY created_at DESC, id DESC LIMIT 1",
         )
         .bind(convo_id)
         .bind(did_str)
@@ -235,18 +235,42 @@ pub async fn fetch_welcome_row_for_recipient(
     }
 
     if !device_candidates.is_empty() {
+        let directly_device_matched: Option<(String, Vec<u8>)> = sqlx::query_as(
+            "SELECT id, welcome_data FROM welcome_messages \
+             WHERE convo_id = $1 \
+               AND (recipient_did = $2 OR recipient_did = $3) \
+               AND consumed = false \
+               AND recipient_device_id = ANY($4::text[]) \
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(convo_id)
+        .bind(did_str)
+        .bind(user_form_did)
+        .bind(device_candidates)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| {
+            error!("Failed to fetch device-bound welcome: {}", e);
+            GetGroupStateContractError::Generic(StatusCode::INTERNAL_SERVER_ERROR)
+        })?;
+
+        if directly_device_matched.is_some() {
+            return Ok(directly_device_matched);
+        }
+
         let device_matched: Option<(String, Vec<u8>)> = sqlx::query_as(
             "SELECT id, welcome_data FROM welcome_messages wm \
              WHERE wm.convo_id = $1 \
                AND (wm.recipient_did = $2 OR wm.recipient_did = $3) \
                AND wm.consumed = false \
+               AND wm.recipient_device_id IS NULL \
                AND (wm.key_package_hash IS NULL OR EXISTS ( \
                     SELECT 1 FROM key_packages kp \
                     WHERE kp.owner_did = $3 \
                       AND kp.key_package_hash = encode(wm.key_package_hash, 'hex') \
                       AND kp.device_id = ANY($4::text[]) \
                )) \
-             ORDER BY wm.created_at DESC LIMIT 1",
+             ORDER BY wm.created_at DESC, wm.id DESC LIMIT 1",
         )
         .bind(convo_id)
         .bind(did_str)
@@ -268,7 +292,8 @@ pub async fn fetch_welcome_row_for_recipient(
              WHERE convo_id = $1 \
                AND (recipient_did = $2 OR recipient_did = $3) \
                AND consumed = false \
-             ORDER BY created_at DESC LIMIT 2",
+               AND recipient_device_id IS NULL \
+             ORDER BY created_at DESC, id DESC LIMIT 2",
         )
         .bind(convo_id)
         .bind(did_str)
@@ -297,7 +322,7 @@ pub async fn fetch_welcome_row_for_recipient(
          WHERE convo_id = $1 \
            AND (recipient_did = $2 OR recipient_did = $3) \
            AND consumed = false \
-         ORDER BY created_at DESC LIMIT 1",
+         ORDER BY created_at DESC, id DESC LIMIT 1",
     )
     .bind(convo_id)
     .bind(did_str)
@@ -559,8 +584,9 @@ pub async fn get_group_state(
         // Defensive against device-form vs user-form ambiguity in
         // `auth_user.did`. Phase B (per-device welcome storage) writes
         // `recipient_did` in user-form (e.g. "did:plc:alice") because
-        // jacquard's `Did<'a>` regex rejects '#'; per-device discrimination
-        // lives in `key_package_hash`. Task 1's verification of
+        // jacquard's `Did<'a>` regex rejects '#'. New rows prefer the
+        // persisted `recipient_device_id`; legacy rows can still fall back
+        // through `key_package_hash`. Task 1's verification of
         // `auth_user.did` for getGroupState callers came back INDIRECT —
         // server-side construction is strong evidence for user-form, but
         // the iOS issuance path was not directly traced. If a device-form

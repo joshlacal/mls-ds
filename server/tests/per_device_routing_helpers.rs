@@ -553,7 +553,7 @@ async fn store_welcomes_per_device_upsert_backfills_null_and_preserves_existing_
 //          IMPORTANT: `key_packages.key_package_hash` is `TEXT` (hex string),
 //          so the second bind MUST be `&entry.hash` (the hex string), NOT
 //          `hash_bytes` (the decoded BYTEA). The decoded form is for
-//          `welcome_messages.key_package_hash` only.
+//          `welcome_messages.key_package_hash` when writing welcome rows.
 //       4. If `device_id = Some(d)`: `member_did = format!("{}#{}", user_did, d)`,
 //          store with `device_id = Some(d)`. Note: `members.member_did` is
 //          plain TEXT — we deliberately bypass jacquard's `#`-rejection by
@@ -866,15 +866,15 @@ async fn insert_members_per_device_empty_kp_hashes_writes_nothing() {
 //                Phase D / Task 9 — get_group_state lookup parity
 //
 // Verifies that the existing welcome lookup in
-// `server/src/handlers/mls_chat/get_group_state.rs:375-378` works against
-// the per-device storage shape Phase B writes (user-form `recipient_did`,
-// `key_package_hash` as the per-device discriminator, identical
+// `server/src/handlers/mls_chat/get_group_state.rs` works against
+// the legacy per-device storage shape Phase B writes (user-form `recipient_did`,
+// `key_package_hash` as the legacy discriminator, identical
 // `welcome_data` across N rows per (convo, user)).
 //
 // Architectural correction recap: Task 2 found jacquard's `Did<'a>` regex
 // rejects `#`, so we cannot use device-form (`did:plc:user#device-x`) as
 // the `recipient_did`. Phase B stores user-form (`entry.did`) instead and
-// distinguishes per-device rows via `key_package_hash`. The MLS Welcome
+// legacy rows can still be distinguished via `key_package_hash`. The MLS Welcome
 // bytes are themselves multi-recipient — each device decrypts its own
 // `EncryptedGroupSecrets` entry locally — so identical `welcome_data`
 // across N rows is correct, and the existing `LIMIT 1` lookup returning
@@ -891,7 +891,7 @@ async fn insert_members_per_device_empty_kp_hashes_writes_nothing() {
 
 /// Asserts that per-device welcomes (multiple rows for the same
 /// `recipient_did = user_did`, distinct `key_package_hash`) are findable
-/// by the exact query shape used in `get_group_state.rs:375-378`. Locks
+/// by the legacy lookup path used in `get_group_state.rs`. Locks
 /// in the contract: future schema or handler changes that break user-form
 /// lookup will fail this test instead of silently returning no welcomes.
 #[tokio::test]
@@ -1102,6 +1102,146 @@ async fn device_hint_miss_returns_sole_user_welcome() {
     .expect("sole user welcome should survive a device metadata miss");
 
     assert_eq!(row.1, welcome_bytes);
+
+    common::cleanup(&pool, &convo_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+async fn device_hint_returns_exact_recipient_device_id_when_multiple_user_welcomes_exist() {
+    let pool = common::setup_test_db().await;
+    let convo_id = format!("convo-perdev-devicehint-exact-{}", Uuid::new_v4());
+    common::cleanup(&pool, &convo_id).await;
+    seed_convo(&pool, &convo_id).await;
+
+    let alice_did = "did:plc:perdevdeviceexact";
+    seed_user(&pool, alice_did).await;
+    let welcome_a = vec![0xA1_u8; 256];
+    let welcome_b = vec![0xB2_u8; 256];
+
+    sqlx::query(
+        "INSERT INTO welcome_messages \
+            (id, convo_id, recipient_did, recipient_device_id, welcome_data, key_package_hash, created_by_did, created_at, consumed) \
+         VALUES \
+            ($1, $2, $3, 'device-a', $4, $5, 'did:plc:senderxxxxx', NOW(), false), \
+            ($6, $2, $3, 'device-b', $7, $8, 'did:plc:senderxxxxx', NOW(), false)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(&convo_id)
+    .bind(alice_did)
+    .bind(&welcome_a)
+    .bind(hex::decode("aa11").unwrap())
+    .bind(Uuid::new_v4().to_string())
+    .bind(&welcome_b)
+    .bind(hex::decode("bb22").unwrap())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let row = fetch_welcome_row_for_recipient(
+        &pool,
+        &convo_id,
+        alice_did,
+        alice_did,
+        None,
+        &["device-b".to_string()],
+    )
+    .await
+    .expect("welcome lookup should not error")
+    .expect("device-bound welcome should be returned");
+
+    assert_eq!(row.1, welcome_b);
+
+    common::cleanup(&pool, &convo_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+async fn device_hint_miss_does_not_return_other_device_bound_welcome() {
+    let pool = common::setup_test_db().await;
+    let convo_id = format!("convo-perdev-devicehint-wrong-{}", Uuid::new_v4());
+    common::cleanup(&pool, &convo_id).await;
+    seed_convo(&pool, &convo_id).await;
+
+    let alice_did = "did:plc:perdevdevicewrong";
+    seed_user(&pool, alice_did).await;
+    let welcome_a = vec![0xC3_u8; 256];
+
+    sqlx::query(
+        "INSERT INTO welcome_messages \
+            (id, convo_id, recipient_did, recipient_device_id, welcome_data, key_package_hash, created_by_did, created_at, consumed) \
+         VALUES \
+            ($1, $2, $3, 'device-a', $4, $5, 'did:plc:senderxxxxx', NOW(), false)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(&convo_id)
+    .bind(alice_did)
+    .bind(&welcome_a)
+    .bind(hex::decode("aa11").unwrap())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let row = fetch_welcome_row_for_recipient(
+        &pool,
+        &convo_id,
+        alice_did,
+        alice_did,
+        None,
+        &["device-b".to_string()],
+    )
+    .await
+    .expect("welcome lookup should not error");
+
+    assert!(
+        row.is_none(),
+        "device-hinted lookup must not fall back to a welcome bound to another device"
+    );
+
+    common::cleanup(&pool, &convo_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+async fn device_hint_miss_does_not_return_other_device_bound_null_hash_welcome() {
+    let pool = common::setup_test_db().await;
+    let convo_id = format!("convo-perdev-devicehint-nullhash-{}", Uuid::new_v4());
+    common::cleanup(&pool, &convo_id).await;
+    seed_convo(&pool, &convo_id).await;
+
+    let alice_did = "did:plc:perdevdevicenullhash";
+    seed_user(&pool, alice_did).await;
+    let welcome_a = vec![0xD4_u8; 256];
+
+    sqlx::query(
+        "INSERT INTO welcome_messages \
+            (id, convo_id, recipient_did, recipient_device_id, welcome_data, key_package_hash, created_by_did, created_at, consumed) \
+         VALUES \
+            ($1, $2, $3, 'device-a', $4, NULL, 'did:plc:senderxxxxx', NOW(), false)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(&convo_id)
+    .bind(alice_did)
+    .bind(&welcome_a)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let row = fetch_welcome_row_for_recipient(
+        &pool,
+        &convo_id,
+        alice_did,
+        alice_did,
+        None,
+        &["device-b".to_string()],
+    )
+    .await
+    .expect("welcome lookup should not error");
+
+    assert!(
+        row.is_none(),
+        "legacy lookup must not return a null-hash welcome bound to another device"
+    );
 
     common::cleanup(&pool, &convo_id).await;
 }
