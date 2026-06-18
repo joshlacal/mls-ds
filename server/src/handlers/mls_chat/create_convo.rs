@@ -986,7 +986,8 @@ async fn handle_create_convo(
         // path through the per-device helper when kp_hashes are present, legacy user-flat path
         // otherwise. The MLS welcome_bytes is itself a multi-recipient blob — each device
         // decrypts only its own EncryptedGroupSecrets entry — so storing identical welcome_data
-        // across N rows is correct; per-device discrimination lives in key_package_hash. See
+        // across N rows is correct. The helper persists recipient_device_id when resolvable,
+        // while key_package_hash remains the hash discriminator/fallback/audit value. See
         // docs/superpowers/plans/2026-05-04-mls-per-device-welcome-and-members-routing.md.
         //
         // Behavior delta vs the prior per-member loop: when kp_hashes is Some(non-empty) but

@@ -424,23 +424,47 @@ pub async fn store_group_info_in_tx(
     .map(|_| ())
 }
 
+pub async fn resolve_device_id_for_key_package_hash<'e, E>(
+    executor: E,
+    owner_did: &str,
+    key_package_hash_hex: &str,
+) -> sqlx::Result<Option<String>>
+where
+    E: sqlx::Executor<'e, Database = Postgres>,
+{
+    sqlx::query_scalar::<_, Option<String>>(
+        "SELECT device_id FROM key_packages \
+         WHERE owner_did = $1 AND key_package_hash = $2 \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(owner_did)
+    .bind(key_package_hash_hex)
+    .fetch_optional(executor)
+    .await
+    .map(|row| row.flatten())
+}
+
 /// Insert one `welcome_messages` row per `key_package_hash` entry,
 /// fanning out a single Welcome message to every recipient device of
 /// every recipient user.
 ///
 /// Each row uses user-form `recipient_did` from the entry (the
 /// jacquard `Did<'a>` type rejects `#` so device-form DIDs aren't
-/// representable here); per-device discrimination lives in
-/// `key_package_hash`. The MLS `welcome_bytes` is a multi-recipient
-/// blob — each device decrypts only its own `EncryptedGroupSecrets`
-/// entry — so identical `welcome_data` across N rows is correct.
+/// representable here). When the selected key package can be resolved
+/// back to local metadata, the row also persists `recipient_device_id`;
+/// `key_package_hash` remains the durable hash discriminator plus the
+/// fallback/audit value for legacy rows and unresolved device metadata.
+/// The MLS `welcome_bytes` is a multi-recipient blob — each device
+/// decrypts only its own `EncryptedGroupSecrets` entry — so identical
+/// `welcome_data` across N rows is correct.
 ///
 /// Mirrors the inline pattern at `bootstrap_reset_group.rs:563-594`,
-/// with one deliberate addition: this helper persists `created_by_did
-/// = sender_did` (audit-trail fix the per-device routing plan calls
-/// out). Hex-decode failures are skipped defensively (mirrors the
-/// inline `continue` at `bootstrap_reset_group.rs:569`). `kp_hashes`
-/// empty ⇒ no-op `Ok(())`.
+/// with deliberate additions: this helper persists `created_by_did =
+/// sender_did` and `recipient_device_id` when resolvable. On conflict,
+/// it backfills a missing `recipient_device_id` while preserving a
+/// previously known binding. Hex-decode failures are skipped
+/// defensively (mirrors the inline `continue` at
+/// `bootstrap_reset_group.rs:569`). `kp_hashes` empty ⇒ no-op `Ok(())`.
 ///
 /// Caller owns the transaction's commit/rollback — this only stages
 /// the per-row INSERTs.
@@ -468,17 +492,22 @@ pub async fn store_welcomes_per_device_in_tx<'a>(
             Ok(b) => b,
             Err(_) => continue, // Defensive: skip malformed hex (mirrors bootstrap_reset_group:569).
         };
+        let recipient_device_id =
+            resolve_device_id_for_key_package_hash(&mut **tx, &recipient, hash_hex).await?;
         let welcome_id = Uuid::new_v4().to_string();
         sqlx::query(
             "INSERT INTO welcome_messages \
-                (id, convo_id, recipient_did, welcome_data, key_package_hash, created_by_did, created_at, consumed) \
-             VALUES ($1, $2, $3, $4, $5, $6, NOW(), false) \
+                (id, convo_id, recipient_did, recipient_device_id, welcome_data, key_package_hash, created_by_did, created_at, consumed) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), false) \
              ON CONFLICT (convo_id, recipient_did, COALESCE(key_package_hash, '\\x00'::bytea)) WHERE consumed = false \
-             DO NOTHING",
+             DO UPDATE SET \
+                recipient_device_id = COALESCE(welcome_messages.recipient_device_id, EXCLUDED.recipient_device_id), \
+                created_by_did = EXCLUDED.created_by_did",
         )
         .bind(&welcome_id)
         .bind(convo_id)
         .bind(&recipient)
+        .bind(recipient_device_id.as_deref())
         .bind(welcome_bytes)
         .bind(Some(hash_bytes))
         .bind(sender_did)

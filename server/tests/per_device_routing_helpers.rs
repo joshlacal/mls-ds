@@ -33,7 +33,8 @@
 //!   - ON CONFLICT against the schema's
 //!     `idx_welcome_messages_unique` (UNIQUE on
 //!     `(convo_id, recipient_did, COALESCE(key_package_hash, '\x00'::bytea))`
-//!     `WHERE consumed = false`) ⇒ DO NOTHING.
+//!     `WHERE consumed = false`) ⇒ backfill a missing `recipient_device_id`
+//!     while preserving a previously known device binding.
 //!
 //! Today's RED state: the symbol does not exist in `catbird_server::db`
 //! (or anywhere else), so this file fails to compile at the `use` line.
@@ -439,6 +440,84 @@ async fn store_welcomes_per_device_leaves_recipient_device_id_null_when_hash_unm
     assert!(
         recipient_device_id.is_none(),
         "unmapped legacy key package hashes must stay NULL and use read-side fallback"
+    );
+
+    common::cleanup(&pool, &convo_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+async fn store_welcomes_per_device_upsert_backfills_null_and_preserves_existing_device_id() {
+    let pool = common::setup_test_db().await;
+    let convo_id = format!("convo-perdev-welcome-upsert-{}", Uuid::new_v4());
+    common::cleanup(&pool, &convo_id).await;
+    seed_convo(&pool, &convo_id).await;
+
+    let alice_did = "did:plc:perdevwelcomeupsert";
+    seed_key_package(&pool, alice_did, "aa11", Some("alice-device-a")).await;
+    seed_key_package(&pool, alice_did, "bb22", Some("alice-device-b-resolved")).await;
+
+    let welcome_existing_null = vec![0xA1_u8; 256];
+    let welcome_existing_bound = vec![0xB2_u8; 256];
+    sqlx::query(
+        "INSERT INTO welcome_messages \
+            (id, convo_id, recipient_did, recipient_device_id, welcome_data, key_package_hash, created_by_did, created_at, consumed) \
+         VALUES \
+            ($1, $2, $3, NULL, $4, $5, 'did:plc:oldsenderxxx', NOW(), false), \
+            ($6, $2, $3, 'alice-device-b-original', $7, $8, 'did:plc:oldsenderxxx', NOW(), false)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(&convo_id)
+    .bind(alice_did)
+    .bind(&welcome_existing_null)
+    .bind(hex::decode("aa11").unwrap())
+    .bind(Uuid::new_v4().to_string())
+    .bind(&welcome_existing_bound)
+    .bind(hex::decode("bb22").unwrap())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let kp_hashes = vec![
+        make_kp_entry(alice_did, "aa11"),
+        make_kp_entry(alice_did, "bb22"),
+    ];
+    let welcome_bytes = vec![0xE3_u8; 256];
+
+    {
+        let mut tx = pool.begin().await.unwrap();
+        store_welcomes_per_device_in_tx(
+            &mut tx,
+            &convo_id,
+            &welcome_bytes,
+            &kp_hashes,
+            "did:plc:newsenderxxx",
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT encode(key_package_hash, 'hex'), recipient_device_id \
+         FROM welcome_messages \
+         WHERE convo_id = $1 AND recipient_did = $2 \
+         ORDER BY encode(key_package_hash, 'hex')",
+    )
+    .bind(&convo_id)
+    .bind(alice_did)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].0, "aa11");
+    assert_eq!(rows[0].1.as_deref(), Some("alice-device-a"));
+    assert_eq!(rows[1].0, "bb22");
+    assert_eq!(
+        rows[1].1.as_deref(),
+        Some("alice-device-b-original"),
+        "conflict updates must not replace an existing recipient_device_id"
     );
 
     common::cleanup(&pool, &convo_id).await;

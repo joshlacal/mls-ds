@@ -927,7 +927,8 @@ pub async fn commit_group_change(
             // ── Store welcome (per-device when kp_hashes provided; user-flat fallback otherwise) ──
             // The MLS welcome_bytes is itself a multi-recipient blob — each device decrypts
             // its own portion locally — so storing identical welcome_data across N rows is
-            // correct; the per-device discrimination lives in key_package_hash. See
+            // correct. The helper persists recipient_device_id when resolvable, while
+            // key_package_hash remains the hash discriminator/fallback/audit value. See
             // docs/superpowers/plans/2026-05-04-mls-per-device-welcome-and-members-routing.md.
             let kp_hashes_for_welcomes = input.key_package_hashes.as_ref();
             let used_per_device_path = match kp_hashes_for_welcomes {
