@@ -62,6 +62,40 @@ fn validate_initial_members_have_welcome(
     Ok(())
 }
 
+fn validate_initial_group_info(
+    has_welcome: bool,
+    group_info: Option<&bytes::Bytes>,
+) -> Result<Option<Vec<u8>>, String> {
+    let Some(group_info) = group_info else {
+        return if has_welcome {
+            Err(
+                "welcomeMessage bootstrap material requires groupInfo for recovery fallback"
+                    .to_string(),
+            )
+        } else {
+            Ok(None)
+        };
+    };
+
+    let len = group_info.len();
+    if len < crate::group_info::MIN_GROUP_INFO_SIZE {
+        return Err(format!(
+            "groupInfo is too small: {} bytes (minimum {})",
+            len,
+            crate::group_info::MIN_GROUP_INFO_SIZE
+        ));
+    }
+    if len > crate::group_info::MAX_GROUP_INFO_SIZE {
+        return Err(format!(
+            "groupInfo is too large: {} bytes (maximum {})",
+            len,
+            crate::group_info::MAX_GROUP_INFO_SIZE
+        ));
+    }
+
+    Ok(Some(group_info.to_vec()))
+}
+
 // ---------------------------------------------------------------------------
 // Handler (v2 – inline SQL, no v1 delegation)
 // ---------------------------------------------------------------------------
@@ -240,6 +274,21 @@ async fn handle_create_convo(
             .into_response());
     }
 
+    let initial_group_info = validate_initial_group_info(
+        input.welcome_message.is_some(),
+        input.group_info.as_ref(),
+    )
+    .map_err(|message| {
+        warn!("❌ [v2.createConvo] Malformed MLS groupInfo bootstrap: {message}");
+        (
+            StatusCode::BAD_REQUEST,
+            Json(LexCreateConvoError::KeyPackageNotFound(Some(
+                message.into(),
+            ))),
+        )
+            .into_response()
+    })?;
+
     // ── Block detection ──────────────────────────────────────────────────
     let mut all_member_dids_for_block_check = vec![auth_user.did.clone()];
     if let Some(ref members) = input.initial_members {
@@ -311,6 +360,8 @@ async fn handle_create_convo(
     let convo_id = input.group_id.to_string();
     let now = Utc::now();
     let bootstrap_epoch = bootstrap_epoch_for_create(input.welcome_message.is_some());
+    let initial_group_info_epoch = initial_group_info.as_ref().map(|_| bootstrap_epoch);
+    let initial_group_info_updated_at = initial_group_info.as_ref().map(|_| now);
     if let Some(client_epoch) = input.current_epoch {
         if client_epoch != bootstrap_epoch as i64 {
             warn!(
@@ -476,14 +527,22 @@ async fn handle_create_convo(
     })?;
 
     sqlx::query(
-        "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at, cipher_suite, sequencer_ds, is_remote, group_id)
-         VALUES ($1, $2, $5, $3, $3, $4, NULL, false, $1)",
+        "INSERT INTO conversations (
+            id, creator_did, current_epoch, created_at, updated_at,
+            cipher_suite, sequencer_ds, is_remote, group_id,
+            group_info, group_info_epoch, group_info_updated_at,
+            bootstrap_completed_at
+         )
+         VALUES ($1, $2, $5, $3, $3, $4, NULL, false, $1, $6, $7, $8, $8)",
     )
     .bind(&convo_id)
     .bind(&auth_user.did)
     .bind(now)
     .bind(input.cipher_suite.as_ref())
     .bind(bootstrap_epoch)
+    .bind(initial_group_info.as_deref())
+    .bind(initial_group_info_epoch)
+    .bind(initial_group_info_updated_at)
     .execute(&mut *tx)
     .await
     .map_err(|e| {
@@ -496,9 +555,10 @@ async fn handle_create_convo(
         "INSERT INTO crypto_sessions ( \
             id, conversation_id, generation, mls_group_id, state, \
             cipher_suite, last_observed_epoch, created_by_did, \
-            created_at, activated_at \
+            created_at, activated_at, group_info, group_info_epoch, \
+            group_info_updated_at \
          ) VALUES (gen_random_uuid()::TEXT, $1, 0, $1, 'active', \
-                   $2, $5, $3, $4, $4) \
+                   $2, $5, $3, $4, $4, $6, $7, $8) \
          RETURNING id",
     )
     .bind(&convo_id)
@@ -506,6 +566,9 @@ async fn handle_create_convo(
     .bind(&auth_user.did)
     .bind(now)
     .bind(bootstrap_epoch)
+    .bind(initial_group_info.as_deref())
+    .bind(initial_group_info_epoch)
+    .bind(initial_group_info_updated_at)
     .fetch_one(&mut *tx)
     .await
     .map_err(|e| {
@@ -1108,5 +1171,33 @@ mod tests {
 
         validate_initial_members_have_welcome(Some(&members), "did:plc:alice", false)
             .expect("creator-only initial members are a no-op");
+    }
+
+    #[test]
+    fn welcome_bootstrap_requires_group_info() {
+        let err = validate_initial_group_info(true, None)
+            .expect_err("Welcome bootstrap without GroupInfo must fail");
+
+        assert!(err.contains("groupInfo"));
+    }
+
+    #[test]
+    fn group_info_must_be_large_enough() {
+        let tiny_group_info = bytes::Bytes::from_static(b"too-small");
+
+        let err = validate_initial_group_info(true, Some(&tiny_group_info))
+            .expect_err("tiny GroupInfo must fail validation");
+
+        assert!(err.contains("too small"));
+    }
+
+    #[test]
+    fn valid_group_info_is_preserved_verbatim() {
+        let group_info = bytes::Bytes::from(vec![0xAB; crate::group_info::MIN_GROUP_INFO_SIZE]);
+
+        let validated = validate_initial_group_info(true, Some(&group_info))
+            .expect("valid GroupInfo must be accepted");
+
+        assert_eq!(validated.as_deref(), Some(group_info.as_ref()));
     }
 }

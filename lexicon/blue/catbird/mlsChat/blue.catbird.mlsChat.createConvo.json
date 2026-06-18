@@ -37,6 +37,10 @@
               "type": "bytes",
               "description": "MLS Welcome message for ALL initial members"
             },
+            "groupInfo": {
+              "type": "bytes",
+              "description": "Serialized post-commit MLS GroupInfo for the newly-created group. Required when welcomeMessage is present so invitees can recover via External Commit if their Welcome is unavailable."
+            },
             "keyPackageHashes": {
               "type": "array",
               "items": {
