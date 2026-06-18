@@ -214,6 +214,32 @@ pub async fn fetch_welcome_row_for_recipient(
             return Ok(None);
         }
 
+        if !device_candidates.is_empty() {
+            return sqlx::query_as(
+                "SELECT id, welcome_data FROM welcome_messages \
+                 WHERE convo_id = $1 \
+                   AND (recipient_did = $2 OR recipient_did = $3) \
+                   AND consumed = false \
+                   AND key_package_hash = ANY($4::bytea[]) \
+                   AND (recipient_device_id IS NULL OR recipient_device_id = ANY($5::text[])) \
+                 ORDER BY created_at DESC, id DESC LIMIT 1",
+            )
+            .bind(convo_id)
+            .bind(did_str)
+            .bind(user_form_did)
+            .bind(hashes)
+            .bind(device_candidates)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| {
+                error!(
+                    "Failed to fetch device-filtered hash-matched welcome: {}",
+                    e
+                );
+                GetGroupStateContractError::Generic(StatusCode::INTERNAL_SERVER_ERROR)
+            });
+        }
+
         return sqlx::query_as(
             "SELECT id, welcome_data FROM welcome_messages \
              WHERE convo_id = $1 \

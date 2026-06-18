@@ -1,8 +1,8 @@
 use axum::{
+    Json,
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use chrono::{Duration, Utc};
 use jacquard_axum::ExtractXrpc;
@@ -200,7 +200,7 @@ async fn handle_register(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-        if let Some((db_id, old_device_id, _old_credential_did)) = existing {
+        if let Some((db_id, old_device_id, old_credential_did)) = existing {
             // Reuse existing device_id for stability
             device_id = old_device_id.clone();
             info!(
@@ -230,9 +230,12 @@ async fn handle_register(
             let invalidated = sqlx::query(
                 r#"UPDATE welcome_messages
                    SET consumed = true, consumed_at = NOW(), error_reason = 'Device re-registered with fresh key packages'
-                   WHERE recipient_did = $1 AND consumed = false"#,
+                   WHERE consumed = false
+                     AND (recipient_did = $1 OR (recipient_did = $2 AND recipient_device_id = $3))"#,
             )
+            .bind(&old_credential_did)
             .bind(&user_did)
+            .bind(&old_device_id)
             .execute(pool)
             .await
             .map_err(|e| {
@@ -290,12 +293,13 @@ async fn handle_register(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-        if let Some((db_id, old_device_id, _old_credential_did)) = existing {
+        if let Some((db_id, old_device_id, old_credential_did)) = existing {
             // Reuse existing device_id for stability
             device_id = old_device_id.clone();
             info!(
                 "Device re-registration detected by signature key for user h:{}: reusing device_id={}",
-                crate::crypto::hash_for_log(&user_did), device_id
+                crate::crypto::hash_for_log(&user_did),
+                device_id
             );
 
             let deleted_count =
@@ -317,9 +321,12 @@ async fn handle_register(
             let invalidated = sqlx::query(
                 r#"UPDATE welcome_messages
                    SET consumed = true, consumed_at = NOW(), error_reason = 'Device re-registered with fresh key packages (sig key match)'
-                   WHERE recipient_did = $1 AND consumed = false"#,
+                   WHERE consumed = false
+                     AND (recipient_did = $1 OR (recipient_did = $2 AND recipient_device_id = $3))"#,
             )
+            .bind(&old_credential_did)
             .bind(&user_did)
+            .bind(&old_device_id)
             .execute(pool)
             .await
             .map_err(|e| {
@@ -329,7 +336,11 @@ async fn handle_register(
             .rows_affected();
 
             if invalidated > 0 {
-                info!("Invalidated {} stale Welcome messages for re-registered user h:{} (sig key match)", invalidated, crate::crypto::hash_for_log(&user_did));
+                info!(
+                    "Invalidated {} stale Welcome messages for re-registered user h:{} (sig key match)",
+                    invalidated,
+                    crate::crypto::hash_for_log(&user_did)
+                );
             }
 
             let rereg_mls_did2 = format!("{}#{}", &user_did, &device_id);
@@ -738,11 +749,17 @@ async fn handle_delete(
             .rows_affected();
 
     // Clean up pending welcome messages (non-critical)
-    sqlx::query("DELETE FROM welcome_messages WHERE recipient_did = $1 AND consumed = false")
-        .bind(&credential_did)
-        .execute(pool)
-        .await
-        .ok();
+    sqlx::query(
+        "DELETE FROM welcome_messages \
+         WHERE consumed = false \
+           AND (recipient_did = $1 OR (recipient_did = $2 AND recipient_device_id = $3))",
+    )
+    .bind(&credential_did)
+    .bind(user_did)
+    .bind(device_id)
+    .execute(pool)
+    .await
+    .ok();
 
     // Delete key packages
     let key_packages_deleted = sqlx::query("DELETE FROM key_packages WHERE device_id = $1")

@@ -1,4 +1,4 @@
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{Json, extract::State, http::StatusCode};
 use jacquard_axum::ExtractXrpc;
 use tracing::{error, info, warn};
 
@@ -79,11 +79,17 @@ pub async fn remove_device(
             .rows_affected();
 
     // Clean up pending welcome messages (non-critical)
-    sqlx::query("DELETE FROM welcome_messages WHERE recipient_did = $1 AND consumed = false")
-        .bind(&credential_did)
-        .execute(&pool)
-        .await
-        .ok();
+    sqlx::query(
+        "DELETE FROM welcome_messages \
+         WHERE consumed = false \
+           AND (recipient_did = $1 OR (recipient_did = $2 AND recipient_device_id = $3))",
+    )
+    .bind(&credential_did)
+    .bind(user_did)
+    .bind(&device_id)
+    .execute(&pool)
+    .await
+    .ok();
 
     // Delete key packages
     let key_packages_deleted = sqlx::query("DELETE FROM key_packages WHERE device_id = $1")

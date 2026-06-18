@@ -501,8 +501,7 @@ pub async fn store_welcomes_per_device_in_tx<'a>(
              VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), false) \
              ON CONFLICT (convo_id, recipient_did, COALESCE(key_package_hash, '\\x00'::bytea)) WHERE consumed = false \
              DO UPDATE SET \
-                recipient_device_id = COALESCE(welcome_messages.recipient_device_id, EXCLUDED.recipient_device_id), \
-                created_by_did = EXCLUDED.created_by_did",
+                recipient_device_id = COALESCE(welcome_messages.recipient_device_id, EXCLUDED.recipient_device_id)",
         )
         .bind(&welcome_id)
         .bind(convo_id)

@@ -456,15 +456,19 @@ async fn store_welcomes_per_device_upsert_backfills_null_and_preserves_existing_
     let alice_did = "did:plc:perdevwelcomeupsert";
     seed_key_package(&pool, alice_did, "aa11", Some("alice-device-a")).await;
     seed_key_package(&pool, alice_did, "bb22", Some("alice-device-b-resolved")).await;
+    seed_key_package(&pool, alice_did, "cc33", Some("alice-device-c")).await;
 
     let welcome_existing_null = vec![0xA1_u8; 256];
     let welcome_existing_bound = vec![0xB2_u8; 256];
+    let welcome_existing_creator_null = vec![0xC3_u8; 256];
+    let old_sender = "did:plc:oldsenderxxx";
     sqlx::query(
         "INSERT INTO welcome_messages \
             (id, convo_id, recipient_did, recipient_device_id, welcome_data, key_package_hash, created_by_did, created_at, consumed) \
          VALUES \
-            ($1, $2, $3, NULL, $4, $5, 'did:plc:oldsenderxxx', NOW(), false), \
-            ($6, $2, $3, 'alice-device-b-original', $7, $8, 'did:plc:oldsenderxxx', NOW(), false)",
+            ($1, $2, $3, NULL, $4, $5, $9, NOW(), false), \
+            ($6, $2, $3, 'alice-device-b-original', $7, $8, $9, NOW(), false), \
+            ($10, $2, $3, NULL, $11, $12, NULL, NOW(), false)",
     )
     .bind(Uuid::new_v4().to_string())
     .bind(&convo_id)
@@ -474,6 +478,10 @@ async fn store_welcomes_per_device_upsert_backfills_null_and_preserves_existing_
     .bind(Uuid::new_v4().to_string())
     .bind(&welcome_existing_bound)
     .bind(hex::decode("bb22").unwrap())
+    .bind(old_sender)
+    .bind(Uuid::new_v4().to_string())
+    .bind(&welcome_existing_creator_null)
+    .bind(hex::decode("cc33").unwrap())
     .execute(&pool)
     .await
     .unwrap();
@@ -481,6 +489,7 @@ async fn store_welcomes_per_device_upsert_backfills_null_and_preserves_existing_
     let kp_hashes = vec![
         make_kp_entry(alice_did, "aa11"),
         make_kp_entry(alice_did, "bb22"),
+        make_kp_entry(alice_did, "cc33"),
     ];
     let welcome_bytes = vec![0xE3_u8; 256];
 
@@ -498,8 +507,8 @@ async fn store_welcomes_per_device_upsert_backfills_null_and_preserves_existing_
         tx.commit().await.unwrap();
     }
 
-    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
-        "SELECT encode(key_package_hash, 'hex'), recipient_device_id \
+    let rows: Vec<(String, Option<String>, Vec<u8>, Option<String>)> = sqlx::query_as(
+        "SELECT encode(key_package_hash, 'hex'), recipient_device_id, welcome_data, created_by_did \
          FROM welcome_messages \
          WHERE convo_id = $1 AND recipient_did = $2 \
          ORDER BY encode(key_package_hash, 'hex')",
@@ -510,14 +519,42 @@ async fn store_welcomes_per_device_upsert_backfills_null_and_preserves_existing_
     .await
     .unwrap();
 
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 3);
     assert_eq!(rows[0].0, "aa11");
     assert_eq!(rows[0].1.as_deref(), Some("alice-device-a"));
+    assert_eq!(
+        rows[0].2, welcome_existing_null,
+        "conflict updates must preserve existing Welcome bytes"
+    );
+    assert_eq!(
+        rows[0].3.as_deref(),
+        Some(old_sender),
+        "conflict updates must not replace existing created_by_did while preserving Welcome bytes"
+    );
     assert_eq!(rows[1].0, "bb22");
     assert_eq!(
         rows[1].1.as_deref(),
         Some("alice-device-b-original"),
         "conflict updates must not replace an existing recipient_device_id"
+    );
+    assert_eq!(
+        rows[1].2, welcome_existing_bound,
+        "conflict updates must preserve existing Welcome bytes"
+    );
+    assert_eq!(
+        rows[1].3.as_deref(),
+        Some(old_sender),
+        "conflict updates must not replace existing created_by_did while preserving Welcome bytes"
+    );
+    assert_eq!(rows[2].0, "cc33");
+    assert_eq!(rows[2].1.as_deref(), Some("alice-device-c"));
+    assert_eq!(
+        rows[2].2, welcome_existing_creator_null,
+        "conflict updates must preserve existing Welcome bytes when created_by_did is NULL"
+    );
+    assert!(
+        rows[2].3.is_none(),
+        "conflict updates must preserve NULL created_by_did instead of backfilling the new sender"
     );
 
     common::cleanup(&pool, &convo_id).await;
@@ -1196,6 +1233,53 @@ async fn device_hint_miss_does_not_return_other_device_bound_welcome() {
     assert!(
         row.is_none(),
         "device-hinted lookup must not fall back to a welcome bound to another device"
+    );
+
+    common::cleanup(&pool, &convo_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+async fn device_hint_with_hash_does_not_return_other_device_bound_welcome() {
+    let pool = common::setup_test_db().await;
+    let convo_id = format!("convo-perdev-devicehint-hash-wrong-{}", Uuid::new_v4());
+    common::cleanup(&pool, &convo_id).await;
+    seed_convo(&pool, &convo_id).await;
+
+    let alice_did = "did:plc:perdevdevicehashwrong";
+    seed_user(&pool, alice_did).await;
+    let welcome_a = vec![0xE5_u8; 256];
+
+    sqlx::query(
+        "INSERT INTO welcome_messages \
+            (id, convo_id, recipient_did, recipient_device_id, welcome_data, key_package_hash, created_by_did, created_at, consumed) \
+         VALUES \
+            ($1, $2, $3, 'device-a', $4, $5, 'did:plc:senderxxxxx', NOW(), false)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(&convo_id)
+    .bind(alice_did)
+    .bind(&welcome_a)
+    .bind(hex::decode("aa11").unwrap())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let requested_hashes = vec![hex::decode("aa11").unwrap()];
+    let row = fetch_welcome_row_for_recipient(
+        &pool,
+        &convo_id,
+        alice_did,
+        alice_did,
+        Some(requested_hashes.as_slice()),
+        &["device-b".to_string()],
+    )
+    .await
+    .expect("welcome lookup should not error");
+
+    assert!(
+        row.is_none(),
+        "hash-matched lookup with a device hint must not return a welcome bound to another device"
     );
 
     common::cleanup(&pool, &convo_id).await;
