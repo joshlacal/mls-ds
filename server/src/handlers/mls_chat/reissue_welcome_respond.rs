@@ -1,5 +1,5 @@
-use axum::{extract::State, http::StatusCode, Json};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use axum::{Json, extract::State, http::StatusCode};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -113,16 +113,40 @@ pub async fn reissue_welcome_respond(
         return Err(StatusCode::FORBIDDEN);
     }
 
+    let recipient_user_did = recipient_device_did
+        .split_once('#')
+        .map(|(user, _device)| user)
+        .unwrap_or(recipient_device_did.as_str());
+    let recipient_device_id_from_did = recipient_device_did
+        .split_once('#')
+        .map(|(_user, device)| device.to_string());
+    let key_package_hash_hex = key_package_hash_bytes.as_ref().map(hex::encode);
+    let recipient_device_id = match key_package_hash_hex.as_deref() {
+        Some(hash_hex) => crate::db::resolve_device_id_for_key_package_hash(
+            &mut *tx,
+            recipient_user_did,
+            hash_hex,
+        )
+        .await
+        .map_err(|e| {
+            error!("reissueWelcomeRespond: device binding lookup failed: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .or(recipient_device_id_from_did),
+        None => recipient_device_id_from_did,
+    };
+
     sqlx::query(
         r#"
         INSERT INTO welcome_messages
-            (id, convo_id, recipient_did, welcome_data, key_package_hash, created_by_did, created_at, consumed)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, false)
+            (id, convo_id, recipient_did, recipient_device_id, welcome_data, key_package_hash, created_by_did, created_at, consumed)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false)
         "#,
     )
     .bind(&welcome_blob_id)
     .bind(&convo_id)
-    .bind(&recipient_device_did)
+    .bind(recipient_user_did)
+    .bind(recipient_device_id.as_deref())
     .bind(&welcome_bytes)
     .bind(key_package_hash_bytes)
     .bind(&auth_user.did)

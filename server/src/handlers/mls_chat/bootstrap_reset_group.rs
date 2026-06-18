@@ -1,8 +1,8 @@
 use axum::{
+    Json,
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use chrono::{DateTime, Utc};
 use jacquard_axum::ExtractXrpc;
@@ -16,11 +16,11 @@ use crate::{
     actors::{ActorRegistry, ConvoMessage, ResetTrigger, WelcomeEnvelope},
     auth::AuthUser,
     generated::blue_catbird::mlsChat::{
+        ConvoView, MemberView,
         bootstrap_reset_group::{
             BootstrapResetGroupError as LexBootstrapResetGroupError, BootstrapResetGroupOutput,
-            BootstrapResetGroupRequest,
+            BootstrapResetGroupRequest, KeyPackageHashEntry,
         },
-        ConvoView, MemberView,
     },
     sqlx_jacquard::{chrono_to_datetime, did_to_string, string_to_did},
     storage::DbPool,
@@ -56,6 +56,46 @@ const NSID: &str = "blue.catbird.mlsChat.bootstrapResetGroup";
 /// **Deletion criterion**: `last_observed_epoch == 1` post-activation
 /// in `crypto_sessions` for at least one full client release cycle.
 pub(crate) const BOOTSTRAP_WIRE_COMPAT_EPOCH: i32 = 1;
+
+async fn dual_write_keyed_legacy_welcomes(
+    pool: &DbPool,
+    original_convo_id: &str,
+    welcome: &[u8],
+    kp_hashes: &[KeyPackageHashEntry<'_>],
+    sender_did: &str,
+) {
+    let mut tx = match pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            warn!(
+                error = ?e,
+                "[bootstrapResetGroup] legacy welcome_messages tx begin failed (non-fatal)"
+            );
+            return;
+        }
+    };
+    if let Err(e) = crate::db::store_welcomes_per_device_in_tx(
+        &mut tx,
+        original_convo_id,
+        welcome,
+        kp_hashes,
+        sender_did,
+    )
+    .await
+    {
+        warn!(
+            error = ?e,
+            "[bootstrapResetGroup] legacy welcome_messages insert failed (non-fatal)"
+        );
+        return;
+    }
+    if let Err(e) = tx.commit().await {
+        warn!(
+            error = ?e,
+            "[bootstrapResetGroup] legacy welcome_messages tx commit failed (non-fatal)"
+        );
+    }
+}
 
 /// Complete a post-reset conversation by submitting MLS group material.
 ///
@@ -561,37 +601,14 @@ pub async fn handle(
     // read pending_welcomes.
     if let Some(welcome) = welcome_bytes.as_ref() {
         if let Some(ref kp_hashes) = input.key_package_hashes {
-            for entry in kp_hashes {
-                let recipient = did_to_string(&entry.did);
-                let hash_hex: &str = &entry.hash;
-                let hash_bytes = match hex::decode(hash_hex) {
-                    Ok(b) => b,
-                    Err(_) => continue, // already validated above; defensive
-                };
-                let welcome_id = Uuid::new_v4().to_string();
-                if let Err(e) = sqlx::query(
-                    "INSERT INTO welcome_messages \
-                        (id, convo_id, recipient_did, welcome_data, key_package_hash, created_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6) \
-                     ON CONFLICT (convo_id, recipient_did, COALESCE(key_package_hash, '\\x00'::bytea)) WHERE consumed = false \
-                     DO NOTHING",
-                )
-                .bind(&welcome_id)
-                .bind(&original_convo_id)
-                .bind(&recipient)
-                .bind(welcome)
-                .bind(Some(hash_bytes))
-                .bind(now)
-                .execute(&pool)
-                .await
-                {
-                    warn!(
-                        error = ?e,
-                        recipient = %crate::crypto::redact_for_log(&recipient),
-                        "[bootstrapResetGroup] legacy welcome_messages INSERT failed (non-fatal)"
-                    );
-                }
-            }
+            dual_write_keyed_legacy_welcomes(
+                &pool,
+                &original_convo_id,
+                welcome,
+                kp_hashes,
+                &auth_user.did,
+            )
+            .await;
         } else {
             let recipients: Vec<String> = match sqlx::query_scalar(
                 "SELECT member_did FROM members \

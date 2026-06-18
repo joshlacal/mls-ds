@@ -620,24 +620,36 @@ impl ConversationActorState {
             // Store the SAME Welcome for each new member
             for target_did in &did_list {
                 let welcome_id = uuid::Uuid::new_v4().to_string();
-
-                // Get the key_package_hash for this member from the input
-                let key_package_hash = key_package_hashes.as_ref().and_then(|hashes| {
-                    hashes
-                        .iter()
-                        .find(|entry| entry.did == *target_did)
-                        .and_then(|entry| hex::decode(&entry.hash).ok())
-                });
+                let key_package_entry = key_package_hashes
+                    .as_ref()
+                    .and_then(|hashes| hashes.iter().find(|entry| entry.did == *target_did));
+                let key_package_hash =
+                    key_package_entry.and_then(|entry| hex::decode(&entry.hash).ok());
+                let recipient_device_id = match key_package_entry {
+                    Some(entry) => crate::db::resolve_device_id_for_key_package_hash(
+                        &mut *tx,
+                        target_did,
+                        &entry.hash,
+                    )
+                    .await
+                    .context(format!(
+                        "Failed to resolve recipient device for welcome message target {}",
+                        target_did
+                    ))?,
+                    None => None,
+                };
 
                 sqlx::query(
-                    "INSERT INTO welcome_messages (id, convo_id, recipient_did, welcome_data, key_package_hash, created_at)
-                     VALUES ($1, $2, $3, $4, $5, $6)
+                    "INSERT INTO welcome_messages \
+                        (id, convo_id, recipient_did, recipient_device_id, welcome_data, key_package_hash, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7) \
                      ON CONFLICT (convo_id, recipient_did, COALESCE(key_package_hash, '\\x00'::bytea)) WHERE consumed = false
-                     DO NOTHING"
+                     DO UPDATE SET recipient_device_id = COALESCE(welcome_messages.recipient_device_id, EXCLUDED.recipient_device_id)"
                 )
                 .bind(&welcome_id)
                 .bind(&self.convo_id)
                 .bind(target_did)
+                .bind(recipient_device_id.as_deref())
                 .bind(&welcome_data)
                 .bind::<Option<Vec<u8>>>(key_package_hash)
                 .bind(now)

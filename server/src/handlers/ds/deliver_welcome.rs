@@ -1,4 +1,4 @@
-use axum::{extract::State, Json};
+use axum::{Json, extract::State};
 use serde_json::json;
 use std::sync::Arc;
 use tracing::debug;
@@ -102,8 +102,8 @@ pub async fn deliver_welcome(
         };
         sqlx::query(
             "INSERT INTO welcome_messages \
-             (id, convo_id, recipient_did, welcome_data, key_package_hash, created_by_did, created_at, consumed) \
-             VALUES ($1, $2, $3, $4, $5, $6, NOW(), false) \
+             (id, convo_id, recipient_did, recipient_device_id, welcome_data, key_package_hash, created_by_did, created_at, consumed) \
+             VALUES ($1, $2, $3, NULL, $4, $5, $6, NOW(), false) \
              ON CONFLICT DO NOTHING",
         )
         .bind(&welcome_id)
