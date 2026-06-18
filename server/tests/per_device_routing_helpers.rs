@@ -346,6 +346,104 @@ async fn store_welcomes_per_device_empty_kp_hashes_writes_nothing() {
     common::cleanup(&pool, &convo_id).await;
 }
 
+#[tokio::test]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+async fn store_welcomes_per_device_binds_recipient_device_id_from_key_package() {
+    let pool = common::setup_test_db().await;
+    let convo_id = format!("convo-perdev-welcome-device-{}", Uuid::new_v4());
+    common::cleanup(&pool, &convo_id).await;
+    seed_convo(&pool, &convo_id).await;
+
+    let alice_did = "did:plc:perdevwelcomedevice";
+    seed_key_package(&pool, alice_did, "aa11", Some("alice-device-a")).await;
+    seed_key_package(&pool, alice_did, "bb22", Some("alice-device-b")).await;
+
+    let kp_hashes = vec![
+        make_kp_entry(alice_did, "aa11"),
+        make_kp_entry(alice_did, "bb22"),
+    ];
+    let welcome_bytes = vec![0xE1_u8; 256];
+
+    {
+        let mut tx = pool.begin().await.unwrap();
+        store_welcomes_per_device_in_tx(
+            &mut tx,
+            &convo_id,
+            &welcome_bytes,
+            &kp_hashes,
+            "did:plc:senderxxxxx",
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    let rows: Vec<(Option<String>, Vec<u8>)> = sqlx::query_as(
+        "SELECT recipient_device_id, key_package_hash \
+         FROM welcome_messages \
+         WHERE convo_id = $1 AND recipient_did = $2 \
+         ORDER BY recipient_device_id",
+    )
+    .bind(&convo_id)
+    .bind(alice_did)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].0.as_deref(), Some("alice-device-a"));
+    assert_eq!(rows[0].1, hex::decode("aa11").unwrap());
+    assert_eq!(rows[1].0.as_deref(), Some("alice-device-b"));
+    assert_eq!(rows[1].1, hex::decode("bb22").unwrap());
+
+    common::cleanup(&pool, &convo_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+async fn store_welcomes_per_device_leaves_recipient_device_id_null_when_hash_unmapped() {
+    let pool = common::setup_test_db().await;
+    let convo_id = format!("convo-perdev-welcome-device-null-{}", Uuid::new_v4());
+    common::cleanup(&pool, &convo_id).await;
+    seed_convo(&pool, &convo_id).await;
+
+    let alice_did = "did:plc:perdevwelcomenull";
+    let kp_hashes = vec![make_kp_entry(alice_did, "cc33")];
+    let welcome_bytes = vec![0xE2_u8; 256];
+
+    {
+        let mut tx = pool.begin().await.unwrap();
+        store_welcomes_per_device_in_tx(
+            &mut tx,
+            &convo_id,
+            &welcome_bytes,
+            &kp_hashes,
+            "did:plc:senderxxxxx",
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    let recipient_device_id: Option<String> = sqlx::query_scalar(
+        "SELECT recipient_device_id \
+         FROM welcome_messages \
+         WHERE convo_id = $1 AND recipient_did = $2",
+    )
+    .bind(&convo_id)
+    .bind(alice_did)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert!(
+        recipient_device_id.is_none(),
+        "unmapped legacy key package hashes must stay NULL and use read-side fallback"
+    );
+
+    common::cleanup(&pool, &convo_id).await;
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 //
 //                  insert_members_per_device_in_tx — RED
