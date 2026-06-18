@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use axum::{
+    Json,
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use jacquard_axum::ExtractXrpc;
 use serde::Serialize;
@@ -199,6 +199,115 @@ async fn resolve_welcome_device_candidates(
     candidates.sort();
     candidates.dedup();
     Ok(candidates)
+}
+
+pub async fn fetch_welcome_row_for_recipient(
+    pool: &DbPool,
+    convo_id: &str,
+    did_str: &str,
+    user_form_did: &str,
+    requested_hashes: Option<&[Vec<u8>]>,
+    device_candidates: &[String],
+) -> Result<Option<(String, Vec<u8>)>, GetGroupStateContractError> {
+    if let Some(hashes) = requested_hashes {
+        if hashes.is_empty() {
+            return Ok(None);
+        }
+
+        return sqlx::query_as(
+            "SELECT id, welcome_data FROM welcome_messages \
+             WHERE convo_id = $1 \
+               AND (recipient_did = $2 OR recipient_did = $3) \
+               AND consumed = false \
+               AND key_package_hash = ANY($4::bytea[]) \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(convo_id)
+        .bind(did_str)
+        .bind(user_form_did)
+        .bind(hashes)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| {
+            error!("Failed to fetch hash-matched welcome: {}", e);
+            GetGroupStateContractError::Generic(StatusCode::INTERNAL_SERVER_ERROR)
+        });
+    }
+
+    if !device_candidates.is_empty() {
+        let device_matched: Option<(String, Vec<u8>)> = sqlx::query_as(
+            "SELECT id, welcome_data FROM welcome_messages wm \
+             WHERE wm.convo_id = $1 \
+               AND (wm.recipient_did = $2 OR wm.recipient_did = $3) \
+               AND wm.consumed = false \
+               AND (wm.key_package_hash IS NULL OR EXISTS ( \
+                    SELECT 1 FROM key_packages kp \
+                    WHERE kp.owner_did = $3 \
+                      AND kp.key_package_hash = encode(wm.key_package_hash, 'hex') \
+                      AND kp.device_id = ANY($4::text[]) \
+               )) \
+             ORDER BY wm.created_at DESC LIMIT 1",
+        )
+        .bind(convo_id)
+        .bind(did_str)
+        .bind(user_form_did)
+        .bind(device_candidates)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| {
+            error!("Failed to fetch device-matched welcome: {}", e);
+            GetGroupStateContractError::Generic(StatusCode::INTERNAL_SERVER_ERROR)
+        })?;
+
+        if device_matched.is_some() {
+            return Ok(device_matched);
+        }
+
+        let fallback_rows: Vec<(String, Vec<u8>)> = sqlx::query_as(
+            "SELECT id, welcome_data FROM welcome_messages \
+             WHERE convo_id = $1 \
+               AND (recipient_did = $2 OR recipient_did = $3) \
+               AND consumed = false \
+             ORDER BY created_at DESC LIMIT 2",
+        )
+        .bind(convo_id)
+        .bind(did_str)
+        .bind(user_form_did)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| {
+            error!("Failed to fetch fallback welcome: {}", e);
+            GetGroupStateContractError::Generic(StatusCode::INTERNAL_SERVER_ERROR)
+        })?;
+
+        if fallback_rows.len() == 1 {
+            warn!(
+                convo_id = %crate::crypto::redact_for_log(convo_id),
+                did = %crate::crypto::redact_for_log(user_form_did),
+                "getGroupState: device-hinted welcome lookup missed; returning sole user-scoped welcome"
+            );
+            return Ok(fallback_rows.into_iter().next());
+        }
+
+        return Ok(None);
+    }
+
+    sqlx::query_as(
+        "SELECT id, welcome_data FROM welcome_messages \
+         WHERE convo_id = $1 \
+           AND (recipient_did = $2 OR recipient_did = $3) \
+           AND consumed = false \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(convo_id)
+    .bind(did_str)
+    .bind(user_form_did)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| {
+        error!("Failed to fetch welcome: {}", e);
+        GetGroupStateContractError::Generic(StatusCode::INTERNAL_SERVER_ERROR)
+    })
 }
 
 /// Consolidated group state query
@@ -476,72 +585,21 @@ pub async fn get_group_state(
             .or_else(|| did_str.split_once('#').map(|(_, device)| device));
         let device_candidates =
             resolve_welcome_device_candidates(&pool, &user_form_did, device_hint).await?;
-
-        let welcome_row: Option<(String, Vec<u8>)> = if requested_hashes.was_provided {
-            if requested_hashes.hashes.is_empty() {
-                None
-            } else {
-                sqlx::query_as(
-                    "SELECT id, welcome_data FROM welcome_messages \
-                     WHERE convo_id = $1 \
-                       AND (recipient_did = $2 OR recipient_did = $3) \
-                       AND consumed = false \
-                       AND key_package_hash = ANY($4::bytea[]) \
-                     ORDER BY created_at DESC LIMIT 1",
-                )
-                .bind(convo_id)
-                .bind(did_str)
-                .bind(&user_form_did)
-                .bind(&requested_hashes.hashes)
-                .fetch_optional(&pool)
-                .await
-                .map_err(|e| {
-                    error!("Failed to fetch hash-matched welcome: {}", e);
-                    GetGroupStateContractError::Generic(StatusCode::INTERNAL_SERVER_ERROR)
-                })?
-            }
-        } else if !device_candidates.is_empty() {
-            sqlx::query_as(
-                "SELECT id, welcome_data FROM welcome_messages wm \
-                 WHERE wm.convo_id = $1 \
-                   AND (wm.recipient_did = $2 OR wm.recipient_did = $3) \
-                   AND wm.consumed = false \
-                   AND (wm.key_package_hash IS NULL OR EXISTS ( \
-                        SELECT 1 FROM key_packages kp \
-                        WHERE kp.owner_did = $3 \
-                          AND kp.key_package_hash = encode(wm.key_package_hash, 'hex') \
-                          AND kp.device_id = ANY($4::text[]) \
-                   )) \
-                 ORDER BY wm.created_at DESC LIMIT 1",
-            )
-            .bind(convo_id)
-            .bind(did_str)
-            .bind(&user_form_did)
-            .bind(&device_candidates)
-            .fetch_optional(&pool)
-            .await
-            .map_err(|e| {
-                error!("Failed to fetch device-matched welcome: {}", e);
-                GetGroupStateContractError::Generic(StatusCode::INTERNAL_SERVER_ERROR)
-            })?
+        let requested_hashes = if requested_hashes.was_provided {
+            Some(requested_hashes.hashes.as_slice())
         } else {
-            sqlx::query_as(
-                "SELECT id, welcome_data FROM welcome_messages \
-                 WHERE convo_id = $1 \
-                   AND (recipient_did = $2 OR recipient_did = $3) \
-                   AND consumed = false \
-                 ORDER BY created_at DESC LIMIT 1",
-            )
-            .bind(convo_id)
-            .bind(did_str)
-            .bind(&user_form_did)
-            .fetch_optional(&pool)
-            .await
-            .map_err(|e| {
-                error!("Failed to fetch welcome: {}", e);
-                GetGroupStateContractError::Generic(StatusCode::INTERNAL_SERVER_ERROR)
-            })?
+            None
         };
+
+        let welcome_row = fetch_welcome_row_for_recipient(
+            &pool,
+            convo_id,
+            did_str,
+            &user_form_did,
+            requested_hashes,
+            &device_candidates,
+        )
+        .await?;
 
         if let Some((_welcome_id, data)) = welcome_row {
             welcome = Some(bytes::Bytes::from(data));

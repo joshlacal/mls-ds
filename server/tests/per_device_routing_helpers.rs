@@ -71,6 +71,7 @@ use catbird_server::db::store_welcomes_per_device_in_tx;
 // at the bottom of this file. Today's import fails to compile (RED).
 use catbird_server::db::insert_members_per_device_in_tx;
 use catbird_server::generated::blue_catbird::mlsChat::bootstrap_reset_group::KeyPackageHashEntry;
+use catbird_server::handlers::mls_chat::get_group_state::fetch_welcome_row_for_recipient;
 use catbird_server::sqlx_jacquard::string_to_did;
 use chrono::Utc;
 use sqlx::PgPool;
@@ -875,6 +876,55 @@ async fn per_device_welcome_findable_by_device_form_did() {
         "negative control: device-form-only bind MUST miss user-form-stored welcomes \
          (this is the bug the OR-clause fixes)"
     );
+
+    common::cleanup(&pool, &convo_id).await;
+}
+
+/// Regression for the production shape from 2026-06-18: iOS omitted a large
+/// local key-package hash manifest and supplied only `deviceId`. If the
+/// selected Welcome row's key_package_hash cannot be joined back to the
+/// current device_id (stale/null device metadata), getGroupState must still
+/// return the sole unconsumed Welcome for the authenticated DID instead of
+/// hiding it behind a device metadata miss.
+#[tokio::test]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+async fn device_hint_miss_returns_sole_user_welcome() {
+    let pool = common::setup_test_db().await;
+    let convo_id = format!("convo-perdev-devicehint-{}", Uuid::new_v4());
+    common::cleanup(&pool, &convo_id).await;
+    seed_convo(&pool, &convo_id).await;
+
+    let alice_did = "did:plc:perdevdevicehint1";
+    let kp_hashes = vec![make_kp_entry(alice_did, "aa11")];
+    let welcome_bytes = vec![0xDD_u8; 256];
+
+    {
+        let mut tx = pool.begin().await.unwrap();
+        store_welcomes_per_device_in_tx(
+            &mut tx,
+            &convo_id,
+            &welcome_bytes,
+            &kp_hashes,
+            "did:plc:senderxxxxx",
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    let row = fetch_welcome_row_for_recipient(
+        &pool,
+        &convo_id,
+        alice_did,
+        alice_did,
+        None,
+        &["current-device".to_string()],
+    )
+    .await
+    .expect("welcome lookup should not error")
+    .expect("sole user welcome should survive a device metadata miss");
+
+    assert_eq!(row.1, welcome_bytes);
 
     common::cleanup(&pool, &convo_id).await;
 }
