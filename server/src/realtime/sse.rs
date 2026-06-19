@@ -1,13 +1,13 @@
 use axum::{
     extract::{Query, State},
-    http::{StatusCode, header},
+    http::{header, StatusCode},
     response::{
-        IntoResponse, Sse,
         sse::{Event, KeepAlive},
+        IntoResponse, Sse,
     },
 };
 use dashmap::DashMap;
-use futures::{StreamExt, stream};
+use futures::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -15,13 +15,13 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::sync::{RwLock, broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
 use crate::{
     auth::AuthUser,
     db::DbPool,
-    realtime::{StreamMessageView, cursor::CursorGenerator},
+    realtime::{cursor::CursorGenerator, StreamMessageView},
 };
 
 /// SSE query parameters for subscribeConvoEvents
@@ -326,7 +326,9 @@ impl<'de> serde::Deserialize<'de> for StreamEvent {
                 #[serde(rename = "pendingAdditionId")]
                 pending_addition_id: String,
             },
-            #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#groupInfoRefreshRequestedEvent")]
+            #[serde(
+                rename = "blue.catbird.mlsChat.subscribeEvents#groupInfoRefreshRequestedEvent"
+            )]
             GroupInfoRefreshRequested {
                 cursor: String,
                 #[serde(rename = "convoId")]
@@ -1324,6 +1326,13 @@ mod tests {
             StreamEvent::InfoEvent {
                 cursor: "01ARZ3NDEKTSV4RRFFQ69G5FB3".into(),
                 info: "hi".into(),
+            },
+            StreamEvent::WelcomeReissueRequestedEvent {
+                cursor: "01ARZ3NDEKTSV4RRFFQ69G5FBC".into(),
+                convo_id: "c1".into(),
+                recipient_device_did: "did:plc:bob#phone".into(),
+                requested_at: "2026-06-19T00:00:00.000Z".into(),
+                request_id: "welcome-reissue-request-1".into(),
             },
             StreamEvent::NewDeviceEvent {
                 cursor: "01ARZ3NDEKTSV4RRFFQ69G5FB4".into(),

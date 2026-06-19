@@ -1,7 +1,7 @@
 use axum::{extract::State, http::StatusCode, Json};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -19,8 +19,30 @@ const NSID: &str = "blue.catbird.mlsChat.reissueWelcomeRespond";
 #[serde(rename_all = "camelCase")]
 pub struct ReissueWelcomeRespondRequest {
     pub request_id: String,
-    pub welcome_blob: String,
+    #[serde(deserialize_with = "deserialize_welcome_blob")]
+    pub welcome_blob: Vec<u8>,
     pub key_package_hash: Option<String>,
+}
+
+fn deserialize_welcome_blob<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let encoded = match value {
+        serde_json::Value::String(encoded) => encoded,
+        serde_json::Value::Object(mut object) => object
+            .remove("$bytes")
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .ok_or_else(|| serde::de::Error::custom("missing welcomeBlob.$bytes string"))?,
+        _ => {
+            return Err(serde::de::Error::custom(
+                "welcomeBlob must be base64 string or {$bytes: string}",
+            ))
+        }
+    };
+
+    STANDARD.decode(encoded).map_err(serde::de::Error::custom)
 }
 
 #[derive(Debug, Serialize)]
@@ -43,10 +65,7 @@ pub async fn reissue_welcome_respond(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    let welcome_bytes = STANDARD.decode(&input.welcome_blob).map_err(|e| {
-        warn!("reissueWelcomeRespond: invalid base64 Welcome blob: {}", e);
-        StatusCode::BAD_REQUEST
-    })?;
+    let welcome_bytes = input.welcome_blob;
     if welcome_bytes.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -228,4 +247,35 @@ pub async fn reissue_welcome_respond(
         welcome_blob_id,
         responded_at,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reissue_welcome_respond_decodes_generated_atproto_bytes() {
+        let request = serde_json::from_value::<ReissueWelcomeRespondRequest>(serde_json::json!({
+            "requestId": "request-1",
+            "welcomeBlob": {
+                "$bytes": "d2VsY29tZQ=="
+            },
+            "keyPackageHash": "0123456789abcdef"
+        }))
+        .expect("generated Petrel Bytes payload should decode");
+
+        assert_eq!(request.request_id, "request-1");
+        assert_eq!(request.welcome_blob, b"welcome");
+    }
+
+    #[test]
+    fn reissue_welcome_respond_decodes_legacy_base64_string() {
+        let request = serde_json::from_value::<ReissueWelcomeRespondRequest>(serde_json::json!({
+            "requestId": "request-1",
+            "welcomeBlob": "d2VsY29tZQ=="
+        }))
+        .expect("legacy base64 string payload should decode");
+
+        assert_eq!(request.welcome_blob, b"welcome");
+    }
 }
