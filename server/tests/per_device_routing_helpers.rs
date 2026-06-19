@@ -1240,7 +1240,7 @@ async fn device_hint_miss_does_not_return_other_device_bound_welcome() {
 
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
-async fn device_hint_with_hash_does_not_return_other_device_bound_welcome() {
+async fn device_hint_with_hash_returns_stale_device_bound_welcome() {
     let pool = common::setup_test_db().await;
     let convo_id = format!("convo-perdev-devicehint-hash-wrong-{}", Uuid::new_v4());
     common::cleanup(&pool, &convo_id).await;
@@ -1278,9 +1278,10 @@ async fn device_hint_with_hash_does_not_return_other_device_bound_welcome() {
     .expect("welcome lookup should not error");
 
     assert!(
-        row.is_none(),
-        "hash-matched lookup with a device hint must not return a welcome bound to another device"
+        row.is_some(),
+        "hash-matched lookup proves local key-package ownership and must survive a stale device hint"
     );
+    assert_eq!(row.unwrap().1, welcome_a);
 
     common::cleanup(&pool, &convo_id).await;
 }

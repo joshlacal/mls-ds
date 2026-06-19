@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use axum::{
-    Json,
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
+    Json,
 };
 use jacquard_axum::ExtractXrpc;
 use serde::Serialize;
@@ -215,7 +215,7 @@ pub async fn fetch_welcome_row_for_recipient(
         }
 
         if !device_candidates.is_empty() {
-            return sqlx::query_as(
+            let device_filtered: Option<(String, Vec<u8>)> = sqlx::query_as(
                 "SELECT id, welcome_data FROM welcome_messages \
                  WHERE convo_id = $1 \
                    AND (recipient_did = $2 OR recipient_did = $3) \
@@ -237,7 +237,43 @@ pub async fn fetch_welcome_row_for_recipient(
                     e
                 );
                 GetGroupStateContractError::Generic(StatusCode::INTERNAL_SERVER_ERROR)
-            });
+            })?;
+
+            if device_filtered.is_some() {
+                return Ok(device_filtered);
+            }
+
+            let hash_matched: Option<(String, Vec<u8>)> = sqlx::query_as(
+                "SELECT id, welcome_data FROM welcome_messages \
+                 WHERE convo_id = $1 \
+                   AND (recipient_did = $2 OR recipient_did = $3) \
+                   AND consumed = false \
+                   AND key_package_hash = ANY($4::bytea[]) \
+                 ORDER BY created_at DESC, id DESC LIMIT 1",
+            )
+            .bind(convo_id)
+            .bind(did_str)
+            .bind(user_form_did)
+            .bind(hashes)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| {
+                error!(
+                    "Failed to fetch hash-matched welcome after device miss: {}",
+                    e
+                );
+                GetGroupStateContractError::Generic(StatusCode::INTERNAL_SERVER_ERROR)
+            })?;
+
+            if hash_matched.is_some() {
+                warn!(
+                    convo_id = %crate::crypto::redact_for_log(convo_id),
+                    did = %crate::crypto::redact_for_log(user_form_did),
+                    "getGroupState: hash-matched welcome lookup bypassed stale device hint"
+                );
+            }
+
+            return Ok(hash_matched);
         }
 
         return sqlx::query_as(
