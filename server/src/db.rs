@@ -1,7 +1,7 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use once_cell::sync::Lazy;
-use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgPoolOptions};
+use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Row, Transaction};
 use std::time::Duration;
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
@@ -3335,5 +3335,103 @@ mod tests {
             .expect("Failed to list members");
 
         assert_eq!(members.len(), 2);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+    async fn preserves_unconsumed_welcome_atomicity_rollback_clears_members_and_welcomes() {
+        let pool = setup_test_db().await;
+        let suffix = Uuid::new_v4().simple().to_string();
+        let owner_did = format!("did:plc:atomic{}", &suffix[..12]);
+        let convo = create_conversation(&pool, &owner_did)
+            .await
+            .expect("create conversation");
+        let hash_a = "7a7b7c7d7e7f80818283848586878889909192939495969798999a9b9c9d9e9f".to_string();
+        let hash_b = "9f9e9d9c9b9a99989796959493929190898887868584838281807f7e7d7c7b7a".to_string();
+
+        sqlx::query("INSERT INTO users (did) VALUES ($1) ON CONFLICT DO NOTHING")
+            .bind(&owner_did)
+            .execute(&pool)
+            .await
+            .expect("seed user");
+
+        for (device_id, hash_hex) in [("device-a", hash_a.as_str()), ("device-b", hash_b.as_str())]
+        {
+            sqlx::query(
+                "INSERT INTO key_packages \
+                    (id, owner_did, device_id, cipher_suite, key_package, key_package_hash, created_at, expires_at, state) \
+                 VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW() + INTERVAL '30 days', 'available')",
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(&owner_did)
+            .bind(device_id)
+            .bind("MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519")
+            .bind::<&[u8]>(&[0xA5])
+            .bind(hash_hex)
+            .execute(&pool)
+            .await
+            .expect("seed key package");
+        }
+
+        let entries = vec![
+            crate::generated::blue_catbird::mlsChat::bootstrap_reset_group::KeyPackageHashEntry {
+                did: crate::sqlx_jacquard::string_to_did(&owner_did),
+                hash: hash_a.clone().into(),
+                extra_data: Default::default(),
+            },
+            crate::generated::blue_catbird::mlsChat::bootstrap_reset_group::KeyPackageHashEntry {
+                did: crate::sqlx_jacquard::string_to_did(&owner_did),
+                hash: hash_b.clone().into(),
+                extra_data: Default::default(),
+            },
+        ];
+
+        let mut tx = pool.begin().await.expect("begin tx");
+        insert_members_per_device_in_tx(&mut tx, &convo.id, &entries, Utc::now(), true)
+            .await
+            .expect("stage members");
+        store_welcomes_per_device_in_tx(
+            &mut tx,
+            &convo.id,
+            b"welcome-atomic",
+            &entries,
+            &owner_did,
+        )
+        .await
+        .expect("stage welcomes");
+        tx.rollback().await.expect("rollback staged tx");
+
+        let member_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM members WHERE convo_id = $1 AND left_at IS NULL",
+        )
+        .bind(&convo.id)
+        .fetch_one(&pool)
+        .await
+        .expect("count members after rollback");
+        let welcome_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM welcome_messages WHERE convo_id = $1")
+                .bind(&convo.id)
+                .fetch_one(&pool)
+                .await
+                .expect("count welcomes after rollback");
+
+        assert_eq!(member_count, 0, "rollback must clear staged members");
+        assert_eq!(
+            welcome_count, 0,
+            "rollback must not leak partial or orphan Welcome rows"
+        );
+
+        let _ = sqlx::query("DELETE FROM key_packages WHERE owner_did = $1")
+            .bind(&owner_did)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE did = $1")
+            .bind(&owner_did)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM conversations WHERE id = $1")
+            .bind(&convo.id)
+            .execute(&pool)
+            .await;
     }
 }

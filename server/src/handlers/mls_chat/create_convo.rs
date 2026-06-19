@@ -1,8 +1,8 @@
 use axum::{
-    Json,
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
+    Json,
 };
 use chrono::{DateTime, Utc};
 use jacquard_axum::ExtractXrpc;
@@ -10,13 +10,13 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use crate::{
-    auth::{AuthUser, verify_is_admin},
+    auth::{verify_is_admin, AuthUser},
     block_sync::BlockSyncService,
     generated::blue_catbird::mlsChat::{
-        ConvoView, MemberView,
         create_convo::{
             CreateConvoError as LexCreateConvoError, CreateConvoOutput, CreateConvoRequest,
         },
+        ConvoView, MemberView,
     },
     sqlx_jacquard::{chrono_to_datetime, did_to_string, string_to_did},
     storage::DbPool,
@@ -25,7 +25,11 @@ use crate::{
 const NSID: &str = "blue.catbird.mlsChat.createConvo";
 
 fn bootstrap_epoch_for_create(has_welcome: bool) -> i32 {
-    if has_welcome { 1 } else { 0 }
+    if has_welcome {
+        1
+    } else {
+        0
+    }
 }
 
 fn validate_initial_members_have_welcome(
@@ -1119,6 +1123,15 @@ async fn handle_create_convo(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+    use sqlx::Row;
+    use std::{sync::Arc, time::Duration};
+
+    use crate::{
+        auth::{AtProtoClaims, AuthUser},
+        block_sync::BlockSyncService,
+        db::{init_db, DbConfig},
+    };
 
     #[test]
     fn bootstrap_epoch_is_zero_without_welcome() {
@@ -1174,5 +1187,170 @@ mod tests {
             .expect("valid GroupInfo must be accepted");
 
         assert_eq!(validated.as_deref(), Some(group_info.as_ref()));
+    }
+
+    async fn setup_test_db() -> DbPool {
+        init_db(DbConfig {
+            database_url: std::env::var("TEST_DATABASE_URL")
+                .unwrap_or_else(|_| "postgres://localhost/catbird_test".to_string()),
+            max_connections: 4,
+            min_connections: 1,
+            acquire_timeout: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(600),
+        })
+        .await
+        .expect("initialize test database")
+    }
+
+    async fn cleanup_test_actor_data(pool: &DbPool, convo_id: &str, owner_did: &str) {
+        let _ = sqlx::query("DELETE FROM key_packages WHERE owner_did = $1")
+            .bind(owner_did)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE did = $1")
+            .bind(owner_did)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM conversations WHERE id = $1")
+            .bind(convo_id)
+            .execute(pool)
+            .await;
+    }
+
+    async fn seed_key_package(pool: &DbPool, owner_did: &str, device_id: &str, hash_hex: &str) {
+        sqlx::query(
+            "INSERT INTO key_packages \
+                (id, owner_did, device_id, cipher_suite, key_package, key_package_hash, created_at, expires_at, state) \
+             VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW() + INTERVAL '30 days', 'available')",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(owner_did)
+        .bind(device_id)
+        .bind("MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519")
+        .bind::<&[u8]>(&[0xA5])
+        .bind(hash_hex)
+        .execute(pool)
+        .await
+        .expect("seed key package");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+    async fn create_convo_preserves_unconsumed_welcome_rows_with_per_device_members() {
+        let pool = setup_test_db().await;
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let owner_did = format!("did:plc:createwelcome{}", &suffix[..10]);
+        let convo_id = format!("convo-create-welcome-{suffix}");
+        let hash_a = "4d83a9f4d9d3f0dfe3fdce4e31d7836ed8b58f4f4f49f7eec46fd882ba8d1111".to_string();
+        let hash_b = "8b6abf7ac8c65d1234567890abcdefabcdef1234567890abcdef1234567890".to_string();
+
+        cleanup_test_actor_data(&pool, &convo_id, &owner_did).await;
+        sqlx::query("INSERT INTO users (did) VALUES ($1) ON CONFLICT DO NOTHING")
+            .bind(&owner_did)
+            .execute(&pool)
+            .await
+            .expect("seed user");
+        seed_key_package(&pool, &owner_did, "device-a", &hash_a).await;
+        seed_key_package(&pool, &owner_did, "device-b", &hash_b).await;
+
+        let auth_user = AuthUser {
+            did: owner_did.clone(),
+            claims: AtProtoClaims {
+                iss: owner_did.clone(),
+                aud: "did:web:mls.example.test".to_string(),
+                exp: Utc::now().timestamp() + 300,
+                iat: Some(Utc::now().timestamp()),
+                sub: Some(owner_did.clone()),
+                lxm: None,
+                jti: Some(format!("jti-{suffix}")),
+            },
+        };
+        let input = crate::generated::blue_catbird::mlsChat::create_convo::CreateConvo {
+            cipher_suite: "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519".into(),
+            current_epoch: Some(1),
+            group_id: convo_id.clone().into(),
+            group_info: Some(Bytes::from(vec![
+                0xAB;
+                crate::group_info::MIN_GROUP_INFO_SIZE
+            ])),
+            key_package_hashes: Some(vec![
+                crate::generated::blue_catbird::mlsChat::create_convo::KeyPackageHashEntry {
+                    did: string_to_did(&owner_did),
+                    hash: hash_a.clone().into(),
+                    extra_data: Default::default(),
+                },
+                crate::generated::blue_catbird::mlsChat::create_convo::KeyPackageHashEntry {
+                    did: string_to_did(&owner_did),
+                    hash: hash_b.clone().into(),
+                    extra_data: Default::default(),
+                },
+            ]),
+            welcome_message: Some(Bytes::from_static(b"welcome-envelope")),
+            ..Default::default()
+        };
+
+        let output = handle_create_convo(
+            pool.clone(),
+            Arc::new(BlockSyncService::new()),
+            auth_user,
+            &input,
+        )
+        .await
+        .expect("createConvo succeeds");
+
+        assert_eq!(output.convo.epoch, 1);
+
+        let member_rows = sqlx::query(
+            "SELECT member_did, user_did, device_id, is_admin \
+             FROM members \
+             WHERE convo_id = $1 AND left_at IS NULL \
+             ORDER BY device_id",
+        )
+        .bind(&convo_id)
+        .fetch_all(&pool)
+        .await
+        .expect("fetch members");
+        assert_eq!(member_rows.len(), 2, "one active member row per device");
+        assert_eq!(
+            member_rows[0].get::<String, _>("member_did"),
+            format!("{owner_did}#device-a")
+        );
+        assert_eq!(
+            member_rows[1].get::<String, _>("member_did"),
+            format!("{owner_did}#device-b")
+        );
+        assert!(
+            member_rows.iter().all(|row| row.get::<bool, _>("is_admin")),
+            "creator device rows must stay admin"
+        );
+
+        let welcome_rows = sqlx::query(
+            "SELECT recipient_did, recipient_device_id, encode(key_package_hash, 'hex') AS hash_hex, consumed \
+             FROM welcome_messages \
+             WHERE convo_id = $1 \
+             ORDER BY recipient_device_id",
+        )
+        .bind(&convo_id)
+        .fetch_all(&pool)
+        .await
+        .expect("fetch welcome rows");
+        assert_eq!(welcome_rows.len(), 2, "one pending Welcome per device");
+        assert_eq!(welcome_rows[0].get::<String, _>("recipient_did"), owner_did);
+        assert_eq!(
+            welcome_rows[0].get::<Option<String>, _>("recipient_device_id"),
+            Some("device-a".to_string())
+        );
+        assert_eq!(welcome_rows[0].get::<String, _>("hash_hex"), hash_a);
+        assert!(
+            !welcome_rows[0].get::<bool, _>("consumed"),
+            "fresh Welcome rows must stay unconsumed"
+        );
+        assert_eq!(
+            welcome_rows[1].get::<Option<String>, _>("recipient_device_id"),
+            Some("device-b".to_string())
+        );
+        assert_eq!(welcome_rows[1].get::<String, _>("hash_hex"), hash_b);
+
+        cleanup_test_actor_data(&pool, &convo_id, &owner_did).await;
     }
 }

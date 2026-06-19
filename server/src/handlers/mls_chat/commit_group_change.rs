@@ -1,8 +1,8 @@
 use axum::{
-    Json,
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
+    Json,
 };
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -21,7 +21,7 @@ use crate::{
     generated::blue_catbird::mlsChat::commit_group_change::{
         CommitGroupChangeOutput, CommitGroupChangeRequest, PendingDeviceAddition,
     },
-    realtime::{SseState, sse::StreamEvent},
+    realtime::{sse::StreamEvent, SseState},
     storage::DbPool,
 };
 
@@ -368,6 +368,27 @@ fn invalidate_welcome_response(rows_affected: u64) -> CommitGroupChangeOutput<'s
         rejoined_at: None,
         extra_data: Default::default(),
     }
+}
+
+async fn mark_reissue_request_answered_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    request_id: &str,
+    convo_id: &str,
+    responded_at: DateTime<Utc>,
+) -> sqlx::Result<u64> {
+    sqlx::query(
+        "UPDATE reissue_requests \
+         SET responded_at = $3 \
+         WHERE id = $1 \
+           AND convo_id = $2 \
+           AND responded_at IS NULL",
+    )
+    .bind(request_id)
+    .bind(convo_id)
+    .bind(responded_at)
+    .execute(&mut **tx)
+    .await
+    .map(|result| result.rows_affected())
 }
 
 /// ADR-002 §A7.4 — Persist the client-supplied `epoch_authenticator` for the
@@ -1010,23 +1031,18 @@ pub async fn commit_group_change(
             // transaction keeps the recovery state tied to the replacement
             // commit + Welcome durability boundary.
             if let Some(ref idem_key) = input.idempotency_key {
-                let answered = sqlx::query(
-                    "UPDATE reissue_requests \
-                     SET responded_at = $3 \
-                     WHERE id = $1 \
-                       AND convo_id = $2 \
-                       AND responded_at IS NULL",
+                let answered = mark_reissue_request_answered_tx(
+                    &mut tx,
+                    &idem_key.to_string(),
+                    &convo_id,
+                    now,
                 )
-                .bind(idem_key.to_string())
-                .bind(&convo_id)
-                .bind(now)
-                .execute(&mut *tx)
                 .await
                 .map_err(|e| {
                     error!("addMembers: failed to mark reissue request answered: {}", e);
                     internal_server_error("Failed to mark reissue request answered")
                 })?;
-                if answered.rows_affected() == 1 {
+                if answered == 1 {
                     info!(
                         "addMembers: marked Welcome reissue request {} answered for convo {}",
                         crate::crypto::redact_for_log(&idem_key.to_string()),
@@ -3551,7 +3567,7 @@ pub async fn commit_group_change(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::{StatusCode, header};
+    use axum::http::{header, StatusCode};
 
     #[test]
     fn invalidate_welcome_response_returns_false_when_nothing_invalidated() {
@@ -3698,5 +3714,169 @@ mod tests {
             "application/json"
         );
         assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "42");
+    }
+
+    async fn setup_test_db() -> DbPool {
+        crate::db::init_db(crate::db::DbConfig {
+            database_url: std::env::var("TEST_DATABASE_URL")
+                .unwrap_or_else(|_| "postgres://localhost/catbird_test".to_string()),
+            max_connections: 4,
+            min_connections: 1,
+            acquire_timeout: std::time::Duration::from_secs(30),
+            idle_timeout: std::time::Duration::from_secs(600),
+        })
+        .await
+        .expect("initialize test database")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+    async fn reissue_request_answered_only_after_commit_and_welcome_persistence() {
+        let pool = setup_test_db().await;
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let admin_did = format!("did:plc:admin{}", &suffix[..12]);
+        let recipient_did = format!("did:plc:recipient{}", &suffix[..8]);
+        let convo_id = format!("convo-reissue-{suffix}");
+        let request_id = format!("req-{suffix}");
+        let hash_hex =
+            "1f1e1d1c1b1a1918171615141312111001020304050607080910111213141516".to_string();
+
+        sqlx::query("INSERT INTO users (did) VALUES ($1) ON CONFLICT DO NOTHING")
+            .bind(&recipient_did)
+            .execute(&pool)
+            .await
+            .expect("seed recipient user");
+        sqlx::query(
+            "INSERT INTO conversations \
+                (id, creator_did, current_epoch, created_at, updated_at, cipher_suite, is_remote, group_id) \
+             VALUES ($1, $2, 1, NOW(), NOW(), $3, false, $1)",
+        )
+        .bind(&convo_id)
+        .bind(&admin_did)
+        .bind("MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519")
+        .execute(&pool)
+        .await
+        .expect("seed conversation");
+        sqlx::query(
+            "INSERT INTO key_packages \
+                (id, owner_did, device_id, cipher_suite, key_package, key_package_hash, created_at, expires_at, state) \
+             VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW() + INTERVAL '30 days', 'available')",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(&recipient_did)
+        .bind("device-a")
+        .bind("MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519")
+        .bind::<&[u8]>(&[0xA5])
+        .bind(&hash_hex)
+        .execute(&pool)
+        .await
+        .expect("seed recipient key package");
+        sqlx::query(
+            "INSERT INTO reissue_requests \
+                (id, convo_id, recipient_device_did, requested_at, attempts, last_attempt_at) \
+             VALUES ($1, $2, $3, NOW(), 1, NOW())",
+        )
+        .bind(&request_id)
+        .bind(&convo_id)
+        .bind(format!("{recipient_did}#device-a"))
+        .execute(&pool)
+        .await
+        .expect("seed reissue request");
+
+        let entries = vec![
+            crate::generated::blue_catbird::mlsChat::bootstrap_reset_group::KeyPackageHashEntry {
+                did: crate::sqlx_jacquard::string_to_did(&recipient_did),
+                hash: hash_hex.clone().into(),
+                extra_data: Default::default(),
+            },
+        ];
+
+        let mut tx = pool.begin().await.expect("begin rollback tx");
+        crate::db::store_welcomes_per_device_in_tx(
+            &mut tx,
+            &convo_id,
+            b"replacement-welcome",
+            &entries,
+            &admin_did,
+        )
+        .await
+        .expect("stage replacement welcome");
+        mark_reissue_request_answered_tx(&mut tx, &request_id, &convo_id, Utc::now())
+            .await
+            .expect("stage answered marker");
+        tx.rollback().await.expect("rollback tx");
+
+        let responded_after_rollback: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT responded_at FROM reissue_requests WHERE id = $1")
+                .bind(&request_id)
+                .fetch_one(&pool)
+                .await
+                .expect("fetch responded_at after rollback");
+        let welcome_rows_after_rollback: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM welcome_messages WHERE convo_id = $1")
+                .bind(&convo_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count welcomes after rollback");
+        assert!(
+            responded_after_rollback.is_none(),
+            "rollback must keep the reissue request pending"
+        );
+        assert_eq!(
+            welcome_rows_after_rollback, 0,
+            "rollback must not expose replacement Welcome rows"
+        );
+
+        let mut tx = pool.begin().await.expect("begin commit tx");
+        crate::db::store_welcomes_per_device_in_tx(
+            &mut tx,
+            &convo_id,
+            b"replacement-welcome",
+            &entries,
+            &admin_did,
+        )
+        .await
+        .expect("stage replacement welcome");
+        mark_reissue_request_answered_tx(&mut tx, &request_id, &convo_id, Utc::now())
+            .await
+            .expect("stage answered marker");
+        tx.commit().await.expect("commit tx");
+
+        let responded_after_commit: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT responded_at FROM reissue_requests WHERE id = $1")
+                .bind(&request_id)
+                .fetch_one(&pool)
+                .await
+                .expect("fetch responded_at after commit");
+        let welcome_rows_after_commit: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM welcome_messages \
+             WHERE convo_id = $1 AND recipient_did = $2 AND consumed = false",
+        )
+        .bind(&convo_id)
+        .bind(&recipient_did)
+        .fetch_one(&pool)
+        .await
+        .expect("count welcomes after commit");
+        assert!(
+            responded_after_commit.is_some(),
+            "commit must publish the answered marker"
+        );
+        assert_eq!(
+            welcome_rows_after_commit, 1,
+            "answered marker must become visible with the durable replacement Welcome"
+        );
+
+        let _ = sqlx::query("DELETE FROM key_packages WHERE owner_did = $1")
+            .bind(&recipient_did)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE did = $1")
+            .bind(&recipient_did)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM conversations WHERE id = $1")
+            .bind(&convo_id)
+            .execute(&pool)
+            .await;
     }
 }
