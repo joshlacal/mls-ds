@@ -27,6 +27,50 @@ use crate::{
 
 const NSID: &str = "blue.catbird.mlsChat.commitGroupChange";
 
+#[cfg(test)]
+const TEST_ADD_MEMBERS_COMMIT_BYTES: &[u8] = b"test-add-members-commit";
+#[cfg(test)]
+const TEST_COMMIT_EPOCH_UNSET: u64 = u64::MAX;
+#[cfg(test)]
+static TEST_ADD_MEMBERS_COMMIT_EPOCH_OVERRIDE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(TEST_COMMIT_EPOCH_UNSET);
+#[cfg(test)]
+static TEST_ADD_MEMBERS_ABORT_AFTER_WELCOME: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+struct AddMembersCommitShapeGuard;
+
+#[cfg(test)]
+impl Drop for AddMembersCommitShapeGuard {
+    fn drop(&mut self) {
+        TEST_ADD_MEMBERS_COMMIT_EPOCH_OVERRIDE
+            .store(TEST_COMMIT_EPOCH_UNSET, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+fn force_add_members_commit_shape_for_test(epoch: u64) -> AddMembersCommitShapeGuard {
+    TEST_ADD_MEMBERS_COMMIT_EPOCH_OVERRIDE.store(epoch, std::sync::atomic::Ordering::SeqCst);
+    AddMembersCommitShapeGuard
+}
+
+#[cfg(test)]
+struct AddMembersAbortAfterWelcomeGuard;
+
+#[cfg(test)]
+impl Drop for AddMembersAbortAfterWelcomeGuard {
+    fn drop(&mut self) {
+        TEST_ADD_MEMBERS_ABORT_AFTER_WELCOME.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+fn enable_add_members_abort_after_welcome_for_test() -> AddMembersAbortAfterWelcomeGuard {
+    TEST_ADD_MEMBERS_ABORT_AFTER_WELCOME.store(true, std::sync::atomic::Ordering::SeqCst);
+    AddMembersAbortAfterWelcomeGuard
+}
+
 // Layer 1 robustness tunables. Plan: ~/.claude/plans/rippling-greeting-whale.md
 // Per-(device, group) External Commit cooldown. The existing per-conversation
 // 30s rate limit (lines below) catches storms across all devices; this gate
@@ -330,6 +374,19 @@ fn inspect_commit_for_action(
     commit_bytes: &[u8],
     convo_id: &str,
 ) -> Result<super::commit_inspect::CommitShape, XrpcError> {
+    #[cfg(test)]
+    if action_name == "addMembers" && commit_bytes == TEST_ADD_MEMBERS_COMMIT_BYTES {
+        let epoch =
+            TEST_ADD_MEMBERS_COMMIT_EPOCH_OVERRIDE.load(std::sync::atomic::Ordering::SeqCst);
+        if epoch != TEST_COMMIT_EPOCH_UNSET {
+            return Ok(super::commit_inspect::CommitShape {
+                wire_format: openmls::prelude::WireFormat::PrivateMessage,
+                content_type: openmls::prelude::ContentType::Commit,
+                epoch,
+            });
+        }
+    }
+
     super::commit_inspect::inspect_commit_shape(commit_bytes).map_err(|e| {
         warn!(
             "{}: rejected — framing invalid ({}) for convo {}",
@@ -389,6 +446,15 @@ async fn mark_reissue_request_answered_tx(
     .execute(&mut **tx)
     .await
     .map(|result| result.rows_affected())
+}
+
+fn maybe_abort_add_members_after_welcome_for_test() -> Result<(), XrpcError> {
+    #[cfg(test)]
+    if TEST_ADD_MEMBERS_ABORT_AFTER_WELCOME.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(internal_server_error("Forced addMembers rollback for test"));
+    }
+
+    Ok(())
 }
 
 /// ADR-002 §A7.4 — Persist the client-supplied `epoch_authenticator` for the
@@ -1025,6 +1091,8 @@ pub async fn commit_group_change(
                     );
                 }
             }
+
+            maybe_abort_add_members_after_welcome_for_test()?;
 
             // Welcome reissue auto-responder uses the reissue request id as
             // this commit's idempotency key. Marking it answered in the same
@@ -3568,6 +3636,9 @@ pub async fn commit_group_change(
 mod tests {
     use super::*;
     use axum::http::{header, StatusCode};
+    use bytes::Bytes;
+    use jacquard_axum::ExtractXrpc;
+    use std::sync::Arc;
 
     #[test]
     fn invalidate_welcome_response_returns_false_when_nothing_invalidated() {
@@ -3727,6 +3798,251 @@ mod tests {
         })
         .await
         .expect("initialize test database")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+    async fn add_members_reissue_request_tracks_idempotency_key_only_after_commit() {
+        let pool = setup_test_db().await;
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let admin_user_did = format!("did:plc:admin{}", &suffix[..12]);
+        let admin_device_did = format!("{admin_user_did}#device-admin");
+        let recipient_did = format!("did:plc:recipient{}", &suffix[..8]);
+        let convo_id = format!("convo-reissue-handler-{suffix}");
+        let request_id = format!("req-{suffix}");
+        let other_request_id = format!("req-other-{suffix}");
+        let hash_hex =
+            "3f1e1d1c1b1a1918171615141312111001020304050607080910111213141516".to_string();
+
+        sqlx::query("INSERT INTO users (did) VALUES ($1) ON CONFLICT DO NOTHING")
+            .bind(&recipient_did)
+            .execute(&pool)
+            .await
+            .expect("seed recipient user");
+        sqlx::query(
+            "INSERT INTO conversations \
+                (id, creator_did, current_epoch, created_at, updated_at, cipher_suite, is_remote, group_id) \
+             VALUES ($1, $2, 1, NOW(), NOW(), $3, false, $1)",
+        )
+        .bind(&convo_id)
+        .bind(&admin_user_did)
+        .bind("MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519")
+        .execute(&pool)
+        .await
+        .expect("seed conversation");
+        sqlx::query(
+            "INSERT INTO members \
+                (convo_id, member_did, user_did, device_id, joined_at, is_admin) \
+             VALUES ($1, $2, $3, $4, NOW(), true)",
+        )
+        .bind(&convo_id)
+        .bind(&admin_device_did)
+        .bind(&admin_user_did)
+        .bind("device-admin")
+        .execute(&pool)
+        .await
+        .expect("seed admin member");
+        sqlx::query(
+            "INSERT INTO key_packages \
+                (id, owner_did, device_id, cipher_suite, key_package, key_package_hash, created_at, expires_at, state) \
+             VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW() + INTERVAL '30 days', 'available')",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(&recipient_did)
+        .bind("device-a")
+        .bind("MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519")
+        .bind::<&[u8]>(&[0xA5])
+        .bind(&hash_hex)
+        .execute(&pool)
+        .await
+        .expect("seed recipient key package");
+        sqlx::query(
+            "INSERT INTO reissue_requests \
+                (id, convo_id, recipient_device_did, requested_at, attempts, last_attempt_at) \
+             VALUES ($1, $2, $3, NOW(), 1, NOW()), ($4, $2, $5, NOW(), 1, NOW())",
+        )
+        .bind(&request_id)
+        .bind(&convo_id)
+        .bind(format!("{recipient_did}#device-a"))
+        .bind(&other_request_id)
+        .bind(format!("{recipient_did}#device-b"))
+        .execute(&pool)
+        .await
+        .expect("seed reissue requests");
+
+        let auth_user = AuthUser {
+            did: admin_device_did.clone(),
+            claims: crate::auth::AtProtoClaims {
+                iss: admin_user_did.clone(),
+                aud: "did:web:mls.example.test".to_string(),
+                exp: Utc::now().timestamp() + 300,
+                iat: Some(Utc::now().timestamp()),
+                sub: Some(admin_user_did.clone()),
+                lxm: Some(NSID.to_string()),
+                jti: Some(format!("jti-{suffix}")),
+            },
+        };
+        let input =
+            crate::generated::blue_catbird::mlsChat::commit_group_change::CommitGroupChange {
+                action: "addMembers".into(),
+                commit: Some(Bytes::from_static(b"test-add-members-commit")),
+                convo_id: convo_id.clone().into(),
+                idempotency_key: Some(request_id.clone().into()),
+                key_package_hashes: Some(vec![
+                crate::generated::blue_catbird::mlsChat::commit_group_change::KeyPackageHashEntry {
+                    did: crate::sqlx_jacquard::string_to_did(&recipient_did),
+                    hash: hash_hex.clone().into(),
+                    extra_data: Default::default(),
+                },
+            ]),
+                member_dids: Some(vec![crate::sqlx_jacquard::string_to_did(&recipient_did)]),
+                welcome: Some(Bytes::from_static(b"replacement-welcome")),
+                ..Default::default()
+            };
+
+        let sse_state = Arc::new(crate::realtime::SseState::new(16));
+        let actor_registry = Arc::new(crate::actors::ActorRegistry::new(
+            pool.clone(),
+            sse_state.clone(),
+            None,
+        ));
+        let inline_trigger_cfg = Arc::new(crate::config::InlineTriggerConfig::default());
+        let block_sync = Arc::new(BlockSyncService::new());
+
+        let _commit_guard = force_add_members_commit_shape_for_test(1);
+        {
+            let _rollback_guard = enable_add_members_abort_after_welcome_for_test();
+            let error = commit_group_change(
+                State(pool.clone()),
+                State(sse_state.clone()),
+                State(actor_registry.clone()),
+                State(inline_trigger_cfg.clone()),
+                State(block_sync.clone()),
+                auth_user.clone(),
+                ExtractXrpc(input.clone()),
+            )
+            .await
+            .expect_err("forced rollback should fail the handler");
+            assert_eq!(
+                error.into_response().status(),
+                StatusCode::INTERNAL_SERVER_ERROR
+            );
+        }
+
+        let responded_after_rollback: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT responded_at FROM reissue_requests WHERE id = $1")
+                .bind(&request_id)
+                .fetch_one(&pool)
+                .await
+                .expect("fetch responded_at after rollback");
+        let other_after_rollback: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT responded_at FROM reissue_requests WHERE id = $1")
+                .bind(&other_request_id)
+                .fetch_one(&pool)
+                .await
+                .expect("fetch other responded_at after rollback");
+        let welcome_rows_after_rollback: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM welcome_messages WHERE convo_id = $1")
+                .bind(&convo_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count welcomes after rollback");
+        let recipient_members_after_rollback: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM members WHERE convo_id = $1 AND user_did = $2 AND left_at IS NULL",
+        )
+        .bind(&convo_id)
+        .bind(&recipient_did)
+        .fetch_one(&pool)
+        .await
+        .expect("count recipient members after rollback");
+        assert!(
+            responded_after_rollback.is_none(),
+            "rollback must keep the matching reissue request pending"
+        );
+        assert!(
+            other_after_rollback.is_none(),
+            "rollback must keep unrelated reissue requests pending"
+        );
+        assert_eq!(
+            welcome_rows_after_rollback, 0,
+            "rollback must not expose replacement Welcome rows"
+        );
+        assert_eq!(
+            recipient_members_after_rollback, 0,
+            "rollback must not leak recipient membership rows"
+        );
+
+        let response = commit_group_change(
+            State(pool.clone()),
+            State(sse_state),
+            State(actor_registry),
+            State(inline_trigger_cfg),
+            State(block_sync),
+            auth_user,
+            ExtractXrpc(input),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("successful addMembers response"));
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let responded_after_commit: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT responded_at FROM reissue_requests WHERE id = $1")
+                .bind(&request_id)
+                .fetch_one(&pool)
+                .await
+                .expect("fetch responded_at after commit");
+        let other_after_commit: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT responded_at FROM reissue_requests WHERE id = $1")
+                .bind(&other_request_id)
+                .fetch_one(&pool)
+                .await
+                .expect("fetch other responded_at after commit");
+        let welcome_rows_after_commit: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM welcome_messages \
+             WHERE convo_id = $1 AND recipient_did = $2 AND consumed = false",
+        )
+        .bind(&convo_id)
+        .bind(&recipient_did)
+        .fetch_one(&pool)
+        .await
+        .expect("count welcomes after commit");
+        let recipient_members_after_commit: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM members WHERE convo_id = $1 AND user_did = $2 AND left_at IS NULL",
+        )
+        .bind(&convo_id)
+        .bind(&recipient_did)
+        .fetch_one(&pool)
+        .await
+        .expect("count recipient members after commit");
+        assert!(
+            responded_after_commit.is_some(),
+            "commit must answer the reissue request named by idempotencyKey"
+        );
+        assert!(
+            other_after_commit.is_none(),
+            "handler must not answer unrelated reissue requests"
+        );
+        assert_eq!(
+            welcome_rows_after_commit, 1,
+            "commit must publish exactly one durable replacement Welcome row"
+        );
+        assert_eq!(
+            recipient_members_after_commit, 1,
+            "commit must publish the recipient membership row atomically with the Welcome"
+        );
+
+        let _ = sqlx::query("DELETE FROM key_packages WHERE owner_did = $1")
+            .bind(&recipient_did)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE did = $1")
+            .bind(&recipient_did)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM conversations WHERE id = $1")
+            .bind(&convo_id)
+            .execute(&pool)
+            .await;
     }
 
     #[tokio::test]

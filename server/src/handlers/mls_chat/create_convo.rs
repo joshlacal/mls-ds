@@ -24,6 +24,35 @@ use crate::{
 
 const NSID: &str = "blue.catbird.mlsChat.createConvo";
 
+#[cfg(test)]
+static TEST_ABORT_AFTER_WELCOME: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+struct CreateConvoAbortAfterWelcomeGuard;
+
+#[cfg(test)]
+impl Drop for CreateConvoAbortAfterWelcomeGuard {
+    fn drop(&mut self) {
+        TEST_ABORT_AFTER_WELCOME.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+fn enable_create_convo_abort_after_welcome_for_test() -> CreateConvoAbortAfterWelcomeGuard {
+    TEST_ABORT_AFTER_WELCOME.store(true, std::sync::atomic::Ordering::SeqCst);
+    CreateConvoAbortAfterWelcomeGuard
+}
+
+fn maybe_abort_create_convo_after_welcome_for_test() -> Result<(), Response> {
+    #[cfg(test)]
+    if TEST_ABORT_AFTER_WELCOME.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
+
+    Ok(())
+}
+
 fn bootstrap_epoch_for_create(has_welcome: bool) -> i32 {
     if has_welcome {
         1
@@ -1051,6 +1080,8 @@ async fn handle_create_convo(
         }
     }
 
+    maybe_abort_create_convo_after_welcome_for_test()?;
+
     tx.commit().await.map_err(|e| {
         error!(
             "❌ [v2.createConvo] Failed to commit atomic createConvo tx: {}",
@@ -1124,6 +1155,7 @@ async fn handle_create_convo(
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use jacquard_axum::ExtractXrpc;
     use sqlx::Row;
     use std::{sync::Arc, time::Duration};
 
@@ -1232,6 +1264,101 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed key package");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+    async fn create_convo_rollback_clears_conversation_members_and_welcomes() {
+        let pool = setup_test_db().await;
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let owner_did = format!("did:plc:createatomic{}", &suffix[..10]);
+        let convo_id = format!("convo-create-atomic-{suffix}");
+        let hash_a = "2d83a9f4d9d3f0dfe3fdce4e31d7836ed8b58f4f4f49f7eec46fd882ba8d2222".to_string();
+        let hash_b = "7b6abf7ac8c65d1234567890abcdefabcdef1234567890abcdef1234567890".to_string();
+
+        cleanup_test_actor_data(&pool, &convo_id, &owner_did).await;
+        sqlx::query("INSERT INTO users (did) VALUES ($1) ON CONFLICT DO NOTHING")
+            .bind(&owner_did)
+            .execute(&pool)
+            .await
+            .expect("seed user");
+        seed_key_package(&pool, &owner_did, "device-a", &hash_a).await;
+        seed_key_package(&pool, &owner_did, "device-b", &hash_b).await;
+
+        let auth_user = AuthUser {
+            did: owner_did.clone(),
+            claims: AtProtoClaims {
+                iss: owner_did.clone(),
+                aud: "did:web:mls.example.test".to_string(),
+                exp: Utc::now().timestamp() + 300,
+                iat: Some(Utc::now().timestamp()),
+                sub: Some(owner_did.clone()),
+                lxm: Some(NSID.to_string()),
+                jti: Some(format!("jti-{suffix}")),
+            },
+        };
+        let input = crate::generated::blue_catbird::mlsChat::create_convo::CreateConvo {
+            cipher_suite: "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519".into(),
+            current_epoch: Some(1),
+            group_id: convo_id.clone().into(),
+            group_info: Some(Bytes::from(vec![
+                0xAB;
+                crate::group_info::MIN_GROUP_INFO_SIZE
+            ])),
+            key_package_hashes: Some(vec![
+                crate::generated::blue_catbird::mlsChat::create_convo::KeyPackageHashEntry {
+                    did: string_to_did(&owner_did),
+                    hash: hash_a.clone().into(),
+                    extra_data: Default::default(),
+                },
+                crate::generated::blue_catbird::mlsChat::create_convo::KeyPackageHashEntry {
+                    did: string_to_did(&owner_did),
+                    hash: hash_b.clone().into(),
+                    extra_data: Default::default(),
+                },
+            ]),
+            welcome_message: Some(Bytes::from_static(b"welcome-envelope")),
+            ..Default::default()
+        };
+
+        let _rollback_guard = enable_create_convo_abort_after_welcome_for_test();
+        let response = create_convo(
+            State(pool.clone()),
+            State(Arc::new(BlockSyncService::new())),
+            auth_user,
+            ExtractXrpc(input),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let conversation_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM conversations WHERE id = $1")
+                .bind(&convo_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count conversations");
+        let member_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM members WHERE convo_id = $1")
+                .bind(&convo_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count members");
+        let welcome_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM welcome_messages WHERE convo_id = $1")
+                .bind(&convo_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count welcomes");
+
+        assert_eq!(
+            conversation_count, 0,
+            "rollback must clear the conversation row"
+        );
+        assert_eq!(member_count, 0, "rollback must clear staged member rows");
+        assert_eq!(welcome_count, 0, "rollback must clear staged Welcome rows");
+
+        cleanup_test_actor_data(&pool, &convo_id, &owner_did).await;
     }
 
     #[tokio::test]
