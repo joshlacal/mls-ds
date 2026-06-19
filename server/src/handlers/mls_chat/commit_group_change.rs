@@ -1112,9 +1112,16 @@ pub async fn commit_group_change(
                 })?;
                 if answered == 1 {
                     info!(
-                        "addMembers: marked Welcome reissue request {} answered for convo {}",
-                        crate::crypto::redact_for_log(&idem_key.to_string()),
-                        crate::crypto::redact_for_log(&convo_id)
+                        convo_id = %crate::crypto::redact_for_log(&convo_id),
+                        request_id = %crate::crypto::redact_for_log(&idem_key.to_string()),
+                        welcome_rows_persisted = used_per_device_path,
+                        "addMembers: auto-response stored for Welcome reissue request"
+                    );
+                } else {
+                    info!(
+                        convo_id = %crate::crypto::redact_for_log(&convo_id),
+                        request_id = %crate::crypto::redact_for_log(&idem_key.to_string()),
+                        "addMembers: idempotency key did not match a pending Welcome reissue request"
                     );
                 }
             }
@@ -2170,9 +2177,11 @@ pub async fn commit_group_change(
             .rows_affected();
 
             info!(
-                "✅ [v2.commitGroupChange] invalidateWelcome complete for convo {} (rows={})",
-                crate::crypto::redact_for_log(&convo_id),
-                invalidated
+                convo_id = %crate::crypto::redact_for_log(&convo_id),
+                recipient_did = %crate::crypto::redact_for_log(&auth_user.did),
+                invalidated_welcome_rows = invalidated,
+                consumed_any = invalidated > 0,
+                "commitGroupChange: invalidateWelcome consumed Welcome rows"
             );
 
             Ok(Json(invalidate_welcome_response(invalidated)).into_response())

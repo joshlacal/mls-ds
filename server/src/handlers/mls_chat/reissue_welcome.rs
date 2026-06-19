@@ -1,8 +1,8 @@
-use axum::{Json, extract::State, http::StatusCode};
+use axum::{extract::State, http::StatusCode, Json};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -147,6 +147,16 @@ pub async fn reissue_welcome(
         error!("reissueWelcome: insert failed: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+    info!(
+        convo_id = %crate::crypto::redact_for_log(&input.convo_id),
+        recipient_device_did = %crate::crypto::redact_for_log(&input.recipient_device_did),
+        request_id = %crate::crypto::redact_for_log(&request_id),
+        inviter_device_did = %crate::crypto::redact_for_log(&inviter_device),
+        recent_request_count = recent_count,
+        requester_is_member,
+        has_reason = !input.reason.trim().is_empty(),
+        "reissueWelcome: request inserted"
+    );
 
     let event = StreamEvent::WelcomeReissueRequestedEvent {
         cursor: sse_state
@@ -160,6 +170,13 @@ pub async fn reissue_welcome(
     };
     if let Err(e) = sse_state.emit(&input.convo_id, event).await {
         warn!("reissueWelcome: best-effort SSE emit failed: {}", e);
+    } else {
+        info!(
+            convo_id = %crate::crypto::redact_for_log(&input.convo_id),
+            recipient_device_did = %crate::crypto::redact_for_log(&input.recipient_device_did),
+            request_id = %crate::crypto::redact_for_log(&request_id),
+            "reissueWelcome: requested event emitted"
+        );
     }
 
     Ok(Json(ReissueWelcomeOutput {

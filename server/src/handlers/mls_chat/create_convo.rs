@@ -61,6 +61,29 @@ fn bootstrap_epoch_for_create(has_welcome: bool) -> i32 {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WelcomeRowsForCreate {
+    expected_rows: usize,
+    used_per_device_path: bool,
+}
+
+fn expected_welcome_rows_for_create(
+    key_package_hash_count: usize,
+    fallback_member_count: usize,
+) -> WelcomeRowsForCreate {
+    if key_package_hash_count > 0 {
+        WelcomeRowsForCreate {
+            expected_rows: key_package_hash_count,
+            used_per_device_path: true,
+        }
+    } else {
+        WelcomeRowsForCreate {
+            expected_rows: fallback_member_count,
+            used_per_device_path: false,
+        }
+    }
+}
+
 fn validate_initial_members_have_welcome(
     initial_members: Option<&[jacquard_common::types::string::Did<'_>]>,
     creator_did: &str,
@@ -403,6 +426,17 @@ async fn handle_create_convo(
     // Plaintext metadata is no longer accepted by the createConvo schema.
     // Group metadata is server-blind: clients encrypt name/description/avatar
     // via the `group_metadata_blobs` blob path.
+
+    let welcome_row_expectation = input.welcome_message.as_ref().map(|_| {
+        expected_welcome_rows_for_create(
+            input
+                .key_package_hashes
+                .as_ref()
+                .map(|hashes| hashes.len())
+                .unwrap_or(0),
+            all_member_dids_for_block_check.len(),
+        )
+    });
 
     // ── Idempotency / first-responder race check ────────────────────────
     // Fetch the existing creator (if any) so we can distinguish:
@@ -1090,6 +1124,30 @@ async fn handle_create_convo(
         StatusCode::INTERNAL_SERVER_ERROR.into_response()
     })?;
 
+    if let Some(expectation) = welcome_row_expectation {
+        let stored_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM welcome_messages WHERE convo_id = $1 AND consumed = false",
+        )
+        .bind(&convo_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(-1);
+        let matched_expected = stored_rows >= 0 && stored_rows == expectation.expected_rows as i64;
+        let log_message = if matched_expected {
+            "createConvo: Welcome rows durable after commit"
+        } else {
+            "createConvo: Welcome row count mismatch after commit"
+        };
+        info!(
+            convo_id = %crate::crypto::redact_for_log(&convo_id),
+            expected_welcome_rows = expectation.expected_rows,
+            stored_welcome_rows = stored_rows,
+            used_per_device_path = expectation.used_per_device_path,
+            matched_expected,
+            "{}", log_message
+        );
+    }
+
     // Mark key packages as consumed after the atomic create succeeds. getKeyPackages
     // already claims packages, so this remains best-effort compatibility cleanup.
     if let Some(ref kp_hashes) = input.key_package_hashes {
@@ -1219,6 +1277,22 @@ mod tests {
             .expect("valid GroupInfo must be accepted");
 
         assert_eq!(validated.as_deref(), Some(group_info.as_ref()));
+    }
+
+    #[test]
+    fn expected_welcome_rows_prefers_per_device_hash_count() {
+        let expected = expected_welcome_rows_for_create(2, 5);
+
+        assert_eq!(expected.expected_rows, 2);
+        assert!(expected.used_per_device_path);
+    }
+
+    #[test]
+    fn expected_welcome_rows_falls_back_to_member_count_without_hashes() {
+        let expected = expected_welcome_rows_for_create(0, 4);
+
+        assert_eq!(expected.expected_rows, 4);
+        assert!(!expected.used_per_device_path);
     }
 
     async fn setup_test_db() -> DbPool {

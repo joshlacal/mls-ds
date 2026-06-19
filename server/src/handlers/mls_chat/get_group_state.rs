@@ -153,6 +153,29 @@ fn parse_requested_welcome_hashes(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WelcomeLookupLogAudit {
+    missing_for_current_member: bool,
+    requested_hash_count: usize,
+    device_candidate_count: usize,
+    had_device_hint: bool,
+}
+
+fn classify_welcome_lookup_for_log(
+    is_current_member: bool,
+    welcome_found: bool,
+    requested_hash_count: usize,
+    device_candidate_count: usize,
+    had_device_hint: bool,
+) -> WelcomeLookupLogAudit {
+    WelcomeLookupLogAudit {
+        missing_for_current_member: is_current_member && !welcome_found,
+        requested_hash_count,
+        device_candidate_count,
+        had_device_hint,
+    }
+}
+
 async fn resolve_welcome_device_candidates(
     pool: &DbPool,
     user_did: &str,
@@ -438,12 +461,18 @@ pub async fn get_group_state(
         ));
     }
 
-    let is_current_or_past_member: bool = sqlx::query_scalar(
-        "SELECT EXISTS(
+    let (is_current_or_past_member, is_current_member): (bool, bool) = sqlx::query_as(
+        "SELECT
+            EXISTS(
             SELECT 1
             FROM members
             WHERE convo_id = $1 AND (member_did = $2 OR user_did = $2)
-        )",
+            ),
+            EXISTS(
+            SELECT 1
+            FROM members
+            WHERE convo_id = $1 AND (member_did = $2 OR user_did = $2) AND left_at IS NULL
+            )",
     )
     .bind(convo_id)
     .bind(&auth_user.did)
@@ -671,6 +700,7 @@ pub async fn get_group_state(
             .device_id
             .as_deref()
             .or_else(|| did_str.split_once('#').map(|(_, device)| device));
+        let had_device_hint = device_hint.is_some();
         let device_candidates =
             resolve_welcome_device_candidates(&pool, &user_form_did, device_hint).await?;
         let requested_hashes = if requested_hashes.was_provided {
@@ -678,6 +708,7 @@ pub async fn get_group_state(
         } else {
             None
         };
+        let requested_hash_count = requested_hashes.map(|hashes| hashes.len()).unwrap_or(0);
 
         let welcome_row = fetch_welcome_row_for_recipient(
             &pool,
@@ -689,8 +720,34 @@ pub async fn get_group_state(
         )
         .await?;
 
-        if let Some((_welcome_id, data)) = welcome_row {
+        let welcome_audit = classify_welcome_lookup_for_log(
+            is_current_member,
+            welcome_row.is_some(),
+            requested_hash_count,
+            device_candidates.len(),
+            had_device_hint,
+        );
+
+        if let Some((welcome_id, data)) = welcome_row {
+            info!(
+                convo_id = %crate::crypto::redact_for_log(convo_id),
+                requester_did = %crate::crypto::redact_for_log(&user_form_did),
+                welcome_id = %crate::crypto::redact_for_log(&welcome_id),
+                requested_hash_count = welcome_audit.requested_hash_count,
+                device_candidate_count = welcome_audit.device_candidate_count,
+                had_device_hint = welcome_audit.had_device_hint,
+                "getGroupState: Welcome row fetched for requester"
+            );
             welcome = Some(bytes::Bytes::from(data));
+        } else if welcome_audit.missing_for_current_member {
+            warn!(
+                convo_id = %crate::crypto::redact_for_log(convo_id),
+                requester_did = %crate::crypto::redact_for_log(&user_form_did),
+                requested_hash_count = welcome_audit.requested_hash_count,
+                device_candidate_count = welcome_audit.device_candidate_count,
+                had_device_hint = welcome_audit.had_device_hint,
+                "getGroupState: current member is missing a pending Welcome row"
+            );
         }
     }
 
@@ -758,6 +815,25 @@ mod tests {
         let parsed = parse_requested_welcome_hashes(Some(&requested));
         assert!(parsed.was_provided);
         assert_eq!(parsed.hashes, vec![vec![0xaa, 0x11], vec![0xbb, 0x22]]);
+    }
+
+    #[test]
+    fn welcome_lookup_log_marks_missing_for_current_member() {
+        let audit = classify_welcome_lookup_for_log(true, false, 2, 1, true);
+
+        assert!(audit.missing_for_current_member);
+        assert_eq!(audit.requested_hash_count, 2);
+        assert_eq!(audit.device_candidate_count, 1);
+        assert!(audit.had_device_hint);
+    }
+
+    #[test]
+    fn welcome_lookup_log_does_not_mark_found_or_former_member_as_missing() {
+        let found = classify_welcome_lookup_for_log(true, true, 0, 0, false);
+        assert!(!found.missing_for_current_member);
+
+        let former_member = classify_welcome_lookup_for_log(false, false, 1, 0, false);
+        assert!(!former_member.missing_for_current_member);
     }
 
     #[tokio::test]

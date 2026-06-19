@@ -1,10 +1,10 @@
-use axum::{Json, extract::State, http::StatusCode};
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use axum::{extract::State, http::StatusCode, Json};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -188,6 +188,16 @@ pub async fn reissue_welcome_respond(
         error!("reissueWelcomeRespond: tx commit failed: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+    info!(
+        convo_id = %crate::crypto::redact_for_log(&convo_id),
+        recipient_device_did = %crate::crypto::redact_for_log(&recipient_device_did),
+        request_id = %crate::crypto::redact_for_log(&input.request_id),
+        welcome_blob_id = %crate::crypto::redact_for_log(&welcome_blob_id),
+        responder_did = %crate::crypto::redact_for_log(&auth_user.did),
+        key_package_hash_present = key_package_hash_hex.is_some(),
+        resolved_recipient_device_id = recipient_device_id.is_some(),
+        "reissueWelcomeRespond: response stored"
+    );
 
     let info = json!({
         "kind": "welcomeReissued",
@@ -203,6 +213,13 @@ pub async fn reissue_welcome_respond(
     };
     if let Err(e) = sse_state.emit(&convo_id, event).await {
         warn!("reissueWelcomeRespond: best-effort SSE emit failed: {}", e);
+    } else {
+        info!(
+            convo_id = %crate::crypto::redact_for_log(&convo_id),
+            request_id = %crate::crypto::redact_for_log(&input.request_id),
+            welcome_blob_id = %crate::crypto::redact_for_log(&welcome_blob_id),
+            "reissueWelcomeRespond: reissued Welcome event emitted"
+        );
     }
 
     Ok(Json(ReissueWelcomeRespondOutput {
