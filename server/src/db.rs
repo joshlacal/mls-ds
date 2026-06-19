@@ -2519,6 +2519,7 @@ pub fn stream_event_type_str(event: &crate::realtime::sse::StreamEvent) -> &'sta
         StreamEvent::TypingEvent { .. } => "typingEvent",
         StreamEvent::ReactionEvent { .. } => "reactionEvent",
         StreamEvent::InfoEvent { .. } => "infoEvent",
+        StreamEvent::WelcomeReissueRequestedEvent { .. } => "welcomeReissueRequestedEvent",
         StreamEvent::NewDeviceEvent { .. } => "newDeviceEvent",
         StreamEvent::GroupInfoRefreshRequested { .. } => "groupInfoRefreshRequestedEvent",
         StreamEvent::ReadditionRequested { .. } => "readditionRequestedEvent",
@@ -2538,6 +2539,7 @@ fn stream_event_cursor(event: &crate::realtime::sse::StreamEvent) -> &str {
         StreamEvent::TypingEvent { cursor, .. } => cursor,
         StreamEvent::ReactionEvent { cursor, .. } => cursor,
         StreamEvent::InfoEvent { cursor, .. } => cursor,
+        StreamEvent::WelcomeReissueRequestedEvent { cursor, .. } => cursor,
         StreamEvent::NewDeviceEvent { cursor, .. } => cursor,
         StreamEvent::GroupInfoRefreshRequested { cursor, .. } => cursor,
         StreamEvent::ReadditionRequested { cursor, .. } => cursor,
@@ -2844,39 +2846,24 @@ pub async fn delete_key_packages_by_hashes_for_device(
     Ok(result.rows_affected())
 }
 
-/// Invalidate pending Welcome messages for a recipient when the referenced key packages are deleted.
+/// Preserve pending Welcome messages for a recipient when referenced key packages are deleted.
 ///
-/// `welcome_messages.key_package_hash` is BYTEA, while server key package hashes are stored/returned as hex TEXT.
+/// Once createConvo/addMembers stores a Welcome, that row is the durable join
+/// receipt for the selected recipient device. Key-package cleanup may delete the
+/// original package row after it has been claimed, but it must not consume the
+/// Welcome before the receiver does. Kept as a compatibility no-op for older
+/// call sites that still invoke the invalidation-shaped API.
 pub async fn invalidate_welcomes_for_orphaned_key_packages(
-    pool: &DbPool,
-    user_did: &str,
+    _pool: &DbPool,
+    _user_did: &str,
     key_package_hashes_hex: &[String],
-    reason: &str,
+    _reason: &str,
 ) -> Result<u64> {
     if key_package_hashes_hex.is_empty() {
         return Ok(0);
     }
 
-    let result = sqlx::query(
-        r#"
-        UPDATE welcome_messages
-        SET consumed = true,
-            consumed_at = NOW(),
-            error_reason = $3
-        WHERE recipient_did = $1
-          AND consumed = false
-          AND key_package_hash IS NOT NULL
-          AND encode(key_package_hash, 'hex') = ANY($2)
-        "#,
-    )
-    .bind(user_did)
-    .bind(key_package_hashes_hex)
-    .bind(reason)
-    .execute(pool)
-    .await
-    .context("Failed to invalidate welcomes for orphaned key packages")?;
-
-    Ok(result.rows_affected())
+    Ok(0)
 }
 
 // ==================== REACTIONS ====================

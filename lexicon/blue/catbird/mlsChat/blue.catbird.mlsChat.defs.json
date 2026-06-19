@@ -146,7 +146,7 @@
       "required": ["convoId", "recipientDeviceDid", "requestedAt", "requestId"],
       "properties": {
         "convoId": { "type": "string", "description": "Conversation needing a reissued Welcome." },
-        "recipientDeviceDid": { "type": "string", "format": "did", "description": "Recipient device that cannot decrypt the original Welcome." },
+        "recipientDeviceDid": { "type": "string", "description": "Recipient device that cannot decrypt the original Welcome. This may be a device-qualified DID (did#deviceId)." },
         "requestedAt": { "type": "string", "format": "datetime" },
         "requestId": { "type": "string", "description": "Server-generated request identifier. Inviter echoes this in the replacement commit's idempotencyKey." }
       }

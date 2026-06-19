@@ -8,13 +8,13 @@
 
 use std::collections::HashMap;
 use std::io::Cursor;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{RwLock, broadcast};
 use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_util::sync::CancellationToken;
@@ -504,6 +504,7 @@ fn extract_cursor(event: &StreamEvent) -> Option<String> {
         StreamEvent::MessageEvent { cursor, .. }
         | StreamEvent::TypingEvent { cursor, .. }
         | StreamEvent::ReactionEvent { cursor, .. }
+        | StreamEvent::WelcomeReissueRequestedEvent { cursor, .. }
         | StreamEvent::NewDeviceEvent { cursor, .. }
         | StreamEvent::GroupInfoRefreshRequested { cursor, .. }
         | StreamEvent::ReadditionRequested { cursor, .. }

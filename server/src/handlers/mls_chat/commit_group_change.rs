@@ -1,8 +1,8 @@
 use axum::{
+    Json,
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -21,7 +21,7 @@ use crate::{
     generated::blue_catbird::mlsChat::commit_group_change::{
         CommitGroupChangeOutput, CommitGroupChangeRequest, PendingDeviceAddition,
     },
-    realtime::{sse::StreamEvent, SseState},
+    realtime::{SseState, sse::StreamEvent},
     storage::DbPool,
 };
 
@@ -851,7 +851,9 @@ pub async fn commit_group_change(
                 if mls_epoch_i32 != new_epoch {
                     warn!(
                         "addMembers: MLS epoch divergence — server epoch={}, MLS epoch={} for convo {}",
-                        new_epoch, mls_epoch_i32, crate::crypto::redact_for_log(&convo_id)
+                        new_epoch,
+                        mls_epoch_i32,
+                        crate::crypto::redact_for_log(&convo_id)
                     );
                 }
             }
@@ -1003,6 +1005,36 @@ pub async fn commit_group_change(
                 }
             }
 
+            // Welcome reissue auto-responder uses the reissue request id as
+            // this commit's idempotency key. Marking it answered in the same
+            // transaction keeps the recovery state tied to the replacement
+            // commit + Welcome durability boundary.
+            if let Some(ref idem_key) = input.idempotency_key {
+                let answered = sqlx::query(
+                    "UPDATE reissue_requests \
+                     SET responded_at = $3 \
+                     WHERE id = $1 \
+                       AND convo_id = $2 \
+                       AND responded_at IS NULL",
+                )
+                .bind(idem_key.to_string())
+                .bind(&convo_id)
+                .bind(now)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    error!("addMembers: failed to mark reissue request answered: {}", e);
+                    internal_server_error("Failed to mark reissue request answered")
+                })?;
+                if answered.rows_affected() == 1 {
+                    info!(
+                        "addMembers: marked Welcome reissue request {} answered for convo {}",
+                        crate::crypto::redact_for_log(&idem_key.to_string()),
+                        crate::crypto::redact_for_log(&convo_id)
+                    );
+                }
+            }
+
             // ── Store idempotency key ──────────────────────────────────
             if let Some(ref idem_key) = input.idempotency_key {
                 if let Err(e) = sqlx::query(
@@ -1146,9 +1178,10 @@ pub async fn commit_group_change(
                     if let Ok(member_dids) = members_result {
                         if !member_dids.is_empty() {
                             let envelope_now = chrono::Utc::now();
-                            let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
-                                "INSERT INTO envelopes (id, convo_id, recipient_did, message_id, created_at) ",
-                            );
+                            let mut qb: sqlx::QueryBuilder<sqlx::Postgres> =
+                                sqlx::QueryBuilder::new(
+                                    "INSERT INTO envelopes (id, convo_id, recipient_did, message_id, created_at) ",
+                                );
                             qb.push_values(member_dids.iter(), |mut b, did| {
                                 b.push_bind(uuid::Uuid::new_v4().to_string())
                                     .push_bind(&convo_id_clone)
@@ -1754,7 +1787,9 @@ pub async fn commit_group_change(
                 if mls_epoch_i32 != new_epoch {
                     warn!(
                         "externalCommit: MLS epoch divergence — server epoch={}, MLS post-commit epoch={} for convo {}",
-                        new_epoch, mls_epoch_i32, crate::crypto::redact_for_log(&convo_id)
+                        new_epoch,
+                        mls_epoch_i32,
+                        crate::crypto::redact_for_log(&convo_id)
                     );
                 }
             }
@@ -1979,9 +2014,10 @@ pub async fn commit_group_change(
                     if let Ok(member_dids) = members_result {
                         if !member_dids.is_empty() {
                             let envelope_now = chrono::Utc::now();
-                            let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
-                                "INSERT INTO envelopes (id, convo_id, recipient_did, message_id, created_at) ",
-                            );
+                            let mut qb: sqlx::QueryBuilder<sqlx::Postgres> =
+                                sqlx::QueryBuilder::new(
+                                    "INSERT INTO envelopes (id, convo_id, recipient_did, message_id, created_at) ",
+                                );
                             qb.push_values(member_dids.iter(), |mut b, did| {
                                 b.push_bind(uuid::Uuid::new_v4().to_string())
                                     .push_bind(&convo_id_clone)
@@ -2789,7 +2825,9 @@ pub async fn commit_group_change(
                     if mls_epoch_i32 != new_epoch {
                         warn!(
                             "removeMember: MLS epoch divergence — server epoch={}, MLS epoch={} for convo {}",
-                            new_epoch, mls_epoch_i32, crate::crypto::redact_for_log(&convo_id)
+                            new_epoch,
+                            mls_epoch_i32,
+                            crate::crypto::redact_for_log(&convo_id)
                         );
                     }
                 }
@@ -2912,9 +2950,10 @@ pub async fn commit_group_change(
                     if let Ok(member_dids) = members_result {
                         if !member_dids.is_empty() {
                             let envelope_now = chrono::Utc::now();
-                            let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
-                                "INSERT INTO envelopes (id, convo_id, recipient_did, message_id, created_at) ",
-                            );
+                            let mut qb: sqlx::QueryBuilder<sqlx::Postgres> =
+                                sqlx::QueryBuilder::new(
+                                    "INSERT INTO envelopes (id, convo_id, recipient_did, message_id, created_at) ",
+                                );
                             qb.push_values(member_dids.iter(), |mut b, did| {
                                 b.push_bind(uuid::Uuid::new_v4().to_string())
                                     .push_bind(&convo_id_clone)
@@ -3166,7 +3205,8 @@ pub async fn commit_group_change(
             // ── GroupInfo: keep existing (stale is better than absent) ─
             warn!(
                 "{}: no GroupInfo provided with commit for convo {} — keeping existing (may be stale)",
-                action_name, crate::crypto::redact_for_log(&convo_id)
+                action_name,
+                crate::crypto::redact_for_log(&convo_id)
             );
 
             // ── Store commit message ───────────────────────────────────
@@ -3283,9 +3323,10 @@ pub async fn commit_group_change(
                     if let Ok(member_dids) = members_result {
                         if !member_dids.is_empty() {
                             let envelope_now = chrono::Utc::now();
-                            let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
-                                "INSERT INTO envelopes (id, convo_id, recipient_did, message_id, created_at) ",
-                            );
+                            let mut qb: sqlx::QueryBuilder<sqlx::Postgres> =
+                                sqlx::QueryBuilder::new(
+                                    "INSERT INTO envelopes (id, convo_id, recipient_did, message_id, created_at) ",
+                                );
                             qb.push_values(member_dids.iter(), |mut b, did| {
                                 b.push_bind(uuid::Uuid::new_v4().to_string())
                                     .push_bind(&convo_id_clone)
@@ -3510,7 +3551,7 @@ pub async fn commit_group_change(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::{header, StatusCode};
+    use axum::http::{StatusCode, header};
 
     #[test]
     fn invalidate_welcome_response_returns_false_when_nothing_invalidated() {

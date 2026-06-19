@@ -9,8 +9,8 @@
 
 use axum::{
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
         Query, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::StatusCode,
     response::Response,
@@ -18,18 +18,18 @@ use axum::{
 use dashmap::DashMap;
 use futures::{sink::SinkExt, stream::StreamExt};
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::sync::{mpsc, Mutex};
-use tokio_stream::{wrappers::BroadcastStream, StreamMap};
+use tokio::sync::{Mutex, mpsc};
+use tokio_stream::{StreamMap, wrappers::BroadcastStream};
 use tracing::{debug, error, info, warn};
 
 use std::collections::HashSet;
 
 use crate::{
     federation::UpstreamManager,
-    handlers::subscription_ticket::{verify_ticket, TicketClaims},
+    handlers::subscription_ticket::{TicketClaims, verify_ticket},
     realtime::sse::{SseState, StreamEvent},
     storage::DbPool,
 };
@@ -519,6 +519,7 @@ async fn handle_socket(
                         StreamEvent::TypingEvent { cursor, .. } => cursor.clone(),
                         StreamEvent::ReactionEvent { cursor, .. } => cursor.clone(),
                         StreamEvent::InfoEvent { cursor, .. } => cursor.clone(),
+                        StreamEvent::WelcomeReissueRequestedEvent { cursor, .. } => cursor.clone(),
                         StreamEvent::NewDeviceEvent { cursor, .. } => cursor.clone(),
                         StreamEvent::GroupInfoRefreshRequested { cursor, .. } => cursor.clone(),
                         StreamEvent::ReadditionRequested { cursor, .. } => cursor.clone(),
@@ -742,6 +743,7 @@ async fn send_event(
         StreamEvent::TypingEvent { .. } => "#typingEvent",
         StreamEvent::ReactionEvent { .. } => "#reactionEvent",
         StreamEvent::InfoEvent { .. } => "#infoEvent",
+        StreamEvent::WelcomeReissueRequestedEvent { .. } => "#welcomeReissueRequestedEvent",
         StreamEvent::NewDeviceEvent { .. } => "#newDeviceEvent",
         StreamEvent::GroupInfoRefreshRequested { .. } => "#groupInfoRefreshRequestedEvent",
         StreamEvent::ReadditionRequested { .. } => "#readditionRequestedEvent",

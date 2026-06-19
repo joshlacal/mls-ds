@@ -1,13 +1,13 @@
 use axum::{
     extract::{Query, State},
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     response::{
-        sse::{Event, KeepAlive},
         IntoResponse, Sse,
+        sse::{Event, KeepAlive},
     },
 };
 use dashmap::DashMap;
-use futures::{stream, StreamExt};
+use futures::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -15,13 +15,13 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{RwLock, broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
 use crate::{
     auth::AuthUser,
     db::DbPool,
-    realtime::{cursor::CursorGenerator, StreamMessageView},
+    realtime::{StreamMessageView, cursor::CursorGenerator},
 };
 
 /// SSE query parameters for subscribeConvoEvents
@@ -73,6 +73,18 @@ pub enum StreamEvent {
     },
     #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#infoEvent")]
     InfoEvent { cursor: String, info: String },
+    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#welcomeReissueRequestedEvent")]
+    WelcomeReissueRequestedEvent {
+        cursor: String,
+        #[serde(rename = "convoId")]
+        convo_id: String,
+        #[serde(rename = "recipientDeviceDid")]
+        recipient_device_did: String,
+        #[serde(rename = "requestedAt")]
+        requested_at: String,
+        #[serde(rename = "requestId")]
+        request_id: String,
+    },
     /// Event indicating a user has registered a new device that needs to be added to the conversation
     #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#newDeviceEvent")]
     NewDeviceEvent {
@@ -231,6 +243,7 @@ pub fn set_stream_event_cursor(event: &mut StreamEvent, new_cursor: String) {
         StreamEvent::TypingEvent { cursor, .. } => *cursor = new_cursor,
         StreamEvent::ReactionEvent { cursor, .. } => *cursor = new_cursor,
         StreamEvent::InfoEvent { cursor, .. } => *cursor = new_cursor,
+        StreamEvent::WelcomeReissueRequestedEvent { cursor, .. } => *cursor = new_cursor,
         StreamEvent::NewDeviceEvent { cursor, .. } => *cursor = new_cursor,
         StreamEvent::GroupInfoRefreshRequested { cursor, .. } => *cursor = new_cursor,
         StreamEvent::ReadditionRequested { cursor, .. } => *cursor = new_cursor,
@@ -285,6 +298,18 @@ impl<'de> serde::Deserialize<'de> for StreamEvent {
             },
             #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#infoEvent")]
             InfoEvent { cursor: String, info: String },
+            #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#welcomeReissueRequestedEvent")]
+            WelcomeReissueRequestedEvent {
+                cursor: String,
+                #[serde(rename = "convoId")]
+                convo_id: String,
+                #[serde(rename = "recipientDeviceDid")]
+                recipient_device_did: String,
+                #[serde(rename = "requestedAt")]
+                requested_at: String,
+                #[serde(rename = "requestId")]
+                request_id: String,
+            },
             #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#newDeviceEvent")]
             NewDeviceEvent {
                 cursor: String,
@@ -301,9 +326,7 @@ impl<'de> serde::Deserialize<'de> for StreamEvent {
                 #[serde(rename = "pendingAdditionId")]
                 pending_addition_id: String,
             },
-            #[serde(
-                rename = "blue.catbird.mlsChat.subscribeEvents#groupInfoRefreshRequestedEvent"
-            )]
+            #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#groupInfoRefreshRequestedEvent")]
             GroupInfoRefreshRequested {
                 cursor: String,
                 #[serde(rename = "convoId")]
@@ -452,6 +475,19 @@ impl<'de> serde::Deserialize<'de> for StreamEvent {
                 action,
             },
             RawStreamEvent::InfoEvent { cursor, info } => StreamEvent::InfoEvent { cursor, info },
+            RawStreamEvent::WelcomeReissueRequestedEvent {
+                cursor,
+                convo_id,
+                recipient_device_did,
+                requested_at,
+                request_id,
+            } => StreamEvent::WelcomeReissueRequestedEvent {
+                cursor,
+                convo_id,
+                recipient_device_did,
+                requested_at,
+                request_id,
+            },
             RawStreamEvent::NewDeviceEvent {
                 cursor,
                 convo_id,
@@ -1082,6 +1118,7 @@ pub async fn subscribe_convo_events(
                                     StreamEvent::TypingEvent { cursor, .. } => cursor,
                                     StreamEvent::ReactionEvent { cursor, .. } => cursor,
                                     StreamEvent::InfoEvent { cursor, .. } => cursor,
+                                    StreamEvent::WelcomeReissueRequestedEvent { cursor, .. } => cursor,
                                     StreamEvent::NewDeviceEvent { cursor, .. } => cursor,
                                     StreamEvent::GroupInfoRefreshRequested { cursor, .. } => cursor,
                                     StreamEvent::ReadditionRequested { cursor, .. } => cursor,

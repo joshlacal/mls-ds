@@ -1,8 +1,8 @@
 use axum::{
+    Json,
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use chrono::{DateTime, Utc};
 use jacquard_axum::ExtractXrpc;
@@ -10,13 +10,13 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use crate::{
-    auth::{verify_is_admin, AuthUser},
+    auth::{AuthUser, verify_is_admin},
     block_sync::BlockSyncService,
     generated::blue_catbird::mlsChat::{
+        ConvoView, MemberView,
         create_convo::{
             CreateConvoError as LexCreateConvoError, CreateConvoOutput, CreateConvoRequest,
         },
-        ConvoView, MemberView,
     },
     sqlx_jacquard::{chrono_to_datetime, did_to_string, string_to_did},
     storage::DbPool,
@@ -25,11 +25,7 @@ use crate::{
 const NSID: &str = "blue.catbird.mlsChat.createConvo";
 
 fn bootstrap_epoch_for_create(has_welcome: bool) -> i32 {
-    if has_welcome {
-        1
-    } else {
-        0
-    }
+    if has_welcome { 1 } else { 0 }
 }
 
 fn validate_initial_members_have_welcome(
@@ -274,20 +270,18 @@ async fn handle_create_convo(
             .into_response());
     }
 
-    let initial_group_info = validate_initial_group_info(
-        input.welcome_message.is_some(),
-        input.group_info.as_ref(),
-    )
-    .map_err(|message| {
-        warn!("❌ [v2.createConvo] Malformed MLS groupInfo bootstrap: {message}");
-        (
-            StatusCode::BAD_REQUEST,
-            Json(LexCreateConvoError::KeyPackageNotFound(Some(
-                message.into(),
-            ))),
-        )
-            .into_response()
-    })?;
+    let initial_group_info =
+        validate_initial_group_info(input.welcome_message.is_some(), input.group_info.as_ref())
+            .map_err(|message| {
+                warn!("❌ [v2.createConvo] Malformed MLS groupInfo bootstrap: {message}");
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(LexCreateConvoError::KeyPackageNotFound(Some(
+                        message.into(),
+                    ))),
+                )
+                    .into_response()
+            })?;
 
     // ── Block detection ──────────────────────────────────────────────────
     let mut all_member_dids_for_block_check = vec![auth_user.did.clone()];
@@ -615,11 +609,6 @@ async fn handle_create_convo(
         StatusCode::INTERNAL_SERVER_ERROR.into_response()
     })?;
 
-    tx.commit().await.map_err(|e| {
-        error!("❌ [v2.createConvo] Failed to commit createConvo tx: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR.into_response()
-    })?;
-
     // ── Add creator as admin member + initial members ──────────────────
     // Per-device when kp_hashes provided; user-flat fallback otherwise.
     // The kp_hashes path resolves device_id from key_packages and inserts
@@ -640,16 +629,9 @@ async fn handle_create_convo(
     // creator. Fallback path (kp_hashes None/empty) preserves legacy
     // every-member behavior unchanged.
     //
-    // Atomicity improvement: today admin and members are two separate
-    // auto-commits on `&pool` (so a partial failure leaves an admin row
-    // without the members rows). The helper requires `&mut Transaction`,
-    // so we open a fresh `members_tx` scoped to both inserts and commit
-    // it before the welcome flow opens its own tx (the conversation tx
-    // already committed at ~480).
-    let mut members_tx = pool.begin().await.map_err(|e| {
-        error!("❌ [v2.createConvo] Failed to begin members tx: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR.into_response()
-    })?;
+    // Keep conversation seed, memberships, and any Welcome rows in the same
+    // transaction. A successful createConvo must never publish a membership
+    // without the corresponding per-device Welcome being durable.
 
     let used_per_device_members_path = match input.key_package_hashes.as_ref() {
         Some(hashes) if !hashes.is_empty() => {
@@ -693,7 +675,7 @@ async fn handle_create_convo(
             if !admin_entries.is_empty() {
                 let admin_count = admin_entries.len();
                 crate::db::insert_members_per_device_in_tx(
-                    &mut members_tx,
+                    &mut tx,
                     &convo_id,
                     &admin_entries,
                     now,
@@ -735,7 +717,7 @@ async fn handle_create_convo(
                 .bind(&auth_user.did)
                 .bind(&caller_user_form)
                 .bind(now)
-                .execute(&mut *members_tx)
+                .execute(&mut *tx)
                 .await
                 .map_err(|e| {
                     error!(
@@ -754,7 +736,7 @@ async fn handle_create_convo(
             if !member_entries.is_empty() {
                 let member_count = member_entries.len();
                 crate::db::insert_members_per_device_in_tx(
-                    &mut members_tx,
+                    &mut tx,
                     &convo_id,
                     &member_entries,
                     now,
@@ -810,7 +792,7 @@ async fn handle_create_convo(
         .bind(&auth_user.did)
         .bind(&caller_user_form)
         .bind(now)
-        .execute(&mut *members_tx)
+        .execute(&mut *tx)
         .await
         .map_err(|e| {
             error!(
@@ -837,7 +819,7 @@ async fn handle_create_convo(
                 .bind(&member_did_str)
                 .bind(&member_did_str)
                 .bind(now)
-                .execute(&mut *members_tx)
+                .execute(&mut *tx)
                 .await
                 .map_err(|e| {
                     error!("❌ [v2.createConvo] Failed to add member: {}", e);
@@ -846,11 +828,6 @@ async fn handle_create_convo(
             }
         }
     }
-
-    members_tx.commit().await.map_err(|e| {
-        error!("❌ [v2.createConvo] Failed to commit members tx: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR.into_response()
-    })?;
 
     // Build MemberView list for the response unchanged (per-device storage is
     // a server-side roster representation; the lexicon-level MemberView still
@@ -998,13 +975,6 @@ async fn handle_create_convo(
         // row was dead storage. The fallback path (kp_hashes None/empty) preserves the legacy
         // every-member behavior unchanged.
         //
-        // The helper requires `&mut Transaction`; the conversation-creation tx already
-        // committed at line ~480, so we open a fresh tx scoped to the welcome inserts.
-        let mut welcome_tx = pool.begin().await.map_err(|e| {
-            error!("❌ [v2.createConvo] Failed to begin welcome tx: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        })?;
-
         let kp_hashes_for_welcomes = input.key_package_hashes.as_ref();
         let used_per_device_path = match kp_hashes_for_welcomes {
             Some(hashes) if !hashes.is_empty() => {
@@ -1023,7 +993,7 @@ async fn handle_create_convo(
                     .collect();
                 let count = converted.len();
                 crate::db::store_welcomes_per_device_in_tx(
-                    &mut welcome_tx,
+                    &mut tx,
                     &convo_id,
                     &welcome_data,
                     &converted,
@@ -1067,7 +1037,7 @@ async fn handle_create_convo(
                 .bind(&welcome_data)
                 .bind::<Option<Vec<u8>>>(None)
                 .bind(now)
-                .execute(&mut *welcome_tx)
+                .execute(&mut *tx)
                 .await
                 .map_err(|e| {
                     error!("❌ [v2.createConvo] store user-flat welcome for {}: {}", crate::crypto::redact_for_log(member_did_str), e);
@@ -1075,35 +1045,39 @@ async fn handle_create_convo(
                 })?;
             }
         }
+    }
 
-        welcome_tx.commit().await.map_err(|e| {
-            error!("❌ [v2.createConvo] Failed to commit welcome tx: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        })?;
+    tx.commit().await.map_err(|e| {
+        error!(
+            "❌ [v2.createConvo] Failed to commit atomic createConvo tx: {}",
+            e
+        );
+        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+    })?;
 
-        // Mark key packages as consumed
-        if let Some(ref kp_hashes) = input.key_package_hashes {
-            for entry in kp_hashes {
-                let member_did_str = did_to_string(&entry.did);
-                let hash_hex: &str = &entry.hash;
+    // Mark key packages as consumed after the atomic create succeeds. getKeyPackages
+    // already claims packages, so this remains best-effort compatibility cleanup.
+    if let Some(ref kp_hashes) = input.key_package_hashes {
+        for entry in kp_hashes {
+            let member_did_str = did_to_string(&entry.did);
+            let hash_hex: &str = &entry.hash;
 
-                match crate::db::mark_key_package_consumed(&pool, &member_did_str, hash_hex).await {
-                    Ok(consumed) => {
-                        if consumed {
-                            tracing::debug!(
-                                "✅ [v2.createConvo] key package consumed for {}",
-                                crate::crypto::redact_for_log(&member_did_str)
-                            );
-                        } else {
-                            tracing::warn!(
-                                "⚠️ [v2.createConvo] key package not found/already consumed for {}",
-                                crate::crypto::redact_for_log(&member_did_str)
-                            );
-                        }
+            match crate::db::mark_key_package_consumed(&pool, &member_did_str, hash_hex).await {
+                Ok(consumed) => {
+                    if consumed {
+                        tracing::debug!(
+                            "✅ [v2.createConvo] key package consumed for {}",
+                            crate::crypto::redact_for_log(&member_did_str)
+                        );
+                    } else {
+                        tracing::warn!(
+                            "⚠️ [v2.createConvo] key package not found/already consumed for {}",
+                            crate::crypto::redact_for_log(&member_did_str)
+                        );
                     }
-                    Err(e) => {
-                        tracing::warn!("⚠️ [v2.createConvo] mark key package consumed: {}", e);
-                    }
+                }
+                Err(e) => {
+                    tracing::warn!("⚠️ [v2.createConvo] mark key package consumed: {}", e);
                 }
             }
         }

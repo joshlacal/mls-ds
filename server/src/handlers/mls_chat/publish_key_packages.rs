@@ -1,9 +1,9 @@
 use std::{collections::HashSet, sync::Arc};
 
 use axum::{
+    Json,
     extract::State,
     http::{HeaderMap, StatusCode},
-    Json,
 };
 // base64 no longer needed — key_package arrives as bytes::Bytes (already decoded)
 use chrono::Utc;
@@ -698,33 +698,17 @@ async fn handle_sync(
         deleted_count, device_scope.raw_device_id
     );
 
-    // Invalidate pending welcomes referencing deleted key packages
+    // Preserve pending welcomes referencing deleted key packages.
+    //
+    // A claimed key package may be deleted during device sync after createConvo
+    // has already stored the matching Welcome. At that point the Welcome row is
+    // the durable receipt the recipient needs to join; consuming it here strands
+    // the member in the "server lists me, Welcome unavailable" state.
     if deleted_count > 0 {
-        let invalidated = sqlx::query(
-            r#"
-            UPDATE welcome_messages
-            SET consumed = true, consumed_at = NOW(),
-                error_reason = 'Key package orphaned during sync'
-            WHERE recipient_did = $1 AND consumed = false
-              AND key_package_hash IS NOT NULL
-              AND encode(key_package_hash, 'hex') = ANY($2)
-            "#,
-        )
-        .bind(user_did)
-        .bind(&orphaned_hashes)
-        .execute(pool)
-        .await;
-
-        match invalidated {
-            Ok(r) if r.rows_affected() > 0 => {
-                info!(
-                    "🗑️ [sync] Invalidated {} Welcome(s) for deleted key packages",
-                    r.rows_affected()
-                );
-            }
-            Err(e) => warn!("Failed to invalidate stale Welcome messages: {}", e),
-            _ => {}
-        }
+        info!(
+            "🛡️ [sync] Preserved pending Welcome(s) for {} deleted key package hash(es)",
+            orphaned_hashes.len()
+        );
     }
 
     // Get remaining count
@@ -1003,16 +987,27 @@ pub async fn publish_key_packages_post(
                     let is_authorized = keys.iter().any(|k| k.as_slice() == expected_sig_key);
                     if !is_authorized {
                         if enforce_auth {
-                            error!("N44 Enforcement: signature key for {} not found in device records (resolved {} keys). Rejecting.", user_did, keys.len());
+                            error!(
+                                "N44 Enforcement: signature key for {} not found in device records (resolved {} keys). Rejecting.",
+                                user_did,
+                                keys.len()
+                            );
                             return Err(StatusCode::FORBIDDEN);
                         } else {
-                            warn!("N44 Warn-only: signature key for {} not found in device records (resolved {} keys)", user_did, keys.len());
+                            warn!(
+                                "N44 Warn-only: signature key for {} not found in device records (resolved {} keys)",
+                                user_did,
+                                keys.len()
+                            );
                         }
                     }
                 }
                 Err(e) => {
                     // PDS resolution failure. In both warn and enforce, we allow to prevent PDS outages from breaking MLS publishing.
-                    warn!("N44 device records resolution failed for {}: {}", user_did, e);
+                    warn!(
+                        "N44 device records resolution failed for {}: {}",
+                        user_did, e
+                    );
                 }
             }
         }
@@ -1132,5 +1127,176 @@ pub async fn publish_key_packages_post(
             warn!("Unknown action for v2 publishKeyPackages POST: {}", unknown);
             Err(StatusCode::BAD_REQUEST)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{DbConfig, init_db};
+    use std::time::Duration;
+    use uuid::Uuid;
+
+    const CIPHER_SUITE: &str = "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519";
+
+    async fn setup_test_db() -> DbPool {
+        let database_url = std::env::var("TEST_DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://localhost/catbird_test".to_string());
+
+        init_db(DbConfig {
+            database_url,
+            max_connections: 4,
+            min_connections: 1,
+            acquire_timeout: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(600),
+        })
+        .await
+        .expect("initialize test database")
+    }
+
+    async fn cleanup(pool: &DbPool, convo_id: &str, user_did: &str) {
+        let _ = sqlx::query("DELETE FROM welcome_messages WHERE convo_id = $1")
+            .bind(convo_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM key_packages WHERE owner_did = $1")
+            .bind(user_did)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM members WHERE convo_id = $1")
+            .bind(convo_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM conversations WHERE id = $1")
+            .bind(convo_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE did = $1")
+            .bind(user_did)
+            .execute(pool)
+            .await;
+    }
+
+    async fn seed_user(pool: &DbPool, did: &str) {
+        sqlx::query("INSERT INTO users (did) VALUES ($1) ON CONFLICT (did) DO NOTHING")
+            .bind(did)
+            .execute(pool)
+            .await
+            .expect("seed user");
+    }
+
+    async fn seed_convo(pool: &DbPool, convo_id: &str, creator_did: &str) {
+        sqlx::query(
+            "INSERT INTO conversations \
+                (id, creator_did, current_epoch, created_at, updated_at, cipher_suite, is_remote, group_id) \
+             VALUES ($1, $2, 1, NOW(), NOW(), $3, false, $1)",
+        )
+        .bind(convo_id)
+        .bind(creator_did)
+        .bind(CIPHER_SUITE)
+        .execute(pool)
+        .await
+        .expect("seed conversation");
+    }
+
+    async fn seed_key_package(pool: &DbPool, owner_did: &str, device_id: &str, hash_hex: &str) {
+        sqlx::query(
+            "INSERT INTO key_packages \
+                (id, owner_did, device_id, cipher_suite, key_package, key_package_hash, created_at, expires_at, state) \
+             VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW() + INTERVAL '30 days', 'available')",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(owner_did)
+        .bind(device_id)
+        .bind(CIPHER_SUITE)
+        .bind::<&[u8]>(&[0xA5])
+        .bind(hash_hex)
+        .execute(pool)
+        .await
+        .expect("seed key package");
+    }
+
+    async fn seed_pending_welcome(
+        pool: &DbPool,
+        convo_id: &str,
+        recipient_did: &str,
+        device_id: &str,
+        hash_hex: &str,
+    ) {
+        let hash_bytes = hex::decode(hash_hex).expect("hash hex");
+        sqlx::query(
+            "INSERT INTO welcome_messages \
+                (id, convo_id, recipient_did, recipient_device_id, welcome_data, key_package_hash, created_by_did, created_at, consumed) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), false)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(convo_id)
+        .bind(recipient_did)
+        .bind(device_id)
+        .bind::<&[u8]>(&[0x57, 0x45, 0x4c])
+        .bind(hash_bytes)
+        .bind("did:plc:syncsender000000")
+        .execute(pool)
+        .await
+        .expect("seed pending welcome");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+    async fn sync_cleanup_preserves_unconsumed_welcome_for_orphaned_key_package() {
+        let pool = setup_test_db().await;
+        let user_did = format!("did:plc:syncwelcome{}", Uuid::new_v4().simple());
+        let convo_id = format!("convo-sync-welcome-{}", Uuid::new_v4());
+        let device_id = "device-sync-a";
+        let hash_hex = "d138a0f7a772bac5db5a96748f01bad7d7a71c641b4ba87bdaf1431c1a6dde83";
+
+        cleanup(&pool, &convo_id, &user_did).await;
+        seed_user(&pool, &user_did).await;
+        seed_convo(&pool, &convo_id, &user_did).await;
+        seed_key_package(&pool, &user_did, device_id, hash_hex).await;
+        seed_pending_welcome(&pool, &convo_id, &user_did, device_id, hash_hex).await;
+
+        let input = PublishKeyPackages {
+            action: "sync".into(),
+            convo_id: None,
+            device_id: Some(device_id.into()),
+            key_packages: None,
+            local_hashes: Some(Vec::new()),
+            reason: None,
+            target_dids: None,
+            extra_data: Default::default(),
+        };
+        let device_scope = DeviceScope {
+            raw_device_id: device_id.to_string(),
+            storage_device_id: device_id.to_string(),
+            storage_candidates: vec![device_id.to_string()],
+            signature_public_key: None,
+        };
+
+        let result = handle_sync(&pool, &input, &user_did, &device_scope)
+            .await
+            .expect("sync succeeds");
+        assert_eq!(result.orphaned_count, 1);
+        assert_eq!(result.deleted_count, 1);
+
+        let welcome: (bool, Option<String>) = sqlx::query_as(
+            "SELECT consumed, error_reason \
+             FROM welcome_messages \
+             WHERE convo_id = $1 AND recipient_did = $2 AND encode(key_package_hash, 'hex') = $3",
+        )
+        .bind(&convo_id)
+        .bind(&user_did)
+        .bind(hash_hex)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch welcome");
+
+        assert!(!welcome.0, "sync cleanup must not consume pending Welcome");
+        assert!(
+            welcome.1.is_none(),
+            "sync cleanup must not mark pending Welcome as orphaned"
+        );
+
+        cleanup(&pool, &convo_id, &user_did).await;
     }
 }

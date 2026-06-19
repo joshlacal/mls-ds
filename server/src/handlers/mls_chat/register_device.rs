@@ -23,6 +23,23 @@ use crate::{
 // NSID for auth enforcement
 const NSID: &str = "blue.catbird.mlsChat.registerDevice";
 
+async fn cleanup_re_registered_device_key_packages(
+    pool: &DbPool,
+    user_did: &str,
+    old_device_id: &str,
+) -> Result<u64, StatusCode> {
+    sqlx::query("DELETE FROM key_packages WHERE owner_did = $1 AND device_id = $2")
+        .bind(user_did)
+        .bind(old_device_id)
+        .execute(pool)
+        .await
+        .map_err(|e| {
+            error!("Failed to delete old key packages: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+        .map(|result| result.rows_affected())
+}
+
 // ─── POST handler ───
 
 /// Consolidated device management endpoint (POST)
@@ -200,7 +217,7 @@ async fn handle_register(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-        if let Some((db_id, old_device_id, old_credential_did)) = existing {
+        if let Some((db_id, old_device_id, _old_credential_did)) = existing {
             // Reuse existing device_id for stability
             device_id = old_device_id.clone();
             info!(
@@ -209,48 +226,12 @@ async fn handle_register(
                 device_id
             );
 
-            // Clean up old key packages
             let deleted_count =
-                sqlx::query("DELETE FROM key_packages WHERE owner_did = $1 AND device_id = $2")
-                    .bind(&user_did)
-                    .bind(&old_device_id)
-                    .execute(pool)
-                    .await
-                    .map_err(|e| {
-                        error!("Failed to delete old key packages: {}", e);
-                        StatusCode::INTERNAL_SERVER_ERROR
-                    })?
-                    .rows_affected();
+                cleanup_re_registered_device_key_packages(pool, &user_did, &old_device_id).await?;
             info!(
                 "Deleted {} old key packages for re-registered device {}",
                 deleted_count, old_device_id
             );
-
-            // Invalidate pending welcomes
-            let invalidated = sqlx::query(
-                r#"UPDATE welcome_messages
-                   SET consumed = true, consumed_at = NOW(), error_reason = 'Device re-registered with fresh key packages'
-                   WHERE consumed = false
-                     AND (recipient_did = $1 OR (recipient_did = $2 AND recipient_device_id = $3))"#,
-            )
-            .bind(&old_credential_did)
-            .bind(&user_did)
-            .bind(&old_device_id)
-            .execute(pool)
-            .await
-            .map_err(|e| {
-                error!("Failed to invalidate old Welcome messages: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?
-            .rows_affected();
-
-            if invalidated > 0 {
-                info!(
-                    "Invalidated {} stale Welcome messages for re-registered user h:{}",
-                    invalidated,
-                    crate::crypto::hash_for_log(&user_did)
-                );
-            }
 
             // Update existing device record (keep device_id stable, update metadata)
             let rereg_mls_did = format!("{}#{}", &user_did, &device_id);
@@ -293,7 +274,7 @@ async fn handle_register(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-        if let Some((db_id, old_device_id, old_credential_did)) = existing {
+        if let Some((db_id, old_device_id, _old_credential_did)) = existing {
             // Reuse existing device_id for stability
             device_id = old_device_id.clone();
             info!(
@@ -303,45 +284,11 @@ async fn handle_register(
             );
 
             let deleted_count =
-                sqlx::query("DELETE FROM key_packages WHERE owner_did = $1 AND device_id = $2")
-                    .bind(&user_did)
-                    .bind(&old_device_id)
-                    .execute(pool)
-                    .await
-                    .map_err(|e| {
-                        error!("Failed to delete old key packages: {}", e);
-                        StatusCode::INTERNAL_SERVER_ERROR
-                    })?
-                    .rows_affected();
+                cleanup_re_registered_device_key_packages(pool, &user_did, &old_device_id).await?;
             info!(
                 "Deleted {} old key packages for re-registered device {} (signature key match)",
                 deleted_count, old_device_id
             );
-
-            let invalidated = sqlx::query(
-                r#"UPDATE welcome_messages
-                   SET consumed = true, consumed_at = NOW(), error_reason = 'Device re-registered with fresh key packages (sig key match)'
-                   WHERE consumed = false
-                     AND (recipient_did = $1 OR (recipient_did = $2 AND recipient_device_id = $3))"#,
-            )
-            .bind(&old_credential_did)
-            .bind(&user_did)
-            .bind(&old_device_id)
-            .execute(pool)
-            .await
-            .map_err(|e| {
-                error!("Failed to invalidate old Welcome messages: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?
-            .rows_affected();
-
-            if invalidated > 0 {
-                info!(
-                    "Invalidated {} stale Welcome messages for re-registered user h:{} (sig key match)",
-                    invalidated,
-                    crate::crypto::hash_for_log(&user_did)
-                );
-            }
 
             let rereg_mls_did2 = format!("{}#{}", &user_did, &device_id);
             sqlx::query(
@@ -1135,4 +1082,118 @@ async fn handle_complete_pending_addition(
     Ok(Json(serde_json::json!({
         "success": true,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{DbConfig, init_db};
+    use sqlx::Row;
+    use std::time::Duration as StdDuration;
+
+    async fn setup_test_db() -> DbPool {
+        let database_url = std::env::var("TEST_DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://localhost/catbird_test".to_string());
+
+        init_db(DbConfig {
+            database_url,
+            max_connections: 4,
+            min_connections: 1,
+            acquire_timeout: StdDuration::from_secs(30),
+            idle_timeout: StdDuration::from_secs(600),
+        })
+        .await
+        .expect("initialize test database")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+    async fn reregistration_cleanup_preserves_unconsumed_welcomes_for_same_device() {
+        let pool = setup_test_db().await;
+        let suffix = Uuid::new_v4().simple().to_string();
+        let user_did = format!("did:plc:rereg{}", &suffix[..16]);
+        let device_id = Uuid::new_v4().to_string();
+        let credential_did = format!("{user_did}#{device_id}");
+        let convo_id = format!("rereg-preserve-{suffix}");
+
+        sqlx::query("INSERT INTO users (did) VALUES ($1) ON CONFLICT DO NOTHING")
+            .bind(&user_did)
+            .execute(&pool)
+            .await
+            .expect("seed user");
+
+        sqlx::query(
+            r#"INSERT INTO conversations
+               (id, creator_did, current_epoch, cipher_suite, is_remote, group_id)
+               VALUES ($1, $2, 1, 'MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519', false, $1)"#,
+        )
+        .bind(&convo_id)
+        .bind(&user_did)
+        .execute(&pool)
+        .await
+        .expect("seed conversation");
+
+        sqlx::query(
+            r#"INSERT INTO key_packages
+               (id, owner_did, device_id, credential_did, cipher_suite, key_package, key_package_hash)
+               VALUES ($1, $2, $3, $4, 'MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519', $5, $6)"#,
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&user_did)
+        .bind(&device_id)
+        .bind(&credential_did)
+        .bind(vec![0x42_u8])
+        .bind(format!("hash-{suffix}"))
+        .execute(&pool)
+        .await
+        .expect("seed key package");
+
+        sqlx::query(
+            r#"INSERT INTO welcome_messages
+               (id, convo_id, recipient_did, recipient_device_id, welcome_data, key_package_hash, consumed)
+               VALUES ($1, $2, $3, $4, $5, $6, false)"#,
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&convo_id)
+        .bind(&user_did)
+        .bind(&device_id)
+        .bind(vec![0xAA_u8, 0xBB])
+        .bind(vec![0xDE_u8, 0xAD])
+        .execute(&pool)
+        .await
+        .expect("seed welcome");
+
+        let deleted = cleanup_re_registered_device_key_packages(&pool, &user_did, &device_id)
+            .await
+            .expect("cleanup succeeds");
+
+        assert_eq!(deleted, 1, "old key packages should still be removed");
+
+        let rows = sqlx::query(
+            "SELECT consumed FROM welcome_messages WHERE convo_id = $1 AND recipient_device_id = $2",
+        )
+        .bind(&convo_id)
+        .bind(&device_id)
+        .fetch_all(&pool)
+        .await
+        .expect("fetch welcomes");
+
+        assert_eq!(rows.len(), 1);
+        let consumed: bool = rows[0].get("consumed");
+        assert!(
+            !consumed,
+            "pending Welcome must remain available for the receiver to consume"
+        );
+
+        sqlx::query("DELETE FROM conversations WHERE id = $1")
+            .bind(&convo_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup conversation");
+        sqlx::query("DELETE FROM users WHERE did = $1")
+            .bind(&user_did)
+            .execute(&pool)
+            .await
+            .expect("cleanup user");
+    }
 }

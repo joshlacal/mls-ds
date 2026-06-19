@@ -1,7 +1,6 @@
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{Json, extract::State, http::StatusCode};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::sync::Arc;
 use tracing::{error, warn};
 use uuid::Uuid;
@@ -149,21 +148,15 @@ pub async fn reissue_welcome(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let info = json!({
-        "kind": "welcomeReissueRequest",
-        "convoId": input.convo_id,
-        "recipientDeviceDid": input.recipient_device_did,
-        "requestedAt": requested_at.to_rfc3339(),
-        "requestId": request_id,
-        "inviterDevice": inviter_device,
-        "reason": input.reason,
-    });
-    let event = StreamEvent::InfoEvent {
+    let event = StreamEvent::WelcomeReissueRequestedEvent {
         cursor: sse_state
             .cursor_gen
-            .next(&input.convo_id, "infoEvent")
+            .next(&input.convo_id, "welcomeReissueRequestedEvent")
             .await,
-        info: info.to_string(),
+        convo_id: input.convo_id.clone(),
+        recipient_device_did: input.recipient_device_did.clone(),
+        requested_at: requested_at.to_rfc3339(),
+        request_id: request_id.clone(),
     };
     if let Err(e) = sse_state.emit(&input.convo_id, event).await {
         warn!("reissueWelcome: best-effort SSE emit failed: {}", e);

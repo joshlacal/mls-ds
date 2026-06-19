@@ -12,7 +12,7 @@
           "required": ["convoId", "recipientDeviceDid", "reason"],
           "properties": {
             "convoId": { "type": "string", "description": "Conversation the failed Welcome is for." },
-            "recipientDeviceDid": { "type": "string", "format": "did", "description": "Recipient device that cannot decrypt." },
+            "recipientDeviceDid": { "type": "string", "description": "Recipient device that cannot decrypt. This may be a device-qualified DID (did#deviceId)." },
             "reason": { "type": "string", "description": "Free-form reason for diagnostics (e.g., NoMatchingKeyPackage hex_ref=...)." }
           }
         }
@@ -21,11 +21,12 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["welcomeRequested", "requestedAt"],
+          "required": ["welcomeRequested", "requestId", "requestedAt"],
           "properties": {
             "welcomeRequested": { "type": "boolean", "description": "True if request was recorded and inviter notified." },
+            "requestId": { "type": "string", "description": "Server-generated request identifier for the reissue workflow." },
             "requestedAt": { "type": "string", "format": "datetime", "description": "Server timestamp." },
-            "inviterDevice": { "type": "string", "format": "did", "description": "Device that will be asked to re-issue. May be empty if no admin exists." }
+            "inviterDevice": { "type": "string", "description": "Device that will be asked to re-issue. May be empty if no admin exists." }
           }
         }
       },
