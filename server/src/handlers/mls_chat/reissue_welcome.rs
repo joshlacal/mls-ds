@@ -15,6 +15,14 @@ use crate::{
 const NSID: &str = "blue.catbird.mlsChat.reissueWelcome";
 const MAX_REISSUE_REQUESTS_PER_HOUR: i64 = 3;
 
+#[derive(Debug)]
+struct ReissueRequestRecord {
+    request_id: String,
+    requested_at: DateTime<Utc>,
+    attempts: i32,
+    reused_existing: bool,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReissueWelcomeRequest {
@@ -42,6 +50,10 @@ fn recipient_belongs_to_auth_user(auth_did: &str, recipient_device_did: &str) ->
         .unwrap_or(false)
 }
 
+fn should_reject_reissue_request(open_request_exists: bool, recent_count: i64) -> bool {
+    !open_request_exists && recent_count >= MAX_REISSUE_REQUESTS_PER_HOUR
+}
+
 #[tracing::instrument(skip(pool, sse_state, auth_user, input))]
 pub async fn reissue_welcome(
     State(pool): State<DbPool>,
@@ -58,6 +70,11 @@ pub async fn reissue_welcome(
         return Err(StatusCode::FORBIDDEN);
     }
 
+    let mut tx = pool.begin().await.map_err(|e| {
+        error!("reissueWelcome: tx begin failed: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
     let requester_is_member: bool = sqlx::query_scalar(
         r#"
         SELECT EXISTS(
@@ -71,7 +88,7 @@ pub async fn reissue_welcome(
     )
     .bind(&input.convo_id)
     .bind(&auth_user.did)
-    .fetch_one(&pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| {
         error!("reissueWelcome: membership check failed: {}", e);
@@ -80,6 +97,26 @@ pub async fn reissue_welcome(
     if !requester_is_member {
         return Err(StatusCode::FORBIDDEN);
     }
+
+    let open_request_exists: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS(
+            SELECT 1
+            FROM reissue_requests
+            WHERE convo_id = $1
+              AND recipient_device_did = $2
+              AND responded_at IS NULL
+        )
+        "#,
+    )
+    .bind(&input.convo_id)
+    .bind(&input.recipient_device_did)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| {
+        error!("reissueWelcome: open request check failed: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let recent_count: i64 = sqlx::query_scalar(
         r#"
@@ -92,13 +129,13 @@ pub async fn reissue_welcome(
     )
     .bind(&input.convo_id)
     .bind(&input.recipient_device_did)
-    .fetch_one(&pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| {
         error!("reissueWelcome: rate-limit check failed: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    if recent_count >= MAX_REISSUE_REQUESTS_PER_HOUR {
+    if should_reject_reissue_request(open_request_exists, recent_count) {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 
@@ -116,7 +153,7 @@ pub async fn reissue_welcome(
     )
     .bind(&input.convo_id)
     .bind(&input.recipient_device_did)
-    .fetch_optional(&pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|e| {
         error!("reissueWelcome: admin lookup failed: {}", e);
@@ -128,34 +165,55 @@ pub async fn reissue_welcome(
         return Err(StatusCode::GONE);
     };
 
-    let request_id = Uuid::new_v4().to_string();
-    let requested_at = Utc::now();
-    sqlx::query(
-        r#"
-        INSERT INTO reissue_requests
-            (id, convo_id, recipient_device_did, requested_at, attempts, last_attempt_at)
-        VALUES ($1, $2, $3, $4, 1, $4)
-        "#,
-    )
-    .bind(&request_id)
-    .bind(&input.convo_id)
-    .bind(&input.recipient_device_did)
-    .bind(requested_at)
-    .execute(&pool)
-    .await
-    .map_err(|e| {
-        error!("reissueWelcome: insert failed: {}", e);
+    let proposed_request_id = Uuid::new_v4().to_string();
+    let attempt_at = Utc::now();
+    let (request_id, requested_at, attempts, reused_existing): (String, DateTime<Utc>, i32, bool) =
+        sqlx::query_as(
+            r#"
+            INSERT INTO reissue_requests
+                (id, convo_id, recipient_device_did, requested_at, attempts, last_attempt_at)
+            VALUES ($1, $2, $3, $4, 1, $4)
+            ON CONFLICT (convo_id, recipient_device_did)
+                WHERE responded_at IS NULL
+            DO UPDATE SET
+                attempts = reissue_requests.attempts + 1,
+                last_attempt_at = EXCLUDED.last_attempt_at
+            RETURNING id, requested_at, attempts, id <> $1 AS reused_existing
+            "#,
+        )
+        .bind(&proposed_request_id)
+        .bind(&input.convo_id)
+        .bind(&input.recipient_device_did)
+        .bind(attempt_at)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| {
+            error!("reissueWelcome: upsert failed: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let request = ReissueRequestRecord {
+        request_id,
+        requested_at,
+        attempts,
+        reused_existing,
+    };
+
+    tx.commit().await.map_err(|e| {
+        error!("reissueWelcome: tx commit failed: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+
     info!(
         convo_id = %crate::crypto::redact_for_log(&input.convo_id),
         recipient_device_did = %crate::crypto::redact_for_log(&input.recipient_device_did),
-        request_id = %crate::crypto::redact_for_log(&request_id),
+        request_id = %crate::crypto::redact_for_log(&request.request_id),
         inviter_device_did = %crate::crypto::redact_for_log(&inviter_device),
         recent_request_count = recent_count,
+        request_attempts = request.attempts,
+        reused_existing = request.reused_existing,
         requester_is_member,
         has_reason = !input.reason.trim().is_empty(),
-        "reissueWelcome: request inserted"
+        "reissueWelcome: request upserted"
     );
 
     let event = StreamEvent::WelcomeReissueRequestedEvent {
@@ -165,24 +223,45 @@ pub async fn reissue_welcome(
             .await,
         convo_id: input.convo_id.clone(),
         recipient_device_did: input.recipient_device_did.clone(),
-        requested_at: requested_at.to_rfc3339(),
-        request_id: request_id.clone(),
+        requested_at: request.requested_at.to_rfc3339(),
+        request_id: request.request_id.clone(),
     };
-    if let Err(e) = sse_state.emit(&input.convo_id, event).await {
-        warn!("reissueWelcome: best-effort SSE emit failed: {}", e);
-    } else {
-        info!(
-            convo_id = %crate::crypto::redact_for_log(&input.convo_id),
-            recipient_device_did = %crate::crypto::redact_for_log(&input.recipient_device_did),
-            request_id = %crate::crypto::redact_for_log(&request_id),
-            "reissueWelcome: requested event emitted"
-        );
-    }
+    sse_state.enqueue_with_store(&input.convo_id, pool.clone(), event);
+    info!(
+        convo_id = %crate::crypto::redact_for_log(&input.convo_id),
+        recipient_device_did = %crate::crypto::redact_for_log(&input.recipient_device_did),
+        request_id = %crate::crypto::redact_for_log(&request.request_id),
+        "reissueWelcome: requested event enqueued with event_stream persistence"
+    );
 
     Ok(Json(ReissueWelcomeOutput {
         welcome_requested: true,
-        request_id,
-        requested_at,
+        request_id: request.request_id,
+        requested_at: request.requested_at,
         inviter_device: Some(inviter_device),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_reissue_request_bypasses_creation_rate_limit() {
+        assert!(
+            !should_reject_reissue_request(
+                true,
+                MAX_REISSUE_REQUESTS_PER_HOUR
+            ),
+            "retries for an existing open request should return/re-emit that request instead of 429"
+        );
+    }
+
+    #[test]
+    fn new_reissue_request_is_rate_limited_after_hourly_limit() {
+        assert!(
+            should_reject_reissue_request(false, MAX_REISSUE_REQUESTS_PER_HOUR),
+            "new open requests should still honor the hourly creation limit"
+        );
+    }
 }

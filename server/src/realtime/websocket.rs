@@ -9,8 +9,8 @@
 
 use axum::{
     extract::{
-        Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
+        Query, State,
     },
     http::StatusCode,
     response::Response,
@@ -18,18 +18,18 @@ use axum::{
 use dashmap::DashMap;
 use futures::{sink::SinkExt, stream::StreamExt};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, mpsc};
-use tokio_stream::{StreamMap, wrappers::BroadcastStream};
+use tokio::sync::{mpsc, Mutex};
+use tokio_stream::{wrappers::BroadcastStream, StreamMap};
 use tracing::{debug, error, info, warn};
 
 use std::collections::HashSet;
 
 use crate::{
     federation::UpstreamManager,
-    handlers::subscription_ticket::{TicketClaims, verify_ticket},
+    handlers::subscription_ticket::{verify_ticket, TicketClaims},
     realtime::sse::{SseState, StreamEvent},
     storage::DbPool,
 };
@@ -321,6 +321,7 @@ async fn handle_socket(
 
     // Track remote (upstream) subscriptions for cleanup on disconnect
     let mut remote_subscriptions: Vec<(String, String)> = Vec::new();
+    let mut global_backfill_convo_ids: Vec<String> = Vec::new();
 
     // 1. Setup Subscriptions
     if let Some(ref cid) = target_convo_id {
@@ -422,14 +423,19 @@ async fn handle_socket(
                                         "Failed upstream subscribe, falling back to local"
                                     );
                                     let tx = sse_state.get_channel(&convo_id).await;
-                                    stream_map
-                                        .insert(convo_id, BroadcastStream::new(tx.subscribe()));
+                                    stream_map.insert(
+                                        convo_id.clone(),
+                                        BroadcastStream::new(tx.subscribe()),
+                                    );
+                                    global_backfill_convo_ids.push(convo_id);
                                 }
                             }
                         }
                         _ => {
                             let tx = sse_state.get_channel(&convo_id).await;
-                            stream_map.insert(convo_id, BroadcastStream::new(tx.subscribe()));
+                            stream_map
+                                .insert(convo_id.clone(), BroadcastStream::new(tx.subscribe()));
+                            global_backfill_convo_ids.push(convo_id);
                         }
                     }
                 }
@@ -445,6 +451,47 @@ async fn handle_socket(
                 )
                 .await;
                 return;
+            }
+        }
+
+        if let Some(ref cursor) = resume_cursor {
+            if !cursor.is_empty() && !global_backfill_convo_ids.is_empty() {
+                let mut replay_items: Vec<(StreamEvent, String)> = Vec::new();
+                for convo_id in &global_backfill_convo_ids {
+                    match backfill_events(&pool, convo_id, cursor).await {
+                        Ok(mut events) => replay_items.append(&mut events),
+                        Err(e) => {
+                            error!(
+                                convo = %crate::crypto::redact_for_log(convo_id),
+                                error = %e,
+                                "Failed to backfill global WebSocket events"
+                            );
+                            let mut sender_guard = sender.lock().await;
+                            let _ = send_error(
+                                &mut sender_guard,
+                                "BackfillFailed",
+                                Some(&e),
+                                frame_format,
+                            )
+                            .await;
+                        }
+                    }
+                }
+
+                let ordered_replay = order_global_backfill_events(replay_items);
+                info!(
+                    backfill_count = ordered_replay.len(),
+                    local_convo_count = global_backfill_convo_ids.len(),
+                    "Sending global WebSocket backfill events"
+                );
+                for (event, _event_cursor) in ordered_replay {
+                    seq += 1;
+                    let mut sender_guard = sender.lock().await;
+                    if let Err(e) = send_event(&mut sender_guard, &event, seq, frame_format).await {
+                        error!("Failed to send global backfill event: {}", e);
+                        return;
+                    }
+                }
             }
         }
     }
@@ -717,6 +764,13 @@ async fn backfill_events(
     Ok(result)
 }
 
+fn order_global_backfill_events(
+    mut events: Vec<(StreamEvent, String)>,
+) -> Vec<(StreamEvent, String)> {
+    events.sort_by(|a, b| a.1.cmp(&b.1));
+    events
+}
+
 // MARK: - Message Parsing
 
 /// Parse a client-to-server DAG-CBOR message
@@ -946,6 +1000,26 @@ async fn get_user_convos_with_sequencer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn global_backfill_events_are_ordered_by_cursor() {
+        let newest = StreamEvent::InfoEvent {
+            cursor: "02ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+            info: "newer".into(),
+        };
+        let oldest = StreamEvent::InfoEvent {
+            cursor: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+            info: "older".into(),
+        };
+
+        let ordered = order_global_backfill_events(vec![
+            (newest, "02ARZ3NDEKTSV4RRFFQ69G5FAV".into()),
+            (oldest, "01ARZ3NDEKTSV4RRFFQ69G5FAV".into()),
+        ]);
+
+        assert_eq!(ordered[0].1, "01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        assert_eq!(ordered[1].1, "02ARZ3NDEKTSV4RRFFQ69G5FAV");
+    }
 
     #[test]
     fn test_connection_tracker() {
