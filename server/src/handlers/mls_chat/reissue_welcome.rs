@@ -245,6 +245,13 @@ pub async fn reissue_welcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::State;
+    use std::time::Duration;
+
+    use crate::{
+        auth::AtProtoClaims,
+        db::{init_db, DbConfig},
+    };
 
     #[test]
     fn open_reissue_request_bypasses_creation_rate_limit() {
@@ -263,5 +270,172 @@ mod tests {
             should_reject_reissue_request(false, MAX_REISSUE_REQUESTS_PER_HOUR),
             "new open requests should still honor the hourly creation limit"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+    async fn reissue_welcome_reuses_open_request_id_and_increments_attempts() {
+        let pool = setup_test_db().await;
+        let sse_state = Arc::new(SseState::new(100));
+        let convo_id = format!("test-reissue-{}", Uuid::new_v4());
+        let requester_did = "did:plc:reissueuser0000000000000000";
+        let recipient_device_did = format!("{requester_did}#phone");
+        let admin_user_did = "did:plc:reissueadmin000000000000000";
+        let admin_device_did = format!("{admin_user_did}#mac");
+
+        cleanup_reissue_test_data(&pool, &convo_id).await;
+        seed_reissue_test_conversation(
+            &pool,
+            &convo_id,
+            requester_did,
+            &recipient_device_did,
+            admin_user_did,
+            &admin_device_did,
+        )
+        .await;
+
+        let auth_user = test_auth_user(requester_did);
+
+        let first = reissue_welcome(
+            State(pool.clone()),
+            State(sse_state.clone()),
+            auth_user.clone(),
+            Json(ReissueWelcomeRequest {
+                convo_id: convo_id.clone(),
+                recipient_device_did: recipient_device_did.clone(),
+                reason: "NoMatchingKeyPackage".to_string(),
+            }),
+        )
+        .await
+        .expect("first reissue request should be accepted")
+        .0;
+
+        let second = reissue_welcome(
+            State(pool.clone()),
+            State(sse_state),
+            auth_user,
+            Json(ReissueWelcomeRequest {
+                convo_id: convo_id.clone(),
+                recipient_device_did: recipient_device_did.clone(),
+                reason: "retry after reconnect".to_string(),
+            }),
+        )
+        .await
+        .expect("retry should reuse the open request instead of rate-limiting")
+        .0;
+
+        assert_eq!(
+            second.request_id, first.request_id,
+            "retries for one open recipient request must reuse the same request_id"
+        );
+        assert_eq!(
+            second.requested_at, first.requested_at,
+            "retries must return the original requested_at for the open request"
+        );
+
+        let open_rows: Vec<(String, i32)> = sqlx::query_as(
+            "SELECT id, attempts \
+             FROM reissue_requests \
+             WHERE convo_id = $1 \
+               AND recipient_device_did = $2 \
+               AND responded_at IS NULL",
+        )
+        .bind(&convo_id)
+        .bind(&recipient_device_did)
+        .fetch_all(&pool)
+        .await
+        .expect("fetch open reissue requests");
+
+        assert_eq!(
+            open_rows,
+            vec![(first.request_id, 2)],
+            "retry should leave exactly one open row and increment attempts"
+        );
+
+        cleanup_reissue_test_data(&pool, &convo_id).await;
+    }
+
+    async fn setup_test_db() -> DbPool {
+        let database_url = std::env::var("TEST_DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://localhost/catbird_test".to_string());
+
+        let config = DbConfig {
+            database_url,
+            max_connections: 4,
+            min_connections: 1,
+            acquire_timeout: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(600),
+        };
+
+        init_db(config)
+            .await
+            .expect("Failed to initialize test database")
+    }
+
+    async fn cleanup_reissue_test_data(pool: &DbPool, convo_id: &str) {
+        let _ = sqlx::query("DELETE FROM event_stream WHERE convo_id = $1")
+            .bind(convo_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM conversations WHERE id = $1")
+            .bind(convo_id)
+            .execute(pool)
+            .await;
+    }
+
+    async fn seed_reissue_test_conversation(
+        pool: &DbPool,
+        convo_id: &str,
+        requester_did: &str,
+        recipient_device_did: &str,
+        admin_user_did: &str,
+        admin_device_did: &str,
+    ) {
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO conversations \
+                (id, creator_did, current_epoch, created_at, updated_at, cipher_suite, is_remote, group_id) \
+             VALUES ($1, $2, 1, $3, $3, $4, false, $5)",
+        )
+        .bind(convo_id)
+        .bind(admin_user_did)
+        .bind(now)
+        .bind("MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519")
+        .bind(format!("{convo_id}-group"))
+        .execute(pool)
+        .await
+        .expect("seed reissue test conversation");
+
+        sqlx::query(
+            "INSERT INTO members \
+                (convo_id, member_did, user_did, device_id, joined_at, is_admin) \
+             VALUES \
+                ($1, $2, $3, 'phone', $5, false), \
+                ($1, $4, $6, 'mac', $5, true)",
+        )
+        .bind(convo_id)
+        .bind(recipient_device_did)
+        .bind(requester_did)
+        .bind(admin_device_did)
+        .bind(now)
+        .bind(admin_user_did)
+        .execute(pool)
+        .await
+        .expect("seed reissue test members");
+    }
+
+    fn test_auth_user(did: &str) -> AuthUser {
+        AuthUser {
+            did: did.to_string(),
+            claims: AtProtoClaims {
+                iss: did.to_string(),
+                aud: "did:web:test.catbird.blue".to_string(),
+                exp: 9_999_999_999,
+                iat: Some(0),
+                sub: Some(did.to_string()),
+                lxm: Some(NSID.to_string()),
+                jti: Some(format!("test-jti-{}", Uuid::new_v4())),
+            },
+        }
     }
 }
