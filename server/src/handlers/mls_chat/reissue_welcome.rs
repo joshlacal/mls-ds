@@ -171,13 +171,21 @@ pub async fn reissue_welcome(
         sqlx::query_as(
             r#"
             INSERT INTO reissue_requests
-                (id, convo_id, recipient_device_did, requested_at, attempts, last_attempt_at)
-            VALUES ($1, $2, $3, $4, 1, $4)
+                (id, convo_id, recipient_device_did, requested_at, attempts, last_attempt_at, status)
+            VALUES ($1, $2, $3, $4, 1, $4, 'requested')
             ON CONFLICT (convo_id, recipient_device_did)
                 WHERE responded_at IS NULL
             DO UPDATE SET
                 attempts = reissue_requests.attempts + 1,
-                last_attempt_at = EXCLUDED.last_attempt_at
+                last_attempt_at = EXCLUDED.last_attempt_at,
+                status = CASE
+                    WHEN reissue_requests.status = 'expired' THEN 'requested'
+                    ELSE reissue_requests.status
+                END,
+                expired_at = CASE
+                    WHEN reissue_requests.status = 'expired' THEN NULL
+                    ELSE reissue_requests.expired_at
+                END
             RETURNING id, requested_at, attempts, id <> $1 AS reused_existing
             "#,
         )
@@ -227,6 +235,26 @@ pub async fn reissue_welcome(
         request_id: request.request_id.clone(),
     };
     sse_state.enqueue_with_store(&input.convo_id, pool.clone(), event);
+    if let Err(e) = sqlx::query(
+        r#"
+        UPDATE reissue_requests
+        SET status = 'delivered_to_inviter',
+            delivered_to_inviter_at = COALESCE(delivered_to_inviter_at, NOW())
+        WHERE id = $1
+          AND responded_at IS NULL
+          AND status = 'requested'
+        "#,
+    )
+    .bind(&request.request_id)
+    .execute(&pool)
+    .await
+    {
+        warn!(
+            request_id = %crate::crypto::redact_for_log(&request.request_id),
+            error = %e,
+            "reissueWelcome: failed to persist delivered_to_inviter status"
+        );
+    }
     info!(
         convo_id = %crate::crypto::redact_for_log(&input.convo_id),
         recipient_device_did = %crate::crypto::redact_for_log(&input.recipient_device_did),

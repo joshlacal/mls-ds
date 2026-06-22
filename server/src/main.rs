@@ -725,6 +725,10 @@ async fn main() -> anyhow::Result<()> {
             "/xrpc/blue.catbird.mlsChat.reissueWelcomeRespond",
             post(handlers::mls_chat::reissue_welcome_respond),
         )
+        .route(
+            "/xrpc/blue.catbird.mlsChat.getWelcomeReissueStatus",
+            get(handlers::mls_chat::get_welcome_reissue_status),
+        )
         .merge(RemoveDeviceRequest::into_router(
             handlers::mls_chat::remove_device,
         ))

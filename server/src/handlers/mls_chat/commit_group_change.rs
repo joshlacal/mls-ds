@@ -2155,8 +2155,9 @@ pub async fn commit_group_change(
                 return Err(bad_request("Missing convoId"));
             }
 
-            let invalidated = sqlx::query(
+            let (invalidated, reissue_requests_marked): (i64, i64) = sqlx::query_as(
                 r#"
+                WITH consumed AS (
                 UPDATE welcome_messages
                 SET consumed = true,
                     consumed_at = NOW(),
@@ -2164,27 +2165,43 @@ pub async fn commit_group_change(
                 WHERE convo_id = $1
                   AND recipient_did = $2
                   AND consumed = false
+                RETURNING id
+                ),
+                marked_reissues AS (
+                    UPDATE reissue_requests
+                    SET status = 'consumed',
+                        consumed_at = NOW()
+                    WHERE welcome_blob_id IN (SELECT id FROM consumed)
+                      AND status IN ('requested', 'delivered_to_inviter', 'responded')
+                    RETURNING 1
+                )
+                SELECT
+                    (SELECT COUNT(*) FROM consumed)::BIGINT,
+                    (SELECT COUNT(*) FROM marked_reissues)::BIGINT
                 "#,
             )
             .bind(&convo_id)
             .bind(&auth_user.did)
-            .execute(&pool)
+            .fetch_one(&pool)
             .await
             .map_err(|e| {
                 error!("invalidateWelcome: failed to invalidate welcome: {}", e);
                 internal_server_error("Failed to invalidate welcome")
-            })?
-            .rows_affected();
+            })?;
 
             info!(
                 convo_id = %crate::crypto::redact_for_log(&convo_id),
                 recipient_did = %crate::crypto::redact_for_log(&auth_user.did),
                 invalidated_welcome_rows = invalidated,
+                reissue_requests_marked,
                 consumed_any = invalidated > 0,
                 "commitGroupChange: invalidateWelcome consumed Welcome rows"
             );
 
-            Ok(Json(invalidate_welcome_response(invalidated)).into_response())
+            Ok(Json(invalidate_welcome_response(
+                u64::try_from(invalidated).unwrap_or_default(),
+            ))
+            .into_response())
         }
         "listPending" => {
             let convo_id = input.convo_id.to_string();

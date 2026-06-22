@@ -1133,19 +1133,30 @@ async fn handle_create_convo(
         .await
         .unwrap_or(-1);
         let matched_expected = stored_rows >= 0 && stored_rows == expectation.expected_rows as i64;
-        let log_message = if matched_expected {
-            "createConvo: Welcome rows durable after commit"
+        if matched_expected {
+            info!(
+                convo_id = %crate::crypto::redact_for_log(&convo_id),
+                expected_welcome_rows = expectation.expected_rows,
+                stored_welcome_rows = stored_rows,
+                used_per_device_path = expectation.used_per_device_path,
+                matched_expected,
+                "createConvo: Welcome rows durable after commit"
+            );
         } else {
-            "createConvo: Welcome row count mismatch after commit"
-        };
-        info!(
-            convo_id = %crate::crypto::redact_for_log(&convo_id),
-            expected_welcome_rows = expectation.expected_rows,
-            stored_welcome_rows = stored_rows,
-            used_per_device_path = expectation.used_per_device_path,
-            matched_expected,
-            "{}", log_message
-        );
+            warn!(
+                convo_id = %crate::crypto::redact_for_log(&convo_id),
+                expected_welcome_rows = expectation.expected_rows,
+                stored_welcome_rows = stored_rows,
+                used_per_device_path = expectation.used_per_device_path,
+                matched_expected,
+                has_welcome_message = input.welcome_message.is_some(),
+                has_group_info = input.group_info.is_some(),
+                key_package_hash_count = input.key_package_hashes.as_ref().map_or(0, Vec::len),
+                auth_lxm = ?auth_user.claims.lxm,
+                auth_jti_present = auth_user.claims.jti.is_some(),
+                "createConvo: Welcome row count mismatch after commit"
+            );
+        }
     }
 
     // Mark key packages as consumed after the atomic create succeeds. getKeyPackages

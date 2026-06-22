@@ -181,7 +181,8 @@ pub async fn reissue_welcome_respond(
         r#"
         UPDATE reissue_requests
         SET responded_at = $2,
-            welcome_blob_id = $3
+            welcome_blob_id = $3,
+            status = 'responded'
         WHERE id = $1
           AND responded_at IS NULL
         "#,
