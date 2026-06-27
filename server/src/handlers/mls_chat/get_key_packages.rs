@@ -219,25 +219,36 @@ pub async fn get_key_packages(
             })?;
 
     let mode = GateKeyPackagesMode::from_env();
+    let max_first_contact = max_first_contact_targets();
     let authorized_set: HashSet<&str> = authorized_dids.iter().map(String::as_str).collect();
-    let denied_count = filtered_did_strs
+    let denied_total = filtered_did_strs
         .iter()
         .filter(|did| !authorized_set.contains(did.as_str()))
         .count();
-    let first_contact_compat = is_single_first_contact_target(&filtered_did_strs, &authorized_dids);
+    let denied_unique = filtered_did_strs
+        .iter()
+        .map(String::as_str)
+        .filter(|did| !authorized_set.contains(did))
+        .collect::<HashSet<_>>()
+        .len();
 
-    if denied_count > 0 {
+    if denied_total > 0 {
         warn!(
             requested = filtered_did_strs.len(),
-            denied = denied_count,
-            first_contact_compat,
+            denied_total,
+            denied_unique,
+            max_first_contact,
             mode = mode.as_str(),
-            "getKeyPackages: unauthorized target DIDs"
+            "getKeyPackages: first-contact (non-relationship-authorized) target DIDs"
         );
     }
 
-    let filtered_did_strs =
-        apply_key_package_target_authz(&filtered_did_strs, &authorized_dids, mode)?;
+    let filtered_did_strs = apply_key_package_target_authz(
+        &filtered_did_strs,
+        &authorized_dids,
+        mode,
+        max_first_contact,
+    )?;
     let filtered_dids: Vec<jacquard_common::types::string::Did<'static>> = filtered_did_strs
         .iter()
         .map(|did| crate::sqlx_jacquard::string_to_did(did))
