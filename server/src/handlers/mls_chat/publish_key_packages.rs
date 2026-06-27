@@ -1,9 +1,9 @@
 use std::{collections::HashSet, sync::Arc};
 
 use axum::{
-    Json,
     extract::State,
     http::{HeaderMap, StatusCode},
+    Json,
 };
 // base64 no longer needed — key_package arrives as bytes::Bytes (already decoded)
 use chrono::Utc;
@@ -1133,7 +1133,7 @@ pub async fn publish_key_packages_post(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{DbConfig, init_db};
+    use crate::db::{init_db, DbConfig};
     use std::time::Duration;
     use uuid::Uuid;
 

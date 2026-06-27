@@ -1,8 +1,8 @@
 use axum::{
-    Json,
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
+    Json,
 };
 use chrono::{Duration, Utc};
 use jacquard_axum::ExtractXrpc;
@@ -1087,7 +1087,7 @@ async fn handle_complete_pending_addition(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{DbConfig, init_db};
+    use crate::db::{init_db, DbConfig};
     use sqlx::Row;
     use std::time::Duration as StdDuration;
 
