@@ -254,12 +254,14 @@ fn enforce_counts_distinct_first_contacts_for_bound() {
     let allowed =
         apply_key_package_target_authz(&dup, &authorized, GateKeyPackagesMode::Enforce, 1)
             .expect("duplicates of one DID count once against the bound");
-    assert_eq!(allowed, dup, "order and duplicates preserved in returned vec");
+    assert_eq!(
+        allowed, dup,
+        "order and duplicates preserved in returned vec"
+    );
 
     // 2 DISTINCT first-contacts, bound = 1 → denied
     let two = vec!["did:plc:a".to_string(), "did:plc:b".to_string()];
-    let denied =
-        apply_key_package_target_authz(&two, &authorized, GateKeyPackagesMode::Enforce, 1);
+    let denied = apply_key_package_target_authz(&two, &authorized, GateKeyPackagesMode::Enforce, 1);
     assert_eq!(denied, Err(axum::http::StatusCode::FORBIDDEN));
 }
 
