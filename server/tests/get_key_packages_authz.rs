@@ -8,7 +8,8 @@
 use catbird_server::handlers::mls_chat::{
     get_key_package_status::authorize_get_key_package_status_target,
     get_key_packages::{
-        apply_key_package_target_authz, authorize_get_key_package_targets, GateKeyPackagesMode,
+        apply_key_package_target_authz, authorize_get_key_package_targets,
+        max_first_contact_targets_from_value, GateKeyPackagesMode,
     },
 };
 use chrono::{Duration, Utc};
@@ -164,6 +165,19 @@ fn key_package_gate_defaults_to_enforce_and_only_log_only_values_disable_strict_
         GateKeyPackagesMode::from_env_value(Some("enforce")),
         GateKeyPackagesMode::Enforce
     );
+}
+
+#[test]
+fn max_first_contact_targets_resolves_env_with_default_fallback() {
+    // default when unset / blank / invalid / non-positive
+    assert_eq!(max_first_contact_targets_from_value(None), 32);
+    assert_eq!(max_first_contact_targets_from_value(Some("")), 32);
+    assert_eq!(max_first_contact_targets_from_value(Some("abc")), 32);
+    assert_eq!(max_first_contact_targets_from_value(Some("0")), 32);
+    assert_eq!(max_first_contact_targets_from_value(Some("-4")), 32);
+    // explicit valid overrides, trimmed
+    assert_eq!(max_first_contact_targets_from_value(Some("8")), 8);
+    assert_eq!(max_first_contact_targets_from_value(Some(" 16 ")), 16);
 }
 
 #[test]

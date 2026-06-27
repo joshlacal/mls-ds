@@ -44,6 +44,28 @@ impl GateKeyPackagesMode {
     }
 }
 
+const MAX_FIRST_CONTACT_TARGETS_DEFAULT: usize = 32;
+const MAX_FIRST_CONTACT_TARGETS_ENV: &str = "MAX_FIRST_CONTACT_TARGETS";
+
+/// Maximum number of DISTINCT first-contact (non-relationship-authorized) target
+/// DIDs permitted in a single getKeyPackages call in Enforce mode. Stopgap until
+/// the declared chat-permission policy (Track B) lands. A missing, unparseable,
+/// or non-positive value falls back to the default — a zero bound would break
+/// legitimate 1:1 first contact.
+pub fn max_first_contact_targets() -> usize {
+    max_first_contact_targets_from_value(
+        std::env::var(MAX_FIRST_CONTACT_TARGETS_ENV).ok().as_deref(),
+    )
+}
+
+pub fn max_first_contact_targets_from_value(value: Option<&str>) -> usize {
+    value
+        .map(str::trim)
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(MAX_FIRST_CONTACT_TARGETS_DEFAULT)
+}
+
 /// Fetch and consume key packages for the given DIDs.
 /// Returns one key package per device (identified by hashed device_id bucket)
 /// for each requested DID, so that all of a user's devices can be added to a group.
