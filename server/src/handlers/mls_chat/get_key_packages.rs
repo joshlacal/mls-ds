@@ -49,15 +49,17 @@ const MAX_FIRST_CONTACT_TARGETS_ENV: &str = "MAX_FIRST_CONTACT_TARGETS";
 
 /// Maximum number of DISTINCT first-contact (non-relationship-authorized) target
 /// DIDs permitted in a single getKeyPackages call in Enforce mode. Stopgap until
-/// the declared chat-permission policy (Track B) lands. A missing, unparseable,
-/// or non-positive value falls back to the default — a zero bound would break
-/// legitimate 1:1 first contact.
+/// the declared chat-permission policy (Track B) lands. A missing, unparseable
+/// (including negative strings), or zero value falls back to the default — a
+/// zero bound would break legitimate 1:1 first contact.
+#[must_use]
 pub fn max_first_contact_targets() -> usize {
     max_first_contact_targets_from_value(
         std::env::var(MAX_FIRST_CONTACT_TARGETS_ENV).ok().as_deref(),
     )
 }
 
+#[must_use]
 pub fn max_first_contact_targets_from_value(value: Option<&str>) -> usize {
     value
         .map(str::trim)
@@ -225,14 +227,14 @@ pub async fn get_key_packages(
         .iter()
         .filter(|did| !authorized_set.contains(did.as_str()))
         .count();
-    let denied_unique = filtered_did_strs
-        .iter()
-        .map(String::as_str)
-        .filter(|did| !authorized_set.contains(did))
-        .collect::<HashSet<_>>()
-        .len();
 
     if denied_total > 0 {
+        let denied_unique = filtered_did_strs
+            .iter()
+            .map(String::as_str)
+            .filter(|did| !authorized_set.contains(did))
+            .collect::<HashSet<_>>()
+            .len();
         warn!(
             requested = filtered_did_strs.len(),
             denied_total,

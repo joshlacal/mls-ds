@@ -220,6 +220,16 @@ fn enforce_denies_first_contact_batch_over_bound() {
     ];
     let authorized: Vec<String> = Vec::new();
 
+    // Exactly at the bound → allowed (guards the `<=` boundary).
+    let two = vec![
+        "did:plc:first-contact-a".to_string(),
+        "did:plc:first-contact-b".to_string(),
+    ];
+    let at_bound =
+        apply_key_package_target_authz(&two, &authorized, GateKeyPackagesMode::Enforce, 2)
+            .expect("a first-contact batch exactly at the bound must be allowed");
+    assert_eq!(at_bound, two);
+
     // bound = 2, three DISTINCT first-contact targets → fail closed
     let enforce =
         apply_key_package_target_authz(&requested, &authorized, GateKeyPackagesMode::Enforce, 2);
