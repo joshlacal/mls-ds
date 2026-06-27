@@ -430,6 +430,7 @@ pub fn apply_key_package_target_authz(
     requested_dids: &[String],
     authorized_dids: &[String],
     mode: GateKeyPackagesMode,
+    max_first_contact: usize,
 ) -> Result<Vec<String>, StatusCode> {
     if requested_dids.is_empty() {
         return Ok(Vec::new());
@@ -445,22 +446,29 @@ pub fn apply_key_package_target_authz(
                 .all(|did| authorized_set.contains(did.as_str()));
 
             if all_authorized {
-                Ok(requested_dids.to_vec())
-            } else if is_single_first_contact_target(requested_dids, authorized_dids) {
-                // Conversation creation has to fetch the recipient's first key
-                // package before any shared conversation, invite, or chat-request
-                // row exists. Keep this compatibility path single-target only so
-                // multi-DID probing still fails closed in enforce mode.
+                return Ok(requested_dids.to_vec());
+            }
+
+            // Every requested DID that is not relationship-authorized is a
+            // first-contact target — block edges are already filtered out
+            // upstream in the handler. Bound the number of DISTINCT first-contact
+            // targets so a legitimate group-create batch passes while large
+            // multi-DID probing/depletion still fails closed. Counting is on the
+            // distinct set (duplicate query params cannot inflate the count); the
+            // returned vec preserves request order and duplicates for the fetch.
+            let first_contact_unique: HashSet<&str> = requested_dids
+                .iter()
+                .map(String::as_str)
+                .filter(|did| !authorized_set.contains(did))
+                .collect();
+
+            if first_contact_unique.len() <= max_first_contact {
                 Ok(requested_dids.to_vec())
             } else {
                 Err(StatusCode::FORBIDDEN)
             }
         }
     }
-}
-
-fn is_single_first_contact_target(requested_dids: &[String], authorized_dids: &[String]) -> bool {
-    requested_dids.len() == 1 && authorized_dids.is_empty()
 }
 
 /// Atomically claim one available key package per `(owner_did, device_id)`

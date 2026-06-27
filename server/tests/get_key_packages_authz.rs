@@ -186,18 +186,18 @@ fn enforce_allows_single_first_contact_target() {
     let authorized: Vec<String> = Vec::new();
 
     let log_only =
-        apply_key_package_target_authz(&requested, &authorized, GateKeyPackagesMode::LogOnly)
+        apply_key_package_target_authz(&requested, &authorized, GateKeyPackagesMode::LogOnly, 32)
             .expect("log_only must preserve first-contact compatibility");
     assert_eq!(log_only, requested);
 
     let enforce =
-        apply_key_package_target_authz(&requested, &authorized, GateKeyPackagesMode::Enforce)
+        apply_key_package_target_authz(&requested, &authorized, GateKeyPackagesMode::Enforce, 32)
             .expect("enforce mode must allow a single first-contact key-package fetch");
     assert_eq!(enforce, requested);
 }
 
 #[test]
-fn enforce_denies_multi_target_first_contact_enumeration() {
+fn enforce_allows_first_contact_batch_within_bound() {
     let requested = vec![
         "did:plc:first-contact-a".to_string(),
         "did:plc:first-contact-b".to_string(),
@@ -205,21 +205,74 @@ fn enforce_denies_multi_target_first_contact_enumeration() {
     let authorized: Vec<String> = Vec::new();
 
     let enforce =
-        apply_key_package_target_authz(&requested, &authorized, GateKeyPackagesMode::Enforce);
+        apply_key_package_target_authz(&requested, &authorized, GateKeyPackagesMode::Enforce, 32)
+            .expect("a 2-target first-contact group-create batch must be allowed under the bound");
+    // Order preserved, full request returned for the key-package fetch.
+    assert_eq!(enforce, requested);
+}
+
+#[test]
+fn enforce_denies_first_contact_batch_over_bound() {
+    let requested = vec![
+        "did:plc:first-contact-a".to_string(),
+        "did:plc:first-contact-b".to_string(),
+        "did:plc:first-contact-c".to_string(),
+    ];
+    let authorized: Vec<String> = Vec::new();
+
+    // bound = 2, three DISTINCT first-contact targets → fail closed
+    let enforce =
+        apply_key_package_target_authz(&requested, &authorized, GateKeyPackagesMode::Enforce, 2);
     assert_eq!(enforce, Err(axum::http::StatusCode::FORBIDDEN));
 }
 
 #[test]
-fn enforce_denies_mixed_authorized_and_unauthorized_targets() {
+fn enforce_allows_mixed_authorized_and_first_contact() {
     let requested = vec![
         "did:plc:authorized".to_string(),
         "did:plc:unauthorized".to_string(),
     ];
     let authorized = vec!["did:plc:authorized".to_string()];
 
+    // one first-contact (<= bound) alongside an authorized target → allowed
     let enforce =
-        apply_key_package_target_authz(&requested, &authorized, GateKeyPackagesMode::Enforce);
-    assert_eq!(enforce, Err(axum::http::StatusCode::FORBIDDEN));
+        apply_key_package_target_authz(&requested, &authorized, GateKeyPackagesMode::Enforce, 32)
+            .expect("mixed batch with a single first-contact must be allowed");
+    assert_eq!(enforce, requested);
+}
+
+#[test]
+fn enforce_counts_distinct_first_contacts_for_bound() {
+    let authorized: Vec<String> = Vec::new();
+
+    // 3 entries, 1 DISTINCT first-contact, bound = 1 → allowed, returned as-is
+    let dup = vec![
+        "did:plc:dup".to_string(),
+        "did:plc:dup".to_string(),
+        "did:plc:dup".to_string(),
+    ];
+    let allowed =
+        apply_key_package_target_authz(&dup, &authorized, GateKeyPackagesMode::Enforce, 1)
+            .expect("duplicates of one DID count once against the bound");
+    assert_eq!(allowed, dup, "order and duplicates preserved in returned vec");
+
+    // 2 DISTINCT first-contacts, bound = 1 → denied
+    let two = vec!["did:plc:a".to_string(), "did:plc:b".to_string()];
+    let denied =
+        apply_key_package_target_authz(&two, &authorized, GateKeyPackagesMode::Enforce, 1);
+    assert_eq!(denied, Err(axum::http::StatusCode::FORBIDDEN));
+}
+
+#[test]
+fn enforce_allows_when_all_targets_authorized() {
+    let requested = vec!["did:plc:a".to_string(), "did:plc:b".to_string()];
+    let authorized = vec!["did:plc:a".to_string(), "did:plc:b".to_string()];
+
+    // even bound = 0 cannot deny a batch with zero first-contacts
+    let enforce =
+        apply_key_package_target_authz(&requested, &authorized, GateKeyPackagesMode::Enforce, 0)
+            .expect("a fully relationship-authorized batch is always allowed");
+    assert_eq!(enforce, requested);
 }
 
 #[tokio::test]
