@@ -2725,6 +2725,145 @@ pub async fn commit_group_change(
                 }
             }
 
+            // ── W4: Roster-ghost reconciliation (no-commit soft-remove) ──
+            //
+            // A "roster ghost" is a member present in the `members` table but
+            // who never joined the MLS ratchet tree: `leaf_index IS NULL` (no
+            // leaf was ever assigned) and `left_at IS NULL` (still active on
+            // the roster). This happens when a member is invited (Welcome
+            // sealed, `members` row written) but never consumes the Welcome —
+            // they have no tree leaf, so an admin's client CANNOT author an MLS
+            // commit that removes them (the Rust layer returns "No members
+            // found to remove"). The normal path below REQUIRES such a commit,
+            // so it can never unstick a ghost (two-sided deadlock: re-add is
+            // blocked by the lingering `members` row, remove fails for lack of
+            // a leaf).
+            //
+            // When the caller sends removeMember WITHOUT a commit, treat it as
+            // a roster-only reconciliation: soft-remove (`left_at = now()`)
+            // every targeted member whose row is a ghost. No epoch advance, no
+            // commit message, no External Commit — roster membership is
+            // decoupled from ratchet-tree membership. This unblocks a
+            // subsequent re-add (which seals a fresh Welcome). A target that
+            // DID join the tree (`leaf_index IS NOT NULL`) is refused here so a
+            // real removal can never skip the commit-based path.
+            if input.commit.is_none() {
+                let member_dids = input.member_dids.as_ref().ok_or_else(|| {
+                    warn!("removeMember(ghost): missing member_dids");
+                    bad_request("Missing memberDids")
+                })?;
+
+                // Verify caller is an admin (same check as the normal path).
+                let (caller_did, _) = parse_device_did(&auth_user.did).map_err(|e| {
+                    error!("removeMember(ghost): invalid DID format: {}", e);
+                    bad_request("Invalid DID format")
+                })?;
+                let is_admin: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM members WHERE convo_id = $1 AND user_did = $2 AND left_at IS NULL AND is_admin = true)",
+                )
+                .bind(&convo_id)
+                .bind(&caller_did)
+                .fetch_one(&pool)
+                .await
+                .map_err(|e| {
+                    error!("removeMember(ghost): admin check failed: {}", e);
+                    internal_server_error("Failed to check admin status")
+                })?;
+                if !is_admin {
+                    return Err(forbidden("Not an admin of this conversation"));
+                }
+
+                let cur_epoch = crate::db::get_current_epoch(&pool, &convo_id)
+                    .await
+                    .unwrap_or(0);
+                let mut removed_any = false;
+
+                for member_did in member_dids {
+                    let member_did_str = crate::sqlx_jacquard::did_to_string(member_did);
+                    match crate::db::soft_remove_roster_ghost(&pool, &convo_id, &member_did_str)
+                        .await
+                        .map_err(|e| {
+                            error!("removeMember(ghost): soft-remove failed: {}", e);
+                            internal_server_error("Failed to remove member")
+                        })? {
+                        crate::db::GhostRemovalOutcome::HasRealLeaf => {
+                            warn!(
+                                "removeMember(ghost): target {} has a ratchet-tree leaf; a commit is required to remove a joined member",
+                                crate::crypto::redact_for_log(&member_did_str)
+                            );
+                            return Err(bad_request(
+                                "Cannot remove a tree-joined member without a commit",
+                            ));
+                        }
+                        crate::db::GhostRemovalOutcome::NotFound => {
+                            info!(
+                                "removeMember(ghost): no active ghost row for target {} in convo {} (idempotent)",
+                                crate::crypto::redact_for_log(&member_did_str),
+                                crate::crypto::redact_for_log(&convo_id)
+                            );
+                        }
+                        crate::db::GhostRemovalOutcome::Removed => {
+                            removed_any = true;
+                            info!(
+                                "removeMember(ghost): soft-removed roster ghost {} from convo {}",
+                                crate::crypto::redact_for_log(&member_did_str),
+                                crate::crypto::redact_for_log(&convo_id)
+                            );
+
+                            // Notify clients to refresh their roster. The tree
+                            // is untouched, so report the unchanged epoch.
+                            let cursor = sse_state
+                                .cursor_gen
+                                .next(&convo_id, "membershipChangeEvent")
+                                .await;
+                            sse_state.enqueue_with_store(
+                                &convo_id,
+                                pool.clone(),
+                                crate::realtime::StreamEvent::MembershipChangeEvent {
+                                    cursor,
+                                    convo_id: convo_id.clone(),
+                                    did: member_did_str.clone(),
+                                    action: "removed".to_string(),
+                                    actor: Some(caller_did.clone()),
+                                    reason: Some("roster ghost reconciliation".to_string()),
+                                    epoch: cur_epoch as usize,
+                                },
+                            );
+                        }
+                    }
+                }
+
+                // Persist idempotency key (best-effort) so a retry is a no-op.
+                if let Some(ref idem_key) = input.idempotency_key {
+                    if let Err(e) = sqlx::query(
+                        "INSERT INTO idempotency_cache (caller_did, key, endpoint, response_body, status_code, created_at, expires_at) VALUES ($1, $2, $3, '{}'::jsonb, 200, NOW(), NOW() + INTERVAL '24 hours') ON CONFLICT DO NOTHING",
+                    )
+                    .bind(&caller_did)
+                    .bind(idem_key.to_string())
+                    .bind(NSID)
+                    .execute(&pool)
+                    .await
+                    {
+                        error!("removeMember(ghost): failed to store idempotency key: {}", e);
+                    }
+                }
+
+                info!(
+                    "✅ v2.commitGroupChange: removeMember(ghost) complete (removed_any={}, epoch unchanged={})",
+                    removed_any, cur_epoch
+                );
+                return Ok(Json(CommitGroupChangeOutput {
+                    success: true,
+                    new_epoch: Some(cur_epoch as i64),
+                    claimed_addition: None,
+                    confirmation_tag: None,
+                    pending_additions: None,
+                    rejoined_at: None,
+                    extra_data: Default::default(),
+                })
+                .into_response());
+            }
+
             // ── Validate required fields (bytes arrive already decoded) ──
             let commit_bytes = input.commit.as_ref().ok_or_else(|| {
                 warn!("removeMember: missing commit");

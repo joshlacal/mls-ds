@@ -1032,6 +1032,108 @@ pub async fn remove_member(pool: &DbPool, convo_id: &str, member_did: &str) -> R
     Ok(())
 }
 
+/// Outcome of a W4 roster-ghost soft-removal attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GhostRemovalOutcome {
+    /// A roster ghost (`leaf_index IS NULL`, `left_at IS NULL`) was
+    /// soft-removed (`left_at` set).
+    Removed,
+    /// The target has an active ratchet-tree leaf (`leaf_index IS NOT NULL`).
+    /// Nothing was modified — removal MUST go through the commit-based path.
+    HasRealLeaf,
+    /// No matching active row found (already left, or never a member).
+    NotFound,
+}
+
+/// Pure classifier for [`soft_remove_roster_ghost`]. Extracted so the gating
+/// logic is unit-testable without a database. `rows_affected` is the number of
+/// rows changed by the race-safe predicated UPDATE; `has_real_leaf` is whether
+/// the target currently has an active ratchet-tree leaf (only consulted when
+/// the UPDATE matched nothing).
+pub(crate) fn classify_ghost_removal(
+    rows_affected: u64,
+    has_real_leaf: bool,
+) -> GhostRemovalOutcome {
+    if rows_affected > 0 {
+        GhostRemovalOutcome::Removed
+    } else if has_real_leaf {
+        GhostRemovalOutcome::HasRealLeaf
+    } else {
+        GhostRemovalOutcome::NotFound
+    }
+}
+
+/// W4: Soft-remove a "roster ghost" — a member present in `members` but who
+/// never joined the MLS ratchet tree (`leaf_index IS NULL`, `left_at IS NULL`).
+///
+/// Such a member has no tree leaf, so no MLS commit can excise them; this
+/// reconciles the roster directly by setting `left_at = now()`, decoupling
+/// roster membership from ratchet-tree membership. This unblocks a subsequent
+/// re-add (which seals a fresh Welcome to the member's current key package).
+///
+/// The write is a single predicated UPDATE
+/// (`leaf_index IS NULL AND left_at IS NULL`) so it is race-safe: a concurrent
+/// real join that sets `leaf_index` will no longer match (the row is left
+/// untouched, returning `HasRealLeaf`), and a concurrent commit-based removal
+/// that sets `left_at` cannot be double-applied. A properly-joined member is
+/// therefore never soft-removed here — callers can never skip a required tree
+/// removal.
+///
+/// `target_did` may be a device MLS DID (`member_did`) or a base user DID
+/// (`user_did`), matching the normal removeMember semantics.
+pub async fn soft_remove_roster_ghost(
+    pool: &DbPool,
+    convo_id: &str,
+    target_did: &str,
+) -> Result<GhostRemovalOutcome> {
+    // Race-safe write: only ghost rows (no leaf, still active) are affected.
+    let result = sqlx::query(
+        r#"
+        UPDATE members
+        SET left_at = $3
+        WHERE convo_id = $1
+          AND (user_did = $2 OR member_did = $2)
+          AND leaf_index IS NULL
+          AND left_at IS NULL
+        "#,
+    )
+    .bind(convo_id)
+    .bind(target_did)
+    .bind(Utc::now())
+    .execute(pool)
+    .await
+    .context("Failed to soft-remove roster ghost")?;
+
+    // Only disambiguate the no-op case: was the target a properly-joined
+    // member (real leaf) or simply absent? This SELECT is purely advisory —
+    // the UPDATE above is the authoritative, race-safe write.
+    let has_real_leaf = if result.rows_affected() == 0 {
+        sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM members
+                WHERE convo_id = $1
+                  AND (user_did = $2 OR member_did = $2)
+                  AND left_at IS NULL
+                  AND leaf_index IS NOT NULL
+            )
+            "#,
+        )
+        .bind(convo_id)
+        .bind(target_did)
+        .fetch_one(pool)
+        .await
+        .context("Failed to check member tree state")?
+    } else {
+        false
+    };
+
+    Ok(classify_ghost_removal(
+        result.rows_affected(),
+        has_real_leaf,
+    ))
+}
+
 /// Check if a user is an active member of a conversation
 ///
 /// Handles both single-device (legacy) and multi-device modes:
@@ -3427,6 +3529,124 @@ mod tests {
             .await;
         let _ = sqlx::query("DELETE FROM users WHERE did = $1")
             .bind(&owner_did)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM conversations WHERE id = $1")
+            .bind(&convo.id)
+            .execute(&pool)
+            .await;
+    }
+
+    // ── W4: roster-ghost removal ──────────────────────────────────────────
+
+    #[test]
+    fn test_classify_ghost_removal_pure() {
+        // A row was soft-removed → Removed (regardless of leaf disambiguation).
+        assert_eq!(
+            classify_ghost_removal(1, false),
+            GhostRemovalOutcome::Removed
+        );
+        assert_eq!(
+            classify_ghost_removal(2, true),
+            GhostRemovalOutcome::Removed
+        );
+        // No row changed, but the target has an active leaf → HasRealLeaf
+        // (the caller must use the commit-based path; we must NOT skip it).
+        assert_eq!(
+            classify_ghost_removal(0, true),
+            GhostRemovalOutcome::HasRealLeaf
+        );
+        // No row changed and no active leaf → NotFound (already left / absent).
+        assert_eq!(
+            classify_ghost_removal(0, false),
+            GhostRemovalOutcome::NotFound
+        );
+    }
+
+    /// DB-backed reproduction of the W4 deadlock: a roster ghost (member row
+    /// with `leaf_index IS NULL`, `left_at IS NULL`) must be soft-removable
+    /// WITHOUT an MLS commit, while a properly-joined member (leaf set) must
+    /// NOT be soft-removed by this path.
+    #[tokio::test]
+    #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+    async fn test_soft_remove_roster_ghost() {
+        let pool = setup_test_db().await;
+
+        let convo = create_conversation(&pool, "did:plc:ghostcreator")
+            .await
+            .expect("Failed to create conversation");
+
+        // Ghost: invited but never joined the tree (leaf_index NULL, active).
+        sqlx::query(
+            "INSERT INTO members (convo_id, member_did, user_did, joined_at, leaf_index, left_at)
+             VALUES ($1, $2, $3, NOW(), NULL, NULL)",
+        )
+        .bind(&convo.id)
+        .bind("did:plc:ghost#deviceG")
+        .bind("did:plc:ghost")
+        .execute(&pool)
+        .await
+        .expect("Failed to insert ghost member");
+
+        // Real member: joined the tree (leaf_index set, active).
+        sqlx::query(
+            "INSERT INTO members (convo_id, member_did, user_did, joined_at, leaf_index, left_at)
+             VALUES ($1, $2, $3, NOW(), 1, NULL)",
+        )
+        .bind(&convo.id)
+        .bind("did:plc:real#deviceR")
+        .bind("did:plc:real")
+        .execute(&pool)
+        .await
+        .expect("Failed to insert real member");
+
+        // Ghost removal succeeds and sets left_at — no commit required.
+        let outcome = soft_remove_roster_ghost(&pool, &convo.id, "did:plc:ghost#deviceG")
+            .await
+            .expect("ghost removal must not error");
+        assert_eq!(outcome, GhostRemovalOutcome::Removed);
+
+        let ghost_left_at: Option<DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT left_at FROM members WHERE convo_id = $1 AND member_did = $2",
+        )
+        .bind(&convo.id)
+        .bind("did:plc:ghost#deviceG")
+        .fetch_one(&pool)
+        .await
+        .expect("fetch ghost row");
+        assert!(
+            ghost_left_at.is_some(),
+            "ghost row must have left_at set after reconciliation"
+        );
+
+        // Real member must be refused (HasRealLeaf) and left untouched.
+        let outcome = soft_remove_roster_ghost(&pool, &convo.id, "did:plc:real#deviceR")
+            .await
+            .expect("real-member probe must not error");
+        assert_eq!(outcome, GhostRemovalOutcome::HasRealLeaf);
+
+        let real_left_at: Option<DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT left_at FROM members WHERE convo_id = $1 AND member_did = $2",
+        )
+        .bind(&convo.id)
+        .bind("did:plc:real#deviceR")
+        .fetch_one(&pool)
+        .await
+        .expect("fetch real row");
+        assert!(
+            real_left_at.is_none(),
+            "properly-joined member must NOT be soft-removed by the ghost path"
+        );
+
+        // Idempotent / absent target → NotFound (re-running on the now-left
+        // ghost yields no change).
+        let outcome = soft_remove_roster_ghost(&pool, &convo.id, "did:plc:ghost#deviceG")
+            .await
+            .expect("repeat removal must not error");
+        assert_eq!(outcome, GhostRemovalOutcome::NotFound);
+
+        let _ = sqlx::query("DELETE FROM members WHERE convo_id = $1")
+            .bind(&convo.id)
             .execute(&pool)
             .await;
         let _ = sqlx::query("DELETE FROM conversations WHERE id = $1")
