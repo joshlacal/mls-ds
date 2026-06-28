@@ -117,6 +117,10 @@
           "type": "string",
           "format": "datetime",
           "description": "Expiration timestamp (required, max 90 days from now)"
+        },
+        "lastResort": {
+          "type": "boolean",
+          "description": "Whether this is a reusable MLS last-resort key package"
         }
       }
     },

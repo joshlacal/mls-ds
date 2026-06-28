@@ -11,7 +11,7 @@
 //!   1. Bulk claim returns the same per-DID rows as the pre-bulk per-DID
 //!      loop would have.
 //!   2. A second invocation observes zero rows for those DIDs (rows are now
-//!      `claimed` — single-call atomicity).
+//!      actively reserved — single-call atomicity for regular packages).
 //!   3. Per-device dedupe is preserved (`DISTINCT ON (owner_did, device_id)`).
 //!
 //! Round-trip count is structural: the helper uses a single `query_as!`
@@ -104,6 +104,23 @@ async fn cleanup(pool: &PgPool, dids: &[String]) {
     }
 }
 
+async fn key_package_state(
+    pool: &PgPool,
+    owner_did: &str,
+    key_package_hash: &str,
+) -> (String, bool, bool) {
+    sqlx::query_as::<_, (String, bool, bool)>(
+        "SELECT state, consumed_at IS NOT NULL, reserved_at IS NOT NULL \
+         FROM key_packages \
+         WHERE owner_did = $1 AND key_package_hash = $2",
+    )
+    .bind(owner_did)
+    .bind(key_package_hash)
+    .fetch_one(pool)
+    .await
+    .expect("fetch key package state")
+}
+
 /// Bulk claim across N DIDs returns the same per-DID result set the
 /// pre-bulk per-DID loop would have produced, in a single SQL round-trip.
 ///
@@ -150,9 +167,15 @@ async fn test_bulk_claim_matches_per_did_loop() {
 
     // ── 1. Single bulk call across all 5 DIDs ───────────────────────────
     let did_strs: Vec<&str> = dids.iter().map(String::as_str).collect();
-    let regular = claim_available_key_packages_bulk(&pool, &did_strs, Some(cipher_suite), false)
-        .await
-        .expect("bulk regular claim");
+    let regular = claim_available_key_packages_bulk(
+        &pool,
+        &did_strs,
+        Some(cipher_suite),
+        false,
+        Some("test-reserver"),
+    )
+    .await
+    .expect("bulk regular claim");
 
     let mut by_did: HashMap<String, usize> = HashMap::new();
     for row in &regular {
@@ -204,9 +227,15 @@ async fn test_bulk_claim_matches_per_did_loop() {
     assert!(unmatched.contains(&dids[3].as_str()));
     assert!(unmatched.contains(&dids[4].as_str()));
 
-    let lr = claim_available_key_packages_bulk(&pool, &unmatched, Some(cipher_suite), true)
-        .await
-        .expect("bulk last-resort claim");
+    let lr = claim_available_key_packages_bulk(
+        &pool,
+        &unmatched,
+        Some(cipher_suite),
+        true,
+        Some("test-reserver"),
+    )
+    .await
+    .expect("bulk last-resort claim");
     let lr_owners: Vec<&str> = lr.iter().map(|r| r.0.as_str()).collect();
     assert_eq!(lr.len(), 1, "expected exactly one last-resort hit");
     assert_eq!(
@@ -216,28 +245,46 @@ async fn test_bulk_claim_matches_per_did_loop() {
     );
 
     // ── 3. Repeat-claim sanity: rows are now `claimed`; bulk returns 0 ──
-    let after = claim_available_key_packages_bulk(&pool, &did_strs, Some(cipher_suite), false)
-        .await
-        .expect("post-claim bulk regular");
+    let after = claim_available_key_packages_bulk(
+        &pool,
+        &did_strs,
+        Some(cipher_suite),
+        false,
+        Some("test-reserver"),
+    )
+    .await
+    .expect("post-claim bulk regular");
     assert!(
         after.is_empty(),
         "post-claim bulk should observe no available rows; got {} rows",
         after.len()
     );
 
-    let after_lr = claim_available_key_packages_bulk(&pool, &did_strs, Some(cipher_suite), true)
-        .await
-        .expect("post-claim bulk last-resort");
-    assert!(
-        after_lr.is_empty(),
-        "post-claim bulk last-resort should observe no available rows; got {} rows",
-        after_lr.len()
+    let after_lr = claim_available_key_packages_bulk(
+        &pool,
+        &did_strs,
+        Some(cipher_suite),
+        true,
+        Some("test-reserver"),
+    )
+    .await
+    .expect("post-claim bulk last-resort");
+    assert_eq!(
+        after_lr.len(),
+        1,
+        "last-resort rows are reusable and should remain available"
     );
 
     // ── 4. Empty input is a no-op (no SQL emitted, no error) ────────────
-    let empty = claim_available_key_packages_bulk(&pool, &[], Some(cipher_suite), false)
-        .await
-        .expect("empty bulk claim");
+    let empty = claim_available_key_packages_bulk(
+        &pool,
+        &[],
+        Some(cipher_suite),
+        false,
+        Some("test-reserver"),
+    )
+    .await
+    .expect("empty bulk claim");
     assert!(empty.is_empty());
 
     cleanup(&pool, &dids).await;
@@ -298,10 +345,15 @@ async fn test_bulk_claim_emits_one_statement_per_call() {
         .expect("xid_before");
 
     let did_strs: Vec<&str> = dids.iter().map(String::as_str).collect();
-    let rows =
-        claim_available_key_packages_bulk(&single_pool, &did_strs, Some(cipher_suite), false)
-            .await
-            .expect("bulk claim");
+    let rows = claim_available_key_packages_bulk(
+        &single_pool,
+        &did_strs,
+        Some(cipher_suite),
+        false,
+        Some("test-reserver"),
+    )
+    .await
+    .expect("bulk claim");
     assert_eq!(
         rows.len(),
         n,
@@ -372,14 +424,20 @@ async fn test_bulk_claim_smoke_distinct_for_update_regression() {
     }
 
     let did_strs: Vec<&str> = dids.iter().map(String::as_str).collect();
-    let rows = claim_available_key_packages_bulk(&pool, &did_strs, Some(cipher_suite), false)
-        .await
-        .expect(
-            "bulk claim must not return an Err — \
+    let rows = claim_available_key_packages_bulk(
+        &pool,
+        &did_strs,
+        Some(cipher_suite),
+        false,
+        Some("test-reserver"),
+    )
+    .await
+    .expect(
+        "bulk claim must not return an Err — \
              a regression to `DISTINCT ON ... FOR UPDATE SKIP LOCKED` \
              trips Postgres parse error 'FOR UPDATE is not allowed with \
              DISTINCT clause' which is exactly the production 500.",
-        );
+    );
 
     assert_eq!(
         rows.len(),
@@ -430,9 +488,15 @@ async fn test_bulk_claim_null_device_id_dedupe() {
         tokio::time::sleep(StdDuration::from_millis(2)).await;
     }
 
-    let rows = claim_available_key_packages_bulk(&pool, &[did.as_str()], Some(cipher_suite), false)
-        .await
-        .expect("bulk claim with NULL device_id");
+    let rows = claim_available_key_packages_bulk(
+        &pool,
+        &[did.as_str()],
+        Some(cipher_suite),
+        false,
+        Some("test-reserver"),
+    )
+    .await
+    .expect("bulk claim with NULL device_id");
 
     assert_eq!(
         rows.len(),
@@ -440,6 +504,157 @@ async fn test_bulk_claim_null_device_id_dedupe() {
         "4 rows × NULL device_id × same DID must collapse to 1 claimed row \
          via COALESCE(device_id, ''); got {}",
         rows.len()
+    );
+
+    cleanup(&pool, &[did]).await;
+}
+
+#[tokio::test]
+async fn test_regular_bulk_claim_reserves_without_consuming_until_commit() {
+    let pool = setup_test_db().await;
+    let cipher_suite = "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519";
+    let did = format!("did:plc:test-reserve-{}", Uuid::new_v4());
+    ensure_user(&pool, &did).await;
+
+    insert_key_package(&pool, &did, cipher_suite, Some("dev-A"), false).await;
+    insert_key_package(&pool, &did, cipher_suite, Some("dev-B"), false).await;
+
+    let rows = claim_available_key_packages_bulk(
+        &pool,
+        &[did.as_str()],
+        Some(cipher_suite),
+        false,
+        Some("test-reserver"),
+    )
+    .await
+    .expect("reserve regular key packages");
+    assert_eq!(rows.len(), 2, "one reserved row per device bucket");
+
+    for (_owner, _cs, _kp, hash) in &rows {
+        let hash = hash.as_deref().expect("test rows have key package hashes");
+        assert_eq!(
+            key_package_state(&pool, &did, hash).await,
+            ("reserved".to_string(), false, true),
+            "getKeyPackages must reserve regular packages without consuming them"
+        );
+    }
+
+    for (_owner, _cs, _kp, hash) in &rows {
+        let hash = hash.as_deref().expect("test rows have key package hashes");
+        let consumed = catbird_server::db::mark_key_package_consumed(&pool, &did, hash)
+            .await
+            .expect("commit reserved package");
+        assert!(consumed, "reserved package should commit exactly once");
+        assert!(
+            !catbird_server::db::mark_key_package_consumed(&pool, &did, hash)
+                .await
+                .expect("second commit attempt"),
+            "already-claimed package must not commit twice"
+        );
+        assert_eq!(
+            key_package_state(&pool, &did, hash).await,
+            ("claimed".to_string(), true, false),
+            "successful create/addMembers must transition reserved packages to claimed"
+        );
+    }
+
+    cleanup(&pool, &[did]).await;
+}
+
+#[tokio::test]
+async fn test_expired_regular_reservations_are_claimable_again() {
+    let pool = setup_test_db().await;
+    let cipher_suite = "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519";
+    let did = format!("did:plc:test-stale-reserve-{}", Uuid::new_v4());
+    ensure_user(&pool, &did).await;
+
+    let id = Uuid::new_v4().to_string();
+    let hash = format!("test-stale-{}", &id[..16]);
+    sqlx::query(
+        "INSERT INTO key_packages \
+           (id, owner_did, cipher_suite, key_package, key_package_hash, \
+            device_id, created_at, expires_at, state, is_last_resort, reserved_at, reserved_by_convo) \
+         VALUES ($1, $2, $3, $4, $5, 'dev-A', NOW(), NOW() + INTERVAL '30 days', \
+                 'reserved', false, NOW() - INTERVAL '10 minutes', 'stale-convo')",
+    )
+    .bind(&id)
+    .bind(&did)
+    .bind(cipher_suite)
+    .bind(vec![0u8; 32])
+    .bind(&hash)
+    .execute(&pool)
+    .await
+    .expect("insert stale reserved key package");
+
+    let rows = claim_available_key_packages_bulk(
+        &pool,
+        &[did.as_str()],
+        Some(cipher_suite),
+        false,
+        Some("test-reserver"),
+    )
+    .await
+    .expect("reclaim stale reservation");
+    assert_eq!(
+        rows.len(),
+        1,
+        "stale reserved row should be selectable again"
+    );
+    assert_eq!(rows[0].3.as_deref(), Some(hash.as_str()));
+    assert_eq!(
+        key_package_state(&pool, &did, &hash).await,
+        ("reserved".to_string(), false, true),
+        "reclaimed stale rows should remain reserved, not consumed"
+    );
+
+    cleanup(&pool, &[did]).await;
+}
+
+#[tokio::test]
+async fn test_last_resort_bulk_fetch_is_reusable_and_does_not_reserve() {
+    let pool = setup_test_db().await;
+    let cipher_suite = "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519";
+    let did = format!("did:plc:test-last-resort-{}", Uuid::new_v4());
+    ensure_user(&pool, &did).await;
+
+    insert_key_package(&pool, &did, cipher_suite, Some("dev-A"), true).await;
+
+    let first = claim_available_key_packages_bulk(
+        &pool,
+        &[did.as_str()],
+        Some(cipher_suite),
+        true,
+        Some("test-reserver"),
+    )
+    .await
+    .expect("first last-resort fetch");
+    assert_eq!(first.len(), 1);
+    let hash = first[0]
+        .3
+        .as_deref()
+        .expect("last-resort row has a hash")
+        .to_string();
+    assert_eq!(
+        key_package_state(&pool, &did, &hash).await,
+        ("available".to_string(), false, false),
+        "last-resort fetch must not reserve or consume the reusable row"
+    );
+
+    let second = claim_available_key_packages_bulk(
+        &pool,
+        &[did.as_str()],
+        Some(cipher_suite),
+        true,
+        Some("test-reserver"),
+    )
+    .await
+    .expect("second last-resort fetch");
+    assert_eq!(second.len(), 1, "last-resort row should be reusable");
+    assert_eq!(second[0].3.as_deref(), Some(hash.as_str()));
+    assert_eq!(
+        key_package_state(&pool, &did, &hash).await,
+        ("available".to_string(), false, false),
+        "last-resort row must stay available across repeated fetches"
     );
 
     cleanup(&pool, &[did]).await;

@@ -1,8 +1,8 @@
-//! Concurrent key-package claim race test.
+//! Concurrent key-package reservation race test.
 //!
-//! Asserts the atomic claim primitive (`UPDATE ... WHERE state='available'`
+//! Asserts the atomic reservation primitive (`UPDATE ... WHERE state='available'`
 //! plus `FOR UPDATE SKIP LOCKED` on the row picker) lets exactly one of two
-//! racing claimants take a single available row. The other must observe
+//! racing callers reserve a single available row. The other must observe
 //! state_after = "no_match" — never both succeed.
 //!
 //! Requires `TEST_DATABASE_URL` (defaults to localhost:5433/catbird). The
@@ -83,7 +83,7 @@ async fn cleanup(pool: &PgPool, owner_did: &str) {
         .await;
 }
 
-/// Calls the production claim helper directly. Previously this test inlined
+/// Calls the production reservation helper directly. Previously this test inlined
 /// a hand-copied SQL string of the helper's body; that copy drifted when the
 /// helper was rewritten to fix a `DISTINCT ON ... FOR UPDATE` regression and
 /// would have started silently testing dead SQL. Routing through the real
@@ -99,19 +99,13 @@ async fn try_claim_one(
         &[owner_did],
         Some(cipher_suite),
         /* last_resort = */ false,
+        Some("test-race"),
     )
     .await
 }
 
-// TODO(phase-2.5-cleanup-test-fixture-rot): the in-test SELECT uses
-// `FOR UPDATE` with `DISTINCT`, which Postgres rejects (`SQLSTATE 0A000:
-// "FOR UPDATE is not allowed with DISTINCT clause"`). The intended
-// behavior is row-level locking on a single key_package; rewrite the
-// query to use `SELECT … FOR UPDATE SKIP LOCKED` against
-// non-deduplicated rows. Held for follow-up.
 #[tokio::test]
-#[ignore = "fixture rot: SELECT DISTINCT … FOR UPDATE is invalid Postgres SQL"]
-async fn test_concurrent_claim_exactly_one_winner() {
+async fn test_concurrent_reserve_exactly_one_winner() {
     let pool = setup_test_db().await;
 
     let owner_did = format!("did:plc:test-claim-race-{}", Uuid::new_v4());
@@ -170,15 +164,26 @@ async fn test_concurrent_claim_exactly_one_winner() {
         loser_rows.len()
     );
 
-    // Repeat-claim sanity: the row is now `claimed`, so a third try returns
-    // zero rows. This is what the metric `key_package_claim_total{state_after="no_match"}`
-    // increments on in production.
+    let (state, consumed, reserved): (String, bool, bool) = sqlx::query_as(
+        "SELECT state, consumed_at IS NOT NULL, reserved_at IS NOT NULL \
+         FROM key_packages WHERE owner_did = $1",
+    )
+    .bind(&owner_did)
+    .fetch_one(&pool)
+    .await
+    .expect("fetch reserved row state");
+    assert_eq!(state, "reserved");
+    assert!(!consumed, "reservation must not consume the key package");
+    assert!(reserved, "winner must stamp reserved_at");
+
+    // Repeat-reserve sanity: the row is now actively reserved, so a third try
+    // returns zero rows until the reservation TTL expires.
     let after = try_claim_one(&pool, &owner_did, cipher_suite)
         .await
-        .expect("post-claim sql");
+        .expect("post-reserve sql");
     assert!(
         after.is_empty(),
-        "post-claim try should find no available row; got {} rows",
+        "post-reserve try should find no available row; got {} rows",
         after.len()
     );
 

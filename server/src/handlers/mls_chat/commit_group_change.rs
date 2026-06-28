@@ -1161,6 +1161,36 @@ pub async fn commit_group_change(
                     internal_server_error("Failed to mark commit success")
                 })?;
 
+            if let Some(ref kp_hashes) = input.key_package_hashes {
+                for entry in kp_hashes {
+                    let member_did_str = crate::sqlx_jacquard::did_to_string(&entry.did);
+                    let hash_hex: &str = &entry.hash;
+                    let consumed = crate::db::mark_key_package_consumed_with_metadata_tx(
+                        &mut tx,
+                        &member_did_str,
+                        hash_hex,
+                        Some(&convo_id),
+                        None,
+                    )
+                    .await
+                    .map_err(|e| {
+                        error!("addMembers: failed to commit reserved key package: {}", e);
+                        internal_server_error("Failed to commit key package reservation")
+                    })?;
+                    if consumed {
+                        tracing::debug!(
+                            "addMembers: committed reserved key package for {}",
+                            crate::crypto::redact_for_log(&member_did_str)
+                        );
+                    } else {
+                        tracing::warn!(
+                            "addMembers: reserved key package not found/already claimed for {}",
+                            crate::crypto::redact_for_log(&member_did_str)
+                        );
+                    }
+                }
+            }
+
             // ── Commit transaction ─────────────────────────────────────
             tx.commit().await.map_err(|e| {
                 error!("addMembers: failed to commit transaction: {}", e);

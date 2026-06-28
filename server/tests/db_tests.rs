@@ -339,6 +339,109 @@ async fn test_key_package_operations() {
 
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+async fn test_last_resort_key_package_store_flag_and_replacement() {
+    let _fixture_guard = DB_FIXTURE_LOCK.lock().await;
+    let pool = setup_test_db().await;
+    cleanup_test_data(&pool).await;
+
+    let did = "did:plc:lastresort-store";
+    let cipher_suite = "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519";
+    let expires_at = Utc::now() + chrono::Duration::hours(24);
+    let device_id = Some("device-A".to_string());
+
+    let regular = common::generate_key_package_bytes(did);
+    let first_last_resort = common::generate_key_package_bytes(did);
+    let second_last_resort = common::generate_key_package_bytes(did);
+
+    let regular_row = store_key_package_with_device_bound_to_signature(
+        &pool,
+        did,
+        cipher_suite,
+        regular,
+        expires_at,
+        device_id.clone(),
+        None,
+        None,
+        false,
+    )
+    .await
+    .expect("store regular key package");
+
+    let first_last_resort_row = store_key_package_with_device_bound_to_signature(
+        &pool,
+        did,
+        cipher_suite,
+        first_last_resort,
+        expires_at,
+        device_id.clone(),
+        None,
+        None,
+        true,
+    )
+    .await
+    .expect("store first last-resort key package");
+
+    let second_last_resort_row = store_key_package_with_device_bound_to_signature(
+        &pool,
+        did,
+        cipher_suite,
+        second_last_resort,
+        expires_at,
+        device_id,
+        None,
+        None,
+        true,
+    )
+    .await
+    .expect("store replacement last-resort key package");
+
+    let regular_is_last_resort: bool =
+        sqlx::query_scalar("SELECT is_last_resort FROM key_packages WHERE key_package_hash = $1")
+            .bind(&regular_row.key_package_hash)
+            .fetch_one(&pool)
+            .await
+            .expect("fetch regular last-resort flag");
+    assert!(!regular_is_last_resort);
+
+    let first_state: (String, bool, bool) = sqlx::query_as(
+        "SELECT state, dead_at IS NOT NULL, is_last_resort \
+         FROM key_packages \
+         WHERE key_package_hash = $1",
+    )
+    .bind(&first_last_resort_row.key_package_hash)
+    .fetch_one(&pool)
+    .await
+    .expect("fetch first last-resort state");
+    assert_eq!(first_state, ("revoked".to_string(), true, true));
+
+    let second_state: (String, bool, bool) = sqlx::query_as(
+        "SELECT state, dead_at IS NOT NULL, is_last_resort \
+         FROM key_packages \
+         WHERE key_package_hash = $1",
+    )
+    .bind(&second_last_resort_row.key_package_hash)
+    .fetch_one(&pool)
+    .await
+    .expect("fetch replacement last-resort state");
+    assert_eq!(second_state, ("available".to_string(), false, true));
+
+    let active_last_resort_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM key_packages \
+         WHERE owner_did = $1 \
+           AND device_id = 'device-A' \
+           AND is_last_resort = true \
+           AND state = 'available' \
+           AND dead_at IS NULL",
+    )
+    .bind(did)
+    .fetch_one(&pool)
+    .await
+    .expect("count active last-resort rows");
+    assert_eq!(active_last_resort_count, 1);
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn test_expired_key_package_cleanup() {
     let _fixture_guard = DB_FIXTURE_LOCK.lock().await;
     let pool = setup_test_db().await;

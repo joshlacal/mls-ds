@@ -1159,8 +1159,9 @@ async fn handle_create_convo(
         }
     }
 
-    // Mark key packages as consumed after the atomic create succeeds. getKeyPackages
-    // already claims packages, so this remains best-effort compatibility cleanup.
+    // Commit reserved key packages after the atomic create succeeds.
+    // getKeyPackages reserves packages at fetch time; successful create is the
+    // first server-side point where those packages are durably bound to Welcomes.
     if let Some(ref kp_hashes) = input.key_package_hashes {
         for entry in kp_hashes {
             let member_did_str = did_to_string(&entry.did);

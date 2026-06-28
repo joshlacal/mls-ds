@@ -1794,6 +1794,7 @@ pub async fn store_key_package_with_device(
         device_id,
         _credential_did,
         None,
+        false,
     )
     .await
 }
@@ -1810,6 +1811,7 @@ pub async fn store_key_package_with_device_bound_to_signature(
     device_id: Option<String>,
     _credential_did: Option<String>, // Ignored - extracted from KeyPackage
     expected_signature_public_key: Option<&[u8]>,
+    last_resort: bool,
 ) -> Result<KeyPackage> {
     let binding =
         validate_key_package_binding(did, &key_data, expected_signature_public_key).await?;
@@ -1831,11 +1833,33 @@ pub async fn store_key_package_with_device_bound_to_signature(
     .await
     .context("Failed to ensure user exists")?;
 
+    if last_resort {
+        sqlx::query(
+            r#"
+            UPDATE key_packages
+            SET state = 'revoked',
+                revoked_at = $3,
+                dead_at = $3
+            WHERE owner_did = $1
+              AND device_id IS NOT DISTINCT FROM $2
+              AND is_last_resort = true
+              AND state = 'available'
+              AND dead_at IS NULL
+            "#,
+        )
+        .bind(did)
+        .bind(&device_id)
+        .bind(now)
+        .execute(pool)
+        .await
+        .context("Failed to replace existing last-resort key package")?;
+    }
+
     // Store with the verified credential identity (not the client-provided one)
     let result = sqlx::query_as::<_, KeyPackage>(
         r#"
-        INSERT INTO key_packages (id, owner_did, cipher_suite, key_package, key_package_hash, created_at, expires_at, device_id, credential_did)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        INSERT INTO key_packages (id, owner_did, cipher_suite, key_package, key_package_hash, created_at, expires_at, device_id, credential_did, is_last_resort)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         RETURNING owner_did, cipher_suite, key_package as key_data, key_package_hash, created_at, expires_at, consumed_at
         "#,
     )
@@ -1848,6 +1872,7 @@ pub async fn store_key_package_with_device_bound_to_signature(
     .bind(expires_at)
     .bind(device_id)
     .bind(&binding.credential_identity)  // Use verified identity from KeyPackage, not client param
+    .bind(last_resort)
     .fetch_one(pool)
     .await
     .context("Failed to store key package")?;
@@ -2070,22 +2095,67 @@ pub async fn mark_key_package_consumed_with_metadata(
     pool: &DbPool,
     did: &str,
     key_package_hash: &str,
-    _consumed_for_convo_id: Option<&str>,
-    _consumed_by_device_id: Option<&str>,
+    consumed_for_convo_id: Option<&str>,
+    consumed_by_device_id: Option<&str>,
 ) -> Result<bool> {
     let result = sqlx::query(
         r#"
         UPDATE key_packages
-        SET consumed_at = $1
-        WHERE owner_did = $2 AND key_package_hash = $3 AND consumed_at IS NULL
+        SET state = 'claimed',
+            consumed_at = $1,
+            consumed_for_convo_id = $4,
+            consumed_by_device_id = $5,
+            reserved_at = NULL,
+            reserved_by_convo = NULL
+        WHERE owner_did = $2
+          AND key_package_hash = $3
+          AND state = 'reserved'
+          AND consumed_at IS NULL
         "#,
     )
     .bind(Utc::now())
     .bind(did)
     .bind(key_package_hash)
+    .bind(consumed_for_convo_id)
+    .bind(consumed_by_device_id)
     .execute(pool)
     .await
     .context("Failed to mark key package as consumed")?;
+
+    Ok(result.rows_affected() > 0)
+}
+
+/// Mark a reserved key package as consumed inside the caller's transaction.
+pub async fn mark_key_package_consumed_with_metadata_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    did: &str,
+    key_package_hash: &str,
+    consumed_for_convo_id: Option<&str>,
+    consumed_by_device_id: Option<&str>,
+) -> Result<bool> {
+    let result = sqlx::query(
+        r#"
+        UPDATE key_packages
+        SET state = 'claimed',
+            consumed_at = $1,
+            consumed_for_convo_id = $4,
+            consumed_by_device_id = $5,
+            reserved_at = NULL,
+            reserved_by_convo = NULL
+        WHERE owner_did = $2
+          AND key_package_hash = $3
+          AND state = 'reserved'
+          AND consumed_at IS NULL
+        "#,
+    )
+    .bind(Utc::now())
+    .bind(did)
+    .bind(key_package_hash)
+    .bind(consumed_for_convo_id)
+    .bind(consumed_by_device_id)
+    .execute(&mut **tx)
+    .await
+    .context("Failed to mark key package as consumed in transaction")?;
 
     Ok(result.rows_affected() > 0)
 }
@@ -2435,6 +2505,31 @@ pub async fn reserve_key_package(
     .context("Failed to reserve key package")?;
 
     Ok(result.rows_affected() > 0)
+}
+
+/// Release stale reservations back to the available pool.
+pub async fn release_expired_key_package_reservations(
+    pool: &DbPool,
+    ttl_minutes: i64,
+) -> Result<u64> {
+    let cutoff = Utc::now() - chrono::Duration::minutes(ttl_minutes);
+    let result = sqlx::query(
+        r#"
+        UPDATE key_packages
+        SET state = 'available',
+            reserved_at = NULL,
+            reserved_by_convo = NULL
+        WHERE state = 'reserved'
+          AND consumed_at IS NULL
+          AND reserved_at < $1
+        "#,
+    )
+    .bind(cutoff)
+    .execute(pool)
+    .await
+    .context("Failed to release expired key package reservations")?;
+
+    Ok(result.rows_affected())
 }
 
 // =============================================================================

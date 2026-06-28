@@ -243,6 +243,7 @@ async fn handle_publish(
         warn!("Key package is empty");
         return Err(StatusCode::BAD_REQUEST);
     }
+    let last_resort = item.last_resort.unwrap_or(false);
 
     info!(
         "Publishing key package, cipher_suite: {}",
@@ -264,6 +265,7 @@ async fn handle_publish(
         dev,
         None,
         Some(expected_signature_public_key),
+        last_resort,
     )
     .await
     .map_err(|e| {
@@ -324,6 +326,7 @@ async fn handle_publish_batch(
              WHERE owner_did = $1
                AND device_id = ANY($2::text[])
                AND consumed_at IS NULL
+               AND is_last_resort = false
                AND expires_at > $3",
         )
         .bind(user_did)
@@ -397,13 +400,21 @@ async fn handle_publish_batch(
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 
-    // Unconsumed limit
+    let regular_uploads = items
+        .iter()
+        .filter(|item| !item.last_resort.unwrap_or(false))
+        .count() as i64;
+
+    // Unconsumed regular-key-package limit. Reusable last-resort rows are
+    // bounded separately to one active row per device and must not block
+    // normal replenishment.
     let unconsumed: (i64,) = if recovery_mode_verified {
         sqlx::query_as(
             "SELECT COUNT(*) FROM key_packages
              WHERE owner_did = $1
                AND device_id = ANY($2::text[])
                AND consumed_at IS NULL
+               AND is_last_resort = false
                AND expires_at > $3",
         )
         .bind(user_did)
@@ -413,7 +424,7 @@ async fn handle_publish_batch(
         .await
     } else {
         sqlx::query_as(
-            "SELECT COUNT(*) FROM key_packages WHERE owner_did = $1 AND consumed_at IS NULL AND expires_at > $2",
+            "SELECT COUNT(*) FROM key_packages WHERE owner_did = $1 AND consumed_at IS NULL AND is_last_resort = false AND expires_at > $2",
         )
         .bind(user_did)
         .bind(now)
@@ -425,7 +436,7 @@ async fn handle_publish_batch(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    if unconsumed.0 >= MAX_UNCONSUMED_PER_USER {
+    if regular_uploads > 0 && unconsumed.0 >= MAX_UNCONSUMED_PER_USER {
         warn!(
             "User {} has {} unconsumed key packages (limit: {})",
             user_did, unconsumed.0, MAX_UNCONSUMED_PER_USER
@@ -433,12 +444,10 @@ async fn handle_publish_batch(
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 
-    if unconsumed.0 + items.len() as i64 > MAX_UNCONSUMED_PER_USER {
+    if unconsumed.0 + regular_uploads > MAX_UNCONSUMED_PER_USER {
         warn!(
             "Batch would exceed unconsumed limit: {} + {} > {}",
-            unconsumed.0,
-            items.len(),
-            MAX_UNCONSUMED_PER_USER
+            unconsumed.0, regular_uploads, MAX_UNCONSUMED_PER_USER
         );
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
@@ -500,6 +509,7 @@ async fn handle_publish_batch(
 
     for (idx, item) in items.iter().enumerate() {
         let key_data = item.key_package.to_vec();
+        let last_resort = item.last_resort.unwrap_or(false);
         if key_data.is_empty() {
             errors.push(BatchError {
                 index: idx as i64,
@@ -545,6 +555,7 @@ async fn handle_publish_batch(
             dev.clone(),
             None,
             Some(expected_signature_public_key),
+            last_resort,
         )
         .await
         {

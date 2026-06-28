@@ -386,6 +386,7 @@ async fn handle_register(
             Some(device_id.clone()),
             None,
             Some(&input.signature_public_key),
+            false,
         )
         .await
         {

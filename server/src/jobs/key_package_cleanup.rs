@@ -66,6 +66,21 @@ pub async fn run_key_package_cleanup_worker(pool: PgPool) {
             }
         }
 
+        // Release stale reservations. The getKeyPackages candidate predicate
+        // already treats expired reservations as claimable; this keeps indexes
+        // and operational counts tidy.
+        match crate::db::release_expired_key_package_reservations(&pool, 5).await {
+            Ok(count) if count > 0 => {
+                info!("Released {} expired key package reservations", count);
+            }
+            Ok(_) => {
+                info!("No expired key package reservations to release");
+            }
+            Err(e) => {
+                error!("Expired key package reservation cleanup failed: {}", e);
+            }
+        }
+
         // Enforce per-device limit
         match crate::db::enforce_key_package_limit(&pool, max_per_device).await {
             Ok(count) if count > 0 => {

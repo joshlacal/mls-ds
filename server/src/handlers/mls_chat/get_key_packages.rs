@@ -259,10 +259,11 @@ pub async fn get_key_packages(
     let mut key_packages: Vec<KeyPackageRef<'static>> = Vec::new();
     let mut missing: Vec<String> = Vec::new();
 
-    // Atomic bulk claim. One SQL round-trip returns one representative
+    // Atomic bulk reservation. One SQL round-trip returns one representative
     // (non-last-resort) row per (DID, device_id bucket) for every DID in the
-    // request. The helper claims every available row in each selected bucket,
-    // so duplicate rows cannot be depleted one at a time by repeat callers.
+    // request. The helper reserves every available/stale-reserved row in each
+    // selected bucket, so duplicate rows cannot be depleted one at a time by
+    // repeat callers.
     //
     // Returns raw bytea — Jacquard's `Bytes` JSON serializer base64-encodes
     // at the wire boundary. Returning `encode(... , 'base64')` here produced
@@ -274,6 +275,7 @@ pub async fn get_key_packages(
         &did_strs,
         input.cipher_suite.as_deref(),
         /* last_resort = */ false,
+        Some(auth_user.did.as_str()),
     )
     .await
     {
@@ -284,8 +286,8 @@ pub async fn get_key_packages(
         }
     };
 
-    // Group claimed rows by DID. Any DID absent from the result set has zero
-    // regular rows claimable and falls through to the last-resort pool.
+    // Group reserved rows by DID. Any DID absent from the result set has zero
+    // regular rows reservable and falls through to the last-resort pool.
     let mut rows_by_did: HashMap<String, Vec<(String, String, Vec<u8>, Option<String>)>> =
         HashMap::new();
     for row in claimed_rows {
@@ -293,10 +295,8 @@ pub async fn get_key_packages(
     }
 
     // Last-resort fallback: identify DIDs with zero regular rows and run a
-    // single bulk claim restricted to those DIDs against the last-resort
-    // pool. Last-resort packages are still single-use here (state ->
-    // claimed) — true "reusable last-resort" semantics are deferred to the
-    // dedicated key-package plan.
+    // single bulk reservation restricted to those DIDs against the last-resort
+    // pool. W2 switches this path to reusable SELECT-only semantics.
     let unmatched_dids: Vec<&str> = did_strs
         .iter()
         .copied()
@@ -308,6 +308,7 @@ pub async fn get_key_packages(
             &unmatched_dids,
             input.cipher_suite.as_deref(),
             /* last_resort = */ true,
+            Some(auth_user.did.as_str()),
         )
         .await
         {
@@ -361,7 +362,7 @@ pub async fn get_key_packages(
         requested = input.dids.len(),
         found = key_packages.len(),
         missing = missing.len(),
-        "Key packages fetched and consumed (one per device)"
+        "Key packages fetched and reserved (one per device)"
     );
 
     let missing_dids = if missing.is_empty() {
@@ -484,14 +485,14 @@ pub fn apply_key_package_target_authz(
     }
 }
 
-/// Atomically claim one available key package per `(owner_did, device_id)`
+/// Atomically reserve one available key package per `(owner_did, device_id)`
 /// bucket for the supplied set of DIDs in a single SQL round-trip.
 ///
 /// Returns rows of `(owner_did, cipher_suite, key_package, key_package_hash)`
-/// for each successfully claimed package — one row per (DID, device_id)
-/// bucket where an available row existed. The transition
-/// `state='available' -> state='claimed'` is the atomic gate; concurrent
-/// callers see disjoint rows because the row-pick CTE uses
+/// for each successfully reserved package — one row per (DID, device_id)
+/// bucket where an available or stale reservation row existed. The transition
+/// to `state='reserved'` is the atomic gate; concurrent callers see disjoint
+/// rows because the row-pick CTE uses
 /// `FOR UPDATE OF kp SKIP LOCKED`.
 ///
 /// Replaces the previous per-DID helper that issued N round-trips for N
@@ -504,17 +505,49 @@ pub fn apply_key_package_target_authz(
 /// 500 in production.
 ///
 /// `last_resort = false` filters to regular packages; `last_resort = true`
-/// claims from the last-resort pool only. Last-resort packages are still
-/// transitioned to `claimed` here — single-use semantics — pending the
-/// dedicated key-package plan.
+/// reserves from the last-resort pool only. W2 layers reusable last-resort
+/// SELECT-only semantics on top of this helper.
 pub async fn claim_available_key_packages_bulk(
     pool: &DbPool,
     owner_dids: &[&str],
     cipher_suite: Option<&str>,
     last_resort: bool,
+    reservation_owner: Option<&str>,
 ) -> Result<Vec<(String, String, Vec<u8>, Option<String>)>, sqlx::Error> {
     if owner_dids.is_empty() {
         return Ok(Vec::new());
+    }
+
+    if last_resort {
+        let sql = r#"
+            WITH candidates AS (
+                SELECT id,
+                       owner_did,
+                       COALESCE(device_id, '') AS device_bucket,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY owner_did, COALESCE(device_id, '')
+                           ORDER BY created_at DESC
+                       ) AS rn
+                FROM key_packages
+                WHERE owner_did = ANY($1::text[])
+                  AND state = 'available'
+                  AND expires_at > NOW()
+                  AND dead_at IS NULL
+                  AND is_last_resort = true
+                  AND ($2::text IS NULL OR cipher_suite = $2)
+            )
+            SELECT kp.owner_did, kp.cipher_suite, kp.key_package, kp.key_package_hash
+            FROM candidates c
+            JOIN key_packages kp ON kp.id = c.id
+            WHERE c.rn = 1
+            ORDER BY c.owner_did, c.device_bucket
+        "#;
+
+        return sqlx::query_as::<_, (String, String, Vec<u8>, Option<String>)>(sql)
+            .bind(owner_dids)
+            .bind(cipher_suite)
+            .fetch_all(pool)
+            .await;
     }
 
     let lr_predicate = if last_resort {
@@ -522,16 +555,12 @@ pub async fn claim_available_key_packages_bulk(
     } else {
         "AND is_last_resort = false"
     };
-    let cs_predicate = if cipher_suite.is_some() {
-        "AND cipher_suite = $2"
-    } else {
-        ""
-    };
+    let reservation_owner = reservation_owner.unwrap_or("getKeyPackages");
 
     // Three-stage CTE:
     //   `candidates` ranks rows per (owner_did, device-bucket) by created_at;
     //   `selected`   locks the rank-1 representative row for each bucket;
-    //   `claimed`    claims every available row in each selected bucket.
+    //   `reserved`   reserves every claimable row in each selected bucket.
     //
     // N23 requires bucket-wide claiming: returning one representative KP while
     // leaving duplicate rows in the same `(owner_did, COALESCE(device_id, ''))`
@@ -564,11 +593,14 @@ pub async fn claim_available_key_packages_bulk(
                     ) AS rn
              FROM key_packages
              WHERE owner_did = ANY($1::text[])
-               AND state = 'available'
+               AND (
+                   state = 'available'
+                   OR (state = 'reserved' AND reserved_at < NOW() - INTERVAL '5 minutes')
+               )
                AND expires_at > NOW()
                AND dead_at IS NULL
                {lr}
-               {cs}
+               AND ($2::text IS NULL OR cipher_suite = $2)
          ),
          selected AS (
              SELECT c.id, c.owner_did, c.device_bucket
@@ -577,33 +609,38 @@ pub async fn claim_available_key_packages_bulk(
              WHERE c.rn = 1
              FOR UPDATE OF kp SKIP LOCKED
          ),
-         claimed AS (
+         reserved AS (
              UPDATE key_packages kp
-             SET state = 'claimed', consumed_at = NOW()
+             SET state = 'reserved',
+                 reserved_at = NOW(),
+                 reserved_by_convo = $3,
+                 consumed_at = NULL
              FROM selected s
              WHERE kp.owner_did = s.owner_did
                AND COALESCE(kp.device_id, '') = s.device_bucket
-               AND kp.state = 'available'
+               AND (
+                   kp.state = 'available'
+                   OR (kp.state = 'reserved' AND kp.reserved_at < NOW() - INTERVAL '5 minutes')
+               )
                AND kp.expires_at > NOW()
                AND kp.dead_at IS NULL
                {lr}
-               {cs}
+               AND ($2::text IS NULL OR kp.cipher_suite = $2)
              RETURNING kp.id
          )
          SELECT kp.owner_did, kp.cipher_suite, kp.key_package, kp.key_package_hash
          FROM selected s
-         JOIN claimed c ON c.id = s.id
+         JOIN reserved c ON c.id = s.id
          JOIN key_packages kp ON kp.id = s.id",
         lr = lr_predicate,
-        cs = cs_predicate,
     );
 
     // Bind the borrowed slice directly — sqlx maps `&[&str]` to Postgres
     // `text[]` without an intermediate `Vec<String>` allocation.
-    let mut q =
-        sqlx::query_as::<_, (String, String, Vec<u8>, Option<String>)>(&sql).bind(owner_dids);
-    if let Some(cs) = cipher_suite {
-        q = q.bind(cs);
-    }
-    q.fetch_all(pool).await
+    sqlx::query_as::<_, (String, String, Vec<u8>, Option<String>)>(&sql)
+        .bind(owner_dids)
+        .bind(cipher_suite)
+        .bind(reservation_owner)
+        .fetch_all(pool)
+        .await
 }
