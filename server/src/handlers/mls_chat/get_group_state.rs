@@ -537,13 +537,31 @@ pub async fn get_group_state(
                 info!(
                     convo_id = %crate::crypto::redact_for_log(convo_id),
                     raw_bytes = group_info_bytes.len(),
-                    epoch = gi_epoch,
+                    group_info_version = gi_epoch,
                     "GroupInfo loaded for response"
                 );
                 group_info = Some(bytes::Bytes::from(group_info_bytes));
-                // Set epoch from group info if not already fetched
+                // Epoch-label honesty (remediation plan I5 / P0.3): the response
+                // `epoch` MUST be the CAS-gated `current_epoch` (the real consensus
+                // epoch), never `group_info_epoch`. The latter (`gi_epoch`) is a
+                // blind +1-on-write tally — a GroupInfo *version*, not a consensus
+                // epoch — and serving it here let recovery-driving clients see an
+                // inflated number and trigger no-op External Commits. If the caller
+                // didn't already request "epoch", resolve it authoritatively from
+                // current_epoch rather than falling back to the cosmetic counter.
                 if epoch.is_none() {
-                    epoch = Some(gi_epoch as i64);
+                    match crate::storage::get_current_epoch(&pool, convo_id).await {
+                        Ok(e) => epoch = Some(e as i64),
+                        Err(e) => {
+                            // Non-fatal: groupInfo is still returned. Leave epoch
+                            // unset rather than serve the inflated gi_epoch.
+                            warn!(
+                                convo_id = %crate::crypto::redact_for_log(convo_id),
+                                error = %e,
+                                "Failed to resolve current_epoch for groupInfo response; omitting epoch rather than serving group_info_epoch"
+                            );
+                        }
+                    }
                 }
                 // Set expiry to 5 minutes from now
                 expires_at = Some(chrono_to_datetime(
