@@ -11,6 +11,30 @@ use std::collections::BTreeMap;
 use super::CodeGenerator;
 use super::utils::{make_ident, value_to_variant_name};
 
+/// Replicates serde's `rename_all = "camelCase"` transformation applied to a
+/// snake_case Rust field identifier. Used to detect when that transformation
+/// fails to round-trip back to the original lexicon field name — all-caps
+/// acronyms (e.g. lexicon `deviceUUID`) become `deviceUuid` under serde, which
+/// silently breaks (de)serialization against the wire contract. When the
+/// round-trip differs, `generate_field` emits an explicit `#[serde(rename)]`.
+fn serde_camel_case(snake: &str) -> String {
+    let mut camel = String::new();
+    let mut capitalize = false;
+    for (i, ch) in snake.char_indices() {
+        if ch == '_' {
+            capitalize = true;
+        } else if i == 0 {
+            camel.push(ch);
+        } else if capitalize {
+            camel.extend(ch.to_uppercase());
+            capitalize = false;
+        } else {
+            camel.push(ch);
+        }
+    }
+    camel
+}
+
 /// Enum variant kind for IntoStatic generation
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -362,6 +386,17 @@ impl<'c> CodeGenerator<'c> {
         let doc = self.generate_doc_comment(description);
 
         let mut attrs = Vec::new();
+
+        // Acronym round-trip guard: the struct carries `#[serde(rename_all =
+        // "camelCase")]`, which mangles all-caps acronyms in lexicon field names
+        // (e.g. `deviceUUID` -> `deviceUuid`), silently dropping the field on
+        // (de)serialization. When serde's camelCase of the snake field ident does
+        // not round-trip to the original lexicon field name, emit an explicit
+        // rename to preserve the wire contract.
+        let snake_name = field_name.to_snake_case();
+        if serde_camel_case(&snake_name) != field_name {
+            attrs.push(quote! { #[serde(rename = #field_name)] });
+        }
 
         if !is_required {
             attrs.push(quote! { #[serde(skip_serializing_if = "std::option::Option::is_none")] });
