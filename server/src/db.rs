@@ -1664,6 +1664,11 @@ pub struct ValidatedKeyPackageBinding {
     pub key_package_hash: String,
     pub credential_identity: String,
     pub leaf_signature_public_key: Vec<u8>,
+    /// True if the KeyPackage carries the MLS `last_resort` extension. Detected
+    /// from the bytes so a client can publish a reusable last-resort KP through
+    /// the normal publish path without a wire flag; the store ORs this with any
+    /// explicit `last_resort` request.
+    pub is_last_resort: bool,
 }
 
 fn validate_key_package_binding_sync(
@@ -1723,10 +1728,17 @@ fn validate_key_package_binding_sync(
         .context("Failed to compute hash_ref")?;
     let key_package_hash = hex::encode(hash_ref.as_slice());
 
+    // Detect the MLS last_resort extension directly from the validated bytes so
+    // a client can publish a reusable last-resort KP via the ordinary publish
+    // path (no wire flag required), and so the flag cannot disagree with the
+    // actual key package contents.
+    let is_last_resort = kp.last_resort();
+
     Ok(ValidatedKeyPackageBinding {
         key_package_hash,
         credential_identity,
         leaf_signature_public_key,
+        is_last_resort,
     })
 }
 
@@ -1815,6 +1827,10 @@ pub async fn store_key_package_with_device_bound_to_signature(
 ) -> Result<KeyPackage> {
     let binding =
         validate_key_package_binding(did, &key_data, expected_signature_public_key).await?;
+    // Honor an explicit request OR the last_resort extension carried in the
+    // KeyPackage bytes. Lets clients publish a reusable last-resort KP through
+    // the normal publish path; the bytes are authoritative.
+    let last_resort = last_resort || binding.is_last_resort;
     let now = Utc::now();
     let id = Uuid::new_v4().to_string();
 
