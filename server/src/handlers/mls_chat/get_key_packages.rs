@@ -613,6 +613,7 @@ pub async fn claim_available_key_packages_bulk(
              UPDATE key_packages kp
              SET state = 'reserved',
                  reserved_at = NOW(),
+                 first_served_at = COALESCE(kp.first_served_at, NOW()),
                  reserved_by_convo = $3,
                  consumed_at = NULL
              FROM selected s

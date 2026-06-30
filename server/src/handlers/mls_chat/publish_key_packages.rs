@@ -132,16 +132,24 @@ async fn build_stats(
         .map(|scope| scope.storage_candidates.as_slice())
         .unwrap_or(&[]);
 
+    // "available" must mean "ready to be handed out by getKeyPackages right
+    // now" — i.e. genuinely `state='available'`, not dead, not expired, not
+    // consumed. The previous predicate (`consumed_at IS NULL AND expires_at >
+    // NOW()`) also counted `reserved` rows stuck in a never-consumed Welcome
+    // and `dead` rows, inflating the count. The client's replenish loop reads
+    // this number; when it is inflated the loop sees a healthy pool, never
+    // republishes, and the true available pool bleeds to zero while
+    // getKeyPackages finds nothing to serve. Count exactly what is servable.
     let available: i64 = if candidates.is_empty() {
         sqlx::query_scalar(
-            "SELECT COUNT(*) FROM key_packages WHERE owner_did = $1 AND consumed_at IS NULL AND expires_at > NOW()",
+            "SELECT COUNT(*) FROM key_packages WHERE owner_did = $1 AND state = 'available' AND dead_at IS NULL AND consumed_at IS NULL AND expires_at > NOW()",
         )
         .bind(user_did)
         .fetch_one(pool)
         .await
     } else {
         sqlx::query_scalar(
-            "SELECT COUNT(*) FROM key_packages WHERE owner_did = $1 AND device_id = ANY($2::text[]) AND consumed_at IS NULL AND expires_at > NOW()",
+            "SELECT COUNT(*) FROM key_packages WHERE owner_did = $1 AND device_id = ANY($2::text[]) AND state = 'available' AND dead_at IS NULL AND consumed_at IS NULL AND expires_at > NOW()",
         )
         .bind(user_did)
         .bind(candidates)

@@ -81,6 +81,33 @@ pub async fn run_key_package_cleanup_worker(pool: PgPool) {
             }
         }
 
+        // Retire poison key packages: served into a Welcome but never consumed
+        // past a grace window. These are almost always KPs whose private key the
+        // recipient lost locally (NoMatchingKeyPackage); without retiring them
+        // getKeyPackages keeps re-serving the same dead ref to every new group.
+        // Grace window is generous (default 2h) — far beyond any legitimate join
+        // latency — so a valid-but-slow join is never killed. Server-side analog
+        // of the client `syncKeyPackages` orphan-drain; self-heals even when the
+        // client drain is not yet deployed.
+        let poison_grace_hours = std::env::var("KEY_PACKAGE_POISON_GRACE_HOURS")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(2);
+        match crate::db::mark_unconsumed_served_key_packages_dead(&pool, poison_grace_hours).await {
+            Ok(count) if count > 0 => {
+                info!(
+                    "Retired {} poison key packages (served but unconsumed > {}h)",
+                    count, poison_grace_hours
+                );
+            }
+            Ok(_) => {
+                info!("No poison key packages to retire");
+            }
+            Err(e) => {
+                error!("Poison key package retirement failed: {}", e);
+            }
+        }
+
         // Enforce per-device limit
         match crate::db::enforce_key_package_limit(&pool, max_per_device).await {
             Ok(count) if count > 0 => {

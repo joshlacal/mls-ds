@@ -2291,6 +2291,49 @@ pub async fn delete_old_unconsumed_key_packages(pool: &DbPool, days_old: i64) ->
     Ok(result.rows_affected())
 }
 
+/// Retire "poison" key packages: ones that were served into a Welcome
+/// reservation (`first_served_at` set) but never consumed within `grace_hours`.
+///
+/// A key package that has been handed to a Welcome and not consumed well past
+/// any legitimate join latency (joins complete in seconds when the KP is valid)
+/// almost always means the recipient could not process it — it lost the
+/// matching private key locally, so `process_welcome` fails with
+/// NoMatchingKeyPackage. Leaving such a KP alive lets `getKeyPackages` keep
+/// re-serving the same dead ref to every new group (the reservation oscillates
+/// reserved -> available -> reserved forever). Marking it `dead` stops it being
+/// served (the getKeyPackages candidate filter excludes `dead_at IS NOT NULL`)
+/// and counted (`build_stats`), which lets replenishment publish a fresh KP
+/// whose private key the owner actually holds.
+///
+/// Last-resort key packages are exempt: they are intentionally long-lived and
+/// reused as the join floor, so they must not be reaped on this heuristic.
+pub async fn mark_unconsumed_served_key_packages_dead(
+    pool: &DbPool,
+    grace_hours: i64,
+) -> Result<u64> {
+    let cutoff = Utc::now() - chrono::Duration::hours(grace_hours);
+
+    let result = sqlx::query(
+        r#"
+        UPDATE key_packages
+        SET dead_at = NOW(),
+            dead_reason = 'noMatchingKeyPackage',
+            state = 'revoked'
+        WHERE consumed_at IS NULL
+          AND dead_at IS NULL
+          AND is_last_resort = false
+          AND first_served_at IS NOT NULL
+          AND first_served_at < $1
+        "#,
+    )
+    .bind(cutoff)
+    .execute(pool)
+    .await
+    .context("Failed to mark unconsumed served key packages dead")?;
+
+    Ok(result.rows_affected())
+}
+
 /// Enforce maximum key packages per device
 pub async fn enforce_key_package_limit(pool: &DbPool, max_per_device: i64) -> Result<u64> {
     // For each DID, keep only the newest max_per_device packages
