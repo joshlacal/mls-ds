@@ -1099,28 +1099,24 @@ pub async fn commit_group_change(
             // transaction keeps the recovery state tied to the replacement
             // commit + Welcome durability boundary.
             if let Some(ref idem_key) = input.idempotency_key {
-                let answered = mark_reissue_request_answered_tx(
-                    &mut tx,
-                    &idem_key.to_string(),
-                    &convo_id,
-                    now,
-                )
-                .await
-                .map_err(|e| {
-                    error!("addMembers: failed to mark reissue request answered: {}", e);
-                    internal_server_error("Failed to mark reissue request answered")
-                })?;
+                let answered =
+                    mark_reissue_request_answered_tx(&mut tx, idem_key.as_ref(), &convo_id, now)
+                        .await
+                        .map_err(|e| {
+                            error!("addMembers: failed to mark reissue request answered: {}", e);
+                            internal_server_error("Failed to mark reissue request answered")
+                        })?;
                 if answered == 1 {
                     info!(
                         convo_id = %crate::crypto::redact_for_log(&convo_id),
-                        request_id = %crate::crypto::redact_for_log(&idem_key.to_string()),
+                        request_id = %crate::crypto::redact_for_log(idem_key.as_ref()),
                         welcome_rows_persisted = used_per_device_path,
                         "addMembers: auto-response stored for Welcome reissue request"
                     );
                 } else {
                     info!(
                         convo_id = %crate::crypto::redact_for_log(&convo_id),
-                        request_id = %crate::crypto::redact_for_log(&idem_key.to_string()),
+                        request_id = %crate::crypto::redact_for_log(idem_key.as_ref()),
                         "addMembers: idempotency key did not match a pending Welcome reissue request"
                     );
                 }

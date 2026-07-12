@@ -234,7 +234,7 @@ async fn handle_register(
             );
 
             // Update existing device record (keep device_id stable, update metadata)
-            let rereg_mls_did = format!("{}#{}", &user_did, &device_id);
+            let rereg_mls_did = format!("{}#{}", user_did, device_id);
             sqlx::query(
                 r#"UPDATE devices
                    SET device_name = $1, credential_did = $2,
@@ -290,7 +290,7 @@ async fn handle_register(
                 deleted_count, old_device_id
             );
 
-            let rereg_mls_did2 = format!("{}#{}", &user_did, &device_id);
+            let rereg_mls_did2 = format!("{}#{}", user_did, device_id);
             sqlx::query(
                 r#"UPDATE devices
                    SET device_name = $1, credential_did = $2,
@@ -313,7 +313,7 @@ async fn handle_register(
     }
 
     // Compute mls_did after device_id is finalized (may be reused from existing device)
-    let mls_did = format!("{}#{}", &user_did, device_id);
+    let mls_did = format!("{}#{}", user_did, device_id);
 
     info!(
         "Registering device for user h:{}: {} ({}) [re-registration: {}]",

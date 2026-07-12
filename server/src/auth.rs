@@ -970,6 +970,64 @@ fn endpoint_nsid_from_path(path: &str) -> Option<&str> {
     path.strip_prefix("/xrpc/")
 }
 
+fn canonical_valid_did(value: &str) -> Option<&str> {
+    if value.trim() != value || value.chars().any(char::is_whitespace) {
+        return None;
+    }
+
+    let did = canonical_did(value);
+    let mut parts = did.splitn(3, ':');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("did"), Some(method), Some(identifier))
+            if !method.is_empty() && !identifier.is_empty() =>
+        {
+            Some(did)
+        }
+        _ => None,
+    }
+}
+
+/// Bind the authenticated principal to the verified JWT issuer unless that
+/// issuer is explicitly configured as a trusted delegating gateway.
+fn resolve_authenticated_principal(
+    claims: &AtProtoClaims,
+    trusted_gateway_dids: Option<&str>,
+) -> Result<String, AuthError> {
+    let issuer = canonical_valid_did(&claims.iss)
+        .ok_or_else(|| AuthError::InvalidToken("iss is not a valid DID".into()))?;
+    let Some(subject_claim) = claims.sub.as_deref() else {
+        return Ok(issuer.to_string());
+    };
+    let subject = canonical_valid_did(subject_claim)
+        .ok_or_else(|| AuthError::InvalidToken("sub is not a valid DID".into()))?;
+
+    if subject == issuer {
+        return Ok(issuer.to_string());
+    }
+
+    let raw_allowlist = trusted_gateway_dids
+        .filter(|raw| !raw.trim().is_empty())
+        .ok_or_else(|| {
+            AuthError::InvalidToken("JWT subject differs from untrusted issuer".into())
+        })?;
+    let configured_gateways: Option<Vec<&str>> = raw_allowlist
+        .split(',')
+        .map(str::trim)
+        .map(canonical_valid_did)
+        .collect();
+    let configured_gateways = configured_gateways
+        .filter(|gateways| !gateways.is_empty())
+        .ok_or_else(|| AuthError::InvalidToken("TRUSTED_GATEWAY_DIDS is malformed".into()))?;
+
+    if configured_gateways.contains(&issuer) {
+        Ok(subject.to_string())
+    } else {
+        Err(AuthError::InvalidToken(
+            "JWT subject differs from untrusted issuer".into(),
+        ))
+    }
+}
+
 /// Axum extractor for authenticated requests
 impl<S> FromRequestParts<S> for AuthUser
 where
@@ -1050,9 +1108,8 @@ where
             });
         }
 
-        // Use sub claim for user identity if present (for gateway-signed tokens),
-        // otherwise fall back to iss (for direct client tokens)
-        let user_did = claims.sub.clone().unwrap_or_else(|| claims.iss.clone());
+        let trusted_gateway_dids = std::env::var("TRUSTED_GATEWAY_DIDS").ok();
+        let user_did = resolve_authenticated_principal(&claims, trusted_gateway_dids.as_deref())?;
 
         debug!(
             "Authenticated request from DID: {} (issuer: {})",
@@ -1219,4 +1276,94 @@ pub async fn verify_is_moderator_or_admin(
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+
+    fn claims(iss: &str, sub: Option<&str>) -> AtProtoClaims {
+        AtProtoClaims {
+            iss: iss.to_string(),
+            aud: "did:web:mls.example.com".to_string(),
+            exp: i64::MAX,
+            iat: None,
+            sub: sub.map(str::to_string),
+            lxm: Some("blue.catbird.mlsChat.getConvos".to_string()),
+            jti: Some("test-jti".to_string()),
+        }
+    }
+
+    #[test]
+    fn direct_token_without_subject_uses_canonical_issuer() {
+        let claims = claims("did:plc:alice#atproto", None);
+
+        assert_eq!(
+            resolve_authenticated_principal(&claims, None).unwrap(),
+            "did:plc:alice"
+        );
+    }
+
+    #[test]
+    fn direct_token_accepts_canonically_equal_subject() {
+        let claims = claims("did:plc:alice#atproto", Some("did:plc:alice#device"));
+
+        assert_eq!(
+            resolve_authenticated_principal(&claims, None).unwrap(),
+            "did:plc:alice"
+        );
+    }
+
+    #[test]
+    fn untrusted_issuer_cannot_impersonate_victim_or_admin() {
+        for subject in ["did:plc:victim", "did:web:admin.catbird.blue"] {
+            let claims = claims("did:plc:attacker", Some(subject));
+
+            assert!(matches!(
+                resolve_authenticated_principal(&claims, None),
+                Err(AuthError::InvalidToken(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn configured_nest_gateway_can_delegate_subject() {
+        let claims = claims(
+            "did:web:api.catbird.blue#atproto",
+            Some("did:plc:alice#device"),
+        );
+
+        assert_eq!(
+            resolve_authenticated_principal(
+                &claims,
+                Some("did:web:other.example, did:web:api.catbird.blue"),
+            )
+            .unwrap(),
+            "did:plc:alice"
+        );
+    }
+
+    #[test]
+    fn missing_empty_or_malformed_allowlist_fails_closed_for_delegation() {
+        let claims = claims("did:web:api.catbird.blue", Some("did:plc:alice"));
+
+        for allowlist in [None, Some(""), Some(" , "), Some("api.catbird.blue")] {
+            assert!(matches!(
+                resolve_authenticated_principal(&claims, allowlist),
+                Err(AuthError::InvalidToken(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn malformed_entries_do_not_make_an_issuer_trusted() {
+        let claims = claims("did:web:api.catbird.blue", Some("did:plc:alice"));
+
+        for allowlist in [
+            "not-a-did, did:web:api.catbird.blue.example",
+            "not-a-did, did:web:api.catbird.blue",
+        ] {
+            assert!(matches!(
+                resolve_authenticated_principal(&claims, Some(allowlist)),
+                Err(AuthError::InvalidToken(_))
+            ));
+        }
+    }
+}
