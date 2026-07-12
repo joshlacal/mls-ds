@@ -130,6 +130,7 @@
                         "receipt": {
                             "type": "ref",
                             "ref": "#sequencerReceipt",
+                            "x-security-strict-decode": true,
                             "description": "Signed sequencer receipt for an accepted epoch-advancing commit. Absent for legacy servers and non-advancing actions."
                         }
           }
