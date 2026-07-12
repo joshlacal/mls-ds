@@ -122,11 +122,16 @@
               "ref": "#pendingDeviceAddition",
               "description": "The claimed pending addition (for claimPendingDeviceAddition)"
             },
-            "confirmationTag": {
-              "type": "bytes",
-              "maxLength": 64,
-              "description": "confirmation tag of the new canonical tree state."
-            }
+                        "confirmationTag": {
+                            "type": "bytes",
+                            "maxLength": 64,
+                            "description": "confirmation tag of the new canonical tree state."
+                        },
+                        "receipt": {
+                            "type": "ref",
+                            "ref": "#sequencerReceipt",
+                            "description": "Signed sequencer receipt for an accepted epoch-advancing commit. Absent for legacy servers and non-advancing actions."
+                        }
           }
         }
       },
@@ -193,7 +198,54 @@
         }
       ]
     },
-    "rateLimitedBody": {
+        "sequencerReceipt": {
+            "type": "object",
+            "description": "Signed receipt binding an accepted commit to its conversation, epoch, sequencer term, and sequencer identity.",
+            "required": [
+                "convoId",
+                "epoch",
+                "sequencerTerm",
+                "commitHash",
+                "sequencerDid",
+                "issuedAt",
+                "signature"
+            ],
+            "properties": {
+                "convoId": {
+                    "type": "string",
+                    "description": "Stable conversation identifier."
+                },
+                "epoch": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Epoch assigned to the accepted commit."
+                },
+                "sequencerTerm": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Active sequencer leadership term included in the signed receipt bytes."
+                },
+                "commitHash": {
+                    "type": "bytes",
+                    "description": "Cryptographic hash of the accepted MLS commit bytes."
+                },
+                "sequencerDid": {
+                    "type": "string",
+                    "format": "did",
+                    "description": "DID of the sequencer that signed the receipt."
+                },
+                "issuedAt": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Unix timestamp at which the receipt was issued."
+                },
+                "signature": {
+                    "type": "bytes",
+                    "description": "Signature over the canonical CATBIRD-RECEIPT-V1 payload."
+                }
+            }
+        },
+        "rateLimitedBody": {
       "type": "object",
       "description": "Structured 429 response body for External-Commit rate-limit rejections. Wire shape locked with clients so retryAfterSeconds is parseable without scraping the message string. Sent for both per-conversation (30s) and per-(device, group) (60s) limits, distinguished by `scope`.",
       "required": ["error", "message", "retryAfterSeconds", "scope"],
