@@ -55,6 +55,9 @@ struct GroupInfoRow {
 }
 
 /// Store GroupInfo for a conversation
+#[deprecated(
+    note = "raw legacy write bypasses ADR-011 context CAS; migrate callers to CryptoSessionRepository::apply_transition"
+)]
 pub async fn store_group_info(
     pool: &PgPool,
     convo_id: &str,

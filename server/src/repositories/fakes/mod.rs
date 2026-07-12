@@ -3,5 +3,7 @@
 pub mod crypto_session;
 pub mod delivery_log;
 
-pub use crypto_session::InMemoryCryptoSessionRepository;
+pub use crypto_session::{
+    FakeTransitionFailure, FakeTransitionSnapshot, InMemoryCryptoSessionRepository,
+};
 pub use delivery_log::InMemoryDeliveryLogRepository;
