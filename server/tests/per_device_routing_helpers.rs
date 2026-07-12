@@ -507,7 +507,8 @@ async fn store_welcomes_per_device_upsert_backfills_null_and_preserves_existing_
         tx.commit().await.unwrap();
     }
 
-    let rows: Vec<(String, Option<String>, Vec<u8>, Option<String>)> = sqlx::query_as(
+    type WelcomeRow = (String, Option<String>, Vec<u8>, Option<String>);
+    let rows: Vec<WelcomeRow> = sqlx::query_as(
         "SELECT encode(key_package_hash, 'hex'), recipient_device_id, welcome_data, created_by_did \
          FROM welcome_messages \
          WHERE convo_id = $1 AND recipient_did = $2 \

@@ -44,6 +44,7 @@ fn enable_create_convo_abort_after_welcome_for_test() -> CreateConvoAbortAfterWe
     CreateConvoAbortAfterWelcomeGuard
 }
 
+#[allow(clippy::result_large_err)] // Test-only abort seam must match the handler's Response error.
 fn maybe_abort_create_convo_after_welcome_for_test() -> Result<(), Response> {
     #[cfg(test)]
     if TEST_ABORT_AFTER_WELCOME.load(std::sync::atomic::Ordering::SeqCst) {
