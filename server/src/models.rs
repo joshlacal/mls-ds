@@ -240,6 +240,44 @@ pub struct NewCryptoSession {
     pub supersedes_id: Option<String>,
 }
 
+/// Immutable, server-observable MLS authority resolved from the active
+/// `crypto_sessions` row and its conversation projection (ADR-011).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedMlsContext {
+    pub conversation_id: String,
+    pub crypto_session_id: String,
+    pub mls_group_id: String,
+    pub reset_generation: i32,
+    pub state: String,
+    pub authoritative_epoch: i32,
+    pub confirmation_tag: Option<Vec<u8>>,
+    pub sequencer_did: String,
+    pub sequencer_term: i64,
+    pub receipt: Option<SequencerReceiptRef>,
+}
+
+/// Reference to a receipt already verified by the operation-specific trust
+/// boundary. This type does not verify signatures by itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SequencerReceiptRef {
+    pub receipt_hash: Vec<u8>,
+    pub epoch: i32,
+    pub term: i64,
+    pub sequencer_did: String,
+    pub commit_hash: Vec<u8>,
+    pub issued_at: i64,
+    pub signature: Vec<u8>,
+}
+
+/// Durable result of one repository-level MLS transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedMlsTransition {
+    pub context: ResolvedMlsContext,
+    pub delivery_event_id: String,
+    pub delivery_sequence: i64,
+    pub receipt: Option<SequencerReceiptRef>,
+}
+
 // =============================================================================
 // DeliveryEvent — server's source-of-truth append-only log. Phase 1: domain
 // type only, no persistence adapter. Phase 2: backed by `delivery_events`.

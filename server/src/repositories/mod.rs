@@ -24,6 +24,12 @@ pub enum RepositoryError {
     NotImplemented,
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
+    #[error("active MLS context is stale")]
+    StaleContext,
+    #[error("active MLS context is missing or inconsistent: {0}")]
+    InvalidContext(String),
+    #[error("sequencer receipt conflicts with an existing receipt")]
+    ReceiptEquivocation,
 }
 
 pub type RepositoryResult<T> = Result<T, RepositoryError>;

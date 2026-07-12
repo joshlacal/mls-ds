@@ -4,6 +4,21 @@ Authoritative reference for the `crypto_sessions` lifecycle introduced in Phase 
 
 > **Architectural principle**: the server is a Delivery Service per RFC 9750 — it sequences observed envelopes and tracks public crypto session metadata. Clients own MLS cryptographic state. Every transition below moves *server-side observable* state; clients keep their own MLS group state and reconcile via SSE / commit submission.
 
+## ADR-011 transition foundation
+
+New call sites resolve an immutable `ResolvedMlsContext` from the unique active
+`crypto_sessions` row and its exact legacy projection, then submit a
+`ValidatedMlsTransition` to the repository. The repository performs one SQL
+transaction containing the active-session CAS, compatibility mirror, optional
+verified-receipt append, and delivery event. Any stale or inconsistent binding
+rolls the transaction back.
+
+`ValidatedMlsTransition` validates server-observable identity and monotonicity
+only. Deserializing or hashing GroupInfo is not cryptographic verification;
+operation-specific code must establish the authenticated signer/device binding
+before constructing the transition. Handler conversion and successor/reset
+activation remain follow-up work.
+
 ## States
 
 | State | Meaning | Set by |

@@ -8,10 +8,13 @@
 //! migration can be telemetry-gated per locked decision #1 in the plan.
 
 use async_trait::async_trait;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use crate::models::{CryptoSession, NewCryptoSession};
+use crate::mls_transition::ValidatedMlsTransition;
+use crate::models::{
+    AppliedMlsTransition, CryptoSession, NewCryptoSession, ResolvedMlsContext, SequencerReceiptRef,
+};
 use crate::repositories::{RepositoryError, RepositoryResult};
 
 #[async_trait]
@@ -33,6 +36,33 @@ pub trait CryptoSessionRepository: Send + Sync {
     /// Mark `id` as superseded by `superseded_by_id`. Idempotent — a no-op
     /// if the row is already superseded by the same id.
     async fn mark_superseded(&self, id: &str, superseded_by_id: &str) -> RepositoryResult<()>;
+
+    /// Resolve the unique active authority for a stable conversation id.
+    async fn resolve_active(
+        &self,
+        conversation_id: &str,
+        local_service_did: &str,
+    ) -> RepositoryResult<Option<ResolvedMlsContext>>;
+
+    /// Resolve by mutable MLS group identity. Superseded groups do not resolve.
+    async fn resolve_active_by_mls_group_id(
+        &self,
+        mls_group_id: &str,
+        local_service_did: &str,
+    ) -> RepositoryResult<Option<ResolvedMlsContext>>;
+
+    /// Apply one validated normal transition with an exact context CAS.
+    async fn apply_transition(
+        &self,
+        transition: ValidatedMlsTransition,
+    ) -> RepositoryResult<AppliedMlsTransition>;
+
+    /// Append an operation-verified receipt, rejecting equivocation.
+    async fn record_verified_receipt(
+        &self,
+        context: &ResolvedMlsContext,
+        receipt: SequencerReceiptRef,
+    ) -> RepositoryResult<SequencerReceiptRef>;
 }
 
 pub struct PostgresCryptoSessionRepository {
@@ -43,6 +73,156 @@ impl PostgresCryptoSessionRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
+
+    async fn resolve_with_predicate(
+        &self,
+        column: &str,
+        value: &str,
+        local_service_did: &str,
+    ) -> RepositoryResult<Option<ResolvedMlsContext>> {
+        if !matches!(column, "conversation_id" | "mls_group_id") {
+            return Err(RepositoryError::InvalidContext(
+                "unsupported context lookup".into(),
+            ));
+        }
+        let rows: Vec<ResolvedContextRow> = sqlx::query_as(&format!(
+            "SELECT cs.conversation_id, cs.id, cs.mls_group_id, cs.generation, cs.state, \
+                    cs.last_observed_epoch, cs.last_confirmation_tag, \
+                    COALESCE(cs.sequencer_did, c.sequencer_ds, $2), \
+                    cs.sequencer_term, c.active_crypto_session_id, c.group_id, \
+                    c.reset_count, c.current_epoch, c.confirmation_tag, c.sequencer_term \
+             FROM crypto_sessions cs \
+             JOIN conversations c ON c.id = cs.conversation_id \
+             WHERE cs.{column} = $1 AND cs.state = 'active'"
+        ))
+        .bind(value)
+        .bind(local_service_did)
+        .fetch_all(&self.pool)
+        .await?;
+
+        match rows.as_slice() {
+            [] => Ok(None),
+            [row] => row.to_context().map(Some),
+            _ => Err(RepositoryError::InvalidContext(
+                "multiple active crypto sessions resolved".into(),
+            )),
+        }
+    }
+}
+
+type ResolvedContextRow = (
+    String,
+    String,
+    String,
+    i32,
+    String,
+    i32,
+    Option<Vec<u8>>,
+    String,
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<i32>,
+    i32,
+    Option<Vec<u8>>,
+    i64,
+);
+
+trait ResolvedContextRowExt {
+    fn to_context(&self) -> RepositoryResult<ResolvedMlsContext>;
+}
+
+impl ResolvedContextRowExt for ResolvedContextRow {
+    fn to_context(&self) -> RepositoryResult<ResolvedMlsContext> {
+        let sequencer = crate::identity::canonical_did(&self.7);
+        if !sequencer.starts_with("did:") || sequencer.is_empty() || sequencer != self.7 {
+            return Err(RepositoryError::InvalidContext(
+                "sequencer DID is missing or non-canonical".into(),
+            ));
+        }
+        if self.9.as_deref() != Some(self.1.as_str())
+            || self.10.as_deref() != Some(self.2.as_str())
+            || self.11.unwrap_or(0) != self.3
+            || self.12 != self.5
+            || self.13 != self.6
+            || self.14 != self.8
+        {
+            metrics::counter!("mls_ds_resolved_context_mismatch_total", 1);
+            return Err(RepositoryError::InvalidContext(
+                "legacy projection disagrees with active crypto session".into(),
+            ));
+        }
+        Ok(ResolvedMlsContext {
+            conversation_id: self.0.clone(),
+            crypto_session_id: self.1.clone(),
+            mls_group_id: self.2.clone(),
+            reset_generation: self.3,
+            state: self.4.clone(),
+            authoritative_epoch: self.5,
+            confirmation_tag: self.6.clone(),
+            sequencer_did: sequencer.to_string(),
+            sequencer_term: self.8,
+            receipt: None,
+        })
+    }
+}
+
+type ReceiptRow = (Vec<u8>, i32, i64, String, Vec<u8>, i64, Vec<u8>);
+
+fn receipt_from_row(row: ReceiptRow) -> SequencerReceiptRef {
+    SequencerReceiptRef {
+        receipt_hash: row.0,
+        epoch: row.1,
+        term: row.2,
+        sequencer_did: row.3,
+        commit_hash: row.4,
+        issued_at: row.5,
+        signature: row.6,
+    }
+}
+
+async fn append_receipt_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    context: &ResolvedMlsContext,
+    receipt: &SequencerReceiptRef,
+) -> RepositoryResult<SequencerReceiptRef> {
+    if receipt.epoch != context.authoritative_epoch + 1
+        || receipt.term != context.sequencer_term
+        || receipt.sequencer_did != context.sequencer_did
+        || crate::identity::canonical_did(&receipt.sequencer_did) != receipt.sequencer_did
+    {
+        return Err(RepositoryError::InvalidContext(
+            "receipt does not bind resolved authority".into(),
+        ));
+    }
+    sqlx::query(
+        "INSERT INTO sequencer_receipts \
+         (convo_id, epoch, sequencer_term, commit_hash, sequencer_did, issued_at, signature, receipt_hash) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (convo_id, epoch) DO NOTHING",
+    )
+    .bind(&context.conversation_id)
+    .bind(receipt.epoch)
+    .bind(receipt.term)
+    .bind(&receipt.commit_hash)
+    .bind(&receipt.sequencer_did)
+    .bind(receipt.issued_at)
+    .bind(&receipt.signature)
+    .bind(&receipt.receipt_hash)
+    .execute(&mut **tx)
+    .await?;
+    let row: ReceiptRow = sqlx::query_as(
+        "SELECT receipt_hash, epoch, sequencer_term, sequencer_did, commit_hash, issued_at, signature \
+         FROM sequencer_receipts WHERE convo_id = $1 AND epoch = $2",
+    )
+    .bind(&context.conversation_id)
+    .bind(receipt.epoch)
+    .fetch_one(&mut **tx)
+    .await?;
+    let stored = receipt_from_row(row);
+    if stored != *receipt {
+        return Err(RepositoryError::ReceiptEquivocation);
+    }
+    Ok(stored)
 }
 
 /// Tuple of `crypto_sessions` columns in canonical order for `query_as`.
@@ -290,5 +470,248 @@ impl CryptoSessionRepository for PostgresCryptoSessionRepository {
         .await?;
 
         Ok(())
+    }
+
+    async fn resolve_active(
+        &self,
+        conversation_id: &str,
+        local_service_did: &str,
+    ) -> RepositoryResult<Option<ResolvedMlsContext>> {
+        self.resolve_with_predicate("conversation_id", conversation_id, local_service_did)
+            .await
+    }
+
+    async fn resolve_active_by_mls_group_id(
+        &self,
+        mls_group_id: &str,
+        local_service_did: &str,
+    ) -> RepositoryResult<Option<ResolvedMlsContext>> {
+        self.resolve_with_predicate("mls_group_id", mls_group_id, local_service_did)
+            .await
+    }
+
+    async fn apply_transition(
+        &self,
+        transition: ValidatedMlsTransition,
+    ) -> RepositoryResult<AppliedMlsTransition> {
+        let mut tx = self.pool.begin().await?;
+        let updated: Option<(i32, Option<Vec<u8>>)> = sqlx::query_as(
+            "UPDATE crypto_sessions SET last_observed_epoch=$1, last_confirmation_tag=$2, \
+                    group_info=$3, group_info_epoch=$1, group_info_updated_at=NOW() \
+             WHERE id=$4 AND conversation_id=$5 AND mls_group_id=$6 AND generation=$7 \
+               AND state='active' AND last_observed_epoch=$8 AND sequencer_term=$9 \
+             RETURNING last_observed_epoch, last_confirmation_tag",
+        )
+        .bind(transition.next_epoch)
+        .bind(&transition.confirmation_tag)
+        .bind(&transition.group_info)
+        .bind(&transition.context.crypto_session_id)
+        .bind(&transition.context.conversation_id)
+        .bind(&transition.context.mls_group_id)
+        .bind(transition.context.reset_generation)
+        .bind(transition.context.authoritative_epoch)
+        .bind(transition.context.sequencer_term)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if updated.is_none() {
+            return Err(RepositoryError::StaleContext);
+        }
+
+        let mirrored = sqlx::query(
+            "UPDATE conversations SET current_epoch=$1, confirmation_tag=$2, group_info=$3, \
+                    group_info_epoch=$1, group_info_updated_at=NOW() \
+             WHERE id=$4 AND active_crypto_session_id=$5 AND group_id=$6 \
+               AND COALESCE(reset_count,0)=$7 AND current_epoch=$8 AND sequencer_term=$9",
+        )
+        .bind(transition.next_epoch)
+        .bind(&transition.confirmation_tag)
+        .bind(&transition.group_info)
+        .bind(&transition.context.conversation_id)
+        .bind(&transition.context.crypto_session_id)
+        .bind(&transition.context.mls_group_id)
+        .bind(transition.context.reset_generation)
+        .bind(transition.context.authoritative_epoch)
+        .bind(transition.context.sequencer_term)
+        .execute(&mut *tx)
+        .await?;
+        if mirrored.rows_affected() != 1 {
+            return Err(RepositoryError::StaleContext);
+        }
+
+        let stored_receipt = match transition.receipt.as_ref() {
+            Some(receipt) => Some(append_receipt_tx(&mut tx, &transition.context, receipt).await?),
+            None => None,
+        };
+        let event_id = Uuid::new_v4().to_string();
+        let sequence: i64 = sqlx::query_scalar(
+            "INSERT INTO delivery_events \
+             (id, conversation_id, seq, crypto_session_id, event_type, sender_did, \
+              sender_device_id, mls_group_id, mls_epoch, payload, payload_json) \
+             SELECT $1,$2,COALESCE(MAX(seq),0)+1,$3,$4,$5,$6,$7,$8,$9,$10 \
+             FROM delivery_events WHERE conversation_id=$2 RETURNING seq",
+        )
+        .bind(&event_id)
+        .bind(&transition.context.conversation_id)
+        .bind(&transition.context.crypto_session_id)
+        .bind(transition.event_type())
+        .bind(&transition.actor_did)
+        .bind(&transition.actor_device_id)
+        .bind(&transition.context.mls_group_id)
+        .bind(i64::from(transition.next_epoch))
+        .bind(&transition.commit_hash)
+        .bind(serde_json::json!({"groupInfoHash": hex::encode(&transition.group_info_hash)}))
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        let mut context = transition.context;
+        context.authoritative_epoch = transition.next_epoch;
+        context.confirmation_tag = transition.confirmation_tag;
+        context.receipt = stored_receipt.clone();
+        Ok(AppliedMlsTransition {
+            context,
+            delivery_event_id: event_id,
+            delivery_sequence: sequence,
+            receipt: stored_receipt,
+        })
+    }
+
+    async fn record_verified_receipt(
+        &self,
+        context: &ResolvedMlsContext,
+        receipt: SequencerReceiptRef,
+    ) -> RepositoryResult<SequencerReceiptRef> {
+        let mut tx = self.pool.begin().await?;
+        let stored = append_receipt_tx(&mut tx, context, &receipt).await?;
+        tx.commit().await?;
+        Ok(stored)
+    }
+}
+
+#[cfg(test)]
+mod transition_repository_tests {
+    use super::*;
+    use crate::mls_transition::{TransitionKind, ValidatedMlsTransition};
+
+    async fn test_pool() -> PgPool {
+        let url = std::env::var("TEST_DATABASE_URL")
+            .expect("TEST_DATABASE_URL is required for ignored transition repository tests");
+        let pool = PgPool::connect(&url).await.expect("connect test postgres");
+        sqlx::migrate!().run(&pool).await.expect("run migrations");
+        pool
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL with migration privileges"]
+    async fn postgres_mls_transition_cas_and_projection_are_atomic() {
+        let pool = test_pool().await;
+        let suffix = Uuid::new_v4().to_string();
+        let conversation_id = format!("transition-convo-{suffix}");
+        let group_id = format!("transition-group-{suffix}");
+        sqlx::query(
+            "INSERT INTO conversations \
+             (id, creator_did, current_epoch, sequencer_term, sequencer_ds, is_remote, \
+              group_id, reset_count, confirmation_tag, group_info, group_info_epoch) \
+             VALUES ($1,'did:plc:alice',9,4,'did:web:mls.example.com',false,$2,2,$3,$4,9)",
+        )
+        .bind(&conversation_id)
+        .bind(&group_id)
+        .bind(vec![1_u8, 2, 3])
+        .bind(vec![0xAA_u8; 128])
+        .execute(&pool)
+        .await
+        .unwrap();
+        let session_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO crypto_sessions \
+             (id,conversation_id,generation,mls_group_id,state,last_observed_epoch, \
+              last_confirmation_tag,group_info,group_info_epoch,sequencer_did,sequencer_term) \
+             VALUES ($1,$2,2,$3,'active',9,$4,$5,9,'did:web:mls.example.com',4)",
+        )
+        .bind(&session_id)
+        .bind(&conversation_id)
+        .bind(&group_id)
+        .bind(vec![1_u8, 2, 3])
+        .bind(vec![0xAA_u8; 128])
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE conversations SET active_crypto_session_id=$1 WHERE id=$2")
+            .bind(&session_id)
+            .bind(&conversation_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let repo = PostgresCryptoSessionRepository::new(pool.clone());
+        let context = repo
+            .resolve_active(&conversation_id, "did:web:mls.example.com")
+            .await
+            .unwrap()
+            .unwrap();
+        let candidate = ValidatedMlsTransition::new_observed(
+            context.clone(),
+            TransitionKind::Commit,
+            "did:plc:alice".into(),
+            "device-a".into(),
+            group_id.clone(),
+            10,
+            vec![0xBB; 128],
+            Some(vec![4, 5, 6]),
+            vec![0xCC; 32],
+            None,
+        )
+        .unwrap();
+        let winner = repo.apply_transition(candidate.clone()).await.unwrap();
+        assert_eq!(winner.context.authoritative_epoch, 10);
+        assert!(matches!(
+            repo.apply_transition(candidate).await,
+            Err(RepositoryError::StaleContext)
+        ));
+        let projection: (i32, i32, Vec<u8>, Vec<u8>) = sqlx::query_as(
+            "SELECT c.current_epoch,cs.last_observed_epoch,c.group_info,cs.group_info \
+             FROM conversations c JOIN crypto_sessions cs ON cs.id=c.active_crypto_session_id \
+             WHERE c.id=$1",
+        )
+        .bind(&conversation_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(projection.0, 10);
+        assert_eq!(projection.0, projection.1);
+        assert_eq!(projection.2, projection.3);
+        sqlx::query("DELETE FROM delivery_events WHERE conversation_id=$1")
+            .bind(&conversation_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM sequencer_receipts WHERE convo_id=$1")
+            .bind(&conversation_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM conversations WHERE id=$1")
+            .bind(&conversation_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL with migration privileges"]
+    async fn mls_transition_migration_is_idempotent() {
+        let pool = test_pool().await;
+        sqlx::migrate!()
+            .run(&pool)
+            .await
+            .expect("second migration run");
+        let columns: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.columns \
+             WHERE table_name='crypto_sessions' AND column_name IN ('sequencer_did','sequencer_term')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(columns, 2);
     }
 }
