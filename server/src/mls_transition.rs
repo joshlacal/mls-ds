@@ -4,6 +4,21 @@ use sha2::{Digest, Sha256};
 
 use crate::models::{ResolvedMlsContext, SequencerReceiptRef};
 
+pub(crate) fn canonical_receipt_hash(
+    conversation_id: &str,
+    receipt: &SequencerReceiptRef,
+) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(conversation_id.as_bytes());
+    hasher.update(receipt.epoch.to_be_bytes());
+    hasher.update(receipt.term.to_be_bytes());
+    hasher.update(crate::identity::canonical_did(&receipt.sequencer_did).as_bytes());
+    hasher.update(&receipt.commit_hash);
+    hasher.update(receipt.issued_at.to_be_bytes());
+    hasher.update(&receipt.signature);
+    hasher.finalize().to_vec()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransitionKind {
     Commit,
@@ -117,7 +132,7 @@ impl ValidatedMlsTransition {
 #[cfg(test)]
 mod tests {
     use crate::models::{ResolvedMlsContext, SequencerReceiptRef};
-    use crate::repositories::fakes::InMemoryCryptoSessionRepository;
+    use crate::repositories::fakes::{FakeTransitionFailure, InMemoryCryptoSessionRepository};
     use crate::repositories::{CryptoSessionRepository, RepositoryError};
 
     use super::{TransitionKind, ValidatedMlsTransition};
@@ -131,6 +146,8 @@ mod tests {
             state: "active".into(),
             authoritative_epoch: 9,
             confirmation_tag: Some(vec![1, 2, 3]),
+            group_info: Some(vec![0xAA; 128]),
+            group_info_epoch: Some(9),
             sequencer_did: "did:web:mls.example.com".into(),
             sequencer_term: 4,
             receipt: None,
@@ -230,7 +247,7 @@ mod tests {
         let repo = InMemoryCryptoSessionRepository::new();
         repo.insert_resolved_context(context());
         let receipt = SequencerReceiptRef {
-            receipt_hash: vec![7; 32],
+            receipt_hash: Vec::new(),
             epoch: 10,
             term: 4,
             sequencer_did: "did:web:mls.example.com".into(),
@@ -240,10 +257,18 @@ mod tests {
         };
         let mut first = transition(context());
         first.set_verified_receipt(receipt.clone()).unwrap();
-        repo.apply_transition(first).await.unwrap();
+        let applied = repo.apply_transition(first).await.unwrap();
+        let canonical = applied.receipt.unwrap();
+        assert_eq!(canonical.receipt_hash.len(), 32);
 
         assert!(repo
-            .record_verified_receipt(&context(), receipt.clone())
+            .record_verified_receipt(
+                &context(),
+                SequencerReceiptRef {
+                    receipt_hash: vec![0xFF; 32],
+                    ..receipt.clone()
+                },
+            )
             .await
             .is_ok());
         let mut conflicting = receipt;
@@ -252,5 +277,68 @@ mod tests {
             repo.record_verified_receipt(&context(), conflicting).await,
             Err(RepositoryError::ReceiptEquivocation)
         ));
+    }
+
+    #[tokio::test]
+    async fn caller_supplied_receipt_hash_cannot_collide_across_conversations() {
+        let repo = InMemoryCryptoSessionRepository::new();
+        let first = context();
+        let mut second = context();
+        second.conversation_id = "convo-2".into();
+        second.crypto_session_id = "session-2".into();
+        second.mls_group_id = "group-2".into();
+        let reused_hash = vec![0xAA; 32];
+        let receipt = |commit_hash: u8| SequencerReceiptRef {
+            receipt_hash: reused_hash.clone(),
+            epoch: 10,
+            term: 4,
+            sequencer_did: "did:web:mls.example.com".into(),
+            commit_hash: vec![commit_hash; 32],
+            issued_at: 1_700_000_000,
+            signature: vec![8; 64],
+        };
+
+        let stored_first = repo
+            .record_verified_receipt(&first, receipt(1))
+            .await
+            .unwrap();
+        let stored_second = repo
+            .record_verified_receipt(&second, receipt(2))
+            .await
+            .unwrap();
+        assert_ne!(stored_first.receipt_hash, reused_hash);
+        assert_ne!(stored_second.receipt_hash, reused_hash);
+        assert_ne!(stored_first.receipt_hash, stored_second.receipt_hash);
+    }
+
+    #[tokio::test]
+    async fn fake_transition_failure_points_roll_back_all_staged_state() {
+        for failure in [
+            FakeTransitionFailure::Mirror,
+            FakeTransitionFailure::Receipt,
+            FakeTransitionFailure::Event,
+        ] {
+            let repo = InMemoryCryptoSessionRepository::new();
+            repo.insert_resolved_context(context());
+            let before = repo.transition_snapshot();
+            let mut candidate = transition(context());
+            if failure == FakeTransitionFailure::Receipt {
+                candidate
+                    .set_verified_receipt(SequencerReceiptRef {
+                        receipt_hash: vec![0xEE; 32],
+                        epoch: 10,
+                        term: 4,
+                        sequencer_did: "did:web:mls.example.com".into(),
+                        commit_hash: vec![0xCC; 32],
+                        issued_at: 1_700_000_000,
+                        signature: vec![8; 64],
+                    })
+                    .unwrap();
+            }
+            repo.fail_next_transition_at(failure);
+
+            assert!(repo.apply_transition(candidate).await.is_err());
+            assert_eq!(repo.transition_snapshot(), before);
+        }
     }
 }

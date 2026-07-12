@@ -30,6 +30,8 @@ pub enum RepositoryError {
     InvalidContext(String),
     #[error("sequencer receipt conflicts with an existing receipt")]
     ReceiptEquivocation,
+    #[error("injected repository failure at {0}")]
+    InjectedFailure(&'static str),
 }
 
 pub type RepositoryResult<T> = Result<T, RepositoryError>;

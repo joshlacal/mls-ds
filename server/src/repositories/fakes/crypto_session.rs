@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use crate::mls_transition::ValidatedMlsTransition;
+use crate::mls_transition::{canonical_receipt_hash, ValidatedMlsTransition};
 use crate::models::{
     AppliedMlsTransition, CryptoSession, NewCryptoSession, ResolvedMlsContext, SequencerReceiptRef,
 };
@@ -23,8 +23,25 @@ pub struct InMemoryCryptoSessionRepository {
     /// keyed by `CryptoSession::id`
     inner: Arc<Mutex<HashMap<String, CryptoSession>>>,
     contexts: Arc<Mutex<HashMap<String, ResolvedMlsContext>>>,
+    legacy_contexts: Arc<Mutex<HashMap<String, ResolvedMlsContext>>>,
     receipts: Arc<Mutex<HashMap<(String, i32), SequencerReceiptRef>>>,
     next_sequence: Arc<Mutex<HashMap<String, i64>>>,
+    next_failure: Arc<Mutex<Option<FakeTransitionFailure>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FakeTransitionFailure {
+    Mirror,
+    Receipt,
+    Event,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FakeTransitionSnapshot {
+    contexts: HashMap<String, ResolvedMlsContext>,
+    legacy_contexts: HashMap<String, ResolvedMlsContext>,
+    receipts: HashMap<(String, i32), SequencerReceiptRef>,
+    next_sequence: HashMap<String, i64>,
 }
 
 impl InMemoryCryptoSessionRepository {
@@ -43,7 +60,43 @@ impl InMemoryCryptoSessionRepository {
         self.contexts
             .lock()
             .expect("fake context mutex poisoned")
+            .insert(context.conversation_id.clone(), context.clone());
+        self.legacy_contexts
+            .lock()
+            .expect("fake legacy context mutex poisoned")
             .insert(context.conversation_id.clone(), context);
+    }
+
+    pub fn fail_next_transition_at(&self, failure: FakeTransitionFailure) {
+        *self
+            .next_failure
+            .lock()
+            .expect("fake failure mutex poisoned") = Some(failure);
+    }
+
+    pub fn transition_snapshot(&self) -> FakeTransitionSnapshot {
+        FakeTransitionSnapshot {
+            contexts: self
+                .contexts
+                .lock()
+                .expect("fake context mutex poisoned")
+                .clone(),
+            legacy_contexts: self
+                .legacy_contexts
+                .lock()
+                .expect("fake legacy context mutex poisoned")
+                .clone(),
+            receipts: self
+                .receipts
+                .lock()
+                .expect("fake receipt mutex poisoned")
+                .clone(),
+            next_sequence: self
+                .next_sequence
+                .lock()
+                .expect("fake sequence mutex poisoned")
+                .clone(),
+        }
     }
 
     /// Test-only helper to mark a session superseded. Phase 2's trait
@@ -144,13 +197,27 @@ impl CryptoSessionRepository for InMemoryCryptoSessionRepository {
         conversation_id: &str,
         _local_service_did: &str,
     ) -> RepositoryResult<Option<ResolvedMlsContext>> {
-        Ok(self
+        let context = self
             .contexts
             .lock()
             .expect("fake context mutex poisoned")
             .get(conversation_id)
             .filter(|context| context.state == "active")
-            .cloned())
+            .cloned();
+        if let Some(context) = context.as_ref() {
+            let legacy = self
+                .legacy_contexts
+                .lock()
+                .expect("fake legacy context mutex poisoned")
+                .get(conversation_id)
+                .cloned();
+            if legacy.as_ref() != Some(context) {
+                return Err(RepositoryError::InvalidContext(
+                    "legacy projection disagrees with active session".into(),
+                ));
+            }
+        }
+        Ok(context)
     }
 
     async fn resolve_active_by_mls_group_id(
@@ -158,30 +225,79 @@ impl CryptoSessionRepository for InMemoryCryptoSessionRepository {
         mls_group_id: &str,
         _local_service_did: &str,
     ) -> RepositoryResult<Option<ResolvedMlsContext>> {
-        Ok(self
+        let context = self
             .contexts
             .lock()
             .expect("fake context mutex poisoned")
             .values()
             .find(|context| context.state == "active" && context.mls_group_id == mls_group_id)
-            .cloned())
+            .cloned();
+        if let Some(context) = context.as_ref() {
+            let legacy = self
+                .legacy_contexts
+                .lock()
+                .expect("fake legacy context mutex poisoned")
+                .get(&context.conversation_id)
+                .cloned();
+            if legacy.as_ref() != Some(context) {
+                return Err(RepositoryError::InvalidContext(
+                    "legacy projection disagrees with active session".into(),
+                ));
+            }
+        }
+        Ok(context)
     }
 
     async fn apply_transition(
         &self,
         transition: ValidatedMlsTransition,
     ) -> RepositoryResult<AppliedMlsTransition> {
-        let receipt = transition.receipt.clone();
-        let mut contexts = self.contexts.lock().expect("fake context mutex poisoned");
+        let mut contexts_guard = self.contexts.lock().expect("fake context mutex poisoned");
+        let mut legacy_guard = self
+            .legacy_contexts
+            .lock()
+            .expect("fake legacy context mutex poisoned");
+        let mut receipts_guard = self.receipts.lock().expect("fake receipt mutex poisoned");
+        let mut sequences_guard = self
+            .next_sequence
+            .lock()
+            .expect("fake sequence mutex poisoned");
+        let failure = self
+            .next_failure
+            .lock()
+            .expect("fake failure mutex poisoned")
+            .take();
+        let mut contexts = contexts_guard.clone();
+        let mut legacy_contexts = legacy_guard.clone();
+        let mut receipts = receipts_guard.clone();
+        let mut sequences = sequences_guard.clone();
         let current = contexts
             .get_mut(&transition.context.conversation_id)
             .ok_or_else(|| RepositoryError::InvalidContext("active session missing".into()))?;
         if current != &transition.context {
             return Err(RepositoryError::StaleContext);
         }
+        let legacy = legacy_contexts
+            .get_mut(&transition.context.conversation_id)
+            .ok_or_else(|| RepositoryError::InvalidContext("legacy projection missing".into()))?;
+        if legacy != &transition.context {
+            return Err(RepositoryError::InvalidContext(
+                "legacy projection disagrees with active session".into(),
+            ));
+        }
+        if failure == Some(FakeTransitionFailure::Mirror) {
+            return Err(RepositoryError::InjectedFailure("mirror"));
+        }
+        let receipt = transition.receipt.clone().map(|mut receipt| {
+            receipt.receipt_hash =
+                canonical_receipt_hash(&transition.context.conversation_id, &receipt);
+            receipt
+        });
         if let Some(receipt) = receipt.as_ref() {
+            if failure == Some(FakeTransitionFailure::Receipt) {
+                return Err(RepositoryError::InjectedFailure("receipt"));
+            }
             let key = (transition.context.conversation_id.clone(), receipt.epoch);
-            let mut receipts = self.receipts.lock().expect("fake receipt mutex poisoned");
             match receipts.get(&key) {
                 Some(existing) if existing == receipt => {}
                 Some(_) => return Err(RepositoryError::ReceiptEquivocation),
@@ -192,22 +308,26 @@ impl CryptoSessionRepository for InMemoryCryptoSessionRepository {
         }
         current.authoritative_epoch = transition.next_epoch;
         current.confirmation_tag = transition.confirmation_tag.clone();
+        current.group_info = Some(transition.group_info.clone());
+        current.group_info_epoch = Some(transition.next_epoch);
         current.receipt = receipt.clone();
+        *legacy = current.clone();
         let updated = current.clone();
-        drop(contexts);
-
-        let mut sequences = self
-            .next_sequence
-            .lock()
-            .expect("fake sequence mutex poisoned");
-        let sequence = sequences
+        if failure == Some(FakeTransitionFailure::Event) {
+            return Err(RepositoryError::InjectedFailure("event"));
+        }
+        let sequence = *sequences
             .entry(updated.conversation_id.clone())
             .and_modify(|seq| *seq += 1)
             .or_insert(1);
+        *contexts_guard = contexts;
+        *legacy_guard = legacy_contexts;
+        *receipts_guard = receipts;
+        *sequences_guard = sequences;
         Ok(AppliedMlsTransition {
             context: updated,
             delivery_event_id: Uuid::new_v4().to_string(),
-            delivery_sequence: *sequence,
+            delivery_sequence: sequence,
             receipt,
         })
     }
@@ -225,6 +345,8 @@ impl CryptoSessionRepository for InMemoryCryptoSessionRepository {
                 "receipt does not bind resolved authority".into(),
             ));
         }
+        let mut receipt = receipt;
+        receipt.receipt_hash = canonical_receipt_hash(&context.conversation_id, &receipt);
         let key = (context.conversation_id.clone(), receipt.epoch);
         let mut receipts = self.receipts.lock().expect("fake receipt mutex poisoned");
         match receipts.get(&key) {

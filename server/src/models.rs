@@ -251,6 +251,8 @@ pub struct ResolvedMlsContext {
     pub state: String,
     pub authoritative_epoch: i32,
     pub confirmation_tag: Option<Vec<u8>>,
+    pub group_info: Option<Vec<u8>>,
+    pub group_info_epoch: Option<i32>,
     pub sequencer_did: String,
     pub sequencer_term: i64,
     pub receipt: Option<SequencerReceiptRef>,
