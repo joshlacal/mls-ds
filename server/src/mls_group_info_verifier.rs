@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use openmls::{
     ciphersuite::{signable::Verifiable, signature::SignaturePublicKey},
     group::{ProposalStore, PublicGroup},
-    prelude::{Credential, MlsMessageBodyIn, MlsMessageIn},
+    prelude::{Credential, LeafNodeIndex, MlsMessageBodyIn, MlsMessageIn},
 };
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use openmls_traits::types::{Ciphersuite, SignatureScheme};
@@ -198,6 +198,28 @@ impl Drop for ActiveVerificationGuard {
     }
 }
 
+fn count_nonblank_leaf_slots(
+    ratchet_tree: &openmls::treesync::RatchetTreeIn,
+) -> Result<(usize, usize), GroupInfoVerificationError> {
+    let serialized = serde_json::to_value(ratchet_tree).map_err(|_| {
+        GroupInfoVerificationError::InvalidPublicState(
+            "ratchet tree member layout could not be inspected".to_owned(),
+        )
+    })?;
+    let nodes = serialized.as_array().ok_or_else(|| {
+        GroupInfoVerificationError::InvalidPublicState(
+            "ratchet tree member layout is malformed".to_owned(),
+        )
+    })?;
+    let member_count = nodes
+        .iter()
+        .step_by(2)
+        .filter(|node| !node.is_null())
+        .count();
+    let leaf_capacity = nodes.len().div_ceil(2);
+    Ok((member_count, leaf_capacity))
+}
+
 /// Strictly parse and authenticate one wrapped MLS `GroupInfo`.
 pub fn verify_group_info(
     bytes: &[u8],
@@ -232,8 +254,7 @@ pub fn verify_group_info(
         .extensions()
         .ratchet_tree()
         .ok_or(GroupInfoVerificationError::MissingRatchetTree)?
-        .ratchet_tree()
-        .clone();
+        .ratchet_tree();
     let ratchet_tree_bytes = ratchet_tree.tls_serialized_len();
     if ratchet_tree_bytes > limits.max_ratchet_tree_bytes {
         return Err(GroupInfoVerificationError::RatchetTreeTooLarge {
@@ -241,18 +262,16 @@ pub fn verify_group_info(
             maximum: limits.max_ratchet_tree_bytes,
         });
     }
+    let (prevalidated_member_count, leaf_capacity) = count_nonblank_leaf_slots(ratchet_tree)?;
+    if prevalidated_member_count > limits.max_members {
+        return Err(GroupInfoVerificationError::TooManyMembers {
+            actual: prevalidated_member_count,
+            maximum: limits.max_members,
+        });
+    }
 
     let _active_guard = ActiveVerificationGuard::acquire(limits.max_concurrent_verifications)?;
     let provider = OpenMlsRustCrypto::default();
-    let (public_group, _group_info) = PublicGroup::from_external(
-        provider.crypto(),
-        provider.storage(),
-        ratchet_tree,
-        verifiable_group_info.clone(),
-        ProposalStore::new(),
-    )
-    .map_err(|error| GroupInfoVerificationError::InvalidPublicState(error.to_string()))?;
-
     let expected_public_key = SignaturePublicKey::from(expected_signer.signature_key.as_slice())
         .into_signature_public_key_enriched(
             verifiable_group_info.ciphersuite().signature_algorithm(),
@@ -261,27 +280,53 @@ pub fn verify_group_info(
         .verify_no_out(provider.crypto(), &expected_public_key)
         .map_err(|_| GroupInfoVerificationError::WrongExpectedSigner)?;
 
-    let matching_members: Vec<_> = public_group
-        .members()
-        .filter(|member| {
-            member.signature_key == expected_signer.signature_key
-                && expected_signer
-                    .credential
-                    .as_ref()
-                    .is_none_or(|credential| member.credential == *credential)
-        })
-        .collect();
-    if matching_members.len() != 1 {
-        return Err(GroupInfoVerificationError::ExpectedSignerNotUnique);
+    let (public_group, _group_info) = PublicGroup::from_external(
+        provider.crypto(),
+        provider.storage(),
+        ratchet_tree.clone(),
+        verifiable_group_info,
+        ProposalStore::new(),
+    )
+    .map_err(|error| GroupInfoVerificationError::InvalidPublicState(error.to_string()))?;
+
+    let mut member_count = 0;
+    let mut matching_signer = None;
+    for leaf_index in 0..leaf_capacity {
+        let leaf_index = u32::try_from(leaf_index).map_err(|_| {
+            GroupInfoVerificationError::InvalidPublicState(
+                "ratchet tree leaf index exceeds MLS limits".to_owned(),
+            )
+        })?;
+        let Some(leaf) = public_group.leaf(LeafNodeIndex::new(leaf_index)) else {
+            continue;
+        };
+        member_count += 1;
+        if leaf.signature_key().as_slice() == expected_signer.signature_key
+            && expected_signer
+                .credential
+                .as_ref()
+                .is_none_or(|credential| leaf.credential() == credential)
+        {
+            if matching_signer.is_some() {
+                return Err(GroupInfoVerificationError::ExpectedSignerNotUnique);
+            }
+            matching_signer = Some(leaf);
+        }
     }
-    let member_count = public_group.members().count();
+    if member_count != prevalidated_member_count {
+        return Err(GroupInfoVerificationError::InvalidPublicState(
+            "ratchet tree member count changed during validation".to_owned(),
+        ));
+    }
     if member_count > limits.max_members {
         return Err(GroupInfoVerificationError::TooManyMembers {
             actual: member_count,
             maximum: limits.max_members,
         });
     }
-    let signer = &matching_members[0];
+    let signer = matching_signer.ok_or(GroupInfoVerificationError::ExpectedSignerNotUnique)?;
+    let signer_signature_key = signer.signature_key().as_slice().to_vec();
+    let signer_credential = signer.credential().clone();
     let ciphersuite = public_group.ciphersuite();
 
     Ok(VerifiedGroupInfo {
@@ -289,8 +334,8 @@ pub fn verify_group_info(
         epoch: public_group.group_context().epoch().as_u64(),
         ratchet_tree_bytes,
         member_count,
-        signer_signature_key: signer.signature_key.clone(),
-        signer_credential: signer.credential.clone(),
+        signer_signature_key,
+        signer_credential,
         ciphersuite,
         signature_scheme: ciphersuite.signature_algorithm(),
         public_group,
