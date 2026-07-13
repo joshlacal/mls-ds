@@ -21,6 +21,179 @@
 //! See `docs/program/decisions/ADR-008-auto-reset-protocol-binding.md` §D1
 //! and the spec referenced above for the rationale.
 
+use std::{fmt, str::FromStr};
+
+/// Rollout posture for authenticated MLS devices.
+///
+/// This type only describes policy. Transition handlers remain unchanged
+/// until the coordinator wires the shared enforcement gate in a later package.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceAuthMode {
+    Observe,
+    Enroll,
+    Require,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvalidDeviceAuthMode;
+
+impl fmt::Display for InvalidDeviceAuthMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DEVICE_AUTH_MODE must be observe, enroll, or require")
+    }
+}
+
+impl std::error::Error for InvalidDeviceAuthMode {}
+
+impl FromStr for DeviceAuthMode {
+    type Err = InvalidDeviceAuthMode;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "observe" => Ok(Self::Observe),
+            "enroll" => Ok(Self::Enroll),
+            "require" => Ok(Self::Require),
+            _ => Err(InvalidDeviceAuthMode),
+        }
+    }
+}
+
+impl DeviceAuthMode {
+    /// Load the rollout mode without silently weakening an invalid value.
+    pub fn from_env() -> Result<Self, InvalidDeviceAuthMode> {
+        Self::from_env_result(std::env::var("DEVICE_AUTH_MODE"))
+    }
+
+    fn from_env_result(
+        value: Result<String, std::env::VarError>,
+    ) -> Result<Self, InvalidDeviceAuthMode> {
+        match value {
+            Ok(value) => value.parse(),
+            Err(std::env::VarError::NotPresent) => Ok(Self::Observe),
+            Err(std::env::VarError::NotUnicode(_)) => Err(InvalidDeviceAuthMode),
+        }
+    }
+
+    pub const fn action_for(self, class: DeviceAuthEndpointClass) -> DeviceAuthPolicyAction {
+        use DeviceAuthEndpointClass::{Bootstrap, Canary, Enrollment, Mutation, Read};
+        use DeviceAuthPolicyAction::{Allow, EnforceEnrollment, ObserveWouldDeny, RequireBinding};
+
+        match (self, class) {
+            (_, Enrollment) => EnforceEnrollment,
+            (_, Bootstrap | Read) => Allow,
+            (Self::Observe, Canary | Mutation) => ObserveWouldDeny,
+            (Self::Enroll, Canary) | (Self::Require, Canary | Mutation) => RequireBinding,
+            (Self::Enroll, Mutation) => Allow,
+        }
+    }
+
+    /// Classify an exact NSID and select its policy. Unknown endpoints return
+    /// an error so callers cannot accidentally treat new mutations as reads.
+    pub fn action_for_nsid(
+        self,
+        nsid: &str,
+    ) -> Result<DeviceAuthPolicyAction, UnknownDeviceAuthEndpoint> {
+        classify_device_auth_endpoint(nsid)
+            .map(|class| self.action_for(class))
+            .ok_or(UnknownDeviceAuthEndpoint)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceAuthEndpointClass {
+    Enrollment,
+    Bootstrap,
+    Read,
+    Canary,
+    Mutation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceAuthPolicyAction {
+    Allow,
+    EnforceEnrollment,
+    ObserveWouldDeny,
+    RequireBinding,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnknownDeviceAuthEndpoint;
+
+impl fmt::Display for UnknownDeviceAuthEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("unknown device-auth endpoint")
+    }
+}
+
+impl std::error::Error for UnknownDeviceAuthEndpoint {}
+
+/// Closed, exact classifier for MLS-chat endpoints. Deliberately avoid
+/// prefix/suffix matching: a newly added endpoint must receive an explicit
+/// rollout class before it can pass the shared policy gate.
+pub fn classify_device_auth_endpoint(nsid: &str) -> Option<DeviceAuthEndpointClass> {
+    use DeviceAuthEndpointClass::{Bootstrap, Canary, Enrollment, Mutation, Read};
+
+    Some(match nsid {
+        "blue.catbird.mlsChat.beginDeviceAuthBinding"
+        | "blue.catbird.mlsChat.completeDeviceAuthBinding" => Enrollment,
+
+        "blue.catbird.mlsChat.registerDevice"
+        | "blue.catbird.mlsChat.registerDeviceToken"
+        | "blue.catbird.mlsChat.publishKeyPackages"
+        | "blue.catbird.mlsChat.reconcileKeyPackages" => Bootstrap,
+
+        "blue.catbird.mlsChat.getKeyPackageStatus"
+        | "blue.catbird.mlsChat.getPendingDevices"
+        | "blue.catbird.mlsChat.listDevices"
+        | "blue.catbird.mlsChat.getConvos"
+        | "blue.catbird.mlsChat.getMessages"
+        | "blue.catbird.mlsChat.getGroupHealth"
+        | "blue.catbird.mlsChat.getGroupState"
+        | "blue.catbird.mlsChat.getWelcomeReissueStatus"
+        | "blue.catbird.mlsChat.getConvoSettings"
+        | "blue.catbird.mlsChat.checkBlocks"
+        | "blue.catbird.mlsChat.getBlockStatus"
+        | "blue.catbird.mlsChat.getDeliveryStatus"
+        | "blue.catbird.mlsChat.getBlob"
+        | "blue.catbird.mlsChat.getBlobUsage"
+        | "blue.catbird.mlsChat.getGroupMetadataBlob"
+        | "blue.catbird.mlsChat.getSubscriptionTicket"
+        | "blue.catbird.mlsChat.subscribeEvents"
+        | "blue.catbird.mlsChat.getGroupInfo"
+        | "blue.catbird.mlsChat.getKeyPackageStats" => Read,
+
+        // Low-impact mutation used to prove enforcement before the complete
+        // state-transition set moves from Enroll to Require.
+        "blue.catbird.mlsChat.updateCursor" => Canary,
+
+        "blue.catbird.mlsChat.getKeyPackages"
+        | "blue.catbird.mlsChat.invalidateKeyPackage"
+        | "blue.catbird.mlsChat.reissueWelcome"
+        | "blue.catbird.mlsChat.reissueWelcomeRespond"
+        | "blue.catbird.mlsChat.removeDevice"
+        | "blue.catbird.mlsChat.createConvo"
+        | "blue.catbird.mlsChat.sendMessage"
+        | "blue.catbird.mlsChat.bootstrapResetGroup"
+        | "blue.catbird.mlsChat.commitGroupChange"
+        | "blue.catbird.mlsChat.addMembers"
+        | "blue.catbird.mlsChat.removeMembers"
+        | "blue.catbird.mlsChat.processExternalCommit"
+        | "blue.catbird.mlsChat.publishGroupInfo"
+        | "blue.catbird.mlsChat.reportRecoveryFailure"
+        | "blue.catbird.mlsChat.resetGroup"
+        | "blue.catbird.mlsChat.leaveConvo"
+        | "blue.catbird.mlsChat.updateConvo"
+        | "blue.catbird.mlsChat.optIn"
+        | "blue.catbird.mlsChat.reportSpam"
+        | "blue.catbird.mlsChat.deleteBlob"
+        | "blue.catbird.mlsChat.putGroupMetadataBlob"
+        | "blue.catbird.mlsChat.uploadBlob"
+        | "blue.catbird.mlsChat.requestFailover" => Mutation,
+        "blue.catbird.mlsChat.syncKeyPackages" => Bootstrap,
+        _ => return None,
+    })
+}
+
 /// Quorum-related configuration for the Path A client-report reset detection.
 ///
 /// Loaded from environment via [`QuorumConfig::from_env`]. Tests should
@@ -338,6 +511,19 @@ fn parse_env_bool(name: &str, default: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_device_auth_mode_is_rejected() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+        assert_eq!(
+            DeviceAuthMode::from_env_result(Err(std::env::VarError::NotUnicode(
+                OsString::from_vec(vec![0xff]),
+            ))),
+            Err(InvalidDeviceAuthMode)
+        );
+    }
 
     #[test]
     fn quorum_config_defaults_match_spec() {

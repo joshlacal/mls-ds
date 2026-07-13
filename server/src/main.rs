@@ -671,6 +671,23 @@ async fn main() -> anyhow::Result<()> {
     });
     tracing::info!("Shared JTI cleanup worker started");
 
+    // Cleanup expired device-auth DPoP replays and enrollment challenges.
+    // Enrollment deliberately bypasses the generic idempotency cache, so its
+    // one-time replay material has an independent bounded-retention worker.
+    let device_auth_cleanup_pool = db_pool.clone();
+    tokio::spawn(async move {
+        let mut interval_timer = interval(Duration::from_secs(300)); // Every 5 minutes
+        loop {
+            interval_timer.tick().await;
+            match auth::device_auth::cleanup_expired_auth_material(&device_auth_cleanup_pool).await
+            {
+                Ok(rows) => tracing::debug!(rows, "Device-auth replay cleanup completed"),
+                Err(e) => tracing::warn!(error = %e, "Device-auth replay cleanup failed"),
+            }
+        }
+    });
+    tracing::info!("Device-auth replay cleanup worker started");
+
     // Create composite app state
     let block_sync_service = Arc::new(block_sync::BlockSyncService::new());
     tracing::info!("Block sync service initialized");
@@ -967,12 +984,14 @@ async fn main() -> anyhow::Result<()> {
     // mlsChat consolidated endpoints (PDSS federation prep)
     // All endpoints use IntoRouter for type-safe routing from lexicon-generated types.
     use catbird_server::generated::blue_catbird::mlsChat::{
+        begin_device_auth_binding::BeginDeviceAuthBindingRequest,
         bootstrap_reset_group::BootstrapResetGroupRequest, check_blocks::CheckBlocksRequest,
-        commit_group_change::CommitGroupChangeRequest, create_convo::CreateConvoRequest,
-        delete_blob::DeleteBlobRequest, get_blob_usage::GetBlobUsageRequest,
-        get_block_status::GetBlockStatusRequest, get_convo_settings::GetConvoSettingsRequest,
-        get_convos::GetConvosRequest, get_group_state::GetGroupStateRequest,
-        get_key_package_status::GetKeyPackageStatusRequest,
+        commit_group_change::CommitGroupChangeRequest,
+        complete_device_auth_binding::CompleteDeviceAuthBindingRequest,
+        create_convo::CreateConvoRequest, delete_blob::DeleteBlobRequest,
+        get_blob_usage::GetBlobUsageRequest, get_block_status::GetBlockStatusRequest,
+        get_convo_settings::GetConvoSettingsRequest, get_convos::GetConvosRequest,
+        get_group_state::GetGroupStateRequest, get_key_package_status::GetKeyPackageStatusRequest,
         get_key_packages::GetKeyPackagesRequest, get_messages::GetMessagesRequest,
         get_pending_devices::GetPendingDevicesRequest,
         get_subscription_ticket::GetSubscriptionTicketRequest, leave_convo::LeaveConvoRequest,
@@ -988,6 +1007,12 @@ async fn main() -> anyhow::Result<()> {
         // Identity & Devices
         .merge(RegisterDeviceRequest::into_router(
             handlers::mls_chat::register_device_post,
+        ))
+        .merge(BeginDeviceAuthBindingRequest::into_router(
+            handlers::mls_chat::begin_device_auth_binding,
+        ))
+        .merge(CompleteDeviceAuthBindingRequest::into_router(
+            handlers::mls_chat::complete_device_auth_binding,
         ))
         // Compat shim: legacy registerDeviceToken endpoint. Folded into
         // registerDevice (action=updateToken) but old iOS Petrel-generated

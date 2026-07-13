@@ -278,7 +278,15 @@ fn get_endpoint_quota(endpoint: &str) -> (u32, Duration) {
         .trim_start_matches("blue.catbird.mlsChat.")
         .trim_start_matches("blue.catbird.mlsDS.");
 
-    let limit = if endpoint_name.contains("sendMessage") {
+    let limit = if matches!(
+        endpoint_name,
+        "beginDeviceAuthBinding" | "completeDeviceAuthBinding"
+    ) {
+        std::env::var("RATE_LIMIT_DEVICE_AUTH_BINDING")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10)
+    } else if endpoint_name.contains("sendMessage") {
         std::env::var("RATE_LIMIT_SEND_MESSAGE")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -614,6 +622,19 @@ mod tests {
 
         assert_eq!(limit, 30);
         assert_eq!(window, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn device_auth_binding_has_dedicated_tight_quota() {
+        let (begin_limit, begin_window) =
+            get_endpoint_quota("/xrpc/blue.catbird.mlsChat.beginDeviceAuthBinding");
+        let (complete_limit, complete_window) =
+            get_endpoint_quota("/xrpc/blue.catbird.mlsChat.completeDeviceAuthBinding");
+
+        assert_eq!(begin_limit, 10);
+        assert_eq!(complete_limit, 10);
+        assert_eq!(begin_window, Duration::from_secs(60));
+        assert_eq!(complete_window, Duration::from_secs(60));
     }
 
     #[test]
