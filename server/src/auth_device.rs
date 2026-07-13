@@ -643,17 +643,26 @@ pub async fn begin_binding(
     if canonical_did_claim(user_did).is_none() || device_id.is_empty() || !valid_jkt(dpop_jkt) {
         return Err(DeviceAuthError::BindingMismatch);
     }
-    let exists: Option<bool> = sqlx::query_scalar(
-        "SELECT active FROM devices WHERE user_did = $1 AND device_id = $2 AND active",
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| DeviceAuthError::Storage(e.to_string()))?;
+    let signature_key_hex = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT signature_public_key FROM devices
+         WHERE user_did = $1 AND device_id = $2 AND active FOR SHARE",
     )
     .bind(user_did)
     .bind(device_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await
-    .map_err(|e| DeviceAuthError::Storage(e.to_string()))?;
-    if exists != Some(true) {
-        return Err(DeviceAuthError::RegistryMismatch);
-    }
+    .map_err(|e| DeviceAuthError::Storage(e.to_string()))?
+    .flatten()
+    .ok_or(DeviceAuthError::RegistryMismatch)?;
+    let signature_key: [u8; 32] = hex::decode(signature_key_hex)
+        .ok()
+        .and_then(|key| key.try_into().ok())
+        .ok_or(DeviceAuthError::RegistryMismatch)?;
+    Ed25519Key::from_bytes(&signature_key).map_err(|_| DeviceAuthError::RegistryMismatch)?;
     let mut nonce = [0_u8; 32];
     rand::thread_rng().fill_bytes(&mut nonce);
     let challenge = BindingChallenge {
@@ -681,9 +690,12 @@ pub async fn begin_binding(
     .bind(&challenge.dpop_jkt)
     .bind(challenge.nonce.as_slice())
     .bind(challenge.expires_at)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| DeviceAuthError::Storage(e.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|e| DeviceAuthError::Storage(e.to_string()))?;
     Ok(challenge)
 }
 
@@ -1838,6 +1850,217 @@ mod tests {
         tx.rollback().await.unwrap();
         sqlx::query("DELETE FROM users WHERE did=$1")
             .bind(&user)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL with migration privileges"]
+    async fn postgres_begin_binding_serializes_registry_mutations_and_rolls_back() {
+        let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL required");
+        let pool = PgPool::connect(&url).await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let now = Utc::now();
+
+        async fn insert_device(
+            pool: &PgPool,
+            label: &str,
+            signature_public_key: Option<String>,
+        ) -> (String, String, VerifiedEnrollmentRequest) {
+            let suffix = Uuid::new_v4().simple().to_string();
+            let user = format!("did:plc:{label}{suffix}");
+            let device = format!("device-{suffix}");
+            sqlx::query("INSERT INTO users(did) VALUES($1)")
+                .bind(&user)
+                .execute(pool)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO devices
+                 (id,user_did,device_id,credential_did,signature_public_key)
+                 VALUES($1,$2,$3,$4,$5)",
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(&user)
+            .bind(&device)
+            .bind(format!("{user}#{device}"))
+            .bind(signature_public_key)
+            .execute(pool)
+            .await
+            .unwrap();
+            let jkt = URL_SAFE_NO_PAD.encode(Sha256::digest(format!("{label}-{suffix}")));
+            let enrollment = enrollment(&user, &device, &jkt);
+            (user, device, enrollment)
+        }
+
+        async fn challenge_count(pool: &PgPool, user: &str, device: &str) -> i64 {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM device_auth_binding_challenges
+                 WHERE user_did=$1 AND device_id=$2",
+            )
+            .bind(user)
+            .bind(device)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        }
+
+        async fn await_begin(
+            task: tokio::task::JoinHandle<Result<BindingChallenge, DeviceAuthError>>,
+        ) -> Result<BindingChallenge, DeviceAuthError> {
+            tokio::time::timeout(std::time::Duration::from_secs(5), task)
+                .await
+                .expect("begin_binding stayed blocked after registry mutation committed")
+                .expect("begin_binding task panicked")
+        }
+
+        async fn named_pool(url: &str, application_name: &str) -> PgPool {
+            let options: sqlx::postgres::PgConnectOptions = url
+                .parse::<sqlx::postgres::PgConnectOptions>()
+                .unwrap()
+                .application_name(application_name);
+            sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .connect_with(options)
+                .await
+                .unwrap()
+        }
+
+        async fn wait_for_lock(
+            observer: &PgPool,
+            application_name: &str,
+            task: &tokio::task::JoinHandle<Result<BindingChallenge, DeviceAuthError>>,
+        ) {
+            for _ in 0..500 {
+                assert!(
+                    !task.is_finished(),
+                    "begin_binding completed before reaching the contested device-row lock"
+                );
+                let waiting: Option<bool> = sqlx::query_scalar(
+                    "SELECT COALESCE(wait_event_type = 'Lock', FALSE)
+                     FROM pg_stat_activity
+                     WHERE application_name = $1 AND state = 'active'",
+                )
+                .bind(application_name)
+                .fetch_optional(observer)
+                .await
+                .unwrap();
+                if waiting == Some(true) {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("begin_binding did not reach the contested device-row lock");
+        }
+
+        let key = SigningKey::generate(&mut rand::thread_rng());
+        let valid_signer = Some(hex::encode(key.verifying_key().as_bytes()));
+
+        // A concurrent delete wins the device-row lock before begin_binding.
+        // The caller must receive registry semantics, never a leaked FK error.
+        let (delete_user, delete_device, delete_enrollment) =
+            insert_device(&pool, "delete", valid_signer.clone()).await;
+        let mut delete_tx = pool.begin().await.unwrap();
+        sqlx::query("DELETE FROM devices WHERE user_did=$1 AND device_id=$2")
+            .bind(&delete_user)
+            .bind(&delete_device)
+            .execute(&mut *delete_tx)
+            .await
+            .unwrap();
+        let delete_application = format!("binding-delete-{delete_device}");
+        let delete_pool = named_pool(&url, &delete_application).await;
+        let delete_task =
+            tokio::spawn(async move { begin_binding(&delete_pool, &delete_enrollment, now).await });
+        wait_for_lock(&pool, &delete_application, &delete_task).await;
+        delete_tx.commit().await.unwrap();
+        assert_eq!(
+            await_begin(delete_task).await.unwrap_err(),
+            DeviceAuthError::RegistryMismatch
+        );
+        assert_eq!(
+            challenge_count(&pool, &delete_user, &delete_device).await,
+            0
+        );
+
+        // Deactivation must serialize before challenge insertion. A failed
+        // begin leaves no challenge behind.
+        let (inactive_user, inactive_device, inactive_enrollment) =
+            insert_device(&pool, "inactive", valid_signer.clone()).await;
+        let mut inactive_tx = pool.begin().await.unwrap();
+        sqlx::query("UPDATE devices SET active=FALSE WHERE user_did=$1 AND device_id=$2")
+            .bind(&inactive_user)
+            .bind(&inactive_device)
+            .execute(&mut *inactive_tx)
+            .await
+            .unwrap();
+        let inactive_application = format!("binding-inactive-{inactive_device}");
+        let inactive_pool = named_pool(&url, &inactive_application).await;
+        let inactive_task =
+            tokio::spawn(
+                async move { begin_binding(&inactive_pool, &inactive_enrollment, now).await },
+            );
+        wait_for_lock(&pool, &inactive_application, &inactive_task).await;
+        inactive_tx.commit().await.unwrap();
+        assert_eq!(
+            await_begin(inactive_task).await.unwrap_err(),
+            DeviceAuthError::RegistryMismatch
+        );
+        assert_eq!(
+            challenge_count(&pool, &inactive_user, &inactive_device).await,
+            0
+        );
+
+        // Losing the row lock to an identity-key invalidation must recheck
+        // the signer under that lock and roll back without a challenge.
+        let (rekey_user, rekey_device, rekey_enrollment) =
+            insert_device(&pool, "rekey", valid_signer).await;
+        let mut rekey_tx = pool.begin().await.unwrap();
+        sqlx::query(
+            "UPDATE devices SET signature_public_key=NULL
+             WHERE user_did=$1 AND device_id=$2",
+        )
+        .bind(&rekey_user)
+        .bind(&rekey_device)
+        .execute(&mut *rekey_tx)
+        .await
+        .unwrap();
+        let rekey_application = format!("binding-rekey-{rekey_device}");
+        let rekey_pool = named_pool(&url, &rekey_application).await;
+        let rekey_task =
+            tokio::spawn(async move { begin_binding(&rekey_pool, &rekey_enrollment, now).await });
+        wait_for_lock(&pool, &rekey_application, &rekey_task).await;
+        rekey_tx.commit().await.unwrap();
+        assert_eq!(
+            await_begin(rekey_task).await.unwrap_err(),
+            DeviceAuthError::RegistryMismatch
+        );
+        assert_eq!(challenge_count(&pool, &rekey_user, &rekey_device).await, 0);
+
+        // Invalid signer material is a registry mismatch and the failed
+        // business transaction is atomic: no challenge can persist.
+        let (invalid_user, invalid_device, invalid_enrollment) =
+            insert_device(&pool, "invalidsigner", Some("not-hex".into())).await;
+        assert_eq!(
+            begin_binding(&pool, &invalid_enrollment, now)
+                .await
+                .unwrap_err(),
+            DeviceAuthError::RegistryMismatch
+        );
+        assert_eq!(
+            challenge_count(&pool, &invalid_user, &invalid_device).await,
+            0
+        );
+
+        for user in [inactive_user, rekey_user, invalid_user] {
+            sqlx::query("DELETE FROM users WHERE did=$1")
+                .bind(user)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query("DELETE FROM users WHERE did=$1")
+            .bind(delete_user)
             .execute(&pool)
             .await
             .unwrap();
