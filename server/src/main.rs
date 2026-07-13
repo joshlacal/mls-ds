@@ -20,13 +20,18 @@
 #[cfg(debug_assertions)]
 use axum::routing::any;
 use axum::{
+    body::HttpBody as _,
     extract::{DefaultBodyLimit, FromRef},
     routing::{get, post},
     Router,
 };
+use once_cell::sync::Lazy;
 use sqlx::PgPool;
 use std::{net::SocketAddr, sync::Arc};
-use tokio::time::{interval, Duration};
+use tokio::{
+    sync::Semaphore,
+    time::{interval, timeout, Duration, Instant},
+};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -91,6 +96,321 @@ fn is_production_environment() -> bool {
         Some(_) => !cfg!(debug_assertions),
         None => !cfg!(debug_assertions),
     }
+}
+
+const DEFAULT_REQUEST_BODY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+const BLOB_UPLOAD_BODY_LIMIT_BYTES: usize = 11 * 1024 * 1024;
+const GROUP_METADATA_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
+// MLS JSON encodes `bytes` fields as base64. A valid 10 MiB ciphertext or
+// GroupInfo therefore needs nearly 13.34 MiB on the wire before the small JSON
+// envelope is counted. Keep the ordinary 4 MiB default, but preserve the
+// existing MLS contracts on routes that carry one or more large artifacts.
+const SINGLE_MLS_ARTIFACT_BODY_LIMIT_BYTES: usize = 15 * 1024 * 1024;
+const DOUBLE_MLS_ARTIFACT_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+const TRIPLE_MLS_ARTIFACT_BODY_LIMIT_BYTES: usize = 44 * 1024 * 1024;
+const DEVICE_REGISTRATION_BODY_LIMIT_BYTES: usize = 20 * 1024 * 1024;
+const KEY_PACKAGE_BATCH_BODY_LIMIT_BYTES: usize = 10 * 1024 * 1024;
+const INGRESS_BODY_BUDGET_MIB: usize = 64;
+const BYTES_PER_INGRESS_PERMIT: usize = 1024 * 1024;
+const DEFAULT_REQUEST_BODY_READ_TIMEOUT_MS: u64 = 15_000;
+const MAX_REQUEST_BODY_READ_TIMEOUT_MS: u64 = 60_000;
+const DEFAULT_REQUEST_BODY_TOTAL_TIMEOUT_MS: u64 = 120_000;
+const DEFAULT_BLOB_UPLOAD_TOTAL_TIMEOUT_MS: u64 = 300_000;
+const MAX_REQUEST_BODY_TOTAL_TIMEOUT_MS: u64 = 600_000;
+const BLOB_UPLOAD_PATH: &str = "/xrpc/blue.catbird.mlsChat.uploadBlob";
+const GROUP_METADATA_PATH: &str = "/xrpc/blue.catbird.mlsChat.putGroupMetadataBlob";
+static INGRESS_BODY_BUDGET: Lazy<Arc<Semaphore>> =
+    Lazy::new(|| Arc::new(Semaphore::new(INGRESS_BODY_BUDGET_MIB)));
+
+#[derive(Clone)]
+struct IngressBodyPolicy {
+    budget: Arc<Semaphore>,
+    read_idle_timeout: Duration,
+    read_total_timeout: Duration,
+    blob_upload_total_timeout: Duration,
+}
+
+impl IngressBodyPolicy {
+    fn new(budget: Arc<Semaphore>, read_idle_timeout: Duration) -> Self {
+        Self {
+            budget,
+            read_idle_timeout,
+            read_total_timeout: Duration::from_millis(DEFAULT_REQUEST_BODY_TOTAL_TIMEOUT_MS),
+            blob_upload_total_timeout: Duration::from_millis(DEFAULT_BLOB_UPLOAD_TOTAL_TIMEOUT_MS),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_timeouts(
+        budget: Arc<Semaphore>,
+        read_idle_timeout: Duration,
+        read_total_timeout: Duration,
+    ) -> Self {
+        Self {
+            budget,
+            read_idle_timeout,
+            read_total_timeout,
+            blob_upload_total_timeout: read_total_timeout,
+        }
+    }
+
+    fn from_env() -> Self {
+        let timeout_ms = std::env::var("REQUEST_BODY_READ_IDLE_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| (1..=MAX_REQUEST_BODY_READ_TIMEOUT_MS).contains(value))
+            .unwrap_or(DEFAULT_REQUEST_BODY_READ_TIMEOUT_MS);
+
+        let total_timeout_ms = std::env::var("REQUEST_BODY_READ_TOTAL_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| (1..=MAX_REQUEST_BODY_TOTAL_TIMEOUT_MS).contains(value))
+            .unwrap_or(DEFAULT_REQUEST_BODY_TOTAL_TIMEOUT_MS);
+        let blob_total_timeout_ms = std::env::var("BLOB_UPLOAD_READ_TOTAL_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| (1..=MAX_REQUEST_BODY_TOTAL_TIMEOUT_MS).contains(value))
+            .unwrap_or(DEFAULT_BLOB_UPLOAD_TOTAL_TIMEOUT_MS);
+
+        Self {
+            budget: INGRESS_BODY_BUDGET.clone(),
+            read_idle_timeout: Duration::from_millis(timeout_ms),
+            read_total_timeout: Duration::from_millis(total_timeout_ms),
+            blob_upload_total_timeout: Duration::from_millis(blob_total_timeout_ms),
+        }
+    }
+
+    fn total_timeout(&self, path: &str) -> Duration {
+        // Large base64 MLS envelopes need the same slow-client allowance as a
+        // raw blob upload. The idle timeout still rejects stalled senders.
+        if request_body_limit(path) > DEFAULT_REQUEST_BODY_LIMIT_BYTES {
+            self.blob_upload_total_timeout
+        } else {
+            self.read_total_timeout
+        }
+    }
+}
+
+fn request_body_limit(path: &str) -> usize {
+    match path {
+        BLOB_UPLOAD_PATH => BLOB_UPLOAD_BODY_LIMIT_BYTES,
+        GROUP_METADATA_PATH => GROUP_METADATA_BODY_LIMIT_BYTES,
+        // commitGroupChange may carry commit, Welcome, and GroupInfo in one
+        // request. Its aliases delegate to the same handler and contract.
+        "/xrpc/blue.catbird.mlsChat.commitGroupChange"
+        | "/xrpc/blue.catbird.mlsChat.addMembers"
+        | "/xrpc/blue.catbird.mlsChat.removeMembers"
+        | "/xrpc/blue.catbird.mlsChat.processExternalCommit"
+        | "/xrpc/blue.catbird.mlsChat.publishGroupInfo" => TRIPLE_MLS_ARTIFACT_BODY_LIMIT_BYTES,
+        // Conversation bootstrap may carry both a Welcome and GroupInfo.
+        "/xrpc/blue.catbird.mlsChat.createConvo"
+        | "/xrpc/blue.catbird.mlsChat.bootstrapResetGroup" => DOUBLE_MLS_ARTIFACT_BODY_LIMIT_BYTES,
+        // Device registration may include the initial KeyPackage batch and a
+        // Welcome. The publish/sync pair carries only the cardinality-limited
+        // batch shape. These are HTTP envelopes; decoded per-item limits remain
+        // an API/lexicon contract and are not invented by this middleware.
+        "/xrpc/blue.catbird.mlsChat.registerDevice" => DEVICE_REGISTRATION_BODY_LIMIT_BYTES,
+        "/xrpc/blue.catbird.mlsChat.publishKeyPackages"
+        | "/xrpc/blue.catbird.mlsChat.syncKeyPackages" => KEY_PACKAGE_BATCH_BODY_LIMIT_BYTES,
+        // These routes carry one potentially large MLS byte string. Federation
+        // peers receive the same allowance as local clients so forwarding does
+        // not truncate an otherwise valid message, Welcome, or commit.
+        "/xrpc/blue.catbird.mlsChat.sendMessage"
+        | "/xrpc/blue.catbird.mlsChat.updateConvo"
+        | "/xrpc/blue.catbird.mlsChat.resetGroup"
+        | "/xrpc/blue.catbird.mlsChat.leaveConvo"
+        | "/xrpc/blue.catbird.mlsChat.reissueWelcomeRespond"
+        | "/xrpc/blue.catbird.mlsDS.deliverMessage"
+        | "/xrpc/blue.catbird.mlsDS.deliverWelcome"
+        | "/xrpc/blue.catbird.mlsDS.submitCommit" => SINGLE_MLS_ARTIFACT_BODY_LIMIT_BYTES,
+        _ => DEFAULT_REQUEST_BODY_LIMIT_BYTES,
+    }
+}
+
+fn method_has_no_application_body(method: &axum::http::Method) -> bool {
+    matches!(
+        *method,
+        axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+    )
+}
+
+fn ingress_body_permits(request: &axum::extract::Request) -> u32 {
+    if method_has_no_application_body(request.method()) {
+        return 0;
+    }
+
+    let limit = request_body_limit(request.uri().path());
+    let has_transfer_encoding = request
+        .headers()
+        .contains_key(axum::http::header::TRANSFER_ENCODING);
+    let declared_length = request
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok());
+    let hinted_length = request
+        .body()
+        .size_hint()
+        .upper()
+        .map(|value| value as usize);
+
+    let reserved_bytes = if has_transfer_encoding {
+        limit
+    } else {
+        declared_length
+            .into_iter()
+            .chain(hinted_length)
+            .max()
+            .map(|length| length.min(limit))
+            .unwrap_or(limit)
+    };
+
+    if reserved_bytes == 0 {
+        0
+    } else {
+        reserved_bytes.div_ceil(BYTES_PER_INGRESS_PERMIT) as u32
+    }
+}
+
+async fn enforce_ingress_body_budget(
+    axum::extract::State(policy): axum::extract::State<IngressBodyPolicy>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<axum::response::Response, axum::http::StatusCode> {
+    let permits = ingress_body_permits(&request);
+    let _reservation = if permits == 0 {
+        None
+    } else {
+        Some(
+            policy
+                .budget
+                .try_acquire_many_owned(permits)
+                .map_err(|_| axum::http::StatusCode::SERVICE_UNAVAILABLE)?,
+        )
+    };
+
+    Ok(next.run(request).await)
+}
+
+async fn buffer_limited_request_body(
+    axum::extract::State(policy): axum::extract::State<IngressBodyPolicy>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<axum::response::Response, axum::http::StatusCode> {
+    if method_has_no_application_body(request.method()) {
+        return Ok(next.run(request).await);
+    }
+
+    let limit = request_body_limit(request.uri().path());
+    if let Some(raw_length) = request.headers().get(axum::http::header::CONTENT_LENGTH) {
+        let declared_length = raw_length
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or(axum::http::StatusCode::BAD_REQUEST)?;
+
+        if declared_length > limit as u64 {
+            return Err(axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+        }
+    }
+
+    let total_timeout = policy.total_timeout(request.uri().path());
+    let (mut parts, body) = request.into_parts();
+    let mut stream = body.into_data_stream();
+    let mut bytes = bytes::BytesMut::new();
+    let started_at = Instant::now();
+    let mut last_progress_at = started_at;
+    loop {
+        let now = Instant::now();
+        let idle_remaining = policy
+            .read_idle_timeout
+            .saturating_sub(now.duration_since(last_progress_at));
+        let total_remaining = total_timeout.saturating_sub(now.duration_since(started_at));
+        let wait_for_progress = idle_remaining.min(total_remaining);
+        if wait_for_progress.is_zero() {
+            return Err(axum::http::StatusCode::REQUEST_TIMEOUT);
+        }
+
+        let chunk = timeout(wait_for_progress, futures::StreamExt::next(&mut stream))
+            .await
+            .map_err(|_| axum::http::StatusCode::REQUEST_TIMEOUT)?;
+        let Some(chunk) = chunk else {
+            break;
+        };
+        let chunk = chunk.map_err(|_| axum::http::StatusCode::PAYLOAD_TOO_LARGE)?;
+        if chunk.is_empty() {
+            continue;
+        }
+        let next_length = bytes
+            .len()
+            .checked_add(chunk.len())
+            .ok_or(axum::http::StatusCode::PAYLOAD_TOO_LARGE)?;
+        if next_length > limit {
+            return Err(axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+        }
+        bytes.extend_from_slice(&chunk);
+        last_progress_at = Instant::now();
+    }
+    let bytes = bytes.freeze();
+    parts.headers.remove(axum::http::header::TRANSFER_ENCODING);
+    parts.headers.insert(
+        axum::http::header::CONTENT_LENGTH,
+        axum::http::HeaderValue::from_str(&bytes.len().to_string())
+            .map_err(|_| axum::http::StatusCode::BAD_REQUEST)?,
+    );
+    let request = axum::extract::Request::from_parts(parts, axum::body::Body::from(bytes));
+
+    Ok(next.run(request).await)
+}
+
+fn merge_application_routers(
+    base_router: Router,
+    mls_chat_router: Router,
+    ds_router: Router,
+    db_pool: PgPool,
+    ingress_body_policy: IngressBodyPolicy,
+) -> Router {
+    // Axum layers affect only routes already present on a Router. Merge every
+    // route family first so the policy cannot silently omit MLS or federation.
+    // Each subsequent call wraps the preceding service, so the reverse-looking
+    // construction below intentionally yields this request order:
+    // trace -> sanitized log -> response normalization -> pre-auth rate limit
+    // -> non-bypassable ingress memory budget -> route-aware bounded body
+    // buffer -> default/route extractor limit
+    // -> idempotency/JWT/cache -> handler.
+    //
+    // The bounded buffer runs before idempotency so declared and unknown-length
+    // bodies cannot evade quotas through early errors or cache hits. It mirrors
+    // uploadBlob's 11 MiB and metadata's 2 MiB route-local extractor overrides.
+    base_router
+        .merge(mls_chat_router)
+        .merge(ds_router)
+        .layer(axum::middleware::from_fn_with_state(
+            middleware::idempotency::IdempotencyLayer::new(db_pool),
+            middleware::idempotency::idempotency_middleware,
+        ))
+        // The path-aware outer buffer enforces the narrower effective limit.
+        // Configure the extractor ceiling to the largest valid route so it
+        // cannot re-reject a body already accepted by that policy.
+        .layer(DefaultBodyLimit::max(TRIPLE_MLS_ARTIFACT_BODY_LIMIT_BYTES))
+        .layer(axum::middleware::from_fn_with_state(
+            ingress_body_policy.clone(),
+            buffer_limited_request_body,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            ingress_body_policy,
+            enforce_ingress_body_budget,
+        ))
+        .layer(axum::middleware::from_fn(
+            middleware::rate_limit::rate_limit_middleware,
+        ))
+        .layer(axum::middleware::from_fn(
+            middleware::response_content_type::response_content_type_middleware,
+        ))
+        .layer(axum::middleware::from_fn(
+            middleware::logging::log_headers_middleware,
+        ))
+        .layer(TraceLayer::new_for_http())
 }
 
 #[tokio::main]
@@ -608,19 +928,6 @@ async fn main() -> anyhow::Result<()> {
         .route("/health/live", get(health::liveness))
         .route("/health/ready", get(health::readiness))
         .merge(metrics_router)
-        .layer(DefaultBodyLimit::max(4 * 1024 * 1024)) // 4 MB
-        .layer(TraceLayer::new_for_http())
-        .layer(axum::middleware::from_fn(
-            middleware::logging::log_headers_middleware,
-        ))
-        // DID-based rate limiter for authenticated requests, IP-based backstop for unauthenticated
-        .layer(axum::middleware::from_fn(
-            middleware::rate_limit::rate_limit_middleware,
-        ))
-        .layer(axum::middleware::from_fn_with_state(
-            middleware::idempotency::IdempotencyLayer::new(db_pool.clone()),
-            middleware::idempotency::idempotency_middleware,
-        ))
         .with_state(app_state.clone());
 
     // ⚠️ SECURITY: Developer-only direct XRPC proxy - NEVER enable in production
@@ -938,12 +1245,13 @@ async fn main() -> anyhow::Result<()> {
     // generated XRPC layer validate Content-Type and throw on empty headers before
     // they can inspect the status code. Applying this to the merged app covers all
     // three sub-routers without having to patch every handler.
-    let app = base_router
-        .merge(mls_chat_router)
-        .merge(ds_router)
-        .layer(axum::middleware::from_fn(
-            middleware::response_content_type::response_content_type_middleware,
-        ));
+    let app = merge_application_routers(
+        base_router,
+        mls_chat_router,
+        ds_router,
+        db_pool.clone(),
+        IngressBodyPolicy::from_env(),
+    );
 
     let port = std::env::var("SERVER_PORT")
         .unwrap_or_else(|_| "8080".to_string())
@@ -985,4 +1293,683 @@ async fn main() -> anyhow::Result<()> {
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        body::{Body, Bytes},
+        http::{Method, Request, StatusCode},
+    };
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use tower_util::ServiceExt;
+
+    async fn consume_body(body: Bytes) -> StatusCode {
+        let _ = body;
+        StatusCode::NO_CONTENT
+    }
+
+    async fn require_normalized_framing(headers: axum::http::HeaderMap, body: Bytes) -> StatusCode {
+        let content_length = headers
+            .get(axum::http::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok());
+        if headers.contains_key(axum::http::header::TRANSFER_ENCODING)
+            || content_length != Some(body.len())
+        {
+            StatusCode::INTERNAL_SERVER_ERROR
+        } else {
+            StatusCode::NO_CONTENT
+        }
+    }
+
+    fn lazy_test_pool() -> PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@127.0.0.1/unused")
+            .expect("lazy pool")
+    }
+
+    fn test_ingress_policy() -> IngressBodyPolicy {
+        IngressBodyPolicy::new(
+            Arc::new(Semaphore::new(INGRESS_BODY_BUDGET_MIB)),
+            Duration::from_secs(1),
+        )
+    }
+
+    #[test]
+    fn empty_mutation_reserves_no_memory_budget() {
+        let empty = Request::post("/write")
+            .body(Body::empty())
+            .expect("request");
+        let nonempty = Request::post("/write")
+            .body(Body::from("{}"))
+            .expect("request");
+
+        assert_eq!(ingress_body_permits(&empty), 0);
+        assert_eq!(ingress_body_permits(&nonempty), 1);
+    }
+
+    #[test]
+    fn large_mls_json_routes_preserve_binary_contracts() {
+        const MAX_MLS_ARTIFACT_BYTES: usize = 10 * 1024 * 1024;
+        let base64_bytes = 4 * MAX_MLS_ARTIFACT_BYTES.div_ceil(3);
+        assert!(SINGLE_MLS_ARTIFACT_BODY_LIMIT_BYTES > base64_bytes);
+
+        for path in [
+            "/xrpc/blue.catbird.mlsChat.sendMessage",
+            "/xrpc/blue.catbird.mlsChat.updateConvo",
+            "/xrpc/blue.catbird.mlsChat.resetGroup",
+            "/xrpc/blue.catbird.mlsChat.leaveConvo",
+            "/xrpc/blue.catbird.mlsChat.reissueWelcomeRespond",
+            "/xrpc/blue.catbird.mlsDS.deliverMessage",
+            "/xrpc/blue.catbird.mlsDS.deliverWelcome",
+            "/xrpc/blue.catbird.mlsDS.submitCommit",
+        ] {
+            assert_eq!(
+                request_body_limit(path),
+                SINGLE_MLS_ARTIFACT_BODY_LIMIT_BYTES
+            );
+        }
+        for path in [
+            "/xrpc/blue.catbird.mlsChat.createConvo",
+            "/xrpc/blue.catbird.mlsChat.bootstrapResetGroup",
+        ] {
+            assert_eq!(
+                request_body_limit(path),
+                DOUBLE_MLS_ARTIFACT_BODY_LIMIT_BYTES
+            );
+        }
+        assert_eq!(
+            request_body_limit("/xrpc/blue.catbird.mlsChat.registerDevice"),
+            DEVICE_REGISTRATION_BODY_LIMIT_BYTES
+        );
+        for path in [
+            "/xrpc/blue.catbird.mlsChat.publishKeyPackages",
+            "/xrpc/blue.catbird.mlsChat.syncKeyPackages",
+        ] {
+            assert_eq!(request_body_limit(path), KEY_PACKAGE_BATCH_BODY_LIMIT_BYTES);
+        }
+        for path in [
+            "/xrpc/blue.catbird.mlsChat.commitGroupChange",
+            "/xrpc/blue.catbird.mlsChat.addMembers",
+            "/xrpc/blue.catbird.mlsChat.removeMembers",
+            "/xrpc/blue.catbird.mlsChat.processExternalCommit",
+            "/xrpc/blue.catbird.mlsChat.publishGroupInfo",
+        ] {
+            assert_eq!(
+                request_body_limit(path),
+                TRIPLE_MLS_ARTIFACT_BODY_LIMIT_BYTES
+            );
+        }
+    }
+
+    #[test]
+    fn large_route_caps_fit_weighted_global_budget() {
+        for (path, expected_permits) in [
+            ("/xrpc/blue.catbird.mlsChat.sendMessage", 15),
+            ("/xrpc/blue.catbird.mlsChat.registerDevice", 20),
+            ("/xrpc/blue.catbird.mlsChat.createConvo", 32),
+            ("/xrpc/blue.catbird.mlsChat.commitGroupChange", 44),
+        ] {
+            let limit = request_body_limit(path);
+            let request = Request::post(path)
+                .header(axum::http::header::CONTENT_LENGTH, limit)
+                .body(Body::empty())
+                .expect("request");
+            assert_eq!(ingress_body_permits(&request), expected_permits, "{path}");
+            assert!(expected_permits <= INGRESS_BODY_BUDGET_MIB as u32, "{path}");
+        }
+    }
+
+    #[test]
+    fn large_mls_routes_receive_extended_total_timeout() {
+        let policy = IngressBodyPolicy {
+            budget: Arc::new(Semaphore::new(INGRESS_BODY_BUDGET_MIB)),
+            read_idle_timeout: Duration::from_secs(1),
+            read_total_timeout: Duration::from_secs(2),
+            blob_upload_total_timeout: Duration::from_secs(3),
+        };
+
+        assert_eq!(policy.total_timeout("/ordinary"), Duration::from_secs(2));
+        for path in [
+            BLOB_UPLOAD_PATH,
+            "/xrpc/blue.catbird.mlsChat.sendMessage",
+            "/xrpc/blue.catbird.mlsChat.commitGroupChange",
+        ] {
+            assert_eq!(policy.total_timeout(path), Duration::from_secs(3), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn body_limit_covers_every_merged_router() {
+        let base_router = Router::new().route("/base", post(consume_body));
+        let mls_chat_router = Router::new().route("/mls", post(consume_body));
+        let ds_router = Router::new().route("/ds", post(consume_body));
+        let app = merge_application_routers(
+            base_router,
+            mls_chat_router,
+            ds_router,
+            lazy_test_pool(),
+            test_ingress_policy(),
+        );
+
+        for path in ["/base", "/mls", "/ds"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post(path)
+                        .body(Body::from(vec![0_u8; 4 * 1024 * 1024 + 1]))
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn idempotency_policy_preserves_optional_contract_and_enrollment_bypass() {
+        let mls_chat_router = Router::new()
+            .route("/xrpc/blue.catbird.mlsChat.testPolicy", post(consume_body))
+            .route(
+                "/xrpc/blue.catbird.mlsChat.beginDeviceAuthBinding",
+                post(consume_body),
+            )
+            .route(
+                "/xrpc/blue.catbird.mlsChat.completeDeviceAuthBinding",
+                post(consume_body),
+            );
+        let app = merge_application_routers(
+            Router::new(),
+            mls_chat_router,
+            Router::new(),
+            lazy_test_pool(),
+            test_ingress_policy(),
+        );
+
+        let protected = app
+            .clone()
+            .oneshot(
+                Request::post("/xrpc/blue.catbird.mlsChat.testPolicy")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(protected.status(), StatusCode::NO_CONTENT);
+
+        let invalid_present_key = app
+            .clone()
+            .oneshot(
+                Request::post("/xrpc/blue.catbird.mlsChat.testPolicy")
+                    .header("Idempotency-Key", "   ")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(invalid_present_key.status(), StatusCode::BAD_REQUEST);
+
+        for path in [
+            "/xrpc/blue.catbird.mlsChat.beginDeviceAuthBinding",
+            "/xrpc/blue.catbird.mlsChat.completeDeviceAuthBinding",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post(path)
+                        .header("Idempotency-Key", "   ")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::NO_CONTENT, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_mls_write_is_rejected_before_idempotency() {
+        let mls_chat_router =
+            Router::new().route("/xrpc/blue.catbird.mlsChat.testPolicy", post(consume_body));
+        let app = merge_application_routers(
+            Router::new(),
+            mls_chat_router,
+            Router::new(),
+            lazy_test_pool(),
+            test_ingress_policy(),
+        );
+
+        let body_length = DEFAULT_REQUEST_BODY_LIMIT_BYTES + 1;
+        let response = app
+            .oneshot(
+                Request::post("/xrpc/blue.catbird.mlsChat.testPolicy")
+                    .header(axum::http::header::CONTENT_LENGTH, body_length)
+                    .body(Body::from(vec![0_u8; body_length]))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn unknown_length_mls_write_is_bounded_before_idempotency() {
+        let mls_chat_router =
+            Router::new().route("/xrpc/blue.catbird.mlsChat.testPolicy", post(consume_body));
+        let app = merge_application_routers(
+            Router::new(),
+            mls_chat_router,
+            Router::new(),
+            lazy_test_pool(),
+            test_ingress_policy(),
+        );
+
+        let response = app
+            .oneshot(
+                Request::post("/xrpc/blue.catbird.mlsChat.testPolicy")
+                    .body(Body::from(vec![0_u8; DEFAULT_REQUEST_BODY_LIMIT_BYTES + 1]))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn unknown_length_body_is_consumed_before_idempotency_early_return() {
+        let mls_chat_router =
+            Router::new().route("/xrpc/blue.catbird.mlsChat.testPolicy", post(consume_body));
+        let app = merge_application_routers(
+            Router::new(),
+            mls_chat_router,
+            Router::new(),
+            lazy_test_pool(),
+            test_ingress_policy(),
+        );
+        let body_was_polled = Arc::new(AtomicBool::new(false));
+        let body_was_polled_by_stream = body_was_polled.clone();
+        let body = Body::from_stream(futures::stream::once(async move {
+            body_was_polled_by_stream.store(true, Ordering::SeqCst);
+            Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(b"{}"))
+        }));
+
+        let response = app
+            .oneshot(
+                Request::post("/xrpc/blue.catbird.mlsChat.testPolicy")
+                    .body(body)
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(body_was_polled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn route_specific_upload_limit_reaches_idempotency_above_default() {
+        let mls_chat_router = Router::new().route(
+            BLOB_UPLOAD_PATH,
+            post(consume_body).layer(DefaultBodyLimit::max(11 * 1024 * 1024)),
+        );
+        let app = merge_application_routers(
+            Router::new(),
+            mls_chat_router,
+            Router::new(),
+            lazy_test_pool(),
+            test_ingress_policy(),
+        );
+
+        let response = app
+            .oneshot(
+                Request::post(BLOB_UPLOAD_PATH)
+                    .body(Body::from(vec![0_u8; 4 * 1024 * 1024 + 1]))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn valid_large_mls_wire_body_is_not_rejected_by_default_limit() {
+        let path = "/xrpc/blue.catbird.mlsChat.sendMessage";
+        let mls_chat_router = Router::new().route(path, post(consume_body));
+        let app = merge_application_routers(
+            Router::new(),
+            mls_chat_router,
+            Router::new(),
+            lazy_test_pool(),
+            test_ingress_policy(),
+        );
+
+        let response = app
+            .oneshot(
+                Request::post(path)
+                    .body(Body::from(vec![0_u8; DEFAULT_REQUEST_BODY_LIMIT_BYTES + 1]))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        // A 413 here would prove the shared body limit still breaks the
+        // established MLS wire contract. Missing idempotency remains valid.
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn large_mls_route_still_rejects_above_its_wire_budget() {
+        let path = "/xrpc/blue.catbird.mlsChat.sendMessage";
+        let mls_chat_router = Router::new().route(path, post(consume_body));
+        let app = merge_application_routers(
+            Router::new(),
+            mls_chat_router,
+            Router::new(),
+            lazy_test_pool(),
+            test_ingress_policy(),
+        );
+        let body_length = SINGLE_MLS_ARTIFACT_BODY_LIMIT_BYTES + 1;
+
+        let response = app
+            .oneshot(
+                Request::post(path)
+                    .header(axum::http::header::CONTENT_LENGTH, body_length)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn metadata_route_uses_narrower_body_limit_before_idempotency() {
+        let mls_chat_router = Router::new().route(GROUP_METADATA_PATH, post(consume_body));
+        let app = merge_application_routers(
+            Router::new(),
+            mls_chat_router,
+            Router::new(),
+            lazy_test_pool(),
+            test_ingress_policy(),
+        );
+
+        let response = app
+            .oneshot(
+                Request::post(GROUP_METADATA_PATH)
+                    .body(Body::from(vec![0_u8; GROUP_METADATA_BODY_LIMIT_BYTES + 1]))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn recovery_mode_cannot_bypass_ingress_budget_or_poll_body() {
+        let path = "/xrpc/blue.catbird.mlsChat.publishKeyPackages";
+        let mls_chat_router = Router::new().route(path, post(consume_body));
+        let exhausted_budget = Arc::new(Semaphore::new(1));
+        let _held = exhausted_budget
+            .clone()
+            .try_acquire_owned()
+            .expect("reserve test budget");
+        let app = merge_application_routers(
+            Router::new(),
+            mls_chat_router,
+            Router::new(),
+            lazy_test_pool(),
+            IngressBodyPolicy::new(exhausted_budget, Duration::from_secs(1)),
+        );
+        let body_was_polled = Arc::new(AtomicBool::new(false));
+        let body_was_polled_by_stream = body_was_polled.clone();
+        let body = Body::from_stream(futures::stream::once(async move {
+            body_was_polled_by_stream.store(true, Ordering::SeqCst);
+            Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(b"{}"))
+        }));
+
+        let response = app
+            .oneshot(
+                Request::post(path)
+                    .header(middleware::rate_limit::RECOVERY_MODE_HEADER, "true")
+                    .body(body)
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!body_was_polled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn bodyless_methods_bypass_exhausted_budget_and_body_buffering() {
+        let exhausted_budget = Arc::new(Semaphore::new(1));
+        let _held = exhausted_budget
+            .clone()
+            .try_acquire_owned()
+            .expect("reserve test budget");
+        let safe_routes = get(|| async { StatusCode::OK })
+            .head(|| async { StatusCode::OK })
+            .options(|| async { StatusCode::NO_CONTENT });
+        let app = merge_application_routers(
+            Router::new().route("/safe", safe_routes),
+            Router::new(),
+            Router::new(),
+            lazy_test_pool(),
+            IngressBodyPolicy::new(exhausted_budget, Duration::from_millis(20)),
+        );
+
+        for (method, expected) in [
+            (Method::GET, StatusCode::OK),
+            (Method::HEAD, StatusCode::OK),
+            (Method::OPTIONS, StatusCode::NO_CONTENT),
+        ] {
+            let pending_body = Body::from_stream(futures::stream::pending::<
+                Result<Bytes, std::convert::Infallible>,
+            >());
+            let response = tokio::time::timeout(
+                Duration::from_secs(1),
+                app.clone().oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri("/safe")
+                        .body(pending_body)
+                        .expect("request"),
+                ),
+            )
+            .await
+            .expect("bodyless method must not poll a pending body")
+            .expect("response");
+
+            assert_eq!(response.status(), expected, "{method}");
+        }
+    }
+
+    #[tokio::test]
+    async fn progressing_body_may_exceed_one_idle_window_in_total() {
+        let path = "/xrpc/blue.catbird.mlsChat.beginDeviceAuthBinding";
+        let app = merge_application_routers(
+            Router::new(),
+            Router::new().route(path, post(consume_body)),
+            Router::new(),
+            lazy_test_pool(),
+            IngressBodyPolicy::new(
+                Arc::new(Semaphore::new(INGRESS_BODY_BUDGET_MIB)),
+                Duration::from_millis(100),
+            ),
+        );
+        let body = Body::from_stream(futures::stream::unfold(0_u8, |index| async move {
+            if index == 4 {
+                None
+            } else {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                Some((
+                    Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(b"x")),
+                    index + 1,
+                ))
+            }
+        }));
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            app.oneshot(Request::post(path).body(body).expect("request")),
+        )
+        .await
+        .expect("progressing body must finish")
+        .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn empty_frames_do_not_reset_idle_timeout() {
+        let path = "/xrpc/blue.catbird.mlsChat.beginDeviceAuthBinding";
+        let budget = Arc::new(Semaphore::new(4));
+        let app = merge_application_routers(
+            Router::new(),
+            Router::new().route(path, post(consume_body)),
+            Router::new(),
+            lazy_test_pool(),
+            IngressBodyPolicy::with_timeouts(
+                budget.clone(),
+                Duration::from_millis(60),
+                Duration::from_millis(500),
+            ),
+        );
+        let body = Body::from_stream(futures::stream::unfold((), |_| async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Some((Ok::<Bytes, std::convert::Infallible>(Bytes::new()), ()))
+        }));
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            app.oneshot(Request::post(path).body(body).expect("request")),
+        )
+        .await
+        .expect("empty-frame stream must hit idle timeout")
+        .expect("response");
+
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(budget.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn progress_trickle_hits_total_timeout_and_releases_budget() {
+        let path = "/xrpc/blue.catbird.mlsChat.beginDeviceAuthBinding";
+        let budget = Arc::new(Semaphore::new(4));
+        let app = merge_application_routers(
+            Router::new().route("/normal", get(|| async { StatusCode::OK })),
+            Router::new().route(path, post(consume_body)),
+            Router::new(),
+            lazy_test_pool(),
+            IngressBodyPolicy::with_timeouts(
+                budget.clone(),
+                Duration::from_millis(100),
+                Duration::from_millis(130),
+            ),
+        );
+        let body = Body::from_stream(futures::stream::unfold((), |_| async {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            Some((
+                Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(b"x")),
+                (),
+            ))
+        }));
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            app.clone()
+                .oneshot(Request::post(path).body(body).expect("request")),
+        )
+        .await
+        .expect("trickle stream must hit total timeout")
+        .expect("response");
+
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(budget.available_permits(), 4);
+
+        let normal = app
+            .oneshot(
+                Request::get("/normal")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(normal.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn timed_out_body_releases_ingress_budget_for_later_request() {
+        let budget = Arc::new(Semaphore::new(
+            DEFAULT_REQUEST_BODY_LIMIT_BYTES / 1024 / 1024,
+        ));
+        let policy = IngressBodyPolicy::new(budget.clone(), Duration::from_millis(20));
+        let app = merge_application_routers(
+            Router::new().route("/normal", get(|| async { StatusCode::OK })),
+            Router::new().route("/slow", post(consume_body)),
+            Router::new(),
+            lazy_test_pool(),
+            policy,
+        );
+        let stalled_body = Body::from_stream(futures::stream::pending::<
+            Result<Bytes, std::convert::Infallible>,
+        >());
+
+        let timed_out = tokio::time::timeout(
+            Duration::from_secs(1),
+            app.clone()
+                .oneshot(Request::post("/slow").body(stalled_body).expect("request")),
+        )
+        .await
+        .expect("body deadline must complete the request")
+        .expect("response");
+
+        assert_eq!(timed_out.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(budget.available_permits(), 4);
+
+        let normal = app
+            .oneshot(
+                Request::get("/normal")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(normal.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn buffered_body_replaces_stale_framing_headers() {
+        let app = merge_application_routers(
+            Router::new(),
+            Router::new().route("/normalized", post(require_normalized_framing)),
+            Router::new(),
+            lazy_test_pool(),
+            test_ingress_policy(),
+        );
+
+        let response = app
+            .oneshot(
+                Request::post("/normalized")
+                    .header(axum::http::header::CONTENT_LENGTH, "99")
+                    .header(axum::http::header::TRANSFER_ENCODING, "chunked")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
 }

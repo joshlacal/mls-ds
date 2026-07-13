@@ -1013,7 +1013,7 @@ fn canonical_valid_did(value: &str) -> Option<&str> {
 
 /// Bind the authenticated principal to the verified JWT issuer unless that
 /// issuer is explicitly configured as a trusted delegating gateway.
-fn resolve_authenticated_principal(
+pub(crate) fn resolve_authenticated_principal(
     claims: &AtProtoClaims,
     trusted_gateway_dids: Option<&str>,
 ) -> Result<String, AuthError> {
