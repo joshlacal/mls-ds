@@ -22,6 +22,11 @@ use tracing::debug;
 
 use crate::identity::{canonical_did, did_web_document_url};
 
+// ADR-016 remains endpoint-opt-in during observe/enroll rollout. Keeping the
+// foundation under auth prevents it from becoming implicit transition policy.
+#[path = "auth_device.rs"]
+pub mod device_auth;
+
 /// Authentication errors
 #[derive(Debug, Error)]
 pub enum AuthError {
@@ -235,6 +240,25 @@ pub struct CachedDidDoc {
 pub struct AuthUser {
     pub did: String,
     pub claims: AtProtoClaims,
+}
+
+/// Opaque exact bearer artifact produced only after `AuthMiddleware` accepts
+/// the token signature and standard claims. Debug output never exposes it.
+#[derive(Clone)]
+pub struct VerifiedGatewayBearer {
+    claims: AtProtoClaims,
+    token: String,
+    effective_user_did: String,
+    delegated_gateway: bool,
+}
+
+impl std::fmt::Debug for VerifiedGatewayBearer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VerifiedGatewayBearer")
+            .field("issuer", &crate::crypto::redact_for_log(&self.claims.iss))
+            .field("token", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Authentication middleware state
@@ -1068,6 +1092,12 @@ where
 
         // Verify JWT and extract claims
         let claims = middleware.verify_jwt(token).await?;
+        parts
+            .extensions
+            .insert(device_auth::VerifiedRequestTarget::from_request_parts(
+                &parts.method,
+                &parts.uri,
+            ));
 
         // Enforce lxm/jti + shared replay store across all authenticated XRPC endpoints.
         let endpoint = parts.uri.path();
@@ -1110,6 +1140,13 @@ where
 
         let trusted_gateway_dids = std::env::var("TRUSTED_GATEWAY_DIDS").ok();
         let user_did = resolve_authenticated_principal(&claims, trusted_gateway_dids.as_deref())?;
+        let delegated_gateway = canonical_did(&claims.iss) != user_did;
+        parts.extensions.insert(VerifiedGatewayBearer {
+            claims: claims.clone(),
+            token: token.to_string(),
+            effective_user_did: user_did.clone(),
+            delegated_gateway,
+        });
 
         debug!(
             "Authenticated request from DID: {} (issuer: {})",
