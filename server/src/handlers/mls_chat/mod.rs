@@ -2,6 +2,7 @@
 // These are thin adapters that delegate to existing handler logic
 
 // Identity & Devices
+pub mod device_auth_binding;
 pub mod get_key_package_status;
 pub mod get_key_packages;
 pub mod get_pending_devices;
@@ -62,6 +63,7 @@ pub mod get_subscription_ticket;
 pub mod request_failover;
 
 // Re-exports: Identity & Devices
+pub use device_auth_binding::{begin_device_auth_binding, complete_device_auth_binding};
 pub use get_key_package_status::get_key_package_status;
 pub use get_key_packages::get_key_packages;
 pub use get_pending_devices::get_pending_devices;

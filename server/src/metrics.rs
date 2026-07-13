@@ -166,6 +166,10 @@ impl MetricsRecorder {
             "key_package_enumeration_suspected_total",
             "Total getKeyPackages calls flagged by the per-caller unique-target-DID cardinality detector (N26 detection half)"
         );
+        metrics::describe_counter!(
+            "device_auth_binding_requests_total",
+            "Device-auth binding requests by closed endpoint and outcome labels"
+        );
 
         Self { handle }
     }
@@ -554,6 +558,62 @@ pub fn record_key_package_last_resort_use() {
 #[allow(dead_code)]
 pub fn record_key_package_enumeration_suspected() {
     metrics::counter!("key_package_enumeration_suspected_total", 1);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceAuthMetricEndpoint {
+    Begin,
+    Complete,
+}
+
+impl DeviceAuthMetricEndpoint {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Begin => "begin",
+            Self::Complete => "complete",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceAuthMetricOutcome {
+    Success,
+    WouldDeny,
+    Unauthorized,
+    InvalidInput,
+    NotFound,
+    Conflict,
+    Expired,
+    InvalidSignature,
+    Unavailable,
+}
+
+impl DeviceAuthMetricOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::WouldDeny => "would_deny",
+            Self::Unauthorized => "unauthorized",
+            Self::InvalidInput => "invalid_input",
+            Self::NotFound => "not_found",
+            Self::Conflict => "conflict",
+            Self::Expired => "expired",
+            Self::InvalidSignature => "invalid_signature",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+pub fn record_device_auth_binding(
+    endpoint: DeviceAuthMetricEndpoint,
+    outcome: DeviceAuthMetricOutcome,
+) {
+    metrics::counter!(
+        "device_auth_binding_requests_total",
+        1,
+        "endpoint" => endpoint.as_str(),
+        "outcome" => outcome.as_str()
+    );
 }
 
 #[cfg(test)]

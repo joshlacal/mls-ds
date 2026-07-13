@@ -1052,6 +1052,27 @@ pub(crate) fn resolve_authenticated_principal(
     }
 }
 
+fn resolve_and_check_endpoint_rate_limit(
+    limiter: &crate::middleware::rate_limit::DidRateLimiter,
+    claims: &AtProtoClaims,
+    trusted_gateway_dids: Option<&str>,
+    endpoint: &str,
+) -> Result<String, AuthError> {
+    let user_did = resolve_authenticated_principal(claims, trusted_gateway_dids)?;
+    if let Err(retry_after) = limiter.check_did_limit(&user_did, endpoint) {
+        tracing::warn!(
+            did = %crate::crypto::redact_for_log(&user_did),
+            endpoint = endpoint,
+            retry_after = retry_after,
+            "DID rate limit exceeded for endpoint"
+        );
+        return Err(AuthError::RateLimitExceeded {
+            retry_after_secs: retry_after,
+        });
+    }
+    Ok(user_did)
+}
+
 /// Axum extractor for authenticated requests
 impl<S> FromRequestParts<S> for AuthUser
 where
@@ -1122,24 +1143,17 @@ where
         // Check rate limit
         middleware.check_rate_limit(&issuer_for_limits)?;
 
-        // Check per-DID endpoint-specific rate limit
+        // Resolve trusted delegation before the endpoint-specific limiter so
+        // gateway users receive independent buckets. The issuer-scoped
+        // limiter above remains as the aggregate gateway abuse boundary.
         let endpoint = parts.uri.path();
-        if let Err(retry_after) = crate::middleware::rate_limit::DID_RATE_LIMITER
-            .check_did_limit(&issuer_for_limits, endpoint)
-        {
-            tracing::warn!(
-                did = %crate::crypto::redact_for_log(&issuer_for_limits),
-                endpoint = endpoint,
-                retry_after = retry_after,
-                "DID rate limit exceeded for endpoint"
-            );
-            return Err(AuthError::RateLimitExceeded {
-                retry_after_secs: retry_after,
-            });
-        }
-
         let trusted_gateway_dids = std::env::var("TRUSTED_GATEWAY_DIDS").ok();
-        let user_did = resolve_authenticated_principal(&claims, trusted_gateway_dids.as_deref())?;
+        let user_did = resolve_and_check_endpoint_rate_limit(
+            &crate::middleware::rate_limit::DID_RATE_LIMITER,
+            &claims,
+            trusted_gateway_dids.as_deref(),
+            endpoint,
+        )?;
         let delegated_gateway = canonical_did(&claims.iss) != user_did;
         parts.extensions.insert(VerifiedGatewayBearer {
             claims: claims.clone(),
@@ -1374,6 +1388,38 @@ mod tests {
             )
             .unwrap(),
             "did:plc:alice"
+        );
+    }
+
+    #[test]
+    fn delegated_subjects_have_independent_endpoint_rate_limits() {
+        let limiter = crate::middleware::rate_limit::DidRateLimiter::new();
+        let endpoint = "/xrpc/blue.catbird.mlsChat.beginDeviceAuthBinding";
+        let trusted_gateway = Some("did:web:api.catbird.blue");
+        let alice = claims("did:web:api.catbird.blue", Some("did:plc:alice"));
+        let bob = claims("did:web:api.catbird.blue", Some("did:plc:bob"));
+
+        let mut alice_exhausted = false;
+        for _ in 0..1_000 {
+            match resolve_and_check_endpoint_rate_limit(&limiter, &alice, trusted_gateway, endpoint)
+            {
+                Ok(principal) => assert_eq!(principal, "did:plc:alice"),
+                Err(AuthError::RateLimitExceeded { .. }) => {
+                    alice_exhausted = true;
+                    break;
+                }
+                Err(error) => panic!("unexpected Alice error: {error}"),
+            }
+        }
+        assert!(
+            alice_exhausted,
+            "Alice must exhaust her own endpoint bucket"
+        );
+
+        assert_eq!(
+            resolve_and_check_endpoint_rate_limit(&limiter, &bob, trusted_gateway, endpoint,)
+                .expect("Bob has an independent endpoint bucket"),
+            "did:plc:bob"
         );
     }
 
