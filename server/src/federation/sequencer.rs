@@ -25,6 +25,16 @@ pub struct Sequencer {
     receipt_signer: Option<ReceiptSigner>,
 }
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum LocalReceiptError {
+    #[error("resolved sequencer is not this delivery service")]
+    WrongSequencer,
+    #[error("local receipt signer is unavailable")]
+    SignerUnavailable,
+    #[error("receipt signer identity is not the canonical resolved sequencer")]
+    SignerIdentityMismatch,
+}
+
 impl Sequencer {
     pub fn new(pool: PgPool, self_did: String) -> Self {
         Self {
@@ -38,6 +48,30 @@ impl Sequencer {
     pub fn with_receipt_signer(mut self, signer: Option<ReceiptSigner>) -> Self {
         self.receipt_signer = signer;
         self
+    }
+
+    /// Issue a receipt only when the resolved authority names this delivery
+    /// service and a production signing key is available.
+    pub fn issue_local_receipt(
+        &self,
+        convo_id: &str,
+        epoch: i32,
+        sequencer_term: u64,
+        commit_ciphertext: &[u8],
+        expected_sequencer_did: &str,
+    ) -> Result<SequencerReceipt, LocalReceiptError> {
+        if canonical_did(expected_sequencer_did) != canonical_did(&self.self_did) {
+            return Err(LocalReceiptError::WrongSequencer);
+        }
+        let receipt = self
+            .receipt_signer
+            .as_ref()
+            .map(|signer| signer.sign_receipt(convo_id, epoch, sequencer_term, commit_ciphertext))
+            .ok_or(LocalReceiptError::SignerUnavailable)?;
+        if receipt.sequencer_did != canonical_did(expected_sequencer_did) {
+            return Err(LocalReceiptError::SignerIdentityMismatch);
+        }
+        Ok(receipt)
     }
 
     /// Check if this DS is the sequencer for a conversation.
@@ -186,5 +220,90 @@ impl Sequencer {
 
     pub fn self_did(&self) -> &str {
         &self.self_did
+    }
+}
+
+#[cfg(test)]
+mod local_receipt_tests {
+    use p256::ecdsa::SigningKey;
+    use rand::rngs::OsRng;
+
+    use super::*;
+
+    fn sequencer(signer: Option<ReceiptSigner>) -> Sequencer {
+        Sequencer::new(
+            PgPool::connect_lazy("postgres://localhost/unused").unwrap(),
+            "did:web:ds.example.com".to_string(),
+        )
+        .with_receipt_signer(signer)
+    }
+
+    #[tokio::test]
+    async fn local_receipt_requires_matching_canonical_sequencer_did() {
+        let signer = ReceiptSigner::new(
+            SigningKey::random(&mut OsRng),
+            "did:web:ds.example.com".to_string(),
+        );
+        assert!(matches!(
+            sequencer(Some(signer)).issue_local_receipt(
+                "convo-1",
+                2,
+                7,
+                b"commit",
+                "did:web:attacker.example"
+            ),
+            Err(LocalReceiptError::WrongSequencer)
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_receipt_requires_configured_signer() {
+        assert!(matches!(
+            sequencer(None).issue_local_receipt(
+                "convo-1",
+                2,
+                7,
+                b"commit",
+                "did:web:ds.example.com"
+            ),
+            Err(LocalReceiptError::SignerUnavailable)
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_receipt_rejects_noncanonical_signer_identity() {
+        let signer = ReceiptSigner::new(
+            SigningKey::random(&mut OsRng),
+            "did:web:ds.example.com#mls".to_string(),
+        );
+        assert!(matches!(
+            sequencer(Some(signer)).issue_local_receipt(
+                "convo-1",
+                2,
+                7,
+                b"commit",
+                "did:web:ds.example.com"
+            ),
+            Err(LocalReceiptError::SignerIdentityMismatch)
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_receipt_is_bound_to_commit_and_authority() {
+        let signer = ReceiptSigner::new(
+            SigningKey::random(&mut OsRng),
+            "did:web:ds.example.com".to_string(),
+        );
+        let receipt = sequencer(Some(signer))
+            .issue_local_receipt("convo-1", 2, 7, b"commit", "did:web:ds.example.com")
+            .expect("local receipt");
+        assert_eq!(receipt.convo_id, "convo-1");
+        assert_eq!(receipt.epoch, 2);
+        assert_eq!(receipt.sequencer_term, 7);
+        assert_eq!(
+            receipt.commit_hash,
+            super::super::receipt::hash_commit(b"commit")
+        );
+        assert_eq!(receipt.sequencer_did, "did:web:ds.example.com");
     }
 }
