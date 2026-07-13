@@ -1,0 +1,62 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.mlsChat.beginDeviceAuthBinding",
+  "description": "Begin proof-of-possession binding between an authenticated session and an owned MLS device registration.",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Returns a short-lived single-use canonical challenge. The caller signs the exact challenge bytes with the registered MLS device identity key and completes the binding under the same DPoP key.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["deviceId"],
+          "properties": {
+            "deviceId": {
+              "type": "string",
+              "description": "Server-issued device registration UUID.",
+              "minLength": 1,
+              "maxLength": 64
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["challengeId", "challenge", "expiresAt", "bindingVersion"],
+          "properties": {
+            "challengeId": {
+              "type": "string",
+              "description": "Opaque single-use challenge identifier.",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "challenge": {
+              "type": "bytes",
+              "description": "Canonical versioned challenge bytes to sign without transformation.",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            "expiresAt": {
+              "type": "string",
+              "format": "datetime"
+            },
+            "bindingVersion": {
+              "type": "integer",
+              "const": 1
+            }
+          }
+        }
+      },
+      "errors": [
+        {"name": "DpopRequired"},
+        {"name": "DeviceNotFound"},
+        {"name": "Unauthorized"},
+        {"name": "InvalidDeviceId"},
+        {"name": "BindingUnavailable"}
+      ]
+    }
+  }
+}
