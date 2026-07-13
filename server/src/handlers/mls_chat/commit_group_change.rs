@@ -422,6 +422,7 @@ fn invalidate_welcome_response(rows_affected: u64) -> CommitGroupChangeOutput<'s
         confirmation_tag: None,
         new_epoch: None,
         pending_additions: None,
+        receipt: None,
         rejoined_at: None,
         extra_data: Default::default(),
     }
@@ -549,6 +550,7 @@ pub async fn commit_group_change(
         confirmation_tag: None,
         new_epoch: None,
         pending_additions: None,
+        receipt: None,
         rejoined_at: None,
         extra_data: Default::default(),
     };
@@ -595,6 +597,7 @@ pub async fn commit_group_change(
                         claimed_addition: None,
                         confirmation_tag: None,
                         pending_additions: None,
+                        receipt: None,
                         rejoined_at: None,
                         extra_data: Default::default(),
                     })
@@ -1326,6 +1329,7 @@ pub async fn commit_group_change(
                 confirmation_tag: add_confirmation_tag.map(bytes::Bytes::from),
                 claimed_addition: None,
                 pending_additions: None,
+                receipt: None,
                 rejoined_at: None,
                 extra_data: Default::default(),
             })
@@ -1559,6 +1563,7 @@ pub async fn commit_group_change(
                         claimed_addition: None,
                         confirmation_tag: None,
                         pending_additions: None,
+                        receipt: None,
                         rejoined_at: None,
                         extra_data: Default::default(),
                     })
@@ -2161,6 +2166,7 @@ pub async fn commit_group_change(
                 confirmation_tag: ec_confirmation_tag.map(bytes::Bytes::from),
                 claimed_addition: None,
                 pending_additions: None,
+                receipt: None,
                 rejoined_at: None,
                 extra_data: Default::default(),
             })
@@ -2369,6 +2375,7 @@ pub async fn commit_group_change(
                 claimed_addition: None,
                 confirmation_tag: None,
                 new_epoch: None,
+                receipt: None,
                 rejoined_at: None,
                 extra_data: Default::default(),
             })
@@ -2600,6 +2607,7 @@ pub async fn commit_group_change(
                         confirmation_tag: None,
                         new_epoch: None,
                         pending_additions: None,
+                        receipt: None,
                         rejoined_at: None,
                         extra_data: Default::default(),
                     })
@@ -2613,6 +2621,7 @@ pub async fn commit_group_change(
                         confirmation_tag: None,
                         new_epoch: None,
                         pending_additions: None,
+                        receipt: None,
                         rejoined_at: None,
                         extra_data: Default::default(),
                     })
@@ -2703,6 +2712,7 @@ pub async fn commit_group_change(
                 confirmation_tag: None,
                 new_epoch: None,
                 pending_additions: None,
+                receipt: None,
                 rejoined_at: None,
                 extra_data: Default::default(),
             })
@@ -2744,6 +2754,7 @@ pub async fn commit_group_change(
                         claimed_addition: None,
                         confirmation_tag: None,
                         pending_additions: None,
+                        receipt: None,
                         rejoined_at: None,
                         extra_data: Default::default(),
                     })
@@ -2884,6 +2895,7 @@ pub async fn commit_group_change(
                     claimed_addition: None,
                     confirmation_tag: None,
                     pending_additions: None,
+                    receipt: None,
                     rejoined_at: None,
                     extra_data: Default::default(),
                 })
@@ -3255,6 +3267,7 @@ pub async fn commit_group_change(
                 claimed_addition: None,
                 confirmation_tag: None,
                 pending_additions: None,
+                receipt: None,
                 rejoined_at: None,
                 extra_data: Default::default(),
             })
@@ -3299,6 +3312,7 @@ pub async fn commit_group_change(
                         claimed_addition: None,
                         confirmation_tag: None,
                         pending_additions: None,
+                        receipt: None,
                         rejoined_at: None,
                         extra_data: Default::default(),
                     })
@@ -3628,6 +3642,7 @@ pub async fn commit_group_change(
                 claimed_addition: None,
                 confirmation_tag: None,
                 pending_additions: None,
+                receipt: None,
                 rejoined_at: None,
                 extra_data: Default::default(),
             })
@@ -3854,6 +3869,7 @@ mod tests {
             claimed_addition: None,
             confirmation_tag: None,
             pending_additions: None,
+            receipt: None,
             rejoined_at: None,
             extra_data: Default::default(),
         };
@@ -3876,6 +3892,7 @@ mod tests {
             claimed_addition: None,
             confirmation_tag: None,
             pending_additions: None,
+            receipt: None,
             rejoined_at: None,
             extra_data: Default::default(),
         };
