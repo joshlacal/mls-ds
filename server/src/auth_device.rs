@@ -9,7 +9,10 @@ use chrono::{DateTime, Duration, Utc};
 use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey as Ed25519Key};
 use p256::ecdsa::{signature::Verifier, Signature as P256Signature, VerifyingKey as P256Key};
 use rand::RngCore;
-use serde::Deserialize;
+use serde::{
+    de::{self, IgnoredAny, MapAccess, Visitor},
+    Deserialize, Deserializer,
+};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Transaction};
 use thiserror::Error;
@@ -47,8 +50,14 @@ pub enum DeviceAuthError {
     Replay,
     #[error("device registration is absent, inactive, rekeyed, or rebound")]
     RegistryMismatch,
-    #[error("binding challenge is absent, expired, consumed, or mismatched")]
-    ChallengeMismatch,
+    #[error("binding challenge was not found")]
+    ChallengeNotFound,
+    #[error("binding challenge has expired")]
+    ChallengeExpired,
+    #[error("binding challenge was already used")]
+    ChallengeAlreadyUsed,
+    #[error("binding challenge does not match the authenticated device")]
+    BindingMismatch,
     #[error("MLS identity signature is invalid")]
     InvalidIdentitySignature,
     #[error("device authentication storage failure: {0}")]
@@ -62,13 +71,76 @@ struct DpopHeader {
     jwk: P256Jwk,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
 struct P256Jwk {
     kty: String,
     crv: String,
     x: String,
     y: String,
+}
+
+impl<'de> Deserialize<'de> for P256Jwk {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct P256JwkVisitor;
+
+        impl<'de> Visitor<'de> for P256JwkVisitor {
+            type Value = P256Jwk;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an RFC 7517 public EC JWK")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut kty = None;
+                let mut crv = None;
+                let mut x = None;
+                let mut y = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "kty" => set_once(&mut kty, map.next_value()?, "kty")?,
+                        "crv" => set_once(&mut crv, map.next_value()?, "crv")?,
+                        "x" => set_once(&mut x, map.next_value()?, "x")?,
+                        "y" => set_once(&mut y, map.next_value()?, "y")?,
+                        // Reject private material for every standard JWK key
+                        // family, even though only public P-256 is accepted.
+                        "d" | "k" | "p" | "q" | "dp" | "dq" | "qi" | "oth" => {
+                            return Err(de::Error::custom("private JWK material is forbidden"));
+                        }
+                        // RFC 7517 public metadata (kid/use/key_ops/alg/x5*) and
+                        // future public members do not affect the RFC 7638
+                        // thumbprint and are intentionally ignored.
+                        _ => {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(P256Jwk {
+                    kty: kty.ok_or_else(|| de::Error::missing_field("kty"))?,
+                    crv: crv.ok_or_else(|| de::Error::missing_field("crv"))?,
+                    x: x.ok_or_else(|| de::Error::missing_field("x"))?,
+                    y: y.ok_or_else(|| de::Error::missing_field("y"))?,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(P256JwkVisitor)
+    }
+}
+
+fn set_once<E>(slot: &mut Option<String>, value: String, field: &'static str) -> Result<(), E>
+where
+    E: de::Error,
+{
+    if slot.replace(value).is_some() {
+        return Err(E::duplicate_field(field));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -115,6 +187,7 @@ pub struct VerifiedEnrollmentRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedRequestTarget {
     method: String,
+    path: String,
     path_and_query: String,
 }
 
@@ -122,6 +195,7 @@ impl VerifiedRequestTarget {
     pub(super) fn from_request_parts(method: &http::Method, uri: &http::Uri) -> Self {
         Self {
             method: method.as_str().to_string(),
+            path: uri.path().to_string(),
             path_and_query: uri
                 .path_and_query()
                 .map(|value| value.as_str())
@@ -130,28 +204,42 @@ impl VerifiedRequestTarget {
         }
     }
 
-    fn absolute_uri(&self) -> Result<String, DeviceAuthError> {
+    fn dpop_uri(&self) -> Result<String, DeviceAuthError> {
         let endpoint = crate::identity::self_endpoint();
-        self.absolute_uri_for_origin(&endpoint)
+        self.dpop_uri_for_origin(&endpoint)
     }
 
-    fn absolute_uri_for_origin(&self, endpoint: &str) -> Result<String, DeviceAuthError> {
+    fn dpop_uri_for_origin(&self, endpoint: &str) -> Result<String, DeviceAuthError> {
         let parsed = Url::parse(endpoint).map_err(|_| DeviceAuthError::RequestTargetMismatch)?;
         if parsed.scheme() != "https"
             || parsed.username() != ""
             || parsed.password().is_some()
             || parsed.query().is_some()
             || parsed.fragment().is_some()
-            || parsed.path() != "/"
             || parsed.host_str().is_none()
-            || !self.path_and_query.starts_with('/')
+            || !self.path.starts_with('/')
         {
             return Err(DeviceAuthError::RequestTargetMismatch);
         }
+        let base_path = parsed.path().trim_end_matches('/');
+        let request_already_has_base = !base_path.is_empty()
+            && (self.path == base_path
+                || self
+                    .path
+                    .strip_prefix(base_path)
+                    .is_some_and(|suffix| suffix.starts_with('/')));
+        if request_already_has_base {
+            return Ok(format!(
+                "{}{}",
+                parsed.origin().ascii_serialization(),
+                self.path
+            ));
+        }
         Ok(format!(
-            "{}{}",
+            "{}{}{}",
             parsed.origin().ascii_serialization(),
-            self.path_and_query
+            base_path,
+            self.path
         ))
     }
 }
@@ -228,6 +316,12 @@ impl BindingChallenge {
     }
 }
 
+/// Parse a wire challenge identifier without exposing UUID parser details.
+/// Handlers can map malformed values to the declared not-found outcome.
+pub fn parse_binding_challenge_id(value: &str) -> Result<Uuid, DeviceAuthError> {
+    Uuid::parse_str(value).map_err(|_| DeviceAuthError::ChallengeNotFound)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompletedBinding {
     pub device_id: String,
@@ -253,14 +347,19 @@ fn valid_jkt(value: &str) -> bool {
 }
 
 fn canonical_did_claim(value: &str) -> Option<&str> {
-    if value.trim() != value || value.contains('#') || value.chars().any(char::is_whitespace) {
+    if value.trim() != value || value.chars().any(char::is_whitespace) {
         return None;
     }
-    let mut parts = value.splitn(3, ':');
-    match (parts.next(), parts.next(), parts.next()) {
-        (Some("did"), Some(method), Some(id)) if !method.is_empty() && !id.is_empty() => {
-            Some(value)
+    let did = value.split_once('#').map_or(value, |(did, fragment)| {
+        if fragment.is_empty() || fragment.contains('#') {
+            ""
+        } else {
+            did
         }
+    });
+    let mut parts = did.splitn(3, ':');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("did"), Some(method), Some(id)) if !method.is_empty() && !id.is_empty() => Some(did),
         _ => None,
     }
 }
@@ -279,11 +378,19 @@ fn resolve_gateway_device_claims(
     if !delegated {
         return Err(DeviceAuthError::UntrustedDelegation);
     }
-    let trusted = trusted_gateway_dids
+    let configured_gateways: Option<Vec<&str>> = trusted_gateway_dids
         .into_iter()
         .flat_map(|raw| raw.split(','))
         .map(str::trim)
-        .any(|candidate| Some(candidate) == issuer);
+        .map(canonical_did_claim)
+        .collect();
+    let trusted = configured_gateways
+        .filter(|gateways| !gateways.is_empty())
+        .is_some_and(|gateways| {
+            gateways
+                .into_iter()
+                .any(|candidate| Some(candidate) == issuer)
+        });
     if !trusted {
         return Err(DeviceAuthError::UntrustedDelegation);
     }
@@ -384,6 +491,7 @@ fn validate_exact_uri(uri: &str) -> Result<(), DeviceAuthError> {
     if parsed.scheme() != "https"
         || parsed.username() != ""
         || parsed.password().is_some()
+        || parsed.query().is_some()
         || parsed.fragment().is_some()
         || parsed.host_str().is_none()
     {
@@ -459,7 +567,7 @@ pub async fn verify_gateway_enrollment_request(
     now: DateTime<Utc>,
 ) -> Result<VerifiedEnrollmentRequest, DeviceAuthError> {
     let device = resolve_verified_gateway_device_claims(verified_bearer)?;
-    let uri = request_target.absolute_uri()?;
+    let uri = request_target.dpop_uri()?;
     let validated = validate_dpop(
         proof,
         &verified_bearer.token,
@@ -533,7 +641,7 @@ pub async fn begin_binding(
     let device_id = enrollment.device_id.as_str();
     let dpop_jkt = enrollment.dpop_jkt.as_str();
     if canonical_did_claim(user_did).is_none() || device_id.is_empty() || !valid_jkt(dpop_jkt) {
-        return Err(DeviceAuthError::ChallengeMismatch);
+        return Err(DeviceAuthError::BindingMismatch);
     }
     let exists: Option<bool> = sqlx::query_scalar(
         "SELECT active FROM devices WHERE user_did = $1 AND device_id = $2 AND active",
@@ -559,7 +667,7 @@ pub async fn begin_binding(
     };
     let challenge_bytes = challenge.challenge_bytes();
     if challenge_bytes.is_empty() || challenge_bytes.len() > 512 {
-        return Err(DeviceAuthError::ChallengeMismatch);
+        return Err(DeviceAuthError::BindingMismatch);
     }
     sqlx::query(
         "INSERT INTO device_auth_binding_challenges
@@ -593,15 +701,25 @@ pub async fn complete_binding(
         .begin()
         .await
         .map_err(|e| DeviceAuthError::Storage(e.to_string()))?;
-    // Serialize all completions for one device before locking individual
-    // challenge rows. This avoids cross-challenge deadlocks and ensures the
-    // first valid completion invalidates every competing challenge.
+    // Resolve the challenge owner first, then serialize all completions for
+    // that authoritative device before locking the individual challenge row.
+    // Every completion follows the same lock order, while attacker-supplied
+    // enrollment fields cannot redirect which device row is locked.
+    let challenge_owner: Option<(String, String)> = sqlx::query_as(
+        "SELECT user_did, device_id FROM device_auth_binding_challenges WHERE id = $1",
+    )
+    .bind(challenge_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| DeviceAuthError::Storage(e.to_string()))?;
+    let (challenge_user_did, challenge_device_id) =
+        challenge_owner.ok_or(DeviceAuthError::ChallengeNotFound)?;
     let signature_key_hex: Option<String> = sqlx::query_scalar(
         "SELECT signature_public_key FROM devices
          WHERE user_did = $1 AND device_id = $2 AND active FOR UPDATE",
     )
-    .bind(expected_user_did)
-    .bind(expected_device_id)
+    .bind(&challenge_user_did)
+    .bind(&challenge_device_id)
     .fetch_optional(&mut *tx)
     .await
     .map_err(|e| DeviceAuthError::Storage(e.to_string()))?
@@ -629,20 +747,24 @@ pub async fn complete_binding(
     .await
     .map_err(|e| DeviceAuthError::Storage(e.to_string()))?;
     let (version, user_did, device_id, dpop_jkt, nonce, expires_at, used_at) =
-        row.ok_or(DeviceAuthError::ChallengeMismatch)?;
+        row.ok_or(DeviceAuthError::ChallengeNotFound)?;
     if version != CHALLENGE_VERSION as i16
         || user_did != expected_user_did
         || device_id != expected_device_id
         || dpop_jkt != expected_jkt
         || nonce.len() != 32
-        || used_at.is_some()
-        || expires_at <= now
     {
-        return Err(DeviceAuthError::ChallengeMismatch);
+        return Err(DeviceAuthError::BindingMismatch);
+    }
+    if used_at.is_some() {
+        return Err(DeviceAuthError::ChallengeAlreadyUsed);
+    }
+    if expires_at <= now {
+        return Err(DeviceAuthError::ChallengeExpired);
     }
     let nonce_array: [u8; 32] = nonce
         .try_into()
-        .map_err(|_| DeviceAuthError::ChallengeMismatch)?;
+        .map_err(|_| DeviceAuthError::BindingMismatch)?;
     let challenge = BindingChallenge {
         challenge_id,
         binding_version: version as u16,
@@ -683,7 +805,7 @@ pub async fn complete_binding(
     .await
     .map_err(|e| DeviceAuthError::Storage(e.to_string()))?;
     if consumed.rows_affected() != 1 {
-        return Err(DeviceAuthError::ChallengeMismatch);
+        return Err(DeviceAuthError::ChallengeAlreadyUsed);
     }
     sqlx::query(
         "UPDATE device_auth_binding_challenges SET used_at = $3
@@ -811,9 +933,7 @@ mod tests {
     ) -> VerifiedDeviceRequest {
         let bearer = verified_bearer(gateway, user_did, device_id, dpop_jkt);
         let target = request_target("POST", "/xrpc/blue.catbird.mlsDS.commitGroupChange");
-        let uri = target
-            .absolute_uri_for_origin("https://mls.example")
-            .unwrap();
+        let uri = target.dpop_uri_for_origin("https://mls.example").unwrap();
         let (dpop, computed_jkt) = proof(dpop_key, &bearer.token, "POST", &uri, now, replay_id);
         assert_eq!(computed_jkt, dpop_jkt);
         verify_gateway_device_request(pool, &dpop, &bearer, &target, now)
@@ -900,6 +1020,36 @@ mod tests {
             .unwrap_err(),
             DeviceAuthError::MissingDeviceClaims
         );
+
+        let fragmented = claims(
+            "did:web:nest.example#atproto-signing-key",
+            Some("did:plc:alice"),
+        );
+        let fragmented_token = device_token(
+            "did:web:nest.example#atproto-signing-key",
+            Some("did:plc:alice"),
+            Some("device-a"),
+            Some(&jkt),
+        );
+        assert!(resolve_gateway_device_claims(
+            &fragmented,
+            Some("did:web:other.example, did:web:nest.example#configured-key"),
+            &fragmented_token,
+        )
+        .is_ok());
+        for rejected in [
+            "did:web:nest.example.evil",
+            "did:web:",
+            "did:web:nest.example#",
+            "not-a-did,did:web:other.example",
+            "not-a-did,did:web:nest.example",
+        ] {
+            assert_eq!(
+                resolve_gateway_device_claims(&fragmented, Some(rejected), &fragmented_token)
+                    .unwrap_err(),
+                DeviceAuthError::UntrustedDelegation
+            );
+        }
     }
 
     #[test]
@@ -932,15 +1082,44 @@ mod tests {
         );
         assert_eq!(
             target
-                .absolute_uri_for_origin("https://mls.example:8443")
+                .dpop_uri_for_origin("https://mls.example:8443")
                 .unwrap(),
-            "https://mls.example:8443/xrpc/blue.catbird.mlsDS.commitGroupChange?epoch=7%2F8"
+            "https://mls.example:8443/xrpc/blue.catbird.mlsDS.commitGroupChange"
         );
         assert_eq!(
             target
-                .absolute_uri_for_origin("https://mls.example:443")
+                .dpop_uri_for_origin("https://mls.example:443")
                 .unwrap(),
-            "https://mls.example/xrpc/blue.catbird.mlsDS.commitGroupChange?epoch=7%2F8"
+            "https://mls.example/xrpc/blue.catbird.mlsDS.commitGroupChange"
+        );
+        for endpoint in [
+            "https://mls.example/user/alice",
+            "https://mls.example/user/alice/",
+            "https://mls.example:8443/user/alice/",
+        ] {
+            let expected_origin = if endpoint.contains(":8443") {
+                "https://mls.example:8443"
+            } else {
+                "https://mls.example"
+            };
+            assert_eq!(
+                target.dpop_uri_for_origin(endpoint).unwrap(),
+                format!("{expected_origin}/user/alice/xrpc/blue.catbird.mlsDS.commitGroupChange")
+            );
+        }
+        let already_prefixed = request_target(
+            "POST",
+            "/user/alice/xrpc/blue.catbird.mlsDS.commitGroupChange?epoch=7",
+        );
+        assert_eq!(
+            already_prefixed
+                .dpop_uri_for_origin("https://mls.example/user/alice")
+                .unwrap(),
+            "https://mls.example/user/alice/xrpc/blue.catbird.mlsDS.commitGroupChange"
+        );
+        assert_eq!(
+            target.path_and_query,
+            "/xrpc/blue.catbird.mlsDS.commitGroupChange?epoch=7%2F8"
         );
 
         let request = http::Request::builder()
@@ -953,32 +1132,30 @@ mod tests {
         let (parts, _) = request.into_parts();
         let sealed = VerifiedRequestTarget::from_request_parts(&parts.method, &parts.uri);
         assert_eq!(
-            sealed
-                .absolute_uri_for_origin("https://mls.example")
-                .unwrap(),
-            "https://mls.example/xrpc/real?value=%2F"
+            sealed.dpop_uri_for_origin("https://mls.example").unwrap(),
+            "https://mls.example/xrpc/real"
         );
+        assert_eq!(sealed.path_and_query, "/xrpc/real?value=%2F");
 
         for invalid_origin in [
             "http://mls.example",
             "https://user@mls.example",
-            "https://mls.example/base",
             "https://mls.example?x=1",
             "https://mls.example/#fragment",
         ] {
             assert_eq!(
-                target.absolute_uri_for_origin(invalid_origin).unwrap_err(),
+                target.dpop_uri_for_origin(invalid_origin).unwrap_err(),
                 DeviceAuthError::RequestTargetMismatch
             );
         }
     }
 
     #[test]
-    fn sealed_request_target_rejects_cross_route_and_query_reuse() {
+    fn sealed_request_target_rejects_cross_route_but_rfc9449_htu_ignores_query() {
         let key = P256SigningKey::random(&mut rand::thread_rng());
         let now = Utc::now();
         let token = "gateway-token";
-        let accepted_uri = "https://mls.example/xrpc/route?a=1";
+        let accepted_uri = "https://mls.example/xrpc/route";
         let (compact, jkt) = proof(
             &key,
             token,
@@ -987,16 +1164,47 @@ mod tests {
             now,
             "sealed-target-proof-1234",
         );
-        for path in ["/xrpc/other?a=1", "/xrpc/route?a=2"] {
+        for path in ["/xrpc/route?a=1", "/xrpc/route?a=2"] {
             let target = request_target("POST", path);
-            let uri = target
-                .absolute_uri_for_origin("https://mls.example")
-                .unwrap();
-            assert_eq!(
-                validate_dpop(&compact, token, &target.method, &uri, &jkt, now).unwrap_err(),
-                DeviceAuthError::RequestTargetMismatch
-            );
+            let uri = target.dpop_uri_for_origin("https://mls.example").unwrap();
+            assert!(validate_dpop(&compact, token, &target.method, &uri, &jkt, now).is_ok());
         }
+        let cross_route = request_target("POST", "/xrpc/other?a=1");
+        let cross_route_uri = cross_route
+            .dpop_uri_for_origin("https://mls.example")
+            .unwrap();
+        assert_eq!(
+            validate_dpop(
+                &compact,
+                token,
+                &cross_route.method,
+                &cross_route_uri,
+                &jkt,
+                now,
+            )
+            .unwrap_err(),
+            DeviceAuthError::RequestTargetMismatch
+        );
+        let (query_bearing_proof, query_jkt) = proof(
+            &key,
+            token,
+            "POST",
+            "https://mls.example/xrpc/route?a=1",
+            now,
+            "query-bearing-proof-1234",
+        );
+        assert_eq!(
+            validate_dpop(
+                &query_bearing_proof,
+                token,
+                "POST",
+                "https://mls.example/xrpc/route?a=1",
+                &query_jkt,
+                now,
+            )
+            .unwrap_err(),
+            DeviceAuthError::RequestTargetMismatch
+        );
     }
 
     #[test]
@@ -1107,10 +1315,40 @@ mod tests {
         let point = key.verifying_key().to_encoded_point(false);
         let x = URL_SAFE_NO_PAD.encode(point.x().unwrap());
         let y = URL_SAFE_NO_PAD.encode(point.y().unwrap());
-        assert!(serde_json::from_value::<P256Jwk>(json!({
-            "kty": "EC", "crv": "P-256", "x": x, "y": y, "d": "private-material"
+        let public_with_metadata = serde_json::from_value::<P256Jwk>(json!({
+            "kty": "EC", "crv": "P-256", "x": x, "y": y,
+            "kid": "device-key", "use": "sig", "key_ops": ["verify"],
+            "alg": "ES256", "x5t#S256": "public-certificate-thumbprint",
+            "future-public-member": {"ignored": true}
         }))
-        .is_err());
+        .unwrap();
+        assert!(jwk_key_and_thumbprint(&public_with_metadata).is_ok());
+        for private_member in ["d", "k", "p", "q", "dp", "dq", "qi", "oth"] {
+            let mut value = json!({"kty":"EC", "crv":"P-256", "x":x, "y":y});
+            value
+                .as_object_mut()
+                .unwrap()
+                .insert(private_member.to_string(), json!("private-material"));
+            assert!(
+                serde_json::from_value::<P256Jwk>(value).is_err(),
+                "accepted private JWK member {private_member}"
+            );
+        }
+        for duplicate in ["kty", "crv", "x", "y"] {
+            let duplicate_jwk = match duplicate {
+                "kty" => format!(r#"{{"kty":"EC","kty":"EC","crv":"P-256","x":"{x}","y":"{y}"}}"#),
+                "crv" => {
+                    format!(r#"{{"kty":"EC","crv":"P-256","crv":"P-256","x":"{x}","y":"{y}"}}"#)
+                }
+                "x" => format!(r#"{{"kty":"EC","crv":"P-256","x":"{x}","x":"{x}","y":"{y}"}}"#),
+                "y" => format!(r#"{{"kty":"EC","crv":"P-256","x":"{x}","y":"{y}","y":"{y}"}}"#),
+                _ => unreachable!(),
+            };
+            assert!(
+                serde_json::from_str::<P256Jwk>(&duplicate_jwk).is_err(),
+                "accepted duplicate security-critical JWK member {duplicate}"
+            );
+        }
         assert_eq!(
             decode_canonical_p256_coordinate(&format!("{x}=")).unwrap_err(),
             DeviceAuthError::InvalidJwk
@@ -1164,12 +1402,35 @@ mod tests {
         assert_ne!(bytes, changed.challenge_bytes());
     }
 
+    #[test]
+    fn malformed_wire_challenge_ids_map_to_not_found() {
+        assert_eq!(
+            parse_binding_challenge_id("not-a-uuid").unwrap_err(),
+            DeviceAuthError::ChallengeNotFound
+        );
+        let valid = Uuid::new_v4();
+        assert_eq!(
+            parse_binding_challenge_id(&valid.to_string()).unwrap(),
+            valid
+        );
+    }
+
     #[tokio::test]
     #[ignore = "requires TEST_DATABASE_URL with migration privileges"]
     async fn postgres_challenge_is_single_use_rebinds_and_rolls_back_bad_signature() {
         let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL required");
         let pool = PgPool::connect(&url).await.unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let challenge_device_index: String = sqlx::query_scalar(
+            "SELECT indexdef FROM pg_indexes
+             WHERE schemaname=current_schema()
+               AND tablename='device_auth_binding_challenges'
+               AND indexname='idx_device_auth_challenges_device'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(challenge_device_index.contains("(user_did, device_id)"));
         let suffix = Uuid::new_v4().simple().to_string();
         let user = format!("did:plc:test{suffix}");
         let device = format!("device-{suffix}");
@@ -1185,24 +1446,30 @@ mod tests {
         let jkt_a = URL_SAFE_NO_PAD.encode(Sha256::digest(b"jkt-a"));
         let enrollment_a = enrollment(&user, &device, &jkt_a);
         let challenge = begin_binding(&pool, &enrollment_a, now).await.unwrap();
+        assert_eq!(
+            complete_binding(&pool, &enrollment_a, Uuid::new_v4(), &[0; 64], now)
+                .await
+                .unwrap_err(),
+            DeviceAuthError::ChallengeNotFound
+        );
         for (wrong_user, wrong_device, wrong_jkt, expected) in [
             (
                 "did:plc:other",
                 device.as_str(),
                 jkt_a.as_str(),
-                DeviceAuthError::RegistryMismatch,
+                DeviceAuthError::BindingMismatch,
             ),
             (
                 user.as_str(),
                 "device-other",
                 jkt_a.as_str(),
-                DeviceAuthError::RegistryMismatch,
+                DeviceAuthError::BindingMismatch,
             ),
             (
                 user.as_str(),
                 device.as_str(),
                 "z012345678901234567890123456789012345678901",
-                DeviceAuthError::ChallengeMismatch,
+                DeviceAuthError::BindingMismatch,
             ),
         ] {
             assert_eq!(
@@ -1248,7 +1515,7 @@ mod tests {
             )
             .await
             .unwrap_err(),
-            DeviceAuthError::ChallengeMismatch
+            DeviceAuthError::ChallengeAlreadyUsed
         );
         let jkt_b = URL_SAFE_NO_PAD.encode(Sha256::digest(b"jkt-b"));
         let enrollment_b = enrollment(&user, &device, &jkt_b);
@@ -1289,7 +1556,7 @@ mod tests {
             )
             .await
             .unwrap_err(),
-            DeviceAuthError::ChallengeMismatch
+            DeviceAuthError::ChallengeExpired
         );
 
         let dpop_key = P256SigningKey::random(&mut rand::thread_rng());
@@ -1324,7 +1591,7 @@ mod tests {
         assert_eq!(first.is_ok() as u8 + second.is_ok() as u8, 1);
         assert!(matches!(
             first.err().or_else(|| second.err()),
-            Some(DeviceAuthError::ChallengeMismatch)
+            Some(DeviceAuthError::ChallengeAlreadyUsed)
         ));
 
         let gateway = "did:web:nest.example";

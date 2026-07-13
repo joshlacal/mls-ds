@@ -62,6 +62,9 @@ CREATE INDEX IF NOT EXISTS idx_device_auth_challenges_expiry
     ON device_auth_binding_challenges(expires_at)
     WHERE used_at IS NULL;
 
+CREATE INDEX IF NOT EXISTS idx_device_auth_challenges_device
+    ON device_auth_binding_challenges(user_did, device_id);
+
 CREATE TABLE IF NOT EXISTS device_auth_dpop_replay (
     dpop_jkt TEXT NOT NULL CHECK (dpop_jkt ~ '^[A-Za-z0-9_-]{43}$'),
     replay_id TEXT NOT NULL CHECK (length(replay_id) BETWEEN 16 AND 200),
