@@ -58,6 +58,7 @@ pub mod jacquard_json;
 pub mod jobs;
 pub mod metrics;
 pub mod middleware;
+pub mod mls_group_info_verifier;
 pub mod mls_transition;
 pub mod models;
 pub mod notifications;
