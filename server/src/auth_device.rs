@@ -8,7 +8,6 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Duration, Utc};
 use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey as Ed25519Key};
 use p256::ecdsa::{signature::Verifier, Signature as P256Signature, VerifyingKey as P256Key};
-use rand::RngCore;
 use serde::{
     de::{self, IgnoredAny, MapAccess, Visitor},
     Deserialize, Deserializer,
@@ -23,6 +22,7 @@ use crate::auth::{AtProtoClaims, VerifiedGatewayBearer};
 
 const CHALLENGE_VERSION: u16 = 1;
 const CHALLENGE_TTL_SECONDS: i64 = 300;
+const CHALLENGE_REGISTRY_BINDING_DOMAIN: &[u8] = b"catbird-device-auth-registry-binding-v1";
 const DPOP_MAX_CLOCK_SKEW_SECONDS: i64 = 60;
 const DPOP_REPLAY_TTL_SECONDS: i64 = 120;
 
@@ -632,6 +632,32 @@ pub async fn verify_gateway_device_request(
     })
 }
 
+fn hash_len_prefixed(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
+
+fn registry_bound_challenge_nonce(
+    challenge_id: Uuid,
+    binding_version: u16,
+    user_did: &str,
+    device_id: &str,
+    dpop_jkt: &str,
+    signature_key: &[u8; 32],
+    auth_generation: i64,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(CHALLENGE_REGISTRY_BINDING_DOMAIN);
+    hasher.update(challenge_id.as_bytes());
+    hasher.update(binding_version.to_be_bytes());
+    hash_len_prefixed(&mut hasher, user_did.as_bytes());
+    hash_len_prefixed(&mut hasher, device_id.as_bytes());
+    hash_len_prefixed(&mut hasher, dpop_jkt.as_bytes());
+    hasher.update(signature_key);
+    hasher.update(auth_generation.to_be_bytes());
+    hasher.finalize().into()
+}
+
 pub async fn begin_binding(
     pool: &PgPool,
     enrollment: &VerifiedEnrollmentRequest,
@@ -647,8 +673,8 @@ pub async fn begin_binding(
         .begin()
         .await
         .map_err(|e| DeviceAuthError::Storage(e.to_string()))?;
-    let signature_key_hex = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT signature_public_key FROM devices
+    let registry: (Option<String>, i64) = sqlx::query_as(
+        "SELECT signature_public_key, auth_generation FROM devices
          WHERE user_did = $1 AND device_id = $2 AND active FOR SHARE",
     )
     .bind(user_did)
@@ -656,17 +682,26 @@ pub async fn begin_binding(
     .fetch_optional(&mut *tx)
     .await
     .map_err(|e| DeviceAuthError::Storage(e.to_string()))?
-    .flatten()
     .ok_or(DeviceAuthError::RegistryMismatch)?;
+    let (signature_key_hex, auth_generation) = registry;
+    let signature_key_hex = signature_key_hex.ok_or(DeviceAuthError::RegistryMismatch)?;
     let signature_key: [u8; 32] = hex::decode(signature_key_hex)
         .ok()
         .and_then(|key| key.try_into().ok())
         .ok_or(DeviceAuthError::RegistryMismatch)?;
     Ed25519Key::from_bytes(&signature_key).map_err(|_| DeviceAuthError::RegistryMismatch)?;
-    let mut nonce = [0_u8; 32];
-    rand::thread_rng().fill_bytes(&mut nonce);
+    let challenge_id = Uuid::new_v4();
+    let nonce = registry_bound_challenge_nonce(
+        challenge_id,
+        CHALLENGE_VERSION,
+        user_did,
+        device_id,
+        dpop_jkt,
+        &signature_key,
+        auth_generation,
+    );
     let challenge = BindingChallenge {
-        challenge_id: Uuid::new_v4(),
+        challenge_id,
         binding_version: CHALLENGE_VERSION,
         user_did: user_did.to_string(),
         device_id: device_id.to_string(),
@@ -726,16 +761,16 @@ pub async fn complete_binding(
     .map_err(|e| DeviceAuthError::Storage(e.to_string()))?;
     let (challenge_user_did, challenge_device_id) =
         challenge_owner.ok_or(DeviceAuthError::ChallengeNotFound)?;
-    let signature_key_hex: Option<String> = sqlx::query_scalar(
-        "SELECT signature_public_key FROM devices
+    let registry: Option<(Option<String>, i64)> = sqlx::query_as(
+        "SELECT signature_public_key, auth_generation FROM devices
          WHERE user_did = $1 AND device_id = $2 AND active FOR UPDATE",
     )
     .bind(&challenge_user_did)
     .bind(&challenge_device_id)
     .fetch_optional(&mut *tx)
     .await
-    .map_err(|e| DeviceAuthError::Storage(e.to_string()))?
-    .flatten();
+    .map_err(|e| DeviceAuthError::Storage(e.to_string()))?;
+    let (signature_key_hex, auth_generation) = registry.ok_or(DeviceAuthError::RegistryMismatch)?;
     let key_bytes = signature_key_hex
         .and_then(|encoded| hex::decode(encoded).ok())
         .ok_or(DeviceAuthError::RegistryMismatch)?;
@@ -777,6 +812,18 @@ pub async fn complete_binding(
     let nonce_array: [u8; 32] = nonce
         .try_into()
         .map_err(|_| DeviceAuthError::BindingMismatch)?;
+    let expected_nonce = registry_bound_challenge_nonce(
+        challenge_id,
+        version as u16,
+        &user_did,
+        &device_id,
+        &dpop_jkt,
+        &key_bytes,
+        auth_generation,
+    );
+    if nonce_array != expected_nonce {
+        return Err(DeviceAuthError::RegistryMismatch);
+    }
     let challenge = BindingChallenge {
         challenge_id,
         binding_version: version as u16,
@@ -2061,6 +2108,136 @@ mod tests {
         }
         sqlx::query("DELETE FROM users WHERE did=$1")
             .bind(delete_user)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL with migration privileges"]
+    async fn postgres_stale_challenge_cannot_cross_rekey_or_device_lifecycle() {
+        let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL required");
+        let pool = PgPool::connect(&url).await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let suffix = Uuid::new_v4().simple().to_string();
+        let user = format!("did:plc:stale{suffix}");
+        let device = format!("device-{suffix}");
+        let key_a = SigningKey::generate(&mut rand::thread_rng());
+        let key_b = SigningKey::generate(&mut rand::thread_rng());
+        sqlx::query("INSERT INTO users(did) VALUES($1)")
+            .bind(&user)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO devices
+             (id,user_did,device_id,credential_did,signature_public_key)
+             VALUES($1,$2,$3,$4,$5)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&user)
+        .bind(&device)
+        .bind(format!("{user}#{device}"))
+        .bind(hex::encode(key_a.verifying_key().as_bytes()))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let now = Utc::now();
+        let jkt = URL_SAFE_NO_PAD.encode(Sha256::digest(format!("stale-{suffix}")));
+        let enrollment = enrollment(&user, &device, &jkt);
+
+        let before_rekey = begin_binding(&pool, &enrollment, now).await.unwrap();
+        sqlx::query(
+            "UPDATE devices SET signature_public_key=$3
+             WHERE user_did=$1 AND device_id=$2",
+        )
+        .bind(&user)
+        .bind(&device)
+        .bind(hex::encode(key_b.verifying_key().as_bytes()))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let stale_rekey_signature = key_b.sign(&before_rekey.challenge_bytes());
+        assert_eq!(
+            complete_binding(
+                &pool,
+                &enrollment,
+                before_rekey.challenge_id,
+                &stale_rekey_signature.to_bytes(),
+                now,
+            )
+            .await
+            .unwrap_err(),
+            DeviceAuthError::RegistryMismatch
+        );
+        let rekey_used_at: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT used_at FROM device_auth_binding_challenges WHERE id=$1")
+                .bind(before_rekey.challenge_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rekey_used_at, None);
+
+        let after_rekey = begin_binding(&pool, &enrollment, now).await.unwrap();
+        let after_rekey_signature = key_b.sign(&after_rekey.challenge_bytes());
+        complete_binding(
+            &pool,
+            &enrollment,
+            after_rekey.challenge_id,
+            &after_rekey_signature.to_bytes(),
+            now,
+        )
+        .await
+        .unwrap();
+
+        let before_lifecycle = begin_binding(&pool, &enrollment, now).await.unwrap();
+        sqlx::query("UPDATE devices SET active=FALSE WHERE user_did=$1 AND device_id=$2")
+            .bind(&user)
+            .bind(&device)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE devices SET active=TRUE WHERE user_did=$1 AND device_id=$2")
+            .bind(&user)
+            .bind(&device)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let stale_lifecycle_signature = key_b.sign(&before_lifecycle.challenge_bytes());
+        assert_eq!(
+            complete_binding(
+                &pool,
+                &enrollment,
+                before_lifecycle.challenge_id,
+                &stale_lifecycle_signature.to_bytes(),
+                now,
+            )
+            .await
+            .unwrap_err(),
+            DeviceAuthError::RegistryMismatch
+        );
+        let lifecycle_used_at: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT used_at FROM device_auth_binding_challenges WHERE id=$1")
+                .bind(before_lifecycle.challenge_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(lifecycle_used_at, None);
+
+        let after_lifecycle = begin_binding(&pool, &enrollment, now).await.unwrap();
+        let after_lifecycle_signature = key_b.sign(&after_lifecycle.challenge_bytes());
+        complete_binding(
+            &pool,
+            &enrollment,
+            after_lifecycle.challenge_id,
+            &after_lifecycle_signature.to_bytes(),
+            now,
+        )
+        .await
+        .unwrap();
+
+        sqlx::query("DELETE FROM users WHERE did=$1")
+            .bind(&user)
             .execute(&pool)
             .await
             .unwrap();
