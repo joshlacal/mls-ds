@@ -1,0 +1,64 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.mlsChat.completeDeviceAuthBinding",
+  "description": "Complete proof-of-possession binding for an MLS device registration.",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Atomically consumes a binding challenge after verifying its signature with the registered MLS device identity key and requiring the same authenticated DPoP key used to begin it.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["challengeId", "signature"],
+          "properties": {
+            "challengeId": {
+              "type": "string",
+              "description": "Opaque identifier returned by beginDeviceAuthBinding.",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "signature": {
+              "type": "bytes",
+              "description": "Ed25519 signature over the exact canonical challenge bytes.",
+              "minLength": 64,
+              "maxLength": 64
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": ["deviceId", "boundAt", "bindingVersion"],
+          "properties": {
+            "deviceId": {
+              "type": "string",
+              "description": "Bound server-issued device registration UUID."
+            },
+            "boundAt": {
+              "type": "string",
+              "format": "datetime"
+            },
+            "bindingVersion": {
+              "type": "integer",
+              "const": 1
+            }
+          }
+        }
+      },
+      "errors": [
+        {"name": "DpopRequired"},
+        {"name": "ChallengeNotFound"},
+        {"name": "ChallengeExpired"},
+        {"name": "ChallengeAlreadyUsed"},
+        {"name": "BindingMismatch"},
+        {"name": "InvalidSignature"},
+        {"name": "DeviceNotFound"},
+        {"name": "Unauthorized"},
+        {"name": "BindingUnavailable"}
+      ]
+    }
+  }
+}
