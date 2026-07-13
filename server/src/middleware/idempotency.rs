@@ -23,6 +23,10 @@ const DEFAULT_TTL_SECONDS: i64 = 86400;
 const IDEMPOTENCY_KEY_HEADER: &str = "Idempotency-Key";
 const IDEMPOTENCY_REPLAYED_HEADER: &str = "Idempotency-Replayed";
 const MLS_CHAT_XRPC_PREFIX: &str = "/xrpc/blue.catbird.mlsChat.";
+const BEGIN_DEVICE_AUTH_BINDING_ENDPOINT: &str =
+    "/xrpc/blue.catbird.mlsChat.beginDeviceAuthBinding";
+const COMPLETE_DEVICE_AUTH_BINDING_ENDPOINT: &str =
+    "/xrpc/blue.catbird.mlsChat.completeDeviceAuthBinding";
 const MAX_IDEMPOTENCY_KEY_LEN: usize = 128;
 const MAX_CACHEABLE_RESPONSE_BYTES: usize = 256 * 1024;
 
@@ -60,6 +64,12 @@ struct CachedResponse {
 fn should_apply(endpoint: &str, method: &Method) -> bool {
     endpoint.starts_with(MLS_CHAT_XRPC_PREFIX)
         && matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE")
+        // Enrollment has stronger, request-bound replay semantics: every
+        // attempt needs a fresh DPoP proof and complete consumes a one-time
+        // challenge. Returning a cached response here would bypass both the
+        // DPoP verifier and the handler's database rechecks.
+        && endpoint != BEGIN_DEVICE_AUTH_BINDING_ENDPOINT
+        && endpoint != COMPLETE_DEVICE_AUTH_BINDING_ENDPOINT
 }
 
 fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -401,6 +411,26 @@ mod tests {
         assert!(!should_apply(
             "/xrpc/blue.catbird.mlsChat.getConvos",
             &Method::GET
+        ));
+    }
+
+    #[test]
+    fn excludes_device_auth_enrollment_from_pre_verification_cache() {
+        for endpoint in [
+            "/xrpc/blue.catbird.mlsChat.beginDeviceAuthBinding",
+            "/xrpc/blue.catbird.mlsChat.completeDeviceAuthBinding",
+        ] {
+            assert!(!should_apply(endpoint, &Method::POST));
+            assert!(!should_apply(endpoint, &Method::PUT));
+        }
+
+        assert!(should_apply(
+            "/xrpc/blue.catbird.mlsChat.beginDeviceAuthBindingExtra",
+            &Method::POST
+        ));
+        assert!(should_apply(
+            "/xrpc/blue.catbird.mlsChat.completeDeviceAuthBinding/extra",
+            &Method::POST
         ));
     }
 
