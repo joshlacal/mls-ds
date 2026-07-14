@@ -505,6 +505,12 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Parse the listener host before initializing external dependencies so a
+    // malformed or non-IP SERVER_HOST fails startup rather than falling back
+    // to an unexpectedly broad bind. Production APP_ENV safety checks above
+    // remain authoritative and run first.
+    let server_bind = config::ServerBindConfig::from_env()?;
+
     // Initialize metrics
     let metrics_recorder = metrics::MetricsRecorder::new();
     let metrics_handle = metrics_recorder.handle().clone();
@@ -1278,11 +1284,7 @@ async fn main() -> anyhow::Result<()> {
         IngressBodyPolicy::from_env(),
     );
 
-    let port = std::env::var("SERVER_PORT")
-        .unwrap_or_else(|_| "8080".to_string())
-        .parse::<u16>()
-        .unwrap_or(8080);
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let addr = server_bind.socket_addr();
     tracing::info!("Server listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;

@@ -169,7 +169,8 @@ server/
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `SERVER_PORT` | Server port | `3000` |
+| `SERVER_HOST` | Listener IP literal; use `127.0.0.1` for proxy-only staging | `0.0.0.0` |
+| `SERVER_PORT` | Server port | `8080` |
 | `RUST_LOG` | Log level | `info` |
 | `SERVICE_DID` | Service DID for JWT validation | - |
 | `SSE_BUFFER_SIZE` | SSE event buffer size | `5000` |

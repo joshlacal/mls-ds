@@ -21,7 +21,68 @@
 //! See `docs/program/decisions/ADR-008-auto-reset-protocol-binding.md` §D1
 //! and the spec referenced above for the rationale.
 
-use std::{fmt, str::FromStr};
+use std::{
+    fmt,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    str::FromStr,
+};
+
+const DEFAULT_SERVER_HOST: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+const DEFAULT_SERVER_PORT: u16 = 8080;
+
+/// Validated address on which the HTTP server listens.
+///
+/// `SERVER_HOST` deliberately accepts only an IP literal. This keeps startup
+/// deterministic and prevents a hostname typo or DNS result from silently
+/// widening the listener's network exposure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ServerBindConfig {
+    host: IpAddr,
+    port: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvalidServerHost;
+
+impl fmt::Display for InvalidServerHost {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SERVER_HOST must be a valid IP address")
+    }
+}
+
+impl std::error::Error for InvalidServerHost {}
+
+impl ServerBindConfig {
+    /// Load the bind address without falling back when `SERVER_HOST` is
+    /// present but invalid. An absent host preserves the historical
+    /// all-interfaces production default.
+    pub fn from_env() -> Result<Self, InvalidServerHost> {
+        Self::from_env_values(std::env::var("SERVER_HOST"), std::env::var("SERVER_PORT"))
+    }
+
+    fn from_env_values(
+        host: Result<String, std::env::VarError>,
+        port: Result<String, std::env::VarError>,
+    ) -> Result<Self, InvalidServerHost> {
+        let host = match host {
+            Ok(host) => host.parse().map_err(|_| InvalidServerHost)?,
+            Err(std::env::VarError::NotPresent) => DEFAULT_SERVER_HOST,
+            Err(std::env::VarError::NotUnicode(_)) => return Err(InvalidServerHost),
+        };
+        // Preserve the existing SERVER_PORT behavior: absent or malformed
+        // values use 8080. This package only tightens host binding.
+        let port = port
+            .ok()
+            .and_then(|port| port.parse::<u16>().ok())
+            .unwrap_or(DEFAULT_SERVER_PORT);
+
+        Ok(Self { host, port })
+    }
+
+    pub const fn socket_addr(self) -> SocketAddr {
+        SocketAddr::new(self.host, self.port)
+    }
+}
 
 /// Rollout posture for authenticated MLS devices.
 ///
@@ -511,6 +572,53 @@ fn parse_env_bool(name: &str, default: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_bind_defaults_to_all_interfaces_for_compatibility() {
+        let config = ServerBindConfig::from_env_values(
+            Err(std::env::VarError::NotPresent),
+            Err(std::env::VarError::NotPresent),
+        )
+        .expect("missing SERVER_HOST must use the production-compatible default");
+
+        assert_eq!(config.host, "0.0.0.0".parse::<IpAddr>().unwrap());
+        assert_eq!(config.port, 8080);
+    }
+
+    #[test]
+    fn server_bind_accepts_explicit_loopback_ip() {
+        let config =
+            ServerBindConfig::from_env_values(Ok("127.0.0.1".to_owned()), Ok("3011".to_owned()))
+                .expect("staging loopback address must parse");
+
+        assert_eq!(config.host, "127.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(config.port, 3011);
+    }
+
+    #[test]
+    fn server_bind_rejects_hostnames_instead_of_resolving_them() {
+        let result = ServerBindConfig::from_env_values(
+            Ok("localhost".to_owned()),
+            Err(std::env::VarError::NotPresent),
+        );
+
+        assert_eq!(result, Err(InvalidServerHost));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn server_bind_rejects_non_unicode_host() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+        let result = ServerBindConfig::from_env_values(
+            Err(std::env::VarError::NotUnicode(OsString::from_vec(vec![
+                0xff,
+            ]))),
+            Err(std::env::VarError::NotPresent),
+        );
+
+        assert_eq!(result, Err(InvalidServerHost));
+    }
 
     #[cfg(unix)]
     #[test]
