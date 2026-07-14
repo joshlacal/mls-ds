@@ -728,6 +728,16 @@ mod transition_repository_tests {
             .await
             .unwrap()
             .unwrap();
+        let commit_hash = vec![0xCC; 32];
+        let receipt = SequencerReceiptRef {
+            receipt_hash: vec![0x11; 32],
+            epoch: 10,
+            term: 4,
+            sequencer_did: "did:web:mls.example.com".into(),
+            commit_hash: commit_hash.clone(),
+            issued_at: 1_700_000_000,
+            signature: vec![0x22; 64],
+        };
         let candidate = ValidatedMlsTransition::new_observed(
             context.clone(),
             TransitionKind::Commit,
@@ -737,8 +747,8 @@ mod transition_repository_tests {
             10,
             vec![0xBB; 128],
             Some(vec![4, 5, 6]),
-            vec![0xCC; 32],
-            None,
+            commit_hash,
+            Some(receipt),
         )
         .unwrap();
 
@@ -751,6 +761,7 @@ mod transition_repository_tests {
             .await
             .unwrap();
         assert_eq!(rolled_back.context.authoritative_epoch, 10);
+        assert!(rolled_back.receipt.is_some());
         operation_tx.rollback().await.unwrap();
         let after_rollback = repo
             .resolve_active(&conversation_id, "did:web:mls.example.com")
@@ -765,6 +776,13 @@ mod transition_repository_tests {
                 .await
                 .unwrap();
         assert_eq!(rolled_back_events, 0);
+        let rolled_back_receipts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sequencer_receipts WHERE convo_id=$1")
+                .bind(&conversation_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rolled_back_receipts, 0);
 
         let winner = repo.apply_transition(candidate.clone()).await.unwrap();
         assert_eq!(winner.context.authoritative_epoch, 10);
