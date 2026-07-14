@@ -271,10 +271,10 @@ mod local_receipt_tests {
     }
 
     #[tokio::test]
-    async fn local_receipt_rejects_noncanonical_signer_identity() {
+    async fn local_receipt_rejects_mismatched_signer_identity() {
         let signer = ReceiptSigner::new(
             SigningKey::random(&mut OsRng),
-            "did:web:ds.example.com#mls".to_string(),
+            "did:web:other.example.com".to_string(),
         );
         assert!(matches!(
             sequencer(Some(signer)).issue_local_receipt(
