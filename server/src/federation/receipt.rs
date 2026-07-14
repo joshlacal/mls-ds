@@ -55,7 +55,7 @@ impl ReceiptSigner {
     pub fn new(signing_key: SigningKey, sequencer_did: String) -> Self {
         Self {
             signing_key,
-            sequencer_did,
+            sequencer_did: crate::identity::canonical_did(&sequencer_did).to_string(),
         }
     }
 
@@ -161,6 +161,18 @@ mod tests {
             receipt.verify(&vk),
             "receipt should verify with correct key"
         );
+    }
+
+    #[test]
+    fn signer_canonicalizes_fragmented_service_did() {
+        let signer = ReceiptSigner::new(
+            SigningKey::random(&mut OsRng),
+            "did:web:ds.example.com#mls".to_string(),
+        );
+
+        let receipt = signer.sign_receipt("convo-fragment", 6, 3, b"commit");
+
+        assert_eq!(receipt.sequencer_did, "did:web:ds.example.com");
     }
 
     #[test]

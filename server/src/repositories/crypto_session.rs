@@ -74,6 +74,20 @@ impl PostgresCryptoSessionRepository {
         Self { pool }
     }
 
+    /// Apply a validated transition inside the caller's operation transaction.
+    ///
+    /// Handler-owned roster, Welcome, message, idempotency, and audit writes
+    /// must commit or roll back with the MLS authority CAS. The pool-owning
+    /// trait method delegates here for callers that do not already have a
+    /// transaction.
+    pub async fn apply_transition_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        transition: ValidatedMlsTransition,
+    ) -> RepositoryResult<AppliedMlsTransition> {
+        apply_transition_tx(tx, transition).await
+    }
+
     async fn resolve_with_predicate(
         &self,
         column: &str,
@@ -534,103 +548,9 @@ impl CryptoSessionRepository for PostgresCryptoSessionRepository {
         transition: ValidatedMlsTransition,
     ) -> RepositoryResult<AppliedMlsTransition> {
         let mut tx = self.pool.begin().await?;
-        let updated: Option<(i32, Option<Vec<u8>>)> = sqlx::query_as(
-            "UPDATE crypto_sessions SET last_observed_epoch=$1, last_confirmation_tag=$2, \
-                    group_info=$3, group_info_epoch=$1, group_info_updated_at=NOW() \
-             WHERE id=$4 AND conversation_id=$5 AND mls_group_id=$6 AND generation=$7 \
-               AND state='active' AND last_observed_epoch=$8 AND sequencer_term=$9 \
-               AND COALESCE(sequencer_did,$10)=$10 \
-               AND last_confirmation_tag IS NOT DISTINCT FROM $11 \
-               AND group_info IS NOT DISTINCT FROM $12 \
-               AND group_info_epoch IS NOT DISTINCT FROM $13 \
-             RETURNING last_observed_epoch, last_confirmation_tag",
-        )
-        .bind(transition.next_epoch)
-        .bind(&transition.confirmation_tag)
-        .bind(&transition.group_info)
-        .bind(&transition.context.crypto_session_id)
-        .bind(&transition.context.conversation_id)
-        .bind(&transition.context.mls_group_id)
-        .bind(transition.context.reset_generation)
-        .bind(transition.context.authoritative_epoch)
-        .bind(transition.context.sequencer_term)
-        .bind(&transition.context.sequencer_did)
-        .bind(&transition.context.confirmation_tag)
-        .bind(&transition.context.group_info)
-        .bind(transition.context.group_info_epoch)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if updated.is_none() {
-            return Err(RepositoryError::StaleContext);
-        }
-
-        let mirrored = sqlx::query(
-            "UPDATE conversations SET current_epoch=$1, confirmation_tag=$2, group_info=$3, \
-                    group_info_epoch=$1, group_info_updated_at=NOW() \
-             WHERE id=$4 AND active_crypto_session_id=$5 AND group_id=$6 \
-               AND COALESCE(reset_count,0)=$7 AND current_epoch=$8 AND sequencer_term=$9 \
-               AND COALESCE(sequencer_ds,$10)=$10 \
-               AND confirmation_tag IS NOT DISTINCT FROM $11 \
-               AND group_info IS NOT DISTINCT FROM $12 \
-               AND group_info_epoch IS NOT DISTINCT FROM $13",
-        )
-        .bind(transition.next_epoch)
-        .bind(&transition.confirmation_tag)
-        .bind(&transition.group_info)
-        .bind(&transition.context.conversation_id)
-        .bind(&transition.context.crypto_session_id)
-        .bind(&transition.context.mls_group_id)
-        .bind(transition.context.reset_generation)
-        .bind(transition.context.authoritative_epoch)
-        .bind(transition.context.sequencer_term)
-        .bind(&transition.context.sequencer_did)
-        .bind(&transition.context.confirmation_tag)
-        .bind(&transition.context.group_info)
-        .bind(transition.context.group_info_epoch)
-        .execute(&mut *tx)
-        .await?;
-        if mirrored.rows_affected() != 1 {
-            return Err(RepositoryError::StaleContext);
-        }
-
-        let stored_receipt = match transition.receipt.as_ref() {
-            Some(receipt) => Some(append_receipt_tx(&mut tx, &transition.context, receipt).await?),
-            None => None,
-        };
-        let event_id = Uuid::new_v4().to_string();
-        let sequence: i64 = sqlx::query_scalar(
-            "INSERT INTO delivery_events \
-             (id, conversation_id, seq, crypto_session_id, event_type, sender_did, \
-              sender_device_id, mls_group_id, mls_epoch, payload, payload_json) \
-             SELECT $1,$2,COALESCE(MAX(seq),0)+1,$3,$4,$5,$6,$7,$8,$9,$10 \
-             FROM delivery_events WHERE conversation_id=$2 RETURNING seq",
-        )
-        .bind(&event_id)
-        .bind(&transition.context.conversation_id)
-        .bind(&transition.context.crypto_session_id)
-        .bind(transition.event_type())
-        .bind(&transition.actor_did)
-        .bind(&transition.actor_device_id)
-        .bind(&transition.context.mls_group_id)
-        .bind(i64::from(transition.next_epoch))
-        .bind(&transition.commit_hash)
-        .bind(serde_json::json!({"groupInfoHash": hex::encode(&transition.group_info_hash)}))
-        .fetch_one(&mut *tx)
-        .await?;
+        let applied = self.apply_transition_in_tx(&mut tx, transition).await?;
         tx.commit().await?;
-
-        let mut context = transition.context;
-        context.authoritative_epoch = transition.next_epoch;
-        context.confirmation_tag = transition.confirmation_tag;
-        context.group_info = Some(transition.group_info);
-        context.group_info_epoch = Some(transition.next_epoch);
-        context.receipt = stored_receipt.clone();
-        Ok(AppliedMlsTransition {
-            context,
-            delivery_event_id: event_id,
-            delivery_sequence: sequence,
-            receipt: stored_receipt,
-        })
+        Ok(applied)
     }
 
     async fn record_verified_receipt(
@@ -643,6 +563,108 @@ impl CryptoSessionRepository for PostgresCryptoSessionRepository {
         tx.commit().await?;
         Ok(stored)
     }
+}
+
+async fn apply_transition_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    transition: ValidatedMlsTransition,
+) -> RepositoryResult<AppliedMlsTransition> {
+    let updated: Option<(i32, Option<Vec<u8>>)> = sqlx::query_as(
+        "UPDATE crypto_sessions SET last_observed_epoch=$1, last_confirmation_tag=$2, \
+                    group_info=$3, group_info_epoch=$1, group_info_updated_at=NOW() \
+             WHERE id=$4 AND conversation_id=$5 AND mls_group_id=$6 AND generation=$7 \
+               AND state='active' AND last_observed_epoch=$8 AND sequencer_term=$9 \
+               AND COALESCE(sequencer_did,$10)=$10 \
+               AND last_confirmation_tag IS NOT DISTINCT FROM $11 \
+               AND group_info IS NOT DISTINCT FROM $12 \
+               AND group_info_epoch IS NOT DISTINCT FROM $13 \
+             RETURNING last_observed_epoch, last_confirmation_tag",
+    )
+    .bind(transition.next_epoch)
+    .bind(&transition.confirmation_tag)
+    .bind(&transition.group_info)
+    .bind(&transition.context.crypto_session_id)
+    .bind(&transition.context.conversation_id)
+    .bind(&transition.context.mls_group_id)
+    .bind(transition.context.reset_generation)
+    .bind(transition.context.authoritative_epoch)
+    .bind(transition.context.sequencer_term)
+    .bind(&transition.context.sequencer_did)
+    .bind(&transition.context.confirmation_tag)
+    .bind(&transition.context.group_info)
+    .bind(transition.context.group_info_epoch)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if updated.is_none() {
+        return Err(RepositoryError::StaleContext);
+    }
+
+    let mirrored = sqlx::query(
+        "UPDATE conversations SET current_epoch=$1, confirmation_tag=$2, group_info=$3, \
+                    group_info_epoch=$1, group_info_updated_at=NOW() \
+             WHERE id=$4 AND active_crypto_session_id=$5 AND group_id=$6 \
+               AND COALESCE(reset_count,0)=$7 AND current_epoch=$8 AND sequencer_term=$9 \
+               AND COALESCE(sequencer_ds,$10)=$10 \
+               AND confirmation_tag IS NOT DISTINCT FROM $11 \
+               AND group_info IS NOT DISTINCT FROM $12 \
+               AND group_info_epoch IS NOT DISTINCT FROM $13",
+    )
+    .bind(transition.next_epoch)
+    .bind(&transition.confirmation_tag)
+    .bind(&transition.group_info)
+    .bind(&transition.context.conversation_id)
+    .bind(&transition.context.crypto_session_id)
+    .bind(&transition.context.mls_group_id)
+    .bind(transition.context.reset_generation)
+    .bind(transition.context.authoritative_epoch)
+    .bind(transition.context.sequencer_term)
+    .bind(&transition.context.sequencer_did)
+    .bind(&transition.context.confirmation_tag)
+    .bind(&transition.context.group_info)
+    .bind(transition.context.group_info_epoch)
+    .execute(&mut **tx)
+    .await?;
+    if mirrored.rows_affected() != 1 {
+        return Err(RepositoryError::StaleContext);
+    }
+
+    let stored_receipt = match transition.receipt.as_ref() {
+        Some(receipt) => Some(append_receipt_tx(tx, &transition.context, receipt).await?),
+        None => None,
+    };
+    let event_id = Uuid::new_v4().to_string();
+    let sequence: i64 = sqlx::query_scalar(
+        "INSERT INTO delivery_events \
+             (id, conversation_id, seq, crypto_session_id, event_type, sender_did, \
+              sender_device_id, mls_group_id, mls_epoch, payload, payload_json) \
+             SELECT $1,$2,COALESCE(MAX(seq),0)+1,$3,$4,$5,$6,$7,$8,$9,$10 \
+             FROM delivery_events WHERE conversation_id=$2 RETURNING seq",
+    )
+    .bind(&event_id)
+    .bind(&transition.context.conversation_id)
+    .bind(&transition.context.crypto_session_id)
+    .bind(transition.event_type())
+    .bind(&transition.actor_did)
+    .bind(&transition.actor_device_id)
+    .bind(&transition.context.mls_group_id)
+    .bind(i64::from(transition.next_epoch))
+    .bind(&transition.commit_hash)
+    .bind(serde_json::json!({"groupInfoHash": hex::encode(&transition.group_info_hash)}))
+    .fetch_one(&mut **tx)
+    .await?;
+
+    let mut context = transition.context;
+    context.authoritative_epoch = transition.next_epoch;
+    context.confirmation_tag = transition.confirmation_tag;
+    context.group_info = Some(transition.group_info);
+    context.group_info_epoch = Some(transition.next_epoch);
+    context.receipt = stored_receipt.clone();
+    Ok(AppliedMlsTransition {
+        context,
+        delivery_event_id: event_id,
+        delivery_sequence: sequence,
+        receipt: stored_receipt,
+    })
 }
 
 #[cfg(test)]
@@ -706,6 +728,16 @@ mod transition_repository_tests {
             .await
             .unwrap()
             .unwrap();
+        let commit_hash = vec![0xCC; 32];
+        let receipt = SequencerReceiptRef {
+            receipt_hash: vec![0x11; 32],
+            epoch: 10,
+            term: 4,
+            sequencer_did: "did:web:mls.example.com".into(),
+            commit_hash: commit_hash.clone(),
+            issued_at: 1_700_000_000,
+            signature: vec![0x22; 64],
+        };
         let candidate = ValidatedMlsTransition::new_observed(
             context.clone(),
             TransitionKind::Commit,
@@ -715,10 +747,43 @@ mod transition_repository_tests {
             10,
             vec![0xBB; 128],
             Some(vec![4, 5, 6]),
-            vec![0xCC; 32],
-            None,
+            commit_hash,
+            Some(receipt),
         )
         .unwrap();
+
+        // Handler-owned adjacent writes must share this transaction. A later
+        // operation failure rolls the authority CAS, projection, event, and
+        // receipt back together.
+        let mut operation_tx = pool.begin().await.unwrap();
+        let rolled_back = repo
+            .apply_transition_in_tx(&mut operation_tx, candidate.clone())
+            .await
+            .unwrap();
+        assert_eq!(rolled_back.context.authoritative_epoch, 10);
+        assert!(rolled_back.receipt.is_some());
+        operation_tx.rollback().await.unwrap();
+        let after_rollback = repo
+            .resolve_active(&conversation_id, "did:web:mls.example.com")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_rollback.authoritative_epoch, 9);
+        let rolled_back_events: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM delivery_events WHERE conversation_id=$1")
+                .bind(&conversation_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rolled_back_events, 0);
+        let rolled_back_receipts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sequencer_receipts WHERE convo_id=$1")
+                .bind(&conversation_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rolled_back_receipts, 0);
+
         let winner = repo.apply_transition(candidate.clone()).await.unwrap();
         assert_eq!(winner.context.authoritative_epoch, 10);
         assert!(matches!(
