@@ -65,7 +65,7 @@ impl ServerBindConfig {
         port: Result<String, std::env::VarError>,
     ) -> Result<Self, InvalidServerHost> {
         let host = match host {
-            Ok(host) => host.parse().map_err(|_| InvalidServerHost)?,
+            Ok(host) => host.trim().parse().map_err(|_| InvalidServerHost)?,
             Err(std::env::VarError::NotPresent) => DEFAULT_SERVER_HOST,
             Err(std::env::VarError::NotUnicode(_)) => return Err(InvalidServerHost),
         };
@@ -73,13 +73,13 @@ impl ServerBindConfig {
         // values use 8080. This package only tightens host binding.
         let port = port
             .ok()
-            .and_then(|port| port.parse::<u16>().ok())
+            .and_then(|port| port.trim().parse::<u16>().ok())
             .unwrap_or(DEFAULT_SERVER_PORT);
 
         Ok(Self { host, port })
     }
 
-    pub const fn socket_addr(self) -> SocketAddr {
+    pub fn socket_addr(self) -> SocketAddr {
         SocketAddr::new(self.host, self.port)
     }
 }
@@ -590,6 +590,18 @@ mod tests {
         let config =
             ServerBindConfig::from_env_values(Ok("127.0.0.1".to_owned()), Ok("3011".to_owned()))
                 .expect("staging loopback address must parse");
+
+        assert_eq!(config.host, "127.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(config.port, 3011);
+    }
+
+    #[test]
+    fn server_bind_trims_operator_whitespace() {
+        let config = ServerBindConfig::from_env_values(
+            Ok(" 127.0.0.1\n".to_owned()),
+            Ok(" 3011\t".to_owned()),
+        )
+        .expect("operator whitespace must not change the configured bind address");
 
         assert_eq!(config.host, "127.0.0.1".parse::<IpAddr>().unwrap());
         assert_eq!(config.port, 3011);
