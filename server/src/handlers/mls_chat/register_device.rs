@@ -23,15 +23,37 @@ use crate::{
 // NSID for auth enforcement
 const NSID: &str = "blue.catbird.mlsChat.registerDevice";
 
+#[cfg(test)]
 async fn cleanup_re_registered_device_key_packages(
     pool: &DbPool,
+    user_did: &str,
+    old_device_id: &str,
+) -> Result<u64, StatusCode> {
+    let mut tx = pool.begin().await.map_err(|e| {
+        error!("Failed to begin re-registration cleanup transaction: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let deleted =
+        cleanup_re_registered_device_key_packages_in_tx(&mut tx, user_did, old_device_id).await?;
+    tx.commit().await.map_err(|e| {
+        error!(
+            "Failed to commit re-registration cleanup transaction: {}",
+            e
+        );
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(deleted)
+}
+
+async fn cleanup_re_registered_device_key_packages_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     user_did: &str,
     old_device_id: &str,
 ) -> Result<u64, StatusCode> {
     sqlx::query("DELETE FROM key_packages WHERE owner_did = $1 AND device_id = $2")
         .bind(user_did)
         .bind(old_device_id)
-        .execute(pool)
+        .execute(&mut **tx)
         .await
         .map_err(|e| {
             error!("Failed to delete old key packages: {}", e);
@@ -170,8 +192,9 @@ async fn handle_register(
             return Err(StatusCode::BAD_REQUEST);
         }
 
-        if let Err(e) = crate::db::validate_key_package_binding(
+        if let Err(e) = crate::db::validate_declared_key_package_binding(
             &user_did,
+            kp.cipher_suite.as_ref(),
             &key_data,
             Some(&input.signature_public_key),
         )
@@ -185,9 +208,106 @@ async fn handle_register(
         }
     }
 
+    let sig_key_hex = hex::encode(&input.signature_public_key);
     let mut device_id = Uuid::new_v4().to_string();
     let now = Utc::now();
-    let sig_key_hex = hex::encode(&input.signature_public_key);
+    let mut tx = pool.begin().await.map_err(|e| {
+        error!("Failed to begin device registration transaction: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let mut matched_by_uuid = false;
+    let mut candidate: Option<(String, String)> = None;
+    if let Some(ref device_uuid) = input.device_uuid {
+        candidate = sqlx::query_as(
+            "SELECT id, device_id FROM devices \
+             WHERE user_did = $1 AND device_uuid = $2",
+        )
+        .bind(&user_did)
+        .bind(device_uuid.as_ref())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| {
+            error!("Failed to find existing device by UUID: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        matched_by_uuid = candidate.is_some();
+    }
+    if candidate.is_none() {
+        candidate = sqlx::query_as(
+            "SELECT id, device_id FROM devices \
+             WHERE user_did = $1 AND signature_public_key = $2",
+        )
+        .bind(&user_did)
+        .bind(&sig_key_hex)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| {
+            error!("Failed to find existing device by signature key: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    }
+
+    // Federation claims lock a KeyPackage before taking a shared device lock. Keep that
+    // global order here: lock every package for the candidate device first, then lock and
+    // revalidate the device row. The preliminary lookup is never trusted for authorization.
+    let mut existing: Option<(String, String, bool)> = None;
+    if let Some((candidate_id, candidate_device_id)) = candidate {
+        sqlx::query(
+            "SELECT id FROM key_packages \
+             WHERE owner_did = $1 AND device_id = $2 \
+             ORDER BY id FOR UPDATE",
+        )
+        .bind(&user_did)
+        .bind(&candidate_device_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| {
+            error!("Failed to lock existing device KeyPackages: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        existing = if matched_by_uuid {
+            sqlx::query_as(
+                "SELECT id, device_id, active FROM devices \
+                 WHERE id = $1 AND user_did = $2 AND device_uuid = $3 FOR UPDATE",
+            )
+            .bind(&candidate_id)
+            .bind(&user_did)
+            .bind(input.device_uuid.as_ref().map(|value| value.as_ref()))
+            .fetch_optional(&mut *tx)
+            .await
+        } else {
+            sqlx::query_as(
+                "SELECT id, device_id, active FROM devices \
+                 WHERE id = $1 AND user_did = $2 AND signature_public_key = $3 FOR UPDATE",
+            )
+            .bind(&candidate_id)
+            .bind(&user_did)
+            .bind(&sig_key_hex)
+            .fetch_optional(&mut *tx)
+            .await
+        }
+        .map_err(|e| {
+            error!("Failed to lock and revalidate existing device: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        if existing.is_none() {
+            warn!(
+                "Rejected re-registration after concurrent device identity change for user h:{}",
+                crate::crypto::hash_for_log(&user_did)
+            );
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+    if matches!(existing, Some((_, _, false))) {
+        warn!(
+            "Rejected re-registration of inactive device for user h:{}",
+            crate::crypto::hash_for_log(&user_did)
+        );
+        return Err(StatusCode::BAD_REQUEST);
+    }
 
     // Upsert user
     sqlx::query(
@@ -196,120 +316,61 @@ async fn handle_register(
            ON CONFLICT (did) DO UPDATE SET last_seen_at = NOW()"#,
     )
     .bind(&user_did)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| {
         error!("Failed to ensure user exists: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    // Check for re-registration by device_uuid
-    let mut is_reregistration = if let Some(ref device_uuid) = input.device_uuid {
-        let existing: Option<(String, String, String)> = sqlx::query_as(
-            "SELECT id, device_id, credential_did FROM devices WHERE user_did = $1 AND device_uuid = $2",
-        )
-        .bind(&user_did)
-        .bind(device_uuid.as_ref())
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| {
-            error!("Failed to check existing device by UUID: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let is_reregistration = existing.is_some();
+    if let Some((db_id, old_device_id, _active)) = existing {
+        device_id = old_device_id.clone();
+        info!(
+            "Device re-registration detected for user h:{}: reusing device_id={}",
+            crate::crypto::hash_for_log(&user_did),
+            device_id
+        );
+        let deleted_count =
+            cleanup_re_registered_device_key_packages_in_tx(&mut tx, &user_did, &old_device_id)
+                .await?;
+        info!(
+            "Deleted {} old key packages for re-registered device {}",
+            deleted_count, old_device_id
+        );
 
-        if let Some((db_id, old_device_id, _old_credential_did)) = existing {
-            // Reuse existing device_id for stability
-            device_id = old_device_id.clone();
-            info!(
-                "Device re-registration detected for user h:{}: reusing device_id={}",
-                crate::crypto::hash_for_log(&user_did),
-                device_id
-            );
-
-            let deleted_count =
-                cleanup_re_registered_device_key_packages(pool, &user_did, &old_device_id).await?;
-            info!(
-                "Deleted {} old key packages for re-registered device {}",
-                deleted_count, old_device_id
-            );
-
-            // Update existing device record (keep device_id stable, update metadata)
-            let rereg_mls_did = format!("{}#{}", user_did, device_id);
+        let rereg_mls_did = format!("{}#{}", user_did, device_id);
+        let update_result = if matched_by_uuid {
             sqlx::query(
                 r#"UPDATE devices
                    SET device_name = $1, credential_did = $2,
                        signature_public_key = $3, registered_at = NOW(), last_seen_at = NOW()
-                   WHERE id = $4"#,
+                   WHERE id = $4 AND active = TRUE"#,
             )
             .bind(&device_name)
             .bind(&rereg_mls_did)
             .bind(&sig_key_hex)
             .bind(&db_id)
-            .execute(pool)
+            .execute(&mut *tx)
             .await
-            .map_err(|e| {
-                error!("Failed to update re-registered device: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-
-            true
         } else {
-            false
-        }
-    } else {
-        false
-    };
-
-    // Check re-registration by signature_public_key
-    if !is_reregistration {
-        let existing: Option<(String, String, String)> = sqlx::query_as(
-            "SELECT id, device_id, credential_did FROM devices WHERE user_did = $1 AND signature_public_key = $2",
-        )
-        .bind(&user_did)
-        .bind(&sig_key_hex)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| {
-            error!("Failed to check existing device by signature key: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-        if let Some((db_id, old_device_id, _old_credential_did)) = existing {
-            // Reuse existing device_id for stability
-            device_id = old_device_id.clone();
-            info!(
-                "Device re-registration detected by signature key for user h:{}: reusing device_id={}",
-                crate::crypto::hash_for_log(&user_did),
-                device_id
-            );
-
-            let deleted_count =
-                cleanup_re_registered_device_key_packages(pool, &user_did, &old_device_id).await?;
-            info!(
-                "Deleted {} old key packages for re-registered device {} (signature key match)",
-                deleted_count, old_device_id
-            );
-
-            let rereg_mls_did2 = format!("{}#{}", user_did, device_id);
             sqlx::query(
                 r#"UPDATE devices
                    SET device_name = $1, credential_did = $2,
                        device_uuid = $3, registered_at = NOW(), last_seen_at = NOW()
-                   WHERE id = $4"#,
+                   WHERE id = $4 AND active = TRUE"#,
             )
             .bind(&device_name)
-            .bind(&rereg_mls_did2)
+            .bind(&rereg_mls_did)
             .bind(input.device_uuid.as_ref().map(|s| s.as_ref()))
             .bind(&db_id)
-            .execute(pool)
+            .execute(&mut *tx)
             .await
-            .map_err(|e| {
-                error!("Failed to update re-registered device: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-
-            is_reregistration = true;
-        }
+        };
+        update_result.map_err(|e| {
+            error!("Failed to update re-registered device: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
     }
 
     // Compute mls_did after device_id is finalized (may be reused from existing device)
@@ -328,7 +389,7 @@ async fn handle_register(
         let device_count: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM devices WHERE user_did = $1")
                 .bind(&user_did)
-                .fetch_one(pool)
+                .fetch_one(&mut *tx)
                 .await
                 .map_err(|e| {
                     error!("Failed to count user devices: {}", e);
@@ -356,7 +417,7 @@ async fn handle_register(
         .bind(&mls_did)
         .bind(&sig_key_hex)
         .bind(input.device_uuid.as_ref().map(|s| s.as_ref()))
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| {
             error!("Failed to insert device: {}", e);
@@ -377,14 +438,13 @@ async fn handle_register(
             continue;
         }
 
-        match crate::db::store_key_package_with_device_bound_to_signature(
-            pool,
+        match crate::db::store_key_package_with_device_bound_to_signature_in_tx(
+            &mut tx,
             &user_did,
             kp.cipher_suite.as_ref(),
             key_data,
             kp.expires.as_ref().with_timezone(&Utc),
             Some(device_id.clone()),
-            None,
             Some(&input.signature_public_key),
             false,
         )
@@ -415,7 +475,7 @@ async fn handle_register(
         .bind(&user_did)
         .bind(&device_id)
         .bind(push_token.as_ref())
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| {
             warn!("Failed to store push token during registration: {}", e);
@@ -423,6 +483,11 @@ async fn handle_register(
         })?;
         info!("Push token stored during device registration");
     }
+
+    tx.commit().await.map_err(|e| {
+        error!("Failed to commit device registration transaction: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     // Find active conversations for auto-join
     let convos: Vec<(String,)> = sqlx::query_as(
@@ -1088,7 +1153,11 @@ async fn handle_complete_pending_addition(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::AtProtoClaims;
     use crate::db::{init_db, DbConfig};
+    use crate::generated::blue_catbird::mlsChat::register_device::{
+        KeyPackageItem, RegisterDevice,
+    };
     use sqlx::Row;
     use std::time::Duration as StdDuration;
 
@@ -1105,6 +1174,673 @@ mod tests {
         })
         .await
         .expect("initialize test database")
+    }
+
+    fn generate_key_package(identity: &str) -> (Vec<u8>, Vec<u8>) {
+        use openmls::prelude::{tls_codec::Serialize as TlsSerialize, *};
+        use openmls_basic_credential::SignatureKeyPair;
+        use openmls_traits::OpenMlsProvider;
+
+        let provider = openmls_libcrux_crypto::Provider::new().expect("libcrux provider");
+        let ciphersuite = Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519;
+        let credential = BasicCredential::new(identity.as_bytes().to_vec());
+        let signature_keys =
+            SignatureKeyPair::new(ciphersuite.signature_algorithm()).expect("signature keypair");
+        signature_keys
+            .store(provider.storage())
+            .expect("store signature keys");
+        let signature_public_key = signature_keys.to_public_vec();
+        let credential_with_key = CredentialWithKey {
+            credential: credential.into(),
+            signature_key: signature_public_key.clone().into(),
+        };
+        let bundle = KeyPackage::builder()
+            .build(ciphersuite, &provider, &signature_keys, credential_with_key)
+            .expect("build key package");
+
+        (
+            bundle
+                .key_package()
+                .tls_serialize_detached()
+                .expect("serialize key package"),
+            signature_public_key,
+        )
+    }
+
+    fn mismatched_registration_input<'a>(
+        device_uuid: &'a str,
+        key_package: Vec<u8>,
+        signature_public_key: Vec<u8>,
+    ) -> RegisterDevice<'a> {
+        registration_input(
+            Some(device_uuid),
+            "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519",
+            key_package,
+            signature_public_key,
+        )
+    }
+
+    fn registration_input<'a>(
+        device_uuid: Option<&'a str>,
+        declared_cipher_suite: &'a str,
+        key_package: Vec<u8>,
+        signature_public_key: Vec<u8>,
+    ) -> RegisterDevice<'a> {
+        let key_package = KeyPackageItem::new()
+            .cipher_suite(declared_cipher_suite)
+            .expires((Utc::now() + Duration::days(1)).fixed_offset())
+            .key_package(key_package)
+            .build();
+
+        RegisterDevice::new()
+            .device_name("Regression device")
+            .maybe_device_uuid(device_uuid.map(Into::into))
+            .key_packages(vec![key_package])
+            .signature_public_key(signature_public_key)
+            .build()
+    }
+
+    fn auth_user(did: &str) -> AuthUser {
+        AuthUser {
+            did: did.to_string(),
+            claims: AtProtoClaims {
+                iss: did.to_string(),
+                aud: "did:web:example.invalid".to_string(),
+                exp: Utc::now().timestamp() + 300,
+                iat: Some(Utc::now().timestamp()),
+                sub: None,
+                lxm: Some(NSID.to_string()),
+                jti: None,
+            },
+        }
+    }
+
+    async fn cleanup_registration_fixture(pool: &DbPool, user_did: &str) {
+        sqlx::query("DELETE FROM key_packages WHERE owner_did = $1")
+            .bind(user_did)
+            .execute(pool)
+            .await
+            .expect("cleanup key packages");
+        sqlx::query("DELETE FROM devices WHERE user_did = $1")
+            .bind(user_did)
+            .execute(pool)
+            .await
+            .expect("cleanup devices");
+        sqlx::query("DELETE FROM users WHERE did = $1")
+            .bind(user_did)
+            .execute(pool)
+            .await
+            .expect("cleanup user");
+    }
+
+    async fn registration_state_snapshot(
+        pool: &DbPool,
+        user_did: &str,
+    ) -> (String, String, bool, i64, String) {
+        let user: String =
+            sqlx::query_scalar("SELECT row_to_json(u)::text FROM users u WHERE u.did = $1")
+                .bind(user_did)
+                .fetch_one(pool)
+                .await
+                .expect("snapshot user");
+        let (device, active, auth_generation): (String, bool, i64) = sqlx::query_as(
+            "SELECT (to_jsonb(d) - 'active' - 'auth_generation')::text, \
+                    active, auth_generation \
+             FROM devices d WHERE d.user_did = $1",
+        )
+        .bind(user_did)
+        .fetch_one(pool)
+        .await
+        .expect("snapshot device");
+        let key_packages: String = sqlx::query_scalar(
+            "SELECT COALESCE(jsonb_agg(to_jsonb(kp) ORDER BY kp.id)::text, '[]') \
+             FROM key_packages kp WHERE kp.owner_did = $1",
+        )
+        .bind(user_did)
+        .fetch_one(pool)
+        .await
+        .expect("snapshot key packages");
+        (user, device, active, auth_generation, key_packages)
+    }
+
+    async fn seed_registration_state(
+        pool: &DbPool,
+        user_did: &str,
+        device_id: &str,
+        device_uuid: &str,
+        signature_hex: &str,
+        suffix: &str,
+        active: bool,
+    ) {
+        cleanup_registration_fixture(pool, user_did).await;
+        sqlx::query(
+            "INSERT INTO users (did, created_at, last_seen_at) \
+             VALUES ($1, '2020-01-01T00:00:00Z', '2020-01-02T00:00:00Z')",
+        )
+        .bind(user_did)
+        .execute(pool)
+        .await
+        .expect("seed registration user");
+        sqlx::query(
+            "INSERT INTO devices \
+             (id, user_did, device_id, device_name, credential_did, signature_public_key, \
+              device_uuid, registered_at, last_seen_at, active) \
+             VALUES ($1, $2, $3, 'Inactive original', $4, $5, $6, \
+                     '2020-01-03T00:00:00Z', '2020-01-04T00:00:00Z', $7)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(user_did)
+        .bind(device_id)
+        .bind(format!("{user_did}#{device_id}"))
+        .bind(signature_hex)
+        .bind(device_uuid)
+        .bind(active)
+        .execute(pool)
+        .await
+        .expect("seed registration device");
+        sqlx::query(
+            "INSERT INTO key_packages \
+             (id, owner_did, device_id, credential_did, cipher_suite, key_package, \
+              key_package_hash, created_at, expires_at, state) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, \
+                     '2020-01-05T00:00:00Z', NOW() + INTERVAL '30 days', 'available')",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(user_did)
+        .bind(device_id)
+        .bind(format!("{user_did}#{device_id}"))
+        .bind("MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519")
+        .bind(vec![0xA5_u8, 0x5A])
+        .bind(format!("registration-{suffix}"))
+        .execute(pool)
+        .await
+        .expect("seed registration key package");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+    async fn inactive_reregistration_by_uuid_or_signature_is_rejected_without_mutation() {
+        let pool = setup_test_db().await;
+
+        for match_by_uuid in [true, false] {
+            let suffix = Uuid::new_v4().simple().to_string();
+            let user_did = format!("did:plc:inactivereg{}", &suffix[..12]);
+            let device_id = format!("device-{suffix}");
+            let stored_uuid = format!("stored-{suffix}");
+            let (key_package, signature_public_key) = generate_key_package(&user_did);
+            let signature_hex = hex::encode(&signature_public_key);
+            seed_registration_state(
+                &pool,
+                &user_did,
+                &device_id,
+                &stored_uuid,
+                &signature_hex,
+                &suffix,
+                false,
+            )
+            .await;
+
+            let before = registration_state_snapshot(&pool, &user_did).await;
+            let requested_uuid = match_by_uuid.then_some(stored_uuid.as_str());
+            let input = registration_input(
+                requested_uuid,
+                "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+                key_package,
+                signature_public_key,
+            );
+
+            let result = handle_register(
+                &pool,
+                &Arc::new(SseState::new(16)),
+                &auth_user(&user_did),
+                &input,
+            )
+            .await;
+
+            assert_eq!(
+                result.expect_err("inactive re-registration must fail closed"),
+                StatusCode::BAD_REQUEST
+            );
+            let after = registration_state_snapshot(&pool, &user_did).await;
+            assert_eq!(
+                after, before,
+                "inactive registration state must be unchanged"
+            );
+            cleanup_registration_fixture(&pool, &user_did).await;
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+    async fn concurrent_deactivation_fences_uuid_and_signature_reregistration() {
+        let pool = setup_test_db().await;
+
+        for match_by_uuid in [true, false] {
+            let suffix = Uuid::new_v4().simple().to_string();
+            let user_did = format!("did:plc:racinginactive{}", &suffix[..12]);
+            let device_id = format!("device-{suffix}");
+            let stored_uuid = format!("stored-{suffix}");
+            let (key_package, signature_public_key) = generate_key_package(&user_did);
+            let signature_hex = hex::encode(&signature_public_key);
+            seed_registration_state(
+                &pool,
+                &user_did,
+                &device_id,
+                &stored_uuid,
+                &signature_hex,
+                &suffix,
+                true,
+            )
+            .await;
+            let before = registration_state_snapshot(&pool, &user_did).await;
+            assert!(before.2, "race fixture must begin active");
+
+            let mut deactivation = pool.begin().await.expect("begin deactivation");
+            sqlx::query(
+                "UPDATE devices SET active = FALSE \
+                 WHERE user_did = $1 AND device_id = $2",
+            )
+            .bind(&user_did)
+            .bind(&device_id)
+            .execute(&mut *deactivation)
+            .await
+            .expect("stage deactivation");
+
+            let requested_uuid = match_by_uuid.then_some(stored_uuid.as_str());
+            let input = registration_input(
+                requested_uuid,
+                "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+                key_package,
+                signature_public_key,
+            );
+            let sse_state = Arc::new(SseState::new(16));
+            let auth_user = auth_user(&user_did);
+            let mut registration = Box::pin(handle_register(&pool, &sse_state, &auth_user, &input));
+
+            assert!(
+                tokio::time::timeout(StdDuration::from_millis(100), &mut registration)
+                    .await
+                    .is_err(),
+                "registration must wait for the contested device-row lock"
+            );
+            deactivation.commit().await.expect("commit deactivation");
+            let result = tokio::time::timeout(StdDuration::from_secs(5), registration)
+                .await
+                .expect("registration resumes after deactivation");
+            assert_eq!(
+                result.expect_err("deactivation winner must reject registration"),
+                StatusCode::BAD_REQUEST
+            );
+
+            let after = registration_state_snapshot(&pool, &user_did).await;
+            assert_eq!(after.0, before.0, "user row must remain unchanged");
+            assert_eq!(after.1, before.1, "device metadata must remain unchanged");
+            assert!(!after.2, "deactivation must be the only device change");
+            assert_eq!(
+                after.3,
+                before.3 + 1,
+                "deactivation must be the only auth-generation change"
+            );
+            assert_eq!(after.4, before.4, "KeyPackages must remain unchanged");
+            cleanup_registration_fixture(&pool, &user_did).await;
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+    async fn reregistration_obeys_key_package_then_device_lock_order() {
+        let pool = setup_test_db().await;
+
+        for match_by_uuid in [true, false] {
+            let suffix = Uuid::new_v4().simple().to_string();
+            let user_did = format!("did:plc:lockorder{}", &suffix[..12]);
+            let device_id = format!("device-{suffix}");
+            let stored_uuid = format!("stored-{suffix}");
+            let (key_package, signature_public_key) = generate_key_package(&user_did);
+            let signature_hex = hex::encode(&signature_public_key);
+            seed_registration_state(
+                &pool,
+                &user_did,
+                &device_id,
+                &stored_uuid,
+                &signature_hex,
+                &suffix,
+                true,
+            )
+            .await;
+
+            // Stage the first lock taken by federation KeyPackage claiming. A registration
+            // following the global order must wait here without holding the device row.
+            let mut federation_claim = pool.begin().await.expect("begin federation claim");
+            sqlx::query(
+                "SELECT id FROM key_packages \
+                 WHERE owner_did = $1 AND device_id = $2 \
+                 ORDER BY id FOR UPDATE",
+            )
+            .bind(&user_did)
+            .bind(&device_id)
+            .fetch_all(&mut *federation_claim)
+            .await
+            .expect("lock candidate KeyPackages");
+
+            let requested_uuid = match_by_uuid.then_some(stored_uuid.as_str());
+            let input = registration_input(
+                requested_uuid,
+                "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+                key_package,
+                signature_public_key,
+            );
+            let sse_state = Arc::new(SseState::new(16));
+            let auth_user = auth_user(&user_did);
+            let mut registration = Box::pin(handle_register(&pool, &sse_state, &auth_user, &input));
+
+            assert!(
+                tokio::time::timeout(StdDuration::from_millis(100), &mut registration)
+                    .await
+                    .is_err(),
+                "registration must wait for the federation KeyPackage lock"
+            );
+
+            // Federation takes the device lock only after its KeyPackage lock. This must not
+            // wait on registration, otherwise the two paths have inverted their lock order.
+            let device_lock = tokio::time::timeout(
+                StdDuration::from_secs(1),
+                sqlx::query(
+                    "SELECT active FROM devices \
+                     WHERE user_did = $1 AND device_id = $2 FOR SHARE",
+                )
+                .bind(&user_did)
+                .bind(&device_id)
+                .fetch_one(&mut *federation_claim),
+            )
+            .await;
+            assert!(
+                device_lock.is_ok(),
+                "registration must not hold the device lock while waiting on KeyPackages"
+            );
+            device_lock
+                .expect("device lock completed")
+                .expect("lock active device");
+
+            federation_claim
+                .commit()
+                .await
+                .expect("commit federation claim");
+            let output = tokio::time::timeout(StdDuration::from_secs(5), registration)
+                .await
+                .expect("registration resumes after federation claim")
+                .expect("registration succeeds");
+            assert_eq!(output.0.device_id.as_ref(), device_id);
+
+            let active: bool = sqlx::query_scalar(
+                "SELECT active FROM devices WHERE user_did = $1 AND device_id = $2",
+            )
+            .bind(&user_did)
+            .bind(&device_id)
+            .fetch_one(&pool)
+            .await
+            .expect("fetch re-registered device");
+            assert!(active, "re-registered device remains active");
+            cleanup_registration_fixture(&pool, &user_did).await;
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+    async fn reregistration_and_last_resort_publish_share_key_package_then_device_order() {
+        let pool = setup_test_db().await;
+        let suffix = Uuid::new_v4().simple().to_string();
+        let user_did = format!("did:plc:lastresortlock{}", &suffix[..12]);
+        let device_id = format!("device-{suffix}");
+        let stored_uuid = format!("stored-{suffix}");
+        let (key_package, signature_public_key) = generate_key_package(&user_did);
+        let signature_hex = hex::encode(&signature_public_key);
+        seed_registration_state(
+            &pool,
+            &user_did,
+            &device_id,
+            &stored_uuid,
+            &signature_hex,
+            &suffix,
+            true,
+        )
+        .await;
+        sqlx::query(
+            "UPDATE key_packages SET is_last_resort = TRUE \
+             WHERE owner_did = $1 AND device_id = $2",
+        )
+        .bind(&user_did)
+        .bind(&device_id)
+        .execute(&pool)
+        .await
+        .expect("mark existing package as last resort");
+
+        // Stage the first lock taken by re-registration. The actual shared publication
+        // helper must wait here before it acquires a shared device lock.
+        let mut registration = pool.begin().await.expect("begin registration");
+        sqlx::query(
+            "SELECT id FROM key_packages \
+             WHERE owner_did = $1 AND device_id = $2 \
+             ORDER BY id FOR UPDATE",
+        )
+        .bind(&user_did)
+        .bind(&device_id)
+        .fetch_all(&mut *registration)
+        .await
+        .expect("lock re-registration KeyPackages");
+
+        let mut publication = pool.begin().await.expect("begin last-resort publication");
+        let publisher_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *publication)
+            .await
+            .expect("fetch publisher backend pid");
+        let publish_did = user_did.clone();
+        let publish_device_id = device_id.clone();
+        let publish_signature_key = signature_public_key.clone();
+        let publisher = tokio::spawn(async move {
+            let result = crate::db::store_key_package_with_device_bound_to_signature_in_tx(
+                &mut publication,
+                &publish_did,
+                "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+                key_package,
+                Utc::now() + Duration::days(1),
+                Some(publish_device_id),
+                Some(&publish_signature_key),
+                true,
+            )
+            .await;
+            (publication, result)
+        });
+
+        let mut publisher_waiting_on_key_package = false;
+        for _ in 0..100 {
+            publisher_waiting_on_key_package = sqlx::query_scalar(
+                "SELECT EXISTS( \
+                   SELECT 1 FROM pg_stat_activity \
+                   WHERE pid = $1 AND wait_event_type = 'Lock' \
+                     AND query LIKE '%UPDATE key_packages%' \
+                 )",
+            )
+            .bind(publisher_pid)
+            .fetch_one(&pool)
+            .await
+            .expect("inspect publisher wait state");
+            if publisher_waiting_on_key_package {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+        assert!(
+            publisher_waiting_on_key_package,
+            "last-resort publication must reach the contested KeyPackage lock"
+        );
+
+        let device_lock = tokio::time::timeout(
+            StdDuration::from_secs(1),
+            sqlx::query(
+                "SELECT active FROM devices \
+                 WHERE user_did = $1 AND device_id = $2 FOR UPDATE",
+            )
+            .bind(&user_did)
+            .bind(&device_id)
+            .fetch_one(&mut *registration),
+        )
+        .await;
+        assert!(
+            device_lock.is_ok(),
+            "last-resort publication must not hold the device lock while waiting on KeyPackages"
+        );
+        device_lock
+            .expect("device lock completed")
+            .expect("lock registration device");
+
+        registration
+            .commit()
+            .await
+            .expect("commit registration lock stage");
+        let (publication, published) = tokio::time::timeout(StdDuration::from_secs(5), publisher)
+            .await
+            .expect("publication resumes after registration")
+            .expect("publisher task completes");
+        published.expect("last-resort publication succeeds");
+        publication.commit().await.expect("commit publication");
+
+        let available_last_resort: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM key_packages \
+             WHERE owner_did = $1 AND device_id = $2 \
+               AND is_last_resort = TRUE AND state = 'available' AND dead_at IS NULL",
+        )
+        .bind(&user_did)
+        .bind(&device_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count available last-resort packages");
+        assert_eq!(
+            available_last_resort, 1,
+            "last-resort replacement semantics must be preserved"
+        );
+        cleanup_registration_fixture(&pool, &user_did).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+    async fn declared_ciphersuite_mismatch_does_not_mutate_new_registration() {
+        let pool = setup_test_db().await;
+        let suffix = Uuid::new_v4().simple().to_string();
+        let user_did = format!("did:plc:newmismatch{}", &suffix[..12]);
+        let device_uuid = format!("new-mismatch-{suffix}");
+        cleanup_registration_fixture(&pool, &user_did).await;
+        let (key_package, signature_public_key) = generate_key_package(&user_did);
+        let input = mismatched_registration_input(&device_uuid, key_package, signature_public_key);
+
+        let result = handle_register(
+            &pool,
+            &Arc::new(SseState::new(16)),
+            &auth_user(&user_did),
+            &input,
+        )
+        .await;
+
+        assert_eq!(
+            result.expect_err("mismatch must fail"),
+            StatusCode::BAD_REQUEST
+        );
+        let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE did = $1")
+            .bind(&user_did)
+            .fetch_one(&pool)
+            .await
+            .expect("count users");
+        let devices: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM devices WHERE user_did = $1")
+            .bind(&user_did)
+            .fetch_one(&pool)
+            .await
+            .expect("count devices");
+        let key_packages: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM key_packages WHERE owner_did = $1")
+                .bind(&user_did)
+                .fetch_one(&pool)
+                .await
+                .expect("count key packages");
+        assert_eq!((users, devices, key_packages), (0, 0, 0));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+    async fn declared_ciphersuite_mismatch_does_not_mutate_reregistration() {
+        let pool = setup_test_db().await;
+        let suffix = Uuid::new_v4().simple().to_string();
+        let user_did = format!("did:plc:reregmismatch{}", &suffix[..12]);
+        let device_id = format!("device-{suffix}");
+        let device_uuid = format!("uuid-{suffix}");
+        let old_signature_hex = hex::encode([0x41_u8; 32]);
+        cleanup_registration_fixture(&pool, &user_did).await;
+        sqlx::query("INSERT INTO users (did) VALUES ($1)")
+            .bind(&user_did)
+            .execute(&pool)
+            .await
+            .expect("seed user");
+        sqlx::query(
+            "INSERT INTO devices \
+             (id, user_did, device_id, device_name, credential_did, signature_public_key, device_uuid) \
+             VALUES ($1, $2, $3, 'Original device', $4, $5, $6)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&user_did)
+        .bind(&device_id)
+        .bind(format!("{user_did}#{device_id}"))
+        .bind(&old_signature_hex)
+        .bind(&device_uuid)
+        .execute(&pool)
+        .await
+        .expect("seed device");
+        sqlx::query(
+            "INSERT INTO key_packages \
+             (id, owner_did, device_id, cipher_suite, key_package, key_package_hash) \
+             VALUES ($1, $2, $3, 'legacy-suite', $4, $5)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&user_did)
+        .bind(&device_id)
+        .bind(vec![0xA5_u8])
+        .bind(format!("legacy-{suffix}"))
+        .execute(&pool)
+        .await
+        .expect("seed key package");
+        let (key_package, signature_public_key) = generate_key_package(&user_did);
+        let input = mismatched_registration_input(&device_uuid, key_package, signature_public_key);
+
+        let result = handle_register(
+            &pool,
+            &Arc::new(SseState::new(16)),
+            &auth_user(&user_did),
+            &input,
+        )
+        .await;
+
+        assert_eq!(
+            result.expect_err("mismatch must fail"),
+            StatusCode::BAD_REQUEST
+        );
+        let device: (String, String) = sqlx::query_as(
+            "SELECT device_name, signature_public_key FROM devices \
+             WHERE user_did = $1 AND device_uuid = $2",
+        )
+        .bind(&user_did)
+        .bind(&device_uuid)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch unchanged device");
+        let key_packages: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM key_packages WHERE owner_did = $1 AND device_id = $2",
+        )
+        .bind(&user_did)
+        .bind(&device_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count unchanged key packages");
+        assert_eq!(device, ("Original device".to_string(), old_signature_hex));
+        assert_eq!(key_packages, 1);
+        cleanup_registration_fixture(&pool, &user_did).await;
     }
 
     #[tokio::test]

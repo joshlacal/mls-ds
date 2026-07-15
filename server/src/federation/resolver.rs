@@ -1,5 +1,7 @@
 use once_cell::sync::Lazy;
 use sqlx::PgPool;
+use std::collections::HashSet;
+use std::future::Future;
 use std::time::Duration;
 use tracing::{debug, info};
 
@@ -8,6 +10,10 @@ use crate::identity::{canonical_did, did_web_document_url};
 
 const PROFILE_COLLECTION: &str = "blue.catbird.mlsChat.profile";
 const PROFILE_RKEY: &str = "self";
+const AUTHORITY_PAGE_SIZE: usize = 100;
+const AUTHORITY_PAGE_SIZE_PARAM: &str = "100";
+const MAX_AUTHORITY_PAGES: usize = 10;
+const MAX_AUTHORITY_RECORDS: usize = AUTHORITY_PAGE_SIZE * MAX_AUTHORITY_PAGES;
 
 fn profile_record_url(pds_endpoint: &str, user_did: &str) -> String {
     format!(
@@ -435,65 +441,55 @@ impl DsResolver {
         &self,
         did: &str,
     ) -> Result<Vec<Vec<u8>>, FederationError> {
-        let pds_endpoint = self.resolve_did_to_pds(did).await?;
+        let deadline = outbound_timeout();
+        let resolution = complete_authority_resolution_with_deadline(
+            || self.resolve_did_to_pds(did),
+            |pds_endpoint| async move {
+                let list_records_url = format!(
+                    "{}/xrpc/com.atproto.repo.listRecords",
+                    pds_endpoint.trim_end_matches('/')
+                );
+                let did_owned = did.to_string();
+                let http = self.http.clone();
 
-        // Construct the listRecords request URL
-        let list_records_url = format!(
-            "{}/xrpc/com.atproto.repo.listRecords?repo={}&collection=blue.catbird.mlsChat.device",
-            pds_endpoint.trim_end_matches('/'),
-            did
-        );
+                collect_authoritative_device_key_pages(
+                    move |cursor| {
+                        let http = http.clone();
+                        let list_records_url = list_records_url.clone();
+                        let did = did_owned.clone();
+                        async move {
+                            let mut request = http.get(list_records_url).query(&[
+                                ("repo", did.as_str()),
+                                ("collection", "blue.catbird.mlsChat.device"),
+                                ("limit", AUTHORITY_PAGE_SIZE_PARAM),
+                            ]);
+                            if let Some(cursor) = cursor.as_deref() {
+                                request = request.query(&[("cursor", cursor)]);
+                            }
 
-        let resp = self
-            .http
-            .get(&list_records_url)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
-            .map_err(|e| FederationError::ResolutionFailed {
-                did: did.to_string(),
-                reason: format!("PDS listRecords HTTP error: {}", e),
-            })?;
-
-        if !resp.status().is_success() {
-            return Err(FederationError::ResolutionFailed {
-                did: did.to_string(),
-                reason: format!("PDS listRecords returned status {}", resp.status()),
-            });
-        }
-
-        let body: serde_json::Value =
-            resp.json()
+                            let response = request.send().await.map_err(|_| ())?;
+                            if !response.status().is_success() {
+                                return Err(());
+                            }
+                            response.json().await.map_err(|_| ())
+                        }
+                    },
+                    deadline,
+                )
                 .await
-                .map_err(|e| FederationError::ResolutionFailed {
+                .map_err(|_| FederationError::ResolutionFailed {
                     did: did.to_string(),
-                    reason: format!("Invalid PDS listRecords JSON: {}", e),
-                })?;
+                    reason: "PDS device-record pagination was incomplete".to_string(),
+                })
+            },
+            deadline,
+        )
+        .await;
 
-        let mut keys = Vec::new();
-        if let Some(records) = body.get("records").and_then(|v| v.as_array()) {
-            for record in records {
-                // Extract value.mlsSignaturePublicKey.$bytes
-                if let Some(bytes_b64) = record
-                    .get("value")
-                    .and_then(|v| v.get("mlsSignaturePublicKey"))
-                    .and_then(|v| v.get("$bytes"))
-                    .and_then(|v| v.as_str())
-                {
-                    use base64::{engine::general_purpose::STANDARD, Engine as _};
-                    // ATProto $bytes are typically standard base64 without padding, but let's handle standard decode
-                    if let Ok(key_bytes) = STANDARD.decode(bytes_b64) {
-                        keys.push(key_bytes);
-                    } else if let Ok(key_bytes) =
-                        base64::engine::general_purpose::STANDARD_NO_PAD.decode(bytes_b64)
-                    {
-                        keys.push(key_bytes);
-                    }
-                }
-            }
-        }
-
-        Ok(keys)
+        resolution.map_err(|_| FederationError::ResolutionFailed {
+            did: did.to_string(),
+            reason: "PDS device authority resolution exceeded its deadline".to_string(),
+        })?
     }
 
     /// Invalidate cache entry for a DID.
@@ -517,6 +513,125 @@ impl DsResolver {
         let parsed = validate_endpoint_url(url_str)?;
         validate_resolved_host_is_public(&parsed).await
     }
+}
+
+fn outbound_timeout() -> Duration {
+    let timeout_secs = std::env::var("OUTBOUND_TIMEOUT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(30);
+    Duration::from_secs(timeout_secs)
+}
+
+async fn complete_authority_resolution_with_deadline<
+    ResolvePds,
+    ResolveFuture,
+    Paginate,
+    PaginateFuture,
+    PdsEndpoint,
+    Output,
+    Error,
+>(
+    resolve_pds: ResolvePds,
+    paginate: Paginate,
+    deadline: Duration,
+) -> Result<Result<Output, Error>, ()>
+where
+    ResolvePds: FnOnce() -> ResolveFuture,
+    ResolveFuture: Future<Output = Result<PdsEndpoint, Error>>,
+    Paginate: FnOnce(PdsEndpoint) -> PaginateFuture,
+    PaginateFuture: Future<Output = Result<Output, Error>>,
+{
+    tokio::time::timeout(deadline, async move {
+        let pds_endpoint = resolve_pds().await?;
+        paginate(pds_endpoint).await
+    })
+    .await
+    .map_err(|_| ())
+}
+
+async fn collect_authoritative_device_key_pages<Fetch, FetchFuture>(
+    mut fetch_page: Fetch,
+    deadline: Duration,
+) -> Result<Vec<Vec<u8>>, ()>
+where
+    Fetch: FnMut(Option<String>) -> FetchFuture,
+    FetchFuture: Future<Output = Result<serde_json::Value, ()>>,
+{
+    tokio::time::timeout(deadline, async move {
+        let mut cursor = None;
+        let mut seen_cursors = HashSet::new();
+        let mut record_count = 0usize;
+        let mut authorized_keys = Vec::new();
+
+        for _ in 0..MAX_AUTHORITY_PAGES {
+            let body = fetch_page(cursor.clone()).await?;
+            let records = body
+                .get("records")
+                .and_then(serde_json::Value::as_array)
+                .ok_or(())?;
+            record_count = record_count.checked_add(records.len()).ok_or(())?;
+            if record_count > MAX_AUTHORITY_RECORDS {
+                return Err(());
+            }
+            authorized_keys.extend(parse_authoritative_device_keys(&body)?);
+
+            match body.get("cursor") {
+                None => return Ok(authorized_keys),
+                Some(value) => {
+                    let next_cursor = value.as_str().filter(|value| !value.is_empty()).ok_or(())?;
+                    if !seen_cursors.insert(next_cursor.to_string()) {
+                        return Err(());
+                    }
+                    cursor = Some(next_cursor.to_string());
+                }
+            }
+        }
+
+        Err(())
+    })
+    .await
+    .map_err(|_| ())?
+}
+
+fn parse_authoritative_device_keys(body: &serde_json::Value) -> Result<Vec<Vec<u8>>, ()> {
+    use base64::Engine as _;
+
+    let records = body
+        .get("records")
+        .and_then(|value| value.as_array())
+        .ok_or(())?;
+    records
+        .iter()
+        .map(|record| {
+            let value = record.get("value").ok_or(())?;
+            let algorithm = value
+                .get("algorithm")
+                .and_then(|value| value.as_str())
+                .ok_or(())?;
+            let created_at = value
+                .get("createdAt")
+                .and_then(|value| value.as_str())
+                .ok_or(())?;
+            chrono::DateTime::parse_from_rfc3339(created_at).map_err(|_| ())?;
+
+            let encoded = value
+                .get("mlsSignaturePublicKey")
+                .and_then(|value| value.get("$bytes"))
+                .and_then(|value| value.as_str())
+                .ok_or(())?;
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(encoded))
+                .map_err(|_| ())?;
+            match algorithm {
+                "ed25519" => (decoded.len() == 32).then_some(Some(decoded)).ok_or(()),
+                "p256" => matches!(decoded.len(), 33 | 65).then_some(None).ok_or(()),
+                _ => Err(()),
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|keys| keys.into_iter().flatten().collect())
 }
 
 /// Extract the `serviceEndpoint` of the DID-document service whose `id` is
@@ -758,6 +873,232 @@ pub(crate) async fn validate_resolved_host_is_public(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
+
+    fn authoritative_record(key: &[u8]) -> serde_json::Value {
+        serde_json::json!({
+            "value": {
+                "mlsSignaturePublicKey": {
+                    "$bytes": base64::engine::general_purpose::STANDARD.encode(key)
+                },
+                "algorithm": "ed25519",
+                "createdAt": "2026-07-15T12:00:00Z"
+            }
+        })
+    }
+
+    #[test]
+    fn authoritative_device_keys_accept_complete_ed25519_record() {
+        let body = serde_json::json!({"records": [authoritative_record(&[0x41; 32])]});
+        assert_eq!(
+            parse_authoritative_device_keys(&body),
+            Ok(vec![vec![0x41; 32]])
+        );
+    }
+
+    #[test]
+    fn authoritative_device_keys_skip_valid_p256_record_in_mixed_set() {
+        let p256 = serde_json::json!({
+            "value": {
+                "mlsSignaturePublicKey": {
+                    "$bytes": base64::engine::general_purpose::STANDARD.encode([0x04; 65])
+                },
+                "algorithm": "p256",
+                "createdAt": "2026-07-15T12:00:00Z"
+            }
+        });
+        let body = serde_json::json!({
+            "records": [p256, authoritative_record(&[0x41; 32])]
+        });
+        assert_eq!(
+            parse_authoritative_device_keys(&body),
+            Ok(vec![vec![0x41; 32]])
+        );
+    }
+
+    #[test]
+    fn authoritative_device_keys_return_empty_for_p256_only_set() {
+        let body = serde_json::json!({
+            "records": [{
+                "value": {
+                    "mlsSignaturePublicKey": {
+                        "$bytes": base64::engine::general_purpose::STANDARD.encode([0x04; 65])
+                    },
+                    "algorithm": "p256",
+                    "createdAt": "2026-07-15T12:00:00Z"
+                }
+            }]
+        });
+        assert_eq!(parse_authoritative_device_keys(&body), Ok(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn authoritative_pagination_retains_ed25519_key_from_second_page() {
+        let requested_cursors = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cursors = requested_cursors.clone();
+        let keys = collect_authoritative_device_key_pages(
+            move |cursor| {
+                cursors.lock().expect("cursor lock").push(cursor.clone());
+                std::future::ready(match cursor.as_deref() {
+                    None => Ok(serde_json::json!({
+                        "records": [{
+                            "value": {
+                                "mlsSignaturePublicKey": {
+                                    "$bytes": base64::engine::general_purpose::STANDARD.encode([0x04; 65])
+                                },
+                                "algorithm": "p256",
+                                "createdAt": "2026-07-15T12:00:00Z"
+                            }
+                        }],
+                        "cursor": "page-2"
+                    })),
+                    Some("page-2") => Ok(serde_json::json!({
+                        "records": [authoritative_record(&[0x42; 32])]
+                    })),
+                    _ => Err(()),
+                })
+            },
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+
+        assert_eq!(keys, Ok(vec![vec![0x42; 32]]));
+        assert_eq!(
+            *requested_cursors.lock().expect("cursor lock"),
+            vec![None, Some("page-2".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn authoritative_pagination_rejects_non_progressing_cursor() {
+        let result = collect_authoritative_device_key_pages(
+            |_| {
+                std::future::ready(Ok(serde_json::json!({
+                    "records": [],
+                    "cursor": "loop"
+                })))
+            },
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn authoritative_pagination_rejects_repeated_cursor_cycle() {
+        let result = collect_authoritative_device_key_pages(
+            |cursor| {
+                std::future::ready(Ok(serde_json::json!({
+                    "records": [],
+                    "cursor": match cursor.as_deref() {
+                        None => "page-1",
+                        Some("page-1") => "page-2",
+                        _ => "page-1",
+                    }
+                })))
+            },
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn authoritative_pagination_rejects_page_limit_overflow() {
+        let page_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = page_counter.clone();
+        let page_limit = collect_authoritative_device_key_pages(
+            move |_| {
+                let page = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(Ok(serde_json::json!({
+                    "records": [],
+                    "cursor": format!("page-{}", page + 1)
+                })))
+            },
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert!(page_limit.is_err());
+    }
+
+    #[tokio::test]
+    async fn authoritative_pagination_rejects_record_limit_overflow() {
+        let records = vec![authoritative_record(&[0x41; 32]); MAX_AUTHORITY_RECORDS + 1];
+        let record_limit = collect_authoritative_device_key_pages(
+            move |_| {
+                let records = records.clone();
+                std::future::ready(Ok(serde_json::json!({
+                    "records": records
+                })))
+            },
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert!(record_limit.is_err());
+    }
+
+    #[tokio::test]
+    async fn authoritative_pagination_enforces_overall_deadline() {
+        let result = collect_authoritative_device_key_pages(
+            |_| std::future::pending::<Result<serde_json::Value, ()>>(),
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[allow(clippy::redundant_closure)]
+    #[tokio::test]
+    async fn authority_deadline_includes_pre_pagination_resolution() {
+        let pagination_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started = pagination_started.clone();
+        let result = complete_authority_resolution_with_deadline(
+            || std::future::pending::<Result<String, ()>>(),
+            move |_| {
+                started.store(true, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(Ok(()))
+            },
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(!pagination_started.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn authoritative_device_keys_reject_mixed_valid_and_malformed_records() {
+        let body = serde_json::json!({
+            "records": [
+                authoritative_record(&[0x41; 32]),
+                {"value": {"mlsSignaturePublicKey": {"$bytes": "not-base64"}}}
+            ]
+        });
+        assert!(parse_authoritative_device_keys(&body).is_err());
+    }
+
+    #[test]
+    fn authoritative_device_keys_reject_missing_or_wrong_length_keys() {
+        for body in [
+            serde_json::json!({"records": [{"value": {}}]}),
+            serde_json::json!({"records": [{"value": {"mlsSignaturePublicKey": {"$bytes": base64::engine::general_purpose::STANDARD.encode([0x41; 31])}}}]}),
+            serde_json::json!({}),
+        ] {
+            assert!(parse_authoritative_device_keys(&body).is_err());
+        }
+    }
+
+    #[test]
+    fn authoritative_device_keys_reject_missing_or_invalid_metadata() {
+        let encoded = base64::engine::general_purpose::STANDARD.encode([0x41; 32]);
+        for body in [
+            serde_json::json!({"records": [{"value": {"mlsSignaturePublicKey": {"$bytes": encoded}, "createdAt": "2026-07-15T12:00:00Z"}}]}),
+            serde_json::json!({"records": [{"value": {"mlsSignaturePublicKey": {"$bytes": encoded}, "algorithm": "p256", "createdAt": "2026-07-15T12:00:00Z"}}]}),
+            serde_json::json!({"records": [{"value": {"mlsSignaturePublicKey": {"$bytes": encoded}, "algorithm": "ed25519"}}]}),
+            serde_json::json!({"records": [{"value": {"mlsSignaturePublicKey": {"$bytes": encoded}, "algorithm": "ed25519", "createdAt": "not-a-datetime"}}]}),
+        ] {
+            assert!(parse_authoritative_device_keys(&body).is_err());
+        }
+    }
     use sqlx::postgres::PgPoolOptions;
     use std::net::IpAddr;
     use uuid::Uuid;
