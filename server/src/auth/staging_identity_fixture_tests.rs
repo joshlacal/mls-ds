@@ -12,6 +12,7 @@ const GATEWAY_DID: &str = "did:web:dev-api.catbird.blue";
 const MLS_DID: &str = "did:web:dev-api.catbird.blue:mls";
 const USER_DID: &str = "did:plc:wave1-staging-user";
 const ENDPOINT: &str = "blue.catbird.mlsChat.getConvos";
+const OTHER_ENDPOINT: &str = "blue.catbird.mlsChat.sendMessage";
 const GATEWAY_KID: &str = "catbird-key-1";
 
 fn strict_fixture_policy() -> AuthEnforcementPolicy {
@@ -108,8 +109,17 @@ fn sign_token(key: &SigningKey, kid: Option<&str>, claims: &AtProtoClaims) -> St
 
 #[derive(Default)]
 struct FixtureReplayStore {
-    consumed: Mutex<HashSet<(String, String, String)>>,
+    consumed: Mutex<HashSet<(String, String)>>,
+    attempts: Mutex<Vec<FixtureReplayAttempt>>,
     calls: AtomicUsize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct FixtureReplayAttempt {
+    issuer_did: String,
+    jti: String,
+    endpoint_nsid: String,
+    ttl_seconds: u64,
 }
 
 #[async_trait::async_trait]
@@ -119,18 +129,23 @@ impl JtiReplayStore for FixtureReplayStore {
         issuer_did: &str,
         jti: &str,
         endpoint_nsid: &str,
-        _ttl_seconds: u64,
+        ttl_seconds: u64,
     ) -> Result<bool, AuthError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.attempts
+            .lock()
+            .expect("fixture replay attempt lock")
+            .push(FixtureReplayAttempt {
+                issuer_did: issuer_did.to_string(),
+                jti: jti.to_string(),
+                endpoint_nsid: endpoint_nsid.to_string(),
+                ttl_seconds,
+            });
         Ok(self
             .consumed
             .lock()
             .expect("fixture replay store lock")
-            .insert((
-                issuer_did.to_string(),
-                jti.to_string(),
-                endpoint_nsid.to_string(),
-            )))
+            .insert((issuer_did.to_string(), jti.to_string())))
     }
 }
 
@@ -217,11 +232,60 @@ async fn wave1_staging_gateway_jwk_verifies_and_delegates_only_with_exact_bindin
         .consumed
         .lock()
         .expect("fixture replay store lock")
-        .contains(&(
-            GATEWAY_DID.to_string(),
-            claims.jti.clone().unwrap(),
-            ENDPOINT.to_string(),
-        )));
+        .contains(&(GATEWAY_DID.to_string(), claims.jti.clone().unwrap())));
+    JTI_CACHE.invalidate(&replay_key);
+}
+
+#[tokio::test]
+async fn persisted_replay_is_issuer_and_jti_scoped_across_endpoints() {
+    let jti = "wave1-staging-cross-endpoint-jti-0001";
+    let first_claims = delegated_claims(GATEWAY_DID, MLS_DID, ENDPOINT, jti);
+    let replay_claims = delegated_claims(GATEWAY_DID, MLS_DID, OTHER_ENDPOINT, jti);
+    let replay_key = format!("{GATEWAY_DID}|{jti}");
+    let replay_store = FixtureReplayStore::default();
+
+    JTI_CACHE.invalidate(&replay_key);
+    enforce_standard_with_store(
+        &first_claims,
+        ENDPOINT,
+        &replay_store,
+        strict_fixture_policy(),
+    )
+    .await
+    .expect("first issuer+jti use is atomically recorded");
+
+    JTI_CACHE.invalidate(&replay_key);
+    assert!(matches!(
+        enforce_standard_with_store(
+            &replay_claims,
+            OTHER_ENDPOINT,
+            &replay_store,
+            strict_fixture_policy(),
+        )
+        .await,
+        Err(AuthError::ReplayDetected)
+    ));
+    assert_eq!(replay_store.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        *replay_store
+            .attempts
+            .lock()
+            .expect("fixture replay attempt lock"),
+        vec![
+            FixtureReplayAttempt {
+                issuer_did: GATEWAY_DID.to_string(),
+                jti: jti.to_string(),
+                endpoint_nsid: ENDPOINT.to_string(),
+                ttl_seconds: 120,
+            },
+            FixtureReplayAttempt {
+                issuer_did: GATEWAY_DID.to_string(),
+                jti: jti.to_string(),
+                endpoint_nsid: OTHER_ENDPOINT.to_string(),
+                ttl_seconds: 120,
+            },
+        ]
+    );
     JTI_CACHE.invalidate(&replay_key);
 }
 
