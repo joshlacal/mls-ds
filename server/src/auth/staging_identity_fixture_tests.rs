@@ -14,6 +14,10 @@ const USER_DID: &str = "did:plc:wave1-staging-user";
 const ENDPOINT: &str = "blue.catbird.mlsChat.getConvos";
 const GATEWAY_KID: &str = "catbird-key-1";
 
+fn strict_fixture_policy() -> AuthEnforcementPolicy {
+    AuthEnforcementPolicy::strict_for_test()
+}
+
 fn fixture_signing_key(last_byte: u8) -> SigningKey {
     let mut scalar = [0_u8; 32];
     scalar[31] = last_byte;
@@ -148,7 +152,8 @@ async fn wave1_staging_gateway_jwk_verifies_and_delegates_only_with_exact_bindin
         .verify_jwt(&token)
         .await
         .expect("staging gateway token verifies against its exact JWK");
-    enforce_standard(&verified, ENDPOINT).expect("audience-bound token is endpoint-bound");
+    enforce_standard_with_policy(&verified, ENDPOINT, strict_fixture_policy())
+        .expect("audience-bound token is endpoint-bound");
     assert_eq!(
         resolve_authenticated_principal(&verified, Some(GATEWAY_DID))
             .expect("configured staging gateway may delegate"),
@@ -191,19 +196,20 @@ async fn wave1_staging_gateway_jwk_verifies_and_delegates_only_with_exact_bindin
         .await
         .expect("signature and audience remain valid");
     assert!(matches!(
-        enforce_standard(&wrong_lxm, ENDPOINT),
+        enforce_standard_with_policy(&wrong_lxm, ENDPOINT, strict_fixture_policy()),
         Err(AuthError::LxmMismatch)
     ));
 
     let replay_key = format!("{}|{}", GATEWAY_DID, claims.jti.as_deref().unwrap());
     JTI_CACHE.invalidate(&replay_key);
     let replay_store = FixtureReplayStore::default();
-    enforce_standard_with_store(&verified, ENDPOINT, &replay_store)
+    enforce_standard_with_store(&verified, ENDPOINT, &replay_store, strict_fixture_policy())
         .await
         .expect("fresh jti is atomically recorded");
     JTI_CACHE.invalidate(&replay_key);
     assert!(matches!(
-        enforce_standard_with_store(&verified, ENDPOINT, &replay_store).await,
+        enforce_standard_with_store(&verified, ENDPOINT, &replay_store, strict_fixture_policy(),)
+            .await,
         Err(AuthError::ReplayDetected)
     ));
     assert_eq!(replay_store.calls.load(Ordering::SeqCst), 2);
@@ -276,7 +282,8 @@ async fn wave1_staging_mls_atproto_jwk_verifies_outbound_token_without_kid() {
     assert_eq!(verified.aud, MLS_DID);
     assert_eq!(verified.lxm.as_deref(), Some(ENDPOINT));
     assert!(verified.jti.as_deref().is_some_and(|jti| !jti.is_empty()));
-    enforce_standard(&verified, ENDPOINT).expect("outbound token is endpoint-bound");
+    enforce_standard_with_policy(&verified, ENDPOINT, strict_fixture_policy())
+        .expect("outbound token is endpoint-bound");
     assert_eq!(
         resolve_authenticated_principal(&verified, Some(GATEWAY_DID))
             .expect("service token without sub remains issuer-bound"),

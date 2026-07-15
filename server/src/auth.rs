@@ -276,8 +276,7 @@ pub struct AuthMiddleware {
     cache_ttl_seconds: u64,
     rate_limit_quota: Quota,
     did_host_allowlist: Option<Vec<String>>,
-    #[cfg(test)]
-    test_service_did: Option<String>,
+    service_did: Option<String>,
 }
 
 impl AuthMiddleware {
@@ -300,6 +299,7 @@ impl AuthMiddleware {
             .filter(|v| *v > 0)
             .unwrap_or(10);
         let did_host_allowlist = parse_host_allowlist("DID_RESOLUTION_HOST_ALLOWLIST");
+        let service_did = std::env::var("SERVICE_DID").ok();
 
         let did_cache = Cache::builder()
             .max_capacity(10_000)
@@ -333,14 +333,13 @@ impl AuthMiddleware {
             cache_ttl_seconds,
             rate_limit_quota: quota,
             did_host_allowlist,
-            #[cfg(test)]
-            test_service_did: None,
+            service_did,
         }
     }
 
     #[cfg(test)]
     fn with_test_service_did(mut self, service_did: &str) -> Self {
-        self.test_service_did = Some(service_did.to_string());
+        self.service_did = Some(service_did.to_string());
         self
     }
 
@@ -381,16 +380,9 @@ impl AuthMiddleware {
         }
 
         // Audience enforcement when configured
-        #[cfg(test)]
-        let service_did = self
-            .test_service_did
-            .clone()
-            .or_else(|| std::env::var("SERVICE_DID").ok());
-        #[cfg(not(test))]
-        let service_did = std::env::var("SERVICE_DID").ok();
-        if let Some(service_did) = service_did {
+        if let Some(service_did) = &self.service_did {
             tracing::debug!("Validating JWT audience against configured SERVICE_DID");
-            if claims.aud != service_did {
+            if claims.aud != service_did.as_str() {
                 tracing::warn!("JWT audience mismatch with SERVICE_DID");
                 return Err(AuthError::InvalidToken(
                     "aud does not match SERVICE_DID".into(),
@@ -895,6 +887,47 @@ async fn validate_resolved_host_is_public(host: &str, port: u16) -> Result<(), A
 /// Enforce optional lxm and jti-claim presence.
 /// Replay uniqueness must be enforced with `enforce_standard_with_replay_store`.
 pub fn enforce_standard(claims: &AtProtoClaims, endpoint_nsid: &str) -> Result<(), AuthError> {
+    enforce_standard_with_policy(claims, endpoint_nsid, AuthEnforcementPolicy::from_env())
+}
+
+#[derive(Clone, Copy)]
+struct AuthEnforcementPolicy {
+    enforce_lxm: bool,
+    enforce_jti: bool,
+    jti_ttl_seconds: u64,
+}
+
+impl AuthEnforcementPolicy {
+    fn from_env() -> Self {
+        Self {
+            enforce_lxm: std::env::var("ENFORCE_LXM")
+                .map(|value| truthy(&value))
+                .unwrap_or(true),
+            enforce_jti: std::env::var("ENFORCE_JTI")
+                .map(|value| truthy(&value))
+                .unwrap_or(true),
+            jti_ttl_seconds: std::env::var("JTI_TTL_SECONDS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(120),
+        }
+    }
+
+    #[cfg(test)]
+    const fn strict_for_test() -> Self {
+        Self {
+            enforce_lxm: true,
+            enforce_jti: true,
+            jti_ttl_seconds: 120,
+        }
+    }
+}
+
+fn enforce_standard_with_policy(
+    claims: &AtProtoClaims,
+    endpoint_nsid: &str,
+    policy: AuthEnforcementPolicy,
+) -> Result<(), AuthError> {
     tracing::debug!(
         iss = %crate::crypto::redact_for_log(&claims.iss),
         endpoint = endpoint_nsid,
@@ -905,10 +938,7 @@ pub fn enforce_standard(claims: &AtProtoClaims, endpoint_nsid: &str) -> Result<(
 
     // Enforce lxm if requested
     // Default to enforcing LXM unless explicitly disabled
-    let enforce_lxm = std::env::var("ENFORCE_LXM")
-        .map(|v| truthy(&v))
-        .unwrap_or(true);
-    if enforce_lxm {
+    if policy.enforce_lxm {
         if let Some(lxm) = &claims.lxm {
             if lxm != endpoint_nsid {
                 tracing::warn!("LXM mismatch: JWT lxm does not match endpoint NSID");
@@ -920,11 +950,7 @@ pub fn enforce_standard(claims: &AtProtoClaims, endpoint_nsid: &str) -> Result<(
     }
 
     // Enforce jti presence unless disabled
-    let enforce_jti = std::env::var("ENFORCE_JTI")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
-        .unwrap_or(true);
-
-    if enforce_jti && claims.jti.is_none() {
+    if policy.enforce_jti && claims.jti.is_none() {
         tracing::warn!(
             iss = %crate::crypto::redact_for_log(&claims.iss),
             endpoint = endpoint_nsid,
@@ -940,7 +966,13 @@ pub async fn enforce_standard_with_replay_store(
     endpoint_nsid: &str,
     pool: &crate::storage::DbPool,
 ) -> Result<(), AuthError> {
-    enforce_standard_with_store(claims, endpoint_nsid, &PostgresJtiReplayStore(pool)).await
+    enforce_standard_with_store(
+        claims,
+        endpoint_nsid,
+        &PostgresJtiReplayStore(pool),
+        AuthEnforcementPolicy::from_env(),
+    )
+    .await
 }
 
 #[async_trait::async_trait]
@@ -987,6 +1019,7 @@ async fn enforce_standard_with_store(
     claims: &AtProtoClaims,
     endpoint_nsid: &str,
     store: &impl JtiReplayStore,
+    policy: AuthEnforcementPolicy,
 ) -> Result<(), AuthError> {
     tracing::debug!(
         iss = %crate::crypto::redact_for_log(&claims.iss),
@@ -996,10 +1029,7 @@ async fn enforce_standard_with_store(
         "Enforcing authorization constraints with shared replay store"
     );
 
-    let enforce_lxm = std::env::var("ENFORCE_LXM")
-        .map(|v| truthy(&v))
-        .unwrap_or(true);
-    if enforce_lxm {
+    if policy.enforce_lxm {
         match &claims.lxm {
             Some(lxm) if lxm == endpoint_nsid => {}
             Some(_) => return Err(AuthError::LxmMismatch),
@@ -1007,17 +1037,11 @@ async fn enforce_standard_with_store(
         }
     }
 
-    let enforce_jti = std::env::var("ENFORCE_JTI")
-        .map(|v| truthy(&v))
-        .unwrap_or(true);
-    if !enforce_jti {
+    if !policy.enforce_jti {
         return Ok(());
     }
 
-    let ttl_seconds = std::env::var("JTI_TTL_SECONDS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(120);
+    let ttl_seconds = policy.jti_ttl_seconds;
 
     let jti = claims.jti.as_ref().ok_or(AuthError::MissingJti)?;
     let canonical_issuer = canonical_did(&claims.iss);
