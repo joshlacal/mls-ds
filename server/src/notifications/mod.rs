@@ -25,13 +25,27 @@ struct ApnsClient {
 
 fn mask_device_token(device_token: &str) -> String {
     if device_token.len() <= 12 {
-        return format!("{}...", &device_token[..device_token.len().min(4)]);
+        let mut prefix_end = device_token.len().min(4);
+        while !device_token.is_char_boundary(prefix_end) {
+            prefix_end -= 1;
+        }
+        return format!("{}...", &device_token[..prefix_end]);
+    }
+
+    let mut prefix_end = 8;
+    while !device_token.is_char_boundary(prefix_end) {
+        prefix_end -= 1;
+    }
+
+    let mut suffix_start = device_token.len() - 4;
+    while !device_token.is_char_boundary(suffix_start) {
+        suffix_start += 1;
     }
 
     format!(
         "{}...{}",
-        &device_token[..8],
-        &device_token[device_token.len().saturating_sub(4)..]
+        &device_token[..prefix_end],
+        &device_token[suffix_start..]
     )
 }
 
@@ -639,6 +653,103 @@ impl Default for NotificationService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mask_device_token_preserves_ascii_compatibility() {
+        assert_eq!(mask_device_token("abc"), "abc...");
+        assert_eq!(mask_device_token("abcdefghijkl"), "abcd...");
+        assert_eq!(mask_device_token("abcdefghijklm"), "abcdefgh...jklm");
+        assert_eq!(mask_device_token("0123456789abcdef"), "01234567...cdef");
+    }
+
+    #[test]
+    fn mask_device_token_uses_unicode_scalar_boundaries() {
+        assert_eq!(mask_device_token("a💥b"), "a...");
+        assert_eq!(mask_device_token("éabc"), "éab...");
+        assert_eq!(mask_device_token("ab💥c"), "ab...");
+        assert_eq!(mask_device_token("abcdef💥ghijkl"), "abcdef...ijkl");
+        assert_eq!(mask_device_token("abcdefghijkl💥x"), "abcdefgh...x");
+    }
+
+    #[test]
+    fn mask_device_token_is_total_and_deterministic_for_unicode_corpus() {
+        let corpus = [
+            "",
+            "é",
+            "e\u{301}",
+            "💥",
+            "👩\u{200d}💻",
+            "设备令牌",
+            "abcdefghi💥jk",
+            "abcdefghi💥jkl",
+            "一二三四五六七八九十十一十二",
+            "一二三四五六七八九十十一十二三",
+        ];
+
+        for token in corpus {
+            let first = mask_device_token(token);
+            let second = mask_device_token(token);
+            assert_eq!(first, second, "mask must be deterministic for {token:?}");
+            assert!(first.ends_with("...") || first.contains("..."));
+        }
+
+        assert_eq!(mask_device_token("abcdefghi💥jk"), "abcdefgh...jk");
+        assert_eq!(mask_device_token("abcdefghi💥jkl"), "abcdefgh...jkl");
+    }
+
+    #[test]
+    fn mask_device_token_is_deterministic_for_very_long_multibyte_token() {
+        let token = format!("{}中{}", "💥".repeat(100_000), "🚀".repeat(100_000));
+        let expected = format!("{}...{}", "💥".repeat(2), "🚀");
+
+        assert_eq!(mask_device_token(&token), expected);
+        assert_eq!(mask_device_token(&token), mask_device_token(&token));
+    }
+
+    fn assert_mask_byte_budget(token: &str) {
+        let masked = mask_device_token(token);
+        let (prefix, suffix) = masked
+            .split_once("...")
+            .expect("masked token must contain separator");
+
+        if token.len() <= 12 {
+            assert!(prefix.len() <= 4, "short prefix exceeded byte budget");
+            assert!(suffix.is_empty(), "short token unexpectedly exposed suffix");
+        } else {
+            assert!(prefix.len() <= 8, "long prefix exceeded byte budget");
+            assert!(suffix.len() <= 4, "long suffix exceeded byte budget");
+            assert!(token.ends_with(suffix));
+        }
+        assert!(token.starts_with(prefix));
+        assert_eq!(masked, mask_device_token(token));
+    }
+
+    #[test]
+    fn mask_device_token_never_exceeds_legacy_byte_budget() {
+        let thirteen_emoji = "💥".repeat(13);
+        assert_eq!(mask_device_token(&thirteen_emoji), "💥💥...💥");
+        assert_mask_byte_budget(&thirteen_emoji);
+
+        let scalars = ["a", "é", "e\u{301}", "💥", "👩\u{200d}💻", "中"];
+        for scalar in scalars {
+            let mut token = String::new();
+            while token.len() + scalar.len() <= 512 {
+                token.push_str(scalar);
+                assert_mask_byte_budget(&token);
+            }
+        }
+
+        for token in [
+            "a💥b",
+            "éabc",
+            "ab💥c",
+            "abcdef💥ghijkl",
+            "abcdefghijkl💥x",
+            "👩\u{200d}💻abcdef中🚀xyz",
+        ] {
+            assert_mask_byte_budget(token);
+        }
+    }
 
     #[tokio::test]
     async fn test_notification_service_creation() {
