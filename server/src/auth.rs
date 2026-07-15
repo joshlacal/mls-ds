@@ -276,6 +276,8 @@ pub struct AuthMiddleware {
     cache_ttl_seconds: u64,
     rate_limit_quota: Quota,
     did_host_allowlist: Option<Vec<String>>,
+    #[cfg(test)]
+    test_service_did: Option<String>,
 }
 
 impl AuthMiddleware {
@@ -331,7 +333,15 @@ impl AuthMiddleware {
             cache_ttl_seconds,
             rate_limit_quota: quota,
             did_host_allowlist,
+            #[cfg(test)]
+            test_service_did: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_test_service_did(mut self, service_did: &str) -> Self {
+        self.test_service_did = Some(service_did.to_string());
+        self
     }
 
     /// Verify JWT token and extract claims.
@@ -371,7 +381,14 @@ impl AuthMiddleware {
         }
 
         // Audience enforcement when configured
-        if let Ok(service_did) = std::env::var("SERVICE_DID") {
+        #[cfg(test)]
+        let service_did = self
+            .test_service_did
+            .clone()
+            .or_else(|| std::env::var("SERVICE_DID").ok());
+        #[cfg(not(test))]
+        let service_did = std::env::var("SERVICE_DID").ok();
+        if let Some(service_did) = service_did {
             tracing::debug!("Validating JWT audience against configured SERVICE_DID");
             if claims.aud != service_did {
                 tracing::warn!("JWT audience mismatch with SERVICE_DID");
@@ -923,6 +940,54 @@ pub async fn enforce_standard_with_replay_store(
     endpoint_nsid: &str,
     pool: &crate::storage::DbPool,
 ) -> Result<(), AuthError> {
+    enforce_standard_with_store(claims, endpoint_nsid, &PostgresJtiReplayStore(pool)).await
+}
+
+#[async_trait::async_trait]
+trait JtiReplayStore: Sync {
+    async fn insert_if_absent(
+        &self,
+        issuer_did: &str,
+        jti: &str,
+        endpoint_nsid: &str,
+        ttl_seconds: u64,
+    ) -> Result<bool, AuthError>;
+}
+
+struct PostgresJtiReplayStore<'a>(&'a crate::storage::DbPool);
+
+#[async_trait::async_trait]
+impl JtiReplayStore for PostgresJtiReplayStore<'_> {
+    async fn insert_if_absent(
+        &self,
+        issuer_did: &str,
+        jti: &str,
+        endpoint_nsid: &str,
+        ttl_seconds: u64,
+    ) -> Result<bool, AuthError> {
+        let inserted: Option<String> = sqlx::query_scalar(
+            "INSERT INTO auth_jti_nonce (issuer_did, jti, endpoint_nsid, expires_at, created_at) \
+             VALUES ($1, $2, $3, NOW() + make_interval(secs => $4), NOW()) \
+             ON CONFLICT (issuer_did, jti) DO NOTHING \
+             RETURNING issuer_did",
+        )
+        .bind(issuer_did)
+        .bind(jti)
+        .bind(endpoint_nsid)
+        .bind(ttl_seconds as f64)
+        .fetch_optional(self.0)
+        .await
+        .map_err(|e| AuthError::Internal(format!("shared jti store failed: {e}")))?;
+
+        Ok(inserted.is_some())
+    }
+}
+
+async fn enforce_standard_with_store(
+    claims: &AtProtoClaims,
+    endpoint_nsid: &str,
+    store: &impl JtiReplayStore,
+) -> Result<(), AuthError> {
     tracing::debug!(
         iss = %crate::crypto::redact_for_log(&claims.iss),
         endpoint = endpoint_nsid,
@@ -961,21 +1026,10 @@ pub async fn enforce_standard_with_replay_store(
         return Err(AuthError::ReplayDetected);
     }
 
-    let inserted: Option<String> = sqlx::query_scalar(
-        "INSERT INTO auth_jti_nonce (issuer_did, jti, endpoint_nsid, expires_at, created_at) \
-         VALUES ($1, $2, $3, NOW() + make_interval(secs => $4), NOW()) \
-         ON CONFLICT (issuer_did, jti) DO NOTHING \
-         RETURNING issuer_did",
-    )
-    .bind(canonical_issuer)
-    .bind(jti)
-    .bind(endpoint_nsid)
-    .bind(ttl_seconds as f64)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| AuthError::Internal(format!("shared jti store failed: {e}")))?;
-
-    if inserted.is_none() {
+    if !store
+        .insert_if_absent(canonical_issuer, jti, endpoint_nsid, ttl_seconds)
+        .await?
+    {
         return Err(AuthError::ReplayDetected);
     }
 
@@ -1450,3 +1504,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "auth/staging_identity_fixture_tests.rs"]
+mod staging_identity_fixture_tests;
