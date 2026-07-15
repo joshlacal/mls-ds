@@ -109,7 +109,7 @@ async fn handle_all(
                COALESCE(is_moderator, false) as is_moderator, leaf_index,
                needs_rejoin, rejoin_requested_at, rejoin_key_package_hash
         FROM members
-        WHERE (user_did = $1 OR member_did = $1 OR member_did LIKE ($1 || '#%'))
+        WHERE (user_did = $1 OR member_did = $1 OR split_part(member_did, '#', 1) = $1)
           AND left_at IS NULL
         ORDER BY joined_at DESC
         "#,
@@ -202,6 +202,7 @@ async fn handle_all(
 mod tests {
     use super::*;
     use sqlx::{postgres::PgPoolOptions, PgPool};
+    use std::collections::BTreeSet;
     use std::time::Duration;
 
     async fn setup_test_db() -> PgPool {
@@ -231,6 +232,135 @@ mod tests {
             .bind(convo_id)
             .execute(pool)
             .await;
+    }
+
+    async fn insert_test_membership(
+        pool: &PgPool,
+        convo_id: &str,
+        member_did: &str,
+        user_did: &str,
+        left_at: Option<DateTime<Utc>>,
+    ) {
+        let created_at = Utc::now();
+
+        cleanup_test_convo(pool, convo_id).await;
+
+        sqlx::query(
+            "INSERT INTO conversations (id, creator_did, current_epoch, created_at, updated_at, cipher_suite, is_remote, group_id)
+             VALUES ($1, $2, 1, $3, $3, $4, false, $1)",
+        )
+        .bind(convo_id)
+        .bind(user_did)
+        .bind(created_at)
+        .bind("MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519")
+        .execute(pool)
+        .await
+        .expect("insert conversation");
+
+        sqlx::query(
+            "INSERT INTO members (convo_id, member_did, user_did, joined_at, left_at, is_admin)
+             VALUES ($1, $2, $3, $4, $5, false)",
+        )
+        .bind(convo_id)
+        .bind(member_did)
+        .bind(user_did)
+        .bind(created_at)
+        .bind(left_at)
+        .execute(pool)
+        .await
+        .expect("insert member");
+    }
+
+    async fn listed_test_conversation_ids(
+        pool: &PgPool,
+        did: &str,
+        prefix: &str,
+    ) -> BTreeSet<String> {
+        handle_all(pool, did)
+            .await
+            .expect("handle_all response")
+            .0
+            .conversations
+            .into_iter()
+            .map(|convo| convo.conversation_id.as_ref().to_string())
+            .filter(|convo_id| convo_id.starts_with(prefix))
+            .collect()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+    async fn handle_all_treats_principal_did_characters_literally() {
+        let pool = setup_test_db().await;
+        let prefix = format!("get-convos-literal-did-{}-", uuid::Uuid::new_v4());
+        let underscore_did = "did:plc:literal_";
+        let percent_did = "did:plc:literal%25";
+
+        let cases = [
+            (
+                "underscore-near-match",
+                "did:plc:literalx#device-attacker",
+                "did:plc:literalx",
+                None,
+            ),
+            (
+                "percent-near-match",
+                "did:plc:literal-other25#device-attacker",
+                "did:plc:literal-other25",
+                None,
+            ),
+            (
+                "exact-user-did",
+                "did:plc:other#device-user",
+                underscore_did,
+                None,
+            ),
+            (
+                "exact-member-did",
+                percent_did,
+                "did:plc:other-member",
+                None,
+            ),
+            (
+                "legacy-device-member",
+                "did:plc:literal_#device-legacy",
+                "did:plc:legacy-device-owner",
+                None,
+            ),
+            (
+                "inactive-device-member",
+                "did:plc:literal_#device-inactive",
+                "did:plc:literal_",
+                Some(Utc::now()),
+            ),
+        ];
+
+        for (suffix, member_did, user_did, left_at) in cases {
+            insert_test_membership(
+                &pool,
+                &format!("{prefix}{suffix}"),
+                member_did,
+                user_did,
+                left_at,
+            )
+            .await;
+        }
+
+        let observed = (
+            listed_test_conversation_ids(&pool, underscore_did, &prefix).await,
+            listed_test_conversation_ids(&pool, percent_did, &prefix).await,
+        );
+        let expected = (
+            BTreeSet::from([
+                format!("{prefix}exact-user-did"),
+                format!("{prefix}legacy-device-member"),
+            ]),
+            BTreeSet::from([format!("{prefix}exact-member-did")]),
+        );
+        assert_eq!(observed, expected);
+
+        for (suffix, _, _, _) in cases {
+            cleanup_test_convo(&pool, &format!("{prefix}{suffix}")).await;
+        }
     }
 
     #[tokio::test]
