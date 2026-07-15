@@ -9,9 +9,9 @@
 use chrono::{DateTime, Utc};
 use moka::future::Cache;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::{collections::HashSet, mem::size_of, time::Duration};
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::{identity::did_web_document_url, storage::DbPool};
 
@@ -35,6 +35,54 @@ pub enum BlockSyncError {
 
     #[error("Invalid DID format: {0}")]
     InvalidDid(String),
+
+    #[error("Resource limit exceeded for {resource} (limit: {limit})")]
+    ResourceLimitExceeded {
+        resource: &'static str,
+        limit: usize,
+    },
+
+    #[error("Deadline exceeded for {operation}")]
+    DeadlineExceeded { operation: &'static str },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResourceLimits {
+    max_conflict_dids: usize,
+    max_pages_per_did: usize,
+    max_records_per_did: usize,
+    max_page_bytes: usize,
+    max_aggregate_bytes_per_did: usize,
+    max_cursor_bytes: usize,
+    did_deadline: Duration,
+    conflict_deadline: Duration,
+    max_conflict_edges: usize,
+    block_cache_capacity_bytes: u64,
+    #[cfg(test)]
+    cache_lookup_delay: Duration,
+    #[cfg(test)]
+    cache_insert_delay: Duration,
+}
+
+impl Default for ResourceLimits {
+    fn default() -> Self {
+        Self {
+            max_conflict_dids: 100,
+            max_pages_per_did: 100,
+            max_records_per_did: 10_000,
+            max_page_bytes: 256 * 1024,
+            max_aggregate_bytes_per_did: 2 * 1024 * 1024,
+            max_cursor_bytes: 4 * 1024,
+            did_deadline: Duration::from_secs(20),
+            conflict_deadline: Duration::from_secs(30),
+            max_conflict_edges: 10_000,
+            block_cache_capacity_bytes: 64 * 1024 * 1024,
+            #[cfg(test)]
+            cache_lookup_delay: Duration::ZERO,
+            #[cfg(test)]
+            cache_insert_delay: Duration::ZERO,
+        }
+    }
 }
 
 /// A block record from the PDS
@@ -105,11 +153,32 @@ pub struct BlockSyncService {
     pds_cache: Cache<String, String>,
     /// Cache of DID -> Vec<BlockRecord>, TTL 1 minute (short for freshness)
     blocks_cache: Cache<String, Vec<BlockRecord>>,
+    limits: ResourceLimits,
+}
+
+fn block_cache_entry_weight(did_capacity: usize, blocks: &[BlockRecord]) -> u32 {
+    let retained_bytes = size_of::<String>()
+        .saturating_add(did_capacity)
+        .saturating_add(size_of::<Vec<BlockRecord>>())
+        .saturating_add(blocks.iter().fold(0_usize, |total, block| {
+            total
+                .saturating_add(size_of::<BlockRecord>())
+                .saturating_add(block.blocker_did.capacity())
+                .saturating_add(block.blocked_did.capacity())
+                .saturating_add(block.uri.capacity())
+                .saturating_add(block.cid.capacity())
+        }));
+
+    u32::try_from(retained_bytes).unwrap_or(u32::MAX)
 }
 
 impl BlockSyncService {
     /// Create a new BlockSyncService
     pub fn new() -> Self {
+        Self::with_limits(ResourceLimits::default())
+    }
+
+    fn with_limits(limits: ResourceLimits) -> Self {
         Self {
             http_client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
@@ -122,9 +191,36 @@ impl BlockSyncService {
                 .build(),
             blocks_cache: Cache::builder()
                 .time_to_live(Duration::from_secs(60)) // 1 minute - short for freshness
-                .max_capacity(10_000)
+                .max_capacity(limits.block_cache_capacity_bytes)
+                .weigher(|did: &String, blocks: &Vec<BlockRecord>| {
+                    block_cache_entry_weight(did.capacity(), blocks)
+                })
                 .build(),
+            limits,
         }
+    }
+
+    #[cfg(test)]
+    fn with_limits_for_test(limits: ResourceLimits) -> Self {
+        Self::with_limits(limits)
+    }
+
+    fn resource_limit(resource: &'static str, limit: usize) -> BlockSyncError {
+        BlockSyncError::ResourceLimitExceeded { resource, limit }
+    }
+
+    async fn before_blocks_cache_lookup(&self) {
+        #[cfg(test)]
+        tokio::time::sleep(self.limits.cache_lookup_delay).await;
+        #[cfg(not(test))]
+        let _ = self;
+    }
+
+    async fn before_blocks_cache_insert(&self) {
+        #[cfg(test)]
+        tokio::time::sleep(self.limits.cache_insert_delay).await;
+        #[cfg(not(test))]
+        let _ = self;
     }
 
     /// Resolve a DID to get the PDS endpoint
@@ -206,6 +302,15 @@ impl BlockSyncService {
         &self,
         did: &str,
     ) -> Result<Vec<BlockRecord>, BlockSyncError> {
+        tokio::time::timeout(self.limits.did_deadline, self.fetch_blocks_with_cache(did))
+            .await
+            .map_err(|_| BlockSyncError::DeadlineExceeded {
+                operation: "did_fetch",
+            })?
+    }
+
+    async fn fetch_blocks_with_cache(&self, did: &str) -> Result<Vec<BlockRecord>, BlockSyncError> {
+        self.before_blocks_cache_lookup().await;
         // Check cache first
         if let Some(blocks) = self.blocks_cache.get(did).await {
             debug!(
@@ -216,11 +321,32 @@ impl BlockSyncService {
             return Ok(blocks);
         }
 
+        let blocks = self.fetch_blocks_uncached(did).await?;
+
+        self.before_blocks_cache_insert().await;
+        self.blocks_cache
+            .insert(did.to_string(), blocks.clone())
+            .await;
+
+        Ok(blocks)
+    }
+
+    async fn fetch_blocks_uncached(&self, did: &str) -> Result<Vec<BlockRecord>, BlockSyncError> {
         let pds_endpoint = self.get_pds_endpoint(did).await?;
         let mut all_blocks = Vec::new();
         let mut cursor: Option<String> = None;
+        let mut seen_cursors = HashSet::new();
+        let mut pages = 0_usize;
+        let mut aggregate_bytes = 0_usize;
 
         loop {
+            if pages >= self.limits.max_pages_per_did {
+                return Err(Self::resource_limit(
+                    "pages_per_did",
+                    self.limits.max_pages_per_did,
+                ));
+            }
+
             let mut url = format!(
                 "{}/xrpc/com.atproto.repo.listRecords?repo={}&collection=app.bsky.graph.block&limit=100",
                 pds_endpoint.trim_end_matches('/'),
@@ -236,7 +362,7 @@ impl BlockSyncService {
                 crate::crypto::redact_for_log(did)
             );
 
-            let response = self
+            let mut response = self
                 .http_client
                 .get(&url)
                 .send()
@@ -244,12 +370,15 @@ impl BlockSyncService {
                 .map_err(|e| BlockSyncError::HttpError(e.to_string()))?;
 
             if !response.status().is_success() {
-                // 400 might mean no blocks exist, which is fine
+                // Preserve the existing compatibility rule that a 400 means the
+                // block collection is absent. Discard any rows accumulated from
+                // earlier pages so a partial projection is never returned or cached.
                 if response.status() == reqwest::StatusCode::BAD_REQUEST {
                     debug!(
                         "No block records found for {}",
                         crate::crypto::redact_for_log(did)
                     );
+                    all_blocks.clear();
                     break;
                 }
                 return Err(BlockSyncError::HttpError(format!(
@@ -258,10 +387,70 @@ impl BlockSyncService {
                 )));
             }
 
-            let list_response: ListRecordsResponse = response
-                .json()
+            if response
+                .content_length()
+                .is_some_and(|length| length > self.limits.max_page_bytes as u64)
+            {
+                return Err(Self::resource_limit(
+                    "page_bytes",
+                    self.limits.max_page_bytes,
+                ));
+            }
+
+            if response.content_length().is_some_and(|length| {
+                length
+                    > self
+                        .limits
+                        .max_aggregate_bytes_per_did
+                        .saturating_sub(aggregate_bytes) as u64
+            }) {
+                return Err(Self::resource_limit(
+                    "aggregate_bytes_per_did",
+                    self.limits.max_aggregate_bytes_per_did,
+                ));
+            }
+
+            let mut page_bytes = Vec::new();
+            while let Some(chunk) = response
+                .chunk()
                 .await
+                .map_err(|e| BlockSyncError::HttpError(e.to_string()))?
+            {
+                let next_page_bytes = page_bytes.len().saturating_add(chunk.len());
+                if next_page_bytes > self.limits.max_page_bytes {
+                    return Err(Self::resource_limit(
+                        "page_bytes",
+                        self.limits.max_page_bytes,
+                    ));
+                }
+
+                let next_aggregate_bytes = aggregate_bytes.saturating_add(chunk.len());
+                if next_aggregate_bytes > self.limits.max_aggregate_bytes_per_did {
+                    return Err(Self::resource_limit(
+                        "aggregate_bytes_per_did",
+                        self.limits.max_aggregate_bytes_per_did,
+                    ));
+                }
+
+                page_bytes.extend_from_slice(&chunk);
+                aggregate_bytes = next_aggregate_bytes;
+            }
+
+            let list_response: ListRecordsResponse = serde_json::from_slice(&page_bytes)
                 .map_err(|e| BlockSyncError::ParseError(e.to_string()))?;
+
+            pages = pages.saturating_add(1);
+            if list_response.records.len()
+                > self
+                    .limits
+                    .max_records_per_did
+                    .saturating_sub(all_blocks.len())
+            {
+                return Err(Self::resource_limit(
+                    "records_per_did",
+                    self.limits.max_records_per_did,
+                ));
+            }
 
             for record in list_response.records {
                 // Parse created_at if present
@@ -280,9 +469,29 @@ impl BlockSyncService {
                 });
             }
 
-            cursor = list_response.cursor;
-            if cursor.is_none() {
-                break;
+            match list_response.cursor {
+                Some(next_cursor) => {
+                    if next_cursor.len() > self.limits.max_cursor_bytes {
+                        return Err(Self::resource_limit(
+                            "cursor_bytes",
+                            self.limits.max_cursor_bytes,
+                        ));
+                    }
+                    if !seen_cursors.insert(next_cursor.clone()) {
+                        return Err(Self::resource_limit(
+                            "cursor_cycle",
+                            self.limits.max_pages_per_did,
+                        ));
+                    }
+                    if pages >= self.limits.max_pages_per_did {
+                        return Err(Self::resource_limit(
+                            "pages_per_did",
+                            self.limits.max_pages_per_did,
+                        ));
+                    }
+                    cursor = Some(next_cursor);
+                }
+                None => break,
             }
         }
 
@@ -291,11 +500,6 @@ impl BlockSyncService {
             all_blocks.len(),
             crate::crypto::redact_for_log(did)
         );
-
-        // Cache the results
-        self.blocks_cache
-            .insert(did.to_string(), all_blocks.clone())
-            .await;
 
         Ok(all_blocks)
     }
@@ -327,31 +531,37 @@ impl BlockSyncService {
         &self,
         dids: &[String],
     ) -> Result<Vec<(String, String)>, BlockSyncError> {
-        let mut conflicts = Vec::new();
-
-        // For each user, fetch their blocks
-        for did in dids {
-            match self.fetch_blocks_from_pds(did).await {
-                Ok(blocks) => {
-                    // Check if any of their blocks target other members
-                    for block in blocks {
-                        if dids.contains(&block.blocked_did) {
-                            conflicts.push((block.blocker_did, block.blocked_did));
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to fetch blocks for {}: {}",
-                        crate::crypto::redact_for_log(did),
-                        e
-                    );
-                    // Continue checking others - don't fail the whole operation
-                }
-            }
+        if dids.len() > self.limits.max_conflict_dids {
+            return Err(Self::resource_limit(
+                "conflict_dids",
+                self.limits.max_conflict_dids,
+            ));
         }
 
-        Ok(conflicts)
+        tokio::time::timeout(self.limits.conflict_deadline, async {
+            let mut conflicts = Vec::new();
+
+            for did in dids {
+                let blocks = self.fetch_blocks_from_pds(did).await?;
+                for block in blocks {
+                    if dids.contains(&block.blocked_did) {
+                        if conflicts.len() >= self.limits.max_conflict_edges {
+                            return Err(Self::resource_limit(
+                                "conflict_edges",
+                                self.limits.max_conflict_edges,
+                            ));
+                        }
+                        conflicts.push((block.blocker_did, block.blocked_did));
+                    }
+                }
+            }
+
+            Ok(conflicts)
+        })
+        .await
+        .map_err(|_| BlockSyncError::DeadlineExceeded {
+            operation: "conflict_check",
+        })?
     }
 
     /// Sync blocks from PDS to the local database for a user
@@ -420,6 +630,678 @@ impl Default for BlockSyncService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        body::Body,
+        extract::Query,
+        http::{Response, StatusCode},
+        response::IntoResponse,
+        routing::get,
+        Json, Router,
+    };
+    use bytes::Bytes;
+    use futures::stream;
+    use serde_json::{json, Value};
+    use std::{
+        collections::HashMap,
+        convert::Infallible,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+    };
+    use tokio::net::TcpListener;
+
+    fn test_limits() -> ResourceLimits {
+        ResourceLimits {
+            max_conflict_dids: 100,
+            max_pages_per_did: 3,
+            max_records_per_did: 10,
+            max_page_bytes: 4 * 1024,
+            max_aggregate_bytes_per_did: 8 * 1024,
+            max_cursor_bytes: 32,
+            did_deadline: Duration::from_secs(2),
+            conflict_deadline: Duration::from_secs(3),
+            max_conflict_edges: 10,
+            block_cache_capacity_bytes: 64 * 1024 * 1024,
+            cache_lookup_delay: Duration::ZERO,
+            cache_insert_delay: Duration::ZERO,
+        }
+    }
+
+    fn record(subject: &str, suffix: usize) -> Value {
+        json!({
+            "uri": format!("at://did:example:alice/app.bsky.graph.block/{suffix}"),
+            "cid": format!("cid-{suffix}"),
+            "value": {
+                "$type": "app.bsky.graph.block",
+                "subject": subject,
+                "createdAt": "2026-07-15T00:00:00Z"
+            }
+        })
+    }
+
+    fn page(records: Vec<Value>, cursor: Option<String>) -> Response<Body> {
+        Json(json!({ "records": records, "cursor": cursor })).into_response()
+    }
+
+    async fn spawn_pds(router: Router) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        format!("http://{address}")
+    }
+
+    async fn service_for_pds(
+        dids: &[&str],
+        endpoint: &str,
+        limits: ResourceLimits,
+    ) -> BlockSyncService {
+        let service = BlockSyncService::with_limits_for_test(limits);
+        for did in dids {
+            service
+                .pds_cache
+                .insert((*did).to_string(), endpoint.to_string())
+                .await;
+        }
+        service
+    }
+
+    fn assert_resource_limit(error: BlockSyncError, expected_resource: &'static str) {
+        assert!(
+            matches!(
+                error,
+                BlockSyncError::ResourceLimitExceeded { resource, .. }
+                    if resource == expected_resource
+            ),
+            "expected {expected_resource} resource limit, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn production_limits_match_frozen_task_card() {
+        let limits = ResourceLimits::default();
+        assert_eq!(limits.max_conflict_dids, 100);
+        assert_eq!(limits.max_pages_per_did, 100);
+        assert_eq!(limits.max_records_per_did, 10_000);
+        assert_eq!(limits.max_page_bytes, 256 * 1024);
+        assert_eq!(limits.max_aggregate_bytes_per_did, 2 * 1024 * 1024);
+        assert_eq!(limits.max_cursor_bytes, 4 * 1024);
+        assert_eq!(limits.did_deadline, Duration::from_secs(20));
+        assert_eq!(limits.conflict_deadline, Duration::from_secs(30));
+        assert_eq!(limits.max_conflict_edges, 10_000);
+        assert_eq!(limits.block_cache_capacity_bytes, 64 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn repeated_cursor_is_rejected_and_failed_fetch_is_not_cached() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_counter = requests.clone();
+        let router = Router::new().route(
+            "/xrpc/com.atproto.repo.listRecords",
+            get(move || {
+                let request_counter = request_counter.clone();
+                async move {
+                    let request = request_counter.fetch_add(1, Ordering::SeqCst);
+                    page(
+                        vec![record("did:example:bob", request)],
+                        Some("same".into()),
+                    )
+                }
+            }),
+        );
+        let endpoint = spawn_pds(router).await;
+        let service = service_for_pds(&["did:example:alice"], &endpoint, test_limits()).await;
+
+        let first = service
+            .fetch_blocks_from_pds("did:example:alice")
+            .await
+            .unwrap_err();
+        assert_resource_limit(first, "cursor_cycle");
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert!(service
+            .blocks_cache
+            .get("did:example:alice")
+            .await
+            .is_none());
+
+        let second = service
+            .fetch_blocks_from_pds("did:example:alice")
+            .await
+            .unwrap_err();
+        assert_resource_limit(second, "cursor_cycle");
+        assert_eq!(requests.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn cyclic_cursor_sequence_is_rejected() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_counter = requests.clone();
+        let router = Router::new().route(
+            "/xrpc/com.atproto.repo.listRecords",
+            get(move || {
+                let request_counter = request_counter.clone();
+                async move {
+                    let request = request_counter.fetch_add(1, Ordering::SeqCst);
+                    let cursor = ["a", "b", "a"][request.min(2)].to_string();
+                    page(Vec::new(), Some(cursor))
+                }
+            }),
+        );
+        let endpoint = spawn_pds(router).await;
+        let mut limits = test_limits();
+        limits.max_pages_per_did = 5;
+        let service = service_for_pds(&["did:example:alice"], &endpoint, limits).await;
+
+        let error = service
+            .fetch_blocks_from_pds("did:example:alice")
+            .await
+            .unwrap_err();
+        assert_resource_limit(error, "cursor_cycle");
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn fresh_cursors_stop_at_page_budget() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_counter = requests.clone();
+        let router = Router::new().route(
+            "/xrpc/com.atproto.repo.listRecords",
+            get(move || {
+                let request_counter = request_counter.clone();
+                async move {
+                    let request = request_counter.fetch_add(1, Ordering::SeqCst);
+                    page(Vec::new(), Some(format!("cursor-{request}")))
+                }
+            }),
+        );
+        let endpoint = spawn_pds(router).await;
+        let mut limits = test_limits();
+        limits.max_pages_per_did = 2;
+        let service = service_for_pds(&["did:example:alice"], &endpoint, limits).await;
+
+        let error = service
+            .fetch_blocks_from_pds("did:example:alice")
+            .await
+            .unwrap_err();
+        assert_resource_limit(error, "pages_per_did");
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn oversized_content_length_is_rejected_before_body_read() {
+        let router = Router::new().route(
+            "/xrpc/com.atproto.repo.listRecords",
+            get(|| async {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from(vec![b' '; 4096]))
+                    .unwrap()
+            }),
+        );
+        let endpoint = spawn_pds(router).await;
+        let mut limits = test_limits();
+        limits.max_page_bytes = 128;
+        let service = service_for_pds(&["did:example:alice"], &endpoint, limits).await;
+
+        let error = service
+            .fetch_blocks_from_pds("did:example:alice")
+            .await
+            .unwrap_err();
+        assert_resource_limit(error, "page_bytes");
+    }
+
+    #[tokio::test]
+    async fn chunked_body_is_rejected_when_stream_crosses_page_limit() {
+        let router = Router::new().route(
+            "/xrpc/com.atproto.repo.listRecords",
+            get(|| async {
+                let chunks = vec![
+                    Ok::<_, Infallible>(Bytes::from(vec![b' '; 80])),
+                    Ok::<_, Infallible>(Bytes::from(vec![b' '; 80])),
+                ];
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from_stream(stream::iter(chunks)))
+                    .unwrap()
+            }),
+        );
+        let endpoint = spawn_pds(router).await;
+        let mut limits = test_limits();
+        limits.max_page_bytes = 128;
+        let service = service_for_pds(&["did:example:alice"], &endpoint, limits).await;
+
+        let error = service
+            .fetch_blocks_from_pds("did:example:alice")
+            .await
+            .unwrap_err();
+        assert_resource_limit(error, "page_bytes");
+    }
+
+    #[tokio::test]
+    async fn aggregate_response_bytes_are_bounded_across_pages() {
+        let router = Router::new().route(
+            "/xrpc/com.atproto.repo.listRecords",
+            get(|Query(query): Query<HashMap<String, String>>| async move {
+                let cursor = query.get("cursor").cloned();
+                if cursor.is_none() {
+                    page(Vec::new(), Some("next".into()))
+                } else {
+                    page(vec![record(&"x".repeat(200), 1)], None)
+                }
+            }),
+        );
+        let endpoint = spawn_pds(router).await;
+        let mut limits = test_limits();
+        limits.max_page_bytes = 1024;
+        limits.max_aggregate_bytes_per_did = 300;
+        let service = service_for_pds(&["did:example:alice"], &endpoint, limits).await;
+
+        let error = service
+            .fetch_blocks_from_pds("did:example:alice")
+            .await
+            .unwrap_err();
+        assert_resource_limit(error, "aggregate_bytes_per_did");
+    }
+
+    #[tokio::test]
+    async fn record_count_is_bounded_across_pages() {
+        let router = Router::new().route(
+            "/xrpc/com.atproto.repo.listRecords",
+            get(|Query(query): Query<HashMap<String, String>>| async move {
+                let cursor = query.get("cursor").cloned();
+                if cursor.is_none() {
+                    page(
+                        vec![record("did:example:bob", 0), record("did:example:bob", 1)],
+                        Some("next".into()),
+                    )
+                } else {
+                    page(
+                        vec![record("did:example:bob", 2), record("did:example:bob", 3)],
+                        None,
+                    )
+                }
+            }),
+        );
+        let endpoint = spawn_pds(router).await;
+        let mut limits = test_limits();
+        limits.max_records_per_did = 3;
+        let service = service_for_pds(&["did:example:alice"], &endpoint, limits).await;
+
+        let error = service
+            .fetch_blocks_from_pds("did:example:alice")
+            .await
+            .unwrap_err();
+        assert_resource_limit(error, "records_per_did");
+    }
+
+    #[tokio::test]
+    async fn oversized_cursor_is_rejected_before_next_request() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_counter = requests.clone();
+        let router = Router::new().route(
+            "/xrpc/com.atproto.repo.listRecords",
+            get(move || {
+                let request_counter = request_counter.clone();
+                async move {
+                    request_counter.fetch_add(1, Ordering::SeqCst);
+                    page(Vec::new(), Some("x".repeat(33)))
+                }
+            }),
+        );
+        let endpoint = spawn_pds(router).await;
+        let service = service_for_pds(&["did:example:alice"], &endpoint, test_limits()).await;
+
+        let error = service
+            .fetch_blocks_from_pds("did:example:alice")
+            .await
+            .unwrap_err();
+        assert_resource_limit(error, "cursor_bytes");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn per_did_deadline_bounds_successive_slow_pages() {
+        let router = Router::new().route(
+            "/xrpc/com.atproto.repo.listRecords",
+            get(|Query(query): Query<HashMap<String, String>>| async move {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                let cursor = query.get("cursor").cloned();
+                page(Vec::new(), cursor.is_none().then(|| "next".into()))
+            }),
+        );
+        let endpoint = spawn_pds(router).await;
+        let mut limits = test_limits();
+        limits.did_deadline = Duration::from_millis(40);
+        let service = service_for_pds(&["did:example:alice"], &endpoint, limits).await;
+
+        let error = service
+            .fetch_blocks_from_pds("did:example:alice")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            BlockSyncError::DeadlineExceeded {
+                operation: "did_fetch"
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn conflict_deadline_bounds_multiple_individually_successful_fetches() {
+        let router = Router::new().route(
+            "/xrpc/com.atproto.repo.listRecords",
+            get(|| async {
+                tokio::time::sleep(Duration::from_millis(35)).await;
+                page(Vec::new(), None)
+            }),
+        );
+        let endpoint = spawn_pds(router).await;
+        let mut limits = test_limits();
+        limits.did_deadline = Duration::from_millis(100);
+        limits.conflict_deadline = Duration::from_millis(50);
+        let service =
+            service_for_pds(&["did:example:alice", "did:example:bob"], &endpoint, limits).await;
+
+        let error = service
+            .check_block_conflicts(&["did:example:alice".into(), "did:example:bob".into()])
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            BlockSyncError::DeadlineExceeded {
+                operation: "conflict_check"
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn conflict_check_limits_dids_and_edges() {
+        let no_requests = Arc::new(AtomicUsize::new(0));
+        let request_counter = no_requests.clone();
+        let router = Router::new().route(
+            "/xrpc/com.atproto.repo.listRecords",
+            get(move || {
+                let request_counter = request_counter.clone();
+                async move {
+                    request_counter.fetch_add(1, Ordering::SeqCst);
+                    page(
+                        vec![record("did:example:bob", 0), record("did:example:carol", 1)],
+                        None,
+                    )
+                }
+            }),
+        );
+        let endpoint = spawn_pds(router).await;
+        let mut did_limits = test_limits();
+        did_limits.max_conflict_dids = 1;
+        let did_service = service_for_pds(&[], &endpoint, did_limits).await;
+        let did_error = did_service
+            .check_block_conflicts(&["did:example:alice".into(), "did:example:bob".into()])
+            .await
+            .unwrap_err();
+        assert_resource_limit(did_error, "conflict_dids");
+        assert_eq!(no_requests.load(Ordering::SeqCst), 0);
+
+        let mut edge_limits = test_limits();
+        edge_limits.max_conflict_edges = 1;
+        let edge_service = service_for_pds(&["did:example:alice"], &endpoint, edge_limits).await;
+        let edge_error = edge_service
+            .check_block_conflicts(&[
+                "did:example:alice".into(),
+                "did:example:bob".into(),
+                "did:example:carol".into(),
+            ])
+            .await
+            .unwrap_err();
+        assert_resource_limit(edge_error, "conflict_edges");
+    }
+
+    #[tokio::test]
+    async fn conflict_check_propagates_first_fetch_failure_without_partial_success() {
+        let router = Router::new().route(
+            "/xrpc/com.atproto.repo.listRecords",
+            get(|Query(query): Query<HashMap<String, String>>| async move {
+                match query.get("repo").map(String::as_str) {
+                    Some("did:example:alice") => page(vec![record("did:example:bob", 0)], None),
+                    _ => Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(Body::empty())
+                        .unwrap(),
+                }
+            }),
+        );
+        let endpoint = spawn_pds(router).await;
+        let service = service_for_pds(
+            &["did:example:alice", "did:example:bob"],
+            &endpoint,
+            test_limits(),
+        )
+        .await;
+
+        let error = service
+            .check_block_conflicts(&["did:example:alice".into(), "did:example:bob".into()])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, BlockSyncError::HttpError(_)));
+    }
+
+    #[tokio::test]
+    async fn finite_boundary_result_is_complete_and_cached() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_counter = requests.clone();
+        let router = Router::new().route(
+            "/xrpc/com.atproto.repo.listRecords",
+            get(move |Query(query): Query<HashMap<String, String>>| {
+                let request_counter = request_counter.clone();
+                async move {
+                    request_counter.fetch_add(1, Ordering::SeqCst);
+                    if !query.contains_key("cursor") {
+                        page(
+                            vec![record("did:example:bob", 0), record("did:example:bob", 1)],
+                            Some("next".into()),
+                        )
+                    } else {
+                        page(
+                            vec![record("did:example:bob", 2), record("did:example:bob", 3)],
+                            None,
+                        )
+                    }
+                }
+            }),
+        );
+        let endpoint = spawn_pds(router).await;
+        let mut limits = test_limits();
+        limits.max_pages_per_did = 2;
+        limits.max_records_per_did = 4;
+        let service = service_for_pds(&["did:example:alice"], &endpoint, limits).await;
+
+        let first = service
+            .fetch_blocks_from_pds("did:example:alice")
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 4);
+        assert_eq!(first[0].blocker_did, "did:example:alice");
+        assert_eq!(first[0].blocked_did, "did:example:bob");
+        assert_eq!(
+            first[0].uri,
+            "at://did:example:alice/app.bsky.graph.block/0"
+        );
+        assert_eq!(first[0].cid, "cid-0");
+        assert_eq!(
+            first[0].created_at,
+            DateTime::parse_from_rfc3339("2026-07-15T00:00:00Z")
+                .ok()
+                .map(|timestamp| timestamp.with_timezone(&Utc))
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+
+        let second = service
+            .fetch_blocks_from_pds("did:example:alice")
+            .await
+            .unwrap();
+        assert_eq!(second.len(), 4);
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn bad_request_remains_an_empty_cached_block_projection() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_counter = requests.clone();
+        let router = Router::new().route(
+            "/xrpc/com.atproto.repo.listRecords",
+            get(move || {
+                let request_counter = request_counter.clone();
+                async move {
+                    request_counter.fetch_add(1, Ordering::SeqCst);
+                    Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(Body::from(vec![b' '; 16 * 1024]))
+                        .unwrap()
+                }
+            }),
+        );
+        let endpoint = spawn_pds(router).await;
+        let service = service_for_pds(&["did:example:alice"], &endpoint, test_limits()).await;
+
+        assert!(service
+            .fetch_blocks_from_pds("did:example:alice")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(service
+            .fetch_blocks_from_pds("did:example:alice")
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn bad_request_after_pagination_starts_discards_partial_records_before_caching_empty() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_counter = requests.clone();
+        let router = Router::new().route(
+            "/xrpc/com.atproto.repo.listRecords",
+            get(move |Query(query): Query<HashMap<String, String>>| {
+                let request_counter = request_counter.clone();
+                async move {
+                    request_counter.fetch_add(1, Ordering::SeqCst);
+                    if query.contains_key("cursor") {
+                        Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .body(Body::empty())
+                            .unwrap()
+                    } else {
+                        page(vec![record("did:example:bob", 0)], Some("next".into()))
+                    }
+                }
+            }),
+        );
+        let endpoint = spawn_pds(router).await;
+        let service = service_for_pds(&["did:example:alice"], &endpoint, test_limits()).await;
+
+        let first = service
+            .fetch_blocks_from_pds("did:example:alice")
+            .await
+            .unwrap();
+        assert!(first.is_empty());
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert!(service
+            .blocks_cache
+            .get("did:example:alice")
+            .await
+            .is_some_and(|blocks| blocks.is_empty()));
+
+        let second = service
+            .fetch_blocks_from_pds("did:example:alice")
+            .await
+            .unwrap();
+        assert!(second.is_empty());
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn per_did_deadline_includes_cache_lookup() {
+        let mut limits = test_limits();
+        limits.did_deadline = Duration::from_millis(20);
+        limits.cache_lookup_delay = Duration::from_millis(50);
+        let service = BlockSyncService::with_limits_for_test(limits);
+        service
+            .blocks_cache
+            .insert("did:example:alice".into(), Vec::new())
+            .await;
+
+        let error = service
+            .fetch_blocks_from_pds("did:example:alice")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            BlockSyncError::DeadlineExceeded {
+                operation: "did_fetch"
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn per_did_deadline_includes_successful_cache_admission() {
+        let router = Router::new().route(
+            "/xrpc/com.atproto.repo.listRecords",
+            get(|| async { page(Vec::new(), None) }),
+        );
+        let endpoint = spawn_pds(router).await;
+        let mut limits = test_limits();
+        limits.did_deadline = Duration::from_millis(20);
+        limits.cache_insert_delay = Duration::from_millis(50);
+        let service = service_for_pds(&["did:example:alice"], &endpoint, limits).await;
+
+        let error = service
+            .fetch_blocks_from_pds("did:example:alice")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            BlockSyncError::DeadlineExceeded {
+                operation: "did_fetch"
+            }
+        ));
+        assert!(service
+            .blocks_cache
+            .get("did:example:alice")
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn retained_cache_weight_stays_within_capacity_under_insert_pressure() {
+        let limits = ResourceLimits::default();
+        let service = BlockSyncService::with_limits_for_test(limits);
+        let mut inserted_weight = 0_u64;
+
+        for index in 0..80 {
+            let did = format!("did:example:{index}");
+            let blocks = vec![BlockRecord {
+                blocker_did: did.clone(),
+                blocked_did: "x".repeat(1024 * 1024),
+                uri: format!("at://{did}/app.bsky.graph.block/{index}"),
+                cid: "c".repeat(256),
+                created_at: None,
+            }];
+            inserted_weight += u64::from(block_cache_entry_weight(did.capacity(), &blocks));
+            service.blocks_cache.insert(did, blocks).await;
+        }
+        service.blocks_cache.run_pending_tasks().await;
+
+        assert!(inserted_weight > limits.block_cache_capacity_bytes);
+        assert!(
+            service.blocks_cache.weighted_size() <= limits.block_cache_capacity_bytes,
+            "cache retained {} bytes above {} byte capacity",
+            service.blocks_cache.weighted_size(),
+            limits.block_cache_capacity_bytes
+        );
+    }
 
     #[tokio::test]
     async fn test_pds_endpoint_resolution() {
