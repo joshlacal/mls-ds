@@ -276,7 +276,10 @@ pub struct AuthMiddleware {
     cache_ttl_seconds: u64,
     rate_limit_quota: Quota,
     did_host_allowlist: Option<Vec<String>>,
-    service_did: Option<String>,
+    #[cfg(test)]
+    service_did_override: Option<String>,
+    #[cfg(test)]
+    test_service_did_source: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
 }
 
 impl AuthMiddleware {
@@ -299,7 +302,6 @@ impl AuthMiddleware {
             .filter(|v| *v > 0)
             .unwrap_or(10);
         let did_host_allowlist = parse_host_allowlist("DID_RESOLUTION_HOST_ALLOWLIST");
-        let service_did = std::env::var("SERVICE_DID").ok();
 
         let did_cache = Cache::builder()
             .max_capacity(10_000)
@@ -333,14 +335,42 @@ impl AuthMiddleware {
             cache_ttl_seconds,
             rate_limit_quota: quota,
             did_host_allowlist,
-            service_did,
+            #[cfg(test)]
+            service_did_override: None,
+            #[cfg(test)]
+            test_service_did_source: None,
         }
     }
 
     #[cfg(test)]
     fn with_test_service_did(mut self, service_did: &str) -> Self {
-        self.service_did = Some(service_did.to_string());
+        self.service_did_override = Some(service_did.to_string());
+        self.test_service_did_source = None;
         self
+    }
+
+    #[cfg(test)]
+    fn with_test_service_did_source(
+        mut self,
+        source: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+    ) -> Self {
+        self.service_did_override = None;
+        self.test_service_did_source = Some(source);
+        self
+    }
+
+    fn configured_service_did(&self) -> Option<String> {
+        #[cfg(test)]
+        {
+            if let Some(source) = &self.test_service_did_source {
+                return source();
+            }
+            if let Some(service_did) = &self.service_did_override {
+                return Some(service_did.clone());
+            }
+        }
+
+        std::env::var("SERVICE_DID").ok()
     }
 
     /// Verify JWT token and extract claims.
@@ -380,9 +410,9 @@ impl AuthMiddleware {
         }
 
         // Audience enforcement when configured
-        if let Some(service_did) = &self.service_did {
+        if let Some(service_did) = self.configured_service_did() {
             tracing::debug!("Validating JWT audience against configured SERVICE_DID");
-            if claims.aud != service_did.as_str() {
+            if claims.aud != service_did {
                 tracing::warn!("JWT audience mismatch with SERVICE_DID");
                 return Err(AuthError::InvalidToken(
                     "aud does not match SERVICE_DID".into(),

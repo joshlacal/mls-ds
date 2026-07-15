@@ -5,7 +5,7 @@ use p256::{
 };
 use std::{
     collections::HashSet,
-    sync::{atomic::AtomicUsize, atomic::Ordering, Mutex},
+    sync::{atomic::AtomicUsize, atomic::Ordering, Arc, Mutex},
 };
 
 const GATEWAY_DID: &str = "did:web:dev-api.catbird.blue";
@@ -79,6 +79,32 @@ async fn middleware_with_document(did_doc: DidDocument) -> AuthMiddleware {
     middleware
 }
 
+async fn middleware_with_dynamic_service_did(
+    did_doc: DidDocument,
+    service_did: Arc<Mutex<Option<String>>>,
+) -> AuthMiddleware {
+    let service_did_source = Arc::clone(&service_did);
+    let middleware = AuthMiddleware::with_config(300, 100, 60).with_test_service_did_source(
+        Arc::new(move || {
+            service_did_source
+                .lock()
+                .expect("fixture service DID source lock")
+                .clone()
+        }),
+    );
+    middleware
+        .did_cache
+        .insert(
+            did_doc.id.clone(),
+            CachedDidDoc {
+                doc: did_doc,
+                cached_at: Utc::now(),
+            },
+        )
+        .await;
+    middleware
+}
+
 fn delegated_claims(issuer: &str, audience: &str, lxm: &str, jti: &str) -> AtProtoClaims {
     let now = Utc::now().timestamp();
     AtProtoClaims {
@@ -105,6 +131,77 @@ fn sign_token(key: &SigningKey, kid: Option<&str>, claims: &AtProtoClaims) -> St
         "{signing_input}.{}",
         URL_SAFE_NO_PAD.encode(signature.to_bytes())
     )
+}
+
+#[tokio::test]
+async fn service_did_set_after_middleware_construction_is_enforced_at_verification_time() {
+    let gateway_key = fixture_signing_key(7);
+    let service_did = Arc::new(Mutex::new(None));
+    let middleware = middleware_with_dynamic_service_did(
+        jwk_document(GATEWAY_DID, GATEWAY_KID, &gateway_key),
+        Arc::clone(&service_did),
+    )
+    .await;
+
+    *service_did.lock().expect("fixture service DID lock") = Some(MLS_DID.to_string());
+    let wrong_audience = sign_token(
+        &gateway_key,
+        Some(GATEWAY_KID),
+        &delegated_claims(
+            GATEWAY_DID,
+            "did:web:stale-mls.example",
+            ENDPOINT,
+            "wave1-staging-late-service-did-jti-0001",
+        ),
+    );
+
+    assert!(matches!(
+        middleware.verify_jwt(&wrong_audience).await,
+        Err(AuthError::InvalidToken(message)) if message.contains("aud does not match")
+    ));
+}
+
+#[tokio::test]
+async fn service_did_swap_rejects_stale_audience_and_accepts_current_audience() {
+    let gateway_key = fixture_signing_key(8);
+    let stale_service_did = "did:web:stale-mls.example";
+    let service_did = Arc::new(Mutex::new(Some(stale_service_did.to_string())));
+    let middleware = middleware_with_dynamic_service_did(
+        jwk_document(GATEWAY_DID, GATEWAY_KID, &gateway_key),
+        Arc::clone(&service_did),
+    )
+    .await;
+
+    *service_did.lock().expect("fixture service DID lock") = Some(MLS_DID.to_string());
+    let stale_audience = sign_token(
+        &gateway_key,
+        Some(GATEWAY_KID),
+        &delegated_claims(
+            GATEWAY_DID,
+            stale_service_did,
+            ENDPOINT,
+            "wave1-staging-stale-service-did-jti-0001",
+        ),
+    );
+    assert!(matches!(
+        middleware.verify_jwt(&stale_audience).await,
+        Err(AuthError::InvalidToken(message)) if message.contains("aud does not match")
+    ));
+
+    let current_audience = sign_token(
+        &gateway_key,
+        Some(GATEWAY_KID),
+        &delegated_claims(
+            GATEWAY_DID,
+            MLS_DID,
+            ENDPOINT,
+            "wave1-staging-current-service-did-jti-0001",
+        ),
+    );
+    middleware
+        .verify_jwt(&current_audience)
+        .await
+        .expect("request-time SERVICE_DID accepts the current exact audience");
 }
 
 #[derive(Default)]
