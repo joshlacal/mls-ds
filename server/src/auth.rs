@@ -749,8 +749,10 @@ static JTI_CACHE: Lazy<moka::sync::Cache<String, ()>> = Lazy::new(|| {
 
 static AUTH_MIDDLEWARE: Lazy<AuthMiddleware> = Lazy::new(AuthMiddleware::new);
 
-fn truthy(var: &str) -> bool {
-    matches!(var, "1" | "true" | "TRUE" | "yes" | "YES")
+/// Keep the binary startup gate and library request gate on identical flag semantics.
+#[doc(hidden)]
+pub fn auth_enforcement_flag_enabled(value: &str) -> bool {
+    value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
 }
 
 fn parse_host_allowlist(var_name: &str) -> Option<Vec<String>> {
@@ -901,10 +903,10 @@ impl AuthEnforcementPolicy {
     fn from_env() -> Self {
         Self {
             enforce_lxm: std::env::var("ENFORCE_LXM")
-                .map(|value| truthy(&value))
+                .map(|value| auth_enforcement_flag_enabled(&value))
                 .unwrap_or(true),
             enforce_jti: std::env::var("ENFORCE_JTI")
-                .map(|value| truthy(&value))
+                .map(|value| auth_enforcement_flag_enabled(&value))
                 .unwrap_or(true),
             jti_ttl_seconds: std::env::var("JTI_TTL_SECONDS")
                 .ok()
@@ -1407,6 +1409,47 @@ pub async fn verify_is_moderator_or_admin(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_enforcement_flags_use_case_insensitive_boolean_semantics() {
+        for enabled in [
+            "1", "true", "TRUE", "True", "tRuE", "yes", "YES", "Yes", "yEs",
+        ] {
+            assert!(
+                auth_enforcement_flag_enabled(enabled),
+                "expected {enabled:?} to enable enforcement"
+            );
+        }
+
+        for disabled in ["0", "false", "False", "no", "No", "", " true "] {
+            assert!(
+                !auth_enforcement_flag_enabled(disabled),
+                "expected {disabled:?} to disable enforcement"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_case_flags_enable_both_lxm_and_jti_policy_gates() {
+        let policy = AuthEnforcementPolicy {
+            enforce_lxm: auth_enforcement_flag_enabled("True"),
+            enforce_jti: auth_enforcement_flag_enabled("Yes"),
+            jti_ttl_seconds: 120,
+        };
+        let mut claims = claims("did:plc:alice", None);
+        claims.lxm = Some("blue.catbird.mlsChat.sendMessage".to_string());
+        assert!(matches!(
+            enforce_standard_with_policy(&claims, "blue.catbird.mlsChat.getConvos", policy,),
+            Err(AuthError::LxmMismatch)
+        ));
+
+        claims.lxm = Some("blue.catbird.mlsChat.getConvos".to_string());
+        claims.jti = None;
+        assert!(matches!(
+            enforce_standard_with_policy(&claims, "blue.catbird.mlsChat.getConvos", policy,),
+            Err(AuthError::MissingJti)
+        ));
+    }
 
     fn claims(iss: &str, sub: Option<&str>) -> AtProtoClaims {
         AtProtoClaims {
