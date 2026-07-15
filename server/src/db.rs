@@ -1671,8 +1671,49 @@ pub struct ValidatedKeyPackageBinding {
     pub is_last_resort: bool,
 }
 
+fn declared_ciphersuite_name(ciphersuite: openmls::prelude::Ciphersuite) -> &'static str {
+    use openmls::prelude::Ciphersuite;
+
+    match ciphersuite {
+        Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519 => {
+            "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519"
+        }
+        Ciphersuite::MLS_128_DHKEMP256_AES128GCM_SHA256_P256 => {
+            "MLS_128_DHKEMP256_AES128GCM_SHA256_P256"
+        }
+        Ciphersuite::MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519 => {
+            "MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519"
+        }
+        Ciphersuite::MLS_256_DHKEMX448_AES256GCM_SHA512_Ed448 => {
+            "MLS_256_DHKEMX448_AES256GCM_SHA512_Ed448"
+        }
+        Ciphersuite::MLS_256_DHKEMP521_AES256GCM_SHA512_P521 => {
+            "MLS_256_DHKEMP521_AES256GCM_SHA512_P521"
+        }
+        Ciphersuite::MLS_256_DHKEMX448_CHACHA20POLY1305_SHA512_Ed448 => {
+            "MLS_256_DHKEMX448_CHACHA20POLY1305_SHA512_Ed448"
+        }
+        Ciphersuite::MLS_256_DHKEMP384_AES256GCM_SHA384_P384 => {
+            "MLS_256_DHKEMP384_AES256GCM_SHA384_P384"
+        }
+        Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519 => {
+            "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519"
+        }
+    }
+}
+
+#[cfg(test)]
 fn validate_key_package_binding_sync(
     did: &str,
+    key_data: &[u8],
+    expected_signature_public_key: Option<&[u8]>,
+) -> Result<ValidatedKeyPackageBinding> {
+    validate_declared_key_package_sync(did, None, key_data, expected_signature_public_key)
+}
+
+fn validate_declared_key_package_sync(
+    did: &str,
+    declared_cipher_suite: Option<&str>,
     key_data: &[u8],
     expected_signature_public_key: Option<&[u8]>,
 ) -> Result<ValidatedKeyPackageBinding> {
@@ -1688,9 +1729,19 @@ fn validate_key_package_binding_sync(
     let mut key_data_reader = key_data;
     let kp_in = KeyPackageIn::tls_deserialize(&mut key_data_reader)
         .context("Failed to deserialize key package")?;
+    if !key_data_reader.is_empty() {
+        bail!("KeyPackage contains trailing data");
+    }
     let kp = kp_in
         .validate(&provider, ProtocolVersion::default())
         .context("Failed to validate key package")?;
+
+    if let Some(declared) = declared_cipher_suite {
+        let actual = declared_ciphersuite_name(kp.ciphersuite());
+        if declared != actual {
+            bail!("Declared ciphersuite does not match signed KeyPackage ciphersuite");
+        }
+    }
 
     // Extract and validate credential identity.
     let credential = kp.leaf_node().credential();
@@ -1747,12 +1798,28 @@ pub async fn validate_key_package_binding(
     key_data: &[u8],
     expected_signature_public_key: Option<&[u8]>,
 ) -> Result<ValidatedKeyPackageBinding> {
+    validate_key_package_binding_with_declared_ciphersuite(
+        did,
+        None,
+        key_data,
+        expected_signature_public_key,
+    )
+    .await
+}
+
+async fn validate_key_package_binding_with_declared_ciphersuite(
+    did: &str,
+    declared_cipher_suite: Option<&str>,
+    key_data: &[u8],
+    expected_signature_public_key: Option<&[u8]>,
+) -> Result<ValidatedKeyPackageBinding> {
     let parse_timeout_secs = std::env::var("KEY_PACKAGE_PARSE_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(10);
 
     let did_owned = did.to_string();
+    let declared_cipher_suite = declared_cipher_suite.map(str::to_string);
     let key_data_for_parse = key_data.to_vec();
     let expected_signature_public_key = expected_signature_public_key.map(|key| key.to_vec());
     let _permit = KEY_PACKAGE_PARSE_LIMITER
@@ -1762,8 +1829,9 @@ pub async fn validate_key_package_binding(
 
     let mut parse_task =
         tokio::task::spawn_blocking(move || -> Result<ValidatedKeyPackageBinding> {
-            validate_key_package_binding_sync(
+            validate_declared_key_package_sync(
                 &did_owned,
+                declared_cipher_suite.as_deref(),
                 &key_data_for_parse,
                 expected_signature_public_key.as_deref(),
             )
@@ -1772,10 +1840,6 @@ pub async fn validate_key_package_binding(
     match tokio::time::timeout(Duration::from_secs(parse_timeout_secs), &mut parse_task).await {
         Ok(join_result) => join_result
             .context("Key package validation task failed")?
-            .map_err(|e| {
-                tracing::error!("Key package validation detail: {:?}", e);
-                e
-            })
             .context("Key package validation error"),
         Err(_) => {
             parse_task.abort();
@@ -1785,6 +1849,23 @@ pub async fn validate_key_package_binding(
             );
         }
     }
+}
+
+/// Validate a KeyPackage against both its authenticated device binding and
+/// the ciphersuite declared by the request carrying it.
+pub async fn validate_declared_key_package_binding(
+    did: &str,
+    declared_cipher_suite: &str,
+    key_data: &[u8],
+    expected_signature_public_key: Option<&[u8]>,
+) -> Result<ValidatedKeyPackageBinding> {
+    validate_key_package_binding_with_declared_ciphersuite(
+        did,
+        Some(declared_cipher_suite),
+        key_data,
+        expected_signature_public_key,
+    )
+    .await
 }
 
 /// Store a new key package with device information
@@ -1825,8 +1906,80 @@ pub async fn store_key_package_with_device_bound_to_signature(
     expected_signature_public_key: Option<&[u8]>,
     last_resort: bool,
 ) -> Result<KeyPackage> {
-    let binding =
-        validate_key_package_binding(did, &key_data, expected_signature_public_key).await?;
+    let binding = validate_key_package_binding_with_declared_ciphersuite(
+        did,
+        Some(cipher_suite),
+        &key_data,
+        expected_signature_public_key,
+    )
+    .await?;
+    let mut tx = pool
+        .begin()
+        .await
+        .context("Failed to begin KeyPackage storage transaction")?;
+    let result = store_validated_key_package_with_device_bound_to_signature_in_tx(
+        &mut tx,
+        did,
+        cipher_suite,
+        key_data,
+        expires_at,
+        device_id,
+        expected_signature_public_key,
+        last_resort,
+        binding,
+    )
+    .await?;
+    tx.commit()
+        .await
+        .context("Failed to commit KeyPackage storage transaction")?;
+
+    Ok(result)
+}
+
+/// Store a KeyPackage inside a caller-owned transaction so registration can
+/// hold its device-row authorization lock through every related mutation.
+pub(crate) async fn store_key_package_with_device_bound_to_signature_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    did: &str,
+    cipher_suite: &str,
+    key_data: Vec<u8>,
+    expires_at: DateTime<Utc>,
+    device_id: Option<String>,
+    expected_signature_public_key: Option<&[u8]>,
+    last_resort: bool,
+) -> Result<KeyPackage> {
+    let binding = validate_key_package_binding_with_declared_ciphersuite(
+        did,
+        Some(cipher_suite),
+        &key_data,
+        expected_signature_public_key,
+    )
+    .await?;
+    store_validated_key_package_with_device_bound_to_signature_in_tx(
+        tx,
+        did,
+        cipher_suite,
+        key_data,
+        expires_at,
+        device_id,
+        expected_signature_public_key,
+        last_resort,
+        binding,
+    )
+    .await
+}
+
+async fn store_validated_key_package_with_device_bound_to_signature_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    did: &str,
+    cipher_suite: &str,
+    key_data: Vec<u8>,
+    expires_at: DateTime<Utc>,
+    device_id: Option<String>,
+    expected_signature_public_key: Option<&[u8]>,
+    last_resort: bool,
+    binding: ValidatedKeyPackageBinding,
+) -> Result<KeyPackage> {
     // Honor an explicit request OR the last_resort extension carried in the
     // KeyPackage bytes. Lets clients publish a reusable last-resort KP through
     // the normal publish path; the bytes are authoritative.
@@ -1834,21 +1987,9 @@ pub async fn store_key_package_with_device_bound_to_signature(
     let now = Utc::now();
     let id = Uuid::new_v4().to_string();
 
-    // Ensure user exists (upsert)
-    sqlx::query(
-        r#"
-        INSERT INTO users (did, created_at, last_seen_at)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (did) DO UPDATE SET last_seen_at = $3
-        "#,
-    )
-    .bind(did)
-    .bind(now)
-    .bind(now)
-    .execute(pool)
-    .await
-    .context("Failed to ensure user exists")?;
-
+    // Registration and federation claims lock KeyPackages before devices. Last-resort
+    // replacement must use the same order, and must not acquire the user row first either:
+    // registration updates that row only after both security-relevant locks are held.
     if last_resort {
         sqlx::query(
             r#"
@@ -1866,10 +2007,49 @@ pub async fn store_key_package_with_device_bound_to_signature(
         .bind(did)
         .bind(&device_id)
         .bind(now)
-        .execute(pool)
+        .execute(&mut **tx)
         .await
         .context("Failed to replace existing last-resort key package")?;
     }
+
+    if let (Some(device_id), Some(expected_signature_public_key)) =
+        (device_id.as_deref(), expected_signature_public_key)
+    {
+        let current_signature_key: Option<String> = sqlx::query_scalar(
+            "SELECT signature_public_key \
+             FROM devices \
+             WHERE user_did = $1 AND device_id = $2 AND active = TRUE \
+             FOR SHARE",
+        )
+        .bind(did)
+        .bind(device_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .context("Failed to lock active KeyPackage device")?
+        .flatten();
+        let current_signature_key = current_signature_key
+            .as_deref()
+            .and_then(|value| hex::decode(value.trim()).ok());
+        if current_signature_key.as_deref() != Some(expected_signature_public_key) {
+            bail!("Active device signing key changed before KeyPackage storage");
+        }
+    }
+
+    // Ensure user exists only after the KeyPackage and device locks, matching the
+    // re-registration transaction and avoiding a user-row-to-KeyPackage inversion.
+    sqlx::query(
+        r#"
+        INSERT INTO users (did, created_at, last_seen_at)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (did) DO UPDATE SET last_seen_at = $3
+        "#,
+    )
+    .bind(did)
+    .bind(now)
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .context("Failed to ensure user exists")?;
 
     // Store with the verified credential identity (not the client-provided one)
     let result = sqlx::query_as::<_, KeyPackage>(
@@ -1886,14 +2066,210 @@ pub async fn store_key_package_with_device_bound_to_signature(
     .bind(&binding.key_package_hash)
     .bind(now)
     .bind(expires_at)
-    .bind(device_id)
+    .bind(&device_id)
     .bind(&binding.credential_identity)  // Use verified identity from KeyPackage, not client param
     .bind(last_resort)
-    .fetch_one(pool)
+    .fetch_one(&mut **tx)
     .await
     .context("Failed to store key package")?;
 
     Ok(result)
+}
+
+/// Revalidate and claim one federated KeyPackage against both the active
+/// local device registration and the caller-supplied authoritative PDS key
+/// set. Invalid legacy/stale rows are quarantined in the same transaction and
+/// skipped. Regular rows are consumed exactly once; last-resort rows remain
+/// reusable.
+pub(crate) enum FederationKeyPackageClaim {
+    Claimed(Vec<u8>, String),
+    RejectedCandidate,
+    Exhausted,
+}
+
+async fn quarantine_federation_key_package_candidate(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE key_packages \
+         SET state = 'revoked', revoked_at = clock_timestamp(), dead_at = clock_timestamp() \
+         WHERE id = $1 AND state = 'available'",
+    )
+    .bind(id)
+    .execute(&mut **tx)
+    .await
+    .context("Failed to quarantine rejected KeyPackage")?;
+    Ok(())
+}
+
+pub(crate) async fn claim_authorized_key_package_candidate_for_federation(
+    pool: &DbPool,
+    owner_did: &str,
+    convo_id: &str,
+    authoritative_signature_keys: &[Vec<u8>],
+    last_resort: bool,
+) -> Result<FederationKeyPackageClaim> {
+    let mut tx = pool
+        .begin()
+        .await
+        .context("Failed to begin authorized KeyPackage claim")?;
+
+    let candidate: Option<(String, Vec<u8>, String, Option<String>, String)> = if last_resort {
+        sqlx::query_as(
+            "SELECT id, key_package, key_package_hash, device_id, cipher_suite \
+                 FROM key_packages \
+                 WHERE owner_did = $1 \
+                   AND state = 'available' \
+                   AND dead_at IS NULL \
+                   AND consumed_at IS NULL \
+                   AND expires_at > NOW() \
+                   AND is_last_resort = TRUE \
+                 ORDER BY created_at ASC \
+                 LIMIT 1 \
+                 FOR UPDATE",
+        )
+        .bind(owner_did)
+        .fetch_optional(&mut *tx)
+        .await
+    } else {
+        sqlx::query_as(
+            "SELECT id, key_package, key_package_hash, device_id, cipher_suite \
+                 FROM key_packages \
+                 WHERE owner_did = $1 \
+                   AND state = 'available' \
+                   AND dead_at IS NULL \
+                   AND consumed_at IS NULL \
+                   AND expires_at > NOW() \
+                   AND is_last_resort = FALSE \
+                 ORDER BY created_at ASC \
+                 LIMIT 1 \
+                 FOR UPDATE SKIP LOCKED",
+        )
+        .bind(owner_did)
+        .fetch_optional(&mut *tx)
+        .await
+    }
+    .context("Failed to select KeyPackage for authorized federation claim")?;
+
+    let Some((id, key_package, key_package_hash, device_id, cipher_suite)) = candidate else {
+        tx.commit()
+            .await
+            .context("Failed to finish empty authorized KeyPackage claim")?;
+        return Ok(FederationKeyPackageClaim::Exhausted);
+    };
+
+    let binding = validate_key_package_binding_with_declared_ciphersuite(
+        owner_did,
+        Some(&cipher_suite),
+        &key_package,
+        None,
+    )
+    .await;
+
+    let local_signature_key = match device_id.as_deref() {
+        Some(device_id) => sqlx::query_scalar::<_, Option<String>>(
+            "SELECT signature_public_key \
+                     FROM devices \
+                     WHERE user_did = $1 AND device_id = $2 AND active = TRUE \
+                     LIMIT 1 \
+                     FOR SHARE",
+        )
+        .bind(owner_did)
+        .bind(device_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .context("Failed to resolve active KeyPackage device")?
+        .flatten()
+        .and_then(|value| hex::decode(value.trim()).ok()),
+        None => None,
+    };
+
+    let authorized = binding.as_ref().is_ok_and(|binding| {
+        local_signature_key.as_deref() == Some(binding.leaf_signature_public_key.as_slice())
+            && authoritative_signature_keys.iter().any(|key| {
+                key.len() == 32 && key.as_slice() == binding.leaf_signature_public_key.as_slice()
+            })
+    });
+
+    if !authorized {
+        quarantine_federation_key_package_candidate(&mut tx, &id).await?;
+        tx.commit()
+            .await
+            .context("Failed to commit unauthorized KeyPackage quarantine")?;
+        return Ok(FederationKeyPackageClaim::RejectedCandidate);
+    }
+
+    if last_resort {
+        let unexpired = sqlx::query_scalar::<_, bool>(
+            "SELECT expires_at > clock_timestamp() FROM key_packages WHERE id = $1",
+        )
+        .bind(&id)
+        .fetch_one(&mut *tx)
+        .await
+        .context("Failed to recheck last-resort KeyPackage expiry")?;
+        if !unexpired {
+            quarantine_federation_key_package_candidate(&mut tx, &id).await?;
+            tx.commit()
+                .await
+                .context("Failed to commit expired last-resort KeyPackage quarantine")?;
+            return Ok(FederationKeyPackageClaim::RejectedCandidate);
+        }
+    } else {
+        let claimed = sqlx::query(
+            "UPDATE key_packages \
+                 SET state = 'claimed', consumed_at = clock_timestamp(), consumed_for_convo_id = $2 \
+                 WHERE id = $1 \
+                   AND state = 'available' \
+                   AND is_last_resort = FALSE \
+                   AND expires_at > clock_timestamp()",
+        )
+        .bind(&id)
+        .bind(convo_id)
+        .execute(&mut *tx)
+        .await
+        .context("Failed to claim authorized regular KeyPackage")?;
+        if claimed.rows_affected() != 1 {
+            quarantine_federation_key_package_candidate(&mut tx, &id).await?;
+            tx.commit()
+                .await
+                .context("Failed to commit expired regular KeyPackage quarantine")?;
+            return Ok(FederationKeyPackageClaim::RejectedCandidate);
+        }
+    }
+
+    tx.commit()
+        .await
+        .context("Failed to commit authorized KeyPackage claim")?;
+    Ok(FederationKeyPackageClaim::Claimed(
+        key_package,
+        key_package_hash,
+    ))
+}
+
+#[cfg(test)]
+pub(crate) async fn claim_authorized_key_package_for_federation(
+    pool: &DbPool,
+    owner_did: &str,
+    convo_id: &str,
+    authoritative_signature_keys: &[Vec<u8>],
+    last_resort: bool,
+) -> Result<Option<(Vec<u8>, String)>> {
+    loop {
+        match claim_authorized_key_package_candidate_for_federation(
+            pool,
+            owner_did,
+            convo_id,
+            authoritative_signature_keys,
+            last_resort,
+        )
+        .await?
+        {
+            FederationKeyPackageClaim::Claimed(bytes, hash) => return Ok(Some((bytes, hash))),
+            FederationKeyPackageClaim::RejectedCandidate => continue,
+            FederationKeyPackageClaim::Exhausted => return Ok(None),
+        }
+    }
 }
 
 /// Get an available key package for a user
@@ -3509,6 +3885,29 @@ mod tests {
     }
 
     #[test]
+    fn key_package_binding_rejects_different_bare_did() {
+        let key_data = generate_key_package_bytes("did:plc:someoneelse");
+        let err = validate_key_package_binding_sync("did:plc:owner", &key_data, None)
+            .expect_err("credential root must match the owner DID");
+        assert!(format!("{err:#}").contains("bare user DID"));
+    }
+
+    #[test]
+    fn key_package_binding_rejects_credential_fragment() {
+        let key_data = generate_key_package_bytes("did:plc:owner#device-a");
+        let err = validate_key_package_binding_sync("did:plc:owner", &key_data, None)
+            .expect_err("fragmented MLS credentials must be rejected");
+        assert!(format!("{err:#}").contains("bare user DID"));
+    }
+
+    #[test]
+    fn key_package_binding_rejects_malformed_bytes() {
+        let err = validate_key_package_binding_sync("did:plc:owner", &[0xde, 0xad], None)
+            .expect_err("malformed KeyPackage bytes must be rejected");
+        assert!(format!("{err:#}").contains("deserialize"));
+    }
+
+    #[test]
     fn key_package_binding_accepts_matching_leaf_signature() {
         let (key_data, package_signature_key) =
             generate_key_package_bytes_and_signature_key("did:plc:bounduser");
@@ -3522,6 +3921,198 @@ mod tests {
 
         assert_eq!(binding.credential_identity, "did:plc:bounduser");
         assert_eq!(binding.leaf_signature_public_key, package_signature_key);
+    }
+
+    #[test]
+    fn key_package_binding_rejects_trailing_data() {
+        let (mut key_data, package_signature_key) =
+            generate_key_package_bytes_and_signature_key("did:plc:bounduser");
+        key_data.extend_from_slice(&[0xde, 0xad]);
+
+        let err = validate_key_package_binding_sync(
+            "did:plc:bounduser",
+            &key_data,
+            Some(&package_signature_key),
+        )
+        .expect_err("trailing bytes must be rejected");
+
+        assert!(
+            format!("{err:#}").contains("trailing"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn key_package_storage_rejects_declared_ciphersuite_mismatch() {
+        let (key_data, package_signature_key) =
+            generate_key_package_bytes_and_signature_key("did:plc:bounduser");
+
+        let err = validate_declared_key_package_sync(
+            "did:plc:bounduser",
+            Some("MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519"),
+            &key_data,
+            Some(&package_signature_key),
+        )
+        .expect_err("declared ciphersuite must match the signed KeyPackage");
+
+        assert!(
+            format!("{err:#}").contains("ciphersuite"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn declared_ciphersuite_names_are_stable_and_exhaustive() {
+        use openmls::prelude::Ciphersuite;
+
+        let cases = [
+            (
+                Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519,
+                "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519",
+            ),
+            (
+                Ciphersuite::MLS_128_DHKEMP256_AES128GCM_SHA256_P256,
+                "MLS_128_DHKEMP256_AES128GCM_SHA256_P256",
+            ),
+            (
+                Ciphersuite::MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519,
+                "MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519",
+            ),
+            (
+                Ciphersuite::MLS_256_DHKEMX448_AES256GCM_SHA512_Ed448,
+                "MLS_256_DHKEMX448_AES256GCM_SHA512_Ed448",
+            ),
+            (
+                Ciphersuite::MLS_256_DHKEMP521_AES256GCM_SHA512_P521,
+                "MLS_256_DHKEMP521_AES256GCM_SHA512_P521",
+            ),
+            (
+                Ciphersuite::MLS_256_DHKEMX448_CHACHA20POLY1305_SHA512_Ed448,
+                "MLS_256_DHKEMX448_CHACHA20POLY1305_SHA512_Ed448",
+            ),
+            (
+                Ciphersuite::MLS_256_DHKEMP384_AES256GCM_SHA384_P384,
+                "MLS_256_DHKEMP384_AES256GCM_SHA384_P384",
+            ),
+            (
+                Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519,
+                "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+            ),
+        ];
+
+        for (suite, declared_name) in cases {
+            assert_eq!(declared_ciphersuite_name(suite), declared_name);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+    async fn rejected_regular_and_last_resort_packages_store_no_rows() {
+        let pool = setup_test_db().await;
+        let did = format!("did:plc:w2nostore{}", Uuid::new_v4().simple());
+        let expires_at = Utc::now() + chrono::Duration::hours(24);
+
+        for last_resort in [false, true] {
+            let result = store_key_package_with_device_bound_to_signature(
+                &pool,
+                &did,
+                "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+                vec![0xde, 0xad],
+                expires_at,
+                Some("device-a".to_string()),
+                None,
+                Some(&[0x41; 32]),
+                last_resort,
+            )
+            .await;
+            assert!(result.is_err(), "malformed package must be rejected");
+        }
+
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM key_packages WHERE owner_did = $1")
+                .bind(&did)
+                .fetch_one(&pool)
+                .await
+                .expect("count rejected package rows");
+        assert_eq!(count, 0, "rejected packages must never reach storage");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+    async fn device_deactivation_race_prevents_key_package_storage() {
+        let pool = setup_test_db().await;
+        let did = format!("did:plc:w2deactivate{}", Uuid::new_v4().simple());
+        let device_id = "device-race";
+        let (key_data, signature_key) = generate_key_package_bytes_and_signature_key(&did);
+        sqlx::query("INSERT INTO users (did) VALUES ($1) ON CONFLICT DO NOTHING")
+            .bind(&did)
+            .execute(&pool)
+            .await
+            .expect("seed user");
+        sqlx::query(
+            "INSERT INTO devices \
+             (id, user_did, device_id, credential_did, signature_public_key, active) \
+             VALUES ($1, $2, $3, $4, $5, TRUE)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&did)
+        .bind(device_id)
+        .bind(format!("{did}#{device_id}"))
+        .bind(hex::encode(&signature_key))
+        .execute(&pool)
+        .await
+        .expect("seed device");
+
+        let mut deactivation = pool.begin().await.expect("begin deactivation");
+        sqlx::query("UPDATE devices SET active = FALSE WHERE user_did = $1 AND device_id = $2")
+            .bind(&did)
+            .bind(device_id)
+            .execute(&mut *deactivation)
+            .await
+            .expect("stage deactivation");
+
+        let store_pool = pool.clone();
+        let store_did = did.clone();
+        let store_key = signature_key.clone();
+        let store = tokio::spawn(async move {
+            store_key_package_with_device_bound_to_signature(
+                &store_pool,
+                &store_did,
+                "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+                key_data,
+                Utc::now() + chrono::Duration::hours(24),
+                Some(device_id.to_string()),
+                None,
+                Some(&store_key),
+                false,
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        deactivation.commit().await.expect("commit deactivation");
+
+        assert!(
+            store.await.expect("join store").is_err(),
+            "storage must recheck the active device after a concurrent deactivation"
+        );
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM key_packages WHERE owner_did = $1")
+                .bind(&did)
+                .fetch_one(&pool)
+                .await
+                .expect("count packages");
+        assert_eq!(count, 0);
+
+        sqlx::query("DELETE FROM devices WHERE user_did = $1")
+            .bind(&did)
+            .execute(&pool)
+            .await
+            .expect("clean device");
+        sqlx::query("DELETE FROM users WHERE did = $1")
+            .bind(&did)
+            .execute(&pool)
+            .await
+            .expect("clean user");
     }
 
     #[tokio::test]

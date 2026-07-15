@@ -35,6 +35,28 @@ struct DeviceScope {
     storage_device_id: String,
     storage_candidates: Vec<String>,
     signature_public_key: Option<Vec<u8>>,
+    active: bool,
+}
+
+fn authorize_device_record<E>(
+    enforce: bool,
+    locally_active: bool,
+    registered_signature_key: Option<&[u8]>,
+    authoritative_keys: &Result<Vec<Vec<u8>>, E>,
+) -> bool {
+    if !enforce {
+        return true;
+    }
+    let Some(registered_signature_key) = registered_signature_key else {
+        return false;
+    };
+    if !locally_active || registered_signature_key.len() != 32 {
+        return false;
+    }
+    authoritative_keys.as_ref().is_ok_and(|keys| {
+        keys.iter()
+            .any(|key| key.len() == 32 && key.as_slice() == registered_signature_key)
+    })
 }
 
 async fn resolve_device_scope(
@@ -49,12 +71,13 @@ async fn resolve_device_scope(
             storage_device_id: String::new(),
             storage_candidates: Vec::new(),
             signature_public_key: None,
+            active: false,
         });
     }
 
     let credential_did = format!("{}#{}", user_did, raw_device_id);
-    let canonical: Option<(String, Option<String>)> = sqlx::query_as(
-        "SELECT device_id, signature_public_key FROM devices \
+    let canonical: Option<(String, Option<String>, bool)> = sqlx::query_as(
+        "SELECT device_id, signature_public_key, active FROM devices \
          WHERE user_did = $1 \
            AND (device_id = $2 OR device_uuid = $2 OR credential_did = $3) \
          ORDER BY registered_at DESC \
@@ -74,8 +97,8 @@ async fn resolve_device_scope(
     })?;
 
     let legacy_bucket = crate::device_utils::bucket_device_id(user_did, raw_device_id);
-    let (storage_device_id, signature_public_key) =
-        if let Some((device_id, signature_public_key_hex)) = canonical {
+    let (storage_device_id, signature_public_key, active) =
+        if let Some((device_id, signature_public_key_hex, active)) = canonical {
             let signature_public_key = match signature_public_key_hex
                 .as_deref()
                 .map(str::trim)
@@ -91,9 +114,9 @@ async fn resolve_device_scope(
                 })?),
                 None => None,
             };
-            (device_id, signature_public_key)
+            (device_id, signature_public_key, active)
         } else {
-            (raw_device_id.to_string(), None)
+            (raw_device_id.to_string(), None, false)
         };
     let mut storage_candidates = vec![storage_device_id.clone(), raw_device_id.to_string()];
     if !legacy_bucket.is_empty() {
@@ -107,6 +130,7 @@ async fn resolve_device_scope(
         storage_device_id,
         storage_candidates,
         signature_public_key,
+        active,
     })
 }
 
@@ -1000,35 +1024,31 @@ pub async fn publish_key_packages_post(
         .unwrap_or(false);
 
     if input.action.as_ref() == "publish" || input.action.as_ref() == "publishBatch" {
-        if let Some(expected_sig_key) = device_scope.signature_public_key.as_deref() {
-            match resolver.resolve_authorized_device_keys(&user_did).await {
-                Ok(keys) => {
-                    let is_authorized = keys.iter().any(|k| k.as_slice() == expected_sig_key);
-                    if !is_authorized {
-                        if enforce_auth {
-                            error!(
-                                "N44 Enforcement: signature key for {} not found in device records (resolved {} keys). Rejecting.",
-                                user_did,
-                                keys.len()
-                            );
-                            return Err(StatusCode::FORBIDDEN);
-                        } else {
-                            warn!(
-                                "N44 Warn-only: signature key for {} not found in device records (resolved {} keys)",
-                                user_did,
-                                keys.len()
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    // PDS resolution failure. In both warn and enforce, we allow to prevent PDS outages from breaking MLS publishing.
-                    warn!(
-                        "N44 device records resolution failed for {}: {}",
-                        user_did, e
-                    );
-                }
-            }
+        let authoritative_keys = resolver.resolve_authorized_device_keys(&user_did).await;
+        if !authorize_device_record(
+            enforce_auth,
+            device_scope.active,
+            device_scope.signature_public_key.as_deref(),
+            &authoritative_keys,
+        ) {
+            warn!(
+                owner = %crate::crypto::hash_for_log(&user_did),
+                "KeyPackage publication rejected by authoritative device policy"
+            );
+            return Err(StatusCode::FORBIDDEN);
+        }
+        if !enforce_auth
+            && !authorize_device_record(
+                true,
+                device_scope.active,
+                device_scope.signature_public_key.as_deref(),
+                &authoritative_keys,
+            )
+        {
+            warn!(
+                owner = %crate::crypto::hash_for_log(&user_did),
+                "KeyPackage publication would fail authoritative device policy"
+            );
         }
     }
 
@@ -1157,6 +1177,82 @@ mod tests {
     use uuid::Uuid;
 
     const CIPHER_SUITE: &str = "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519";
+
+    #[test]
+    fn authoritative_device_policy_fails_closed_only_when_enforcement_is_selected() {
+        let registered_key = vec![0x41; 32];
+        let matching: Result<Vec<Vec<u8>>, ()> = Ok(vec![registered_key.clone()]);
+        let mismatch: Result<Vec<Vec<u8>>, ()> = Ok(vec![vec![0x42; 32]]);
+        let empty: Result<Vec<Vec<u8>>, ()> = Ok(Vec::new());
+        let resolver_error = Err(());
+
+        assert!(authorize_device_record(
+            false,
+            true,
+            Some(&registered_key),
+            &mismatch
+        ));
+        assert!(authorize_device_record(
+            false,
+            true,
+            Some(&registered_key),
+            &empty
+        ));
+        assert!(authorize_device_record(
+            false,
+            true,
+            Some(&registered_key),
+            &resolver_error
+        ));
+
+        assert!(authorize_device_record(
+            true,
+            true,
+            Some(&registered_key),
+            &matching
+        ));
+        assert!(!authorize_device_record(
+            true,
+            true,
+            Some(&registered_key),
+            &mismatch
+        ));
+        assert!(!authorize_device_record(
+            true,
+            true,
+            Some(&registered_key),
+            &empty
+        ));
+        assert!(!authorize_device_record(
+            true,
+            true,
+            Some(&registered_key),
+            &resolver_error
+        ));
+        assert!(!authorize_device_record(
+            true,
+            false,
+            Some(&registered_key),
+            &matching
+        ));
+        assert!(!authorize_device_record(true, true, None, &matching));
+    }
+
+    #[test]
+    fn key_package_publication_remains_bootstrap_available_in_all_device_auth_modes() {
+        use crate::config::{DeviceAuthMode, DeviceAuthPolicyAction};
+
+        for mode in [
+            DeviceAuthMode::Observe,
+            DeviceAuthMode::Enroll,
+            DeviceAuthMode::Require,
+        ] {
+            assert_eq!(
+                mode.action_for_nsid(NSID).expect("known publication NSID"),
+                DeviceAuthPolicyAction::Allow
+            );
+        }
+    }
 
     async fn setup_test_db() -> DbPool {
         let database_url = std::env::var("TEST_DATABASE_URL")
@@ -1290,6 +1386,7 @@ mod tests {
             storage_device_id: device_id.to_string(),
             storage_candidates: vec![device_id.to_string()],
             signature_public_key: None,
+            active: false,
         };
 
         let result = handle_sync(&pool, &input, &user_did, &device_scope)
