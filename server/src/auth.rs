@@ -276,6 +276,10 @@ pub struct AuthMiddleware {
     cache_ttl_seconds: u64,
     rate_limit_quota: Quota,
     did_host_allowlist: Option<Vec<String>>,
+    #[cfg(test)]
+    service_did_override: Option<String>,
+    #[cfg(test)]
+    test_service_did_source: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
 }
 
 impl AuthMiddleware {
@@ -331,7 +335,42 @@ impl AuthMiddleware {
             cache_ttl_seconds,
             rate_limit_quota: quota,
             did_host_allowlist,
+            #[cfg(test)]
+            service_did_override: None,
+            #[cfg(test)]
+            test_service_did_source: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_test_service_did(mut self, service_did: &str) -> Self {
+        self.service_did_override = Some(service_did.to_string());
+        self.test_service_did_source = None;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_test_service_did_source(
+        mut self,
+        source: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+    ) -> Self {
+        self.service_did_override = None;
+        self.test_service_did_source = Some(source);
+        self
+    }
+
+    fn configured_service_did(&self) -> Option<String> {
+        #[cfg(test)]
+        {
+            if let Some(source) = &self.test_service_did_source {
+                return source();
+            }
+            if let Some(service_did) = &self.service_did_override {
+                return Some(service_did.clone());
+            }
+        }
+
+        std::env::var("SERVICE_DID").ok()
     }
 
     /// Verify JWT token and extract claims.
@@ -371,7 +410,7 @@ impl AuthMiddleware {
         }
 
         // Audience enforcement when configured
-        if let Ok(service_did) = std::env::var("SERVICE_DID") {
+        if let Some(service_did) = self.configured_service_did() {
             tracing::debug!("Validating JWT audience against configured SERVICE_DID");
             if claims.aud != service_did {
                 tracing::warn!("JWT audience mismatch with SERVICE_DID");
@@ -740,8 +779,10 @@ static JTI_CACHE: Lazy<moka::sync::Cache<String, ()>> = Lazy::new(|| {
 
 static AUTH_MIDDLEWARE: Lazy<AuthMiddleware> = Lazy::new(AuthMiddleware::new);
 
-fn truthy(var: &str) -> bool {
-    matches!(var, "1" | "true" | "TRUE" | "yes" | "YES")
+/// Keep the binary startup gate and library request gate on identical flag semantics.
+#[doc(hidden)]
+pub fn auth_enforcement_flag_enabled(value: &str) -> bool {
+    value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
 }
 
 fn parse_host_allowlist(var_name: &str) -> Option<Vec<String>> {
@@ -878,6 +919,47 @@ async fn validate_resolved_host_is_public(host: &str, port: u16) -> Result<(), A
 /// Enforce optional lxm and jti-claim presence.
 /// Replay uniqueness must be enforced with `enforce_standard_with_replay_store`.
 pub fn enforce_standard(claims: &AtProtoClaims, endpoint_nsid: &str) -> Result<(), AuthError> {
+    enforce_standard_with_policy(claims, endpoint_nsid, AuthEnforcementPolicy::from_env())
+}
+
+#[derive(Clone, Copy)]
+struct AuthEnforcementPolicy {
+    enforce_lxm: bool,
+    enforce_jti: bool,
+    jti_ttl_seconds: u64,
+}
+
+impl AuthEnforcementPolicy {
+    fn from_env() -> Self {
+        Self {
+            enforce_lxm: std::env::var("ENFORCE_LXM")
+                .map(|value| auth_enforcement_flag_enabled(&value))
+                .unwrap_or(true),
+            enforce_jti: std::env::var("ENFORCE_JTI")
+                .map(|value| auth_enforcement_flag_enabled(&value))
+                .unwrap_or(true),
+            jti_ttl_seconds: std::env::var("JTI_TTL_SECONDS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(120),
+        }
+    }
+
+    #[cfg(test)]
+    const fn strict_for_test() -> Self {
+        Self {
+            enforce_lxm: true,
+            enforce_jti: true,
+            jti_ttl_seconds: 120,
+        }
+    }
+}
+
+fn enforce_standard_with_policy(
+    claims: &AtProtoClaims,
+    endpoint_nsid: &str,
+    policy: AuthEnforcementPolicy,
+) -> Result<(), AuthError> {
     tracing::debug!(
         iss = %crate::crypto::redact_for_log(&claims.iss),
         endpoint = endpoint_nsid,
@@ -888,10 +970,7 @@ pub fn enforce_standard(claims: &AtProtoClaims, endpoint_nsid: &str) -> Result<(
 
     // Enforce lxm if requested
     // Default to enforcing LXM unless explicitly disabled
-    let enforce_lxm = std::env::var("ENFORCE_LXM")
-        .map(|v| truthy(&v))
-        .unwrap_or(true);
-    if enforce_lxm {
+    if policy.enforce_lxm {
         if let Some(lxm) = &claims.lxm {
             if lxm != endpoint_nsid {
                 tracing::warn!("LXM mismatch: JWT lxm does not match endpoint NSID");
@@ -903,11 +982,7 @@ pub fn enforce_standard(claims: &AtProtoClaims, endpoint_nsid: &str) -> Result<(
     }
 
     // Enforce jti presence unless disabled
-    let enforce_jti = std::env::var("ENFORCE_JTI")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
-        .unwrap_or(true);
-
-    if enforce_jti && claims.jti.is_none() {
+    if policy.enforce_jti && claims.jti.is_none() {
         tracing::warn!(
             iss = %crate::crypto::redact_for_log(&claims.iss),
             endpoint = endpoint_nsid,
@@ -923,6 +998,61 @@ pub async fn enforce_standard_with_replay_store(
     endpoint_nsid: &str,
     pool: &crate::storage::DbPool,
 ) -> Result<(), AuthError> {
+    enforce_standard_with_store(
+        claims,
+        endpoint_nsid,
+        &PostgresJtiReplayStore(pool),
+        AuthEnforcementPolicy::from_env(),
+    )
+    .await
+}
+
+#[async_trait::async_trait]
+trait JtiReplayStore: Sync {
+    async fn insert_if_absent(
+        &self,
+        issuer_did: &str,
+        jti: &str,
+        endpoint_nsid: &str,
+        ttl_seconds: u64,
+    ) -> Result<bool, AuthError>;
+}
+
+struct PostgresJtiReplayStore<'a>(&'a crate::storage::DbPool);
+
+#[async_trait::async_trait]
+impl JtiReplayStore for PostgresJtiReplayStore<'_> {
+    async fn insert_if_absent(
+        &self,
+        issuer_did: &str,
+        jti: &str,
+        endpoint_nsid: &str,
+        ttl_seconds: u64,
+    ) -> Result<bool, AuthError> {
+        let inserted: Option<String> = sqlx::query_scalar(
+            "INSERT INTO auth_jti_nonce (issuer_did, jti, endpoint_nsid, expires_at, created_at) \
+             VALUES ($1, $2, $3, NOW() + make_interval(secs => $4), NOW()) \
+             ON CONFLICT (issuer_did, jti) DO NOTHING \
+             RETURNING issuer_did",
+        )
+        .bind(issuer_did)
+        .bind(jti)
+        .bind(endpoint_nsid)
+        .bind(ttl_seconds as f64)
+        .fetch_optional(self.0)
+        .await
+        .map_err(|e| AuthError::Internal(format!("shared jti store failed: {e}")))?;
+
+        Ok(inserted.is_some())
+    }
+}
+
+async fn enforce_standard_with_store(
+    claims: &AtProtoClaims,
+    endpoint_nsid: &str,
+    store: &impl JtiReplayStore,
+    policy: AuthEnforcementPolicy,
+) -> Result<(), AuthError> {
     tracing::debug!(
         iss = %crate::crypto::redact_for_log(&claims.iss),
         endpoint = endpoint_nsid,
@@ -931,10 +1061,7 @@ pub async fn enforce_standard_with_replay_store(
         "Enforcing authorization constraints with shared replay store"
     );
 
-    let enforce_lxm = std::env::var("ENFORCE_LXM")
-        .map(|v| truthy(&v))
-        .unwrap_or(true);
-    if enforce_lxm {
+    if policy.enforce_lxm {
         match &claims.lxm {
             Some(lxm) if lxm == endpoint_nsid => {}
             Some(_) => return Err(AuthError::LxmMismatch),
@@ -942,17 +1069,11 @@ pub async fn enforce_standard_with_replay_store(
         }
     }
 
-    let enforce_jti = std::env::var("ENFORCE_JTI")
-        .map(|v| truthy(&v))
-        .unwrap_or(true);
-    if !enforce_jti {
+    if !policy.enforce_jti {
         return Ok(());
     }
 
-    let ttl_seconds = std::env::var("JTI_TTL_SECONDS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(120);
+    let ttl_seconds = policy.jti_ttl_seconds;
 
     let jti = claims.jti.as_ref().ok_or(AuthError::MissingJti)?;
     let canonical_issuer = canonical_did(&claims.iss);
@@ -961,21 +1082,10 @@ pub async fn enforce_standard_with_replay_store(
         return Err(AuthError::ReplayDetected);
     }
 
-    let inserted: Option<String> = sqlx::query_scalar(
-        "INSERT INTO auth_jti_nonce (issuer_did, jti, endpoint_nsid, expires_at, created_at) \
-         VALUES ($1, $2, $3, NOW() + make_interval(secs => $4), NOW()) \
-         ON CONFLICT (issuer_did, jti) DO NOTHING \
-         RETURNING issuer_did",
-    )
-    .bind(canonical_issuer)
-    .bind(jti)
-    .bind(endpoint_nsid)
-    .bind(ttl_seconds as f64)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| AuthError::Internal(format!("shared jti store failed: {e}")))?;
-
-    if inserted.is_none() {
+    if !store
+        .insert_if_absent(canonical_issuer, jti, endpoint_nsid, ttl_seconds)
+        .await?
+    {
         return Err(AuthError::ReplayDetected);
     }
 
@@ -1330,6 +1440,47 @@ pub async fn verify_is_moderator_or_admin(
 mod tests {
     use super::*;
 
+    #[test]
+    fn auth_enforcement_flags_use_case_insensitive_boolean_semantics() {
+        for enabled in [
+            "1", "true", "TRUE", "True", "tRuE", "yes", "YES", "Yes", "yEs",
+        ] {
+            assert!(
+                auth_enforcement_flag_enabled(enabled),
+                "expected {enabled:?} to enable enforcement"
+            );
+        }
+
+        for disabled in ["0", "false", "False", "no", "No", "", " true "] {
+            assert!(
+                !auth_enforcement_flag_enabled(disabled),
+                "expected {disabled:?} to disable enforcement"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_case_flags_enable_both_lxm_and_jti_policy_gates() {
+        let policy = AuthEnforcementPolicy {
+            enforce_lxm: auth_enforcement_flag_enabled("True"),
+            enforce_jti: auth_enforcement_flag_enabled("Yes"),
+            jti_ttl_seconds: 120,
+        };
+        let mut claims = claims("did:plc:alice", None);
+        claims.lxm = Some("blue.catbird.mlsChat.sendMessage".to_string());
+        assert!(matches!(
+            enforce_standard_with_policy(&claims, "blue.catbird.mlsChat.getConvos", policy,),
+            Err(AuthError::LxmMismatch)
+        ));
+
+        claims.lxm = Some("blue.catbird.mlsChat.getConvos".to_string());
+        claims.jti = None;
+        assert!(matches!(
+            enforce_standard_with_policy(&claims, "blue.catbird.mlsChat.getConvos", policy,),
+            Err(AuthError::MissingJti)
+        ));
+    }
+
     fn claims(iss: &str, sub: Option<&str>) -> AtProtoClaims {
         AtProtoClaims {
             iss: iss.to_string(),
@@ -1450,3 +1601,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "auth/staging_identity_fixture_tests.rs"]
+mod staging_identity_fixture_tests;

@@ -477,10 +477,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Check LXM/JTI enforcement safety
     let enforce_lxm = std::env::var("ENFORCE_LXM")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
+        .map(|value| auth::auth_enforcement_flag_enabled(&value))
         .unwrap_or(true);
     let enforce_jti = std::env::var("ENFORCE_JTI")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
+        .map(|value| auth::auth_enforcement_flag_enabled(&value))
         .unwrap_or(true);
 
     if !enforce_lxm || !enforce_jti {
