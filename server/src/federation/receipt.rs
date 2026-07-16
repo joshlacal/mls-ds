@@ -1,7 +1,80 @@
 use chrono::Utc;
 use p256::ecdsa::{signature::Verifier, Signature, SigningKey, VerifyingKey};
+use p256::pkcs8::DecodePrivateKey;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+/// The only verification method clients may resolve for V1 sequencer receipts.
+///
+/// The DID document itself is published by the edge/operations layer. The
+/// server validates this fixed identifier before enabling receipt issuance so
+/// configuration cannot silently select the service-auth verification method.
+pub const RECEIPT_VERIFICATION_METHOD: &str = "did:web:mlschat.catbird.blue#mls-receipt-1";
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ReceiptConfigError {
+    #[error("RECEIPT_ISSUANCE_MODE must be disabled or issue")]
+    InvalidIssuanceMode,
+    #[error("RECEIPT_SIGNING_KEY_PEM is required when receipt issuance is enabled")]
+    MissingSigningKey,
+    #[error("RECEIPT_SIGNING_KEY_PEM is not a valid ES256 PKCS#8 private key")]
+    MalformedSigningKey,
+    #[error("RECEIPT_VERIFICATION_METHOD must name the fixed MLS receipt method")]
+    UnexpectedVerificationMethod,
+    #[error("SERVICE_DID must own the fixed MLS receipt verification method")]
+    VerificationMethodOwnerMismatch,
+    #[error("the receipt-signing key must be distinct from the service-auth key")]
+    ServiceAuthKeyReuse,
+}
+
+/// Build the optional receipt signer from its dedicated configuration.
+///
+/// `SIGNING_KEY_PEM` is accepted only for a public-key separation check. It is
+/// never used to construct the receipt signer and is never a fallback for a
+/// missing `RECEIPT_SIGNING_KEY_PEM`.
+pub fn configured_receipt_signer(
+    issuance_mode: Option<&str>,
+    receipt_signing_key_pem: Option<&str>,
+    receipt_verification_method: Option<&str>,
+    service_auth_signing_key_pem: Option<&str>,
+    service_did: &str,
+) -> Result<Option<ReceiptSigner>, ReceiptConfigError> {
+    let mode = issuance_mode.unwrap_or("disabled").trim();
+    if mode.eq_ignore_ascii_case("disabled") || mode.eq_ignore_ascii_case("off") {
+        return Ok(None);
+    }
+    if !mode.eq_ignore_ascii_case("issue") {
+        return Err(ReceiptConfigError::InvalidIssuanceMode);
+    }
+
+    if receipt_verification_method != Some(RECEIPT_VERIFICATION_METHOD) {
+        return Err(ReceiptConfigError::UnexpectedVerificationMethod);
+    }
+    let method_owner = RECEIPT_VERIFICATION_METHOD
+        .split_once('#')
+        .map(|(did, _)| did)
+        .expect("fixed receipt verification method contains a fragment");
+    if crate::identity::canonical_did(service_did) != method_owner {
+        return Err(ReceiptConfigError::VerificationMethodOwnerMismatch);
+    }
+
+    let pem = receipt_signing_key_pem.ok_or(ReceiptConfigError::MissingSigningKey)?;
+    let receipt_key =
+        SigningKey::from_pkcs8_pem(pem).map_err(|_| ReceiptConfigError::MalformedSigningKey)?;
+
+    if let Some(service_pem) = service_auth_signing_key_pem {
+        if let Ok(service_key) = SigningKey::from_pkcs8_pem(service_pem) {
+            if service_key.verifying_key() == receipt_key.verifying_key() {
+                return Err(ReceiptConfigError::ServiceAuthKeyReuse);
+            }
+        }
+    }
+
+    Ok(Some(ReceiptSigner::new(
+        receipt_key,
+        service_did.to_string(),
+    )))
+}
 
 /// A signed receipt proving the sequencer accepted and ordered a commit.
 ///
@@ -45,6 +118,7 @@ impl SequencerReceipt {
 }
 
 /// Signs sequencer receipts using an ES256 private key.
+#[derive(Debug)]
 pub struct ReceiptSigner {
     signing_key: SigningKey,
     sequencer_did: String,
@@ -139,7 +213,142 @@ fn canonical_bytes(
 mod tests {
     use super::*;
     use p256::ecdsa::SigningKey;
+    use p256::pkcs8::{EncodePrivateKey, LineEnding};
     use rand::rngs::OsRng;
+
+    fn pem(key: &SigningKey) -> String {
+        key.to_pkcs8_pem(LineEnding::LF)
+            .expect("encode test key")
+            .to_string()
+    }
+
+    #[test]
+    fn issue_mode_requires_dedicated_receipt_key() {
+        let service_key = SigningKey::random(&mut OsRng);
+        let error = configured_receipt_signer(
+            Some("issue"),
+            None,
+            Some(RECEIPT_VERIFICATION_METHOD),
+            Some(&pem(&service_key)),
+            "did:web:mlschat.catbird.blue",
+        )
+        .expect_err("missing dedicated receipt key must fail closed");
+
+        assert_eq!(error, ReceiptConfigError::MissingSigningKey);
+    }
+
+    #[test]
+    fn issue_mode_rejects_malformed_receipt_key() {
+        let service_key = SigningKey::random(&mut OsRng);
+        let error = configured_receipt_signer(
+            Some("issue"),
+            Some("not-a-private-key"),
+            Some(RECEIPT_VERIFICATION_METHOD),
+            Some(&pem(&service_key)),
+            "did:web:mlschat.catbird.blue",
+        )
+        .expect_err("malformed dedicated receipt key must fail closed");
+
+        assert_eq!(error, ReceiptConfigError::MalformedSigningKey);
+    }
+
+    #[test]
+    fn issue_mode_requires_fixed_verification_method() {
+        let receipt_key = SigningKey::random(&mut OsRng);
+        let service_key = SigningKey::random(&mut OsRng);
+        let error = configured_receipt_signer(
+            Some("issue"),
+            Some(&pem(&receipt_key)),
+            Some("did:web:mlschat.catbird.blue#service-auth"),
+            Some(&pem(&service_key)),
+            "did:web:mlschat.catbird.blue",
+        )
+        .expect_err("a different verification method must fail closed");
+
+        assert_eq!(error, ReceiptConfigError::UnexpectedVerificationMethod);
+    }
+
+    #[test]
+    fn issue_mode_requires_service_did_to_own_fixed_method() {
+        let receipt_key = SigningKey::random(&mut OsRng);
+        let service_key = SigningKey::random(&mut OsRng);
+        let error = configured_receipt_signer(
+            Some("issue"),
+            Some(&pem(&receipt_key)),
+            Some(RECEIPT_VERIFICATION_METHOD),
+            Some(&pem(&service_key)),
+            "did:web:other.example",
+        )
+        .expect_err("the configured service DID must own the receipt method");
+
+        assert_eq!(error, ReceiptConfigError::VerificationMethodOwnerMismatch);
+    }
+
+    #[test]
+    fn issue_mode_rejects_service_auth_key_reuse() {
+        let shared_key = SigningKey::random(&mut OsRng);
+        let shared_pem = pem(&shared_key);
+        let error = configured_receipt_signer(
+            Some("issue"),
+            Some(&shared_pem),
+            Some(RECEIPT_VERIFICATION_METHOD),
+            Some(&shared_pem),
+            "did:web:mlschat.catbird.blue",
+        )
+        .expect_err("receipt and service-auth keys must be distinct");
+
+        assert_eq!(error, ReceiptConfigError::ServiceAuthKeyReuse);
+    }
+
+    #[test]
+    fn issue_mode_builds_signer_only_from_dedicated_key() {
+        let receipt_key = SigningKey::random(&mut OsRng);
+        let service_key = SigningKey::random(&mut OsRng);
+        let signer = configured_receipt_signer(
+            Some("issue"),
+            Some(&pem(&receipt_key)),
+            Some(RECEIPT_VERIFICATION_METHOD),
+            Some(&pem(&service_key)),
+            "did:web:mlschat.catbird.blue",
+        )
+        .expect("valid receipt configuration")
+        .expect("issue mode signer");
+
+        assert_eq!(signer.verifying_key(), *receipt_key.verifying_key());
+        assert_ne!(signer.verifying_key(), *service_key.verifying_key());
+    }
+
+    #[test]
+    fn disabled_mode_does_not_fall_back_to_service_auth_key() {
+        let service_key = SigningKey::random(&mut OsRng);
+        let signer = configured_receipt_signer(
+            Some("disabled"),
+            None,
+            None,
+            Some(&pem(&service_key)),
+            "did:web:mlschat.catbird.blue",
+        )
+        .expect("disabled mode is valid");
+
+        assert!(signer.is_none());
+    }
+
+    #[test]
+    fn canonical_receipt_v1_golden_includes_sequencer_term() {
+        let bytes = canonical_bytes(
+            "c",
+            0x0102_0304,
+            0x0102_0304_0506_0708,
+            &[0xabu8; 32],
+            "did:web:mlschat.catbird.blue",
+            0x0102_0304_0506_0708,
+        );
+
+        assert_eq!(
+            hex::encode(bytes),
+            "434154424952442d524543454950542d56313a0100000063010203040102030405060708abababababababababababababababababababababababababababababababab1c0000006469643a7765623a6d6c73636861742e636174626972642e626c75650102030405060708"
+        );
+    }
 
     #[test]
     fn sign_and_verify_round_trip() {

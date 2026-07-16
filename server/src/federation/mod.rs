@@ -267,6 +267,13 @@ pub struct FederationConfig {
     pub self_endpoint: String,
     /// PEM-encoded ES256 private key for signing outbound service auth JWTs.
     pub signing_key_pem: Option<String>,
+    /// `disabled` (default) or `issue`. Issue mode fails startup closed unless
+    /// the dedicated receipt key and fixed verification method are valid.
+    pub receipt_issuance_mode: Option<String>,
+    /// Dedicated ES256 receipt key. This must never reuse `signing_key_pem`.
+    pub receipt_signing_key_pem: Option<String>,
+    /// Fixed DID verification method used by receipt verifiers.
+    pub receipt_verification_method: Option<String>,
     /// Fallback DS endpoint for users without a `blue.catbird.mlsChat.profile` record.
     pub default_ds_endpoint: Option<String>,
     pub endpoint_cache_ttl_secs: u64,
@@ -287,6 +294,9 @@ impl FederationConfig {
             self_did: crate::identity::service_did(),
             self_endpoint: crate::identity::self_endpoint(),
             signing_key_pem: std::env::var("SIGNING_KEY_PEM").ok(),
+            receipt_issuance_mode: std::env::var("RECEIPT_ISSUANCE_MODE").ok(),
+            receipt_signing_key_pem: std::env::var("RECEIPT_SIGNING_KEY_PEM").ok(),
+            receipt_verification_method: std::env::var("RECEIPT_VERIFICATION_METHOD").ok(),
             default_ds_endpoint: std::env::var("DEFAULT_DS_ENDPOINT").ok(),
             endpoint_cache_ttl_secs: std::env::var("ENDPOINT_CACHE_TTL")
                 .ok()
