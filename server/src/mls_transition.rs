@@ -2,7 +2,11 @@
 
 use sha2::{Digest, Sha256};
 
-use crate::models::{ResolvedMlsContext, SequencerReceiptRef};
+use crate::{
+    auth::device_auth::VerifiedDeviceRequest,
+    mls_group_info_verifier::VerifiedGroupInfo,
+    models::{ResolvedMlsContext, SequencerReceiptRef},
+};
 
 pub(crate) fn canonical_receipt_hash(
     conversation_id: &str,
@@ -39,6 +43,10 @@ pub enum TransitionValidationError {
     MissingEvidence,
     #[error("receipt does not bind this transition")]
     ReceiptMismatch,
+    #[error("verified GroupInfo does not bind this resolved conversation context")]
+    VerifiedContextMismatch,
+    #[error("verified GroupInfo does not bind this verified device authority")]
+    VerifiedDeviceMismatch,
 }
 
 /// A server-observable transition whose identity and monotonicity bindings
@@ -61,7 +69,10 @@ pub struct ValidatedMlsTransition {
 
 impl ValidatedMlsTransition {
     #[allow(clippy::too_many_arguments)]
-    pub fn new_observed(
+    /// Transitional raw constructor retained only for existing in-crate handler
+    /// callsites until ADR-016 B2 converts them to verified provenance.
+    #[allow(dead_code)]
+    pub(crate) fn new_observed(
         context: ResolvedMlsContext,
         kind: TransitionKind,
         actor_did: String,
@@ -104,6 +115,59 @@ impl ValidatedMlsTransition {
         Ok(transition)
     }
 
+    /// Construct a transition solely from context-bound, cryptographically
+    /// verified GroupInfo evidence and matching device authority.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_verified_group_info(
+        context: ResolvedMlsContext,
+        kind: TransitionKind,
+        device: &VerifiedDeviceRequest,
+        verified_group_info: VerifiedGroupInfo,
+        confirmation_tag: Option<Vec<u8>>,
+        commit_hash: Vec<u8>,
+        receipt: Option<SequencerReceiptRef>,
+    ) -> Result<Self, TransitionValidationError> {
+        let expected_epoch = context
+            .authoritative_epoch
+            .checked_add(1)
+            .ok_or(TransitionValidationError::VerifiedContextMismatch)?;
+        if verified_group_info.conversation_id() != context.conversation_id
+            || hex::encode(verified_group_info.group_id()) != context.mls_group_id
+            || i32::try_from(verified_group_info.epoch()).ok() != Some(expected_epoch)
+        {
+            return Err(TransitionValidationError::VerifiedContextMismatch);
+        }
+        if verified_group_info.actor_did() != device.user_did()
+            || verified_group_info.actor_device_id() != device.device_id()
+            || verified_group_info.device_dpop_jkt() != device.dpop_jkt()
+            || verified_group_info.device_auth_generation() != device.auth_generation()
+        {
+            return Err(TransitionValidationError::VerifiedDeviceMismatch);
+        }
+        if commit_hash.is_empty() {
+            return Err(TransitionValidationError::MissingEvidence);
+        }
+
+        let group_info = verified_group_info.into_canonical_bytes();
+        let group_info_hash = Sha256::digest(&group_info).to_vec();
+        let mut transition = Self {
+            context,
+            kind,
+            actor_did: device.user_did().to_owned(),
+            actor_device_id: device.device_id().to_owned(),
+            next_epoch: expected_epoch,
+            group_info,
+            group_info_hash,
+            confirmation_tag,
+            commit_hash,
+            receipt: None,
+        };
+        if let Some(receipt) = receipt {
+            transition.set_verified_receipt(receipt)?;
+        }
+        Ok(transition)
+    }
+
     pub fn set_verified_receipt(
         &mut self,
         receipt: SequencerReceiptRef,
@@ -131,6 +195,11 @@ impl ValidatedMlsTransition {
 
 #[cfg(test)]
 mod tests {
+    use crate::auth::device_auth::VerifiedDeviceRequest;
+    use crate::mls_group_info_verifier::{
+        context_binding_tests::bound_fixture, verify_group_info_for_transition,
+        GroupInfoVerifierLimits,
+    };
     use crate::models::{ResolvedMlsContext, SequencerReceiptRef};
     use crate::repositories::fakes::{FakeTransitionFailure, InMemoryCryptoSessionRepository};
     use crate::repositories::{CryptoSessionRepository, RepositoryError};
@@ -340,5 +409,82 @@ mod tests {
             assert!(repo.apply_transition(candidate).await.is_err());
             assert_eq!(repo.transition_snapshot(), before);
         }
+    }
+
+    #[test]
+    fn verified_transition_consumes_only_matching_group_info_and_device_provenance() {
+        let fixture = bound_fixture();
+        let verified = verify_group_info_for_transition(
+            &fixture.bytes,
+            &fixture.context,
+            &fixture.device,
+            &fixture.signer_key,
+            GroupInfoVerifierLimits::default(),
+        )
+        .expect("verified GroupInfo");
+        let transition = ValidatedMlsTransition::from_verified_group_info(
+            fixture.context.clone(),
+            TransitionKind::Commit,
+            &fixture.device,
+            verified,
+            None,
+            vec![0xCC; 32],
+            None,
+        )
+        .expect("provenance-bound transition");
+        assert_eq!(transition.actor_did, "did:plc:alice");
+        assert_eq!(transition.actor_device_id, "device-a");
+        assert_eq!(transition.next_epoch, 1);
+        assert_eq!(transition.group_info, fixture.bytes);
+
+        let verified = verify_group_info_for_transition(
+            &fixture.bytes,
+            &fixture.context,
+            &fixture.device,
+            &fixture.signer_key,
+            GroupInfoVerifierLimits::default(),
+        )
+        .expect("verified GroupInfo");
+        let mut wrong_context = fixture.context.clone();
+        wrong_context.conversation_id = "convo-2".into();
+        assert!(matches!(
+            ValidatedMlsTransition::from_verified_group_info(
+                wrong_context,
+                TransitionKind::Commit,
+                &fixture.device,
+                verified,
+                None,
+                vec![0xCC; 32],
+                None,
+            ),
+            Err(super::TransitionValidationError::VerifiedContextMismatch)
+        ));
+
+        let verified = verify_group_info_for_transition(
+            &fixture.bytes,
+            &fixture.context,
+            &fixture.device,
+            &fixture.signer_key,
+            GroupInfoVerifierLimits::default(),
+        )
+        .expect("verified GroupInfo");
+        let other_device = VerifiedDeviceRequest::fixture_for_policy_test(
+            "did:plc:alice",
+            "device-b",
+            &"b".repeat(43),
+            8,
+        );
+        assert!(matches!(
+            ValidatedMlsTransition::from_verified_group_info(
+                fixture.context,
+                TransitionKind::Commit,
+                &other_device,
+                verified,
+                None,
+                vec![0xCC; 32],
+                None,
+            ),
+            Err(super::TransitionValidationError::VerifiedDeviceMismatch)
+        ));
     }
 }
