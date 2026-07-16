@@ -170,6 +170,10 @@ impl MetricsRecorder {
             "device_auth_binding_requests_total",
             "Device-auth binding requests by closed endpoint and outcome labels"
         );
+        metrics::describe_counter!(
+            "device_auth_policy_observations_total",
+            "Device-auth policy observations by closed verified or would_deny outcome"
+        );
 
         Self { handle }
     }
@@ -612,6 +616,29 @@ pub fn record_device_auth_binding(
         "device_auth_binding_requests_total",
         1,
         "endpoint" => endpoint.as_str(),
+        "outcome" => outcome.as_str()
+    );
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceAuthPolicyMetricOutcome {
+    Verified,
+    WouldDeny,
+}
+
+impl DeviceAuthPolicyMetricOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::WouldDeny => "would_deny",
+        }
+    }
+}
+
+pub fn record_device_auth_policy(outcome: DeviceAuthPolicyMetricOutcome) {
+    metrics::counter!(
+        "device_auth_policy_observations_total",
+        1,
         "outcome" => outcome.as_str()
     );
 }
