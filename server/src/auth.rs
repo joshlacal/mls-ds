@@ -73,6 +73,9 @@ pub enum AuthError {
     #[error("lxm does not match endpoint")]
     LxmMismatch,
 
+    #[error("Authentication or device authorization denied")]
+    DeviceAuthorizationDenied,
+
     #[error("Internal error: {0}")]
     Internal(String),
 }
@@ -123,6 +126,11 @@ impl IntoResponse for AuthError {
             }
             AuthError::MissingLxm => (StatusCode::UNAUTHORIZED, "MissingLxm", self.to_string()),
             AuthError::LxmMismatch => (StatusCode::UNAUTHORIZED, "LxmMismatch", self.to_string()),
+            AuthError::DeviceAuthorizationDenied => (
+                StatusCode::UNAUTHORIZED,
+                "Unauthorized",
+                "Authentication or device authorization denied".to_string(),
+            ),
             AuthError::Internal(e) => {
                 tracing::error!("Internal auth error: {}", e);
                 (
@@ -1251,12 +1259,9 @@ where
 
         // Verify JWT and extract claims
         let claims = middleware.verify_jwt(token).await?;
-        parts
-            .extensions
-            .insert(device_auth::VerifiedRequestTarget::from_request_parts(
-                &parts.method,
-                &parts.uri,
-            ));
+        let request_target =
+            device_auth::VerifiedRequestTarget::from_request_parts(&parts.method, &parts.uri);
+        parts.extensions.insert(request_target.clone());
 
         // Enforce lxm/jti + shared replay store across all authenticated XRPC endpoints.
         let endpoint = parts.uri.path();
@@ -1293,12 +1298,38 @@ where
             endpoint,
         )?;
         let delegated_gateway = canonical_did(&claims.iss) != user_did;
-        parts.extensions.insert(VerifiedGatewayBearer {
+        let verified_bearer = VerifiedGatewayBearer {
             claims: claims.clone(),
             token: token.to_string(),
             effective_user_did: user_did.clone(),
             delegated_gateway,
-        });
+        };
+        parts.extensions.insert(verified_bearer.clone());
+
+        // Startup installs the validated rollout mode exactly once. Keeping
+        // this writer commit inert until that coordinator-owned integration
+        // lands prevents tests and intermediate builds from reading mutable
+        // process environment on every request.
+        if let (Some(endpoint_nsid), Some(mode)) = (
+            endpoint_nsid_from_path(endpoint),
+            crate::middleware::device_auth::installed_device_auth_mode(),
+        ) {
+            if endpoint_nsid.starts_with("blue.catbird.mlsChat.") {
+                let pool = crate::storage::DbPool::from_ref(state);
+                crate::middleware::device_auth::enforce_device_auth_policy(
+                    mode,
+                    endpoint_nsid,
+                    &parts.headers,
+                    &mut parts.extensions,
+                    &pool,
+                    &verified_bearer,
+                    &request_target,
+                    Utc::now(),
+                )
+                .await
+                .map_err(|_| AuthError::DeviceAuthorizationDenied)?;
+            }
+        }
 
         debug!(
             "Authenticated request from DID: {} (issuer: {})",

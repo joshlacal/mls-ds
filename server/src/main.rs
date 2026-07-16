@@ -505,6 +505,13 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Parse and install the closed device-auth rollout mode once at startup.
+    // Invalid values fail before external dependencies or the listener are
+    // initialized, and request handling never re-reads mutable environment.
+    let device_auth_mode = config::DeviceAuthMode::from_env()?;
+    middleware::device_auth::install_device_auth_mode(device_auth_mode)?;
+    tracing::info!(?device_auth_mode, "Device-auth rollout mode installed");
+
     // Parse the listener host before initializing external dependencies so a
     // malformed or non-IP SERVER_HOST fails startup rather than falling back
     // to an unexpectedly broad bind. Production APP_ENV safety checks above

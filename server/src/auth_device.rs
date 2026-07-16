@@ -264,7 +264,7 @@ impl VerifiedEnrollmentRequest {
 ///     auth_generation: 1,
 /// };
 /// ```
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedDeviceRequest {
     user_did: String,
     device_id: String,
@@ -273,6 +273,21 @@ pub struct VerifiedDeviceRequest {
 }
 
 impl VerifiedDeviceRequest {
+    #[cfg(test)]
+    pub(crate) fn fixture_for_policy_test(
+        user_did: &str,
+        device_id: &str,
+        dpop_jkt: &str,
+        auth_generation: i64,
+    ) -> Self {
+        Self {
+            user_did: user_did.to_string(),
+            device_id: device_id.to_string(),
+            dpop_jkt: dpop_jkt.to_string(),
+            auth_generation,
+        }
+    }
+
     pub fn user_did(&self) -> &str {
         &self.user_did
     }
