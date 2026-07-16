@@ -6,7 +6,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use jacquard_axum::ExtractXrpc;
-use std::sync::Arc;
+use std::{collections::HashSet, future::Future, sync::Arc, time::Duration};
 use tracing::{error, info, warn};
 
 use crate::{
@@ -23,6 +23,8 @@ use crate::{
 };
 
 const NSID: &str = "blue.catbird.mlsChat.createConvo";
+const MAX_CONFLICT_SYNC_BLOCKERS: usize = 100;
+const CONFLICT_SYNC_DEADLINE: Duration = Duration::from_secs(5);
 
 #[cfg(test)]
 static TEST_ABORT_AFTER_WELCOME: std::sync::atomic::AtomicBool =
@@ -147,6 +149,45 @@ fn validate_initial_group_info(
     }
 
     Ok(Some(group_info.to_vec()))
+}
+
+async fn deny_block_conflicts_after_sync<F, Fut, E>(
+    conflicts: &[(String, String)],
+    mut sync_blocker: F,
+) -> Response
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<(), E>>,
+    E: std::fmt::Display,
+{
+    let sync_unique_blockers = async {
+        let mut seen = HashSet::with_capacity(conflicts.len().min(MAX_CONFLICT_SYNC_BLOCKERS));
+        for (blocker, _blocked) in conflicts {
+            if seen.len() == MAX_CONFLICT_SYNC_BLOCKERS {
+                break;
+            }
+            if seen.insert(blocker.as_str()) {
+                if let Err(error) = sync_blocker(blocker.clone()).await {
+                    warn!("Failed to sync blocks to DB: {error}");
+                }
+            }
+        }
+    };
+
+    if tokio::time::timeout(CONFLICT_SYNC_DEADLINE, sync_unique_blockers)
+        .await
+        .is_err()
+    {
+        warn!("Timed out synchronizing conflict blockers to DB");
+    }
+
+    (
+        StatusCode::FORBIDDEN,
+        Json(LexCreateConvoError::MutualBlockDetected(Some(
+            "Cannot create conversation: one or more members have blocked each other".into(),
+        ))),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -358,22 +399,23 @@ async fn handle_create_convo(
         {
             Ok(conflicts) => {
                 if !conflicts.is_empty() {
-                    for (blocker, _blocked) in &conflicts {
-                        if let Err(e) = block_sync.sync_blocks_to_db(&pool, blocker).await {
-                            warn!("Failed to sync blocks to DB: {}", e);
-                        }
-                    }
                     warn!(
                         "❌ [v2.createConvo] Block detected: {} blocks found via PDS",
                         conflicts.len()
                     );
-                    return Err((
-                        StatusCode::FORBIDDEN,
-                        Json(LexCreateConvoError::MutualBlockDetected(Some(
-                            "Cannot create conversation: one or more members have blocked each other".into(),
-                        ))),
-                    )
-                        .into_response());
+                    let sync_service = Arc::clone(&block_sync);
+                    let sync_pool = pool.clone();
+                    return Err(deny_block_conflicts_after_sync(&conflicts, move |blocker| {
+                        let sync_service = Arc::clone(&sync_service);
+                        let sync_pool = sync_pool.clone();
+                        async move {
+                            sync_service
+                                .sync_blocks_to_db(&sync_pool, &blocker)
+                                .await
+                                .map(|_| ())
+                        }
+                    })
+                    .await);
                 }
             }
             Err(e) => {
@@ -1225,10 +1267,17 @@ async fn handle_create_convo(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::to_bytes;
     use bytes::Bytes;
     use jacquard_axum::ExtractXrpc;
     use sqlx::Row;
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
 
     use crate::{
         auth::{AtProtoClaims, AuthUser},
@@ -1306,6 +1355,185 @@ mod tests {
 
         assert_eq!(expected.expected_rows, 4);
         assert!(!expected.used_per_device_path);
+    }
+
+    #[tokio::test]
+    async fn ten_thousand_conflict_edges_for_one_blocker_sync_once() {
+        let conflicts =
+            vec![("did:plc:blocker".to_string(), "did:plc:blocked".to_string()); 10_000];
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let response = deny_block_conflicts_after_sync(&conflicts, {
+            let calls = Arc::clone(&calls);
+            move |blocker| {
+                let calls = Arc::clone(&calls);
+                async move {
+                    calls.lock().expect("calls mutex").push(blocker);
+                    Result::<(), &'static str>::Ok(())
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            *calls.lock().expect("calls mutex"),
+            vec!["did:plc:blocker".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_blockers_sync_in_first_seen_order_with_one_hundred_call_cap() {
+        let mut conflicts = Vec::new();
+        for index in 0..150 {
+            let blocker = format!("did:plc:blocker{index:03}");
+            conflicts.push((blocker.clone(), "did:plc:first".to_string()));
+            conflicts.push((blocker, "did:plc:duplicate".to_string()));
+        }
+        let expected: Vec<String> = (0..100)
+            .map(|index| format!("did:plc:blocker{index:03}"))
+            .collect();
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        deny_block_conflicts_after_sync(&conflicts, {
+            let calls = Arc::clone(&calls);
+            move |blocker| {
+                let calls = Arc::clone(&calls);
+                async move {
+                    calls.lock().expect("calls mutex").push(blocker);
+                    Result::<(), &'static str>::Ok(())
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(*calls.lock().expect("calls mutex"), expected);
+    }
+
+    #[tokio::test]
+    async fn stalled_sync_hits_aggregate_deadline_and_starts_no_later_callback() {
+        let conflicts = vec![
+            ("did:plc:stalled".to_string(), "did:plc:a".to_string()),
+            ("did:plc:later".to_string(), "did:plc:b".to_string()),
+        ];
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(6),
+            deny_block_conflicts_after_sync(&conflicts, {
+                let calls = Arc::clone(&calls);
+                move |blocker| {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        calls.lock().expect("calls mutex").push(blocker.clone());
+                        if blocker == "did:plc:stalled" {
+                            std::future::pending::<Result<(), &'static str>>().await
+                        } else {
+                            Ok(())
+                        }
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("helper must enforce its five-second aggregate deadline");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            *calls.lock().expect("calls mutex"),
+            vec!["did:plc:stalled".to_string()]
+        );
+    }
+
+    async fn assert_original_mutual_block_response(response: Response) {
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read MutualBlockDetected response body");
+        assert_eq!(
+            body.as_ref(),
+            br#"{"error":"MutualBlockDetected","message":"Cannot create conversation: one or more members have blocked each other"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn individual_sync_errors_keep_original_sanitized_conflict_denial() {
+        let conflicts = vec![
+            ("did:plc:first".to_string(), "did:plc:a".to_string()),
+            ("did:plc:second".to_string(), "did:plc:b".to_string()),
+        ];
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let response = deny_block_conflicts_after_sync(&conflicts, {
+            let calls = Arc::clone(&calls);
+            move |blocker| {
+                let calls = Arc::clone(&calls);
+                async move {
+                    calls.lock().expect("calls mutex").push(blocker);
+                    Result::<(), &'static str>::Err("injected sync failure")
+                }
+            }
+        })
+        .await;
+
+        assert_original_mutual_block_response(response).await;
+        assert_eq!(calls.lock().expect("calls mutex").len(), 2);
+    }
+
+    struct InFlightDropGuard(Arc<AtomicBool>);
+
+    impl Drop for InFlightDropGuard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn timeout_drops_in_flight_sync_and_keeps_original_conflict_denial() {
+        let conflicts = vec![("did:plc:stalled".to_string(), "did:plc:blocked".to_string())];
+        let dropped = Arc::new(AtomicBool::new(false));
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(6),
+            deny_block_conflicts_after_sync(&conflicts, {
+                let dropped = Arc::clone(&dropped);
+                move |_blocker| {
+                    let guard = InFlightDropGuard(Arc::clone(&dropped));
+                    async move {
+                        let _guard = guard;
+                        std::future::pending::<Result<(), &'static str>>().await
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("helper must enforce its five-second aggregate deadline");
+
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "dropping the aggregate timed future must cancel in-flight sync work"
+        );
+        assert_original_mutual_block_response(response).await;
+    }
+
+    #[tokio::test]
+    async fn one_thousand_conflict_dids_are_rejected_before_outbound_work() {
+        let dids: Vec<String> = (0..1_000)
+            .map(|index| format!("did:example:member{index}"))
+            .collect();
+
+        let error = BlockSyncService::new()
+            .check_block_conflicts(&dids)
+            .await
+            .expect_err("1,000 DIDs must exceed the conflict-check bound");
+
+        assert!(matches!(
+            error,
+            crate::block_sync::BlockSyncError::ResourceLimitExceeded {
+                resource: "conflict_dids",
+                limit: 100
+            }
+        ));
     }
 
     async fn setup_test_db() -> DbPool {
