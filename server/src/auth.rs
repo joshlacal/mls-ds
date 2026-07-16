@@ -16,11 +16,12 @@ use moka::future::Cache;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{num::NonZeroU32, sync::Arc};
+use std::{num::NonZeroU32, sync::Arc, time::Duration};
 use thiserror::Error;
 use tracing::debug;
 
 use crate::identity::{canonical_did, did_web_document_url};
+use crate::util::outbound_body::{decode_json_bounded, ResponseBodyBudget, DID_DOCUMENT_MAX_BYTES};
 
 // ADR-016 remains endpoint-opt-in during observe/enroll rollout. Keeping the
 // foundation under auth prevents it from becoming implicit transition policy.
@@ -268,6 +269,7 @@ pub struct AuthMiddleware {
     rate_limiters:
         Arc<moka::sync::Cache<String, Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>>>,
     http_client: reqwest::Client,
+    did_resolution_timeout: Duration,
     /// Stored TTL value used to construct `did_cache` (moka's `time_to_live`).
     /// Not read after construction today, but useful for diagnostics endpoints
     /// and future on-demand TTL reconfiguration without rebuilding the cache.
@@ -327,11 +329,10 @@ impl AuthMiddleware {
                     .build(),
             ),
             http_client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(
-                    did_resolution_timeout_seconds,
-                ))
+                .timeout(Duration::from_secs(did_resolution_timeout_seconds))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
+            did_resolution_timeout: Duration::from_secs(did_resolution_timeout_seconds),
             cache_ttl_seconds,
             rate_limit_quota: quota,
             did_host_allowlist,
@@ -587,10 +588,10 @@ impl AuthMiddleware {
         );
 
         // Resolve based on DID method
-        let doc = if did.starts_with("did:plc:") {
-            self.resolve_plc_did(did).await?
+        let resolution = if did.starts_with("did:plc:") {
+            self.resolve_plc_did(did).await
         } else if did.starts_with("did:web:") {
-            self.resolve_web_did(did).await?
+            self.resolve_web_did(did).await
         } else {
             return Err(AuthError::InvalidDid(format!(
                 "Unsupported DID method: {}",
@@ -598,7 +599,15 @@ impl AuthMiddleware {
             )));
         };
 
-        // Cache the result
+        self.cache_successful_did_resolution(did, resolution).await
+    }
+
+    async fn cache_successful_did_resolution(
+        &self,
+        did: &str,
+        resolution: Result<DidDocument, AuthError>,
+    ) -> Result<DidDocument, AuthError> {
+        let doc = resolution?;
         let cached = CachedDidDoc {
             doc: doc.clone(),
             cached_at: Utc::now(),
@@ -629,29 +638,14 @@ impl AuthMiddleware {
             "Resolving DID document via PLC directory"
         );
 
-        let response = self
-            .http_client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| AuthError::DidResolutionFailed(format!("HTTP error: {}", e)))?;
-
-        if !response.status().is_success() {
+        self.send_and_decode_did_document(self.http_client.get(&url), |status| {
             tracing::error!(
-                status = response.status().as_u16(),
+                status = status.as_u16(),
                 "Failed to resolve DID from PLC directory"
             );
-            return Err(AuthError::DidResolutionFailed(format!(
-                "PLC directory returned status {}",
-                response.status()
-            )));
-        }
-
-        let doc = response.json::<DidDocument>().await.map_err(|e| {
-            AuthError::DidResolutionFailed(format!("Failed to parse DID document: {}", e))
-        })?;
-
-        Ok(doc)
+            format!("PLC directory returned status {status}")
+        })
+        .await
     }
 
     /// Resolve did:web DID via HTTPS
@@ -677,25 +671,48 @@ impl AuthMiddleware {
         let port = parsed.port_or_known_default().unwrap_or(443);
         validate_resolved_host_is_public(host, port).await?;
 
-        let response = self
-            .http_client
-            .get(&url)
-            .send()
+        self.send_and_decode_did_document(self.http_client.get(&url), |status| {
+            format!("Web server returned status {status}")
+        })
+        .await
+    }
+
+    async fn send_and_decode_did_document<F>(
+        &self,
+        request: reqwest::RequestBuilder,
+        status_error: F,
+    ) -> Result<DidDocument, AuthError>
+    where
+        F: FnOnce(StatusCode) -> String,
+    {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.did_resolution_timeout)
+            .ok_or_else(|| {
+                AuthError::DidResolutionFailed(
+                    "DID resolution deadline could not be represented".to_string(),
+                )
+            })?;
+        let response = tokio::time::timeout_at(deadline, request.send())
             .await
-            .map_err(|e| AuthError::DidResolutionFailed(format!("HTTP error: {}", e)))?;
+            .map_err(|_| {
+                AuthError::DidResolutionFailed("DID resolution deadline exceeded".to_string())
+            })?
+            .map_err(map_did_request_error)?;
 
         if !response.status().is_success() {
-            return Err(AuthError::DidResolutionFailed(format!(
-                "Web server returned status {}",
-                response.status()
+            return Err(AuthError::DidResolutionFailed(status_error(
+                response.status(),
             )));
         }
 
-        let doc = response.json::<DidDocument>().await.map_err(|e| {
-            AuthError::DidResolutionFailed(format!("Failed to parse DID document: {}", e))
-        })?;
-
-        Ok(doc)
+        decode_json_bounded(
+            response,
+            ResponseBodyBudget::new(DID_DOCUMENT_MAX_BYTES, deadline),
+        )
+        .await
+        .map_err(|error| {
+            AuthError::DidResolutionFailed(format!("Failed to parse DID document: {error}"))
+        })
     }
     /// Check rate limit for a DID
     fn check_rate_limit(&self, did: &str) -> Result<(), AuthError> {
@@ -710,6 +727,17 @@ impl AuthMiddleware {
 
         Ok(())
     }
+}
+
+fn map_did_request_error(error: reqwest::Error) -> AuthError {
+    tracing::warn!(
+        did_resolution_error_is_timeout = error.is_timeout(),
+        did_resolution_error_is_connect = error.is_connect(),
+        did_resolution_error_is_request = error.is_request(),
+        did_resolution_error_is_builder = error.is_builder(),
+        "DID resolution HTTP request failed"
+    );
+    AuthError::DidResolutionFailed("DID resolution HTTP request failed".into())
 }
 
 impl Default for AuthMiddleware {
@@ -1439,6 +1467,301 @@ pub async fn verify_is_moderator_or_admin(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    #[test]
+    fn did_document_resolution_has_no_unbounded_success_collector() {
+        let source = include_str!("auth.rs");
+        let response_json = [".json::<", "DidDocument>()"].concat();
+        let response_bytes = [".by", "tes()"].concat();
+        let response_text = [".te", "xt()"].concat();
+
+        assert!(!source.contains(&response_json));
+        assert!(!source.contains(&response_bytes));
+        assert!(!source.contains(&response_text));
+    }
+
+    #[test]
+    fn did_request_error_telemetry_is_classified_without_formatting_the_error() {
+        let source = include_str!("auth.rs");
+        let mapper = source
+            .split("fn map_did_request_error")
+            .nth(1)
+            .expect("dedicated request error mapper")
+            .split("impl Default for AuthMiddleware")
+            .next()
+            .expect("mapper source boundary");
+
+        for classifier in ["is_timeout", "is_connect", "is_request", "is_builder"] {
+            assert!(
+                mapper.contains(&format!("error.{classifier}()")),
+                "missing sanitized {classifier} classifier"
+            );
+        }
+        for prohibited in [
+            "format!(",
+            "format_args!(",
+            ".to_string()",
+            "%error",
+            "?error",
+            "error =",
+            "source =",
+            "url",
+        ] {
+            assert!(
+                !mapper.contains(prohibited),
+                "request error mapper must not contain {prohibited:?}"
+            );
+        }
+    }
+
+    fn did_test_middleware(timeout: Duration) -> AuthMiddleware {
+        let mut middleware = AuthMiddleware::with_config(300, 100, 60);
+        middleware.http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("test HTTP client");
+        middleware.did_resolution_timeout = timeout;
+        middleware
+    }
+
+    async fn spawn_raw_http_response(parts: Vec<(Duration, Vec<u8>)>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind raw HTTP fixture");
+        let address = listener.local_addr().expect("fixture address");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept fixture request");
+            let mut request = [0_u8; 4096];
+            let _ = stream.readable().await;
+            let _ = stream.try_read(&mut request);
+            for (delay, bytes) in parts {
+                tokio::time::sleep(delay).await;
+                if stream.write_all(&bytes).await.is_err() {
+                    break;
+                }
+            }
+        });
+        format!("http://{address}/did.json")
+    }
+
+    fn exact_size_did_document(size: usize) -> Vec<u8> {
+        let mut document = serde_json::json!({
+            "id": "did:plc:bounded",
+            "verificationMethod": [],
+            "service": null,
+            "padding": ""
+        });
+        let base = serde_json::to_vec(&document).expect("serialize base DID document");
+        let padding = size.checked_sub(base.len()).expect("target fits base JSON");
+        document["padding"] = serde_json::Value::String("x".repeat(padding));
+        let encoded = serde_json::to_vec(&document).expect("serialize padded DID document");
+        assert_eq!(encoded.len(), size);
+        encoded
+    }
+
+    #[tokio::test]
+    async fn declared_oversize_did_document_is_rejected_before_body_and_not_cached() {
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            DID_DOCUMENT_MAX_BYTES + 1
+        )
+        .into_bytes();
+        let url = spawn_raw_http_response(vec![
+            (Duration::ZERO, header),
+            (Duration::from_secs(2), vec![b'x']),
+        ])
+        .await;
+        let middleware = did_test_middleware(Duration::from_secs(5));
+        let started = tokio::time::Instant::now();
+
+        let resolution = middleware
+            .send_and_decode_did_document(middleware.http_client.get(url), |_| {
+                unreachable!("success response")
+            })
+            .await;
+        let error = middleware
+            .cache_successful_did_resolution("did:plc:bounded", resolution)
+            .await
+            .expect_err("declared oversize response must fail");
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(matches!(error, AuthError::DidResolutionFailed(_)));
+        assert!(middleware.did_cache.get("did:plc:bounded").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn chunked_did_document_is_rejected_at_crossing_chunk() {
+        let first = vec![b' '; DID_DOCUMENT_MAX_BYTES];
+        let response = [
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec(),
+            format!("{:X}\r\n", first.len()).into_bytes(),
+            first,
+            b"\r\n1\r\nx\r\n0\r\n\r\n".to_vec(),
+        ]
+        .concat();
+        let url = spawn_raw_http_response(vec![(Duration::ZERO, response)]).await;
+        let middleware = did_test_middleware(Duration::from_secs(1));
+
+        let error = middleware
+            .send_and_decode_did_document(middleware.http_client.get(url), |_| {
+                unreachable!("success response")
+            })
+            .await
+            .expect_err("streamed oversize response must fail");
+
+        let message = error.to_string();
+        assert!(message.contains("exceeding limit 262144"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn exactly_maximum_sized_did_document_succeeds() {
+        let body = exact_size_did_document(DID_DOCUMENT_MAX_BYTES);
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        let url = spawn_raw_http_response(vec![(Duration::ZERO, [header, body].concat())]).await;
+        let middleware = did_test_middleware(Duration::from_secs(1));
+
+        let document = middleware
+            .send_and_decode_did_document(middleware.http_client.get(url), |_| {
+                unreachable!("success response")
+            })
+            .await
+            .expect("exactly bounded response succeeds");
+
+        assert_eq!(document.id, "did:plc:bounded");
+    }
+
+    #[tokio::test]
+    async fn bounded_malformed_did_document_fails_closed_and_is_not_cached() {
+        let body = b"{not-json}".to_vec();
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        let url = spawn_raw_http_response(vec![(Duration::ZERO, [header, body].concat())]).await;
+        let middleware = did_test_middleware(Duration::from_secs(1));
+
+        let resolution = middleware
+            .send_and_decode_did_document(middleware.http_client.get(url), |_| {
+                unreachable!("success response")
+            })
+            .await;
+        let error = middleware
+            .cache_successful_did_resolution("did:plc:bounded", resolution)
+            .await
+            .expect_err("malformed JSON must fail");
+
+        assert!(matches!(error, AuthError::DidResolutionFailed(_)));
+        assert!(middleware.did_cache.get("did:plc:bounded").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn send_and_body_decode_share_one_pre_send_deadline() {
+        let body = br#"{"id":"did:plc:bounded","verificationMethod":[],"service":null}"#.to_vec();
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        let url = spawn_raw_http_response(vec![
+            (Duration::from_millis(120), header),
+            (Duration::from_millis(120), body),
+        ])
+        .await;
+        let middleware = did_test_middleware(Duration::from_millis(200));
+
+        let error = middleware
+            .send_and_decode_did_document(middleware.http_client.get(&url), |_| {
+                unreachable!("success response")
+            })
+            .await
+            .expect_err("body phase must receive only the pre-send time remaining");
+
+        let diagnostic = format!("{error:?} {error}");
+        assert!(diagnostic.contains("deadline exceeded"));
+        assert!(!diagnostic.contains(&url), "{diagnostic}");
+    }
+
+    #[test]
+    fn plc_and_web_success_paths_use_the_common_bounded_decoder() {
+        let source = include_str!("auth.rs");
+        let production = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production auth source");
+
+        assert_eq!(
+            production.matches(".send_and_decode_did_document(").count(),
+            2
+        );
+        assert_eq!(production.matches("decode_json_bounded(").count(), 1);
+        assert!(production.contains("ResponseBodyBudget::new(DID_DOCUMENT_MAX_BYTES, deadline)"));
+    }
+
+    #[tokio::test]
+    async fn non_success_statuses_keep_messages_and_do_not_collect_bodies() {
+        for expected in [
+            "PLC directory returned status 404 Not Found",
+            "Web server returned status 404 Not Found",
+        ] {
+            let header =
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 1\r\nConnection: close\r\n\r\n"
+                    .to_vec();
+            let url = spawn_raw_http_response(vec![
+                (Duration::ZERO, header),
+                (Duration::from_secs(2), vec![b'x']),
+            ])
+            .await;
+            let middleware = did_test_middleware(Duration::from_secs(5));
+            let started = tokio::time::Instant::now();
+            let expected_owned = expected.to_string();
+
+            let error = middleware
+                .send_and_decode_did_document(middleware.http_client.get(url), |_| expected_owned)
+                .await
+                .expect_err("non-success status must fail before reading body");
+
+            assert_eq!(
+                error.to_string(),
+                format!("Failed to resolve DID document: {expected}")
+            );
+            assert!(started.elapsed() < Duration::from_secs(1));
+        }
+    }
+
+    #[tokio::test]
+    async fn body_limit_diagnostics_omit_content_credentials_and_urls() {
+        let sentinel = "Bearer SECRET Cookie=SESSION https://sensitive.example/path";
+        let body = sentinel.repeat((DID_DOCUMENT_MAX_BYTES / sentinel.len()) + 2);
+        let response = [
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec(),
+            format!("{:X}\r\n", body.len()).into_bytes(),
+            body.into_bytes(),
+            b"\r\n0\r\n\r\n".to_vec(),
+        ]
+        .concat();
+        let url = spawn_raw_http_response(vec![(Duration::ZERO, response)]).await;
+        let middleware = did_test_middleware(Duration::from_secs(1));
+
+        let error = middleware
+            .send_and_decode_did_document(middleware.http_client.get(&url), |_| {
+                unreachable!("success response")
+            })
+            .await
+            .expect_err("oversize body must fail");
+        let diagnostic = format!("{error:?} {error}");
+
+        assert!(!diagnostic.contains("SECRET"), "{diagnostic}");
+        assert!(!diagnostic.contains("SESSION"), "{diagnostic}");
+        assert!(!diagnostic.contains("sensitive.example"), "{diagnostic}");
+        assert!(!diagnostic.contains(&url), "{diagnostic}");
+    }
 
     #[test]
     fn auth_enforcement_flags_use_case_insensitive_boolean_semantics() {
@@ -1491,6 +1814,68 @@ mod tests {
             lxm: Some("blue.catbird.mlsChat.getConvos".to_string()),
             jti: Some("test-jti".to_string()),
         }
+    }
+
+    #[tokio::test]
+    async fn cached_es256k_did_document_verifies_production_jwt_branch() {
+        use k256::ecdsa::{signature::Signer, Signature, SigningKey};
+
+        let issuer = "did:plc:es256k-compatibility";
+        let key_id = format!("{issuer}#atproto");
+        let mut scalar = [0_u8; 32];
+        scalar[31] = 7;
+        let signing_key =
+            SigningKey::from_slice(&scalar).expect("fixture scalar is valid secp256k1");
+        let point = signing_key.verifying_key().to_encoded_point(false);
+        let document = DidDocument {
+            id: issuer.to_string(),
+            verification_method: vec![VerificationMethod {
+                id: key_id.clone(),
+                key_type: "JsonWebKey2020".to_string(),
+                controller: issuer.to_string(),
+                public_key_multibase: None,
+                public_key_jwk: Some(PublicKeyJwk {
+                    kty: "EC".to_string(),
+                    crv: "secp256k1".to_string(),
+                    x: URL_SAFE_NO_PAD.encode(point.x().expect("uncompressed point has x")),
+                    y: Some(URL_SAFE_NO_PAD.encode(point.y().expect("uncompressed point has y"))),
+                }),
+            }],
+            service: None,
+        };
+        let middleware = AuthMiddleware::with_config(300, 100, 60)
+            .with_test_service_did("did:web:mls.example.com");
+        middleware
+            .did_cache
+            .insert(
+                issuer.to_string(),
+                CachedDidDoc {
+                    doc: document,
+                    cached_at: Utc::now(),
+                },
+            )
+            .await;
+        let claims = claims(issuer, None);
+        let header = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&json!({"alg": "ES256K", "typ": "JWT", "kid": key_id}))
+                .expect("serialize ES256K header"),
+        );
+        let payload =
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).expect("serialize ES256K claims"));
+        let signing_input = format!("{header}.{payload}");
+        let signature: Signature = signing_key.sign(signing_input.as_bytes());
+        let token = format!(
+            "{signing_input}.{}",
+            URL_SAFE_NO_PAD.encode(signature.to_bytes())
+        );
+
+        let verified = middleware
+            .verify_jwt(&token)
+            .await
+            .expect("production ES256K branch verifies cached DID key");
+
+        assert_eq!(verified.iss, issuer);
+        assert!(middleware.did_cache.get(issuer).await.is_some());
     }
 
     #[test]
