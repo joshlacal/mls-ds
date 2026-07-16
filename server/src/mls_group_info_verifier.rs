@@ -699,7 +699,7 @@ pub(crate) mod context_binding_tests {
     }
 
     #[test]
-    fn context_bound_verification_rejects_wrong_group_epoch_and_device_authority() {
+    fn context_bound_verification_rejects_wrong_group_and_epoch() {
         let fixture = bound_fixture();
 
         let mut wrong_group = fixture.context.clone();
@@ -729,22 +729,72 @@ pub(crate) mod context_binding_tests {
             .expect_err("wrong epoch"),
             GroupInfoVerificationError::UnexpectedEpoch
         );
+    }
 
-        let wrong_device = VerifiedDeviceRequest::fixture_for_policy_test(
-            "did:plc:mallory",
-            "device-m",
-            &"m".repeat(43),
-            1,
-        );
+    #[test]
+    fn registry_authority_rejects_user_did_mismatch() {
+        let mut fixture = bound_fixture();
+        fixture.authority.user_did = "did:plc:mallory".into();
         assert_eq!(
             verify_group_info_for_transition(
                 &fixture.bytes,
                 &fixture.context,
-                &wrong_device,
+                &fixture.device,
                 &fixture.authority,
                 GroupInfoVerifierLimits::default(),
             )
-            .expect_err("credential identity must be the verified bare user DID"),
+            .expect_err("registry user DID must match the authenticated device"),
+            GroupInfoVerificationError::RegistryAuthorityMismatch
+        );
+    }
+
+    #[test]
+    fn registry_authority_rejects_device_id_mismatch() {
+        let mut fixture = bound_fixture();
+        fixture.authority.device_id = "device-m".into();
+        assert_eq!(
+            verify_group_info_for_transition(
+                &fixture.bytes,
+                &fixture.context,
+                &fixture.device,
+                &fixture.authority,
+                GroupInfoVerifierLimits::default(),
+            )
+            .expect_err("registry device ID must match the authenticated device"),
+            GroupInfoVerificationError::RegistryAuthorityMismatch
+        );
+    }
+
+    #[test]
+    fn registry_authority_rejects_dpop_jkt_mismatch() {
+        let mut fixture = bound_fixture();
+        fixture.authority.dpop_jkt = "m".repeat(43);
+        assert_eq!(
+            verify_group_info_for_transition(
+                &fixture.bytes,
+                &fixture.context,
+                &fixture.device,
+                &fixture.authority,
+                GroupInfoVerifierLimits::default(),
+            )
+            .expect_err("registry DPoP thumbprint must match the authenticated device"),
+            GroupInfoVerificationError::RegistryAuthorityMismatch
+        );
+    }
+
+    #[test]
+    fn registry_authority_rejects_auth_generation_mismatch() {
+        let mut fixture = bound_fixture();
+        fixture.authority.auth_generation += 1;
+        assert_eq!(
+            verify_group_info_for_transition(
+                &fixture.bytes,
+                &fixture.context,
+                &fixture.device,
+                &fixture.authority,
+                GroupInfoVerifierLimits::default(),
+            )
+            .expect_err("registry generation must match the authenticated device"),
             GroupInfoVerificationError::RegistryAuthorityMismatch
         );
     }
