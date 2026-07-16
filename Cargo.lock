@@ -114,6 +114,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "250f629c0161ad8107cf89319e990051fae62832fd343083bea452d93e2205fd"
 
 [[package]]
+name = "alloc-no-stdlib"
+version = "2.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc7bb162ec39d46ab1ca8c77bf72e890535becd1751bb45f64c597edb4c8c6b3"
+
+[[package]]
+name = "alloc-stdlib"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e76a019e91224d279006ff972f1e984179a6e9feb050adba6ce8274aef23195"
+dependencies = [
+ "alloc-no-stdlib",
+]
+
+[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -906,6 +921,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "borrow-or-share"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc0b364ead1874514c8c2855ab558056ebfeb775653e7ae45ff72f28f8f3166c"
+
+[[package]]
 name = "borsh"
 version = "1.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -913,6 +934,27 @@ checksum = "cfd1e3f8955a5d7de9fab72fc8373fade9fb8a703968cb200ae3dc6cf08e185a"
 dependencies = [
  "bytes",
  "cfg_aliases",
+]
+
+[[package]]
+name = "brotli"
+version = "8.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5cc91aac060a7a1e25823bdccbfb6af1875b88f17c6daac97894eed8207166b3"
+dependencies = [
+ "alloc-no-stdlib",
+ "alloc-stdlib",
+ "brotli-decompressor",
+]
+
+[[package]]
+name = "brotli-decompressor"
+version = "5.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a32acac15fe1967bc3986b2a6347dffc965602354ea6f450ad07e8bfd253583"
+dependencies = [
+ "alloc-no-stdlib",
+ "alloc-stdlib",
 ]
 
 [[package]]
@@ -975,14 +1017,15 @@ name = "catbird-atproto"
 version = "0.1.0"
 dependencies = [
  "bytes",
- "jacquard-common",
+ "jacquard-common 0.9.5",
  "jacquard-derive",
- "jacquard-lexicon",
+ "jacquard-lexicon 0.9.5",
  "miette",
  "rustversion",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+ "unicode-segmentation",
 ]
 
 [[package]]
@@ -1008,9 +1051,9 @@ dependencies = [
  "http 1.4.0",
  "ipnet",
  "jacquard-axum",
- "jacquard-common",
+ "jacquard-common 0.9.5",
  "jacquard-derive",
- "jacquard-lexicon",
+ "jacquard-lexicon 0.9.5",
  "jsonwebtoken",
  "k256",
  "lazy_static",
@@ -1264,6 +1307,7 @@ version = "0.4.38"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce2548391e9c1929c21bf6aa2680af86fe4c1b33e6cea9ac1cfeec0bd11218cf"
 dependencies = [
+ "brotli",
  "compression-core",
  "flate2",
  "memchr",
@@ -1632,7 +1676,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 1.0.109",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1977,6 +2021,17 @@ checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
+]
+
+[[package]]
+name = "fluent-uri"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc74ac4d8359ae70623506d512209619e5cf8f347124910440dbc221714b328e"
+dependencies = [
+ "borrow-or-share",
+ "ref-cast",
+ "serde",
 ]
 
 [[package]]
@@ -3088,7 +3143,7 @@ dependencies = [
  "gloo-storage",
  "http 1.4.0",
  "jacquard-api",
- "jacquard-common",
+ "jacquard-common 0.9.5",
  "jacquard-identity",
  "jacquard-oauth",
  "jose-jwk",
@@ -3115,9 +3170,9 @@ checksum = "4979fb1848c1dd7ac8fd12745bc71f56f6da61374407d5f9b06005467a954e5a"
 dependencies = [
  "bon",
  "bytes",
- "jacquard-common",
+ "jacquard-common 0.9.5",
  "jacquard-derive",
- "jacquard-lexicon",
+ "jacquard-lexicon 0.9.5",
  "miette",
  "rustversion",
  "serde",
@@ -3136,7 +3191,7 @@ dependencies = [
  "axum",
  "bytes",
  "jacquard",
- "jacquard-common",
+ "jacquard-common 0.9.5",
  "jacquard-derive",
  "jacquard-identity",
  "miette",
@@ -3192,13 +3247,62 @@ dependencies = [
 ]
 
 [[package]]
+name = "jacquard-common"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fec8b6661e6fcfb4d8b9eb1132503be71bc3e3c6f6ff15fa5500ec62655f6da7"
+dependencies = [
+ "base64 0.22.1",
+ "bon",
+ "bytes",
+ "chrono",
+ "ciborium",
+ "ciborium-io",
+ "cid",
+ "fluent-uri",
+ "getrandom 0.2.17",
+ "getrandom 0.3.4",
+ "hashbrown 0.15.5",
+ "http 1.4.0",
+ "ipld-core",
+ "k256",
+ "maitake-sync",
+ "miette",
+ "multibase",
+ "multihash",
+ "oxilangtag",
+ "p256 0.13.2",
+ "phf",
+ "postcard",
+ "rand 0.9.4",
+ "regex",
+ "regex-automata",
+ "regex-lite",
+ "reqwest",
+ "rustversion",
+ "serde",
+ "serde_bytes",
+ "serde_html_form 0.3.2",
+ "serde_ipld_dagcbor",
+ "serde_json",
+ "signature 2.2.0",
+ "smol_str",
+ "spin 0.10.1",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "trait-variant",
+ "unicode-segmentation",
+]
+
+[[package]]
 name = "jacquard-derive"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9c8d73dfee07943fdab93569ed1c28b06c6921ed891c08b415c4a323ff67e593"
 dependencies = [
  "heck 0.5.0",
- "jacquard-lexicon",
+ "jacquard-lexicon 0.9.5",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -3214,8 +3318,8 @@ dependencies = [
  "bytes",
  "http 1.4.0",
  "jacquard-api",
- "jacquard-common",
- "jacquard-lexicon",
+ "jacquard-common 0.9.5",
+ "jacquard-lexicon 0.9.5",
  "miette",
  "mini-moka-wasm",
  "n0-future",
@@ -3234,12 +3338,14 @@ dependencies = [
 [[package]]
 name = "jacquard-lexicon"
 version = "0.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8411aff546569b0a1e0ef669bed2380cec1c00d48f02f3fcd57a71545321b3d8"
 dependencies = [
  "cid",
  "dashmap 6.1.0",
  "heck 0.5.0",
  "inventory",
- "jacquard-common",
+ "jacquard-common 0.9.5",
  "miette",
  "multihash",
  "prettyplease",
@@ -3248,6 +3354,34 @@ dependencies = [
  "serde",
  "serde_ipld_dagcbor",
  "serde_json",
+ "serde_repr",
+ "serde_with",
+ "sha2 0.10.9",
+ "syn 2.0.117",
+ "thiserror 2.0.18",
+ "unicode-segmentation",
+]
+
+[[package]]
+name = "jacquard-lexicon"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "160049c269e3d7ec56f130736d25d61953fc6216da660c8b5e102f6b052dd3a1"
+dependencies = [
+ "cid",
+ "dashmap 6.1.0",
+ "heck 0.5.0",
+ "inventory",
+ "jacquard-common 0.12.1",
+ "miette",
+ "multihash",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "serde",
+ "serde_ipld_dagcbor",
+ "serde_json",
+ "serde_path_to_error",
  "serde_repr",
  "serde_with",
  "sha2 0.10.9",
@@ -3268,7 +3402,7 @@ dependencies = [
  "dashmap 6.1.0",
  "elliptic-curve 0.13.8",
  "http 1.4.0",
- "jacquard-common",
+ "jacquard-common 0.9.5",
  "jacquard-identity",
  "jose-jwa",
  "jose-jwk",
@@ -3759,6 +3893,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c41e0c4fef86961ac6d6f8a82609f55f31b05e4fce149ac5710e439df7619ba4"
 
 [[package]]
+name = "maitake-sync"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6816ab14147f80234c675b80ed6dc4f440d8a1cefc158e766067aedb84c0bcd5"
+dependencies = [
+ "cordyceps",
+ "loom",
+ "mycelium-bitfield",
+ "pin-project",
+ "portable-atomic",
+]
+
+[[package]]
 name = "markup5ever"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3967,7 +4114,7 @@ name = "mls-codegen"
 version = "0.1.0"
 dependencies = [
  "clap",
- "jacquard-lexicon",
+ "jacquard-lexicon 0.12.1",
  "serde_json",
  "tempfile",
 ]
@@ -4013,6 +4160,12 @@ dependencies = [
  "serde",
  "unsigned-varint",
 ]
+
+[[package]]
+name = "mycelium-bitfield"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "24e0cc5e2c585acbd15c5ce911dff71e1f4d5313f43345873311c4f5efd741cc"
 
 [[package]]
 name = "n0-future"
@@ -4354,6 +4507,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
 
 [[package]]
+name = "oxilangtag"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d3b4eb570abd4a1dcb062c31fd37b832264d9dc7292c3e69acfe926c87b063f"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "p256"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4458,6 +4620,7 @@ version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fd6780a80ae0c52cc120a26a1a42c1ae51b247a253e4e06113d23d2c2edd078"
 dependencies = [
+ "phf_macros",
  "phf_shared",
 ]
 
@@ -4479,6 +4642,19 @@ checksum = "3c80231409c20246a13fddb31776fb942c38553c51e871f8cbd687a4cfb5843d"
 dependencies = [
  "phf_shared",
  "rand 0.8.6",
+]
+
+[[package]]
+name = "phf_macros"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f84ac04429c13a7ff43785d75ad27569f2951ce0ffd30a3321230db2fc727216"
+dependencies = [
+ "phf_generator",
+ "phf_shared",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -5479,6 +5655,18 @@ dependencies = [
  "indexmap 2.14.0",
  "itoa",
  "ryu",
+ "serde_core",
+]
+
+[[package]]
+name = "serde_html_form"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2acf96b1d9364968fce46ebb548f1c0e1d7eceae27bdff73865d42e6c7369d94"
+dependencies = [
+ "form_urlencoded",
+ "indexmap 2.14.0",
+ "itoa",
  "serde_core",
 ]
 

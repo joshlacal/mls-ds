@@ -13,10 +13,3 @@ license = "MIT"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
-
-# Vendored jacquard-lexicon 0.9.5 with a determinism fix for builder typestate
-# emission (upstream collect_required_fields round-tripped through a HashSet,
-# producing nondeterministic field order in generated code on every run).
-# See vendor/jacquard-lexicon/src/codegen/builder_gen/state_mod.rs.
-[patch.crates-io]
-jacquard-lexicon = { path = "vendor/jacquard-lexicon" }
