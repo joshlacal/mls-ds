@@ -418,7 +418,7 @@ mod tests {
             &fixture.bytes,
             &fixture.context,
             &fixture.device,
-            &fixture.signer_key,
+            &fixture.authority,
             GroupInfoVerifierLimits::default(),
         )
         .expect("verified GroupInfo");
@@ -436,12 +436,16 @@ mod tests {
         assert_eq!(transition.actor_device_id, "device-a");
         assert_eq!(transition.next_epoch, 1);
         assert_eq!(transition.group_info, fixture.bytes);
+    }
 
+    #[test]
+    fn verified_transition_rejects_wrong_conversation() {
+        let fixture = bound_fixture();
         let verified = verify_group_info_for_transition(
             &fixture.bytes,
             &fixture.context,
             &fixture.device,
-            &fixture.signer_key,
+            &fixture.authority,
             GroupInfoVerifierLimits::default(),
         )
         .expect("verified GroupInfo");
@@ -459,20 +463,86 @@ mod tests {
             ),
             Err(super::TransitionValidationError::VerifiedContextMismatch)
         ));
+    }
 
+    #[test]
+    fn verified_transition_rejects_device_id_substitution() {
+        let fixture = bound_fixture();
         let verified = verify_group_info_for_transition(
             &fixture.bytes,
             &fixture.context,
             &fixture.device,
-            &fixture.signer_key,
+            &fixture.authority,
             GroupInfoVerifierLimits::default(),
         )
         .expect("verified GroupInfo");
         let other_device = VerifiedDeviceRequest::fixture_for_policy_test(
             "did:plc:alice",
             "device-b",
+            fixture.device.dpop_jkt(),
+            fixture.device.auth_generation(),
+        );
+        assert!(matches!(
+            ValidatedMlsTransition::from_verified_group_info(
+                fixture.context,
+                TransitionKind::Commit,
+                &other_device,
+                verified,
+                None,
+                vec![0xCC; 32],
+                None,
+            ),
+            Err(super::TransitionValidationError::VerifiedDeviceMismatch)
+        ));
+    }
+
+    #[test]
+    fn verified_transition_rejects_dpop_thumbprint_substitution() {
+        let fixture = bound_fixture();
+        let verified = verify_group_info_for_transition(
+            &fixture.bytes,
+            &fixture.context,
+            &fixture.device,
+            &fixture.authority,
+            GroupInfoVerifierLimits::default(),
+        )
+        .expect("verified GroupInfo");
+        let other_device = VerifiedDeviceRequest::fixture_for_policy_test(
+            fixture.device.user_did(),
+            fixture.device.device_id(),
             &"b".repeat(43),
-            8,
+            fixture.device.auth_generation(),
+        );
+        assert!(matches!(
+            ValidatedMlsTransition::from_verified_group_info(
+                fixture.context,
+                TransitionKind::Commit,
+                &other_device,
+                verified,
+                None,
+                vec![0xCC; 32],
+                None,
+            ),
+            Err(super::TransitionValidationError::VerifiedDeviceMismatch)
+        ));
+    }
+
+    #[test]
+    fn verified_transition_rejects_auth_generation_substitution() {
+        let fixture = bound_fixture();
+        let verified = verify_group_info_for_transition(
+            &fixture.bytes,
+            &fixture.context,
+            &fixture.device,
+            &fixture.authority,
+            GroupInfoVerifierLimits::default(),
+        )
+        .expect("verified GroupInfo");
+        let other_device = VerifiedDeviceRequest::fixture_for_policy_test(
+            fixture.device.user_did(),
+            fixture.device.device_id(),
+            fixture.device.dpop_jkt(),
+            fixture.device.auth_generation() + 1,
         );
         assert!(matches!(
             ValidatedMlsTransition::from_verified_group_info(

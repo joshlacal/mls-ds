@@ -16,6 +16,7 @@ use openmls::{
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use openmls_traits::types::{Ciphersuite, SignatureScheme};
 use openmls_traits::OpenMlsProvider;
+use sqlx::PgPool;
 use thiserror::Error;
 use tls_codec::{Deserialize as TlsDeserialize, Size as TlsSize};
 
@@ -68,6 +69,42 @@ impl ExpectedGroupInfoSigner {
 }
 
 use crate::{auth::device_auth::VerifiedDeviceRequest, models::ResolvedMlsContext};
+
+/// Device signer authority returned only after an exact active-registry lookup.
+///
+/// All fields are private. A wire DTO, bearer claim, or caller-selected key
+/// cannot be promoted into registry authority.
+///
+/// ```compile_fail
+/// use catbird_server::mls_group_info_verifier::RegistryVerifiedDeviceSigner;
+///
+/// let forged = RegistryVerifiedDeviceSigner {
+///     user_did: "did:plc:alice".to_string(),
+///     device_id: "device-a".to_string(),
+///     dpop_jkt: "a".repeat(43),
+///     auth_generation: 1,
+///     signature_key: vec![0; 32],
+/// };
+/// ```
+pub struct RegistryVerifiedDeviceSigner {
+    user_did: String,
+    device_id: String,
+    dpop_jkt: String,
+    auth_generation: i64,
+    signature_key: Vec<u8>,
+}
+
+impl std::fmt::Debug for RegistryVerifiedDeviceSigner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RegistryVerifiedDeviceSigner")
+            .field("user_did", &self.user_did)
+            .field("device_id", &self.device_id)
+            .field("auth_generation", &self.auth_generation)
+            .field("signature_key_len", &self.signature_key.len())
+            .finish_non_exhaustive()
+    }
+}
 
 /// The exact security statement made by [`AuthenticatedGroupInfo`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -256,10 +293,63 @@ pub enum GroupInfoVerificationError {
     UnexpectedGroupId,
     #[error("GroupInfo epoch is not exactly authoritative_epoch + 1")]
     UnexpectedEpoch,
+    #[error("registry signer authority does not match the verified device request")]
+    RegistryAuthorityMismatch,
+    #[error("active registry signer authority is unavailable")]
+    RegistryAuthorityUnavailable,
+    #[error("registry signing key is malformed or unsupported")]
+    InvalidRegistrySigningKey,
+    #[error("registry signer resolution failed")]
+    RegistryResolutionFailed,
     #[error("expected signer evidence does not identify exactly one member")]
     ExpectedSignerNotUnique,
     #[error("group has too many members: {actual} exceeds {maximum}")]
     TooManyMembers { actual: usize, maximum: usize },
+}
+
+fn authority_from_registry_key(
+    device: &VerifiedDeviceRequest,
+    encoded_signature_key: Option<String>,
+) -> Result<RegistryVerifiedDeviceSigner, GroupInfoVerificationError> {
+    let signature_key: [u8; 32] = encoded_signature_key
+        .and_then(|encoded| hex::decode(encoded).ok())
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or(GroupInfoVerificationError::InvalidRegistrySigningKey)?;
+    ed25519_dalek::VerifyingKey::from_bytes(&signature_key)
+        .map_err(|_| GroupInfoVerificationError::InvalidRegistrySigningKey)?;
+    Ok(RegistryVerifiedDeviceSigner {
+        user_did: device.user_did().to_owned(),
+        device_id: device.device_id().to_owned(),
+        dpop_jkt: device.dpop_jkt().to_owned(),
+        auth_generation: device.auth_generation(),
+        signature_key: signature_key.to_vec(),
+    })
+}
+
+/// Resolve the signing key from the exact active device row already bound by
+/// bearer + DPoP verification. The returned capability is a snapshot; mutation
+/// callsites must still recheck `auth_generation` inside their transaction.
+pub async fn resolve_registry_verified_device_signer(
+    pool: &PgPool,
+    device: &VerifiedDeviceRequest,
+) -> Result<RegistryVerifiedDeviceSigner, GroupInfoVerificationError> {
+    let encoded_signature_key: Option<String> = sqlx::query_scalar(
+        "SELECT signature_public_key FROM devices
+         WHERE user_did = $1 AND device_id = $2 AND dpop_jkt = $3
+           AND auth_generation = $4 AND active AND auth_bound_at IS NOT NULL
+           AND signature_public_key IS NOT NULL
+         FOR SHARE",
+    )
+    .bind(device.user_did())
+    .bind(device.device_id())
+    .bind(device.dpop_jkt())
+    .bind(device.auth_generation())
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| GroupInfoVerificationError::RegistryResolutionFailed)?;
+    let encoded_signature_key =
+        encoded_signature_key.ok_or(GroupInfoVerificationError::RegistryAuthorityUnavailable)?;
+    authority_from_registry_key(device, Some(encoded_signature_key))
 }
 
 struct ActiveVerificationGuard;
@@ -446,14 +536,21 @@ pub fn verify_group_info_for_transition(
     bytes: &[u8],
     context: &ResolvedMlsContext,
     device: &VerifiedDeviceRequest,
-    expected_registry_signature_key: &[u8],
+    registry_authority: &RegistryVerifiedDeviceSigner,
     limits: GroupInfoVerifierLimits,
 ) -> Result<VerifiedGroupInfo, GroupInfoVerificationError> {
+    if registry_authority.user_did != device.user_did()
+        || registry_authority.device_id != device.device_id()
+        || registry_authority.dpop_jkt != device.dpop_jkt()
+        || registry_authority.auth_generation != device.auth_generation()
+    {
+        return Err(GroupInfoVerificationError::RegistryAuthorityMismatch);
+    }
     let expected_credential =
         Credential::from(BasicCredential::new(device.user_did().as_bytes().to_vec()));
     let authenticated = verify_group_info(
         bytes,
-        &ExpectedGroupInfoSigner::by_signature_key(expected_registry_signature_key)
+        &ExpectedGroupInfoSigner::by_signature_key(&registry_authority.signature_key)
             .with_credential(expected_credential),
         limits,
     )?;
@@ -493,7 +590,8 @@ pub(crate) mod context_binding_tests {
     use crate::{auth::device_auth::VerifiedDeviceRequest, models::ResolvedMlsContext};
 
     use super::{
-        verify_group_info_for_transition, GroupInfoVerificationError, GroupInfoVerifierLimits,
+        authority_from_registry_key, verify_group_info_for_transition, GroupInfoVerificationError,
+        GroupInfoVerifierLimits, RegistryVerifiedDeviceSigner,
     };
 
     const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
@@ -504,6 +602,7 @@ pub(crate) mod context_binding_tests {
         pub signer_key: Vec<u8>,
         pub context: ResolvedMlsContext,
         pub device: VerifiedDeviceRequest,
+        pub authority: RegistryVerifiedDeviceSigner,
     }
 
     pub(crate) fn bound_fixture() -> BoundFixture {
@@ -537,9 +636,23 @@ pub(crate) mod context_binding_tests {
             .expect("export group info")
             .tls_serialize_detached()
             .expect("serialize wrapped GroupInfo");
+        let signer_key = signer.to_public_vec();
+        let device = VerifiedDeviceRequest::fixture_for_policy_test(
+            "did:plc:alice",
+            "device-a",
+            &"a".repeat(43),
+            7,
+        );
+        let authority = RegistryVerifiedDeviceSigner {
+            user_did: device.user_did().to_owned(),
+            device_id: device.device_id().to_owned(),
+            dpop_jkt: device.dpop_jkt().to_owned(),
+            auth_generation: device.auth_generation(),
+            signature_key: signer_key.clone(),
+        };
         BoundFixture {
             bytes,
-            signer_key: signer.to_public_vec(),
+            signer_key,
             context: ResolvedMlsContext {
                 conversation_id: "convo-1".into(),
                 crypto_session_id: "session-1".into(),
@@ -554,12 +667,8 @@ pub(crate) mod context_binding_tests {
                 sequencer_term: 4,
                 receipt: None,
             },
-            device: VerifiedDeviceRequest::fixture_for_policy_test(
-                "did:plc:alice",
-                "device-a",
-                &"a".repeat(43),
-                7,
-            ),
+            device,
+            authority,
         }
     }
 
@@ -570,7 +679,7 @@ pub(crate) mod context_binding_tests {
             &fixture.bytes,
             &fixture.context,
             &fixture.device,
-            &fixture.signer_key,
+            &fixture.authority,
             GroupInfoVerifierLimits::default(),
         )
         .expect("context-bound GroupInfo");
@@ -590,7 +699,7 @@ pub(crate) mod context_binding_tests {
     }
 
     #[test]
-    fn context_bound_verification_rejects_wrong_group_epoch_and_credential() {
+    fn context_bound_verification_rejects_wrong_group_epoch_and_device_authority() {
         let fixture = bound_fixture();
 
         let mut wrong_group = fixture.context.clone();
@@ -600,7 +709,7 @@ pub(crate) mod context_binding_tests {
                 &fixture.bytes,
                 &wrong_group,
                 &fixture.device,
-                &fixture.signer_key,
+                &fixture.authority,
                 GroupInfoVerifierLimits::default(),
             )
             .expect_err("wrong group"),
@@ -614,7 +723,7 @@ pub(crate) mod context_binding_tests {
                 &fixture.bytes,
                 &wrong_epoch,
                 &fixture.device,
-                &fixture.signer_key,
+                &fixture.authority,
                 GroupInfoVerifierLimits::default(),
             )
             .expect_err("wrong epoch"),
@@ -632,11 +741,52 @@ pub(crate) mod context_binding_tests {
                 &fixture.bytes,
                 &fixture.context,
                 &wrong_device,
-                &fixture.signer_key,
+                &fixture.authority,
                 GroupInfoVerifierLimits::default(),
             )
             .expect_err("credential identity must be the verified bare user DID"),
-            GroupInfoVerificationError::WrongExpectedCredential
+            GroupInfoVerificationError::RegistryAuthorityMismatch
+        );
+    }
+
+    #[test]
+    fn registry_authority_rejects_missing_malformed_and_wrong_length_keys() {
+        let fixture = bound_fixture();
+        assert!(matches!(
+            authority_from_registry_key(&fixture.device, None),
+            Err(GroupInfoVerificationError::InvalidRegistrySigningKey)
+        ));
+        assert!(matches!(
+            authority_from_registry_key(&fixture.device, Some("not-hex".into())),
+            Err(GroupInfoVerificationError::InvalidRegistrySigningKey)
+        ));
+        assert!(matches!(
+            authority_from_registry_key(&fixture.device, Some(hex::encode([0xFF; 31]))),
+            Err(GroupInfoVerificationError::InvalidRegistrySigningKey)
+        ));
+    }
+
+    #[test]
+    fn attacker_selected_raw_registry_key_cannot_mint_verified_group_info() {
+        let fixture = bound_fixture();
+        let attacker = SignatureKeyPair::new(CIPHERSUITE.signature_algorithm()).expect("attacker");
+        let attacker_authority = RegistryVerifiedDeviceSigner {
+            user_did: fixture.device.user_did().to_owned(),
+            device_id: fixture.device.device_id().to_owned(),
+            dpop_jkt: fixture.device.dpop_jkt().to_owned(),
+            auth_generation: fixture.device.auth_generation(),
+            signature_key: attacker.to_public_vec(),
+        };
+        assert_eq!(
+            verify_group_info_for_transition(
+                &fixture.bytes,
+                &fixture.context,
+                &fixture.device,
+                &attacker_authority,
+                GroupInfoVerifierLimits::default(),
+            )
+            .expect_err("attacker-selected key cannot authenticate GroupInfo"),
+            GroupInfoVerificationError::WrongExpectedSigner
         );
     }
 }
