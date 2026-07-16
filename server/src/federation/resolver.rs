@@ -7,6 +7,9 @@ use tracing::{debug, info};
 
 use super::errors::FederationError;
 use crate::identity::{canonical_did, did_web_document_url};
+use crate::util::outbound_body::{
+    decode_json_bounded, ResponseBodyBudget, DID_DOCUMENT_MAX_BYTES, PROFILE_OR_DEVICE_MAX_BYTES,
+};
 
 const PROFILE_COLLECTION: &str = "blue.catbird.mlsChat.profile";
 const PROFILE_RKEY: &str = "self";
@@ -312,17 +315,15 @@ impl DsResolver {
         let pds_endpoint = self.resolve_did_to_pds(user_did).await?;
 
         let profile_url = profile_record_url(&pds_endpoint, user_did);
+        let deadline = checked_outbound_deadline(user_did, Duration::from_secs(10))?;
 
-        let resp = self
-            .http
-            .get(&profile_url)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
-            .map_err(|e| FederationError::ResolutionFailed {
-                did: user_did.to_string(),
-                reason: format!("HTTP request failed: {e}"),
-            })?;
+        let resp = send_resolution_request(
+            self.http.get(&profile_url),
+            deadline,
+            user_did,
+            "HTTP request failed",
+        )
+        .await?;
 
         if !resp.status().is_success() {
             return Err(FederationError::ResolutionFailed {
@@ -331,13 +332,14 @@ impl DsResolver {
             });
         }
 
-        let body: serde_json::Value =
-            resp.json()
-                .await
-                .map_err(|e| FederationError::ResolutionFailed {
-                    did: user_did.to_string(),
-                    reason: format!("Invalid JSON response: {e}"),
-                })?;
+        let body: serde_json::Value = decode_resolution_json(
+            resp,
+            PROFILE_OR_DEVICE_MAX_BYTES,
+            deadline,
+            user_did,
+            "Invalid JSON response",
+        )
+        .await?;
 
         let value = body
             .get("value")
@@ -409,17 +411,15 @@ impl DsResolver {
         };
 
         self.validate_remote_url(&did_doc_url).await?;
+        let deadline = checked_outbound_deadline(did, Duration::from_secs(10))?;
 
-        let resp = self
-            .http
-            .get(&did_doc_url)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
-            .map_err(|e| FederationError::ResolutionFailed {
-                did: did.to_string(),
-                reason: format!("DID resolution HTTP error: {e}"),
-            })?;
+        let resp = send_resolution_request(
+            self.http.get(&did_doc_url),
+            deadline,
+            did,
+            "DID resolution HTTP error",
+        )
+        .await?;
 
         if !resp.status().is_success() {
             return Err(FederationError::ResolutionFailed {
@@ -428,12 +428,14 @@ impl DsResolver {
             });
         }
 
-        resp.json()
-            .await
-            .map_err(|e| FederationError::ResolutionFailed {
-                did: did.to_string(),
-                reason: format!("Invalid DID document JSON: {e}"),
-            })
+        decode_resolution_json(
+            resp,
+            DID_DOCUMENT_MAX_BYTES,
+            deadline,
+            did,
+            "Invalid DID document JSON",
+        )
+        .await
     }
 
     /// Resolve authorized device keys for a DID via its PDS.
@@ -441,7 +443,7 @@ impl DsResolver {
         &self,
         did: &str,
     ) -> Result<Vec<Vec<u8>>, FederationError> {
-        let deadline = outbound_timeout();
+        let deadline = checked_outbound_deadline(did, outbound_timeout())?;
         let resolution = complete_authority_resolution_with_deadline(
             || self.resolve_did_to_pds(did),
             |pds_endpoint| async move {
@@ -467,11 +469,19 @@ impl DsResolver {
                                 request = request.query(&[("cursor", cursor)]);
                             }
 
-                            let response = request.send().await.map_err(|_| ())?;
+                            let response = tokio::time::timeout_at(deadline, request.send())
+                                .await
+                                .map_err(|_| ())?
+                                .map_err(|_| ())?;
                             if !response.status().is_success() {
                                 return Err(());
                             }
-                            response.json().await.map_err(|_| ())
+                            decode_json_bounded(
+                                response,
+                                ResponseBodyBudget::new(PROFILE_OR_DEVICE_MAX_BYTES, deadline),
+                            )
+                            .await
+                            .map_err(|_| ())
                         }
                     },
                     deadline,
@@ -515,6 +525,51 @@ impl DsResolver {
     }
 }
 
+fn checked_outbound_deadline(
+    did: &str,
+    timeout: Duration,
+) -> Result<tokio::time::Instant, FederationError> {
+    tokio::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| FederationError::ResolutionFailed {
+            did: did.to_string(),
+            reason: "Outbound resolution deadline overflowed".to_string(),
+        })
+}
+
+async fn send_resolution_request(
+    request: reqwest::RequestBuilder,
+    deadline: tokio::time::Instant,
+    did: &str,
+    context: &str,
+) -> Result<reqwest::Response, FederationError> {
+    tokio::time::timeout_at(deadline, request.send())
+        .await
+        .map_err(|_| FederationError::ResolutionFailed {
+            did: did.to_string(),
+            reason: format!("{context}: deadline exceeded"),
+        })?
+        .map_err(|error| FederationError::ResolutionFailed {
+            did: did.to_string(),
+            reason: format!("{context}: {error}"),
+        })
+}
+
+async fn decode_resolution_json<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    max_bytes: usize,
+    deadline: tokio::time::Instant,
+    did: &str,
+    context: &str,
+) -> Result<T, FederationError> {
+    decode_json_bounded(response, ResponseBodyBudget::new(max_bytes, deadline))
+        .await
+        .map_err(|error| FederationError::ResolutionFailed {
+            did: did.to_string(),
+            reason: format!("{context}: {error}"),
+        })
+}
+
 fn outbound_timeout() -> Duration {
     let timeout_secs = std::env::var("OUTBOUND_TIMEOUT")
         .ok()
@@ -534,7 +589,7 @@ async fn complete_authority_resolution_with_deadline<
 >(
     resolve_pds: ResolvePds,
     paginate: Paginate,
-    deadline: Duration,
+    deadline: tokio::time::Instant,
 ) -> Result<Result<Output, Error>, ()>
 where
     ResolvePds: FnOnce() -> ResolveFuture,
@@ -542,7 +597,7 @@ where
     Paginate: FnOnce(PdsEndpoint) -> PaginateFuture,
     PaginateFuture: Future<Output = Result<Output, Error>>,
 {
-    tokio::time::timeout(deadline, async move {
+    tokio::time::timeout_at(deadline, async move {
         let pds_endpoint = resolve_pds().await?;
         paginate(pds_endpoint).await
     })
@@ -552,13 +607,13 @@ where
 
 async fn collect_authoritative_device_key_pages<Fetch, FetchFuture>(
     mut fetch_page: Fetch,
-    deadline: Duration,
+    deadline: tokio::time::Instant,
 ) -> Result<Vec<Vec<u8>>, ()>
 where
     Fetch: FnMut(Option<String>) -> FetchFuture,
     FetchFuture: Future<Output = Result<serde_json::Value, ()>>,
 {
-    tokio::time::timeout(deadline, async move {
+    tokio::time::timeout_at(deadline, async move {
         let mut cursor = None;
         let mut seen_cursors = HashSet::new();
         let mut record_count = 0usize;
@@ -570,6 +625,9 @@ where
                 .get("records")
                 .and_then(serde_json::Value::as_array)
                 .ok_or(())?;
+            if records.len() > AUTHORITY_PAGE_SIZE {
+                return Err(());
+            }
             record_count = record_count.checked_add(records.len()).ok_or(())?;
             if record_count > MAX_AUTHORITY_RECORDS {
                 return Err(());
@@ -875,6 +933,197 @@ mod tests {
     use super::*;
     use base64::Engine as _;
 
+    async fn response_from_raw(raw: Vec<u8>) -> reqwest::Response {
+        use tokio::io::AsyncReadExt as _;
+        use tokio::io::AsyncWriteExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept test request");
+            let mut request = [0u8; 1024];
+            let bytes_read = stream.read(&mut request).await.expect("read test request");
+            assert!(bytes_read > 0, "test client sent a request");
+            stream.write_all(&raw).await.expect("write test response");
+        });
+
+        reqwest::Client::new()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .expect("receive test response")
+    }
+
+    async fn declared_response(length: usize) -> reqwest::Response {
+        response_from_raw(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
+            )
+            .into_bytes(),
+        )
+        .await
+    }
+
+    async fn chunked_response(body: &[u8]) -> reqwest::Response {
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response.extend_from_slice(b"\r\n0\r\n\r\n");
+        response_from_raw(response).await
+    }
+
+    async fn delayed_body_response(delay: Duration) -> reqwest::Response {
+        use tokio::io::AsyncReadExt as _;
+        use tokio::io::AsyncWriteExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept test request");
+            let mut request = [0u8; 1024];
+            let bytes_read = stream.read(&mut request).await.expect("read test request");
+            assert!(bytes_read > 0, "test client sent a request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("write test headers");
+            tokio::time::sleep(delay).await;
+            let _ = stream.write_all(b"{}").await;
+        });
+
+        reqwest::Client::new()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .expect("receive test response headers")
+    }
+
+    #[tokio::test]
+    async fn resolver_json_rejects_declared_did_body_over_limit() {
+        let response = declared_response(DID_DOCUMENT_MAX_BYTES + 1).await;
+        let result: Result<serde_json::Value, _> = decode_resolution_json(
+            response,
+            DID_DOCUMENT_MAX_BYTES,
+            tokio::time::Instant::now() + Duration::from_secs(30),
+            "did:plc:test",
+            "Invalid DID document JSON",
+        )
+        .await;
+
+        let error = result.expect_err("oversized DID document must fail");
+        assert!(error.to_string().contains("exceeding limit"));
+    }
+
+    #[tokio::test]
+    async fn resolver_json_preserves_valid_bounded_response() {
+        let response = response_from_raw(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                .to_vec(),
+        )
+        .await;
+        let value: serde_json::Value = decode_resolution_json(
+            response,
+            DID_DOCUMENT_MAX_BYTES,
+            tokio::time::Instant::now() + Duration::from_secs(30),
+            "did:plc:test",
+            "Invalid DID document JSON",
+        )
+        .await
+        .expect("valid bounded JSON remains accepted");
+
+        assert_eq!(value, serde_json::json!({}));
+    }
+
+    #[tokio::test]
+    async fn resolver_json_rejects_chunked_did_body_over_limit_before_json() {
+        let response = chunked_response(&vec![b'x'; DID_DOCUMENT_MAX_BYTES + 1]).await;
+        let result: Result<serde_json::Value, _> = decode_resolution_json(
+            response,
+            DID_DOCUMENT_MAX_BYTES,
+            tokio::time::Instant::now() + Duration::from_secs(30),
+            "did:plc:test",
+            "Invalid DID document JSON",
+        )
+        .await;
+
+        let error = result.expect_err("oversized chunked DID document must fail");
+        assert!(
+            error.to_string().contains("exceeding limit"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolver_json_rejects_profile_and_device_bodies_over_limit() {
+        for context in ["Invalid profile JSON", "Invalid device-page JSON"] {
+            let response = declared_response(PROFILE_OR_DEVICE_MAX_BYTES + 1).await;
+            let result: Result<serde_json::Value, _> = decode_resolution_json(
+                response,
+                PROFILE_OR_DEVICE_MAX_BYTES,
+                tokio::time::Instant::now() + Duration::from_secs(30),
+                "did:plc:test",
+                context,
+            )
+            .await;
+
+            let error = result.expect_err("oversized profile/device body must fail");
+            assert!(error.to_string().contains("exceeding limit"));
+        }
+    }
+
+    #[tokio::test]
+    async fn resolver_json_body_cannot_reset_presend_deadline() {
+        let response = delayed_body_response(Duration::from_millis(50)).await;
+        let result: Result<serde_json::Value, _> = decode_resolution_json(
+            response,
+            DID_DOCUMENT_MAX_BYTES,
+            tokio::time::Instant::now() + Duration::from_millis(5),
+            "did:plc:test",
+            "Invalid DID document JSON",
+        )
+        .await;
+
+        let error = result.expect_err("slow body must not reset the request deadline");
+        assert!(error.to_string().contains("deadline exceeded"));
+    }
+
+    #[tokio::test]
+    async fn resolver_request_headers_cannot_outlive_presend_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.expect("accept test request");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        });
+
+        let result = send_resolution_request(
+            reqwest::Client::new().get(format!("http://{address}/")),
+            tokio::time::Instant::now() + Duration::from_millis(5),
+            "did:plc:test",
+            "DID resolution HTTP error",
+        )
+        .await;
+
+        let error = result.expect_err("slow headers must not reset the request deadline");
+        assert!(error.to_string().contains("deadline exceeded"));
+    }
+
+    #[test]
+    fn resolver_deadline_rejects_overflow() {
+        assert!(checked_outbound_deadline("did:plc:test", Duration::MAX).is_err());
+    }
+
     fn authoritative_record(key: &[u8]) -> serde_json::Value {
         serde_json::json!({
             "value": {
@@ -958,7 +1207,7 @@ mod tests {
                     _ => Err(()),
                 })
             },
-            std::time::Duration::from_secs(1),
+            tokio::time::Instant::now() + Duration::from_secs(1),
         )
         .await;
 
@@ -978,7 +1227,7 @@ mod tests {
                     "cursor": "loop"
                 })))
             },
-            std::time::Duration::from_secs(1),
+            tokio::time::Instant::now() + Duration::from_secs(1),
         )
         .await;
         assert!(result.is_err());
@@ -997,7 +1246,7 @@ mod tests {
                     }
                 })))
             },
-            std::time::Duration::from_secs(1),
+            tokio::time::Instant::now() + Duration::from_secs(1),
         )
         .await;
         assert!(result.is_err());
@@ -1015,7 +1264,7 @@ mod tests {
                     "cursor": format!("page-{}", page + 1)
                 })))
             },
-            std::time::Duration::from_secs(1),
+            tokio::time::Instant::now() + Duration::from_secs(1),
         )
         .await;
         assert!(page_limit.is_err());
@@ -1031,17 +1280,62 @@ mod tests {
                     "records": records
                 })))
             },
-            std::time::Duration::from_secs(1),
+            tokio::time::Instant::now() + Duration::from_secs(1),
         )
         .await;
         assert!(record_limit.is_err());
     }
 
     #[tokio::test]
+    async fn authoritative_pagination_rejects_101_records_in_one_page() {
+        let records = vec![authoritative_record(&[0x41; 32]); AUTHORITY_PAGE_SIZE + 1];
+        let result = collect_authoritative_device_key_pages(
+            move |_| {
+                let records = records.clone();
+                std::future::ready(Ok(serde_json::json!({ "records": records })))
+            },
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn authoritative_pagination_accepts_ten_pages_of_100_records() {
+        let page_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = page_counter.clone();
+        let records = vec![authoritative_record(&[0x41; 32]); AUTHORITY_PAGE_SIZE];
+        let result = collect_authoritative_device_key_pages(
+            move |_| {
+                let page = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let cursor = (page + 1 < MAX_AUTHORITY_PAGES).then(|| format!("page-{}", page + 1));
+                let records = records.clone();
+                let mut body = serde_json::json!({ "records": records });
+                if let Some(cursor) = cursor {
+                    body["cursor"] = serde_json::Value::String(cursor);
+                }
+                std::future::ready(Ok(body))
+            },
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await;
+
+        assert_eq!(
+            result.expect("ten full pages remain valid").len(),
+            MAX_AUTHORITY_RECORDS
+        );
+        assert_eq!(
+            page_counter.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_AUTHORITY_PAGES
+        );
+    }
+
+    #[tokio::test]
     async fn authoritative_pagination_enforces_overall_deadline() {
         let result = collect_authoritative_device_key_pages(
             |_| std::future::pending::<Result<serde_json::Value, ()>>(),
-            std::time::Duration::from_millis(1),
+            tokio::time::Instant::now() + Duration::from_millis(1),
         )
         .await;
         assert!(result.is_err());
@@ -1058,7 +1352,7 @@ mod tests {
                 started.store(true, std::sync::atomic::Ordering::SeqCst);
                 std::future::ready(Ok(()))
             },
-            std::time::Duration::from_millis(1),
+            tokio::time::Instant::now() + Duration::from_millis(1),
         )
         .await;
         assert!(result.is_err());
