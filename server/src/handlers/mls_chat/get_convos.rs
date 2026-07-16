@@ -402,6 +402,139 @@ impl RosterProjection {
     }
 }
 
+fn listing_keys_sql(filter: ListingFilter) -> &'static str {
+    const ALL_SQL: &str = r#"
+        WITH principal AS (
+            SELECT m.convo_id, MAX(m.joined_at) AS joined_at
+            FROM members m
+            WHERE (m.user_did = $1 OR m.member_did = $1 OR split_part(m.member_did, '#', 1) = $1)
+              AND m.left_at IS NULL
+            GROUP BY m.convo_id
+        ),
+        candidate AS MATERIALIZED (
+            SELECT c.id AS convo_id, p.joined_at
+            FROM principal p
+            JOIN conversations c ON c.id = p.convo_id
+            WHERE c.id <> ''
+              AND ($2::timestamptz IS NULL OR (p.joined_at, c.id) < ($2, $3))
+            ORDER BY p.joined_at DESC, c.id DESC
+            LIMIT $4
+        )
+        SELECT c.id AS convo_id, candidate.joined_at, activity.last_message_at,
+               roster.member_count,
+               (
+                   octet_length(c.id)::bigint
+                   + octet_length(c.creator_did)::bigint
+                   + 4 + 8
+                   + COALESCE(octet_length(c.cipher_suite), 0)::bigint
+                   + COALESCE(octet_length(c.confirmation_tag), 0)::bigint
+                   + COALESCE(octet_length(c.sequencer_ds), 0)::bigint
+                   + COALESCE(octet_length(c.group_id), 0)::bigint
+                   + CASE WHEN c.reset_count IS NULL THEN 0 ELSE 4 END
+                   + CASE WHEN activity.last_message_at IS NULL THEN 0 ELSE 8 END
+                   + roster.member_bytes
+               )::bigint AS raw_bytes
+        FROM candidate
+        JOIN conversations c ON c.id = candidate.convo_id
+        LEFT JOIN LATERAL (
+            SELECT MAX(msg.created_at) AS last_message_at
+            FROM messages msg
+            WHERE msg.convo_id = c.id
+        ) activity ON true
+        JOIN LATERAL (
+            SELECT COUNT(*)::bigint AS member_count,
+                   COALESCE(SUM(
+                       octet_length(rm.convo_id)::bigint
+                       + octet_length(rm.member_did)::bigint
+                       + COALESCE(octet_length(rm.user_did), 0)::bigint
+                       + COALESCE(octet_length(rm.device_id), 0)::bigint
+                       + COALESCE(octet_length(rm.device_name), 0)::bigint
+                       + 8 + 1 + 1
+                       + CASE WHEN rm.leaf_index IS NULL THEN 0 ELSE 4 END
+                       + CASE WHEN rm.promoted_at IS NULL THEN 0 ELSE 8 END
+                       + COALESCE(octet_length(rm.promoted_by_did), 0)::bigint
+                   ), 0)::bigint AS member_bytes
+            FROM (
+                SELECT m2.convo_id, m2.member_did, m2.user_did, m2.device_id,
+                       m2.device_name, m2.joined_at, m2.is_admin,
+                       COALESCE(m2.is_moderator, false) AS is_moderator,
+                       m2.leaf_index, m2.promoted_at, m2.promoted_by_did
+                FROM members m2
+                WHERE m2.convo_id = c.id AND m2.left_at IS NULL
+                LIMIT 10001
+            ) rm
+        ) roster ON true
+        ORDER BY candidate.joined_at DESC, c.id DESC
+    "#;
+    const EXPECTED_SQL: &str = r#"
+        WITH principal AS (
+            SELECT m.convo_id, MAX(m.joined_at) AS joined_at
+            FROM members m
+            WHERE m.user_did = $1 AND m.left_at IS NULL
+            GROUP BY m.convo_id
+        ),
+        candidate AS MATERIALIZED (
+            SELECT c.id AS convo_id, p.joined_at
+            FROM principal p
+            JOIN conversations c ON c.id = p.convo_id
+            WHERE c.id <> ''
+              AND ($2::timestamptz IS NULL OR (p.joined_at, c.id) < ($2, $3))
+            ORDER BY p.joined_at DESC, c.id DESC
+            LIMIT $4
+        )
+        SELECT c.id AS convo_id, candidate.joined_at, activity.last_message_at,
+               roster.member_count,
+               (
+                   octet_length(c.id)::bigint
+                   + octet_length(c.creator_did)::bigint
+                   + 4 + 8
+                   + COALESCE(octet_length(c.cipher_suite), 0)::bigint
+                   + COALESCE(octet_length(c.confirmation_tag), 0)::bigint
+                   + COALESCE(octet_length(c.sequencer_ds), 0)::bigint
+                   + COALESCE(octet_length(c.group_id), 0)::bigint
+                   + CASE WHEN c.reset_count IS NULL THEN 0 ELSE 4 END
+                   + CASE WHEN activity.last_message_at IS NULL THEN 0 ELSE 8 END
+                   + roster.member_bytes
+               )::bigint AS raw_bytes
+        FROM candidate
+        JOIN conversations c ON c.id = candidate.convo_id
+        LEFT JOIN LATERAL (
+            SELECT MAX(msg.created_at) AS last_message_at
+            FROM messages msg
+            WHERE msg.convo_id = c.id
+        ) activity ON true
+        JOIN LATERAL (
+            SELECT COUNT(*)::bigint AS member_count,
+                   COALESCE(SUM(
+                       octet_length(rm.convo_id)::bigint
+                       + octet_length(rm.member_did)::bigint
+                       + COALESCE(octet_length(rm.user_did), 0)::bigint
+                       + COALESCE(octet_length(rm.device_id), 0)::bigint
+                       + COALESCE(octet_length(rm.device_name), 0)::bigint
+                       + 8 + 1 + 1
+                       + CASE WHEN rm.leaf_index IS NULL THEN 0 ELSE 4 END
+                       + CASE WHEN rm.promoted_at IS NULL THEN 0 ELSE 8 END
+                       + COALESCE(octet_length(rm.promoted_by_did), 0)::bigint
+                   ), 0)::bigint AS member_bytes
+            FROM (
+                SELECT m2.convo_id, m2.member_did, m2.user_did, m2.device_id,
+                       m2.device_name, m2.joined_at, m2.is_admin,
+                       COALESCE(m2.is_moderator, false) AS is_moderator,
+                       m2.leaf_index, m2.promoted_at, m2.promoted_by_did
+                FROM members m2
+                WHERE m2.convo_id = c.id AND m2.left_at IS NULL
+                LIMIT 10001
+            ) rm
+        ) roster ON true
+        ORDER BY candidate.joined_at DESC, c.id DESC
+    "#;
+
+    match filter {
+        ListingFilter::All => ALL_SQL,
+        ListingFilter::Expected => EXPECTED_SQL,
+    }
+}
+
 async fn fetch_listing_keys(
     connection: &mut PgConnection,
     principal_did: &str,
@@ -410,137 +543,20 @@ async fn fetch_listing_keys(
     fetch_limit: usize,
     tracker: QueryTracker<'_>,
 ) -> Result<Vec<ListingKey>, ListingError> {
-    const ALL_SQL: &str = r#"
-        WITH principal AS (
-            SELECT m.convo_id, MAX(m.joined_at) AS joined_at
-            FROM members m
-            WHERE (m.user_did = $1 OR m.member_did = $1 OR split_part(m.member_did, '#', 1) = $1)
-              AND m.left_at IS NULL
-            GROUP BY m.convo_id
-        )
-        SELECT c.id AS convo_id, p.joined_at, activity.last_message_at,
-               roster.member_count,
-               (
-                   octet_length(c.id)::bigint
-                   + octet_length(c.creator_did)::bigint
-                   + 4 + 8
-                   + COALESCE(octet_length(c.cipher_suite), 0)::bigint
-                   + COALESCE(octet_length(c.confirmation_tag), 0)::bigint
-                   + COALESCE(octet_length(c.sequencer_ds), 0)::bigint
-                   + COALESCE(octet_length(c.group_id), 0)::bigint
-                   + CASE WHEN c.reset_count IS NULL THEN 0 ELSE 4 END
-                   + CASE WHEN activity.last_message_at IS NULL THEN 0 ELSE 8 END
-                   + roster.member_bytes
-               )::bigint AS raw_bytes
-        FROM principal p
-        JOIN conversations c ON c.id = p.convo_id
-        LEFT JOIN LATERAL (
-            SELECT MAX(msg.created_at) AS last_message_at
-            FROM messages msg
-            WHERE msg.convo_id = c.id
-        ) activity ON true
-        JOIN LATERAL (
-            SELECT COUNT(*)::bigint AS member_count,
-                   COALESCE(SUM(
-                       octet_length(rm.convo_id)::bigint
-                       + octet_length(rm.member_did)::bigint
-                       + COALESCE(octet_length(rm.user_did), 0)::bigint
-                       + COALESCE(octet_length(rm.device_id), 0)::bigint
-                       + COALESCE(octet_length(rm.device_name), 0)::bigint
-                       + 8 + 1 + 1
-                       + CASE WHEN rm.leaf_index IS NULL THEN 0 ELSE 4 END
-                       + CASE WHEN rm.promoted_at IS NULL THEN 0 ELSE 8 END
-                       + COALESCE(octet_length(rm.promoted_by_did), 0)::bigint
-                   ), 0)::bigint AS member_bytes
-            FROM (
-                SELECT m2.convo_id, m2.member_did, m2.user_did, m2.device_id,
-                       m2.device_name, m2.joined_at, m2.is_admin,
-                       COALESCE(m2.is_moderator, false) AS is_moderator,
-                       m2.leaf_index, m2.promoted_at, m2.promoted_by_did
-                FROM members m2
-                WHERE m2.convo_id = c.id AND m2.left_at IS NULL
-                LIMIT 10001
-            ) rm
-        ) roster ON true
-        WHERE c.id <> ''
-          AND ($2::timestamptz IS NULL OR (p.joined_at, c.id) < ($2, $3))
-        ORDER BY p.joined_at DESC, c.id DESC
-        LIMIT $4
-    "#;
-    const EXPECTED_SQL: &str = r#"
-        WITH principal AS (
-            SELECT m.convo_id, MAX(m.joined_at) AS joined_at
-            FROM members m
-            WHERE m.user_did = $1 AND m.left_at IS NULL
-            GROUP BY m.convo_id
-        )
-        SELECT c.id AS convo_id, p.joined_at, activity.last_message_at,
-               roster.member_count,
-               (
-                   octet_length(c.id)::bigint
-                   + octet_length(c.creator_did)::bigint
-                   + 4 + 8
-                   + COALESCE(octet_length(c.cipher_suite), 0)::bigint
-                   + COALESCE(octet_length(c.confirmation_tag), 0)::bigint
-                   + COALESCE(octet_length(c.sequencer_ds), 0)::bigint
-                   + COALESCE(octet_length(c.group_id), 0)::bigint
-                   + CASE WHEN c.reset_count IS NULL THEN 0 ELSE 4 END
-                   + CASE WHEN activity.last_message_at IS NULL THEN 0 ELSE 8 END
-                   + roster.member_bytes
-               )::bigint AS raw_bytes
-        FROM principal p
-        JOIN conversations c ON c.id = p.convo_id
-        LEFT JOIN LATERAL (
-            SELECT MAX(msg.created_at) AS last_message_at
-            FROM messages msg
-            WHERE msg.convo_id = c.id
-        ) activity ON true
-        JOIN LATERAL (
-            SELECT COUNT(*)::bigint AS member_count,
-                   COALESCE(SUM(
-                       octet_length(rm.convo_id)::bigint
-                       + octet_length(rm.member_did)::bigint
-                       + COALESCE(octet_length(rm.user_did), 0)::bigint
-                       + COALESCE(octet_length(rm.device_id), 0)::bigint
-                       + COALESCE(octet_length(rm.device_name), 0)::bigint
-                       + 8 + 1 + 1
-                       + CASE WHEN rm.leaf_index IS NULL THEN 0 ELSE 4 END
-                       + CASE WHEN rm.promoted_at IS NULL THEN 0 ELSE 8 END
-                       + COALESCE(octet_length(rm.promoted_by_did), 0)::bigint
-                   ), 0)::bigint AS member_bytes
-            FROM (
-                SELECT m2.convo_id, m2.member_did, m2.user_did, m2.device_id,
-                       m2.device_name, m2.joined_at, m2.is_admin,
-                       COALESCE(m2.is_moderator, false) AS is_moderator,
-                       m2.leaf_index, m2.promoted_at, m2.promoted_by_did
-                FROM members m2
-                WHERE m2.convo_id = c.id AND m2.left_at IS NULL
-                LIMIT 10001
-            ) rm
-        ) roster ON true
-        WHERE c.id <> ''
-          AND ($2::timestamptz IS NULL OR (p.joined_at, c.id) < ($2, $3))
-        ORDER BY p.joined_at DESC, c.id DESC
-        LIMIT $4
-    "#;
-
     tracker.record();
     let cursor_time = cursor.map(|value| value.joined_at);
     let cursor_id = cursor.map(|value| value.convo_id.as_str());
-    sqlx::query_as::<_, ListingKey>(match filter {
-        ListingFilter::All => ALL_SQL,
-        ListingFilter::Expected => EXPECTED_SQL,
-    })
-    .bind(principal_did)
-    .bind(cursor_time)
-    .bind(cursor_id)
-    .bind(i64::try_from(fetch_limit).map_err(|_| ListingError::Internal)?)
-    .fetch_all(&mut *connection)
-    .await
-    .map_err(|e| {
-        error!("❌ [v2.getConvos] bounded key query failed: {}", e);
-        ListingError::Internal
-    })
+    sqlx::query_as::<_, ListingKey>(listing_keys_sql(filter))
+        .bind(principal_did)
+        .bind(cursor_time)
+        .bind(cursor_id)
+        .bind(i64::try_from(fetch_limit).map_err(|_| ListingError::Internal)?)
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(|e| {
+            error!("❌ [v2.getConvos] bounded key query failed: {}", e);
+            ListingError::Internal
+        })
 }
 
 async fn fetch_conversation_projections(
@@ -1326,6 +1342,130 @@ mod tests {
             .bind(&pattern)
             .execute(pool)
             .await;
+    }
+
+    fn relation_actual_loops(plan: &serde_json::Value, relation: &str, loops: &mut Vec<u64>) {
+        if plan["Relation Name"].as_str() == Some(relation) {
+            loops.push(
+                plan["Actual Loops"]
+                    .as_u64()
+                    .expect("EXPLAIN ANALYZE relation node has Actual Loops"),
+            );
+        }
+        if let Some(children) = plan["Plans"].as_array() {
+            for child in children {
+                relation_actual_loops(child, relation, loops);
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+    async fn key_query_bounds_lateral_roster_and_message_work_to_candidate_page() {
+        let pool = setup_test_db().await;
+        let prefix = format!("get-convos-plan-{}-", uuid::Uuid::new_v4());
+        let did = format!("did:plc:getconvosplan{}", uuid::Uuid::new_v4().simple());
+        let joined_at = Utc::now();
+        let conversation_count = 40_i32;
+        let page_limit = 1_i64;
+        let fetch_limit = page_limit + 1;
+        assert!(i64::from(conversation_count) > fetch_limit);
+        cleanup_test_prefix(&pool, &prefix).await;
+
+        sqlx::query(
+            r#"
+            INSERT INTO conversations
+                (id, creator_did, current_epoch, created_at, updated_at, cipher_suite,
+                 is_remote, group_id)
+            SELECT $1 || lpad(gs::text, 3, '0'), $2, 1,
+                   $3 - make_interval(secs => gs),
+                   $3 - make_interval(secs => gs), $4, false,
+                   $1 || lpad(gs::text, 3, '0')
+            FROM generate_series(1, $5) gs
+            "#,
+        )
+        .bind(&prefix)
+        .bind(&did)
+        .bind(joined_at)
+        .bind("MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519")
+        .bind(conversation_count)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO members
+                (convo_id, member_did, user_did, joined_at, is_admin)
+            SELECT id, $2 || '#principal', $2, created_at, true
+            FROM conversations WHERE id LIKE $1
+            UNION ALL
+            SELECT id, $3 || id, $3 || id, created_at, false
+            FROM conversations WHERE id LIKE $1
+            "#,
+        )
+        .bind(format!("{prefix}%"))
+        .bind(&did)
+        .bind("did:plc:roster-")
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO messages
+                (id, convo_id, sender_did, message_type, epoch, wire_epoch, seq,
+                 ciphertext, msg_id, padded_size, created_at)
+            SELECT id || '-message', id, NULL, 'app', 1, 1, 1,
+                   decode('ca7b1d', 'hex'), id || '-msg', 512, created_at
+            FROM conversations WHERE id LIKE $1
+            "#,
+        )
+        .bind(format!("{prefix}%"))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("ANALYZE conversations, members, messages")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        for filter in [ListingFilter::All, ListingFilter::Expected] {
+            let explain = format!(
+                "EXPLAIN (ANALYZE, FORMAT JSON) {}",
+                listing_keys_sql(filter)
+            );
+            let document: serde_json::Value = sqlx::query_scalar(&explain)
+                .bind(&did)
+                .bind(Option::<DateTime<Utc>>::None)
+                .bind(Option::<String>::None)
+                .bind(fetch_limit)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            let plan = &document[0]["Plan"];
+            let mut roster_loops = Vec::new();
+            let mut message_loops = Vec::new();
+            relation_actual_loops(plan, "members", &mut roster_loops);
+            relation_actual_loops(plan, "messages", &mut message_loops);
+
+            assert!(
+                !roster_loops.is_empty(),
+                "members plan node missing: {plan}"
+            );
+            assert!(
+                !message_loops.is_empty(),
+                "messages plan node missing: {plan}"
+            );
+            assert!(
+                roster_loops.iter().copied().max().unwrap() <= fetch_limit as u64,
+                "{filter:?} roster work exceeded bounded candidate page: {roster_loops:?}"
+            );
+            assert!(
+                message_loops.iter().copied().max().unwrap() <= fetch_limit as u64,
+                "{filter:?} message work exceeded bounded candidate page: {message_loops:?}"
+            );
+        }
+
+        cleanup_test_prefix(&pool, &prefix).await;
     }
 
     async fn listing_json(
