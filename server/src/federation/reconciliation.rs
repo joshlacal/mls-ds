@@ -1,4 +1,7 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -11,11 +14,16 @@ use super::{
     outbound::OutboundClient, peer_policy, resolver::DsResolver, CAPABILITY_RECONCILIATION_V1,
 };
 use crate::identity::canonical_did;
+use crate::util::outbound_body::{
+    decode_json_bounded, ResponseBodyBudget, ORDINARY_DS_CONTROL_MAX_BYTES,
+};
 
 const DIGEST_NSID: &str = "blue.catbird.mlsDS.getConvoDigest";
 const EVENTS_NSID: &str = "blue.catbird.mlsDS.getConvoEvents";
 const HEALTH_CHECK_NSID: &str = "blue.catbird.mlsDS.healthCheck";
 const EVENTS_PAGE_LIMIT: i64 = 500;
+
+static DISCOVERY_CLIENT: OnceLock<Option<reqwest::Client>> = OnceLock::new();
 
 /// Decoded `getConvoDigest` response from a peer DS.
 ///
@@ -312,20 +320,39 @@ async fn reconcile_conversation(
 }
 
 async fn fetch_discovery_payload(endpoint: &str) -> Option<serde_json::Value> {
+    fetch_discovery_payload_with_timeout(endpoint, Duration::from_secs(10)).await
+}
+
+fn discovery_client() -> Option<&'static reqwest::Client> {
+    DISCOVERY_CLIENT
+        .get_or_init(|| reqwest::Client::builder().build().ok())
+        .as_ref()
+}
+
+async fn fetch_discovery_payload_with_timeout(
+    endpoint: &str,
+    timeout: Duration,
+) -> Option<serde_json::Value> {
+    let deadline = tokio::time::Instant::now().checked_add(timeout)?;
     let url = format!(
         "{}/xrpc/{}",
         endpoint.trim_end_matches('/'),
         HEALTH_CHECK_NSID
     );
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
+    let client = discovery_client()?;
+    let resp = tokio::time::timeout_at(deadline, client.get(&url).send())
+        .await
+        .ok()?
         .ok()?;
-    let resp = client.get(&url).send().await.ok()?;
     if !resp.status().is_success() {
         return None;
     }
-    resp.json::<serde_json::Value>().await.ok()
+    decode_json_bounded(
+        resp,
+        ResponseBodyBudget::new(ORDINARY_DS_CONTROL_MAX_BYTES, deadline),
+    )
+    .await
+    .ok()
 }
 
 async fn apply_remote_events(
@@ -431,4 +458,184 @@ async fn local_digest_state(
 fn hash_len_prefixed(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update((bytes.len() as u32).to_be_bytes());
     hasher.update(bytes);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{Response, StatusCode},
+        routing::get,
+        Router,
+    };
+    use bytes::Bytes;
+    use futures::stream;
+    use serde_json::json;
+    use std::convert::Infallible;
+    use tokio::net::TcpListener;
+
+    async fn spawn_discovery_server(router: Router) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn valid_bounded_discovery_json_succeeds() {
+        let expected = json!({ "capabilities": [CAPABILITY_RECONCILIATION_V1] });
+        let body = expected.to_string();
+        let endpoint = spawn_discovery_server(Router::new().route(
+            &format!("/xrpc/{HEALTH_CHECK_NSID}"),
+            get(move || {
+                let body = body.clone();
+                async move { Body::from(body) }
+            }),
+        ))
+        .await;
+
+        let discovery = fetch_discovery_payload(&endpoint).await;
+        assert_eq!(discovery, Some(expected));
+        assert!(crate::federation::target_supports_capability(
+            CAPABILITY_RECONCILIATION_V1,
+            None,
+            discovery.as_ref(),
+        ));
+    }
+
+    #[tokio::test]
+    async fn declared_discovery_body_over_one_mib_returns_none() {
+        let body = json!({
+            "capabilities": [CAPABILITY_RECONCILIATION_V1],
+            "padding": "x".repeat(ORDINARY_DS_CONTROL_MAX_BYTES),
+        })
+        .to_string();
+        assert!(body.len() > ORDINARY_DS_CONTROL_MAX_BYTES);
+        let endpoint = spawn_discovery_server(Router::new().route(
+            &format!("/xrpc/{HEALTH_CHECK_NSID}"),
+            get(move || {
+                let body = body.clone();
+                async move {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-length", body.len().to_string())
+                        .body(Body::from(body))
+                        .unwrap()
+                }
+            }),
+        ))
+        .await;
+
+        assert_eq!(fetch_discovery_payload(&endpoint).await, None);
+    }
+
+    #[tokio::test]
+    async fn chunked_discovery_body_over_one_mib_returns_none() {
+        let prefix = format!(r#"{{"capabilities":["{CAPABILITY_RECONCILIATION_V1}"],"padding":""#);
+        let chunks = vec![
+            Ok::<_, Infallible>(Bytes::from(prefix)),
+            Ok(Bytes::from(vec![b'x'; ORDINARY_DS_CONTROL_MAX_BYTES])),
+            Ok(Bytes::from_static(br#""}"#)),
+        ];
+        let endpoint = spawn_discovery_server(Router::new().route(
+            &format!("/xrpc/{HEALTH_CHECK_NSID}"),
+            get(move || {
+                let chunks = chunks.clone();
+                async move {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Body::from_stream(stream::iter(chunks)))
+                        .unwrap()
+                }
+            }),
+        ))
+        .await;
+
+        assert_eq!(fetch_discovery_payload(&endpoint).await, None);
+    }
+
+    #[tokio::test]
+    async fn non_success_and_malformed_discovery_keep_best_effort_none() {
+        const CANARY: &str = "cookie=discovery-canary token=discovery-secret";
+        let unavailable = spawn_discovery_server(Router::new().route(
+            &format!("/xrpc/{HEALTH_CHECK_NSID}"),
+            get(|| async {
+                Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .body(Body::from(CANARY))
+                    .unwrap()
+            }),
+        ))
+        .await;
+        assert_eq!(fetch_discovery_payload(&unavailable).await, None);
+
+        let malformed = spawn_discovery_server(Router::new().route(
+            &format!("/xrpc/{HEALTH_CHECK_NSID}"),
+            get(|| async { Body::from(format!(r#"{{"secret":"{CANARY}""#)) }),
+        ))
+        .await;
+        assert_eq!(fetch_discovery_payload(&malformed).await, None);
+    }
+
+    #[tokio::test]
+    async fn discovery_headers_and_body_share_one_pre_send_deadline() {
+        let endpoint = spawn_discovery_server(Router::new().route(
+            &format!("/xrpc/{HEALTH_CHECK_NSID}"),
+            get(|| async {
+                tokio::time::sleep(Duration::from_millis(45)).await;
+                let chunks = stream::once(async {
+                    tokio::time::sleep(Duration::from_millis(45)).await;
+                    Ok::<_, Infallible>(Bytes::from_static(
+                        br#"{"capabilities":["reconciliation-v1"]}"#,
+                    ))
+                });
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from_stream(chunks))
+                    .unwrap()
+            }),
+        ))
+        .await;
+
+        assert_eq!(
+            fetch_discovery_payload_with_timeout(&endpoint, Duration::from_millis(70)).await,
+            None
+        );
+    }
+
+    #[test]
+    fn discovery_has_no_unbounded_collector_and_event_queries_remain_separate() {
+        let source = include_str!("reconciliation.rs");
+        let query_call = [".call_query", "_json("].concat();
+        assert_eq!(source.matches(&query_call).count(), 2);
+        for suffix in [".json()", ".bytes()", ".text()"] {
+            let needle = ["resp", suffix].concat();
+            assert!(!source.contains(&needle), "found {needle}");
+        }
+
+        let discovery_start = source
+            .find("async fn fetch_discovery_payload_with_timeout")
+            .unwrap();
+        let discovery_end = source[discovery_start..]
+            .find("\nasync fn apply_remote_events")
+            .unwrap();
+        let discovery = &source[discovery_start..discovery_start + discovery_end];
+        for log_macro in ["debug!(", "info!(", "warn!(", "error!("] {
+            assert!(!discovery.contains(log_macro));
+        }
+    }
+
+    #[test]
+    fn discovery_client_is_process_reused_and_fallible() {
+        let source = include_str!("reconciliation.rs");
+        let fallible_static = ["OnceLock<Option<", "reqwest::Client>>"].concat();
+        assert_eq!(source.matches(&fallible_static).count(), 1);
+
+        let first = discovery_client().expect("test client should build");
+        let second = discovery_client().expect("test client should remain available");
+        assert!(std::ptr::eq(first, second));
+    }
 }
