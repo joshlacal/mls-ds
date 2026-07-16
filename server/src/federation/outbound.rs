@@ -1,14 +1,22 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+use tokio::time::Instant;
 use tracing::{debug, warn};
 
 use super::ack::DeliveryAck;
 use super::receipt::SequencerReceipt;
+use crate::util::outbound_body::{
+    decode_json_bounded, summarize_error_body, OutboundBodyError, ResponseBodyBudget,
+    ORDINARY_DS_CONTROL_MAX_BYTES,
+};
+
+const REMOTE_DS: &str = "remote DS";
 
 /// HTTP client for outbound DS-to-DS calls.
 pub struct OutboundClient {
     http: Client,
+    request_timeout: Duration,
 }
 
 /// Response from a remote DS.
@@ -40,7 +48,10 @@ impl OutboundClient {
             .build()
             .expect("failed to build HTTP client");
 
-        Self { http }
+        Self {
+            http,
+            request_timeout: Duration::from_secs(request_timeout_secs),
+        }
     }
 
     /// Make an authenticated XRPC procedure call to a remote DS.
@@ -52,19 +63,22 @@ impl OutboundClient {
         body: &impl Serialize,
     ) -> Result<DsResponse, OutboundError> {
         let url = format!("{}/xrpc/{}", endpoint.trim_end_matches('/'), method);
-        debug!(url = %url, method, "Outbound DS call");
+        debug!(method, "Outbound DS call");
+        let deadline = self.deadline(method)?;
 
-        let resp = self
+        let send = self
             .http
             .post(&url)
             .header("Authorization", format!("Bearer {auth_token}"))
             .header("Content-Type", "application/json")
             .json(body)
-            .send()
+            .send();
+        let resp = tokio::time::timeout_at(deadline, send)
             .await
-            .map_err(|e| classify_reqwest_error(e, endpoint, method))?;
+            .map_err(|_| timeout_error(method))?
+            .map_err(|error| classify_ordinary_reqwest_error(error, method))?;
 
-        parse_response(resp, endpoint, method).await
+        parse_response(resp, method, deadline).await
     }
 
     /// Make an authenticated XRPC query call to a remote DS.
@@ -76,18 +90,21 @@ impl OutboundClient {
         params: &[(&str, &str)],
     ) -> Result<DsResponse, OutboundError> {
         let url = format!("{}/xrpc/{}", endpoint.trim_end_matches('/'), method);
-        debug!(url = %url, method, "Outbound DS query");
+        debug!(method, "Outbound DS query");
+        let deadline = self.deadline(method)?;
 
-        let resp = self
+        let send = self
             .http
             .get(&url)
             .header("Authorization", format!("Bearer {auth_token}"))
             .query(params)
-            .send()
+            .send();
+        let resp = tokio::time::timeout_at(deadline, send)
             .await
-            .map_err(|e| classify_reqwest_error(e, endpoint, method))?;
+            .map_err(|_| timeout_error(method))?
+            .map_err(|error| classify_ordinary_reqwest_error(error, method))?;
 
-        parse_response(resp, endpoint, method).await
+        parse_response(resp, method, deadline).await
     }
 
     /// Make an authenticated XRPC query call returning raw JSON.
@@ -143,11 +160,17 @@ impl OutboundClient {
         {
             Ok(_) => Ok(true),
             Err(OutboundError::Timeout { .. } | OutboundError::ConnectionFailed { .. }) => {
-                warn!(endpoint, "Remote DS health check failed (unreachable)");
+                warn!("Remote DS health check failed (unreachable)");
                 Ok(false)
             }
             Err(e) => Err(e),
         }
+    }
+
+    fn deadline(&self, method: &str) -> Result<Instant, OutboundError> {
+        Instant::now()
+            .checked_add(self.request_timeout)
+            .ok_or_else(|| timeout_error(method))
     }
 }
 
@@ -174,29 +197,75 @@ fn classify_reqwest_error(e: reqwest::Error, endpoint: &str, method: &str) -> Ou
     }
 }
 
+fn timeout_error(method: &str) -> OutboundError {
+    OutboundError::Timeout {
+        endpoint: REMOTE_DS.to_string(),
+        method: method.to_string(),
+    }
+}
+
+fn classify_ordinary_reqwest_error(error: reqwest::Error, method: &str) -> OutboundError {
+    if error.is_timeout() {
+        timeout_error(method)
+    } else if error.is_connect() {
+        OutboundError::ConnectionFailed {
+            endpoint: REMOTE_DS.to_string(),
+            reason: "connection failed".to_string(),
+        }
+    } else {
+        OutboundError::RequestFailed {
+            endpoint: REMOTE_DS.to_string(),
+            reason: "request failed".to_string(),
+        }
+    }
+}
+
 async fn parse_response(
     resp: reqwest::Response,
-    endpoint: &str,
     method: &str,
+    deadline: Instant,
 ) -> Result<DsResponse, OutboundError> {
     let status = resp.status();
     if status.is_success() {
-        resp.json::<DsResponse>()
-            .await
-            .map_err(|e| OutboundError::InvalidResponse {
-                reason: e.to_string(),
-            })
+        decode_json_bounded(
+            resp,
+            ResponseBodyBudget::new(ORDINARY_DS_CONTROL_MAX_BYTES, deadline),
+        )
+        .await
+        .map_err(|error| map_ordinary_body_error(error, method))
     } else {
-        let body_text = resp
-            .text()
+        let body = summarize_error_body(resp, deadline)
             .await
-            .unwrap_or_else(|_| String::from("<unreadable>"));
+            .map(|summary| summary.to_string())
+            .unwrap_or_else(|error| format!("error response metadata unavailable: {error}"));
         Err(OutboundError::RemoteError {
             status: status.as_u16(),
-            body: body_text,
-            endpoint: endpoint.to_string(),
+            body,
+            endpoint: REMOTE_DS.to_string(),
             method: method.to_string(),
         })
+    }
+}
+
+fn map_ordinary_body_error(error: OutboundBodyError, method: &str) -> OutboundError {
+    match error {
+        OutboundBodyError::DeadlineExceeded => timeout_error(method),
+        OutboundBodyError::ReadFailed(source) => {
+            if source.is_timeout() {
+                timeout_error(method)
+            } else {
+                OutboundError::RequestFailed {
+                    endpoint: REMOTE_DS.to_string(),
+                    reason: "response body read failed".to_string(),
+                }
+            }
+        }
+        OutboundBodyError::InvalidJson(_) => OutboundError::InvalidResponse {
+            reason: "outbound response JSON was invalid".to_string(),
+        },
+        other => OutboundError::InvalidResponse {
+            reason: format!("Response body rejected: {other}"),
+        },
     }
 }
 
@@ -244,6 +313,215 @@ impl OutboundError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        body::Body,
+        http::{Response, StatusCode},
+        routing::{get, post},
+        Json, Router,
+    };
+    use bytes::Bytes;
+    use futures::stream;
+    use serde_json::json;
+    use std::convert::Infallible;
+    use tokio::net::TcpListener;
+
+    const TEST_METHOD: &str = "blue.catbird.mlsDS.test";
+
+    async fn spawn_ds(router: Router) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn bounded_procedure_and_typed_query_responses_succeed() {
+        let route = format!("/xrpc/{TEST_METHOD}");
+        let router = Router::new().route(
+            &route,
+            post(|| async { Json(json!({ "accepted": true, "seq": 41 })) })
+                .get(|| async { Json(json!({ "accepted": true, "seq": 42 })) }),
+        );
+        let endpoint = spawn_ds(router).await;
+        let client = OutboundClient::new(1, 1);
+
+        let procedure = client
+            .call_procedure(&endpoint, TEST_METHOD, "token", &json!({}))
+            .await
+            .unwrap();
+        let query = client
+            .call_query(&endpoint, TEST_METHOD, "token", &[])
+            .await
+            .unwrap();
+
+        assert_eq!(procedure.seq, Some(41));
+        assert_eq!(query.seq, Some(42));
+    }
+
+    #[tokio::test]
+    async fn declared_procedure_body_over_one_mib_is_rejected() {
+        let route = format!("/xrpc/{TEST_METHOD}");
+        let router = Router::new().route(
+            &route,
+            post(|| async {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from(vec![
+                        b' ';
+                        crate::util::outbound_body::ORDINARY_DS_CONTROL_MAX_BYTES
+                            + 1
+                    ]))
+                    .unwrap()
+            }),
+        );
+        let endpoint = spawn_ds(router).await;
+
+        let error = OutboundClient::new(1, 1)
+            .call_procedure(&endpoint, TEST_METHOD, "token", &json!({}))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            OutboundError::InvalidResponse { ref reason }
+                if reason.contains("exceeding limit 1048576")
+        ));
+    }
+
+    #[tokio::test]
+    async fn chunked_typed_query_body_over_one_mib_is_rejected() {
+        let route = format!("/xrpc/{TEST_METHOD}");
+        let router = Router::new().route(
+            &route,
+            get(|| async {
+                let chunks = [
+                    Ok::<_, Infallible>(Bytes::from(vec![b' '; 700 * 1024])),
+                    Ok::<_, Infallible>(Bytes::from(vec![b' '; 400 * 1024])),
+                ];
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from_stream(stream::iter(chunks)))
+                    .unwrap()
+            }),
+        );
+        let endpoint = spawn_ds(router).await;
+
+        let error = OutboundClient::new(1, 1)
+            .call_query(&endpoint, TEST_METHOD, "token", &[])
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            OutboundError::InvalidResponse { ref reason }
+                if reason.contains("exceeding limit 1048576")
+        ));
+    }
+
+    #[tokio::test]
+    async fn procedure_headers_and_body_share_one_deadline() {
+        let route = format!("/xrpc/{TEST_METHOD}");
+        let router = Router::new().route(
+            &route,
+            post(|| async {
+                tokio::time::sleep(Duration::from_millis(550)).await;
+                let chunks = stream::once(async {
+                    tokio::time::sleep(Duration::from_millis(550)).await;
+                    Ok::<_, Infallible>(Bytes::from_static(br#"{"accepted":true}"#))
+                });
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from_stream(chunks))
+                    .unwrap()
+            }),
+        );
+        let endpoint = spawn_ds(router).await;
+
+        let error = OutboundClient::new(1, 1)
+            .call_procedure(&endpoint, TEST_METHOD, "token", &json!({}))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, OutboundError::Timeout { .. }));
+    }
+
+    #[tokio::test]
+    async fn non_success_preserves_status_and_retryability_without_body_content() {
+        const CANARY: &str = "bearer=canary-token cookie=canary-cookie";
+        let route = format!("/xrpc/{TEST_METHOD}");
+        let router = Router::new().route(
+            &route,
+            get(|| async {
+                Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .body(Body::from(CANARY))
+                    .unwrap()
+            }),
+        );
+        let endpoint = spawn_ds(router).await;
+
+        let error = OutboundClient::new(1, 1)
+            .call_query(&endpoint, TEST_METHOD, "token", &[])
+            .await
+            .unwrap_err();
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+
+        assert!(matches!(
+            error,
+            OutboundError::RemoteError { status: 503, .. }
+        ));
+        assert!(error.is_retryable());
+        assert!(!display.contains(CANARY));
+        assert!(!debug.contains(CANARY));
+        assert!(!display.contains("canary"));
+        assert!(!debug.contains("canary"));
+    }
+
+    #[tokio::test]
+    async fn malformed_bounded_json_has_sanitized_invalid_response() {
+        const CANARY: &str = "malformed-canary-secret";
+        let route = format!("/xrpc/{TEST_METHOD}");
+        let router = Router::new().route(
+            &route,
+            post(|| async {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from(CANARY))
+                    .unwrap()
+            }),
+        );
+        let endpoint = spawn_ds(router).await;
+
+        let error = OutboundClient::new(1, 1)
+            .call_procedure(&endpoint, TEST_METHOD, "token", &json!({}))
+            .await
+            .unwrap_err();
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+
+        assert!(matches!(error, OutboundError::InvalidResponse { .. }));
+        assert!(!display.contains(CANARY));
+        assert!(!debug.contains(CANARY));
+        assert!(!display.contains("canary"));
+        assert!(!debug.contains("canary"));
+    }
+
+    #[test]
+    fn health_check_warning_does_not_attach_endpoint_url() {
+        let source = include_str!("outbound.rs");
+        let health_check = source
+            .split("    pub async fn health_check(")
+            .nth(1)
+            .unwrap()
+            .split("    fn deadline(")
+            .next()
+            .unwrap();
+
+        assert!(!health_check.contains("warn!(endpoint"));
+    }
 
     #[test]
     fn test_connection_failed_is_retryable() {
