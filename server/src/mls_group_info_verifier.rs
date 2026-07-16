@@ -18,7 +18,7 @@ use openmls_traits::types::{Ciphersuite, SignatureScheme};
 use openmls_traits::OpenMlsProvider;
 use sqlx::PgPool;
 use thiserror::Error;
-use tls_codec::{Deserialize as TlsDeserialize, Size as TlsSize};
+use tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize, Size as TlsSize};
 
 pub const DEFAULT_MAX_GROUP_INFO_BYTES: usize = 1_048_576;
 pub const DEFAULT_MAX_RATCHET_TREE_BYTES: usize = 786_432;
@@ -125,6 +125,7 @@ pub struct AuthenticatedGroupInfo {
     member_count: usize,
     signer_signature_key: Vec<u8>,
     signer_credential: Credential,
+    confirmation_tag: Vec<u8>,
     ciphersuite: Ciphersuite,
     signature_scheme: SignatureScheme,
 }
@@ -175,6 +176,10 @@ impl AuthenticatedGroupInfo {
 
     pub fn signer_credential(&self) -> &Credential {
         &self.signer_credential
+    }
+
+    pub fn confirmation_tag(&self) -> &[u8] {
+        &self.confirmation_tag
     }
 
     pub fn ciphersuite(&self) -> Ciphersuite {
@@ -254,6 +259,10 @@ impl VerifiedGroupInfo {
 
     pub fn signer_credential(&self) -> &Credential {
         self.authenticated.signer_credential()
+    }
+
+    pub fn confirmation_tag(&self) -> &[u8] {
+        self.authenticated.confirmation_tag()
     }
 
     pub(crate) fn device_dpop_jkt(&self) -> &str {
@@ -510,6 +519,10 @@ pub fn verify_group_info(
     })?;
     let signer_signature_key = signer.signature_key().as_slice().to_vec();
     let signer_credential = signer.credential().clone();
+    let confirmation_tag = public_group
+        .confirmation_tag()
+        .tls_serialize_detached()
+        .map_err(|error| GroupInfoVerificationError::InvalidPublicState(error.to_string()))?;
     let ciphersuite = public_group.ciphersuite();
 
     Ok(AuthenticatedGroupInfo {
@@ -519,6 +532,7 @@ pub fn verify_group_info(
         member_count,
         signer_signature_key,
         signer_credential,
+        confirmation_tag,
         ciphersuite,
         signature_scheme: ciphersuite.signature_algorithm(),
         public_group,
@@ -594,6 +608,7 @@ pub(crate) mod context_binding_tests {
     pub(crate) struct BoundFixture {
         pub bytes: Vec<u8>,
         pub signer_key: Vec<u8>,
+        pub confirmation_tag: Vec<u8>,
         pub context: ResolvedMlsContext,
         pub device: VerifiedDeviceRequest,
         pub authority: RegistryVerifiedDeviceSigner,
@@ -625,6 +640,10 @@ pub(crate) mod context_binding_tests {
         group
             .merge_pending_commit(&provider)
             .expect("merge self update");
+        let confirmation_tag = group
+            .confirmation_tag()
+            .tls_serialize_detached()
+            .expect("serialize confirmation tag");
         let bytes = group
             .export_group_info(provider.crypto(), &signer, true)
             .expect("export group info")
@@ -647,6 +666,7 @@ pub(crate) mod context_binding_tests {
         BoundFixture {
             bytes,
             signer_key,
+            confirmation_tag,
             context: ResolvedMlsContext {
                 conversation_id: "convo-1".into(),
                 crypto_session_id: "session-1".into(),
@@ -722,6 +742,30 @@ pub(crate) mod context_binding_tests {
             )
             .expect_err("wrong epoch"),
             GroupInfoVerificationError::UnexpectedEpoch
+        );
+    }
+
+    #[test]
+    fn context_bound_verification_rejects_same_key_with_wrong_did_credential() {
+        let mut fixture = bound_fixture();
+        fixture.device = VerifiedDeviceRequest::fixture_for_policy_test(
+            "did:plc:mallory",
+            fixture.device.device_id(),
+            fixture.device.dpop_jkt(),
+            fixture.device.auth_generation(),
+        );
+        fixture.authority.user_did = fixture.device.user_did().to_owned();
+
+        assert_eq!(
+            verify_group_info_for_transition(
+                &fixture.bytes,
+                &fixture.context,
+                &fixture.device,
+                &fixture.authority,
+                GroupInfoVerifierLimits::default(),
+            )
+            .expect_err("same signing key must not substitute the DID credential"),
+            GroupInfoVerificationError::WrongExpectedCredential
         );
     }
 

@@ -149,7 +149,6 @@ impl ValidatedMlsTransition {
         kind: TransitionKind,
         device: &VerifiedDeviceRequest,
         verified_group_info: VerifiedGroupInfo,
-        confirmation_tag: Option<Vec<u8>>,
         commit_hash: Vec<u8>,
         receipt: Option<SequencerReceiptRef>,
     ) -> Result<Self, TransitionValidationError> {
@@ -174,6 +173,7 @@ impl ValidatedMlsTransition {
             return Err(TransitionValidationError::MissingEvidence);
         }
 
+        let confirmation_tag = verified_group_info.confirmation_tag().to_vec();
         let group_info = verified_group_info.into_canonical_bytes();
         let group_info_hash = Sha256::digest(&group_info).to_vec();
         let mut transition = Self {
@@ -184,7 +184,7 @@ impl ValidatedMlsTransition {
             next_epoch: expected_epoch,
             group_info,
             group_info_hash,
-            confirmation_tag,
+            confirmation_tag: Some(confirmation_tag),
             commit_hash,
             receipt: None,
         };
@@ -497,7 +497,6 @@ mod tests {
             TransitionKind::Commit,
             &fixture.device,
             verified,
-            None,
             vec![0xCC; 32],
             None,
         )
@@ -506,6 +505,7 @@ mod tests {
         assert_eq!(transition.actor_device_id, "device-a");
         assert_eq!(transition.next_epoch, 1);
         assert_eq!(transition.group_info, fixture.bytes);
+        assert_eq!(transition.confirmation_tag, Some(fixture.confirmation_tag));
     }
 
     #[test]
@@ -527,7 +527,6 @@ mod tests {
                 TransitionKind::Commit,
                 &fixture.device,
                 verified,
-                None,
                 vec![0xCC; 32],
                 None,
             ),
@@ -558,7 +557,6 @@ mod tests {
                 TransitionKind::Commit,
                 &other_device,
                 verified,
-                None,
                 vec![0xCC; 32],
                 None,
             ),
@@ -589,7 +587,6 @@ mod tests {
                 TransitionKind::Commit,
                 &other_device,
                 verified,
-                None,
                 vec![0xCC; 32],
                 None,
             ),
@@ -620,7 +617,6 @@ mod tests {
                 TransitionKind::Commit,
                 &other_device,
                 verified,
-                None,
                 vec![0xCC; 32],
                 None,
             ),
