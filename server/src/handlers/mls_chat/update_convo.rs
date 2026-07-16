@@ -43,7 +43,7 @@ pub async fn update_convo(
     let convo_id = input.convo_id.to_string();
     let caller_did = &auth_user.did;
 
-    match input.action.as_ref() {
+    match input.action.as_str() {
         "promoteAdmin" => handle_promote_admin(&pool, caller_did, &convo_id, &input).await,
         "demoteAdmin" => handle_demote_admin(&pool, caller_did, &convo_id, &input).await,
         "promoteModerator" => handle_promote_moderator(&pool, caller_did, &convo_id, &input).await,
@@ -64,7 +64,7 @@ async fn handle_promote_admin(
     pool: &DbPool,
     caller_did: &str,
     convo_id: &str,
-    input: &UpdateConvo<'_>,
+    input: &UpdateConvo,
 ) -> Response {
     let target_did = match input.target_did.as_ref() {
         Some(did) => did.to_string(),
@@ -130,7 +130,7 @@ async fn handle_promote_admin(
     .execute(pool)
     .await;
 
-    Json(UpdateConvoOutput {
+    Json(UpdateConvoOutput::<jacquard_common::DefaultStr> {
         success: true,
         new_epoch: None,
         policy: None,
@@ -143,7 +143,7 @@ async fn handle_demote_admin(
     pool: &DbPool,
     caller_did: &str,
     convo_id: &str,
-    input: &UpdateConvo<'_>,
+    input: &UpdateConvo,
 ) -> Response {
     let target_did = match input.target_did.as_ref() {
         Some(did) => did.to_string(),
@@ -217,7 +217,7 @@ async fn handle_demote_admin(
     .execute(pool)
     .await;
 
-    Json(UpdateConvoOutput {
+    Json(UpdateConvoOutput::<jacquard_common::DefaultStr> {
         success: true,
         new_epoch: None,
         policy: None,
@@ -230,7 +230,7 @@ async fn handle_promote_moderator(
     pool: &DbPool,
     caller_did: &str,
     convo_id: &str,
-    input: &UpdateConvo<'_>,
+    input: &UpdateConvo,
 ) -> Response {
     let target_did = match input.target_did.as_ref() {
         Some(did) => did.to_string(),
@@ -306,7 +306,7 @@ async fn handle_promote_moderator(
     .execute(pool)
     .await;
 
-    Json(UpdateConvoOutput {
+    Json(UpdateConvoOutput::<jacquard_common::DefaultStr> {
         success: true,
         new_epoch: None,
         policy: None,
@@ -319,7 +319,7 @@ async fn handle_demote_moderator(
     pool: &DbPool,
     caller_did: &str,
     convo_id: &str,
-    input: &UpdateConvo<'_>,
+    input: &UpdateConvo,
 ) -> Response {
     let target_did = match input.target_did.as_ref() {
         Some(did) => did.to_string(),
@@ -384,7 +384,7 @@ async fn handle_demote_moderator(
     .execute(pool)
     .await;
 
-    Json(UpdateConvoOutput {
+    Json(UpdateConvoOutput::<jacquard_common::DefaultStr> {
         success: true,
         new_epoch: None,
         policy: None,
@@ -397,7 +397,7 @@ async fn handle_update_policy(
     pool: &DbPool,
     caller_did: &str,
     convo_id: &str,
-    input: &UpdateConvo<'_>,
+    input: &UpdateConvo,
 ) -> Response {
     info!(
         "v2.updateConvo: updatePolicy for {}",
@@ -534,7 +534,7 @@ async fn handle_update_group_info(
     pool: &DbPool,
     caller_did: &str,
     convo_id: &str,
-    input: &UpdateConvo<'_>,
+    input: &UpdateConvo,
 ) -> Response {
     info!(
         "v2.updateConvo: updateGroupInfo for {}",
@@ -605,7 +605,7 @@ async fn handle_update_group_info(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
-    Json(UpdateConvoOutput {
+    Json(UpdateConvoOutput::<jacquard_common::DefaultStr> {
         success: true,
         new_epoch: None,
         policy: None,
@@ -672,7 +672,7 @@ async fn handle_refresh_group_info(
     .unwrap_or(0);
 
     if active_members == 0 {
-        return Json(UpdateConvoOutput {
+        return Json(UpdateConvoOutput::<jacquard_common::DefaultStr> {
             success: true,
             new_epoch: None,
             policy: None,
@@ -697,7 +697,7 @@ async fn handle_refresh_group_info(
         warn!(error = %e, "Failed to emit GroupInfoRefreshRequested event");
     }
 
-    Json(UpdateConvoOutput {
+    Json(UpdateConvoOutput::<jacquard_common::DefaultStr> {
         success: true,
         new_epoch: None,
         policy: None,

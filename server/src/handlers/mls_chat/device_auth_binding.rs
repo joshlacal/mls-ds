@@ -47,7 +47,7 @@ const MSG_BINDING_MISMATCH: &str = "The binding challenge does not match this de
 const MSG_INVALID_SIGNATURE: &str = "The device identity signature is invalid";
 
 #[derive(Debug)]
-pub struct BeginBindingHttpError(pub(crate) StatusCode, BeginDeviceAuthBindingError<'static>);
+pub struct BeginBindingHttpError(pub(crate) StatusCode, BeginDeviceAuthBindingError);
 
 impl IntoResponse for BeginBindingHttpError {
     fn into_response(self) -> Response {
@@ -56,10 +56,7 @@ impl IntoResponse for BeginBindingHttpError {
 }
 
 #[derive(Debug)]
-pub struct CompleteBindingHttpError(
-    pub(crate) StatusCode,
-    CompleteDeviceAuthBindingError<'static>,
-);
+pub struct CompleteBindingHttpError(pub(crate) StatusCode, CompleteDeviceAuthBindingError);
 
 impl IntoResponse for CompleteBindingHttpError {
     fn into_response(self) -> Response {
@@ -219,7 +216,7 @@ pub async fn begin_device_auth_binding(
     Extension(target): Extension<VerifiedRequestTarget>,
     headers: HeaderMap,
     ExtractXrpc(input): ExtractXrpc<BeginDeviceAuthBindingRequest>,
-) -> Result<Json<BeginDeviceAuthBindingOutput<'static>>, BeginBindingHttpError> {
+) -> Result<Json<BeginDeviceAuthBindingOutput>, BeginBindingHttpError> {
     let proof = extract_dpop_proof(&headers).map_err(|_| {
         let error = begin_dpop_error(&headers);
         record_device_auth_binding(MetricEndpoint::Begin, begin_outcome(error.0));
@@ -284,7 +281,7 @@ pub async fn complete_device_auth_binding(
     Extension(target): Extension<VerifiedRequestTarget>,
     headers: HeaderMap,
     ExtractXrpc(input): ExtractXrpc<CompleteDeviceAuthBindingRequest>,
-) -> Result<Json<CompleteDeviceAuthBindingOutput<'static>>, CompleteBindingHttpError> {
+) -> Result<Json<CompleteDeviceAuthBindingOutput>, CompleteBindingHttpError> {
     let proof = extract_dpop_proof(&headers).map_err(|_| {
         let error = complete_dpop_error(&headers);
         record_device_auth_binding(MetricEndpoint::Complete, complete_outcome(error.0));

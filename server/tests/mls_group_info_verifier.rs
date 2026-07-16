@@ -514,6 +514,31 @@ fn trailing_bytes_are_rejected() {
 }
 
 #[test]
+fn noncanonical_variable_length_encoding_is_rejected() {
+    let fixture = valid_fixture();
+    let mut bytes = fixture.bytes;
+    // MLSMessage header (version + wire format), GroupContext version and
+    // ciphersuite occupy the first eight bytes. The group_id VL length follows.
+    let canonical_length = bytes[8];
+    assert!(
+        canonical_length < 64,
+        "fixture group id uses one-byte VL encoding"
+    );
+    bytes[8] = 0x40;
+    bytes.insert(9, canonical_length);
+
+    assert_eq!(
+        verify_group_info(
+            &bytes,
+            &ExpectedGroupInfoSigner::by_signature_key(&fixture.signer_key),
+            GroupInfoVerifierLimits::default(),
+        )
+        .expect_err("non-minimal VL encoding must fail"),
+        GroupInfoVerificationError::Malformed
+    );
+}
+
+#[test]
 fn raw_legacy_group_info_framing_is_rejected() {
     let fixture = valid_fixture();
     let error = verify_group_info(

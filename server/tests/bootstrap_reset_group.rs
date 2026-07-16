@@ -447,7 +447,7 @@ async fn bootstrap_handle_updates_row_and_returns_view() {
     let input = BootstrapResetGroup {
         original_convo_id: ORIGINAL_CONVO_ID.into(),
         new_group_id: NEW_GROUP_ID.into(),
-        cipher_suite: "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519".into(),
+        cipher_suite: catbird_server::generated::blue_catbird::mlsChat::bootstrap_reset_group::BootstrapResetGroupCipherSuite::Mls256XwingChacha20poly1305Sha256Ed25519,
         group_info: group_info_payload.clone(),
         members: vec![string_to_did(ALICE), string_to_did(BOB)],
         welcome_message: None,
@@ -508,8 +508,8 @@ async fn bootstrap_handle_updates_row_and_returns_view() {
     // Inspect ConvoView shape via the returned output.
     let output = result.unwrap();
     assert_eq!(output.convo.epoch, 1);
-    assert_eq!(output.convo.conversation_id.as_ref(), ORIGINAL_CONVO_ID);
-    assert_eq!(output.convo.group_id.as_ref(), NEW_GROUP_ID);
+    assert_eq!(output.convo.conversation_id.as_str(), ORIGINAL_CONVO_ID);
+    assert_eq!(output.convo.group_id.as_str(), NEW_GROUP_ID);
     assert_eq!(output.convo.members.len(), 2, "preserved 2-member roster");
 
     cleanup(&pool, ORIGINAL_CONVO_ID).await;
@@ -527,7 +527,7 @@ async fn bootstrap_handle_with_welcome_inserts_per_recipient_envelopes() {
     let input = BootstrapResetGroup {
         original_convo_id: ORIGINAL_CONVO_ID.into(),
         new_group_id: NEW_GROUP_ID.into(),
-        cipher_suite: "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519".into(),
+        cipher_suite: catbird_server::generated::blue_catbird::mlsChat::bootstrap_reset_group::BootstrapResetGroupCipherSuite::Mls256XwingChacha20poly1305Sha256Ed25519,
         group_info: bytes::Bytes::from_static(b"gi-bytes"),
         members: vec![string_to_did(ALICE), string_to_did(BOB)],
         welcome_message: Some(welcome_payload.clone()),
@@ -683,7 +683,7 @@ async fn bootstrap_self_heal_rejects_partial_welcome_fanout() {
     let input = BootstrapResetGroup {
         original_convo_id: SELFHEAL_CONVO_ID.into(),
         new_group_id: SELFHEAL_NEW_GROUP_ID.into(),
-        cipher_suite: "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519".into(),
+        cipher_suite: catbird_server::generated::blue_catbird::mlsChat::bootstrap_reset_group::BootstrapResetGroupCipherSuite::Mls256XwingChacha20poly1305Sha256Ed25519,
         group_info: bytes::Bytes::from_static(b"selfheal-group-info"),
         members: vec![
             string_to_did(ALICE),

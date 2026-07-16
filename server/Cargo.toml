@@ -51,10 +51,10 @@ jsonwebtoken = "9"
 
 # Jacquard (ATProto types)
 catbird-atproto = { path = "../../catbird-atproto" }
-jacquard-common = "0.9"
-jacquard-axum = "0.9"
-jacquard-derive = "0.9"
-jacquard-lexicon = "0.9"
+jacquard-common = "=0.12.1"
+jacquard-axum = "=0.12.1"
+jacquard-derive = "=0.12.1"
+jacquard-lexicon = "=0.12.1"
 serde_html_form = "0.4"
 miette = "7"
 rustversion = "1"

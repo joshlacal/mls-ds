@@ -20,7 +20,7 @@ pub async fn remove_device(
     State(pool): State<DbPool>,
     auth_user: AuthUser,
     ExtractXrpc(input): ExtractXrpc<RemoveDeviceRequest>,
-) -> Result<Json<RemoveDeviceOutput<'static>>, StatusCode> {
+) -> Result<Json<RemoveDeviceOutput>, StatusCode> {
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
         return Err(StatusCode::UNAUTHORIZED);
     }

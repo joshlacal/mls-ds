@@ -129,10 +129,12 @@ where
                 Ok(proof) => verify(proof.to_owned()).await,
                 Err(_) => Err(DeviceAuthError::MalformedProof),
             };
-            let outcome = if verification.is_ok() {
-                DeviceAuthPolicyMetricOutcome::Verified
-            } else {
-                DeviceAuthPolicyMetricOutcome::WouldDeny
+            let outcome = match verification {
+                Ok(verified) => {
+                    extensions.insert(verified);
+                    DeviceAuthPolicyMetricOutcome::Verified
+                }
+                Err(_) => DeviceAuthPolicyMetricOutcome::WouldDeny,
             };
             record_observation(outcome);
             Ok(())
@@ -232,7 +234,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn observe_passes_invalid_requests_and_records_only_closed_outcomes() {
+    async fn observe_passes_invalid_requests_without_minting_authority() {
         for headers in [HeaderMap::new(), {
             let mut duplicate = proof_headers();
             duplicate.append("dpop", HeaderValue::from_static("second"));
@@ -258,12 +260,9 @@ mod tests {
             assert!(extensions.get::<VerifiedDeviceRequest>().is_none());
         }
 
-        for (verification, expected) in [
-            (Ok(verified()), DeviceAuthPolicyMetricOutcome::Verified),
-            (
-                Err(DeviceAuthError::RegistryMismatch),
-                DeviceAuthPolicyMetricOutcome::WouldDeny,
-            ),
+        for verification in [
+            Err(DeviceAuthError::UntrustedDelegation),
+            Err(DeviceAuthError::RegistryMismatch),
         ] {
             let mut extensions = Extensions::new();
             let outcomes = Arc::new(Mutex::new(Vec::new()));
@@ -278,9 +277,43 @@ mod tests {
             )
             .await;
             assert_eq!(result, Ok(()));
-            assert_eq!(*outcomes.lock().unwrap(), vec![expected]);
+            assert_eq!(
+                *outcomes.lock().unwrap(),
+                vec![DeviceAuthPolicyMetricOutcome::WouldDeny]
+            );
             assert!(extensions.get::<VerifiedDeviceRequest>().is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn observe_inserts_authority_only_after_full_verification_succeeds() {
+        let mut extensions = Extensions::new();
+        let outcomes = Arc::new(Mutex::new(Vec::new()));
+        let outcomes_for_recorder = outcomes.clone();
+
+        assert_eq!(
+            enforce_device_auth_policy_with(
+                DeviceAuthMode::Observe,
+                "blue.catbird.mlsChat.commitGroupChange",
+                &proof_headers(),
+                &mut extensions,
+                |_| async { Ok(verified()) },
+                move |outcome| outcomes_for_recorder.lock().unwrap().push(outcome),
+            )
+            .await,
+            Ok(())
+        );
+
+        assert_eq!(
+            *outcomes.lock().unwrap(),
+            vec![DeviceAuthPolicyMetricOutcome::Verified]
+        );
+        let inserted = extensions
+            .get::<VerifiedDeviceRequest>()
+            .expect("fully verified observe request carries opaque authority");
+        assert_eq!(inserted.user_did(), "did:plc:alice");
+        assert_eq!(inserted.device_id(), "device-a");
+        assert_eq!(inserted.auth_generation(), 7);
     }
 
     #[tokio::test]

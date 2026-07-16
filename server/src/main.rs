@@ -781,23 +781,23 @@ async fn main() -> anyhow::Result<()> {
         auth::AuthMiddleware::new(),
     ));
 
-    // Build receipt signer from the same PEM key used for service auth (if available).
-    let receipt_signer = fed_config.signing_key_pem.as_ref().and_then(|pem| {
-        use p256::pkcs8::DecodePrivateKey;
-        match p256::ecdsa::SigningKey::from_pkcs8_pem(pem) {
-            Ok(sk) => {
-                tracing::info!("Receipt signer initialized");
-                Some(federation::ReceiptSigner::new(
-                    sk,
-                    fed_config.self_did.clone(),
-                ))
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to parse signing key for receipt signer");
-                None
-            }
-        }
-    });
+    // Receipt issuance has its own key and fixed DID verification method.
+    // Issue mode fails startup closed; SIGNING_KEY_PEM is comparison-only and
+    // is never used as a receipt-signing fallback.
+    let receipt_signer = federation::configured_receipt_signer(
+        fed_config.receipt_issuance_mode.as_deref(),
+        fed_config.receipt_signing_key_pem.as_deref(),
+        fed_config.receipt_verification_method.as_deref(),
+        fed_config.signing_key_pem.as_deref(),
+        &fed_config.self_did,
+    )
+    .unwrap_or_else(|error| panic!("Invalid sequencer receipt configuration: {error}"));
+    if receipt_signer.is_some() {
+        tracing::info!(
+            verification_method = federation::RECEIPT_VERIFICATION_METHOD,
+            "Dedicated receipt signer initialized"
+        );
+    }
 
     let sequencer = Arc::new(
         federation::Sequencer::new(db_pool.clone(), fed_config.self_did.clone())

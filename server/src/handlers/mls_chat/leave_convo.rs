@@ -29,7 +29,7 @@ pub async fn leave_convo(
     State(sequencer_transfer): State<Arc<SequencerTransfer>>,
     auth_user: AuthUser,
     ExtractXrpc(input): ExtractXrpc<LeaveConvoRequest>,
-) -> Result<Json<LeaveConvoOutput<'static>>, StatusCode> {
+) -> Result<Json<LeaveConvoOutput>, StatusCode> {
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
         return Err(StatusCode::UNAUTHORIZED);
     }

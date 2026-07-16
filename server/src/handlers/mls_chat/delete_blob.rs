@@ -33,7 +33,7 @@ pub async fn delete_blob(
     let result = sqlx::query(
         "UPDATE blobs SET deleted_at = now() WHERE id = $1 AND owner_did = $2 AND deleted_at IS NULL",
     )
-    .bind(input.blob_id.as_ref())
+    .bind(input.blob_id.as_str())
     .bind(owner_did)
     .execute(&pool)
     .await

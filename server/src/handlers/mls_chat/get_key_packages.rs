@@ -10,7 +10,7 @@ use crate::{
     device_utils::parse_device_did,
     generated::blue_catbird::mlsChat::{
         get_key_packages::{GetKeyPackagesOutput, GetKeyPackagesRequest},
-        KeyPackageRef,
+        KeyPackageRef, KeyPackageRefCipherSuite,
     },
     storage::DbPool,
 };
@@ -84,7 +84,7 @@ pub async fn get_key_packages(
     State(block_sync): State<Arc<BlockSyncService>>,
     auth_user: AuthUser,
     ExtractXrpc(input): ExtractXrpc<GetKeyPackagesRequest>,
-) -> Result<Json<GetKeyPackagesOutput<'static>>, StatusCode> {
+) -> Result<Json<GetKeyPackagesOutput>, StatusCode> {
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -183,7 +183,7 @@ pub async fn get_key_packages(
         })
         .collect();
 
-    let filtered_dids: Vec<jacquard_common::types::string::Did<'static>> = input
+    let filtered_dids: Vec<jacquard_common::types::string::Did> = input
         .dids
         .iter()
         .filter(|d| !blocked_from_caller.contains(&d.to_string()))
@@ -251,12 +251,12 @@ pub async fn get_key_packages(
         mode,
         max_first_contact,
     )?;
-    let filtered_dids: Vec<jacquard_common::types::string::Did<'static>> = filtered_did_strs
+    let filtered_dids: Vec<jacquard_common::types::string::Did> = filtered_did_strs
         .iter()
         .map(|did| crate::sqlx_jacquard::string_to_did(did))
         .collect();
 
-    let mut key_packages: Vec<KeyPackageRef<'static>> = Vec::new();
+    let mut key_packages: Vec<KeyPackageRef> = Vec::new();
     let mut missing: Vec<String> = Vec::new();
 
     // Atomic bulk reservation. One SQL round-trip returns one representative
@@ -343,7 +343,7 @@ pub async fn get_key_packages(
                     crate::metrics::record_key_package_claim("claimed");
                     key_packages.push(KeyPackageRef {
                         did: crate::sqlx_jacquard::string_to_did(&owner_did),
-                        cipher_suite: cipher_suite.into(),
+                        cipher_suite: KeyPackageRefCipherSuite::from_value(cipher_suite.into()),
                         key_package: kp_bytes.into(),
                         key_package_hash: kp_hash.map(Into::into),
                         extra_data: Default::default(),

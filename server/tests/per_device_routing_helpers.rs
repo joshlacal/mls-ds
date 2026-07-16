@@ -106,7 +106,7 @@ async fn seed_convo(pool: &PgPool, convo_id: &str) {
 /// Construct a `KeyPackageHashEntry` for tests. Uses the same direct-struct
 /// form as `tests/bootstrap_reset_group.rs:649` so the test stays robust to
 /// any reshuffling of the lexicon-generated builder API.
-fn make_kp_entry(did_str: &'static str, hash_hex: &'static str) -> KeyPackageHashEntry<'static> {
+fn make_kp_entry(did_str: &'static str, hash_hex: &'static str) -> KeyPackageHashEntry {
     KeyPackageHashEntry {
         did: string_to_did(did_str),
         hash: hash_hex.into(),
@@ -317,7 +317,7 @@ async fn store_welcomes_per_device_empty_kp_hashes_writes_nothing() {
     seed_convo(&pool, &convo_id).await;
 
     let welcome_bytes = vec![0xAA_u8; 256];
-    let empty: Vec<KeyPackageHashEntry<'static>> = Vec::new();
+    let empty: Vec<KeyPackageHashEntry> = Vec::new();
 
     {
         let mut tx = pool.begin().await.expect("begin tx");
@@ -879,7 +879,7 @@ async fn insert_members_per_device_empty_kp_hashes_writes_nothing() {
     common::cleanup(&pool, &convo_id).await;
     seed_convo(&pool, &convo_id).await;
 
-    let empty: Vec<KeyPackageHashEntry<'static>> = Vec::new();
+    let empty: Vec<KeyPackageHashEntry> = Vec::new();
 
     {
         let mut tx = pool.begin().await.expect("begin tx");

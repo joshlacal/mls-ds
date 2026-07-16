@@ -961,10 +961,8 @@ pub async fn get_convos(
 async fn handle_all(
     pool: &DbPool,
     did: &str,
-) -> Result<
-    Json<crate::generated::blue_catbird::mlsChat::get_convos::GetConvosOutput<'static>>,
-    StatusCode,
-> {
+) -> Result<Json<crate::generated::blue_catbird::mlsChat::get_convos::GetConvosOutput>, StatusCode>
+{
     let response = bounded_listing_response(
         pool,
         did,
@@ -978,7 +976,7 @@ async fn handle_all(
     let body = axum::body::to_bytes(response.into_body(), 32 * MIB)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let output: crate::generated::blue_catbird::mlsChat::get_convos::GetConvosOutput<'_> =
+    let output: crate::generated::blue_catbird::mlsChat::get_convos::GetConvosOutput =
         serde_json::from_slice(&body).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(jacquard_common::IntoStatic::into_static(output)))
 }
@@ -2061,7 +2059,7 @@ mod tests {
             .0
             .conversations
             .into_iter()
-            .map(|convo| convo.conversation_id.as_ref().to_string())
+            .map(|convo| convo.conversation_id.as_str().to_string())
             .filter(|convo_id| convo_id.starts_with(prefix))
             .collect()
     }

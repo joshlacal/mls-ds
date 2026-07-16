@@ -46,7 +46,7 @@ pub struct GroupResetBody {
 pub enum GetGroupStateContractError {
     Structured {
         status: StatusCode,
-        error: GetGroupStateError<'static>,
+        error: GetGroupStateError,
     },
     GroupReset {
         status: StatusCode,
@@ -132,8 +132,8 @@ struct RequestedWelcomeHashes {
     hashes: Vec<Vec<u8>>,
 }
 
-fn parse_requested_welcome_hashes(
-    hashes: Option<&Vec<jacquard_common::CowStr<'_>>>,
+fn parse_requested_welcome_hashes<S: AsRef<str>>(
+    hashes: Option<&Vec<S>>,
 ) -> RequestedWelcomeHashes {
     let Some(hashes) = hashes else {
         return RequestedWelcomeHashes {
@@ -431,7 +431,7 @@ pub async fn get_group_state(
     State(inline_trigger_cfg): State<Arc<InlineTriggerConfig>>,
     auth_user: AuthUser,
     ExtractXrpc(params): ExtractXrpc<GetGroupStateRequest>,
-) -> Result<Json<GetGroupStateOutput<'static>>, GetGroupStateContractError> {
+) -> Result<Json<GetGroupStateOutput>, GetGroupStateContractError> {
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
         return Err(GetGroupStateContractError::Generic(
             StatusCode::UNAUTHORIZED,
@@ -693,7 +693,7 @@ pub async fn get_group_state(
         // Defensive against device-form vs user-form ambiguity in
         // `auth_user.did`. Phase B (per-device welcome storage) writes
         // `recipient_did` in user-form (e.g. "did:plc:alice") because
-        // jacquard's `Did<'a>` regex rejects '#'. New rows prefer the
+        // jacquard's `Did` regex rejects '#'. New rows prefer the
         // persisted `recipient_device_id`; legacy rows can still fall back
         // through `key_package_hash`. Task 1's verification of
         // `auth_user.did` for getGroupState callers came back INDIRECT —
@@ -816,7 +816,7 @@ mod tests {
 
     #[test]
     fn welcome_hash_filter_preserves_caller_intent() {
-        let absent = parse_requested_welcome_hashes(None);
+        let absent = parse_requested_welcome_hashes::<jacquard_common::DefaultStr>(None);
         assert!(!absent.was_provided);
         assert!(absent.hashes.is_empty());
 

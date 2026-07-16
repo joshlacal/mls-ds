@@ -379,37 +379,36 @@ fn canonical_did_claim(value: &str) -> Option<&str> {
     }
 }
 
-/// Parse device claims only after the caller has established explicit
-/// trusted-gateway delegation. This stays private so raw bearer material can
+/// Resolve signed device claims for either a direct principal or an explicitly
+/// trusted gateway delegation. This stays private so raw bearer material can
 /// never become transition authority outside the opaque verified artifact.
-fn resolve_gateway_device_claims(
+fn resolve_bearer_device_claims(
     claims: &AtProtoClaims,
     trusted_gateway_dids: Option<&str>,
-    gateway_token: &str,
+    bearer_token: &str,
 ) -> Result<GatewayDeviceClaims, DeviceAuthError> {
     let subject = claims.sub.as_deref().and_then(canonical_did_claim);
-    let issuer = canonical_did_claim(&claims.iss);
-    let delegated = matches!((subject, issuer), (Some(sub), Some(iss)) if sub != iss);
-    if !delegated {
-        return Err(DeviceAuthError::UntrustedDelegation);
-    }
-    let configured_gateways: Option<Vec<&str>> = trusted_gateway_dids
-        .into_iter()
-        .flat_map(|raw| raw.split(','))
-        .map(str::trim)
-        .map(canonical_did_claim)
-        .collect();
-    let trusted = configured_gateways
-        .filter(|gateways| !gateways.is_empty())
-        .is_some_and(|gateways| {
-            gateways
+    let issuer = canonical_did_claim(&claims.iss).ok_or(DeviceAuthError::MissingDeviceClaims)?;
+    let user_did = match subject {
+        None => issuer,
+        Some(subject) if subject == issuer => issuer,
+        Some(subject) => {
+            let configured_gateways: Option<Vec<&str>> = trusted_gateway_dids
                 .into_iter()
-                .any(|candidate| Some(candidate) == issuer)
-        });
-    if !trusted {
-        return Err(DeviceAuthError::UntrustedDelegation);
-    }
-    let mut token_segments = gateway_token.split('.');
+                .flat_map(|raw| raw.split(','))
+                .map(str::trim)
+                .map(canonical_did_claim)
+                .collect();
+            let trusted = configured_gateways
+                .filter(|gateways| !gateways.is_empty())
+                .is_some_and(|gateways| gateways.into_iter().any(|candidate| candidate == issuer));
+            if !trusted {
+                return Err(DeviceAuthError::UntrustedDelegation);
+            }
+            subject
+        }
+    };
+    let mut token_segments = bearer_token.split('.');
     let (Some(_header), Some(payload), Some(_signature), None) = (
         token_segments.next(),
         token_segments.next(),
@@ -426,7 +425,9 @@ fn resolve_gateway_device_claims(
     let device_id = token_payload
         .device_id
         .as_deref()
-        .filter(|v| !v.is_empty() && v.len() <= 200 && v.trim() == *v)
+        .filter(|v| {
+            !v.is_empty() && v.len() <= 200 && v.trim() == *v && !v.chars().any(char::is_whitespace)
+        })
         .ok_or(DeviceAuthError::MissingDeviceClaims)?;
     let jkt = token_payload
         .cnf
@@ -435,7 +436,7 @@ fn resolve_gateway_device_claims(
         .filter(|value| valid_jkt(value))
         .ok_or(DeviceAuthError::MissingDeviceClaims)?;
     Ok(GatewayDeviceClaims {
-        user_did: subject.expect("delegated subject checked").to_string(),
+        user_did: user_did.to_string(),
         device_id: device_id.to_string(),
         dpop_jkt: jkt.to_string(),
     })
@@ -444,13 +445,12 @@ fn resolve_gateway_device_claims(
 fn resolve_verified_gateway_device_claims(
     bearer: &VerifiedGatewayBearer,
 ) -> Result<GatewayDeviceClaims, DeviceAuthError> {
-    if !bearer.delegated_gateway {
-        return Err(DeviceAuthError::UntrustedDelegation);
-    }
     // The opaque artifact exists only after the parent auth module applied the
-    // configured trusted-gateway policy to this exact token.
-    let device =
-        resolve_gateway_device_claims(&bearer.claims, Some(&bearer.claims.iss), &bearer.token)?;
+    // direct-principal or configured trusted-gateway policy to this exact token.
+    let trusted_gateway = bearer
+        .delegated_gateway
+        .then_some(bearer.claims.iss.as_str());
+    let device = resolve_bearer_device_claims(&bearer.claims, trusted_gateway, &bearer.token)?;
     if device.user_did != bearer.effective_user_did {
         return Err(DeviceAuthError::MissingDeviceClaims);
     }
@@ -967,6 +967,10 @@ mod tests {
         format!("e30.{payload}.signature")
     }
 
+    fn token_with_raw_payload(payload: &str) -> String {
+        format!("e30.{}.signature", URL_SAFE_NO_PAD.encode(payload))
+    }
+
     fn enrollment(user_did: &str, device_id: &str, dpop_jkt: &str) -> VerifiedEnrollmentRequest {
         VerifiedEnrollmentRequest {
             user_did: user_did.to_string(),
@@ -1041,10 +1045,10 @@ mod tests {
     }
 
     #[test]
-    fn gateway_claims_require_trusted_delegation_and_exact_device_material() {
+    fn direct_and_trusted_gateway_claims_share_exact_device_material() {
         let jkt = "a".repeat(43);
         let trusted = claims("did:web:nest.example", Some("did:plc:alice"));
-        assert!(resolve_gateway_device_claims(
+        assert!(resolve_bearer_device_claims(
             &trusted,
             Some("did:web:nest.example"),
             &device_token(
@@ -1055,19 +1059,21 @@ mod tests {
             )
         )
         .is_ok());
-        let direct = claims("did:plc:alice", None);
-        assert_eq!(
-            resolve_gateway_device_claims(
+        for subject in [None, Some("did:plc:alice")] {
+            let direct = claims("did:plc:alice", subject);
+            let resolved = resolve_bearer_device_claims(
                 &direct,
                 Some("did:web:nest.example"),
-                &device_token("did:plc:alice", None, Some("device-a"), Some(&jkt))
+                &device_token("did:plc:alice", subject, Some("device-a"), Some(&jkt)),
             )
-            .unwrap_err(),
-            DeviceAuthError::UntrustedDelegation
-        );
+            .expect("direct signed device claims");
+            assert_eq!(resolved.user_did, "did:plc:alice");
+            assert_eq!(resolved.device_id, "device-a");
+            assert_eq!(resolved.dpop_jkt, jkt);
+        }
         let evil = claims("did:web:evil.example", Some("did:plc:alice"));
         assert_eq!(
-            resolve_gateway_device_claims(
+            resolve_bearer_device_claims(
                 &evil,
                 Some("did:web:nest.example"),
                 &device_token(
@@ -1081,7 +1087,7 @@ mod tests {
             DeviceAuthError::UntrustedDelegation
         );
         assert_eq!(
-            resolve_gateway_device_claims(
+            resolve_bearer_device_claims(
                 &trusted,
                 Some("did:web:nest.example"),
                 &device_token(
@@ -1105,7 +1111,7 @@ mod tests {
             Some("device-a"),
             Some(&jkt),
         );
-        assert!(resolve_gateway_device_claims(
+        assert!(resolve_bearer_device_claims(
             &fragmented,
             Some("did:web:other.example, did:web:nest.example#configured-key"),
             &fragmented_token,
@@ -1119,7 +1125,7 @@ mod tests {
             "not-a-did,did:web:nest.example",
         ] {
             assert_eq!(
-                resolve_gateway_device_claims(&fragmented, Some(rejected), &fragmented_token)
+                resolve_bearer_device_claims(&fragmented, Some(rejected), &fragmented_token)
                     .unwrap_err(),
                 DeviceAuthError::UntrustedDelegation
             );
@@ -1146,6 +1152,46 @@ mod tests {
         assert_eq!(resolved.dpop_jkt, "a".repeat(43));
         assert_ne!(accepted.token, substituted);
         assert!(!format!("{accepted:?}").contains(&accepted.token));
+    }
+
+    #[test]
+    fn signed_device_claims_reject_wrong_principal_duplicate_and_whitespace_material() {
+        let direct = claims("did:plc:alice", None);
+        let jkt = "a".repeat(43);
+        for payload in [
+            format!(
+                r#"{{"iss":"did:plc:alice","sub":"did:plc:bob","device_id":"device-a","cnf":{{"jkt":"{jkt}"}}}}"#
+            ),
+            format!(
+                r#"{{"iss":"did:plc:alice","sub":null,"device_id":"device-a","device_id":"device-b","cnf":{{"jkt":"{jkt}"}}}}"#
+            ),
+            format!(
+                r#"{{"iss":"did:plc:alice","sub":null,"device_id":"device a","cnf":{{"jkt":"{jkt}"}}}}"#
+            ),
+            format!(
+                r#"{{"iss":"did:plc:alice","sub":null,"device_id":"device-a","cnf":{{"jkt":"{jkt}","jkt":"{jkt}"}}}}"#
+            ),
+        ] {
+            assert_eq!(
+                resolve_bearer_device_claims(&direct, None, &token_with_raw_payload(&payload))
+                    .unwrap_err(),
+                DeviceAuthError::MissingDeviceClaims,
+                "accepted payload: {payload}"
+            );
+        }
+
+        let mut wrong_effective = VerifiedGatewayBearer {
+            claims: direct.clone(),
+            token: device_token("did:plc:alice", None, Some("device-a"), Some(&jkt)),
+            effective_user_did: "did:plc:bob".into(),
+            delegated_gateway: false,
+        };
+        assert_eq!(
+            resolve_verified_gateway_device_claims(&wrong_effective).unwrap_err(),
+            DeviceAuthError::MissingDeviceClaims
+        );
+        wrong_effective.effective_user_did = "did:plc:alice".into();
+        assert!(resolve_verified_gateway_device_claims(&wrong_effective).is_ok());
     }
 
     #[test]

@@ -29,7 +29,7 @@ pub async fn check_blocks_post(
     State(block_sync): State<Arc<BlockSyncService>>,
     auth_user: AuthUser,
     ExtractXrpc(input): ExtractXrpc<CheckBlocksRequest>,
-) -> Result<Json<CheckBlocksOutput<'static>>, StatusCode> {
+) -> Result<Json<CheckBlocksOutput>, StatusCode> {
     if let Err(_e) = enforce_standard(&auth_user.claims, NSID) {
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -46,7 +46,7 @@ pub async fn check_blocks_post(
     }
 
     let now = chrono::Utc::now();
-    let mut blocks: Vec<BlockRelationship<'static>> = Vec::new();
+    let mut blocks: Vec<BlockRelationship> = Vec::new();
 
     match block_sync.check_block_conflicts(&did_strs).await {
         Ok(conflicts) => {

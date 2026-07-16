@@ -10,7 +10,7 @@ use crate::{
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResolveDeliveryServiceOutput<'a> {
-    did: jacquard_common::types::string::Did<'a>,
+    did: jacquard_common::types::string::Did,
     endpoint: jacquard_common::CowStr<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     supported_cipher_suites: Option<Vec<jacquard_common::CowStr<'a>>>,
@@ -55,11 +55,12 @@ pub async fn resolve(
     })?;
 
     let endpoint =
-        jacquard_common::types::string::Uri::new_owned(&ds_endpoint.endpoint).map_err(|e| {
-            FederationError::ResolutionFailed {
-                did: user_did.clone(),
-                reason: format!("Invalid endpoint URI: {}", e),
-            }
+        jacquard_common::types::string::UriValue::<jacquard_common::DefaultStr>::new_owned(
+            &ds_endpoint.endpoint,
+        )
+        .map_err(|e| FederationError::ResolutionFailed {
+            did: user_did.clone(),
+            reason: format!("Invalid endpoint URI: {}", e),
         })?;
 
     let supported_cipher_suites = ds_endpoint.supported_cipher_suites.map(|suites| {

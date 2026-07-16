@@ -22,7 +22,7 @@ pub async fn get_pending_devices(
     State(pool): State<DbPool>,
     auth_user: AuthUser,
     ExtractXrpc(input): ExtractXrpc<GetPendingDevicesRequest>,
-) -> Result<Json<GetPendingDevicesOutput<'static>>, StatusCode> {
+) -> Result<Json<GetPendingDevicesOutput>, StatusCode> {
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -164,7 +164,7 @@ pub async fn get_pending_devices(
 
     info!("Found {} pending device additions for user", rows.len());
 
-    let pending_additions: Vec<PendingDeviceAddition<'static>> = rows
+    let pending_additions: Vec<PendingDeviceAddition> = rows
         .into_iter()
         .map(|r| PendingDeviceAddition {
             convo_id: r.get::<String, _>("convo_id").into(),
