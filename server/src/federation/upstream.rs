@@ -24,12 +24,16 @@ use crate::federation::errors::FederationError;
 use crate::federation::resolver::DsResolver;
 use crate::federation::service_auth::ServiceAuthClient;
 use crate::realtime::sse::StreamEvent;
+use crate::util::outbound_body::{
+    decode_json_bounded, summarize_error_body, ResponseBodyBudget, ORDINARY_DS_CONTROL_MAX_BYTES,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const TICKET_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const TICKET_METHOD: &str = "blue.catbird.mlsChat.getSubscriptionTicket";
 const SUBSCRIBE_METHOD: &str = "blue.catbird.mlsChat.subscribeEvents";
 const RECONNECT_BASE: Duration = Duration::from_secs(1);
@@ -421,6 +425,22 @@ async fn connect_and_stream(ctx: &ReaderTaskContext) -> Result<(), FederationErr
 
 /// Acquire a subscription ticket from the sequencer DS using service auth.
 async fn acquire_ticket(ctx: &ReaderTaskContext) -> Result<String, FederationError> {
+    acquire_ticket_with_timeout(ctx, TICKET_REQUEST_TIMEOUT).await
+}
+
+async fn acquire_ticket_with_timeout(
+    ctx: &ReaderTaskContext,
+    timeout: Duration,
+) -> Result<String, FederationError> {
+    let started_at = tokio::time::Instant::now();
+    let deadline =
+        started_at
+            .checked_add(timeout)
+            .ok_or_else(|| FederationError::DsUnreachable {
+                endpoint: "remote DS".into(),
+                reason: "Ticket request deadline could not be computed".into(),
+            })?;
+
     let token = ctx
         .auth
         .sign_request(&ctx.sequencer_did, TICKET_METHOD)
@@ -434,35 +454,45 @@ async fn acquire_ticket(ctx: &ReaderTaskContext) -> Result<String, FederationErr
       "convoId": ctx.convo_id,
     });
 
-    let resp = ctx
+    let send = ctx
         .http
         .post(&url)
         .bearer_auth(&token)
         .header("atproto-proxy", &ctx.self_did)
         .json(&body)
-        .send()
+        .send();
+    let resp = tokio::time::timeout_at(deadline, send)
         .await
-        .map_err(|e| FederationError::DsUnreachable {
-            endpoint: ctx.endpoint_url.clone(),
-            reason: format!("Ticket request failed: {e}"),
+        .map_err(|_| FederationError::DsUnreachable {
+            endpoint: "remote DS".into(),
+            reason: "Ticket request deadline exceeded".into(),
+        })?
+        .map_err(|_| FederationError::DsUnreachable {
+            endpoint: "remote DS".into(),
+            reason: "Ticket request failed".into(),
         })?;
 
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
-        let body_text = resp.text().await.unwrap_or_default();
+        let summary = summarize_error_body(resp, deadline)
+            .await
+            .map(|summary| summary.to_string())
+            .unwrap_or_else(|error| format!("error response metadata unavailable: {error}"));
         return Err(FederationError::RemoteError {
             status,
-            body: body_text,
+            body: summary,
         });
     }
 
-    let ticket_resp: TicketResponse =
-        resp.json()
-            .await
-            .map_err(|e| FederationError::RemoteError {
-                status: 200,
-                body: format!("Failed to parse ticket response: {e}"),
-            })?;
+    let ticket_resp: TicketResponse = decode_json_bounded(
+        resp,
+        ResponseBodyBudget::new(ORDINARY_DS_CONTROL_MAX_BYTES, deadline),
+    )
+    .await
+    .map_err(|error| FederationError::RemoteError {
+        status: 200,
+        body: format!("Failed to parse ticket response: {error}"),
+    })?;
 
     Ok(ticket_resp.ticket)
 }
@@ -524,6 +554,203 @@ fn extract_cursor(event: &StreamEvent) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        body::Body,
+        http::{Response, StatusCode},
+        routing::post,
+        Json, Router,
+    };
+    use bytes::Bytes;
+    use futures::stream;
+    use serde_json::json;
+    use std::convert::Infallible;
+    use tokio::net::TcpListener;
+
+    async fn spawn_ticket_server(router: Router) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        format!("http://{address}")
+    }
+
+    fn ticket_context(endpoint_url: String) -> ReaderTaskContext {
+        let (tx, _) = broadcast::channel(1);
+        ReaderTaskContext {
+            key: UpstreamKey {
+                sequencer_did: "did:web:sequencer.test".into(),
+                convo_id: "convo-test".into(),
+            },
+            endpoint_url,
+            sequencer_did: "did:web:sequencer.test".into(),
+            convo_id: "convo-test".into(),
+            auth: Arc::new(ServiceAuthClient::from_shared_secret(
+                "did:web:local.test".into(),
+                b"test-only-secret",
+            )),
+            http: reqwest::Client::new(),
+            self_did: "did:web:local.test".into(),
+            tx,
+            cancel: CancellationToken::new(),
+            last_cursor: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_ticket_response_succeeds() {
+        let router = Router::new().route(
+            &format!("/xrpc/{TICKET_METHOD}"),
+            post(|| async { Json(json!({ "ticket": "bounded-ticket" })) }),
+        );
+        let context = ticket_context(spawn_ticket_server(router).await);
+
+        let ticket = acquire_ticket_with_timeout(&context, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        assert_eq!(ticket, "bounded-ticket");
+    }
+
+    #[tokio::test]
+    async fn declared_ticket_body_over_one_mib_is_rejected() {
+        let router = Router::new().route(
+            &format!("/xrpc/{TICKET_METHOD}"),
+            post(|| async {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from(vec![b' '; ORDINARY_DS_CONTROL_MAX_BYTES + 1]))
+                    .unwrap()
+            }),
+        );
+        let context = ticket_context(spawn_ticket_server(router).await);
+
+        let error = acquire_ticket_with_timeout(&context, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            FederationError::RemoteError { status: 200, ref body }
+                if body.contains("exceeding limit 1048576")
+        ));
+    }
+
+    #[tokio::test]
+    async fn chunked_ticket_body_over_one_mib_is_rejected() {
+        let router = Router::new().route(
+            &format!("/xrpc/{TICKET_METHOD}"),
+            post(|| async {
+                let chunks = vec![
+                    Ok::<_, Infallible>(Bytes::from(vec![b' '; 700 * 1024])),
+                    Ok::<_, Infallible>(Bytes::from(vec![b' '; 400 * 1024])),
+                ];
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from_stream(stream::iter(chunks)))
+                    .unwrap()
+            }),
+        );
+        let context = ticket_context(spawn_ticket_server(router).await);
+
+        let error = acquire_ticket_with_timeout(&context, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            FederationError::RemoteError { status: 200, ref body }
+                if body.contains("exceeding limit 1048576")
+        ));
+    }
+
+    #[tokio::test]
+    async fn ticket_headers_and_body_share_one_deadline() {
+        let router = Router::new().route(
+            &format!("/xrpc/{TICKET_METHOD}"),
+            post(|| async {
+                tokio::time::sleep(Duration::from_millis(45)).await;
+                let chunks = stream::once(async {
+                    tokio::time::sleep(Duration::from_millis(45)).await;
+                    Ok::<_, Infallible>(Bytes::from_static(br#"{"ticket":"too-late"}"#))
+                });
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from_stream(chunks))
+                    .unwrap()
+            }),
+        );
+        let context = ticket_context(spawn_ticket_server(router).await);
+
+        let error = acquire_ticket_with_timeout(&context, Duration::from_millis(70))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            FederationError::RemoteError { status: 200, ref body }
+                if body.contains("deadline exceeded")
+        ));
+    }
+
+    #[tokio::test]
+    async fn non_success_preserves_status_without_body_content() {
+        const CANARY: &str = "ticket=canary-secret bearer=canary-token cookie=canary-cookie";
+        let router = Router::new().route(
+            &format!("/xrpc/{TICKET_METHOD}"),
+            post(|| async {
+                Response::builder()
+                    .status(StatusCode::IM_A_TEAPOT)
+                    .body(Body::from(CANARY))
+                    .unwrap()
+            }),
+        );
+        let context = ticket_context(spawn_ticket_server(router).await);
+
+        let error = acquire_ticket_with_timeout(&context, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+
+        assert!(matches!(
+            error,
+            FederationError::RemoteError { status: 418, .. }
+        ));
+        assert!(!display.contains(CANARY));
+        assert!(!debug.contains(CANARY));
+        assert!(!display.contains("canary"));
+        assert!(!debug.contains("canary"));
+    }
+
+    #[tokio::test]
+    async fn malformed_bounded_ticket_keeps_remote_error_shape() {
+        const CANARY: &str = "malformed-canary-ticket";
+        let router = Router::new().route(
+            &format!("/xrpc/{TICKET_METHOD}"),
+            post(|| async {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from(CANARY))
+                    .unwrap()
+            }),
+        );
+        let context = ticket_context(spawn_ticket_server(router).await);
+
+        let error = acquire_ticket_with_timeout(&context, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+
+        assert!(matches!(
+            error,
+            FederationError::RemoteError { status: 200, ref body }
+                if body.starts_with("Failed to parse ticket response:")
+        ));
+        assert!(!display.contains(CANARY));
+        assert!(!debug.contains(CANARY));
+    }
 
     #[test]
     fn test_upstream_key_eq() {
