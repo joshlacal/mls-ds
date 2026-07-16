@@ -7,6 +7,12 @@ use tracing::{debug, error};
 
 use super::errors::FederationError;
 use super::resolver::DsResolver;
+use crate::util::outbound_body::{
+    decode_json_bounded, OutboundBodyError, ResponseBodyBudget, PROFILE_OR_DEVICE_MAX_BYTES,
+};
+
+const OUTBOUND_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_DEVICE_RECORDS: usize = 100;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceRecord {
@@ -82,6 +88,23 @@ impl DeviceRecordClient {
     async fn fetch_from_pds(&self, did: &str) -> Result<Vec<DeviceRecord>, FederationError> {
         let pds_endpoint = self.resolver.resolve_did_to_pds(did).await?;
 
+        self.fetch_from_pds_endpoint(did, &pds_endpoint, OUTBOUND_REQUEST_TIMEOUT)
+            .await
+    }
+
+    async fn fetch_from_pds_endpoint(
+        &self,
+        did: &str,
+        pds_endpoint: &str,
+        timeout: Duration,
+    ) -> Result<Vec<DeviceRecord>, FederationError> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| FederationError::ResolutionFailed {
+                did: did.to_string(),
+                reason: "HTTP request deadline overflow".to_string(),
+            })?;
+
         // com.atproto.repo.listRecords
         // Using "blue.catbird.mlsChat.device" collection
         let url = format!(
@@ -93,15 +116,8 @@ impl DeviceRecordClient {
         debug!("Fetching device records for {} from {}", did, url);
 
         let resp = self
-            .http
-            .get(&url)
-            .timeout(Duration::from_secs(10))
-            .send()
-            .await
-            .map_err(|e| FederationError::ResolutionFailed {
-                did: did.to_string(),
-                reason: format!("HTTP request failed: {}", e),
-            })?;
+            .send_before_deadline(self.http.get(&url), deadline, did)
+            .await?;
 
         if !resp.status().is_success() {
             return Err(FederationError::ResolutionFailed {
@@ -110,13 +126,12 @@ impl DeviceRecordClient {
             });
         }
 
-        let body: serde_json::Value =
-            resp.json()
-                .await
-                .map_err(|e| FederationError::ResolutionFailed {
-                    did: did.to_string(),
-                    reason: format!("Invalid JSON response: {}", e),
-                })?;
+        let body: serde_json::Value = decode_json_bounded(
+            resp,
+            ResponseBodyBudget::new(PROFILE_OR_DEVICE_MAX_BYTES, deadline),
+        )
+        .await
+        .map_err(|error| Self::response_decode_error(did, error))?;
 
         // Extract records array
         let records_json = body
@@ -127,6 +142,13 @@ impl DeviceRecordClient {
                 reason: "No 'records' field in listRecords response".to_string(),
             })?;
 
+        if records_json.len() > MAX_DEVICE_RECORDS {
+            return Err(FederationError::ResolutionFailed {
+                did: did.to_string(),
+                reason: format!("PDS returned more than {MAX_DEVICE_RECORDS} device records"),
+            });
+        }
+
         let mut records = Vec::new();
         for record_json in records_json {
             match serde_json::from_value::<DeviceRecord>(record_json.clone()) {
@@ -134,7 +156,6 @@ impl DeviceRecordClient {
                 Err(e) => {
                     // Log but don't fail entire fetch
                     error!("Failed to parse device record for {}: {}", did, e);
-                    debug!("Record JSON: {:?}", record_json);
                 }
             }
         }
@@ -149,6 +170,23 @@ impl DeviceRecordClient {
     pub async fn get_chat_policy(&self, did: &str) -> Result<MLSChatPolicy, FederationError> {
         let pds_endpoint = self.resolver.resolve_did_to_pds(did).await?;
 
+        self.get_chat_policy_from_endpoint(did, &pds_endpoint, OUTBOUND_REQUEST_TIMEOUT)
+            .await
+    }
+
+    async fn get_chat_policy_from_endpoint(
+        &self,
+        did: &str,
+        pds_endpoint: &str,
+        timeout: Duration,
+    ) -> Result<MLSChatPolicy, FederationError> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| FederationError::ResolutionFailed {
+                did: did.to_string(),
+                reason: "HTTP request deadline overflow".to_string(),
+            })?;
+
         let url = format!(
             "{}/xrpc/com.atproto.repo.getRecord?repo={}&collection=blue.catbird.mlsChat.policy&rkey=self",
             pds_endpoint,
@@ -158,15 +196,8 @@ impl DeviceRecordClient {
         debug!("Fetching chat policy for {} from {}", did, url);
 
         let resp = self
-            .http
-            .get(&url)
-            .timeout(Duration::from_secs(10))
-            .send()
-            .await
-            .map_err(|e| FederationError::ResolutionFailed {
-                did: did.to_string(),
-                reason: format!("HTTP request failed: {}", e),
-            })?;
+            .send_before_deadline(self.http.get(&url), deadline, did)
+            .await?;
 
         if !resp.status().is_success() {
             // 400/404 is expected if user hasn't set a policy yet
@@ -178,13 +209,12 @@ impl DeviceRecordClient {
             return Ok(MLSChatPolicy::default());
         }
 
-        let body: serde_json::Value =
-            resp.json()
-                .await
-                .map_err(|e| FederationError::ResolutionFailed {
-                    did: did.to_string(),
-                    reason: format!("Invalid JSON response: {}", e),
-                })?;
+        let body: serde_json::Value = decode_json_bounded(
+            resp,
+            ResponseBodyBudget::new(PROFILE_OR_DEVICE_MAX_BYTES, deadline),
+        )
+        .await
+        .map_err(|error| Self::response_decode_error(did, error))?;
 
         // The record value is in body.value
         let value = body.get("value").unwrap_or(&body);
@@ -204,6 +234,35 @@ impl DeviceRecordClient {
 
         Ok(policy)
     }
+
+    async fn send_before_deadline(
+        &self,
+        request: reqwest::RequestBuilder,
+        deadline: tokio::time::Instant,
+        did: &str,
+    ) -> Result<reqwest::Response, FederationError> {
+        tokio::time::timeout_at(deadline, request.send())
+            .await
+            .map_err(|_| FederationError::ResolutionFailed {
+                did: did.to_string(),
+                reason: "HTTP request failed: outbound request deadline exceeded".to_string(),
+            })?
+            .map_err(|error| FederationError::ResolutionFailed {
+                did: did.to_string(),
+                reason: format!("HTTP request failed: {error}"),
+            })
+    }
+
+    fn response_decode_error(did: &str, error: OutboundBodyError) -> FederationError {
+        let category = match error {
+            OutboundBodyError::InvalidJson(_) => "Invalid JSON response",
+            _ => "Response body rejected",
+        };
+        FederationError::ResolutionFailed {
+            did: did.to_string(),
+            reason: format!("{category}: {error}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -212,4 +271,328 @@ pub struct MLSChatPolicy {
     pub allow_following_bypass: Option<bool>,
     pub who_can_message_me: Option<String>,
     pub auto_expire_days: Option<i32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{Response, StatusCode},
+        routing::get,
+        Router,
+    };
+    use bytes::Bytes;
+    use futures::stream;
+    use serde_json::{json, Value};
+    use sqlx::postgres::PgPoolOptions;
+    use std::convert::Infallible;
+    use tokio::net::TcpListener;
+
+    const TEST_DID: &str = "did:example:alice";
+
+    fn device_record(index: usize) -> Value {
+        json!({
+            "uri": format!("at://{TEST_DID}/blue.catbird.mlsChat.device/{index}"),
+            "cid": format!("cid-{index}"),
+            "value": {
+                "$type": "blue.catbird.mlsChat.device",
+                "mlsSignaturePublicKey": { "$bytes": "AQID" },
+                "algorithm": "ed25519",
+                "createdAt": "2026-07-16T00:00:00Z"
+            }
+        })
+    }
+
+    async fn spawn_pds(router: Router) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        format!("http://{address}")
+    }
+
+    fn client() -> DeviceRecordClient {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@127.0.0.1/unused")
+            .unwrap();
+        let http = Client::new();
+        let resolver = Arc::new(DsResolver::new(
+            pool,
+            http.clone(),
+            TEST_DID.to_string(),
+            "https://unused.invalid".to_string(),
+            None,
+            300,
+        ));
+        DeviceRecordClient::new(http, resolver)
+    }
+
+    fn resolution_reason(error: FederationError) -> String {
+        match error {
+            FederationError::ResolutionFailed { did, reason } => {
+                assert_eq!(did, TEST_DID);
+                reason
+            }
+            other => panic!("expected ResolutionFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn device_list_accepts_100_records_and_rejects_101() {
+        async fn list_records() -> Response<Body> {
+            let count = 101;
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::from(
+                    json!({
+                        "records": (0..count).map(device_record).collect::<Vec<_>>()
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        }
+
+        let endpoint =
+            spawn_pds(Router::new().route("/xrpc/com.atproto.repo.listRecords", get(list_records)))
+                .await;
+        let error = client()
+            .fetch_from_pds_endpoint(TEST_DID, &endpoint, Duration::from_secs(10))
+            .await
+            .unwrap_err();
+
+        assert!(resolution_reason(error).contains("more than 100"));
+
+        async fn exact_list() -> Response<Body> {
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::from(
+                    json!({
+                        "records": (0..100).map(device_record).collect::<Vec<_>>()
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        }
+        let endpoint =
+            spawn_pds(Router::new().route("/xrpc/com.atproto.repo.listRecords", get(exact_list)))
+                .await;
+        assert_eq!(
+            client()
+                .fetch_from_pds_endpoint(TEST_DID, &endpoint, Duration::from_secs(10))
+                .await
+                .unwrap()
+                .len(),
+            100
+        );
+    }
+
+    #[tokio::test]
+    async fn device_list_rejects_declared_and_chunked_oversize_bodies() {
+        async fn declared() -> Response<Body> {
+            let body = vec![b' '; crate::util::outbound_body::PROFILE_OR_DEVICE_MAX_BYTES + 1];
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-length", body.len().to_string())
+                .body(Body::from(body))
+                .unwrap()
+        }
+        let endpoint =
+            spawn_pds(Router::new().route("/xrpc/com.atproto.repo.listRecords", get(declared)))
+                .await;
+        let reason = resolution_reason(
+            client()
+                .fetch_from_pds_endpoint(TEST_DID, &endpoint, Duration::from_secs(10))
+                .await
+                .unwrap_err(),
+        );
+        assert!(reason.contains("exceeding limit"), "{reason}");
+        assert!(!reason.contains("Invalid JSON response"), "{reason}");
+
+        async fn chunked() -> Response<Body> {
+            let chunks = stream::iter([
+                Ok::<_, Infallible>(Bytes::from(vec![
+                    b' ';
+                    crate::util::outbound_body::PROFILE_OR_DEVICE_MAX_BYTES
+                ])),
+                Ok(Bytes::from_static(b"x")),
+            ]);
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::from_stream(chunks))
+                .unwrap()
+        }
+        let endpoint =
+            spawn_pds(Router::new().route("/xrpc/com.atproto.repo.listRecords", get(chunked)))
+                .await;
+        let reason = resolution_reason(
+            client()
+                .fetch_from_pds_endpoint(TEST_DID, &endpoint, Duration::from_secs(10))
+                .await
+                .unwrap_err(),
+        );
+        assert!(reason.contains("exceeding limit"), "{reason}");
+        assert!(!reason.contains("Invalid JSON response"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn device_malformed_json_and_non_success_keep_resolution_failed_mapping() {
+        async fn malformed() -> Response<Body> {
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::from(r#"{"secret":"do-not-log","#))
+                .unwrap()
+        }
+        let endpoint =
+            spawn_pds(Router::new().route("/xrpc/com.atproto.repo.listRecords", get(malformed)))
+                .await;
+        let reason = resolution_reason(
+            client()
+                .fetch_from_pds_endpoint(TEST_DID, &endpoint, Duration::from_secs(10))
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(
+            reason,
+            "Invalid JSON response: outbound response JSON was invalid"
+        );
+        assert!(!reason.contains("do-not-log"));
+
+        async fn unavailable() -> StatusCode {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        let endpoint =
+            spawn_pds(Router::new().route("/xrpc/com.atproto.repo.listRecords", get(unavailable)))
+                .await;
+        let reason = resolution_reason(
+            client()
+                .fetch_from_pds_endpoint(TEST_DID, &endpoint, Duration::from_secs(10))
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(reason, "PDS returned status 503 Service Unavailable");
+    }
+
+    #[tokio::test]
+    async fn policy_non_success_returns_default_without_collecting_body() {
+        for status in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::NOT_FOUND,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            let endpoint = spawn_pds(Router::new().route(
+                "/xrpc/com.atproto.repo.getRecord",
+                get(move || async move {
+                    Response::builder()
+                        .status(status)
+                        .body(Body::from_stream(stream::pending::<
+                            Result<Bytes, Infallible>,
+                        >()))
+                        .unwrap()
+                }),
+            ))
+            .await;
+            let policy = tokio::time::timeout(
+                Duration::from_millis(250),
+                client().get_chat_policy_from_endpoint(
+                    TEST_DID,
+                    &endpoint,
+                    Duration::from_secs(10),
+                ),
+            )
+            .await
+            .expect("non-success policy response must not collect its body")
+            .unwrap();
+
+            assert!(policy.allow_followers_bypass.is_none());
+            assert!(policy.allow_following_bypass.is_none());
+            assert!(policy.who_can_message_me.is_none());
+            assert!(policy.auto_expire_days.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_success_rejects_declared_and_chunked_oversize_bodies() {
+        async fn declared() -> Response<Body> {
+            let body = vec![b' '; crate::util::outbound_body::PROFILE_OR_DEVICE_MAX_BYTES + 1];
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-length", body.len().to_string())
+                .body(Body::from(body))
+                .unwrap()
+        }
+        let endpoint =
+            spawn_pds(Router::new().route("/xrpc/com.atproto.repo.getRecord", get(declared))).await;
+        let reason = resolution_reason(
+            client()
+                .get_chat_policy_from_endpoint(TEST_DID, &endpoint, Duration::from_secs(10))
+                .await
+                .unwrap_err(),
+        );
+        assert!(reason.contains("exceeding limit"), "{reason}");
+        assert!(!reason.contains("Invalid JSON response"), "{reason}");
+
+        async fn chunked() -> Response<Body> {
+            let chunks = stream::iter([
+                Ok::<_, Infallible>(Bytes::from(vec![
+                    b' ';
+                    crate::util::outbound_body::PROFILE_OR_DEVICE_MAX_BYTES
+                ])),
+                Ok(Bytes::from_static(b"x")),
+            ]);
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::from_stream(chunks))
+                .unwrap()
+        }
+        let endpoint =
+            spawn_pds(Router::new().route("/xrpc/com.atproto.repo.getRecord", get(chunked))).await;
+        let reason = resolution_reason(
+            client()
+                .get_chat_policy_from_endpoint(TEST_DID, &endpoint, Duration::from_secs(10))
+                .await
+                .unwrap_err(),
+        );
+        assert!(reason.contains("exceeding limit"), "{reason}");
+        assert!(!reason.contains("Invalid JSON response"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn slow_headers_and_body_share_one_pre_send_deadline() {
+        async fn slow_response() -> Response<Body> {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let body = stream::once(async {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                Ok::<_, Infallible>(Bytes::from_static(br#"{"records":[]}"#))
+            });
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::from_stream(body))
+                .unwrap()
+        }
+        let endpoint = spawn_pds(
+            Router::new().route("/xrpc/com.atproto.repo.listRecords", get(slow_response)),
+        )
+        .await;
+
+        let reason = resolution_reason(
+            client()
+                .fetch_from_pds_endpoint(TEST_DID, &endpoint, Duration::from_millis(120))
+                .await
+                .unwrap_err(),
+        );
+
+        assert!(reason.contains("deadline exceeded"), "{reason}");
+        assert!(!reason.contains("Invalid JSON response"), "{reason}");
+    }
+
+    #[test]
+    fn success_paths_have_no_unbounded_response_collectors() {
+        let source = include_str!("declaration_client.rs");
+        for suffix in [".json()", ".bytes()", ".text()"] {
+            let needle = ["resp", suffix].concat();
+            assert!(!source.contains(&needle), "found {needle}");
+        }
+    }
 }
