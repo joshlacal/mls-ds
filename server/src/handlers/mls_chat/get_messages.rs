@@ -212,10 +212,10 @@ where
 }
 
 fn enforce_serialized_budget(
-    mut output: GetMessagesOutput<'static>,
+    mut output: GetMessagesOutput,
     had_eligible: bool,
     final_sequence_sort: bool,
-) -> Result<GetMessagesOutput<'static>, StatusCode> {
+) -> Result<GetMessagesOutput, StatusCode> {
     if final_sequence_sort
         && output
             .messages
@@ -287,7 +287,7 @@ pub async fn get_messages(
     auth_user: AuthUser,
     RawQuery(extra_query): RawQuery,
     ExtractXrpc(params): ExtractXrpc<GetMessagesRequest>,
-) -> Result<Json<GetMessagesOutput<'static>>, StatusCode> {
+) -> Result<Json<GetMessagesOutput>, StatusCode> {
     let extra_query_str = extra_query.as_deref().unwrap_or("");
 
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
@@ -437,14 +437,7 @@ pub async fn get_messages(
 // type="app" — inline of v1 get_messages
 // ---------------------------------------------------------------------------
 
-type AppFetchResult = (
-    Vec<MessageView<'static>>,
-    Option<i64>,
-    Option<i64>,
-    i64,
-    bool,
-    bool,
-);
+type AppFetchResult = (Vec<MessageView>, Option<i64>, Option<i64>, i64, bool, bool);
 
 async fn begin_read_snapshot(
     pool: &DbPool,
@@ -593,12 +586,12 @@ async fn fetch_app_messages_in_snapshot(
     let suppressed_before_join =
         count_suppressed_before_join(tx, convo_id, since_seq, join_epoch).await?;
 
-    let message_views: Vec<MessageView<'static>> = messages
+    let message_views: Vec<MessageView> = messages
         .into_iter()
         .map(|m| {
             let mut extra = std::collections::BTreeMap::new();
             extra.insert(
-                jacquard_common::smol_str::SmolStr::new("resetGeneration"),
+                jacquard_common::SmolStr::new("resetGeneration"),
                 jacquard_common::types::value::Data::Integer(m.reset_generation as i64),
             );
             // Same legacy-row migration as fetch_commits below.
@@ -692,7 +685,7 @@ async fn count_suppressed_before_join(
 // type="commit" — inline of v1 get_commits
 // ---------------------------------------------------------------------------
 
-type CommitFetchResult = (Vec<MessageView<'static>>, i64, bool, bool);
+type CommitFetchResult = (Vec<MessageView>, i64, bool, bool);
 
 async fn fetch_commits(
     pool: &DbPool,
@@ -865,17 +858,17 @@ async fn fetch_commits_in_snapshot(
         .map(|commit| (commits.len() as i64) < commit.candidate_count)
         .unwrap_or(first_raw_size.is_some());
     let raw_used = commits.iter().map(|commit| commit.raw_size).sum();
-    let commit_views: Vec<MessageView<'static>> = commits
+    let commit_views: Vec<MessageView> = commits
         .into_iter()
         .map(|c| {
             let mut extra = std::collections::BTreeMap::new();
             extra.insert(
-                jacquard_common::smol_str::SmolStr::new("resetGeneration"),
+                jacquard_common::SmolStr::new("resetGeneration"),
                 jacquard_common::types::value::Data::Integer(c.reset_generation as i64),
             );
             if let Some(wire_epoch) = c.wire_epoch {
                 extra.insert(
-                    jacquard_common::smol_str::SmolStr::new("wireEpoch"),
+                    jacquard_common::SmolStr::new("wireEpoch"),
                     jacquard_common::types::value::Data::Integer(wire_epoch),
                 );
             }
@@ -915,17 +908,7 @@ async fn fetch_all_messages(
     limit: i64,
     join_epoch: Option<i64>,
     epoch_range: (i64, Option<i64>),
-) -> Result<
-    (
-        Vec<MessageView<'static>>,
-        Option<i64>,
-        Option<i64>,
-        bool,
-        bool,
-        bool,
-    ),
-    StatusCode,
-> {
+) -> Result<(Vec<MessageView>, Option<i64>, Option<i64>, bool, bool, bool), StatusCode> {
     let mut tx = begin_read_snapshot(pool).await?;
     // Commits are required to advance MLS state and decrypt later app
     // messages, so they receive first admission to the shared raw budget.
@@ -979,7 +962,7 @@ async fn fetch_all_messages(
 mod tests {
     use super::*;
 
-    fn message_view(seq: i64, id_len: usize) -> MessageView<'static> {
+    fn message_view(seq: i64, id_len: usize) -> MessageView {
         MessageView {
             id: "x".repeat(id_len).into(),
             convo_id: "convo".into(),
@@ -992,7 +975,7 @@ mod tests {
         }
     }
 
-    fn commit_view(seq: i64, id_len: usize) -> MessageView<'static> {
+    fn commit_view(seq: i64, id_len: usize) -> MessageView {
         let mut message = message_view(seq, id_len);
         message.message_type = Some("commit".into());
         message

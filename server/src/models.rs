@@ -22,7 +22,8 @@ pub use chat_request::{
 // lexicon entirely; this re-export is dropped pre-emptively so handler code
 // can't construct it.
 pub use crate::generated::blue_catbird::mlsChat::{
-    ConvoView, KeyPackageRef, MemberView, MessageView,
+    ConvoView, ConvoViewCipherSuite, KeyPackageRef, KeyPackageRefCipherSuite, MemberView,
+    MessageView,
 };
 
 // Note: handler-specific types (AddMembers, LeaveConvo, etc.) are imported
@@ -102,19 +103,19 @@ impl Conversation {
     /// Returns an error if the creator_did is not a valid DID string.
     pub fn to_convo_view(
         &self,
-        members: Vec<MemberView<'static>>,
+        members: Vec<MemberView>,
         local_ds_did: Option<&str>,
-    ) -> Result<ConvoView<'static>, String> {
+    ) -> Result<ConvoView, String> {
         self.to_convo_view_with_last_message_at(members, local_ds_did, None)
     }
 
     /// Convert to API ConvoView with members and server-observed message activity.
     pub fn to_convo_view_with_last_message_at(
         &self,
-        members: Vec<MemberView<'static>>,
+        members: Vec<MemberView>,
         local_ds_did: Option<&str>,
         last_message_at: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> Result<ConvoView<'static>, String> {
+    ) -> Result<ConvoView, String> {
         use jacquard_common::IntoStatic;
 
         let creator = crate::sqlx_jacquard::try_string_to_did(&self.creator_did)
@@ -155,7 +156,7 @@ impl Conversation {
         // twice and strict parsers (serde, kotlinx.serialization) will reject it.
         let mut extra = std::collections::BTreeMap::new();
         extra.insert(
-            jacquard_common::smol_str::SmolStr::new("currentGroupId"),
+            jacquard_common::SmolStr::new("currentGroupId"),
             jacquard_common::types::value::Data::String(
                 jacquard_common::types::string::AtprotoStr::String(current_group_id.clone().into()),
             ),
@@ -167,11 +168,12 @@ impl Conversation {
             creator,
             members,
             epoch: self.current_epoch as i64,
-            cipher_suite: self
-                .cipher_suite
-                .clone()
-                .unwrap_or_else(|| "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519".to_string())
-                .into(),
+            cipher_suite: ConvoViewCipherSuite::from_value(
+                self.cipher_suite
+                    .clone()
+                    .unwrap_or_else(|| "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519".to_string())
+                    .into(),
+            ),
             created_at: crate::sqlx_jacquard::chrono_to_datetime(self.created_at),
             last_message_at: last_message_at.map(crate::sqlx_jacquard::chrono_to_datetime),
             confirmation_tag: conf_tag_b64.map(|s| s.into()),
@@ -372,7 +374,7 @@ impl Membership {
     ///
     /// # Errors
     /// Returns an error if member_did is not a valid DID string or promoted_by_did is invalid.
-    pub fn to_member_view(&self) -> Result<MemberView<'static>, String> {
+    pub fn to_member_view(&self) -> Result<MemberView, String> {
         use jacquard_common::IntoStatic;
 
         let did_without_fragment = self
@@ -442,7 +444,7 @@ impl Message {
     /// Convert to API MessageView
     ///
     /// Note: sender field removed per security hardening - clients derive sender from decrypted MLS content
-    pub fn to_message_view(&self) -> Result<MessageView<'static>, String> {
+    pub fn to_message_view(&self) -> Result<MessageView, String> {
         Ok(MessageView {
             id: self.id.clone().into(),
             convo_id: self.convo_id.clone().into(),
@@ -478,7 +480,7 @@ impl KeyPackage {
     ///
     /// # Errors
     /// Returns an error if the DID is not a valid DID string.
-    pub fn to_key_package_ref(&self) -> Result<KeyPackageRef<'static>, String> {
+    pub fn to_key_package_ref(&self) -> Result<KeyPackageRef, String> {
         use base64::Engine;
         let key_package_b64 = base64::engine::general_purpose::STANDARD.encode(&self.key_data);
 
@@ -488,7 +490,7 @@ impl KeyPackage {
         Ok(KeyPackageRef {
             did,
             key_package: key_package_b64.into(),
-            cipher_suite: self.cipher_suite.clone().into(),
+            cipher_suite: KeyPackageRefCipherSuite::from_value(self.cipher_suite.clone().into()),
             key_package_hash: Some(self.key_package_hash.clone().into()),
             extra_data: Default::default(),
         })

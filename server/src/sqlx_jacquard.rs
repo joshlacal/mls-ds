@@ -3,8 +3,8 @@
 //! Since we can't implement foreign traits on foreign types (orphan rule),
 //! we provide conversion functions instead.
 //!
-//! Jacquard's `Did<'a>` is lifetime-parameterized. For SQLx storage we always
-//! use `Did<'static>` (owned) so the value is self-contained.
+//! Jacquard's `Did` is lifetime-parameterized. For SQLx storage we always
+//! use `Did` (owned) so the value is self-contained.
 
 use chrono::{DateTime, Utc};
 use jacquard_common::types::string::{Datetime, Did};
@@ -13,21 +13,21 @@ use jacquard_common::types::string::{Datetime, Did};
 // Did conversions
 // =============================================================================
 
-/// Convert a database string to `Did<'static>` (owned).
+/// Convert a database string to `Did` (owned).
 ///
 /// Panics on invalid DID strings — use only for values known to be valid
 /// (i.e. previously validated before storage).
-pub fn string_to_did(s: &str) -> Did<'static> {
+pub fn string_to_did(s: &str) -> Did {
     Did::new_owned(s).unwrap_or_else(|e| panic!("Invalid DID '{}': {}", s, e))
 }
 
-/// Try to convert a database string to `Did<'static>`, returning an error on failure.
-pub fn try_string_to_did(s: &str) -> Result<Did<'static>, String> {
+/// Try to convert a database string to `Did`, returning an error on failure.
+pub fn try_string_to_did(s: &str) -> Result<Did, String> {
     Did::new_owned(s).map_err(|e| format!("Invalid DID '{}': {}", s, e))
 }
 
 /// Convert `Did` to `String` for database storage.
-pub fn did_to_string(did: &Did<'_>) -> String {
+pub fn did_to_string(did: &Did) -> String {
     did.as_str().to_string()
 }
 

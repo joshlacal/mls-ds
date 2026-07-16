@@ -449,7 +449,7 @@ where
 /// every recipient user.
 ///
 /// Each row uses user-form `recipient_did` from the entry (the
-/// jacquard `Did<'a>` type rejects `#` so device-form DIDs aren't
+/// jacquard `Did` type rejects `#` so device-form DIDs aren't
 /// representable here). When the selected key package can be resolved
 /// back to local metadata, the row also persists `recipient_device_id`;
 /// `key_package_hash` remains the durable hash discriminator plus the
@@ -476,13 +476,11 @@ where
 /// (e.g. `addMembers`, `processExternalCommit` arms) must convert at
 /// the boundary. A future refactor can hoist the helper to a trait if
 /// the duplication becomes onerous.
-pub async fn store_welcomes_per_device_in_tx<'a>(
+pub async fn store_welcomes_per_device_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     convo_id: &str,
     welcome_bytes: &[u8],
-    kp_hashes: &[crate::generated::blue_catbird::mlsChat::bootstrap_reset_group::KeyPackageHashEntry<
-        'a,
-    >],
+    kp_hashes: &[crate::generated::blue_catbird::mlsChat::bootstrap_reset_group::KeyPackageHashEntry],
     sender_did: &str,
 ) -> sqlx::Result<()> {
     for entry in kp_hashes {
@@ -536,9 +534,9 @@ pub async fn store_welcomes_per_device_in_tx<'a>(
 ///   - There's no UNIQUE on `(owner_did, key_package_hash)` in
 ///     `key_packages`, so the lookup adds `ORDER BY created_at DESC
 ///     LIMIT 1` to keep the device_id deterministic across reruns.
-///   - `members.member_did` is plain `TEXT`, not jacquard's `Did<'a>`,
+///   - `members.member_did` is plain `TEXT`, not jacquard's `Did`,
 ///     so the `#`-bearing device-form DID is a legitimate column value
-///     even though `Did<'a>` rejects `#` at the type level.
+///     even though `Did` rejects `#` at the type level.
 ///
 /// ON CONFLICT clears `left_at` and `needs_rejoin`, mirroring the
 /// existing inline addMembers re-add pattern at
@@ -556,12 +554,10 @@ pub async fn store_welcomes_per_device_in_tx<'a>(
 /// welcomes helper and Task 6's test contract; call sites holding the
 /// `commit_group_change` form (e.g. `addMembers`) convert at the
 /// boundary via a mechanical field copy (see Task 3 commit a60b8af).
-pub async fn insert_members_per_device_in_tx<'a>(
+pub async fn insert_members_per_device_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     convo_id: &str,
-    kp_hashes: &[crate::generated::blue_catbird::mlsChat::bootstrap_reset_group::KeyPackageHashEntry<
-        'a,
-    >],
+    kp_hashes: &[crate::generated::blue_catbird::mlsChat::bootstrap_reset_group::KeyPackageHashEntry],
     joined_at: chrono::DateTime<chrono::Utc>,
     is_admin: bool,
 ) -> sqlx::Result<()> {

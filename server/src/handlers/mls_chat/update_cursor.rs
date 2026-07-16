@@ -49,7 +49,7 @@ pub async fn update_cursor(
     State(pool): State<DbPool>,
     auth_user: AuthUser,
     ExtractXrpc(input): ExtractXrpc<UpdateCursorRequest>,
-) -> Result<Json<UpdateCursorOutput<'static>>, XrpcError> {
+) -> Result<Json<UpdateCursorOutput>, XrpcError> {
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
         error!("❌ [v2.updateCursor] Unauthorized");
         return Err(XrpcError(

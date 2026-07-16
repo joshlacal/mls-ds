@@ -24,10 +24,10 @@ fn make_output(
     convo_id: &str,
     epoch: i32,
     sequencer_term: u64,
-) -> RequestFailoverOutput<'static> {
+) -> RequestFailoverOutput {
     RequestFailoverOutput {
         new_sequencer_did: crate::sqlx_jacquard::string_to_did(new_sequencer_did),
-        convo_id: jacquard_common::CowStr::Owned(convo_id.into()),
+        convo_id: convo_id.into(),
         epoch: epoch as i64,
         sequencer_term: sequencer_term as i64,
         extra_data: Default::default(),
@@ -59,11 +59,11 @@ pub async fn request_failover(
     State(outbound_queue): State<Arc<federation::queue::OutboundQueue>>,
     auth_user: AuthUser,
     ExtractXrpc(input): ExtractXrpc<RequestFailoverRequest>,
-) -> Result<Json<RequestFailoverOutput<'static>>, StatusCode> {
-    // The `ExtractXrpc` associated type is `RequestFailover<'_>` (borrowed);
+) -> Result<Json<RequestFailoverOutput>, StatusCode> {
+    // The `ExtractXrpc` associated type is `RequestFailover` (borrowed);
     // name it explicitly so the rest of the function reads naturally.
-    let input: RequestFailover<'_> = input;
-    let convo_id: String = input.convo_id.as_ref().to_string();
+    let input: RequestFailover = input;
+    let convo_id: String = input.convo_id.as_str().to_string();
 
     // Enforce standard client auth
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, NSID) {

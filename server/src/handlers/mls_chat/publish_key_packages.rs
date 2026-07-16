@@ -151,7 +151,7 @@ async fn build_stats(
     pool: &DbPool,
     user_did: &str,
     device_scope: Option<&DeviceScope>,
-) -> Result<KeyPackageStats<'static>, StatusCode> {
+) -> Result<KeyPackageStats, StatusCode> {
     let candidates = device_scope
         .map(|scope| scope.storage_candidates.as_slice())
         .unwrap_or(&[]);
@@ -240,11 +240,11 @@ async fn build_stats(
 /// Handle "publish" action — store a single key package via `store_key_package_with_device`.
 async fn handle_publish(
     pool: &DbPool,
-    input: &crate::generated::blue_catbird::mlsChat::publish_key_packages::PublishKeyPackages<'_>,
+    input: &crate::generated::blue_catbird::mlsChat::publish_key_packages::PublishKeyPackages,
     user_did: &str,
     device_id: &str,
     expected_signature_public_key: &[u8],
-) -> Result<PublishResult<'static>, StatusCode> {
+) -> Result<PublishResult, StatusCode> {
     let items = input.key_packages.as_ref().ok_or_else(|| {
         warn!("publish action requires keyPackages");
         StatusCode::BAD_REQUEST
@@ -259,7 +259,7 @@ async fn handle_publish(
         warn!("Empty key_package provided");
         return Err(StatusCode::BAD_REQUEST);
     }
-    if item.cipher_suite.is_empty() {
+    if item.cipher_suite.as_str().is_empty() {
         warn!("Empty cipher_suite provided");
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -320,11 +320,11 @@ async fn handle_publish(
 async fn handle_publish_batch(
     pool: &DbPool,
     headers: &HeaderMap,
-    input: &crate::generated::blue_catbird::mlsChat::publish_key_packages::PublishKeyPackages<'_>,
+    input: &crate::generated::blue_catbird::mlsChat::publish_key_packages::PublishKeyPackages,
     user_did: &str,
     device_scope: &DeviceScope,
     expected_signature_public_key: &[u8],
-) -> Result<PublishResult<'static>, StatusCode> {
+) -> Result<PublishResult, StatusCode> {
     let items = input.key_packages.as_ref().ok_or_else(|| {
         warn!("publishBatch action requires keyPackages");
         StatusCode::BAD_REQUEST
@@ -487,7 +487,7 @@ async fn handle_publish_batch(
     info!("Publishing batch of {} key packages", items.len());
 
     // Validate all packages first (fail fast)
-    let mut errors: Vec<BatchError<'static>> = Vec::new();
+    let mut errors: Vec<BatchError> = Vec::new();
     let mut failed: i64 = 0;
 
     for (idx, item) in items.iter().enumerate() {
@@ -500,7 +500,7 @@ async fn handle_publish_batch(
             failed += 1;
             continue;
         }
-        if item.cipher_suite.is_empty() {
+        if item.cipher_suite.as_str().is_empty() {
             errors.push(BatchError {
                 index: idx as i64,
                 error: "Empty cipher_suite".into(),
@@ -632,10 +632,10 @@ async fn handle_publish_batch(
 /// Handle "sync" action — reconcile local/server key package state for a device.
 async fn handle_sync(
     pool: &DbPool,
-    input: &crate::generated::blue_catbird::mlsChat::publish_key_packages::PublishKeyPackages<'_>,
+    input: &crate::generated::blue_catbird::mlsChat::publish_key_packages::PublishKeyPackages,
     user_did: &str,
     device_scope: &DeviceScope,
-) -> Result<SyncResult<'static>, StatusCode> {
+) -> Result<SyncResult, StatusCode> {
     let local_hashes_cow = input.local_hashes.as_ref().ok_or_else(|| {
         warn!("sync action requires localHashes");
         StatusCode::BAD_REQUEST
@@ -816,9 +816,9 @@ async fn handle_sync(
 async fn handle_request_replenish(
     pool: &DbPool,
     notification_service: Option<Arc<NotificationService>>,
-    input: &PublishKeyPackages<'_>,
+    input: &PublishKeyPackages,
     requester_did: &str,
-) -> Result<ReplenishResult<'static>, StatusCode> {
+) -> Result<ReplenishResult, StatusCode> {
     let Some(target_dids) = input.target_dids.as_ref() else {
         warn!("requestReplenish action requires targetDids");
         return Err(StatusCode::BAD_REQUEST);
@@ -843,7 +843,7 @@ async fn handle_request_replenish(
     let convo_id = input
         .convo_id
         .as_ref()
-        .map(|value| value.as_ref().trim())
+        .map(|value| value.as_str().trim())
         .filter(|value| !value.is_empty());
 
     if let Some(convo_id) = convo_id {
@@ -938,7 +938,7 @@ async fn handle_request_replenish(
     let reason = input
         .reason
         .as_ref()
-        .map(|value| value.as_ref())
+        .map(|value| value.as_str())
         .filter(|value| !value.is_empty());
 
     if let Some(notification_service) = notification_service {
@@ -993,7 +993,7 @@ pub async fn publish_key_packages_post(
     headers: HeaderMap,
     auth_user: AuthUser,
     ExtractXrpc(input): ExtractXrpc<PublishKeyPackagesRequest>,
-) -> Result<Json<PublishKeyPackagesOutput<'static>>, StatusCode> {
+) -> Result<Json<PublishKeyPackagesOutput>, StatusCode> {
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -1008,7 +1008,7 @@ pub async fn publish_key_packages_post(
     // If the auth DID doesn't include a #device fragment, use device_id from the request body
     if raw_device_id.is_empty() {
         if let Some(ref req_device_id) = input.device_id {
-            let req_dev = req_device_id.as_ref().trim();
+            let req_dev = req_device_id.as_str().trim();
             if !req_dev.is_empty() {
                 raw_device_id = req_dev.to_string();
             }
@@ -1372,7 +1372,7 @@ mod tests {
         seed_pending_welcome(&pool, &convo_id, &user_did, device_id, hash_hex).await;
 
         let input = PublishKeyPackages {
-            action: "sync".into(),
+            action: crate::generated::blue_catbird::mlsChat::publish_key_packages::PublishKeyPackagesAction::Sync,
             convo_id: None,
             device_id: Some(device_id.into()),
             key_packages: None,

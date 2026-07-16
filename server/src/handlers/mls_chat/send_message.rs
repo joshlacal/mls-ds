@@ -65,7 +65,11 @@ pub async fn send_message(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    let delivery = input.delivery.as_deref().unwrap_or("persistent");
+    let delivery = input
+        .delivery
+        .as_ref()
+        .map(|value| value.as_str())
+        .unwrap_or("persistent");
 
     match delivery {
         "persistent" => Ok(handle_persistent(
@@ -81,7 +85,11 @@ pub async fn send_message(
         .await?),
 
         "ephemeral" => {
-            let action = input.action.as_deref().unwrap_or("typing");
+            let action = input
+                .action
+                .as_ref()
+                .map(|value| value.as_str())
+                .unwrap_or("typing");
             Ok(match action {
                 "typingStop" | "stopTyping" => {
                     handle_typing(pool, sse_state, auth_user, &input, false).await?
@@ -118,7 +126,7 @@ async fn handle_persistent(
     federation_config: federation::FederationConfig,
     outbound_queue: Arc<federation::queue::OutboundQueue>,
     auth_user: AuthUser,
-    input: &crate::generated::blue_catbird::mlsChat::send_message::SendMessage<'_>,
+    input: &crate::generated::blue_catbird::mlsChat::send_message::SendMessage,
 ) -> Result<Response, StatusCode> {
     let convo_id = input.convo_id.to_string();
     let msg_id = input.msg_id.to_string();
@@ -367,7 +375,7 @@ async fn handle_persistent(
 
     if let Some((eid, eseq, eepoch, eat)) = existing {
         tx.rollback().await.ok();
-        return Ok(Json(SendMessageOutput {
+        return Ok(Json(SendMessageOutput::<jacquard_common::DefaultStr> {
             message_id: eid.into(),
             received_at: crate::sqlx_jacquard::chrono_to_datetime(eat),
             seq: eseq,
@@ -593,7 +601,7 @@ async fn handle_persistent(
 
     info!("✅ [v2.sendMessage] COMPLETE");
 
-    Ok(Json(SendMessageOutput {
+    Ok(Json(SendMessageOutput::<jacquard_common::DefaultStr> {
         message_id: row_id.into(),
         received_at: crate::sqlx_jacquard::chrono_to_datetime(now),
         seq,
@@ -611,7 +619,7 @@ async fn handle_typing(
     pool: DbPool,
     sse_state: Arc<SseState>,
     auth_user: AuthUser,
-    input: &crate::generated::blue_catbird::mlsChat::send_message::SendMessage<'_>,
+    input: &crate::generated::blue_catbird::mlsChat::send_message::SendMessage,
     is_typing: bool,
 ) -> Result<Response, StatusCode> {
     let convo_id = input.convo_id.to_string();
@@ -652,7 +660,7 @@ async fn handle_typing(
     let msg_id = input.msg_id.to_string();
     let received_bucket_ts = (now.timestamp() / 2) * 2;
     let received_at = chrono::DateTime::from_timestamp(received_bucket_ts, 0).unwrap_or(now);
-    Ok(Json(SendMessageOutput {
+    Ok(Json(SendMessageOutput::<jacquard_common::DefaultStr> {
         message_id: msg_id.into(),
         received_at: crate::sqlx_jacquard::chrono_to_datetime(received_at),
         seq: 0,

@@ -849,7 +849,7 @@ async fn send_event(
         #[serde(rename = "$type")]
         type_tag: &'a str,
         cursor: &'a str,
-        message: &'a crate::generated::blue_catbird::mlsChat::MessageView<'static>,
+        message: &'a crate::generated::blue_catbird::mlsChat::MessageView,
         #[serde(default, skip_serializing_if = "crate::realtime::sse::is_false")]
         ephemeral: bool,
         seq: i64,

@@ -16,7 +16,7 @@ use crate::{
         create_convo::{
             CreateConvoError as LexCreateConvoError, CreateConvoOutput, CreateConvoRequest,
         },
-        ConvoView, MemberView,
+        ConvoView, ConvoViewCipherSuite, MemberView,
     },
     sqlx_jacquard::{chrono_to_datetime, did_to_string, string_to_did},
     storage::DbPool,
@@ -88,7 +88,7 @@ fn expected_welcome_rows_for_create(
 }
 
 fn validate_initial_members_have_welcome(
-    initial_members: Option<&[jacquard_common::types::string::Did<'_>]>,
+    initial_members: Option<&[jacquard_common::types::string::Did]>,
     creator_did: &str,
     has_welcome: bool,
 ) -> Result<(), String> {
@@ -234,7 +234,7 @@ pub async fn create_convo(
 async fn handle_revoke_invite(
     pool: &DbPool,
     auth_user: &AuthUser,
-    invite: &crate::generated::blue_catbird::mlsChat::create_convo::InviteAction<'_>,
+    invite: &crate::generated::blue_catbird::mlsChat::create_convo::InviteAction,
 ) -> Response {
     let invite_id = invite.code.as_deref().unwrap_or_default().to_string();
     let caller_did = &auth_user.did;
@@ -299,8 +299,8 @@ async fn handle_create_convo(
     pool: DbPool,
     block_sync: Arc<BlockSyncService>,
     auth_user: AuthUser,
-    input: &crate::generated::blue_catbird::mlsChat::create_convo::CreateConvo<'_>,
-) -> Result<CreateConvoOutput<'static>, Response> {
+    input: &crate::generated::blue_catbird::mlsChat::create_convo::CreateConvo,
+) -> Result<CreateConvoOutput, Response> {
     tracing::debug!("🔷 [v2.createConvo] incoming create request");
 
     info!(
@@ -539,7 +539,7 @@ async fn handle_create_convo(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         })?;
 
-        let members_typed: Vec<MemberView<'static>> = existing_members
+        let members_typed: Vec<MemberView> = existing_members
             .into_iter()
             .map(
                 |(
@@ -586,7 +586,9 @@ async fn handle_create_convo(
                 creator: string_to_did(&creator_did),
                 members: members_typed,
                 epoch: existing_epoch as i64,
-                cipher_suite: input.cipher_suite.as_ref().to_string().into(),
+                cipher_suite: ConvoViewCipherSuite::from_value(
+                    input.cipher_suite.as_ref().to_string().into(),
+                ),
                 created_at: chrono_to_datetime(now),
                 last_message_at: None,
                 confirmation_tag: None,
@@ -759,7 +761,7 @@ async fn handle_create_convo(
                 .collect();
 
             // Partition kp_hashes into admin (creator's devices) and non-admin
-            // (everyone else's devices). The lexicon `Did<'_>` regex rejects
+            // (everyone else's devices). The lexicon `Did` regex rejects
             // '#', so `did_to_string(&e.did)` is always user-form. By contrast,
             // `auth_user.did` may be device-form (e.g. "did:plc:alice#deviceA")
             // for some callers — Task 1's verification was INDIRECT for the
@@ -942,7 +944,7 @@ async fn handle_create_convo(
     // Build MemberView list for the response unchanged (per-device storage is
     // a server-side roster representation; the lexicon-level MemberView still
     // models user-flat semantics with leaf_index ordering for now).
-    let mut members_typed: Vec<MemberView<'static>> = vec![MemberView {
+    let mut members_typed: Vec<MemberView> = vec![MemberView {
         did: string_to_did(&creator_did),
         user_did: string_to_did(&creator_did),
         joined_at: chrono_to_datetime(now),
@@ -1246,7 +1248,9 @@ async fn handle_create_convo(
             creator: string_to_did(&creator_did),
             members: members_typed,
             epoch: bootstrap_epoch as i64,
-            cipher_suite: input.cipher_suite.as_ref().to_string().into(),
+            cipher_suite: ConvoViewCipherSuite::from_value(
+                input.cipher_suite.as_ref().to_string().into(),
+            ),
             created_at: chrono_to_datetime(now),
             last_message_at: None,
             confirmation_tag: None,
@@ -1613,7 +1617,7 @@ mod tests {
             },
         };
         let input = crate::generated::blue_catbird::mlsChat::create_convo::CreateConvo {
-            cipher_suite: "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519".into(),
+            cipher_suite: crate::generated::blue_catbird::mlsChat::create_convo::CreateConvoCipherSuite::Mls256XwingChacha20poly1305Sha256Ed25519,
             current_epoch: Some(1),
             group_id: convo_id.clone().into(),
             group_info: Some(Bytes::from(vec![
@@ -1708,7 +1712,7 @@ mod tests {
             },
         };
         let input = crate::generated::blue_catbird::mlsChat::create_convo::CreateConvo {
-            cipher_suite: "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519".into(),
+            cipher_suite: crate::generated::blue_catbird::mlsChat::create_convo::CreateConvoCipherSuite::Mls256XwingChacha20poly1305Sha256Ed25519,
             current_epoch: Some(1),
             group_id: convo_id.clone().into(),
             group_info: Some(Bytes::from(vec![

@@ -8,7 +8,7 @@ use crate::{
     device_utils::parse_device_did,
     generated::blue_catbird::mlsChat::get_key_package_status::{
         GetKeyPackageStatusOutput, GetKeyPackageStatusRequest, KeyPackageHistoryItem,
-        KeyPackageStats, KeyPackageStatusItem,
+        KeyPackageHistoryItemAction, KeyPackageStats, KeyPackageStatusItem,
     },
     handlers::mls_chat::get_key_packages::{
         authorize_get_key_package_targets, GateKeyPackagesMode,
@@ -25,7 +25,7 @@ pub async fn get_key_package_status(
     State(pool): State<DbPool>,
     auth_user: AuthUser,
     ExtractXrpc(input): ExtractXrpc<GetKeyPackageStatusRequest>,
-) -> Result<Json<GetKeyPackageStatusOutput<'static>>, StatusCode> {
+) -> Result<Json<GetKeyPackageStatusOutput>, StatusCode> {
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -178,7 +178,7 @@ pub async fn get_key_package_status(
                     }
                 }
 
-                let status_items: Vec<KeyPackageStatusItem<'static>> = rows
+                let status_items: Vec<KeyPackageStatusItem> = rows
                     .into_iter()
                     .map(|r| KeyPackageStatusItem {
                         id: r.get::<String, _>("id").into(),
@@ -254,11 +254,11 @@ pub async fn get_key_package_status(
                     }
                 }
 
-                let history_items: Vec<KeyPackageHistoryItem<'static>> = rows
+                let history_items: Vec<KeyPackageHistoryItem> = rows
                     .into_iter()
                     .map(|r| KeyPackageHistoryItem {
                         id: r.get::<String, _>("key_package_hash").into(),
-                        action: "consumed".into(),
+                        action: KeyPackageHistoryItemAction::Consumed,
                         created_at: crate::sqlx_jacquard::chrono_to_datetime(
                             r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
                         ),

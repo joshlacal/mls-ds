@@ -137,8 +137,8 @@ async fn handle_register(
     pool: &DbPool,
     sse_state: &Arc<SseState>,
     auth_user: &AuthUser,
-    input: &crate::generated::blue_catbird::mlsChat::register_device::RegisterDevice<'_>,
-) -> Result<Json<RegisterDeviceOutput<'static>>, StatusCode> {
+    input: &crate::generated::blue_catbird::mlsChat::register_device::RegisterDevice,
+) -> Result<Json<RegisterDeviceOutput>, StatusCode> {
     let (user_did, _) = parse_device_did(&auth_user.did).map_err(|e| {
         error!("Invalid device DID format: {}", e);
         StatusCode::BAD_REQUEST
@@ -147,7 +147,7 @@ async fn handle_register(
     // Sanitize device name
     let sanitized_device_name: String = input
         .device_name
-        .as_ref()
+        .as_str()
         .chars()
         .filter(|c| !c.is_control() && *c != '\u{FEFF}' && *c != '\u{200B}')
         .take(100)
@@ -194,7 +194,7 @@ async fn handle_register(
 
         if let Err(e) = crate::db::validate_declared_key_package_binding(
             &user_did,
-            kp.cipher_suite.as_ref(),
+            kp.cipher_suite.as_str(),
             &key_data,
             Some(&input.signature_public_key),
         )
@@ -224,7 +224,7 @@ async fn handle_register(
              WHERE user_did = $1 AND device_uuid = $2",
         )
         .bind(&user_did)
-        .bind(device_uuid.as_ref())
+        .bind(device_uuid.as_str())
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| {
@@ -274,7 +274,7 @@ async fn handle_register(
             )
             .bind(&candidate_id)
             .bind(&user_did)
-            .bind(input.device_uuid.as_ref().map(|value| value.as_ref()))
+            .bind(input.device_uuid.as_ref().map(|value| value.as_str()))
             .fetch_optional(&mut *tx)
             .await
         } else {
@@ -362,7 +362,7 @@ async fn handle_register(
             )
             .bind(&device_name)
             .bind(&rereg_mls_did)
-            .bind(input.device_uuid.as_ref().map(|s| s.as_ref()))
+            .bind(input.device_uuid.as_ref().map(|s| s.as_str()))
             .bind(&db_id)
             .execute(&mut *tx)
             .await
@@ -416,7 +416,7 @@ async fn handle_register(
         .bind(&device_name)
         .bind(&mls_did)
         .bind(&sig_key_hex)
-        .bind(input.device_uuid.as_ref().map(|s| s.as_ref()))
+        .bind(input.device_uuid.as_ref().map(|s| s.as_str()))
         .execute(&mut *tx)
         .await
         .map_err(|e| {
@@ -441,7 +441,7 @@ async fn handle_register(
         match crate::db::store_key_package_with_device_bound_to_signature_in_tx(
             &mut tx,
             &user_did,
-            kp.cipher_suite.as_ref(),
+            kp.cipher_suite.as_str(),
             key_data,
             kp.expires.as_ref().with_timezone(&Utc),
             Some(device_id.clone()),
@@ -474,7 +474,7 @@ async fn handle_register(
         )
         .bind(&user_did)
         .bind(&device_id)
-        .bind(push_token.as_ref())
+        .bind(push_token.as_str())
         .execute(&mut *tx)
         .await
         .map_err(|e| {
@@ -587,19 +587,19 @@ async fn handle_register(
 async fn handle_update_token(
     pool: &DbPool,
     auth_user: &AuthUser,
-    input: &crate::generated::blue_catbird::mlsChat::register_device::RegisterDevice<'_>,
-) -> Result<Json<RegisterDeviceOutput<'static>>, StatusCode> {
+    input: &crate::generated::blue_catbird::mlsChat::register_device::RegisterDevice,
+) -> Result<Json<RegisterDeviceOutput>, StatusCode> {
     let push_token = input
         .push_token
         .as_ref()
-        .map(|s| s.as_ref().to_string())
+        .map(|s| s.as_str().to_string())
         .ok_or_else(|| {
             warn!("updateToken action requires pushToken field");
             StatusCode::BAD_REQUEST
         })?;
 
-    let device_name = input.device_name.as_ref().to_string();
-    let device_uuid = input.device_uuid.as_ref().map(|s| s.as_ref().to_string());
+    let device_name = input.device_name.as_str().to_string();
+    let device_uuid = input.device_uuid.as_ref().map(|s| s.as_str().to_string());
 
     // Find device — prefer deviceUUID, fall back to most recent
     let device: Option<(String, String)> = if let Some(ref uuid) = device_uuid {
@@ -1207,11 +1207,11 @@ mod tests {
         )
     }
 
-    fn mismatched_registration_input<'a>(
-        device_uuid: &'a str,
+    fn mismatched_registration_input(
+        device_uuid: &str,
         key_package: Vec<u8>,
         signature_public_key: Vec<u8>,
-    ) -> RegisterDevice<'a> {
+    ) -> RegisterDevice {
         registration_input(
             Some(device_uuid),
             "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519",
@@ -1220,12 +1220,12 @@ mod tests {
         )
     }
 
-    fn registration_input<'a>(
-        device_uuid: Option<&'a str>,
-        declared_cipher_suite: &'a str,
+    fn registration_input(
+        device_uuid: Option<&str>,
+        declared_cipher_suite: &str,
         key_package: Vec<u8>,
         signature_public_key: Vec<u8>,
-    ) -> RegisterDevice<'a> {
+    ) -> RegisterDevice {
         let key_package = KeyPackageItem::new()
             .cipher_suite(declared_cipher_suite)
             .expires((Utc::now() + Duration::days(1)).fixed_offset())

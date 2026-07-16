@@ -29,7 +29,7 @@ pub async fn get_block_status_post(
     State(block_sync): State<Arc<BlockSyncService>>,
     auth_user: AuthUser,
     ExtractXrpc(input): ExtractXrpc<GetBlockStatusRequest>,
-) -> Result<Json<GetBlockStatusOutput<'static>>, StatusCode> {
+) -> Result<Json<GetBlockStatusOutput>, StatusCode> {
     if let Err(_e) = enforce_standard(&auth_user.claims, NSID) {
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -74,7 +74,7 @@ pub async fn get_block_status_post(
     let now = chrono::Utc::now();
     let member_count = member_dids.len() as i64;
 
-    let mut blocks: Vec<BlockRelationship<'static>> = Vec::new();
+    let mut blocks: Vec<BlockRelationship> = Vec::new();
 
     if member_dids.len() >= 2 {
         match block_sync.check_block_conflicts(&member_dids).await {

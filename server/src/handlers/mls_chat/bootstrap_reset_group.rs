@@ -20,7 +20,7 @@ use crate::{
             BootstrapResetGroupError as LexBootstrapResetGroupError, BootstrapResetGroupOutput,
             BootstrapResetGroupRequest, KeyPackageHashEntry,
         },
-        ConvoView, MemberView,
+        ConvoView, ConvoViewCipherSuite, MemberView,
     },
     sqlx_jacquard::{chrono_to_datetime, did_to_string, string_to_did},
     storage::DbPool,
@@ -61,7 +61,7 @@ async fn dual_write_keyed_legacy_welcomes(
     pool: &DbPool,
     original_convo_id: &str,
     welcome: &[u8],
-    kp_hashes: &[KeyPackageHashEntry<'_>],
+    kp_hashes: &[KeyPackageHashEntry],
     sender_did: &str,
 ) {
     let mut tx = match pool.begin().await {
@@ -148,8 +148,8 @@ pub async fn handle(
     pool: DbPool,
     actor_registry: Arc<ActorRegistry>,
     auth_user: AuthUser,
-    input: &crate::generated::blue_catbird::mlsChat::bootstrap_reset_group::BootstrapResetGroup<'_>,
-) -> Result<BootstrapResetGroupOutput<'static>, Response> {
+    input: &crate::generated::blue_catbird::mlsChat::bootstrap_reset_group::BootstrapResetGroup,
+) -> Result<BootstrapResetGroupOutput, Response> {
     let caller_did = auth_user.did.clone();
     let original_convo_id = input.original_convo_id.to_string();
     let new_group_id = input.new_group_id.to_string();
@@ -723,7 +723,7 @@ pub async fn handle(
         StatusCode::INTERNAL_SERVER_ERROR.into_response()
     })?;
 
-    let members_typed: Vec<MemberView<'static>> = member_rows
+    let members_typed: Vec<MemberView> = member_rows
         .into_iter()
         .map(
             |(member_did, user_did, device_id, device_name, joined_at, is_admin, leaf_index)| {
@@ -783,7 +783,7 @@ pub async fn handle(
             creator: string_to_did(&creator_did_persisted),
             members: members_typed,
             epoch: response_epoch as i64,
-            cipher_suite: cipher_suite_persisted.into(),
+            cipher_suite: ConvoViewCipherSuite::from_value(cipher_suite_persisted.into()),
             created_at: chrono_to_datetime(created_at),
             last_message_at: last_message_at.map(chrono_to_datetime),
             confirmation_tag: None,

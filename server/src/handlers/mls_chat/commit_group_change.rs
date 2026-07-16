@@ -20,12 +20,14 @@ use crate::{
     device_utils::parse_device_did,
     generated::blue_catbird::mlsChat::commit_group_change::{
         CommitGroupChangeOutput, CommitGroupChangeRequest, PendingDeviceAddition,
+        PendingDeviceAdditionStatus,
     },
     realtime::{sse::StreamEvent, SseState},
     storage::DbPool,
 };
 
 const NSID: &str = "blue.catbird.mlsChat.commitGroupChange";
+type OwnedCommitGroupChangeOutput = CommitGroupChangeOutput<jacquard_common::DefaultStr>;
 
 #[cfg(test)]
 const TEST_ADD_MEMBERS_COMMIT_BYTES: &[u8] = b"test-add-members-commit";
@@ -415,8 +417,8 @@ struct PendingAdditionRow {
     created_at: DateTime<Utc>,
 }
 
-fn invalidate_welcome_response(rows_affected: u64) -> CommitGroupChangeOutput<'static> {
-    CommitGroupChangeOutput {
+fn invalidate_welcome_response(rows_affected: u64) -> OwnedCommitGroupChangeOutput {
+    OwnedCommitGroupChangeOutput {
         success: rows_affected > 0,
         claimed_addition: None,
         confirmation_tag: None,
@@ -470,11 +472,11 @@ fn maybe_abort_add_members_after_welcome_for_test() -> Result<(), XrpcError> {
 ///
 /// The INSERT is idempotent on `(convo_id, epoch, authenticator)` so a
 /// client retrying with the same input doesn't error.
-async fn record_epoch_authenticator_tx(
+async fn record_epoch_authenticator_tx<S: AsRef<str>>(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     convo_id: &str,
     epoch: i32,
-    authenticator: &Option<jacquard_common::CowStr<'_>>,
+    authenticator: &Option<S>,
     branch: &str,
 ) {
     let Some(auth) = authenticator else {
@@ -544,7 +546,7 @@ pub async fn commit_group_change(
         return Err(auth_required("Authentication required"));
     }
 
-    let success_response = || CommitGroupChangeOutput {
+    let success_response = || OwnedCommitGroupChangeOutput {
         success: true,
         claimed_addition: None,
         confirmation_tag: None,
@@ -591,7 +593,7 @@ pub async fn commit_group_change(
                             .ok()
                             .flatten();
                     info!("v2.commitGroupChange: addMembers idempotent hit");
-                    return Ok(Json(CommitGroupChangeOutput {
+                    return Ok(Json(OwnedCommitGroupChangeOutput {
                         success: true,
                         new_epoch: Some(current_epoch.unwrap_or(0) as i64),
                         claimed_addition: None,
@@ -660,7 +662,7 @@ pub async fn commit_group_change(
 
                 let new_member_dids: Vec<String> = member_dids
                     .iter()
-                    .map(|d| crate::sqlx_jacquard::did_to_string(d))
+                    .map(crate::sqlx_jacquard::did_to_string)
                     .collect();
 
                 let mut all_dids: Vec<String> = existing_member_dids;
@@ -828,7 +830,7 @@ pub async fn commit_group_change(
             // user. See docs/superpowers/plans/2026-05-04-mls-per-device-welcome-and-members-routing.md.
             let member_did_strings: Vec<String> = member_dids
                 .iter()
-                .map(|d| crate::sqlx_jacquard::did_to_string(d))
+                .map(crate::sqlx_jacquard::did_to_string)
                 .collect();
 
             let used_per_device_members_path = match input.key_package_hashes.as_ref() {
@@ -1323,7 +1325,7 @@ pub async fn commit_group_change(
                 crate::crypto::redact_for_log(&convo_id),
                 new_epoch
             );
-            Ok(Json(CommitGroupChangeOutput {
+            Ok(Json(OwnedCommitGroupChangeOutput {
                 success: true,
                 new_epoch: Some(new_epoch as i64),
                 confirmation_tag: add_confirmation_tag.map(bytes::Bytes::from),
@@ -1557,7 +1559,7 @@ pub async fn commit_group_change(
                             .ok()
                             .flatten();
                     info!("v2.commitGroupChange: externalCommit idempotent hit");
-                    return Ok(Json(CommitGroupChangeOutput {
+                    return Ok(Json(OwnedCommitGroupChangeOutput {
                         success: true,
                         new_epoch: Some(current_epoch.unwrap_or(0) as i64),
                         claimed_addition: None,
@@ -2160,7 +2162,7 @@ pub async fn commit_group_change(
                 "✅ v2.commitGroupChange: externalCommit complete, epoch={}",
                 new_epoch
             );
-            Ok(Json(CommitGroupChangeOutput {
+            Ok(Json(OwnedCommitGroupChangeOutput {
                 success: true,
                 new_epoch: Some(new_epoch as i64),
                 confirmation_tag: ec_confirmation_tag.map(bytes::Bytes::from),
@@ -2350,7 +2352,7 @@ pub async fn commit_group_change(
                 pending.len()
             );
 
-            let additions: Vec<PendingDeviceAddition<'static>> = pending
+            let additions: Vec<PendingDeviceAddition> = pending
                 .into_iter()
                 .map(|row| PendingDeviceAddition {
                     id: row.id.into(),
@@ -2358,7 +2360,7 @@ pub async fn commit_group_change(
                     user_did: crate::sqlx_jacquard::string_to_did(&row.user_did),
                     device_id: row.new_device_id.into(),
                     device_credential_did: row.new_device_credential_did.into(),
-                    status: row.status.into(),
+                    status: PendingDeviceAdditionStatus::from_value(row.status.into()),
                     created_at: crate::sqlx_jacquard::chrono_to_datetime(row.created_at),
                     device_name: row.device_name.map(|n| n.into()),
                     claimed_by: row
@@ -2369,7 +2371,7 @@ pub async fn commit_group_change(
                 })
                 .collect();
 
-            Ok(Json(CommitGroupChangeOutput {
+            Ok(Json(OwnedCommitGroupChangeOutput {
                 success: true,
                 pending_additions: Some(additions),
                 claimed_addition: None,
@@ -2592,7 +2594,7 @@ pub async fn commit_group_change(
                         user_did: crate::sqlx_jacquard::string_to_did(&row.user_did),
                         device_id: row.new_device_id.into(),
                         device_credential_did: row.new_device_credential_did.into(),
-                        status: row.status.into(),
+                        status: PendingDeviceAdditionStatus::from_value(row.status.into()),
                         created_at: crate::sqlx_jacquard::chrono_to_datetime(row.created_at),
                         device_name: row.device_name.map(|n| n.into()),
                         claimed_by: row
@@ -2601,7 +2603,7 @@ pub async fn commit_group_change(
                             .map(crate::sqlx_jacquard::string_to_did),
                         extra_data: Default::default(),
                     };
-                    Ok(Json(CommitGroupChangeOutput {
+                    Ok(Json(OwnedCommitGroupChangeOutput {
                         success: true,
                         claimed_addition: Some(addition),
                         confirmation_tag: None,
@@ -2615,7 +2617,7 @@ pub async fn commit_group_change(
                 }
                 None => {
                     warn!("claimPending: no matching pending addition found");
-                    Ok(Json(CommitGroupChangeOutput {
+                    Ok(Json(OwnedCommitGroupChangeOutput {
                         success: false,
                         claimed_addition: None,
                         confirmation_tag: None,
@@ -2706,7 +2708,7 @@ pub async fn commit_group_change(
                 }
             }
 
-            Ok(Json(CommitGroupChangeOutput {
+            Ok(Json(OwnedCommitGroupChangeOutput {
                 success: completed,
                 claimed_addition: None,
                 confirmation_tag: None,
@@ -2748,7 +2750,7 @@ pub async fn commit_group_change(
                             .ok()
                             .flatten();
                     info!("v2.commitGroupChange: removeMember idempotent hit");
-                    return Ok(Json(CommitGroupChangeOutput {
+                    return Ok(Json(OwnedCommitGroupChangeOutput {
                         success: true,
                         new_epoch: Some(current_epoch.unwrap_or(0) as i64),
                         claimed_addition: None,
@@ -2889,7 +2891,7 @@ pub async fn commit_group_change(
                     "✅ v2.commitGroupChange: removeMember(ghost) complete (removed_any={}, epoch unchanged={})",
                     removed_any, cur_epoch
                 );
-                return Ok(Json(CommitGroupChangeOutput {
+                return Ok(Json(OwnedCommitGroupChangeOutput {
                     success: true,
                     new_epoch: Some(cur_epoch as i64),
                     claimed_addition: None,
@@ -3261,7 +3263,7 @@ pub async fn commit_group_change(
                 "✅ v2.commitGroupChange: removeMember complete, epoch={}",
                 new_epoch
             );
-            Ok(Json(CommitGroupChangeOutput {
+            Ok(Json(OwnedCommitGroupChangeOutput {
                 success: true,
                 new_epoch: Some(new_epoch as i64),
                 claimed_addition: None,
@@ -3306,7 +3308,7 @@ pub async fn commit_group_change(
                             .ok()
                             .flatten();
                     info!("v2.commitGroupChange: {} idempotent hit", action_name);
-                    return Ok(Json(CommitGroupChangeOutput {
+                    return Ok(Json(OwnedCommitGroupChangeOutput {
                         success: true,
                         new_epoch: Some(current_epoch.unwrap_or(0) as i64),
                         claimed_addition: None,
@@ -3636,7 +3638,7 @@ pub async fn commit_group_change(
                 "✅ v2.commitGroupChange: {} complete, epoch={}",
                 action_name, new_epoch
             );
-            Ok(Json(CommitGroupChangeOutput {
+            Ok(Json(OwnedCommitGroupChangeOutput {
                 success: true,
                 new_epoch: Some(new_epoch as i64),
                 claimed_addition: None,
@@ -3863,7 +3865,7 @@ mod tests {
     #[test]
     fn add_members_idempotent_response_includes_new_epoch() {
         let epoch: i32 = 5;
-        let response = CommitGroupChangeOutput {
+        let response = OwnedCommitGroupChangeOutput {
             success: true,
             new_epoch: Some(epoch as i64),
             claimed_addition: None,
@@ -3886,7 +3888,7 @@ mod tests {
         let current_epoch: Option<i32> = std::env::var("__never_set_epoch_override")
             .ok()
             .and_then(|v| v.parse().ok());
-        let response = CommitGroupChangeOutput {
+        let response = OwnedCommitGroupChangeOutput {
             success: true,
             new_epoch: Some(current_epoch.unwrap_or(0) as i64),
             claimed_addition: None,
@@ -4092,7 +4094,7 @@ mod tests {
         };
         let input =
             crate::generated::blue_catbird::mlsChat::commit_group_change::CommitGroupChange {
-                action: "addMembers".into(),
+                action: crate::generated::blue_catbird::mlsChat::commit_group_change::CommitGroupChangeAction::AddMembers,
                 commit: Some(Bytes::from_static(b"test-add-members-commit")),
                 convo_id: convo_id.clone().into(),
                 idempotency_key: Some(request_id.clone().into()),

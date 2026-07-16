@@ -21,7 +21,7 @@ pub async fn get_subscription_ticket(
     State(pool): State<DbPool>,
     auth_user: AuthUser,
     ExtractXrpc(params): ExtractXrpc<GetSubscriptionTicketRequest>,
-) -> Result<Json<GetSubscriptionTicketOutput<'static>>, StatusCode> {
+) -> Result<Json<GetSubscriptionTicketOutput>, StatusCode> {
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -53,7 +53,7 @@ pub async fn get_subscription_ticket(
         .unwrap_or_else(|_| chrono_to_datetime(chrono::Utc::now()));
 
     // Clients depend on endpoint to establish WebSocket connections — fail loudly if invalid.
-    let endpoint = match jacquard_common::types::string::Uri::new_owned(&v1_output.endpoint) {
+    let endpoint = match jacquard_common::types::string::UriValue::new_owned(&v1_output.endpoint) {
         Ok(uri) => Some(uri),
         Err(e) => {
             tracing::error!(

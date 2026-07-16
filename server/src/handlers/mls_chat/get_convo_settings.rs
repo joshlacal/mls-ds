@@ -19,12 +19,12 @@ pub async fn get_convo_settings(
     State(pool): State<DbPool>,
     auth_user: AuthUser,
     ExtractXrpc(input): ExtractXrpc<GetConvoSettingsRequest>,
-) -> Result<Json<GetConvoSettingsOutput<'static>>, StatusCode> {
+) -> Result<Json<GetConvoSettingsOutput>, StatusCode> {
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    let convo_id = input.convo_id.as_ref();
+    let convo_id = input.convo_id.as_str();
     let caller_did = &auth_user.did;
 
     // Check membership

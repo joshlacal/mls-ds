@@ -20,7 +20,7 @@ pub async fn list_devices(
     State(pool): State<DbPool>,
     auth_user: AuthUser,
     ExtractXrpc(_input): ExtractXrpc<ListDevicesRequest>,
-) -> Result<Json<ListDevicesOutput<'static>>, StatusCode> {
+) -> Result<Json<ListDevicesOutput>, StatusCode> {
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -65,7 +65,7 @@ pub async fn list_devices(
         crate::crypto::redact_for_log(user_did)
     );
 
-    let devices: Vec<DeviceInfo<'static>> = rows
+    let devices: Vec<DeviceInfo> = rows
         .into_iter()
         .map(|r| DeviceInfo {
             device_id: r.get::<String, _>("device_id").into(),

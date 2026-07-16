@@ -27,7 +27,7 @@ pub async fn opt_in_post(
     State(device_client): State<Arc<DeviceRecordClient>>,
     auth_user: AuthUser,
     ExtractXrpc(input): ExtractXrpc<OptInRequest>,
-) -> Result<Json<OptInOutput<'static>>, StatusCode> {
+) -> Result<Json<OptInOutput>, StatusCode> {
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -215,7 +215,7 @@ pub async fn opt_in_post(
                 }
             }
 
-            let statuses: Vec<OptInStatus<'static>> = dids
+            let statuses: Vec<OptInStatus> = dids
                 .into_iter()
                 .map(|did| {
                     if let Some(opted_in_at) = status_map.remove(&did) {

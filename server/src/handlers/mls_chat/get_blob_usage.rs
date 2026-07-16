@@ -25,7 +25,7 @@ pub async fn get_blob_usage(
     State(blob_store): State<BlobStore>,
     auth_user: AuthUser,
     ExtractXrpc(_input): ExtractXrpc<GetBlobUsageRequest>,
-) -> Result<Json<GetBlobUsageOutput<'static>>, StatusCode> {
+) -> Result<Json<GetBlobUsageOutput>, StatusCode> {
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
         error!("❌ [getBlobUsage] Unauthorized");
         return Err(StatusCode::UNAUTHORIZED);
