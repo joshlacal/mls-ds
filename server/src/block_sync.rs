@@ -19,6 +19,9 @@ use std::{
 use thiserror::Error;
 use tracing::{debug, info};
 
+use crate::util::outbound_body::{
+    decode_json_bounded, OutboundBodyError, ResponseBodyBudget, DID_DOCUMENT_MAX_BYTES,
+};
 use crate::{identity::did_web_document_url, storage::DbPool};
 
 /// Errors that can occur during block synchronization
@@ -79,6 +82,7 @@ struct TestDestinationFixture {
         std::collections::HashMap<String, std::collections::VecDeque<TestDnsAnswer>>,
     >,
     allow_literal_loopback_http: bool,
+    validation_delay: Duration,
     lookups: std::sync::atomic::AtomicUsize,
 }
 
@@ -101,6 +105,22 @@ impl TestDestinationFixture {
                     .map(|(host, answers)| (host, answers.into()))
                     .collect(),
             ),
+            ..Self::default()
+        })
+    }
+
+    fn with_answers_and_delay(
+        answers: impl IntoIterator<Item = (String, Vec<TestDnsAnswer>)>,
+        validation_delay: Duration,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            answers: std::sync::Mutex::new(
+                answers
+                    .into_iter()
+                    .map(|(host, answers)| (host, answers.into()))
+                    .collect(),
+            ),
+            validation_delay,
             ..Self::default()
         })
     }
@@ -136,6 +156,7 @@ struct ResourceLimits {
     max_aggregate_bytes_per_did: usize,
     max_cursor_bytes: usize,
     did_deadline: Duration,
+    did_document_deadline: Duration,
     conflict_deadline: Duration,
     max_conflict_edges: usize,
     block_cache_capacity_bytes: u64,
@@ -155,6 +176,7 @@ impl Default for ResourceLimits {
             max_aggregate_bytes_per_did: 2 * 1024 * 1024,
             max_cursor_bytes: 4 * 1024,
             did_deadline: Duration::from_secs(20),
+            did_document_deadline: Duration::from_secs(10),
             conflict_deadline: Duration::from_secs(30),
             max_conflict_edges: 10_000,
             block_cache_capacity_bytes: 64 * 1024 * 1024,
@@ -390,6 +412,11 @@ impl BlockSyncService {
         })?;
 
         #[cfg(test)]
+        if let Some(fixture) = &self.destination_fixture {
+            tokio::time::sleep(fixture.validation_delay).await;
+        }
+
+        #[cfg(test)]
         let fixture_answer = self
             .destination_fixture
             .as_ref()
@@ -474,6 +501,69 @@ impl BlockSyncService {
         Ok(response)
     }
 
+    async fn send_did_request_before(
+        &self,
+        raw_url: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<Response, BlockSyncError> {
+        let destination = tokio::time::timeout_at(deadline, self.validate_destination(raw_url))
+            .await
+            .map_err(|_| BlockSyncError::DeadlineExceeded {
+                operation: "did_resolution",
+            })??;
+        let client = reqwest::Client::builder()
+            .user_agent("Catbird-MLS/1.0")
+            .no_proxy()
+            .redirect(Policy::none())
+            .resolve_to_addrs(&destination.host, &destination.addrs)
+            .build()
+            .map_err(|_| BlockSyncError::HttpError("DID resolver client setup failed".into()))?;
+        let response = tokio::time::timeout_at(deadline, client.get(destination.url).send())
+            .await
+            .map_err(|_| BlockSyncError::DeadlineExceeded {
+                operation: "did_resolution",
+            })?
+            .map_err(|error| {
+                if error.is_timeout() {
+                    BlockSyncError::DeadlineExceeded {
+                        operation: "did_resolution",
+                    }
+                } else {
+                    BlockSyncError::HttpError("DID resolver request failed".into())
+                }
+            })?;
+        if response.status().is_redirection() {
+            return Err(BlockSyncError::RedirectRejected {
+                status: response.status(),
+            });
+        }
+        Ok(response)
+    }
+
+    fn map_did_body_error(error: OutboundBodyError) -> BlockSyncError {
+        match error {
+            OutboundBodyError::DeclaredTooLarge { .. }
+            | OutboundBodyError::StreamedTooLarge { .. }
+            | OutboundBodyError::LengthOverflow => {
+                BlockSyncError::ParseError("DID document response exceeded size limit".into())
+            }
+            OutboundBodyError::DeadlineExceeded => BlockSyncError::DeadlineExceeded {
+                operation: "did_resolution",
+            },
+            OutboundBodyError::ReadFailed(source) if source.is_timeout() => {
+                BlockSyncError::DeadlineExceeded {
+                    operation: "did_resolution",
+                }
+            }
+            OutboundBodyError::ReadFailed(_) => {
+                BlockSyncError::HttpError("DID document response body read failed".into())
+            }
+            OutboundBodyError::InvalidJson(_) => {
+                BlockSyncError::ParseError("DID document response JSON was invalid".into())
+            }
+        }
+    }
+
     fn resource_limit(resource: &'static str, limit: usize) -> BlockSyncError {
         BlockSyncError::ResourceLimitExceeded { resource, limit }
     }
@@ -548,7 +638,12 @@ impl BlockSyncService {
             )));
         };
 
-        let response = self.send_validated(&url).await?;
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.limits.did_document_deadline)
+            .ok_or(BlockSyncError::DeadlineExceeded {
+                operation: "did_resolution",
+            })?;
+        let response = self.send_did_request_before(&url, deadline).await?;
 
         if !response.status().is_success() {
             return Err(BlockSyncError::DidResolutionFailed(format!(
@@ -557,10 +652,12 @@ impl BlockSyncService {
             )));
         }
 
-        response
-            .json::<DidDocument>()
-            .await
-            .map_err(|e| BlockSyncError::ParseError(e.to_string()))
+        decode_json_bounded(
+            response,
+            ResponseBodyBudget::new(DID_DOCUMENT_MAX_BYTES, deadline),
+        )
+        .await
+        .map_err(Self::map_did_body_error)
     }
 
     /// Fetch all block records for a user from their PDS
@@ -924,6 +1021,7 @@ mod tests {
             max_aggregate_bytes_per_did: 8 * 1024,
             max_cursor_bytes: 32,
             did_deadline: Duration::from_secs(2),
+            did_document_deadline: Duration::from_secs(10),
             conflict_deadline: Duration::from_secs(3),
             max_conflict_edges: 10,
             block_cache_capacity_bytes: 64 * 1024 * 1024,
@@ -955,6 +1053,37 @@ mod tests {
             axum::serve(listener, router).await.unwrap();
         });
         format!("http://{address}")
+    }
+
+    fn did_document(did: &str, endpoint: &str) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "id": did,
+            "service": [{
+                "id": "#atproto_pds",
+                "type": "AtprotoPersonalDataServer",
+                "serviceEndpoint": endpoint
+            }]
+        }))
+        .unwrap()
+    }
+
+    fn did_web_service_for_endpoint(
+        local_endpoint: &str,
+        host: &str,
+    ) -> (BlockSyncService, String) {
+        let answer = fixture_answer(local_endpoint, true);
+        let fixture = TestDestinationFixture::with_answers([(
+            host.to_string(),
+            vec![answer.clone(), answer],
+        )]);
+        let service = BlockSyncService::with_test_destination_fixture(test_limits(), fixture);
+        let port = Url::parse(local_endpoint).unwrap().port().unwrap();
+        (service, format!("did:web:{host}%3A{port}"))
+    }
+
+    async fn did_web_service(router: Router, host: &str) -> (BlockSyncService, String) {
+        let local_endpoint = spawn_pds(router).await;
+        did_web_service_for_endpoint(&local_endpoint, host)
     }
 
     async fn service_for_pds(
@@ -1417,6 +1546,215 @@ mod tests {
         assert!(service.pds_cache.get(did).await.is_none());
     }
 
+    #[tokio::test]
+    async fn bounded_plc_and_web_documents_admit_the_pds_endpoint() {
+        let endpoint = "https://pds.test";
+        let body = did_document("did:plc:bounded", endpoint);
+        let router = Router::new().fallback(get(move || {
+            let body = body.clone();
+            async move {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from(body))
+                    .unwrap()
+            }
+        }));
+        let local_endpoint = spawn_pds(router).await;
+        let answer = fixture_answer(&local_endpoint, true);
+        let fixture = TestDestinationFixture::with_answers([
+            ("plc.directory".into(), vec![answer.clone()]),
+            ("bounded-web.test".into(), vec![answer.clone()]),
+            ("pds.test".into(), vec![answer]),
+        ]);
+        let service = BlockSyncService::with_test_destination_fixture(test_limits(), fixture);
+        let port = Url::parse(&local_endpoint).unwrap().port().unwrap();
+        let web_did = format!("did:web:bounded-web.test%3A{port}");
+
+        assert_eq!(
+            service.get_pds_endpoint("did:plc:bounded").await.unwrap(),
+            endpoint
+        );
+        assert_eq!(service.get_pds_endpoint(&web_did).await.unwrap(), endpoint);
+        assert_eq!(
+            service.pds_cache.get("did:plc:bounded").await.as_deref(),
+            Some(endpoint)
+        );
+        assert_eq!(
+            service.pds_cache.get(&web_did).await.as_deref(),
+            Some(endpoint)
+        );
+    }
+
+    #[tokio::test]
+    async fn declared_oversize_did_document_is_rejected_before_cache_admission() {
+        let oversized = vec![b'x'; crate::util::outbound_body::DID_DOCUMENT_MAX_BYTES + 1];
+        let router = Router::new().fallback(get(move || {
+            let oversized = oversized.clone();
+            async move {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-length", oversized.len())
+                    .body(Body::from(oversized))
+                    .unwrap()
+            }
+        }));
+        let (service, did) = did_web_service(router, "declared-did.test").await;
+
+        let error = service.get_pds_endpoint(&did).await.unwrap_err();
+
+        assert!(matches!(error, BlockSyncError::ParseError(_)));
+        assert_eq!(
+            error.to_string(),
+            "Failed to parse response: DID document response exceeded size limit"
+        );
+        assert!(service.pds_cache.get(&did).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn chunked_oversize_did_document_is_rejected_before_cache_admission() {
+        let router = Router::new().fallback(get(|| async {
+            let chunks = vec![
+                Ok::<_, Infallible>(Bytes::from(vec![
+                    b'x';
+                    crate::util::outbound_body::DID_DOCUMENT_MAX_BYTES
+                ])),
+                Ok::<_, Infallible>(Bytes::from_static(b"x")),
+            ];
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::from_stream(stream::iter(chunks)))
+                .unwrap()
+        }));
+        let (service, did) = did_web_service(router, "chunked-did.test").await;
+
+        let error = service.get_pds_endpoint(&did).await.unwrap_err();
+
+        assert!(matches!(error, BlockSyncError::ParseError(_)));
+        assert_eq!(
+            error.to_string(),
+            "Failed to parse response: DID document response exceeded size limit"
+        );
+        assert!(service.pds_cache.get(&did).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_did_document_diagnostics_are_content_free_and_not_cached() {
+        let body_canary = "BODY_SECRET_CANARY";
+        let router = Router::new().fallback(get(move || async move {
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::from(format!("{{not-json:{body_canary}")))
+                .unwrap()
+        }));
+        let (service, did) = did_web_service(router, "diagnostic-did.test").await;
+
+        let error = service.get_pds_endpoint(&did).await.unwrap_err();
+        let diagnostic = format!("{error} {error:?}");
+
+        assert!(!diagnostic.contains(body_canary), "{diagnostic}");
+        assert!(!diagnostic.contains(&did), "{diagnostic}");
+        assert!(!diagnostic.contains("diagnostic-did.test"), "{diagnostic}");
+        assert!(service.pds_cache.get(&did).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn truncated_did_body_failure_is_sanitized_and_not_cached() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 1024\r\nConnection: close\r\n\r\ntruncated",
+                )
+                .await
+                .unwrap();
+        });
+        let local_endpoint = format!("http://{address}");
+        let (service, did) = did_web_service_for_endpoint(&local_endpoint, "transport-canary.test");
+
+        let error = service.get_pds_endpoint(&did).await.unwrap_err();
+        let diagnostic = format!("{error} {error:?}");
+
+        assert_eq!(
+            error.to_string(),
+            "HTTP request failed: DID document response body read failed"
+        );
+        assert!(!diagnostic.contains(&did), "{diagnostic}");
+        assert!(
+            !diagnostic.contains("transport-canary.test"),
+            "{diagnostic}"
+        );
+        assert!(service.pds_cache.get(&did).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn validation_headers_and_body_share_one_did_deadline() {
+        let body = did_document("did:web:deadline.test", "https://pds.test");
+        let router = Router::new().fallback(get(move || {
+            let body = body.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                let stream = stream::once(async move {
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    Ok::<_, Infallible>(Bytes::from(body))
+                });
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from_stream(stream))
+                    .unwrap()
+            }
+        }));
+        let local_endpoint = spawn_pds(router).await;
+        let answer = fixture_answer(&local_endpoint, true);
+        let fixture = TestDestinationFixture::with_answers_and_delay(
+            [("deadline.test".into(), vec![answer])],
+            Duration::from_millis(40),
+        );
+        let mut limits = test_limits();
+        limits.did_document_deadline = Duration::from_millis(90);
+        let service = BlockSyncService::with_test_destination_fixture(limits, fixture);
+        let port = Url::parse(&local_endpoint).unwrap().port().unwrap();
+        let did = format!("did:web:deadline.test%3A{port}");
+
+        let error = service.get_pds_endpoint(&did).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            BlockSyncError::DeadlineExceeded {
+                operation: "did_resolution"
+            }
+        ));
+        assert!(service.pds_cache.get(&did).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn non_success_did_status_mapping_does_not_collect_body() {
+        let router = Router::new().fallback(get(|| async {
+            let chunks = stream::once(async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Ok::<_, Infallible>(Bytes::from_static(b"unused-secret-body"))
+            });
+            Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::from_stream(chunks))
+                .unwrap()
+        }));
+        let (service, did) = did_web_service(router, "status-did.test").await;
+        let started = tokio::time::Instant::now();
+
+        let error = service.get_pds_endpoint(&did).await.unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Failed to resolve DID: HTTP 404 Not Found from DID resolver"
+        );
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(service.pds_cache.get(&did).await.is_none());
+    }
+
     #[test]
     fn production_limits_match_frozen_task_card() {
         let limits = ResourceLimits::default();
@@ -1427,6 +1765,7 @@ mod tests {
         assert_eq!(limits.max_aggregate_bytes_per_did, 2 * 1024 * 1024);
         assert_eq!(limits.max_cursor_bytes, 4 * 1024);
         assert_eq!(limits.did_deadline, Duration::from_secs(20));
+        assert_eq!(limits.did_document_deadline, Duration::from_secs(10));
         assert_eq!(limits.conflict_deadline, Duration::from_secs(30));
         assert_eq!(limits.max_conflict_edges, 10_000);
         assert_eq!(limits.block_cache_capacity_bytes, 64 * 1024 * 1024);
