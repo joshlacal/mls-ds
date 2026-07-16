@@ -27,8 +27,34 @@ pub(crate) fn canonical_receipt_hash(
 pub enum TransitionKind {
     Commit,
     AddMembers,
+    RemoveMembers,
     Update,
     ExternalCommit,
+}
+
+impl TransitionKind {
+    // Consumed by the ADR-016 B2 handler conversion after this prelude lands.
+    #[allow(dead_code)]
+    pub(crate) fn for_commit_group_change_action(action: &str) -> Option<Self> {
+        match action {
+            "addMembers" => Some(Self::AddMembers),
+            "externalCommit" => Some(Self::ExternalCommit),
+            "removeMember" | "removeMembers" => Some(Self::RemoveMembers),
+            "commit" => Some(Self::Commit),
+            "updateMetadata" => Some(Self::Update),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn event_type(self) -> &'static str {
+        match self {
+            Self::Commit => "mls_transition_commit",
+            Self::AddMembers => "mls_transition_add_members",
+            Self::RemoveMembers => "mls_transition_remove_members",
+            Self::Update => "mls_transition_update",
+            Self::ExternalCommit => "mls_transition_external_commit",
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -184,12 +210,7 @@ impl ValidatedMlsTransition {
     }
 
     pub(crate) fn event_type(&self) -> &'static str {
-        match self.kind {
-            TransitionKind::Commit => "mls_transition_commit",
-            TransitionKind::AddMembers => "mls_transition_add_members",
-            TransitionKind::Update => "mls_transition_update",
-            TransitionKind::ExternalCommit => "mls_transition_external_commit",
-        }
+        self.kind.event_type()
     }
 }
 
@@ -237,6 +258,55 @@ mod tests {
             None,
         )
         .expect("valid transition")
+    }
+
+    #[test]
+    fn transition_actions_map_to_exact_distinct_kinds_and_events() {
+        for (action, kind, event) in [
+            (
+                "addMembers",
+                TransitionKind::AddMembers,
+                "mls_transition_add_members",
+            ),
+            (
+                "externalCommit",
+                TransitionKind::ExternalCommit,
+                "mls_transition_external_commit",
+            ),
+            (
+                "removeMember",
+                TransitionKind::RemoveMembers,
+                "mls_transition_remove_members",
+            ),
+            (
+                "removeMembers",
+                TransitionKind::RemoveMembers,
+                "mls_transition_remove_members",
+            ),
+            ("commit", TransitionKind::Commit, "mls_transition_commit"),
+            (
+                "updateMetadata",
+                TransitionKind::Update,
+                "mls_transition_update",
+            ),
+        ] {
+            assert_eq!(
+                TransitionKind::for_commit_group_change_action(action),
+                Some(kind)
+            );
+            assert_eq!(kind.event_type(), event);
+        }
+
+        for action in [
+            "remove",
+            "RemoveMember",
+            "removeMember ",
+            "commitGroupChange",
+            "",
+        ] {
+            assert_eq!(TransitionKind::for_commit_group_change_action(action), None);
+        }
+        assert_ne!(TransitionKind::RemoveMembers, TransitionKind::Commit);
     }
 
     #[test]
