@@ -565,12 +565,6 @@ pub fn verify_group_info_for_transition(
     if authenticated.epoch() != expected_epoch {
         return Err(GroupInfoVerificationError::UnexpectedEpoch);
     }
-    if authenticated.signer_credential()
-        != &Credential::from(BasicCredential::new(device.user_did().as_bytes().to_vec()))
-    {
-        return Err(GroupInfoVerificationError::WrongExpectedCredential);
-    }
-
     Ok(VerifiedGroupInfo {
         authenticated,
         conversation_id: context.conversation_id.clone(),
