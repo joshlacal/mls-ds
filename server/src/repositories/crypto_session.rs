@@ -88,6 +88,42 @@ impl PostgresCryptoSessionRepository {
         apply_transition_tx(tx, transition).await
     }
 
+    /// Append an operation-verified receipt inside the caller's transaction.
+    ///
+    /// The resolved generation and sequencer authority must still be current;
+    /// callers can compose this with handler-owned writes without introducing
+    /// a receipt-before-operation crash window.
+    pub async fn record_verified_receipt_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        context: &ResolvedMlsContext,
+        receipt: &SequencerReceiptRef,
+    ) -> RepositoryResult<SequencerReceiptRef> {
+        let context_is_current: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM crypto_sessions cs \
+             JOIN conversations c ON c.active_crypto_session_id=cs.id \
+             WHERE cs.id=$1 AND cs.conversation_id=$2 AND cs.generation=$3 \
+               AND cs.mls_group_id=$4 AND cs.state='active' \
+               AND cs.last_observed_epoch=$5 AND cs.sequencer_term=$6 \
+               AND COALESCE(cs.sequencer_did,$7)=$7 \
+               AND c.id=$2 AND c.current_epoch=$5 AND COALESCE(c.reset_count,0)=$3 \
+               AND COALESCE(c.sequencer_ds,$7)=$7)",
+        )
+        .bind(&context.crypto_session_id)
+        .bind(&context.conversation_id)
+        .bind(context.reset_generation)
+        .bind(&context.mls_group_id)
+        .bind(context.authoritative_epoch)
+        .bind(context.sequencer_term)
+        .bind(&context.sequencer_did)
+        .fetch_one(&mut **tx)
+        .await?;
+        if !context_is_current {
+            return Err(RepositoryError::StaleContext);
+        }
+        append_receipt_tx(tx, context, receipt).await
+    }
+
     async fn resolve_with_predicate(
         &self,
         column: &str,
@@ -219,6 +255,45 @@ impl ResolvedContextRowExt for ResolvedContextRow {
 
 type ReceiptRow = (Vec<u8>, i32, i64, String, Vec<u8>, i64, Vec<u8>);
 
+pub(crate) fn generation_qualified_receipt_hash(
+    conversation_id: &str,
+    reset_generation: i32,
+    epoch: i32,
+    term: i64,
+    sequencer_did: &str,
+    commit_hash: &[u8],
+    issued_at: i64,
+    signature: &[u8],
+) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"CATBIRD-PERSISTED-RECEIPT-V1:");
+    hasher.update((conversation_id.len() as u32).to_be_bytes());
+    hasher.update(conversation_id.as_bytes());
+    hasher.update(reset_generation.to_be_bytes());
+    hasher.update(epoch.to_be_bytes());
+    hasher.update(term.to_be_bytes());
+    let sequencer_did = crate::identity::canonical_did(sequencer_did);
+    hasher.update((sequencer_did.len() as u32).to_be_bytes());
+    hasher.update(sequencer_did.as_bytes());
+    hasher.update((commit_hash.len() as u32).to_be_bytes());
+    hasher.update(commit_hash);
+    hasher.update(issued_at.to_be_bytes());
+    hasher.update((signature.len() as u32).to_be_bytes());
+    hasher.update(signature);
+    hasher.finalize().to_vec()
+}
+
+fn receipt_contents_match(left: &SequencerReceiptRef, right: &SequencerReceiptRef) -> bool {
+    left.epoch == right.epoch
+        && left.term == right.term
+        && left.sequencer_did == right.sequencer_did
+        && left.commit_hash == right.commit_hash
+        && left.issued_at == right.issued_at
+        && left.signature == right.signature
+}
+
 fn receipt_from_row(row: ReceiptRow) -> SequencerReceiptRef {
     SequencerReceiptRef {
         receipt_hash: row.0,
@@ -246,14 +321,37 @@ async fn append_receipt_tx(
         ));
     }
     let mut canonical_receipt = receipt.clone();
-    canonical_receipt.receipt_hash =
-        crate::mls_transition::canonical_receipt_hash(&context.conversation_id, receipt);
-    sqlx::query(
-        "INSERT INTO sequencer_receipts \
-         (convo_id, epoch, sequencer_term, commit_hash, sequencer_did, issued_at, signature, receipt_hash) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (convo_id, epoch) DO NOTHING",
+    canonical_receipt.receipt_hash = generation_qualified_receipt_hash(
+        &context.conversation_id,
+        context.reset_generation,
+        receipt.epoch,
+        receipt.term,
+        &receipt.sequencer_did,
+        &receipt.commit_hash,
+        receipt.issued_at,
+        &receipt.signature,
+    );
+    let legacy: Option<ReceiptRow> = sqlx::query_as(
+        "SELECT receipt_hash, epoch, sequencer_term, sequencer_did, commit_hash, issued_at, signature \
+         FROM sequencer_receipts WHERE convo_id = $1 AND epoch = $2",
     )
     .bind(&context.conversation_id)
+    .bind(canonical_receipt.epoch)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(legacy) = legacy.map(receipt_from_row) {
+        if !receipt_contents_match(&legacy, &canonical_receipt) {
+            return Err(RepositoryError::ReceiptEquivocation);
+        }
+    }
+    sqlx::query(
+        "INSERT INTO sequencer_receipts_v2 \
+         (convo_id, reset_generation, epoch, sequencer_term, commit_hash, sequencer_did, issued_at, signature, receipt_hash) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) \
+         ON CONFLICT (convo_id, reset_generation, epoch) DO NOTHING",
+    )
+    .bind(&context.conversation_id)
+    .bind(context.reset_generation)
     .bind(canonical_receipt.epoch)
     .bind(canonical_receipt.term)
     .bind(&canonical_receipt.commit_hash)
@@ -265,14 +363,18 @@ async fn append_receipt_tx(
     .await?;
     let row: ReceiptRow = sqlx::query_as(
         "SELECT receipt_hash, epoch, sequencer_term, sequencer_did, commit_hash, issued_at, signature \
-         FROM sequencer_receipts WHERE convo_id = $1 AND epoch = $2",
+         FROM sequencer_receipts_v2 \
+         WHERE convo_id = $1 AND reset_generation = $2 AND epoch = $3",
     )
     .bind(&context.conversation_id)
+    .bind(context.reset_generation)
     .bind(canonical_receipt.epoch)
     .fetch_one(&mut **tx)
     .await?;
     let stored = receipt_from_row(row);
-    if stored != canonical_receipt {
+    if !receipt_contents_match(&stored, &canonical_receipt)
+        || stored.receipt_hash != canonical_receipt.receipt_hash
+    {
         return Err(RepositoryError::ReceiptEquivocation);
     }
     Ok(stored)
@@ -559,7 +661,9 @@ impl CryptoSessionRepository for PostgresCryptoSessionRepository {
         receipt: SequencerReceiptRef,
     ) -> RepositoryResult<SequencerReceiptRef> {
         let mut tx = self.pool.begin().await?;
-        let stored = append_receipt_tx(&mut tx, context, &receipt).await?;
+        let stored = self
+            .record_verified_receipt_in_tx(&mut tx, context, &receipt)
+            .await?;
         tx.commit().await?;
         Ok(stored)
     }
@@ -680,6 +784,28 @@ mod transition_repository_tests {
         pool
     }
 
+    #[test]
+    fn persisted_receipt_identity_binds_generation_and_authority() {
+        let hash = |generation, term, digest: u8| {
+            generation_qualified_receipt_hash(
+                "convo-1",
+                generation,
+                8,
+                term,
+                "did:web:mls.example.com",
+                &[digest; 32],
+                1_700_000_000,
+                &[0x44; 64],
+            )
+        };
+
+        let baseline = hash(2, 7, 0x33);
+        assert_eq!(baseline, hash(2, 7, 0x33));
+        assert_ne!(baseline, hash(3, 7, 0x33));
+        assert_ne!(baseline, hash(2, 8, 0x33));
+        assert_ne!(baseline, hash(2, 7, 0x34));
+    }
+
     #[tokio::test]
     #[ignore = "requires TEST_DATABASE_URL with migration privileges"]
     async fn postgres_mls_transition_cas_and_projection_are_atomic() {
@@ -777,7 +903,7 @@ mod transition_repository_tests {
                 .unwrap();
         assert_eq!(rolled_back_events, 0);
         let rolled_back_receipts: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM sequencer_receipts WHERE convo_id=$1")
+            sqlx::query_scalar("SELECT COUNT(*) FROM sequencer_receipts_v2 WHERE convo_id=$1")
                 .bind(&conversation_id)
                 .fetch_one(&pool)
                 .await
@@ -844,7 +970,7 @@ mod transition_repository_tests {
                 "SELECT cs.last_observed_epoch,cs.last_confirmation_tag,cs.sequencer_did, \
                         cs.group_info,cs.group_info_epoch,c.current_epoch,c.confirmation_tag, \
                         c.sequencer_ds,c.group_info,c.group_info_epoch, \
-                        (SELECT COUNT(*) FROM sequencer_receipts WHERE convo_id=$1), \
+                        (SELECT COUNT(*) FROM sequencer_receipts_v2 WHERE convo_id=$1), \
                         (SELECT COUNT(*) FROM delivery_events WHERE conversation_id=$1) \
                  FROM conversations c JOIN crypto_sessions cs ON cs.id=c.active_crypto_session_id \
                  WHERE c.id=$1",
@@ -954,6 +1080,14 @@ mod transition_repository_tests {
             .await
             .unwrap();
         assert_ne!(stored.receipt_hash, vec![0x11; 32]);
+        let restarted_repo = PostgresCryptoSessionRepository::new(pool.clone());
+        assert_eq!(
+            restarted_repo
+                .record_verified_receipt(&current, stored.clone())
+                .await
+                .unwrap(),
+            stored
+        );
         let candidate_receipt = SequencerReceiptRef {
             receipt_hash: stored.receipt_hash.clone(),
             commit_hash: vec![0xCE; 32],
@@ -998,7 +1132,7 @@ mod transition_repository_tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("DELETE FROM sequencer_receipts WHERE convo_id=$1")
+        sqlx::query("DELETE FROM sequencer_receipts_v2 WHERE convo_id=$1")
             .bind(&conversation_id)
             .execute(&pool)
             .await

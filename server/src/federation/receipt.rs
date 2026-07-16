@@ -27,6 +27,82 @@ pub enum ReceiptConfigError {
     ServiceAuthKeyReuse,
 }
 
+/// Fail-closed validation errors for the receipt verification method published
+/// by the sequencer's DID document.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ReceiptDidDocumentError {
+    #[error("receipt DID document is not valid JSON")]
+    MalformedDocument,
+    #[error("receipt DID document id does not own the fixed verification method")]
+    DocumentOwnerMismatch,
+    #[error("receipt DID document omits the fixed receipt verification method")]
+    MissingReceiptMethod,
+    #[error("receipt verification method controller does not match the document owner")]
+    ControllerMismatch,
+    #[error("receipt verification method must be a P-256 Multikey")]
+    UnsupportedReceiptKey,
+    #[error("published receipt key does not match the configured receipt signer")]
+    SignerKeyMismatch,
+    #[error("published receipt key must be distinct from the service-auth key")]
+    ServiceAuthKeyReuse,
+}
+
+/// Validate the fixed receipt verification method in a resolved DID document.
+///
+/// This is deliberately separate from generic service authentication. Receipt
+/// issuance may only be enabled after the exact method resolves to the
+/// configured P-256 signer and is distinct from the service-auth key.
+pub fn validate_receipt_did_document(
+    document: &str,
+    expected_receipt_key: &VerifyingKey,
+    service_auth_key: Option<&VerifyingKey>,
+) -> Result<(), ReceiptDidDocumentError> {
+    let document: serde_json::Value =
+        serde_json::from_str(document).map_err(|_| ReceiptDidDocumentError::MalformedDocument)?;
+    let method_owner = RECEIPT_VERIFICATION_METHOD
+        .split_once('#')
+        .map(|(did, _)| did)
+        .expect("fixed receipt verification method contains a fragment");
+    if document.get("id").and_then(serde_json::Value::as_str) != Some(method_owner) {
+        return Err(ReceiptDidDocumentError::DocumentOwnerMismatch);
+    }
+    let method = document
+        .get("verificationMethod")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|methods| {
+            methods.iter().find(|method| {
+                method.get("id").and_then(serde_json::Value::as_str)
+                    == Some(RECEIPT_VERIFICATION_METHOD)
+            })
+        })
+        .ok_or(ReceiptDidDocumentError::MissingReceiptMethod)?;
+    if method.get("controller").and_then(serde_json::Value::as_str) != Some(method_owner) {
+        return Err(ReceiptDidDocumentError::ControllerMismatch);
+    }
+    if method.get("type").and_then(serde_json::Value::as_str) != Some("Multikey") {
+        return Err(ReceiptDidDocumentError::UnsupportedReceiptKey);
+    }
+    let encoded = method
+        .get("publicKeyMultibase")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(ReceiptDidDocumentError::UnsupportedReceiptKey)?;
+    let (_, decoded) =
+        multibase::decode(encoded).map_err(|_| ReceiptDidDocumentError::UnsupportedReceiptKey)?;
+    // p256-pub has multicodec value 0x1200, encoded as unsigned varint 0x80 0x24.
+    if !decoded.starts_with(&[0x80, 0x24]) || decoded.len() != 2 + 33 {
+        return Err(ReceiptDidDocumentError::UnsupportedReceiptKey);
+    }
+    let published_key = VerifyingKey::from_sec1_bytes(&decoded[2..])
+        .map_err(|_| ReceiptDidDocumentError::UnsupportedReceiptKey)?;
+    if &published_key != expected_receipt_key {
+        return Err(ReceiptDidDocumentError::SignerKeyMismatch);
+    }
+    if service_auth_key == Some(&published_key) {
+        return Err(ReceiptDidDocumentError::ServiceAuthKeyReuse);
+    }
+    Ok(())
+}
+
 /// Build the optional receipt signer from its dedicated configuration.
 ///
 /// `SIGNING_KEY_PEM` is accepted only for a public-key separation check. It is
@@ -102,7 +178,7 @@ impl SequencerReceipt {
     /// Reconstructs the canonical byte representation and checks the ES256
     /// signature. Returns `true` if the signature is valid.
     pub fn verify(&self, verifying_key: &VerifyingKey) -> bool {
-        let canonical = canonical_bytes(
+        let canonical = canonical_receipt_bytes(
             &self.convo_id,
             self.epoch,
             self.sequencer_term,
@@ -146,7 +222,7 @@ impl ReceiptSigner {
     ) -> SequencerReceipt {
         let commit_hash = hash_commit(commit_ciphertext);
         let issued_at = Utc::now().timestamp();
-        let canonical = canonical_bytes(
+        let canonical = canonical_receipt_bytes(
             convo_id,
             epoch,
             sequencer_term,
@@ -184,7 +260,7 @@ pub fn hash_commit(ciphertext: &[u8]) -> [u8; 32] {
 /// Build the canonical byte representation for signing/verification.
 ///
 /// Format: `"CATBIRD-RECEIPT-V1:" || len(convo_id) (LE u32) || convo_id_bytes || epoch (BE i32) || sequencer_term (BE u64) || commit_hash || len(sequencer_did) (LE u32) || sequencer_did_bytes || issued_at (BE i64)`
-fn canonical_bytes(
+pub fn canonical_receipt_bytes(
     convo_id: &str,
     epoch: i32,
     sequencer_term: u64,
@@ -220,6 +296,107 @@ mod tests {
         key.to_pkcs8_pem(LineEnding::LF)
             .expect("encode test key")
             .to_string()
+    }
+
+    fn did_document(method_id: &str, controller: &str, key: &VerifyingKey) -> String {
+        let mut multikey = vec![0x80, 0x24]; // unsigned-varint multicodec p256-pub (0x1200)
+        multikey.extend_from_slice(key.to_encoded_point(true).as_bytes());
+        let public_key_multibase = multibase::encode(multibase::Base::Base58Btc, multikey);
+        serde_json::json!({
+            "id": "did:web:mlschat.catbird.blue",
+            "verificationMethod": [{
+                "id": method_id,
+                "type": "Multikey",
+                "controller": controller,
+                "publicKeyMultibase": public_key_multibase,
+            }],
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn receipt_did_document_requires_fixed_method() {
+        let receipt_key = SigningKey::random(&mut OsRng);
+        let document = did_document(
+            "did:web:mlschat.catbird.blue#atproto",
+            "did:web:mlschat.catbird.blue",
+            receipt_key.verifying_key(),
+        );
+
+        assert_eq!(
+            validate_receipt_did_document(&document, receipt_key.verifying_key(), None),
+            Err(ReceiptDidDocumentError::MissingReceiptMethod)
+        );
+    }
+
+    #[test]
+    fn receipt_did_document_rejects_wrong_controller() {
+        let receipt_key = SigningKey::random(&mut OsRng);
+        let document = did_document(
+            RECEIPT_VERIFICATION_METHOD,
+            "did:web:attacker.example",
+            receipt_key.verifying_key(),
+        );
+
+        assert_eq!(
+            validate_receipt_did_document(&document, receipt_key.verifying_key(), None),
+            Err(ReceiptDidDocumentError::ControllerMismatch)
+        );
+    }
+
+    #[test]
+    fn receipt_did_document_rejects_service_auth_key_reuse() {
+        let shared_key = SigningKey::random(&mut OsRng);
+        let document = did_document(
+            RECEIPT_VERIFICATION_METHOD,
+            "did:web:mlschat.catbird.blue",
+            shared_key.verifying_key(),
+        );
+
+        assert_eq!(
+            validate_receipt_did_document(
+                &document,
+                shared_key.verifying_key(),
+                Some(shared_key.verifying_key()),
+            ),
+            Err(ReceiptDidDocumentError::ServiceAuthKeyReuse)
+        );
+    }
+
+    #[test]
+    fn receipt_did_document_rejects_signer_key_mismatch() {
+        let published_key = SigningKey::random(&mut OsRng);
+        let signer_key = SigningKey::random(&mut OsRng);
+        let document = did_document(
+            RECEIPT_VERIFICATION_METHOD,
+            "did:web:mlschat.catbird.blue",
+            published_key.verifying_key(),
+        );
+
+        assert_eq!(
+            validate_receipt_did_document(&document, signer_key.verifying_key(), None),
+            Err(ReceiptDidDocumentError::SignerKeyMismatch)
+        );
+    }
+
+    #[test]
+    fn receipt_did_document_accepts_dedicated_published_key() {
+        let receipt_key = SigningKey::random(&mut OsRng);
+        let service_key = SigningKey::random(&mut OsRng);
+        let document = did_document(
+            RECEIPT_VERIFICATION_METHOD,
+            "did:web:mlschat.catbird.blue",
+            receipt_key.verifying_key(),
+        );
+
+        assert_eq!(
+            validate_receipt_did_document(
+                &document,
+                receipt_key.verifying_key(),
+                Some(service_key.verifying_key()),
+            ),
+            Ok(())
+        );
     }
 
     #[test]
@@ -335,7 +512,7 @@ mod tests {
 
     #[test]
     fn canonical_receipt_v1_golden_includes_sequencer_term() {
-        let bytes = canonical_bytes(
+        let bytes = canonical_receipt_bytes(
             "c",
             0x0102_0304,
             0x0102_0304_0506_0708,
@@ -407,6 +584,32 @@ mod tests {
         let mut receipt = signer.sign_receipt("convo-789", 3, 9, b"original");
         receipt.epoch = 4; // tamper
         assert!(!receipt.verify(&vk), "tampered receipt should not verify");
+    }
+
+    #[test]
+    fn verify_rejects_each_authority_binding_tamper() {
+        let signer = ReceiptSigner::new(
+            SigningKey::random(&mut OsRng),
+            "did:web:ds.example.com".to_string(),
+        );
+        let verifying_key = signer.verifying_key();
+        let receipt = signer.sign_receipt("convo-bound", 7, 11, b"commit");
+
+        let mut conversation = receipt.clone();
+        conversation.convo_id = "convo-other".into();
+        assert!(!conversation.verify(&verifying_key));
+
+        let mut epoch = receipt.clone();
+        epoch.epoch += 1;
+        assert!(!epoch.verify(&verifying_key));
+
+        let mut term = receipt.clone();
+        term.sequencer_term += 1;
+        assert!(!term.verify(&verifying_key));
+
+        let mut digest = receipt;
+        digest.commit_hash[0] ^= 0xff;
+        assert!(!digest.verify(&verifying_key));
     }
 
     #[test]
