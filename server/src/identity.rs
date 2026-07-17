@@ -139,6 +139,9 @@ pub fn did_web_service_endpoint(did: &str) -> Option<String> {
     Some(format!("https://{host_port}/{}", path.join("/")))
 }
 
+/// Canonical root DID document path shared by URL resolution and serving.
+pub const DID_WEB_WELL_KNOWN_PATH: &str = "/.well-known/did.json";
+
 /// Build DID document URL from `did:web` per method rules.
 ///
 /// - `did:web:example.com` -> `https://example.com/.well-known/did.json`
@@ -146,7 +149,7 @@ pub fn did_web_service_endpoint(did: &str) -> Option<String> {
 pub fn did_web_document_url(did: &str) -> Option<String> {
     let (host_port, path) = parse_did_web(did)?;
     if path.is_empty() {
-        return Some(format!("https://{host_port}/.well-known/did.json"));
+        return Some(format!("https://{host_port}{DID_WEB_WELL_KNOWN_PATH}"));
     }
     Some(format!("https://{host_port}/{}/did.json", path.join("/")))
 }
@@ -154,6 +157,11 @@ pub fn did_web_document_url(did: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn well_known_did_path_is_exact_and_shared() {
+        assert_eq!(DID_WEB_WELL_KNOWN_PATH, "/.well-known/did.json");
+    }
 
     #[test]
     fn canonicalization_strips_fragment() {

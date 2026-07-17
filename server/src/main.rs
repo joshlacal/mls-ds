@@ -84,7 +84,7 @@ where
     };
     let document = Arc::new(document);
     Router::new().route(
-        "/.well-known/did.json",
+        catbird_server::identity::DID_WEB_WELL_KNOWN_PATH,
         get(move || {
             let document = document.clone();
             async move { axum::Json((*document).clone()).into_response() }
@@ -1394,7 +1394,7 @@ mod tests {
         let app: Router = receipt_did_document_router(Some(document.clone()));
         let response = app
             .oneshot(
-                Request::get("/.well-known/did.json")
+                Request::get(catbird_server::identity::DID_WEB_WELL_KNOWN_PATH)
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -1412,7 +1412,7 @@ mod tests {
         let disabled: Router = receipt_did_document_router(None);
         let response = disabled
             .oneshot(
-                Request::get("/.well-known/did.json")
+                Request::get(catbird_server::identity::DID_WEB_WELL_KNOWN_PATH)
                     .body(Body::empty())
                     .expect("request"),
             )
