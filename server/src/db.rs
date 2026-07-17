@@ -3671,22 +3671,28 @@ pub async fn store_sequencer_receipt(
     );
     let mut tx = pool.begin().await?;
 
-    let legacy: Option<(i64, Vec<u8>, String, i64, Vec<u8>)> = sqlx::query_as(
-        "SELECT sequencer_term, commit_hash, sequencer_did, issued_at, signature \
-         FROM sequencer_receipts WHERE convo_id=$1 AND epoch=$2",
-    )
-    .bind(&receipt.convo_id)
-    .bind(receipt.epoch)
-    .fetch_optional(&mut *tx)
-    .await?;
-    if let Some((term, commit_hash, did, issued_at, signature)) = legacy {
-        if term != sequencer_term
-            || commit_hash != receipt.commit_hash
-            || did != receipt.sequencer_did
-            || issued_at != receipt.issued_at
-            || signature != receipt.signature
-        {
-            bail!("sequencer receipt conflicts with immutable legacy evidence");
+    // The legacy key omitted reset generation, so its rows can only be
+    // authoritative for generation zero. Looking them up for later
+    // generations would turn legitimate epoch reuse after reset into false
+    // equivocation.
+    if reset_generation == 0 {
+        let legacy: Option<(i64, Vec<u8>, String, i64, Vec<u8>)> = sqlx::query_as(
+            "SELECT sequencer_term, commit_hash, sequencer_did, issued_at, signature \
+             FROM sequencer_receipts WHERE convo_id=$1 AND epoch=$2",
+        )
+        .bind(&receipt.convo_id)
+        .bind(receipt.epoch)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((term, commit_hash, did, issued_at, signature)) = legacy {
+            if term != sequencer_term
+                || commit_hash != receipt.commit_hash
+                || did != receipt.sequencer_did
+                || issued_at != receipt.issued_at
+                || signature != receipt.signature
+            {
+                bail!("sequencer receipt conflicts with immutable legacy evidence");
+            }
         }
     }
 
@@ -3746,23 +3752,28 @@ pub async fn get_sequencer_receipts(
     let receipts = if let Some(epoch) = since_epoch {
         sqlx::query_as::<_, SequencerReceipt>(
             r#"
-            WITH current_generation AS (
-                SELECT COALESCE(reset_count, 0) AS generation
-                FROM conversations WHERE id = $1
-            ), current_receipts AS (
+            WITH v2_receipts AS (
                 SELECT v.convo_id, v.epoch, v.sequencer_term, v.commit_hash,
                        v.sequencer_did, v.issued_at, v.signature, v.created_at
-                FROM sequencer_receipts_v2 v, current_generation g
-                WHERE v.convo_id = $1 AND v.reset_generation = g.generation AND v.epoch >= $2
+                FROM sequencer_receipts_v2 v
+                WHERE v.convo_id = $1 AND v.epoch >= $2
             )
-            SELECT * FROM current_receipts
+            SELECT * FROM v2_receipts
             UNION ALL
             SELECT l.convo_id, l.epoch, l.sequencer_term, l.commit_hash,
                    l.sequencer_did, l.issued_at, l.signature, l.created_at
             FROM sequencer_receipts l
             WHERE l.convo_id = $1 AND l.epoch >= $2
-              AND NOT EXISTS (SELECT 1 FROM current_receipts)
-            ORDER BY epoch DESC
+              AND NOT EXISTS (
+                  SELECT 1 FROM v2_receipts v
+                  WHERE v.epoch = l.epoch
+                    AND v.sequencer_term = l.sequencer_term
+                    AND v.commit_hash = l.commit_hash
+                    AND v.sequencer_did = l.sequencer_did
+                    AND v.issued_at = l.issued_at
+                    AND v.signature = l.signature
+              )
+            ORDER BY epoch DESC, issued_at DESC
             "#,
         )
         .bind(convo_id)
@@ -3772,23 +3783,28 @@ pub async fn get_sequencer_receipts(
     } else {
         sqlx::query_as::<_, SequencerReceipt>(
             r#"
-            WITH current_generation AS (
-                SELECT COALESCE(reset_count, 0) AS generation
-                FROM conversations WHERE id = $1
-            ), current_receipts AS (
+            WITH v2_receipts AS (
                 SELECT v.convo_id, v.epoch, v.sequencer_term, v.commit_hash,
                        v.sequencer_did, v.issued_at, v.signature, v.created_at
-                FROM sequencer_receipts_v2 v, current_generation g
-                WHERE v.convo_id = $1 AND v.reset_generation = g.generation
+                FROM sequencer_receipts_v2 v
+                WHERE v.convo_id = $1
             )
-            SELECT * FROM current_receipts
+            SELECT * FROM v2_receipts
             UNION ALL
             SELECT l.convo_id, l.epoch, l.sequencer_term, l.commit_hash,
                    l.sequencer_did, l.issued_at, l.signature, l.created_at
             FROM sequencer_receipts l
             WHERE l.convo_id = $1
-              AND NOT EXISTS (SELECT 1 FROM current_receipts)
-            ORDER BY epoch DESC
+              AND NOT EXISTS (
+                  SELECT 1 FROM v2_receipts v
+                  WHERE v.epoch = l.epoch
+                    AND v.sequencer_term = l.sequencer_term
+                    AND v.commit_hash = l.commit_hash
+                    AND v.sequencer_did = l.sequencer_did
+                    AND v.issued_at = l.issued_at
+                    AND v.signature = l.signature
+              )
+            ORDER BY epoch DESC, issued_at DESC
             "#,
         )
         .bind(convo_id)
@@ -3867,6 +3883,171 @@ mod tests {
         store_sequencer_receipt(&restarted, 0, &receipt)
             .await
             .expect("exact replay remains stable after reconnect");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated TEST_DATABASE_URL with migration privileges"]
+    async fn sequencer_receipt_read_preserves_legacy_rows_after_first_v2_append() {
+        let pool = setup_test_db().await;
+        let suffix = Uuid::new_v4().to_string();
+        let convo_id = format!("receipt-visibility-{suffix}");
+        let legacy_receipt_hash = Uuid::new_v4().as_bytes().repeat(2);
+        sqlx::query(
+            "INSERT INTO conversations (id, creator_did, group_id, reset_count) \
+             VALUES ($1, 'did:plc:receipt-test', $2, 0)",
+        )
+        .bind(&convo_id)
+        .bind(format!("group-{suffix}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sequencer_receipts \
+             (convo_id, epoch, sequencer_term, commit_hash, sequencer_did, issued_at, signature, receipt_hash) \
+             VALUES ($1, 3, 7, $2, 'did:web:mls.example.com', 1700000000, $3, $4)",
+        )
+        .bind(&convo_id)
+        .bind(vec![0x31_u8; 32])
+        .bind(vec![0x32_u8; 64])
+        .bind(legacy_receipt_hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let v2 = SequencerReceipt {
+            convo_id: convo_id.clone(),
+            epoch: 4,
+            sequencer_term: 7,
+            commit_hash: vec![0x41; 32],
+            sequencer_did: "did:web:mls.example.com".into(),
+            issued_at: 1_700_000_001,
+            signature: vec![0x42; 64],
+            created_at: Utc::now(),
+        };
+        store_sequencer_receipt(&pool, 0, &v2)
+            .await
+            .expect("append first v2 receipt");
+
+        let durable_total: i64 = sqlx::query_scalar(
+            "SELECT (SELECT COUNT(*) FROM sequencer_receipts WHERE convo_id=$1) + \
+                    (SELECT COUNT(*) FROM sequencer_receipts_v2 WHERE convo_id=$1)",
+        )
+        .bind(&convo_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let visible_after_first_v2 = get_sequencer_receipts(&pool, &convo_id, None)
+            .await
+            .expect("read merged receipt history")
+            .len();
+        assert_eq!(durable_total, 2);
+        assert_eq!(
+            visible_after_first_v2, 2,
+            "durable_total={durable_total} visible_after_first_v2={visible_after_first_v2}"
+        );
+
+        let backfilled_legacy = SequencerReceipt {
+            convo_id: convo_id.clone(),
+            epoch: 3,
+            sequencer_term: 7,
+            commit_hash: vec![0x31; 32],
+            sequencer_did: "did:web:mls.example.com".into(),
+            issued_at: 1_700_000_000,
+            signature: vec![0x32; 64],
+            created_at: Utc::now(),
+        };
+        store_sequencer_receipt(&pool, 0, &backfilled_legacy)
+            .await
+            .expect("exact legacy receipt may be represented in v2");
+        assert_eq!(
+            get_sequencer_receipts(&pool, &convo_id, None)
+                .await
+                .expect("exact legacy/v2 duplicate is hidden once")
+                .len(),
+            2,
+            "merged reads must deduplicate only exact legacy/v2 receipt contents"
+        );
+
+        sqlx::query("DELETE FROM sequencer_receipts_v2 WHERE convo_id=$1")
+            .bind(&convo_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM sequencer_receipts WHERE convo_id=$1")
+            .bind(&convo_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM conversations WHERE id=$1")
+            .bind(&convo_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated TEST_DATABASE_URL with migration privileges"]
+    async fn sequencer_receipt_store_allows_epoch_reuse_after_reset() {
+        let pool = setup_test_db().await;
+        let suffix = Uuid::new_v4().to_string();
+        let convo_id = format!("receipt-reset-{suffix}");
+        let legacy_receipt_hash = Uuid::new_v4().as_bytes().repeat(2);
+        sqlx::query(
+            "INSERT INTO conversations (id, creator_did, group_id, reset_count) \
+             VALUES ($1, 'did:plc:receipt-test', $2, 1)",
+        )
+        .bind(&convo_id)
+        .bind(format!("group-{suffix}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sequencer_receipts \
+             (convo_id, epoch, sequencer_term, commit_hash, sequencer_did, issued_at, signature, receipt_hash) \
+             VALUES ($1, 4, 7, $2, 'did:web:mls.example.com', 1700000000, $3, $4)",
+        )
+        .bind(&convo_id)
+        .bind(vec![0x51_u8; 32])
+        .bind(vec![0x52_u8; 64])
+        .bind(legacy_receipt_hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let reset_receipt = SequencerReceipt {
+            convo_id: convo_id.clone(),
+            epoch: 4,
+            sequencer_term: 8,
+            commit_hash: vec![0x61; 32],
+            sequencer_did: "did:web:mls.example.com".into(),
+            issued_at: 1_700_000_001,
+            signature: vec![0x62; 64],
+            created_at: Utc::now(),
+        };
+        assert!(store_sequencer_receipt(&pool, 0, &reset_receipt)
+            .await
+            .expect_err("generation zero must still honor immutable legacy evidence")
+            .to_string()
+            .contains("immutable legacy evidence"));
+        store_sequencer_receipt(&pool, 1, &reset_receipt)
+            .await
+            .expect(
+                "same epoch in a reset generation must not conflict with legacy generation zero",
+            );
+
+        sqlx::query("DELETE FROM sequencer_receipts_v2 WHERE convo_id=$1")
+            .bind(&convo_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM sequencer_receipts WHERE convo_id=$1")
+            .bind(&convo_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM conversations WHERE id=$1")
+            .bind(&convo_id)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

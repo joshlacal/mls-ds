@@ -331,17 +331,22 @@ async fn append_receipt_tx(
         receipt.issued_at,
         &receipt.signature,
     );
-    let legacy: Option<ReceiptRow> = sqlx::query_as(
-        "SELECT receipt_hash, epoch, sequencer_term, sequencer_did, commit_hash, issued_at, signature \
-         FROM sequencer_receipts WHERE convo_id = $1 AND epoch = $2",
-    )
-    .bind(&context.conversation_id)
-    .bind(canonical_receipt.epoch)
-    .fetch_optional(&mut **tx)
-    .await?;
-    if let Some(legacy) = legacy.map(receipt_from_row) {
-        if !receipt_contents_match(&legacy, &canonical_receipt) {
-            return Err(RepositoryError::ReceiptEquivocation);
+    // Legacy receipt identity had no generation and therefore represents only
+    // generation zero. Later generations may legitimately reuse the same MLS
+    // epoch with different authoritative contents.
+    if context.reset_generation == 0 {
+        let legacy: Option<ReceiptRow> = sqlx::query_as(
+            "SELECT receipt_hash, epoch, sequencer_term, sequencer_did, commit_hash, issued_at, signature \
+             FROM sequencer_receipts WHERE convo_id = $1 AND epoch = $2",
+        )
+        .bind(&context.conversation_id)
+        .bind(canonical_receipt.epoch)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if let Some(legacy) = legacy.map(receipt_from_row) {
+            if !receipt_contents_match(&legacy, &canonical_receipt) {
+                return Err(RepositoryError::ReceiptEquivocation);
+            }
         }
     }
     sqlx::query(
@@ -804,6 +809,117 @@ mod transition_repository_tests {
         assert_ne!(baseline, hash(3, 7, 0x33));
         assert_ne!(baseline, hash(2, 8, 0x33));
         assert_ne!(baseline, hash(2, 7, 0x34));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL with migration privileges"]
+    async fn verified_receipt_allows_epoch_reuse_after_reset_generation() {
+        let pool = test_pool().await;
+        let suffix = Uuid::new_v4().to_string();
+        let conversation_id = format!("receipt-reset-repo-{suffix}");
+        let group_id = format!("receipt-reset-group-{suffix}");
+        let legacy_receipt_hash = Uuid::new_v4().as_bytes().repeat(2);
+        sqlx::query(
+            "INSERT INTO conversations \
+             (id, creator_did, current_epoch, sequencer_term, sequencer_ds, is_remote, \
+              group_id, reset_count, confirmation_tag, group_info, group_info_epoch) \
+             VALUES ($1,'did:plc:alice',3,8,'did:web:mls.example.com',false,$2,0,$3,$4,3)",
+        )
+        .bind(&conversation_id)
+        .bind(&group_id)
+        .bind(vec![1_u8, 2, 3])
+        .bind(vec![0xAA_u8; 128])
+        .execute(&pool)
+        .await
+        .unwrap();
+        let session_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO crypto_sessions \
+             (id,conversation_id,generation,mls_group_id,state,last_observed_epoch, \
+              last_confirmation_tag,group_info,group_info_epoch,sequencer_did,sequencer_term) \
+             VALUES ($1,$2,0,$3,'active',3,$4,$5,3,'did:web:mls.example.com',8)",
+        )
+        .bind(&session_id)
+        .bind(&conversation_id)
+        .bind(&group_id)
+        .bind(vec![1_u8, 2, 3])
+        .bind(vec![0xAA_u8; 128])
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE conversations SET active_crypto_session_id=$1 WHERE id=$2")
+            .bind(&session_id)
+            .bind(&conversation_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO sequencer_receipts \
+             (convo_id, epoch, sequencer_term, commit_hash, sequencer_did, issued_at, signature, receipt_hash) \
+             VALUES ($1, 4, 7, $2, 'did:web:mls.example.com', 1700000000, $3, $4)",
+        )
+        .bind(&conversation_id)
+        .bind(vec![0x71_u8; 32])
+        .bind(vec![0x72_u8; 64])
+        .bind(legacy_receipt_hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let repo = PostgresCryptoSessionRepository::new(pool.clone());
+        let generation_zero = repo
+            .resolve_active(&conversation_id, "did:web:mls.example.com")
+            .await
+            .unwrap()
+            .unwrap();
+        let reset_receipt = SequencerReceiptRef {
+            receipt_hash: vec![0; 32],
+            epoch: 4,
+            term: 8,
+            sequencer_did: "did:web:mls.example.com".into(),
+            commit_hash: vec![0x81; 32],
+            issued_at: 1_700_000_001,
+            signature: vec![0x82; 64],
+        };
+        assert!(matches!(
+            repo.record_verified_receipt(&generation_zero, reset_receipt.clone())
+                .await,
+            Err(RepositoryError::ReceiptEquivocation)
+        ));
+        sqlx::query("UPDATE crypto_sessions SET generation=1 WHERE id=$1")
+            .bind(&session_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE conversations SET reset_count=1 WHERE id=$1")
+            .bind(&conversation_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let reset_context = repo
+            .resolve_active(&conversation_id, "did:web:mls.example.com")
+            .await
+            .unwrap()
+            .unwrap();
+        repo.record_verified_receipt(&reset_context, reset_receipt)
+            .await
+            .expect("legacy generation-zero evidence must not conflict with reset generation one");
+
+        sqlx::query("DELETE FROM sequencer_receipts_v2 WHERE convo_id=$1")
+            .bind(&conversation_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM sequencer_receipts WHERE convo_id=$1")
+            .bind(&conversation_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM conversations WHERE id=$1")
+            .bind(&conversation_id)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

@@ -274,6 +274,10 @@ pub struct FederationConfig {
     pub receipt_signing_key_pem: Option<String>,
     /// Fixed DID verification method used by receipt verifiers.
     pub receipt_verification_method: Option<String>,
+    /// Exact DID document served at `/.well-known/did.json`. Issue mode
+    /// validates this document against both configured signing keys before
+    /// startup can complete.
+    pub receipt_did_document_json: Option<String>,
     /// Fallback DS endpoint for users without a `blue.catbird.mlsChat.profile` record.
     pub default_ds_endpoint: Option<String>,
     pub endpoint_cache_ttl_secs: u64,
@@ -297,6 +301,7 @@ impl FederationConfig {
             receipt_issuance_mode: std::env::var("RECEIPT_ISSUANCE_MODE").ok(),
             receipt_signing_key_pem: std::env::var("RECEIPT_SIGNING_KEY_PEM").ok(),
             receipt_verification_method: std::env::var("RECEIPT_VERIFICATION_METHOD").ok(),
+            receipt_did_document_json: std::env::var("RECEIPT_DID_DOCUMENT_JSON").ok(),
             default_ds_endpoint: std::env::var("DEFAULT_DS_ENDPOINT").ok(),
             endpoint_cache_ttl_secs: std::env::var("ENDPOINT_CACHE_TTL")
                 .ok()

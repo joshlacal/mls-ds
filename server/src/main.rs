@@ -22,6 +22,7 @@ use axum::routing::any;
 use axum::{
     body::HttpBody as _,
     extract::{DefaultBodyLimit, FromRef},
+    response::IntoResponse,
     routing::{get, post},
     Router,
 };
@@ -72,6 +73,23 @@ struct AppState {
     ack_signer: Option<Arc<federation::AckSigner>>,
     device_client: Arc<federation::DeviceRecordClient>,
     blob_store: blob_store::BlobStore,
+}
+
+fn receipt_did_document_router<S>(document: Option<serde_json::Value>) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    let Some(document) = document else {
+        return Router::new();
+    };
+    let document = Arc::new(document);
+    Router::new().route(
+        "/.well-known/did.json",
+        get(move || {
+            let document = document.clone();
+            async move { axum::Json((*document).clone()).into_response() }
+        }),
+    )
 }
 
 fn truthy_env_var(name: &str) -> bool {
@@ -790,8 +808,22 @@ async fn main() -> anyhow::Result<()> {
         fed_config.receipt_verification_method.as_deref(),
         fed_config.signing_key_pem.as_deref(),
         &fed_config.self_did,
+        fed_config.receipt_did_document_json.as_deref(),
     )
     .unwrap_or_else(|error| panic!("Invalid sequencer receipt configuration: {error}"));
+    let receipt_did_document = if receipt_signer.is_some() {
+        Some(
+            serde_json::from_str(
+                fed_config
+                    .receipt_did_document_json
+                    .as_deref()
+                    .expect("validated issue mode has a DID document"),
+            )
+            .expect("validated issue-mode DID document is JSON"),
+        )
+    } else {
+        None
+    };
     if receipt_signer.is_some() {
         tracing::info!(
             verification_method = federation::RECEIPT_VERIFICATION_METHOD,
@@ -957,6 +989,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(health::health))
         .route("/health/live", get(health::liveness))
         .route("/health/ready", get(health::readiness))
+        .merge(receipt_did_document_router(receipt_did_document))
         .merge(metrics_router)
         .with_state(app_state.clone());
 
@@ -1345,6 +1378,47 @@ mod tests {
     async fn consume_body(body: Bytes) -> StatusCode {
         let _ = body;
         StatusCode::NO_CONTENT
+    }
+
+    #[tokio::test]
+    async fn receipt_did_route_serves_only_the_startup_validated_document() {
+        let document = serde_json::json!({
+            "id": "did:web:mlschat.catbird.blue",
+            "verificationMethod": [{
+                "id": federation::RECEIPT_VERIFICATION_METHOD,
+                "controller": "did:web:mlschat.catbird.blue",
+                "type": "Multikey",
+                "publicKeyMultibase": "zPublishedByOperations"
+            }]
+        });
+        let app: Router = receipt_did_document_router(Some(document.clone()));
+        let response = app
+            .oneshot(
+                Request::get("/.well-known/did.json")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("bounded response body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("DID JSON"),
+            document
+        );
+
+        let disabled: Router = receipt_did_document_router(None);
+        let response = disabled
+            .oneshot(
+                Request::get("/.well-known/did.json")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     async fn require_normalized_framing(headers: axum::http::HeaderMap, body: Bytes) -> StatusCode {
