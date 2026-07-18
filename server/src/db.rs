@@ -424,6 +424,67 @@ pub async fn store_group_info_in_tx(
     .map(|_| ())
 }
 
+/// Namespace seed for the per-owner blob-quota advisory lock, so it cannot
+/// collide with other `hashtextextended`-keyed advisory locks in the app.
+const BLOB_QUOTA_LOCK_SEED: i64 = 0x424c_4f42; // "BLOB"
+
+/// Atomically check the per-owner byte quota and insert a `blobs` row.
+///
+/// The quota check and the INSERT run inside one transaction serialized on a
+/// per-owner `pg_advisory_xact_lock`, closing the TOCTOU window where two
+/// concurrent uploads both observed the same `SUM(size_bytes)` snapshot and
+/// both inserted, exceeding the quota (finding F39).
+///
+/// Returns `Ok(true)` when the blob row was inserted, `Ok(false)` when the
+/// insert was rejected because it would exceed `quota_bytes`.
+pub async fn insert_blob_within_quota(
+    pool: &PgPool,
+    blob_id: &str,
+    owner_did: &str,
+    convo_id: &str,
+    size_bytes: i64,
+    quota_bytes: i64,
+    expires_at: DateTime<Utc>,
+) -> sqlx::Result<bool> {
+    let mut tx = pool.begin().await?;
+
+    // Serialize concurrent quota check-and-insert for the same owner. The
+    // xact-scoped lock is released automatically on commit/rollback.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, $2))")
+        .bind(owner_did)
+        .bind(BLOB_QUOTA_LOCK_SEED)
+        .execute(&mut *tx)
+        .await?;
+
+    let used_bytes: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(size_bytes), 0)::BIGINT FROM blobs \
+         WHERE owner_did = $1 AND deleted_at IS NULL",
+    )
+    .bind(owner_did)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    if used_bytes + size_bytes > quota_bytes {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+
+    sqlx::query(
+        "INSERT INTO blobs (id, owner_did, convo_id, size_bytes, created_at, expires_at) \
+         VALUES ($1, $2, $3, $4, now(), $5)",
+    )
+    .bind(blob_id)
+    .bind(owner_did)
+    .bind(convo_id)
+    .bind(size_bytes)
+    .bind(expires_at)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(true)
+}
+
 pub async fn resolve_device_id_for_key_package_hash<'e, E>(
     executor: E,
     owner_did: &str,

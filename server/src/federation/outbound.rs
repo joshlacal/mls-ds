@@ -116,33 +116,37 @@ impl OutboundClient {
         params: &[(&str, &str)],
     ) -> Result<serde_json::Value, OutboundError> {
         let url = format!("{}/xrpc/{}", endpoint.trim_end_matches('/'), method);
-        debug!(url = %url, method, "Outbound DS query (raw json)");
+        debug!(method, "Outbound DS query (raw json)");
+        let deadline = self.deadline(method)?;
 
-        let resp = self
+        let send = self
             .http
             .get(&url)
             .header("Authorization", format!("Bearer {auth_token}"))
             .query(params)
-            .send()
+            .send();
+        let resp = tokio::time::timeout_at(deadline, send)
             .await
-            .map_err(|e| classify_reqwest_error(e, endpoint, method))?;
+            .map_err(|_| timeout_error(method))?
+            .map_err(|error| classify_ordinary_reqwest_error(error, method))?;
 
         let status = resp.status();
         if status.is_success() {
-            resp.json::<serde_json::Value>()
-                .await
-                .map_err(|e| OutboundError::InvalidResponse {
-                    reason: e.to_string(),
-                })
+            decode_json_bounded(
+                resp,
+                ResponseBodyBudget::new(ORDINARY_DS_CONTROL_MAX_BYTES, deadline),
+            )
+            .await
+            .map_err(|error| map_ordinary_body_error(error, method))
         } else {
-            let body_text = resp
-                .text()
+            let body = summarize_error_body(resp, deadline)
                 .await
-                .unwrap_or_else(|_| String::from("<unreadable>"));
+                .map(|summary| summary.to_string())
+                .unwrap_or_else(|error| format!("error response metadata unavailable: {error}"));
             Err(OutboundError::RemoteError {
                 status: status.as_u16(),
-                body: body_text,
-                endpoint: endpoint.to_string(),
+                body,
+                endpoint: REMOTE_DS.to_string(),
                 method: method.to_string(),
             })
         }
@@ -177,25 +181,6 @@ impl OutboundClient {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn classify_reqwest_error(e: reqwest::Error, endpoint: &str, method: &str) -> OutboundError {
-    if e.is_timeout() {
-        OutboundError::Timeout {
-            endpoint: endpoint.to_string(),
-            method: method.to_string(),
-        }
-    } else if e.is_connect() {
-        OutboundError::ConnectionFailed {
-            endpoint: endpoint.to_string(),
-            reason: e.to_string(),
-        }
-    } else {
-        OutboundError::RequestFailed {
-            endpoint: endpoint.to_string(),
-            reason: e.to_string(),
-        }
-    }
-}
 
 fn timeout_error(method: &str) -> OutboundError {
     OutboundError::Timeout {
@@ -418,6 +403,63 @@ mod tests {
             OutboundError::InvalidResponse { ref reason }
                 if reason.contains("exceeding limit 1048576")
         ));
+    }
+
+    #[tokio::test]
+    async fn declared_raw_json_query_body_over_one_mib_is_rejected() {
+        let route = format!("/xrpc/{TEST_METHOD}");
+        let router = Router::new().route(
+            &route,
+            get(|| async {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from(vec![
+                        b' ';
+                        crate::util::outbound_body::ORDINARY_DS_CONTROL_MAX_BYTES
+                            + 1
+                    ]))
+                    .unwrap()
+            }),
+        );
+        let endpoint = spawn_ds(router).await;
+
+        let error = OutboundClient::new(1, 1)
+            .call_query_json(&endpoint, TEST_METHOD, "token", &[])
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            OutboundError::InvalidResponse { ref reason }
+                if reason.contains("exceeding limit 1048576")
+        ));
+    }
+
+    #[tokio::test]
+    async fn raw_json_query_headers_and_body_share_one_deadline() {
+        let route = format!("/xrpc/{TEST_METHOD}");
+        let router = Router::new().route(
+            &route,
+            get(|| async {
+                tokio::time::sleep(Duration::from_millis(550)).await;
+                let chunks = stream::once(async {
+                    tokio::time::sleep(Duration::from_millis(550)).await;
+                    Ok::<_, Infallible>(Bytes::from_static(br#"{}"#))
+                });
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from_stream(chunks))
+                    .unwrap()
+            }),
+        );
+        let endpoint = spawn_ds(router).await;
+
+        let error = OutboundClient::new(1, 1)
+            .call_query_json(&endpoint, TEST_METHOD, "token", &[])
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, OutboundError::Timeout { .. }));
     }
 
     #[tokio::test]

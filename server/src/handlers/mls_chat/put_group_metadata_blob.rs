@@ -14,6 +14,15 @@ const NSID: &str = "blue.catbird.mlsChat.putGroupMetadataBlob";
 /// Maximum metadata blob size: 1 MB
 const MAX_METADATA_BLOB_SIZE: usize = 1_048_576;
 
+/// Retention bound: keep at most this many metadata blobs per conversation
+/// (newest first). Superseded blobs beyond the bound are pruned on write,
+/// capping per-convo accumulation at
+/// `MAX_METADATA_BLOBS_PER_CONVO * MAX_METADATA_BLOB_SIZE` (64 MB) instead
+/// of growing without bound (finding F9). The bound is generous: only the
+/// newest metadata/avatar blobs are live — late joiners fetch the current
+/// locator from group state, not historical ones.
+pub const MAX_METADATA_BLOBS_PER_CONVO: i64 = 64;
+
 // ---------------------------------------------------------------------------
 // Request / Response types
 // ---------------------------------------------------------------------------
@@ -240,6 +249,42 @@ pub async fn put_group_metadata_blob(
         error!("❌ [putGroupMetadataBlob] DB error inserting blob: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+
+    // Retention-on-write (finding F9): prune superseded blobs for this
+    // conversation beyond the newest MAX_METADATA_BLOBS_PER_CONVO. Matched
+    // by convo_id (current scoping) OR group_id (legacy rows with NULL
+    // convo_id, and pre-reset generations of the same conversation).
+    // Best-effort — a pruning failure must not fail the upload.
+    match sqlx::query(
+        "DELETE FROM group_metadata_blobs \
+         WHERE blob_locator IN ( \
+             SELECT blob_locator FROM group_metadata_blobs \
+             WHERE convo_id = $1 OR group_id = $2 \
+             ORDER BY created_at DESC, blob_locator DESC \
+             OFFSET $3 \
+         )",
+    )
+    .bind(&convo_id)
+    .bind(group_id)
+    .bind(MAX_METADATA_BLOBS_PER_CONVO)
+    .execute(&pool)
+    .await
+    {
+        Ok(result) if result.rows_affected() > 0 => {
+            info!(
+                "🧹 [putGroupMetadataBlob] Pruned {} superseded metadata blobs for convo {}",
+                result.rows_affected(),
+                crate::crypto::redact_for_log(&convo_id)
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            warn!(
+                "⚠️ [putGroupMetadataBlob] Metadata blob retention pruning failed: {}",
+                e
+            );
+        }
+    }
 
     info!(
         "✅ [putGroupMetadataBlob] Stored blob {} ({} bytes) for group {} by {}",

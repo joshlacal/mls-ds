@@ -338,6 +338,7 @@ impl AuthMiddleware {
             ),
             http_client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(did_resolution_timeout_seconds))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             did_resolution_timeout: Duration::from_secs(did_resolution_timeout_seconds),
@@ -454,6 +455,11 @@ impl AuthMiddleware {
                 let y = URL_SAFE_NO_PAD
                     .decode(jwk.y.as_ref().ok_or(AuthError::MissingVerificationMethod)?)
                     .map_err(|e| AuthError::InvalidToken(format!("bad jwk.y: {}", e)))?;
+                if x.len() != 32 || y.len() != 32 {
+                    return Err(AuthError::InvalidToken(
+                        "invalid P-256 JWK coordinate length".into(),
+                    ));
+                }
                 let ep = EncodedPoint::from_affine_coordinates(
                     p256::FieldBytes::from_slice(&x),
                     p256::FieldBytes::from_slice(&y),
@@ -771,6 +777,9 @@ pub fn extract_p256_key(did_doc: &DidDocument) -> Option<p256::ecdsa::VerifyingK
             if jwk.kty == "EC" && jwk.crv.eq_ignore_ascii_case("P-256") {
                 let x = URL_SAFE_NO_PAD.decode(&jwk.x).ok()?;
                 let y = URL_SAFE_NO_PAD.decode(jwk.y.as_ref()?).ok()?;
+                if x.len() != 32 || y.len() != 32 {
+                    continue;
+                }
                 let ep = EncodedPoint::from_affine_coordinates(
                     p256::FieldBytes::from_slice(&x),
                     p256::FieldBytes::from_slice(&y),
@@ -1511,6 +1520,48 @@ mod tests {
         assert!(!source.contains(&response_json));
         assert!(!source.contains(&response_bytes));
         assert!(!source.contains(&response_text));
+    }
+
+    #[test]
+    fn did_resolution_client_rejects_redirects() {
+        let source = include_str!("auth.rs");
+        let builder = source
+            .split("http_client: reqwest::Client::builder()")
+            .nth(1)
+            .expect("auth DID client builder")
+            .split(".build()")
+            .next()
+            .expect("auth DID client builder boundary");
+
+        assert!(
+            builder.contains("redirect(reqwest::redirect::Policy::none())"),
+            "DID resolution must not follow an unvalidated redirect hop"
+        );
+    }
+
+    #[test]
+    fn malformed_p256_jwk_coordinates_are_rejected_without_panicking() {
+        let issuer = "did:plc:malformed-p256";
+        let document = DidDocument {
+            id: issuer.to_string(),
+            verification_method: vec![VerificationMethod {
+                id: format!("{issuer}#atproto"),
+                key_type: "JsonWebKey2020".to_string(),
+                controller: issuer.to_string(),
+                public_key_multibase: None,
+                public_key_jwk: Some(PublicKeyJwk {
+                    kty: "EC".to_string(),
+                    crv: "P-256".to_string(),
+                    x: URL_SAFE_NO_PAD.encode([1_u8; 31]),
+                    y: Some(URL_SAFE_NO_PAD.encode([2_u8; 33])),
+                }),
+            }],
+            service: None,
+        };
+
+        let result = std::panic::catch_unwind(|| extract_p256_key(&document));
+        assert!(result.is_ok(), "malformed public input must not panic");
+        assert!(result.unwrap().is_none());
     }
 
     #[test]

@@ -84,7 +84,9 @@ pub async fn upload_blob(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    // Check quota
+    // Fast-fail quota pre-check before paying for the S3 upload. This is
+    // advisory only — the authoritative, race-free check happens inside
+    // `insert_blob_within_quota` below (finding F39).
     let used_bytes: i64 = sqlx::query_scalar(
         "SELECT COALESCE(SUM(size_bytes), 0)::BIGINT FROM blobs WHERE owner_did = $1 AND deleted_at IS NULL",
     )
@@ -113,18 +115,19 @@ pub async fn upload_blob(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    // Insert metadata with convo_id
+    // Insert metadata with convo_id. The quota is re-checked atomically
+    // (per-owner advisory lock + SUM + INSERT in one transaction) so
+    // concurrent uploads cannot both slip past the pre-check above.
     let expires_at = Utc::now() + Duration::days(blob_store.ttl_days());
-    sqlx::query(
-        "INSERT INTO blobs (id, owner_did, convo_id, size_bytes, created_at, expires_at) \
-         VALUES ($1, $2, $3, $4, now(), $5)",
+    let inserted = crate::db::insert_blob_within_quota(
+        &pool,
+        &blob_id,
+        owner_did,
+        &params.convo_id,
+        size,
+        blob_store.quota_bytes(),
+        expires_at,
     )
-    .bind(&blob_id)
-    .bind(owner_did)
-    .bind(&params.convo_id)
-    .bind(size)
-    .bind(expires_at)
-    .execute(&pool)
     .await
     .map_err(|e| {
         error!("❌ [uploadBlob] DB error inserting blob metadata: {}", e);
@@ -136,6 +139,22 @@ pub async fn upload_blob(
         });
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+
+    if !inserted {
+        warn!(
+            "❌ [uploadBlob] Quota exceeded (concurrent uploads) for {}: new={}, quota={}",
+            crate::crypto::redact_for_log(owner_did),
+            size,
+            blob_store.quota_bytes()
+        );
+        // The blob row was never inserted — remove the orphaned S3 object.
+        let bs = blob_store.clone();
+        let bid = blob_id.clone();
+        tokio::spawn(async move {
+            let _ = bs.delete(&bid).await;
+        });
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
 
     info!(
         "✅ [uploadBlob] Uploaded blob {} ({} bytes) for {} in convo {}",

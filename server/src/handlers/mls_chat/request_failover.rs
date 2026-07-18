@@ -145,14 +145,69 @@ pub async fn request_failover(
         }
     };
 
-    // Health-check the current sequencer (15s timeout)
+    // SSRF guard (finding F55): validate the resolved endpoint (scheme,
+    // blocked-host list, literal private IPs) and re-check its DNS
+    // resolution against private/loopback ranges before probing — parity
+    // with the hardened outbound paths in auth.rs / block_sync.rs. An
+    // endpoint we refuse to probe is treated exactly like a resolution
+    // failure: unreachable, so the caller may assume the sequencer role
+    // (still guarded by SequencerTransfer's term CAS + authorization).
     let health_url = format!(
         "{}/xrpc/blue.catbird.mlsDS.healthCheck",
         sequencer_endpoint.trim_end_matches('/')
     );
 
+    let validated_health_url = match crate::federation::resolver::validate_endpoint_url(&health_url)
+    {
+        Ok(url) => url,
+        Err(e) => {
+            warn!(
+                convo_id = %crate::crypto::redact_for_log(&convo_id),
+                sequencer = %crate::crypto::redact_for_log(&current_seq),
+                error = %e,
+                "Sequencer endpoint failed SSRF validation, treating as unreachable"
+            );
+            let (new_epoch, new_term) =
+                do_assume(&sequencer_transfer, &convo_id, self_did, &current_seq).await?;
+            broadcast_sequencer_change(
+                &federated_backend,
+                &outbound_queue,
+                &convo_id,
+                self_did,
+                new_epoch,
+                new_term,
+            );
+            return Ok(Json(make_output(self_did, &convo_id, new_epoch, new_term)));
+        }
+    };
+
+    if let Err(e) =
+        crate::federation::resolver::validate_resolved_host_is_public(&validated_health_url).await
+    {
+        warn!(
+            convo_id = %crate::crypto::redact_for_log(&convo_id),
+            sequencer = %crate::crypto::redact_for_log(&current_seq),
+            error = %e,
+            "Sequencer endpoint resolved to a non-public address, treating as unreachable"
+        );
+        let (new_epoch, new_term) =
+            do_assume(&sequencer_transfer, &convo_id, self_did, &current_seq).await?;
+        broadcast_sequencer_change(
+            &federated_backend,
+            &outbound_queue,
+            &convo_id,
+            self_did,
+            new_epoch,
+            new_term,
+        );
+        return Ok(Json(make_output(self_did, &convo_id, new_epoch, new_term)));
+    }
+
+    // Health-check the current sequencer (15s timeout). Redirects are never
+    // followed — a 3xx counts as an unhealthy response, not a new target.
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap_or_default();
 
@@ -317,4 +372,51 @@ fn broadcast_sequencer_change(
             "Failover broadcast enqueued to remote DSes"
         );
     });
+}
+
+#[cfg(test)]
+mod tests {
+    /// Regression test for finding F55: the failover health-check client was
+    /// built without `redirect(Policy::none())` and probed the resolved
+    /// sequencer endpoint with no SSRF validation — unlike the hardened
+    /// clients in `auth.rs` / `block_sync.rs`. A hostile DID document (or a
+    /// redirect from a compromised sequencer host) could steer the probe at
+    /// internal targets, and a failed probe then hands the caller the
+    /// sequencer role.
+    ///
+    /// Mirrors the source-scrape pattern of
+    /// `auth.rs::did_resolution_client_rejects_redirects`. Only the handler
+    /// section (everything before this `#[cfg(test)]` module) is scanned so
+    /// the needles below can't satisfy their own assertions.
+    #[test]
+    fn health_check_client_is_ssrf_hardened() {
+        let source = include_str!("request_failover.rs");
+        let handler_src = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("handler section before test module");
+
+        let builder = handler_src
+            .split("reqwest::Client::builder()")
+            .nth(1)
+            .expect("failover health-check client builder")
+            .split(".build()")
+            .next()
+            .expect("failover health-check client builder boundary");
+        assert!(
+            builder.contains("redirect(reqwest::redirect::Policy::none())"),
+            "failover health-check client must not follow redirects (F55)"
+        );
+
+        assert!(
+            handler_src.contains("validate_endpoint_url"),
+            "failover health-check must validate the resolved sequencer endpoint \
+             (scheme + literal-IP SSRF guard) before probing (F55)"
+        );
+        assert!(
+            handler_src.contains("validate_resolved_host_is_public"),
+            "failover health-check must re-check DNS resolution against \
+             private/loopback ranges before probing (F55)"
+        );
+    }
 }

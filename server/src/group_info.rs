@@ -54,7 +54,16 @@ struct GroupInfoRow {
     group_info_updated_at: Option<DateTime<Utc>>,
 }
 
-/// Store GroupInfo for a conversation
+/// Store GroupInfo for a conversation.
+///
+/// The epoch comparison lives in the UPDATE's WHERE clause (compare-and-set)
+/// so a stale writer that lost a read-then-write race (see
+/// `update_convo.rs::handle_upload_group_info`, finding F63) cannot roll the
+/// cached GroupInfo backward: the write only lands when `epoch` is strictly
+/// greater than the stored `group_info_epoch` (or none is stored yet).
+///
+/// Returns `Ok(true)` when the row was updated, `Ok(false)` when the CAS
+/// rejected the write (stale/equal epoch, or unknown convo).
 #[deprecated(
     note = "raw legacy write bypasses ADR-011 context CAS; migrate callers to CryptoSessionRepository::apply_transition"
 )]
@@ -63,13 +72,14 @@ pub async fn store_group_info(
     convo_id: &str,
     group_info: &[u8],
     epoch: i32,
-) -> Result<()> {
-    sqlx::query(
-        "UPDATE conversations 
-         SET group_info = $1, 
+) -> Result<bool> {
+    let result = sqlx::query(
+        "UPDATE conversations
+         SET group_info = $1,
              group_info_updated_at = NOW(),
              group_info_epoch = $2
-         WHERE id = $3",
+         WHERE id = $3
+           AND (group_info_epoch IS NULL OR group_info_epoch < $2)",
     )
     .bind(group_info)
     .bind(epoch)
@@ -78,7 +88,7 @@ pub async fn store_group_info(
     .await
     .context("Failed to store GroupInfo")?;
 
-    Ok(())
+    Ok(result.rows_affected() > 0)
 }
 
 /// Get cached GroupInfo for a conversation
