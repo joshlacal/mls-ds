@@ -262,10 +262,16 @@ async fn reconcile_conversation(
             if page.events.is_empty() {
                 break;
             }
+            if page.to_seq_inclusive <= after_seq {
+                return Err(format!(
+                    "events page did not advance reconciliation cursor (after_seq={after_seq}, to_seq_inclusive={})",
+                    page.to_seq_inclusive
+                ));
+            }
             apply_remote_events(pool, convo_id, &page.events)
                 .await
                 .map_err(|e| format!("apply events failed: {e}"))?;
-            after_seq = page.to_seq_inclusive.max(after_seq);
+            after_seq = page.to_seq_inclusive;
             if page.events.len() < EVENTS_PAGE_LIMIT as usize {
                 break;
             }
@@ -637,5 +643,19 @@ mod tests {
         let first = discovery_client().expect("test client should build");
         let second = discovery_client().expect("test client should remain available");
         assert!(std::ptr::eq(first, second));
+    }
+
+    #[test]
+    fn reconciliation_rejects_a_full_page_without_cursor_progress() {
+        let source = include_str!("reconciliation.rs");
+        let silent_max = ["after_seq = page.to_seq_inclusive.", "max(after_seq);"].concat();
+        assert!(
+            source.contains("page.to_seq_inclusive <= after_seq"),
+            "a malicious peer must not keep the worker in a non-progress loop"
+        );
+        assert!(
+            !source.contains(&silent_max),
+            "max() silently accepts a full page that does not advance the cursor"
+        );
     }
 }

@@ -595,14 +595,32 @@ async fn handle_update_group_info(
         }
     }
 
-    // Store
-    if let Err(e) = store_group_info(pool, convo_id, gi_slice, epoch as i32).await {
-        error!(
-            convo_id = %crate::crypto::redact_for_log(convo_id),
-            error = %e,
-            "Failed to store GroupInfo"
-        );
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    // Store. The epoch guard is enforced again inside the UPDATE itself
+    // (compare-and-set) because the read-then-write above is not atomic:
+    // a concurrent uploader may have committed a newer GroupInfo between
+    // our `get_group_info` and this write (finding F63).
+    match store_group_info(pool, convo_id, gi_slice, epoch as i32).await {
+        Ok(true) => {}
+        Ok(false) => {
+            warn!(
+                convo_id = %crate::crypto::redact_for_log(convo_id),
+                new_epoch = epoch,
+                "GroupInfo CAS rejected write: a newer epoch landed concurrently"
+            );
+            return (
+                StatusCode::CONFLICT,
+                "Epoch must be greater than current epoch",
+            )
+                .into_response();
+        }
+        Err(e) => {
+            error!(
+                convo_id = %crate::crypto::redact_for_log(convo_id),
+                error = %e,
+                "Failed to store GroupInfo"
+            );
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
     }
 
     Json(UpdateConvoOutput::<jacquard_common::DefaultStr> {

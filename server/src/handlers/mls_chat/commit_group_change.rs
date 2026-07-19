@@ -545,6 +545,10 @@ pub async fn commit_group_change(
     if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
         return Err(auth_required("Authentication required"));
     }
+    let (authenticated_caller_did, _) = parse_device_did(&auth_user.did).map_err(|e| {
+        error!("commitGroupChange: invalid authenticated DID format: {}", e);
+        bad_request("Invalid DID format")
+    })?;
 
     let success_response = || OwnedCommitGroupChangeOutput {
         success: true,
@@ -574,8 +578,10 @@ pub async fn commit_group_change(
             if let Some(ref idem_key) = input.idempotency_key {
                 let idem_key_str = idem_key.to_string();
                 let already: bool = sqlx::query_scalar(
-                    "SELECT EXISTS(SELECT 1 FROM idempotency_cache WHERE key = $1)",
+                    "SELECT EXISTS(SELECT 1 FROM idempotency_cache WHERE caller_did = $1 AND endpoint = $2 AND key = $3)",
                 )
+                .bind(&authenticated_caller_did)
+                .bind(NSID)
                 .bind(&idem_key_str)
                 .fetch_one(&pool)
                 .await
@@ -1540,8 +1546,10 @@ pub async fn commit_group_change(
             if let Some(ref idem_key) = input.idempotency_key {
                 let idem_key_str = idem_key.to_string();
                 let already: bool = sqlx::query_scalar(
-                    "SELECT EXISTS(SELECT 1 FROM idempotency_cache WHERE key = $1)",
+                    "SELECT EXISTS(SELECT 1 FROM idempotency_cache WHERE caller_did = $1 AND endpoint = $2 AND key = $3)",
                 )
+                .bind(&authenticated_caller_did)
+                .bind(NSID)
                 .bind(&idem_key_str)
                 .fetch_one(&pool)
                 .await
@@ -2731,8 +2739,10 @@ pub async fn commit_group_change(
             if let Some(ref idem_key) = input.idempotency_key {
                 let idem_key_str = idem_key.to_string();
                 let already: bool = sqlx::query_scalar(
-                    "SELECT EXISTS(SELECT 1 FROM idempotency_cache WHERE key = $1)",
+                    "SELECT EXISTS(SELECT 1 FROM idempotency_cache WHERE caller_did = $1 AND endpoint = $2 AND key = $3)",
                 )
+                .bind(&authenticated_caller_did)
+                .bind(NSID)
                 .bind(&idem_key_str)
                 .fetch_one(&pool)
                 .await
@@ -3289,8 +3299,10 @@ pub async fn commit_group_change(
             if let Some(ref idem_key) = input.idempotency_key {
                 let idem_key_str = idem_key.to_string();
                 let already: bool = sqlx::query_scalar(
-                    "SELECT EXISTS(SELECT 1 FROM idempotency_cache WHERE key = $1)",
+                    "SELECT EXISTS(SELECT 1 FROM idempotency_cache WHERE caller_did = $1 AND endpoint = $2 AND key = $3)",
                 )
+                .bind(&authenticated_caller_did)
+                .bind(NSID)
                 .bind(&idem_key_str)
                 .fetch_one(&pool)
                 .await
@@ -3877,6 +3889,27 @@ mod tests {
         };
         assert!(response.success);
         assert_eq!(response.new_epoch, Some(5));
+    }
+
+    #[test]
+    fn handler_local_idempotency_lookups_are_principal_and_endpoint_scoped() {
+        let source = include_str!("commit_group_change.rs");
+        let key_only_lookup = ["idempotency_cache WHERE key", " = $1"].concat();
+        let scoped_lookup = [
+            "idempotency_cache WHERE caller_did = $1 AND endpoint = $2",
+            " AND key = $3",
+        ]
+        .concat();
+        assert_eq!(
+            source.matches(&key_only_lookup).count(),
+            0,
+            "key-only lookups allow one principal to hit another principal's replay"
+        );
+        assert_eq!(
+            source.matches(&scoped_lookup).count(),
+            4,
+            "every handler-local fallback must match the cache primary-key scope"
+        );
     }
 
     /// When no epoch row exists the idempotency path falls back to 0.
