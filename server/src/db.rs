@@ -2722,6 +2722,14 @@ pub async fn delete_consumed_key_packages(pool: &DbPool, hours_old: i64) -> Resu
 }
 
 /// Delete old unconsumed key packages (prevent accumulation of stale packages)
+///
+/// Last-resort packages are exempt: they are the reusable fallback that keeps a
+/// user reachable after their regular pool is depleted or aged out, and clients
+/// publish them with a 30-day `expires_at`. Sweeping them at `days_old` (7 in
+/// the cleanup worker) deleted every KP of any user inactive for a week, making
+/// them unreachable — group creates against them failed with
+/// "Key package exhausted". Expiry-based deletion still reaps last-resort rows
+/// once their own `expires_at` passes.
 pub async fn delete_old_unconsumed_key_packages(pool: &DbPool, days_old: i64) -> Result<u64> {
     let cutoff = Utc::now() - chrono::Duration::days(days_old);
 
@@ -2730,6 +2738,7 @@ pub async fn delete_old_unconsumed_key_packages(pool: &DbPool, days_old: i64) ->
         DELETE FROM key_packages
         WHERE consumed_at IS NULL
           AND created_at < $1
+          AND is_last_resort = false
         "#,
     )
     .bind(cutoff)

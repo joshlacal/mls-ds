@@ -337,6 +337,71 @@ async fn test_key_package_operations() {
     assert_eq!(kp2.key_data, key_data2);
 }
 
+/// Regression: the 7-day unconsumed sweep must NOT delete last-resort key
+/// packages. It previously deleted every KP (including last-resort) of any
+/// user inactive for `days_old`, making them unreachable — group creates
+/// against them failed with "Key package exhausted" even though clients
+/// publish last-resort KPs with a 30-day expiry precisely to survive
+/// inactivity.
+#[tokio::test]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+async fn test_old_unconsumed_sweep_preserves_last_resort() {
+    let _fixture_guard = DB_FIXTURE_LOCK.lock().await;
+    let pool = setup_test_db().await;
+    cleanup_test_data(&pool).await;
+
+    let cipher_suite = "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519";
+    let expires_at = Utc::now() + chrono::Duration::days(30);
+    let regular_bytes = common::generate_key_package_bytes("did:plc:alice");
+    let last_resort_bytes = common::generate_key_package_bytes("did:plc:alice");
+
+    store_key_package(
+        &pool,
+        "did:plc:alice",
+        cipher_suite,
+        regular_bytes,
+        expires_at,
+    )
+    .await
+    .expect("Failed to store regular key package");
+
+    store_key_package_with_device_bound_to_signature(
+        &pool,
+        "did:plc:alice",
+        cipher_suite,
+        last_resort_bytes,
+        expires_at,
+        None,
+        None,
+        None,
+        /* last_resort = */ true,
+    )
+    .await
+    .expect("Failed to store last-resort key package");
+
+    // Age both rows past the sweep cutoff while keeping them unexpired.
+    sqlx::query("UPDATE key_packages SET created_at = NOW() - INTERVAL '8 days'")
+        .execute(&pool)
+        .await
+        .expect("Failed to backdate key packages");
+
+    let deleted = delete_old_unconsumed_key_packages(&pool, 7)
+        .await
+        .expect("Failed to run unconsumed sweep");
+    assert_eq!(deleted, 1, "sweep must delete only the regular key package");
+
+    let survivors: Vec<(bool,)> =
+        sqlx::query_as("SELECT is_last_resort FROM key_packages WHERE owner_did = 'did:plc:alice'")
+            .fetch_all(&pool)
+            .await
+            .expect("Failed to query survivors");
+    assert_eq!(survivors.len(), 1);
+    assert!(
+        survivors[0].0,
+        "the surviving key package must be the last-resort one"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn test_last_resort_key_package_store_flag_and_replacement() {
