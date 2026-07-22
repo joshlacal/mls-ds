@@ -13,7 +13,7 @@ use std::{
 
 use openmls::{
     group::PublicGroup,
-    prelude::{Ciphersuite, GroupId, ProtocolVersion},
+    prelude::{Ciphersuite, CredentialType, GroupId, ProtocolVersion},
 };
 use openmls_libcrux_crypto::Provider;
 use openmls_traits::OpenMlsProvider;
@@ -24,13 +24,15 @@ use tls_codec::{
     TlsSize, VLBytes,
 };
 
-use super::xwing_public_key_is_valid;
+use super::{xwing_public_key_is_valid, MAX_BASIC_CREDENTIAL_BYTES, MIN_BASIC_CREDENTIAL_BYTES};
 
 const SNAPSHOT_MAGIC: &[u8; 8] = b"CBPGSNAP";
 const SNAPSHOT_SCHEMA: u16 = 1;
 const OPENMLS_VERSION: &[u8] = b"0.8.1";
 const STORAGE_VERSION: &[u8] = b"0.5.0";
 const PUBLIC_RECORD_COUNT: usize = 4;
+const MAX_PUBLIC_GROUP_LEAVES: usize = 100;
+const ED25519_PUBLIC_KEY_BYTES: usize = 32;
 const MAX_ENVELOPE_RECORDS: usize = 256;
 const STORAGE_SCHEMA_BYTES: [u8; 2] = [0x00, 0x01];
 const ALLOWED_PUBLIC_LABELS: [&[u8]; PUBLIC_RECORD_COUNT] = [
@@ -218,6 +220,76 @@ pub struct PublicGroupSnapshotCoordinate {
     lifecycle: PublicGroupSnapshotLifecycle,
 }
 
+/// One exact public MLS leaf expected by the separately locked database head.
+///
+/// The clean profile fixes the credential type to `Basic`; the remaining
+/// fields are compared byte-for-byte with OpenMLS' loaded member projection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublicGroupSnapshotLeaf {
+    leaf_index: u32,
+    basic_credential: Vec<u8>,
+    signature_key: Vec<u8>,
+    encryption_key: Vec<u8>,
+}
+
+impl PublicGroupSnapshotLeaf {
+    pub fn new(
+        leaf_index: u32,
+        basic_credential: Vec<u8>,
+        signature_key: Vec<u8>,
+        encryption_key: Vec<u8>,
+    ) -> Self {
+        Self {
+            leaf_index,
+            basic_credential,
+            signature_key,
+            encryption_key,
+        }
+    }
+
+    pub const fn leaf_index(&self) -> u32 {
+        self.leaf_index
+    }
+
+    pub fn basic_credential(&self) -> &[u8] {
+        &self.basic_credential
+    }
+
+    pub fn signature_key(&self) -> &[u8] {
+        &self.signature_key
+    }
+
+    pub fn encryption_key(&self) -> &[u8] {
+        &self.encryption_key
+    }
+}
+
+/// Canonical public-tree summary persisted independently in the locked head.
+///
+/// The GroupContext hash already seals the full RFC tree, including leaf
+/// sources, capabilities, parent hashes, extensions, and signatures. This
+/// additional summary makes the database's exact logical leaf projection an
+/// unavoidable load-time input rather than a transaction-layer convention.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublicGroupSnapshotTreeSummary {
+    tree_hash: [u8; 32],
+    leaves: Vec<PublicGroupSnapshotLeaf>,
+}
+
+impl PublicGroupSnapshotTreeSummary {
+    pub fn new(tree_hash: [u8; 32], leaves: Vec<PublicGroupSnapshotLeaf>) -> Self {
+        Self { tree_hash, leaves }
+    }
+
+    pub const fn tree_hash(&self) -> &[u8; 32] {
+        &self.tree_hash
+    }
+
+    pub fn leaves(&self) -> &[PublicGroupSnapshotLeaf] {
+        &self.leaves
+    }
+}
+
 impl PublicGroupSnapshotCoordinate {
     #[allow(clippy::too_many_arguments)]
     pub const fn new(
@@ -289,15 +361,16 @@ impl PublicGroupSnapshotCoordinate {
 /// Callers must obtain this binding from a separately trusted monotonic
 /// conversation coordinate (generation/state version), never from the snapshot
 /// being decoded.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PublicGroupSnapshotBinding {
     coordinate: PublicGroupSnapshotCoordinate,
     snapshot_sha256: [u8; 32],
+    tree_summary: PublicGroupSnapshotTreeSummary,
 }
 
 impl PublicGroupSnapshotBinding {
     #[allow(clippy::too_many_arguments)]
-    pub const fn new(
+    pub fn new(
         conversation_id: [u8; 16],
         generation: u64,
         state_version: u64,
@@ -307,6 +380,7 @@ impl PublicGroupSnapshotBinding {
         confirmation_tag: [u8; 32],
         lifecycle: PublicGroupSnapshotLifecycle,
         snapshot_sha256: [u8; 32],
+        tree_summary: PublicGroupSnapshotTreeSummary,
     ) -> Self {
         Self {
             coordinate: PublicGroupSnapshotCoordinate::new(
@@ -320,6 +394,7 @@ impl PublicGroupSnapshotBinding {
                 lifecycle,
             ),
             snapshot_sha256,
+            tree_summary,
         }
     }
 
@@ -362,10 +437,22 @@ impl PublicGroupSnapshotBinding {
     pub const fn snapshot_sha256(&self) -> &[u8; 32] {
         &self.snapshot_sha256
     }
+
+    pub const fn tree_summary(&self) -> &PublicGroupSnapshotTreeSummary {
+        &self.tree_summary
+    }
 }
 
 pub fn public_group_snapshot_sha256(encoded: &[u8]) -> [u8; 32] {
     Sha256::digest(encoded).into()
+}
+
+/// Derive the canonical public-tree summary that transaction code must persist
+/// beside the snapshot and full conversation coordinate.
+pub fn public_group_snapshot_tree_summary(
+    state: &PublicGroupState,
+) -> Result<PublicGroupSnapshotTreeSummary, PublicGroupSnapshotError> {
+    tree_summary_from_public_group(state.public_group())
 }
 
 /// Bind an encoded snapshot to the trusted in-memory state that produced it.
@@ -414,6 +501,7 @@ pub fn public_group_snapshot_binding(
     {
         return Err(PublicGroupSnapshotError::SnapshotCoordinateMismatch);
     }
+    let tree_summary = public_group_snapshot_tree_summary(state)?;
     Ok(PublicGroupSnapshotBinding::new(
         trusted.conversation_id,
         trusted.generation,
@@ -424,6 +512,7 @@ pub fn public_group_snapshot_binding(
         trusted.confirmation_tag,
         trusted.lifecycle,
         public_group_snapshot_sha256(encoded),
+        tree_summary,
     ))
 }
 
@@ -481,6 +570,10 @@ pub enum PublicGroupSnapshotError {
     SnapshotStateMismatch,
     #[error("public group snapshot MLS coordinate does not match its database binding")]
     SnapshotCoordinateMismatch,
+    #[error("locked conversation head contains an invalid canonical public-tree summary")]
+    InvalidExpectedTreeSummary,
+    #[error("public group snapshot tree or leaf summary does not match its locked database head")]
+    SnapshotTreeSummaryMismatch,
     #[error("public group snapshot records are internally incoherent")]
     IncoherentStoredPublicGroup,
 }
@@ -545,6 +638,9 @@ pub fn decode_public_group_snapshot(
     expected: &PublicGroupSnapshotBinding,
 ) -> Result<PublicGroupState, PublicGroupSnapshotError> {
     validate_trusted_coordinate(expected.coordinate())?;
+    if !tree_summary_shape_is_valid(expected.tree_summary()) {
+        return Err(PublicGroupSnapshotError::InvalidExpectedTreeSummary);
+    }
     if encoded.is_empty() {
         return Err(PublicGroupSnapshotError::Empty);
     }
@@ -601,8 +697,69 @@ pub fn decode_public_group_snapshot(
     validate_snapshot_coordinate(&public_group, expected)?;
     validate_ratchet_tree_hash(&public_group)?;
     validate_interim_transcript_hash(&records, &public_group)?;
+    validate_snapshot_tree_summary(&public_group, expected.tree_summary())?;
 
     Ok(PublicGroupState::new(provider, public_group))
+}
+
+fn tree_summary_shape_is_valid(summary: &PublicGroupSnapshotTreeSummary) -> bool {
+    if !(1..=MAX_PUBLIC_GROUP_LEAVES).contains(&summary.leaves.len()) {
+        return false;
+    }
+    let mut previous_index = None;
+    for leaf in &summary.leaves {
+        if previous_index.is_some_and(|previous| previous >= leaf.leaf_index)
+            || !(MIN_BASIC_CREDENTIAL_BYTES..=MAX_BASIC_CREDENTIAL_BYTES)
+                .contains(&leaf.basic_credential.len())
+            || leaf.signature_key.len() != ED25519_PUBLIC_KEY_BYTES
+            || !xwing_public_key_is_valid(&leaf.encryption_key)
+        {
+            return false;
+        }
+        previous_index = Some(leaf.leaf_index);
+    }
+    true
+}
+
+fn tree_summary_from_public_group(
+    public_group: &PublicGroup,
+) -> Result<PublicGroupSnapshotTreeSummary, PublicGroupSnapshotError> {
+    let tree_hash: [u8; 32] = public_group
+        .group_context()
+        .tree_hash()
+        .try_into()
+        .map_err(|_| PublicGroupSnapshotError::IncoherentStoredPublicGroup)?;
+    let mut leaves = public_group
+        .members()
+        .map(|member| {
+            if member.credential.credential_type() != CredentialType::Basic {
+                return Err(PublicGroupSnapshotError::IncoherentStoredPublicGroup);
+            }
+            Ok(PublicGroupSnapshotLeaf::new(
+                member.index.u32(),
+                member.credential.serialized_content().to_vec(),
+                member.signature_key,
+                member.encryption_key,
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    leaves.sort_by_key(PublicGroupSnapshotLeaf::leaf_index);
+    let summary = PublicGroupSnapshotTreeSummary::new(tree_hash, leaves);
+    if !tree_summary_shape_is_valid(&summary) {
+        return Err(PublicGroupSnapshotError::IncoherentStoredPublicGroup);
+    }
+    Ok(summary)
+}
+
+fn validate_snapshot_tree_summary(
+    public_group: &PublicGroup,
+    expected: &PublicGroupSnapshotTreeSummary,
+) -> Result<(), PublicGroupSnapshotError> {
+    let actual = tree_summary_from_public_group(public_group)?;
+    if &actual != expected {
+        return Err(PublicGroupSnapshotError::SnapshotTreeSummaryMismatch);
+    }
+    Ok(())
 }
 
 fn validate_trusted_coordinate(
@@ -659,7 +816,7 @@ fn validate_ratchet_tree_hash(public_group: &PublicGroup) -> Result<(), PublicGr
 /// leaf. Recover the padded conceptual width so missing tail nodes remain
 /// explicit blanks during tree hashing and path-resolution traversal.
 fn conceptual_tree_width(trimmed_width: usize) -> Option<usize> {
-    if trimmed_width == 0 || trimmed_width % 2 == 0 {
+    if trimmed_width == 0 || trimmed_width.is_multiple_of(2) {
         return None;
     }
     trimmed_width

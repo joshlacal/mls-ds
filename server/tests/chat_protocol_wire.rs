@@ -22,6 +22,9 @@ use rand::{rngs::StdRng, RngCore, SeedableRng};
 use sha2::{Digest, Sha256};
 use tls_codec::{Deserialize as TlsDeserialize, VLBytes};
 
+const TEST_ALICE_CREDENTIAL: &[u8] = b"did:web:a#00000000-0000-4000-8000-000000000001";
+const TEST_BOB_CREDENTIAL: &[u8] = b"did:web:b#00000000-0000-4000-8000-000000000002";
+
 #[derive(Clone, Debug, tls_codec::TlsSerialize, tls_codec::TlsDeserialize, tls_codec::TlsSize)]
 struct TestWelcomeEnvelope {
     version: u16,
@@ -910,6 +913,8 @@ struct RightmostSenderTransition {
     confirmation_tag: [u8; 32],
     sender_index: u32,
     expected_member_count: usize,
+    expected_add_count: usize,
+    expected_remove_count: usize,
 }
 
 struct RightmostSenderFixture {
@@ -997,7 +1002,7 @@ fn stateful_commit_fixture(variant: StatefulCommitVariant) -> StatefulCommitFixt
         &config,
         GroupId::from_slice(&[0xC7; 32]),
         CredentialWithKey {
-            credential: BasicCredential::new(b"did:plc:alice#phone".to_vec()).into(),
+            credential: BasicCredential::new(TEST_ALICE_CREDENTIAL.to_vec()).into(),
             signature_key: signature_key.clone().into(),
         },
     )
@@ -1034,7 +1039,7 @@ fn stateful_commit_fixture(variant: StatefulCommitVariant) -> StatefulCommitFixt
                     &provider,
                     &bob_signer,
                     CredentialWithKey {
-                        credential: BasicCredential::new(b"did:plc:bob#laptop".to_vec()).into(),
+                        credential: BasicCredential::new(TEST_BOB_CREDENTIAL.to_vec()).into(),
                         signature_key: bob_signer.to_public_vec().into(),
                     },
                 )
@@ -1088,7 +1093,7 @@ fn stateful_fixture_group_info(
     validate_group_info(
         &fixture.group_info,
         GroupInfoValidationPolicy {
-            expected_basic_credential: b"did:plc:alice#phone",
+            expected_basic_credential: TEST_ALICE_CREDENTIAL,
             expected_signature_key: &fixture.signature_key,
             now_unix_seconds: fixture.now_unix_seconds,
             max_bytes: MAX_GROUP_INFO_WIRE_BYTES,
@@ -1102,6 +1107,14 @@ fn stateful_fixture_group_info(
 fn genesis_group_info_fixture(
     capabilities: Option<Capabilities>,
     lifetime: Option<Lifetime>,
+) -> GenesisGroupInfoFixture {
+    genesis_group_info_fixture_with_credential(capabilities, lifetime, b"did:plc:alice#genesis")
+}
+
+fn genesis_group_info_fixture_with_credential(
+    capabilities: Option<Capabilities>,
+    lifetime: Option<Lifetime>,
+    credential: &[u8],
 ) -> GenesisGroupInfoFixture {
     let provider = openmls_libcrux_crypto::Provider::new().expect("libcrux provider");
     let signer =
@@ -1126,7 +1139,7 @@ fn genesis_group_info_fixture(
         &builder.build(),
         GroupId::from_slice(&[0xD0; 32]),
         CredentialWithKey {
-            credential: BasicCredential::new(b"did:plc:alice#genesis".to_vec()).into(),
+            credential: BasicCredential::new(credential.to_vec()).into(),
             signature_key: signer.to_public_vec().into(),
         },
     )
@@ -1179,7 +1192,7 @@ fn rightmost_sender_fixture(member_count: usize) -> RightmostSenderFixture {
         &group_config,
         GroupId::from_slice(&[0xC8; 32]),
         CredentialWithKey {
-            credential: BasicCredential::new(b"did:plc:alice#phone".to_vec()).into(),
+            credential: BasicCredential::new(TEST_ALICE_CREDENTIAL.to_vec()).into(),
             signature_key: alice_signature_key.clone().into(),
         },
     )
@@ -1199,7 +1212,8 @@ fn rightmost_sender_fixture(member_count: usize) -> RightmostSenderFixture {
         signer
             .store(member_provider.storage())
             .expect("store member signer");
-        let credential = format!("did:plc:member{leaf_index}#device").into_bytes();
+        let credential =
+            format!("did:web:m{leaf_index}#00000000-0000-4000-8000-{leaf_index:012}").into_bytes();
         let key_package = KeyPackage::builder()
             .leaf_node_capabilities(exact_capabilities())
             .key_package_lifetime(Lifetime::init(
@@ -1249,12 +1263,14 @@ fn rightmost_sender_fixture(member_count: usize) -> RightmostSenderFixture {
             confirmation_tag,
             sender_index: 0,
             expected_member_count: next_member_count,
+            expected_add_count: 1,
+            expected_remove_count: 0,
         });
         final_welcome = Some(welcome);
     }
 
     let welcome_message =
-        MlsMessageIn::tls_deserialize_exact(&final_welcome.expect("rightmost member Welcome"))
+        MlsMessageIn::tls_deserialize_exact(final_welcome.expect("rightmost member Welcome"))
             .expect("parse rightmost member Welcome");
     let MlsMessageBodyIn::Welcome(welcome) = welcome_message.extract() else {
         panic!("rightmost member fixture must contain Welcome");
@@ -1293,6 +1309,66 @@ fn rightmost_sender_fixture(member_count: usize) -> RightmostSenderFixture {
         confirmation_tag,
         sender_index: u32::try_from(member_count - 1).expect("bounded leaf index"),
         expected_member_count: member_count - 1,
+        expected_add_count: 0,
+        expected_remove_count: 1,
+    });
+
+    let replacement_signer =
+        SignatureKeyPair::new(XWING_CIPHERSUITE.signature_algorithm()).expect("replacement signer");
+    replacement_signer
+        .store(member_provider.storage())
+        .expect("store replacement signer");
+    let replacement_key_package = KeyPackage::builder()
+        .leaf_node_capabilities(exact_capabilities())
+        .key_package_lifetime(Lifetime::init(
+            now_unix_seconds - 60,
+            now_unix_seconds + 3_600,
+        ))
+        .build(
+            XWING_CIPHERSUITE,
+            &member_provider,
+            &replacement_signer,
+            CredentialWithKey {
+                credential: BasicCredential::new(
+                    format!(
+                        "did:web:r{member_count}#00000000-0000-4000-8000-{:012}",
+                        member_count + 100
+                    )
+                    .into_bytes(),
+                )
+                .into(),
+                signature_key: replacement_signer.to_public_vec().into(),
+            },
+        )
+        .expect("build replacement KeyPackage")
+        .key_package()
+        .clone();
+    let add_aad = b"rightmost-add".to_vec();
+    rightmost_group.set_aad(add_aad.clone());
+    let (add, _, _) = rightmost_group
+        .add_members(
+            &member_provider,
+            &rightmost_signer,
+            &[replacement_key_package],
+        )
+        .expect("rightmost member creates Add Commit");
+    let add = add
+        .tls_serialize_detached()
+        .expect("serialize rightmost-member Add Commit");
+    rightmost_group
+        .merge_pending_commit(&member_provider)
+        .expect("merge rightmost-member Add Commit");
+    let (group_context_hash, confirmation_tag) =
+        exported_group_coordinate(&rightmost_group, &member_provider, &rightmost_signer);
+    transitions.push(RightmostSenderTransition {
+        aad: add_aad,
+        commit: add,
+        group_context_hash,
+        confirmation_tag,
+        sender_index: u32::try_from(member_count - 1).expect("bounded leaf index"),
+        expected_member_count: member_count,
+        expected_add_count: 1,
+        expected_remove_count: 0,
     });
 
     RightmostSenderFixture {
@@ -1338,7 +1414,7 @@ fn coherent_wire_fixture_with_group_id(group_id: &[u8]) -> CoherentWireFixture {
         &group_config,
         GroupId::from_slice(&group_id),
         CredentialWithKey {
-            credential: BasicCredential::new(b"did:plc:alice#phone".to_vec()).into(),
+            credential: BasicCredential::new(TEST_ALICE_CREDENTIAL.to_vec()).into(),
             signature_key: alice_signature_key.clone().into(),
         },
     )
@@ -1365,7 +1441,7 @@ fn coherent_wire_fixture_with_group_id(group_id: &[u8]) -> CoherentWireFixture {
             &provider,
             &bob_signer,
             CredentialWithKey {
-                credential: BasicCredential::new(b"did:plc:bob#laptop".to_vec()).into(),
+                credential: BasicCredential::new(TEST_BOB_CREDENTIAL.to_vec()).into(),
                 signature_key: bob_signer.to_public_vec().into(),
             },
         )
@@ -1436,7 +1512,7 @@ fn coherent_wire_fixture() -> CoherentWireFixture {
 
 fn group_info_policy(fixture: &CoherentWireFixture) -> GroupInfoValidationPolicy<'_> {
     GroupInfoValidationPolicy {
-        expected_basic_credential: b"did:plc:alice#phone",
+        expected_basic_credential: TEST_ALICE_CREDENTIAL,
         expected_signature_key: &fixture.alice_signature_key,
         now_unix_seconds: fixture.now_unix_seconds,
         max_bytes: MAX_GROUP_INFO_WIRE_BYTES,
@@ -1758,10 +1834,7 @@ fn coherent_xwing_artifacts_validate_with_visible_metadata_and_public_group_seam
     assert_eq!(processed.next_state().public_group().members().count(), 2);
     assert_eq!(processed.adds().len(), 1);
     assert!(processed.removes().is_empty());
-    assert_eq!(
-        processed.adds()[0].basic_credential(),
-        b"did:plc:bob#laptop"
-    );
+    assert_eq!(processed.adds()[0].basic_credential(), TEST_BOB_CREDENTIAL);
     assert_eq!(
         processed.adds()[0].key_package().key_package_ref(),
         &fixture.bob_key_package_ref
@@ -1787,6 +1860,52 @@ fn coherent_xwing_artifacts_validate_with_visible_metadata_and_public_group_seam
     assert_eq!(private.group_id(), fixture.group_id);
     assert_eq!(private.epoch(), 1);
     assert_eq!(private.aad(), b"application-aad");
+}
+
+#[test]
+fn snapshot_binding_and_load_accept_exact_basic_credential_boundaries() {
+    let maximum_bare_did = format!("did:web:a:{}", "x".repeat(2_038));
+    for credential in [
+        b"did:web:a#00000000-0000-4000-8000-000000000000".to_vec(),
+        format!("{maximum_bare_did}#00000000-0000-4000-8000-000000000000").into_bytes(),
+    ] {
+        assert!(matches!(credential.len(), 46 | 2_085));
+        let fixture = genesis_group_info_fixture_with_credential(
+            Some(exact_capabilities()),
+            Some(Lifetime::init(frozen_now() - 60, frozen_now() + 3_600)),
+            &credential,
+        );
+        let validated = validate_group_info(
+            &fixture.bytes,
+            GroupInfoValidationPolicy {
+                expected_basic_credential: &credential,
+                expected_signature_key: &fixture.signature_key,
+                now_unix_seconds: fixture.now_unix_seconds,
+                max_bytes: MAX_GROUP_INFO_WIRE_BYTES,
+                max_ratchet_tree_bytes: 786_432,
+                max_members: 1,
+            },
+        )
+        .expect("validate boundary-credential GroupInfo");
+        let snapshot = encode_public_group_snapshot(validated.public_state())
+            .expect("encode boundary-credential public state");
+        let coordinate = coordinate_for_validated_group(&validated, 0, 0);
+        let binding =
+            public_group_snapshot_binding(validated.public_state(), &snapshot, &coordinate)
+                .expect("bind boundary-credential public state");
+        let restored = decode_public_group_snapshot(&snapshot, &binding)
+            .expect("reload boundary-credential public state");
+        assert_eq!(
+            restored
+                .public_group()
+                .members()
+                .next()
+                .expect("singleton member")
+                .credential
+                .serialized_content(),
+            credential
+        );
+    }
 }
 
 #[test]
@@ -2393,7 +2512,7 @@ fn stateful_remove_commit_derives_exact_removed_identity_and_next_snapshot() {
     assert_eq!(epoch_two.removes()[0].leaf_index(), 1);
     assert_eq!(
         epoch_two.removes()[0].basic_credential(),
-        b"did:plc:bob#laptop"
+        TEST_BOB_CREDENTIAL
     );
     assert_eq!(epoch_two.next_state().public_group().members().count(), 1);
     decode_public_group_snapshot(epoch_two.next_snapshot(), epoch_two.next_binding())
@@ -2407,7 +2526,7 @@ fn rightmost_member_commits_round_trip_across_trimmed_non_power_of_two_trees() {
         let genesis = validate_group_info(
             &fixture.genesis_group_info,
             GroupInfoValidationPolicy {
-                expected_basic_credential: b"did:plc:alice#phone",
+                expected_basic_credential: TEST_ALICE_CREDENTIAL,
                 expected_signature_key: &fixture.alice_signature_key,
                 now_unix_seconds: fixture.now_unix_seconds,
                 max_bytes: MAX_GROUP_INFO_WIRE_BYTES,
@@ -2452,9 +2571,11 @@ fn rightmost_member_commits_round_trip_across_trimmed_non_power_of_two_trees() {
                 processed.next_state().public_group().members().count(),
                 transition.expected_member_count
             );
+            assert_eq!(processed.adds().len(), transition.expected_add_count);
+            assert_eq!(processed.removes().len(), transition.expected_remove_count);
             decode_public_group_snapshot(processed.next_snapshot(), processed.next_binding())
                 .expect("round-trip non-power-of-two public snapshot");
-            binding = *processed.next_binding();
+            binding = processed.next_binding().clone();
             state = processed.into_next_state();
         }
     }

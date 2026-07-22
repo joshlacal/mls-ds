@@ -3,58 +3,115 @@ use std::{fs, path::PathBuf};
 use catbird_server::chat_protocol::snapshot::{
     decode_public_group_snapshot, encode_public_group_snapshot, public_group_snapshot_binding,
     public_group_snapshot_sha256, PublicGroupSnapshotBinding, PublicGroupSnapshotError,
-    PublicGroupSnapshotLifecycle, MAX_PROTOCOL_INTEGER, MAX_PUBLIC_GROUP_SNAPSHOT_BYTES,
-    MAX_SNAPSHOT_KEY_BYTES, MAX_SNAPSHOT_VALUE_BYTES,
+    PublicGroupSnapshotLeaf, PublicGroupSnapshotLifecycle, PublicGroupSnapshotTreeSummary,
+    MAX_PROTOCOL_INTEGER, MAX_PUBLIC_GROUP_SNAPSHOT_BYTES, MAX_SNAPSHOT_KEY_BYTES,
+    MAX_SNAPSHOT_VALUE_BYTES,
 };
 
 const MAGIC: &[u8; 8] = b"CBPGSNAP";
 const SCHEMA: u16 = 1;
 const OPENMLS_VERSION: &[u8] = b"0.8.1";
 const STORAGE_VERSION: &[u8] = b"0.5.0";
-const CONVERSATION_ID: [u8; 16] = [
-    0xd4, 0xe3, 0xc7, 0x14, 0x41, 0xb5, 0x43, 0xa8, 0xb2, 0xdf, 0x6d, 0x1d, 0x1f, 0x78, 0x99, 0x54,
-];
-const GROUP_ID: [u8; 32] = [
-    0x10, 0x2f, 0x52, 0x11, 0x83, 0x65, 0x4c, 0x7d, 0xb4, 0xc9, 0xfa, 0xf3, 0x21, 0xa7, 0x3e, 0x00,
-    0xca, 0xc2, 0xf8, 0xce, 0xf3, 0xbd, 0x1c, 0x87, 0xa1, 0x88, 0xc3, 0x85, 0x2a, 0xac, 0x20, 0xb1,
-];
 
-fn hex32(value: &str) -> [u8; 32] {
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TrustedCorpusIdentifiers {
+    conversation_id_hex: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TrustedCorpusChain {
+    generation: u64,
+    genesis_state_version: u64,
+    genesis_epoch: u64,
+    genesis_group_context_hash_hex: String,
+    genesis_confirmation_tag_hex: String,
+    committed_state_version: u64,
+    committed_epoch: u64,
+    committed_group_context_hash_hex: String,
+    committed_confirmation_tag_hex: String,
+    group_id_hex: String,
+}
+
+#[derive(serde::Deserialize)]
+struct TrustedCorpusManifest {
+    identifiers: TrustedCorpusIdentifiers,
+    chain: TrustedCorpusChain,
+}
+
+fn hex_array<const N: usize>(value: &str) -> [u8; N] {
     hex::decode(value)
         .expect("valid test hex")
         .try_into()
-        .expect("32-byte test value")
+        .unwrap_or_else(|_| panic!("expected {N}-byte test value"))
+}
+
+fn trusted_corpus_manifest() -> TrustedCorpusManifest {
+    serde_json::from_slice(&corpus_file("manifest.json")).expect("trusted corpus manifest")
+}
+
+fn trusted_conversation_id() -> [u8; 16] {
+    hex_array(&trusted_corpus_manifest().identifiers.conversation_id_hex)
+}
+
+fn trusted_group_id() -> [u8; 32] {
+    hex_array(&trusted_corpus_manifest().chain.group_id_hex)
 }
 
 fn snapshot_binding(encoded: &[u8], epoch: u64) -> PublicGroupSnapshotBinding {
-    let (context_hash, confirmation_tag) = match epoch {
-        0 => (
-            "5f79e703f1b0813b12b141ae108297567d2c10025554cc42efd37e0c9ad1e102",
-            "d9c06dcf2a42924b9f91e48ce2201b9827a43b0cd9f19c0f6e042792de7db71a",
-        ),
-        1 => (
-            "a1d6f53e64ab5b4e8eb9309b3b8eb7f32c64a7d406609cf0a0ab0e138d6ad37f",
-            "a38367abdc76779da5e786aaf73abd95763f33a5e1a030c0a76c48f29f3ebb9b",
-        ),
-        _ => panic!("unsupported test epoch"),
+    let manifest = trusted_corpus_manifest();
+    let chain = &manifest.chain;
+    let (state_version, context_hash, confirmation_tag) = if epoch == chain.genesis_epoch {
+        (
+            chain.genesis_state_version,
+            chain.genesis_group_context_hash_hex.as_str(),
+            chain.genesis_confirmation_tag_hex.as_str(),
+        )
+    } else if epoch == chain.committed_epoch {
+        (
+            chain.committed_state_version,
+            chain.committed_group_context_hash_hex.as_str(),
+            chain.committed_confirmation_tag_hex.as_str(),
+        )
+    } else {
+        panic!("unsupported test epoch")
     };
     PublicGroupSnapshotBinding::new(
-        CONVERSATION_ID,
-        0,
+        hex_array::<16>(&manifest.identifiers.conversation_id_hex),
+        chain.generation,
+        state_version,
+        hex_array::<32>(&chain.group_id_hex),
         epoch,
-        GROUP_ID,
-        epoch,
-        hex32(context_hash),
-        hex32(confirmation_tag),
+        hex_array::<32>(context_hash),
+        hex_array::<32>(confirmation_tag),
         PublicGroupSnapshotLifecycle::Active,
         public_group_snapshot_sha256(encoded),
+        trusted_tree_summary(encoded),
     )
 }
 
 fn decode_genesis(
     encoded: &[u8],
 ) -> Result<catbird_server::chat_protocol::snapshot::PublicGroupState, PublicGroupSnapshotError> {
-    decode_public_group_snapshot(encoded, &snapshot_binding(encoded, 0))
+    // Negative envelope tests deliberately pass bytes that cannot be parsed as
+    // a snapshot.  The independently locked tree summary still comes from the
+    // known-good database head; only the expected artifact digest follows the
+    // candidate bytes under test.
+    let trusted = snapshot_binding(&corpus_file("genesis-public-state.bin"), 0);
+    let binding = PublicGroupSnapshotBinding::new(
+        *trusted.conversation_id(),
+        trusted.generation(),
+        trusted.state_version(),
+        *trusted.group_id(),
+        trusted.epoch(),
+        *trusted.group_context_hash(),
+        *trusted.confirmation_tag(),
+        trusted.lifecycle(),
+        public_group_snapshot_sha256(encoded),
+        trusted.tree_summary().clone(),
+    );
+    decode_public_group_snapshot(encoded, &binding)
 }
 
 #[derive(Clone)]
@@ -115,6 +172,57 @@ fn parse_valid_snapshot(bytes: &[u8]) -> RawSnapshot {
         storage_version,
         records,
     }
+}
+
+fn json_bytes(value: &serde_json::Value) -> Vec<u8> {
+    value
+        .as_array()
+        .expect("trusted fixture byte array")
+        .iter()
+        .map(|byte| {
+            u8::try_from(byte.as_u64().expect("trusted fixture byte")).expect("trusted fixture u8")
+        })
+        .collect()
+}
+
+fn trusted_tree_summary(encoded: &[u8]) -> PublicGroupSnapshotTreeSummary {
+    let raw = parse_valid_snapshot(encoded);
+    let group_context = raw
+        .records
+        .iter()
+        .find(|(key, _)| key.starts_with(b"GroupContext"))
+        .map(|(_, value)| serde_json::from_slice::<serde_json::Value>(value).expect("GroupContext"))
+        .expect("GroupContext record");
+    let tree_hash: [u8; 32] = json_bytes(&group_context["tree_hash"]["vec"])
+        .try_into()
+        .expect("trusted 32-byte tree hash");
+    let tree = raw
+        .records
+        .iter()
+        .find(|(key, _)| key.starts_with(b"Tree"))
+        .map(|(_, value)| serde_json::from_slice::<serde_json::Value>(value).expect("Tree"))
+        .expect("Tree record");
+    let leaves = tree["tree"]["leaf_nodes"]
+        .as_array()
+        .expect("trusted leaf array")
+        .iter()
+        .enumerate()
+        .filter_map(|(leaf_index, stored)| {
+            let node = stored.get("node")?;
+            if node.is_null() {
+                return None;
+            }
+            let payload = &node["payload"];
+            assert_eq!(payload["credential"]["credential_type"], "Basic");
+            Some(PublicGroupSnapshotLeaf::new(
+                u32::try_from(leaf_index).expect("trusted leaf index"),
+                json_bytes(&payload["credential"]["serialized_credential_content"]["vec"]),
+                json_bytes(&payload["signature_key"]["value"]["vec"]),
+                json_bytes(&payload["encryption_key"]["key"]["vec"]),
+            ))
+        })
+        .collect();
+    PublicGroupSnapshotTreeSummary::new(tree_hash, leaves)
 }
 
 fn push_u16_len(output: &mut Vec<u8>, value: &[u8]) {
@@ -178,7 +286,10 @@ fn frozen_public_group_snapshots_load_and_round_trip_canonically() {
         let binding = snapshot_binding(&encoded, expected_epoch);
         let state = decode_public_group_snapshot(&encoded, &binding)
             .expect("load frozen public snapshot into a fresh provider");
-        assert_eq!(state.public_group().group_id().as_slice(), GROUP_ID);
+        assert_eq!(
+            state.public_group().group_id().as_slice(),
+            trusted_group_id()
+        );
         assert_eq!(
             state.public_group().group_context().epoch().as_u64(),
             expected_epoch
@@ -385,7 +496,7 @@ fn snapshot_rejects_corrupt_values_and_wrong_expected_group() {
         PublicGroupSnapshotError::InvalidStoredPublicGroup
     );
 
-    let mut wrong_group_id = GROUP_ID;
+    let mut wrong_group_id = trusted_group_id();
     wrong_group_id[0] ^= 0x01;
     let encoded = corpus_file("genesis-public-state.bin");
     let correct = snapshot_binding(&encoded, 0);
@@ -399,6 +510,7 @@ fn snapshot_rejects_corrupt_values_and_wrong_expected_group() {
         *correct.confirmation_tag(),
         correct.lifecycle(),
         *correct.snapshot_sha256(),
+        correct.tree_summary().clone(),
     );
     assert_eq!(
         decode_public_group_snapshot(&encoded, &wrong_binding)
@@ -411,7 +523,7 @@ fn snapshot_rejects_corrupt_values_and_wrong_expected_group() {
 fn snapshot_requires_an_active_bounded_uuidv4_outer_coordinate() {
     let encoded = corpus_file("genesis-public-state.bin");
     let correct = snapshot_binding(&encoded, 0);
-    assert_eq!(correct.conversation_id(), &CONVERSATION_ID);
+    assert_eq!(correct.conversation_id(), &trusted_conversation_id());
     assert_eq!(correct.generation(), 0);
     assert_eq!(correct.state_version(), 0);
     assert_eq!(correct.lifecycle(), PublicGroupSnapshotLifecycle::Active);
@@ -421,12 +533,13 @@ fn snapshot_requires_an_active_bounded_uuidv4_outer_coordinate() {
             conversation_id,
             generation,
             state_version,
-            GROUP_ID,
+            trusted_group_id(),
             epoch,
             *correct.group_context_hash(),
             *correct.confirmation_tag(),
             lifecycle,
             *correct.snapshot_sha256(),
+            correct.tree_summary().clone(),
         )
     };
     for (invalid, expected_error) in [
@@ -436,7 +549,7 @@ fn snapshot_requires_an_active_bounded_uuidv4_outer_coordinate() {
         ),
         (
             binding(
-                CONVERSATION_ID,
+                trusted_conversation_id(),
                 MAX_PROTOCOL_INTEGER + 1,
                 0,
                 0,
@@ -446,7 +559,7 @@ fn snapshot_requires_an_active_bounded_uuidv4_outer_coordinate() {
         ),
         (
             binding(
-                CONVERSATION_ID,
+                trusted_conversation_id(),
                 0,
                 MAX_PROTOCOL_INTEGER + 1,
                 0,
@@ -456,7 +569,7 @@ fn snapshot_requires_an_active_bounded_uuidv4_outer_coordinate() {
         ),
         (
             binding(
-                CONVERSATION_ID,
+                trusted_conversation_id(),
                 0,
                 0,
                 MAX_PROTOCOL_INTEGER + 1,
@@ -466,7 +579,7 @@ fn snapshot_requires_an_active_bounded_uuidv4_outer_coordinate() {
         ),
         (
             binding(
-                CONVERSATION_ID,
+                trusted_conversation_id(),
                 0,
                 0,
                 0,
@@ -519,34 +632,37 @@ fn snapshot_binding_rejects_digest_coordinate_stale_blob_and_record_splicing() {
             *genesis_binding.conversation_id(),
             genesis_binding.generation(),
             genesis_binding.state_version(),
-            GROUP_ID,
+            trusted_group_id(),
             1,
             *genesis_binding.group_context_hash(),
             *genesis_binding.confirmation_tag(),
             genesis_binding.lifecycle(),
             *genesis_binding.snapshot_sha256(),
+            genesis_binding.tree_summary().clone(),
         ),
         PublicGroupSnapshotBinding::new(
             *genesis_binding.conversation_id(),
             genesis_binding.generation(),
             genesis_binding.state_version(),
-            GROUP_ID,
+            trusted_group_id(),
             0,
             [0xA5; 32],
             *genesis_binding.confirmation_tag(),
             genesis_binding.lifecycle(),
             *genesis_binding.snapshot_sha256(),
+            genesis_binding.tree_summary().clone(),
         ),
         PublicGroupSnapshotBinding::new(
             *genesis_binding.conversation_id(),
             genesis_binding.generation(),
             genesis_binding.state_version(),
-            GROUP_ID,
+            trusted_group_id(),
             0,
             *genesis_binding.group_context_hash(),
             [0x5A; 32],
             genesis_binding.lifecycle(),
             *genesis_binding.snapshot_sha256(),
+            genesis_binding.tree_summary().clone(),
         ),
     ] {
         assert_eq!(
@@ -573,6 +689,299 @@ fn snapshot_binding_rejects_digest_coordinate_stale_blob_and_record_splicing() {
         assert!(
             decode_public_group_snapshot(&spliced, &snapshot_binding(&spliced, 0)).is_err(),
             "record {record_index} splice escaped semantic coherence validation"
+        );
+    }
+}
+
+#[test]
+fn snapshot_rejects_coordinate_consistent_stale_and_spliced_tree_summaries() {
+    let genesis = corpus_file("genesis-public-state.bin");
+    let committed = corpus_file("committed-public-state.bin");
+    let correct = snapshot_binding(&committed, 1);
+    let genesis_summary = trusted_tree_summary(&genesis);
+    let committed_summary = correct.tree_summary();
+    assert_eq!(committed_summary.leaves().len(), 2);
+
+    let bind = |summary| {
+        PublicGroupSnapshotBinding::new(
+            *correct.conversation_id(),
+            correct.generation(),
+            correct.state_version(),
+            *correct.group_id(),
+            correct.epoch(),
+            *correct.group_context_hash(),
+            *correct.confirmation_tag(),
+            correct.lifecycle(),
+            *correct.snapshot_sha256(),
+            summary,
+        )
+    };
+    let alice = committed_summary.leaves()[0].clone();
+    let bob = committed_summary.leaves()[1].clone();
+
+    let mut wrong_credential = bob.basic_credential().to_vec();
+    wrong_credential.push(b'x');
+    let mut wrong_signature_key = bob.signature_key().to_vec();
+    wrong_signature_key[0] ^= 1;
+    let extra_leaf = PublicGroupSnapshotLeaf::new(
+        2,
+        alice.basic_credential().to_vec(),
+        alice.signature_key().to_vec(),
+        alice.encryption_key().to_vec(),
+    );
+    let wrong_leaf_summaries = [
+        (
+            "stale missing leaf",
+            PublicGroupSnapshotTreeSummary::new(
+                *committed_summary.tree_hash(),
+                vec![alice.clone()],
+            ),
+        ),
+        (
+            "wrong leaf index",
+            PublicGroupSnapshotTreeSummary::new(
+                *committed_summary.tree_hash(),
+                vec![
+                    alice.clone(),
+                    PublicGroupSnapshotLeaf::new(
+                        2,
+                        bob.basic_credential().to_vec(),
+                        bob.signature_key().to_vec(),
+                        bob.encryption_key().to_vec(),
+                    ),
+                ],
+            ),
+        ),
+        (
+            "wrong BasicCredential bytes",
+            PublicGroupSnapshotTreeSummary::new(
+                *committed_summary.tree_hash(),
+                vec![
+                    alice.clone(),
+                    PublicGroupSnapshotLeaf::new(
+                        bob.leaf_index(),
+                        wrong_credential,
+                        bob.signature_key().to_vec(),
+                        bob.encryption_key().to_vec(),
+                    ),
+                ],
+            ),
+        ),
+        (
+            "wrong signature key",
+            PublicGroupSnapshotTreeSummary::new(
+                *committed_summary.tree_hash(),
+                vec![
+                    alice.clone(),
+                    PublicGroupSnapshotLeaf::new(
+                        bob.leaf_index(),
+                        bob.basic_credential().to_vec(),
+                        wrong_signature_key,
+                        bob.encryption_key().to_vec(),
+                    ),
+                ],
+            ),
+        ),
+        (
+            "stale encryption key spliced from genesis",
+            PublicGroupSnapshotTreeSummary::new(
+                *committed_summary.tree_hash(),
+                vec![genesis_summary.leaves()[0].clone(), bob.clone()],
+            ),
+        ),
+        (
+            "wrong tree hash",
+            PublicGroupSnapshotTreeSummary::new([0xA5; 32], vec![alice.clone(), bob.clone()]),
+        ),
+        (
+            "extra shape-valid leaf",
+            PublicGroupSnapshotTreeSummary::new(
+                *committed_summary.tree_hash(),
+                vec![alice, bob, extra_leaf],
+            ),
+        ),
+    ];
+
+    for (case, summary) in wrong_leaf_summaries {
+        assert_eq!(
+            decode_public_group_snapshot(&committed, &bind(summary))
+                .expect_err("coordinate-consistent wrong tree summary"),
+            PublicGroupSnapshotError::SnapshotTreeSummaryMismatch,
+            "{case} escaped exact locked-head comparison"
+        );
+    }
+}
+
+#[test]
+fn snapshot_rejects_noncanonical_locked_head_tree_summary_shape() {
+    let encoded = corpus_file("committed-public-state.bin");
+    let correct = snapshot_binding(&encoded, 1);
+    let expected = correct.tree_summary();
+    let alice = expected.leaves()[0].clone();
+    let bob = expected.leaves()[1].clone();
+    let bind = |summary| {
+        PublicGroupSnapshotBinding::new(
+            *correct.conversation_id(),
+            correct.generation(),
+            correct.state_version(),
+            *correct.group_id(),
+            correct.epoch(),
+            *correct.group_context_hash(),
+            *correct.confirmation_tag(),
+            correct.lifecycle(),
+            *correct.snapshot_sha256(),
+            summary,
+        )
+    };
+
+    let mut too_many = Vec::with_capacity(101);
+    for leaf_index in 0_u32..101 {
+        too_many.push(PublicGroupSnapshotLeaf::new(
+            leaf_index,
+            alice.basic_credential().to_vec(),
+            alice.signature_key().to_vec(),
+            alice.encryption_key().to_vec(),
+        ));
+    }
+    let mut short_signature_key = bob.signature_key().to_vec();
+    short_signature_key.pop();
+    let mut short_encryption_key = bob.encryption_key().to_vec();
+    short_encryption_key.pop();
+    let mut noncanonical_encryption_key = bob.encryption_key().to_vec();
+    *noncanonical_encryption_key
+        .last_mut()
+        .expect("XWing X25519 component") |= 0x80;
+    let invalid = vec![
+        (
+            "empty summary",
+            PublicGroupSnapshotTreeSummary::new(*expected.tree_hash(), vec![]),
+        ),
+        (
+            "more than 100 leaves",
+            PublicGroupSnapshotTreeSummary::new(*expected.tree_hash(), too_many),
+        ),
+        (
+            "duplicate leaf index",
+            PublicGroupSnapshotTreeSummary::new(
+                *expected.tree_hash(),
+                vec![
+                    alice.clone(),
+                    PublicGroupSnapshotLeaf::new(
+                        alice.leaf_index(),
+                        bob.basic_credential().to_vec(),
+                        bob.signature_key().to_vec(),
+                        bob.encryption_key().to_vec(),
+                    ),
+                ],
+            ),
+        ),
+        (
+            "out-of-order leaf indices",
+            PublicGroupSnapshotTreeSummary::new(
+                *expected.tree_hash(),
+                vec![bob.clone(), alice.clone()],
+            ),
+        ),
+        (
+            "BasicCredential below the shortest DID plus device-id identity",
+            PublicGroupSnapshotTreeSummary::new(
+                *expected.tree_hash(),
+                vec![PublicGroupSnapshotLeaf::new(
+                    alice.leaf_index(),
+                    vec![b'x'; 45],
+                    alice.signature_key().to_vec(),
+                    alice.encryption_key().to_vec(),
+                )],
+            ),
+        ),
+        (
+            "BasicCredential above the exact DID plus device-id maximum",
+            PublicGroupSnapshotTreeSummary::new(
+                *expected.tree_hash(),
+                vec![PublicGroupSnapshotLeaf::new(
+                    alice.leaf_index(),
+                    vec![b'x'; 2_086],
+                    alice.signature_key().to_vec(),
+                    alice.encryption_key().to_vec(),
+                )],
+            ),
+        ),
+        (
+            "wrong signature-key length",
+            PublicGroupSnapshotTreeSummary::new(
+                *expected.tree_hash(),
+                vec![PublicGroupSnapshotLeaf::new(
+                    bob.leaf_index(),
+                    bob.basic_credential().to_vec(),
+                    short_signature_key,
+                    bob.encryption_key().to_vec(),
+                )],
+            ),
+        ),
+        (
+            "wrong XWing encryption-key length",
+            PublicGroupSnapshotTreeSummary::new(
+                *expected.tree_hash(),
+                vec![PublicGroupSnapshotLeaf::new(
+                    bob.leaf_index(),
+                    bob.basic_credential().to_vec(),
+                    bob.signature_key().to_vec(),
+                    short_encryption_key,
+                )],
+            ),
+        ),
+        (
+            "noncanonical XWing X25519 component",
+            PublicGroupSnapshotTreeSummary::new(
+                *expected.tree_hash(),
+                vec![PublicGroupSnapshotLeaf::new(
+                    bob.leaf_index(),
+                    bob.basic_credential().to_vec(),
+                    bob.signature_key().to_vec(),
+                    noncanonical_encryption_key,
+                )],
+            ),
+        ),
+    ];
+
+    for (case, summary) in invalid {
+        assert_eq!(
+            decode_public_group_snapshot(&encoded, &bind(summary))
+                .expect_err("invalid locked-head tree summary"),
+            PublicGroupSnapshotError::InvalidExpectedTreeSummary,
+            "{case} escaped expected-summary validation"
+        );
+    }
+
+    for (case, credential) in [
+        (
+            "minimum",
+            b"did:web:a#00000000-0000-4000-8000-000000000000".to_vec(),
+        ),
+        (
+            "maximum",
+            format!(
+                "did:web:a:{}#00000000-0000-4000-8000-000000000000",
+                "x".repeat(2_038)
+            )
+            .into_bytes(),
+        ),
+    ] {
+        assert!(matches!(credential.len(), 46 | 2_085));
+        let boundary_summary = PublicGroupSnapshotTreeSummary::new(
+            *expected.tree_hash(),
+            vec![PublicGroupSnapshotLeaf::new(
+                alice.leaf_index(),
+                credential,
+                alice.signature_key().to_vec(),
+                alice.encryption_key().to_vec(),
+            )],
+        );
+        assert_eq!(
+            decode_public_group_snapshot(&encoded, &bind(boundary_summary))
+                .expect_err("shape-valid boundary credential differs from the loaded leaf"),
+            PublicGroupSnapshotError::SnapshotTreeSummaryMismatch,
+            "the exact {case} BasicCredential boundary must remain accepted"
         );
     }
 }
