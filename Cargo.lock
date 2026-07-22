@@ -1031,6 +1031,7 @@ dependencies = [
  "jsonwebtoken",
  "k256",
  "lazy_static",
+ "libcrux-kem",
  "metrics 0.21.1",
  "metrics-exporter-prometheus",
  "miette",
@@ -1040,6 +1041,7 @@ dependencies = [
  "openmls",
  "openmls_basic_credential",
  "openmls_libcrux_crypto",
+ "openmls_memory_storage",
  "openmls_rust_crypto",
  "openmls_traits",
  "p256 0.13.2",
@@ -1072,6 +1074,7 @@ dependencies = [
  "url",
  "urlencoding",
  "uuid",
+ "x25519-dalek",
 ]
 
 [[package]]
