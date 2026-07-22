@@ -1,7 +1,7 @@
 {
   "lexicon": 1,
   "id": "blue.catbird.chat.getLeafRecoveryInbox",
-  "description": "Returns recovery work from the retained inventorySession created by getConversations. inventorySessionId is always required; pageCursor is an opaque recovery-domain cursor bound to the same device, session, audience, fence, and expiry. Every response echoes the exact session event cursor and expiry; nextPageCursor is absent after the final page.",
+  "description": "Returns the flat closed exact-device recovery inbox from the retained inventorySession created by getConversations: the unchanged target-device-signed leafRecoveryView and the four concrete non-authorizing recoveryWorkView-family variants sourced only from retained expired or rejected Welcomes. Every union ref is a concrete object. inventorySessionId is always required; pageCursor is an opaque recovery-domain cursor bound to the same device, session, audience, fence, and expiry. Every response echoes the exact session event cursor and expiry; nextPageCursor is absent after the final page.",
   "defs": {
     "main": {
       "type": "query",
@@ -11,7 +11,7 @@
         "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50}
       }},
       "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["items", "inventorySessionId", "snapshotEventCursor", "hasMore", "snapshotExpiresAt"], "properties": {
-        "items": {"type": "array", "items": {"type": "ref", "ref": "blue.catbird.chat.defs#leafRecoveryView"}, "minLength": 0, "maxLength": 100},
+        "items": {"type": "array", "items": {"type": "ref", "ref": "blue.catbird.chat.defs#leafRecoveryInboxItem"}, "minLength": 0, "maxLength": 100},
         "inventorySessionId": {"type": "string", "minLength": 32, "maxLength": 512},
         "snapshotEventCursor": {"type": "string", "minLength": 1, "maxLength": 512},
         "nextPageCursor": {"type": "string", "minLength": 1, "maxLength": 512},
