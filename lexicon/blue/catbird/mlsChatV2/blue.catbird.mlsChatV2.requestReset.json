@@ -1,0 +1,8 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.mlsChatV2.requestReset",
+  "description": "Request, but never autonomously execute, a destructive reset. Any current member device may submit this signed exact-coordinate request; authorization and bootstrap are separate.",
+  "defs": {"main": {"type": "procedure", "input": {"encoding": "application/json", "schema": {"type": "object", "required": ["conversationId", "generation", "stateVersion", "groupId", "epoch", "confirmationTag", "actorDeviceId", "keyId", "reason", "idempotencyKey", "signature"], "properties": {
+    "conversationId": {"type": "string", "maxLength": 128}, "generation": {"type": "integer", "minimum": 0}, "stateVersion": {"type": "integer", "minimum": 0}, "groupId": {"type": "string", "maxLength": 256}, "epoch": {"type": "integer", "minimum": 0}, "confirmationTag": {"type": "bytes", "maxLength": 128}, "actorDeviceId": {"type": "string", "maxLength": 128}, "keyId": {"type": "string", "maxLength": 128}, "reason": {"type": "string", "minLength": 1, "maxLength": 1024}, "idempotencyKey": {"type": "string", "maxLength": 128}, "signature": {"type": "bytes", "maxLength": 64}
+  }}}, "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["resetRequest", "eventCursor"], "properties": {"resetRequest": {"type": "ref", "ref": "blue.catbird.mlsChatV2.defs#resetRequest"}, "eventCursor": {"type": "string", "maxLength": 512}}}}, "errors": [{"name": "StaleCoordinates"}, {"name": "InvalidSignature"}, {"name": "NotMember"}, {"name": "IdempotencyConflict"}]}}
+}

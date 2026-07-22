@@ -1,0 +1,177 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.mlsChatV2.defs",
+  "description": "Canonical shared contracts for the isolated MLS protocol v2. This namespace never interoperates with blue.catbird.mlsChat v1.",
+  "defs": {
+    "lifecycle": {
+      "type": "string",
+      "description": "Generation lifecycle. Only active accepts messages or ordinary transitions; resetRequested accepts only the authorized successor activation; superseded and closed are immutable.",
+      "knownValues": ["active", "resetRequested", "superseded", "closed"]
+    },
+    "conversationCoordinates": {
+      "type": "object",
+      "description": "The complete compare-and-swap coordinate of one MLS conversation generation. All seven values are exact-match values, never hints.",
+      "required": ["conversationId", "generation", "stateVersion", "groupId", "epoch", "confirmationTag", "lifecycle"],
+      "properties": {
+        "conversationId": {"type": "string", "maxLength": 128},
+        "generation": {"type": "integer", "minimum": 0},
+        "stateVersion": {"type": "integer", "minimum": 0},
+        "groupId": {"type": "string", "maxLength": 256},
+        "epoch": {"type": "integer", "minimum": 0},
+        "confirmationTag": {"type": "bytes", "maxLength": 128},
+        "lifecycle": {"type": "ref", "ref": "#lifecycle"}
+      }
+    },
+    "deviceCapability": {
+      "type": "object",
+      "required": ["protocolVersion", "platform", "supportsV2", "supportsWelcomeAcknowledgement", "supportsEventCursor"],
+      "properties": {
+        "protocolVersion": {"type": "string", "knownValues": ["v2"]},
+        "platform": {"type": "string", "knownValues": ["ios", "android", "macos", "web", "desktop", "cli", "bot"]},
+        "supportsV2": {"type": "boolean"},
+        "supportsWelcomeAcknowledgement": {"type": "boolean"},
+        "supportsEventCursor": {"type": "boolean"},
+        "clientVersion": {"type": "string", "maxLength": 128}
+      }
+    },
+    "deviceView": {
+      "type": "object",
+      "required": ["deviceId", "userDid", "deviceDid", "signaturePublicKey", "keyId", "capabilities", "registeredAt"],
+      "properties": {
+        "deviceId": {"type": "string", "maxLength": 128},
+        "userDid": {"type": "string", "format": "did"},
+        "deviceDid": {"type": "string", "maxLength": 256},
+        "signaturePublicKey": {"type": "bytes", "maxLength": 32},
+        "keyId": {"type": "string", "maxLength": 128},
+        "capabilities": {"type": "array", "minItems": 1, "items": {"type": "ref", "ref": "#deviceCapability"}},
+        "registeredAt": {"type": "string", "format": "datetime"},
+        "revokedAt": {"type": "string", "format": "datetime"}
+      }
+    },
+    "keyPackageReservation": {
+      "type": "object",
+      "description": "A single-use key package reservation. A reservation is bound to one signed transition and cannot be re-assigned after consumption or expiry.",
+      "required": ["reservationId", "deviceId", "keyPackageRef", "transitionId", "expiresAt"],
+      "properties": {
+        "reservationId": {"type": "string", "maxLength": 128},
+        "deviceId": {"type": "string", "maxLength": 128},
+        "keyPackageRef": {"type": "string", "maxLength": 128},
+        "transitionId": {"type": "string", "maxLength": 128},
+        "expiresAt": {"type": "string", "format": "datetime"},
+        "consumedAt": {"type": "string", "format": "datetime"}
+      }
+    },
+    "welcomeView": {
+      "type": "object",
+      "description": "A device-qualified, one-time MLS Welcome. Fetching never acknowledges it; acknowledgement is an explicit CAS-guarded mutation.",
+      "required": ["welcomeId", "deviceId", "coordinates", "reservationId", "welcome", "expiresAt"],
+      "properties": {
+        "welcomeId": {"type": "string", "maxLength": 128},
+        "deviceId": {"type": "string", "maxLength": 128},
+        "coordinates": {"type": "ref", "ref": "#conversationCoordinates"},
+        "reservationId": {"type": "string", "maxLength": 128},
+        "welcome": {"type": "bytes", "maxLength": 10485760},
+        "expiresAt": {"type": "string", "format": "datetime"}
+      }
+    },
+    "transitionKind": {
+      "type": "string",
+      "knownValues": ["create", "commit", "membership", "activateReset", "close"]
+    },
+    "signedTransitionEnvelope": {
+      "type": "object",
+      "description": "Canonical signed protocol transition. signature is Ed25519 over UTF-8 domain separator CBMLS-V2\\u0000 followed by the canonical CBOR encoding of every field except signature; payloadHash is SHA-256(payload). actorDeviceId and keyId bind the signature to an active registered device key.",
+      "required": ["transitionId", "idempotencyKey", "actorDeviceId", "actorDid", "keyId", "transitionKind", "prior", "next", "payload", "payloadHash", "signature", "signedAt"],
+      "properties": {
+        "transitionId": {"type": "string", "maxLength": 128},
+        "idempotencyKey": {"type": "string", "maxLength": 128},
+        "actorDeviceId": {"type": "string", "maxLength": 128},
+        "actorDid": {"type": "string", "format": "did"},
+        "keyId": {"type": "string", "maxLength": 128},
+        "transitionKind": {"type": "ref", "ref": "#transitionKind"},
+        "prior": {"type": "ref", "ref": "#conversationCoordinates"},
+        "next": {"type": "ref", "ref": "#conversationCoordinates"},
+        "payload": {"type": "bytes", "maxLength": 10485760},
+        "payloadHash": {"type": "string", "maxLength": 64},
+        "signature": {"type": "bytes", "maxLength": 64},
+        "signedAt": {"type": "string", "format": "datetime"}
+      }
+    },
+    "conversationState": {
+      "type": "object",
+      "required": ["coordinates", "lastSeq", "members", "updatedAt"],
+      "properties": {
+        "coordinates": {"type": "ref", "ref": "#conversationCoordinates"},
+        "lastSeq": {"type": "integer", "minimum": 0},
+        "members": {"type": "array", "items": {"type": "ref", "ref": "#memberView"}},
+        "updatedAt": {"type": "string", "format": "datetime"}
+      }
+    },
+    "memberView": {
+      "type": "object",
+      "required": ["userDid", "deviceId", "deviceDid", "role", "joinedAt"],
+      "properties": {
+        "userDid": {"type": "string", "format": "did"},
+        "deviceId": {"type": "string", "maxLength": 128},
+        "deviceDid": {"type": "string", "maxLength": 256},
+        "role": {"type": "string", "knownValues": ["admin", "member"]},
+        "joinedAt": {"type": "string", "format": "datetime"},
+        "leftAt": {"type": "string", "format": "datetime"}
+      }
+    },
+    "messageView": {
+      "type": "object",
+      "description": "An immutable ciphertext row. seq is conversation-global and never restarts at a generation or epoch boundary; the server never relabels ciphertext.",
+      "required": ["conversationId", "generation", "groupId", "epoch", "seq", "messageId", "ciphertext", "receivedAt"],
+      "properties": {
+        "conversationId": {"type": "string", "maxLength": 128},
+        "generation": {"type": "integer", "minimum": 0},
+        "groupId": {"type": "string", "maxLength": 256},
+        "epoch": {"type": "integer", "minimum": 0},
+        "seq": {"type": "integer", "minimum": 1},
+        "messageId": {"type": "string", "maxLength": 128},
+        "ciphertext": {"type": "bytes", "maxLength": 10485760},
+        "receivedAt": {"type": "string", "format": "datetime"}
+      }
+    },
+    "resetRequest": {
+      "type": "object",
+      "required": ["resetRequestId", "coordinates", "requestedByDeviceId", "reason", "requestedAt"],
+      "properties": {
+        "resetRequestId": {"type": "string", "maxLength": 128},
+        "coordinates": {"type": "ref", "ref": "#conversationCoordinates"},
+        "requestedByDeviceId": {"type": "string", "maxLength": 128},
+        "reason": {"type": "string", "maxLength": 1024},
+        "requestedAt": {"type": "string", "format": "datetime"},
+        "authorizedAt": {"type": "string", "format": "datetime"}
+      }
+    },
+    "eventEnvelope": {
+      "type": "object",
+      "description": "An opaque global event-stream position. cursor is never a conversation seq and replay starts strictly after the supplied cursor.",
+      "required": ["cursor", "eventId", "kind", "emittedAt"],
+      "properties": {
+        "cursor": {"type": "string", "maxLength": 512},
+        "eventId": {"type": "string", "maxLength": 128},
+        "kind": {"type": "string", "knownValues": ["transitionAccepted", "messageAccepted", "welcomeAvailable", "welcomeAcknowledged", "resetRequested", "resetActivated", "cursorExpired"]},
+        "coordinates": {"type": "ref", "ref": "#conversationCoordinates"},
+        "message": {"type": "ref", "ref": "#messageView"},
+        "welcomeId": {"type": "string", "maxLength": 128},
+        "resetRequestId": {"type": "string", "maxLength": 128},
+        "emittedAt": {"type": "string", "format": "datetime"}
+      }
+    },
+    "typedError": {
+      "type": "object",
+      "description": "Stable machine-readable error body. currentCoordinates is present for every stale/CAS error and clients must recover through Rust policy rather than guessing a transition.",
+      "required": ["code", "retryable"],
+      "properties": {
+        "code": {"type": "string", "knownValues": ["invalidRequest", "deviceNotRegistered", "deviceRevoked", "capabilityRequired", "conversationNotFound", "notMember", "notAuthorized", "staleCoordinates", "invalidLifecycleTransition", "invalidSignature", "idempotencyConflict", "keyPackageUnavailable", "keyPackageReservationExpired", "welcomeNotFound", "welcomeAlreadyAcknowledged", "resetAuthorizationRequired", "cursorExpired", "cutoverRequired"]},
+        "retryable": {"type": "boolean"},
+        "currentCoordinates": {"type": "ref", "ref": "#conversationCoordinates"},
+        "eventCursor": {"type": "string", "maxLength": 512},
+        "retryAfterMs": {"type": "integer", "minimum": 0}
+      }
+    }
+  }
+}

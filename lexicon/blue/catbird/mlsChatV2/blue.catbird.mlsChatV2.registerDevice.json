@@ -1,0 +1,8 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.mlsChatV2.registerDevice",
+  "description": "Register or idempotently renew one v2-capable device. v1 device credentials and key packages are never accepted here.",
+  "defs": {"main": {"type": "procedure", "input": {"encoding": "application/json", "schema": {"type": "object", "required": ["deviceId", "deviceName", "signaturePublicKey", "capabilities", "keyPackages", "idempotencyKey"], "properties": {
+    "deviceId": {"type": "string", "maxLength": 128}, "deviceName": {"type": "string", "minLength": 1, "maxLength": 128}, "signaturePublicKey": {"type": "bytes", "maxLength": 32}, "capabilities": {"type": "array", "minItems": 1, "items": {"type": "ref", "ref": "blue.catbird.mlsChatV2.defs#deviceCapability"}}, "keyPackages": {"type": "array", "minItems": 1, "maxItems": 200, "items": {"type": "bytes", "maxLength": 1048576}}, "idempotencyKey": {"type": "string", "maxLength": 128}
+  }}}, "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["device"], "properties": {"device": {"type": "ref", "ref": "blue.catbird.mlsChatV2.defs#deviceView"}}}}, "errors": [{"name": "InvalidRequest"}, {"name": "CapabilityRequired"}, {"name": "IdempotencyConflict"}]}}
+}

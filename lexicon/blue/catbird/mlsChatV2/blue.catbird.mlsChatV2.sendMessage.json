@@ -1,0 +1,8 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.mlsChatV2.sendMessage",
+  "description": "Append one immutable MLS ciphertext only when every supplied active coordinate exactly matches. The server assigns seq and never mutates the submitted generation, groupId, epoch, or ciphertext.",
+  "defs": {"main": {"type": "procedure", "input": {"encoding": "application/json", "schema": {"type": "object", "required": ["conversationId", "generation", "stateVersion", "groupId", "epoch", "confirmationTag", "messageId", "ciphertext", "idempotencyKey"], "properties": {
+    "conversationId": {"type": "string", "maxLength": 128}, "generation": {"type": "integer", "minimum": 0}, "stateVersion": {"type": "integer", "minimum": 0}, "groupId": {"type": "string", "maxLength": 256}, "epoch": {"type": "integer", "minimum": 0}, "confirmationTag": {"type": "bytes", "maxLength": 128}, "messageId": {"type": "string", "maxLength": 128}, "ciphertext": {"type": "bytes", "maxLength": 10485760}, "idempotencyKey": {"type": "string", "maxLength": 128}
+  }}}, "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["message", "eventCursor"], "properties": {"message": {"type": "ref", "ref": "blue.catbird.mlsChatV2.defs#messageView"}, "eventCursor": {"type": "string", "maxLength": 512}}}}, "errors": [{"name": "StaleCoordinates"}, {"name": "InvalidLifecycleTransition"}, {"name": "IdempotencyConflict"}, {"name": "NotMember"}]}}
+}

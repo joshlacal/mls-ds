@@ -1,0 +1,6 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.mlsChatV2.submitTransition",
+  "description": "Submit one signed device-bound state transition. The server verifies the active device key, payload hash, exact prior coordinates, legal lifecycle edge, reservation bindings, and idempotency atomically.",
+  "defs": {"main": {"type": "procedure", "input": {"encoding": "application/json", "schema": {"type": "object", "required": ["envelope"], "properties": {"envelope": {"type": "ref", "ref": "blue.catbird.mlsChatV2.defs#signedTransitionEnvelope"}}}}, "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["transitionId", "coordinates", "eventCursor"], "properties": {"transitionId": {"type": "string", "maxLength": 128}, "coordinates": {"type": "ref", "ref": "blue.catbird.mlsChatV2.defs#conversationCoordinates"}, "eventCursor": {"type": "string", "maxLength": 512}}}}, "errors": [{"name": "InvalidSignature"}, {"name": "StaleCoordinates"}, {"name": "InvalidLifecycleTransition"}, {"name": "KeyPackageUnavailable"}, {"name": "KeyPackageReservationExpired"}, {"name": "IdempotencyConflict"}]}}
+}

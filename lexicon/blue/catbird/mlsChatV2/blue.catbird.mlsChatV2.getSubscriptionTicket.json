@@ -1,0 +1,6 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.mlsChatV2.getSubscriptionTicket",
+  "description": "Issue a short-lived v2-only event subscription ticket bound to an authenticated device and its last opaque global event cursor.",
+  "defs": {"main": {"type": "procedure", "input": {"encoding": "application/json", "schema": {"type": "object", "required": ["deviceId", "eventCursor"], "properties": {"deviceId": {"type": "string", "maxLength": 128}, "eventCursor": {"type": "string", "maxLength": 512}}}}, "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["ticket", "endpoint", "expiresAt", "eventCursor"], "properties": {"ticket": {"type": "string", "maxLength": 4096}, "endpoint": {"type": "string", "format": "uri"}, "expiresAt": {"type": "string", "format": "datetime"}, "eventCursor": {"type": "string", "maxLength": 512}}}}, "errors": [{"name": "DeviceNotRegistered"}, {"name": "CursorExpired"}, {"name": "CutoverRequired"}]}}
+}
