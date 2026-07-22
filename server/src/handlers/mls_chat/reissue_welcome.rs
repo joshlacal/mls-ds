@@ -161,7 +161,18 @@ pub async fn reissue_welcome(
     })?;
 
     let Some(inviter_device) = inviter_device else {
-        warn!("reissueWelcome: no admin available to reissue Welcome");
+        // NOTE: `member_did <> $2` excludes by USER DID, so a same-user
+        // second device (multi-device Welcome recovery) always lands here —
+        // its only admin IS the same user. Clients bound by the reissue
+        // attempt ladder escalate to External Commit with history gap, which
+        // recovers the device. Making same-user OTHER devices eligible
+        // requires a device-qualified recipient end-to-end plus verified
+        // same-user SwapMembers semantics in the responder — tracked as a
+        // follow-up, not silently enabled here.
+        warn!(
+            "reissueWelcome: no admin available to reissue Welcome (convo={} recipient={})",
+            input.convo_id, input.recipient_device_did
+        );
         return Err(StatusCode::GONE);
     };
 
