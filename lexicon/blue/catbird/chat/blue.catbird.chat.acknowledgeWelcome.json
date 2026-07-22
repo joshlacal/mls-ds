@@ -1,0 +1,27 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.chat.acknowledgeWelcome",
+  "description": "Idempotently acknowledges one historically addressed Welcome after local join succeeds. Authorization is tied to the immutable recipient device and transition coordinate, not current coordinates or current membership.",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "input": {"encoding": "application/json", "schema": {"type": "object", "required": ["signedRequest"], "properties": {"signedRequest": {"type": "ref", "ref": "blue.catbird.chat.defs#signedWelcomeAcknowledgement"}}}},
+      "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["status", "acknowledgedAt"], "properties": {
+        "status": {"type": "string", "const": "acknowledged"},
+        "acknowledgedAt": {"type": "ref", "ref": "blue.catbird.chat.defs#canonicalDatetime"}
+      }}},
+      "errors": [
+        {"name": "AcknowledgementConflict"},
+        {"name": "CutoverRequired"},
+        {"name": "DeviceNotRegistered"},
+        {"name": "DeviceRevoked"},
+        {"name": "InvalidDPoP"},
+        {"name": "InvalidRequest"},
+        {"name": "InvalidSignature"},
+        {"name": "WelcomeExpired"},
+        {"name": "WelcomeNotFound"},
+        {"name": "WelcomeSuperseded"}
+      ]
+    }
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.chat.getConversationState",
+  "description": "Returns public state and visible pending reset/leave work under separate control-plane entitlement. state.snapshotSeq is the greatest committed conversation seq included in this transactionally observed state; it is not a getEntries afterSeq or an application-visibility grant. A logical participant with zero leaves may receive bounded inventory/reset/recovery/leave visibility needed to join or leave, but roster status and sibling-device membership grant no application ciphertext. A former concrete device leaf is bounded by its own inclusive terminalSeq and cannot inherit another device's interval.",
+  "defs": {
+    "main": {
+      "type": "query",
+      "parameters": {"type": "params", "required": ["conversationId"], "properties": {"conversationId": {"type": "string", "minLength": 36, "maxLength": 36, "description": "Canonical lowercase hyphenated RFC 4122-variant UUIDv4 conversation ID; strict runtime validation rejects every other spelling/version/variant."}}},
+      "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["state", "pendingResetRequests", "pendingLeaveRequests"], "properties": {
+        "state": {"type": "ref", "ref": "blue.catbird.chat.defs#conversationState"},
+        "pendingResetRequests": {"type": "array", "items": {"type": "ref", "ref": "blue.catbird.chat.defs#resetRequestView"}, "minLength": 0, "maxLength": 100},
+        "pendingLeaveRequests": {"type": "array", "items": {"type": "ref", "ref": "blue.catbird.chat.defs#leaveRequestView"}, "minLength": 0, "maxLength": 100}
+      }}},
+      "errors": [
+        {"name": "AccessOutsideMembershipInterval"},
+        {"name": "ConversationNotFound"},
+        {"name": "CutoverRequired"},
+        {"name": "DeviceNotRegistered"},
+        {"name": "DeviceRevoked"},
+        {"name": "InvalidDPoP"},
+        {"name": "InvalidRequest"},
+        {"name": "NotEntitled"}
+      ]
+    }
+  }
+}

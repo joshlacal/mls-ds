@@ -1,0 +1,6 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.chat.replenishKeyPackages",
+  "description": "Publish a whole-or-nothing batch for the exact active device binding. Stored immutable key, submitted key/keyId, auth generation, signed JKT, token claims, and DPoP proof are rechecked under the mutation lock; package-only replenishment does not change auth generation.",
+  "defs": {"main": {"type": "procedure", "input": {"encoding": "application/json", "schema": {"type": "object", "required": ["signedRequest"], "properties": {"signedRequest": {"type": "ref", "ref": "blue.catbird.chat.defs#signedKeyPackageReplenishment"}}}}, "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["device"], "properties": {"device": {"type": "ref", "ref": "blue.catbird.chat.defs#deviceView"}}}}, "errors": [{"name": "AuthenticationGenerationConflict"}, {"name": "CutoverRequired"}, {"name": "DeviceNotRegistered"}, {"name": "DeviceRevoked"}, {"name": "IdempotencyConflict"}, {"name": "InvalidDPoP"}, {"name": "InvalidKeyPackage"}, {"name": "InvalidRequest"}, {"name": "InvalidSignature"}, {"name": "KeyPackageInventoryLimitReached"}, {"name": "NotAuthorized"}]}}
+}

@@ -7,10 +7,12 @@ use libcrux_kem::{Algorithm as KemAlgorithm, PublicKey as KemPublicKey};
 pub(crate) const XWING_PUBLIC_KEY_BYTES: usize = 1_216;
 pub(crate) const XWING_KEM_OUTPUT_BYTES: usize = 1_120;
 // Canonical BasicCredential identity is `actorDid + "#" + deviceId`.
-// `did:web:a` is the shortest supported bare DID, bare DIDs are capped at
-// 2,048 UTF-8 bytes, and device IDs are canonical textual UUIDs.
-pub(crate) const MIN_BASIC_CREDENTIAL_BYTES: usize = 9 + 1 + 36;
-pub(crate) const MAX_BASIC_CREDENTIAL_BYTES: usize = 2_048 + 1 + 36;
+// Protocol v1 supports exact `did:plc:[a-z2-7]{24}` identities or hostname-only
+// production `did:web` identities. `did:web:a.co` is the shortest supported DID,
+// while `did:web:` plus a 253-byte hostname is the longest; device IDs are
+// canonical textual UUIDv4 values.
+pub(crate) const MIN_BASIC_CREDENTIAL_BYTES: usize = 12 + 1 + 36;
+pub(crate) const MAX_BASIC_CREDENTIAL_BYTES: usize = (8 + 253) + 1 + 36;
 const XWING_X25519_PUBLIC_KEY_OFFSET: usize = 1_184;
 const XWING_X25519_KEM_OUTPUT_OFFSET: usize = 1_088;
 const X25519_FIELD_MODULUS_LE: [u8; 32] = [

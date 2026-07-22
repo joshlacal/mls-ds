@@ -1,0 +1,24 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.chat.cancelLeave",
+  "description": "Cancels an exact pending leave request before fulfillment. Exact replay returns the recorded cancellation; changed bytes or a terminal request state conflict.",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "input": {"encoding": "application/json", "schema": {"type": "object", "required": ["signedRequest"], "properties": {"signedRequest": {"type": "ref", "ref": "blue.catbird.chat.defs#signedLeaveCancellation"}}}},
+      "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["leaveRequest", "entry"], "properties": {"leaveRequest": {"type": "ref", "ref": "blue.catbird.chat.defs#leaveRequestView"}, "entry": {"type": "ref", "ref": "blue.catbird.chat.defs#leaveCancellationEntry"}}}},
+      "errors": [
+        {"name": "CancellationConflict"},
+        {"name": "CutoverRequired"},
+        {"name": "DeviceNotRegistered"},
+        {"name": "DeviceRevoked"},
+        {"name": "IdempotencyConflict"},
+        {"name": "InvalidDPoP"},
+        {"name": "InvalidRequest"},
+        {"name": "InvalidSignature"},
+        {"name": "LeaveRequestNotFound"},
+        {"name": "NotAuthorized"}
+      ]
+    }
+  }
+}

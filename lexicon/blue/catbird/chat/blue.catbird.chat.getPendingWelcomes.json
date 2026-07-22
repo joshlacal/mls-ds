@@ -1,0 +1,33 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.chat.getPendingWelcomes",
+  "description": "Returns device-addressed pending Welcomes from the retained inventorySession created by getConversations. inventorySessionId is always required; pageCursor is an opaque Welcome-domain cursor bound to the same device, session, audience, fence, and expiry. Every response echoes the exact session event cursor and expiry; nextPageCursor is absent after the final page.",
+  "defs": {
+    "main": {
+      "type": "query",
+      "parameters": {"type": "params", "required": ["inventorySessionId", "limit"], "properties": {
+        "inventorySessionId": {"type": "string", "minLength": 32, "maxLength": 512},
+        "pageCursor": {"type": "string", "minLength": 1, "maxLength": 512},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50}
+      }},
+      "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["items", "inventorySessionId", "snapshotEventCursor", "hasMore", "snapshotExpiresAt"], "properties": {
+        "items": {"type": "array", "items": {"type": "ref", "ref": "blue.catbird.chat.defs#welcomeView"}, "minLength": 0, "maxLength": 100},
+        "inventorySessionId": {"type": "string", "minLength": 32, "maxLength": 512},
+        "snapshotEventCursor": {"type": "string", "minLength": 1, "maxLength": 512},
+        "nextPageCursor": {"type": "string", "minLength": 1, "maxLength": 512},
+        "hasMore": {"type": "boolean"},
+        "snapshotExpiresAt": {"type": "ref", "ref": "blue.catbird.chat.defs#canonicalDatetime"}
+      }}},
+      "errors": [
+        {"name": "CursorExpired"},
+        {"name": "CutoverRequired"},
+        {"name": "DeviceNotRegistered"},
+        {"name": "DeviceRevoked"},
+        {"name": "InvalidDPoP"},
+        {"name": "InvalidRequest"},
+        {"name": "InventorySessionExpired"},
+        {"name": "InventorySessionMismatch"}
+      ]
+    }
+  }
+}

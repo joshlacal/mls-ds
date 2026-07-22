@@ -1,0 +1,6 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.chat.getOwnDevices",
+  "description": "Authoritative fenced inventory of the authenticated bare DID's active and revoked/package-ineligible devices. Every page is evaluated as of one retained fence and uses a distinct principal-bound cursor domain.",
+  "defs": {"main": {"type": "query", "parameters": {"type": "params", "properties": {"pageCursor": {"type": "string", "minLength": 1, "maxLength": 512}, "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50}}}, "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["items", "hasMore", "snapshotExpiresAt"], "properties": {"items": {"type": "array", "items": {"type": "ref", "ref": "blue.catbird.chat.defs#ownDeviceView"}, "minLength": 0, "maxLength": 100}, "nextPageCursor": {"type": "string", "minLength": 1, "maxLength": 512}, "hasMore": {"type": "boolean"}, "snapshotExpiresAt": {"type": "ref", "ref": "blue.catbird.chat.defs#canonicalDatetime"}}}}, "errors": [{"name": "CursorExpired"}, {"name": "CutoverRequired"}, {"name": "DeviceNotRegistered"}, {"name": "DeviceRevoked"}, {"name": "InvalidDPoP"}]}}
+}

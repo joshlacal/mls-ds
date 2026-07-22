@@ -1,0 +1,6 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.chat.getBlobUsage",
+  "description": "Return auth-derived aggregate opaque-blob usage and reserved quota for the verified bare DID; no caller-selected principal is accepted.",
+  "defs": {"main": {"type": "query", "parameters": {"type": "params", "properties": {}}, "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["usage"], "properties": {"usage": {"type": "ref", "ref": "blue.catbird.chat.defs#blobUsageView"}}}}, "errors": [{"name": "CutoverRequired"}, {"name": "DeviceNotRegistered"}, {"name": "DeviceRevoked"}, {"name": "InvalidDPoP"}]}}
+}

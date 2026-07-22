@@ -1,0 +1,28 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.chat.requestReset",
+  "description": "Durably records an idempotent signed reset request at the exact prior coordinate from any active registered device of an active logical participant; the device need not be an MLS leaf. Pending participants may accept or close but cannot request reset. The request expires after exactly 24 hours and any coordinate change makes it stale. This does not itself mutate or retire the MLS group.",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "input": {"encoding": "application/json", "schema": {"type": "object", "required": ["signedRequest"], "properties": {"signedRequest": {"type": "ref", "ref": "blue.catbird.chat.defs#signedResetRequest"}}}},
+      "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["resetRequest", "entry"], "properties": {
+        "resetRequest": {"type": "ref", "ref": "blue.catbird.chat.defs#resetRequestView"},
+        "entry": {"type": "ref", "ref": "blue.catbird.chat.defs#resetRequestEntry"}
+      }}},
+      "errors": [
+        {"name": "ConversationNotFound"},
+        {"name": "CutoverRequired"},
+        {"name": "DeviceNotRegistered"},
+        {"name": "DeviceRevoked"},
+        {"name": "IdempotencyConflict"},
+        {"name": "InvalidDPoP"},
+        {"name": "InvalidRequest"},
+        {"name": "InvalidSignature"},
+        {"name": "NotMember"},
+        {"name": "ResetAlreadyPending"},
+        {"name": "StaleCoordinates"}
+      ]
+    }
+  }
+}

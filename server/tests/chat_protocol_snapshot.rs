@@ -888,7 +888,7 @@ fn snapshot_rejects_noncanonical_locked_head_tree_summary_shape() {
                 *expected.tree_hash(),
                 vec![PublicGroupSnapshotLeaf::new(
                     alice.leaf_index(),
-                    vec![b'x'; 45],
+                    vec![b'x'; 48],
                     alice.signature_key().to_vec(),
                     alice.encryption_key().to_vec(),
                 )],
@@ -900,7 +900,7 @@ fn snapshot_rejects_noncanonical_locked_head_tree_summary_shape() {
                 *expected.tree_hash(),
                 vec![PublicGroupSnapshotLeaf::new(
                     alice.leaf_index(),
-                    vec![b'x'; 2_086],
+                    vec![b'x'; 299],
                     alice.signature_key().to_vec(),
                     alice.encryption_key().to_vec(),
                 )],
@@ -953,21 +953,24 @@ fn snapshot_rejects_noncanonical_locked_head_tree_summary_shape() {
         );
     }
 
+    let maximum_hostname = format!(
+        "{}.{}.{}.{}",
+        "a".repeat(63),
+        "b".repeat(63),
+        "c".repeat(63),
+        "d".repeat(61)
+    );
     for (case, credential) in [
         (
             "minimum",
-            b"did:web:a#00000000-0000-4000-8000-000000000000".to_vec(),
+            b"did:web:a.co#00000000-0000-4000-8000-000000000000".to_vec(),
         ),
         (
             "maximum",
-            format!(
-                "did:web:a:{}#00000000-0000-4000-8000-000000000000",
-                "x".repeat(2_038)
-            )
-            .into_bytes(),
+            format!("did:web:{maximum_hostname}#00000000-0000-4000-8000-000000000000").into_bytes(),
         ),
     ] {
-        assert!(matches!(credential.len(), 46 | 2_085));
+        assert!(matches!(credential.len(), 49 | 298));
         let boundary_summary = PublicGroupSnapshotTreeSummary::new(
             *expected.tree_hash(),
             vec![PublicGroupSnapshotLeaf::new(

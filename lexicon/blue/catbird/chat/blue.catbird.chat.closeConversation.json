@@ -1,0 +1,26 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.chat.closeConversation",
+  "description": "Terminal signed close. Either exact direct participant, including a pending invitee, may close unilaterally; a group may close only when its sole remaining logical participant is an active admin. The atomic CAS has no successor, closes every application interval, releases invitation counts and request-bound reservations, supersedes pending work, and returns the immutable terminal tombstone and entry.",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "input": {"encoding": "application/json", "schema": {"type": "object", "required": ["signedRequest"], "properties": {"signedRequest": {"type": "ref", "ref": "blue.catbird.chat.defs#signedConversationClose"}}}},
+      "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["result"], "properties": {"result": {"type": "ref", "ref": "blue.catbird.chat.defs#conversationCloseResult"}}}},
+      "errors": [
+        {"name": "ConversationCloseNotAllowed"},
+        {"name": "ConversationNotFound"},
+        {"name": "CoordinateOverflow"},
+        {"name": "CutoverRequired"},
+        {"name": "DeviceNotRegistered"},
+        {"name": "DeviceRevoked"},
+        {"name": "IdempotencyConflict"},
+        {"name": "InvalidDPoP"},
+        {"name": "InvalidRequest"},
+        {"name": "InvalidSignature"},
+        {"name": "NotParticipant"},
+        {"name": "StaleCoordinates"}
+      ]
+    }
+  }
+}

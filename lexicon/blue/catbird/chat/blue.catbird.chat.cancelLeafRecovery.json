@@ -1,0 +1,24 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.chat.cancelLeafRecovery",
+  "description": "Idempotently cancels an open leaf-recovery request owned by the signing device and releases its unconsumed KeyPackage reservation. No conversation coordinate is required because cancellation does not mutate MLS state.",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "input": {"encoding": "application/json", "schema": {"type": "object", "required": ["signedRequest"], "properties": {"signedRequest": {"type": "ref", "ref": "blue.catbird.chat.defs#signedLeafRecoveryCancellation"}}}},
+      "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["recovery"], "properties": {"recovery": {"type": "ref", "ref": "blue.catbird.chat.defs#leafRecoveryView"}}}},
+      "errors": [
+        {"name": "CancellationConflict"},
+        {"name": "CutoverRequired"},
+        {"name": "DeviceNotRegistered"},
+        {"name": "DeviceRevoked"},
+        {"name": "IdempotencyConflict"},
+        {"name": "InvalidDPoP"},
+        {"name": "InvalidRequest"},
+        {"name": "InvalidSignature"},
+        {"name": "LeafRecoveryNotFound"},
+        {"name": "NotAuthorized"}
+      ]
+    }
+  }
+}

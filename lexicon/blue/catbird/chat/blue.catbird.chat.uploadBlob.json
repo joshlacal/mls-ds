@@ -1,0 +1,6 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.chat.uploadBlob",
+  "description": "Consume one opaque upload ticket with exact raw ciphertext bytes. Exact hash/size and ticket owner are enforced; same bytes replay succeeds and any changed bytes conflict. The upload remains immutable and unbound until an accepted message or metadata transition binds it. Its uploadedBlobBinding result reports the prepared attachment or metadata purpose but is upload-result transport only and cannot inhabit either signed projection.",
+  "defs": {"main": {"type": "procedure", "parameters": {"type": "params", "required": ["uploadTicket"], "properties": {"uploadTicket": {"type": "string", "minLength": 32, "maxLength": 512}}}, "input": {"encoding": "application/octet-stream"}, "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["binding", "uploadedAt"], "properties": {"binding": {"type": "ref", "ref": "blue.catbird.chat.defs#uploadedBlobBinding"}, "uploadedAt": {"type": "ref", "ref": "blue.catbird.chat.defs#canonicalDatetime"}}}}, "errors": [{"name": "BlobConflict"}, {"name": "BlobHashMismatch"}, {"name": "BlobSizeMismatch"}, {"name": "CutoverRequired"}, {"name": "InvalidDPoP"}, {"name": "InvalidRequest"}, {"name": "UploadTicketExpired"}, {"name": "UploadTicketNotFound"}]}}
+}

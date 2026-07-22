@@ -22,8 +22,8 @@ use rand::{rngs::StdRng, RngCore, SeedableRng};
 use sha2::{Digest, Sha256};
 use tls_codec::{Deserialize as TlsDeserialize, VLBytes};
 
-const TEST_ALICE_CREDENTIAL: &[u8] = b"did:web:a#00000000-0000-4000-8000-000000000001";
-const TEST_BOB_CREDENTIAL: &[u8] = b"did:web:b#00000000-0000-4000-8000-000000000002";
+const TEST_ALICE_CREDENTIAL: &[u8] = b"did:web:a.co#00000000-0000-4000-8000-000000000001";
+const TEST_BOB_CREDENTIAL: &[u8] = b"did:web:b.co#00000000-0000-4000-8000-000000000002";
 
 #[derive(Clone, Debug, tls_codec::TlsSerialize, tls_codec::TlsDeserialize, tls_codec::TlsSize)]
 struct TestWelcomeEnvelope {
@@ -1213,7 +1213,8 @@ fn rightmost_sender_fixture(member_count: usize) -> RightmostSenderFixture {
             .store(member_provider.storage())
             .expect("store member signer");
         let credential =
-            format!("did:web:m{leaf_index}#00000000-0000-4000-8000-{leaf_index:012}").into_bytes();
+            format!("did:web:m{leaf_index}.co#00000000-0000-4000-8000-{leaf_index:012}")
+                .into_bytes();
         let key_package = KeyPackage::builder()
             .leaf_node_capabilities(exact_capabilities())
             .key_package_lifetime(Lifetime::init(
@@ -1331,7 +1332,7 @@ fn rightmost_sender_fixture(member_count: usize) -> RightmostSenderFixture {
             CredentialWithKey {
                 credential: BasicCredential::new(
                     format!(
-                        "did:web:r{member_count}#00000000-0000-4000-8000-{:012}",
+                        "did:web:r{member_count}.co#00000000-0000-4000-8000-{:012}",
                         member_count + 100
                     )
                     .into_bytes(),
@@ -1864,12 +1865,19 @@ fn coherent_xwing_artifacts_validate_with_visible_metadata_and_public_group_seam
 
 #[test]
 fn snapshot_binding_and_load_accept_exact_basic_credential_boundaries() {
-    let maximum_bare_did = format!("did:web:a:{}", "x".repeat(2_038));
+    let maximum_hostname = format!(
+        "{}.{}.{}.{}",
+        "a".repeat(63),
+        "b".repeat(63),
+        "c".repeat(63),
+        "d".repeat(61)
+    );
+    let maximum_bare_did = format!("did:web:{maximum_hostname}");
     for credential in [
-        b"did:web:a#00000000-0000-4000-8000-000000000000".to_vec(),
+        b"did:web:a.co#00000000-0000-4000-8000-000000000000".to_vec(),
         format!("{maximum_bare_did}#00000000-0000-4000-8000-000000000000").into_bytes(),
     ] {
-        assert!(matches!(credential.len(), 46 | 2_085));
+        assert!(matches!(credential.len(), 49 | 298));
         let fixture = genesis_group_info_fixture_with_credential(
             Some(exact_capabilities()),
             Some(Lifetime::init(frozen_now() - 60, frozen_now() + 3_600)),

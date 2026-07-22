@@ -1,0 +1,33 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.chat.sendMessage",
+  "description": "Stores one signed MLS PrivateMessage Application wrapper from a current leaf after exact coordinate/AAD validation. A complete at-most-60-second relationship projection between the actor DID and every current active participant DID is required; any actor-involving direct/list block denies and incomplete or stale policy fails closed. Direct additionally requires both exact participants active and each represented by at least one current MLS leaf, rejecting pre-consent and acceptance/recovery/reset gaps; group traffic may continue for remaining leaves. An application attachment binding, if present, is exactly applicationAttachmentBinding with purpose attachment; it must be completed-unbound and owned by this exact signer, and metadataAvatarBinding or generic uploadedBlobBinding rejects. The service remains blind to plaintext. (conversationId,messageId) is unique, and a stale attempt terminally retires that ID. The returned applicationEntry carries the exact signedRequest rather than duplicated unsigned actor, device, coordinate, message, artifact, or blob fields; entry conversationId must equal signedRequest.body.prior.conversationId. Clients verify the canonical CATBIRD-CHAT-MESSAGE\\0 Ed25519 transcript before decrypting or attributing. Its immutable fingerprint is SHA-256 of UTF8(CATBIRD-CHAT-APPLICATION-ENTRY-FINGERPRINT\\0) followed by canonical DAG-CBOR of exact entryId bytes16, conversationId bytes16, seq, requestDigest bytes32, signature bytes64, and receivedAt canonical text; plaintext-only or unsigned substitutes are forbidden.",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "input": {"encoding": "application/json", "schema": {"type": "object", "required": ["signedRequest"], "properties": {"signedRequest": {"type": "ref", "ref": "blue.catbird.chat.defs#signedApplicationSend"}}}},
+      "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["entry"], "properties": {"entry": {"type": "ref", "ref": "blue.catbird.chat.defs#applicationEntry"}}}},
+      "errors": [
+        {"name": "BlobBindingConflict"},
+        {"name": "BlobNotFound"},
+        {"name": "BlockedRelationship"},
+        {"name": "ConversationNotAccepted"},
+        {"name": "ConversationNotFound"},
+        {"name": "CutoverRequired"},
+        {"name": "DeviceNotLeaf"},
+        {"name": "DeviceNotRegistered"},
+        {"name": "DeviceRevoked"},
+        {"name": "IdempotencyConflict"},
+        {"name": "InvalidApplicationMessage"},
+        {"name": "InvalidDPoP"},
+        {"name": "InvalidRequest"},
+        {"name": "InvalidSignature"},
+        {"name": "NotMember"},
+        {"name": "RecipientNotReady"},
+        {"name": "RelationshipPolicyUnavailable"},
+        {"name": "StaleCoordinates"},
+        {"name": "UnsupportedMlsProfile"}
+      ]
+    }
+  }
+}

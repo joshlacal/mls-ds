@@ -1,0 +1,34 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.chat.createConversation",
+  "description": "True-absence-CAS creates immutable direct or group state from a client-staged creator-only epoch-zero group. Every noncreator is a pending zero-leaf consent request with no server-readable invitation body. Direct is exactly creator plus one pending admin-role invitee, is unique per unordered DID pair while nonterminal, and a concurrent loser receives the existing identity as a typed success outcome. Group invitees are pending members. Consent, invitation limits, and every-pair block policy are checked under lock. There is no preparation, general reservation, bootstrap Commit, or Welcome.",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "input": {"encoding": "application/json", "schema": {"type": "object", "required": ["signedRequest"], "properties": {"signedRequest": {"type": "ref", "ref": "blue.catbird.chat.defs#signedCreation"}}}},
+      "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["result"], "properties": {"result": {"type": "ref", "ref": "blue.catbird.chat.defs#conversationCreationResult"}}}},
+      "errors": [
+        {"name": "BlockedRelationship"},
+        {"name": "ConversationAlreadyExists"},
+        {"name": "CutoverRequired"},
+        {"name": "DeviceNotRegistered"},
+        {"name": "DeviceRevoked"},
+        {"name": "GroupInvitesDisabled"},
+        {"name": "IdempotencyConflict"},
+        {"name": "InvalidDPoP"},
+        {"name": "InvalidGenesisGroupInfo"},
+        {"name": "InvalidMetadataSnapshot"},
+        {"name": "InvalidMlsArtifact"},
+        {"name": "InvalidRequest"},
+        {"name": "InvalidSignature"},
+        {"name": "InvitationLimitReached"},
+        {"name": "MessagesDisabled"},
+        {"name": "MetadataNonceReuse"},
+        {"name": "NotAuthorized"},
+        {"name": "NotFollowedByRecipient"},
+        {"name": "RelationshipPolicyUnavailable"},
+        {"name": "UnsupportedMlsProfile"}
+      ]
+    }
+  }
+}

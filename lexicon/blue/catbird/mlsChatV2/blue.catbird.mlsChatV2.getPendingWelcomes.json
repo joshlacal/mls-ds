@@ -1,6 +1,0 @@
-{
-  "lexicon": 1,
-  "id": "blue.catbird.mlsChatV2.getPendingWelcomes",
-  "description": "Return unacknowledged v2 Welcomes only for the authenticated registered device. This call has no acknowledgement side effect.",
-  "defs": {"main": {"type": "query", "parameters": {"type": "params", "required": ["deviceId"], "properties": {"deviceId": {"type": "string", "maxLength": 128}, "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50}}}, "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["welcomes"], "properties": {"welcomes": {"type": "array", "items": {"type": "ref", "ref": "blue.catbird.mlsChatV2.defs#welcomeView"}}}}}, "errors": [{"name": "DeviceNotRegistered"}, {"name": "DeviceRevoked"}]}}
-}

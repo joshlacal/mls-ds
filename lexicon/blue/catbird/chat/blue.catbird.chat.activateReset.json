@@ -1,0 +1,38 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.chat.activateReset",
+  "description": "An active registered device of an active admin DID authorizes an exact unexpired pending request; it need not be an old-generation leaf. Activation preserves immutable conversationKind plus every participant status/role/provenance, atomically supersedes the old generation, closes every old application interval at the reset seq, and installs the activator-only epoch-zero successor leaf. Every other participant has zero successor leaves: active participants recover through their own signed requests and pending participants remain pending. There is no reset reservation, bootstrap Commit, or Welcome. Metadata is either the same signed content/version/origin reencrypted with a fresh nonce or an activator-signed empty prior-version-plus-one snapshot.",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "input": {"encoding": "application/json", "schema": {"type": "object", "required": ["signedRequest"], "properties": {"signedRequest": {"type": "ref", "ref": "blue.catbird.chat.defs#signedResetActivation"}}}},
+      "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["retiredCoordinates", "successorCoordinates", "entry"], "properties": {
+        "retiredCoordinates": {"type": "ref", "ref": "blue.catbird.chat.defs#conversationCoordinates"},
+        "successorCoordinates": {"type": "ref", "ref": "blue.catbird.chat.defs#conversationCoordinates"},
+        "entry": {"type": "ref", "ref": "blue.catbird.chat.defs#resetActivationEntry"}
+      }}},
+      "errors": [
+        {"name": "AdminRequired"},
+        {"name": "ConversationNotFound"},
+        {"name": "CoordinateOverflow"},
+        {"name": "CutoverRequired"},
+        {"name": "DeviceNotRegistered"},
+        {"name": "DeviceRevoked"},
+        {"name": "IdempotencyConflict"},
+        {"name": "InvalidDPoP"},
+        {"name": "InvalidGenesisGroupInfo"},
+        {"name": "InvalidMetadataSnapshot"},
+        {"name": "InvalidMlsArtifact"},
+        {"name": "InvalidRequest"},
+        {"name": "InvalidSignature"},
+        {"name": "MetadataNonceReuse"},
+        {"name": "NotAuthorized"},
+        {"name": "NotMember"},
+        {"name": "ResetRequestNotFound"},
+        {"name": "ResetRequestStale"},
+        {"name": "StaleCoordinates"},
+        {"name": "UnsupportedMlsProfile"}
+      ]
+    }
+  }
+}

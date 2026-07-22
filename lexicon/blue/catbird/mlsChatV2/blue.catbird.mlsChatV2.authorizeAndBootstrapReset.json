@@ -1,6 +1,0 @@
-{
-  "lexicon": 1,
-  "id": "blue.catbird.mlsChatV2.authorizeAndBootstrapReset",
-  "description": "Authorize and activate the sole successor generation for a pending reset. A current admin device is required, except either current participant may authorize a two-member 1:1 conversation. The envelope payload contains fresh MLS bootstrap material and device-qualified Welcome reservations.",
-  "defs": {"main": {"type": "procedure", "input": {"encoding": "application/json", "schema": {"type": "object", "required": ["resetRequestId", "envelope"], "properties": {"resetRequestId": {"type": "string", "maxLength": 128}, "envelope": {"type": "ref", "ref": "blue.catbird.mlsChatV2.defs#signedTransitionEnvelope"}}}}, "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["coordinates", "welcomes", "eventCursor"], "properties": {"coordinates": {"type": "ref", "ref": "blue.catbird.mlsChatV2.defs#conversationCoordinates"}, "welcomes": {"type": "array", "items": {"type": "ref", "ref": "blue.catbird.mlsChatV2.defs#welcomeView"}}, "eventCursor": {"type": "string", "maxLength": 512}}}}, "errors": [{"name": "ResetAuthorizationRequired"}, {"name": "StaleCoordinates"}, {"name": "InvalidSignature"}, {"name": "InvalidLifecycleTransition"}, {"name": "KeyPackageReservationExpired"}]}}
-}

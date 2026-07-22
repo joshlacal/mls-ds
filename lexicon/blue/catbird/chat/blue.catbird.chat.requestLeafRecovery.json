@@ -1,0 +1,28 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.chat.requestLeafRecovery",
+  "description": "An active participant's target device signs an idempotent, expiring add-or-replace recovery request and atomically reserves its own compatible KeyPackage. Under the mutation lock the server rechecks block policy for every unordered roster pair. This does not alter MLS state; a different current leaf must fulfill exactly this one request with one ordinary public Add Commit and Welcome.",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "input": {"encoding": "application/json", "schema": {"type": "object", "required": ["signedRequest"], "properties": {"signedRequest": {"type": "ref", "ref": "blue.catbird.chat.defs#signedLeafRecoveryRequest"}}}},
+      "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["recovery"], "properties": {"recovery": {"type": "ref", "ref": "blue.catbird.chat.defs#leafRecoveryView"}}}},
+      "errors": [
+        {"name": "BlockedRelationship"},
+        {"name": "ConversationNotFound"},
+        {"name": "CutoverRequired"},
+        {"name": "DeviceNotRegistered"},
+        {"name": "DeviceRevoked"},
+        {"name": "IdempotencyConflict"},
+        {"name": "InvalidDPoP"},
+        {"name": "InvalidRequest"},
+        {"name": "InvalidSignature"},
+        {"name": "KeyPackageUnavailable"},
+        {"name": "LeafRecoveryAlreadyOpen"},
+        {"name": "NotParticipant"},
+        {"name": "RelationshipPolicyUnavailable"},
+        {"name": "StaleCoordinates"}
+      ]
+    }
+  }
+}

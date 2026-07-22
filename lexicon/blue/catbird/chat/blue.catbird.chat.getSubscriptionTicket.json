@@ -1,0 +1,27 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.chat.getSubscriptionTicket",
+  "description": "After conversations, pending Welcomes, and recovery inbox have all reached hasMore=false for one inventorySession, a fresh DPoP-authenticated call atomically marks that barrier complete and mints a one-use short-lived ticket. The ticket binds effective DID, device, JKT, authGeneration, inventorySessionId, exact event cursor, and subscription path. The first durable envelope's previousCursor equals that cursor.",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "input": {"encoding": "application/json", "schema": {"type": "object", "required": ["inventorySessionId", "eventCursor"], "properties": {"inventorySessionId": {"type": "string", "minLength": 32, "maxLength": 512}, "eventCursor": {"type": "string", "minLength": 1, "maxLength": 512}}}},
+      "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["ticket", "endpoint", "expiresAt"], "properties": {
+        "ticket": {"type": "string", "minLength": 32, "maxLength": 4096},
+        "endpoint": {"type": "string", "format": "uri", "minLength": 1, "maxLength": 2048},
+        "expiresAt": {"type": "ref", "ref": "blue.catbird.chat.defs#canonicalDatetime"}
+      }}},
+      "errors": [
+        {"name": "CursorExpired"},
+        {"name": "CutoverRequired"},
+        {"name": "DeviceNotRegistered"},
+        {"name": "DeviceRevoked"},
+        {"name": "InvalidDPoP"},
+        {"name": "InvalidRequest"},
+        {"name": "InventoryIncomplete"},
+        {"name": "InventorySessionExpired"},
+        {"name": "InventorySessionMismatch"}
+      ]
+    }
+  }
+}

@@ -1,6 +1,0 @@
-{
-  "lexicon": 1,
-  "id": "blue.catbird.mlsChatV2.subscribeEvents",
-  "description": "Subscribe to v2 global events after the supplied opaque cursor. Events are delivery hints; clients reconcile with getConversations, getConversationState, and getMessages before acting.",
-  "defs": {"main": {"type": "subscription", "parameters": {"type": "params", "required": ["ticket", "cursor"], "properties": {"ticket": {"type": "string", "maxLength": 4096}, "cursor": {"type": "string", "maxLength": 512}}}, "message": {"schema": {"type": "ref", "ref": "blue.catbird.mlsChatV2.defs#eventEnvelope"}}}}
-}

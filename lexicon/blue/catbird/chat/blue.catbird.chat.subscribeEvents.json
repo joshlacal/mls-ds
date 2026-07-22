@@ -1,0 +1,22 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.chat.subscribeEvents",
+  "description": "The sole non-DPoP endpoint: browser WebSocket upgrade authentication uses only the one-use short-lived getSubscriptionTicket token. cursor must byte-equal the cursor bound into the DID/device/JKT/authGeneration/path-bound ticket, which is consumed atomically before upgrade; mismatch, reuse, or expiry rejects. Streams durable entitlement-filtered envelopes plus uncursored best-effort typing variants. For durable envelopes previousCursor is the immediately preceding visible audience cursor and the first continues the ticket cursor. Typing events never alter this chain.",
+  "defs": {
+    "main": {
+      "type": "subscription",
+      "parameters": {"type": "params", "required": ["ticket", "cursor"], "properties": {
+        "ticket": {"type": "string", "minLength": 32, "maxLength": 4096},
+        "cursor": {"type": "string", "minLength": 1, "maxLength": 512}
+      }},
+      "message": {"schema": {"type": "ref", "ref": "blue.catbird.chat.defs#subscriptionMessage"}},
+      "errors": [
+        {"name": "CursorExpired"},
+        {"name": "CutoverRequired"},
+        {"name": "DeviceNotRegistered"},
+        {"name": "DeviceRevoked"},
+        {"name": "InvalidTicket"}
+      ]
+    }
+  }
+}

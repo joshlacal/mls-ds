@@ -1,0 +1,28 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.chat.requestLeave",
+  "description": "Group-only self-leave. A pending or active zero-leaf participant signs immediate stateVersion-plus-one self-removal. An active participant with leaves signs durable 24-hour consent for a different-DID current leaf to remove every requester leaf and the participant by Commit. Neither path can remove the last active admin. Relationship blocks or policy unavailability never deny self-exit. Direct participants use closeConversation instead.",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "input": {"encoding": "application/json", "schema": {"type": "object", "required": ["signedRequest"], "properties": {"signedRequest": {"type": "ref", "ref": "blue.catbird.chat.defs#signedLeaveOperation"}}}},
+      "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["result"], "properties": {"result": {"type": "ref", "ref": "blue.catbird.chat.defs#leaveOperationResult"}}}},
+      "errors": [
+        {"name": "ConversationNotFound"},
+        {"name": "CoordinateOverflow"},
+        {"name": "CutoverRequired"},
+        {"name": "DeviceNotRegistered"},
+        {"name": "DeviceRevoked"},
+        {"name": "DirectParticipantMutationForbidden"},
+        {"name": "IdempotencyConflict"},
+        {"name": "InvalidDPoP"},
+        {"name": "InvalidRequest"},
+        {"name": "InvalidSignature"},
+        {"name": "LastAdminRequired"},
+        {"name": "LeaveAlreadyPending"},
+        {"name": "NotMember"},
+        {"name": "StaleCoordinates"}
+      ]
+    }
+  }
+}

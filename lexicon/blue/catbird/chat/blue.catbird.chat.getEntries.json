@@ -1,0 +1,30 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.chat.getEntries",
+  "description": "Reads entries visible to the exact authenticated (DID,deviceId), strictly after global scan position afterSeq. Application intervals are per concrete MLS leaf: creation opens the genesis device at creation seq, Add opens only that device at its Welcome-producing transition seq, and that device's own Remove or reset closes it inclusively. Reset opens only the activator device at the same seq. Sibling, roster-only, and zero-leaf devices inherit no application ciphertext; re-Add opens a new interval without backfill. afterSeq need not lie in an interval. The server skips inaccessible gaps and never returns their entries. nextAfterSeq is afterSeq when entries is empty, otherwise the greatest returned seq; hasMore is true exactly when another caller-visible application or separately entitled control entry has seq greater than nextAfterSeq. AccessOutsideMembershipInterval means the caller has neither a concrete leaf interval nor separate control entitlement, not that afterSeq lies in a gap. Clients never fetch a gap to resolve targets.",
+  "defs": {
+    "main": {
+      "type": "query",
+      "parameters": {"type": "params", "required": ["conversationId", "afterSeq", "limit"], "properties": {
+        "conversationId": {"type": "string", "minLength": 36, "maxLength": 36, "description": "Canonical lowercase hyphenated RFC 4122-variant UUIDv4 conversation ID; strict runtime validation rejects every other spelling/version/variant."},
+        "afterSeq": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 100}
+      }},
+      "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["entries", "nextAfterSeq", "hasMore"], "properties": {
+        "entries": {"type": "array", "items": {"type": "ref", "ref": "blue.catbird.chat.defs#conversationEntry"}, "minLength": 0, "maxLength": 100},
+        "nextAfterSeq": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "hasMore": {"type": "boolean"}
+      }}},
+      "errors": [
+        {"name": "AccessOutsideMembershipInterval"},
+        {"name": "ConversationNotFound"},
+        {"name": "CutoverRequired"},
+        {"name": "DeviceNotRegistered"},
+        {"name": "DeviceRevoked"},
+        {"name": "InvalidDPoP"},
+        {"name": "InvalidRequest"},
+        {"name": "NotEntitled"}
+      ]
+    }
+  }
+}

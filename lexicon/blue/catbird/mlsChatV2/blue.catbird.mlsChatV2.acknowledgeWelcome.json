@@ -1,6 +1,0 @@
-{
-  "lexicon": 1,
-  "id": "blue.catbird.mlsChatV2.acknowledgeWelcome",
-  "description": "Acknowledge exactly one device-qualified Welcome after local MLS processing. The acknowledgement is idempotent only for the same Welcome and exact state version.",
-  "defs": {"main": {"type": "procedure", "input": {"encoding": "application/json", "schema": {"type": "object", "required": ["welcomeId", "conversationId", "generation", "stateVersion"], "properties": {"welcomeId": {"type": "string", "maxLength": 128}, "conversationId": {"type": "string", "maxLength": 128}, "generation": {"type": "integer", "minimum": 0}, "stateVersion": {"type": "integer", "minimum": 0}}}}, "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["acknowledgedAt", "eventCursor"], "properties": {"acknowledgedAt": {"type": "string", "format": "datetime"}, "eventCursor": {"type": "string", "maxLength": 512}}}}, "errors": [{"name": "WelcomeNotFound"}, {"name": "WelcomeAlreadyAcknowledged"}, {"name": "StaleCoordinates"}, {"name": "NotMember"}]}}
-}

@@ -1,0 +1,30 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.chat.getConversations",
+  "description": "The first call creates one opaque retained inventorySession with a single event fence and materialized audience snapshots for active conversation states, device-removal tombstones, terminal close tombstones, pending Welcomes, and recovery inbox. Every page returns the same inventorySessionId, snapshotEventCursor, and expiry. pageCursor is domain-specific, audience/device/session-bound, and never an event cursor; nextPageCursor is absent after the final page. Mixed, expired, or device-mismatched sessions are rejected.",
+  "defs": {
+    "main": {
+      "type": "query",
+      "parameters": {"type": "params", "required": ["limit"], "properties": {
+        "pageCursor": {"type": "string", "minLength": 1, "maxLength": 512},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50}
+      }},
+      "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["items", "inventorySessionId", "snapshotEventCursor", "hasMore", "snapshotExpiresAt"], "properties": {
+        "items": {"type": "array", "items": {"type": "ref", "ref": "blue.catbird.chat.defs#conversationInventoryItem"}, "minLength": 0, "maxLength": 100},
+        "inventorySessionId": {"type": "string", "minLength": 32, "maxLength": 512},
+        "snapshotEventCursor": {"type": "string", "minLength": 1, "maxLength": 512},
+        "nextPageCursor": {"type": "string", "minLength": 1, "maxLength": 512},
+        "hasMore": {"type": "boolean"},
+        "snapshotExpiresAt": {"type": "ref", "ref": "blue.catbird.chat.defs#canonicalDatetime"}
+      }}},
+      "errors": [
+        {"name": "CursorExpired"},
+        {"name": "CutoverRequired"},
+        {"name": "DeviceNotRegistered"},
+        {"name": "DeviceRevoked"},
+        {"name": "InvalidDPoP"},
+        {"name": "InvalidRequest"}
+      ]
+    }
+  }
+}

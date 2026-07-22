@@ -1,0 +1,27 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.chat.rejectWelcome",
+  "description": "Idempotently records a signed terminal rejection of one historically addressed Welcome. Authorization is tied to the immutable recipient device and transition coordinate, not current coordinates or current membership.",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "input": {"encoding": "application/json", "schema": {"type": "object", "required": ["signedRequest"], "properties": {"signedRequest": {"type": "ref", "ref": "blue.catbird.chat.defs#signedWelcomeRejection"}}}},
+      "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["status", "rejectedAt"], "properties": {
+        "status": {"type": "string", "const": "rejected"},
+        "rejectedAt": {"type": "ref", "ref": "blue.catbird.chat.defs#canonicalDatetime"}
+      }}},
+      "errors": [
+        {"name": "CutoverRequired"},
+        {"name": "DeviceNotRegistered"},
+        {"name": "DeviceRevoked"},
+        {"name": "InvalidDPoP"},
+        {"name": "InvalidRequest"},
+        {"name": "InvalidSignature"},
+        {"name": "RejectionConflict"},
+        {"name": "WelcomeExpired"},
+        {"name": "WelcomeNotFound"},
+        {"name": "WelcomeSuperseded"}
+      ]
+    }
+  }
+}
