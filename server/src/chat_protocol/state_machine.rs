@@ -10095,6 +10095,46 @@ impl TransitionEvidence {
         });
         Ok(evidence)
     }
+
+    /// A `leaveCommitFulfillment` `TransitionEvidence`: the exact body a real
+    /// different-DID leave-fulfilling Commit carries — prior/next coordinates +
+    /// `leave_request_id` (`require_commit_body`), and a Leave manifest
+    /// (`require_commit_manifest` Leave arm: `participant_changes ==
+    /// [Remove(requester)]`, NO Add leaf change, no recovery id, no welcome) plus
+    /// the mandatory re-encryption metadata (`leaveCommit` ∈ requires_snapshot).
+    /// `authority = None` skips only the crypto-digest cross-checks.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_test_leave_fulfillment_with_metadata(
+        seq: u64,
+        transition_id: [u8; 16],
+        outer_entry_fingerprint: [u8; 32],
+        received_at: ServerTimestamp,
+        leave_request_id: [u8; 16],
+        prior: PublicGroupSnapshotCoordinate,
+        next: PublicGroupSnapshotCoordinate,
+        requester: DeviceIdentity,
+        metadata: MetadataSnapshotBinding,
+    ) -> Result<Self, StateMachineError> {
+        let mut evidence =
+            Self::for_test_at(seq, transition_id, outer_entry_fingerprint, received_at)?;
+        evidence.body_binding = Some(TransitionBodyBinding::LeaveCommitFulfillment {
+            leave_request_id,
+            prior,
+            next,
+            aad_digest: [0u8; 32],
+            manifest: TransitionManifestBinding {
+                participant_changes: vec![ManifestParticipantChange::Remove(
+                    requester.principal().clone(),
+                )],
+                leaf_changes: vec![ManifestLeafChange::Remove(requester)],
+                leaf_recovery_request_id: None,
+                welcome: None,
+            },
+            commit_sha256: [0u8; 32],
+            metadata,
+        });
+        Ok(evidence)
+    }
 }
 
 #[cfg(test)]
@@ -13554,16 +13594,32 @@ mod executor {
             }
             PlanKind::Metadata => Err(ExecutorError::UnsupportedEffect("metadata")),
             PlanKind::Commit => {
-                // Both the generic (zero-add) commit and the leaf-recovery
-                // fulfillment are `PlanKind::Commit`. A fulfillment ALWAYS emits
-                // exactly one Welcome (how the recovered target joins); a generic
-                // commit never does. Branch on that. Generic commit stays a hard
-                // `UnsupportedEffect` (blocked on the corpus zero-add fixture gap).
-                let is_fulfillment = effects
+                // Three `PlanKind::Commit` shapes, discriminated by their own edges
+                // (mutually exclusive by construction, backstopped by each arm's
+                // guards): a LEAVE fulfillment terminalizes a leave request
+                // (`leave_request_changes` non-empty); a leaf-recovery fulfillment
+                // ALWAYS emits exactly one NEW Welcome (`None->Some`); a generic
+                // (zero-proposal) commit does neither.
+                let is_leave_fulfillment = !effects.leave_request_changes().is_empty();
+                let is_recovery_fulfillment = effects
                     .welcome_changes()
                     .iter()
                     .any(|change| matches!((change.before(), change.after()), (None, Some(_))));
-                if is_fulfillment {
+                if is_leave_fulfillment {
+                    apply_leave_fulfillment(
+                        transaction,
+                        plan,
+                        ctx,
+                        conversation_id,
+                        transition_id,
+                        seq_i64,
+                        successor_next_entry_seq,
+                        generation,
+                        state_version,
+                        epoch,
+                    )
+                    .await
+                } else if is_recovery_fulfillment {
                     apply_leaf_recovery_fulfillment(
                         transaction,
                         plan,
@@ -14707,6 +14763,365 @@ mod executor {
         // recovery/reservation/package delta; this additionally catches a malformed
         // welcome delta (e.g. Pending->Expired) that `write_welcome_supersessions`
         // skips, closing the last silent-drop path.
+        reconcile_coordinate_change_families(effects, &FamilyCounts::default(), &superseded)?;
+
+        Ok(AppliedTransition {
+            allocated_seq: u64::try_from(seq_i64).unwrap(),
+            entry_id: ctx.entry.entry_id,
+            event_positions,
+            successor_coordinate: plan.successor_coordinate().copied(),
+        })
+    }
+
+    /// Apply a `leaveCommitFulfillment` (`PlanKind::Commit`): a DIFFERENT-DID
+    /// current member commits a Remove of every requester leaf, fulfilling the
+    /// requester's retained group-leave consent. `sv+1` AND `epoch+1` (fresh
+    /// hash/tag), metadata re-encryption carry-forward (`leaveCommit` ∈
+    /// requires_snapshot), every requester leaf closed + its interval closed
+    /// (`Remove`, inclusive at the fulfillment seq), the requester participant
+    /// terminalized, and the pending leave request marked `fulfilled` (bound to
+    /// this `leaveCommit` transition). Coordinate-changing, so it runs the SHARED
+    /// prior-bound supersession path WITH the reconciliation from the start — the
+    /// fulfillment-scenario prior carries a pending Welcome the epoch change
+    /// supersedes (own welcome 0 + superseded 1). The committer's own key rotation
+    /// surfaces as a `(Some,Some)` leaf change with no DS row impact (tolerated).
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_leave_fulfillment(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        plan: &ConversationPersistencePlan,
+        ctx: &ExecutionContext,
+        conversation_id: Uuid,
+        transition_id: Uuid,
+        seq_i64: i64,
+        successor_next_entry_seq: i64,
+        generation: i64,
+        state_version: i64,
+        epoch: i64,
+    ) -> Result<AppliedTransition, ExecutorError> {
+        let effects = plan.effects();
+        let hydration = plan.state();
+        let coordinate = &hydration.coordinate; // successor (sv+1, epoch+1).
+        let applied_at = ctx.applied_at;
+        let head = effects
+            .head_cas()
+            .ok_or(ExecutorError::InconsistentPlan("missing head CAS binding"))?;
+        let expected_prior = head
+            .expected_prior()
+            .ok_or(ExecutorError::InconsistentPlan(
+                "leave fulfillment needs a prior",
+            ))?;
+        let expected_generation = checked_i64(expected_prior.generation())?;
+        let expected_state_version = checked_i64(expected_prior.state_version())?;
+        let expected_next_entry_seq = checked_i64(head.expected_next_entry_seq())?;
+
+        // Guards. Leave fulfillment carries participant/leaf/interval/leave-request/
+        // metadata changes + (a legal interleaving) prior-bound recovery/welcome
+        // SUPERSESSIONS. It has NO own recovery/reservation/package edge and no
+        // reset/terminal-proof/revocation change; those recovery families flow
+        // ONLY through the shared supersession path (own counts 0, verified by the
+        // reconciliation). Reject the families it never carries.
+        reject_if_present("terminal_proof_changes", effects.terminal_proof_changes())?;
+        reject_if_present("reset_request_changes", effects.reset_request_changes())?;
+        reject_if_present("recovery_package_cas", effects.recovery_package_cas())?;
+        reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
+        if effects.revocation_target_cas().is_some()
+            || effects.welcome_cas().is_some()
+            || effects.invitation_quota_cas().is_some()
+        {
+            return Err(ExecutorError::UnsupportedEffect(
+                "leave fulfillment revocation/welcome/quota CAS",
+            ));
+        }
+
+        // Metadata re-encryption is MANDATORY (DDL requires_snapshot ∋ leaveCommit).
+        let metadata = effects
+            .metadata_change()
+            .and_then(StateChange::after)
+            .ok_or(ExecutorError::InconsistentPlan(
+                "leave fulfillment carries no metadata re-encryption",
+            ))?;
+        let author_cols = ctx
+            .metadata_author
+            .as_ref()
+            .ok_or(ExecutorError::MissingContext(
+                "leave fulfillment commit metadata author",
+            ))?;
+
+        // Exactly one leave request is fulfilled.
+        if effects.leave_request_changes().len() != 1 {
+            return Err(ExecutorError::InconsistentPlan(
+                "leave fulfillment must fulfill exactly one leave request",
+            ));
+        }
+        let fulfilled = effects
+            .leave_request_changes()
+            .iter()
+            .find_map(|change| match (change.before(), change.after()) {
+                (Some(before), Some(after))
+                    if before.status() == LeaveRequestStatus::Pending
+                        && after.status() == LeaveRequestStatus::Fulfilled =>
+                {
+                    Some(after)
+                }
+                _ => None,
+            })
+            .ok_or(ExecutorError::InconsistentPlan(
+                "leave fulfillment must fulfill a pending leave request",
+            ))?;
+        let leave_request_id = Uuid::from_bytes(fulfilled.request_id);
+
+        // Exactly one participant is removed (the requester).
+        if effects.participant_changes().len() != 1 {
+            return Err(ExecutorError::InconsistentPlan(
+                "leave fulfillment must remove exactly one participant",
+            ));
+        }
+        let removed = effects
+            .participant_changes()
+            .iter()
+            .find_map(|change| match (change.before(), change.after()) {
+                (Some(before), None) => Some(before),
+                _ => None,
+            })
+            .ok_or(ExecutorError::InconsistentPlan(
+                "leave fulfillment must close the requester participant",
+            ))?;
+        let participant_period_id = ctx
+            .closing_participant_periods
+            .iter()
+            .find(|(device, _)| device.principal() == removed.principal())
+            .map(|(_, id)| *id)
+            .ok_or(ExecutorError::MissingContext(
+                "closing participant period id for the leave requester",
+            ))?;
+
+        // 1. Head CAS sv+1.
+        transition::cas_conversation_head(
+            transaction,
+            &transition::ConversationHeadCas {
+                conversation_id,
+                expected_generation,
+                expected_state_version,
+                expected_next_entry_seq,
+                successor_generation: generation,
+                successor_state_version: state_version,
+                successor_next_entry_seq,
+                close: None,
+            },
+        )
+        .await?;
+
+        // 2. Generation state-version pointer CAS (same generation).
+        transition::cas_generation_state_version(
+            transaction,
+            &transition::GenerationStateVersionCas {
+                conversation_id,
+                generation,
+                expected_state_version,
+                successor_state_version: state_version,
+            },
+        )
+        .await?;
+
+        // 3. `commit`/active gen_state at the NEW epoch (fresh hash/tag).
+        transition::insert_generation_state_row(
+            transaction,
+            &NewGenerationState {
+                conversation_id,
+                generation,
+                state_version,
+                group_id: coordinate.group_id().to_vec(),
+                epoch,
+                group_context_hash: coordinate.group_context_hash().to_vec(),
+                confirmation_tag: coordinate.confirmation_tag().to_vec(),
+                lifecycle: GenerationStateLifecycle::Active,
+                state_kind: GenerationStateKind::Commit,
+                producing_transition_id: transition_id,
+                public_snapshot_bytes: ctx.spine.public_snapshot_bytes.clone(),
+                snapshot_sha256: ctx.spine.public_snapshot_sha256.clone(),
+                tree_summary_bytes: ctx.spine.tree_summary_bytes.clone(),
+                tree_summary_sha256: ctx.spine.tree_summary_sha256.clone(),
+                leaf_count: ctx.spine.leaf_count,
+                created_at: applied_at,
+            },
+        )
+        .await?;
+
+        // 4. Entry (leaveCommitFulfillmentEntry).
+        let append = build_append_entry(
+            ctx,
+            conversation_id,
+            generation,
+            state_version,
+            transition_id,
+        );
+        delivery::append_entry_at(transaction, &append, u64::try_from(seq_i64).unwrap()).await?;
+
+        // 5. Transition (kind leaveCommit, prior -> next).
+        transition::insert_transition_row(
+            transaction,
+            &NewTransition {
+                transition_id,
+                conversation_id,
+                kind: TransitionKind::LeaveCommit,
+                actor_did: ctx.actor.user_did.clone(),
+                actor_device_id: ctx.actor.device_id,
+                actor_key_id: ctx.actor.key_id.clone(),
+                actor_auth_generation: ctx.actor.auth_generation,
+                actor_role: ctx.actor.role,
+                actor_device_status: ctx.actor.device_status.clone(),
+                signed_request_bytes: ctx.entry.signed_request_bytes.clone(),
+                unsigned_projection_bytes: ctx.entry.unsigned_projection_bytes.clone(),
+                signing_transcript_bytes: ctx.entry.signing_transcript_bytes.clone(),
+                request_digest: ctx.entry.request_digest.clone(),
+                signature: ctx.entry.signature.clone(),
+                coordinates: TransitionCoordinates {
+                    prior: Some((expected_generation, expected_state_version)),
+                    next: Some((generation, state_version)),
+                    retired: None,
+                    successor: None,
+                },
+                reset_request_id: None,
+                close_transition_id: None,
+                metadata_snapshot_id: Some(author_cols.metadata_snapshot_id),
+                entry_seq: seq_i64,
+                accepted_at: applied_at,
+            },
+        )
+        .await?;
+
+        // 6. Metadata re-encryption snapshot (carry-forward author/origin/version).
+        write_commit_metadata_snapshot(
+            transaction,
+            metadata,
+            author_cols,
+            conversation_id,
+            generation,
+            state_version,
+            epoch,
+            &coordinate.group_id().to_vec(),
+            &coordinate.group_context_hash().to_vec(),
+            &coordinate.confirmation_tag().to_vec(),
+            transition_id,
+            applied_at,
+        )
+        .await?;
+
+        // 7. Close every requester leaf. A `(Some,None)` is a real removal; the
+        //    committer's own key rotation is a tolerated `(Some,Some)` (no DS row);
+        //    an add `(None,Some)` is not a leave and is a hard error.
+        let mut removed_leaves = 0usize;
+        for change in effects.leaf_changes() {
+            match (change.before(), change.after()) {
+                (Some(before), None) => {
+                    let leaf = closing_leaf_period(ctx, before.device())?;
+                    transition::close_leaf_period(
+                        transaction,
+                        &LeafClose {
+                            leaf_period_id: leaf,
+                            removed_state_version: state_version,
+                            removed_transition_id: transition_id,
+                            removed_seq: seq_i64,
+                            removed_at: applied_at,
+                        },
+                    )
+                    .await?;
+                    removed_leaves += 1;
+                }
+                (Some(_), Some(_)) => {}
+                (None, Some(_)) => {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "leave fulfillment must not add a leaf",
+                    ))
+                }
+                (None, None) => {}
+            }
+        }
+        if removed_leaves == 0 {
+            return Err(ExecutorError::InconsistentPlan(
+                "leave fulfillment removed no leaf",
+            ));
+        }
+
+        // 8. Close every removed device's interval inclusively at the fulfillment
+        //    seq (`Remove`), sourcing the closing leaf period from ctx.
+        for change in effects.interval_changes() {
+            match (change.before(), change.after()) {
+                (Some(_), Some(after)) => {
+                    let end = after.end().ok_or(ExecutorError::InconsistentPlan(
+                        "leave-closed interval has no end",
+                    ))?;
+                    let leaf = closing_leaf_period(ctx, after.recipient())?;
+                    delivery::close_application_interval(
+                        transaction,
+                        &ApplicationIntervalClose {
+                            membership_interval_id: Uuid::from_bytes(
+                                *after.opening_transition_id(),
+                            ),
+                            terminal_seq: checked_i64(end.seq())?,
+                            closing_state_version: state_version,
+                            closing_transition_id: Uuid::from_bytes(*end.transition_id()),
+                            closing_outer_entry_fingerprint: end.outer_entry_fingerprint().to_vec(),
+                            closing_kind: repo_interval_close_kind(end.kind()),
+                            closing_leaf_period_id: leaf,
+                            removed_at: applied_at,
+                        },
+                    )
+                    .await?;
+                }
+                _ => {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "leave fulfillment interval change must close an open interval",
+                    ))
+                }
+            }
+        }
+
+        // 9. Terminalize the requester's participant period.
+        transition::terminalize_participant_period(
+            transaction,
+            &transition::ParticipantTerminalization {
+                participant_period_id,
+                removing_transition_id: transition_id,
+                removing_seq: seq_i64,
+                removed_at: applied_at,
+            },
+        )
+        .await?;
+
+        // 10. Mark the leave request `fulfilled`, bound to this leaveCommit
+        //     transition (the assert_leave_request_mapping fulfilled arm cross-checks
+        //     kind ∈ leaveCommit/leavePolicy + prior coordinate + digest + instant).
+        transition::terminalize_leave_request(
+            transaction,
+            leave_request_id,
+            &LeaveRequestTermination::Fulfilled {
+                terminal_request_digest: ctx.entry.request_digest.clone(),
+                terminal_transition_id: transition_id,
+                terminal_at: applied_at,
+            },
+        )
+        .await?;
+
+        // 11. Audience + events.
+        let recipients = build_entry_recipients(&ctx.entry_recipients)?;
+        delivery::insert_entry_recipients(
+            transaction,
+            conversation_id,
+            u64::try_from(seq_i64).unwrap(),
+            &recipients,
+        )
+        .await?;
+        let event_positions = write_events(transaction, ctx).await?;
+
+        // 12. Shared prior-bound supersession + welcome supersession + the
+        //     silent-drop reconciliation (own recovery/reservation/package/welcome
+        //     edges are ALL zero for a leave fulfillment — every such delta must be
+        //     a supersession the calls below applied).
+        let mut superseded =
+            write_prior_bound_supersessions(transaction, effects, transition_id, applied_at)
+                .await?;
+        superseded.welcomes = write_welcome_supersessions(transaction, ctx, effects).await?;
         reconcile_coordinate_change_families(effects, &FamilyCounts::default(), &superseded)?;
 
         Ok(AppliedTransition {

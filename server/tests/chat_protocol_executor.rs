@@ -104,13 +104,13 @@ use chat_protocol::state_machine::{
     apply_conversation_persistence_plan, persistence_plan_for_test, plan_accept_conversation,
     plan_close, plan_commit, plan_creation, plan_leaf_recovery_cancellation,
     plan_leaf_recovery_fulfillment, plan_leaf_recovery_request, plan_leave_cancellation,
-    plan_leave_request, plan_policy, plan_reset_activation, plan_reset_request,
-    plan_zero_leaf_leave, AcceptConversation, CloseConversation, CommitCommand,
+    plan_leave_fulfillment, plan_leave_request, plan_policy, plan_reset_activation,
+    plan_reset_request, plan_zero_leaf_leave, AcceptConversation, CloseConversation, CommitCommand,
     ControlEntryContent, ConversationHeadCasBinding, ConversationKind, ConversationState,
     CreationCommand, CreationDecision, DeviceIdentity, EventFanout, ExecutionActor,
     ExecutionContext, ExecutorError, LeafPersistenceColumns, LeafRecoveryCancellation,
     LeafRecoveryFulfillment, LeafRecoveryKind, LeafRecoveryRequestCommand, LeaveCancellation,
-    LeaveRequestCommand, LockedRegistrationProjection, MetadataAuthorColumns,
+    LeaveFulfillment, LeaveRequestCommand, LockedRegistrationProjection, MetadataAuthorColumns,
     MetadataSnapshotBinding, PrincipalId, RecoveryOpenContext, RequestEntryKind, RequestEvidence,
     ResetActivation, ResetRequestCommand, ResetRequestRow, ServerTimestamp, SpineArtifacts,
     TransitionEvidence, WelcomeDispositionInput, ZeroLeafLeave,
@@ -4197,7 +4197,6 @@ async fn generic_commit_commits_epoch_bump_and_reencrypts_metadata() {
         commit_transition,
     } = build_generic_commit(&pool, &scenario).await;
     let fixture = &scenario.fixture;
-    let prior = &scenario.fulfillment_state;
 
     let mut tx = pool.begin().await.expect("begin generic commit");
     let applied = apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
@@ -4884,6 +4883,322 @@ async fn zero_leaf_leave_commits_immediate_self_removal() {
             .await
             .unwrap();
     assert_eq!(before, after, "zero-leaf leave replay left zero residue");
+}
+
+#[tokio::test]
+async fn leave_fulfillment_commits_remove_and_supersedes_pending_welcome() {
+    let (pool, _db) = setup().await;
+    let manifest = corpus_manifest();
+    let scenario = run_fulfillment_scenario(&pool).await;
+    let conversation_id = scenario.conversation_id;
+    let bob_id = scenario.bob_id.clone();
+    let bob_did = scenario.bob_did.clone();
+    let bob_device = Uuid::from_bytes(*bob_id.device_id());
+    let welcome_id = scenario.welcome_id;
+    let alice_id = scenario.fixture.alice_id.clone();
+    let alice_did = scenario.fixture.alice_did.clone();
+    let alice_device = scenario.fixture.alice_device;
+    let alice_key_id = scenario.fixture.alice_key_id.clone();
+    let creation_transition_id = scenario.fixture.creation_transition_id;
+    let protocol_instance_id = scenario.fixture.protocol_instance_id;
+
+    // 1. Bob opens a pending leave request (seq 4).
+    let req_received = ServerTimestamp::from_unix_millis_for_test(
+        manifest.evaluation_unix_seconds as i64 * 1_000 + 5_000,
+    )
+    .unwrap();
+    let (pending_state, leave_request_id, _seq, _plan, _ctx) =
+        commit_leave_request(&pool, &scenario, 4, req_received).await;
+
+    // Bob's existing leaf + participant periods — the DB facts the successor
+    // hydration can't carry (bob is removed from it).
+    let bob_leaf_period: Uuid = sqlx::query_scalar(
+        "SELECT leaf_period_id FROM chat.member_devices WHERE conversation_id=$1 AND user_did=$2 AND active",
+    )
+    .bind(conversation_id)
+    .bind(&bob_did)
+    .fetch_one(&pool)
+    .await
+    .expect("bob leaf period");
+    let bob_participant_period: Uuid = sqlx::query_scalar(
+        "SELECT participant_period_id FROM chat.participants WHERE conversation_id=$1 AND user_did=$2 AND current_membership",
+    )
+    .bind(conversation_id)
+    .bind(&bob_did)
+    .fetch_one(&pool)
+    .await
+    .expect("bob participant period");
+
+    // 2. Alice fulfills the retained consent with a Remove commit removing bob.
+    let alice_leaf_index = pending_state
+        .leaf(&alice_id)
+        .expect("alice leaf")
+        .leaf_index();
+    let bob_leaf_index = pending_state.leaf(&bob_id).expect("bob leaf").leaf_index();
+    let successor_coord = PublicGroupSnapshotCoordinate::new(
+        *conversation_id.as_bytes(),
+        manifest.chain.generation,
+        pending_state.coordinate().state_version() + 1,
+        *pending_state.coordinate().group_id(),
+        pending_state.coordinate().epoch() + 1,
+        [0xD1_u8; 32],
+        [0xD2_u8; 32],
+        PublicGroupSnapshotLifecycle::Active,
+    );
+    assert_eq!(successor_coord.state_version(), 3);
+    assert_eq!(successor_coord.epoch(), 2);
+    let commit = chat_protocol::public_state::VerifiedCommitPublicState::for_test_remove(
+        pending_state.public_state(),
+        successor_coord,
+        alice_leaf_index,
+        &[bob_leaf_index],
+    )
+    .expect("synthetic sealed remove evidence");
+
+    let fulfill_transition = Uuid::new_v4();
+    let fulfill_entry = Uuid::new_v4();
+    let fulfill_received = ServerTimestamp::from_unix_millis_for_test(
+        manifest.evaluation_unix_seconds as i64 * 1_000 + 6_000,
+    )
+    .unwrap();
+    let alice_key_id_bytes: [u8; 32] = Sha256::digest(&scenario.alice_sig_key).into();
+    // Re-encryption: SAME author/origin/version/size as the creation snapshot; a
+    // fresh nonce + ciphertext; coordinate epoch = 2 (validate_state).
+    let reencryption = MetadataSnapshotBinding::for_test_creation(
+        *conversation_id.as_bytes(),
+        0,
+        successor_coord.epoch(),
+        *successor_coord.group_context_hash(),
+        creation_transition_id,
+        1,
+        alice_id.clone(),
+        alice_key_id_bytes,
+        scenario.alice_sig_key.clone().try_into().unwrap(),
+        1,
+        1,
+        [0xF7_u8; 12],
+        vec![0xF8_u8; 48],
+    );
+    let fulfill_evidence = TransitionEvidence::for_test_leave_fulfillment_with_metadata(
+        5,
+        *fulfill_transition.as_bytes(),
+        [0x1D_u8; 32],
+        fulfill_received,
+        *leave_request_id.as_bytes(),
+        *pending_state.coordinate(),
+        successor_coord,
+        bob_id.clone(),
+        reencryption,
+    )
+    .unwrap();
+    let planned = plan_leave_fulfillment(
+        &pending_state,
+        LeaveFulfillment {
+            actor: alice_id.clone(),
+            requester: bob_id.principal().clone(),
+            leave_request_id: *leave_request_id.as_bytes(),
+            transition: fulfill_evidence,
+            commit,
+        },
+    )
+    .expect("valid leave fulfillment plan");
+    let head_cas = ConversationHeadCasBinding::for_test_edge(
+        *conversation_id.as_bytes(),
+        *fulfill_entry.as_bytes(),
+        *pending_state.coordinate(),
+        5,
+        fulfill_received,
+    );
+    let plan = persistence_plan_for_test(planned, head_cas);
+
+    let applied_at = clock_now(&pool).await;
+    let payload = vec![0xFA_u8; 12];
+    let transcript = vec![0xFB_u8; 12];
+    let alice_pred = device_event_predecessor(&pool, &alice_did, alice_device).await;
+    let bob_pred = device_event_predecessor(&pool, &bob_did, bob_device).await;
+    let ctx = ExecutionContext {
+        protocol_instance_id,
+        applied_at,
+        actor: ExecutionActor {
+            user_did: alice_did.clone(),
+            device_id: alice_device,
+            key_id: alice_key_id.clone(),
+            auth_generation: 1,
+            role: TransitionActorRole::Admin,
+            device_status: "active".to_owned(),
+        },
+        entry: ControlEntryContent {
+            entry_id: fulfill_entry,
+            entry_kind: "blue.catbird.chat.defs#leaveCommitFulfillmentEntry".to_owned(),
+            accepted_payload_bytes: payload.clone(),
+            accepted_payload_sha256: Sha256::digest(&payload).to_vec(),
+            signed_request_bytes: transcript.clone(),
+            unsigned_projection_bytes: vec![0xFC_u8; 8],
+            signing_transcript_bytes: transcript.clone(),
+            request_digest: Sha256::digest(&transcript).to_vec(),
+            signature: vec![0xFD_u8; 64],
+            server_fields_bytes: vec![0xFE_u8; 8],
+            outer_entry_fingerprint: vec![0x1D_u8; 32],
+        },
+        spine: SpineArtifacts {
+            public_snapshot_bytes: vec![0xC1_u8; 16],
+            public_snapshot_sha256: Sha256::digest([0xC1_u8; 16]).to_vec(),
+            tree_summary_bytes: vec![0xC2_u8; 16],
+            tree_summary_sha256: Sha256::digest([0xC2_u8; 16]).to_vec(),
+            leaf_count: 1,
+            genesis_group_info_bytes: vec![],
+            genesis_group_info_sha256: vec![],
+        },
+        opened_leaves: vec![],
+        metadata_author: Some(MetadataAuthorColumns {
+            author_role: "admin".to_owned(),
+            author_device_status: "active".to_owned(),
+            author_public_key: scenario.alice_sig_key.clone(),
+            author_key_id: alice_key_id.clone(),
+            metadata_snapshot_id: Uuid::new_v4(),
+        }),
+        participant_period_ids: vec![],
+        leaf_period_ids: vec![],
+        // Alice (remaining) fetches the control entry; bob (removed) fetches the
+        // closing control via the `intervalClose` entitlement the interval-close
+        // provenance trigger requires at the terminal seq.
+        entry_recipients: vec![
+            (alice_id.clone(), EntryEntitlementKind::Control),
+            (bob_id.clone(), EntryEntitlementKind::IntervalClose),
+        ],
+        events: vec![EventFanout {
+            event_id: Uuid::new_v4(),
+            event_kind: EventKind::LeaveRequest,
+            payload_bytes: vec![0xC4_u8; 8],
+            recipients: vec![(
+                alice_id.clone(),
+                EventEntitlementKind::Participant,
+                alice_pred,
+            )],
+            outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+        }],
+        closing_leaf_periods: vec![(bob_id.clone(), bob_leaf_period)],
+        closing_participant_periods: vec![(bob_id.clone(), bob_participant_period)],
+        reset_request_row: None,
+        recovery_open: None,
+        // The epoch change supersedes the fulfillment scenario's pending Welcome.
+        welcome_dispositions: vec![WelcomeDispositionInput {
+            welcome_id,
+            event: EventFanout {
+                event_id: Uuid::new_v4(),
+                event_kind: EventKind::WelcomeDisposition,
+                payload_bytes: vec![0xC5_u8; 8],
+                recipients: vec![(bob_id.clone(), EventEntitlementKind::Welcome, bob_pred)],
+                outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+            },
+        }],
+    };
+
+    let mut tx = pool.begin().await.expect("begin leave fulfillment");
+    let applied = apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+        .await
+        .expect("leave fulfillment applies");
+    tx.commit()
+        .await
+        .expect("leave fulfillment COMMIT past all deferred triggers");
+    assert_eq!(applied.allocated_seq, 5);
+
+    // Head at the committed successor (sv 3, seq 6).
+    let (sv, next_seq): (i64, i64) = sqlx::query_as(
+        "SELECT current_state_version,next_entry_seq FROM chat.conversations WHERE conversation_id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("head");
+    assert_eq!((sv, next_seq), (3, 6));
+    // commit gen_state at epoch 2, one leaf (bob removed).
+    let (skind, sepoch, sleaf): (String, i64, i64) = sqlx::query_as(
+        "SELECT state_kind,epoch,leaf_count FROM chat.generation_states WHERE conversation_id=$1 AND state_version=3",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("commit gen state");
+    assert_eq!((skind.as_str(), sepoch, sleaf), ("commit", 2, 1));
+    // Bob's leaf is closed, bound to the leave transition.
+    let (bob_active, removed_transition): (bool, Option<Uuid>) = sqlx::query_as(
+        "SELECT active,removed_transition_id FROM chat.member_devices WHERE leaf_period_id=$1",
+    )
+    .bind(bob_leaf_period)
+    .fetch_one(&pool)
+    .await
+    .expect("bob leaf");
+    assert!(!bob_active);
+    assert_eq!(removed_transition, Some(fulfill_transition));
+    // Bob's interval is Remove-closed at the fulfillment seq.
+    let (interval_end, close_kind): (Option<i64>, Option<String>) = sqlx::query_as(
+        "SELECT terminal_seq,closing_kind FROM chat.application_intervals WHERE conversation_id=$1 AND recipient_did=$2",
+    )
+    .bind(conversation_id)
+    .bind(&bob_did)
+    .fetch_one(&pool)
+    .await
+    .expect("bob interval");
+    assert_eq!(interval_end, Some(5));
+    assert_eq!(close_kind.as_deref(), Some("remove"));
+    // Bob's participant is closed; the leave request is fulfilled.
+    let bob_membership: bool = sqlx::query_scalar(
+        "SELECT current_membership FROM chat.participants WHERE participant_period_id=$1",
+    )
+    .bind(bob_participant_period)
+    .fetch_one(&pool)
+    .await
+    .expect("bob participant");
+    assert!(!bob_membership);
+    let (leave_status, leave_terminal): (String, Option<Uuid>) = sqlx::query_as(
+        "SELECT status,terminal_transition_id FROM chat.leave_requests WHERE leave_request_id=$1",
+    )
+    .bind(leave_request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("leave request");
+    assert_eq!(leave_status, "fulfilled");
+    assert_eq!(leave_terminal, Some(fulfill_transition));
+    // The prior pending Welcome is superseded.
+    let welcome_status: String =
+        sqlx::query_scalar("SELECT status FROM chat.welcome_deliveries WHERE welcome_id=$1")
+            .bind(welcome_id)
+            .fetch_one(&pool)
+            .await
+            .expect("welcome");
+    assert_eq!(welcome_status, "superseded");
+    // The re-encryption metadata snapshot for the fulfillment transition.
+    let snap_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.metadata_snapshots WHERE producing_transition_id=$1",
+    )
+    .bind(fulfill_transition)
+    .fetch_one(&pool)
+    .await
+    .expect("snapshot");
+    assert_eq!(snap_count, 1);
+
+    // Replay -> head CAS conflict (head already at sv 3), zero residue.
+    let before: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM chat.transitions WHERE conversation_id=$1")
+            .bind(conversation_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let mut tx2 = pool.begin().await.expect("begin replay");
+    let replay = apply_conversation_persistence_plan(&mut tx2, &plan, &ctx).await;
+    assert!(
+        matches!(replay, Err(ExecutorError::Transition(_))),
+        "leave fulfillment replay must conflict on the head CAS, got {replay:?}"
+    );
+    tx2.rollback().await.expect("rollback replay");
+    let after: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM chat.transitions WHERE conversation_id=$1")
+            .bind(conversation_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(before, after, "leave fulfillment replay left zero residue");
 }
 
 #[tokio::test]
