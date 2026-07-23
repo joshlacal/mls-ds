@@ -35,8 +35,8 @@ use cursor::{
 };
 use repository::inventory::{
     lock_inventory_session_for_test, seal_conversation_inventory_page,
-    seal_pending_welcome_inventory_page, seal_recovery_inventory_page,
-    InventoryCompletionEvidence, InventoryRepositoryError, InventorySessionLockFixture,
+    seal_pending_welcome_inventory_page, seal_recovery_inventory_page, InventoryCompletionEvidence,
+    InventoryRepositoryError, InventorySessionLockFixture,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -116,7 +116,8 @@ fn fixture(issued: &IssuedInventory) -> InventorySessionLockFixture {
         auth_generation: 7,
         snapshot_event_position: 42,
         snapshot_event_cursor_bytes: issued.event_cursor.as_str().as_bytes().to_vec(),
-        snapshot_event_cursor_sha256: Sha256::digest(issued.event_cursor.as_str().as_bytes()).into(),
+        snapshot_event_cursor_sha256: Sha256::digest(issued.event_cursor.as_str().as_bytes())
+            .into(),
         created_at: Utc.timestamp_opt(CREATED_AT, 0).unwrap(),
         expires_at: Utc.timestamp_opt(EXPIRES_AT, 0).unwrap(),
         conversations: InventoryCompletionEvidence::incomplete(),
@@ -165,14 +166,7 @@ fn page_cursor(
         )
         .unwrap();
     codec
-        .issue_inventory_page_cursor(
-            &binding,
-            ordinal,
-            item_key,
-            LOCKED_AT as u64,
-            10,
-            42,
-        )
+        .issue_inventory_page_cursor(&binding, ordinal, item_key, LOCKED_AT as u64, 10, 42)
         .unwrap()
         .as_str()
         .to_owned()
@@ -200,7 +194,10 @@ fn conversation_continuation_consumes_hash_selected_locked_row() {
 
     let authority =
         seal_conversation_inventory_page(&codec, &encoded, locator, guard, FILTER).unwrap();
-    assert_eq!(authority.inventory_session_id(), Uuid::parse_str(SESSION_ID).unwrap());
+    assert_eq!(
+        authority.inventory_session_id(),
+        Uuid::parse_str(SESSION_ID).unwrap()
+    );
     assert_eq!(authority.domain(), InventoryPageDomain::Conversations);
     assert_eq!(authority.last_ordinal(), 9);
     authority
@@ -226,8 +223,14 @@ fn welcome_and_recovery_continuations_require_the_exact_raw_session_id() {
     let issued = issued_inventory(&codec);
 
     for (domain, item_key) in [
-        (InventoryPageDomain::PendingWelcomes, b"welcome-key".as_slice()),
-        (InventoryPageDomain::LeafRecovery, b"recovery-key".as_slice()),
+        (
+            InventoryPageDomain::PendingWelcomes,
+            b"welcome-key".as_slice(),
+        ),
+        (
+            InventoryPageDomain::LeafRecovery,
+            b"recovery-key".as_slice(),
+        ),
     ] {
         let encoded = page_cursor(&codec, &issued, domain, 3, item_key);
         let locator = codec
@@ -431,25 +434,40 @@ fn production_sql_locks_and_consumes_exact_inventory_authority() {
         "snapshot_event_cursor_bytes",
         "snapshot_event_cursor_sha256",
         "rows_affected() != 1",
-        "conversations_complete = FALSE",
-        "conversation_item_count IS NULL",
-        "conversation_items_sha256 IS NULL",
-        "welcomes_complete = FALSE",
-        "welcome_item_count IS NULL",
-        "welcome_items_sha256 IS NULL",
-        "recovery_complete = FALSE",
-        "recovery_item_count IS NULL",
-        "recovery_items_sha256 IS NULL",
+        // Every per-arm completion column is wired into the consume query. The
+        // FALSE/IS NULL (incomplete) and TRUE/= (complete) invariants are now
+        // emitted by `push_completion_predicate`, so the exact predicate
+        // templates are asserted separately below rather than inline per column.
+        "conversations_complete",
+        "conversation_item_count",
+        "conversation_items_sha256",
+        "welcomes_complete",
+        "welcome_item_count",
+        "welcome_items_sha256",
+        "recovery_complete",
+        "recovery_item_count",
+        "recovery_items_sha256",
+        " = FALSE AND ",
+        " IS NULL AND ",
+        " IS NULL",
+        " = TRUE AND ",
     ] {
-        assert!(source.contains(required), "missing production invariant: {required}");
+        assert!(
+            source.contains(required),
+            "missing production invariant: {required}"
+        );
     }
 
+    // Bound the guard to its own struct body (the fields between `{` and the
+    // closing `}`). Unrelated repository structs now sit between the guard
+    // declaration and its `impl`, so anchoring on the struct's closing brace
+    // keeps this contract focused on the guard definition itself.
     let guard = source
         .split_once("pub(crate) struct LockedInventorySessionGuard")
         .expect("locked session guard exists")
         .1
-        .split_once("impl LockedInventorySessionGuard")
-        .expect("guard implementation follows declaration")
+        .split_once("\n}")
+        .expect("guard struct body is closed")
         .0;
     assert!(!guard.contains("InventorySessionToken"));
     assert!(!guard.contains("raw_inventory_session"));

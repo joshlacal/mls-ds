@@ -216,12 +216,13 @@ mod repository {
                             && allocation_id.get_version_num() == 4
                     })
                     .map(|value| Self::for_test_allocation(allocation_id, value))
-                }
+            }
         }
 
         #[derive(Debug)]
         pub(crate) struct LockedConversationHeadGuard {
             transaction_id: String,
+            conversation_id: uuid::Uuid,
             prior_coordinate: Option<()>,
             next_entry_seq: u64,
             durable_row_digest: [u8; 32],
@@ -230,12 +231,14 @@ mod repository {
         impl LockedConversationHeadGuard {
             pub(crate) fn for_scope_test(
                 transaction_id: &str,
+                conversation_id: [u8; 16],
                 prior_exists: bool,
                 next_entry_seq: u64,
                 durable_row_digest: [u8; 32],
             ) -> Self {
                 Self {
                     transaction_id: transaction_id.to_owned(),
+                    conversation_id: uuid::Uuid::from_bytes(conversation_id),
                     prior_coordinate: prior_exists.then_some(()),
                     next_entry_seq,
                     durable_row_digest,
@@ -244,6 +247,10 @@ mod repository {
 
             pub(crate) fn transaction_id(&self) -> &str {
                 &self.transaction_id
+            }
+
+            pub(crate) fn conversation_id(&self) -> uuid::Uuid {
+                self.conversation_id
             }
 
             pub(crate) fn prior_coordinate(&self) -> Option<&()> {
@@ -401,8 +408,9 @@ use relationship_policy::{
     AdmissionOperation, AdmissionRequest, AllocatedProjectionRevisionGuard, HttpRelationshipSource,
     ProjectionClock, ProjectionOperationScope, ProjectionScope, PublicGet, PublicResponse,
     PublicTransport, RelationshipPolicyConfig, RelationshipPolicyConfigInput, TrafficGraphScope,
-    TransportError, HARD_MAX_REQUEST_BURST, HARD_MAX_REQUEST_RATE, MAX_ADMISSION_GRAPH_CALLS,
-    MAX_ADMISSION_SOURCE_CALLS, MAX_DECLARATION_HTTP_CALLS, MAX_TRAFFIC_GRAPH_CALLS,
+    TransportError, TrustedRelationshipPersistenceInstant, HARD_MAX_REQUEST_BURST,
+    HARD_MAX_REQUEST_RATE, MAX_ADMISSION_GRAPH_CALLS, MAX_ADMISSION_SOURCE_CALLS,
+    MAX_DECLARATION_HTTP_CALLS, MAX_TRAFFIC_GRAPH_CALLS,
 };
 use repository::relationship::{
     allocate_projection_revision, load_fallback_relationship_projection,
@@ -421,8 +429,8 @@ use std::time::Duration;
 use validation::{CanonicalTimestamp, TrustedRequestInstant};
 
 use repository::core::{
-    LockedConversationHeadGuard, LockedConversationStateGuard,
-    LockedDirectConversationLookupGuard, LockedDirectLookupOutcome, LockedInvitationQuotaGuard,
+    LockedConversationHeadGuard, LockedConversationStateGuard, LockedDirectConversationLookupGuard,
+    LockedDirectLookupOutcome, LockedInvitationQuotaGuard,
 };
 use state_machine::{
     ConversationKind, ConversationState, DeviceIdentity, LockedRegistrationProjection,
@@ -550,6 +558,7 @@ fn locked_scope_state(
         ConversationState::new(kind, conversation_id, participants),
         LockedConversationHeadGuard::for_scope_test(
             transaction_id,
+            conversation_id,
             true,
             2,
             head_digest,
@@ -567,8 +576,22 @@ fn production_scope_sealers_bind_transaction_actor_roster_and_every_locked_diges
     let bob = did(1);
     let carol = did(2);
 
-    let creation_head =
-        LockedConversationHeadGuard::for_scope_test(transaction_id, false, 1, [0x11; 32]);
+    let creation_head = LockedConversationHeadGuard::for_scope_test(
+        transaction_id,
+        conversation_id,
+        false,
+        1,
+        [0x11; 32],
+    );
+    // The creation sealers now authenticate the inviter against a locked
+    // registration bound to the same transaction + conversation coordinate.
+    let creation_registration = LockedRegistrationProjection::for_scope_test(
+        transaction_id,
+        conversation_id,
+        &alice,
+        PersistedRegistrationStatus::Active,
+        [0x2a; 32],
+    );
     let group_quota = LockedInvitationQuotaGuard::for_scope_test(
         transaction_id,
         alice.clone(),
@@ -576,8 +599,10 @@ fn production_scope_sealers_bind_transaction_actor_roster_and_every_locked_diges
         [0x12; 32],
     );
     let group_scope =
-        seal_group_creation_fallback_scope(&creation_head, &group_quota).expect("group scope");
-    let (transaction, operation, scope, digest) = group_scope.parts_for_test();
+        seal_group_creation_fallback_scope(&creation_head, &group_quota, &creation_registration)
+            .expect("group scope");
+    let (transaction, operation, scope, _authenticated_actor_digest, digest) =
+        group_scope.parts_for_test();
     assert_eq!(transaction, transaction_id);
     assert_eq!(operation, ProjectionOperationScope::Creation);
     assert_ne!(digest, &[0; 32]);
@@ -595,16 +620,24 @@ fn production_scope_sealers_bind_transaction_actor_roster_and_every_locked_diges
         vec![bob.clone()],
         [0x12; 32],
     );
-    assert!(
-        seal_group_creation_fallback_scope(&creation_head, &wrong_transaction_quota).is_err()
-    );
+    assert!(seal_group_creation_fallback_scope(
+        &creation_head,
+        &wrong_transaction_quota,
+        &creation_registration,
+    )
+    .is_err());
     let zero_digest_quota = LockedInvitationQuotaGuard::for_scope_test(
         transaction_id,
         alice.clone(),
         vec![bob.clone()],
         [0; 32],
     );
-    assert!(seal_group_creation_fallback_scope(&creation_head, &zero_digest_quota).is_err());
+    assert!(seal_group_creation_fallback_scope(
+        &creation_head,
+        &zero_digest_quota,
+        &creation_registration,
+    )
+    .is_err());
 
     let direct_quota = LockedInvitationQuotaGuard::for_scope_test(
         transaction_id,
@@ -619,10 +652,14 @@ fn production_scope_sealers_bind_transaction_actor_roster_and_every_locked_diges
         LockedDirectLookupOutcome::Absent,
         [0x14; 32],
     );
-    let direct_scope =
-        seal_direct_creation_fallback_scope(&creation_head, &direct_quota, &direct_lookup)
-            .expect("direct scope");
-    let direct_digest = *direct_scope.parts_for_test().3;
+    let direct_scope = seal_direct_creation_fallback_scope(
+        &creation_head,
+        &direct_quota,
+        &direct_lookup,
+        &creation_registration,
+    )
+    .expect("direct scope");
+    let direct_digest = *direct_scope.parts_for_test().4;
     let changed_direct_lookup = LockedDirectConversationLookupGuard::for_scope_test(
         transaction_id,
         alice.clone(),
@@ -634,9 +671,10 @@ fn production_scope_sealers_bind_transaction_actor_roster_and_every_locked_diges
         &creation_head,
         &direct_quota,
         &changed_direct_lookup,
+        &creation_registration,
     )
     .expect("changed direct scope");
-    assert_ne!(direct_digest, *changed_direct_scope.parts_for_test().3);
+    assert_ne!(direct_digest, *changed_direct_scope.parts_for_test().4);
     let wrong_transaction_lookup = LockedDirectConversationLookupGuard::for_scope_test(
         other_transaction_id,
         alice.clone(),
@@ -644,14 +682,13 @@ fn production_scope_sealers_bind_transaction_actor_roster_and_every_locked_diges
         LockedDirectLookupOutcome::Absent,
         [0x14; 32],
     );
-    assert!(
-        seal_direct_creation_fallback_scope(
-            &creation_head,
-            &direct_quota,
-            &wrong_transaction_lookup,
-        )
-        .is_err()
-    );
+    assert!(seal_direct_creation_fallback_scope(
+        &creation_head,
+        &direct_quota,
+        &wrong_transaction_lookup,
+        &creation_registration,
+    )
+    .is_err());
     let existing_lookup = LockedDirectConversationLookupGuard::for_scope_test(
         transaction_id,
         alice.clone(),
@@ -659,10 +696,13 @@ fn production_scope_sealers_bind_transaction_actor_roster_and_every_locked_diges
         LockedDirectLookupOutcome::Existing,
         [0x14; 32],
     );
-    assert!(
-        seal_direct_creation_fallback_scope(&creation_head, &direct_quota, &existing_lookup)
-            .is_err()
-    );
+    assert!(seal_direct_creation_fallback_scope(
+        &creation_head,
+        &direct_quota,
+        &existing_lookup,
+        &creation_registration,
+    )
+    .is_err());
 
     let inviter = DeviceIdentity::from_did(&alice);
     let pending_locked = locked_scope_state(
@@ -671,11 +711,7 @@ fn production_scope_sealers_bind_transaction_actor_roster_and_every_locked_diges
         ConversationKind::Group,
         vec![
             ParticipantRecord::new(&alice, ParticipantStatus::Active, None),
-            ParticipantRecord::new(
-                &bob,
-                ParticipantStatus::Pending,
-                Some(inviter.clone()),
-            ),
+            ParticipantRecord::new(&bob, ParticipantStatus::Pending, Some(inviter.clone())),
         ],
         [0x21; 32],
         [0x22; 32],
@@ -687,7 +723,8 @@ fn production_scope_sealers_bind_transaction_actor_roster_and_every_locked_diges
         [0x23; 32],
     );
     let pending_add =
-        seal_pending_add_fallback_scope(&pending_locked, &add_quota).expect("pending-add scope");
+        seal_pending_add_fallback_scope(&pending_locked, &add_quota, &creation_registration)
+            .expect("pending-add scope");
     assert_eq!(
         pending_add.parts_for_test().1,
         ProjectionOperationScope::PendingAdd
@@ -702,12 +739,9 @@ fn production_scope_sealers_bind_transaction_actor_roster_and_every_locked_diges
     );
     let acceptance = seal_acceptance_fallback_scope(&pending_locked, &accepting_registration)
         .expect("retained inviter and pending actor derive acceptance");
-    let (_, acceptance_operation, acceptance_scope, acceptance_digest) =
+    let (_, acceptance_operation, acceptance_scope, _acceptance_actor_digest, acceptance_digest) =
         acceptance.parts_for_test();
-    assert_eq!(
-        acceptance_operation,
-        ProjectionOperationScope::Acceptance
-    );
+    assert_eq!(acceptance_operation, ProjectionOperationScope::Acceptance);
     let ProjectionScope::Admission(acceptance_request) = acceptance_scope else {
         panic!("acceptance must produce admission scope");
     };
@@ -722,13 +756,9 @@ fn production_scope_sealers_bind_transaction_actor_roster_and_every_locked_diges
         PersistedRegistrationStatus::Active,
         [0x25; 32],
     );
-    let changed_acceptance =
-        seal_acceptance_fallback_scope(&pending_locked, &changed_registration)
-            .expect("changed actor row remains structurally valid");
-    assert_ne!(
-        *acceptance_digest,
-        *changed_acceptance.parts_for_test().3
-    );
+    let changed_acceptance = seal_acceptance_fallback_scope(&pending_locked, &changed_registration)
+        .expect("changed actor row remains structurally valid");
+    assert_ne!(*acceptance_digest, *changed_acceptance.parts_for_test().4);
     let wrong_actor_registration = LockedRegistrationProjection::for_scope_test(
         transaction_id,
         conversation_id,
@@ -736,9 +766,7 @@ fn production_scope_sealers_bind_transaction_actor_roster_and_every_locked_diges
         PersistedRegistrationStatus::Active,
         [0x24; 32],
     );
-    assert!(
-        seal_acceptance_fallback_scope(&pending_locked, &wrong_actor_registration).is_err()
-    );
+    assert!(seal_acceptance_fallback_scope(&pending_locked, &wrong_actor_registration).is_err());
     let wrong_transaction_registration = LockedRegistrationProjection::for_scope_test(
         other_transaction_id,
         conversation_id,
@@ -764,21 +792,23 @@ fn production_scope_sealers_bind_transaction_actor_roster_and_every_locked_diges
         PersistedRegistrationStatus::Active,
         [0; 32],
     );
-    assert!(
-        seal_acceptance_fallback_scope(&pending_locked, &zero_digest_registration).is_err()
-    );
+    assert!(seal_acceptance_fallback_scope(&pending_locked, &zero_digest_registration).is_err());
 
     for operation in [
         ProjectionOperationScope::RecoveryReservation,
         ProjectionOperationScope::RecoveryFulfillment,
     ] {
         let recovery =
-            seal_recovery_fallback_scope(&pending_locked, operation).expect("recovery scope");
+            seal_recovery_fallback_scope(&pending_locked, &creation_registration, operation)
+                .expect("recovery scope");
         assert_eq!(recovery.parts_for_test().1, operation);
     }
-    assert!(
-        seal_recovery_fallback_scope(&pending_locked, ProjectionOperationScope::Traffic).is_err()
-    );
+    assert!(seal_recovery_fallback_scope(
+        &pending_locked,
+        &creation_registration,
+        ProjectionOperationScope::Traffic,
+    )
+    .is_err());
 
     assert!(
         seal_traffic_fallback_scope(&pending_locked, &accepting_registration).is_err(),
@@ -797,15 +827,13 @@ fn production_scope_sealers_bind_transaction_actor_roster_and_every_locked_diges
     );
     let traffic = seal_traffic_fallback_scope(&active_locked, &accepting_registration)
         .expect("authenticated active actor derives traffic scope");
-    let (_, traffic_scope, traffic_digest) = traffic.parts_for_test();
+    let (_, traffic_scope, _traffic_actor_digest, traffic_digest) = traffic.parts_for_test();
     assert_eq!(traffic_scope.actor, bob);
     assert_eq!(traffic_scope.members, vec![alice, bob]);
     let changed_traffic =
         seal_traffic_fallback_scope(&active_locked, &changed_registration).expect("traffic scope");
-    assert_ne!(*traffic_digest, *changed_traffic.parts_for_test().2);
-    assert!(
-        seal_traffic_fallback_scope(&active_locked, &wrong_transaction_registration).is_err()
-    );
+    assert_ne!(*traffic_digest, *changed_traffic.parts_for_test().3);
+    assert!(seal_traffic_fallback_scope(&active_locked, &wrong_transaction_registration).is_err());
     assert!(seal_traffic_fallback_scope(&active_locked, &zero_digest_registration).is_err());
 }
 
@@ -846,6 +874,10 @@ fn trusted_at(value: DateTime<Utc>) -> TrustedRequestInstant {
     };
     let canonical = canonical_value.to_rfc3339_opts(SecondsFormat::Millis, true);
     TrustedRequestInstant::from_canonical_for_test(CanonicalTimestamp::parse(&canonical).unwrap())
+}
+
+fn persistence_at(value: DateTime<Utc>) -> TrustedRelationshipPersistenceInstant {
+    TrustedRelationshipPersistenceInstant::for_test(value)
 }
 
 struct StepClock {
@@ -1073,7 +1105,11 @@ async fn relationship_fallback(
     .unwrap();
     let trusted_now = trusted_at(live.completed_at());
     let persisted = live
-        .export_persisted_fallback(allocated_revision(pool).await, &authority, &trusted_now)
+        .export_persisted_fallback(
+            allocated_revision(pool).await,
+            &authority,
+            &persistence_at(live.completed_at()),
+        )
         .unwrap();
     (authority, request, trusted_now, persisted)
 }
@@ -1100,7 +1136,11 @@ async fn traffic_fallback(
     let scope = live.scope().clone();
     let trusted_now = trusted_at(live.completed_at());
     let persisted = live
-        .export_persisted_fallback(allocated_revision(pool).await, &authority, &trusted_now)
+        .export_persisted_fallback(
+            allocated_revision(pool).await,
+            &authority,
+            &persistence_at(live.completed_at()),
+        )
         .unwrap();
     (authority, scope, trusted_now, persisted)
 }
@@ -1109,7 +1149,7 @@ async fn traffic_fallback(
 #[ignore = "root fresh-database authorization required"]
 async fn relationship_snapshot_is_atomic_and_hydrates_after_pool_restart() {
     let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
-    let (authority, request, trusted_now, mut persisted) = relationship_fallback(&pool).await;
+    let (authority, request, _trusted_now, mut persisted) = relationship_fallback(&pool).await;
     let projection_id = uuid::Uuid::parse_str(&persisted.projection_id).unwrap();
     let expected_revision = persisted.projection_revision;
 
@@ -1171,7 +1211,6 @@ async fn relationship_snapshot_is_atomic_and_hydrates_after_pool_restart() {
         &mut load_transaction,
         stale_witness,
         &authority,
-        &trusted_now,
     )
     .await
     .is_err());
@@ -1182,7 +1221,6 @@ async fn relationship_snapshot_is_atomic_and_hydrates_after_pool_restart() {
         &mut load_transaction,
         wrong_witness,
         &authority,
-        &trusted_now,
     )
     .await
     .unwrap()
@@ -1192,15 +1230,11 @@ async fn relationship_snapshot_is_atomic_and_hydrates_after_pool_restart() {
     let (exact_witness, exact_request) =
         lock_creation_scope(&mut load_transaction, &request.roster).await;
     assert_eq!(exact_request, request);
-    let loaded = load_fallback_relationship_projection(
-        &mut load_transaction,
-        exact_witness,
-        &authority,
-        &trusted_now,
-    )
-    .await
-    .unwrap()
-    .expect("exact fresh fallback survives pool restart");
+    let (loaded, decision) =
+        load_fallback_relationship_projection(&mut load_transaction, exact_witness, &authority)
+            .await
+            .unwrap()
+            .expect("exact fresh fallback survives pool restart");
     assert_eq!(loaded.projection_id(), projection_id);
     assert_eq!(loaded.projection_revision(), expected_revision);
     assert_eq!(loaded.scope(), &ProjectionScope::Admission(request.clone()));
@@ -1210,7 +1244,7 @@ async fn relationship_snapshot_is_atomic_and_hydrates_after_pool_restart() {
             ProjectionOperationScope::Creation,
             &request,
             &authority,
-            &trusted_now,
+            &decision,
             false,
         ),
         Ok(())
@@ -1251,7 +1285,7 @@ async fn failed_child_insert_leaves_no_partial_projection() {
 #[ignore = "root fresh-database authorization required"]
 async fn traffic_fallback_hydrates_exact_scope_and_freshness_after_restart() {
     let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
-    let (authority, scope, trusted_now, mut persisted) = traffic_fallback(&pool).await;
+    let (authority, scope, _trusted_now, mut persisted) = traffic_fallback(&pool).await;
     let projection_id = uuid::Uuid::parse_str(&persisted.projection_id).unwrap();
     let expected_revision = persisted.projection_revision;
     persisted.relationships.reverse();
@@ -1274,28 +1308,25 @@ async fn traffic_fallback_hydrates_exact_scope_and_freshness_after_restart() {
     stale_transaction.rollback().await.unwrap();
 
     let mut load_transaction = restarted.begin().await.unwrap();
-    assert!(load_fallback_traffic_projection(
-        &mut load_transaction,
-        stale_witness,
-        &authority,
-        &trusted_now,
-    )
-    .await
-    .is_err());
+    assert!(
+        load_fallback_traffic_projection(&mut load_transaction, stale_witness, &authority,)
+            .await
+            .is_err()
+    );
 
     let (wrong_witness, wrong_scope) =
         lock_traffic_scope(&mut load_transaction, &wrong_members).await;
-    assert!(load_fallback_traffic_projection(
-        &mut load_transaction,
-        wrong_witness,
-        &authority,
-        &trusted_now,
-    )
-    .await
-    .unwrap()
-    .is_none());
+    assert!(
+        load_fallback_traffic_projection(&mut load_transaction, wrong_witness, &authority,)
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert_ne!(wrong_scope, scope);
 
+    // Freshness is now enforced from the loader's own post-lock observation
+    // clock; the loader no longer accepts an injected instant (the prior
+    // `trusted_now + 61s` argument was removed from the production signature).
     let (stale_time_witness, stale_time_scope) =
         lock_traffic_scope(&mut load_transaction, &scope.members).await;
     assert_eq!(stale_time_scope, scope);
@@ -1303,7 +1334,6 @@ async fn traffic_fallback_hydrates_exact_scope_and_freshness_after_restart() {
         &mut load_transaction,
         stale_time_witness,
         &authority,
-        &trusted_at(trusted_now.datetime() + TimeDelta::seconds(61)),
     )
     .await
     .unwrap()
@@ -1312,26 +1342,16 @@ async fn traffic_fallback_hydrates_exact_scope_and_freshness_after_restart() {
     let (exact_witness, exact_scope) =
         lock_traffic_scope(&mut load_transaction, &scope.members).await;
     assert_eq!(exact_scope, scope);
-    let loaded = load_fallback_traffic_projection(
-        &mut load_transaction,
-        exact_witness,
-        &authority,
-        &trusted_now,
-    )
-    .await
-    .unwrap()
-    .expect("exact fresh traffic fallback survives pool restart");
+    let (loaded, decision) =
+        load_fallback_traffic_projection(&mut load_transaction, exact_witness, &authority)
+            .await
+            .unwrap()
+            .expect("exact fresh traffic fallback survives pool restart");
     assert_eq!(loaded.projection_id(), projection_id);
     assert_eq!(loaded.projection_revision(), expected_revision);
     assert_eq!(loaded.scope(), &scope);
     assert_eq!(
-        relationship_policy::consume_traffic_projection(
-            &loaded,
-            &scope.actor,
-            &scope.members,
-            &authority,
-            &trusted_now,
-        ),
+        relationship_policy::consume_traffic_projection(&loaded, &authority, &decision,),
         Ok(())
     );
     load_transaction.commit().await.unwrap();
@@ -1352,9 +1372,12 @@ async fn zero_call_traffic_fallback_hydrates_after_restart() {
     )
     .await
     .unwrap();
-    let trusted_now = trusted_at(live.completed_at());
     let persisted = live
-        .export_persisted_fallback(allocated_revision(&pool).await, &authority, &trusted_now)
+        .export_persisted_fallback(
+            allocated_revision(&pool).await,
+            &authority,
+            &persistence_at(live.completed_at()),
+        )
         .unwrap();
     assert_eq!(persisted.source_call_count, 0);
     assert!(persisted.relationships.is_empty());
@@ -1371,20 +1394,13 @@ async fn zero_call_traffic_fallback_hydrates_after_restart() {
     let mut load_transaction = restarted.begin().await.unwrap();
     let (witness, scope) =
         lock_traffic_scope(&mut load_transaction, std::slice::from_ref(&actor)).await;
-    let loaded =
-        load_fallback_traffic_projection(&mut load_transaction, witness, &authority, &trusted_now)
+    let (loaded, decision) =
+        load_fallback_traffic_projection(&mut load_transaction, witness, &authority)
             .await
             .unwrap()
             .expect("zero-call traffic fallback survives pool restart");
     assert_eq!(loaded.scope(), &scope);
-    relationship_policy::consume_traffic_projection(
-        &loaded,
-        &scope.actor,
-        &scope.members,
-        &authority,
-        &trusted_now,
-    )
-    .unwrap();
+    relationship_policy::consume_traffic_projection(&loaded, &authority, &decision).unwrap();
     load_transaction.commit().await.unwrap();
 }
 
@@ -1410,9 +1426,8 @@ async fn sequence_is_unique_across_concurrency_restarts_and_rollback_gaps() {
             .await
             .unwrap();
             let revision = live.projection_revision();
-            let trusted_now = trusted_at(live.completed_at());
             let persisted = live
-                .export_persisted(authority.as_ref(), &trusted_now)
+                .export_persisted(authority.as_ref(), &persistence_at(live.completed_at()))
                 .unwrap();
             let mut transaction = pool.begin().await.unwrap();
             persist_traffic_projection(&mut transaction, persisted)

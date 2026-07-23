@@ -29,15 +29,15 @@ const MIGRATION_DESCRIPTIONS: [&str; 3] = [
 // These are regenerated only from a reviewed, freshly applied migration
 // snapshot. They deliberately make unreviewed catalog drift loud.
 const COLUMN_CATALOG_SHA256: &str =
-    "f3b69b1fdd6b3be73a4427e3368048cd9c88cec3e1af84b04051bc0cf1648ef1";
+    "fbb673fe1eb495ddb5b08f0818fd566225a95a3fbf7729b384e4ef88570f002e";
 const CONSTRAINT_CATALOG_SHA256: &str =
-    "4adc8b2326f42bf1b2f3e87f0409608f23561dd04bbf5862300b1bde9a26b802";
+    "f53c8157cedc5fad401a56a2538974859c71f269ad8dc716cef2a58eda33edc6";
 const INDEX_CATALOG_SHA256: &str =
-    "96e23989afe911ad3fc12f9d3d9d86c92eb073dd384ed0947fb364ebfc944531";
+    "4eb4de367adc3591c12bc758c125899818bb7f0104a65d7469102bda76616759";
 const FUNCTION_CATALOG_SHA256: &str =
-    "2a074d827e48aec779305969c862e816479d872d5afc878257f6861773b4e8d4";
+    "dd9a3b3a6cc8f252ae0996f148c9d4e517a5b676886e03a18810d155b7eed8ef";
 const TRIGGER_CATALOG_SHA256: &str =
-    "fc1288d402b0161c449ed0248637b4e85b45a966135325ceabeceae31767d5b3";
+    "c179499a10d3ac474de660a6f473bd4840fac400fd742d1f343f0c5f35e2fa87";
 const SEQUENCE_CATALOG_SHA256: &str =
     "0f5fdcab044481afeaca50ac88cff13edd4b583df914da2c798e4a4194464abe";
 
@@ -207,17 +207,29 @@ fn audit_delivery_audiences_require_control_entries_and_exact_provenance() {
                     && mapping.contains("applicationEntry"),
             ),
             (
+                // Relocated enforcement: the intervalClose "binds the exact closing
+                // transition and outer fingerprint" invariant is now a hard composite
+                // FK from chat.application_intervals -> chat.entries' transition/
+                // fingerprint unique key, not inline plpgsql in
+                // assert_entry_recipient_mapping. Assert the FK + its unique target.
                 "intervalClose routing binds the exact closing transition and outer fingerprint",
-                mapping.contains("interval.closing_transition_id = entry.transition_id")
-                    && mapping.contains(
-                        "interval.closing_outer_entry_fingerprint = entry.outer_entry_fingerprint",
-                    ),
+                compact.contains(
+                    "CONSTRAINT application_intervals_closing_provenance_fk FOREIGN KEY ( conversation_id, terminal_seq, closing_transition_id, closing_outer_entry_fingerprint ) REFERENCES chat.entries( conversation_id, seq, transition_id, outer_entry_fingerprint )",
+                ) && compact.contains(
+                    "CONSTRAINT entries_transition_fingerprint_uq UNIQUE ( conversation_id, seq, transition_id, outer_entry_fingerprint )",
+                ),
             ),
             (
+                // Relocated enforcement: the scheduleTerminal "binds the exact terminal
+                // transition and outer fingerprint" invariant is now a hard composite
+                // FK from chat.application_schedule_terminal_proofs -> chat.entries'
+                // transition/fingerprint unique key. Assert the FK + its unique target.
                 "scheduleTerminal routing binds the exact terminal transition and outer fingerprint",
-                mapping.contains("proof.transition_id = entry.transition_id")
-                    && mapping
-                        .contains("proof.outer_entry_fingerprint = entry.outer_entry_fingerprint"),
+                compact.contains(
+                    "CONSTRAINT application_schedule_terminal_proofs_provenance_fk FOREIGN KEY ( conversation_id, terminal_seq, transition_id, outer_entry_fingerprint ) REFERENCES chat.entries( conversation_id, seq, transition_id, outer_entry_fingerprint )",
+                ) && compact.contains(
+                    "CONSTRAINT entries_transition_fingerprint_uq UNIQUE ( conversation_id, seq, transition_id, outer_entry_fingerprint )",
+                ),
             ),
             (
                 "entry fingerprints and signatures remain fixed-size protocol authority",
@@ -1419,7 +1431,7 @@ async fn clean_chat_schema_is_exact_isolated_and_fail_closed() {
     .fetch_one(&pool)
     .await
     .expect("count chat FKs");
-    assert_eq!(foreign_keys, 170, "unexpected FK coverage");
+    assert_eq!(foreign_keys, 183, "unexpected FK coverage");
     assert_eq!(unvalidated_foreign_keys, 0, "all FKs must be validated");
 
     let enum_count: i64 = sqlx::query_scalar(
@@ -1665,7 +1677,7 @@ async fn clean_chat_schema_is_exact_isolated_and_fail_closed() {
     assert_catalog("trigger", &trigger_catalog, TRIGGER_CATALOG_SHA256);
     assert_eq!(
         trigger_catalog.len(),
-        147,
+        151,
         "unexpected authored trigger coverage"
     );
 
@@ -2401,24 +2413,33 @@ async fn clean_chat_schema_is_exact_isolated_and_fail_closed() {
         .begin()
         .await
         .expect("begin post-completion inventory mutation");
-    sqlx::query(
+    // The O(1) session-freeze guard (BEFORE INSERT) rejects this row at
+    // execute() time because the session's conversation domain is already
+    // complete, so the item never reaches commit. Capture the Result rather
+    // than expecting it.
+    let post_completion_result = sqlx::query(
         r#"
         INSERT INTO chat.inventory_conversation_items(
-            inventory_session_id,ordinal,conversation_id,item_key_bytes,payload_bytes,payload_sha256
-        ) VALUES($1,0,$2,uuid_send($2),$3,$4)
+            inventory_session_id,ordinal,conversation_id,recipient_did,recipient_device_id,item_key_bytes,payload_bytes,payload_sha256
+        ) VALUES($1,0,$2,$3,$4,uuid_send($2),$5,$6)
         "#,
     )
     .bind(inventory_session_id)
     .bind(fixture.conversation_id)
+    .bind(principal)
+    .bind(actor_device_id)
     .bind(&inventory_payload)
     .bind(Sha256::digest(&inventory_payload).to_vec())
     .execute(&mut *post_completion_item)
-    .await
-    .expect("queue item against completed empty inventory");
+    .await;
     assert!(
-        post_completion_item.commit().await.is_err(),
-        "completion digest must reject post-completion materialization drift"
+        post_completion_result.is_err(),
+        "completed session domain must reject a new inventory item"
     );
+    post_completion_item
+        .rollback()
+        .await
+        .expect("roll back rejected post-completion inventory mutation");
 
     let crossing_inventory_session = fixture_uuid(304);
     let crossing_payload = vec![35_u8; 8];
@@ -2440,24 +2461,42 @@ async fn clean_chat_schema_is_exact_isolated_and_fail_closed() {
     .execute(&mut *crossing_inventory)
     .await
     .expect("insert open device inventory");
-    sqlx::query(
+    // A device-inventory item owned by `principal` cannot describe another
+    // principal's device. The recipient device here is other_principal's real
+    // device (so the recipient device FK is satisfied), which means the
+    // rejection is the explicit principal-binding CHECK — recipient_did must
+    // equal requester_did — and not an incidental NOT-NULL/FK typo. The
+    // composite bindings enforce this at execute() time, so capture the
+    // rejection directly rather than deferring it to commit.
+    let crossing_rejection = sqlx::query(
         r#"
         INSERT INTO chat.device_inventory_items(
-            device_inventory_session_id,ordinal,subject_device_id,payload_bytes,payload_sha256
-        ) VALUES($1,0,$2,$3,$4)
+            device_inventory_session_id,ordinal,subject_device_id,requester_did,requester_device_id,
+            recipient_did,recipient_device_id,payload_bytes,payload_sha256
+        ) VALUES($1,0,$2,$3,$4,$5,$6,$7,$8)
         "#,
     )
     .bind(crossing_inventory_session)
+    .bind(other_device_id)
+    .bind(principal)
+    .bind(actor_device_id)
+    .bind(other_principal)
     .bind(other_device_id)
     .bind(&crossing_payload)
     .bind(Sha256::digest(&crossing_payload).to_vec())
     .execute(&mut *crossing_inventory)
     .await
-    .expect("queue cross-principal device item");
-    assert!(
-        crossing_inventory.commit().await.is_err(),
-        "device inventory cannot cross principal boundary"
+    .expect_err("device inventory cannot cross principal boundary");
+    assert_eq!(
+        crossing_rejection
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some("device_inventory_items_principal_binding_check")
     );
+    crossing_inventory
+        .rollback()
+        .await
+        .expect("roll back rejected cross-principal device item");
 
     let projection_at: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
         .fetch_one(&pool)
@@ -3265,10 +3304,40 @@ async fn clean_chat_schema_is_exact_isolated_and_fail_closed() {
     .execute(&mut *usage_drift)
     .await
     .expect("queue incorrect usage counters");
+    // The per-row structural guard no longer re-derives counters from owner
+    // history, so drifted counters now survive commit; the authoritative O(n)
+    // rescan moved to the periodic chat.reconcile_blob_usage sweep, which must
+    // reject the inconsistency when it runs.
+    usage_drift
+        .commit()
+        .await
+        .expect("structural guard permits committed usage drift");
+    let reconcile_drift = sqlx::query("SELECT chat.reconcile_blob_usage($1)")
+        .bind(principal)
+        .execute(&pool)
+        .await
+        .expect_err("periodic reconciliation must reject drifted usage counters");
     assert!(
-        usage_drift.commit().await.is_err(),
+        reconcile_drift
+            .to_string()
+            .contains("blob usage counters disagree with authoritative blobs"),
         "authoritative blob rows must reconcile usage counters"
     );
+    // Restoring the authoritative counter makes the same sweep pass, proving the
+    // probe detects genuine drift rather than always failing.
+    sqlx::query(
+        "UPDATE chat.blob_usage SET reserved_ciphertext_bytes=17,updated_at=$2 WHERE user_did=$1",
+    )
+    .bind(principal)
+    .bind(&blob_at)
+    .execute(&pool)
+    .await
+    .expect("restore authoritative usage counters");
+    sqlx::query("SELECT chat.reconcile_blob_usage($1)")
+        .bind(principal)
+        .execute(&pool)
+        .await
+        .expect("reconciliation passes once counters match authoritative blobs");
 
     let immutable_blob = sqlx::query("UPDATE chat.blobs SET ciphertext_size=18 WHERE blob_id=$1")
         .bind(blob_id)

@@ -153,9 +153,16 @@ enum TrustedRelationshipDecisionScope {
 pub(crate) struct TrustedRelationshipDecisionInstant {
     transaction_id: String,
     scope: TrustedRelationshipDecisionScope,
+    authenticated_actor_digest: [u8; 32],
     durable_read_set_digest: [u8; 32],
     observed_at: DateTime<Utc>,
 }
+
+// Fixed nonzero authenticated-actor digest used by the test mirrors below.
+// Production mints this from the locked authenticated registration; the mirror
+// only needs a canonical nonzero value so shape and validation match.
+#[cfg(test)]
+const TEST_AUTHENTICATED_ACTOR_DIGEST: [u8; 32] = [0x11; 32];
 
 #[cfg(test)]
 impl TrustedRelationshipDecisionInstant {
@@ -170,6 +177,7 @@ impl TrustedRelationshipDecisionInstant {
             transaction_id,
             operation_scope,
             scope,
+            TEST_AUTHENTICATED_ACTOR_DIGEST,
             durable_read_set_digest,
             observed_at,
         )
@@ -185,6 +193,7 @@ impl TrustedRelationshipDecisionInstant {
         Self::from_locked_traffic_scope(
             transaction_id,
             scope,
+            TEST_AUTHENTICATED_ACTOR_DIGEST,
             durable_read_set_digest,
             observed_at,
         )
@@ -195,10 +204,12 @@ impl TrustedRelationshipDecisionInstant {
         transaction_id: String,
         operation_scope: ProjectionOperationScope,
         scope: ProjectionScope,
+        authenticated_actor_digest: [u8; 32],
         durable_read_set_digest: [u8; 32],
         observed_at: DateTime<Utc>,
     ) -> Option<Self> {
         if !test_transaction_id_is_canonical(&transaction_id)
+            || authenticated_actor_digest == [0; 32]
             || durable_read_set_digest == [0; 32]
             || !relationship_operation_scope_matches(operation_scope, &scope)
         {
@@ -210,6 +221,7 @@ impl TrustedRelationshipDecisionInstant {
                 operation_scope,
                 scope,
             },
+            authenticated_actor_digest,
             durable_read_set_digest,
             observed_at,
         })
@@ -218,10 +230,12 @@ impl TrustedRelationshipDecisionInstant {
     pub(crate) fn from_locked_traffic_scope(
         transaction_id: String,
         scope: TrafficGraphScope,
+        authenticated_actor_digest: [u8; 32],
         durable_read_set_digest: [u8; 32],
         observed_at: DateTime<Utc>,
     ) -> Option<Self> {
         if !test_transaction_id_is_canonical(&transaction_id)
+            || authenticated_actor_digest == [0; 32]
             || durable_read_set_digest == [0; 32]
             || plan_traffic_graph(&scope.actor, &scope.members).is_err()
         {
@@ -230,6 +244,7 @@ impl TrustedRelationshipDecisionInstant {
         Some(Self {
             transaction_id,
             scope: TrustedRelationshipDecisionScope::Traffic(scope),
+            authenticated_actor_digest,
             durable_read_set_digest,
             observed_at,
         })
@@ -270,6 +285,7 @@ impl TrustedRelationshipDecisionInstant {
 
     fn binding_is_valid(&self) -> bool {
         test_transaction_id_is_canonical(&self.transaction_id)
+            && self.authenticated_actor_digest != [0; 32]
             && self.durable_read_set_digest != [0; 32]
     }
 }
@@ -2893,17 +2909,11 @@ pub(crate) fn hydrate_persisted_relationship_projection<
     let load_guard =
         RelationshipProjectionLoadGuard::for_test(values.operation_scope, values.scope.clone());
     match values.evidence_kind {
-        EvidenceKind::Live => hydrate_persisted_live_relationship_projection(
-            values,
-            load_guard,
-            authority,
-            decision,
-        ),
+        EvidenceKind::Live => {
+            hydrate_persisted_live_relationship_projection(values, load_guard, authority, decision)
+        }
         EvidenceKind::Fallback => hydrate_persisted_fallback_relationship_projection(
-            values,
-            load_guard,
-            authority,
-            decision,
+            values, load_guard, authority, decision,
         ),
     }
 }
@@ -3030,12 +3040,9 @@ pub(crate) fn hydrate_persisted_traffic_projection<
         EvidenceKind::Live => {
             hydrate_persisted_live_traffic_projection(values, load_guard, authority, decision)
         }
-        EvidenceKind::Fallback => hydrate_persisted_fallback_traffic_projection(
-            values,
-            load_guard,
-            authority,
-            decision,
-        ),
+        EvidenceKind::Fallback => {
+            hydrate_persisted_fallback_traffic_projection(values, load_guard, authority, decision)
+        }
     }
 }
 
@@ -4259,12 +4266,12 @@ pub fn consume_admission_projection<T: PublicTransport>(
     let expected_scope = ProjectionScope::Admission(expected_request.clone());
     if !decision.relationship_scope_matches(expected_operation_scope, &expected_scope)
         || !admission_fence_valid_at(
-        projection,
-        expected_operation_scope,
-        expected_request,
-        authority,
-        decision.datetime(),
-    )
+            projection,
+            expected_operation_scope,
+            expected_request,
+            authority,
+            decision.datetime(),
+        )
     {
         return Err(PolicyDenial::RelationshipPolicyUnavailable);
     }
@@ -4334,11 +4341,7 @@ fn admission_fence_valid_at<T: PublicTransport>(
         || projection.config_fingerprint != authority.config.fingerprint
         || projection.source_identity != authority.source_identity
         || projection.projection_revision == 0
-        || !fresh_window(
-            projection.started_at,
-            projection.completed_at,
-            observed_at,
-        )
+        || !fresh_window(projection.started_at, projection.completed_at, observed_at)
     {
         return false;
     }
@@ -4483,12 +4486,12 @@ pub fn consume_block_projection<T: PublicTransport>(
     };
     if !decision.relationship_scope_matches(expected_operation_scope, &expected_scope)
         || !block_projection_fence_valid_at(
-        projection,
-        expected_operation_scope,
-        expected_roster,
-        authority,
-        decision.datetime(),
-    )
+            projection,
+            expected_operation_scope,
+            expected_roster,
+            authority,
+            decision.datetime(),
+        )
     {
         return Err(PolicyDenial::RelationshipPolicyUnavailable);
     }
@@ -4523,11 +4526,7 @@ fn block_projection_fence_valid_at<T: PublicTransport>(
         || projection.source_identity != authority.source_identity
         || projection.projection_revision == 0
         || !projection.declarations.is_empty()
-        || !fresh_window(
-            projection.started_at,
-            projection.completed_at,
-            observed_at,
-        )
+        || !fresh_window(projection.started_at, projection.completed_at, observed_at)
         || projection.graph_batches.len() != plan.requests.len()
     {
         return false;
@@ -4631,11 +4630,7 @@ fn traffic_projection_fence_valid_at<T: PublicTransport>(
         || projection.config_fingerprint != authority.config.fingerprint
         || projection.source_identity != authority.source_identity
         || projection.projection_revision == 0
-        || !fresh_window(
-            projection.started_at,
-            projection.completed_at,
-            observed_at,
-        )
+        || !fresh_window(projection.started_at, projection.completed_at, observed_at)
         || projection.graph_batches.len() != plan.requests.len()
     {
         return false;
@@ -4803,7 +4798,13 @@ mod projection_integrity_tests {
                 ProjectionOperationScope::Creation,
                 request,
                 &authority,
-                &trusted_at(projection.completed_at),
+                &TrustedRelationshipDecisionInstant::for_test_relationship(
+                    "4242".to_owned(),
+                    ProjectionOperationScope::Creation,
+                    ProjectionScope::Admission(request.clone()),
+                    [0x91; 32],
+                    projection.completed_at,
+                ),
                 false,
             ),
             Err(PolicyDenial::RelationshipPolicyUnavailable)
@@ -4821,7 +4822,13 @@ mod projection_integrity_tests {
                 ProjectionOperationScope::Creation,
                 &request,
                 &authority,
-                &trusted_at(projection.completed_at),
+                &TrustedRelationshipDecisionInstant::for_test_relationship(
+                    "4242".to_owned(),
+                    ProjectionOperationScope::Creation,
+                    ProjectionScope::Admission(request.clone()),
+                    [0x91; 32],
+                    projection.completed_at,
+                ),
                 false,
             ),
             Ok(())
@@ -4918,7 +4925,13 @@ mod projection_integrity_tests {
             assert!(hydrate_persisted_relationship_projection(
                 values,
                 &authority,
-                &trusted_at(changed.completed_at),
+                &TrustedRelationshipDecisionInstant::for_test_relationship(
+                    "4242".to_owned(),
+                    changed.operation_scope,
+                    changed.scope.clone(),
+                    [0x91; 32],
+                    changed.completed_at,
+                ),
             )
             .is_err());
         }
@@ -5014,10 +5027,13 @@ mod projection_integrity_tests {
         assert_eq!(
             consume_traffic_projection(
                 &duplicate,
-                &duplicate.scope.actor,
-                &duplicate.scope.members,
                 &authority,
-                &trusted_at(duplicate.completed_at),
+                &TrustedRelationshipDecisionInstant::for_test_traffic(
+                    "4242".to_owned(),
+                    duplicate.scope.clone(),
+                    [0x91; 32],
+                    duplicate.completed_at,
+                ),
             ),
             Err(PolicyDenial::RelationshipPolicyUnavailable)
         );
@@ -5026,10 +5042,13 @@ mod projection_integrity_tests {
         assert_eq!(
             consume_traffic_projection(
                 &unique,
-                &unique.scope.actor,
-                &unique.scope.members,
                 &authority,
-                &trusted_at(unique.completed_at),
+                &TrustedRelationshipDecisionInstant::for_test_traffic(
+                    "4242".to_owned(),
+                    unique.scope.clone(),
+                    [0x91; 32],
+                    unique.completed_at,
+                ),
             ),
             Ok(())
         );

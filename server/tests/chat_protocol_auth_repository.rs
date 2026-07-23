@@ -6,6 +6,9 @@
 mod common;
 
 #[allow(dead_code)]
+#[path = "../src/chat_protocol/cursor.rs"]
+mod cursor;
+#[allow(dead_code)]
 #[path = "../src/chat_protocol/dpop.rs"]
 mod dpop;
 #[allow(dead_code)]

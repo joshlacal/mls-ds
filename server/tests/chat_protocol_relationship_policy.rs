@@ -1709,7 +1709,7 @@ async fn persisted_graph_rows_regroup_only_as_the_exact_canonical_batches() {
         expected_scope.members[1..].iter().collect::<Vec<_>>()
     );
 
-    let rejects = |candidate: PersistedTrafficProjection| {
+    let rejects = |candidate: SealedTrafficProjection| {
         let decision = traffic_decision_at(candidate.scope.clone(), live.completed_at());
         assert!(hydrate_persisted_traffic_projection(candidate, &source, &decision,).is_err());
     };
@@ -1768,7 +1768,7 @@ async fn persisted_projection_rejects_rehashed_noncanonical_or_mismatched_metada
     let values = live
         .export_persisted(&source, &persistence_at(live.completed_at()))
         .unwrap();
-    let rejects = |candidate: PersistedRelationshipProjection| {
+    let rejects = |candidate: SealedRelationshipProjection| {
         let decision = relationship_decision_at(
             candidate.operation_scope,
             candidate.scope.clone(),

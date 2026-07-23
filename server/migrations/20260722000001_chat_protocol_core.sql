@@ -1003,6 +1003,12 @@ CREATE UNIQUE INDEX participants_one_current_uq
 CREATE INDEX participants_live_inviter_recipient_idx
     ON chat.participants (created_by_did, user_did, invited_at)
     WHERE current_membership AND status = 'pending';
+-- Supports the per-recipient live-pending invitation quota scope (limit 3):
+-- the inviter-recipient index above leads with created_by_did and cannot serve
+-- a recipient-only (user_did) scan.
+CREATE INDEX participants_live_recipient_idx
+    ON chat.participants (user_did, invited_at)
+    WHERE current_membership AND status = 'pending';
 
 CREATE TABLE chat.member_devices (
     leaf_period_id UUID PRIMARY KEY,
@@ -1512,6 +1518,14 @@ CREATE TABLE chat.leaf_recovery_requests (
     ) DEFERRABLE INITIALLY DEFERRED,
     CONSTRAINT leaf_recovery_requests_terminal_request_uq UNIQUE (
         recovery_request_id, terminal_request_digest, terminal_at
+    ),
+    -- Referenced by inventory_recovery_items_request_source_fk (inventory-1) so a
+    -- leafRecoveryRequest inventory item is bound to the exact requesting device
+    -- of its source request. recovery_request_id is already the PK, so this is a
+    -- superkey unique that simply exposes the (request, requester device) tuple
+    -- as a composite FK target.
+    CONSTRAINT leaf_recovery_requests_requester_identity_uq UNIQUE (
+        recovery_request_id, requester_did, requester_device_id
     )
 );
 
@@ -1535,6 +1549,11 @@ ALTER TABLE chat.key_package_reservations
 CREATE UNIQUE INDEX leaf_recovery_requests_one_open_uq
     ON chat.leaf_recovery_requests (conversation_id, generation, requester_did, requester_device_id)
     WHERE status = 'open';
+-- Non-partial index for all-status exact-device lookups. The unique index above
+-- is partial (status = 'open') so terminal-row (fulfilled/cancelled/expired/
+-- superseded) lookups by exact requester device would otherwise seq-scan.
+CREATE INDEX leaf_recovery_requests_device_all_status_idx
+    ON chat.leaf_recovery_requests (requester_did, requester_device_id, status, requested_at);
 
 CREATE TABLE chat.leave_requests (
     leave_request_id UUID PRIMARY KEY,
@@ -1927,7 +1946,8 @@ BEGIN
      WHERE projection_id = target_projection;
 
     IF snapshot_row.source_call_count <> graph_call_count + declaration_count * 2
-       OR (snapshot_row.operation_scope = 'traffic' AND declaration_count <> 0)
+       OR (snapshot_row.operation_scope IN ('traffic','recoveryReservation','recoveryFulfillment')
+           AND declaration_count <> 0)
        OR EXISTS (
             SELECT 1
              FROM chat.relationship_projection_relationships relation
@@ -2973,6 +2993,81 @@ CREATE CONSTRAINT TRIGGER key_packages_live_limit_deferred
 AFTER INSERT OR UPDATE OF status ON chat.key_packages
 DEFERRABLE INITIALLY DEFERRED
 FOR EACH ROW EXECUTE FUNCTION chat.enforce_live_key_package_limit();
+
+CREATE FUNCTION chat.enforce_invitation_quota()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    pair_live_count BIGINT;
+    inviter_recent_count BIGINT;
+    recipient_live_count BIGINT;
+BEGIN
+    -- Only newly created live pending invitations consume invitation quota. A
+    -- live pending invitation is (current_membership AND status = 'pending').
+    -- Acceptance (pending -> active), removal, or close can only release live
+    -- counts, never add, so no UPDATE path needs to be guarded here.
+    IF NOT (NEW.current_membership AND NEW.status = 'pending') THEN
+        RETURN NEW;
+    END IF;
+
+    -- Serialize concurrent invitation inserts against the inviter and recipient
+    -- principals so the deferred counts below are race-free (mirrors the
+    -- FOR UPDATE parent-lock pattern used by the device/key-package limits).
+    -- Locking in canonical DID order keeps acquisition deterministic and
+    -- deadlock-free when two transactions touch the same DIDs in opposite roles.
+    PERFORM 1 FROM chat.principals
+     WHERE user_did IN (NEW.created_by_did, NEW.user_did)
+     ORDER BY user_did
+     FOR UPDATE;
+
+    -- Limit 1: at most 5 live pending invitations per (inviterDid, recipientDid)
+    -- pair, across all conversations.
+    SELECT count(*) INTO pair_live_count
+      FROM chat.participants
+     WHERE created_by_did = NEW.created_by_did
+       AND user_did = NEW.user_did
+       AND current_membership
+       AND status = 'pending';
+    IF pair_live_count > 5 THEN
+        RAISE EXCEPTION 'invitation limit reached: at most 5 live pending invitations per (inviter, recipient) pair'
+            USING ERRCODE = '23514';
+    END IF;
+
+    -- Limit 2: at most 100 newly created pending invitations per inviter in a
+    -- rolling 24 hours. This is a creation-rate cap, so it counts every
+    -- invitation row this inviter created in the window regardless of current
+    -- status (acceptance or removal does not refund the daily creation budget).
+    SELECT count(*) INTO inviter_recent_count
+      FROM chat.participants
+     WHERE created_by_did = NEW.created_by_did
+       AND invitation_transition_id IS NOT NULL
+       AND created_at >= now() - INTERVAL '24 hours';
+    IF inviter_recent_count > 100 THEN
+        RAISE EXCEPTION 'invitation limit reached: at most 100 newly created pending invitations per inviter per rolling 24h'
+            USING ERRCODE = '23514';
+    END IF;
+
+    -- Limit 3: at most 100 live pending invitations per recipient, across all
+    -- conversations.
+    SELECT count(*) INTO recipient_live_count
+      FROM chat.participants
+     WHERE user_did = NEW.user_did
+       AND current_membership
+       AND status = 'pending';
+    IF recipient_live_count > 100 THEN
+        RAISE EXCEPTION 'invitation limit reached: at most 100 live pending invitations per recipient'
+            USING ERRCODE = '23514';
+    END IF;
+
+    RETURN NEW;
+END
+$$;
+
+CREATE CONSTRAINT TRIGGER participants_invitation_quota_deferred
+AFTER INSERT ON chat.participants
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION chat.enforce_invitation_quota();
 
 CREATE FUNCTION chat.enforce_conversation_pointer_agreement()
 RETURNS trigger

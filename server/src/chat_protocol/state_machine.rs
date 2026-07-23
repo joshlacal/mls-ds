@@ -4134,7 +4134,15 @@ fn device_revocation_row_digest(evidence: &DeviceRevocationEvidence) -> [u8; 32]
 fn validate_device_revocation_evidence(evidence: &DeviceRevocationEvidence) -> bool {
     is_uuid_v4(&evidence.revocation_id)
         && evidence.actor.principal() == evidence.target.principal()
-        && evidence.actor.device_id() != evidence.target.device_id()
+        // Self-revoke (actor device == target device) is a first-class spec
+        // operation (CHAT_PROTOCOL.md L56: "Completed first-enroll, self-revoke,
+        // and rebind operations have one narrow response-loss path"), and the DB
+        // schema accepts it (device_revocations positive fixture, and
+        // assert_device_revocation_mapping's actor.revoked_at >= accepted_at
+        // tolerance). Same-DID is already required above; both self-revoke and
+        // sibling-revoke are permitted. Do NOT reintroduce an actor != target
+        // requirement — it makes a single-device user unable to revoke their only
+        // device and contradicts the DB authority.
         && evidence.actor_key_id != [0; 32]
         && evidence.actor_auth_generation > 0
         && evidence.actor_auth_generation <= MAX_PROTOCOL_INTEGER

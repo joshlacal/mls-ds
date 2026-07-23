@@ -422,19 +422,12 @@ impl LockedTrafficFallbackScope {
         scope: TrafficGraphScope,
         durable_read_set_digest: [u8; 32],
     ) -> Self {
-        Self::from_locked_read_set(
-            transaction_id,
-            scope,
-            [0xA2; 32],
-            durable_read_set_digest,
-        )
+        Self::from_locked_read_set(transaction_id, scope, [0xA2; 32], durable_read_set_digest)
             .expect("valid test traffic read-set witness")
     }
 
     #[cfg(test)]
-    pub(crate) fn parts_for_test(
-        &self,
-    ) -> (&str, &TrafficGraphScope, &[u8; 32], &[u8; 32]) {
+    pub(crate) fn parts_for_test(&self) -> (&str, &TrafficGraphScope, &[u8; 32], &[u8; 32]) {
         (
             &self.transaction_id,
             &self.scope,
@@ -449,13 +442,7 @@ pub(crate) fn seal_group_creation_fallback_scope(
     quota: &LockedInvitationQuotaGuard,
     registration: &LockedRegistrationProjection,
 ) -> Result<LockedRelationshipFallbackScope, RelationshipRepositoryError> {
-    seal_creation_fallback_scope(
-        head,
-        quota,
-        registration,
-        AdmissionOperation::Group,
-        None,
-    )
+    seal_creation_fallback_scope(head, quota, registration, AdmissionOperation::Group, None)
 }
 
 pub(crate) fn seal_direct_creation_fallback_scope(
@@ -721,9 +708,7 @@ pub(crate) fn seal_traffic_fallback_scope(
     registration: &LockedRegistrationProjection,
 ) -> Result<LockedTrafficFallbackScope, RelationshipRepositoryError> {
     let head = locked.head();
-    if head.durable_row_digest() == &[0; 32]
-        || locked.locked_graph_digest() == &[0; 32]
-    {
+    if head.durable_row_digest() == &[0; 32] || locked.locked_graph_digest() == &[0; 32] {
         return Err(RelationshipRepositoryError::InvalidProjection);
     }
     let actor = authenticated_registration_actor(
@@ -993,8 +978,7 @@ pub(crate) async fn observe_locked_relationship_decision(
         scope,
         authenticated_actor_digest,
         durable_read_set_digest,
-    ) =
-        locked_scope.into_parts();
+    ) = locked_scope.into_parts();
     require_witness_transaction(transaction, &transaction_id).await?;
     let observed_at = observe_post_lock_time(transaction).await?;
     TrustedRelationshipDecisionInstant::from_locked_relationship_scope(
@@ -1045,8 +1029,7 @@ pub(crate) async fn load_fallback_relationship_projection<T: PublicTransport>(
         scope,
         authenticated_actor_digest,
         durable_read_set_digest,
-    ) =
-        locked_scope.into_parts();
+    ) = locked_scope.into_parts();
     require_witness_transaction(transaction, &transaction_id).await?;
     if durable_read_set_digest == [0; 32] {
         return Err(RelationshipRepositoryError::InvalidProjection);

@@ -1261,6 +1261,14 @@ CREATE TABLE chat.application_schedule_terminal_proofs (
     CONSTRAINT application_schedule_terminal_proofs_transition_id_check CHECK (chat.is_uuid_v4(transition_id)),
     CONSTRAINT application_schedule_terminal_proofs_fingerprint_check CHECK (
         octet_length(outer_entry_fingerprint) = 32
+    ),
+    -- Full-tuple uniqueness (inventory-1) so a materialized conversation
+    -- inventory item can carry a 6-column composite FK to the exact typed
+    -- schedule-terminal proof (recipient + terminal seq + transition +
+    -- fingerprint). The 3-column PK alone cannot be an FK target for it.
+    CONSTRAINT application_schedule_terminal_proofs_full_uq UNIQUE (
+        conversation_id, recipient_did, recipient_device_id,
+        terminal_seq, transition_id, outer_entry_fingerprint
     )
 );
 
@@ -1376,7 +1384,13 @@ CREATE TABLE chat.welcome_deliveries (
         (status = 'pending' AND terminal_at IS NULL)
         OR (status = 'expired' AND terminal_at = expires_at)
         OR (status IN ('acknowledged','rejected','superseded')
-            AND terminal_at IS NOT NULL AND terminal_at <= expires_at)
+            AND terminal_at IS NOT NULL AND terminal_at < expires_at)
+    ),
+    -- Referenced by inventory_welcome_items' source composite FK (inventory-1)
+    -- so each materialized Welcome item is bound to the delivery row for the
+    -- exact recipient device, not merely to a welcome_id.
+    CONSTRAINT welcome_deliveries_recipient_identity_uq UNIQUE (
+        welcome_id, recipient_did, recipient_device_id
     )
 );
 
@@ -1387,6 +1401,11 @@ CREATE INDEX welcome_deliveries_pending_device_idx
 CREATE INDEX welcome_deliveries_pending_global_expiry_idx
     ON chat.welcome_deliveries (expires_at, welcome_id)
     WHERE status = 'pending';
+
+-- Non-partial exact-device lookup across all statuses (inventory-6): the
+-- pending-only partials above cannot serve terminal-status inventory scans.
+CREATE INDEX welcome_deliveries_device_all_status_idx
+    ON chat.welcome_deliveries (recipient_did, recipient_device_id, status, expires_at, welcome_id);
 
 CREATE TABLE chat.welcome_dispositions (
     welcome_id UUID PRIMARY KEY,
@@ -1495,12 +1514,23 @@ CREATE TABLE chat.recovery_work_items (
             AND terminal_at >= created_at
             AND num_nonnulls(terminal_transition_id, terminal_revocation_id) = 1)
     ),
-    CONSTRAINT recovery_work_items_source_uq UNIQUE (source_id)
+    CONSTRAINT recovery_work_items_source_uq UNIQUE (source_id),
+    -- Referenced by inventory_recovery_items' recoveryWork source composite FK
+    -- (inventory-1): binds each materialized recovery-work item to the work row
+    -- for the exact recipient device.
+    CONSTRAINT recovery_work_items_recipient_identity_uq UNIQUE (
+        recovery_work_id, recipient_did, recipient_device_id
+    )
 );
 
 CREATE INDEX recovery_work_items_pending_device_idx
     ON chat.recovery_work_items (recipient_did, recipient_device_id, created_at, recovery_work_id)
     WHERE status = 'pending';
+
+-- Non-partial exact-device lookup across all statuses (inventory-6): mirrors
+-- welcome_deliveries_device_all_status_idx for the recovery inbox.
+CREATE INDEX recovery_work_items_device_all_status_idx
+    ON chat.recovery_work_items (recipient_did, recipient_device_id, status, created_at, recovery_work_id);
 
 CREATE TABLE chat.events (
     event_position BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -1986,7 +2016,10 @@ CREATE TABLE chat.inventory_sessions (
         AND octet_length(snapshot_event_cursor_sha256) = 32
         AND snapshot_event_cursor_sha256 = digest(snapshot_event_cursor_bytes, 'sha256')
     ),
-    CONSTRAINT inventory_sessions_expiry_check CHECK (expires_at > created_at),
+    CONSTRAINT inventory_sessions_expiry_check CHECK (
+        expires_at > created_at
+        AND expires_at <= created_at + INTERVAL '15 minutes'
+    ),
     CONSTRAINT inventory_sessions_completion_evidence_check CHECK (
         ((NOT conversations_complete AND conversation_item_count IS NULL
             AND conversation_items_sha256 IS NULL)
@@ -2011,13 +2044,30 @@ CREATE TABLE chat.inventory_sessions (
         inventory_session_id, user_did, device_id, jkt, auth_generation,
         snapshot_event_position, snapshot_event_cursor_bytes,
         snapshot_event_cursor_sha256
+    ),
+    -- Referenced by the per-item recipient composite FKs (inventory-1): binds
+    -- every materialized item row to the exact owning recipient device.
+    CONSTRAINT inventory_sessions_owner_identity_uq UNIQUE (
+        inventory_session_id, user_did, device_id
     )
 );
+
+-- Expired-session GC support (inventory-2): partial index over the expiry
+-- floor. expires_at is NOT NULL on this table, so the predicate is total, but
+-- it mirrors the outbox reclaim-index convention and keeps the GC scan tight.
+CREATE INDEX inventory_sessions_expiry_gc_idx
+    ON chat.inventory_sessions (expires_at, inventory_session_id)
+    WHERE expires_at IS NOT NULL;
 
 CREATE TABLE chat.inventory_conversation_items (
     inventory_session_id UUID NOT NULL,
     ordinal BIGINT NOT NULL,
     conversation_id UUID NOT NULL,
+    recipient_did TEXT NOT NULL,
+    recipient_device_id UUID NOT NULL,
+    schedule_terminal_transition_id UUID,
+    schedule_terminal_outer_entry_fingerprint BYTEA,
+    schedule_terminal_seq BIGINT,
     item_key_bytes BYTEA NOT NULL,
     payload_bytes BYTEA NOT NULL,
     payload_sha256 BYTEA NOT NULL,
@@ -2026,9 +2076,46 @@ CREATE TABLE chat.inventory_conversation_items (
         REFERENCES chat.inventory_sessions(inventory_session_id),
     CONSTRAINT inventory_conversation_items_conversation_fk FOREIGN KEY (conversation_id)
         REFERENCES chat.conversations(conversation_id),
+    CONSTRAINT inventory_conversation_items_recipient_device_fk
+        FOREIGN KEY (recipient_did, recipient_device_id)
+        REFERENCES chat.devices(user_did, device_id),
+    -- Bind each item to the exact owning recipient device of its session
+    -- (inventory-1). Prevents cross-device audience leakage into a snapshot.
+    CONSTRAINT inventory_conversation_items_recipient_session_fk
+        FOREIGN KEY (inventory_session_id, recipient_did, recipient_device_id)
+        REFERENCES chat.inventory_sessions(inventory_session_id, user_did, device_id),
+    -- Typed schedule-terminal proof binding (inventory-1): when the item
+    -- carries a schedule-terminal tuple it must reference the exact proof row
+    -- for this recipient/conversation. MATCH SIMPLE + all-or-none nullability
+    -- means the FK is only enforced when all three typed columns are present.
+    CONSTRAINT inventory_conversation_items_schedule_terminal_fk
+        FOREIGN KEY (
+            conversation_id, recipient_did, recipient_device_id,
+            schedule_terminal_seq, schedule_terminal_transition_id,
+            schedule_terminal_outer_entry_fingerprint
+        )
+        REFERENCES chat.application_schedule_terminal_proofs (
+            conversation_id, recipient_did, recipient_device_id,
+            terminal_seq, transition_id, outer_entry_fingerprint
+        ) MATCH SIMPLE DEFERRABLE INITIALLY DEFERRED,
     CONSTRAINT inventory_conversation_items_session_id_check CHECK (chat.is_uuid_v4(inventory_session_id)),
     CONSTRAINT inventory_conversation_items_ordinal_check CHECK (chat.is_safe_integer(ordinal)),
     CONSTRAINT inventory_conversation_items_conversation_id_check CHECK (chat.is_uuid_v4(conversation_id)),
+    CONSTRAINT inventory_conversation_items_recipient_did_check CHECK (chat.is_bare_did(recipient_did)),
+    CONSTRAINT inventory_conversation_items_recipient_device_check CHECK (chat.is_uuid_v4(recipient_device_id)),
+    CONSTRAINT inventory_conversation_items_schedule_terminal_shape_check CHECK (
+        num_nonnulls(
+            schedule_terminal_transition_id,
+            schedule_terminal_outer_entry_fingerprint,
+            schedule_terminal_seq
+        ) IN (0, 3)
+        AND (schedule_terminal_transition_id IS NULL
+             OR chat.is_uuid_v4(schedule_terminal_transition_id))
+        AND (schedule_terminal_outer_entry_fingerprint IS NULL
+             OR octet_length(schedule_terminal_outer_entry_fingerprint) = 32)
+        AND (schedule_terminal_seq IS NULL
+             OR (chat.is_safe_integer(schedule_terminal_seq) AND schedule_terminal_seq >= 1))
+    ),
     CONSTRAINT inventory_conversation_items_payload_hash_check CHECK (
         octet_length(item_key_bytes) = 16
         AND item_key_bytes = uuid_send(conversation_id)
@@ -2047,6 +2134,8 @@ CREATE TABLE chat.inventory_welcome_items (
     inventory_session_id UUID NOT NULL,
     ordinal BIGINT NOT NULL,
     welcome_id UUID NOT NULL,
+    recipient_did TEXT NOT NULL,
+    recipient_device_id UUID NOT NULL,
     item_key_bytes BYTEA NOT NULL,
     payload_bytes BYTEA NOT NULL,
     payload_sha256 BYTEA NOT NULL,
@@ -2055,9 +2144,23 @@ CREATE TABLE chat.inventory_welcome_items (
         REFERENCES chat.inventory_sessions(inventory_session_id),
     CONSTRAINT inventory_welcome_items_welcome_fk FOREIGN KEY (welcome_id)
         REFERENCES chat.welcome_deliveries(welcome_id),
+    CONSTRAINT inventory_welcome_items_recipient_device_fk
+        FOREIGN KEY (recipient_did, recipient_device_id)
+        REFERENCES chat.devices(user_did, device_id),
+    -- Bind item to the owning recipient device of its session (inventory-1).
+    CONSTRAINT inventory_welcome_items_recipient_session_fk
+        FOREIGN KEY (inventory_session_id, recipient_did, recipient_device_id)
+        REFERENCES chat.inventory_sessions(inventory_session_id, user_did, device_id),
+    -- Bind item to its source delivery row for the exact recipient device
+    -- (inventory-1): the delivery must actually target this device.
+    CONSTRAINT inventory_welcome_items_source_fk
+        FOREIGN KEY (welcome_id, recipient_did, recipient_device_id)
+        REFERENCES chat.welcome_deliveries(welcome_id, recipient_did, recipient_device_id),
     CONSTRAINT inventory_welcome_items_session_id_check CHECK (chat.is_uuid_v4(inventory_session_id)),
     CONSTRAINT inventory_welcome_items_ordinal_check CHECK (chat.is_safe_integer(ordinal)),
     CONSTRAINT inventory_welcome_items_welcome_id_check CHECK (chat.is_uuid_v4(welcome_id)),
+    CONSTRAINT inventory_welcome_items_recipient_did_check CHECK (chat.is_bare_did(recipient_did)),
+    CONSTRAINT inventory_welcome_items_recipient_device_check CHECK (chat.is_uuid_v4(recipient_device_id)),
     CONSTRAINT inventory_welcome_items_payload_hash_check CHECK (
         octet_length(item_key_bytes) = 16
         AND item_key_bytes = uuid_send(welcome_id)
@@ -2078,6 +2181,8 @@ CREATE TABLE chat.inventory_recovery_items (
     item_kind TEXT NOT NULL,
     leaf_recovery_request_id UUID,
     recovery_work_id UUID,
+    recipient_did TEXT NOT NULL,
+    recipient_device_id UUID NOT NULL,
     item_key_bytes BYTEA NOT NULL,
     payload_bytes BYTEA NOT NULL,
     payload_sha256 BYTEA NOT NULL,
@@ -2090,8 +2195,34 @@ CREATE TABLE chat.inventory_recovery_items (
     CONSTRAINT inventory_recovery_items_work_fk FOREIGN KEY (recovery_work_id)
         REFERENCES chat.recovery_work_items(recovery_work_id)
         DEFERRABLE INITIALLY DEFERRED,
+    CONSTRAINT inventory_recovery_items_recipient_device_fk
+        FOREIGN KEY (recipient_did, recipient_device_id)
+        REFERENCES chat.devices(user_did, device_id),
+    -- Bind item to the owning recipient device of its session (inventory-1).
+    CONSTRAINT inventory_recovery_items_recipient_session_fk
+        FOREIGN KEY (inventory_session_id, recipient_did, recipient_device_id)
+        REFERENCES chat.inventory_sessions(inventory_session_id, user_did, device_id),
+    -- Bind each recovery item to its source row for the exact recipient device
+    -- (inventory-1). Both FKs are MATCH SIMPLE so each is enforced only for its
+    -- own arm (the other arm's source id is NULL): the recoveryWork arm binds
+    -- (recovery_work_id, recipient_did, recipient_device_id) to its work row, and
+    -- the leafRecoveryRequest arm binds (leaf_recovery_request_id, recipient_did,
+    -- recipient_device_id) to the exact requesting device of its request via
+    -- leaf_recovery_requests_requester_identity_uq.
+    CONSTRAINT inventory_recovery_items_work_source_fk
+        FOREIGN KEY (recovery_work_id, recipient_did, recipient_device_id)
+        REFERENCES chat.recovery_work_items(
+            recovery_work_id, recipient_did, recipient_device_id
+        ) MATCH SIMPLE DEFERRABLE INITIALLY DEFERRED,
+    CONSTRAINT inventory_recovery_items_request_source_fk
+        FOREIGN KEY (leaf_recovery_request_id, recipient_did, recipient_device_id)
+        REFERENCES chat.leaf_recovery_requests(
+            recovery_request_id, requester_did, requester_device_id
+        ) MATCH SIMPLE DEFERRABLE INITIALLY DEFERRED,
     CONSTRAINT inventory_recovery_items_session_id_check CHECK (chat.is_uuid_v4(inventory_session_id)),
     CONSTRAINT inventory_recovery_items_ordinal_check CHECK (chat.is_safe_integer(ordinal)),
+    CONSTRAINT inventory_recovery_items_recipient_did_check CHECK (chat.is_bare_did(recipient_did)),
+    CONSTRAINT inventory_recovery_items_recipient_device_check CHECK (chat.is_uuid_v4(recipient_device_id)),
     CONSTRAINT inventory_recovery_items_kind_check CHECK (
         item_kind IN ('leafRecoveryRequest','recoveryWork')
     ),
@@ -2150,26 +2281,64 @@ CREATE TABLE chat.device_inventory_sessions (
         chat.is_safe_integer(auth_generation) AND auth_generation >= 1
     ),
     CONSTRAINT device_inventory_sessions_fence_revision_check CHECK (chat.is_safe_integer(fence_revision)),
-    CONSTRAINT device_inventory_sessions_expiry_check CHECK (expires_at > created_at),
+    CONSTRAINT device_inventory_sessions_expiry_check CHECK (
+        expires_at > created_at
+        AND expires_at <= created_at + INTERVAL '15 minutes'
+    ),
     CONSTRAINT device_inventory_sessions_completion_evidence_check CHECK (
         (NOT complete AND item_count IS NULL AND items_sha256 IS NULL)
         OR (complete AND item_count IS NOT NULL AND chat.is_safe_integer(item_count)
             AND items_sha256 IS NOT NULL AND octet_length(items_sha256) = 32)
+    ),
+    -- Referenced by device_inventory_items' requester composite FK (inventory-1)
+    -- so each item is bound to the exact requesting device of its session.
+    CONSTRAINT device_inventory_sessions_owner_identity_uq UNIQUE (
+        device_inventory_session_id, user_did, device_id
     )
 );
+
+-- Expired-session GC support (inventory-2), mirroring inventory_sessions.
+CREATE INDEX device_inventory_sessions_expiry_gc_idx
+    ON chat.device_inventory_sessions (expires_at, device_inventory_session_id)
+    WHERE expires_at IS NOT NULL;
 
 CREATE TABLE chat.device_inventory_items (
     device_inventory_session_id UUID NOT NULL,
     ordinal BIGINT NOT NULL,
     subject_device_id UUID NOT NULL,
+    requester_did TEXT NOT NULL,
+    requester_device_id UUID NOT NULL,
+    recipient_did TEXT NOT NULL,
+    recipient_device_id UUID NOT NULL,
     payload_bytes BYTEA NOT NULL,
     payload_sha256 BYTEA NOT NULL,
     PRIMARY KEY (device_inventory_session_id, ordinal),
     CONSTRAINT device_inventory_items_session_fk FOREIGN KEY (device_inventory_session_id)
         REFERENCES chat.device_inventory_sessions(device_inventory_session_id),
+    -- Bind item to the exact requesting device of its session (inventory-1).
+    CONSTRAINT device_inventory_items_requester_session_fk
+        FOREIGN KEY (device_inventory_session_id, requester_did, requester_device_id)
+        REFERENCES chat.device_inventory_sessions(
+            device_inventory_session_id, user_did, device_id
+        ),
+    -- The described (recipient) device must be a real device; the CHECKs below
+    -- pin it to the item's subject and to the requester's principal.
+    CONSTRAINT device_inventory_items_recipient_device_fk
+        FOREIGN KEY (recipient_did, recipient_device_id)
+        REFERENCES chat.devices(user_did, device_id),
     CONSTRAINT device_inventory_items_session_id_check CHECK (chat.is_uuid_v4(device_inventory_session_id)),
     CONSTRAINT device_inventory_items_ordinal_check CHECK (chat.is_safe_integer(ordinal)),
     CONSTRAINT device_inventory_items_subject_device_check CHECK (chat.is_uuid_v4(subject_device_id)),
+    CONSTRAINT device_inventory_items_requester_did_check CHECK (chat.is_bare_did(requester_did)),
+    CONSTRAINT device_inventory_items_requester_device_check CHECK (chat.is_uuid_v4(requester_device_id)),
+    CONSTRAINT device_inventory_items_recipient_did_check CHECK (chat.is_bare_did(recipient_did)),
+    CONSTRAINT device_inventory_items_recipient_device_check CHECK (chat.is_uuid_v4(recipient_device_id)),
+    -- Same principal for requester and recipient, and the recipient identifies
+    -- the exact subject device the item describes (inventory-1).
+    CONSTRAINT device_inventory_items_principal_binding_check CHECK (
+        recipient_did = requester_did
+        AND recipient_device_id = subject_device_id
+    ),
     CONSTRAINT device_inventory_items_payload_hash_check CHECK (
         octet_length(payload_bytes) BETWEEN 1 AND 16777216
         AND octet_length(payload_sha256) = 32 AND payload_sha256 = digest(payload_bytes, 'sha256')
@@ -2227,7 +2396,7 @@ CREATE TABLE chat.subscription_tickets (
         AND expires_at <= created_at + INTERVAL '60 seconds'
     ),
     CONSTRAINT subscription_tickets_consumption_check CHECK (
-        consumed_at IS NULL OR consumed_at BETWEEN created_at AND expires_at
+        consumed_at IS NULL OR (consumed_at >= created_at AND consumed_at < expires_at)
     )
 );
 
@@ -2442,6 +2611,68 @@ BEGIN
      FOR UPDATE;
     IF NOT FOUND THEN RETURN; END IF;
 
+    -- Exact recipient binding (inventory-1): every materialized item across all
+    -- three domains must join its session's owning device. The join is explicit
+    -- (not a scalar inequality against the cached session_row) so materialization
+    -- verifies the session/device relationship structurally; an item that fails
+    -- to join its session on the exact {recipient_did, recipient_device_id} drops
+    -- to a NULL session and trips this guard.
+    IF EXISTS (
+        SELECT 1
+          FROM chat.inventory_conversation_items item
+          LEFT JOIN chat.inventory_sessions session
+            ON session.inventory_session_id = item.inventory_session_id
+           AND item.recipient_did = session.user_did
+           AND item.recipient_device_id = session.device_id
+         WHERE item.inventory_session_id = target_session
+           AND session.inventory_session_id IS NULL
+    ) OR EXISTS (
+        SELECT 1
+          FROM chat.inventory_welcome_items item
+          LEFT JOIN chat.inventory_sessions session
+            ON session.inventory_session_id = item.inventory_session_id
+           AND item.recipient_did = session.user_did
+           AND item.recipient_device_id = session.device_id
+         WHERE item.inventory_session_id = target_session
+           AND session.inventory_session_id IS NULL
+    ) OR EXISTS (
+        SELECT 1
+          FROM chat.inventory_recovery_items item
+          LEFT JOIN chat.inventory_sessions session
+            ON session.inventory_session_id = item.inventory_session_id
+           AND item.recipient_did = session.user_did
+           AND item.recipient_device_id = session.device_id
+         WHERE item.inventory_session_id = target_session
+           AND session.inventory_session_id IS NULL
+    ) THEN
+        RAISE EXCEPTION 'inventory item recipient binding mismatch'
+            USING ERRCODE = '23514';
+    END IF;
+
+    -- Typed schedule-terminal proof binding (inventory-1): any conversation
+    -- item carrying a schedule-terminal tuple must join a real proof row for
+    -- this exact recipient/conversation. The join binds every proof coordinate
+    -- (terminal_seq, transition_id, outer fingerprint); a tuple that fails to
+    -- join its source proof drops to a NULL proof and trips this guard.
+    IF EXISTS (
+        SELECT 1
+          FROM chat.inventory_conversation_items item
+          LEFT JOIN chat.application_schedule_terminal_proofs proof
+            ON proof.conversation_id = item.conversation_id
+           AND proof.recipient_did = item.recipient_did
+           AND proof.recipient_device_id = item.recipient_device_id
+           AND proof.terminal_seq = item.schedule_terminal_seq
+           AND proof.transition_id = item.schedule_terminal_transition_id
+           AND proof.outer_entry_fingerprint
+               = item.schedule_terminal_outer_entry_fingerprint
+         WHERE item.inventory_session_id = target_session
+           AND item.schedule_terminal_seq IS NOT NULL
+           AND proof.conversation_id IS NULL
+    ) THEN
+        RAISE EXCEPTION 'conversation inventory schedule terminal proof missing'
+            USING ERRCODE = '23514';
+    END IF;
+
     SELECT count(*), min(ordinal), max(ordinal),
            digest(COALESCE(string_agg(
                int8send(ordinal) || uuid_send(conversation_id)
@@ -2520,20 +2751,12 @@ AFTER INSERT OR UPDATE OR DELETE ON chat.inventory_sessions
 DEFERRABLE INITIALLY DEFERRED
 FOR EACH ROW EXECUTE FUNCTION chat.enforce_inventory_materialization();
 
-CREATE CONSTRAINT TRIGGER inventory_conversation_items_materialization_deferred
-AFTER INSERT OR UPDATE OR DELETE ON chat.inventory_conversation_items
-DEFERRABLE INITIALLY DEFERRED
-FOR EACH ROW EXECUTE FUNCTION chat.enforce_inventory_materialization();
-
-CREATE CONSTRAINT TRIGGER inventory_welcome_items_materialization_deferred
-AFTER INSERT OR UPDATE OR DELETE ON chat.inventory_welcome_items
-DEFERRABLE INITIALLY DEFERRED
-FOR EACH ROW EXECUTE FUNCTION chat.enforce_inventory_materialization();
-
-CREATE CONSTRAINT TRIGGER inventory_recovery_items_materialization_deferred
-AFTER INSERT OR UPDATE OR DELETE ON chat.inventory_recovery_items
-DEFERRABLE INITIALLY DEFERRED
-FOR EACH ROW EXECUTE FUNCTION chat.enforce_inventory_materialization();
+-- Per-item materialization constraint triggers intentionally omitted
+-- (inventory-3): the session-level trigger above runs the whole-session
+-- materialization check once at completion, and per-row integrity is already
+-- covered by each item table's PK/UNIQUE (inventory_session_id, ordinal) plus
+-- the recipient/source composite FKs. Running the aggregate check per item was
+-- redundant and quadratic.
 
 CREATE FUNCTION chat.assert_device_inventory_materialization(target_session UUID)
 RETURNS void
@@ -2612,10 +2835,188 @@ AFTER INSERT OR UPDATE OR DELETE ON chat.device_inventory_sessions
 DEFERRABLE INITIALLY DEFERRED
 FOR EACH ROW EXECUTE FUNCTION chat.enforce_device_inventory_materialization();
 
-CREATE CONSTRAINT TRIGGER device_inventory_items_materialization_deferred
-AFTER INSERT OR UPDATE OR DELETE ON chat.device_inventory_items
+-- Per-item materialization constraint trigger intentionally omitted
+-- (inventory-3): the session-level trigger above runs the whole-session
+-- materialization check once at completion; per-row integrity is covered by
+-- device_inventory_items' PK/UNIQUE and its requester/recipient FKs.
+
+-- ---------------------------------------------------------------------------
+-- Historical schedule fanout ceiling (inventory-4)
+-- ---------------------------------------------------------------------------
+-- Configured constant ceiling on the number of schedule-terminal proofs a
+-- single conversation may accumulate. Chosen as a defensible few-thousand bound
+-- (a conversation's historical schedule fanout is O(devices ever removed); a
+-- few thousand comfortably exceeds any real group while blocking an unbounded
+-- close-path fanout amplification). Adjust here if group-size limits change.
+CREATE FUNCTION chat.max_historical_schedule_fanout()
+RETURNS INT
+LANGUAGE sql
+IMMUTABLE
+AS $$ SELECT 4096 $$;
+
+CREATE FUNCTION chat.assert_historical_schedule_fanout(target_conversation UUID)
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    fanout_count BIGINT;
+BEGIN
+    SELECT count(*) INTO fanout_count
+      FROM chat.application_schedule_terminal_proofs
+     WHERE conversation_id = target_conversation;
+    IF fanout_count > chat.max_historical_schedule_fanout() THEN
+        RAISE EXCEPTION 'historical_schedule_fanout_exceeded'
+            USING ERRCODE = '23514';
+    END IF;
+END
+$$;
+
+-- ---------------------------------------------------------------------------
+-- Per-exact-device active inventory-session cap (inventory-2)
+-- ---------------------------------------------------------------------------
+-- A device legitimately needs only a handful of in-flight snapshot sessions (a
+-- foreground page walk plus a stray retry). Anything beyond this is a leak or
+-- an attempt to pin unbounded retained event fences, so cap the count of
+-- non-expired sessions per exact {did,device} across both inventory-session
+-- families.
+CREATE FUNCTION chat.max_active_inventory_sessions_per_device()
+RETURNS INT
+LANGUAGE sql
+IMMUTABLE
+AS $$ SELECT 8 $$;
+
+CREATE FUNCTION chat.assert_exact_device_inventory_session_cap(
+    target_did TEXT,
+    target_device UUID
+)
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    active_count BIGINT;
+BEGIN
+    -- Serialize concurrent inserts for the same device against its device row.
+    PERFORM 1 FROM chat.devices
+     WHERE user_did = target_did AND device_id = target_device
+     FOR UPDATE;
+
+    SELECT count(*) INTO active_count
+      FROM (
+        SELECT 1
+          FROM chat.inventory_sessions
+         WHERE user_did = target_did
+           AND device_id = target_device
+           AND expires_at > now()
+        UNION ALL
+        SELECT 1
+          FROM chat.device_inventory_sessions
+         WHERE user_did = target_did
+           AND device_id = target_device
+           AND expires_at > now()
+      ) active;
+
+    IF active_count > chat.max_active_inventory_sessions_per_device() THEN
+        RAISE EXCEPTION 'exact device inventory session cap exceeded'
+            USING ERRCODE = '23514';
+    END IF;
+END
+$$;
+
+CREATE FUNCTION chat.enforce_exact_device_inventory_session_cap()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    PERFORM chat.assert_exact_device_inventory_session_cap(NEW.user_did, NEW.device_id);
+    RETURN NEW;
+END
+$$;
+
+CREATE CONSTRAINT TRIGGER inventory_sessions_device_cap_deferred
+AFTER INSERT ON chat.inventory_sessions
 DEFERRABLE INITIALLY DEFERRED
-FOR EACH ROW EXECUTE FUNCTION chat.enforce_device_inventory_materialization();
+FOR EACH ROW EXECUTE FUNCTION chat.enforce_exact_device_inventory_session_cap();
+
+CREATE CONSTRAINT TRIGGER device_inventory_sessions_device_cap_deferred
+AFTER INSERT ON chat.device_inventory_sessions
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION chat.enforce_exact_device_inventory_session_cap();
+
+-- ---------------------------------------------------------------------------
+-- Expired inventory-session garbage collection (inventory-2)
+-- ---------------------------------------------------------------------------
+-- Batched, concurrency-safe reclamation of expired sessions and their items.
+-- The item/session tables carry BEFORE DELETE immutable-identity triggers (and
+-- deferred constraint triggers) that hard-block ordinary deletes, so the GC
+-- switches session_replication_role to 'replica' (transaction-local) to skip
+-- user + RI triggers for its own maintenance deletes. The switch is done in the
+-- body via set_config rather than as a function SET clause so that CREATE does
+-- not require superuser at migration time; the switch itself is privilege-
+-- checked only at call time, so the GC must be invoked by a role permitted to
+-- set that GUC (a maintenance/superuser role). It is never on a client path.
+-- FOR UPDATE SKIP LOCKED lets multiple GC workers share the backlog without
+-- contending. Children are deleted before parents so a partial failure cannot
+-- orphan rows.
+CREATE FUNCTION chat.gc_expired_inventory_sessions(batch_limit INTEGER)
+RETURNS BIGINT
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    victims UUID[];
+    removed BIGINT;
+BEGIN
+    IF batch_limit < 0 THEN batch_limit := 0; END IF;
+    PERFORM set_config('session_replication_role', 'replica', true);
+    SELECT array_agg(inventory_session_id) INTO victims
+      FROM (
+        SELECT inventory_session_id
+          FROM chat.inventory_sessions
+         WHERE expires_at IS NOT NULL
+           AND expires_at < now()
+         ORDER BY expires_at
+         FOR UPDATE SKIP LOCKED
+         LIMIT batch_limit
+      ) expired;
+    IF victims IS NULL THEN RETURN 0; END IF;
+
+    DELETE FROM chat.subscription_tickets WHERE inventory_session_id = ANY(victims);
+    DELETE FROM chat.inventory_conversation_items WHERE inventory_session_id = ANY(victims);
+    DELETE FROM chat.inventory_welcome_items WHERE inventory_session_id = ANY(victims);
+    DELETE FROM chat.inventory_recovery_items WHERE inventory_session_id = ANY(victims);
+    DELETE FROM chat.inventory_sessions WHERE inventory_session_id = ANY(victims);
+    GET DIAGNOSTICS removed = ROW_COUNT;
+    RETURN removed;
+END
+$$;
+
+CREATE FUNCTION chat.gc_expired_device_inventory_sessions(batch_limit INTEGER)
+RETURNS BIGINT
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    victims UUID[];
+    removed BIGINT;
+BEGIN
+    IF batch_limit < 0 THEN batch_limit := 0; END IF;
+    PERFORM set_config('session_replication_role', 'replica', true);
+    SELECT array_agg(device_inventory_session_id) INTO victims
+      FROM (
+        SELECT device_inventory_session_id
+          FROM chat.device_inventory_sessions
+         WHERE expires_at IS NOT NULL
+           AND expires_at < now()
+         ORDER BY expires_at
+         FOR UPDATE SKIP LOCKED
+         LIMIT batch_limit
+      ) expired;
+    IF victims IS NULL THEN RETURN 0; END IF;
+
+    DELETE FROM chat.device_inventory_items WHERE device_inventory_session_id = ANY(victims);
+    DELETE FROM chat.device_inventory_sessions WHERE device_inventory_session_id = ANY(victims);
+    GET DIAGNOSTICS removed = ROW_COUNT;
+    RETURN removed;
+END
+$$;
 
 CREATE FUNCTION chat.assert_welcome_mapping(target_welcome UUID)
 RETURNS void
@@ -3340,13 +3741,57 @@ AS $$
 DECLARE
     recipient_kind TEXT;
 BEGIN
-    SELECT entitlement_kind INTO recipient_kind
-      FROM chat.entry_recipients
-     WHERE conversation_id = target_conversation
-       AND seq = target_seq
-       AND user_did = target_did
-       AND device_id = target_device;
+    -- Resolve the audience row jointly with the entry it addresses. The JOIN to
+    -- chat.entries makes the audience-to-entry binding structural: the row is
+    -- only ever evaluated against the exact entry at its (conversation, seq).
+    SELECT recipient.entitlement_kind
+      INTO recipient_kind
+      FROM chat.entry_recipients recipient
+      JOIN chat.entries entry
+        ON entry.conversation_id = recipient.conversation_id
+       AND entry.seq = recipient.seq
+     WHERE recipient.conversation_id = target_conversation
+       AND recipient.seq = target_seq
+       AND recipient.user_did = target_did
+       AND recipient.device_id = target_device;
     IF NOT FOUND THEN RETURN; END IF;
+
+    -- An audience row must never attach to an application entry, on any arm. The
+    -- intervalClose/scheduleTerminal arms are additionally bound to the exact
+    -- closing/terminal transition + outer fingerprint by their provenance FKs
+    -- (application_intervals_closing_provenance_fk /
+    -- application_schedule_terminal_proofs_provenance_fk). This guard closes the
+    -- previously unguarded 'control' entitlement and any other attempt to route
+    -- an audience row at an application seq.
+    IF NOT EXISTS (
+        SELECT 1
+          FROM chat.entry_recipients recipient
+          JOIN chat.entries entry
+            ON entry.conversation_id = recipient.conversation_id
+           AND entry.seq = recipient.seq
+         WHERE recipient.conversation_id = target_conversation
+           AND recipient.seq = target_seq
+           AND recipient.user_did = target_did
+           AND recipient.device_id = target_device
+           AND entry.entry_kind <> 'blue.catbird.chat.defs#applicationEntry'
+    ) THEN
+        RAISE EXCEPTION 'entry recipient audience on application entry'
+            USING ERRCODE = '23514';
+    END IF;
+
+    -- Positive control-arm check: a 'control' audience row must bind a
+    -- non-application control entry (not merely "not an application entry" by
+    -- omission -- the entry must exist and be a non-application entry_kind).
+    IF recipient_kind = 'control' AND NOT EXISTS (
+        SELECT 1
+          FROM chat.entries entry
+         WHERE entry.conversation_id = target_conversation
+           AND entry.seq = target_seq
+           AND entry.entry_kind <> 'blue.catbird.chat.defs#applicationEntry'
+    ) THEN
+        RAISE EXCEPTION 'control audience must bind a non-application entry'
+            USING ERRCODE = '23514';
+    END IF;
 
     PERFORM 1 FROM chat.conversations
      WHERE conversation_id = target_conversation
@@ -3835,6 +4280,44 @@ BEGIN
 END
 $$;
 
+-- O(1) freeze guard (inventory-3 follow-up): a completed inventory session's
+-- item set is frozen, so no new item row may be materialized into a domain that
+-- is already marked complete. This is a single-row session-flag lookup on
+-- BEFORE INSERT (NOT a per-item rescan), preserving the O(1) materialization
+-- contract while restoring the completed-session immutability the dropped
+-- per-item materialization triggers used to enforce.
+CREATE FUNCTION chat.assert_inventory_item_session_open()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    session_complete BOOLEAN;
+BEGIN
+    IF TG_TABLE_NAME = 'inventory_conversation_items' THEN
+        SELECT conversations_complete INTO session_complete
+          FROM chat.inventory_sessions
+         WHERE inventory_session_id = NEW.inventory_session_id;
+    ELSIF TG_TABLE_NAME = 'inventory_welcome_items' THEN
+        SELECT welcomes_complete INTO session_complete
+          FROM chat.inventory_sessions
+         WHERE inventory_session_id = NEW.inventory_session_id;
+    ELSIF TG_TABLE_NAME = 'inventory_recovery_items' THEN
+        SELECT recovery_complete INTO session_complete
+          FROM chat.inventory_sessions
+         WHERE inventory_session_id = NEW.inventory_session_id;
+    ELSIF TG_TABLE_NAME = 'device_inventory_items' THEN
+        SELECT complete INTO session_complete
+          FROM chat.device_inventory_sessions
+         WHERE device_inventory_session_id = NEW.device_inventory_session_id;
+    END IF;
+    IF session_complete THEN
+        RAISE EXCEPTION 'inventory item cannot be inserted into a completed session domain'
+            USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END
+$$;
+
 CREATE TRIGGER entries_immutable
 BEFORE UPDATE OR DELETE ON chat.entries
 FOR EACH ROW EXECUTE FUNCTION chat.enforce_immutable_identity();
@@ -3932,13 +4415,25 @@ CREATE TRIGGER inventory_conversation_items_immutable
 BEFORE UPDATE OR DELETE ON chat.inventory_conversation_items
 FOR EACH ROW EXECUTE FUNCTION chat.enforce_immutable_identity();
 
+CREATE TRIGGER inventory_conversation_items_session_open
+BEFORE INSERT ON chat.inventory_conversation_items
+FOR EACH ROW EXECUTE FUNCTION chat.assert_inventory_item_session_open();
+
 CREATE TRIGGER inventory_welcome_items_immutable
 BEFORE UPDATE OR DELETE ON chat.inventory_welcome_items
 FOR EACH ROW EXECUTE FUNCTION chat.enforce_immutable_identity();
 
+CREATE TRIGGER inventory_welcome_items_session_open
+BEFORE INSERT ON chat.inventory_welcome_items
+FOR EACH ROW EXECUTE FUNCTION chat.assert_inventory_item_session_open();
+
 CREATE TRIGGER inventory_recovery_items_immutable
 BEFORE UPDATE OR DELETE ON chat.inventory_recovery_items
 FOR EACH ROW EXECUTE FUNCTION chat.enforce_immutable_identity();
+
+CREATE TRIGGER inventory_recovery_items_session_open
+BEFORE INSERT ON chat.inventory_recovery_items
+FOR EACH ROW EXECUTE FUNCTION chat.assert_inventory_item_session_open();
 
 CREATE TRIGGER device_inventory_sessions_identity_immutable
 BEFORE UPDATE OR DELETE ON chat.device_inventory_sessions
@@ -3953,6 +4448,10 @@ FOR EACH ROW EXECUTE FUNCTION chat.enforce_delivery_lifecycle_transition();
 CREATE TRIGGER device_inventory_items_immutable
 BEFORE UPDATE OR DELETE ON chat.device_inventory_items
 FOR EACH ROW EXECUTE FUNCTION chat.enforce_immutable_identity();
+
+CREATE TRIGGER device_inventory_items_session_open
+BEFORE INSERT ON chat.device_inventory_items
+FOR EACH ROW EXECUTE FUNCTION chat.assert_inventory_item_session_open();
 
 CREATE TRIGGER subscription_tickets_identity_immutable
 BEFORE UPDATE OR DELETE ON chat.subscription_tickets

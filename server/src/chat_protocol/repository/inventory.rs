@@ -1148,8 +1148,8 @@ pub(crate) async fn issue_next_inventory_page_cursor(
     if transaction_id != authority.session.transaction_id {
         return Err(InventoryRepositoryError::TransactionMismatch);
     }
-    let issued_at =
-        unix_seconds(authority.session.locked_at).ok_or(InventoryRepositoryError::DurableRowInvalid)?;
+    let issued_at = unix_seconds(authority.session.locked_at)
+        .ok_or(InventoryRepositoryError::DurableRowInvalid)?;
     let cursor = codec.issue_inventory_page_cursor(
         &authority.page_binding,
         authority.last_ordinal,
@@ -1214,9 +1214,10 @@ pub(crate) async fn complete_inventory_page(
         }
     });
     query
-        .push_bind(i64::try_from(authority.item_count).map_err(|_| {
-            InventoryRepositoryError::InvalidMaterialization
-        })?)
+        .push_bind(
+            i64::try_from(authority.item_count)
+                .map_err(|_| InventoryRepositoryError::InvalidMaterialization)?,
+        )
         .push(match authority.domain {
             InventoryPageDomain::Conversations => ", conversation_items_sha256 = ",
             InventoryPageDomain::PendingWelcomes => ", welcome_items_sha256 = ",
@@ -1234,9 +1235,10 @@ pub(crate) async fn complete_inventory_page(
         .push(" AND jkt = ")
         .push_bind(&authority.session.jkt)
         .push(" AND auth_generation = ")
-        .push_bind(i64::try_from(authority.session.auth_generation).map_err(|_| {
-            InventoryRepositoryError::DurableRowInvalid
-        })?)
+        .push_bind(
+            i64::try_from(authority.session.auth_generation)
+                .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?,
+        )
         .push(" AND snapshot_event_position = ")
         .push_bind(
             i64::try_from(authority.session.snapshot_event_position)
@@ -1276,11 +1278,9 @@ pub(crate) async fn complete_inventory_page(
     if result.rows_affected() != 1 {
         return Err(InventoryRepositoryError::RaceOrReuse);
     }
-    sqlx::query(
-        "SET CONSTRAINTS chat.inventory_sessions_materialization_deferred IMMEDIATE",
-    )
-    .execute(&mut **transaction)
-    .await?;
+    sqlx::query("SET CONSTRAINTS chat.inventory_sessions_materialization_deferred IMMEDIATE")
+        .execute(&mut **transaction)
+        .await?;
 
     let _consumed_cursor_hash = authority.verified_cursor_hash;
     Ok(InventoryCompletionReceipt {
@@ -1332,8 +1332,8 @@ async fn fetch_inventory_items_after(
     last_ordinal: u64,
     limit: u64,
 ) -> Result<Vec<InventoryItemRow>, InventoryRepositoryError> {
-    let last_ordinal =
-        i64::try_from(last_ordinal).map_err(|_| InventoryRepositoryError::InvalidMaterialization)?;
+    let last_ordinal = i64::try_from(last_ordinal)
+        .map_err(|_| InventoryRepositoryError::InvalidMaterialization)?;
     let limit =
         i64::try_from(limit).map_err(|_| InventoryRepositoryError::InvalidMaterialization)?;
     let sql = match domain {
@@ -1411,8 +1411,8 @@ fn validate_materialization_digest(
 ) -> Result<(u64, [u8; 32]), InventoryRepositoryError> {
     let item_count = database_protocol_integer(row.item_count)
         .map_err(|_| InventoryRepositoryError::InvalidMaterialization)?;
-    let items_sha256 =
-        fixed_hash(row.items_sha256).map_err(|_| InventoryRepositoryError::InvalidMaterialization)?;
+    let items_sha256 = fixed_hash(row.items_sha256)
+        .map_err(|_| InventoryRepositoryError::InvalidMaterialization)?;
     let shape_valid = if item_count == 0 {
         row.minimum_ordinal.is_none() && row.maximum_ordinal.is_none()
     } else {
