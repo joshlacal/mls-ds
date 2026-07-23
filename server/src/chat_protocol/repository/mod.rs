@@ -8,3 +8,5 @@ pub(crate) mod delivery;
 pub(crate) mod inventory;
 #[cfg(not(test))]
 pub(crate) mod relationship;
+#[cfg(not(test))]
+pub(crate) mod transition;
