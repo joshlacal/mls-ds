@@ -13069,14 +13069,54 @@ mod executor {
         let coordinate = &hydration.coordinate;
         let conversation_id = Uuid::from_bytes(*coordinate.conversation_id());
         let transition_id = Uuid::from_bytes(*hydration.producer.transition_id());
+        let generation = checked_i64(coordinate.generation())?;
+        let state_version = checked_i64(coordinate.state_version())?;
+        let epoch = checked_i64(coordinate.epoch())?;
+
+        // Dispatch split: entry-less internal ops vs entry-bearing edges.
+        //
+        // `leafRecoveryRequest` / `leafRecoveryCancellation` are INTERNAL — there
+        // is no control-entry kind for them (`bind_non_control_request_authority`:
+        // `allocated_seq == None`, `successor_next_entry_seq == expected`), so they
+        // append NO entry and allocate NO seq, and their head CAS is a
+        // prior-coordinate VERIFY that advances neither the coordinate nor the
+        // counter. Branch on these BEFORE the entry-bearing `allocated_seq`
+        // extraction (which would otherwise `InconsistentPlan` on their `None`
+        // seq). Every OTHER plan kind is entry-bearing (creation / policy / accept
+        // / commit / close / reset-activation / fulfillment) and allocates a seq.
+        match effects.kind() {
+            PlanKind::RecoveryRequest => {
+                return apply_leaf_recovery_request(
+                    transaction,
+                    plan,
+                    ctx,
+                    conversation_id,
+                    generation,
+                    state_version,
+                    epoch,
+                )
+                .await;
+            }
+            PlanKind::RecoveryCancellation => {
+                return apply_leaf_recovery_cancellation(
+                    transaction,
+                    plan,
+                    ctx,
+                    conversation_id,
+                    generation,
+                    state_version,
+                    epoch,
+                )
+                .await;
+            }
+            _ => {}
+        }
+
         let allocated_seq = head.allocated_seq().ok_or(ExecutorError::InconsistentPlan(
             "head CAS has no allocated seq",
         ))?;
         let seq_i64 = checked_i64(allocated_seq)?;
         let successor_next_entry_seq = checked_i64(head.successor_next_entry_seq())?;
-        let generation = checked_i64(coordinate.generation())?;
-        let state_version = checked_i64(coordinate.state_version())?;
-        let epoch = checked_i64(coordinate.epoch())?;
 
         match effects.kind() {
             PlanKind::Creation => {
@@ -13118,11 +13158,10 @@ mod executor {
             PlanKind::Acceptance => Err(ExecutorError::UnsupportedEffect("acceptConversation")),
             PlanKind::Metadata => Err(ExecutorError::UnsupportedEffect("metadata")),
             PlanKind::Commit => Err(ExecutorError::UnsupportedEffect("commit")),
-            PlanKind::RecoveryRequest => {
-                Err(ExecutorError::UnsupportedEffect("leafRecoveryRequest"))
-            }
-            PlanKind::RecoveryCancellation => {
-                Err(ExecutorError::UnsupportedEffect("leafRecoveryCancellation"))
+            // Entry-less internal ops are dispatched (and returned) above, before
+            // the entry-bearing `allocated_seq` extraction.
+            PlanKind::RecoveryRequest | PlanKind::RecoveryCancellation => {
+                unreachable!("entry-less recovery ops are dispatched before this match")
             }
             PlanKind::DeviceRevocation => Err(ExecutorError::UnsupportedEffect("deviceRevocation")),
             PlanKind::ResetRequest => {
@@ -13180,6 +13219,36 @@ mod executor {
                 .await
             }
         }
+    }
+
+    /// Apply an entry-less `leafRecoveryRequest` internal op. (Filled in E2b-6
+    /// arm 3; the dispatch split lands first as its own regression-green change.)
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_leaf_recovery_request(
+        _transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        _plan: &ConversationPersistencePlan,
+        _ctx: &ExecutionContext,
+        _conversation_id: Uuid,
+        _generation: i64,
+        _state_version: i64,
+        _epoch: i64,
+    ) -> Result<AppliedTransition, ExecutorError> {
+        Err(ExecutorError::UnsupportedEffect("leafRecoveryRequest"))
+    }
+
+    /// Apply an entry-less `leafRecoveryCancellation` internal op. (Filled in
+    /// E2b-6 arm 3.)
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_leaf_recovery_cancellation(
+        _transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        _plan: &ConversationPersistencePlan,
+        _ctx: &ExecutionContext,
+        _conversation_id: Uuid,
+        _generation: i64,
+        _state_version: i64,
+        _epoch: i64,
+    ) -> Result<AppliedTransition, ExecutorError> {
+        Err(ExecutorError::UnsupportedEffect("leafRecoveryCancellation"))
     }
 
     #[allow(clippy::too_many_arguments)]
