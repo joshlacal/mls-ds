@@ -39,6 +39,18 @@ mod repository {
             "/src/chat_protocol/repository/transition.rs"
         ));
     }
+
+    // The migration-2 state-family row writers (task E2b-1) live in
+    // `repository/delivery.rs` alongside the E1 append-log primitives. Like the
+    // `transition` module above, it is production-gated `#[cfg(not(test))]`, so
+    // this test `include!`s it directly. Both modules are self-contained (only
+    // `chrono`/`sha2`/`sqlx`/`uuid`), so no other production module is included.
+    pub(crate) mod delivery {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/chat_protocol/repository/delivery.rs"
+        ));
+    }
 }
 
 use chrono::{DateTime, Duration, Utc};
@@ -61,6 +73,16 @@ use repository::transition::{
     ParticipantStatus, ParticipantTerminalization, ReservationTermination, ResetReason,
     ResetRequestTermination, TransitionActorRole, TransitionCoordinates, TransitionKind,
     TransitionRepositoryError,
+};
+
+use repository::delivery::{
+    close_application_interval, insert_application_interval, insert_recovery_work_item,
+    insert_schedule_terminal_proof, insert_welcome_bundle, insert_welcome_delivery,
+    terminalize_recovery_work_item, terminalize_welcome_delivery, ApplicationIntervalClose,
+    DeliveryRepositoryError, IntervalCloseKind, IntervalOpeningKind, NewApplicationInterval,
+    NewRecoveryWorkItem, NewScheduleTerminalProof, NewWelcomeBundle, NewWelcomeDelivery,
+    RecoveryWorkSourceKind, RecoveryWorkTermination, WelcomeClientAuthorization,
+    WelcomeDisposition, WelcomeRejectionReason,
 };
 
 // ---------------------------------------------------------------------------
@@ -438,6 +460,16 @@ fn conflict(result: Result<(), TransitionRepositoryError>) {
     match result {
         Err(TransitionRepositoryError::CompareAndSetConflict) => {}
         other => panic!("expected CompareAndSetConflict, got {other:?}"),
+    }
+}
+
+/// Migration-2 (delivery) analogue of `conflict`: a CAS that changed no row must
+/// surface `DeliveryRepositoryError::CompareAndSetConflict`, never a silent
+/// success or an opaque database error.
+fn delivery_conflict(result: Result<(), DeliveryRepositoryError>) {
+    match result {
+        Err(DeliveryRepositoryError::CompareAndSetConflict) => {}
+        other => panic!("expected DeliveryRepositoryError::CompareAndSetConflict, got {other:?}"),
     }
 }
 
@@ -1425,6 +1457,742 @@ async fn recovery_terminalizers_conflict_on_missing_row() {
             &LeafRecoveryTermination::Expired { terminal_at: now },
         )
         .await,
+    );
+    tx.rollback().await.unwrap();
+}
+
+// ===========================================================================
+// Migration-2 Family A — chat.application_intervals.
+//
+// These extend the transition-repository harness to the delivery migration's
+// per-device exact-visibility interval writers. As with the migration-1
+// families, each writer is exercised inside one transaction with same-transaction
+// read-back and then ROLLED BACK: this verifies every IMMEDIATE constraint
+// (opening/leaf-opening unique indexes, the `membership_interval_id`
+// identity/primary key, the opening-context length CHECKs, the all-or-none
+// `application_intervals_close_shape_check`, `terminal_seq > start_seq`, and the
+// BEFORE-UPDATE immutable-identity + lifecycle-monotonic triggers) while the
+// DEFERRED cross-table coherence triggers and provenance FKs (the composer's job)
+// fire only at COMMIT.
+// ===========================================================================
+
+#[tokio::test]
+async fn application_interval_insert_and_close_are_faithful_and_cas_guarded() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let fixture = seed_fixture(&pool).await;
+    let now = clock_now(&pool).await;
+
+    // A fresh opening transition id doubles as the interval identity
+    // (application_intervals_id_check: membership_interval_id = opening_transition_id).
+    let interval_id = Uuid::new_v4();
+    let fingerprint = vec![0x21_u8; 32];
+    let opening_group_id = vec![0x22_u8; 32];
+    let opening_gch = vec![0x23_u8; 32];
+    let opening_ct = vec![0x24_u8; 32];
+    let interval = NewApplicationInterval {
+        membership_interval_id: interval_id,
+        conversation_id: fixture.conversation_id,
+        generation: 0,
+        recipient_did: fixture.actor_did.clone(),
+        recipient_device_id: fixture.actor_device_id,
+        start_seq: 2,
+        opening_kind: IntervalOpeningKind::Add,
+        opening_transition_id: interval_id,
+        opening_outer_entry_fingerprint: fingerprint.clone(),
+        opening_state_version: 1,
+        opening_group_id: opening_group_id.clone(),
+        opening_epoch: 1,
+        opening_group_context_hash: opening_gch.clone(),
+        opening_confirmation_tag: opening_ct.clone(),
+        opening_leaf_period_id: fixture.leaf_period_id,
+        created_at: now,
+    };
+
+    let mut tx = pool.begin().await.unwrap();
+    insert_application_interval(&mut tx, &interval)
+        .await
+        .expect("insert open application interval");
+
+    // Full-column read-back of the open row (BYTEA byte-equality; all closing
+    // columns NULL).
+    #[allow(clippy::type_complexity)]
+    let row: (
+        String,
+        i64,
+        String,
+        Vec<u8>,
+        Vec<u8>,
+        i64,
+        Option<i64>,
+        Option<String>,
+        Option<Vec<u8>>,
+        Option<DateTime<Utc>>,
+    ) = sqlx::query_as(
+        "SELECT opening_kind,start_seq,recipient_did,opening_outer_entry_fingerprint,\
+                opening_group_id,opening_epoch,terminal_seq,closing_kind,\
+                closing_outer_entry_fingerprint,removed_at \
+           FROM chat.application_intervals WHERE membership_interval_id=$1",
+    )
+    .bind(interval_id)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(row.0, "add");
+    assert_eq!(row.1, 2);
+    assert_eq!(row.2, fixture.actor_did);
+    assert_eq!(row.3, fingerprint);
+    assert_eq!(row.4, opening_group_id);
+    assert_eq!(row.5, 1);
+    assert_eq!(row.6, None);
+    assert_eq!(row.7, None);
+    assert_eq!(row.8, None);
+    assert_eq!(row.9, None);
+
+    // CAS close: open -> finite, writing all seven closing columns at once.
+    // terminal_seq > start_seq (strict gap). Closing entry/transition provenance
+    // FKs are DEFERRED, so only the CAS/column shape is verified here.
+    let closing_fingerprint = vec![0x25_u8; 32];
+    let close = ApplicationIntervalClose {
+        membership_interval_id: interval_id,
+        terminal_seq: 5,
+        closing_state_version: 2,
+        closing_transition_id: fixture.creation_transition_id,
+        closing_outer_entry_fingerprint: closing_fingerprint.clone(),
+        closing_kind: IntervalCloseKind::Remove,
+        closing_leaf_period_id: fixture.leaf_period_id,
+        removed_at: now,
+    };
+    close_application_interval(&mut tx, &close)
+        .await
+        .expect("close open application interval");
+    let (terminal_seq, closing_kind, closing_sv, closing_fp, removed_at): (
+        Option<i64>,
+        Option<String>,
+        Option<i64>,
+        Option<Vec<u8>>,
+        Option<DateTime<Utc>>,
+    ) = sqlx::query_as(
+        "SELECT terminal_seq,closing_kind,closing_state_version,closing_outer_entry_fingerprint,removed_at \
+           FROM chat.application_intervals WHERE membership_interval_id=$1",
+    )
+    .bind(interval_id)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(terminal_seq, Some(5));
+    assert_eq!(closing_kind.as_deref(), Some("remove"));
+    assert_eq!(closing_sv, Some(2));
+    assert_eq!(closing_fp, Some(closing_fingerprint));
+    assert!(removed_at.is_some());
+
+    // Second close misses (interval no longer open) -> conflict; a closed interval
+    // is immutable/terminal.
+    delivery_conflict(close_application_interval(&mut tx, &close).await);
+
+    // CAS-drift: closing an interval id that matches no open row -> conflict.
+    let drift = ApplicationIntervalClose {
+        membership_interval_id: Uuid::new_v4(),
+        ..close.clone()
+    };
+    delivery_conflict(close_application_interval(&mut tx, &drift).await);
+    tx.rollback().await.unwrap();
+
+    // DB constraint cross-check A: a duplicate opening (same membership_interval_id
+    // / opening_transition_id) is rejected by the identity primary key (the single
+    // opening guard; opening_uq / leaf_opening_uq subsume it since the id equals
+    // the opening transition).
+    let mut tx = pool.begin().await.unwrap();
+    insert_application_interval(&mut tx, &interval)
+        .await
+        .expect("first open interval");
+    assert!(
+        matches!(
+            insert_application_interval(&mut tx, &interval).await,
+            Err(DeliveryRepositoryError::Database(_))
+        ),
+        "a duplicate opening must violate the interval identity primary key"
+    );
+    tx.rollback().await.unwrap();
+
+    // DB constraint cross-check B: the all-or-none close shape CHECK rejects a
+    // partial close (terminal_seq set while the other closing columns stay NULL).
+    // The writer cannot emit a partial close, so this drives the DDL directly.
+    let mut tx = pool.begin().await.unwrap();
+    insert_application_interval(&mut tx, &interval)
+        .await
+        .expect("open interval for partial-close probe");
+    let partial = sqlx::query(
+        "UPDATE chat.application_intervals SET terminal_seq=5 WHERE membership_interval_id=$1",
+    )
+    .bind(interval_id)
+    .execute(&mut *tx)
+    .await;
+    assert!(
+        partial.is_err(),
+        "a partial close (terminal_seq without the rest) must violate application_intervals_close_shape_check"
+    );
+    tx.rollback().await.unwrap();
+
+    // DB constraint cross-check C: terminal_seq must be strictly greater than
+    // start_seq. A close with terminal_seq == start_seq is rejected by the DDL and
+    // surfaces (via the writer) as a database error, never a CAS success.
+    let mut tx = pool.begin().await.unwrap();
+    insert_application_interval(&mut tx, &interval)
+        .await
+        .expect("open interval for strict-gap probe");
+    let not_strict = ApplicationIntervalClose {
+        terminal_seq: 2, // == start_seq
+        ..close.clone()
+    };
+    assert!(
+        matches!(
+            close_application_interval(&mut tx, &not_strict).await,
+            Err(DeliveryRepositoryError::Database(_))
+        ),
+        "terminal_seq == start_seq must violate application_intervals_close_shape_check"
+    );
+    tx.rollback().await.unwrap();
+
+    // DB constraint cross-check D: the five-field opening binding is immutable —
+    // an UPDATE of an opening column after insert is rejected by the
+    // application_intervals_identity_immutable trigger (opening columns are not in
+    // its mutable set).
+    let mut tx = pool.begin().await.unwrap();
+    insert_application_interval(&mut tx, &interval)
+        .await
+        .expect("open interval for immutability probe");
+    let mutate_opening = sqlx::query(
+        "UPDATE chat.application_intervals SET opening_kind='reset' WHERE membership_interval_id=$1",
+    )
+    .bind(interval_id)
+    .execute(&mut *tx)
+    .await;
+    assert!(
+        mutate_opening.is_err(),
+        "mutating an opening column must be rejected by the immutable-identity trigger"
+    );
+    tx.rollback().await.unwrap();
+}
+
+// ===========================================================================
+// Migration-2 Family B — chat.application_schedule_terminal_proofs.
+// ===========================================================================
+
+#[tokio::test]
+async fn schedule_terminal_proof_insert_is_faithful_and_pk_guarded() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let fixture = seed_fixture(&pool).await;
+    let now = clock_now(&pool).await;
+
+    // terminal_seq references the committed creation entry at seq 1 (IMMEDIATE
+    // entry_fk); transition_id references the creation transition (IMMEDIATE
+    // transition_fk). The 4-column provenance FK is DEFERRED.
+    let fingerprint = vec![0x31_u8; 32];
+    let proof = NewScheduleTerminalProof {
+        conversation_id: fixture.conversation_id,
+        recipient_did: fixture.actor_did.clone(),
+        recipient_device_id: fixture.actor_device_id,
+        terminal_seq: 1,
+        transition_id: fixture.creation_transition_id,
+        outer_entry_fingerprint: fingerprint.clone(),
+        received_at: now,
+    };
+
+    let mut tx = pool.begin().await.unwrap();
+    insert_schedule_terminal_proof(&mut tx, &proof)
+        .await
+        .expect("insert schedule terminal proof");
+    let (terminal_seq, transition_id, fp): (i64, Uuid, Vec<u8>) = sqlx::query_as(
+        "SELECT terminal_seq,transition_id,outer_entry_fingerprint \
+           FROM chat.application_schedule_terminal_proofs \
+          WHERE conversation_id=$1 AND recipient_did=$2 AND recipient_device_id=$3",
+    )
+    .bind(fixture.conversation_id)
+    .bind(&fixture.actor_did)
+    .bind(fixture.actor_device_id)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(terminal_seq, 1);
+    assert_eq!(transition_id, fixture.creation_transition_id);
+    assert_eq!(fp, fingerprint);
+
+    // DB constraint cross-check: a second proof for the same
+    // (conversation, recipient device) violates the primary key.
+    assert!(
+        matches!(
+            insert_schedule_terminal_proof(&mut tx, &proof).await,
+            Err(DeliveryRepositoryError::Database(_))
+        ),
+        "a second proof for the same recipient device must violate the primary key"
+    );
+    tx.rollback().await.unwrap();
+}
+
+// ===========================================================================
+// Migration-2 Family C — chat.welcome_bundles.
+// ===========================================================================
+
+#[tokio::test]
+async fn welcome_bundle_insert_is_faithful_and_transition_unique() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let fixture = seed_fixture(&pool).await;
+    let now = clock_now(&pool).await;
+
+    let welcome_id = Uuid::new_v4();
+    let wrapper = vec![0x41_u8; 64];
+    let bundle = NewWelcomeBundle {
+        welcome_id,
+        conversation_id: fixture.conversation_id,
+        transition_id: fixture.creation_transition_id,
+        entry_seq: 1,
+        generation: 0,
+        state_version: 0,
+        group_id: fixture.group_id.clone(),
+        epoch: 0,
+        group_context_hash: fixture.group_context_hash.clone(),
+        confirmation_tag: fixture.confirmation_tag.clone(),
+        wrapper_bytes: wrapper.clone(),
+        wrapper_sha256: Sha256::digest(&wrapper).to_vec(),
+        created_at: now,
+    };
+
+    let mut tx = pool.begin().await.unwrap();
+    insert_welcome_bundle(&mut tx, &bundle)
+        .await
+        .expect("insert welcome bundle");
+    let (transition_id, entry_seq, wrapper_back, sha_back): (Uuid, i64, Vec<u8>, Vec<u8>) =
+        sqlx::query_as(
+            "SELECT transition_id,entry_seq,wrapper_bytes,wrapper_sha256 \
+               FROM chat.welcome_bundles WHERE welcome_id=$1",
+        )
+        .bind(welcome_id)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(transition_id, fixture.creation_transition_id);
+    assert_eq!(entry_seq, 1);
+    assert_eq!(wrapper_back, wrapper);
+    assert_eq!(sha_back, Sha256::digest(&wrapper).to_vec());
+
+    // DB constraint cross-check: one bundle per Add commit — a second bundle
+    // (fresh welcome_id) reusing the same transition_id violates the UNIQUE.
+    let dup = NewWelcomeBundle {
+        welcome_id: Uuid::new_v4(),
+        ..bundle.clone()
+    };
+    assert!(
+        matches!(
+            insert_welcome_bundle(&mut tx, &dup).await,
+            Err(DeliveryRepositoryError::Database(_))
+        ),
+        "a second bundle for the same transition_id must violate the UNIQUE"
+    );
+    tx.rollback().await.unwrap();
+}
+
+// ===========================================================================
+// Migration-2 Family D + E — chat.welcome_deliveries + chat.welcome_dispositions.
+//
+// A Welcome delivery's IMMEDIATE FKs require a committed KeyPackage owned by the
+// recipient plus a same-transaction leaf-recovery request, reservation, and
+// bundle. The terminalizer is the Welcome terminal race: it CAS-flips the pending
+// delivery to its terminal status AND inserts the one immutable disposition row in
+// one call. The DEFERRED disposition/recovery coherence triggers (the composer's
+// job) fire only at COMMIT and are not exercised by these rollback-scoped writers.
+// ===========================================================================
+
+/// Seed the committed KeyPackage and same-transaction leaf-recovery request,
+/// reservation, and Welcome bundle a delivery's IMMEDIATE FKs require, then return
+/// the ids the delivery/disposition writers need. `expires_at` on the delivery
+/// must equal the consumed package's `not_after` (composite package-identity FK).
+async fn seed_welcome_delivery_prereqs(
+    pool: &PgPool,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    fixture: &Fixture,
+    now: DateTime<Utc>,
+) -> (Uuid, Uuid, Vec<u8>, DateTime<Utc>) {
+    let (key_package_ref, not_after) = seed_key_package(
+        pool,
+        &fixture.actor_did,
+        fixture.actor_device_id,
+        &fixture.actor_key_id,
+    )
+    .await;
+
+    let recovery_request_id = Uuid::new_v4();
+    let reservation_expiry = now + Duration::minutes(5);
+    let recovery_transcript = vec![0x51_u8; 16];
+    let recovery = NewLeafRecoveryRequest {
+        recovery_request_id,
+        conversation_id: fixture.conversation_id,
+        generation: 0,
+        requester_did: fixture.actor_did.clone(),
+        requester_device_id: fixture.actor_device_id,
+        requester_key_id: fixture.actor_key_id.clone(),
+        requester_auth_generation: 1,
+        recovery_kind: LeafRecoveryKind::Add,
+        source: LeafRecoverySource::AcceptConversation,
+        bound_state_version: 0,
+        bound_group_id: fixture.group_id.clone(),
+        bound_epoch: 0,
+        bound_group_context_hash: fixture.group_context_hash.clone(),
+        bound_confirmation_tag: fixture.confirmation_tag.clone(),
+        reservation_request_id: recovery_request_id,
+        signed_request_bytes: vec![0x52_u8; 16],
+        signing_transcript_bytes: recovery_transcript.clone(),
+        request_digest: Sha256::digest(&recovery_transcript).to_vec(),
+        signature: vec![0x53_u8; 64],
+        requested_at: now,
+        expires_at: reservation_expiry,
+    };
+    insert_leaf_recovery_request(tx, &recovery)
+        .await
+        .expect("seed leaf recovery request");
+
+    let reservation = NewReservation {
+        recovery_request_id,
+        key_package_ref: key_package_ref.clone(),
+        conversation_id: fixture.conversation_id,
+        generation: 0,
+        requester_did: fixture.actor_did.clone(),
+        requester_device_id: fixture.actor_device_id,
+        requester_key_id: fixture.actor_key_id.clone(),
+        requester_auth_generation: 1,
+        recipient_did: fixture.actor_did.clone(),
+        recipient_device_id: fixture.actor_device_id,
+        bound_state_version: 0,
+        bound_group_id: fixture.group_id.clone(),
+        bound_epoch: 0,
+        bound_group_context_hash: fixture.group_context_hash.clone(),
+        bound_confirmation_tag: fixture.confirmation_tag.clone(),
+        expires_at: reservation_expiry,
+        created_at: now,
+    };
+    insert_reservation(tx, &reservation)
+        .await
+        .expect("seed key package reservation");
+
+    let welcome_id = Uuid::new_v4();
+    let wrapper = vec![0x54_u8; 48];
+    let bundle = NewWelcomeBundle {
+        welcome_id,
+        conversation_id: fixture.conversation_id,
+        transition_id: fixture.creation_transition_id,
+        entry_seq: 1,
+        generation: 0,
+        state_version: 0,
+        group_id: fixture.group_id.clone(),
+        epoch: 0,
+        group_context_hash: fixture.group_context_hash.clone(),
+        confirmation_tag: fixture.confirmation_tag.clone(),
+        wrapper_bytes: wrapper.clone(),
+        wrapper_sha256: Sha256::digest(&wrapper).to_vec(),
+        created_at: now,
+    };
+    insert_welcome_bundle(tx, &bundle)
+        .await
+        .expect("seed welcome bundle");
+
+    (welcome_id, recovery_request_id, key_package_ref, not_after)
+}
+
+#[tokio::test]
+async fn welcome_delivery_insert_and_disposition_terminal_race() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let fixture = seed_fixture(&pool).await;
+    let now = clock_now(&pool).await;
+
+    let mut tx = pool.begin().await.unwrap();
+    let (welcome_id, recovery_request_id, key_package_ref, not_after) =
+        seed_welcome_delivery_prereqs(&pool, &mut tx, &fixture, now).await;
+
+    let delivery = NewWelcomeDelivery {
+        welcome_id,
+        recipient_did: fixture.actor_did.clone(),
+        recipient_device_id: fixture.actor_device_id,
+        recovery_request_id,
+        key_package_ref: key_package_ref.clone(),
+        expires_at: not_after,
+    };
+    insert_welcome_delivery(&mut tx, &delivery)
+        .await
+        .expect("insert pending welcome delivery");
+
+    // Full-column read-back of the pending delivery (BYTEA byte-equality).
+    let (status, ref_back, req_back, terminal_at): (String, Vec<u8>, Uuid, Option<DateTime<Utc>>) =
+        sqlx::query_as(
+            "SELECT status,key_package_ref,recovery_request_id,terminal_at \
+               FROM chat.welcome_deliveries WHERE welcome_id=$1",
+        )
+        .bind(welcome_id)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(status, "pending");
+    assert_eq!(ref_back, key_package_ref);
+    assert_eq!(req_back, recovery_request_id);
+    assert_eq!(terminal_at, None);
+
+    // Terminal race, first winner: acknowledged with a client authorization block.
+    // terminal_at < expires_at (required for a non-expired terminal status).
+    let terminal_at = now + Duration::minutes(1);
+    let ack_transcript = vec![0x61_u8; 24];
+    let authorization = WelcomeClientAuthorization {
+        signed_request_bytes: vec![0x62_u8; 32],
+        signing_transcript_bytes: ack_transcript.clone(),
+        request_digest: Sha256::digest(&ack_transcript).to_vec(),
+        signature: vec![0x63_u8; 64],
+    };
+    terminalize_welcome_delivery(
+        &mut tx,
+        welcome_id,
+        &WelcomeDisposition::Acknowledged {
+            authorization: authorization.clone(),
+        },
+        terminal_at,
+        1,
+    )
+    .await
+    .expect("acknowledge pending welcome delivery");
+
+    // The delivery flipped to acknowledged and the single disposition row carries
+    // the winner kind, the signed authorization bytes (byte-equality), and the
+    // event position; rejection_reason stays NULL for an acknowledgement.
+    let (delivery_status, delivery_terminal): (String, Option<DateTime<Utc>>) = sqlx::query_as(
+        "SELECT status,terminal_at FROM chat.welcome_deliveries WHERE welcome_id=$1",
+    )
+    .bind(welcome_id)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(delivery_status, "acknowledged");
+    assert!(delivery_terminal.is_some());
+
+    #[allow(clippy::type_complexity)]
+    let (winner, signed, digest, signature, reason, event_position): (
+        String,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<String>,
+        i64,
+    ) = sqlx::query_as(
+        "SELECT winner_kind,signed_request_bytes,request_digest,signature,rejection_reason,event_position \
+           FROM chat.welcome_dispositions WHERE welcome_id=$1",
+    )
+    .bind(welcome_id)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(winner, "acknowledged");
+    assert_eq!(signed, Some(authorization.signed_request_bytes.clone()));
+    assert_eq!(digest, Some(Sha256::digest(&ack_transcript).to_vec()));
+    assert_eq!(signature, Some(authorization.signature.clone()));
+    assert_eq!(reason, None);
+    assert_eq!(event_position, 1);
+
+    // Second winner loses the race: the delivery is no longer pending, so the CAS
+    // misses and NO second disposition is written.
+    delivery_conflict(
+        terminalize_welcome_delivery(
+            &mut tx,
+            welcome_id,
+            &WelcomeDisposition::Rejected {
+                authorization,
+                reason: WelcomeRejectionReason::InvalidWelcome,
+            },
+            terminal_at,
+            2,
+        )
+        .await,
+    );
+    let disposition_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM chat.welcome_dispositions WHERE welcome_id=$1")
+            .bind(welcome_id)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    assert_eq!(disposition_count, 1, "the loser must not add a disposition");
+
+    // CAS-drift: terminalizing a welcome_id with no pending delivery -> conflict.
+    delivery_conflict(
+        terminalize_welcome_delivery(
+            &mut tx,
+            Uuid::new_v4(),
+            &WelcomeDisposition::Expired,
+            terminal_at,
+            3,
+        )
+        .await,
+    );
+    tx.rollback().await.unwrap();
+
+    // DB constraint cross-check: one delivery per welcome_id — a second delivery
+    // for the same welcome_id violates the primary key (Welcome delivery
+    // uniqueness).
+    let mut tx = pool.begin().await.unwrap();
+    let (welcome_id, recovery_request_id, key_package_ref, not_after) =
+        seed_welcome_delivery_prereqs(&pool, &mut tx, &fixture, now).await;
+    let delivery = NewWelcomeDelivery {
+        welcome_id,
+        recipient_did: fixture.actor_did.clone(),
+        recipient_device_id: fixture.actor_device_id,
+        recovery_request_id,
+        key_package_ref,
+        expires_at: not_after,
+    };
+    insert_welcome_delivery(&mut tx, &delivery)
+        .await
+        .expect("first delivery");
+    assert!(
+        matches!(
+            insert_welcome_delivery(&mut tx, &delivery).await,
+            Err(DeliveryRepositoryError::Database(_))
+        ),
+        "a second delivery for the same welcome_id must violate the primary key"
+    );
+    tx.rollback().await.unwrap();
+}
+
+// ===========================================================================
+// Migration-2 Family F — chat.recovery_work_items.
+// ===========================================================================
+
+#[tokio::test]
+async fn recovery_work_item_insert_and_terminalize_are_cas_guarded() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let fixture = seed_fixture(&pool).await;
+    let now = clock_now(&pool).await;
+
+    // The source disposition FK and the (generation, state_version) coordinate FK
+    // are DEFERRED, so a pending work item inserts against a fresh source id and
+    // the fixture's genesis coordinate without a committed disposition graph.
+    let recovery_work_id = Uuid::new_v4();
+    let source_id = Uuid::new_v4();
+    let item = NewRecoveryWorkItem {
+        recovery_work_id,
+        conversation_id: fixture.conversation_id,
+        recipient_did: fixture.actor_did.clone(),
+        recipient_device_id: fixture.actor_device_id,
+        source_kind: RecoveryWorkSourceKind::WelcomeExpired,
+        source_id,
+        generation: 0,
+        state_version: 0,
+        created_at: now,
+    };
+
+    let mut tx = pool.begin().await.unwrap();
+    insert_recovery_work_item(&mut tx, &item)
+        .await
+        .expect("insert pending recovery work item");
+    let (source_kind, status, source_back, generation): (String, String, Uuid, i64) =
+        sqlx::query_as(
+            "SELECT source_kind,status,source_id,generation \
+               FROM chat.recovery_work_items WHERE recovery_work_id=$1",
+        )
+        .bind(recovery_work_id)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(source_kind, "welcomeExpired");
+    assert_eq!(status, "pending");
+    assert_eq!(source_back, source_id);
+    assert_eq!(generation, 0);
+
+    // Terminalize completed-by-transition (revocation stays NULL). The terminal
+    // transition FK is DEFERRED; only the CAS/shape is verified here. terminal_at
+    // >= created_at.
+    let terminal_at = now + Duration::minutes(1);
+    terminalize_recovery_work_item(
+        &mut tx,
+        recovery_work_id,
+        &RecoveryWorkTermination::CompletedByTransition {
+            terminal_transition_id: fixture.creation_transition_id,
+            terminal_at,
+        },
+    )
+    .await
+    .expect("complete recovery work item");
+    let (term_status, term_tid, term_rev): (String, Option<Uuid>, Option<Uuid>) = sqlx::query_as(
+        "SELECT status,terminal_transition_id,terminal_revocation_id \
+           FROM chat.recovery_work_items WHERE recovery_work_id=$1",
+    )
+    .bind(recovery_work_id)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(term_status, "completed");
+    assert_eq!(term_tid, Some(fixture.creation_transition_id));
+    assert_eq!(term_rev, None);
+
+    // Second terminalize misses (no longer pending) -> conflict.
+    delivery_conflict(
+        terminalize_recovery_work_item(
+            &mut tx,
+            recovery_work_id,
+            &RecoveryWorkTermination::SupersededByRevocation {
+                terminal_revocation_id: Uuid::new_v4(),
+                terminal_at,
+            },
+        )
+        .await,
+    );
+
+    // CAS-drift: terminalizing an id that matches no pending row -> conflict.
+    delivery_conflict(
+        terminalize_recovery_work_item(
+            &mut tx,
+            Uuid::new_v4(),
+            &RecoveryWorkTermination::SupersededByTransition {
+                terminal_transition_id: fixture.creation_transition_id,
+                terminal_at,
+            },
+        )
+        .await,
+    );
+    tx.rollback().await.unwrap();
+
+    // DB constraint cross-check A: the terminal-shape CHECK rejects a wrong
+    // status/terminal combination (status='completed' with no terminal columns).
+    // The writer cannot emit this shape, so it is driven directly against the DDL.
+    let mut tx = pool.begin().await.unwrap();
+    let bad_shape = sqlx::query(
+        "INSERT INTO chat.recovery_work_items(\
+            recovery_work_id,conversation_id,recipient_did,recipient_device_id,\
+            source_kind,source_id,generation,state_version,status,created_at) \
+         VALUES($1,$2,$3,$4,'welcomeExpired',$5,0,0,'completed',$6)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(fixture.conversation_id)
+    .bind(&fixture.actor_did)
+    .bind(fixture.actor_device_id)
+    .bind(Uuid::new_v4())
+    .bind(now)
+    .execute(&mut *tx)
+    .await;
+    assert!(
+        bad_shape.is_err(),
+        "status='completed' with NULL terminal columns must violate recovery_work_items_terminal_shape_check"
+    );
+    tx.rollback().await.unwrap();
+
+    // DB constraint cross-check B: one work item per source disposition — a second
+    // pending item reusing the same source_id violates recovery_work_items_source_uq.
+    let mut tx = pool.begin().await.unwrap();
+    insert_recovery_work_item(&mut tx, &item)
+        .await
+        .expect("first recovery work item");
+    let dup = NewRecoveryWorkItem {
+        recovery_work_id: Uuid::new_v4(),
+        ..item.clone()
+    };
+    assert!(
+        matches!(
+            insert_recovery_work_item(&mut tx, &dup).await,
+            Err(DeliveryRepositoryError::Database(_))
+        ),
+        "a second work item for the same source_id must violate recovery_work_items_source_uq"
     );
     tx.rollback().await.unwrap();
 }

@@ -49,6 +49,14 @@ pub(crate) enum DeliveryRepositoryError {
     /// lease owner, or the row is no longer leased. The stale/non-owner caller
     /// changed nothing, which is an error rather than a silent no-op.
     OutboxLeaseMismatch,
+    /// A compare-and-set matched no row: the stored row's compared columns did
+    /// not equal the expected pre-state — drift, a wrong status, or an already
+    /// terminalized period. The caller changed nothing, which is a conflict,
+    /// not a silent success. Used by the migration-2 state-family terminalizers
+    /// (interval close, Welcome delivery terminalize, recovery work terminalize)
+    /// exactly as `transition::TransitionRepositoryError::CompareAndSetConflict`
+    /// is used for the migration-1 families.
+    CompareAndSetConflict,
 }
 
 impl From<sqlx::Error> for DeliveryRepositoryError {
@@ -595,6 +603,689 @@ pub(crate) async fn mark_outbox_delivered(
 
     if result.rows_affected() != 1 {
         return Err(DeliveryRepositoryError::OutboxLeaseMismatch);
+    }
+    Ok(())
+}
+
+// ===========================================================================
+// Migration-2 state-family row writers (delivery migration
+// `20260722000002_chat_protocol_delivery.sql`).
+//
+// These are the dumb, exact SQL layer for the migration-2 side families the
+// transition executor (task E2b, `state_machine.rs`) composes on top of
+// `append_entry` + the audience/event/outbox primitives above, inside one
+// caller-owned transaction. They mirror `repository::transition` exactly:
+// param structs derived column-for-column from the sealed DDL, closed enums for
+// the terminal / kind shapes the schema's CHECKs allow, and CAS via
+// `rows_affected() == 1` (any other count is a typed `CompareAndSetConflict`,
+// never a silent no-op or blind overwrite). Nothing here re-derives, validates,
+// or "fixes up" a value: the caller hands down the exact bytes and the database's
+// own CHECK / FK / UNIQUE / partial-index constraints and BEFORE-UPDATE
+// immutability + lifecycle-monotonic triggers remain the ultimate authority.
+//
+// Every writer is transaction-scoped (`&mut Transaction`); it never commits and
+// never opens its own transaction. The migration's DEFERRED cross-table
+// coherence triggers (`assert_member_interval_mapping`,
+// `assert_welcome_disposition_cas`, `assert_recovery_work_integrity`, the
+// terminal-schedule guards, and the deferred provenance FKs into
+// `chat.entries`/`chat.transitions`/`chat.generation_states`) fire only at
+// COMMIT; building the fully coherent transition+entry+state graph they enforce
+// is the composing executor's job, not these unit writers'.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Family A — chat.application_intervals (per-device exact-visibility periods).
+// ---------------------------------------------------------------------------
+
+/// Opening kind of an application interval. Mirrors
+/// `application_intervals_opening_kind_check` exactly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IntervalOpeningKind {
+    Creation,
+    Add,
+    Reset,
+}
+
+impl IntervalOpeningKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Creation => "creation",
+            Self::Add => "add",
+            Self::Reset => "reset",
+        }
+    }
+}
+
+/// Closing kind of a finite application interval. Mirrors
+/// `application_intervals_close_kind_check` exactly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IntervalCloseKind {
+    Remove,
+    Replace,
+    Reset,
+    Terminal,
+}
+
+impl IntervalCloseKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Remove => "remove",
+            Self::Replace => "replace",
+            Self::Reset => "reset",
+            Self::Terminal => "terminal",
+        }
+    }
+}
+
+/// One new **open** application interval, carried column-for-column. The insert
+/// always writes the full five-field opening binding (`start_seq`, `opening_kind`,
+/// `opening_transition_id`, 32-byte `opening_outer_entry_fingerprint`, and the
+/// opening group-context coordinate) plus the recipient device + opening leaf,
+/// and leaves every closing column NULL (an interval is never born finite). The
+/// `membership_interval_id = opening_transition_id` identity, the 32-byte length
+/// CHECKs, and the opening / leaf-opening unique indexes remain the DB's
+/// authority; this helper writes exactly what the plan says.
+#[derive(Clone, Debug)]
+pub(crate) struct NewApplicationInterval {
+    pub(crate) membership_interval_id: Uuid,
+    pub(crate) conversation_id: Uuid,
+    pub(crate) generation: i64,
+    pub(crate) recipient_did: String,
+    pub(crate) recipient_device_id: Uuid,
+    pub(crate) start_seq: i64,
+    pub(crate) opening_kind: IntervalOpeningKind,
+    pub(crate) opening_transition_id: Uuid,
+    pub(crate) opening_outer_entry_fingerprint: Vec<u8>,
+    pub(crate) opening_state_version: i64,
+    pub(crate) opening_group_id: Vec<u8>,
+    pub(crate) opening_epoch: i64,
+    pub(crate) opening_group_context_hash: Vec<u8>,
+    pub(crate) opening_confirmation_tag: Vec<u8>,
+    pub(crate) opening_leaf_period_id: Uuid,
+    pub(crate) created_at: DateTime<Utc>,
+}
+
+/// Insert one new open application interval (all closing fields NULL).
+///
+/// The `application_intervals_opening_uq` / `_leaf_opening_uq` unique indexes and
+/// the `membership_interval_id` primary key reject a re-opened duplicate; the
+/// `application_intervals_close_shape_check` (open arm) and the opening-context
+/// length CHECKs reject an illegal shape. Written verbatim.
+pub(crate) async fn insert_application_interval(
+    transaction: &mut Transaction<'_, Postgres>,
+    interval: &NewApplicationInterval,
+) -> Result<(), DeliveryRepositoryError> {
+    sqlx::query(
+        r#"
+        INSERT INTO chat.application_intervals(
+            membership_interval_id, conversation_id, generation, recipient_did,
+            recipient_device_id, start_seq, opening_kind, opening_transition_id,
+            opening_outer_entry_fingerprint, opening_state_version, opening_group_id,
+            opening_epoch, opening_group_context_hash, opening_confirmation_tag,
+            opening_leaf_period_id, terminal_seq, closing_state_version,
+            closing_transition_id, closing_outer_entry_fingerprint, closing_kind,
+            closing_leaf_period_id, removed_at, created_at
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+            NULL, NULL, NULL, NULL, NULL, NULL, NULL, $16
+        )
+        "#,
+    )
+    .bind(interval.membership_interval_id)
+    .bind(interval.conversation_id)
+    .bind(interval.generation)
+    .bind(&interval.recipient_did)
+    .bind(interval.recipient_device_id)
+    .bind(interval.start_seq)
+    .bind(interval.opening_kind.as_str())
+    .bind(interval.opening_transition_id)
+    .bind(&interval.opening_outer_entry_fingerprint)
+    .bind(interval.opening_state_version)
+    .bind(&interval.opening_group_id)
+    .bind(interval.opening_epoch)
+    .bind(&interval.opening_group_context_hash)
+    .bind(&interval.opening_confirmation_tag)
+    .bind(interval.opening_leaf_period_id)
+    .bind(interval.created_at)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+/// The finite close applied to an open application interval. Every closing column
+/// is present together (`application_intervals_close_shape_check` all-present arm);
+/// there is no per-arm column variation, so the closing kind is a plain enum and
+/// all other closing values are carried verbatim. The DB requires
+/// `terminal_seq > start_seq` and a 32-byte `closing_outer_entry_fingerprint`.
+#[derive(Clone, Debug)]
+pub(crate) struct ApplicationIntervalClose {
+    pub(crate) membership_interval_id: Uuid,
+    pub(crate) terminal_seq: i64,
+    pub(crate) closing_state_version: i64,
+    pub(crate) closing_transition_id: Uuid,
+    pub(crate) closing_outer_entry_fingerprint: Vec<u8>,
+    pub(crate) closing_kind: IntervalCloseKind,
+    pub(crate) closing_leaf_period_id: Uuid,
+    pub(crate) removed_at: DateTime<Utc>,
+}
+
+/// Compare-and-set an open application interval to finite, writing all seven
+/// closing columns at once. Matches only a still-open interval (`terminal_seq IS
+/// NULL`); a second close, a wrong id, or a drifted (already-closed) row matches
+/// nothing and is a typed conflict. A closed interval is terminal — the
+/// `application_intervals_lifecycle_monotonic` trigger also rejects any rewrite of
+/// a finite row, and the `application_intervals_identity_immutable` trigger allows
+/// only these seven closing columns to change.
+pub(crate) async fn close_application_interval(
+    transaction: &mut Transaction<'_, Postgres>,
+    close: &ApplicationIntervalClose,
+) -> Result<(), DeliveryRepositoryError> {
+    let result = sqlx::query(
+        r#"
+        UPDATE chat.application_intervals
+           SET terminal_seq = $2,
+               closing_state_version = $3,
+               closing_transition_id = $4,
+               closing_outer_entry_fingerprint = $5,
+               closing_kind = $6,
+               closing_leaf_period_id = $7,
+               removed_at = $8
+         WHERE membership_interval_id = $1
+           AND terminal_seq IS NULL
+        "#,
+    )
+    .bind(close.membership_interval_id)
+    .bind(close.terminal_seq)
+    .bind(close.closing_state_version)
+    .bind(close.closing_transition_id)
+    .bind(&close.closing_outer_entry_fingerprint)
+    .bind(close.closing_kind.as_str())
+    .bind(close.closing_leaf_period_id)
+    .bind(close.removed_at)
+    .execute(&mut **transaction)
+    .await?;
+
+    if result.rows_affected() != 1 {
+        return Err(DeliveryRepositoryError::CompareAndSetConflict);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Family B — chat.application_schedule_terminal_proofs (immutable per-device
+// historical-schedule terminal proofs).
+// ---------------------------------------------------------------------------
+
+/// One immutable schedule terminal proof, carried column-for-column. The
+/// `(conversation_id, recipient_did, recipient_device_id)` primary key admits one
+/// proof per exact device per conversation; a duplicate insert violates the PK and
+/// propagates verbatim (mirroring the spine-PK convention in
+/// `repository::transition`). The row is fully immutable once written.
+#[derive(Clone, Debug)]
+pub(crate) struct NewScheduleTerminalProof {
+    pub(crate) conversation_id: Uuid,
+    pub(crate) recipient_did: String,
+    pub(crate) recipient_device_id: Uuid,
+    pub(crate) terminal_seq: i64,
+    pub(crate) transition_id: Uuid,
+    pub(crate) outer_entry_fingerprint: Vec<u8>,
+    pub(crate) received_at: DateTime<Utc>,
+}
+
+pub(crate) async fn insert_schedule_terminal_proof(
+    transaction: &mut Transaction<'_, Postgres>,
+    proof: &NewScheduleTerminalProof,
+) -> Result<(), DeliveryRepositoryError> {
+    sqlx::query(
+        r#"
+        INSERT INTO chat.application_schedule_terminal_proofs(
+            conversation_id, recipient_did, recipient_device_id, terminal_seq,
+            transition_id, outer_entry_fingerprint, received_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+        "#,
+    )
+    .bind(proof.conversation_id)
+    .bind(&proof.recipient_did)
+    .bind(proof.recipient_device_id)
+    .bind(proof.terminal_seq)
+    .bind(proof.transition_id)
+    .bind(&proof.outer_entry_fingerprint)
+    .bind(proof.received_at)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Family C — chat.welcome_bundles (immutable per-Add-commit Welcome wrapper).
+// ---------------------------------------------------------------------------
+
+/// One immutable Welcome bundle, carried column-for-column: the wrapper bytes and
+/// their hash, the producing Add transition + entry coordinate, and the bound
+/// generation-state coordinate. The caller supplies `wrapper_sha256`; the DB's
+/// `= digest(wrapper_bytes, 'sha256')` CHECK re-verifies it. `transition_id` is
+/// UNIQUE (one bundle per Add commit). Written verbatim; the row is immutable.
+#[derive(Clone, Debug)]
+pub(crate) struct NewWelcomeBundle {
+    pub(crate) welcome_id: Uuid,
+    pub(crate) conversation_id: Uuid,
+    pub(crate) transition_id: Uuid,
+    pub(crate) entry_seq: i64,
+    pub(crate) generation: i64,
+    pub(crate) state_version: i64,
+    pub(crate) group_id: Vec<u8>,
+    pub(crate) epoch: i64,
+    pub(crate) group_context_hash: Vec<u8>,
+    pub(crate) confirmation_tag: Vec<u8>,
+    pub(crate) wrapper_bytes: Vec<u8>,
+    pub(crate) wrapper_sha256: Vec<u8>,
+    pub(crate) created_at: DateTime<Utc>,
+}
+
+pub(crate) async fn insert_welcome_bundle(
+    transaction: &mut Transaction<'_, Postgres>,
+    bundle: &NewWelcomeBundle,
+) -> Result<(), DeliveryRepositoryError> {
+    sqlx::query(
+        r#"
+        INSERT INTO chat.welcome_bundles(
+            welcome_id, conversation_id, transition_id, entry_seq, generation,
+            state_version, group_id, epoch, group_context_hash, confirmation_tag,
+            wrapper_bytes, wrapper_sha256, created_at
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
+        )
+        "#,
+    )
+    .bind(bundle.welcome_id)
+    .bind(bundle.conversation_id)
+    .bind(bundle.transition_id)
+    .bind(bundle.entry_seq)
+    .bind(bundle.generation)
+    .bind(bundle.state_version)
+    .bind(&bundle.group_id)
+    .bind(bundle.epoch)
+    .bind(&bundle.group_context_hash)
+    .bind(&bundle.confirmation_tag)
+    .bind(&bundle.wrapper_bytes)
+    .bind(&bundle.wrapper_sha256)
+    .bind(bundle.created_at)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Family D — chat.welcome_deliveries (the single pending recipient tuple per
+// Welcome, keyed by welcome_id).
+// ---------------------------------------------------------------------------
+
+/// One new **pending** Welcome delivery, carried column-for-column: the canonical
+/// Add-order recipient tuple, the open leaf-recovery request + reservation
+/// provenance (`recovery_request_id`), the consumed package ref, and `expires_at`
+/// (which the DB requires to equal the consumed KeyPackage's `not_after` via the
+/// composite package-identity FK). The insert always writes `status = 'pending'`
+/// with NULL `terminal_at`; the reservation-identity and package-identity FKs and
+/// the `welcome_deliveries_terminal_shape_check` remain the DB's authority.
+#[derive(Clone, Debug)]
+pub(crate) struct NewWelcomeDelivery {
+    pub(crate) welcome_id: Uuid,
+    pub(crate) recipient_did: String,
+    pub(crate) recipient_device_id: Uuid,
+    pub(crate) recovery_request_id: Uuid,
+    pub(crate) key_package_ref: Vec<u8>,
+    pub(crate) expires_at: DateTime<Utc>,
+}
+
+pub(crate) async fn insert_welcome_delivery(
+    transaction: &mut Transaction<'_, Postgres>,
+    delivery: &NewWelcomeDelivery,
+) -> Result<(), DeliveryRepositoryError> {
+    sqlx::query(
+        r#"
+        INSERT INTO chat.welcome_deliveries(
+            welcome_id, recipient_did, recipient_device_id, recovery_request_id,
+            key_package_ref, expires_at, status, terminal_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, 'pending', NULL)
+        "#,
+    )
+    .bind(delivery.welcome_id)
+    .bind(&delivery.recipient_did)
+    .bind(delivery.recipient_device_id)
+    .bind(delivery.recovery_request_id)
+    .bind(&delivery.key_package_ref)
+    .bind(delivery.expires_at)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Family E — chat.welcome_dispositions + the delivery-status terminal race.
+// ---------------------------------------------------------------------------
+
+/// Closed rejection reason for a client-authored Welcome rejection. Mirrors
+/// `welcome_dispositions_reason_check` exactly (present iff `winner_kind =
+/// 'rejected'`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WelcomeRejectionReason {
+    NoMatchingKeyPackage,
+    InvalidWelcome,
+    UnsupportedCipherSuite,
+    CoordinateMismatch,
+    LocalStateConflict,
+}
+
+impl WelcomeRejectionReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NoMatchingKeyPackage => "noMatchingKeyPackage",
+            Self::InvalidWelcome => "invalidWelcome",
+            Self::UnsupportedCipherSuite => "unsupportedCipherSuite",
+            Self::CoordinateMismatch => "coordinateMismatch",
+            Self::LocalStateConflict => "localStateConflict",
+        }
+    }
+}
+
+/// The signed client authorization block a client-authored Welcome terminalization
+/// carries (`acknowledged` / `rejected` arms of
+/// `welcome_dispositions_signature_shape_check`). The DB requires
+/// `request_digest = digest(signing_transcript_bytes, 'sha256')`, a 32-byte digest,
+/// and a 64-byte signature; the caller supplies them verbatim.
+#[derive(Clone, Debug)]
+pub(crate) struct WelcomeClientAuthorization {
+    pub(crate) signed_request_bytes: Vec<u8>,
+    pub(crate) signing_transcript_bytes: Vec<u8>,
+    pub(crate) request_digest: Vec<u8>,
+    pub(crate) signature: Vec<u8>,
+}
+
+/// The exact terminal disposition a pending Welcome delivery takes. Each arm
+/// determines BOTH the delivery successor status AND the disposition `winner_kind`
+/// (they are required equal by the schema) AND the disposition columns that arm
+/// carries, per `welcome_dispositions_signature_shape_check` /
+/// `welcome_dispositions_reason_check`:
+/// * `Acknowledged` / `Rejected` bind the client authorization block (and
+///   `Rejected` also a closed rejection reason);
+/// * `Expired` / `Superseded` are server-authored — no signature block, no reason.
+#[derive(Clone, Debug)]
+pub(crate) enum WelcomeDisposition {
+    Acknowledged {
+        authorization: WelcomeClientAuthorization,
+    },
+    Rejected {
+        authorization: WelcomeClientAuthorization,
+        reason: WelcomeRejectionReason,
+    },
+    Expired,
+    Superseded,
+}
+
+impl WelcomeDisposition {
+    /// The winner kind, which is also the delivery's successor status. Mirrors
+    /// `welcome_dispositions_winner_check` / `welcome_deliveries_status_check`.
+    fn winner_kind(&self) -> &'static str {
+        match self {
+            Self::Acknowledged { .. } => "acknowledged",
+            Self::Rejected { .. } => "rejected",
+            Self::Expired => "expired",
+            Self::Superseded => "superseded",
+        }
+    }
+
+    fn authorization(&self) -> Option<&WelcomeClientAuthorization> {
+        match self {
+            Self::Acknowledged { authorization } | Self::Rejected { authorization, .. } => {
+                Some(authorization)
+            }
+            Self::Expired | Self::Superseded => None,
+        }
+    }
+
+    fn rejection_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Rejected { reason, .. } => Some(reason.as_str()),
+            Self::Acknowledged { .. } | Self::Expired | Self::Superseded => None,
+        }
+    }
+}
+
+/// Terminalize a pending Welcome delivery: the terminal race. In one call this
+/// compare-and-sets the delivery's status `pending -> winner_kind` (the immutable
+/// identity trigger allows only `status` + `terminal_at` to change, and the
+/// lifecycle-monotonic trigger requires the row to be pending), AND — only if the
+/// CAS wins — inserts the single immutable `chat.welcome_dispositions` row for the
+/// same `welcome_id` (its `PRIMARY KEY (welcome_id)` enforces one disposition per
+/// delivery). A loser CAS-misses and returns `CompareAndSetConflict` before any
+/// disposition is written, so the disposition row count stays exactly one.
+///
+/// `terminal_at` is written to both the delivery and the disposition (the schema's
+/// deferred `assert_welcome_disposition_cas` requires them equal at COMMIT), and
+/// `event_position` binds the disposition to its `welcomeDisposition` event.
+pub(crate) async fn terminalize_welcome_delivery(
+    transaction: &mut Transaction<'_, Postgres>,
+    welcome_id: Uuid,
+    disposition: &WelcomeDisposition,
+    terminal_at: DateTime<Utc>,
+    event_position: i64,
+) -> Result<(), DeliveryRepositoryError> {
+    let winner_kind = disposition.winner_kind();
+
+    // 1. CAS the pending delivery to its terminal status. The loser (a repeat or
+    //    wrong-state call) matches nothing and returns before writing a
+    //    disposition, so the delivery keeps exactly one disposition row.
+    let result = sqlx::query(
+        r#"
+        UPDATE chat.welcome_deliveries
+           SET status = $2,
+               terminal_at = $3
+         WHERE welcome_id = $1
+           AND status = 'pending'
+        "#,
+    )
+    .bind(welcome_id)
+    .bind(winner_kind)
+    .bind(terminal_at)
+    .execute(&mut **transaction)
+    .await?;
+
+    if result.rows_affected() != 1 {
+        return Err(DeliveryRepositoryError::CompareAndSetConflict);
+    }
+
+    // 2. Insert the one immutable disposition row for the winning terminalization.
+    let (signed_request_bytes, signing_transcript_bytes, request_digest, signature) =
+        match disposition.authorization() {
+            Some(authorization) => (
+                Some(authorization.signed_request_bytes.clone()),
+                Some(authorization.signing_transcript_bytes.clone()),
+                Some(authorization.request_digest.clone()),
+                Some(authorization.signature.clone()),
+            ),
+            None => (None, None, None, None),
+        };
+
+    sqlx::query(
+        r#"
+        INSERT INTO chat.welcome_dispositions(
+            welcome_id, winner_kind, signed_request_bytes, signing_transcript_bytes,
+            request_digest, signature, rejection_reason, terminal_at, event_position
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        "#,
+    )
+    .bind(welcome_id)
+    .bind(winner_kind)
+    .bind(signed_request_bytes)
+    .bind(signing_transcript_bytes)
+    .bind(request_digest)
+    .bind(signature)
+    .bind(disposition.rejection_reason())
+    .bind(terminal_at)
+    .bind(event_position)
+    .execute(&mut **transaction)
+    .await?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Family F — chat.recovery_work_items (deferred re-add work for expired/rejected
+// Welcomes).
+// ---------------------------------------------------------------------------
+
+/// Source kind of a recovery work item. Mirrors
+/// `recovery_work_items_source_kind_check` exactly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecoveryWorkSourceKind {
+    WelcomeExpired,
+    WelcomeRejected,
+}
+
+impl RecoveryWorkSourceKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::WelcomeExpired => "welcomeExpired",
+            Self::WelcomeRejected => "welcomeRejected",
+        }
+    }
+}
+
+/// One new **pending** recovery work item, carried column-for-column: the exact
+/// recipient device, the retained source disposition id + kind, and the bound
+/// source `(generation, state_version)` coordinate. The insert always writes
+/// `status = 'pending'` with NULL terminal provenance; the `source_id` unique and
+/// `recovery_work_items_terminal_shape_check` (pending arm) remain the DB's
+/// authority.
+#[derive(Clone, Debug)]
+pub(crate) struct NewRecoveryWorkItem {
+    pub(crate) recovery_work_id: Uuid,
+    pub(crate) conversation_id: Uuid,
+    pub(crate) recipient_did: String,
+    pub(crate) recipient_device_id: Uuid,
+    pub(crate) source_kind: RecoveryWorkSourceKind,
+    pub(crate) source_id: Uuid,
+    pub(crate) generation: i64,
+    pub(crate) state_version: i64,
+    pub(crate) created_at: DateTime<Utc>,
+}
+
+pub(crate) async fn insert_recovery_work_item(
+    transaction: &mut Transaction<'_, Postgres>,
+    item: &NewRecoveryWorkItem,
+) -> Result<(), DeliveryRepositoryError> {
+    sqlx::query(
+        r#"
+        INSERT INTO chat.recovery_work_items(
+            recovery_work_id, conversation_id, recipient_did, recipient_device_id,
+            source_kind, source_id, generation, state_version, status,
+            terminal_transition_id, terminal_revocation_id, created_at, terminal_at
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, 'pending', NULL, NULL, $9, NULL
+        )
+        "#,
+    )
+    .bind(item.recovery_work_id)
+    .bind(item.conversation_id)
+    .bind(&item.recipient_did)
+    .bind(item.recipient_device_id)
+    .bind(item.source_kind.as_str())
+    .bind(item.source_id)
+    .bind(item.generation)
+    .bind(item.state_version)
+    .bind(item.created_at)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+/// The exact terminal edge a pending recovery work item takes, per
+/// `recovery_work_items_terminal_shape_check`:
+/// * `CompletedByTransition` — `completed`, binds the fulfilling leaf-recovery
+///   transition + timestamp (revocation NULL);
+/// * `SupersededByTransition` — `superseded`, binds a superseding transition +
+///   timestamp;
+/// * `SupersededByRevocation` — `superseded`, binds the recipient's device
+///   revocation + timestamp.
+/// Every arm requires `terminal_at >= created_at` (the DB's authority).
+#[derive(Clone, Debug)]
+pub(crate) enum RecoveryWorkTermination {
+    CompletedByTransition {
+        terminal_transition_id: Uuid,
+        terminal_at: DateTime<Utc>,
+    },
+    SupersededByTransition {
+        terminal_transition_id: Uuid,
+        terminal_at: DateTime<Utc>,
+    },
+    SupersededByRevocation {
+        terminal_revocation_id: Uuid,
+        terminal_at: DateTime<Utc>,
+    },
+}
+
+/// Terminalize a pending recovery work item. CAS on `status = 'pending'`, writing
+/// exactly the `status` + terminal columns the target shape allows (the immutable
+/// identity trigger allows only `status`, `terminal_transition_id`,
+/// `terminal_revocation_id`, `terminal_at` to change; the lifecycle-monotonic
+/// trigger requires the row to be pending). A repeat or wrong-state attempt
+/// matches nothing and is a typed conflict.
+pub(crate) async fn terminalize_recovery_work_item(
+    transaction: &mut Transaction<'_, Postgres>,
+    recovery_work_id: Uuid,
+    termination: &RecoveryWorkTermination,
+) -> Result<(), DeliveryRepositoryError> {
+    let (status, terminal_transition_id, terminal_revocation_id, terminal_at) = match termination {
+        RecoveryWorkTermination::CompletedByTransition {
+            terminal_transition_id,
+            terminal_at,
+        } => (
+            "completed",
+            Some(*terminal_transition_id),
+            None,
+            *terminal_at,
+        ),
+        RecoveryWorkTermination::SupersededByTransition {
+            terminal_transition_id,
+            terminal_at,
+        } => (
+            "superseded",
+            Some(*terminal_transition_id),
+            None,
+            *terminal_at,
+        ),
+        RecoveryWorkTermination::SupersededByRevocation {
+            terminal_revocation_id,
+            terminal_at,
+        } => (
+            "superseded",
+            None,
+            Some(*terminal_revocation_id),
+            *terminal_at,
+        ),
+    };
+
+    let result = sqlx::query(
+        r#"
+        UPDATE chat.recovery_work_items
+           SET status = $2,
+               terminal_transition_id = $3,
+               terminal_revocation_id = $4,
+               terminal_at = $5
+         WHERE recovery_work_id = $1
+           AND status = 'pending'
+        "#,
+    )
+    .bind(recovery_work_id)
+    .bind(status)
+    .bind(terminal_transition_id)
+    .bind(terminal_revocation_id)
+    .bind(terminal_at)
+    .execute(&mut **transaction)
+    .await?;
+
+    if result.rows_affected() != 1 {
+        return Err(DeliveryRepositoryError::CompareAndSetConflict);
     }
     Ok(())
 }
