@@ -78,7 +78,7 @@ mod chat_protocol {
 
 use std::{fs, path::PathBuf};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -91,6 +91,7 @@ use chat_protocol::repository::delivery::{
     append_entry_at, AppendEntry, DeliveryRepositoryError, EntryEntitlementKind,
     EventEntitlementKind, EventKind, OutboxWorkKind,
 };
+use chat_protocol::repository::transition::ResetReason;
 use chat_protocol::repository::transition::{
     cas_conversation_head, cas_generation_state_version, supersede_generation, ConversationHeadCas,
     ConversationHeadClose, GenerationStateVersionCas, GenerationSupersede, TransitionActorRole,
@@ -98,11 +99,13 @@ use chat_protocol::repository::transition::{
 };
 use chat_protocol::snapshot::{PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle};
 use chat_protocol::state_machine::{
-    apply_conversation_persistence_plan, persistence_plan_for_test, plan_creation, plan_policy,
-    ControlEntryContent, ConversationHeadCasBinding, ConversationKind, CreationCommand,
-    CreationDecision, DeviceIdentity, EventFanout, ExecutionActor, ExecutionContext, ExecutorError,
+    apply_conversation_persistence_plan, persistence_plan_for_test, plan_close, plan_creation,
+    plan_policy, plan_reset_request, CloseConversation, ControlEntryContent,
+    ConversationHeadCasBinding, ConversationKind, CreationCommand, CreationDecision,
+    DeviceIdentity, EventFanout, ExecutionActor, ExecutionContext, ExecutorError,
     LeafPersistenceColumns, MetadataAuthorColumns, MetadataSnapshotBinding, PrincipalId,
-    ServerTimestamp, SpineArtifacts, TransitionEvidence,
+    RequestEntryKind, RequestEvidence, ResetRequestCommand, ResetRequestRow, ServerTimestamp,
+    SpineArtifacts, TransitionEvidence,
 };
 use chat_protocol::validation::ed25519_key_id;
 
@@ -491,6 +494,8 @@ async fn build_creation(pool: &PgPool, kind: ConversationKind) -> CreationApply 
             recipients: event_audience(pool, &alice_id, &alice_did, &bob_id, &bob_did).await,
             outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
         }],
+        closing_leaf_periods: Vec::new(),
+        reset_request_row: None,
     };
 
     CreationApply {
@@ -1177,6 +1182,8 @@ async fn group_policy_add_participant_commits_state_version_plus_one() {
             recipients: event_recips,
             outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
         }],
+        closing_leaf_periods: Vec::new(),
+        reset_request_row: None,
     };
 
     // 5. Apply + COMMIT the policy edge.
@@ -1240,6 +1247,30 @@ async fn group_policy_add_participant_commits_state_version_plus_one() {
     .await
     .expect("policy snapshot count");
     assert_eq!(policy_snap, 0);
+
+    // Reviewer's existing-edge re-apply variant: re-applying the committed POLICY
+    // plan hits the head CAS (the head already advanced to stateVersion 1) →
+    // typed conflict, whole transaction rolls back with zero residue.
+    let before: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM chat.transitions WHERE conversation_id=$1")
+            .bind(conversation_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let mut tx3 = pool.begin().await.expect("begin re-apply policy");
+    let reapply = apply_conversation_persistence_plan(&mut tx3, &plan, &ctx).await;
+    assert!(
+        matches!(reapply, Err(ExecutorError::Transition(_))),
+        "policy re-apply must conflict on the head CAS, got {reapply:?}"
+    );
+    tx3.rollback().await.expect("rollback re-apply policy");
+    let after: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM chat.transitions WHERE conversation_id=$1")
+            .bind(conversation_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(before, after, "policy re-apply left zero residue");
 }
 
 #[tokio::test]
@@ -1337,6 +1368,389 @@ async fn creation_failure_injection_rolls_back_whole_graph() {
         .await,
         0
     );
+}
+
+async fn commit_creation(pool: &PgPool, kind: ConversationKind) -> CreationApply {
+    let fixture = build_creation(pool, kind).await;
+    let mut tx = pool.begin().await.expect("begin creation");
+    apply_conversation_persistence_plan(&mut tx, &fixture.plan, &fixture.ctx)
+        .await
+        .expect("creation applies");
+    tx.commit().await.expect("creation COMMIT");
+    fixture
+}
+
+async fn device_event_predecessor(pool: &PgPool, did: &str, device: Uuid) -> Option<i64> {
+    sqlx::query_scalar(
+        "SELECT max(event_position) FROM chat.event_recipients WHERE user_did=$1 AND device_id=$2",
+    )
+    .bind(did)
+    .bind(device)
+    .fetch_one(pool)
+    .await
+    .expect("predecessor")
+}
+
+#[tokio::test]
+async fn direct_close_commits_terminal_graph_and_reapply_conflicts() {
+    let pool = setup().await;
+    let fixture = commit_creation(&pool, ConversationKind::Direct).await;
+    let conversation_id = fixture.conversation_id;
+
+    // The creator's committed genesis leaf period (the interval's closing leaf).
+    let leaf_period_id: Uuid = sqlx::query_scalar(
+        "SELECT leaf_period_id FROM chat.member_devices WHERE conversation_id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("genesis leaf period");
+
+    // Build the REAL close plan. Close entry is seq 2 (> the creation seq 1).
+    let received_at = ServerTimestamp::from_unix_millis_for_test(
+        corpus_manifest().evaluation_unix_seconds as i64 * 1_000 + 3_000,
+    )
+    .unwrap();
+    let entry_id = Uuid::new_v4();
+    let transition_id = Uuid::new_v4();
+    let close_evidence =
+        TransitionEvidence::for_test_at(2, *transition_id.as_bytes(), [0x13_u8; 32], received_at)
+            .unwrap();
+    let planned = plan_close(
+        &fixture.state,
+        CloseConversation {
+            actor: fixture.alice_id.clone(),
+            transition: close_evidence,
+        },
+    )
+    .expect("valid close plan");
+    let head_cas = ConversationHeadCasBinding::for_test_edge(
+        *conversation_id.as_bytes(),
+        *entry_id.as_bytes(),
+        fixture.coordinate,
+        2,
+        received_at,
+    );
+    let plan = persistence_plan_for_test(planned, head_cas);
+
+    let applied_at = clock_now(&pool).await;
+    let alice_pred =
+        device_event_predecessor(&pool, &fixture.alice_did, fixture.alice_device).await;
+    let ctx = close_ctx(&fixture, entry_id, applied_at, leaf_period_id, alice_pred);
+
+    let mut tx = pool.begin().await.expect("begin close");
+    let applied = apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+        .await
+        .expect("close applies");
+    tx.commit()
+        .await
+        .expect("close COMMIT past all deferred triggers");
+    assert_eq!(applied.allocated_seq, 2);
+
+    // Head superseded with the close coordinate.
+    let (lifecycle, ct, cseq): (String, Option<Uuid>, Option<i64>) = sqlx::query_as(
+        "SELECT lifecycle,close_transition_id,close_seq FROM chat.conversations WHERE conversation_id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("head");
+    assert_eq!(lifecycle, "superseded");
+    assert_eq!(ct, Some(transition_id));
+    assert_eq!(cseq, Some(2));
+    // Generation superseded; superseded closeConversation state at sv 1.
+    let gen_life: String = sqlx::query_scalar(
+        "SELECT lifecycle FROM chat.generations WHERE conversation_id=$1 AND generation=0",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("gen");
+    assert_eq!(gen_life, "superseded");
+    let (skind, slife): (String, String) = sqlx::query_as(
+        "SELECT state_kind,lifecycle FROM chat.generation_states WHERE conversation_id=$1 AND state_version=1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("close state");
+    assert_eq!(
+        (skind.as_str(), slife.as_str()),
+        ("closeConversation", "superseded")
+    );
+    // Interval closed with a Terminal proof at the close seq.
+    let (tseq, ckind): (Option<i64>, Option<String>) = sqlx::query_as(
+        "SELECT terminal_seq,closing_kind FROM chat.application_intervals WHERE conversation_id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("interval");
+    assert_eq!((tseq, ckind.as_deref()), (Some(2), Some("terminal")));
+    // One schedule terminal proof; a retained scheduleTerminal audience row.
+    assert_eq!(count(&pool, "SELECT count(*) FROM chat.application_schedule_terminal_proofs WHERE conversation_id=$1", conversation_id).await, 1);
+    let sched_recips: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.entry_recipients WHERE conversation_id=$1 AND seq=2 AND entitlement_kind='scheduleTerminal'",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("sched recipients");
+    assert_eq!(sched_recips, 1);
+    // The single conversation-close tombstone event.
+    let evt_kind: String =
+        sqlx::query_scalar("SELECT event_kind FROM chat.events WHERE event_position=$1")
+            .bind(applied.event_positions[0])
+            .fetch_one(&pool)
+            .await
+            .expect("event");
+    assert_eq!(evt_kind, "conversationClosed");
+
+    // Re-apply the same close plan -> head CAS conflict (the head is already
+    // superseded), whole transaction rolls back with zero residue.
+    let before: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM chat.transitions WHERE conversation_id=$1")
+            .bind(conversation_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let mut tx2 = pool.begin().await.expect("begin re-close");
+    let reapply = apply_conversation_persistence_plan(&mut tx2, &plan, &ctx).await;
+    assert!(
+        matches!(reapply, Err(ExecutorError::Transition(_))),
+        "re-close must conflict, got {reapply:?}"
+    );
+    tx2.rollback().await.expect("rollback");
+    let after: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM chat.transitions WHERE conversation_id=$1")
+            .bind(conversation_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(before, after, "re-close left zero residue");
+}
+
+fn close_ctx(
+    fixture: &CreationApply,
+    entry_id: Uuid,
+    applied_at: DateTime<Utc>,
+    leaf_period_id: Uuid,
+    alice_pred: Option<i64>,
+) -> ExecutionContext {
+    let payload = vec![0x31_u8; 12];
+    let transcript = vec![0x32_u8; 12];
+    ExecutionContext {
+        protocol_instance_id: fixture.protocol_instance_id,
+        applied_at,
+        actor: ExecutionActor {
+            user_did: fixture.alice_did.clone(),
+            device_id: fixture.alice_device,
+            key_id: fixture.alice_key_id.clone(),
+            auth_generation: 1,
+            role: chat_protocol::repository::transition::TransitionActorRole::Admin,
+            device_status: "active".to_owned(),
+        },
+        entry: ControlEntryContent {
+            entry_id,
+            entry_kind: "blue.catbird.chat.defs#conversationCloseEntry".to_owned(),
+            accepted_payload_bytes: payload.clone(),
+            accepted_payload_sha256: Sha256::digest(&payload).to_vec(),
+            signed_request_bytes: transcript.clone(),
+            unsigned_projection_bytes: vec![0x33_u8; 8],
+            signing_transcript_bytes: transcript.clone(),
+            request_digest: Sha256::digest(&transcript).to_vec(),
+            signature: vec![0x34_u8; 64],
+            server_fields_bytes: vec![0x35_u8; 8],
+            outer_entry_fingerprint: vec![0x13_u8; 32],
+        },
+        spine: SpineArtifacts {
+            public_snapshot_bytes: vec![0x41_u8; 16],
+            public_snapshot_sha256: Sha256::digest([0x41_u8; 16]).to_vec(),
+            tree_summary_bytes: vec![0x42_u8; 16],
+            tree_summary_sha256: Sha256::digest([0x42_u8; 16]).to_vec(),
+            leaf_count: 1,
+            genesis_group_info_bytes: vec![],
+            genesis_group_info_sha256: vec![],
+        },
+        opened_leaves: vec![],
+        metadata_author: None,
+        participant_period_ids: vec![],
+        leaf_period_ids: vec![],
+        entry_recipients: vec![(
+            fixture.alice_id.clone(),
+            chat_protocol::repository::delivery::EntryEntitlementKind::ScheduleTerminal,
+        )],
+        events: vec![EventFanout {
+            event_id: Uuid::new_v4(),
+            event_kind: EventKind::ConversationClosed,
+            payload_bytes: vec![0x51_u8; 8],
+            recipients: vec![(
+                fixture.alice_id.clone(),
+                EventEntitlementKind::Participant,
+                alice_pred,
+            )],
+            outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+        }],
+        closing_leaf_periods: vec![(fixture.alice_id.clone(), leaf_period_id)],
+        reset_request_row: None,
+    }
+}
+
+#[tokio::test]
+async fn reset_request_commits_without_changing_the_coordinate() {
+    let pool = setup().await;
+    let fixture = commit_creation(&pool, ConversationKind::Group).await;
+    let conversation_id = fixture.conversation_id;
+
+    // A reset request by the active admin (alice). Non-mutating: seq advances, the
+    // (generation,state_version) coordinate must be untouched.
+    let request_id = Uuid::new_v4();
+    let received_at = ServerTimestamp::from_unix_millis_for_test(
+        corpus_manifest().evaluation_unix_seconds as i64 * 1_000 + 3_000,
+    )
+    .unwrap();
+    let evidence = RequestEvidence::for_test(
+        RequestEntryKind::ResetRequest,
+        2,
+        *request_id.as_bytes(),
+        fixture.alice_id.clone(),
+        *conversation_id.as_bytes(),
+        received_at,
+        0x61,
+    )
+    .unwrap();
+    let planned = plan_reset_request(
+        &fixture.state,
+        ResetRequestCommand {
+            actor: fixture.alice_id.clone(),
+            reset_request_id: *request_id.as_bytes(),
+            received_at,
+            evidence,
+        },
+    )
+    .expect("valid reset request plan");
+    let entry_id = Uuid::new_v4();
+    let head_cas = ConversationHeadCasBinding::for_test_edge(
+        *conversation_id.as_bytes(),
+        *entry_id.as_bytes(),
+        fixture.coordinate,
+        2,
+        received_at,
+    );
+    let plan = persistence_plan_for_test(planned, head_cas);
+
+    // The reset-request entry and the reset_requests row MUST carry identical
+    // signed bytes / digest / signature / received_at (the entry↔request mapping
+    // trigger); source both from the same values.
+    let applied_at = clock_now(&pool).await;
+    let transcript = vec![0x62_u8; 16];
+    let request_digest = Sha256::digest(&transcript).to_vec();
+    let signature = vec![0x63_u8; 64];
+    let alice_pred =
+        device_event_predecessor(&pool, &fixture.alice_did, fixture.alice_device).await;
+    let ctx = ExecutionContext {
+        protocol_instance_id: fixture.protocol_instance_id,
+        applied_at,
+        actor: ExecutionActor {
+            user_did: fixture.alice_did.clone(),
+            device_id: fixture.alice_device,
+            key_id: fixture.alice_key_id.clone(),
+            auth_generation: 1,
+            role: chat_protocol::repository::transition::TransitionActorRole::Admin,
+            device_status: "active".to_owned(),
+        },
+        entry: ControlEntryContent {
+            entry_id,
+            entry_kind: "blue.catbird.chat.defs#resetRequestEntry".to_owned(),
+            accepted_payload_bytes: vec![0x64_u8; 8],
+            accepted_payload_sha256: Sha256::digest([0x64_u8; 8]).to_vec(),
+            signed_request_bytes: transcript.clone(),
+            unsigned_projection_bytes: vec![0x65_u8; 8],
+            signing_transcript_bytes: transcript.clone(),
+            request_digest: request_digest.clone(),
+            signature: signature.clone(),
+            server_fields_bytes: vec![0x66_u8; 8],
+            outer_entry_fingerprint: vec![0x14_u8; 32],
+        },
+        spine: SpineArtifacts {
+            public_snapshot_bytes: vec![],
+            public_snapshot_sha256: vec![],
+            tree_summary_bytes: vec![],
+            tree_summary_sha256: vec![],
+            leaf_count: 1,
+            genesis_group_info_bytes: vec![],
+            genesis_group_info_sha256: vec![],
+        },
+        opened_leaves: vec![],
+        metadata_author: None,
+        participant_period_ids: vec![],
+        leaf_period_ids: vec![],
+        entry_recipients: vec![(
+            fixture.alice_id.clone(),
+            chat_protocol::repository::delivery::EntryEntitlementKind::Control,
+        )],
+        events: vec![EventFanout {
+            event_id: Uuid::new_v4(),
+            event_kind: EventKind::ResetRequested,
+            payload_bytes: vec![0x67_u8; 8],
+            recipients: vec![(
+                fixture.alice_id.clone(),
+                EventEntitlementKind::Participant,
+                alice_pred,
+            )],
+            outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+        }],
+        closing_leaf_periods: vec![],
+        reset_request_row: Some(ResetRequestRow {
+            reset_request_id: request_id,
+            reason: ResetReason::PoisonedState,
+            signed_request_bytes: transcript.clone(),
+            signing_transcript_bytes: transcript.clone(),
+            request_digest,
+            signature,
+            expires_at: applied_at + Duration::hours(24),
+        }),
+    };
+
+    let mut tx = pool.begin().await.expect("begin reset");
+    apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+        .await
+        .expect("reset request applies");
+    tx.commit().await.expect("reset request COMMIT");
+
+    // Coordinate UNTOUCHED (still 0,0 active); only the seq advanced.
+    let (gen, sv, next_seq, lifecycle): (i64, i64, i64, String) = sqlx::query_as(
+        "SELECT current_generation,current_state_version,next_entry_seq,lifecycle FROM chat.conversations WHERE conversation_id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("head");
+    assert_eq!((gen, sv, next_seq, lifecycle.as_str()), (0, 0, 3, "active"));
+    // A pending reset request row + a resetRequestEntry, no new transition.
+    let (status,): (String,) =
+        sqlx::query_as("SELECT status FROM chat.reset_requests WHERE reset_request_id=$1")
+            .bind(request_id)
+            .fetch_one(&pool)
+            .await
+            .expect("reset request row");
+    assert_eq!(status, "pending");
+    let entry_kind: String = sqlx::query_scalar(
+        "SELECT entry_kind FROM chat.entries WHERE conversation_id=$1 AND seq=2",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("entry");
+    assert_eq!(entry_kind, "blue.catbird.chat.defs#resetRequestEntry");
+    // No transition row was produced by the reset request (it is non-mutating).
+    let transitions: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM chat.transitions WHERE conversation_id=$1")
+            .bind(conversation_id)
+            .fetch_one(&pool)
+            .await
+            .expect("transitions");
+    assert_eq!(transitions, 1, "only the creation transition exists");
 }
 
 #[tokio::test]

@@ -12755,7 +12755,7 @@ fn would_remove_last_active_admin(state: &ConversationState, principal: &Princip
 pub(crate) use executor::{
     apply_conversation_persistence_plan, AppliedTransition, ControlEntryContent, EventFanout,
     ExecutionActor, ExecutionContext, ExecutorError, LeafPersistenceColumns, MetadataAuthorColumns,
-    SpineArtifacts,
+    ResetRequestRow, SpineArtifacts,
 };
 
 mod executor {
@@ -12765,19 +12765,21 @@ mod executor {
     use std::collections::HashMap;
 
     use super::super::repository::delivery::{
-        self as delivery, AppendEntry, DeliveryRepositoryError, EntryEntitlementKind,
-        EntryRecipient, EventEntitlementKind, EventKind, EventRecipient, IntervalOpeningKind,
-        NewApplicationInterval, NewEvent, OutboxWorkKind,
+        self as delivery, AppendEntry, ApplicationIntervalClose, DeliveryRepositoryError,
+        EntryEntitlementKind, EntryRecipient, EventEntitlementKind, EventKind, EventRecipient,
+        IntervalCloseKind, IntervalOpeningKind, NewApplicationInterval, NewEvent,
+        NewScheduleTerminalProof, OutboxWorkKind,
     };
     use super::super::repository::transition::{
-        self as transition, ConversationHeadKind, GenerationStateKind, GenerationStateLifecycle,
-        LeafOrigin, NewGeneration, NewGenerationState, NewLeafPeriod, NewMetadataSnapshot,
-        NewParticipantPeriod, NewTransition, ParticipantInvitation,
+        self as transition, ConversationHeadClose, ConversationHeadKind, GenerationStateKind,
+        GenerationStateLifecycle, GenerationSupersede, LeafClose, LeafOrigin, NewGeneration,
+        NewGenerationState, NewLeafPeriod, NewMetadataSnapshot, NewParticipantPeriod,
+        NewResetRequest, NewTransition, ParticipantInvitation,
         ParticipantRole as RepoParticipantRole, ParticipantStatus as RepoParticipantStatus,
         TransitionActorRole, TransitionCoordinates, TransitionKind, TransitionRepositoryError,
     };
     use super::{
-        ConversationKind, DeviceIdentity, LeafHydrationRow, MetadataSnapshotBinding,
+        CloseKind, ConversationKind, DeviceIdentity, LeafHydrationRow, MetadataSnapshotBinding,
         ParticipantHydrationRow, ParticipantRole, ParticipantStatus, PlanKind, PrincipalId,
         PublicGroupSnapshotCoordinate, ServerTimestamp, StateChange, TransitionEffects,
     };
@@ -12924,6 +12926,31 @@ mod executor {
         /// The exact control-entry audience, canonical `(DID, device)` order.
         pub(crate) entry_recipients: Vec<(DeviceIdentity, EntryEntitlementKind)>,
         pub(crate) events: Vec<EventFanout>,
+        /// For a `close`/`reset` edge that closes existing intervals: the exact
+        /// active leaf-period id to record as each interval's
+        /// `closing_leaf_period_id`. The facade queries `chat.member_devices` for
+        /// the recipient's active leaf under lock; the plan's `interval_changes`
+        /// supply everything else (terminal seq, closing transition + fingerprint).
+        /// Empty for edges that close no interval (creation / policy / reset req).
+        pub(crate) closing_leaf_periods: Vec<(DeviceIdentity, Uuid)>,
+        /// For a `reset request` edge: the exact `chat.reset_requests` row content
+        /// the signed request carries (reason + signed material + expiry). `None`
+        /// for every other edge.
+        pub(crate) reset_request_row: Option<ResetRequestRow>,
+    }
+
+    /// The exact `chat.reset_requests` row a reset-request edge persists. Sourced
+    /// from the verified signed `requestReset` body; the executor writes it
+    /// verbatim (the DB re-verifies `request_digest`/`expires_at`).
+    #[derive(Clone, Debug)]
+    pub(crate) struct ResetRequestRow {
+        pub(crate) reset_request_id: Uuid,
+        pub(crate) reason: transition::ResetReason,
+        pub(crate) signed_request_bytes: Vec<u8>,
+        pub(crate) signing_transcript_bytes: Vec<u8>,
+        pub(crate) request_digest: Vec<u8>,
+        pub(crate) signature: Vec<u8>,
+        pub(crate) expires_at: DateTime<Utc>,
     }
 
     /// What the executor allocated/produced, echoed for the caller's response.
@@ -13057,7 +13084,20 @@ mod executor {
                 Err(ExecutorError::UnsupportedEffect("leafRecoveryCancellation"))
             }
             PlanKind::DeviceRevocation => Err(ExecutorError::UnsupportedEffect("deviceRevocation")),
-            PlanKind::ResetRequest => Err(ExecutorError::UnsupportedEffect("resetRequest")),
+            PlanKind::ResetRequest => {
+                apply_reset_request(
+                    transaction,
+                    plan,
+                    ctx,
+                    conversation_id,
+                    seq_i64,
+                    successor_next_entry_seq,
+                    generation,
+                    state_version,
+                    epoch,
+                )
+                .await
+            }
             PlanKind::ResetActivation => Err(ExecutorError::UnsupportedEffect("resetActivation")),
             PlanKind::LeaveRequest => Err(ExecutorError::UnsupportedEffect("leaveRequest")),
             PlanKind::LeaveCancellation => {
@@ -13069,7 +13109,21 @@ mod executor {
             }
             PlanKind::WelcomeRejection => Err(ExecutorError::UnsupportedEffect("welcomeRejection")),
             PlanKind::WelcomeExpiry => Err(ExecutorError::UnsupportedEffect("welcomeExpiry")),
-            PlanKind::Close => Err(ExecutorError::UnsupportedEffect("closeConversation")),
+            PlanKind::Close => {
+                apply_close(
+                    transaction,
+                    plan,
+                    ctx,
+                    conversation_id,
+                    transition_id,
+                    seq_i64,
+                    successor_next_entry_seq,
+                    generation,
+                    state_version,
+                    epoch,
+                )
+                .await
+            }
         }
     }
 
@@ -13515,6 +13569,415 @@ mod executor {
             event_positions,
             successor_coordinate: plan.successor_coordinate().copied(),
         })
+    }
+
+    /// Apply a `closeConversation` edge: `stateVersion+1`, `lifecycle=superseded`,
+    /// no successor. Closes every still-open interval with a `Terminal` proof,
+    /// inserts one schedule terminal proof per historical device schedule, closes
+    /// the genesis leaf, and emits the single conversation-close tombstone event.
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_close(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        plan: &ConversationPersistencePlan,
+        ctx: &ExecutionContext,
+        conversation_id: Uuid,
+        transition_id: Uuid,
+        seq_i64: i64,
+        successor_next_entry_seq: i64,
+        generation: i64,
+        state_version: i64,
+        epoch: i64,
+    ) -> Result<AppliedTransition, ExecutorError> {
+        let effects = plan.effects();
+        let hydration = plan.state();
+        let coordinate = &hydration.coordinate; // retired coordinate (same crypto).
+        let applied_at = ctx.applied_at;
+        let head = effects
+            .head_cas()
+            .ok_or(ExecutorError::InconsistentPlan("missing head CAS binding"))?;
+        let expected_prior = head
+            .expected_prior()
+            .ok_or(ExecutorError::InconsistentPlan(
+                "close needs an expected prior",
+            ))?;
+        let expected_generation = checked_i64(expected_prior.generation())?;
+        let expected_state_version = checked_i64(expected_prior.state_version())?;
+        let expected_next_entry_seq = checked_i64(head.expected_next_entry_seq())?;
+
+        // Close is coordinate-retire + interval/leaf teardown; it carries no
+        // participant/metadata/recovery/reservation/welcome change on the simple
+        // (creator-only / direct) terminal path. Anything else is a hard error.
+        reject_if_present("participant_changes", effects.participant_changes())?;
+        reject_if_present(
+            "recovery_request_changes",
+            effects.recovery_request_changes(),
+        )?;
+        reject_if_present("reservation_changes", effects.reservation_changes())?;
+        reject_if_present("leave_request_changes", effects.leave_request_changes())?;
+        reject_if_present("reset_request_changes", effects.reset_request_changes())?;
+        reject_if_present("welcome_changes", effects.welcome_changes())?;
+        reject_if_present("package_transitions", effects.package_transitions())?;
+        reject_if_present("recovery_package_cas", effects.recovery_package_cas())?;
+        reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
+        if effects.metadata_change().is_some() {
+            return Err(ExecutorError::UnsupportedEffect("close metadata change"));
+        }
+        if effects.revocation_target_cas().is_some() || effects.welcome_cas().is_some() {
+            return Err(ExecutorError::UnsupportedEffect(
+                "close revocation/welcome CAS",
+            ));
+        }
+
+        // 1. Head CAS to superseded with the exact close coordinate.
+        transition::cas_conversation_head(
+            transaction,
+            &transition::ConversationHeadCas {
+                conversation_id,
+                expected_generation,
+                expected_state_version,
+                expected_next_entry_seq,
+                successor_generation: generation,
+                successor_state_version: state_version,
+                successor_next_entry_seq,
+                close: Some(ConversationHeadClose {
+                    close_transition_id: transition_id,
+                    close_generation: generation,
+                    close_state_version: state_version,
+                    close_seq: seq_i64,
+                    closed_at: applied_at,
+                }),
+            },
+        )
+        .await?;
+
+        // 2. Supersede the generation (points at the superseded state).
+        transition::supersede_generation(
+            transaction,
+            &GenerationSupersede {
+                conversation_id,
+                generation,
+                expected_state_version,
+                successor_state_version: state_version,
+                superseded_seq: seq_i64,
+                superseded_at: applied_at,
+            },
+        )
+        .await?;
+
+        // 3. Superseded closeConversation generation state (same crypto edge).
+        transition::insert_generation_state_row(
+            transaction,
+            &NewGenerationState {
+                conversation_id,
+                generation,
+                state_version,
+                group_id: coordinate.group_id().to_vec(),
+                epoch,
+                group_context_hash: coordinate.group_context_hash().to_vec(),
+                confirmation_tag: coordinate.confirmation_tag().to_vec(),
+                lifecycle: GenerationStateLifecycle::Superseded,
+                state_kind: GenerationStateKind::CloseConversation,
+                producing_transition_id: transition_id,
+                public_snapshot_bytes: ctx.spine.public_snapshot_bytes.clone(),
+                snapshot_sha256: ctx.spine.public_snapshot_sha256.clone(),
+                tree_summary_bytes: ctx.spine.tree_summary_bytes.clone(),
+                tree_summary_sha256: ctx.spine.tree_summary_sha256.clone(),
+                leaf_count: ctx.spine.leaf_count,
+                created_at: applied_at,
+            },
+        )
+        .await?;
+
+        // 4. Entry (conversationCloseEntry) at the close seq.
+        let append = build_append_entry(
+            ctx,
+            conversation_id,
+            generation,
+            state_version,
+            transition_id,
+        );
+        delivery::append_entry_at(transaction, &append, u64::try_from(seq_i64).unwrap()).await?;
+
+        // 5. Transition (prior -> retired; a close transition references itself).
+        transition::insert_transition_row(
+            transaction,
+            &NewTransition {
+                transition_id,
+                conversation_id,
+                kind: TransitionKind::CloseConversation,
+                actor_did: ctx.actor.user_did.clone(),
+                actor_device_id: ctx.actor.device_id,
+                actor_key_id: ctx.actor.key_id.clone(),
+                actor_auth_generation: ctx.actor.auth_generation,
+                actor_role: ctx.actor.role,
+                actor_device_status: ctx.actor.device_status.clone(),
+                signed_request_bytes: ctx.entry.signed_request_bytes.clone(),
+                unsigned_projection_bytes: ctx.entry.unsigned_projection_bytes.clone(),
+                signing_transcript_bytes: ctx.entry.signing_transcript_bytes.clone(),
+                request_digest: ctx.entry.request_digest.clone(),
+                signature: ctx.entry.signature.clone(),
+                coordinates: TransitionCoordinates {
+                    prior: Some((expected_generation, expected_state_version)),
+                    next: Some((generation, state_version)),
+                    retired: None,
+                    successor: None,
+                },
+                reset_request_id: None,
+                close_transition_id: Some(transition_id),
+                metadata_snapshot_id: None,
+                entry_seq: seq_i64,
+                accepted_at: applied_at,
+            },
+        )
+        .await?;
+
+        // 6. Close the genesis leaf (leaf_change = Some -> None).
+        for change in effects.leaf_changes() {
+            let before = match (change.before(), change.after()) {
+                (Some(before), None) => before,
+                _ => {
+                    return Err(ExecutorError::UnsupportedEffect(
+                        "close leaf change is not a removal",
+                    ))
+                }
+            };
+            let leaf_period_id = closing_leaf_period(ctx, before.device())?;
+            transition::close_leaf_period(
+                transaction,
+                &LeafClose {
+                    leaf_period_id,
+                    removed_state_version: state_version,
+                    removed_transition_id: transition_id,
+                    removed_seq: seq_i64,
+                    removed_at: applied_at,
+                },
+            )
+            .await?;
+        }
+
+        // 7. Close every still-open interval with the Terminal proof (from the plan).
+        for change in effects.interval_changes() {
+            let after = match (change.before(), change.after()) {
+                (Some(_), Some(after)) => after,
+                _ => {
+                    return Err(ExecutorError::UnsupportedEffect(
+                        "close interval change is not a finite close",
+                    ))
+                }
+            };
+            let end = after.end().ok_or(ExecutorError::InconsistentPlan(
+                "close interval carries no end",
+            ))?;
+            let leaf_period_id = closing_leaf_period(ctx, after.recipient())?;
+            delivery::close_application_interval(
+                transaction,
+                &ApplicationIntervalClose {
+                    membership_interval_id: Uuid::from_bytes(*after.opening_transition_id()),
+                    terminal_seq: checked_i64(end.seq())?,
+                    closing_state_version: state_version,
+                    closing_transition_id: Uuid::from_bytes(*end.transition_id()),
+                    closing_outer_entry_fingerprint: end.outer_entry_fingerprint().to_vec(),
+                    closing_kind: repo_interval_close_kind(end.kind()),
+                    closing_leaf_period_id: leaf_period_id,
+                    removed_at: applied_at,
+                },
+            )
+            .await?;
+        }
+
+        // 8. One schedule terminal proof per historical device schedule.
+        for change in effects.terminal_proof_changes() {
+            let proof = match (change.before(), change.after()) {
+                (None, Some(proof)) => proof,
+                _ => {
+                    return Err(ExecutorError::UnsupportedEffect(
+                        "schedule proof change is not an insert",
+                    ))
+                }
+            };
+            delivery::insert_schedule_terminal_proof(
+                transaction,
+                &NewScheduleTerminalProof {
+                    conversation_id,
+                    recipient_did: device_did(proof.recipient())?,
+                    recipient_device_id: device_uuid(proof.recipient()),
+                    terminal_seq: seq_i64,
+                    transition_id,
+                    outer_entry_fingerprint: ctx.entry.outer_entry_fingerprint.clone(),
+                    received_at: applied_at,
+                },
+            )
+            .await?;
+        }
+
+        // 9. Retained scheduleTerminal audience + the conversation-close event.
+        let recipients = build_entry_recipients(&ctx.entry_recipients)?;
+        delivery::insert_entry_recipients(
+            transaction,
+            conversation_id,
+            u64::try_from(seq_i64).unwrap(),
+            &recipients,
+        )
+        .await?;
+        let event_positions = write_events(transaction, ctx).await?;
+
+        Ok(AppliedTransition {
+            allocated_seq: u64::try_from(seq_i64).unwrap(),
+            entry_id: ctx.entry.entry_id,
+            event_positions,
+            successor_coordinate: plan.successor_coordinate().copied(),
+        })
+    }
+
+    /// Apply a `reset request` edge: a non-mutating signed intent. It appends the
+    /// request entry + the `chat.reset_requests` row + the event, and advances the
+    /// seq counter — but the crypto coordinate is UNCHANGED (no generation state,
+    /// no transition row, no stateVersion bump).
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_reset_request(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        plan: &ConversationPersistencePlan,
+        ctx: &ExecutionContext,
+        conversation_id: Uuid,
+        seq_i64: i64,
+        successor_next_entry_seq: i64,
+        generation: i64,
+        state_version: i64,
+        epoch: i64,
+    ) -> Result<AppliedTransition, ExecutorError> {
+        let effects = plan.effects();
+        let hydration = plan.state();
+        let coordinate = &hydration.coordinate; // unchanged coordinate.
+        let applied_at = ctx.applied_at;
+        let head = effects
+            .head_cas()
+            .ok_or(ExecutorError::InconsistentPlan("missing head CAS binding"))?;
+        let expected_prior = head
+            .expected_prior()
+            .ok_or(ExecutorError::InconsistentPlan(
+                "reset request needs an expected prior",
+            ))?;
+        let expected_generation = checked_i64(expected_prior.generation())?;
+        let expected_state_version = checked_i64(expected_prior.state_version())?;
+        let expected_next_entry_seq = checked_i64(head.expected_next_entry_seq())?;
+
+        // Non-mutating: only a reset-request row changes. Everything else empty.
+        reject_if_present("participant_changes", effects.participant_changes())?;
+        reject_if_present("leaf_changes", effects.leaf_changes())?;
+        reject_if_present("interval_changes", effects.interval_changes())?;
+        reject_if_present("terminal_proof_changes", effects.terminal_proof_changes())?;
+        reject_if_present(
+            "recovery_request_changes",
+            effects.recovery_request_changes(),
+        )?;
+        reject_if_present("reservation_changes", effects.reservation_changes())?;
+        reject_if_present("leave_request_changes", effects.leave_request_changes())?;
+        reject_if_present("welcome_changes", effects.welcome_changes())?;
+        if effects.metadata_change().is_some() {
+            return Err(ExecutorError::UnsupportedEffect(
+                "reset request metadata change",
+            ));
+        }
+        let row = ctx
+            .reset_request_row
+            .as_ref()
+            .ok_or(ExecutorError::MissingContext("reset request row content"))?;
+        // Exactly one new pending reset request in the delta.
+        if effects.reset_request_changes().len() != 1 {
+            return Err(ExecutorError::InconsistentPlan(
+                "reset request must add exactly one pending request",
+            ));
+        }
+
+        // 1. Head CAS: advance the seq counter, coordinate UNCHANGED.
+        transition::cas_conversation_head(
+            transaction,
+            &transition::ConversationHeadCas {
+                conversation_id,
+                expected_generation,
+                expected_state_version,
+                expected_next_entry_seq,
+                successor_generation: generation,
+                successor_state_version: state_version,
+                successor_next_entry_seq,
+                close: None,
+            },
+        )
+        .await?;
+
+        // 2. The request entry (resetRequestEntry carries no transition_id).
+        let mut append =
+            build_append_entry(ctx, conversation_id, generation, state_version, Uuid::nil());
+        append.generation = None;
+        append.state_version = None;
+        append.transition_id = None;
+        delivery::append_entry_at(transaction, &append, u64::try_from(seq_i64).unwrap()).await?;
+
+        // 3. The pending reset_requests row (signed content from ctx; bound
+        //    coordinate from the unchanged current coordinate).
+        transition::insert_reset_request(
+            transaction,
+            &transition::NewResetRequest {
+                reset_request_id: row.reset_request_id,
+                conversation_id,
+                requester_did: ctx.actor.user_did.clone(),
+                requester_device_id: ctx.actor.device_id,
+                requester_key_id: ctx.actor.key_id.clone(),
+                requester_auth_generation: ctx.actor.auth_generation,
+                prior_generation: generation,
+                prior_state_version: state_version,
+                prior_group_id: coordinate.group_id().to_vec(),
+                prior_epoch: epoch,
+                prior_group_context_hash: coordinate.group_context_hash().to_vec(),
+                prior_confirmation_tag: coordinate.confirmation_tag().to_vec(),
+                reason: row.reason.clone(),
+                signed_request_bytes: row.signed_request_bytes.clone(),
+                signing_transcript_bytes: row.signing_transcript_bytes.clone(),
+                request_digest: row.request_digest.clone(),
+                signature: row.signature.clone(),
+                received_at: applied_at,
+                expires_at: row.expires_at,
+            },
+        )
+        .await?;
+
+        // 4. Audience + event.
+        let recipients = build_entry_recipients(&ctx.entry_recipients)?;
+        delivery::insert_entry_recipients(
+            transaction,
+            conversation_id,
+            u64::try_from(seq_i64).unwrap(),
+            &recipients,
+        )
+        .await?;
+        let event_positions = write_events(transaction, ctx).await?;
+
+        Ok(AppliedTransition {
+            allocated_seq: u64::try_from(seq_i64).unwrap(),
+            entry_id: ctx.entry.entry_id,
+            event_positions,
+            successor_coordinate: plan.successor_coordinate().copied(),
+        })
+    }
+
+    fn closing_leaf_period(
+        ctx: &ExecutionContext,
+        device: &DeviceIdentity,
+    ) -> Result<Uuid, ExecutorError> {
+        ctx.closing_leaf_periods
+            .iter()
+            .find(|(candidate, _)| candidate == device)
+            .map(|(_, id)| *id)
+            .ok_or(ExecutorError::MissingContext("closing leaf period id"))
+    }
+
+    fn repo_interval_close_kind(kind: CloseKind) -> IntervalCloseKind {
+        match kind {
+            CloseKind::Remove => IntervalCloseKind::Remove,
+            CloseKind::Replace => IntervalCloseKind::Replace,
+            CloseKind::Reset => IntervalCloseKind::Reset,
+            CloseKind::Terminal => IntervalCloseKind::Terminal,
+        }
     }
 
     fn direct_pair(
