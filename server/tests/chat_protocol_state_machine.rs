@@ -33,6 +33,30 @@ mod chat_protocol {
         ));
     }
 
+    // The E2b-2/E2b-3 transition executor lives in `state_machine.rs` (included
+    // below) and is now compiled unconditionally, so its `super::repository::*`
+    // references must resolve inside this test crate too. The repository writer
+    // modules are self-contained (only `chrono`/`sha2`/`sqlx`/`uuid`), so they
+    // `include!` directly — mirroring `chat_protocol_transition_repository.rs`.
+    // The existing 27 state-machine tests do not use these; they are inert here.
+    pub mod repository {
+        pub mod transition {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/transition.rs"
+            ));
+        }
+
+        pub mod delivery {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/delivery.rs"
+            ));
+        }
+    }
+
     pub mod state_machine {
         #![allow(dead_code)]
         include!(concat!(

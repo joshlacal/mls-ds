@@ -9812,6 +9812,219 @@ fn plan_close_inner(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Task E2b-3 test-support: build a metadata-bearing creation
+// `ConversationPersistencePlan` from the pure planner + a synthesized head CAS,
+// so the executor's end-to-end COMMIT path can be exercised from the integration
+// harness. These are the minimal `pub(crate)` seams the E2b-2 report anticipated.
+//
+// FAITHFULNESS: production creation evidence (authenticated) carries a
+// `Creation` body whose metadata has `metadata_version == 1`,
+// `origin_transition_id == transitionId`, `author == actor`, and
+// `roleAtOrigin/deviceStatusAtOrigin == admin/active` (validated during
+// `decode_metadata_snapshot`, and re-checked by `require_creation_body` +
+// `metadata_author_matches_evidence` whenever `authority.is_some()`). The
+// constructors below reproduce exactly that shape. `require_creation_body` skips
+// the manifest/author cross-checks when `authority.is_none()` (the test-seam
+// case), so a bare roster manifest is legal here; the metadata itself is still
+// built to the production shape the COMMIT-time trigger demands. No production
+// path (`plan_*`, `require_creation_body`, the decode) is modified.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+impl MetadataSnapshotBinding {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_test_creation(
+        conversation_id: [u8; 16],
+        group_context_hash: [u8; 32],
+        transition_id: [u8; 16],
+        origin_seq: u64,
+        author: DeviceIdentity,
+        author_key_id: [u8; 32],
+        signature_public_key: [u8; 32],
+        auth_generation: u64,
+        nonce: [u8; 12],
+        ciphertext: Vec<u8>,
+    ) -> Self {
+        let ciphertext_sha256: [u8; 32] = Sha256::digest(&ciphertext).into();
+        // The canonical snapshot/digest are not persisted by the executor for a
+        // creation snapshot (the DB stores nonce/ciphertext/hash + author cols);
+        // use a stable, self-consistent placeholder so equality/debug hold.
+        let canonical_snapshot = ciphertext.clone();
+        let digest: [u8; 32] = Sha256::digest(&canonical_snapshot).into();
+        Self {
+            coordinate: MetadataCryptoCoordinate {
+                conversation_id,
+                generation: 0,
+                epoch: 0,
+                group_context_hash,
+            },
+            origin_transition_id: transition_id,
+            metadata_version: 1,
+            nonce,
+            ciphertext,
+            ciphertext_sha256,
+            avatar_binding_digest: None,
+            author_proof: MetadataAuthorProofBinding {
+                author,
+                author_key_id,
+                signature_public_key,
+                auth_generation_at_origin: auth_generation,
+                origin_transition_id: transition_id,
+                origin_seq,
+            },
+            canonical_snapshot,
+            digest,
+        }
+    }
+}
+
+#[cfg(test)]
+impl TransitionEvidence {
+    /// A creation `TransitionEvidence` carrying the exact `Creation` body a real
+    /// creation produces, including the metadata snapshot the COMMIT-time
+    /// `assert_metadata_snapshot_mapping` demands. `authority` stays `None` (the
+    /// test seam), which the pure planner accepts; the metadata is nevertheless
+    /// built to the production shape.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_test_creation_with_metadata(
+        seq: u64,
+        transition_id: [u8; 16],
+        outer_entry_fingerprint: [u8; 32],
+        received_at: ServerTimestamp,
+        kind: ConversationKind,
+        next: PublicGroupSnapshotCoordinate,
+        creator: DeviceIdentity,
+        metadata: MetadataSnapshotBinding,
+    ) -> Result<Self, StateMachineError> {
+        let mut evidence =
+            Self::for_test_at(seq, transition_id, outer_entry_fingerprint, received_at)?;
+        evidence.body_binding = Some(TransitionBodyBinding::Creation {
+            kind,
+            next,
+            manifest: RosterManifestBinding {
+                participants: Vec::new(),
+                actor_leaf: creator,
+            },
+            group_info_sha256: [0u8; 32],
+            metadata,
+        });
+        Ok(evidence)
+    }
+}
+
+#[cfg(test)]
+impl ConversationHeadCasBinding {
+    /// The head CAS a creation transaction's conversation-head lock would mint:
+    /// true absence (`expected_prior == None`), genesis entry at seq 1, counter
+    /// advanced to 2.
+    pub(crate) fn for_test_creation(
+        conversation_id: [u8; 16],
+        entry_id: [u8; 16],
+        locked_at: ServerTimestamp,
+    ) -> Self {
+        Self {
+            transaction_id: "e2b3-executor-test".to_owned(),
+            conversation_id,
+            expected_prior: None,
+            expected_next_entry_seq: 1,
+            allocated_entry_id: Some(entry_id),
+            allocated_seq: Some(1),
+            successor_next_entry_seq: 2,
+            locked_at,
+            locked_head_digest: [1u8; 32],
+        }
+    }
+}
+
+/// Assemble a `ConversationPersistencePlan` from a pure-planner `PlannedTransition`
+/// plus a synthesized head CAS, mirroring what `into_persistence_plan` produces in
+/// production (which is `#[cfg(not(test))]` and unreachable from the test build).
+#[cfg(test)]
+pub(crate) fn persistence_plan_for_test(
+    transition: PlannedTransition,
+    head_cas: ConversationHeadCasBinding,
+) -> ConversationPersistencePlan {
+    let mut effects = transition.effects;
+    effects.head_cas = Some(head_cas);
+    ConversationPersistencePlan {
+        expected_prior: transition.expected_prior,
+        retired_coordinate: transition.retired_coordinate,
+        successor_coordinate: transition.successor_coordinate,
+        state: ConversationStateHydration::from_state(transition.state),
+        effects,
+    }
+}
+
+#[cfg(test)]
+impl TransitionEvidence {
+    /// A group `policy` addParticipant `TransitionEvidence`: authority-less test
+    /// seam carrying the exact `Policy` body a real add produces (prior/next
+    /// coordinate-only successor + `Add` changes).
+    pub(crate) fn for_test_policy_add(
+        seq: u64,
+        transition_id: [u8; 16],
+        outer_entry_fingerprint: [u8; 32],
+        received_at: ServerTimestamp,
+        prior: PublicGroupSnapshotCoordinate,
+        added: Vec<PrincipalId>,
+    ) -> Result<Self, StateMachineError> {
+        let next = coordinate_only_successor(&prior)?;
+        let mut evidence =
+            Self::for_test_at(seq, transition_id, outer_entry_fingerprint, received_at)?;
+        evidence.body_binding = Some(TransitionBodyBinding::Policy {
+            prior,
+            next,
+            participant_changes: added
+                .into_iter()
+                .map(ManifestParticipantChange::Add)
+                .collect(),
+        });
+        Ok(evidence)
+    }
+}
+
+#[cfg(test)]
+impl ConversationHeadCasBinding {
+    /// The head CAS an existing-conversation edge's head lock would mint: the
+    /// prior coordinate, the entry at `allocated_seq`, counter advanced by one.
+    pub(crate) fn for_test_edge(
+        conversation_id: [u8; 16],
+        entry_id: [u8; 16],
+        prior: PublicGroupSnapshotCoordinate,
+        allocated_seq: u64,
+        locked_at: ServerTimestamp,
+    ) -> Self {
+        Self {
+            transaction_id: "e2b3-executor-test".to_owned(),
+            conversation_id,
+            expected_prior: Some(prior),
+            expected_next_entry_seq: allocated_seq,
+            allocated_entry_id: Some(entry_id),
+            allocated_seq: Some(allocated_seq),
+            successor_next_entry_seq: allocated_seq + 1,
+            locked_at,
+            locked_head_digest: [1u8; 32],
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn plan_policy(
+    prior: &ConversationState,
+    actor: DeviceIdentity,
+    transition: TransitionEvidence,
+    relationship_evidence_digest: [u8; 32],
+) -> Result<PlannedTransition, StateMachineError> {
+    plan_policy_transition(
+        prior,
+        PolicyCommand {
+            actor,
+            transition,
+            relationship_evidence_digest,
+        },
+    )
+}
+
 // The deterministic pure planners are intentionally reachable only from the
 // test build. Production callers must enter through HydrationAuthority's
 // route-specific methods, which consume repository lock/auth witnesses.
@@ -12456,22 +12669,22 @@ fn would_remove_last_active_admin(state: &ConversationState, principal: &Princip
 // writers. It is transaction-scoped: it never begins or commits the outer
 // transaction, so failure paths stay testable (the caller owns commit/rollback).
 //
-// This module is gated `#[cfg(not(test))]` — identical to `into_persistence_plan`
-// and every other `super::repository::*` consumer in this file. That gating is
-// exactly why the lib unit-test build and `tests/chat_protocol_state_machine.rs`
-// (which `include!`s this file under `cfg(test)`) compile without a `repository`
-// module in scope. See the E2b-2 report §1.6 / §3 for the integration-harness
-// consequence.
+// This module is compiled unconditionally (E2b-3). It resolves
+// `super::repository::{transition,delivery}`, which `repository/mod.rs` now
+// compiles unconditionally too. Under the production `cfg(not(test))` build this
+// is byte-identical to the prior `#[cfg(not(test))]` gating (both were present);
+// under `cfg(test)` it is additionally available so the integration harness can
+// drive the executor end-to-end. The integration test include chain therefore
+// provides a `chat_protocol::repository` module (matching the lib layout) so the
+// `super::repository::*` paths resolve there as well. See the E2b-3 report.
 // ===========================================================================
 
-#[cfg(not(test))]
 pub(crate) use executor::{
     apply_conversation_persistence_plan, AppliedTransition, ControlEntryContent, EventFanout,
     ExecutionActor, ExecutionContext, ExecutorError, LeafPersistenceColumns, MetadataAuthorColumns,
     SpineArtifacts,
 };
 
-#[cfg(not(test))]
 mod executor {
     use chrono::{DateTime, Utc};
     use uuid::Uuid;
@@ -12740,13 +12953,27 @@ mod executor {
                 )
                 .await
             }
+            PlanKind::Policy => {
+                apply_policy(
+                    transaction,
+                    plan,
+                    ctx,
+                    conversation_id,
+                    transition_id,
+                    seq_i64,
+                    successor_next_entry_seq,
+                    generation,
+                    state_version,
+                    epoch,
+                )
+                .await
+            }
             // Every other plan kind is a real, planned edge this executor slice
             // does not yet compose. It is a HARD error (never a silent skip), so a
             // caller cannot mistake "not implemented" for "applied". The
-            // remaining kinds (policy, acceptConversation, metadata, commit,
-            // reset request/activation, leave family, welcome dispositions, device
-            // revocation, close) are the E2b-2 remainder — see the report.
-            PlanKind::Policy => Err(ExecutorError::UnsupportedEffect("policy")),
+            // remaining kinds (acceptConversation, metadata, commit, reset
+            // request/activation, leave family, welcome dispositions, device
+            // revocation, close) are the E2b-3 remainder — see the report.
             PlanKind::Acceptance => Err(ExecutorError::UnsupportedEffect("acceptConversation")),
             PlanKind::Metadata => Err(ExecutorError::UnsupportedEffect("metadata")),
             PlanKind::Commit => Err(ExecutorError::UnsupportedEffect("commit")),
@@ -12991,6 +13218,191 @@ mod executor {
         .await?;
 
         // 9. Events + audience + outbox.
+        let event_positions = write_events(transaction, ctx).await?;
+
+        Ok(AppliedTransition {
+            allocated_seq: u64::try_from(seq_i64).unwrap(),
+            entry_id: ctx.entry.entry_id,
+            event_positions,
+            successor_coordinate: plan.successor_coordinate().copied(),
+        })
+    }
+
+    /// Apply a group `policy` addParticipant edge: same crypto coordinate,
+    /// `stateVersion+1`, no metadata / leaf / interval change. Reuses the head
+    /// CAS (existing conversation), the generation-pointer CAS, and the
+    /// participant-insert path that creation uses; the only new participant is
+    /// the added `pending/member` (the `StateChange` diff).
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_policy(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        plan: &ConversationPersistencePlan,
+        ctx: &ExecutionContext,
+        conversation_id: Uuid,
+        transition_id: Uuid,
+        seq_i64: i64,
+        successor_next_entry_seq: i64,
+        generation: i64,
+        state_version: i64,
+        epoch: i64,
+    ) -> Result<AppliedTransition, ExecutorError> {
+        let effects = plan.effects();
+        let hydration = plan.state();
+        let coordinate = &hydration.coordinate;
+        let applied_at = ctx.applied_at;
+        let head = effects
+            .head_cas()
+            .ok_or(ExecutorError::InconsistentPlan("missing head CAS binding"))?;
+        let expected_prior = head
+            .expected_prior()
+            .ok_or(ExecutorError::InconsistentPlan(
+                "policy needs an expected prior",
+            ))?;
+        let expected_generation = checked_i64(expected_prior.generation())?;
+        let expected_state_version = checked_i64(expected_prior.state_version())?;
+        let expected_next_entry_seq = checked_i64(head.expected_next_entry_seq())?;
+
+        // Policy is a coordinate-only, participant-only edge; every other family
+        // is a hard error so nothing is silently dropped.
+        reject_if_present("leaf_changes", effects.leaf_changes())?;
+        reject_if_present("interval_changes", effects.interval_changes())?;
+        reject_if_present("terminal_proof_changes", effects.terminal_proof_changes())?;
+        reject_if_present(
+            "recovery_request_changes",
+            effects.recovery_request_changes(),
+        )?;
+        reject_if_present("reservation_changes", effects.reservation_changes())?;
+        reject_if_present("reset_request_changes", effects.reset_request_changes())?;
+        reject_if_present("leave_request_changes", effects.leave_request_changes())?;
+        reject_if_present("welcome_changes", effects.welcome_changes())?;
+        reject_if_present("package_transitions", effects.package_transitions())?;
+        reject_if_present("recovery_package_cas", effects.recovery_package_cas())?;
+        reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
+        if effects.metadata_change().is_some() {
+            return Err(ExecutorError::UnsupportedEffect("policy metadata change"));
+        }
+        if effects.revocation_target_cas().is_some() {
+            return Err(ExecutorError::UnsupportedEffect("revocation_target_cas"));
+        }
+        if effects.welcome_cas().is_some() {
+            return Err(ExecutorError::UnsupportedEffect("welcome_cas"));
+        }
+
+        // 1. Head CAS advances the coordinate + counter (single seq authority).
+        transition::cas_conversation_head(
+            transaction,
+            &transition::ConversationHeadCas {
+                conversation_id,
+                expected_generation,
+                expected_state_version,
+                expected_next_entry_seq,
+                successor_generation: generation,
+                successor_state_version: state_version,
+                successor_next_entry_seq,
+                close: None,
+            },
+        )
+        .await?;
+
+        // 2. Advance the generation's state-version pointer (same generation).
+        transition::cas_generation_state_version(
+            transaction,
+            &transition::GenerationStateVersionCas {
+                conversation_id,
+                generation,
+                expected_state_version,
+                successor_state_version: state_version,
+            },
+        )
+        .await?;
+
+        // 3. Successor generation state (policy kind, identical crypto edge).
+        transition::insert_generation_state_row(
+            transaction,
+            &NewGenerationState {
+                conversation_id,
+                generation,
+                state_version,
+                group_id: coordinate.group_id().to_vec(),
+                epoch,
+                group_context_hash: coordinate.group_context_hash().to_vec(),
+                confirmation_tag: coordinate.confirmation_tag().to_vec(),
+                lifecycle: GenerationStateLifecycle::Active,
+                state_kind: GenerationStateKind::Policy,
+                producing_transition_id: transition_id,
+                public_snapshot_bytes: ctx.spine.public_snapshot_bytes.clone(),
+                snapshot_sha256: ctx.spine.public_snapshot_sha256.clone(),
+                tree_summary_bytes: ctx.spine.tree_summary_bytes.clone(),
+                tree_summary_sha256: ctx.spine.tree_summary_sha256.clone(),
+                leaf_count: ctx.spine.leaf_count,
+                created_at: applied_at,
+            },
+        )
+        .await?;
+
+        // 4. Entry at the allocated seq.
+        let append = build_append_entry(
+            ctx,
+            conversation_id,
+            generation,
+            state_version,
+            transition_id,
+        );
+        delivery::append_entry_at(transaction, &append, u64::try_from(seq_i64).unwrap()).await?;
+
+        // 5. Transition (prior -> next).
+        transition::insert_transition_row(
+            transaction,
+            &NewTransition {
+                transition_id,
+                conversation_id,
+                kind: TransitionKind::Policy,
+                actor_did: ctx.actor.user_did.clone(),
+                actor_device_id: ctx.actor.device_id,
+                actor_key_id: ctx.actor.key_id.clone(),
+                actor_auth_generation: ctx.actor.auth_generation,
+                actor_role: ctx.actor.role,
+                actor_device_status: ctx.actor.device_status.clone(),
+                signed_request_bytes: ctx.entry.signed_request_bytes.clone(),
+                unsigned_projection_bytes: ctx.entry.unsigned_projection_bytes.clone(),
+                signing_transcript_bytes: ctx.entry.signing_transcript_bytes.clone(),
+                request_digest: ctx.entry.request_digest.clone(),
+                signature: ctx.entry.signature.clone(),
+                coordinates: TransitionCoordinates {
+                    prior: Some((expected_generation, expected_state_version)),
+                    next: Some((generation, state_version)),
+                    retired: None,
+                    successor: None,
+                },
+                reset_request_id: None,
+                close_transition_id: None,
+                metadata_snapshot_id: None,
+                entry_seq: seq_i64,
+                accepted_at: applied_at,
+            },
+        )
+        .await?;
+
+        // 6. The added pending participant(s) — the participant-change diff.
+        write_creation_participants(
+            transaction,
+            ctx,
+            hydration,
+            effects,
+            transition_id,
+            applied_at,
+        )
+        .await?;
+
+        // 7. Audience + events.
+        let recipients = build_entry_recipients(&ctx.entry_recipients)?;
+        delivery::insert_entry_recipients(
+            transaction,
+            conversation_id,
+            u64::try_from(seq_i64).unwrap(),
+            &recipients,
+        )
+        .await?;
         let event_positions = write_events(transaction, ctx).await?;
 
         Ok(AppliedTransition {

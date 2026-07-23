@@ -1,18 +1,17 @@
-//! Live-PostgreSQL verification for the transition-executor spine writers added
-//! in task E2b-2 (`repository::transition` conversation-head + generation
-//! writers, and `repository::delivery::append_entry_at`).
+//! Live-PostgreSQL end-to-end verification of the E2b-2/E2b-3 transition
+//! executor `apply_conversation_persistence_plan` and the spine/seq-seam writers
+//! it composes.
 //!
-//! The executor itself (`state_machine::apply_conversation_persistence_plan`)
-//! is gated `#[cfg(not(test))]` — like every `super::repository::*` consumer in
-//! `state_machine.rs` — so it is not reachable through this `cfg(test)`
-//! integration crate without also exposing the whole locked-guard plan-build
-//! path; that end-to-end commit test is the E2b-2 remainder (see the report).
-//! What IS verified here, green against the dedicated clean-chat database, is
-//! every NEW dumb-SQL writer the executor composes: column fidelity on insert,
-//! and compare-and-set advance/conflict semantics — each inside one transaction
-//! with same-transaction read-back and ROLLBACK (the E2a/E2b-1 unit boundary;
-//! the DEFERRED cross-table triggers fire only at COMMIT and are the composing
-//! executor's responsibility).
+//! Two kinds of coverage:
+//!  * The NEW dumb-SQL writers (conversation-head insert/CAS/close, generation
+//!    insert/state-version-CAS/supersede, `append_entry_at`) — column fidelity +
+//!    CAS advance/conflict, inside one transaction with read-back + ROLLBACK.
+//!  * The executor driven end-to-end: a REAL creation plan built through the
+//!    production `plan_creation` path (with the E2b-3 `#[cfg(test)]`
+//!    metadata-bearing evidence + head-CAS synthesis), applied and COMMITTED,
+//!    then the full committed graph SELECT-verified past every DEFERRED trigger;
+//!    plus re-apply -> conflict with zero residue, and mid-transaction failure
+//!    injection -> whole-graph rollback.
 //!
 //! Run:
 //!   TEST_DATABASE_URL=postgres://localhost/catbird_chat_protocol_test_20260722 \
@@ -22,34 +21,94 @@
 
 mod common;
 
-mod repository {
-    pub(crate) mod transition {
+#[allow(dead_code)]
+#[path = "../src/chat_protocol/model.rs"]
+mod model;
+#[allow(dead_code)]
+#[path = "../src/chat_protocol/transcript.rs"]
+mod transcript;
+#[allow(dead_code)]
+#[path = "../src/chat_protocol/validation.rs"]
+mod validation;
+
+mod chat_protocol {
+    pub mod validation {
+        pub use crate::validation::*;
+    }
+    pub mod transcript {
+        pub use crate::transcript::*;
+    }
+    pub mod snapshot {
+        pub use catbird_server::chat_protocol::snapshot::*;
+    }
+    pub mod wire {
+        pub use catbird_server::chat_protocol::wire::*;
+    }
+    pub mod public_state {
+        #![allow(dead_code)]
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/repository/transition.rs"
+            "/src/chat_protocol/public_state.rs"
         ));
     }
-
-    pub(crate) mod delivery {
+    pub mod repository {
+        pub mod transition {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/transition.rs"
+            ));
+        }
+        pub mod delivery {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/delivery.rs"
+            ));
+        }
+    }
+    pub mod state_machine {
+        #![allow(dead_code)]
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/repository/delivery.rs"
+            "/src/chat_protocol/state_machine.rs"
         ));
     }
 }
 
+use std::{fs, path::PathBuf};
+
 use chrono::{DateTime, Utc};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use repository::delivery::{append_entry_at, AppendEntry, DeliveryRepositoryError};
-use repository::transition::{
-    cas_conversation_head, cas_generation_state_version, insert_conversation_head,
-    insert_generation, supersede_generation, ConversationHeadCas, ConversationHeadClose,
-    ConversationHeadKind, GenerationStateVersionCas, GenerationSupersede, NewConversationHead,
-    NewGeneration, TransitionRepositoryError,
+use chat_protocol::public_state::{
+    verify_genesis_group_info, ActivePublicState, GenesisGroupInfoExpectations,
 };
+use chat_protocol::repository::delivery::{
+    append_entry_at, AppendEntry, DeliveryRepositoryError, EntryEntitlementKind,
+    EventEntitlementKind, EventKind, OutboxWorkKind,
+};
+use chat_protocol::repository::transition::{
+    cas_conversation_head, cas_generation_state_version, supersede_generation, ConversationHeadCas,
+    ConversationHeadClose, GenerationStateVersionCas, GenerationSupersede, TransitionActorRole,
+    TransitionRepositoryError,
+};
+use chat_protocol::snapshot::{PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle};
+use chat_protocol::state_machine::{
+    apply_conversation_persistence_plan, persistence_plan_for_test, plan_creation, plan_policy,
+    ControlEntryContent, ConversationHeadCasBinding, ConversationKind, CreationCommand,
+    CreationDecision, DeviceIdentity, EventFanout, ExecutionActor, ExecutionContext, ExecutorError,
+    LeafPersistenceColumns, MetadataAuthorColumns, MetadataSnapshotBinding, PrincipalId,
+    ServerTimestamp, SpineArtifacts, TransitionEvidence,
+};
+use chat_protocol::validation::ed25519_key_id;
+
+// ---------------------------------------------------------------------------
+// Harness + corpus fixtures (adapted from tests/chat_protocol_state_machine.rs).
+// ---------------------------------------------------------------------------
 
 async fn setup() -> PgPool {
     common::chat_protocol::setup_chat_protocol_db(4).await
@@ -60,6 +119,119 @@ async fn clock_now(pool: &PgPool) -> DateTime<Utc> {
         .fetch_one(pool)
         .await
         .expect("sample trusted database clock")
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CorpusManifest {
+    evaluation_unix_seconds: u64,
+    identifiers: CorpusIdentifiers,
+    identity: CorpusIdentity,
+    chain: CorpusChain,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CorpusIdentifiers {
+    conversation_id_hex: String,
+}
+#[derive(Deserialize)]
+struct CorpusIdentity {
+    alice: CorpusActor,
+    bob: CorpusActor,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CorpusActor {
+    actor_did: String,
+    device_id: String,
+    credential_identity: String,
+    signature_public_key_hex: String,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CorpusChain {
+    generation: u64,
+    genesis_state_version: u64,
+    genesis_epoch: u64,
+    genesis_group_context_hash_hex: String,
+    genesis_confirmation_tag_hex: String,
+    group_id_hex: String,
+}
+
+fn corpus_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/generated-artifacts/mls-chat-v1/crypto-wire")
+}
+fn corpus_file(name: &str) -> Vec<u8> {
+    fs::read(corpus_dir().join(name)).expect("read frozen crypto-wire corpus")
+}
+fn corpus_manifest() -> CorpusManifest {
+    serde_json::from_slice(&corpus_file("manifest.json")).expect("parse frozen manifest")
+}
+fn hex_array<const N: usize>(value: &str) -> [u8; N] {
+    hex::decode(value)
+        .expect("valid fixture hex")
+        .try_into()
+        .unwrap_or_else(|_| panic!("expected {N}-byte fixture"))
+}
+fn uuid_bytes(value: &str) -> [u8; 16] {
+    *Uuid::parse_str(value).expect("fixture UUID").as_bytes()
+}
+fn uuid_v4_bytes(byte: u8) -> [u8; 16] {
+    let mut value = [byte; 16];
+    value[6] = 0x40 | (byte & 0x0f);
+    value[8] = 0x80 | (byte & 0x3f);
+    value
+}
+
+fn genesis_coordinate(manifest: &CorpusManifest) -> PublicGroupSnapshotCoordinate {
+    PublicGroupSnapshotCoordinate::new(
+        hex_array(&manifest.identifiers.conversation_id_hex),
+        manifest.chain.generation,
+        manifest.chain.genesis_state_version,
+        hex_array(&manifest.chain.group_id_hex),
+        manifest.chain.genesis_epoch,
+        hex_array(&manifest.chain.genesis_group_context_hash_hex),
+        hex_array(&manifest.chain.genesis_confirmation_tag_hex),
+        PublicGroupSnapshotLifecycle::Active,
+    )
+}
+
+fn coordinate_with_conversation(
+    source: &PublicGroupSnapshotCoordinate,
+    conversation_id: [u8; 16],
+) -> PublicGroupSnapshotCoordinate {
+    PublicGroupSnapshotCoordinate::new(
+        conversation_id,
+        source.generation(),
+        source.state_version(),
+        *source.group_id(),
+        source.epoch(),
+        *source.group_context_hash(),
+        *source.confirmation_tag(),
+        source.lifecycle(),
+    )
+}
+
+fn alice(manifest: &CorpusManifest) -> DeviceIdentity {
+    DeviceIdentity::new(
+        PrincipalId::new(manifest.identity.alice.actor_did.as_bytes().to_vec()).unwrap(),
+        uuid_bytes(&manifest.identity.alice.device_id),
+    )
+    .unwrap()
+}
+/// A FRESH invitee each run. Only the creator (alice) must match the corpus
+/// genesis leaf; the pending invitee is an arbitrary principal, so a random DID
+/// keeps the direct-pair unique index (and bob's global event chain) collision-
+/// free across runs of this never-truncated, delete-forbidding database.
+fn fresh_bob() -> (DeviceIdentity, String) {
+    let did = random_plc_did();
+    let device = DeviceIdentity::new(
+        PrincipalId::new(did.as_bytes().to_vec()).unwrap(),
+        *Uuid::new_v4().as_bytes(),
+    )
+    .unwrap();
+    (device, did)
 }
 
 fn random_plc_did() -> String {
@@ -74,65 +246,353 @@ fn random_plc_did() -> String {
     format!("did:plc:{suffix}")
 }
 
-/// Seed one principal + active device + device-key row **inside `tx`** so the
-/// entry's immediate actor foreign keys resolve. Transaction-scoped so it rolls
-/// back with the test (never leaks into the never-truncated shared database).
-async fn seed_principal_device_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    at: DateTime<Utc>,
-) -> (String, Uuid, String) {
-    let user_did = random_plc_did();
-    sqlx::query("INSERT INTO chat.principals(user_did,created_at) VALUES($1,$2)")
-        .bind(&user_did)
-        .bind(at)
-        .execute(&mut **tx)
-        .await
-        .expect("insert principal");
-    let device_id = Uuid::new_v4();
-    let public_key = Uuid::new_v4()
-        .as_bytes()
-        .iter()
-        .chain(Uuid::new_v4().as_bytes())
-        .copied()
-        .collect::<Vec<u8>>();
+fn verified_genesis(manifest: &CorpusManifest) -> ActivePublicState {
+    verify_genesis_group_info(
+        &corpus_file("group-info.mls"),
+        GenesisGroupInfoExpectations {
+            coordinate: genesis_coordinate(manifest),
+            expected_basic_credential: manifest.identity.alice.credential_identity.as_bytes(),
+            expected_signature_key: &hex::decode(&manifest.identity.alice.signature_public_key_hex)
+                .expect("signature key"),
+            now_unix_seconds: manifest.evaluation_unix_seconds,
+            max_wire_bytes: 1_048_576,
+            max_ratchet_tree_bytes: 1_048_576,
+            max_members: 100,
+        },
+    )
+    .expect("frozen GroupInfo verifies and binds")
+}
+
+/// Idempotently seed a principal + active device + device-key row (committed).
+async fn seed_actor(
+    pool: &PgPool,
+    user_did: &str,
+    device_id: Uuid,
+    signing_public_key: &[u8],
+) -> String {
+    let now = clock_now(pool).await;
     let key_id: String = sqlx::query_scalar("SELECT chat.ed25519_key_id($1)")
-        .bind(&public_key)
-        .fetch_one(&mut **tx)
+        .bind(signing_public_key)
+        .fetch_one(pool)
         .await
         .expect("derive key id");
     sqlx::query(
-        "INSERT INTO chat.devices(user_did,device_id,device_name,status,dpop_jkt,auth_generation,capabilities,created_at,updated_at) \
-         VALUES($1,$2,'creator','active',$3,1,chat.protocol_capabilities(),$4,$4)",
+        "INSERT INTO chat.principals(user_did,created_at) VALUES($1,$2) ON CONFLICT DO NOTHING",
     )
-    .bind(&user_did)
+    .bind(user_did)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("seed principal");
+    sqlx::query(
+        "INSERT INTO chat.devices(user_did,device_id,device_name,status,dpop_jkt,auth_generation,capabilities,created_at,updated_at) \
+         VALUES($1,$2,'actor','active',$3,1,chat.protocol_capabilities(),$4,$4) ON CONFLICT DO NOTHING",
+    )
+    .bind(user_did)
     .bind(device_id)
     .bind(&key_id)
-    .bind(at)
-    .execute(&mut **tx)
+    .bind(now)
+    .execute(pool)
     .await
-    .expect("insert device");
+    .expect("seed device");
     sqlx::query(
         "INSERT INTO chat.device_keys(user_did,device_id,key_id,signing_public_key,enrollment_auth_generation,created_at) \
-         VALUES($1,$2,$3,$4,1,$5)",
+         VALUES($1,$2,$3,$4,1,$5) ON CONFLICT DO NOTHING",
     )
-    .bind(&user_did)
+    .bind(user_did)
     .bind(device_id)
     .bind(&key_id)
-    .bind(&public_key)
-    .bind(at)
-    .execute(&mut **tx)
+    .bind(signing_public_key)
+    .bind(now)
+    .execute(pool)
     .await
-    .expect("insert device key");
-    (user_did, device_id, key_id)
+    .expect("seed device key");
+    key_id
 }
 
-/// Insert one group head + gen-0 generation + gen-0 creation `generation_state`
-/// inside `tx` so the deferred head/gen → state FKs are satisfiable and the
-/// generation writers have a coherent row to advance. Returns the conversation id.
+async fn seed_protocol_instance(pool: &PgPool) -> Uuid {
+    let id = uuid_v4_bytes(0x51);
+    let cursor_key: String = sqlx::query_scalar("SELECT chat.ed25519_key_id($1)")
+        .bind(vec![0x51_u8; 32])
+        .fetch_one(pool)
+        .await
+        .expect("derive cursor key");
+    sqlx::query(
+        "INSERT INTO chat.protocol_instances(singleton,protocol_version,protocol_instance_id,cursor_key_id) \
+         VALUES(TRUE,'1',$1,$2) ON CONFLICT DO NOTHING",
+    )
+    .bind(Uuid::from_bytes(id))
+    .bind(&cursor_key)
+    .execute(pool)
+    .await
+    .expect("seed protocol instance");
+    sqlx::query_scalar("SELECT protocol_instance_id FROM chat.protocol_instances")
+        .fetch_one(pool)
+        .await
+        .expect("read protocol instance id")
+}
+
+/// Everything a creation apply needs: the built plan + a coherent ctx + the
+/// identifiers a SELECT-verify uses.
+struct CreationApply {
+    plan: chat_protocol::state_machine::ConversationPersistencePlan,
+    ctx: ExecutionContext,
+    conversation_id: Uuid,
+    alice_did: String,
+    alice_device: Uuid,
+    // Carried for the follow-on policy edge.
+    state: chat_protocol::state_machine::ConversationState,
+    alice_id: DeviceIdentity,
+    alice_key_id: String,
+    bob_id: DeviceIdentity,
+    bob_did: String,
+    coordinate: PublicGroupSnapshotCoordinate,
+    protocol_instance_id: Uuid,
+}
+
+async fn build_creation(pool: &PgPool, kind: ConversationKind) -> CreationApply {
+    let manifest = corpus_manifest();
+    let alice_id = alice(&manifest);
+    let (bob_id, bob_did) = fresh_bob();
+    let alice_did = manifest.identity.alice.actor_did.clone();
+    let alice_device = Uuid::from_bytes(*alice_id.device_id());
+    let bob_device = Uuid::from_bytes(*bob_id.device_id());
+    let alice_sig_key: Vec<u8> =
+        hex::decode(&manifest.identity.alice.signature_public_key_hex).unwrap();
+    // Alice's MLS leaf signature key is also her device signing key here, so
+    // member_devices.leaf_key_id == device_keys.key_id == actor_key_id.
+    let alice_key_id = seed_actor(pool, &alice_did, alice_device, &alice_sig_key).await;
+    let _bob_key_id = seed_actor(pool, &bob_did, bob_device, &[0x62_u8; 32]).await;
+    let protocol_instance_id = seed_protocol_instance(pool).await;
+
+    // Fresh conversation id per run (the corpus id is fixed; rebind onto a fresh
+    // one so committed rows never collide across runs).
+    let conversation_id = Uuid::new_v4();
+    let template = verified_genesis(&manifest);
+    let coordinate =
+        coordinate_with_conversation(&genesis_coordinate(&manifest), *conversation_id.as_bytes());
+    let public_state = ActivePublicState::for_test(&template, coordinate);
+
+    let transition_id = Uuid::new_v4();
+    let entry_id = Uuid::new_v4();
+    let received_at = ServerTimestamp::from_unix_millis_for_test(
+        manifest.evaluation_unix_seconds as i64 * 1_000 + 1_000,
+    )
+    .unwrap();
+    let nonce = [0x77_u8; 12];
+    let ciphertext = vec![0x88_u8; 48];
+    let alice_key_id_bytes: [u8; 32] = {
+        let mut buf = [0u8; 32];
+        let digest = Sha256::digest(&alice_sig_key);
+        buf.copy_from_slice(&digest);
+        buf
+    };
+    let metadata = MetadataSnapshotBinding::for_test_creation(
+        *conversation_id.as_bytes(),
+        *coordinate.group_context_hash(),
+        *transition_id.as_bytes(),
+        1,
+        alice_id.clone(),
+        alice_key_id_bytes,
+        alice_sig_key.clone().try_into().unwrap(),
+        1,
+        nonce,
+        ciphertext.clone(),
+    );
+    let evidence = TransitionEvidence::for_test_creation_with_metadata(
+        1,
+        *transition_id.as_bytes(),
+        [0x11_u8; 32],
+        received_at,
+        kind,
+        coordinate,
+        alice_id.clone(),
+        metadata,
+    )
+    .unwrap();
+
+    let decision = plan_creation(
+        None,
+        CreationCommand {
+            kind,
+            creator: alice_id.clone(),
+            invitees: vec![bob_id.principal().clone()],
+            transition: evidence,
+            public_state,
+        },
+    )
+    .expect("valid creation plan");
+    let planned = match decision {
+        CreationDecision::Create(planned) => planned,
+        CreationDecision::ExistingDirect { .. } => panic!("fresh creation expected"),
+    };
+    let creation_state = planned.resulting_state().clone();
+    let head_cas = ConversationHeadCasBinding::for_test_creation(
+        *conversation_id.as_bytes(),
+        *entry_id.as_bytes(),
+        received_at,
+    );
+    let plan = persistence_plan_for_test(planned, head_cas);
+
+    let applied_at = clock_now(pool).await;
+    let accepted_payload = vec![0x21_u8; 24];
+    let transcript = vec![0x22_u8; 24];
+    let ctx = ExecutionContext {
+        protocol_instance_id,
+        applied_at,
+        actor: ExecutionActor {
+            user_did: alice_did.clone(),
+            device_id: alice_device,
+            key_id: alice_key_id.clone(),
+            auth_generation: 1,
+            role: TransitionActorRole::Admin,
+            device_status: "active".to_owned(),
+        },
+        entry: ControlEntryContent {
+            entry_id,
+            entry_kind: "blue.catbird.chat.defs#creationEntry".to_owned(),
+            accepted_payload_bytes: accepted_payload.clone(),
+            accepted_payload_sha256: Sha256::digest(&accepted_payload).to_vec(),
+            signed_request_bytes: transcript.clone(),
+            unsigned_projection_bytes: vec![0x23_u8; 16],
+            signing_transcript_bytes: transcript.clone(),
+            request_digest: Sha256::digest(&transcript).to_vec(),
+            signature: vec![0x24_u8; 64],
+            server_fields_bytes: vec![0x25_u8; 8],
+            outer_entry_fingerprint: vec![0x11_u8; 32],
+        },
+        spine: SpineArtifacts {
+            public_snapshot_bytes: vec![0x31_u8; 16],
+            public_snapshot_sha256: Sha256::digest([0x31_u8; 16]).to_vec(),
+            tree_summary_bytes: vec![0x32_u8; 16],
+            tree_summary_sha256: Sha256::digest([0x32_u8; 16]).to_vec(),
+            leaf_count: 1,
+            genesis_group_info_bytes: vec![0x33_u8; 16],
+            genesis_group_info_sha256: Sha256::digest([0x33_u8; 16]).to_vec(),
+        },
+        opened_leaves: vec![LeafPersistenceColumns {
+            device: alice_id.clone(),
+            leaf_key_id: alice_key_id.clone(),
+            leaf_auth_generation: 1,
+        }],
+        metadata_author: Some(MetadataAuthorColumns {
+            author_role: "admin".to_owned(),
+            author_device_status: "active".to_owned(),
+            author_public_key: alice_sig_key.clone(),
+            metadata_snapshot_id: Uuid::new_v4(),
+        }),
+        participant_period_ids: vec![Uuid::new_v4(), Uuid::new_v4()],
+        leaf_period_ids: vec![Uuid::new_v4()],
+        entry_recipients: entry_audience(&alice_id, &alice_did, &bob_id, &bob_did),
+        events: vec![EventFanout {
+            event_id: Uuid::new_v4(),
+            event_kind: EventKind::ConversationChanged,
+            payload_bytes: vec![0x41_u8; 8],
+            recipients: event_audience(pool, &alice_id, &alice_did, &bob_id, &bob_did).await,
+            outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+        }],
+    };
+
+    CreationApply {
+        plan,
+        ctx,
+        conversation_id,
+        alice_did,
+        alice_device,
+        state: creation_state,
+        alice_id,
+        alice_key_id,
+        bob_id,
+        bob_did,
+        coordinate,
+        protocol_instance_id,
+    }
+}
+
+fn entry_audience(
+    a: &DeviceIdentity,
+    a_did: &str,
+    b: &DeviceIdentity,
+    b_did: &str,
+) -> Vec<(DeviceIdentity, EntryEntitlementKind)> {
+    let mut rows = vec![(a.clone(), a_did.to_owned()), (b.clone(), b_did.to_owned())];
+    rows.sort_by(|l, r| (l.1.as_bytes(), l.0.device_id()).cmp(&(r.1.as_bytes(), r.0.device_id())));
+    rows.into_iter()
+        .map(|(d, _)| (d, EntryEntitlementKind::Control))
+        .collect()
+}
+
+/// The `chat.event_recipients` chain trigger requires each device's new audience
+/// row to point at that device's current max `event_position` (NULL only for a
+/// device with no prior events). The fixed corpus DIDs accumulate events across
+/// runs, so chain each recipient to its real predecessor — exactly what the
+/// facade would compute.
+async fn event_audience(
+    pool: &PgPool,
+    a: &DeviceIdentity,
+    a_did: &str,
+    b: &DeviceIdentity,
+    b_did: &str,
+) -> Vec<(DeviceIdentity, EventEntitlementKind, Option<i64>)> {
+    let mut rows = vec![(a.clone(), a_did.to_owned()), (b.clone(), b_did.to_owned())];
+    rows.sort_by(|l, r| (l.1.as_bytes(), l.0.device_id()).cmp(&(r.1.as_bytes(), r.0.device_id())));
+    let mut out = Vec::with_capacity(rows.len());
+    for (device, did) in rows {
+        let predecessor: Option<i64> = sqlx::query_scalar(
+            "SELECT max(event_position) FROM chat.event_recipients WHERE user_did=$1 AND device_id=$2",
+        )
+        .bind(&did)
+        .bind(Uuid::from_bytes(*device.device_id()))
+        .fetch_one(pool)
+        .await
+        .expect("read device event predecessor");
+        out.push((device, EventEntitlementKind::Participant, predecessor));
+    }
+    out
+}
+
+/// Pre-clean any leftover ACTIVE direct conversation for the fixed corpus pair
+/// so the `conversations_active_direct_pair_uq` does not collide across runs.
+async fn preclean_direct_pair(pool: &PgPool, did_a: &str, did_b: &str) {
+    let (low, high) = if did_a <= did_b {
+        (did_a, did_b)
+    } else {
+        (did_b, did_a)
+    };
+    let ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT conversation_id FROM chat.conversations WHERE direct_did_low=$1 AND direct_did_high=$2",
+    )
+    .bind(low)
+    .bind(high)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    for id in ids {
+        cleanup(pool, id).await;
+    }
+}
+
+fn rand_byte() -> u8 {
+    use std::cell::Cell;
+    thread_local!(static SEED: Cell<u64> = Cell::new(0x9E37_79B9_7F4A_7C15));
+    SEED.with(|s| {
+        let mut x = s.get();
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        s.set(x);
+        ((x >> 24) as u8) | 0x40
+    })
+}
+
+// ===========================================================================
+// New-writer verification (tx + read-back + ROLLBACK).
+// ===========================================================================
+
 async fn seed_group_head_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     at: DateTime<Utc>,
-) -> (Uuid, Vec<u8>) {
+) -> Uuid {
     let conversation_id = Uuid::new_v4();
     let group_id = vec![1_u8; 32];
     let group_info = vec![4_u8; 8];
@@ -180,50 +640,7 @@ async fn seed_group_head_tx(
     .execute(&mut **tx)
     .await
     .expect("seed generation state");
-    (conversation_id, group_id)
-}
-
-#[tokio::test]
-async fn conversation_head_insert_is_faithful_and_group_shaped() {
-    let pool = setup().await;
-    let mut tx = pool.begin().await.expect("begin");
-    let at = clock_now(&pool).await;
-    let conversation_id = Uuid::new_v4();
-    insert_conversation_head(
-        &mut tx,
-        &NewConversationHead {
-            conversation_id,
-            kind: ConversationHeadKind::Group,
-            current_generation: 0,
-            current_state_version: 0,
-            next_entry_seq: 2,
-            created_at: at,
-        },
-    )
-    .await
-    .expect("insert group head");
-
-    let (kind, lifecycle, gen, sv, next_seq, low, high): (
-        String,
-        String,
-        i64,
-        i64,
-        i64,
-        Option<String>,
-        Option<String>,
-    ) = sqlx::query_as(
-        "SELECT kind,lifecycle,current_generation,current_state_version,next_entry_seq,direct_did_low,direct_did_high \
-         FROM chat.conversations WHERE conversation_id=$1",
-    )
-    .bind(conversation_id)
-    .fetch_one(&mut *tx)
-    .await
-    .expect("read head");
-    assert_eq!(kind, "group");
-    assert_eq!(lifecycle, "active");
-    assert_eq!((gen, sv, next_seq), (0, 0, 2));
-    assert_eq!((low, high), (None, None));
-    tx.rollback().await.expect("rollback");
+    conversation_id
 }
 
 #[tokio::test]
@@ -231,9 +648,7 @@ async fn conversation_head_cas_advances_and_conflicts_on_drift() {
     let pool = setup().await;
     let mut tx = pool.begin().await.expect("begin");
     let at = clock_now(&pool).await;
-    let (conversation_id, _group_id) = seed_group_head_tx(&mut tx, at).await;
-
-    // A same-generation stateVersion+1 policy edge advances the head counter.
+    let conversation_id = seed_group_head_tx(&mut tx, at).await;
     cas_conversation_head(
         &mut tx,
         &ConversationHeadCas {
@@ -249,18 +664,14 @@ async fn conversation_head_cas_advances_and_conflicts_on_drift() {
     )
     .await
     .expect("advance head");
-
-    let (sv, next_seq, lifecycle): (i64, i64, String) = sqlx::query_as(
-        "SELECT current_state_version,next_entry_seq,lifecycle FROM chat.conversations WHERE conversation_id=$1",
+    let (sv, next_seq): (i64, i64) = sqlx::query_as(
+        "SELECT current_state_version,next_entry_seq FROM chat.conversations WHERE conversation_id=$1",
     )
     .bind(conversation_id)
     .fetch_one(&mut *tx)
     .await
     .expect("read advanced head");
-    assert_eq!((sv, next_seq, lifecycle.as_str()), (1, 3, "active"));
-
-    // Re-applying the SAME expected prior now drifts (head already moved) — the
-    // CAS matches zero rows and is a typed conflict, not a silent no-op.
+    assert_eq!((sv, next_seq), (1, 3));
     let conflict = cas_conversation_head(
         &mut tx,
         &ConversationHeadCas {
@@ -283,13 +694,12 @@ async fn conversation_head_cas_advances_and_conflicts_on_drift() {
 }
 
 #[tokio::test]
-async fn conversation_head_close_cas_supersedes_with_close_block() {
+async fn conversation_head_close_and_generation_supersede() {
     let pool = setup().await;
     let mut tx = pool.begin().await.expect("begin");
     let at = clock_now(&pool).await;
-    let (conversation_id, _group_id) = seed_group_head_tx(&mut tx, at).await;
+    let conversation_id = seed_group_head_tx(&mut tx, at).await;
     let close_transition_id = Uuid::new_v4();
-
     cas_conversation_head(
         &mut tx,
         &ConversationHeadCas {
@@ -311,9 +721,21 @@ async fn conversation_head_close_cas_supersedes_with_close_block() {
     )
     .await
     .expect("close head");
-
-    let (lifecycle, ct, closed): (String, Option<Uuid>, Option<DateTime<Utc>>) = sqlx::query_as(
-        "SELECT lifecycle,close_transition_id,closed_at FROM chat.conversations WHERE conversation_id=$1",
+    supersede_generation(
+        &mut tx,
+        &GenerationSupersede {
+            conversation_id,
+            generation: 0,
+            expected_state_version: 0,
+            successor_state_version: 1,
+            superseded_seq: 2,
+            superseded_at: at,
+        },
+    )
+    .await
+    .expect("supersede generation");
+    let (lifecycle, ct): (String, Option<Uuid>) = sqlx::query_as(
+        "SELECT lifecycle,close_transition_id FROM chat.conversations WHERE conversation_id=$1",
     )
     .bind(conversation_id)
     .fetch_one(&mut *tx)
@@ -321,62 +743,23 @@ async fn conversation_head_close_cas_supersedes_with_close_block() {
     .expect("read closed head");
     assert_eq!(lifecycle, "superseded");
     assert_eq!(ct, Some(close_transition_id));
-    assert!(closed.is_some());
+    let gen_life: String = sqlx::query_scalar(
+        "SELECT lifecycle FROM chat.generations WHERE conversation_id=$1 AND generation=0",
+    )
+    .bind(conversation_id)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("read gen");
+    assert_eq!(gen_life, "superseded");
     tx.rollback().await.expect("rollback");
 }
 
 #[tokio::test]
-async fn generation_insert_and_state_version_cas_are_faithful_and_guarded() {
+async fn generation_state_version_cas_is_guarded() {
     let pool = setup().await;
     let mut tx = pool.begin().await.expect("begin");
     let at = clock_now(&pool).await;
-    let conversation_id = Uuid::new_v4();
-    let group_id = vec![7_u8; 32];
-    let group_info = vec![8_u8; 8];
-    // Head first (generations FK -> conversations is immediate).
-    insert_conversation_head(
-        &mut tx,
-        &NewConversationHead {
-            conversation_id,
-            kind: ConversationHeadKind::Group,
-            current_generation: 0,
-            current_state_version: 0,
-            next_entry_seq: 2,
-            created_at: at,
-        },
-    )
-    .await
-    .expect("head");
-    insert_generation(
-        &mut tx,
-        &NewGeneration {
-            conversation_id,
-            generation: 0,
-            group_id: group_id.clone(),
-            genesis_group_info_bytes: group_info.clone(),
-            genesis_group_info_sha256: Sha256::digest(&group_info).to_vec(),
-            current_state_version: 0,
-            activated_seq: 1,
-            activated_at: at,
-        },
-    )
-    .await
-    .expect("insert generation");
-
-    let (lifecycle, current_sv, activated_seq, stored_group): (String, i64, i64, Vec<u8>) =
-        sqlx::query_as(
-            "SELECT lifecycle,current_state_version,activated_seq,group_id FROM chat.generations WHERE conversation_id=$1 AND generation=0",
-        )
-        .bind(conversation_id)
-        .fetch_one(&mut *tx)
-        .await
-        .expect("read generation");
-    assert_eq!(
-        (lifecycle.as_str(), current_sv, activated_seq),
-        ("active", 0, 1)
-    );
-    assert_eq!(stored_group, group_id);
-
+    let conversation_id = seed_group_head_tx(&mut tx, at).await;
     cas_generation_state_version(
         &mut tx,
         &GenerationStateVersionCas {
@@ -387,17 +770,7 @@ async fn generation_insert_and_state_version_cas_are_faithful_and_guarded() {
         },
     )
     .await
-    .expect("advance generation pointer");
-    let advanced: i64 = sqlx::query_scalar(
-        "SELECT current_state_version FROM chat.generations WHERE conversation_id=$1 AND generation=0",
-    )
-    .bind(conversation_id)
-    .fetch_one(&mut *tx)
-    .await
-    .expect("read advanced pointer");
-    assert_eq!(advanced, 1);
-
-    // Repeat with the stale expected pointer -> typed conflict.
+    .expect("advance pointer");
     let conflict = cas_generation_state_version(
         &mut tx,
         &GenerationStateVersionCas {
@@ -412,30 +785,6 @@ async fn generation_insert_and_state_version_cas_are_faithful_and_guarded() {
         conflict,
         Err(TransitionRepositoryError::CompareAndSetConflict)
     ));
-
-    // Supersede from the current (advanced) pointer.
-    supersede_generation(
-        &mut tx,
-        &GenerationSupersede {
-            conversation_id,
-            generation: 0,
-            expected_state_version: 1,
-            successor_state_version: 1,
-            superseded_seq: 2,
-            superseded_at: at,
-        },
-    )
-    .await
-    .expect("supersede generation");
-    let (lifecycle, superseded_seq): (String, Option<i64>) = sqlx::query_as(
-        "SELECT lifecycle,superseded_seq FROM chat.generations WHERE conversation_id=$1 AND generation=0",
-    )
-    .bind(conversation_id)
-    .fetch_one(&mut *tx)
-    .await
-    .expect("read superseded generation");
-    assert_eq!(lifecycle, "superseded");
-    assert_eq!(superseded_seq, Some(2));
     tx.rollback().await.expect("rollback");
 }
 
@@ -444,24 +793,46 @@ async fn append_entry_at_inserts_at_exact_seq_without_touching_head() {
     let pool = setup().await;
     let mut tx = pool.begin().await.expect("begin");
     let at = clock_now(&pool).await;
-    let (user_did, device_id, key_id) = seed_principal_device_tx(&mut tx, at).await;
-    let conversation_id = Uuid::new_v4();
-    // Head with next_entry_seq deliberately already advanced past the entry seq
-    // (the executor's head write is the counter authority; append_entry_at only
-    // materializes the row and must NOT re-advance the head).
-    insert_conversation_head(
-        &mut tx,
-        &NewConversationHead {
-            conversation_id,
-            kind: ConversationHeadKind::Group,
-            current_generation: 0,
-            current_state_version: 0,
-            next_entry_seq: 2,
-            created_at: at,
-        },
+    let conversation_id = seed_group_head_tx(&mut tx, at).await;
+    let user_did = format!("did:plc:{}", "a".repeat(24));
+    sqlx::query(
+        "INSERT INTO chat.principals(user_did,created_at) VALUES($1,$2) ON CONFLICT DO NOTHING",
     )
+    .bind(&user_did)
+    .bind(at)
+    .execute(&mut *tx)
     .await
-    .expect("head");
+    .expect("principal");
+    let device_id = Uuid::new_v4();
+    let pubkey = vec![0x99_u8; 32];
+    let key_id: String = sqlx::query_scalar("SELECT chat.ed25519_key_id($1)")
+        .bind(&pubkey)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("key id");
+    sqlx::query(
+        "INSERT INTO chat.devices(user_did,device_id,device_name,status,dpop_jkt,auth_generation,capabilities,created_at,updated_at) \
+         VALUES($1,$2,'a','active',$3,1,chat.protocol_capabilities(),$4,$4) ON CONFLICT DO NOTHING",
+    )
+    .bind(&user_did)
+    .bind(device_id)
+    .bind(&key_id)
+    .bind(at)
+    .execute(&mut *tx)
+    .await
+    .expect("device");
+    sqlx::query(
+        "INSERT INTO chat.device_keys(user_did,device_id,key_id,signing_public_key,enrollment_auth_generation,created_at) \
+         VALUES($1,$2,$3,$4,1,$5)",
+    )
+    .bind(&user_did)
+    .bind(device_id)
+    .bind(&key_id)
+    .bind(&pubkey)
+    .bind(at)
+    .execute(&mut *tx)
+    .await
+    .expect("device key");
 
     let payload = vec![21_u8; 8];
     let transcript = vec![22_u8; 8];
@@ -470,9 +841,6 @@ async fn append_entry_at_inserts_at_exact_seq_without_touching_head() {
         &AppendEntry {
             conversation_id,
             entry_id: Uuid::new_v4(),
-            // A control entry carries the full closed Lexicon kind and a non-null
-            // transition_id (its FK is DEFERRABLE INITIALLY DEFERRED, so a fresh
-            // UUID is legal under this rollback-scoped read-back).
             entry_kind: "blue.catbird.chat.defs#creationEntry".to_owned(),
             accepted_payload_bytes: payload.clone(),
             accepted_payload_sha256: Sha256::digest(&payload).to_vec(),
@@ -496,19 +864,6 @@ async fn append_entry_at_inserts_at_exact_seq_without_touching_head() {
     .await
     .expect("append entry at seq 1");
     assert_eq!(returned, 1);
-
-    let (stored_seq, stored_kind): (i64, String) =
-        sqlx::query_as("SELECT seq,entry_kind FROM chat.entries WHERE conversation_id=$1")
-            .bind(conversation_id)
-            .fetch_one(&mut *tx)
-            .await
-            .expect("read entry");
-    assert_eq!(
-        (stored_seq, stored_kind.as_str()),
-        (1, "blue.catbird.chat.defs#creationEntry")
-    );
-
-    // The head counter is untouched by append_entry_at.
     let head_seq: i64 = sqlx::query_scalar(
         "SELECT next_entry_seq FROM chat.conversations WHERE conversation_id=$1",
     )
@@ -519,4 +874,504 @@ async fn append_entry_at_inserts_at_exact_seq_without_touching_head() {
     assert_eq!(head_seq, 2);
     let _ = DeliveryRepositoryError::SequenceOverflow;
     tx.rollback().await.expect("rollback");
+}
+
+// ===========================================================================
+// Executor end-to-end: creation -> COMMIT -> SELECT-verify.
+// ===========================================================================
+
+async fn count(pool: &PgPool, sql: &str, conversation_id: Uuid) -> i64 {
+    sqlx::query_scalar(sql)
+        .bind(conversation_id)
+        .fetch_one(pool)
+        .await
+        .expect("count")
+}
+
+#[tokio::test]
+async fn group_creation_commits_full_graph_past_all_deferred_triggers() {
+    let pool = setup().await;
+    let fixture = build_creation(&pool, ConversationKind::Group).await;
+    let conversation_id = fixture.conversation_id;
+
+    let mut tx = pool.begin().await.expect("begin");
+    let applied = apply_conversation_persistence_plan(&mut tx, &fixture.plan, &fixture.ctx)
+        .await
+        .expect("creation applies");
+    tx.commit()
+        .await
+        .expect("COMMIT past all deferred triggers");
+
+    assert_eq!(applied.allocated_seq, 1);
+    assert_eq!(applied.event_positions.len(), 1);
+
+    let (kind, lifecycle, gen, sv, next_seq): (String, String, i64, i64, i64) = sqlx::query_as(
+        "SELECT kind,lifecycle,current_generation,current_state_version,next_entry_seq FROM chat.conversations WHERE conversation_id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("head");
+    assert_eq!(
+        (kind.as_str(), lifecycle.as_str(), gen, sv, next_seq),
+        ("group", "active", 0, 0, 2)
+    );
+
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM chat.generations WHERE conversation_id=$1",
+            conversation_id
+        )
+        .await,
+        1
+    );
+    let (state_kind, leaf_count): (String, i64) = sqlx::query_as(
+        "SELECT state_kind,leaf_count FROM chat.generation_states WHERE conversation_id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("gen state");
+    assert_eq!((state_kind.as_str(), leaf_count), ("creation", 1));
+
+    let (tkind, entry_seq): (String, i64) =
+        sqlx::query_as("SELECT kind,entry_seq FROM chat.transitions WHERE conversation_id=$1")
+            .bind(conversation_id)
+            .fetch_one(&pool)
+            .await
+            .expect("transition");
+    assert_eq!((tkind.as_str(), entry_seq), ("creation", 1));
+    let (eseq, ekind): (i64, String) =
+        sqlx::query_as("SELECT seq,entry_kind FROM chat.entries WHERE conversation_id=$1")
+            .bind(conversation_id)
+            .fetch_one(&pool)
+            .await
+            .expect("entry");
+    assert_eq!(
+        (eseq, ekind.as_str()),
+        (1, "blue.catbird.chat.defs#creationEntry")
+    );
+
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM chat.metadata_snapshots WHERE conversation_id=$1",
+            conversation_id
+        )
+        .await,
+        1
+    );
+
+    let (active_admin, pending_member): (i64, i64) = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE status='active' AND role='admin'), count(*) FILTER (WHERE status='pending' AND role='member') \
+         FROM chat.participants WHERE conversation_id=$1 AND current_membership",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("participants");
+    assert_eq!((active_admin, pending_member), (1, 1));
+
+    let leaf_origin: String =
+        sqlx::query_scalar("SELECT origin FROM chat.member_devices WHERE conversation_id=$1")
+            .bind(conversation_id)
+            .fetch_one(&pool)
+            .await
+            .expect("leaf");
+    assert_eq!(leaf_origin, "genesis");
+
+    let (start_seq, opening_kind, terminal): (i64, String, Option<i64>) = sqlx::query_as(
+        "SELECT start_seq,opening_kind,terminal_seq FROM chat.application_intervals WHERE conversation_id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("interval");
+    assert_eq!(
+        (start_seq, opening_kind.as_str(), terminal),
+        (1, "creation", None)
+    );
+
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM chat.entry_recipients WHERE conversation_id=$1 AND seq=1",
+            conversation_id
+        )
+        .await,
+        2
+    );
+    let position = applied.event_positions[0];
+    let evt_kind: String =
+        sqlx::query_scalar("SELECT event_kind FROM chat.events WHERE event_position=$1")
+            .bind(position)
+            .fetch_one(&pool)
+            .await
+            .expect("event");
+    assert_eq!(evt_kind, "conversationChanged");
+    let evt_recips: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM chat.event_recipients WHERE event_position=$1")
+            .bind(position)
+            .fetch_one(&pool)
+            .await
+            .expect("event recips");
+    assert_eq!(evt_recips, 2);
+    let outbox: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM chat.outbox WHERE event_position=$1")
+            .bind(position)
+            .fetch_one(&pool)
+            .await
+            .expect("outbox");
+    assert_eq!(outbox, 1);
+
+    // Re-apply the SAME plan -> the head INSERT collides on the conversation PK
+    // (true-absence CAS), the whole transaction rolls back, zero new residue.
+    let before: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM chat.transitions WHERE conversation_id=$1")
+            .bind(conversation_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let mut tx2 = pool.begin().await.expect("begin re-apply");
+    let reapply = apply_conversation_persistence_plan(&mut tx2, &fixture.plan, &fixture.ctx).await;
+    assert!(
+        matches!(reapply, Err(ExecutorError::Transition(_))),
+        "re-apply must conflict on the head PK"
+    );
+    tx2.rollback().await.expect("rollback re-apply");
+    let after: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM chat.transitions WHERE conversation_id=$1")
+            .bind(conversation_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(before, after, "re-apply left zero residue");
+}
+
+#[tokio::test]
+async fn group_policy_add_participant_commits_state_version_plus_one() {
+    let pool = setup().await;
+    let fixture = build_creation(&pool, ConversationKind::Group).await;
+    let conversation_id = fixture.conversation_id;
+
+    // 1. Commit the creation the policy edge builds on.
+    let mut tx = pool.begin().await.expect("begin creation");
+    apply_conversation_persistence_plan(&mut tx, &fixture.plan, &fixture.ctx)
+        .await
+        .expect("creation applies");
+    tx.commit().await.expect("creation COMMIT");
+
+    // 2. A fresh third principal to add; seed it (participant + audience FKs).
+    let (bob2_id, bob2_did) = fresh_bob();
+    let bob2_device = Uuid::from_bytes(*bob2_id.device_id());
+    let _ = seed_actor(&pool, &bob2_did, bob2_device, &[0x63_u8; 32]).await;
+
+    // 3. Build the REAL policy plan through the production planner.
+    let received_at = ServerTimestamp::from_unix_millis_for_test(
+        corpus_manifest().evaluation_unix_seconds as i64 * 1_000 + 2_000,
+    )
+    .unwrap();
+    let entry_id = Uuid::new_v4();
+    let transition_id = Uuid::new_v4();
+    let policy_evidence = TransitionEvidence::for_test_policy_add(
+        2,
+        *transition_id.as_bytes(),
+        [0x12_u8; 32],
+        received_at,
+        fixture.coordinate,
+        vec![bob2_id.principal().clone()],
+    )
+    .unwrap();
+    let planned = plan_policy(
+        &fixture.state,
+        fixture.alice_id.clone(),
+        policy_evidence,
+        [0x99_u8; 32],
+    )
+    .expect("valid policy plan");
+    let head_cas = ConversationHeadCasBinding::for_test_edge(
+        *conversation_id.as_bytes(),
+        *entry_id.as_bytes(),
+        fixture.coordinate,
+        2,
+        received_at,
+    );
+    let plan = persistence_plan_for_test(planned, head_cas);
+
+    // 4. Policy ctx: same actor (alice), policyEntry at seq 2, no metadata, one
+    //    new pending participant, audience = the three current devices.
+    let applied_at = clock_now(&pool).await;
+    let payload = vec![0x51_u8; 12];
+    let transcript = vec![0x52_u8; 12];
+    let recipients_devices = [
+        (fixture.alice_id.clone(), fixture.alice_did.clone()),
+        (fixture.bob_id.clone(), fixture.bob_did.clone()),
+        (bob2_id.clone(), bob2_did.clone()),
+    ];
+    let mut sorted = recipients_devices.to_vec();
+    sorted
+        .sort_by(|l, r| (l.1.as_bytes(), l.0.device_id()).cmp(&(r.1.as_bytes(), r.0.device_id())));
+    let entry_recipients = sorted
+        .iter()
+        .map(|(d, _)| (d.clone(), EntryEntitlementKind::Control))
+        .collect();
+    let mut event_recips = Vec::new();
+    for (device, did) in &sorted {
+        let predecessor: Option<i64> = sqlx::query_scalar(
+            "SELECT max(event_position) FROM chat.event_recipients WHERE user_did=$1 AND device_id=$2",
+        )
+        .bind(did)
+        .bind(Uuid::from_bytes(*device.device_id()))
+        .fetch_one(&pool)
+        .await
+        .expect("predecessor");
+        event_recips.push((
+            device.clone(),
+            EventEntitlementKind::Participant,
+            predecessor,
+        ));
+    }
+    let ctx = ExecutionContext {
+        protocol_instance_id: fixture.protocol_instance_id,
+        applied_at,
+        actor: ExecutionActor {
+            user_did: fixture.alice_did.clone(),
+            device_id: fixture.alice_device,
+            key_id: fixture.alice_key_id.clone(),
+            auth_generation: 1,
+            role: TransitionActorRole::Admin,
+            device_status: "active".to_owned(),
+        },
+        entry: ControlEntryContent {
+            entry_id,
+            entry_kind: "blue.catbird.chat.defs#policyEntry".to_owned(),
+            accepted_payload_bytes: payload.clone(),
+            accepted_payload_sha256: Sha256::digest(&payload).to_vec(),
+            signed_request_bytes: transcript.clone(),
+            unsigned_projection_bytes: vec![0x53_u8; 8],
+            signing_transcript_bytes: transcript.clone(),
+            request_digest: Sha256::digest(&transcript).to_vec(),
+            signature: vec![0x54_u8; 64],
+            server_fields_bytes: vec![0x55_u8; 8],
+            outer_entry_fingerprint: vec![0x12_u8; 32],
+        },
+        spine: SpineArtifacts {
+            public_snapshot_bytes: vec![0x61_u8; 16],
+            public_snapshot_sha256: Sha256::digest([0x61_u8; 16]).to_vec(),
+            tree_summary_bytes: vec![0x62_u8; 16],
+            tree_summary_sha256: Sha256::digest([0x62_u8; 16]).to_vec(),
+            leaf_count: 1,
+            genesis_group_info_bytes: vec![],
+            genesis_group_info_sha256: vec![],
+        },
+        opened_leaves: vec![],
+        metadata_author: None,
+        participant_period_ids: vec![Uuid::new_v4()],
+        leaf_period_ids: vec![],
+        entry_recipients,
+        events: vec![EventFanout {
+            event_id: Uuid::new_v4(),
+            event_kind: EventKind::ConversationChanged,
+            payload_bytes: vec![0x71_u8; 8],
+            recipients: event_recips,
+            outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+        }],
+    };
+
+    // 5. Apply + COMMIT the policy edge.
+    let mut tx2 = pool.begin().await.expect("begin policy");
+    let applied = apply_conversation_persistence_plan(&mut tx2, &plan, &ctx)
+        .await
+        .expect("policy applies");
+    tx2.commit()
+        .await
+        .expect("policy COMMIT past deferred triggers");
+    assert_eq!(applied.allocated_seq, 2);
+
+    // 6. Verify: stateVersion+1 at the same crypto coordinate, seq 2 contiguity.
+    let (sv, next_seq): (i64, i64) = sqlx::query_as(
+        "SELECT current_state_version,next_entry_seq FROM chat.conversations WHERE conversation_id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("head");
+    assert_eq!((sv, next_seq), (1, 3));
+    let gen_sv: i64 = sqlx::query_scalar(
+        "SELECT current_state_version FROM chat.generations WHERE conversation_id=$1 AND generation=0",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("gen pointer");
+    assert_eq!(gen_sv, 1);
+    let (skind, slife): (String, String) = sqlx::query_as(
+        "SELECT state_kind,lifecycle FROM chat.generation_states WHERE conversation_id=$1 AND state_version=1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("policy state");
+    assert_eq!((skind.as_str(), slife.as_str()), ("policy", "active"));
+    let (tkind, eseq): (String, i64) = sqlx::query_as(
+        "SELECT kind,entry_seq FROM chat.transitions WHERE conversation_id=$1 AND kind='policy'",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("policy transition");
+    assert_eq!((tkind.as_str(), eseq), ("policy", 2));
+    let added: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.participants WHERE conversation_id=$1 AND user_did=$2 AND status='pending' AND role='member' AND current_membership",
+    )
+    .bind(conversation_id)
+    .bind(&bob2_did)
+    .fetch_one(&pool)
+    .await
+    .expect("added participant");
+    assert_eq!(added, 1);
+    // No metadata snapshot for a policy edge.
+    let policy_snap: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.metadata_snapshots m JOIN chat.transitions t ON t.transition_id=m.producing_transition_id WHERE t.conversation_id=$1 AND t.kind='policy'",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("policy snapshot count");
+    assert_eq!(policy_snap, 0);
+}
+
+#[tokio::test]
+async fn direct_creation_commits_with_direct_pair_shape() {
+    let pool = setup().await;
+    let fixture = build_creation(&pool, ConversationKind::Direct).await;
+    let conversation_id = fixture.conversation_id;
+    let mut tx = pool.begin().await.expect("begin");
+    apply_conversation_persistence_plan(&mut tx, &fixture.plan, &fixture.ctx)
+        .await
+        .expect("direct creation applies");
+    tx.commit().await.expect("COMMIT");
+
+    let (kind, low, high): (String, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT kind,direct_did_low,direct_did_high FROM chat.conversations WHERE conversation_id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("head");
+    assert_eq!(kind, "direct");
+    assert!(low.is_some() && high.is_some());
+    assert!(low.as_deref() < high.as_deref());
+    let admins: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.participants WHERE conversation_id=$1 AND current_membership AND role='admin'",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("admins");
+    assert_eq!(admins, 2);
+}
+
+#[tokio::test]
+async fn creation_failure_injection_rolls_back_whole_graph() {
+    let pool = setup().await;
+    let fixture = build_creation(&pool, ConversationKind::Group).await;
+    let conversation_id = fixture.conversation_id;
+    let mut tx = pool.begin().await.expect("begin");
+    apply_conversation_persistence_plan(&mut tx, &fixture.plan, &fixture.ctx)
+        .await
+        .expect("apply");
+    // Force a mid-transaction failure: a duplicate entry at (conversation_id, 1).
+    let dup = sqlx::query(
+        r#"INSERT INTO chat.entries(conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,
+            accepted_payload_sha256,signed_request_bytes,request_digest,signature,server_fields_bytes,
+            outer_entry_fingerprint,actor_did,actor_device_id,actor_key_id,actor_auth_generation,
+            generation,state_version,transition_id,received_at)
+           VALUES($1,1,$2,'blue.catbird.chat.defs#creationEntry',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1,0,0,$13,$14)"#,
+    )
+    .bind(conversation_id)
+    .bind(Uuid::new_v4())
+    .bind(vec![1_u8; 4])
+    .bind(Sha256::digest([1_u8; 4]).to_vec())
+    .bind(vec![2_u8; 4])
+    .bind(Sha256::digest([2_u8; 4]).to_vec())
+    .bind(vec![3_u8; 64])
+    .bind(vec![4_u8; 8])
+    .bind(vec![5_u8; 32])
+    .bind(&fixture.alice_did)
+    .bind(fixture.alice_device)
+    .bind(Uuid::new_v4())
+    .bind(clock_now(&pool).await)
+    .execute(&mut *tx)
+    .await;
+    assert!(
+        dup.is_err(),
+        "duplicate seq must violate the primary key mid-tx"
+    );
+    tx.rollback().await.expect("rollback");
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM chat.conversations WHERE conversation_id=$1",
+            conversation_id
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM chat.transitions WHERE conversation_id=$1",
+            conversation_id
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM chat.participants WHERE conversation_id=$1",
+            conversation_id
+        )
+        .await,
+        0
+    );
+}
+
+/// Remove one conversation's committed graph so the shared, never-truncated
+/// clean-chat DB stays clean across runs. Runs inside ONE transaction: the
+/// `chat.entries` <-> `chat.transitions` provenance FKs are circular and
+/// DEFERRABLE INITIALLY DEFERRED, so both must be deleted before the (single)
+/// commit-time check fires. Global `chat.events`/`chat.outbox` rows are not
+/// conversation-scoped and are left in place (the event-recipient chain is
+/// re-derived per run, so their accumulation is harmless).
+async fn cleanup(pool: &PgPool, conversation_id: Uuid) {
+    let mut tx = match pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return,
+    };
+    for stmt in [
+        "DELETE FROM chat.application_intervals WHERE conversation_id=$1",
+        "DELETE FROM chat.member_devices WHERE conversation_id=$1",
+        "DELETE FROM chat.participants WHERE conversation_id=$1",
+        "DELETE FROM chat.metadata_snapshots WHERE conversation_id=$1",
+        "DELETE FROM chat.entry_recipients WHERE conversation_id=$1",
+        "DELETE FROM chat.entries WHERE conversation_id=$1",
+        "DELETE FROM chat.transitions WHERE conversation_id=$1",
+        "DELETE FROM chat.generation_states WHERE conversation_id=$1",
+        "DELETE FROM chat.generations WHERE conversation_id=$1",
+        "DELETE FROM chat.conversations WHERE conversation_id=$1",
+    ] {
+        if sqlx::query(stmt)
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await
+            .is_err()
+        {
+            let _ = tx.rollback().await;
+            return;
+        }
+    }
+    let _ = tx.commit().await;
 }

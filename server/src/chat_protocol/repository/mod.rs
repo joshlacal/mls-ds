@@ -3,10 +3,15 @@
 pub(crate) mod auth;
 #[cfg(not(test))]
 pub(crate) mod core;
-#[cfg(not(test))]
+// `delivery` and `transition` are the dumb-SQL writers the E2b-2 transition
+// executor composes. They are unconditionally compiled (not `#[cfg(not(test))]`)
+// so the executor — which is likewise now unconditional — resolves
+// `super::repository::{delivery,transition}` under the lib's `cfg(test)` build
+// and from the integration harness. Under the production `cfg(not(test))` build
+// they were already compiled, so this is behaviour-neutral for production; it
+// only additionally makes them available to the test configuration.
 pub(crate) mod delivery;
 pub(crate) mod inventory;
 #[cfg(not(test))]
 pub(crate) mod relationship;
-#[cfg(not(test))]
 pub(crate) mod transition;
