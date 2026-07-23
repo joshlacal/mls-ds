@@ -26,14 +26,23 @@ mod repository {
     }
 }
 
+use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Transaction};
+use tokio::sync::Barrier;
 use uuid::Uuid;
 
-use repository::delivery::{append_entry, AppendEntry, DeliveryRepositoryError};
+use repository::delivery::{
+    append_entry, append_event, claim_outbox_batch, enqueue_outbox, insert_entry_recipients,
+    insert_event_recipients, mark_outbox_delivered, AppendEntry, DeliveryRepositoryError,
+    EntryEntitlementKind, EntryRecipient, EventEntitlementKind, EventKind, EventRecipient,
+    NewEvent, OutboxWorkKind,
+};
 
 const APPLICATION_ENTRY_KIND: &str = "blue.catbird.chat.defs#applicationEntry";
 
@@ -681,4 +690,1071 @@ async fn append_reports_missing_conversation() {
         matches!(error, DeliveryRepositoryError::ConversationMissing),
         "absent conversation is reported as ConversationMissing, got {error:?}"
     );
+}
+
+// ===========================================================================
+// Audience / event / outbox write primitives (Task E1)
+//
+// The append-log allocator above materializes `chat.entries`. The primitives
+// below materialize the *frozen* control-entry audience, the global event log,
+// the event audience, and the durable outbox work the transition executor
+// (later tasks) composes on top of a single caller-owned transaction. Each
+// primitive is exercised against the sealed production schema: the immediate
+// table constraints (kind CHECKs, PKs, FKs) and — where a whole coherent
+// transaction is required — the deferred audience/mapping triggers.
+// ===========================================================================
+
+/// The clean-chat schema pins a *singleton* `chat.protocol_instances` row that
+/// every `chat.events` / `chat.event_retention` row references. The test
+/// database is never truncated between runs, so seed it idempotently and return
+/// the one instance id all events must bind.
+async fn ensure_protocol_instance(pool: &PgPool) -> Uuid {
+    let created_at = clock_now(pool).await;
+    sqlx::query(
+        "INSERT INTO chat.protocol_instances(protocol_instance_id, cursor_key_id, created_at) \
+         VALUES ($1, $2, $3) ON CONFLICT (singleton) DO NOTHING",
+    )
+    .bind(Uuid::new_v4())
+    .bind(URL_SAFE_NO_PAD.encode([0x41_u8; 32]))
+    .bind(created_at)
+    .execute(pool)
+    .await
+    .expect("ensure singleton protocol instance");
+    sqlx::query_scalar("SELECT protocol_instance_id FROM chat.protocol_instances")
+        .fetch_one(pool)
+        .await
+        .expect("read singleton protocol instance id")
+}
+
+/// Seed one additional active device under an existing principal. Audience rows
+/// FK only `chat.devices` (never `chat.device_keys`), so a bare device row is
+/// all the frozen-recipient primitives require. Each device carries a unique
+/// active `dpop_jkt` to satisfy `devices_active_dpop_jkt_uq`.
+async fn seed_extra_device(pool: &PgPool, user_did: &str) -> Uuid {
+    let device_id = Uuid::new_v4();
+    let created_at = clock_now(pool).await;
+    let mut jkt_material = Uuid::new_v4().as_bytes().to_vec();
+    jkt_material.extend_from_slice(Uuid::new_v4().as_bytes());
+    let dpop_jkt = URL_SAFE_NO_PAD.encode(&jkt_material[..32]);
+    sqlx::query(
+        "INSERT INTO chat.devices(user_did,device_id,device_name,status,dpop_jkt,auth_generation,capabilities,created_at,updated_at) \
+         VALUES($1,$2,'audience-device','active',$3,1,chat.protocol_capabilities(),$4,$4)",
+    )
+    .bind(user_did)
+    .bind(device_id)
+    .bind(&dpop_jkt)
+    .bind(created_at)
+    .execute(pool)
+    .await
+    .expect("insert extra audience device");
+    device_id
+}
+
+/// Canonical audience order is `(user-DID UTF-8 bytes, device UUID raw bytes)`.
+fn sorted_by_raw_bytes(mut devices: Vec<Uuid>) -> Vec<Uuid> {
+    devices.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    devices
+}
+
+async fn entry_recipient_rows(
+    pool: &PgPool,
+    conversation_id: Uuid,
+    seq: i64,
+) -> Vec<(String, Uuid, String)> {
+    sqlx::query_as(
+        "SELECT user_did, device_id, entitlement_kind FROM chat.entry_recipients \
+         WHERE conversation_id = $1 AND seq = $2 ORDER BY user_did, device_id",
+    )
+    .bind(conversation_id)
+    .bind(seq)
+    .fetch_all(pool)
+    .await
+    .expect("read frozen entry recipients")
+}
+
+async fn event_kind_at(pool: &PgPool, position: i64) -> String {
+    sqlx::query_scalar("SELECT event_kind FROM chat.events WHERE event_position = $1")
+        .bind(position)
+        .fetch_one(pool)
+        .await
+        .expect("read event kind")
+}
+
+async fn event_created_at(pool: &PgPool, position: i64) -> DateTime<Utc> {
+    sqlx::query_scalar("SELECT created_at FROM chat.events WHERE event_position = $1")
+        .bind(position)
+        .fetch_one(pool)
+        .await
+        .expect("read event created_at")
+}
+
+async fn event_payload_sha256(pool: &PgPool, position: i64) -> Vec<u8> {
+    sqlx::query_scalar("SELECT payload_sha256 FROM chat.events WHERE event_position = $1")
+        .bind(position)
+        .fetch_one(pool)
+        .await
+        .expect("read event payload hash")
+}
+
+async fn outbox_row(
+    pool: &PgPool,
+    outbox_id: Uuid,
+) -> (String, Option<Uuid>, Option<DateTime<Utc>>) {
+    sqlx::query_as("SELECT status, lease_owner, delivered_at FROM chat.outbox WHERE outbox_id = $1")
+        .bind(outbox_id)
+        .fetch_one(pool)
+        .await
+        .expect("read outbox work row")
+}
+
+// ---------------------------------------------------------------------------
+// entry_recipients
+// ---------------------------------------------------------------------------
+
+/// A control audience for the genesis creation entry freezes one immutable row
+/// per exact device, in canonical `(DID,device)` order, and commits cleanly:
+/// the deferred `entry_recipients_mapping_deferred` guard is satisfied because
+/// seq 1 is a non-application control entry.
+#[tokio::test]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+async fn entry_recipients_control_arm_freezes_and_commits() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let fixture = seed_fixture(&pool).await;
+    let extra_a = seed_extra_device(&pool, &fixture.actor_did).await;
+    let extra_b = seed_extra_device(&pool, &fixture.actor_did).await;
+
+    let devices = sorted_by_raw_bytes(vec![fixture.actor_device_id, extra_a, extra_b]);
+    let recipients: Vec<EntryRecipient> = devices
+        .iter()
+        .map(|device| EntryRecipient {
+            user_did: fixture.actor_did.clone(),
+            device_id: *device,
+            entitlement_kind: EntryEntitlementKind::Control,
+        })
+        .collect();
+
+    let mut tx = pool.begin().await.expect("begin control audience freeze");
+    insert_entry_recipients(&mut tx, fixture.conversation_id, 1, &recipients)
+        .await
+        .expect("freeze control audience for the genesis entry");
+    tx.commit().await.expect("commit control audience freeze");
+
+    let rows = entry_recipient_rows(&pool, fixture.conversation_id, 1).await;
+    assert_eq!(rows.len(), 3, "one frozen row per exact device");
+    assert!(
+        rows.iter()
+            .all(|(did, _, kind)| did == &fixture.actor_did && kind == "control"),
+        "every frozen row is a control-arm row for the actor principal: {rows:?}"
+    );
+    let mut stored: Vec<Uuid> = rows.iter().map(|(_, device, _)| *device).collect();
+    stored.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    assert_eq!(stored, devices, "all three exact devices are frozen");
+}
+
+/// A control entry with no audience is a caller bug: the primitive refuses an
+/// empty recipient list rather than writing zero rows.
+#[tokio::test]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+async fn entry_recipients_reject_empty_audience() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let fixture = seed_fixture(&pool).await;
+
+    let mut tx = pool.begin().await.expect("begin empty audience probe");
+    let error = insert_entry_recipients(&mut tx, fixture.conversation_id, 1, &[])
+        .await
+        .expect_err("empty control audience must be rejected");
+    assert!(
+        matches!(error, DeliveryRepositoryError::EmptyRecipients),
+        "empty audience is reported as EmptyRecipients, got {error:?}"
+    );
+}
+
+/// The primitive enforces canonical `(DID,device)` input order and rejects both
+/// out-of-order and duplicate tuples rather than silently sorting/deduping.
+#[tokio::test]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+async fn entry_recipients_reject_noncanonical_or_duplicate_input() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let fixture = seed_fixture(&pool).await;
+    let extra = seed_extra_device(&pool, &fixture.actor_did).await;
+
+    let ordered = sorted_by_raw_bytes(vec![fixture.actor_device_id, extra]);
+    let (low, high) = (ordered[0], ordered[1]);
+    let row = |device: Uuid| EntryRecipient {
+        user_did: fixture.actor_did.clone(),
+        device_id: device,
+        entitlement_kind: EntryEntitlementKind::Control,
+    };
+
+    let mut tx = pool.begin().await.expect("begin ordering probe");
+    let reversed =
+        insert_entry_recipients(&mut tx, fixture.conversation_id, 1, &[row(high), row(low)])
+            .await
+            .expect_err("descending audience input must be rejected");
+    assert!(
+        matches!(reversed, DeliveryRepositoryError::NonCanonicalRecipients),
+        "out-of-order input is reported as NonCanonicalRecipients, got {reversed:?}"
+    );
+
+    let duplicate =
+        insert_entry_recipients(&mut tx, fixture.conversation_id, 1, &[row(low), row(low)])
+            .await
+            .expect_err("duplicate audience input must be rejected");
+    assert!(
+        matches!(duplicate, DeliveryRepositoryError::NonCanonicalRecipients),
+        "duplicate input is reported as NonCanonicalRecipients, got {duplicate:?}"
+    );
+}
+
+/// The `(conversation,seq,DID,device)` primary key rejects a second frozen row
+/// for the same exact device at the same entry — audience rows are immutable.
+#[tokio::test]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+async fn entry_recipients_duplicate_pk_rejected() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let fixture = seed_fixture(&pool).await;
+
+    let recipient = EntryRecipient {
+        user_did: fixture.actor_did.clone(),
+        device_id: fixture.actor_device_id,
+        entitlement_kind: EntryEntitlementKind::Control,
+    };
+
+    let mut tx = pool.begin().await.expect("begin duplicate-pk probe");
+    insert_entry_recipients(
+        &mut tx,
+        fixture.conversation_id,
+        1,
+        std::slice::from_ref(&recipient),
+    )
+    .await
+    .expect("first frozen row is accepted");
+    let error = insert_entry_recipients(
+        &mut tx,
+        fixture.conversation_id,
+        1,
+        std::slice::from_ref(&recipient),
+    )
+    .await
+    .expect_err("a second row for the same exact device must be rejected");
+    let db_error = match &error {
+        DeliveryRepositoryError::Database(db) => db.as_database_error().expect("database error"),
+        other => panic!("duplicate audience must surface a database error, got {other:?}"),
+    };
+    assert_eq!(
+        db_error.code().as_deref(),
+        Some("23505"),
+        "duplicate audience is a unique_violation"
+    );
+    assert_eq!(
+        db_error.constraint(),
+        Some("entry_recipients_pkey"),
+        "the rejecting constraint is the audience primary key"
+    );
+}
+
+/// Frozen rows require both the addressed entry and the exact device to exist:
+/// the two immediate foreign keys reject an audience row aimed at a
+/// non-existent seq or a non-existent device.
+#[tokio::test]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+async fn entry_recipients_reject_missing_entry_or_device_fk() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let fixture = seed_fixture(&pool).await;
+
+    // Missing device: a real seq (genesis entry 1) but a device absent from
+    // chat.devices trips entry_recipients_device_fk.
+    let mut tx = pool.begin().await.expect("begin missing-device probe");
+    let missing_device = insert_entry_recipients(
+        &mut tx,
+        fixture.conversation_id,
+        1,
+        &[EntryRecipient {
+            user_did: fixture.actor_did.clone(),
+            device_id: Uuid::new_v4(),
+            entitlement_kind: EntryEntitlementKind::Control,
+        }],
+    )
+    .await
+    .expect_err("audience for an unknown device must be rejected");
+    let device_error = match &missing_device {
+        DeliveryRepositoryError::Database(db) => db.as_database_error().expect("database error"),
+        other => panic!("missing device must surface a database error, got {other:?}"),
+    };
+    assert_eq!(
+        device_error.code().as_deref(),
+        Some("23503"),
+        "missing device is a foreign_key_violation"
+    );
+    assert_eq!(
+        device_error.constraint(),
+        Some("entry_recipients_device_fk")
+    );
+    drop(tx);
+
+    // Missing entry: a real device but a seq with no committed entry trips
+    // entry_recipients_entry_fk.
+    let mut tx = pool.begin().await.expect("begin missing-entry probe");
+    let missing_entry = insert_entry_recipients(
+        &mut tx,
+        fixture.conversation_id,
+        9_999,
+        &[EntryRecipient {
+            user_did: fixture.actor_did.clone(),
+            device_id: fixture.actor_device_id,
+            entitlement_kind: EntryEntitlementKind::Control,
+        }],
+    )
+    .await
+    .expect_err("audience for an absent entry seq must be rejected");
+    let entry_error = match &missing_entry {
+        DeliveryRepositoryError::Database(db) => db.as_database_error().expect("database error"),
+        other => panic!("missing entry must surface a database error, got {other:?}"),
+    };
+    assert_eq!(
+        entry_error.code().as_deref(),
+        Some("23503"),
+        "missing entry is a foreign_key_violation"
+    );
+    assert_eq!(entry_error.constraint(), Some("entry_recipients_entry_fk"));
+}
+
+/// The `intervalClose` and `scheduleTerminal` arms are written by this primitive
+/// (immediate table constraints pass) but their COMMIT coherence is enforced by
+/// the deferred `entry_recipients_mapping_deferred` guard, which the transition
+/// executor satisfies by composing the closed application interval / terminal
+/// proof in the same transaction. Isolated here — with no interval/proof — the
+/// insert is accepted while the commit is rejected, proving both the primitive
+/// and the schema guard.
+#[tokio::test]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+async fn entry_recipients_interval_kinds_written_but_guarded_at_commit() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
+    let fixture = seed_fixture(&pool).await;
+    let interval_device = seed_extra_device(&pool, &fixture.actor_did).await;
+    let terminal_device = seed_extra_device(&pool, &fixture.actor_did).await;
+
+    for (device, kind) in [
+        (interval_device, EntryEntitlementKind::IntervalClose),
+        (terminal_device, EntryEntitlementKind::ScheduleTerminal),
+    ] {
+        let mut tx = pool.begin().await.expect("begin interval-kind probe");
+        insert_entry_recipients(
+            &mut tx,
+            fixture.conversation_id,
+            1,
+            &[EntryRecipient {
+                user_did: fixture.actor_did.clone(),
+                device_id: device,
+                entitlement_kind: kind,
+            }],
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!("{kind:?} row must pass immediate constraints, got {error:?}")
+        });
+
+        let commit = tx
+            .commit()
+            .await
+            .expect_err("an un-scaffolded interval-bound audience row must be rejected at commit");
+        let db_error = commit
+            .as_database_error()
+            .expect("deferred mapping guard raises a database error");
+        assert_eq!(
+            db_error.code().as_deref(),
+            Some("23514"),
+            "the deferred audience-mapping guard rejects {kind:?} with a check_violation"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// events
+// ---------------------------------------------------------------------------
+
+fn new_event(instance: Uuid, kind: EventKind, created_at: DateTime<Utc>, salt: u8) -> NewEvent {
+    NewEvent {
+        event_id: Uuid::new_v4(),
+        event_kind: kind,
+        payload_bytes: vec![salt; 8],
+        created_at,
+        protocol_instance_id: instance,
+    }
+}
+
+/// The DB-allocated `event_position` identity is strictly increasing across
+/// sequential appends (gaps are allowed, order is not).
+#[tokio::test]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+async fn append_event_allocates_strictly_increasing_positions() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
+    let instance = ensure_protocol_instance(&pool).await;
+    let created_at = clock_now(&pool).await;
+
+    let mut tx = pool.begin().await.expect("begin event batch");
+    let mut positions = Vec::new();
+    for salt in [1_u8, 2, 3, 4] {
+        let event = new_event(instance, EventKind::MessageAvailable, created_at, salt);
+        positions.push(append_event(&mut tx, &event).await.expect("append event"));
+    }
+    tx.commit().await.expect("commit event batch");
+
+    assert!(
+        positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "event positions must be strictly increasing: {positions:?}"
+    );
+}
+
+/// Each of the ten closed `event_kind` values round-trips through the primitive,
+/// and the caller-supplied `created_at` is stored verbatim (never `now()`).
+#[tokio::test]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+async fn append_event_roundtrips_every_kind_and_caller_timestamp() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
+    let instance = ensure_protocol_instance(&pool).await;
+    // A caller-authored instant firmly in the past: if the primitive used
+    // now() the stored value would not match.
+    let authored_at = "2020-01-02T03:04:05.678Z"
+        .parse::<DateTime<Utc>>()
+        .expect("parse caller-authored instant");
+
+    let kinds = [
+        (EventKind::ConversationChanged, "conversationChanged"),
+        (EventKind::ConversationClosed, "conversationClosed"),
+        (EventKind::MessageAvailable, "messageAvailable"),
+        (EventKind::WelcomeAvailable, "welcomeAvailable"),
+        (EventKind::WelcomeDisposition, "welcomeDisposition"),
+        (EventKind::ResetRequested, "resetRequested"),
+        (EventKind::LeafRecovery, "leafRecovery"),
+        (EventKind::LeaveRequest, "leaveRequest"),
+        (EventKind::AccessEnded, "accessEnded"),
+        (EventKind::Watermark, "watermark"),
+    ];
+
+    for (salt, (kind, expected)) in kinds.into_iter().enumerate() {
+        let mut tx = pool.begin().await.expect("begin single-kind append");
+        let event = new_event(instance, kind, authored_at, salt as u8);
+        let position = append_event(&mut tx, &event)
+            .await
+            .expect("append typed event");
+        tx.commit().await.expect("commit single-kind append");
+
+        assert_eq!(
+            event_kind_at(&pool, position).await,
+            expected,
+            "kind {kind:?} round-trips"
+        );
+        assert_eq!(
+            event_created_at(&pool, position).await,
+            authored_at,
+            "created_at is the caller-supplied instant for {kind:?}"
+        );
+    }
+}
+
+/// The API computes `payload_sha256` from the same bytes it stores, so a hash
+/// mismatch is impossible through the primitive; the DB CHECK independently
+/// rejects a hand-rolled row whose stored hash does not match its payload.
+#[tokio::test]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+async fn append_event_hash_is_api_computed_and_db_enforced() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
+    let instance = ensure_protocol_instance(&pool).await;
+    let created_at = clock_now(&pool).await;
+
+    let mut tx = pool.begin().await.expect("begin hashed append");
+    let event = new_event(instance, EventKind::MessageAvailable, created_at, 7);
+    let position = append_event(&mut tx, &event)
+        .await
+        .expect("append hashed event");
+    tx.commit().await.expect("commit hashed append");
+    assert_eq!(
+        event_payload_sha256(&pool, position).await,
+        Sha256::digest(&event.payload_bytes).to_vec(),
+        "the stored hash is the API-computed digest of the payload"
+    );
+
+    // A direct insert with a deliberately wrong hash must be refused by the DB.
+    let mut tx = pool.begin().await.expect("begin bad-hash probe");
+    let bad = sqlx::query(
+        "INSERT INTO chat.events(event_id,event_kind,payload_bytes,payload_sha256,created_at,protocol_instance_id) \
+         VALUES($1,'messageAvailable',$2,$3,$4,$5)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(vec![9_u8; 8])
+    .bind(vec![0_u8; 32])
+    .bind(created_at)
+    .bind(instance)
+    .execute(&mut *tx)
+    .await
+    .expect_err("a mismatched payload hash must be rejected by the DB CHECK");
+    assert_eq!(
+        bad.as_database_error()
+            .and_then(|db| db.code().map(|code| code.into_owned()))
+            .as_deref(),
+        Some("23514"),
+        "the payload-hash CHECK rejects a mismatched digest"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// event_recipients
+// ---------------------------------------------------------------------------
+
+fn event_recipient(did: &str, device: Uuid, predecessor: Option<i64>) -> EventRecipient {
+    EventRecipient {
+        user_did: did.to_owned(),
+        device_id: device,
+        entitlement_kind: EventEntitlementKind::Participant,
+        audience_predecessor_position: predecessor,
+    }
+}
+
+/// A device's audience rows chain across events via
+/// `audience_predecessor_position`: the first row is `NULL`, each later row
+/// points at the same device's immediately preceding event_position. A valid
+/// chain commits.
+#[tokio::test]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+async fn event_recipients_valid_predecessor_chain_commits() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
+    let fixture = seed_fixture(&pool).await;
+    let instance = ensure_protocol_instance(&pool).await;
+    let created_at = clock_now(&pool).await;
+
+    let mut tx = pool.begin().await.expect("begin chain build");
+    let first = append_event(
+        &mut tx,
+        &new_event(instance, EventKind::MessageAvailable, created_at, 1),
+    )
+    .await
+    .expect("append first event");
+    insert_event_recipients(
+        &mut tx,
+        first,
+        &[event_recipient(
+            &fixture.actor_did,
+            fixture.actor_device_id,
+            None,
+        )],
+    )
+    .await
+    .expect("freeze first audience row (chain head)");
+
+    let second = append_event(
+        &mut tx,
+        &new_event(instance, EventKind::MessageAvailable, created_at, 2),
+    )
+    .await
+    .expect("append second event");
+    insert_event_recipients(
+        &mut tx,
+        second,
+        &[event_recipient(
+            &fixture.actor_did,
+            fixture.actor_device_id,
+            Some(first),
+        )],
+    )
+    .await
+    .expect("freeze second audience row chained to the first");
+    tx.commit()
+        .await
+        .expect("a valid same-device chain commits");
+
+    let predecessor: Option<i64> = sqlx::query_scalar(
+        "SELECT audience_predecessor_position FROM chat.event_recipients \
+         WHERE event_position = $1 AND user_did = $2 AND device_id = $3",
+    )
+    .bind(second)
+    .bind(&fixture.actor_did)
+    .bind(fixture.actor_device_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read chained predecessor");
+    assert_eq!(
+        predecessor,
+        Some(first),
+        "the second row chains to the first event position"
+    );
+}
+
+/// A predecessor that names a *different* device's event_position has no
+/// matching `event_recipients(user_did,device_id,event_position)` row, so the
+/// deferred self-referential foreign key rejects the chain at commit.
+#[tokio::test]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+async fn event_recipients_cross_device_predecessor_rejected_at_commit() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
+    let fixture = seed_fixture(&pool).await;
+    let other_device = seed_extra_device(&pool, &fixture.actor_did).await;
+    let instance = ensure_protocol_instance(&pool).await;
+    let created_at = clock_now(&pool).await;
+
+    let mut tx = pool.begin().await.expect("begin cross-device chain");
+    let first = append_event(
+        &mut tx,
+        &new_event(instance, EventKind::MessageAvailable, created_at, 1),
+    )
+    .await
+    .expect("append first event");
+    insert_event_recipients(
+        &mut tx,
+        first,
+        &[event_recipient(
+            &fixture.actor_did,
+            fixture.actor_device_id,
+            None,
+        )],
+    )
+    .await
+    .expect("freeze the actor device's head row");
+
+    let second = append_event(
+        &mut tx,
+        &new_event(instance, EventKind::MessageAvailable, created_at, 2),
+    )
+    .await
+    .expect("append second event");
+    // `other_device` points its predecessor at the actor device's position.
+    insert_event_recipients(
+        &mut tx,
+        second,
+        &[event_recipient(
+            &fixture.actor_did,
+            other_device,
+            Some(first),
+        )],
+    )
+    .await
+    .expect("insert is accepted; the mis-chain is caught at commit");
+
+    let commit = tx
+        .commit()
+        .await
+        .expect_err("a cross-device predecessor must be rejected at commit");
+    let db_error = commit
+        .as_database_error()
+        .expect("deferred chain guard raises a database error");
+    assert!(
+        matches!(db_error.code().as_deref(), Some("23503") | Some("23514")),
+        "cross-device predecessor fails the deferred FK / chain guard, got {:?}",
+        db_error.code()
+    );
+}
+
+/// The `audience_predecessor_position < event_position` CHECK is immediate: a
+/// predecessor at or beyond the row's own position is refused at insert.
+#[tokio::test]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+async fn event_recipients_non_earlier_predecessor_rejected() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
+    let fixture = seed_fixture(&pool).await;
+    let instance = ensure_protocol_instance(&pool).await;
+    let created_at = clock_now(&pool).await;
+
+    let mut tx = pool.begin().await.expect("begin self-predecessor probe");
+    let position = append_event(
+        &mut tx,
+        &new_event(instance, EventKind::MessageAvailable, created_at, 1),
+    )
+    .await
+    .expect("append event");
+    let error = insert_event_recipients(
+        &mut tx,
+        position,
+        &[event_recipient(
+            &fixture.actor_did,
+            fixture.actor_device_id,
+            Some(position),
+        )],
+    )
+    .await
+    .expect_err("a predecessor equal to the row position must be rejected");
+    let db_error = match &error {
+        DeliveryRepositoryError::Database(db) => db.as_database_error().expect("database error"),
+        other => panic!("non-earlier predecessor must surface a database error, got {other:?}"),
+    };
+    assert_eq!(
+        db_error.code().as_deref(),
+        Some("23514"),
+        "predecessor >= position fails the immediate CHECK"
+    );
+}
+
+/// The `(event_position,user_did,device_id)` primary key rejects a second
+/// audience row for the same exact device at the same event.
+#[tokio::test]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+async fn event_recipients_duplicate_pk_rejected() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
+    let fixture = seed_fixture(&pool).await;
+    let instance = ensure_protocol_instance(&pool).await;
+    let created_at = clock_now(&pool).await;
+
+    let mut tx = pool.begin().await.expect("begin duplicate audience probe");
+    let position = append_event(
+        &mut tx,
+        &new_event(instance, EventKind::MessageAvailable, created_at, 1),
+    )
+    .await
+    .expect("append event");
+    insert_event_recipients(
+        &mut tx,
+        position,
+        &[event_recipient(
+            &fixture.actor_did,
+            fixture.actor_device_id,
+            None,
+        )],
+    )
+    .await
+    .expect("first audience row accepted");
+    let error = insert_event_recipients(
+        &mut tx,
+        position,
+        &[event_recipient(
+            &fixture.actor_did,
+            fixture.actor_device_id,
+            None,
+        )],
+    )
+    .await
+    .expect_err("a second row for the same exact device is rejected");
+    let db_error = match &error {
+        DeliveryRepositoryError::Database(db) => db.as_database_error().expect("database error"),
+        other => panic!("duplicate audience must surface a database error, got {other:?}"),
+    };
+    assert_eq!(
+        db_error.code().as_deref(),
+        Some("23505"),
+        "duplicate audience is a unique_violation"
+    );
+    assert_eq!(db_error.constraint(), Some("event_recipients_pkey"));
+}
+
+// ---------------------------------------------------------------------------
+// outbox
+// ---------------------------------------------------------------------------
+
+/// Enqueue one durable work row per `(event_position, work_kind)`. The
+/// `outbox_event_work_uq` uniqueness prevents a double enqueue for the same
+/// work kind, while a different work kind for the same event is allowed.
+#[tokio::test]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+async fn enqueue_outbox_enforces_event_work_uniqueness() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
+    let instance = ensure_protocol_instance(&pool).await;
+    let now = clock_now(&pool).await;
+
+    // Commit the event and its first stream work so both the duplicate probe
+    // and the distinct-kind enqueue observe a durable event + outbox row.
+    let mut tx = pool.begin().await.expect("begin enqueue");
+    let position = append_event(
+        &mut tx,
+        &new_event(instance, EventKind::MessageAvailable, now, 1),
+    )
+    .await
+    .expect("append event");
+    enqueue_outbox(
+        &mut tx,
+        Uuid::new_v4(),
+        position,
+        OutboxWorkKind::Stream,
+        now,
+    )
+    .await
+    .expect("first stream work enqueued");
+    tx.commit().await.expect("commit event + first stream work");
+
+    // A second stream row for the same event violates the work-kind uniqueness.
+    let mut tx = pool.begin().await.expect("begin duplicate enqueue probe");
+    let duplicate = enqueue_outbox(
+        &mut tx,
+        Uuid::new_v4(),
+        position,
+        OutboxWorkKind::Stream,
+        now,
+    )
+    .await
+    .expect_err("a second stream row for the same event is rejected");
+    let db_error = match &duplicate {
+        DeliveryRepositoryError::Database(db) => db.as_database_error().expect("database error"),
+        other => panic!("double enqueue must surface a database error, got {other:?}"),
+    };
+    assert_eq!(
+        db_error.code().as_deref(),
+        Some("23505"),
+        "double enqueue is a unique_violation"
+    );
+    assert_eq!(db_error.constraint(), Some("outbox_event_work_uq"));
+    drop(tx);
+
+    // A distinct work kind for the same event position is legitimate.
+    let mut tx = pool.begin().await.expect("begin distinct-kind enqueue");
+    enqueue_outbox(
+        &mut tx,
+        Uuid::new_v4(),
+        position,
+        OutboxWorkKind::Notification,
+        now,
+    )
+    .await
+    .expect("notification work for the same event is allowed");
+    tx.commit().await.expect("commit distinct-kind enqueue");
+}
+
+/// SECURITY-CRITICAL: two workers claiming the queue concurrently (two
+/// connections, a shared barrier) partition the pending rows via
+/// `FOR UPDATE SKIP LOCKED` and never claim the same row twice.
+#[tokio::test]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+async fn claim_outbox_batch_two_claimers_never_double_claim() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(6).await;
+    let instance = ensure_protocol_instance(&pool).await;
+    let base = clock_now(&pool).await;
+
+    const WORK_COUNT: usize = 6;
+    let mut enqueue_tx = pool.begin().await.expect("begin enqueue batch");
+    let mut outbox_ids = Vec::new();
+    for salt in 0..WORK_COUNT {
+        let position = append_event(
+            &mut enqueue_tx,
+            &new_event(instance, EventKind::MessageAvailable, base, salt as u8),
+        )
+        .await
+        .expect("append event for outbox row");
+        let outbox_id = Uuid::new_v4();
+        enqueue_outbox(
+            &mut enqueue_tx,
+            outbox_id,
+            position,
+            OutboxWorkKind::Stream,
+            base,
+        )
+        .await
+        .expect("enqueue pending stream work");
+        outbox_ids.push(outbox_id);
+    }
+    enqueue_tx.commit().await.expect("commit enqueue batch");
+
+    let lease_expires_at = base + chrono::Duration::seconds(300);
+    let barrier = Arc::new(Barrier::new(2));
+
+    let claim = |owner: Uuid| {
+        let pool = pool.clone();
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            let mut tx = pool.begin().await.expect("begin claimer tx");
+            barrier.wait().await;
+            let claimed =
+                claim_outbox_batch(&mut tx, owner, base, lease_expires_at, WORK_COUNT as i64)
+                    .await
+                    .expect("claim outbox batch");
+            tx.commit().await.expect("commit claimer tx");
+            claimed
+                .into_iter()
+                .map(|work| work.outbox_id)
+                .collect::<Vec<_>>()
+        })
+    };
+
+    let claimer_a = claim(Uuid::new_v4());
+    let claimer_b = claim(Uuid::new_v4());
+    let claimed_a = claimer_a.await.expect("join claimer a");
+    let claimed_b = claimer_b.await.expect("join claimer b");
+
+    let set_a: HashSet<Uuid> = claimed_a.iter().copied().collect();
+    let set_b: HashSet<Uuid> = claimed_b.iter().copied().collect();
+    assert_eq!(
+        set_a.len(),
+        claimed_a.len(),
+        "claimer a returns no internal duplicates"
+    );
+    assert_eq!(
+        set_b.len(),
+        claimed_b.len(),
+        "claimer b returns no internal duplicates"
+    );
+    assert!(
+        set_a.is_disjoint(&set_b),
+        "no outbox row is claimed by both workers"
+    );
+    assert_eq!(
+        claimed_a.len() + claimed_b.len(),
+        WORK_COUNT,
+        "the two workers together claim every pending row exactly once"
+    );
+    let mut union = set_a;
+    union.extend(set_b);
+    assert_eq!(
+        union,
+        outbox_ids.iter().copied().collect::<HashSet<Uuid>>(),
+        "the claimed union is exactly the enqueued set"
+    );
+}
+
+/// A lease that has expired relative to the caller's `now` is reclaimable by a
+/// fresh worker; a still-valid lease is not.
+#[tokio::test]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+async fn claim_outbox_batch_reclaims_only_expired_leases() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
+    let instance = ensure_protocol_instance(&pool).await;
+    let base = clock_now(&pool).await;
+
+    let mut tx = pool.begin().await.expect("begin enqueue");
+    let position = append_event(
+        &mut tx,
+        &new_event(instance, EventKind::MessageAvailable, base, 1),
+    )
+    .await
+    .expect("append event");
+    let outbox_id = Uuid::new_v4();
+    enqueue_outbox(&mut tx, outbox_id, position, OutboxWorkKind::Stream, base)
+        .await
+        .expect("enqueue pending work");
+    tx.commit().await.expect("commit enqueue");
+
+    // First worker takes a short lease.
+    let owner_a = Uuid::new_v4();
+    let mut tx = pool.begin().await.expect("begin first claim");
+    let first = claim_outbox_batch(
+        &mut tx,
+        owner_a,
+        base,
+        base + chrono::Duration::seconds(100),
+        10,
+    )
+    .await
+    .expect("first claim");
+    tx.commit().await.expect("commit first claim");
+    assert_eq!(first.len(), 1, "the pending row is claimed once");
+
+    // A second worker before the lease expires reclaims nothing.
+    let mut tx = pool.begin().await.expect("begin early reclaim");
+    let early = claim_outbox_batch(
+        &mut tx,
+        Uuid::new_v4(),
+        base + chrono::Duration::seconds(50),
+        base + chrono::Duration::seconds(400),
+        10,
+    )
+    .await
+    .expect("early reclaim attempt");
+    tx.commit().await.expect("commit early reclaim");
+    assert!(early.is_empty(), "a still-valid lease is not reclaimable");
+
+    // After the lease expires the row is reclaimed by a new owner.
+    let owner_b = Uuid::new_v4();
+    let mut tx = pool.begin().await.expect("begin expired reclaim");
+    let reclaimed = claim_outbox_batch(
+        &mut tx,
+        owner_b,
+        base + chrono::Duration::seconds(200),
+        base + chrono::Duration::seconds(600),
+        10,
+    )
+    .await
+    .expect("expired reclaim");
+    tx.commit().await.expect("commit expired reclaim");
+    assert_eq!(reclaimed.len(), 1, "the expired lease is reclaimed");
+
+    let (status, lease_owner, _) = outbox_row(&pool, outbox_id).await;
+    assert_eq!(status, "leased", "the reclaimed row remains leased");
+    assert_eq!(
+        lease_owner,
+        Some(owner_b),
+        "the reclaim installs the new owner"
+    );
+}
+
+/// Marking work delivered is an owner-scoped CAS: only the exact current lease
+/// owner can terminalize the row. A stale or non-owner caller updates zero rows
+/// and is reported as an error, leaving the row untouched.
+#[tokio::test]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+async fn mark_outbox_delivered_requires_exact_lease_owner() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
+    let instance = ensure_protocol_instance(&pool).await;
+    let base = clock_now(&pool).await;
+
+    let mut tx = pool.begin().await.expect("begin enqueue");
+    let position = append_event(
+        &mut tx,
+        &new_event(instance, EventKind::MessageAvailable, base, 1),
+    )
+    .await
+    .expect("append event");
+    let outbox_id = Uuid::new_v4();
+    enqueue_outbox(&mut tx, outbox_id, position, OutboxWorkKind::Stream, base)
+        .await
+        .expect("enqueue pending work");
+    tx.commit().await.expect("commit enqueue");
+
+    let owner = Uuid::new_v4();
+    let mut tx = pool.begin().await.expect("begin claim");
+    claim_outbox_batch(
+        &mut tx,
+        owner,
+        base,
+        base + chrono::Duration::seconds(100),
+        10,
+    )
+    .await
+    .expect("claim the row");
+    tx.commit().await.expect("commit claim");
+
+    // A non-owner cannot terminalize the lease.
+    let mut tx = pool.begin().await.expect("begin wrong-owner mark");
+    let wrong = mark_outbox_delivered(
+        &mut tx,
+        outbox_id,
+        Uuid::new_v4(),
+        base + chrono::Duration::seconds(10),
+    )
+    .await
+    .expect_err("a non-owner mark must be rejected");
+    assert!(
+        matches!(wrong, DeliveryRepositoryError::OutboxLeaseMismatch),
+        "a stale/non-owner mark is reported as OutboxLeaseMismatch, got {wrong:?}"
+    );
+    tx.commit().await.expect("commit wrong-owner mark (no-op)");
+    let (status, _, _) = outbox_row(&pool, outbox_id).await;
+    assert_eq!(
+        status, "leased",
+        "the row is untouched after a rejected mark"
+    );
+
+    // The exact owner terminalizes the row exactly once.
+    let mut tx = pool.begin().await.expect("begin owner mark");
+    mark_outbox_delivered(
+        &mut tx,
+        outbox_id,
+        owner,
+        base + chrono::Duration::seconds(20),
+    )
+    .await
+    .expect("the exact lease owner delivers the row");
+    tx.commit().await.expect("commit owner mark");
+    let (status, _, delivered_at) = outbox_row(&pool, outbox_id).await;
+    assert_eq!(status, "delivered", "the row is delivered");
+    assert!(delivered_at.is_some(), "delivered_at is stamped");
+
+    // A repeat mark on an already-delivered row updates nothing and is an error.
+    let mut tx = pool.begin().await.expect("begin repeat mark");
+    let repeat = mark_outbox_delivered(
+        &mut tx,
+        outbox_id,
+        owner,
+        base + chrono::Duration::seconds(30),
+    )
+    .await
+    .expect_err("a repeat mark on a terminal row must be rejected");
+    assert!(
+        matches!(repeat, DeliveryRepositoryError::OutboxLeaseMismatch),
+        "a repeat mark is reported as OutboxLeaseMismatch, got {repeat:?}"
+    );
+    drop(tx);
 }
