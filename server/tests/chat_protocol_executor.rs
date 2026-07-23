@@ -3434,7 +3434,26 @@ struct FulfillmentScenario {
     event_positions: Vec<i64>,
 }
 
-async fn run_fulfillment_scenario(pool: &PgPool) -> FulfillmentScenario {
+/// The uncommitted leaf-recovery fulfillment plan + ctx (create + acceptance are
+/// already COMMITTED). Extracted so the reconciliation negative test can apply a
+/// MUTATED plan against the same accepted state without run_fulfillment_scenario
+/// committing it first.
+struct BuiltFulfillment {
+    plan: chat_protocol::state_machine::ConversationPersistencePlan,
+    ctx: ExecutionContext,
+    fixture: CreationApply,
+    conversation_id: Uuid,
+    bob_id: DeviceIdentity,
+    bob_did: String,
+    alice_sig_key: Vec<u8>,
+    fulfill_transition: Uuid,
+    welcome_id: Uuid,
+    recovery_request_id: Uuid,
+    corpus_ref: [u8; 32],
+    fulfillment_state: chat_protocol::state_machine::ConversationState,
+}
+
+async fn build_fulfillment(pool: &PgPool) -> BuiltFulfillment {
     let pool = pool.clone();
     let manifest = corpus_manifest();
     let bob_id = bob_corpus(&manifest);
@@ -3711,6 +3730,41 @@ async fn run_fulfillment_scenario(pool: &PgPool) -> FulfillmentScenario {
         welcome_dispositions: vec![],
     };
 
+    BuiltFulfillment {
+        plan,
+        ctx,
+        fixture,
+        conversation_id,
+        bob_id,
+        bob_did,
+        alice_sig_key,
+        fulfill_transition,
+        welcome_id,
+        recovery_request_id,
+        corpus_ref,
+        fulfillment_state,
+    }
+}
+
+/// Create + acceptance + fulfillment, all COMMITTED on a fresh DB, at sv 2 /
+/// epoch 1 with alice + bob leaves — the prior for the epoch-changing follow-ons.
+async fn run_fulfillment_scenario(pool: &PgPool) -> FulfillmentScenario {
+    let BuiltFulfillment {
+        plan,
+        ctx,
+        fixture,
+        conversation_id,
+        bob_id,
+        bob_did,
+        alice_sig_key,
+        fulfill_transition,
+        welcome_id,
+        recovery_request_id,
+        corpus_ref,
+        fulfillment_state,
+    } = build_fulfillment(pool).await;
+    let pool = pool.clone();
+
     let mut tx = pool.begin().await.expect("begin fulfillment");
     let applied = apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
         .await
@@ -3885,11 +3939,73 @@ async fn leaf_recovery_fulfillment_commits_add_leaf_and_welcome() {
     let _ = run_fulfillment_scenario(&pool).await;
 }
 
+/// Silent-drop guard (fulfillment arm): a plan carrying an EXTRA recovery-request
+/// delta that is neither the arm's own `Open->Fulfilled` edge nor a valid
+/// `Open->Superseded` supersession must be REJECTED, never silently dropped.
+/// `write_prior_bound_supersessions` skips it; `reconcile_coordinate_change_families`
+/// catches the `own + superseded != total` mismatch. Removing that reconciliation
+/// makes this fulfillment COMMIT with the extra delta lost.
 #[tokio::test]
-async fn generic_commit_commits_epoch_bump_and_reencrypts_metadata() {
+async fn fulfillment_untracked_recovery_request_delta_is_rejected() {
     let (pool, _db) = setup().await;
+    let built = build_fulfillment(&pool).await;
+    let conversation_id = built.conversation_id;
+    let recovery_request_id = built.recovery_request_id;
+    let bad = built.plan.with_extra_untracked_recovery_request_for_test();
+    let mut tx = pool.begin().await.expect("begin");
+    let result = apply_conversation_persistence_plan(&mut tx, &bad, &built.ctx).await;
+    assert!(
+        matches!(result, Err(ExecutorError::InconsistentPlan(_))),
+        "an untracked recovery-request delta must be an InconsistentPlan, got {result:?}"
+    );
+    tx.rollback().await.expect("rollback");
+
+    // Zero residue: the accepted-state coordinate (sv 1) is untouched, the request
+    // is still open, and no fulfillment transition landed.
+    let sv: i64 = sqlx::query_scalar(
+        "SELECT current_state_version FROM chat.conversations WHERE conversation_id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("head");
+    assert_eq!(sv, 1);
+    let req_status: String = sqlx::query_scalar(
+        "SELECT status FROM chat.leaf_recovery_requests WHERE recovery_request_id=$1",
+    )
+    .bind(recovery_request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("request");
+    assert_eq!(
+        req_status, "open",
+        "a rejected fulfillment leaves the request open"
+    );
+    let transitions: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM chat.transitions WHERE conversation_id=$1")
+            .bind(conversation_id)
+            .fetch_one(&pool)
+            .await
+            .expect("transitions");
+    assert_eq!(
+        transitions, 2,
+        "only creation + acceptance transitions exist"
+    );
+}
+
+/// The uncommitted generic (epoch-only) commit plan + ctx on top of a COMMITTED
+/// fulfillment scenario — extracted so the reconciliation negative test can apply
+/// a MUTATED plan (a corrupted welcome supersession) without committing it first.
+struct BuiltGenericCommit {
+    plan: chat_protocol::state_machine::ConversationPersistencePlan,
+    ctx: ExecutionContext,
+    conversation_id: Uuid,
+    commit_transition: Uuid,
+}
+
+async fn build_generic_commit(pool: &PgPool, scenario: &FulfillmentScenario) -> BuiltGenericCommit {
+    let pool = pool.clone();
     let manifest = corpus_manifest();
-    let scenario = run_fulfillment_scenario(&pool).await;
     let fixture = &scenario.fixture;
     let conversation_id = scenario.conversation_id;
     let prior = &scenario.fulfillment_state; // sv 2, epoch 1, alice + bob.
@@ -4062,6 +4178,27 @@ async fn generic_commit_commits_epoch_bump_and_reencrypts_metadata() {
         }],
     };
 
+    BuiltGenericCommit {
+        plan,
+        ctx,
+        conversation_id,
+        commit_transition,
+    }
+}
+
+#[tokio::test]
+async fn generic_commit_commits_epoch_bump_and_reencrypts_metadata() {
+    let (pool, _db) = setup().await;
+    let scenario = run_fulfillment_scenario(&pool).await;
+    let BuiltGenericCommit {
+        plan,
+        ctx,
+        conversation_id,
+        commit_transition,
+    } = build_generic_commit(&pool, &scenario).await;
+    let fixture = &scenario.fixture;
+    let prior = &scenario.fulfillment_state;
+
     let mut tx = pool.begin().await.expect("begin generic commit");
     let applied = apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
         .await
@@ -4149,6 +4286,50 @@ async fn generic_commit_commits_epoch_bump_and_reencrypts_metadata() {
             .await
             .unwrap();
     assert_eq!(before, after, "generic commit replay left zero residue");
+}
+
+/// Silent-drop guard (generic commit arm — the welcome MINOR): a generic commit
+/// whose ONLY welcome delta is a non-supersession shape (`Pending->Expired`, which
+/// `write_welcome_supersessions` skips) must be REJECTED, not committed with the
+/// durable Welcome delivery left un-terminalized. `reconcile_coordinate_change_families`
+/// catches `own(0) + superseded(0) != total(1)`. Removing the welcome reconciliation
+/// makes this generic commit COMMIT while silently dropping the welcome supersession.
+#[tokio::test]
+async fn generic_commit_untracked_welcome_delta_is_rejected() {
+    let (pool, _db) = setup().await;
+    let scenario = run_fulfillment_scenario(&pool).await;
+    let conversation_id = scenario.conversation_id;
+    let welcome_id = scenario.welcome_id;
+    let built = build_generic_commit(&pool, &scenario).await;
+    let bad = built.plan.with_welcome_supersession_corrupted_for_test();
+    let mut tx = pool.begin().await.expect("begin");
+    let result = apply_conversation_persistence_plan(&mut tx, &bad, &built.ctx).await;
+    assert!(
+        matches!(result, Err(ExecutorError::InconsistentPlan(_))),
+        "a corrupted welcome supersession must be an InconsistentPlan, got {result:?}"
+    );
+    tx.rollback().await.expect("rollback");
+
+    // Zero residue: the epoch commit never landed (head still at sv 2), and the
+    // prior pending Welcome delivery is UNTOUCHED (still pending, not superseded).
+    let sv: i64 = sqlx::query_scalar(
+        "SELECT current_state_version FROM chat.conversations WHERE conversation_id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("head");
+    assert_eq!(sv, 2);
+    let welcome_status: String =
+        sqlx::query_scalar("SELECT status FROM chat.welcome_deliveries WHERE welcome_id=$1")
+            .bind(welcome_id)
+            .fetch_one(&pool)
+            .await
+            .expect("welcome delivery");
+    assert_eq!(
+        welcome_status, "pending",
+        "a rejected commit leaves the prior Welcome delivery pending"
+    );
 }
 
 /// Build + COMMIT a `leaveRequest` by the active member `bob` (leafed at the

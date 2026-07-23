@@ -10257,6 +10257,45 @@ impl ConversationPersistencePlan {
         self.effects.recovery_package_cas.clear();
         self
     }
+
+    /// Inject an EXTRA recovery-request delta that is neither the arm's own edge
+    /// (`Open->Fulfilled`) nor a valid supersession (`Open->Superseded`): an
+    /// `Open->Expired` change cloned from the plan's first request. A
+    /// coordinate-changing arm must REJECT it (`reconcile_coordinate_change_families`),
+    /// never silently drop it — removing that reconciliation fails the negative test.
+    pub(crate) fn with_extra_untracked_recovery_request_for_test(mut self) -> Self {
+        if let Some(open) = self
+            .effects
+            .recovery_request_changes
+            .first()
+            .and_then(|change| change.before.clone())
+        {
+            let mut expired = open.clone();
+            expired.status = RecoveryRequestStatus::Expired;
+            self.effects.recovery_request_changes.push(StateChange {
+                before: Some(open),
+                after: Some(expired),
+            });
+        }
+        self
+    }
+
+    /// Corrupt the plan's first welcome supersession into a non-supersession shape
+    /// (`Pending->Superseded` -> `Pending->Expired`). `write_welcome_supersessions`
+    /// SKIPS it, so a coordinate-changing arm must catch it in the reconciliation
+    /// rather than silently leave the durable Welcome delivery un-terminalized —
+    /// removing the welcome reconciliation fails the negative test.
+    pub(crate) fn with_welcome_supersession_corrupted_for_test(mut self) -> Self {
+        if let Some(after) = self
+            .effects
+            .welcome_changes
+            .first_mut()
+            .and_then(|change| change.after.as_mut())
+        {
+            after.status = WelcomeStatus::Expired;
+        }
+        self
+    }
 }
 
 #[cfg(test)]
@@ -14393,8 +14432,24 @@ mod executor {
         let event_positions = write_events(transaction, ctx).await?;
         // Prior-coordinate open-work supersession (a legal interleaving): the corpus
         // fulfillment carries none, but the path composes it for the general case.
-        write_prior_bound_supersessions(transaction, effects, transition_id, applied_at).await?;
-        write_welcome_supersessions(transaction, ctx, effects).await?;
+        let mut superseded =
+            write_prior_bound_supersessions(transaction, effects, transition_id, applied_at)
+                .await?;
+        superseded.welcomes = write_welcome_supersessions(transaction, ctx, effects).await?;
+        // Silent-drop guard: this arm's OWN edges are exactly one fulfilled request +
+        // consumed reservation + Reserved->Consumed package + new pending welcome; every
+        // OTHER delta MUST be a supersession the calls above applied. Reject any delta
+        // that is neither (e.g. an Open->Expired request) rather than dropping it.
+        reconcile_coordinate_change_families(
+            effects,
+            &FamilyCounts {
+                requests: 1,
+                reservations: 1,
+                packages: 1,
+                welcomes: 1,
+            },
+            &superseded,
+        )?;
 
         Ok(AppliedTransition {
             allocated_seq: u64::try_from(seq_i64).unwrap(),
@@ -14642,8 +14697,17 @@ mod executor {
         let event_positions = write_events(transaction, ctx).await?;
         // Supersede prior-coordinate open work (requests/reservations/packages) +
         // any prior pending Welcome the epoch change retired.
-        write_prior_bound_supersessions(transaction, effects, transition_id, applied_at).await?;
-        write_welcome_supersessions(transaction, ctx, effects).await?;
+        let mut superseded =
+            write_prior_bound_supersessions(transaction, effects, transition_id, applied_at)
+                .await?;
+        superseded.welcomes = write_welcome_supersessions(transaction, ctx, effects).await?;
+        // Silent-drop guard: a generic commit has NO own recovery/reservation/package/
+        // welcome edge — every such delta MUST be a supersession the calls above
+        // applied. The per-delta shape loops above already reject a malformed
+        // recovery/reservation/package delta; this additionally catches a malformed
+        // welcome delta (e.g. Pending->Expired) that `write_welcome_supersessions`
+        // skips, closing the last silent-drop path.
+        reconcile_coordinate_change_families(effects, &FamilyCounts::default(), &superseded)?;
 
         Ok(AppliedTransition {
             allocated_seq: u64::try_from(seq_i64).unwrap(),
@@ -17265,8 +17329,8 @@ mod executor {
         effects: &TransitionEffects,
         transition_id: Uuid,
         applied_at: DateTime<Utc>,
-    ) -> Result<SupersessionCounts, ExecutorError> {
-        let mut counts = SupersessionCounts::default();
+    ) -> Result<FamilyCounts, ExecutorError> {
+        let mut counts = FamilyCounts::default();
         for change in effects.recovery_request_changes() {
             if let (Some(before), Some(after)) = (change.before(), change.after()) {
                 if before.status() == RecoveryRequestStatus::Open
@@ -17318,11 +17382,57 @@ mod executor {
         Ok(counts)
     }
 
+    /// The per-family count of deltas a coordinate-changing arm actually
+    /// consumed. Used for both the applied SUPERSESSIONS (what
+    /// `write_prior_bound_supersessions` / `write_welcome_supersessions` wrote) and
+    /// the arm's OWN edges, so the reconciliation `own + superseded == total` holds
+    /// per family (see `reconcile_coordinate_change_families`).
     #[derive(Default)]
-    struct SupersessionCounts {
+    struct FamilyCounts {
         requests: usize,
         reservations: usize,
         packages: usize,
+        welcomes: usize,
+    }
+
+    /// The silent-drop guard for every coordinate-changing arm (fulfillment,
+    /// generic commit, leave fulfillment). `write_prior_bound_supersessions` and
+    /// `write_welcome_supersessions` SKIP any delta that is not their exact
+    /// supersession shape; an arm's own-edge handling consumes exactly its own
+    /// deltas. So a delta that is NEITHER the arm's own shape NOR a valid
+    /// supersession (e.g. an `Open->Expired` request, a wrong-direction package
+    /// edge, a `Pending->Expired` welcome) would be neither applied nor rejected —
+    /// a silent drop. This reconciliation makes that impossible: for EVERY family,
+    /// `own + superseded` MUST equal the plan's total delta count, else the whole
+    /// transaction is a hard `InconsistentPlan` (rolled back by the caller). A
+    /// future planner that emits a shape neither path handles surfaces here, never
+    /// as a lost write.
+    fn reconcile_coordinate_change_families(
+        effects: &TransitionEffects,
+        own: &FamilyCounts,
+        superseded: &FamilyCounts,
+    ) -> Result<(), ExecutorError> {
+        if own.requests + superseded.requests != effects.recovery_request_changes().len() {
+            return Err(ExecutorError::InconsistentPlan(
+                "recovery request delta neither applied as own nor superseded (silent-drop guard)",
+            ));
+        }
+        if own.reservations + superseded.reservations != effects.reservation_changes().len() {
+            return Err(ExecutorError::InconsistentPlan(
+                "reservation delta neither applied as own nor released (silent-drop guard)",
+            ));
+        }
+        if own.packages + superseded.packages != effects.package_transitions().len() {
+            return Err(ExecutorError::InconsistentPlan(
+                "package edge neither applied as own nor reactivated (silent-drop guard)",
+            ));
+        }
+        if own.welcomes + superseded.welcomes != effects.welcome_changes().len() {
+            return Err(ExecutorError::InconsistentPlan(
+                "welcome delta neither applied as own nor superseded (silent-drop guard)",
+            ));
+        }
+        Ok(())
     }
 
     /// Supersede each prior-coordinate pending Welcome the plan retired: append its
@@ -17331,11 +17441,17 @@ mod executor {
     /// pending Welcome (e.g. an epoch commit after a leaf-recovery fulfillment)
     /// carries these `welcome_changes` `(Pending -> Superseded)`; consuming them
     /// keeps the durable delivery in sync with the state machine.
+    ///
+    /// Returns the COUNT of welcomes actually superseded so the caller can
+    /// reconcile `own + superseded == total` (`reconcile_coordinate_change_families`)
+    /// — a `Pending->Expired` or other non-supersession welcome delta is skipped
+    /// here and must be caught by that reconciliation, never silently dropped.
     async fn write_welcome_supersessions(
         transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         ctx: &ExecutionContext,
         effects: &TransitionEffects,
-    ) -> Result<(), ExecutorError> {
+    ) -> Result<usize, ExecutorError> {
+        let mut superseded = 0usize;
         for change in effects.welcome_changes() {
             // Only prior-bound supersessions here; a fulfillment's OWN new welcome
             // (None->Some Pending) is handled by its arm and skipped.
@@ -17365,8 +17481,9 @@ mod executor {
                 position,
             )
             .await?;
+            superseded += 1;
         }
-        Ok(())
+        Ok(superseded)
     }
 
     /// Append one event with its audience + outbox, returning its position.
