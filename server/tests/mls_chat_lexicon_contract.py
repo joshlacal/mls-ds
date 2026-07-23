@@ -40,7 +40,7 @@ PROTOCOL_PATH = STACK_ROOT / "docs/CHAT_PROTOCOL.md"
 APPLICATION_PROTOCOL_PATH = STACK_ROOT / "docs/CHAT_APPLICATION_PROTOCOL.md"
 APPLICATION_MANIFEST_PATH = STACK_ROOT / "docs/generated-artifacts/chat-application-v1/manifest.json"
 APPLICATION_MANIFEST_INPUT_ENV = "CATBIRD_CHAT_APPLICATION_FIXTURE_INPUT"
-FROZEN_APPLICATION_MANIFEST_SHA256 = "8bbfeb884256d384b43a60f8f511e81bbdfff9e6d216eedb5c6c1f936b1a501f"
+FROZEN_APPLICATION_MANIFEST_SHA256 = "d596ec1cd9819c86cfa0a7e0592f60ab340bf81d362d9833e1bb6dfc816dddda"
 TASK1_DOC_PATHS = (
     STACK_ROOT / ".superpowers/sdd/mls-chat-task-1-semantic-repair-brief.md",
     STACK_ROOT / ".superpowers/sdd/mls-chat-task-1-report.md",
@@ -4731,6 +4731,8 @@ def validate_crypto_wire_corpus() -> None:
         "key-package-ref.bin", "group-info.mls", "commit-public.mls",
         "welcome.mls", "application-frame.cbor", "application-private.mls",
         "genesis-public-state.bin", "committed-public-state.bin",
+        "commit-generic-public.mls", "committed-generic-public-state.bin",
+        "commit-remove-public.mls", "committed-remove-public-state.bin",
     }
     actual_files = {path.name for path in CRYPTO_WIRE_ROOT.iterdir() if path.is_file()}
     assert actual_files == expected_files, f"crypto wire manifest mismatch: missing={sorted(expected_files-actual_files)}, extra={sorted(actual_files-expected_files)}"
@@ -4818,6 +4820,8 @@ def validate_crypto_wire_corpus() -> None:
         "key-package.mls": 5,
         "group-info.mls": 4,
         "commit-public.mls": 1,
+        "commit-generic-public.mls": 1,
+        "commit-remove-public.mls": 1,
         "welcome.mls": 3,
         "application-private.mls": 2,
     }
