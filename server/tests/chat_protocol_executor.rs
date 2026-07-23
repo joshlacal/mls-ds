@@ -4341,7 +4341,13 @@ async fn commit_leave_request(
     scenario: &FulfillmentScenario,
     request_seq: u64,
     received_at: ServerTimestamp,
-) -> (ConversationState, Uuid, u64) {
+) -> (
+    ConversationState,
+    Uuid,
+    u64,
+    chat_protocol::state_machine::ConversationPersistencePlan,
+    ExecutionContext,
+) {
     let fixture = &scenario.fixture;
     let conversation_id = scenario.conversation_id;
     let bob_id = scenario.bob_id.clone();
@@ -4445,7 +4451,7 @@ async fn commit_leave_request(
         .await
         .expect("leave request applies");
     tx.commit().await.expect("leave request COMMIT");
-    (state, request_id, applied.allocated_seq)
+    (state, request_id, applied.allocated_seq, plan, ctx)
 }
 
 #[tokio::test]
@@ -4458,7 +4464,8 @@ async fn leave_request_commits_pending_consent_without_advancing_coordinate() {
         corpus_manifest().evaluation_unix_seconds as i64 * 1_000 + 5_000,
     )
     .unwrap();
-    let (_state, request_id, seq) = commit_leave_request(&pool, &scenario, 4, received_at).await;
+    let (_state, request_id, seq, plan, ctx) =
+        commit_leave_request(&pool, &scenario, 4, received_at).await;
     assert_eq!(seq, 4);
 
     // Coordinate UNTOUCHED (still gen 0, sv 2, active); only the seq advanced 4->5.
@@ -4493,6 +4500,23 @@ async fn leave_request_commits_pending_consent_without_advancing_coordinate() {
     .expect("entry");
     assert_eq!(entry_kind, "blue.catbird.chat.defs#leaveRequestEntry");
     assert!(transition.is_none());
+
+    // Replay -> the head CAS conflicts (seq already advanced 4->5), zero residue
+    // (symmetric with the cancellation + zero-leaf happy paths).
+    let mut tx2 = pool.begin().await.expect("begin replay");
+    let replay = apply_conversation_persistence_plan(&mut tx2, &plan, &ctx).await;
+    assert!(
+        matches!(replay, Err(ExecutorError::Transition(_))),
+        "leave request replay must conflict on the head CAS, got {replay:?}"
+    );
+    tx2.rollback().await.expect("rollback replay");
+    let leave_requests: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM chat.leave_requests WHERE conversation_id=$1")
+            .bind(conversation_id)
+            .fetch_one(&pool)
+            .await
+            .expect("leave requests");
+    assert_eq!(leave_requests, 1, "replay wrote no duplicate leave request");
 }
 
 #[tokio::test]
@@ -4510,7 +4534,7 @@ async fn leave_cancellation_terminalizes_pending_request_and_conflicts_on_replay
         corpus_manifest().evaluation_unix_seconds as i64 * 1_000 + 5_000,
     )
     .unwrap();
-    let (pending_state, request_id, _seq) =
+    let (pending_state, request_id, _seq, _plan, _ctx) =
         commit_leave_request(&pool, &scenario, 4, req_received).await;
 
     // 2. Bob cancels it (a later control seq 5, same coordinate).
