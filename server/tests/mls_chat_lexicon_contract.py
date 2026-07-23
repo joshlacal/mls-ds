@@ -19,6 +19,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tomllib
 import unicodedata
 import unittest
@@ -39,7 +40,7 @@ PROTOCOL_PATH = STACK_ROOT / "docs/CHAT_PROTOCOL.md"
 APPLICATION_PROTOCOL_PATH = STACK_ROOT / "docs/CHAT_APPLICATION_PROTOCOL.md"
 APPLICATION_MANIFEST_PATH = STACK_ROOT / "docs/generated-artifacts/chat-application-v1/manifest.json"
 APPLICATION_MANIFEST_INPUT_ENV = "CATBIRD_CHAT_APPLICATION_FIXTURE_INPUT"
-FROZEN_APPLICATION_MANIFEST_SHA256 = "1c9830db9be547a96745f42d6e9090d1f102eb90111e6c41f2a70489ce226410"
+FROZEN_APPLICATION_MANIFEST_SHA256 = "4a523fe59f421cb85b0086564c58955add610097edb926ed1c5bf56678b5c7d0"
 TASK1_DOC_PATHS = (
     STACK_ROOT / ".superpowers/sdd/mls-chat-task-1-semantic-repair-brief.md",
     STACK_ROOT / ".superpowers/sdd/mls-chat-task-1-report.md",
@@ -282,6 +283,13 @@ CONTROL_ENTRY_FINGERPRINT_KINDS: dict[str, tuple[str, str | None]] = {
     f"{PREFIX}.defs#leaveCommitFulfillmentEntry": ("signedLeaveCommitFulfillment", None),
 }
 
+RECOVERY_WORK_VARIANTS = {
+    "recoveryWorkPendingView",
+    "recoveryWorkCompletedByTransitionView",
+    "recoveryWorkSupersededByTransitionView",
+    "recoveryWorkSupersededByRevocationView",
+}
+
 CLOSED_UNIONS: dict[str, set[str]] = {
     "participantChange": {"addParticipant", "removeParticipant", "changeParticipantRole"},
     "leafChange": {"addLeafByRecovery", "removeLeaf"},
@@ -304,6 +312,8 @@ CLOSED_UNIONS: dict[str, set[str]] = {
     "signedLeaveOperation": {"signedLeaveRequest", "signedZeroLeafLeave"},
     "leaveOperationResult": {"durableLeaveRequestResult", "zeroLeafLeaveResult"},
     "conversationCreationResult": {"conversationCreatedResult", "existingDirectConversationResult"},
+    "recoveryWorkView": RECOVERY_WORK_VARIANTS,
+    "leafRecoveryInboxItem": {"leafRecoveryView", *RECOVERY_WORK_VARIANTS},
     "applicationFrameBody": {"messageFrameVariant", "reactionFrameVariant", "editFrameVariant", "tombstoneFrameVariant", "readStateFrameVariant"},
     "applicationEmbed": {"encryptedImageEmbedVariant", "encryptedAudioEmbedVariant", "atprotoRecordEmbedVariant", "externalLinkEmbedVariant"},
     "subscriptionMessage": {"eventEnvelope", "typingEvent"},
@@ -474,6 +484,71 @@ def resolve_ref_with_document(
     return document, resolve_ref(documents, current, ref), canonical_ref
 
 
+def is_canonical_key_id(value: Any) -> bool:
+    if not isinstance(value, str) or len(value) != 43:
+        return False
+    if not re.fullmatch(r"[A-Za-z0-9_-]{43}", value):
+        return False
+    try:
+        decoded = base64.b64decode(value + "=", altchars=b"-_", validate=True)
+    except ValueError:
+        return False
+    return (
+        len(decoded) == 32
+        and base64.urlsafe_b64encode(decoded).rstrip(b"=").decode("ascii") == value
+    )
+
+
+def assert_closed_lexicon_scalar(
+    schema: dict[str, Any], value: Any, path: str
+) -> None:
+    node_type = schema["type"]
+    if node_type == "bytes":
+        assert isinstance(value, bytes), f"expected bytes at {path}"
+        assert schema.get("minLength", 0) <= len(value), f"bytes too short at {path}"
+        assert len(value) <= schema.get("maxLength", SAFE_INTEGER_MAX), (
+            f"bytes too long at {path}"
+        )
+        return
+    if node_type == "string":
+        assert isinstance(value, str), f"expected string at {path}"
+        encoded_length = len(value.encode("utf-8"))
+        assert schema.get("minLength", 0) <= encoded_length, f"string too short at {path}"
+        assert encoded_length <= schema.get("maxLength", SAFE_INTEGER_MAX), (
+            f"string too long at {path}"
+        )
+        if "const" in schema:
+            assert value == schema["const"], f"wrong string const at {path}"
+        if "enum" in schema:
+            assert value in schema["enum"], f"unknown string enum value at {path}"
+        if schema.get("format") == "did":
+            assert is_valid_bare_did(value), f"invalid bare DID at {path}"
+        if schema.get("format") == "datetime":
+            assert TIMESTAMP_RE.fullmatch(value), f"invalid canonical datetime at {path}"
+            dt.datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ")
+        return
+    if node_type == "integer":
+        assert type(value) is int, f"expected integer at {path}"
+        assert schema.get("minimum", 0) <= value, f"integer too small at {path}"
+        assert value <= schema.get("maximum", SAFE_INTEGER_MAX), (
+            f"integer too large at {path}"
+        )
+        if "const" in schema:
+            assert value == schema["const"], f"wrong integer const at {path}"
+        if "enum" in schema:
+            assert value in schema["enum"], f"unknown integer enum value at {path}"
+        return
+    if node_type == "boolean":
+        assert type(value) is bool, f"expected boolean at {path}"
+        if "const" in schema:
+            assert value is schema["const"], f"wrong boolean const at {path}"
+        return
+    if node_type == "unknown":
+        assert value is not None, f"null is forbidden at {path}"
+        return
+    raise AssertionError(f"unsupported scalar schema type {node_type!r} at {path}")
+
+
 def assert_closed_lexicon_value(
     documents: dict[str, dict[str, Any]],
     current: dict[str, Any],
@@ -486,9 +561,23 @@ def assert_closed_lexicon_value(
 
     node_type = schema["type"]
     if node_type == "ref":
-        target_document, target_schema, _ = resolve_ref_with_document(
+        target_document, target_schema, canonical_ref = resolve_ref_with_document(
             documents, current, schema["ref"]
         )
+        if canonical_ref in {
+            f"{PREFIX}.defs#operationId",
+            f"{PREFIX}.defs#deviceId",
+        }:
+            assert isinstance(value, bytes) and len(value) == 16, (
+                f"expected canonical UUID bytes at {path}"
+            )
+            identifier = uuid.UUID(bytes=value)
+            assert identifier.version == 4 and identifier.variant == uuid.RFC_4122, (
+                f"expected RFC 4122 UUIDv4 bytes at {path}"
+            )
+            return
+        if canonical_ref == f"{PREFIX}.defs#keyId":
+            assert is_canonical_key_id(value), f"invalid key thumbprint at {path}"
         assert_closed_lexicon_value(
             documents, target_document, target_schema, value, path, expected_type_tag
         )
@@ -518,6 +607,16 @@ def assert_closed_lexicon_value(
             allowed.add("$type")
         assert required(schema) <= set(value), f"missing required field(s) at {path}"
         assert set(value) <= allowed, f"unknown field(s) at {path}"
+        public_key = value.get("signaturePublicKey")
+        if isinstance(public_key, bytes):
+            expected_key_id = base64.urlsafe_b64encode(
+                hashlib.sha256(public_key).digest()
+            ).rstrip(b"=").decode("ascii")
+            for key_field in ("keyId", "authorKeyId", "requesterKeyId"):
+                if key_field in value:
+                    assert value[key_field] == expected_key_id, (
+                        f"{key_field} does not bind signaturePublicKey at {path}"
+                    )
         for name, child in value.items():
             if name != "$type":
                 assert_closed_lexicon_value(
@@ -533,6 +632,8 @@ def assert_closed_lexicon_value(
             assert_closed_lexicon_value(
                 documents, current, schema["items"], child, f"{path}[{index}]"
             )
+        return
+    assert_closed_lexicon_scalar(schema, value, path)
 
 
 def closed_lexicon_value_is_valid(
@@ -664,7 +765,15 @@ def validate_core_definitions(documents: dict[str, dict[str, Any]]) -> None:
         "coordinateMismatch", "localStateConflict",
     ]
     assert defs["leafRecoveryStatus"].get("enum") == ["open", "fulfilled", "cancelled", "expired", "superseded"]
+    assert defs["recoveryWorkSourceKind"].get("enum") == ["welcomeExpired", "welcomeRejected"]
+    assert defs["recoveryWorkStatus"].get("enum") == ["pending", "completed", "superseded"]
     assert defs["leaveRequestStatus"].get("enum") == ["pending", "fulfilled", "cancelled", "expired", "stale"]
+    assert defs["resetReason"].get("enum") == [
+        "localStateLost", "poisonedState", "epochDivergence", "manualRecovery",
+    ]
+    encoded_defs = json.dumps(defs, sort_keys=True)
+    assert "joinFailure" not in encoded_defs
+    assert encoded_defs.count('"poisonedState"') == 1
 
     coordinates = defs["conversationCoordinates"]
     assert required(coordinates) == COORDINATE_FIELDS
@@ -847,6 +956,81 @@ def validate_core_definitions(documents: dict[str, dict[str, Any]]) -> None:
     assert "prior" not in defs["leafRecoveryView"]["properties"]
     assert_ref(defs["leafRecoveryView"]["properties"]["boundCoordinate"], "conversationCoordinates")
     assert recovery_reservation["properties"]["purpose"].get("const") == "leafRecovery"
+    recovery_work_required = {
+        "recoveryWorkId", "conversationId", "recipientDid", "recipientDeviceId",
+        "sourceKind", "sourceId", "sourceCoordinate", "status", "createdAt",
+    }
+    recovery_work_variants = {
+        "recoveryWorkPendingView": ("pending", set()),
+        "recoveryWorkCompletedByTransitionView": (
+            "completed", {"terminalTransitionId", "terminalAt"},
+        ),
+        "recoveryWorkSupersededByTransitionView": (
+            "superseded", {"terminalTransitionId", "terminalAt"},
+        ),
+        "recoveryWorkSupersededByRevocationView": (
+            "superseded", {"terminalRevocationId", "terminalAt"},
+        ),
+    }
+    assert set(recovery_work_variants) == RECOVERY_WORK_VARIANTS
+    assert {status for status, _ in recovery_work_variants.values()} == set(
+        defs["recoveryWorkStatus"]["enum"]
+    )
+    for variant_name, (status, terminal_fields) in recovery_work_variants.items():
+        variant = defs[variant_name]
+        assert variant["type"] == "object"
+        assert required(variant) == recovery_work_required | terminal_fields
+        assert set(variant["properties"]) == recovery_work_required | terminal_fields
+        assert_ref(variant["properties"]["recoveryWorkId"], "operationId")
+        assert_ref(variant["properties"]["conversationId"], "operationId")
+        assert_ref(variant["properties"]["recipientDid"], "bareDid")
+        assert_ref(variant["properties"]["recipientDeviceId"], "deviceId")
+        assert_ref(variant["properties"]["sourceKind"], "recoveryWorkSourceKind")
+        assert_ref(variant["properties"]["sourceId"], "operationId")
+        assert_ref(variant["properties"]["sourceCoordinate"], "conversationCoordinates")
+        assert variant["properties"]["status"] == {"type": "string", "const": status}
+        assert_ref(variant["properties"]["createdAt"], "canonicalDatetime")
+        if "terminalTransitionId" in terminal_fields:
+            assert_ref(variant["properties"]["terminalTransitionId"], "operationId")
+        if "terminalRevocationId" in terminal_fields:
+            assert_ref(variant["properties"]["terminalRevocationId"], "operationId")
+        if "terminalAt" in terminal_fields:
+            assert_ref(variant["properties"]["terminalAt"], "canonicalDatetime")
+
+    recovery_work = defs["recoveryWorkView"]
+    recovery_inbox = defs["leafRecoveryInboxItem"]
+    for union in (recovery_work, recovery_inbox):
+        assert union["type"] == "union" and union.get("closed") is True
+        for ref in union["refs"]:
+            assert defs[local_ref_name(ref)]["type"] == "object", (
+                "a public union must directly reference concrete object variants"
+            )
+    assert {local_ref_name(ref) for ref in recovery_work["refs"]} == RECOVERY_WORK_VARIANTS
+    assert {local_ref_name(ref) for ref in recovery_inbox["refs"]} == {
+        "leafRecoveryView", *RECOVERY_WORK_VARIANTS,
+    }
+    recovery_work_description = recovery_work.get("description", "")
+    for phrase in (
+        "four concrete object variants",
+        "pending has no terminal fields",
+        "completed-by-transition requires exactly terminalTransitionId plus terminalAt",
+        "superseded-by-transition requires exactly terminalTransitionId plus terminalAt",
+        "superseded-by-revocation requires exactly terminalRevocationId plus terminalAt",
+        "exact recipient DID/device",
+        "does not authorize recovery",
+        "does not grant application history",
+        "does not prove MLS poison or decryptability failure",
+    ):
+        assert phrase in recovery_work_description
+    revocation_work_description = defs["recoveryWorkSupersededByRevocationView"].get(
+        "description", ""
+    )
+    for phrase in (
+        "target DID byte-equals recipientDid",
+        "target device ID byte-equals recipientDeviceId",
+        "same-DID sibling-device revocation rejects",
+    ):
+        assert phrase in revocation_work_description
     finalized = defs["transitionManifest"]
     assert required(finalized) == {"participantChanges", "leafChanges"}
     assert "target-device-signed" in finalized.get("description", "")
@@ -1271,7 +1455,7 @@ def validate_endpoint_contract(documents: dict[str, dict[str, Any]]) -> None:
 
     for endpoint, item_ref in (
         ("getPendingWelcomes", "welcomeView"),
-        ("getLeafRecoveryInbox", "leafRecoveryView"),
+        ("getLeafRecoveryInbox", "leafRecoveryInboxItem"),
     ):
         document = endpoint_document(documents, endpoint)
         params = endpoint_input(document)
@@ -1281,6 +1465,11 @@ def validate_endpoint_contract(documents: dict[str, dict[str, Any]]) -> None:
         assert {"items", "inventorySessionId", "snapshotEventCursor", "hasMore", "snapshotExpiresAt"} <= required(output)
         assert "nextPageCursor" in output["properties"] and "nextPageCursor" not in required(output)
         assert_ref(output["properties"]["items"]["items"], item_ref)
+
+    recovery_inbox_description = endpoint_document(documents, "getLeafRecoveryInbox").get("description", "")
+    assert "flat closed exact-device recovery inbox" in recovery_inbox_description
+    assert "Every union ref is a concrete object" in recovery_inbox_description
+    assert "sourced only from retained expired or rejected Welcomes" in recovery_inbox_description
 
     own_devices = endpoint_document(documents, "getOwnDevices")
     own_device_params = endpoint_input(own_devices)
@@ -1450,6 +1639,14 @@ def validate_normative_prose() -> None:
         "structurally validate every suite-specific XWing update-path ciphertext",
         "server acceptance never proves recipient decryptability",
         "poisoned victim authenticates outside MLS",
+        "`recoveryWorkView` is a named closed union of four concrete object variants",
+        "The recovery inbox item union is flat and closed",
+        "never the union-valued `recoveryWorkView`",
+        "Its source kind is exactly `welcomeExpired | welcomeRejected`",
+        "Recovery work never authorizes recovery",
+        "`terminalTransitionId + terminalAt`",
+        "`terminalRevocationId + terminalAt`",
+        "same-DID sibling-device revocation is invalid",
         "receives no history backfill",
         "malicious sole admin",
         "three-DID poison → victim-signed `replace`",
@@ -1586,6 +1783,15 @@ def validate_normative_prose() -> None:
             assert required in source, f"decision/Task 2 document missing application repair token {required!r}: {path}"
 
     task2_brief = AUTH_DECISION_DOC_PATHS[-1].read_text(encoding="utf-8")
+    for required in (
+        "Source kind is closed to `welcomeExpired | welcomeRejected`",
+        "The named `recoveryWorkView` is a closed union of four concrete object variants",
+        "each repeating exactly `recoveryWorkId,conversationId,recipientDid,recipientDeviceId,sourceKind,sourceId,sourceCoordinate,status,createdAt` with a status const",
+        "`getLeafRecoveryInbox` uses a flat closed union that directly references the unchanged signed-request/reservation `leafRecoveryView` plus the same four concrete recovery-work objects",
+        "neither public union directly references another union",
+    ):
+        assert required in task2_brief, f"Task 2 recovery-work contract missing {required!r}"
+    assert "expired/rejected/poisoned Welcome or deterministic join failure" not in task2_brief
     assert (
         "Malformed, out-of-bounds, misbound, unknown/duplicate/null, or signature-invalid attempts "
         "must leave the same capability unpinned, unburned, and usable by a later valid body"
@@ -1807,9 +2013,11 @@ def validate_application_provenance(generator: dict[str, Any]) -> None:
         "docs/superpowers/plans/2026-07-22-chat-protocol.md",
         "docs/program/decisions/ADR-019-chat-protocol-clean-cutover.md",
         "mls-ds/server/tests/fixtures/mls_chat_contract_vectors.json",
+        "mls-ds/server/tests/generate_mls_chat_contract_vectors.py",
+        "mls-ds/server/tests/fixtures/mls_chat_control_fingerprint_source.json",
     ]
     contract_sources = generator["contractSources"]
-    assert len(contract_sources) == 9
+    assert len(contract_sources) == 11
     assert [source["path"] for source in contract_sources] == contract_paths
     contract_by_path: dict[str, tuple[dict[str, Any], bytes]] = {}
     for source in contract_sources:
@@ -4732,6 +4940,353 @@ class ChatLexiconContractTests(unittest.TestCase):
 
     def test_non_crypto_contract_is_decision_complete(self) -> None:
         validate_non_crypto_contract(self.canonical, self.vectors)
+
+    def test_control_fingerprint_corpus_matches_deterministic_generator(self) -> None:
+        generator = Path(__file__).with_name("generate_mls_chat_contract_vectors.py")
+        completed = subprocess.run(
+            [sys.executable, str(generator), "--check"],
+            cwd=MLS_DS_ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            completed.stdout + completed.stderr,
+        )
+
+    def test_control_fingerprint_generator_rejects_duplicate_source_keys(self) -> None:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                "-m",
+                "unittest",
+                "server.tests.generate_mls_chat_contract_vectors_test",
+            ],
+            cwd=MLS_DS_ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            completed.stdout + completed.stderr,
+        )
+
+    def test_closed_lexicon_validator_rejects_noncanonical_nested_key_id(self) -> None:
+        case = next(
+            candidate
+            for candidate in self.vectors["controlEntryFingerprints"]["cases"]
+            if candidate["entryKind"] == f"{PREFIX}.defs#commitEntry"
+        )
+        body = decode_dag_cbor(
+            bytes.fromhex(case["unsignedSigningProjectionCanonicalDagCborHex"])
+        )
+        body["metadataSnapshot"]["authorProof"]["authorKeyId"] = "a" * 43
+        defs_document = self.canonical[f"{PREFIX}.defs.json"]
+        body_ref, _ = SIGNED_PROJECTIONS["signedCommitTransition"]
+        self.assertFalse(
+            closed_lexicon_value_is_valid(
+                self.canonical,
+                defs_document,
+                defs_document["defs"][body_ref],
+                body,
+                f"{PREFIX}.defs#{body_ref}",
+            )
+        )
+
+    def test_closed_lexicon_validator_rejects_wrong_boolean_const(self) -> None:
+        case = next(
+            candidate
+            for candidate in self.vectors["controlEntryFingerprints"]["cases"]
+            if candidate["entryKind"] == f"{PREFIX}.defs#creationEntry"
+        )
+        body = decode_dag_cbor(
+            bytes.fromhex(case["unsignedSigningProjectionCanonicalDagCborHex"])
+        )
+        body["absence"] = False
+        defs_document = self.canonical[f"{PREFIX}.defs.json"]
+        body_ref, _ = SIGNED_PROJECTIONS["signedCreation"]
+        self.assertFalse(
+            closed_lexicon_value_is_valid(
+                self.canonical,
+                defs_document,
+                defs_document["defs"][body_ref],
+                body,
+                f"{PREFIX}.defs#{body_ref}",
+            )
+        )
+
+    def test_recovery_work_terminal_shapes_are_structurally_closed(self) -> None:
+        defs_document = self.canonical[f"{PREFIX}.defs.json"]
+        defs = defs_document["defs"]
+        recovery_work = defs["recoveryWorkView"]
+        recovery_inbox = defs["leafRecoveryInboxItem"]
+
+        def uuid_bytes(value: str) -> bytes:
+            return uuid.UUID(value).bytes
+
+        coordinates = {
+            "conversationId": uuid_bytes("11111111-1111-4111-9111-111111111111"),
+            "generation": 3,
+            "stateVersion": 7,
+            "groupId": b"g" * 32,
+            "epoch": 5,
+            "groupContextHash": b"h" * 32,
+            "confirmationTag": b"t" * 32,
+            "lifecycle": "active",
+        }
+        base = {
+            "recoveryWorkId": uuid_bytes("22222222-2222-4222-a222-222222222222"),
+            "conversationId": coordinates["conversationId"],
+            "recipientDid": "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
+            "recipientDeviceId": uuid_bytes("33333333-3333-4333-b333-333333333333"),
+            "sourceKind": "welcomeExpired",
+            "sourceId": uuid_bytes("44444444-4444-4444-8444-444444444444"),
+            "sourceCoordinate": coordinates,
+            "createdAt": "2026-07-22T12:00:00.000Z",
+        }
+        transition_id = uuid_bytes("55555555-5555-4555-9555-555555555555")
+        revocation_id = uuid_bytes("66666666-6666-4666-a666-666666666666")
+        terminal_at = "2026-07-22T12:01:00.000Z"
+        positives = {
+            "recoveryWorkPendingView": {**base, "status": "pending"},
+            "recoveryWorkCompletedByTransitionView": {
+                **base,
+                "status": "completed",
+                "terminalTransitionId": transition_id,
+                "terminalAt": terminal_at,
+            },
+            "recoveryWorkSupersededByTransitionView": {
+                **base,
+                "status": "superseded",
+                "terminalTransitionId": transition_id,
+                "terminalAt": terminal_at,
+            },
+            "recoveryWorkSupersededByRevocationView": {
+                **base,
+                "status": "superseded",
+                "terminalRevocationId": revocation_id,
+                "terminalAt": terminal_at,
+            },
+        }
+
+        terminal_values = {
+            "terminalTransitionId": transition_id,
+            "terminalRevocationId": revocation_id,
+            "terminalAt": terminal_at,
+        }
+        revocation_targets = {
+            revocation_id: (base["recipientDid"], base["recipientDeviceId"]),
+        }
+
+        def is_valid_with_revocation_authority(value: dict[str, Any]) -> bool:
+            if not closed_lexicon_value_is_valid(
+                self.canonical,
+                defs_document,
+                recovery_work,
+                value,
+                f"{PREFIX}.defs#recoveryWorkView",
+            ):
+                return False
+            if value["$type"] != (
+                f"{PREFIX}.defs#recoveryWorkSupersededByRevocationView"
+            ):
+                return True
+            return revocation_targets.get(value["terminalRevocationId"]) == (
+                value["recipientDid"],
+                value["recipientDeviceId"],
+            )
+
+        for variant_name, untagged in positives.items():
+            tagged = {
+                "$type": f"{PREFIX}.defs#{variant_name}",
+                **untagged,
+            }
+            self.assertTrue(
+                closed_lexicon_value_is_valid(
+                    self.canonical,
+                    defs_document,
+                    recovery_work,
+                    tagged,
+                    f"{PREFIX}.defs#recoveryWorkView",
+                ),
+                variant_name,
+            )
+            self.assertTrue(
+                closed_lexicon_value_is_valid(
+                    self.canonical,
+                    defs_document,
+                    recovery_inbox,
+                    tagged,
+                    f"{PREFIX}.defs#leafRecoveryInboxItem",
+                ),
+                f"inbox {variant_name}",
+            )
+
+            variant_schema = defs[variant_name]
+            for field in required(variant_schema) | {"$type"}:
+                missing = copy.deepcopy(tagged)
+                missing.pop(field)
+                self.assertFalse(
+                    closed_lexicon_value_is_valid(
+                        self.canonical,
+                        defs_document,
+                        recovery_work,
+                        missing,
+                        f"{PREFIX}.defs#recoveryWorkView",
+                    ),
+                    f"{variant_name} accepted missing {field}",
+                )
+
+            for field, value in terminal_values.items():
+                if field in variant_schema["properties"]:
+                    continue
+                extra = copy.deepcopy(tagged)
+                extra[field] = value
+                self.assertFalse(
+                    closed_lexicon_value_is_valid(
+                        self.canonical,
+                        defs_document,
+                        recovery_work,
+                        extra,
+                        f"{PREFIX}.defs#recoveryWorkView",
+                    ),
+                    f"{variant_name} accepted extra {field}",
+                )
+
+            unknown = copy.deepcopy(tagged)
+            unknown["unexpected"] = True
+            self.assertFalse(
+                closed_lexicon_value_is_valid(
+                    self.canonical,
+                    defs_document,
+                    recovery_work,
+                    unknown,
+                    f"{PREFIX}.defs#recoveryWorkView",
+                ),
+                f"{variant_name} accepted an unknown field",
+            )
+
+            for wrong_status in {"pending", "completed", "superseded"} - {tagged["status"]}:
+                wrong = copy.deepcopy(tagged)
+                wrong["status"] = wrong_status
+                self.assertFalse(
+                    closed_lexicon_value_is_valid(
+                        self.canonical,
+                        defs_document,
+                        recovery_work,
+                        wrong,
+                        f"{PREFIX}.defs#recoveryWorkView",
+                    ),
+                    f"{variant_name} accepted status {wrong_status}",
+                )
+
+        rejected_welcome_source = {
+            "$type": f"{PREFIX}.defs#recoveryWorkPendingView",
+            **positives["recoveryWorkPendingView"],
+            "sourceKind": "welcomeRejected",
+        }
+        self.assertTrue(
+            closed_lexicon_value_is_valid(
+                self.canonical,
+                defs_document,
+                recovery_work,
+                rejected_welcome_source,
+                f"{PREFIX}.defs#recoveryWorkView",
+            )
+        )
+
+        both_terminal_ids = {
+            "$type": f"{PREFIX}.defs#recoveryWorkSupersededByTransitionView",
+            **positives["recoveryWorkSupersededByTransitionView"],
+            "terminalRevocationId": revocation_id,
+        }
+        self.assertFalse(
+            closed_lexicon_value_is_valid(
+                self.canonical,
+                defs_document,
+                recovery_work,
+                both_terminal_ids,
+                f"{PREFIX}.defs#recoveryWorkView",
+            )
+        )
+
+        revocation_variant = {
+            "$type": f"{PREFIX}.defs#recoveryWorkSupersededByRevocationView",
+            **positives["recoveryWorkSupersededByRevocationView"],
+        }
+        self.assertTrue(is_valid_with_revocation_authority(revocation_variant))
+        sibling_device = copy.deepcopy(revocation_variant)
+        sibling_device["recipientDeviceId"] = uuid_bytes(
+            "77777777-7777-4777-b777-777777777777"
+        )
+        self.assertTrue(
+            closed_lexicon_value_is_valid(
+                self.canonical,
+                defs_document,
+                recovery_work,
+                sibling_device,
+                f"{PREFIX}.defs#recoveryWorkView",
+            ),
+            "the closed object validates shape; authority must reject sibling evidence",
+        )
+        self.assertFalse(is_valid_with_revocation_authority(sibling_device))
+        wrong_recipient = copy.deepcopy(revocation_variant)
+        wrong_recipient["recipientDid"] = "did:web:bob.example.net"
+        self.assertFalse(is_valid_with_revocation_authority(wrong_recipient))
+        wrong_revocation = copy.deepcopy(revocation_variant)
+        wrong_revocation["terminalRevocationId"] = uuid_bytes(
+            "88888888-8888-4888-8888-888888888888"
+        )
+        self.assertFalse(is_valid_with_revocation_authority(wrong_revocation))
+
+        nested_union_tag = {
+            "$type": f"{PREFIX}.defs#recoveryWorkView",
+            **positives["recoveryWorkPendingView"],
+        }
+        self.assertFalse(
+            closed_lexicon_value_is_valid(
+                self.canonical,
+                defs_document,
+                recovery_inbox,
+                nested_union_tag,
+                f"{PREFIX}.defs#leafRecoveryInboxItem",
+            )
+        )
+
+        for forbidden_source in ("poisonedState", "joinFailure"):
+            wrong_source = {
+                "$type": f"{PREFIX}.defs#recoveryWorkPendingView",
+                **positives["recoveryWorkPendingView"],
+                "sourceKind": forbidden_source,
+            }
+            self.assertFalse(
+                closed_lexicon_value_is_valid(
+                    self.canonical,
+                    defs_document,
+                    recovery_work,
+                    wrong_source,
+                    f"{PREFIX}.defs#recoveryWorkView",
+                )
+            )
+
+        unknown_variant = {
+            "$type": f"{PREFIX}.defs#unknownRecoveryWorkView",
+            **positives["recoveryWorkPendingView"],
+        }
+        self.assertFalse(
+            closed_lexicon_value_is_valid(
+                self.canonical,
+                defs_document,
+                recovery_work,
+                unknown_variant,
+                f"{PREFIX}.defs#recoveryWorkView",
+            )
+        )
 
     def test_server_mirror_has_exact_manifest_and_bytes(self) -> None:
         canonical = {path.name: path.read_bytes() for path in CANONICAL_ROOT.glob("*.json")}
