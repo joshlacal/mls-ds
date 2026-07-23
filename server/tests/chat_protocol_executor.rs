@@ -81,6 +81,7 @@ use std::{fs, path::PathBuf};
 use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -115,8 +116,106 @@ use chat_protocol::validation::ed25519_key_id;
 // Harness + corpus fixtures (adapted from tests/chat_protocol_state_machine.rs).
 // ---------------------------------------------------------------------------
 
-async fn setup() -> PgPool {
-    common::chat_protocol::setup_chat_protocol_db(4).await
+/// Drops a uniquely-named per-run executor database (best-effort) when it falls
+/// out of scope. Every executor test binds this guard so its private DB is torn
+/// down at the end; a leaked `chat_exec_<uuid>` DB from a crashed run is
+/// acceptable and identifiable by name. A fresh DB per run makes the whole
+/// executor suite perfectly rerun-idempotent — no cross-run accumulation of the
+/// fixed corpus creator's pending invitations (the shared-DB quota trip), and no
+/// global `key_package_ref` / corpus-identity collisions — which is exactly what
+/// unblocks the fixed-corpus-identity fulfillment test. The shared-DB harness
+/// (`common::chat_protocol::setup_chat_protocol_db`, used by every OTHER test
+/// file) is left untouched.
+struct FreshDbGuard {
+    maintenance_url: String,
+    db_name: String,
+}
+
+impl Drop for FreshDbGuard {
+    fn drop(&mut self) {
+        let maintenance_url = self.maintenance_url.clone();
+        let db_name = self.db_name.clone();
+        // Own thread + runtime so teardown runs during panic unwind too.
+        let _ = std::thread::spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            rt.block_on(async move {
+                let Ok(admin) = PgPoolOptions::new()
+                    .max_connections(1)
+                    .connect(&maintenance_url)
+                    .await
+                else {
+                    return;
+                };
+                // Terminate the test's still-open connections so DROP is not blocked.
+                let _ = sqlx::query(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                     WHERE datname = $1 AND pid <> pg_backend_pid()",
+                )
+                .bind(&db_name)
+                .execute(&admin)
+                .await;
+                let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS \"{db_name}\""))
+                    .execute(&admin)
+                    .await;
+            });
+        })
+        .join();
+    }
+}
+
+/// Derive the maintenance connection URL (the server's `postgres` database) from
+/// `TEST_DATABASE_URL`, enforcing loopback safety exactly as the shared gate does.
+fn maintenance_url_from_env() -> String {
+    let database_url = std::env::var("TEST_DATABASE_URL")
+        .expect("TEST_DATABASE_URL must name the loopback clean-chat test database");
+    common::chat_protocol::validate_chat_protocol_database_url(Some(&database_url))
+        .expect("unsafe TEST_DATABASE_URL for the fresh-DB executor harness");
+    let mut parsed = url::Url::parse(&database_url).expect("valid TEST_DATABASE_URL");
+    parsed.set_path("/postgres");
+    parsed.into()
+}
+
+async fn fresh_executor_db() -> (PgPool, FreshDbGuard) {
+    let maintenance_url = maintenance_url_from_env();
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&maintenance_url)
+        .await
+        .expect("connect to the loopback maintenance database");
+    let db_name = format!("chat_exec_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
+        .execute(&admin)
+        .await
+        .expect("create a fresh per-run executor database");
+    admin.close().await;
+
+    let mut db_url = url::Url::parse(&maintenance_url).expect("maintenance url");
+    db_url.set_path(&format!("/{db_name}"));
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(db_url.as_str())
+        .await
+        .expect("connect to the fresh per-run executor database");
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .expect("run the production migration set on the fresh executor database");
+    (
+        pool,
+        FreshDbGuard {
+            maintenance_url,
+            db_name,
+        },
+    )
+}
+
+async fn setup() -> (PgPool, FreshDbGuard) {
+    fresh_executor_db().await
 }
 
 async fn clock_now(pool: &PgPool) -> DateTime<Utc> {
@@ -666,7 +765,7 @@ async fn seed_group_head_tx(
 
 #[tokio::test]
 async fn conversation_head_cas_advances_and_conflicts_on_drift() {
-    let pool = setup().await;
+    let (pool, _db) = setup().await;
     let mut tx = pool.begin().await.expect("begin");
     let at = clock_now(&pool).await;
     let conversation_id = seed_group_head_tx(&mut tx, at).await;
@@ -716,7 +815,7 @@ async fn conversation_head_cas_advances_and_conflicts_on_drift() {
 
 #[tokio::test]
 async fn conversation_head_close_and_generation_supersede() {
-    let pool = setup().await;
+    let (pool, _db) = setup().await;
     let mut tx = pool.begin().await.expect("begin");
     let at = clock_now(&pool).await;
     let conversation_id = seed_group_head_tx(&mut tx, at).await;
@@ -777,7 +876,7 @@ async fn conversation_head_close_and_generation_supersede() {
 
 #[tokio::test]
 async fn generation_state_version_cas_is_guarded() {
-    let pool = setup().await;
+    let (pool, _db) = setup().await;
     let mut tx = pool.begin().await.expect("begin");
     let at = clock_now(&pool).await;
     let conversation_id = seed_group_head_tx(&mut tx, at).await;
@@ -811,7 +910,7 @@ async fn generation_state_version_cas_is_guarded() {
 
 #[tokio::test]
 async fn append_entry_at_inserts_at_exact_seq_without_touching_head() {
-    let pool = setup().await;
+    let (pool, _db) = setup().await;
     let mut tx = pool.begin().await.expect("begin");
     let at = clock_now(&pool).await;
     let conversation_id = seed_group_head_tx(&mut tx, at).await;
@@ -911,7 +1010,7 @@ async fn count(pool: &PgPool, sql: &str, conversation_id: Uuid) -> i64 {
 
 #[tokio::test]
 async fn group_creation_commits_full_graph_past_all_deferred_triggers() {
-    let pool = setup().await;
+    let (pool, _db) = setup().await;
     let fixture = build_creation(&pool, ConversationKind::Group).await;
     let conversation_id = fixture.conversation_id;
 
@@ -1072,7 +1171,7 @@ async fn group_creation_commits_full_graph_past_all_deferred_triggers() {
 
 #[tokio::test]
 async fn group_policy_add_participant_commits_state_version_plus_one() {
-    let pool = setup().await;
+    let (pool, _db) = setup().await;
     let fixture = build_creation(&pool, ConversationKind::Group).await;
     let conversation_id = fixture.conversation_id;
 
@@ -1292,7 +1391,7 @@ async fn group_policy_add_participant_commits_state_version_plus_one() {
 
 #[tokio::test]
 async fn direct_creation_commits_with_direct_pair_shape() {
-    let pool = setup().await;
+    let (pool, _db) = setup().await;
     let fixture = build_creation(&pool, ConversationKind::Direct).await;
     let conversation_id = fixture.conversation_id;
     let mut tx = pool.begin().await.expect("begin");
@@ -1323,7 +1422,7 @@ async fn direct_creation_commits_with_direct_pair_shape() {
 
 #[tokio::test]
 async fn creation_failure_injection_rolls_back_whole_graph() {
-    let pool = setup().await;
+    let (pool, _db) = setup().await;
     let fixture = build_creation(&pool, ConversationKind::Group).await;
     let conversation_id = fixture.conversation_id;
     let mut tx = pool.begin().await.expect("begin");
@@ -1410,7 +1509,7 @@ async fn device_event_predecessor(pool: &PgPool, did: &str, device: Uuid) -> Opt
 
 #[tokio::test]
 async fn direct_close_commits_terminal_graph_and_reapply_conflicts() {
-    let pool = setup().await;
+    let (pool, _db) = setup().await;
     let fixture = commit_creation(&pool, ConversationKind::Direct).await;
     let conversation_id = fixture.conversation_id;
 
@@ -1616,7 +1715,7 @@ fn close_ctx(
 
 #[tokio::test]
 async fn reset_request_commits_without_changing_the_coordinate() {
-    let pool = setup().await;
+    let (pool, _db) = setup().await;
     let fixture = commit_creation(&pool, ConversationKind::Group).await;
     let conversation_id = fixture.conversation_id;
 
@@ -1891,7 +1990,7 @@ async fn commit_reset_request(
 
 #[tokio::test]
 async fn reset_activation_commits_two_generation_graph_and_conflicts_on_replay() {
-    let pool = setup().await;
+    let (pool, _db) = setup().await;
     let fixture = commit_creation(&pool, ConversationKind::Group).await;
     let conversation_id = fixture.conversation_id;
     let manifest = corpus_manifest();
@@ -2193,7 +2292,7 @@ async fn reset_activation_commits_two_generation_graph_and_conflicts_on_replay()
 
 #[tokio::test]
 async fn creation_plan_without_invitation_quota_binding_is_rejected() {
-    let pool = setup().await;
+    let (pool, _db) = setup().await;
     let fixture = build_creation(&pool, ConversationKind::Group).await;
     let conversation_id = fixture.conversation_id;
     // A Creation plan MUST carry the invitation-quota CAS binding (production
@@ -2221,7 +2320,7 @@ async fn creation_plan_without_invitation_quota_binding_is_rejected() {
 
 #[tokio::test]
 async fn creation_mid_executor_metadata_conflict_rolls_back_whole_graph() {
-    let pool = setup().await;
+    let (pool, _db) = setup().await;
 
     // A real creation that COMMITS — its metadata snapshot id is a global primary
     // key we then force a collision against.
@@ -2350,7 +2449,7 @@ async fn seed_key_package(
 
 #[tokio::test]
 async fn acceptance_commits_recovery_open_and_promotes_participant() {
-    let pool = setup().await;
+    let (pool, _db) = setup().await;
     let fixture = commit_creation(&pool, ConversationKind::Group).await;
     let conversation_id = fixture.conversation_id;
     let bob_device = Uuid::from_bytes(*fixture.bob_id.device_id());
@@ -2572,7 +2671,7 @@ async fn acceptance_commits_recovery_open_and_promotes_participant() {
 
 #[tokio::test]
 async fn leaf_recovery_replace_request_commits_without_advancing_coordinate() {
-    let pool = setup().await;
+    let (pool, _db) = setup().await;
     let fixture = commit_creation(&pool, ConversationKind::Group).await;
     let conversation_id = fixture.conversation_id;
 
