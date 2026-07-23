@@ -12891,19 +12891,20 @@ mod executor {
     use super::super::repository::transition::{
         self as transition, ConversationHeadClose, ConversationHeadKind, GenerationStateKind,
         GenerationStateLifecycle, GenerationSupersede, LeafClose, LeafOrigin,
-        LeafRecoveryKind as RepoLeafRecoveryKind, LeafRecoverySource, NewGeneration,
-        NewGenerationState, NewLeafPeriod, NewLeafRecoveryRequest, NewMetadataSnapshot,
-        NewParticipantPeriod, NewReservation, NewResetRequest, NewTransition,
+        LeafRecoveryKind as RepoLeafRecoveryKind, LeafRecoverySource, LeafRecoveryTermination,
+        NewGeneration, NewGenerationState, NewLeafPeriod, NewLeafRecoveryRequest,
+        NewMetadataSnapshot, NewParticipantPeriod, NewReservation, NewResetRequest, NewTransition,
         PackageStatus as RepoPackageStatus, PackageSuccessor, ParticipantAcceptance,
         ParticipantAcceptanceCas, ParticipantInvitation, ParticipantRole as RepoParticipantRole,
-        ParticipantStatus as RepoParticipantStatus, ResetRequestTermination, TransitionActorRole,
-        TransitionCoordinates, TransitionKind, TransitionRepositoryError,
+        ParticipantStatus as RepoParticipantStatus, ReservationTermination,
+        ResetRequestTermination, TransitionActorRole, TransitionCoordinates, TransitionKind,
+        TransitionRepositoryError,
     };
     use super::{
         CloseKind, ConversationKind, DeviceIdentity, LeafHydrationRow, LeafRecoveryKind,
         MetadataSnapshotBinding, ParticipantHydrationRow, ParticipantRole, ParticipantStatus,
-        PlanKind, PrincipalId, PublicGroupSnapshotCoordinate, RecoverySource, ServerTimestamp,
-        StateChange, TransitionEffects,
+        PlanKind, PrincipalId, PublicGroupSnapshotCoordinate, RecoveryRequestStatus,
+        RecoverySource, ServerTimestamp, StateChange, TransitionEffects,
     };
     use super::{ConversationPersistencePlan, ConversationStateHydration};
 
@@ -13451,34 +13452,155 @@ mod executor {
         })
     }
 
-    /// Apply an entry-less `leafRecoveryCancellation` internal op.
-    ///
-    /// WRITER GAP (E2b-6, reported): a cancelled recovery request must RELEASE its
-    /// reserved key package back to `available` with all terminal columns NULL —
-    /// the `assert_recovery_fulfillment_mapping` cancelled-status arm asserts
-    /// `package_row.status = 'available' AND terminal_transition_id IS NULL AND
-    /// terminal_revocation_id IS NULL AND terminal_at IS NULL`. The only
-    /// `chat.key_packages` status writer, `cas_key_package_status`, offers the
-    /// successor set `{Reserve, Consume, Expire, Revoke}` — there is NO
-    /// `Reserved -> Available` (re-activation) edge, and its UPDATE always writes
-    /// the target arm's terminal columns. So the release the cancelled-status
-    /// mapping demands is UNWRITABLE with the current review-approved writer layer.
-    /// The reservation release (`terminalize_reservation(ReleasedByRequestDigest)`)
-    /// and the request terminalization (`terminalize_leaf_recovery_request(Cancelled)`)
-    /// both exist; only the package re-activation writer is missing. Per the
-    /// no-writer-SQL-edit discipline this arm is left a hard `UnsupportedEffect`
-    /// and the gap is reported rather than worked around.
+    /// Apply an entry-less `leafRecoveryCancellation` internal op: terminalize one
+    /// open recovery request as `cancelled` with its signed cancellation
+    /// provenance, release its reservation, and RE-ACTIVATE the reserved key
+    /// package back to `available` (the E2b-6b `PackageSuccessor::Reactivate`
+    /// writer). The coordinate and seq counter are byte-untouched (head CAS
+    /// verify). The `assert_recovery_fulfillment_mapping` cancelled-status arm
+    /// requires the released reservation and request to carry the SAME
+    /// `terminal_request_digest` + `terminal_at`, and the package to be
+    /// `available` with all terminal columns NULL — all satisfied here.
     #[allow(clippy::too_many_arguments)]
     async fn apply_leaf_recovery_cancellation(
-        _transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        _plan: &ConversationPersistencePlan,
-        _ctx: &ExecutionContext,
-        _conversation_id: Uuid,
-        _generation: i64,
-        _state_version: i64,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        plan: &ConversationPersistencePlan,
+        ctx: &ExecutionContext,
+        conversation_id: Uuid,
+        generation: i64,
+        state_version: i64,
         _epoch: i64,
     ) -> Result<AppliedTransition, ExecutorError> {
-        Err(ExecutorError::UnsupportedEffect("leafRecoveryCancellation"))
+        let effects = plan.effects();
+        let applied_at = ctx.applied_at;
+        let head = effects
+            .head_cas()
+            .ok_or(ExecutorError::InconsistentPlan("missing head CAS binding"))?;
+        let expected_prior = head
+            .expected_prior()
+            .ok_or(ExecutorError::InconsistentPlan(
+                "leaf recovery cancellation needs a prior",
+            ))?;
+        let expected_generation = checked_i64(expected_prior.generation())?;
+        let expected_state_version = checked_i64(expected_prior.state_version())?;
+        let expected_next_entry_seq = checked_i64(head.expected_next_entry_seq())?;
+        let successor_next_entry_seq = checked_i64(head.successor_next_entry_seq())?;
+
+        // Only a request terminalization + reservation release + package
+        // re-activation. Everything else must be empty.
+        reject_if_present("participant_changes", effects.participant_changes())?;
+        reject_if_present("leaf_changes", effects.leaf_changes())?;
+        reject_if_present("interval_changes", effects.interval_changes())?;
+        reject_if_present("terminal_proof_changes", effects.terminal_proof_changes())?;
+        reject_if_present("reset_request_changes", effects.reset_request_changes())?;
+        reject_if_present("leave_request_changes", effects.leave_request_changes())?;
+        reject_if_present("welcome_changes", effects.welcome_changes())?;
+        reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
+        if effects.metadata_change().is_some() {
+            return Err(ExecutorError::UnsupportedEffect(
+                "leaf recovery cancellation metadata change",
+            ));
+        }
+        if effects.revocation_target_cas().is_some()
+            || effects.welcome_cas().is_some()
+            || effects.invitation_quota_cas().is_some()
+        {
+            return Err(ExecutorError::UnsupportedEffect(
+                "leaf recovery cancellation revocation/welcome/quota CAS",
+            ));
+        }
+        let _recovery_package_cas_witness = effects.recovery_package_cas();
+
+        // Exactly one Open->Cancelled recovery request + one released reservation +
+        // one package edge.
+        let recovery = effects
+            .recovery_request_changes()
+            .iter()
+            .find_map(|change| match (change.before(), change.after()) {
+                (Some(before), Some(after))
+                    if before.status() == RecoveryRequestStatus::Open
+                        && after.status() == RecoveryRequestStatus::Cancelled =>
+                {
+                    Some(after)
+                }
+                _ => None,
+            })
+            .ok_or(ExecutorError::InconsistentPlan(
+                "cancellation does not cancel an open recovery request",
+            ))?;
+        if effects.recovery_request_changes().len() != 1
+            || effects.reservation_changes().len() != 1
+            || effects.package_transitions().len() != 1
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "cancellation must terminalize exactly one request + reservation + package edge",
+            ));
+        }
+        let recovery_request_id = Uuid::from_bytes(*recovery.request_id());
+        let key_package_ref = recovery.key_package_ref().to_vec();
+        // The signed cancellation request's digest — the SAME value the released
+        // reservation records, per the cancelled-status mapping cross-check.
+        let terminal_request_digest = ctx.entry.request_digest.clone();
+
+        // 1. Head CAS VERIFY (coordinate + seq counter unchanged).
+        transition::cas_conversation_head(
+            transaction,
+            &transition::ConversationHeadCas {
+                conversation_id,
+                expected_generation,
+                expected_state_version,
+                expected_next_entry_seq,
+                successor_generation: generation,
+                successor_state_version: state_version,
+                successor_next_entry_seq,
+                close: None,
+            },
+        )
+        .await?;
+
+        // 2. Terminalize the request as cancelled with its signed provenance.
+        transition::terminalize_leaf_recovery_request(
+            transaction,
+            recovery_request_id,
+            &LeafRecoveryTermination::Cancelled {
+                terminal_signed_request_bytes: ctx.entry.signed_request_bytes.clone(),
+                terminal_signing_transcript_bytes: ctx.entry.signing_transcript_bytes.clone(),
+                terminal_request_digest: terminal_request_digest.clone(),
+                terminal_signature: ctx.entry.signature.clone(),
+                terminal_at: applied_at,
+            },
+        )
+        .await?;
+
+        // 3. Release the reservation by the same signed cancellation request digest.
+        transition::terminalize_reservation(
+            transaction,
+            recovery_request_id,
+            &ReservationTermination::ReleasedByRequestDigest {
+                terminal_request_digest,
+                terminal_at: applied_at,
+            },
+        )
+        .await?;
+
+        // 4. Re-activate the reserved package back to the available pool.
+        transition::cas_key_package_status(
+            transaction,
+            &key_package_ref,
+            RepoPackageStatus::Reserved,
+            &PackageSuccessor::Reactivate,
+        )
+        .await?;
+
+        // 5. No control entry (internal op); only events.
+        let event_positions = write_events(transaction, ctx).await?;
+
+        Ok(AppliedTransition {
+            allocated_seq: u64::try_from(successor_next_entry_seq).unwrap(),
+            entry_id: ctx.entry.entry_id,
+            event_positions,
+            successor_coordinate: plan.successor_coordinate().copied(),
+        })
     }
 
     #[allow(clippy::too_many_arguments)]

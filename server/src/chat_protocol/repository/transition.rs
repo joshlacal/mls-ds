@@ -1400,6 +1400,12 @@ impl PackageStatus {
 /// terminal provenance the target `key_packages_terminal_shape_check` arm
 /// allows:
 /// * `Reserve` — `available` → `reserved`, no terminal columns;
+/// * `Reactivate` — `reserved` → `available`, terminal columns cleared (a
+///   cancelled / released reservation returns the package to the pool). The
+///   `key_packages_lifecycle_monotonic` trigger permits `reserved → available`,
+///   and `status`/`terminal_*` are the row's mutable lifecycle columns, so the
+///   `key_packages_terminal_shape_check` `available` arm (all terminal columns
+///   NULL) is satisfied.
 /// * `Consume` — → `consumed`, binds the consuming transition + timestamp;
 /// * `Expire` — → `expired`, records only the timestamp (DB requires it to
 ///   equal `not_after`);
@@ -1407,6 +1413,7 @@ impl PackageStatus {
 #[derive(Clone, Debug)]
 pub(crate) enum PackageSuccessor {
     Reserve,
+    Reactivate,
     Consume {
         terminal_transition_id: Uuid,
         terminal_at: DateTime<Utc>,
@@ -1434,6 +1441,7 @@ pub(crate) async fn cas_key_package_status(
     let (successor_status, terminal_transition_id, terminal_revocation_id, terminal_at) =
         match successor {
             PackageSuccessor::Reserve => (PackageStatus::Reserved, None, None, None),
+            PackageSuccessor::Reactivate => (PackageStatus::Available, None, None, None),
             PackageSuccessor::Consume {
                 terminal_transition_id,
                 terminal_at,
