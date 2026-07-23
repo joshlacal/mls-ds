@@ -1339,6 +1339,116 @@ async fn creation_failure_injection_rolls_back_whole_graph() {
     );
 }
 
+#[tokio::test]
+async fn creation_plan_without_invitation_quota_binding_is_rejected() {
+    let pool = setup().await;
+    let fixture = build_creation(&pool, ConversationKind::Group).await;
+    let conversation_id = fixture.conversation_id;
+    // A Creation plan MUST carry the invitation-quota CAS binding (production
+    // `into_persistence_plan` rejects it as InvalidHydrationAuthority otherwise).
+    // The executor rejects the stripped plan as InconsistentPlan BEFORE any write.
+    let stripped = fixture.plan.with_invitation_quota_cleared_for_test();
+    let mut tx = pool.begin().await.expect("begin");
+    let result = apply_conversation_persistence_plan(&mut tx, &stripped, &fixture.ctx).await;
+    assert!(
+        matches!(result, Err(ExecutorError::InconsistentPlan(_))),
+        "missing invitation-quota binding must be an InconsistentPlan, got {result:?}"
+    );
+    tx.rollback().await.expect("rollback");
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM chat.conversations WHERE conversation_id=$1",
+            conversation_id
+        )
+        .await,
+        0,
+        "a rejected plan writes nothing"
+    );
+}
+
+#[tokio::test]
+async fn creation_mid_executor_metadata_conflict_rolls_back_whole_graph() {
+    let pool = setup().await;
+
+    // A real creation that COMMITS — its metadata snapshot id is a global primary
+    // key we then force a collision against.
+    let first = build_creation(&pool, ConversationKind::Group).await;
+    let mut tx0 = pool.begin().await.expect("begin first");
+    apply_conversation_persistence_plan(&mut tx0, &first.plan, &first.ctx)
+        .await
+        .expect("first creation applies");
+    tx0.commit().await.expect("first COMMIT");
+    let existing_snapshot_id: Uuid = sqlx::query_scalar(
+        "SELECT metadata_snapshot_id FROM chat.metadata_snapshots WHERE conversation_id=$1",
+    )
+    .bind(first.conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("first snapshot id");
+
+    // Second creation whose metadata snapshot id collides with the committed one.
+    // The executor's OWN metadata insert (step 5, AFTER the head insert at step 1)
+    // fails on the metadata_snapshots primary key mid-executor; the whole graph
+    // must roll back.
+    let mut second = build_creation(&pool, ConversationKind::Group).await;
+    let conversation_id = second.conversation_id;
+    second
+        .ctx
+        .metadata_author
+        .as_mut()
+        .expect("creation carries a metadata author")
+        .metadata_snapshot_id = existing_snapshot_id;
+
+    let mut tx = pool.begin().await.expect("begin second");
+    let result = apply_conversation_persistence_plan(&mut tx, &second.plan, &second.ctx).await;
+    assert!(
+        matches!(result, Err(ExecutorError::Transition(_))),
+        "mid-executor metadata PK collision must surface as a Transition error, got {result:?}"
+    );
+    tx.rollback().await.expect("rollback second");
+
+    // The head insert (step 1) executed inside the same transaction BEFORE the
+    // failing metadata insert (step 5): confirm it — and every other row — rolled
+    // back, proving executor atomicity across the whole graph.
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM chat.conversations WHERE conversation_id=$1",
+            conversation_id
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM chat.generations WHERE conversation_id=$1",
+            conversation_id
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM chat.participants WHERE conversation_id=$1",
+            conversation_id
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM chat.entries WHERE conversation_id=$1",
+            conversation_id
+        )
+        .await,
+        0
+    );
+}
+
 /// Remove one conversation's committed graph so the shared, never-truncated
 /// clean-chat DB stays clean across runs. Runs inside ONE transaction: the
 /// `chat.entries` <-> `chat.transitions` provenance FKs are circular and

@@ -9939,12 +9939,66 @@ impl ConversationHeadCasBinding {
 /// Assemble a `ConversationPersistencePlan` from a pure-planner `PlannedTransition`
 /// plus a synthesized head CAS, mirroring what `into_persistence_plan` produces in
 /// production (which is `#[cfg(not(test))]` and unreachable from the test build).
+///
+/// For a `Creation`/`Policy` plan this ALSO synthesizes the
+/// `InvitationQuotaCasBinding` that `into_persistence_plan` (state_machine.rs
+/// `invitation_quota_valid`) requires every such plan to carry — modeled on
+/// `bind_invitation_quota_cas`: the sorted newly-pending recipients, the inviter
+/// (the sole/first active admin), the prior/successor live-pending counts, a
+/// generous limit, and a non-zero locked-row digest bound to the head lock. Test
+/// plans therefore mirror real plans, so the executor's invitation-quota consume
+/// arm is exercised (removing it now fails the suite).
 #[cfg(test)]
 pub(crate) fn persistence_plan_for_test(
     transition: PlannedTransition,
     head_cas: ConversationHeadCasBinding,
 ) -> ConversationPersistencePlan {
     let mut effects = transition.effects;
+    if matches!(effects.kind, PlanKind::Creation | PlanKind::Policy) {
+        let mut new_recipients: Vec<PrincipalId> = effects
+            .participant_changes
+            .iter()
+            .filter_map(|change| match (change.before(), change.after()) {
+                (None, Some(after)) if after.status() == ParticipantStatus::Pending => {
+                    Some(after.principal().clone())
+                }
+                _ => None,
+            })
+            .collect();
+        new_recipients.sort();
+        let successor_pending = transition
+            .state
+            .participants()
+            .iter()
+            .filter(|participant| participant.status() == ParticipantStatus::Pending)
+            .count() as u64;
+        let expected_pending = successor_pending.saturating_sub(new_recipients.len() as u64);
+        let inviter = transition
+            .state
+            .participants()
+            .iter()
+            .find(|participant| {
+                participant.status() == ParticipantStatus::Active
+                    && participant.role() == ParticipantRole::Admin
+            })
+            .map(|participant| participant.principal().clone())
+            .unwrap_or_else(|| {
+                new_recipients
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(dummy_principal)
+            });
+        effects.invitation_quota_cas = Some(InvitationQuotaCasBinding {
+            transaction_id: head_cas.transaction_id.clone(),
+            inviter,
+            new_recipients,
+            expected_pending,
+            successor_pending,
+            quota_limit: 100,
+            locked_at: head_cas.locked_at,
+            locked_row_digest: [1u8; 32],
+        });
+    }
     effects.head_cas = Some(head_cas);
     ConversationPersistencePlan {
         expected_prior: transition.expected_prior,
@@ -9952,6 +10006,25 @@ pub(crate) fn persistence_plan_for_test(
         successor_coordinate: transition.successor_coordinate,
         state: ConversationStateHydration::from_state(transition.state),
         effects,
+    }
+}
+
+/// A syntactically-valid placeholder principal for the (unreachable) case where a
+/// Creation/Policy plan has neither an active admin nor a pending recipient.
+#[cfg(test)]
+fn dummy_principal() -> PrincipalId {
+    PrincipalId::new(b"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".to_vec()).expect("valid placeholder DID")
+}
+
+#[cfg(test)]
+impl ConversationPersistencePlan {
+    /// Drop the invitation-quota CAS binding, producing a plan production would
+    /// reject as `InvalidHydrationAuthority` and the executor rejects as
+    /// `InconsistentPlan`. Used to make the executor's invitation-quota consume
+    /// arm an executable contract (removing the arm fails the negative test).
+    pub(crate) fn with_invitation_quota_cleared_for_test(mut self) -> Self {
+        self.effects.invitation_quota_cas = None;
+        self
     }
 }
 
@@ -13041,6 +13114,27 @@ mod executor {
         if effects.welcome_cas().is_some() {
             return Err(ExecutorError::UnsupportedEffect("welcome_cas"));
         }
+        // invitation_quota_cas: EXPLICITLY consumed, not written. It is the
+        // WITNESS of the planner's locked live-pending-invitation counts for the
+        // newly pending recipients; there is no row for the executor to persist.
+        // The invitation quota is enforced by the `enforce_invitation_quota`
+        // DEFERRED trigger, which independently re-counts live pending
+        // invitations under `FOR UPDATE` at COMMIT. Production
+        // `into_persistence_plan` requires EVERY Creation/Policy plan to carry
+        // this binding (else `InvalidHydrationAuthority`); a missing binding here
+        // is an `InconsistentPlan`, so this family is consumed — never silently
+        // dropped — exactly as the exhaustive-dispatch contract demands.
+        let _invitation_quota_witness =
+            effects
+                .invitation_quota_cas()
+                .ok_or(ExecutorError::InconsistentPlan(
+                    "creation plan missing invitation quota CAS binding",
+                ))?;
+        // effects.authority() is likewise deliberately unread: it is the sealed
+        // control/request/revocation authority that JUSTIFIED the plan
+        // (provenance/witness), not a persistable row family. The signed bytes it
+        // attests to reach the durable rows through `ExecutionContext` (the entry
+        // + transition signed material), which is caller-supplied input.
 
         // 1. Head (INSERT — true absence; the seq counter starts already advanced
         //    past the genesis entry).
@@ -13287,6 +13381,16 @@ mod executor {
         if effects.welcome_cas().is_some() {
             return Err(ExecutorError::UnsupportedEffect("welcome_cas"));
         }
+        // invitation_quota_cas: consumed as witness (see apply_creation) — a
+        // group policy addParticipant edge is the other kind production requires
+        // to carry it. The quota itself is enforced by the deferred
+        // `enforce_invitation_quota` trigger; a missing binding is InconsistentPlan.
+        let _invitation_quota_witness =
+            effects
+                .invitation_quota_cas()
+                .ok_or(ExecutorError::InconsistentPlan(
+                    "policy plan missing invitation quota CAS binding",
+                ))?;
 
         // 1. Head CAS advances the coordinate + counter (single seq authority).
         transition::cas_conversation_head(
