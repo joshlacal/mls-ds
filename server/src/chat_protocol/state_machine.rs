@@ -13594,12 +13594,30 @@ mod executor {
             }
             PlanKind::Metadata => Err(ExecutorError::UnsupportedEffect("metadata")),
             PlanKind::Commit => {
-                // Three `PlanKind::Commit` shapes, discriminated by their own edges
-                // (mutually exclusive by construction, backstopped by each arm's
-                // guards): a LEAVE fulfillment terminalizes a leave request
-                // (`leave_request_changes` non-empty); a leaf-recovery fulfillment
-                // ALWAYS emits exactly one NEW Welcome (`None->Some`); a generic
-                // (zero-proposal) commit does neither.
+                // Three `PlanKind::Commit` shapes, partitioned by their own edges.
+                //
+                // PARTITION PROOF (exhaustive + mutually exclusive by construction —
+                // the planners are the authority):
+                //   * A LEAVE fulfillment is the ONLY `Commit` whose planner
+                //     (`plan_leave_fulfillment_inner`) terminalizes a leave request,
+                //     so `leave_request_changes` is non-empty IFF leave fulfillment;
+                //     it removes members and emits NO new Welcome.
+                //   * A leaf-recovery fulfillment (`plan_leaf_recovery_fulfillment_inner`)
+                //     ALWAYS emits exactly one NEW Welcome (`None->Some`, how the
+                //     recovered target joins) and NEVER touches a leave request.
+                //   * A generic zero-proposal commit (`plan_commit_inner`) does
+                //     NEITHER — no leave request, no `None->Some` welcome (its only
+                //     welcome delta is a prior-bound `Pending->Superseded`).
+                // The two predicates are therefore disjoint (leave-request-change vs.
+                // new-welcome are never both set) and exhaustive (their negation is
+                // exactly the generic commit). Each branch's own exact-shape guards
+                // (leave requires exactly one leave-request + participant close;
+                // recovery requires exactly one own request/reservation/package/new
+                // welcome; generic rejects every membership/leave delta) HARD-error a
+                // mis-partitioned plan rather than mis-applying it — the discriminator
+                // is backstopped, never load-bearing alone. This extends the
+                // recovery-vs-generic `is_fulfillment` note: the Welcome-presence
+                // discriminator is now the SECOND cut, after the leave-request cut.
                 let is_leave_fulfillment = !effects.leave_request_changes().is_empty();
                 let is_recovery_fulfillment = effects
                     .welcome_changes()
