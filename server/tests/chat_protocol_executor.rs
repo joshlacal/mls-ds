@@ -105,15 +105,16 @@ use chat_protocol::state_machine::{
     plan_close, plan_commit, plan_creation, plan_leaf_recovery_cancellation,
     plan_leaf_recovery_fulfillment, plan_leaf_recovery_request, plan_leave_cancellation,
     plan_leave_fulfillment, plan_leave_request, plan_policy, plan_reset_activation,
-    plan_reset_request, plan_zero_leaf_leave, AcceptConversation, CloseConversation, CommitCommand,
-    ControlEntryContent, ConversationHeadCasBinding, ConversationKind, ConversationState,
-    CreationCommand, CreationDecision, DeviceIdentity, EventFanout, ExecutionActor,
-    ExecutionContext, ExecutorError, LeafPersistenceColumns, LeafRecoveryCancellation,
-    LeafRecoveryFulfillment, LeafRecoveryKind, LeafRecoveryRequestCommand, LeaveCancellation,
-    LeaveFulfillment, LeaveRequestCommand, LockedRegistrationProjection, MetadataAuthorColumns,
-    MetadataSnapshotBinding, PrincipalId, RecoveryOpenContext, RequestEntryKind, RequestEvidence,
-    ResetActivation, ResetRequestCommand, ResetRequestRow, ServerTimestamp, SpineArtifacts,
-    TransitionEvidence, WelcomeDispositionInput, ZeroLeafLeave,
+    plan_reset_request, plan_welcome_expiry_for_test, plan_zero_leaf_leave, AcceptConversation,
+    CloseConversation, CommitCommand, ControlEntryContent, ConversationHeadCasBinding,
+    ConversationKind, ConversationState, CreationCommand, CreationDecision, DeviceIdentity,
+    EventFanout, ExecutionActor, ExecutionContext, ExecutorError, LeafPersistenceColumns,
+    LeafRecoveryCancellation, LeafRecoveryFulfillment, LeafRecoveryKind,
+    LeafRecoveryRequestCommand, LeaveCancellation, LeaveFulfillment, LeaveRequestCommand,
+    LockedRegistrationProjection, MetadataAuthorColumns, MetadataSnapshotBinding, PrincipalId,
+    RecoveryOpenContext, RequestEntryKind, RequestEvidence, ResetActivation, ResetRequestCommand,
+    ResetRequestRow, ServerTimestamp, SpineArtifacts, TransitionEvidence, WelcomeDispositionInput,
+    WelcomeExpiryContext, ZeroLeafLeave,
 };
 use chat_protocol::validation::ed25519_key_id;
 use chat_protocol::wire::{validate_public_commit, MAX_PUBLIC_MESSAGE_WIRE_BYTES};
@@ -634,6 +635,7 @@ async fn build_creation_with_invitee(
         closing_participant_periods: Vec::new(),
         reset_request_row: None,
         recovery_open: None,
+        welcome_expiry: None,
         welcome_dispositions: vec![],
     };
 
@@ -1327,6 +1329,7 @@ async fn group_policy_add_participant_commits_state_version_plus_one() {
         closing_participant_periods: Vec::new(),
         reset_request_row: None,
         recovery_open: None,
+        welcome_expiry: None,
         welcome_dispositions: vec![],
     };
 
@@ -1739,6 +1742,7 @@ fn close_ctx(
         closing_participant_periods: vec![],
         reset_request_row: None,
         recovery_open: None,
+        welcome_expiry: None,
         welcome_dispositions: vec![],
     }
 }
@@ -1859,6 +1863,7 @@ async fn reset_request_commits_without_changing_the_coordinate() {
             expires_at: applied_at + Duration::hours(24),
         }),
         recovery_open: None,
+        welcome_expiry: None,
         welcome_dispositions: vec![],
     };
 
@@ -2012,6 +2017,7 @@ async fn commit_reset_request(
             expires_at: applied_at + Duration::hours(24),
         }),
         recovery_open: None,
+        welcome_expiry: None,
         welcome_dispositions: vec![],
     };
     let mut tx = pool.begin().await.expect("begin reset request");
@@ -2213,6 +2219,7 @@ async fn reset_activation_commits_two_generation_graph_and_conflicts_on_replay()
         closing_participant_periods: vec![],
         reset_request_row: None,
         recovery_open: None,
+        welcome_expiry: None,
         welcome_dispositions: vec![],
     };
 
@@ -2633,6 +2640,7 @@ async fn acceptance_commits_recovery_open_and_promotes_participant() {
             package_not_after,
             replaced_leaf_period_id: None,
         }),
+        welcome_expiry: None,
         welcome_dispositions: vec![],
     };
 
@@ -2867,6 +2875,7 @@ async fn leaf_recovery_replace_request_commits_without_advancing_coordinate() {
             package_not_after,
             replaced_leaf_period_id: Some(alice_leaf_period),
         }),
+        welcome_expiry: None,
         welcome_dispositions: vec![],
     };
 
@@ -3077,6 +3086,7 @@ async fn build_replace_recovery_request(
             package_not_after,
             replaced_leaf_period_id: Some(alice_leaf_period),
         }),
+        welcome_expiry: None,
         welcome_dispositions: vec![],
     };
     BuiltReplaceRequest {
@@ -3217,6 +3227,7 @@ async fn leaf_recovery_cancellation_releases_reservation_and_reactivates_package
         closing_participant_periods: vec![],
         reset_request_row: None,
         recovery_open: None,
+        welcome_expiry: None,
         welcome_dispositions: vec![],
     };
 
@@ -3359,6 +3370,7 @@ async fn acceptance_ctx(
             package_not_after,
             replaced_leaf_period_id: None,
         }),
+        welcome_expiry: None,
         welcome_dispositions: vec![],
     }
 }
@@ -3727,6 +3739,7 @@ async fn build_fulfillment(pool: &PgPool) -> BuiltFulfillment {
         closing_participant_periods: vec![],
         reset_request_row: None,
         recovery_open: None,
+        welcome_expiry: None,
         welcome_dispositions: vec![],
     };
 
@@ -3937,6 +3950,227 @@ async fn run_fulfillment_scenario(pool: &PgPool) -> FulfillmentScenario {
 async fn leaf_recovery_fulfillment_commits_add_leaf_and_welcome() {
     let (pool, _db) = setup().await;
     let _ = run_fulfillment_scenario(&pool).await;
+}
+
+/// Arm 4 (welcome expiry): a pending Welcome whose `expires_at` has passed is
+/// terminalized `expired` (server-authored disposition + `welcomeDisposition`
+/// event) and a `welcomeExpired` recovery-work item is materialized — atomically,
+/// past every deferred trigger (`assert_welcome_disposition_cas` +
+/// `assert_recovery_work_integrity`). The op is ENTRY-LESS: the coordinate and seq
+/// counter are byte-untouched (head CAS verify). Builds on `run_fulfillment_scenario`,
+/// which leaves bob a pending Welcome at the fulfillment coordinate (gen 0, sv 2).
+#[tokio::test]
+async fn welcome_expiry_terminalizes_delivery_and_materializes_recovery_work() {
+    let (pool, _db) = setup().await;
+    let scenario = run_fulfillment_scenario(&pool).await;
+    let conversation_id = scenario.conversation_id;
+    let welcome_id = scenario.welcome_id;
+
+    // The pending Welcome's expiry instant (== the reserved package `not_after`).
+    // The delivery terminal_at, the disposition + its event's created_at, and the
+    // recovery-work item's created_at must ALL equal this (the DB cross-checks), so
+    // the executor's applied_at for an expiry is exactly the welcome's expires_at.
+    let expires_at: DateTime<Utc> =
+        sqlx::query_scalar("SELECT expires_at FROM chat.welcome_deliveries WHERE welcome_id=$1")
+            .bind(welcome_id)
+            .fetch_one(&pool)
+            .await
+            .expect("pending welcome expires_at");
+
+    let planned = plan_welcome_expiry_for_test(&scenario.fulfillment_state, *welcome_id.as_bytes())
+        .expect("valid welcome expiry plan");
+    let locked_at = ServerTimestamp::from_unix_millis_for_test(expires_at.timestamp_millis())
+        .expect("locked_at");
+    // Entry-less head: prior = the fulfillment coordinate, counter UNCHANGED at 4.
+    let head_cas = ConversationHeadCasBinding::for_test_internal(
+        *conversation_id.as_bytes(),
+        scenario.coordinate,
+        4,
+        locked_at,
+    );
+    let plan = persistence_plan_for_test(planned, head_cas);
+
+    // applied_at == the welcome's expires_at (the disposition event created_at must
+    // equal the delivery terminal_at per `assert_welcome_disposition_cas`).
+    let applied_at = expires_at;
+    let bob_device = Uuid::from_bytes(*scenario.bob_id.device_id());
+    let bob_pred = device_event_predecessor(&pool, &scenario.bob_did, bob_device).await;
+    let recovery_work_id = Uuid::new_v4();
+    let disposition_event_id = Uuid::new_v4();
+    let fixture = &scenario.fixture;
+    let ctx = ExecutionContext {
+        protocol_instance_id: fixture.protocol_instance_id,
+        applied_at,
+        // Server-observed expiry: the actor fields are not written (no transition).
+        actor: ExecutionActor {
+            user_did: fixture.alice_did.clone(),
+            device_id: fixture.alice_device,
+            key_id: fixture.alice_key_id.clone(),
+            auth_generation: 1,
+            role: TransitionActorRole::Admin,
+            device_status: "active".to_owned(),
+        },
+        // No control entry (internal op); only the entry_id is echoed back.
+        entry: ControlEntryContent {
+            entry_id: Uuid::new_v4(),
+            entry_kind: "blue.catbird.chat.defs#applicationEntry".to_owned(),
+            accepted_payload_bytes: vec![0x7A_u8; 8],
+            accepted_payload_sha256: Sha256::digest([0x7A_u8; 8]).to_vec(),
+            signed_request_bytes: vec![0x7B_u8; 16],
+            unsigned_projection_bytes: vec![0x7C_u8; 8],
+            signing_transcript_bytes: vec![0x7B_u8; 16],
+            request_digest: Sha256::digest([0x7B_u8; 16]).to_vec(),
+            signature: vec![0x7D_u8; 64],
+            server_fields_bytes: vec![0x7E_u8; 8],
+            outer_entry_fingerprint: vec![0x18_u8; 32],
+        },
+        spine: SpineArtifacts {
+            public_snapshot_bytes: vec![],
+            public_snapshot_sha256: vec![],
+            tree_summary_bytes: vec![],
+            tree_summary_sha256: vec![],
+            leaf_count: 2,
+            genesis_group_info_bytes: vec![],
+            genesis_group_info_sha256: vec![],
+        },
+        opened_leaves: vec![],
+        metadata_author: None,
+        participant_period_ids: vec![],
+        leaf_period_ids: vec![],
+        entry_recipients: vec![],
+        events: vec![],
+        closing_leaf_periods: vec![],
+        closing_participant_periods: vec![],
+        reset_request_row: None,
+        recovery_open: None,
+        // The recovery-work id + the welcomeDisposition event (recipient = bob, the
+        // welcome recipient, entitlement `welcome`, a `stream` outbox row).
+        welcome_expiry: Some(WelcomeExpiryContext {
+            recovery_work_id,
+            event: EventFanout {
+                event_id: disposition_event_id,
+                event_kind: EventKind::WelcomeDisposition,
+                payload_bytes: vec![0xF8_u8; 8],
+                recipients: vec![(
+                    scenario.bob_id.clone(),
+                    EventEntitlementKind::Welcome,
+                    bob_pred,
+                )],
+                outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+            },
+        }),
+        welcome_dispositions: vec![],
+    };
+
+    let mut tx = pool.begin().await.expect("begin welcome expiry");
+    let applied = apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+        .await
+        .expect("welcome expiry applies");
+    tx.commit()
+        .await
+        .expect("welcome expiry COMMIT past all deferred triggers");
+    // No seq allocated (internal op): the counter is echoed unchanged.
+    assert_eq!(applied.allocated_seq, 4);
+
+    // Coordinate + seq counter byte-untouched (still gen 0, sv 2, next_seq 4).
+    let (gen, sv, next_seq): (i64, i64, i64) = sqlx::query_as(
+        "SELECT current_generation,current_state_version,next_entry_seq FROM chat.conversations WHERE conversation_id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("head");
+    assert_eq!((gen, sv, next_seq), (0, 2, 4));
+
+    // The delivery is `expired`, terminal_at == expires_at.
+    let (del_status, del_terminal): (String, Option<DateTime<Utc>>) = sqlx::query_as(
+        "SELECT status,terminal_at FROM chat.welcome_deliveries WHERE welcome_id=$1",
+    )
+    .bind(welcome_id)
+    .fetch_one(&pool)
+    .await
+    .expect("delivery");
+    assert_eq!(
+        (del_status.as_str(), del_terminal),
+        ("expired", Some(expires_at))
+    );
+
+    // Exactly one disposition row, winner `expired`, bound to the welcomeDisposition event.
+    let (winner, disp_terminal): (String, DateTime<Utc>) = sqlx::query_as(
+        "SELECT winner_kind,terminal_at FROM chat.welcome_dispositions WHERE welcome_id=$1",
+    )
+    .bind(welcome_id)
+    .fetch_one(&pool)
+    .await
+    .expect("disposition");
+    assert_eq!((winner.as_str(), disp_terminal), ("expired", expires_at));
+    let disp_event_kind: String = sqlx::query_scalar(
+        "SELECT event.event_kind FROM chat.welcome_dispositions disposition \
+         JOIN chat.events event ON event.event_position = disposition.event_position \
+         WHERE disposition.welcome_id=$1",
+    )
+    .bind(welcome_id)
+    .fetch_one(&pool)
+    .await
+    .expect("disposition event");
+    assert_eq!(disp_event_kind, "welcomeDisposition");
+
+    // The `welcomeExpired` recovery-work item: pending, at the welcome BUNDLE's
+    // coordinate (gen 0, sv 2), created_at == the disposition terminal_at, for bob.
+    let (rw_kind, rw_status, rw_gen, rw_sv, rw_created, rw_recipient): (
+        String,
+        String,
+        i64,
+        i64,
+        DateTime<Utc>,
+        String,
+    ) = sqlx::query_as(
+        "SELECT source_kind,status,generation,state_version,created_at,recipient_did \
+         FROM chat.recovery_work_items WHERE source_id=$1",
+    )
+    .bind(welcome_id)
+    .fetch_one(&pool)
+    .await
+    .expect("recovery work item");
+    assert_eq!(
+        (rw_kind.as_str(), rw_status.as_str(), rw_gen, rw_sv),
+        ("welcomeExpired", "pending", 0, 2)
+    );
+    assert_eq!(rw_created, expires_at);
+    assert_eq!(rw_recipient, scenario.bob_did);
+    let rw_id: Uuid = sqlx::query_scalar(
+        "SELECT recovery_work_id FROM chat.recovery_work_items WHERE source_id=$1",
+    )
+    .bind(welcome_id)
+    .fetch_one(&pool)
+    .await
+    .expect("recovery work id");
+    assert_eq!(rw_id, recovery_work_id);
+
+    // Replay -> conflict (the disposition event id + the pending-only delivery CAS
+    // are both already consumed), whole transaction rolls back, zero residue.
+    let before: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.recovery_work_items WHERE conversation_id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let mut tx2 = pool.begin().await.expect("begin replay");
+    let replay = apply_conversation_persistence_plan(&mut tx2, &plan, &ctx).await;
+    assert!(
+        matches!(replay, Err(ExecutorError::Delivery(_))),
+        "welcome expiry replay must conflict, got {replay:?}"
+    );
+    tx2.rollback().await.expect("rollback replay");
+    let after: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.recovery_work_items WHERE conversation_id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(before, after, "welcome expiry replay left zero residue");
 }
 
 /// Silent-drop guard (fulfillment arm): a plan carrying an EXTRA recovery-request
@@ -4162,6 +4396,7 @@ async fn build_generic_commit(pool: &PgPool, scenario: &FulfillmentScenario) -> 
         recovery_open: None,
         // The epoch change supersedes the fulfillment's pending Welcome; provide its
         // welcomeDisposition event (recipient = bob, the welcome recipient).
+        welcome_expiry: None,
         welcome_dispositions: vec![WelcomeDispositionInput {
             welcome_id: scenario.welcome_id,
             event: EventFanout {
@@ -4196,7 +4431,6 @@ async fn generic_commit_commits_epoch_bump_and_reencrypts_metadata() {
         conversation_id,
         commit_transition,
     } = build_generic_commit(&pool, &scenario).await;
-    let fixture = &scenario.fixture;
 
     let mut tx = pool.begin().await.expect("begin generic commit");
     let applied = apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
@@ -4443,6 +4677,7 @@ async fn commit_leave_request(
         closing_participant_periods: vec![],
         reset_request_row: None,
         recovery_open: None,
+        welcome_expiry: None,
         welcome_dispositions: vec![],
     };
     let mut tx = pool.begin().await.expect("begin leave request");
@@ -4630,6 +4865,7 @@ async fn leave_cancellation_terminalizes_pending_request_and_conflicts_on_replay
         closing_participant_periods: vec![],
         reset_request_row: None,
         recovery_open: None,
+        welcome_expiry: None,
         welcome_dispositions: vec![],
     };
     let mut tx = pool.begin().await.expect("begin leave cancellation");
@@ -4800,6 +5036,7 @@ async fn zero_leaf_leave_commits_immediate_self_removal() {
         closing_participant_periods: vec![(bob_id.clone(), bob_period)],
         reset_request_row: None,
         recovery_open: None,
+        welcome_expiry: None,
         welcome_dispositions: vec![],
     };
 
@@ -5082,6 +5319,7 @@ async fn leave_fulfillment_commits_remove_and_supersedes_pending_welcome() {
         reset_request_row: None,
         recovery_open: None,
         // The epoch change supersedes the fulfillment scenario's pending Welcome.
+        welcome_expiry: None,
         welcome_dispositions: vec![WelcomeDispositionInput {
             welcome_id,
             event: EventFanout {
@@ -5199,6 +5437,162 @@ async fn leave_fulfillment_commits_remove_and_supersedes_pending_welcome() {
             .await
             .unwrap();
     assert_eq!(before, after, "leave fulfillment replay left zero residue");
+}
+
+#[tokio::test]
+async fn welcome_expiry_terminalizes_delivery_and_creates_recovery_work() {
+    let (pool, _db) = setup().await;
+    let scenario = run_fulfillment_scenario(&pool).await;
+    let conversation_id = scenario.conversation_id;
+    let bob_id = scenario.bob_id.clone();
+    let bob_did = scenario.bob_did.clone();
+    let bob_device = Uuid::from_bytes(*bob_id.device_id());
+    let welcome_id = scenario.welcome_id;
+    let fixture = &scenario.fixture;
+
+    // The scenario left a PENDING welcome for bob at sv 2 / epoch 1. Expire it (the
+    // pure planner does not gate on the observed instant — the entry wrapper does).
+    let planned = plan_welcome_expiry_for_test(&scenario.fulfillment_state, *welcome_id.as_bytes())
+        .expect("valid welcome expiry plan");
+    // Non-mutating: coordinate + seq counter UNCHANGED (next_entry_seq stays 4).
+    let head_cas = ConversationHeadCasBinding::for_test_internal(
+        *conversation_id.as_bytes(),
+        scenario.coordinate,
+        4,
+        ServerTimestamp::from_unix_millis_for_test(
+            corpus_manifest().evaluation_unix_seconds as i64 * 1_000 + 5_000,
+        )
+        .unwrap(),
+    );
+    let plan = persistence_plan_for_test(planned, head_cas);
+
+    let applied_at = clock_now(&pool).await;
+    let recovery_work_id = Uuid::new_v4();
+    let bob_pred = device_event_predecessor(&pool, &bob_did, bob_device).await;
+    let ctx = ExecutionContext {
+        protocol_instance_id: fixture.protocol_instance_id,
+        applied_at,
+        actor: ExecutionActor {
+            user_did: fixture.alice_did.clone(),
+            device_id: fixture.alice_device,
+            key_id: fixture.alice_key_id.clone(),
+            auth_generation: 1,
+            role: TransitionActorRole::Admin,
+            device_status: "active".to_owned(),
+        },
+        entry: ControlEntryContent {
+            entry_id: Uuid::new_v4(),
+            entry_kind: "blue.catbird.chat.defs#applicationEntry".to_owned(),
+            accepted_payload_bytes: vec![0xD6_u8; 8],
+            accepted_payload_sha256: Sha256::digest([0xD6_u8; 8]).to_vec(),
+            signed_request_bytes: vec![0xD7_u8; 8],
+            unsigned_projection_bytes: vec![0xD8_u8; 8],
+            signing_transcript_bytes: vec![0xD7_u8; 8],
+            request_digest: Sha256::digest([0xD7_u8; 8]).to_vec(),
+            signature: vec![0xD9_u8; 64],
+            server_fields_bytes: vec![0xDA_u8; 8],
+            outer_entry_fingerprint: vec![0x1E_u8; 32],
+        },
+        spine: SpineArtifacts {
+            public_snapshot_bytes: vec![],
+            public_snapshot_sha256: vec![],
+            tree_summary_bytes: vec![],
+            tree_summary_sha256: vec![],
+            leaf_count: 2,
+            genesis_group_info_bytes: vec![],
+            genesis_group_info_sha256: vec![],
+        },
+        opened_leaves: vec![],
+        metadata_author: None,
+        participant_period_ids: vec![],
+        leaf_period_ids: vec![],
+        entry_recipients: vec![],
+        events: vec![],
+        closing_leaf_periods: vec![],
+        closing_participant_periods: vec![],
+        reset_request_row: None,
+        recovery_open: None,
+        welcome_expiry: Some(WelcomeExpiryContext {
+            recovery_work_id,
+            event: EventFanout {
+                event_id: Uuid::new_v4(),
+                event_kind: EventKind::WelcomeDisposition,
+                payload_bytes: vec![0xDB_u8; 8],
+                recipients: vec![(bob_id.clone(), EventEntitlementKind::Welcome, bob_pred)],
+                outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+            },
+        }),
+        welcome_dispositions: vec![],
+    };
+
+    let mut tx = pool.begin().await.expect("begin welcome expiry");
+    apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+        .await
+        .expect("welcome expiry applies");
+    tx.commit()
+        .await
+        .expect("welcome expiry COMMIT past all deferred triggers");
+
+    // Coordinate + seq UNTOUCHED (still sv 2, next_seq 4).
+    let (sv, next_seq): (i64, i64) = sqlx::query_as(
+        "SELECT current_state_version,next_entry_seq FROM chat.conversations WHERE conversation_id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("head");
+    assert_eq!((sv, next_seq), (2, 4));
+    // The delivery is `expired`, terminal_at == its expires_at.
+    let (del_status, terminal_at, expires_at): (String, Option<DateTime<Utc>>, DateTime<Utc>) =
+        sqlx::query_as(
+            "SELECT status,terminal_at,expires_at FROM chat.welcome_deliveries WHERE welcome_id=$1",
+        )
+        .bind(welcome_id)
+        .fetch_one(&pool)
+        .await
+        .expect("delivery");
+    assert_eq!(del_status, "expired");
+    assert_eq!(terminal_at, Some(expires_at));
+    // The disposition row winner_kind == expired.
+    let winner: String =
+        sqlx::query_scalar("SELECT winner_kind FROM chat.welcome_dispositions WHERE welcome_id=$1")
+            .bind(welcome_id)
+            .fetch_one(&pool)
+            .await
+            .expect("disposition");
+    assert_eq!(winner, "expired");
+    // The welcomeExpired recovery work item for bob, still pending.
+    let (work_kind, work_recipient, work_status): (String, String, String) = sqlx::query_as(
+        "SELECT source_kind,recipient_did,status FROM chat.recovery_work_items WHERE recovery_work_id=$1",
+    )
+    .bind(recovery_work_id)
+    .fetch_one(&pool)
+    .await
+    .expect("recovery work");
+    assert_eq!(
+        (
+            work_kind.as_str(),
+            work_recipient.as_str(),
+            work_status.as_str()
+        ),
+        ("welcomeExpired", bob_did.as_str(), "pending")
+    );
+
+    // Replay -> the welcome-delivery CAS conflicts (already expired), zero residue.
+    let mut tx2 = pool.begin().await.expect("begin replay");
+    let replay = apply_conversation_persistence_plan(&mut tx2, &plan, &ctx).await;
+    assert!(
+        matches!(replay, Err(ExecutorError::Delivery(_))),
+        "welcome expiry replay must conflict on the delivery CAS, got {replay:?}"
+    );
+    tx2.rollback().await.expect("rollback replay");
+    let work_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM chat.recovery_work_items WHERE source_id=$1")
+            .bind(welcome_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(work_count, 1, "replay wrote no duplicate recovery work");
 }
 
 #[tokio::test]
@@ -5327,6 +5721,7 @@ async fn generic_commit_supersedes_prior_open_recovery_request() {
             package_not_after: req_pkg_not_after,
             replaced_leaf_period_id: Some(alice_leaf_period),
         }),
+        welcome_expiry: None,
         welcome_dispositions: vec![],
     };
     {
@@ -5491,6 +5886,7 @@ async fn generic_commit_supersedes_prior_open_recovery_request() {
         closing_participant_periods: vec![],
         reset_request_row: None,
         recovery_open: None,
+        welcome_expiry: None,
         welcome_dispositions: vec![WelcomeDispositionInput {
             welcome_id: scenario.welcome_id,
             event: EventFanout {

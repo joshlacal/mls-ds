@@ -10259,6 +10259,81 @@ pub(crate) fn persistence_plan_for_test(
             }
         }
     }
+    // Synthesize the welcome CAS a `welcomeExpiry` plan carries (production's
+    // `bind_welcome_cas`), built from the single `Pending -> Expired` welcome
+    // change + the head lock, so the executor's welcome-cas witness is present.
+    if effects.welcome_cas.is_none() {
+        if let Some(before) = effects.welcome_changes.iter().find_map(|change| {
+            match (change.before.as_ref(), change.after.as_ref()) {
+                (Some(before), Some(after))
+                    if before.status == WelcomeStatus::Pending
+                        && after.status == WelcomeStatus::Expired =>
+                {
+                    Some(before)
+                }
+                _ => None,
+            }
+        }) {
+            effects.welcome_cas = Some(WelcomeCasBinding {
+                transaction_id: head_cas.transaction_id.clone(),
+                conversation_id: head_cas.conversation_id,
+                welcome_id: before.welcome_id,
+                recipient: before.recipient.clone(),
+                transition_seq: before.transition_seq,
+                coordinate: before.coordinate,
+                recovery_request_id: before.recovery_request_id,
+                key_package_ref: before.key_package_ref,
+                opaque_welcome_sha256: before.sha256,
+                expires_at: before.expires_at,
+                expected_status: WelcomeStatus::Pending,
+                successor_status: WelcomeStatus::Expired,
+                locked_at: head_cas.locked_at,
+                locked_row_digest: [1u8; 32],
+            });
+        }
+    }
+    // Synthesize the welcome-disposition CAS binding production requires for a
+    // welcome terminalization edge (expiry / acknowledge / reject), mirroring
+    // `welcome_cas_from_guard`. The executor consumes it as a LOAD-BEARING witness
+    // (it must match the welcome_change), and production carries it via
+    // `bind_welcome_cas`, so synthesizing it here keeps the test plan
+    // production-shaped. Only the identity/coordinate/status columns are read by the
+    // executor; the locked-row digest is a provenance placeholder.
+    if effects.welcome_cas.is_none() {
+        if let Some((before, after)) = effects.welcome_changes.iter().find_map(|change| {
+            match (change.before.as_ref(), change.after.as_ref()) {
+                (Some(before), Some(after))
+                    if before.status == WelcomeStatus::Pending
+                        && matches!(
+                            after.status,
+                            WelcomeStatus::Expired
+                                | WelcomeStatus::Acknowledged
+                                | WelcomeStatus::Rejected
+                        ) =>
+                {
+                    Some((before, after))
+                }
+                _ => None,
+            }
+        }) {
+            effects.welcome_cas = Some(WelcomeCasBinding {
+                transaction_id: head_cas.transaction_id.clone(),
+                conversation_id: *after.coordinate.conversation_id(),
+                welcome_id: after.welcome_id,
+                recipient: after.recipient.clone(),
+                transition_seq: after.transition_seq,
+                coordinate: after.coordinate,
+                recovery_request_id: after.recovery_request_id,
+                key_package_ref: after.key_package_ref,
+                opaque_welcome_sha256: after.sha256,
+                expires_at: after.expires_at,
+                expected_status: before.status,
+                successor_status: after.status,
+                locked_at: head_cas.locked_at,
+                locked_row_digest: [1u8; 32],
+            });
+        }
+    }
     effects.head_cas = Some(head_cas);
     ConversationPersistencePlan {
         expected_prior: transition.expected_prior,
@@ -10503,6 +10578,14 @@ pub(crate) fn plan_reset_request(
     command: ResetRequestCommand,
 ) -> Result<PlannedTransition, StateMachineError> {
     plan_reset_request_inner(prior, command)
+}
+
+#[cfg(test)]
+pub(crate) fn plan_welcome_expiry_for_test(
+    prior: &ConversationState,
+    welcome_id: [u8; 16],
+) -> Result<PlannedTransition, StateMachineError> {
+    plan_welcome_expiry(prior, welcome_id)
 }
 
 #[cfg(test)]
@@ -13088,6 +13171,7 @@ pub(crate) use executor::{
     apply_conversation_persistence_plan, AppliedTransition, ControlEntryContent, EventFanout,
     ExecutionActor, ExecutionContext, ExecutorError, LeafPersistenceColumns, MetadataAuthorColumns,
     RecoveryOpenContext, ResetRequestRow, SpineArtifacts, WelcomeDispositionInput,
+    WelcomeExpiryContext,
 };
 
 mod executor {
@@ -13252,6 +13336,17 @@ mod executor {
         pub(crate) outbox: Vec<(Uuid, OutboxWorkKind)>,
     }
 
+    /// For a `welcomeExpiry` edge: the DB-side facts the plan does not carry — the
+    /// fresh `recovery_work_items` primary key and the `welcomeDisposition` event
+    /// whose position binds the disposition row. The welcome id / recipient /
+    /// bound coordinate / `expires_at` come from the plan's `welcome_changes`.
+    /// `None` for every other edge.
+    #[derive(Clone, Debug)]
+    pub(crate) struct WelcomeExpiryContext {
+        pub(crate) recovery_work_id: Uuid,
+        pub(crate) event: EventFanout,
+    }
+
     /// Everything the plan does NOT carry. AUDIENCE IS INPUT, NOT DERIVED: the
     /// executor never queries `chat.devices` to invent an audience.
     #[derive(Clone, Debug)]
@@ -13296,6 +13391,8 @@ mod executor {
         /// (`ctx.actor`); the request id, kind, bound coordinate, and key-package
         /// ref come from the plan's `recovery_request_changes`.
         pub(crate) recovery_open: Option<RecoveryOpenContext>,
+        /// For a `welcomeExpiry` edge (see `WelcomeExpiryContext`). `None` otherwise.
+        pub(crate) welcome_expiry: Option<WelcomeExpiryContext>,
         /// For a coordinate-changing commit that SUPERSEDES a prior-coordinate
         /// pending Welcome: the `welcomeDisposition` event the executor appends and
         /// binds the disposition row to (one per superseded welcome). Empty for
@@ -13531,6 +13628,22 @@ mod executor {
                 )
                 .await;
             }
+            // `welcomeExpiry` is ALSO entry-less (server-observed pending-only CAS,
+            // `bind_welcome_expiry_authority`: `allocated_seq == None`, coordinate +
+            // seq counter UNCHANGED) — dispatch it here before the `allocated_seq`
+            // extraction would `InconsistentPlan` on its `None` seq.
+            PlanKind::WelcomeExpiry => {
+                return apply_welcome_expiry(
+                    transaction,
+                    plan,
+                    ctx,
+                    conversation_id,
+                    generation,
+                    state_version,
+                    epoch,
+                )
+                .await;
+            }
             _ => {}
         }
 
@@ -13749,7 +13862,10 @@ mod executor {
                 Err(ExecutorError::UnsupportedEffect("welcomeAcknowledgement"))
             }
             PlanKind::WelcomeRejection => Err(ExecutorError::UnsupportedEffect("welcomeRejection")),
-            PlanKind::WelcomeExpiry => Err(ExecutorError::UnsupportedEffect("welcomeExpiry")),
+            // Entry-less; dispatched (and returned) above.
+            PlanKind::WelcomeExpiry => {
+                unreachable!("entry-less welcome expiry is dispatched before this match")
+            }
             PlanKind::Close => {
                 apply_close(
                     transaction,
@@ -13888,6 +14004,218 @@ mod executor {
             allocated_seq: u64::try_from(successor_next_entry_seq).unwrap(),
             entry_id: ctx.entry.entry_id,
             event_positions,
+            successor_coordinate: plan.successor_coordinate().copied(),
+        })
+    }
+
+    /// Apply an entry-less `welcomeExpiry` op: a server-observed pending Welcome
+    /// past its `expires_at` is terminalized `expired` and a `welcomeExpired`
+    /// `recovery_work_items` row is created so the recipient can be re-added later.
+    /// Coordinate + seq counter UNCHANGED (a pure prior-coordinate verify). NO
+    /// entry, transition, or membership change. Both the disposition `terminal_at`
+    /// and the recovery-work `created_at` are the welcome's OWN `expires_at` (the DB
+    /// `welcome_deliveries.terminal_at = expires_at` and `recovery_work_items.created_at
+    /// = disposition_terminal_at` cross-checks), NOT `applied_at`; the recovery-work
+    /// coordinate is the welcome's OWN bound coordinate.
+    async fn apply_welcome_expiry(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        plan: &ConversationPersistencePlan,
+        ctx: &ExecutionContext,
+        conversation_id: Uuid,
+        generation: i64,
+        state_version: i64,
+        _epoch: i64,
+    ) -> Result<AppliedTransition, ExecutorError> {
+        let effects = plan.effects();
+        let head = effects
+            .head_cas()
+            .ok_or(ExecutorError::InconsistentPlan("missing head CAS binding"))?;
+        let expected_prior = head
+            .expected_prior()
+            .ok_or(ExecutorError::InconsistentPlan(
+                "welcome expiry needs an expected prior",
+            ))?;
+        let expected_generation = checked_i64(expected_prior.generation())?;
+        let expected_state_version = checked_i64(expected_prior.state_version())?;
+        let expected_next_entry_seq = checked_i64(head.expected_next_entry_seq())?;
+        let successor_next_entry_seq = checked_i64(head.successor_next_entry_seq())?;
+
+        // Only a welcome delivery CAS (Pending -> Expired). Reject every other family.
+        reject_if_present("participant_changes", effects.participant_changes())?;
+        reject_if_present("leaf_changes", effects.leaf_changes())?;
+        reject_if_present("interval_changes", effects.interval_changes())?;
+        reject_if_present("terminal_proof_changes", effects.terminal_proof_changes())?;
+        reject_if_present(
+            "recovery_request_changes",
+            effects.recovery_request_changes(),
+        )?;
+        reject_if_present("reservation_changes", effects.reservation_changes())?;
+        reject_if_present("reset_request_changes", effects.reset_request_changes())?;
+        reject_if_present("leave_request_changes", effects.leave_request_changes())?;
+        reject_if_present("package_transitions", effects.package_transitions())?;
+        reject_if_present("recovery_package_cas", effects.recovery_package_cas())?;
+        reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
+        if effects.metadata_change().is_some() {
+            return Err(ExecutorError::UnsupportedEffect(
+                "welcome expiry metadata change",
+            ));
+        }
+        if effects.revocation_target_cas().is_some() || effects.invitation_quota_cas().is_some() {
+            return Err(ExecutorError::UnsupportedEffect(
+                "welcome expiry revocation/quota CAS",
+            ));
+        }
+        // A `welcomeExpiry` is the ONE kind that carries `welcome_cas` (the
+        // authoritative pending-only CAS binding). The `welcome_changes` delta drives
+        // the write; the CAS binding is a LOAD-BEARING witness validated against that
+        // delta below (welcome id, recipient, bound coordinate, expiry instant, and
+        // the Pending->Expired direction must all agree).
+        let welcome_cas = effects
+            .welcome_cas()
+            .ok_or(ExecutorError::InconsistentPlan(
+                "welcome expiry plan missing welcome CAS binding",
+            ))?;
+
+        // Pure prior-coordinate verify: coordinate + seq counter UNCHANGED.
+        if successor_next_entry_seq != expected_next_entry_seq {
+            return Err(ExecutorError::InconsistentPlan(
+                "welcome expiry must not advance the seq counter",
+            ));
+        }
+        if generation != expected_generation || state_version != expected_state_version {
+            return Err(ExecutorError::InconsistentPlan(
+                "welcome expiry must not change the coordinate",
+            ));
+        }
+
+        // Exactly one Pending -> Expired welcome change.
+        if effects.welcome_changes().len() != 1 {
+            return Err(ExecutorError::InconsistentPlan(
+                "welcome expiry must change exactly one welcome",
+            ));
+        }
+        let expired = effects
+            .welcome_changes()
+            .iter()
+            .find_map(|change| match (change.before(), change.after()) {
+                (Some(before), Some(after))
+                    if before.status() == WelcomeStatus::Pending
+                        && after.status() == WelcomeStatus::Expired =>
+                {
+                    Some(after)
+                }
+                _ => None,
+            })
+            .ok_or(ExecutorError::InconsistentPlan(
+                "welcome expiry must expire a pending welcome",
+            ))?;
+        let welcome_id = Uuid::from_bytes(*expired.welcome_id());
+        let terminal_at = server_instant(expired.expires_at())?;
+        let recipient = expired.recipient().clone();
+        let welcome_coordinate = expired.coordinate();
+        // Consume the CAS binding as load-bearing: it must bind exactly the pending
+        // welcome the delta expires. A planner that disagreed is a hard
+        // `InconsistentPlan`, never a silently-unread witness.
+        if welcome_cas.welcome_id() != expired.welcome_id()
+            || welcome_cas.recipient() != &recipient
+            || welcome_cas.coordinate() != welcome_coordinate
+            || welcome_cas.expires_at() != expired.expires_at()
+            || welcome_cas.expected_status() != WelcomeStatus::Pending
+            || welcome_cas.successor_status() != WelcomeStatus::Expired
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "welcome expiry CAS binding disagrees with the welcome change",
+            ));
+        }
+        let expiry = ctx
+            .welcome_expiry
+            .as_ref()
+            .ok_or(ExecutorError::MissingContext("welcome expiry context"))?;
+
+        // 1. Head CAS VERIFY (coordinate + seq counter both UNCHANGED).
+        transition::cas_conversation_head(
+            transaction,
+            &transition::ConversationHeadCas {
+                conversation_id,
+                expected_generation,
+                expected_state_version,
+                expected_next_entry_seq,
+                successor_generation: generation,
+                successor_state_version: state_version,
+                successor_next_entry_seq,
+                close: None,
+            },
+        )
+        .await?;
+
+        // 2. Append the `welcomeDisposition` event. Its `created_at` MUST equal the
+        //    welcome's `expires_at` (`assert_welcome_disposition_cas`:
+        //    `event.created_at = delivery.terminal_at`), NOT `applied_at` — a welcome
+        //    expiry is stamped at the deterministic `expires_at`, so this arm uses
+        //    `terminal_at` throughout and never `applied_at`.
+        let position = delivery::append_event(
+            transaction,
+            &NewEvent {
+                event_id: expiry.event.event_id,
+                event_kind: expiry.event.event_kind,
+                payload_bytes: expiry.event.payload_bytes.clone(),
+                created_at: terminal_at,
+                protocol_instance_id: ctx.protocol_instance_id,
+            },
+        )
+        .await?;
+        let event_recipients = expiry
+            .event
+            .recipients
+            .iter()
+            .map(|(device, kind, predecessor)| {
+                Ok(EventRecipient {
+                    user_did: device_did(device)?,
+                    device_id: device_uuid(device),
+                    entitlement_kind: *kind,
+                    audience_predecessor_position: *predecessor,
+                })
+            })
+            .collect::<Result<Vec<_>, ExecutorError>>()?;
+        delivery::insert_event_recipients(transaction, position, &event_recipients).await?;
+        for (outbox_id, work_kind) in &expiry.event.outbox {
+            delivery::enqueue_outbox(transaction, *outbox_id, position, *work_kind, terminal_at)
+                .await?;
+        }
+
+        // 3. Terminalize the pending delivery `expired` at its `expires_at`.
+        delivery::terminalize_welcome_delivery(
+            transaction,
+            welcome_id,
+            &WelcomeDisposition::Expired,
+            terminal_at,
+            position,
+        )
+        .await?;
+
+        // 4. The `welcomeExpired` recovery work item (created_at == the disposition
+        //    terminal_at; coordinate == the welcome's own bound coordinate).
+        delivery::insert_recovery_work_item(
+            transaction,
+            &delivery::NewRecoveryWorkItem {
+                recovery_work_id: expiry.recovery_work_id,
+                conversation_id,
+                recipient_did: device_did(&recipient)?,
+                recipient_device_id: device_uuid(&recipient),
+                source_kind: delivery::RecoveryWorkSourceKind::WelcomeExpired,
+                source_id: welcome_id,
+                generation: checked_i64(welcome_coordinate.generation())?,
+                state_version: checked_i64(welcome_coordinate.state_version())?,
+                created_at: terminal_at,
+            },
+        )
+        .await?;
+
+        Ok(AppliedTransition {
+            // No control entry / seq was allocated; echo the unchanged counter.
+            allocated_seq: u64::try_from(successor_next_entry_seq).unwrap(),
+            entry_id: ctx.entry.entry_id,
+            event_positions: vec![position],
             successor_coordinate: plan.successor_coordinate().copied(),
         })
     }
