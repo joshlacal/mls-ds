@@ -9833,8 +9833,10 @@ fn plan_close_inner(
 #[cfg(test)]
 impl MetadataSnapshotBinding {
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn for_test_creation(
         conversation_id: [u8; 16],
+        generation: u64,
         group_context_hash: [u8; 32],
         transition_id: [u8; 16],
         origin_seq: u64,
@@ -9842,24 +9844,25 @@ impl MetadataSnapshotBinding {
         author_key_id: [u8; 32],
         signature_public_key: [u8; 32],
         auth_generation: u64,
+        metadata_version: u64,
         nonce: [u8; 12],
         ciphertext: Vec<u8>,
     ) -> Self {
         let ciphertext_sha256: [u8; 32] = Sha256::digest(&ciphertext).into();
         // The canonical snapshot/digest are not persisted by the executor for a
-        // creation snapshot (the DB stores nonce/ciphertext/hash + author cols);
+        // self-origin snapshot (the DB stores nonce/ciphertext/hash + author cols);
         // use a stable, self-consistent placeholder so equality/debug hold.
         let canonical_snapshot = ciphertext.clone();
         let digest: [u8; 32] = Sha256::digest(&canonical_snapshot).into();
         Self {
             coordinate: MetadataCryptoCoordinate {
                 conversation_id,
-                generation: 0,
+                generation,
                 epoch: 0,
                 group_context_hash,
             },
             origin_transition_id: transition_id,
-            metadata_version: 1,
+            metadata_version,
             nonce,
             ciphertext,
             ciphertext_sha256,
@@ -9904,6 +9907,43 @@ impl TransitionEvidence {
             manifest: RosterManifestBinding {
                 participants: Vec::new(),
                 actor_leaf: creator,
+            },
+            group_info_sha256: [0u8; 32],
+            metadata,
+        });
+        Ok(evidence)
+    }
+
+    /// A `resetActivation` `TransitionEvidence` carrying the exact `ResetActivation`
+    /// body a real activation produces (matching kind/reset_request_id/prior/
+    /// retired/successor coordinates + the successor metadata snapshot).
+    /// `authority` stays `None`, which `require_reset_activation_body` accepts
+    /// while still requiring those coordinate fields to match.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_test_reset_activation_with_metadata(
+        seq: u64,
+        transition_id: [u8; 16],
+        outer_entry_fingerprint: [u8; 32],
+        received_at: ServerTimestamp,
+        kind: ConversationKind,
+        reset_request_id: [u8; 16],
+        prior: PublicGroupSnapshotCoordinate,
+        retired: PublicGroupSnapshotCoordinate,
+        successor: PublicGroupSnapshotCoordinate,
+        activator: DeviceIdentity,
+        metadata: MetadataSnapshotBinding,
+    ) -> Result<Self, StateMachineError> {
+        let mut evidence =
+            Self::for_test_at(seq, transition_id, outer_entry_fingerprint, received_at)?;
+        evidence.body_binding = Some(TransitionBodyBinding::ResetActivation {
+            kind,
+            reset_request_id,
+            prior,
+            retired,
+            successor,
+            manifest: RosterManifestBinding {
+                participants: Vec::new(),
+                actor_leaf: activator,
             },
             group_info_sha256: [0u8; 32],
             metadata,
@@ -12776,7 +12816,8 @@ mod executor {
         NewGenerationState, NewLeafPeriod, NewMetadataSnapshot, NewParticipantPeriod,
         NewResetRequest, NewTransition, ParticipantInvitation,
         ParticipantRole as RepoParticipantRole, ParticipantStatus as RepoParticipantStatus,
-        TransitionActorRole, TransitionCoordinates, TransitionKind, TransitionRepositoryError,
+        ResetRequestTermination, TransitionActorRole, TransitionCoordinates, TransitionKind,
+        TransitionRepositoryError,
     };
     use super::{
         CloseKind, ConversationKind, DeviceIdentity, LeafHydrationRow, MetadataSnapshotBinding,
@@ -13098,7 +13139,21 @@ mod executor {
                 )
                 .await
             }
-            PlanKind::ResetActivation => Err(ExecutorError::UnsupportedEffect("resetActivation")),
+            PlanKind::ResetActivation => {
+                apply_reset_activation(
+                    transaction,
+                    plan,
+                    ctx,
+                    conversation_id,
+                    transition_id,
+                    seq_i64,
+                    successor_next_entry_seq,
+                    generation,
+                    state_version,
+                    epoch,
+                )
+                .await
+            }
             PlanKind::LeaveRequest => Err(ExecutorError::UnsupportedEffect("leaveRequest")),
             PlanKind::LeaveCancellation => {
                 Err(ExecutorError::UnsupportedEffect("leaveCancellation"))
@@ -13627,6 +13682,11 @@ mod executor {
                 "close revocation/welcome CAS",
             ));
         }
+        if effects.invitation_quota_cas().is_some() {
+            return Err(ExecutorError::UnsupportedEffect(
+                "close invitation quota CAS",
+            ));
+        }
 
         // 1. Head CAS to superseded with the exact close coordinate.
         transition::cas_conversation_head(
@@ -13873,9 +13933,25 @@ mod executor {
         reject_if_present("reservation_changes", effects.reservation_changes())?;
         reject_if_present("leave_request_changes", effects.leave_request_changes())?;
         reject_if_present("welcome_changes", effects.welcome_changes())?;
+        reject_if_present("package_transitions", effects.package_transitions())?;
+        reject_if_present("recovery_package_cas", effects.recovery_package_cas())?;
+        reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
         if effects.metadata_change().is_some() {
             return Err(ExecutorError::UnsupportedEffect(
                 "reset request metadata change",
+            ));
+        }
+        // Complete defensive dispatch (E2b-4 review): a resetRequest plan carries
+        // none of these; production `into_persistence_plan` forces them empty/None.
+        // Guarding them keeps this path in the same no-silent-skip class as the rest.
+        if effects.revocation_target_cas().is_some() || effects.welcome_cas().is_some() {
+            return Err(ExecutorError::UnsupportedEffect(
+                "reset request revocation/welcome CAS",
+            ));
+        }
+        if effects.invitation_quota_cas().is_some() {
+            return Err(ExecutorError::UnsupportedEffect(
+                "reset request invitation quota CAS",
             ));
         }
         let row = ctx
@@ -13958,6 +14034,449 @@ mod executor {
             event_positions,
             successor_coordinate: plan.successor_coordinate().copied(),
         })
+    }
+
+    /// Apply a `resetActivation` edge: retire the old generation and activate a
+    /// fresh one. Retired gen_state (`stateVersion+1`, superseded) + a new
+    /// generation at `generation+1` (epoch 0, fresh group/hash/tag) + successor
+    /// gen_state (sv 0, active) + head CAS to the successor pointer; close every
+    /// still-open old interval at the reset seq and open ONLY the activator's
+    /// successor interval at the same seq (touching `Reset -> Reset`); close every
+    /// old-generation leaf and install the activator's new genesis leaf;
+    /// terminalize the pending reset request as consumed.
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_reset_activation(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        plan: &ConversationPersistencePlan,
+        ctx: &ExecutionContext,
+        conversation_id: Uuid,
+        transition_id: Uuid,
+        seq_i64: i64,
+        successor_next_entry_seq: i64,
+        generation: i64,
+        state_version: i64,
+        epoch: i64,
+    ) -> Result<AppliedTransition, ExecutorError> {
+        let effects = plan.effects();
+        let hydration = plan.state();
+        let coordinate = &hydration.coordinate; // successor coordinate.
+        let applied_at = ctx.applied_at;
+        let head = effects
+            .head_cas()
+            .ok_or(ExecutorError::InconsistentPlan("missing head CAS binding"))?;
+        let prior = head
+            .expected_prior()
+            .ok_or(ExecutorError::InconsistentPlan(
+                "reset activation needs a prior",
+            ))?;
+        let retired = plan
+            .retired_coordinate()
+            .ok_or(ExecutorError::InconsistentPlan(
+                "reset activation needs a retired coordinate",
+            ))?;
+        let prior_generation = checked_i64(prior.generation())?;
+        let prior_state_version = checked_i64(prior.state_version())?;
+        let retired_generation = checked_i64(retired.generation())?;
+        let retired_state_version = checked_i64(retired.state_version())?;
+        let expected_next_entry_seq = checked_i64(head.expected_next_entry_seq())?;
+
+        // Reset activation carries no participant/leave/welcome change on the
+        // simple path; recovery supersession would appear as recovery/reservation
+        // deltas, which this slice does not yet compose.
+        reject_if_present("participant_changes", effects.participant_changes())?;
+        reject_if_present("leave_request_changes", effects.leave_request_changes())?;
+        reject_if_present("welcome_changes", effects.welcome_changes())?;
+        reject_if_present(
+            "recovery_request_changes",
+            effects.recovery_request_changes(),
+        )?;
+        reject_if_present("reservation_changes", effects.reservation_changes())?;
+        reject_if_present("package_transitions", effects.package_transitions())?;
+        reject_if_present("recovery_package_cas", effects.recovery_package_cas())?;
+        reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
+        reject_if_present("terminal_proof_changes", effects.terminal_proof_changes())?;
+        if effects.revocation_target_cas().is_some() || effects.welcome_cas().is_some() {
+            return Err(ExecutorError::UnsupportedEffect(
+                "reset revocation/welcome CAS",
+            ));
+        }
+        if effects.metadata_change().is_none() {
+            return Err(ExecutorError::InconsistentPlan(
+                "reset activation carries no metadata",
+            ));
+        }
+        if effects.invitation_quota_cas().is_some() {
+            return Err(ExecutorError::UnsupportedEffect(
+                "reset invitation quota CAS",
+            ));
+        }
+        // Exactly one pending reset request is consumed.
+        let consumed_request = effects
+            .reset_request_changes()
+            .iter()
+            .find_map(|change| match (change.before(), change.after()) {
+                (Some(_), Some(after)) => Some(after),
+                _ => None,
+            })
+            .ok_or(ExecutorError::InconsistentPlan(
+                "reset activation consumes no pending reset request",
+            ))?;
+        let reset_request_id = Uuid::from_bytes(consumed_request.request_id);
+        let metadata = effects
+            .metadata_change()
+            .and_then(StateChange::after)
+            .ok_or(ExecutorError::InconsistentPlan(
+                "reset activation carries no metadata",
+            ))?;
+        let author_cols = ctx
+            .metadata_author
+            .as_ref()
+            .ok_or(ExecutorError::MissingContext(
+                "reset metadata author columns",
+            ))?;
+
+        // 1. Head CAS to the successor pointer (generation+1, stateVersion 0).
+        transition::cas_conversation_head(
+            transaction,
+            &transition::ConversationHeadCas {
+                conversation_id,
+                expected_generation: prior_generation,
+                expected_state_version: prior_state_version,
+                expected_next_entry_seq,
+                successor_generation: generation,
+                successor_state_version: state_version,
+                successor_next_entry_seq,
+                close: None,
+            },
+        )
+        .await?;
+
+        // 2. Supersede the old generation (points at the retired state).
+        transition::supersede_generation(
+            transaction,
+            &GenerationSupersede {
+                conversation_id,
+                generation: prior_generation,
+                expected_state_version: prior_state_version,
+                successor_state_version: retired_state_version,
+                superseded_seq: seq_i64,
+                superseded_at: applied_at,
+            },
+        )
+        .await?;
+
+        // 3. Retired generation state (old crypto, superseded, resetRetirement).
+        transition::insert_generation_state_row(
+            transaction,
+            &NewGenerationState {
+                conversation_id,
+                generation: retired_generation,
+                state_version: retired_state_version,
+                group_id: prior.group_id().to_vec(),
+                epoch: checked_i64(prior.epoch())?,
+                group_context_hash: prior.group_context_hash().to_vec(),
+                confirmation_tag: prior.confirmation_tag().to_vec(),
+                lifecycle: GenerationStateLifecycle::Superseded,
+                state_kind: GenerationStateKind::ResetRetirement,
+                producing_transition_id: transition_id,
+                public_snapshot_bytes: ctx.spine.public_snapshot_bytes.clone(),
+                snapshot_sha256: ctx.spine.public_snapshot_sha256.clone(),
+                tree_summary_bytes: ctx.spine.tree_summary_bytes.clone(),
+                tree_summary_sha256: ctx.spine.tree_summary_sha256.clone(),
+                leaf_count: ctx.spine.leaf_count,
+                created_at: applied_at,
+            },
+        )
+        .await?;
+
+        // 4. Fresh successor generation (epoch 0, fresh group id).
+        transition::insert_generation(
+            transaction,
+            &NewGeneration {
+                conversation_id,
+                generation,
+                group_id: coordinate.group_id().to_vec(),
+                genesis_group_info_bytes: ctx.spine.genesis_group_info_bytes.clone(),
+                genesis_group_info_sha256: ctx.spine.genesis_group_info_sha256.clone(),
+                current_state_version: state_version,
+                activated_seq: seq_i64,
+                activated_at: applied_at,
+            },
+        )
+        .await?;
+
+        // 5. Successor generation state (fresh crypto, active, resetSuccessor).
+        transition::insert_generation_state_row(
+            transaction,
+            &NewGenerationState {
+                conversation_id,
+                generation,
+                state_version,
+                group_id: coordinate.group_id().to_vec(),
+                epoch,
+                group_context_hash: coordinate.group_context_hash().to_vec(),
+                confirmation_tag: coordinate.confirmation_tag().to_vec(),
+                lifecycle: GenerationStateLifecycle::Active,
+                state_kind: GenerationStateKind::ResetSuccessor,
+                producing_transition_id: transition_id,
+                public_snapshot_bytes: ctx.spine.public_snapshot_bytes.clone(),
+                snapshot_sha256: ctx.spine.public_snapshot_sha256.clone(),
+                tree_summary_bytes: ctx.spine.tree_summary_bytes.clone(),
+                tree_summary_sha256: ctx.spine.tree_summary_sha256.clone(),
+                leaf_count: ctx.spine.leaf_count,
+                created_at: applied_at,
+            },
+        )
+        .await?;
+
+        // 6. Entry (resetActivationEntry).
+        let append = build_append_entry(
+            ctx,
+            conversation_id,
+            generation,
+            state_version,
+            transition_id,
+        );
+        delivery::append_entry_at(transaction, &append, u64::try_from(seq_i64).unwrap()).await?;
+
+        // 7. Transition (prior -> retired + successor; carries the reset request).
+        transition::insert_transition_row(
+            transaction,
+            &NewTransition {
+                transition_id,
+                conversation_id,
+                kind: TransitionKind::ResetActivation,
+                actor_did: ctx.actor.user_did.clone(),
+                actor_device_id: ctx.actor.device_id,
+                actor_key_id: ctx.actor.key_id.clone(),
+                actor_auth_generation: ctx.actor.auth_generation,
+                actor_role: ctx.actor.role,
+                actor_device_status: ctx.actor.device_status.clone(),
+                signed_request_bytes: ctx.entry.signed_request_bytes.clone(),
+                unsigned_projection_bytes: ctx.entry.unsigned_projection_bytes.clone(),
+                signing_transcript_bytes: ctx.entry.signing_transcript_bytes.clone(),
+                request_digest: ctx.entry.request_digest.clone(),
+                signature: ctx.entry.signature.clone(),
+                coordinates: TransitionCoordinates {
+                    // resetActivation: next == successor (both point at the fresh
+                    // generation), retired == (prior_gen, prior_sv + 1).
+                    prior: Some((prior_generation, prior_state_version)),
+                    next: Some((generation, state_version)),
+                    retired: Some((retired_generation, retired_state_version)),
+                    successor: Some((generation, state_version)),
+                },
+                reset_request_id: Some(reset_request_id),
+                close_transition_id: None,
+                metadata_snapshot_id: Some(author_cols.metadata_snapshot_id),
+                entry_seq: seq_i64,
+                accepted_at: applied_at,
+            },
+        )
+        .await?;
+
+        // 8. Successor metadata snapshot (self-origin, version from the binding).
+        write_creation_metadata_snapshot(
+            transaction,
+            metadata,
+            author_cols,
+            &ctx.actor,
+            conversation_id,
+            generation,
+            state_version,
+            epoch,
+            &coordinate.group_id().to_vec(),
+            &coordinate.group_context_hash().to_vec(),
+            &coordinate.confirmation_tag().to_vec(),
+            transition_id,
+            seq_i64,
+            applied_at,
+        )
+        .await?;
+
+        // 9. Close every old-generation leaf (facade-supplied) and install the
+        //    successor genesis leaf(s). `leaf_changes` is a same-content diff that
+        //    under-reports the generation change (the activator's new leaf has the
+        //    same credential/index/keys as its old leaf), so the reset leaf ops are
+        //    driven authoritatively by ctx.closing_leaf_periods + the successor
+        //    hydration leaves rather than by the delta.
+        for (device, old_leaf) in &ctx.closing_leaf_periods {
+            let _ = device;
+            transition::close_leaf_period(
+                transaction,
+                &LeafClose {
+                    leaf_period_id: *old_leaf,
+                    removed_state_version: retired_state_version,
+                    removed_transition_id: transition_id,
+                    removed_seq: seq_i64,
+                    removed_at: applied_at,
+                },
+            )
+            .await?;
+        }
+        for (index, row) in hydration.leaves.iter().enumerate() {
+            let leaf_period_id = *ctx
+                .leaf_period_ids
+                .get(index)
+                .ok_or(ExecutorError::MissingContext("successor leaf period id"))?;
+            write_successor_leaf(
+                transaction,
+                ctx,
+                hydration,
+                row,
+                leaf_period_id,
+                conversation_id,
+                generation,
+                transition_id,
+                state_version,
+                seq_i64,
+                applied_at,
+            )
+            .await?;
+        }
+
+        // 10. Close old open intervals (Reset), open the activator's new one (Reset).
+        for change in effects.interval_changes() {
+            match (change.before(), change.after()) {
+                (Some(_), Some(after)) => {
+                    let end = after.end().ok_or(ExecutorError::InconsistentPlan(
+                        "reset closed interval has no end",
+                    ))?;
+                    let leaf = closing_leaf_period(ctx, after.recipient())?;
+                    delivery::close_application_interval(
+                        transaction,
+                        &ApplicationIntervalClose {
+                            membership_interval_id: Uuid::from_bytes(
+                                *after.opening_transition_id(),
+                            ),
+                            terminal_seq: checked_i64(end.seq())?,
+                            closing_state_version: retired_state_version,
+                            closing_transition_id: Uuid::from_bytes(*end.transition_id()),
+                            closing_outer_entry_fingerprint: end.outer_entry_fingerprint().to_vec(),
+                            closing_kind: repo_interval_close_kind(end.kind()),
+                            closing_leaf_period_id: leaf,
+                            removed_at: applied_at,
+                        },
+                    )
+                    .await?;
+                }
+                (None, Some(after)) => {
+                    let opening_context = after.opening_context();
+                    let opening_leaf_period_id =
+                        *ctx.leaf_period_ids
+                            .first()
+                            .ok_or(ExecutorError::MissingContext(
+                                "successor interval leaf period",
+                            ))?;
+                    delivery::insert_application_interval(
+                        transaction,
+                        &NewApplicationInterval {
+                            membership_interval_id: Uuid::from_bytes(
+                                *after.opening_transition_id(),
+                            ),
+                            conversation_id,
+                            generation: checked_i64(opening_context.generation())?,
+                            recipient_did: device_did(after.recipient())?,
+                            recipient_device_id: device_uuid(after.recipient()),
+                            start_seq: checked_i64(after.opening_seq())?,
+                            opening_kind: IntervalOpeningKind::Reset,
+                            opening_transition_id: Uuid::from_bytes(*after.opening_transition_id()),
+                            opening_outer_entry_fingerprint: after
+                                .opening_outer_entry_fingerprint()
+                                .to_vec(),
+                            opening_state_version: checked_i64(opening_context.state_version())?,
+                            opening_group_id: opening_context.group_id().to_vec(),
+                            opening_epoch: checked_i64(opening_context.epoch())?,
+                            opening_group_context_hash: opening_context
+                                .group_context_hash()
+                                .to_vec(),
+                            opening_confirmation_tag: opening_context.confirmation_tag().to_vec(),
+                            opening_leaf_period_id,
+                            created_at: applied_at,
+                        },
+                    )
+                    .await?;
+                }
+                _ => {
+                    return Err(ExecutorError::UnsupportedEffect(
+                        "reset interval change shape",
+                    ))
+                }
+            }
+        }
+
+        // 11. Terminalize the pending reset request as consumed.
+        transition::terminalize_reset_request(
+            transaction,
+            reset_request_id,
+            &ResetRequestTermination::Consumed {
+                terminal_transition_id: transition_id,
+                terminal_at: applied_at,
+            },
+        )
+        .await?;
+
+        // 12. Audience + event.
+        let recipients = build_entry_recipients(&ctx.entry_recipients)?;
+        delivery::insert_entry_recipients(
+            transaction,
+            conversation_id,
+            u64::try_from(seq_i64).unwrap(),
+            &recipients,
+        )
+        .await?;
+        let event_positions = write_events(transaction, ctx).await?;
+
+        Ok(AppliedTransition {
+            allocated_seq: u64::try_from(seq_i64).unwrap(),
+            entry_id: ctx.entry.entry_id,
+            event_positions,
+            successor_coordinate: plan.successor_coordinate().copied(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn write_successor_leaf(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        ctx: &ExecutionContext,
+        hydration: &ConversationStateHydration,
+        row: &LeafHydrationRow,
+        leaf_period_id: Uuid,
+        conversation_id: Uuid,
+        generation: i64,
+        transition_id: Uuid,
+        state_version: i64,
+        seq_i64: i64,
+        applied_at: DateTime<Utc>,
+    ) -> Result<(), ExecutorError> {
+        let cols = ctx
+            .opened_leaves
+            .iter()
+            .find(|cols| cols.device == row.device)
+            .ok_or(ExecutorError::MissingContext("successor leaf columns"))?;
+        let participant_period_id = participant_period_for(ctx, hydration, row.device.principal())?;
+        transition::insert_leaf_period(
+            transaction,
+            &NewLeafPeriod {
+                leaf_period_id,
+                participant_period_id,
+                conversation_id,
+                generation,
+                user_did: device_did(&row.device)?,
+                device_id: device_uuid(&row.device),
+                leaf_index: checked_i64(u64::from(row.leaf_index))?,
+                basic_credential: row.basic_credential.clone(),
+                leaf_signature_key: row.signature_key.clone(),
+                leaf_key_id: cols.leaf_key_id.clone(),
+                leaf_auth_generation: cols.leaf_auth_generation,
+                origin: LeafOrigin::Genesis,
+                joined_state_version: state_version,
+                joined_transition_id: transition_id,
+                joined_seq: seq_i64,
+                created_at: applied_at,
+            },
+        )
+        .await?;
+        Ok(())
     }
 
     fn closing_leaf_period(
@@ -14065,8 +14584,12 @@ mod executor {
                 group_context_hash: group_context_hash.to_vec(),
                 confirmation_tag: confirmation_tag.to_vec(),
                 producing_transition_id: transition_id,
+                // Self-origin snapshot: creation (version 1) and reset activation
+                // (fresh, version prior+1) both set origin_transition_id to the
+                // producing transition and author = the actor; the version comes
+                // from the plan's binding so this serves both edges.
                 origin_transition_id: transition_id,
-                metadata_version: 1,
+                metadata_version: checked_i64(metadata.metadata_version())?,
                 nonce: metadata.nonce().to_vec(),
                 ciphertext_sha256: metadata.ciphertext_sha256().to_vec(),
                 ciphertext,
