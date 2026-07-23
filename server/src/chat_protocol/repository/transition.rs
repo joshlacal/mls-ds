@@ -1751,3 +1751,326 @@ fn split_coordinate(pair: Option<(i64, i64)>) -> (Option<i64>, Option<i64>) {
         None => (None, None),
     }
 }
+
+// ===========================================================================
+// Family 8 — the conversation-head and generation spine the executor owns.
+//
+// No writer previously existed for `chat.conversations` (the head) or
+// `chat.generations`; the transition executor (task E2b) is their first
+// in-crate consumer. They are added here in the same dumb-SQL / closed-enum
+// E2a style: the head write is the single authority that advances
+// `next_entry_seq` (the seq seam), and the generation writers own the
+// per-generation lifecycle spine the deferred pointer-agreement triggers check.
+// ===========================================================================
+
+/// Conversation kind for a freshly created head row. Mirrors
+/// `conversations_kind_check` / `conversations_kind_shape_check`: a `direct`
+/// head carries the canonical unordered DID pair; a `group` head carries none.
+#[derive(Clone, Debug)]
+pub(crate) enum ConversationHeadKind {
+    Direct {
+        direct_did_low: String,
+        direct_did_high: String,
+    },
+    Group,
+}
+
+impl ConversationHeadKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Direct { .. } => "direct",
+            Self::Group => "group",
+        }
+    }
+
+    fn direct_pair(&self) -> (Option<&str>, Option<&str>) {
+        match self {
+            Self::Direct {
+                direct_did_low,
+                direct_did_high,
+            } => (Some(direct_did_low), Some(direct_did_high)),
+            Self::Group => (None, None),
+        }
+    }
+}
+
+/// One freshly created `chat.conversations` head row. The insert always writes
+/// `lifecycle = 'active'` with NULL close provenance and the caller-chosen
+/// `next_entry_seq` (which the executor sets to the plan's
+/// `successor_next_entry_seq`, since the genesis entry consumes the allocated
+/// seq). The deferred `conversations_current_state_fk` and the pointer-agreement
+/// triggers remain the DB's authority.
+#[derive(Clone, Debug)]
+pub(crate) struct NewConversationHead {
+    pub(crate) conversation_id: Uuid,
+    pub(crate) kind: ConversationHeadKind,
+    pub(crate) current_generation: i64,
+    pub(crate) current_state_version: i64,
+    pub(crate) next_entry_seq: i64,
+    pub(crate) created_at: DateTime<Utc>,
+}
+
+pub(crate) async fn insert_conversation_head(
+    transaction: &mut Transaction<'_, Postgres>,
+    head: &NewConversationHead,
+) -> Result<(), TransitionRepositoryError> {
+    let (direct_did_low, direct_did_high) = head.kind.direct_pair();
+    sqlx::query(
+        r#"
+        INSERT INTO chat.conversations(
+            conversation_id, kind, lifecycle, current_generation,
+            current_state_version, next_entry_seq, direct_did_low, direct_did_high,
+            created_at, close_transition_id, close_generation, close_state_version,
+            close_seq, closed_at
+        ) VALUES (
+            $1, $2, 'active', $3, $4, $5, $6, $7, $8, NULL, NULL, NULL, NULL, NULL
+        )
+        "#,
+    )
+    .bind(head.conversation_id)
+    .bind(head.kind.as_str())
+    .bind(head.current_generation)
+    .bind(head.current_state_version)
+    .bind(head.next_entry_seq)
+    .bind(direct_did_low)
+    .bind(direct_did_high)
+    .bind(head.created_at)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+/// The optional terminal close block a head compare-and-set may carry. Present
+/// only for `closeConversation`, which flips the head to `superseded` and
+/// records the exact close coordinate (`conversations_close_shape_check`).
+#[derive(Clone, Debug)]
+pub(crate) struct ConversationHeadClose {
+    pub(crate) close_transition_id: Uuid,
+    pub(crate) close_generation: i64,
+    pub(crate) close_state_version: i64,
+    pub(crate) close_seq: i64,
+    pub(crate) closed_at: DateTime<Utc>,
+}
+
+/// Compare-and-set the conversation head across one legal coordinate edge.
+///
+/// Matches only a head whose `(current_generation, current_state_version,
+/// next_entry_seq, lifecycle)` all equal the expected prior; a stale or drifted
+/// head (a concurrent edge already advanced it, or it was already closed)
+/// matches nothing and is a typed `CompareAndSetConflict`. This is the seq
+/// seam's single counter authority for an existing conversation: it advances
+/// `next_entry_seq` from `expected_next_entry_seq` (= the plan's `allocated_seq`)
+/// to `successor_next_entry_seq`. The `close` block, when present, additionally
+/// flips `lifecycle` to `superseded` and records the close coordinate.
+#[derive(Clone, Debug)]
+pub(crate) struct ConversationHeadCas {
+    pub(crate) conversation_id: Uuid,
+    pub(crate) expected_generation: i64,
+    pub(crate) expected_state_version: i64,
+    pub(crate) expected_next_entry_seq: i64,
+    pub(crate) successor_generation: i64,
+    pub(crate) successor_state_version: i64,
+    pub(crate) successor_next_entry_seq: i64,
+    pub(crate) close: Option<ConversationHeadClose>,
+}
+
+pub(crate) async fn cas_conversation_head(
+    transaction: &mut Transaction<'_, Postgres>,
+    cas: &ConversationHeadCas,
+) -> Result<(), TransitionRepositoryError> {
+    let (
+        successor_lifecycle,
+        close_transition_id,
+        close_generation,
+        close_state_version,
+        close_seq,
+        closed_at,
+    ) = match &cas.close {
+        Some(close) => (
+            "superseded",
+            Some(close.close_transition_id),
+            Some(close.close_generation),
+            Some(close.close_state_version),
+            Some(close.close_seq),
+            Some(close.closed_at),
+        ),
+        None => ("active", None, None, None, None, None),
+    };
+
+    let result = sqlx::query(
+        r#"
+        UPDATE chat.conversations
+           SET current_generation = $5,
+               current_state_version = $6,
+               next_entry_seq = $7,
+               lifecycle = $8,
+               close_transition_id = $9,
+               close_generation = $10,
+               close_state_version = $11,
+               close_seq = $12,
+               closed_at = $13
+         WHERE conversation_id = $1
+           AND current_generation = $2
+           AND current_state_version = $3
+           AND next_entry_seq = $4
+           AND lifecycle = 'active'
+        "#,
+    )
+    .bind(cas.conversation_id)
+    .bind(cas.expected_generation)
+    .bind(cas.expected_state_version)
+    .bind(cas.expected_next_entry_seq)
+    .bind(cas.successor_generation)
+    .bind(cas.successor_state_version)
+    .bind(cas.successor_next_entry_seq)
+    .bind(successor_lifecycle)
+    .bind(close_transition_id)
+    .bind(close_generation)
+    .bind(close_state_version)
+    .bind(close_seq)
+    .bind(closed_at)
+    .execute(&mut **transaction)
+    .await?;
+
+    if result.rows_affected() != 1 {
+        return Err(TransitionRepositoryError::CompareAndSetConflict);
+    }
+    Ok(())
+}
+
+/// One freshly activated `chat.generations` row (creation or reset successor).
+/// The insert always writes `lifecycle = 'active'` with NULL supersede
+/// provenance; `activated_seq` equals the producing transition's entry seq and
+/// `activated_at` equals its accepted instant (both checked by the deferred
+/// state-output trigger). `current_state_version` starts at the successor's
+/// state version (0 for a fresh generation).
+#[derive(Clone, Debug)]
+pub(crate) struct NewGeneration {
+    pub(crate) conversation_id: Uuid,
+    pub(crate) generation: i64,
+    pub(crate) group_id: Vec<u8>,
+    pub(crate) genesis_group_info_bytes: Vec<u8>,
+    pub(crate) genesis_group_info_sha256: Vec<u8>,
+    pub(crate) current_state_version: i64,
+    pub(crate) activated_seq: i64,
+    pub(crate) activated_at: DateTime<Utc>,
+}
+
+pub(crate) async fn insert_generation(
+    transaction: &mut Transaction<'_, Postgres>,
+    generation: &NewGeneration,
+) -> Result<(), TransitionRepositoryError> {
+    sqlx::query(
+        r#"
+        INSERT INTO chat.generations(
+            conversation_id, generation, group_id, lifecycle,
+            genesis_group_info_bytes, genesis_group_info_sha256,
+            current_state_version, activated_seq, activated_at,
+            superseded_seq, superseded_at
+        ) VALUES (
+            $1, $2, $3, 'active', $4, $5, $6, $7, $8, NULL, NULL
+        )
+        "#,
+    )
+    .bind(generation.conversation_id)
+    .bind(generation.generation)
+    .bind(&generation.group_id)
+    .bind(&generation.genesis_group_info_bytes)
+    .bind(&generation.genesis_group_info_sha256)
+    .bind(generation.current_state_version)
+    .bind(generation.activated_seq)
+    .bind(generation.activated_at)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+/// Advance an active generation's `current_state_version` pointer within the
+/// same generation (policy / acceptConversation / metadata / leavePolicy — every
+/// same-generation `stateVersion+1` edge). Matches only a still-active
+/// generation whose `current_state_version` equals the expected prior; a drifted
+/// pointer matches nothing and is a typed conflict. The deferred
+/// generation-pointer-agreement trigger requires the new pointer to equal the
+/// max produced state version and to point at an active state row.
+#[derive(Clone, Debug)]
+pub(crate) struct GenerationStateVersionCas {
+    pub(crate) conversation_id: Uuid,
+    pub(crate) generation: i64,
+    pub(crate) expected_state_version: i64,
+    pub(crate) successor_state_version: i64,
+}
+
+pub(crate) async fn cas_generation_state_version(
+    transaction: &mut Transaction<'_, Postgres>,
+    cas: &GenerationStateVersionCas,
+) -> Result<(), TransitionRepositoryError> {
+    let result = sqlx::query(
+        r#"
+        UPDATE chat.generations
+           SET current_state_version = $4
+         WHERE conversation_id = $1
+           AND generation = $2
+           AND current_state_version = $3
+           AND lifecycle = 'active'
+        "#,
+    )
+    .bind(cas.conversation_id)
+    .bind(cas.generation)
+    .bind(cas.expected_state_version)
+    .bind(cas.successor_state_version)
+    .execute(&mut **transaction)
+    .await?;
+
+    if result.rows_affected() != 1 {
+        return Err(TransitionRepositoryError::CompareAndSetConflict);
+    }
+    Ok(())
+}
+
+/// Supersede an active generation, recording the superseding seq/instant and its
+/// final `current_state_version` pointer. Used by `closeConversation` (the
+/// generation goes terminal with the conversation) and by reset retirement (the
+/// old generation is superseded as its successor activates). Matches only a
+/// still-active generation whose `current_state_version` equals the expected
+/// prior; a drifted or already-superseded generation is a typed conflict.
+#[derive(Clone, Debug)]
+pub(crate) struct GenerationSupersede {
+    pub(crate) conversation_id: Uuid,
+    pub(crate) generation: i64,
+    pub(crate) expected_state_version: i64,
+    pub(crate) successor_state_version: i64,
+    pub(crate) superseded_seq: i64,
+    pub(crate) superseded_at: DateTime<Utc>,
+}
+
+pub(crate) async fn supersede_generation(
+    transaction: &mut Transaction<'_, Postgres>,
+    supersede: &GenerationSupersede,
+) -> Result<(), TransitionRepositoryError> {
+    let result = sqlx::query(
+        r#"
+        UPDATE chat.generations
+           SET lifecycle = 'superseded',
+               current_state_version = $4,
+               superseded_seq = $5,
+               superseded_at = $6
+         WHERE conversation_id = $1
+           AND generation = $2
+           AND current_state_version = $3
+           AND lifecycle = 'active'
+        "#,
+    )
+    .bind(supersede.conversation_id)
+    .bind(supersede.generation)
+    .bind(supersede.expected_state_version)
+    .bind(supersede.successor_state_version)
+    .bind(supersede.superseded_seq)
+    .bind(supersede.superseded_at)
+    .execute(&mut **transaction)
+    .await?;
+
+    if result.rows_affected() != 1 {
+        return Err(TransitionRepositoryError::CompareAndSetConflict);
+    }
+    Ok(())
+}

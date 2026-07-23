@@ -12445,3 +12445,939 @@ fn would_remove_last_active_admin(state: &ConversationState, principal: &Princip
         .count()
         == 1
 }
+
+// ===========================================================================
+// Task E2b-2 — the transition executor: apply_conversation_persistence_plan.
+//
+// This is the composition seam. It lives inside `state_machine.rs` (the
+// protocol's "only writer") because it reads the plan's PRIVATE evidence types
+// without widening any type surface, then delegates the raw SQL to the E2a
+// (`repository::transition`) and E1 + E2b-1 (`repository::delivery`) dumb-SQL
+// writers. It is transaction-scoped: it never begins or commits the outer
+// transaction, so failure paths stay testable (the caller owns commit/rollback).
+//
+// This module is gated `#[cfg(not(test))]` — identical to `into_persistence_plan`
+// and every other `super::repository::*` consumer in this file. That gating is
+// exactly why the lib unit-test build and `tests/chat_protocol_state_machine.rs`
+// (which `include!`s this file under `cfg(test)`) compile without a `repository`
+// module in scope. See the E2b-2 report §1.6 / §3 for the integration-harness
+// consequence.
+// ===========================================================================
+
+#[cfg(not(test))]
+pub(crate) use executor::{
+    apply_conversation_persistence_plan, AppliedTransition, ControlEntryContent, EventFanout,
+    ExecutionActor, ExecutionContext, ExecutorError, LeafPersistenceColumns, MetadataAuthorColumns,
+    SpineArtifacts,
+};
+
+#[cfg(not(test))]
+mod executor {
+    use chrono::{DateTime, Utc};
+    use uuid::Uuid;
+
+    use std::collections::HashMap;
+
+    use super::super::repository::delivery::{
+        self as delivery, AppendEntry, DeliveryRepositoryError, EntryEntitlementKind,
+        EntryRecipient, EventEntitlementKind, EventKind, EventRecipient, IntervalOpeningKind,
+        NewApplicationInterval, NewEvent, OutboxWorkKind,
+    };
+    use super::super::repository::transition::{
+        self as transition, ConversationHeadKind, GenerationStateKind, GenerationStateLifecycle,
+        LeafOrigin, NewGeneration, NewGenerationState, NewLeafPeriod, NewMetadataSnapshot,
+        NewParticipantPeriod, NewTransition, ParticipantInvitation,
+        ParticipantRole as RepoParticipantRole, ParticipantStatus as RepoParticipantStatus,
+        TransitionActorRole, TransitionCoordinates, TransitionKind, TransitionRepositoryError,
+    };
+    use super::{
+        ConversationKind, DeviceIdentity, LeafHydrationRow, MetadataSnapshotBinding,
+        ParticipantHydrationRow, ParticipantRole, ParticipantStatus, PlanKind, PrincipalId,
+        PublicGroupSnapshotCoordinate, ServerTimestamp, StateChange, TransitionEffects,
+    };
+    use super::{ConversationPersistencePlan, ConversationStateHydration};
+
+    /// Failures the executor surfaces. Repository errors propagate typed; the
+    /// executor's own contract violations (an effect family the current
+    /// composition does not persist, a missing context input, a coordinate that
+    /// overflows `i64`) are distinct so a caller can tell a CAS conflict from a
+    /// programming/plan-shape error.
+    #[derive(Debug)]
+    pub(crate) enum ExecutorError {
+        /// A `repository::transition` writer failed (including its typed
+        /// `CompareAndSetConflict` — the head/spine CAS lost a race or drifted).
+        Transition(TransitionRepositoryError),
+        /// A `repository::delivery` writer failed (append/audience/event, or its
+        /// typed `CompareAndSetConflict`).
+        Delivery(DeliveryRepositoryError),
+        /// The plan carried a non-empty effect family this executor does not yet
+        /// persist. Emitted as a HARD error rather than silently dropped, so a
+        /// future planner change cannot lose writes. Carries the family name.
+        UnsupportedEffect(&'static str),
+        /// The plan was internally inconsistent for the executor's contract
+        /// (e.g. a creation plan without a head CAS binding or without the
+        /// required metadata snapshot). Never a silent skip.
+        InconsistentPlan(&'static str),
+        /// An `ExecutionContext` input required for a row was absent (e.g. no
+        /// leaf-auth-generation for an opened leaf).
+        MissingContext(&'static str),
+        /// A protocol integer or timestamp fell outside the safe `i64` range.
+        ValueOutOfRange,
+    }
+
+    impl From<TransitionRepositoryError> for ExecutorError {
+        fn from(error: TransitionRepositoryError) -> Self {
+            Self::Transition(error)
+        }
+    }
+
+    impl From<DeliveryRepositoryError> for ExecutorError {
+        fn from(error: DeliveryRepositoryError) -> Self {
+            Self::Delivery(error)
+        }
+    }
+
+    /// The actor's identity + auth-sourced columns the plan does NOT carry. The
+    /// facade sources these from the locked registration / participant / device
+    /// context; the integration tests supply them explicitly from their fixtures.
+    #[derive(Clone, Debug)]
+    pub(crate) struct ExecutionActor {
+        pub(crate) user_did: String,
+        pub(crate) device_id: Uuid,
+        pub(crate) key_id: String,
+        pub(crate) auth_generation: i64,
+        /// `transitions.actor_role` — the actor's locked participant role.
+        pub(crate) role: TransitionActorRole,
+        /// `transitions.actor_device_status` — the actor's locked device status.
+        pub(crate) device_status: String,
+    }
+
+    /// The exact control-entry row content + the transition's signed material.
+    /// Every field is the verified signed artifact or its digest; none is
+    /// re-derived by the executor.
+    #[derive(Clone, Debug)]
+    pub(crate) struct ControlEntryContent {
+        pub(crate) entry_id: Uuid,
+        pub(crate) entry_kind: String,
+        pub(crate) accepted_payload_bytes: Vec<u8>,
+        pub(crate) accepted_payload_sha256: Vec<u8>,
+        pub(crate) signed_request_bytes: Vec<u8>,
+        pub(crate) unsigned_projection_bytes: Vec<u8>,
+        pub(crate) signing_transcript_bytes: Vec<u8>,
+        pub(crate) request_digest: Vec<u8>,
+        pub(crate) signature: Vec<u8>,
+        pub(crate) server_fields_bytes: Vec<u8>,
+        pub(crate) outer_entry_fingerprint: Vec<u8>,
+    }
+
+    /// The public-state serialization artifacts the coordinate spine stores. The
+    /// facade produces these from the validated merged public state; they are
+    /// input, never re-serialized by the executor.
+    #[derive(Clone, Debug)]
+    pub(crate) struct SpineArtifacts {
+        pub(crate) public_snapshot_bytes: Vec<u8>,
+        pub(crate) public_snapshot_sha256: Vec<u8>,
+        pub(crate) tree_summary_bytes: Vec<u8>,
+        pub(crate) tree_summary_sha256: Vec<u8>,
+        pub(crate) leaf_count: i64,
+        /// Genesis GroupInfo for the activated generation (creation / reset).
+        pub(crate) genesis_group_info_bytes: Vec<u8>,
+        pub(crate) genesis_group_info_sha256: Vec<u8>,
+    }
+
+    /// Per-opened-leaf columns absent from `LeafHydrationRow`: the leaf's key id
+    /// and `member_devices.leaf_auth_generation` (sourced from
+    /// `chat.device_keys.enrollment_auth_generation`).
+    #[derive(Clone, Debug)]
+    pub(crate) struct LeafPersistenceColumns {
+        pub(crate) device: DeviceIdentity,
+        pub(crate) leaf_key_id: String,
+        pub(crate) leaf_auth_generation: i64,
+    }
+
+    /// Metadata author columns the `MetadataSnapshotBinding` does not carry as DB
+    /// strings: `author_role` / `author_device_status` (DDL-forced `admin` /
+    /// `active`) and the 32-byte Ed25519 signature public key stored verbatim.
+    #[derive(Clone, Debug)]
+    pub(crate) struct MetadataAuthorColumns {
+        pub(crate) author_role: String,
+        pub(crate) author_device_status: String,
+        pub(crate) author_public_key: Vec<u8>,
+        /// Fresh `chat.metadata_snapshots` primary key for this snapshot.
+        pub(crate) metadata_snapshot_id: Uuid,
+    }
+
+    /// One event to append with its frozen audience and outbox work.
+    #[derive(Clone, Debug)]
+    pub(crate) struct EventFanout {
+        pub(crate) event_id: Uuid,
+        pub(crate) event_kind: EventKind,
+        pub(crate) payload_bytes: Vec<u8>,
+        /// `(device, entitlement, predecessor_position)` in canonical order.
+        pub(crate) recipients: Vec<(DeviceIdentity, EventEntitlementKind, Option<i64>)>,
+        /// `(outbox_id, work_kind)` rows to enqueue for this event.
+        pub(crate) outbox: Vec<(Uuid, OutboxWorkKind)>,
+    }
+
+    /// Everything the plan does NOT carry. AUDIENCE IS INPUT, NOT DERIVED: the
+    /// executor never queries `chat.devices` to invent an audience.
+    #[derive(Clone, Debug)]
+    pub(crate) struct ExecutionContext {
+        pub(crate) protocol_instance_id: Uuid,
+        /// The trusted request instant `T` — every `*_at` the executor writes.
+        pub(crate) applied_at: DateTime<Utc>,
+        pub(crate) actor: ExecutionActor,
+        pub(crate) entry: ControlEntryContent,
+        pub(crate) spine: SpineArtifacts,
+        pub(crate) opened_leaves: Vec<LeafPersistenceColumns>,
+        pub(crate) metadata_author: Option<MetadataAuthorColumns>,
+        /// Fresh participant-period ids in the plan's canonical participant order.
+        pub(crate) participant_period_ids: Vec<Uuid>,
+        /// Fresh leaf-period ids in the plan's opened-leaf order.
+        pub(crate) leaf_period_ids: Vec<Uuid>,
+        /// The exact control-entry audience, canonical `(DID, device)` order.
+        pub(crate) entry_recipients: Vec<(DeviceIdentity, EntryEntitlementKind)>,
+        pub(crate) events: Vec<EventFanout>,
+    }
+
+    /// What the executor allocated/produced, echoed for the caller's response.
+    #[derive(Clone, Debug)]
+    pub(crate) struct AppliedTransition {
+        pub(crate) allocated_seq: u64,
+        pub(crate) entry_id: Uuid,
+        pub(crate) event_positions: Vec<i64>,
+        pub(crate) successor_coordinate: Option<PublicGroupSnapshotCoordinate>,
+    }
+
+    fn principal_did(principal: &PrincipalId) -> Result<String, ExecutorError> {
+        String::from_utf8(principal.as_bytes().to_vec()).map_err(|_| ExecutorError::ValueOutOfRange)
+    }
+
+    fn device_did(device: &DeviceIdentity) -> Result<String, ExecutorError> {
+        principal_did(device.principal())
+    }
+
+    fn device_uuid(device: &DeviceIdentity) -> Uuid {
+        Uuid::from_bytes(*device.device_id())
+    }
+
+    fn checked_i64(value: u64) -> Result<i64, ExecutorError> {
+        i64::try_from(value).map_err(|_| ExecutorError::ValueOutOfRange)
+    }
+
+    fn server_instant(value: ServerTimestamp) -> Result<DateTime<Utc>, ExecutorError> {
+        DateTime::<Utc>::from_timestamp_millis(value.unix_millis())
+            .ok_or(ExecutorError::ValueOutOfRange)
+    }
+
+    fn repo_participant_status(status: ParticipantStatus) -> RepoParticipantStatus {
+        match status {
+            ParticipantStatus::Pending => RepoParticipantStatus::Pending,
+            ParticipantStatus::Active => RepoParticipantStatus::Active,
+        }
+    }
+
+    fn repo_participant_role(role: ParticipantRole) -> RepoParticipantRole {
+        match role {
+            ParticipantRole::Member => RepoParticipantRole::Member,
+            ParticipantRole::Admin => RepoParticipantRole::Admin,
+        }
+    }
+
+    /// Reject any non-empty effect family the executor does not (yet) persist,
+    /// so nothing is ever silently dropped. Called for every family this
+    /// composition path does not translate.
+    fn reject_if_present<T>(family: &'static str, changes: &[T]) -> Result<(), ExecutorError> {
+        if changes.is_empty() {
+            Ok(())
+        } else {
+            Err(ExecutorError::UnsupportedEffect(family))
+        }
+    }
+
+    /// Apply one `ConversationPersistencePlan` inside the caller's transaction.
+    ///
+    /// Transaction-scoped: never begins or commits. Ordered per the E2b-2 design
+    /// (head → generation → generation_state → entry → transition → metadata →
+    /// families → audience → events). Every effect family is consumed
+    /// exhaustively; a non-empty family this path does not handle is a hard
+    /// `UnsupportedEffect`, never a silent skip.
+    pub(crate) async fn apply_conversation_persistence_plan(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        plan: &ConversationPersistencePlan,
+        ctx: &ExecutionContext,
+    ) -> Result<AppliedTransition, ExecutorError> {
+        let effects = plan.effects();
+        let head = effects
+            .head_cas()
+            .ok_or(ExecutorError::InconsistentPlan("missing head CAS binding"))?;
+        let hydration = plan.state();
+        let coordinate = &hydration.coordinate;
+        let conversation_id = Uuid::from_bytes(*coordinate.conversation_id());
+        let transition_id = Uuid::from_bytes(*hydration.producer.transition_id());
+        let allocated_seq = head.allocated_seq().ok_or(ExecutorError::InconsistentPlan(
+            "head CAS has no allocated seq",
+        ))?;
+        let seq_i64 = checked_i64(allocated_seq)?;
+        let successor_next_entry_seq = checked_i64(head.successor_next_entry_seq())?;
+        let generation = checked_i64(coordinate.generation())?;
+        let state_version = checked_i64(coordinate.state_version())?;
+        let epoch = checked_i64(coordinate.epoch())?;
+
+        match effects.kind() {
+            PlanKind::Creation => {
+                apply_creation(
+                    transaction,
+                    plan,
+                    ctx,
+                    conversation_id,
+                    transition_id,
+                    seq_i64,
+                    successor_next_entry_seq,
+                    generation,
+                    state_version,
+                    epoch,
+                )
+                .await
+            }
+            // Every other plan kind is a real, planned edge this executor slice
+            // does not yet compose. It is a HARD error (never a silent skip), so a
+            // caller cannot mistake "not implemented" for "applied". The
+            // remaining kinds (policy, acceptConversation, metadata, commit,
+            // reset request/activation, leave family, welcome dispositions, device
+            // revocation, close) are the E2b-2 remainder — see the report.
+            PlanKind::Policy => Err(ExecutorError::UnsupportedEffect("policy")),
+            PlanKind::Acceptance => Err(ExecutorError::UnsupportedEffect("acceptConversation")),
+            PlanKind::Metadata => Err(ExecutorError::UnsupportedEffect("metadata")),
+            PlanKind::Commit => Err(ExecutorError::UnsupportedEffect("commit")),
+            PlanKind::RecoveryRequest => {
+                Err(ExecutorError::UnsupportedEffect("leafRecoveryRequest"))
+            }
+            PlanKind::RecoveryCancellation => {
+                Err(ExecutorError::UnsupportedEffect("leafRecoveryCancellation"))
+            }
+            PlanKind::DeviceRevocation => Err(ExecutorError::UnsupportedEffect("deviceRevocation")),
+            PlanKind::ResetRequest => Err(ExecutorError::UnsupportedEffect("resetRequest")),
+            PlanKind::ResetActivation => Err(ExecutorError::UnsupportedEffect("resetActivation")),
+            PlanKind::LeaveRequest => Err(ExecutorError::UnsupportedEffect("leaveRequest")),
+            PlanKind::LeaveCancellation => {
+                Err(ExecutorError::UnsupportedEffect("leaveCancellation"))
+            }
+            PlanKind::ZeroLeafLeave => Err(ExecutorError::UnsupportedEffect("zeroLeafLeave")),
+            PlanKind::WelcomeAcknowledgement => {
+                Err(ExecutorError::UnsupportedEffect("welcomeAcknowledgement"))
+            }
+            PlanKind::WelcomeRejection => Err(ExecutorError::UnsupportedEffect("welcomeRejection")),
+            PlanKind::WelcomeExpiry => Err(ExecutorError::UnsupportedEffect("welcomeExpiry")),
+            PlanKind::Close => Err(ExecutorError::UnsupportedEffect("closeConversation")),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_creation(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        plan: &ConversationPersistencePlan,
+        ctx: &ExecutionContext,
+        conversation_id: Uuid,
+        transition_id: Uuid,
+        seq_i64: i64,
+        successor_next_entry_seq: i64,
+        generation: i64,
+        state_version: i64,
+        epoch: i64,
+    ) -> Result<AppliedTransition, ExecutorError> {
+        let effects = plan.effects();
+        let hydration = plan.state();
+        let coordinate = &hydration.coordinate;
+        let applied_at = ctx.applied_at;
+        let group_id = coordinate.group_id().to_vec();
+        let group_context_hash = coordinate.group_context_hash().to_vec();
+        let confirmation_tag = coordinate.confirmation_tag().to_vec();
+
+        // Creation carries no prior; every side family is a pure insert. Reject
+        // any family this path does not translate so nothing is silently dropped.
+        reject_if_present("terminal_proof_changes", effects.terminal_proof_changes())?;
+        reject_if_present(
+            "recovery_request_changes",
+            effects.recovery_request_changes(),
+        )?;
+        reject_if_present("reservation_changes", effects.reservation_changes())?;
+        reject_if_present("reset_request_changes", effects.reset_request_changes())?;
+        reject_if_present("leave_request_changes", effects.leave_request_changes())?;
+        reject_if_present("welcome_changes", effects.welcome_changes())?;
+        reject_if_present("package_transitions", effects.package_transitions())?;
+        reject_if_present("recovery_package_cas", effects.recovery_package_cas())?;
+        reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
+        if effects.revocation_target_cas().is_some() {
+            return Err(ExecutorError::UnsupportedEffect("revocation_target_cas"));
+        }
+        if effects.welcome_cas().is_some() {
+            return Err(ExecutorError::UnsupportedEffect("welcome_cas"));
+        }
+
+        // 1. Head (INSERT — true absence; the seq counter starts already advanced
+        //    past the genesis entry).
+        let head_kind = match hydration.kind {
+            ConversationKind::Group => ConversationHeadKind::Group,
+            ConversationKind::Direct => {
+                let (low, high) = direct_pair(&hydration.participants)?;
+                ConversationHeadKind::Direct {
+                    direct_did_low: low,
+                    direct_did_high: high,
+                }
+            }
+        };
+        transition::insert_conversation_head(
+            transaction,
+            &transition::NewConversationHead {
+                conversation_id,
+                kind: head_kind,
+                current_generation: generation,
+                current_state_version: state_version,
+                next_entry_seq: successor_next_entry_seq,
+                created_at: applied_at,
+            },
+        )
+        .await?;
+
+        // 2. Generation (activated at the genesis seq/instant).
+        transition::insert_generation(
+            transaction,
+            &NewGeneration {
+                conversation_id,
+                generation,
+                group_id: group_id.clone(),
+                genesis_group_info_bytes: ctx.spine.genesis_group_info_bytes.clone(),
+                genesis_group_info_sha256: ctx.spine.genesis_group_info_sha256.clone(),
+                current_state_version: state_version,
+                activated_seq: seq_i64,
+                activated_at: applied_at,
+            },
+        )
+        .await?;
+
+        // 3. Generation state (the produced `creation` public coordinate).
+        transition::insert_generation_state_row(
+            transaction,
+            &NewGenerationState {
+                conversation_id,
+                generation,
+                state_version,
+                group_id: group_id.clone(),
+                epoch,
+                group_context_hash: group_context_hash.clone(),
+                confirmation_tag: confirmation_tag.clone(),
+                lifecycle: GenerationStateLifecycle::Active,
+                state_kind: GenerationStateKind::Creation,
+                producing_transition_id: transition_id,
+                public_snapshot_bytes: ctx.spine.public_snapshot_bytes.clone(),
+                snapshot_sha256: ctx.spine.public_snapshot_sha256.clone(),
+                tree_summary_bytes: ctx.spine.tree_summary_bytes.clone(),
+                tree_summary_sha256: ctx.spine.tree_summary_sha256.clone(),
+                leaf_count: ctx.spine.leaf_count,
+                created_at: applied_at,
+            },
+        )
+        .await?;
+
+        // 4. Entry at the exact allocated seq (the head already advanced the
+        //    counter). Immediate FK targets for the transition's `entry_seq`.
+        let append = build_append_entry(
+            ctx,
+            conversation_id,
+            generation,
+            state_version,
+            transition_id,
+        );
+        delivery::append_entry_at(transaction, &append, u64::try_from(seq_i64).unwrap()).await?;
+
+        // 5. Metadata snapshot — REQUIRED for creation by the deferred mapping.
+        let metadata = effects
+            .metadata_change()
+            .and_then(StateChange::after)
+            .ok_or(ExecutorError::InconsistentPlan(
+                "creation plan carries no metadata snapshot",
+            ))?;
+        let author_cols = ctx
+            .metadata_author
+            .as_ref()
+            .ok_or(ExecutorError::MissingContext("metadata author columns"))?;
+        write_creation_metadata_snapshot(
+            transaction,
+            metadata,
+            author_cols,
+            &ctx.actor,
+            conversation_id,
+            generation,
+            state_version,
+            epoch,
+            &group_id,
+            &group_context_hash,
+            &confirmation_tag,
+            transition_id,
+            seq_i64,
+            applied_at,
+        )
+        .await?;
+
+        // 6. Transition row (needs entry_seq; entry written above).
+        transition::insert_transition_row(
+            transaction,
+            &NewTransition {
+                transition_id,
+                conversation_id,
+                kind: TransitionKind::Creation,
+                actor_did: ctx.actor.user_did.clone(),
+                actor_device_id: ctx.actor.device_id,
+                actor_key_id: ctx.actor.key_id.clone(),
+                actor_auth_generation: ctx.actor.auth_generation,
+                actor_role: ctx.actor.role,
+                actor_device_status: ctx.actor.device_status.clone(),
+                signed_request_bytes: ctx.entry.signed_request_bytes.clone(),
+                unsigned_projection_bytes: ctx.entry.unsigned_projection_bytes.clone(),
+                signing_transcript_bytes: ctx.entry.signing_transcript_bytes.clone(),
+                request_digest: ctx.entry.request_digest.clone(),
+                signature: ctx.entry.signature.clone(),
+                coordinates: TransitionCoordinates {
+                    prior: None,
+                    next: Some((generation, state_version)),
+                    retired: None,
+                    successor: None,
+                },
+                reset_request_id: None,
+                close_transition_id: None,
+                metadata_snapshot_id: Some(author_cols.metadata_snapshot_id),
+                entry_seq: seq_i64,
+                accepted_at: applied_at,
+            },
+        )
+        .await?;
+
+        // 7. Participant periods, then leaves, then intervals — every change is a
+        //    pure insert for creation; a non-insert shape is a hard error.
+        write_creation_participants(
+            transaction,
+            ctx,
+            hydration,
+            effects,
+            transition_id,
+            applied_at,
+        )
+        .await?;
+        let leaf_ids = write_creation_leaves(
+            transaction,
+            ctx,
+            hydration,
+            effects,
+            conversation_id,
+            generation,
+            transition_id,
+            state_version,
+            seq_i64,
+            applied_at,
+        )
+        .await?;
+        write_creation_intervals(transaction, effects, &leaf_ids, conversation_id, applied_at)
+            .await?;
+
+        // 8. Frozen control-entry audience.
+        let recipients = build_entry_recipients(&ctx.entry_recipients)?;
+        delivery::insert_entry_recipients(
+            transaction,
+            conversation_id,
+            u64::try_from(seq_i64).unwrap(),
+            &recipients,
+        )
+        .await?;
+
+        // 9. Events + audience + outbox.
+        let event_positions = write_events(transaction, ctx).await?;
+
+        Ok(AppliedTransition {
+            allocated_seq: u64::try_from(seq_i64).unwrap(),
+            entry_id: ctx.entry.entry_id,
+            event_positions,
+            successor_coordinate: plan.successor_coordinate().copied(),
+        })
+    }
+
+    fn direct_pair(
+        participants: &[ParticipantHydrationRow],
+    ) -> Result<(String, String), ExecutorError> {
+        if participants.len() != 2 {
+            return Err(ExecutorError::InconsistentPlan(
+                "direct conversation is not a pair",
+            ));
+        }
+        let mut dids = participants
+            .iter()
+            .map(|row| principal_did(&row.principal))
+            .collect::<Result<Vec<_>, _>>()?;
+        dids.sort();
+        Ok((dids[0].clone(), dids[1].clone()))
+    }
+
+    fn build_append_entry(
+        ctx: &ExecutionContext,
+        conversation_id: Uuid,
+        generation: i64,
+        state_version: i64,
+        transition_id: Uuid,
+    ) -> AppendEntry {
+        AppendEntry {
+            conversation_id,
+            entry_id: ctx.entry.entry_id,
+            entry_kind: ctx.entry.entry_kind.clone(),
+            accepted_payload_bytes: ctx.entry.accepted_payload_bytes.clone(),
+            accepted_payload_sha256: ctx.entry.accepted_payload_sha256.clone(),
+            signed_request_bytes: ctx.entry.signed_request_bytes.clone(),
+            request_digest: ctx.entry.request_digest.clone(),
+            signature: ctx.entry.signature.clone(),
+            server_fields_bytes: ctx.entry.server_fields_bytes.clone(),
+            outer_entry_fingerprint: ctx.entry.outer_entry_fingerprint.clone(),
+            actor_did: ctx.actor.user_did.clone(),
+            actor_device_id: ctx.actor.device_id,
+            actor_key_id: ctx.actor.key_id.clone(),
+            actor_auth_generation: ctx.actor.auth_generation,
+            generation: Some(generation),
+            state_version: Some(state_version),
+            transition_id: Some(transition_id),
+            message_id: None,
+            received_at: ctx.applied_at,
+        }
+    }
+
+    /// Persist the creation metadata snapshot. The author identity is sourced
+    /// from the **actor** (not the binding): for creation the metadata author is
+    /// definitionally the creation actor, and the deferred author-proof trigger
+    /// joins the snapshot's author columns back to the creation transition's
+    /// actor columns, so they must byte-equal. The encrypted CONTENT (nonce,
+    /// ciphertext, its digest) is sourced from the plan's `MetadataSnapshotBinding`;
+    /// `origin_transition_id`/`metadata_version`/`author_origin_seq` are the
+    /// creation transition itself / 1 / the genesis seq.
+    #[allow(clippy::too_many_arguments)]
+    async fn write_creation_metadata_snapshot(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        metadata: &MetadataSnapshotBinding,
+        author_cols: &MetadataAuthorColumns,
+        actor: &ExecutionActor,
+        conversation_id: Uuid,
+        generation: i64,
+        state_version: i64,
+        epoch: i64,
+        group_id: &[u8],
+        group_context_hash: &[u8],
+        confirmation_tag: &[u8],
+        transition_id: Uuid,
+        seq_i64: i64,
+        applied_at: DateTime<Utc>,
+    ) -> Result<(), ExecutorError> {
+        let ciphertext = metadata.ciphertext().to_vec();
+        let ciphertext_size = checked_i64(ciphertext.len() as u64)?;
+        transition::insert_metadata_snapshot(
+            transaction,
+            &NewMetadataSnapshot {
+                metadata_snapshot_id: author_cols.metadata_snapshot_id,
+                conversation_id,
+                generation,
+                state_version,
+                group_id: group_id.to_vec(),
+                epoch,
+                group_context_hash: group_context_hash.to_vec(),
+                confirmation_tag: confirmation_tag.to_vec(),
+                producing_transition_id: transition_id,
+                origin_transition_id: transition_id,
+                metadata_version: 1,
+                nonce: metadata.nonce().to_vec(),
+                ciphertext_sha256: metadata.ciphertext_sha256().to_vec(),
+                ciphertext,
+                ciphertext_size,
+                avatar: None,
+                author_did: actor.user_did.clone(),
+                author_device_id: actor.device_id,
+                author_key_id: actor.key_id.clone(),
+                author_public_key: author_cols.author_public_key.clone(),
+                author_auth_generation: actor.auth_generation,
+                author_origin_seq: seq_i64,
+                author_role: author_cols.author_role.clone(),
+                author_device_status: author_cols.author_device_status.clone(),
+                created_at: applied_at,
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn write_creation_participants(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        ctx: &ExecutionContext,
+        hydration: &ConversationStateHydration,
+        effects: &TransitionEffects,
+        transition_id: Uuid,
+        applied_at: DateTime<Utc>,
+    ) -> Result<(), ExecutorError> {
+        let creator = &ctx.actor;
+        let mut period_ids = ctx.participant_period_ids.iter();
+        for change in effects.participant_changes() {
+            let (before, after) = (change.before(), change.after());
+            let after = match (before, after) {
+                (None, Some(after)) => after,
+                _ => {
+                    return Err(ExecutorError::UnsupportedEffect(
+                        "participant change is not a creation insert",
+                    ))
+                }
+            };
+            let row = hydration
+                .participants
+                .iter()
+                .find(|row| &row.principal == after.principal())
+                .ok_or(ExecutorError::InconsistentPlan(
+                    "participant not in hydration",
+                ))?;
+            let period_id = *period_ids
+                .next()
+                .ok_or(ExecutorError::MissingContext("participant period id"))?;
+            let invitation = match &row.invitation {
+                Some(_) => Some(ParticipantInvitation {
+                    invitation_transition_id: transition_id,
+                    invitation_entry_id: ctx.entry.entry_id,
+                    invited_at: applied_at,
+                }),
+                None => None,
+            };
+            transition::insert_participant_period(
+                transaction,
+                &NewParticipantPeriod {
+                    participant_period_id: period_id,
+                    conversation_id: Uuid::from_bytes(*hydration.coordinate.conversation_id()),
+                    user_did: principal_did(&row.principal)?,
+                    status: repo_participant_status(row.status),
+                    role: repo_participant_role(row.role),
+                    role_transition_id: transition_id,
+                    role_changed_at: applied_at,
+                    created_by_did: creator.user_did.clone(),
+                    created_by_device_id: creator.device_id,
+                    invitation,
+                    acceptance: None,
+                    created_at: applied_at,
+                },
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn write_creation_leaves(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        ctx: &ExecutionContext,
+        hydration: &ConversationStateHydration,
+        effects: &TransitionEffects,
+        conversation_id: Uuid,
+        generation: i64,
+        transition_id: Uuid,
+        state_version: i64,
+        seq_i64: i64,
+        applied_at: DateTime<Utc>,
+    ) -> Result<HashMap<DeviceIdentity, Uuid>, ExecutorError> {
+        let mut opened: HashMap<DeviceIdentity, Uuid> = HashMap::new();
+        let mut leaf_ids = ctx.leaf_period_ids.iter();
+        for change in effects.leaf_changes() {
+            let after = match (change.before(), change.after()) {
+                (None, Some(after)) => after,
+                _ => {
+                    return Err(ExecutorError::UnsupportedEffect(
+                        "leaf change is not a creation insert",
+                    ))
+                }
+            };
+            let row: &LeafHydrationRow = hydration
+                .leaves
+                .iter()
+                .find(|row| &row.device == after.device())
+                .ok_or(ExecutorError::InconsistentPlan("leaf not in hydration"))?;
+            let cols = ctx
+                .opened_leaves
+                .iter()
+                .find(|cols| &cols.device == after.device())
+                .ok_or(ExecutorError::MissingContext("leaf persistence columns"))?;
+            // The owning participant period must already be inserted; its id is
+            // matched by DID (one current period per DID at creation).
+            let participant_period_id =
+                participant_period_for(ctx, hydration, after.device().principal())?;
+            let leaf_id = *leaf_ids
+                .next()
+                .ok_or(ExecutorError::MissingContext("leaf period id"))?;
+            transition::insert_leaf_period(
+                transaction,
+                &NewLeafPeriod {
+                    leaf_period_id: leaf_id,
+                    participant_period_id,
+                    conversation_id,
+                    generation,
+                    user_did: device_did(after.device())?,
+                    device_id: device_uuid(after.device()),
+                    leaf_index: checked_i64(u64::from(row.leaf_index))?,
+                    basic_credential: row.basic_credential.clone(),
+                    leaf_signature_key: row.signature_key.clone(),
+                    leaf_key_id: cols.leaf_key_id.clone(),
+                    leaf_auth_generation: cols.leaf_auth_generation,
+                    origin: LeafOrigin::Genesis,
+                    joined_state_version: state_version,
+                    joined_transition_id: transition_id,
+                    joined_seq: seq_i64,
+                    created_at: applied_at,
+                },
+            )
+            .await?;
+            opened.insert(after.device().clone(), leaf_id);
+        }
+        Ok(opened)
+    }
+
+    /// Resolve the participant-period id the executor minted for `principal`.
+    /// Creation inserts periods in the plan's canonical participant order, so the
+    /// id is the ctx `participant_period_ids` entry at that principal's index.
+    fn participant_period_for(
+        ctx: &ExecutionContext,
+        hydration: &ConversationStateHydration,
+        principal: &PrincipalId,
+    ) -> Result<Uuid, ExecutorError> {
+        let index = hydration
+            .participants
+            .iter()
+            .position(|row| &row.principal == principal)
+            .ok_or(ExecutorError::InconsistentPlan(
+                "leaf owner not a participant",
+            ))?;
+        ctx.participant_period_ids
+            .get(index)
+            .copied()
+            .ok_or(ExecutorError::MissingContext(
+                "participant period id for leaf owner",
+            ))
+    }
+
+    async fn write_creation_intervals(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        effects: &TransitionEffects,
+        leaf_ids: &HashMap<DeviceIdentity, Uuid>,
+        conversation_id: Uuid,
+        applied_at: DateTime<Utc>,
+    ) -> Result<(), ExecutorError> {
+        for change in effects.interval_changes() {
+            let after = match (change.before(), change.after()) {
+                (None, Some(after)) => after,
+                _ => {
+                    return Err(ExecutorError::UnsupportedEffect(
+                        "interval change is not a creation open",
+                    ))
+                }
+            };
+            if after.end().is_some() {
+                return Err(ExecutorError::UnsupportedEffect(
+                    "creation interval is born closed",
+                ));
+            }
+            if after.opening_kind() != super::OpeningKind::Creation {
+                return Err(ExecutorError::UnsupportedEffect(
+                    "non-creation interval opening in a creation plan",
+                ));
+            }
+            let opening_transition_id = Uuid::from_bytes(*after.opening_transition_id());
+            let opening_leaf_period_id =
+                *leaf_ids
+                    .get(after.recipient())
+                    .ok_or(ExecutorError::InconsistentPlan(
+                        "interval recipient has no opened leaf",
+                    ))?;
+            let opening_context = after.opening_context();
+            delivery::insert_application_interval(
+                transaction,
+                &NewApplicationInterval {
+                    membership_interval_id: opening_transition_id,
+                    conversation_id,
+                    generation: checked_i64(opening_context.generation())?,
+                    recipient_did: device_did(after.recipient())?,
+                    recipient_device_id: device_uuid(after.recipient()),
+                    start_seq: checked_i64(after.opening_seq())?,
+                    opening_kind: IntervalOpeningKind::Creation,
+                    opening_transition_id,
+                    opening_outer_entry_fingerprint: after
+                        .opening_outer_entry_fingerprint()
+                        .to_vec(),
+                    opening_state_version: checked_i64(opening_context.state_version())?,
+                    opening_group_id: opening_context.group_id().to_vec(),
+                    opening_epoch: checked_i64(opening_context.epoch())?,
+                    opening_group_context_hash: opening_context.group_context_hash().to_vec(),
+                    opening_confirmation_tag: opening_context.confirmation_tag().to_vec(),
+                    opening_leaf_period_id,
+                    created_at: applied_at,
+                },
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    fn build_entry_recipients(
+        recipients: &[(DeviceIdentity, EntryEntitlementKind)],
+    ) -> Result<Vec<EntryRecipient>, ExecutorError> {
+        recipients
+            .iter()
+            .map(|(device, kind)| {
+                Ok(EntryRecipient {
+                    user_did: device_did(device)?,
+                    device_id: device_uuid(device),
+                    entitlement_kind: *kind,
+                })
+            })
+            .collect()
+    }
+
+    async fn write_events(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        ctx: &ExecutionContext,
+    ) -> Result<Vec<i64>, ExecutorError> {
+        let mut positions = Vec::with_capacity(ctx.events.len());
+        for event in &ctx.events {
+            let position = delivery::append_event(
+                transaction,
+                &NewEvent {
+                    event_id: event.event_id,
+                    event_kind: event.event_kind,
+                    payload_bytes: event.payload_bytes.clone(),
+                    created_at: ctx.applied_at,
+                    protocol_instance_id: ctx.protocol_instance_id,
+                },
+            )
+            .await?;
+            let recipients = event
+                .recipients
+                .iter()
+                .map(|(device, kind, predecessor)| {
+                    Ok(EventRecipient {
+                        user_did: device_did(device)?,
+                        device_id: device_uuid(device),
+                        entitlement_kind: *kind,
+                        audience_predecessor_position: *predecessor,
+                    })
+                })
+                .collect::<Result<Vec<_>, ExecutorError>>()?;
+            delivery::insert_event_recipients(transaction, position, &recipients).await?;
+            for (outbox_id, work_kind) in &event.outbox {
+                delivery::enqueue_outbox(
+                    transaction,
+                    *outbox_id,
+                    position,
+                    *work_kind,
+                    ctx.applied_at,
+                )
+                .await?;
+            }
+            positions.push(position);
+        }
+        Ok(positions)
+    }
+}

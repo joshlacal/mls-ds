@@ -177,6 +177,71 @@ pub(crate) async fn append_entry(
     u64::try_from(seq).map_err(|_| DeliveryRepositoryError::SequenceOverflow)
 }
 
+/// Insert one append-log entry at an **exact, pre-allocated** seq, without
+/// touching `chat.conversations.next_entry_seq`.
+///
+/// This is the seq-seam partner of the transition executor's conversation-head
+/// write. The executor's head write (INSERT for creation, compare-and-set UPDATE
+/// for an existing conversation) is the single authority that advances
+/// `next_entry_seq` from the planner's `allocated_seq` to
+/// `successor_next_entry_seq`; the entry itself is then materialized here at that
+/// exact `allocated_seq`. Unlike [`append_entry`], this primitive does **not**
+/// `SELECT ... FOR UPDATE` the head or advance the counter — doing both here and
+/// in the head write would double-advance it. The database's own
+/// `(conversation_id, seq)` primary key and the deferred append-contiguity
+/// invariant (`next_entry_seq == max(seq) + 1` at COMMIT) remain the arbiter: a
+/// seq that disagrees with the head write's counter fails the deferred check at
+/// COMMIT, and a duplicate seq fails the primary key immediately.
+///
+/// The caller must have already written the conversation head row in the same
+/// transaction (the immediate `chat.entries` → `chat.conversations` foreign key
+/// requires it).
+pub(crate) async fn append_entry_at(
+    transaction: &mut Transaction<'_, Postgres>,
+    entry: &AppendEntry,
+    seq: u64,
+) -> Result<u64, DeliveryRepositoryError> {
+    let seq_i64 = i64::try_from(seq).map_err(|_| DeliveryRepositoryError::SequenceOverflow)?;
+    sqlx::query(
+        r#"
+        INSERT INTO chat.entries(
+            conversation_id, seq, entry_id, entry_kind,
+            accepted_payload_bytes, accepted_payload_sha256,
+            signed_request_bytes, request_digest, signature,
+            server_fields_bytes, outer_entry_fingerprint,
+            actor_did, actor_device_id, actor_key_id, actor_auth_generation,
+            generation, state_version, transition_id, message_id, received_at
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+            $11, $12, $13, $14, $15, $16, $17, $18, $19, $20
+        )
+        "#,
+    )
+    .bind(entry.conversation_id)
+    .bind(seq_i64)
+    .bind(entry.entry_id)
+    .bind(&entry.entry_kind)
+    .bind(&entry.accepted_payload_bytes)
+    .bind(&entry.accepted_payload_sha256)
+    .bind(&entry.signed_request_bytes)
+    .bind(&entry.request_digest)
+    .bind(&entry.signature)
+    .bind(&entry.server_fields_bytes)
+    .bind(&entry.outer_entry_fingerprint)
+    .bind(&entry.actor_did)
+    .bind(entry.actor_device_id)
+    .bind(&entry.actor_key_id)
+    .bind(entry.actor_auth_generation)
+    .bind(entry.generation)
+    .bind(entry.state_version)
+    .bind(entry.transition_id)
+    .bind(entry.message_id)
+    .bind(entry.received_at)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(seq)
+}
+
 // ===========================================================================
 // Audience, event, and outbox write primitives.
 //
