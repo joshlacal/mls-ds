@@ -10154,6 +10154,28 @@ impl TransitionEvidence {
 
 #[cfg(test)]
 impl ConversationHeadCasBinding {
+    /// The head CAS an INTERNAL (entry-less) op's head lock would mint: the prior
+    /// coordinate verified, NO seq allocated, the counter UNCHANGED
+    /// (`bind_non_control_request_authority` shape).
+    pub(crate) fn for_test_internal(
+        conversation_id: [u8; 16],
+        prior: PublicGroupSnapshotCoordinate,
+        next_entry_seq: u64,
+        locked_at: ServerTimestamp,
+    ) -> Self {
+        Self {
+            transaction_id: "e2b6-executor-test".to_owned(),
+            conversation_id,
+            expected_prior: Some(prior),
+            expected_next_entry_seq: next_entry_seq,
+            allocated_entry_id: None,
+            allocated_seq: None,
+            successor_next_entry_seq: next_entry_seq,
+            locked_at,
+            locked_head_digest: [1u8; 32],
+        }
+    }
+
     /// The head CAS an existing-conversation edge's head lock would mint: the
     /// prior coordinate, the entry at `allocated_seq`, counter advanced by one.
     pub(crate) fn for_test_edge(
@@ -13319,23 +13341,133 @@ mod executor {
         }
     }
 
-    /// Apply an entry-less `leafRecoveryRequest` internal op. (Filled in E2b-6
-    /// arm 3; the dispatch split lands first as its own regression-green change.)
+    /// Apply an entry-less `leafRecoveryRequest` internal op. The coordinate and
+    /// seq counter are UNCHANGED (the head CAS is a prior-coordinate verify); it
+    /// opens the `add`/`replace` recovery request + reservation and reserves the
+    /// requester's key package, all bound to the CURRENT coordinate. No entry, no
+    /// transition, no generation state, no participant change.
     #[allow(clippy::too_many_arguments)]
     async fn apply_leaf_recovery_request(
-        _transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        _plan: &ConversationPersistencePlan,
-        _ctx: &ExecutionContext,
-        _conversation_id: Uuid,
-        _generation: i64,
-        _state_version: i64,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        plan: &ConversationPersistencePlan,
+        ctx: &ExecutionContext,
+        conversation_id: Uuid,
+        generation: i64,
+        state_version: i64,
         _epoch: i64,
     ) -> Result<AppliedTransition, ExecutorError> {
-        Err(ExecutorError::UnsupportedEffect("leafRecoveryRequest"))
+        let effects = plan.effects();
+        let applied_at = ctx.applied_at;
+        let head = effects
+            .head_cas()
+            .ok_or(ExecutorError::InconsistentPlan("missing head CAS binding"))?;
+        let expected_prior = head
+            .expected_prior()
+            .ok_or(ExecutorError::InconsistentPlan(
+                "leaf recovery request needs a prior",
+            ))?;
+        let expected_generation = checked_i64(expected_prior.generation())?;
+        let expected_state_version = checked_i64(expected_prior.state_version())?;
+        let expected_next_entry_seq = checked_i64(head.expected_next_entry_seq())?;
+        let successor_next_entry_seq = checked_i64(head.successor_next_entry_seq())?;
+
+        // Internal op: only a new open recovery request + its reservation + the
+        // Available->Reserved package edge. Everything else must be empty.
+        reject_if_present("participant_changes", effects.participant_changes())?;
+        reject_if_present("leaf_changes", effects.leaf_changes())?;
+        reject_if_present("interval_changes", effects.interval_changes())?;
+        reject_if_present("terminal_proof_changes", effects.terminal_proof_changes())?;
+        reject_if_present("reset_request_changes", effects.reset_request_changes())?;
+        reject_if_present("leave_request_changes", effects.leave_request_changes())?;
+        reject_if_present("welcome_changes", effects.welcome_changes())?;
+        reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
+        if effects.metadata_change().is_some() {
+            return Err(ExecutorError::UnsupportedEffect(
+                "leaf recovery request metadata change",
+            ));
+        }
+        if effects.revocation_target_cas().is_some()
+            || effects.welcome_cas().is_some()
+            || effects.invitation_quota_cas().is_some()
+        {
+            return Err(ExecutorError::UnsupportedEffect(
+                "leaf recovery request revocation/welcome/quota CAS",
+            ));
+        }
+        // recovery_package_cas: production KeyPackage CAS authority, empty in the
+        // test seam; the semantic package_transitions drives the KP CAS. Consume
+        // as witness (see apply_acceptance).
+        let _recovery_package_cas_witness = effects.recovery_package_cas();
+
+        let recovery = effects
+            .recovery_request_changes()
+            .iter()
+            .find_map(|change| match (change.before(), change.after()) {
+                (None, Some(after)) => Some(after),
+                _ => None,
+            })
+            .ok_or(ExecutorError::InconsistentPlan(
+                "leaf recovery request adds no open recovery request",
+            ))?;
+        if effects.recovery_request_changes().len() != 1
+            || effects.reservation_changes().len() != 1
+            || effects.package_transitions().len() != 1
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "leaf recovery request must add exactly one request + reservation + package edge",
+            ));
+        }
+
+        // 1. Head CAS VERIFY — coordinate and seq counter both UNCHANGED
+        //    (successor == expected on every column). A drifted head is a typed
+        //    conflict; a matched head is a no-op update that pins the read.
+        transition::cas_conversation_head(
+            transaction,
+            &transition::ConversationHeadCas {
+                conversation_id,
+                expected_generation,
+                expected_state_version,
+                expected_next_entry_seq,
+                successor_generation: generation,
+                successor_state_version: state_version,
+                successor_next_entry_seq,
+                close: None,
+            },
+        )
+        .await?;
+
+        // 2. The atomic recovery open (request + reservation + package reserve).
+        write_recovery_open(transaction, ctx, recovery, conversation_id, applied_at).await?;
+
+        // 3. No control entry (internal op) -> no entry recipients; only events.
+        let event_positions = write_events(transaction, ctx).await?;
+
+        Ok(AppliedTransition {
+            // No control entry / seq was allocated; echo the unchanged counter.
+            allocated_seq: u64::try_from(successor_next_entry_seq).unwrap(),
+            entry_id: ctx.entry.entry_id,
+            event_positions,
+            successor_coordinate: plan.successor_coordinate().copied(),
+        })
     }
 
-    /// Apply an entry-less `leafRecoveryCancellation` internal op. (Filled in
-    /// E2b-6 arm 3.)
+    /// Apply an entry-less `leafRecoveryCancellation` internal op.
+    ///
+    /// WRITER GAP (E2b-6, reported): a cancelled recovery request must RELEASE its
+    /// reserved key package back to `available` with all terminal columns NULL —
+    /// the `assert_recovery_fulfillment_mapping` cancelled-status arm asserts
+    /// `package_row.status = 'available' AND terminal_transition_id IS NULL AND
+    /// terminal_revocation_id IS NULL AND terminal_at IS NULL`. The only
+    /// `chat.key_packages` status writer, `cas_key_package_status`, offers the
+    /// successor set `{Reserve, Consume, Expire, Revoke}` — there is NO
+    /// `Reserved -> Available` (re-activation) edge, and its UPDATE always writes
+    /// the target arm's terminal columns. So the release the cancelled-status
+    /// mapping demands is UNWRITABLE with the current review-approved writer layer.
+    /// The reservation release (`terminalize_reservation(ReleasedByRequestDigest)`)
+    /// and the request terminalization (`terminalize_leaf_recovery_request(Cancelled)`)
+    /// both exist; only the package re-activation writer is missing. Per the
+    /// no-writer-SQL-edit discipline this arm is left a hard `UnsupportedEffect`
+    /// and the gap is reported rather than worked around.
     #[allow(clippy::too_many_arguments)]
     async fn apply_leaf_recovery_cancellation(
         _transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,

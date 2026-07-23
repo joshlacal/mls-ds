@@ -100,10 +100,11 @@ use chat_protocol::repository::transition::{
 use chat_protocol::snapshot::{PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle};
 use chat_protocol::state_machine::{
     apply_conversation_persistence_plan, persistence_plan_for_test, plan_accept_conversation,
-    plan_close, plan_creation, plan_policy, plan_reset_activation, plan_reset_request,
-    AcceptConversation, CloseConversation, ControlEntryContent, ConversationHeadCasBinding,
-    ConversationKind, CreationCommand, CreationDecision, DeviceIdentity, EventFanout,
-    ExecutionActor, ExecutionContext, ExecutorError, LeafPersistenceColumns, MetadataAuthorColumns,
+    plan_close, plan_creation, plan_leaf_recovery_request, plan_policy, plan_reset_activation,
+    plan_reset_request, AcceptConversation, CloseConversation, ControlEntryContent,
+    ConversationHeadCasBinding, ConversationKind, CreationCommand, CreationDecision,
+    DeviceIdentity, EventFanout, ExecutionActor, ExecutionContext, ExecutorError,
+    LeafPersistenceColumns, LeafRecoveryKind, LeafRecoveryRequestCommand, MetadataAuthorColumns,
     MetadataSnapshotBinding, PrincipalId, RecoveryOpenContext, RequestEntryKind, RequestEvidence,
     ResetActivation, ResetRequestCommand, ResetRequestRow, ServerTimestamp, SpineArtifacts,
     TransitionEvidence,
@@ -2567,6 +2568,192 @@ async fn acceptance_commits_recovery_open_and_promotes_participant() {
     .await
     .expect("acceptance transition");
     assert_eq!((tkind.as_str(), eseq), ("acceptConversation", 2));
+}
+
+#[tokio::test]
+async fn leaf_recovery_replace_request_commits_without_advancing_coordinate() {
+    let pool = setup().await;
+    let fixture = commit_creation(&pool, ConversationKind::Group).await;
+    let conversation_id = fixture.conversation_id;
+
+    // alice's committed genesis leaf period (the leaf a `replace` recovers).
+    let alice_leaf_period: Uuid = sqlx::query_scalar(
+        "SELECT leaf_period_id FROM chat.member_devices WHERE conversation_id=$1 AND user_did=$2",
+    )
+    .bind(conversation_id)
+    .bind(&fixture.alice_did)
+    .fetch_one(&pool)
+    .await
+    .expect("alice leaf period");
+
+    // A fresh available key package owned by alice to reserve.
+    let key_package_ref = random_ref32();
+    let package_not_after = seed_key_package(
+        &pool,
+        &fixture.alice_did,
+        fixture.alice_device,
+        &fixture.alice_key_id,
+        &key_package_ref,
+    )
+    .await;
+
+    let received_at = ServerTimestamp::from_unix_millis_for_test(
+        corpus_manifest().evaluation_unix_seconds as i64 * 1_000 + 3_000,
+    )
+    .unwrap();
+    let pkg_not_after_ts = ServerTimestamp::from_unix_millis_for_test(
+        corpus_manifest().evaluation_unix_seconds as i64 * 1_000 + 3_600_000,
+    )
+    .unwrap();
+    let recovery_request_id = Uuid::new_v4();
+    let evidence = RequestEvidence::for_test(
+        RequestEntryKind::LeafRecoveryRequest,
+        2,
+        *recovery_request_id.as_bytes(),
+        fixture.alice_id.clone(),
+        *conversation_id.as_bytes(),
+        received_at,
+        0x71,
+    )
+    .unwrap();
+    let planned = plan_leaf_recovery_request(
+        &fixture.state,
+        LeafRecoveryRequestCommand {
+            actor: fixture.alice_id.clone(),
+            recovery_request_id: *recovery_request_id.as_bytes(),
+            kind: LeafRecoveryKind::Replace,
+            key_package_ref,
+            received_at,
+            package_not_after: pkg_not_after_ts,
+            evidence,
+        },
+    )
+    .expect("valid leaf recovery request plan");
+    let head_cas = ConversationHeadCasBinding::for_test_internal(
+        *conversation_id.as_bytes(),
+        fixture.coordinate,
+        2,
+        received_at,
+    );
+    let plan = persistence_plan_for_test(planned, head_cas);
+
+    let applied_at = clock_now(&pool).await;
+    let transcript = vec![0x72_u8; 16];
+    let alice_pred =
+        device_event_predecessor(&pool, &fixture.alice_did, fixture.alice_device).await;
+    let ctx = ExecutionContext {
+        protocol_instance_id: fixture.protocol_instance_id,
+        applied_at,
+        actor: ExecutionActor {
+            user_did: fixture.alice_did.clone(),
+            device_id: fixture.alice_device,
+            key_id: fixture.alice_key_id.clone(),
+            auth_generation: 1,
+            role: TransitionActorRole::Admin,
+            device_status: "active".to_owned(),
+        },
+        // Internal op: the executor appends no control entry, but write_recovery_open
+        // sources the leaf_recovery_requests signed material from ctx.entry.
+        entry: ControlEntryContent {
+            entry_id: Uuid::new_v4(),
+            entry_kind: "blue.catbird.chat.defs#applicationEntry".to_owned(),
+            accepted_payload_bytes: vec![0x73_u8; 8],
+            accepted_payload_sha256: Sha256::digest([0x73_u8; 8]).to_vec(),
+            signed_request_bytes: transcript.clone(),
+            unsigned_projection_bytes: vec![0x74_u8; 8],
+            signing_transcript_bytes: transcript.clone(),
+            request_digest: Sha256::digest(&transcript).to_vec(),
+            signature: vec![0x75_u8; 64],
+            server_fields_bytes: vec![0x76_u8; 8],
+            outer_entry_fingerprint: vec![0x17_u8; 32],
+        },
+        spine: SpineArtifacts {
+            public_snapshot_bytes: vec![],
+            public_snapshot_sha256: vec![],
+            tree_summary_bytes: vec![],
+            tree_summary_sha256: vec![],
+            leaf_count: 1,
+            genesis_group_info_bytes: vec![],
+            genesis_group_info_sha256: vec![],
+        },
+        opened_leaves: vec![],
+        metadata_author: None,
+        participant_period_ids: vec![],
+        leaf_period_ids: vec![],
+        entry_recipients: vec![],
+        events: vec![EventFanout {
+            event_id: Uuid::new_v4(),
+            event_kind: EventKind::ConversationChanged,
+            payload_bytes: vec![0x77_u8; 8],
+            recipients: vec![(
+                fixture.alice_id.clone(),
+                EventEntitlementKind::Participant,
+                alice_pred,
+            )],
+            outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+        }],
+        closing_leaf_periods: vec![],
+        reset_request_row: None,
+        recovery_open: Some(RecoveryOpenContext {
+            participant_period_id: None,
+            package_not_after,
+            replaced_leaf_period_id: Some(alice_leaf_period),
+        }),
+    };
+
+    let mut tx = pool.begin().await.expect("begin leaf recovery request");
+    apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+        .await
+        .expect("leaf recovery request applies");
+    tx.commit()
+        .await
+        .expect("leaf recovery request COMMIT past all deferred triggers");
+
+    // Coordinate + seq counter UNCHANGED (still 0,0,active,next_seq 2).
+    let (gen, sv, next_seq, lifecycle): (i64, i64, i64, String) = sqlx::query_as(
+        "SELECT current_generation,current_state_version,next_entry_seq,lifecycle FROM chat.conversations WHERE conversation_id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("head");
+    assert_eq!((gen, sv, next_seq, lifecycle.as_str()), (0, 0, 2, "active"));
+    // No new transition (internal op authored none).
+    let transitions: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM chat.transitions WHERE conversation_id=$1")
+            .bind(conversation_id)
+            .fetch_one(&pool)
+            .await
+            .expect("transitions");
+    assert_eq!(transitions, 1, "only the creation transition exists");
+    // Open replace recovery request + active reservation + reserved package.
+    let (req_status, req_source, req_kind, replaced): (String, String, String, Option<Uuid>) = sqlx::query_as(
+        "SELECT status,source,recovery_kind,replaced_leaf_period_id FROM chat.leaf_recovery_requests WHERE recovery_request_id=$1",
+    )
+    .bind(recovery_request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("recovery request");
+    assert_eq!(
+        (req_status.as_str(), req_source.as_str(), req_kind.as_str()),
+        ("open", "requestLeafRecovery", "replace")
+    );
+    assert_eq!(replaced, Some(alice_leaf_period));
+    let res_status: String = sqlx::query_scalar(
+        "SELECT status FROM chat.key_package_reservations WHERE recovery_request_id=$1",
+    )
+    .bind(recovery_request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("reservation");
+    assert_eq!(res_status, "active");
+    let pkg_status: String =
+        sqlx::query_scalar("SELECT status FROM chat.key_packages WHERE key_package_ref=$1")
+            .bind(key_package_ref.to_vec())
+            .fetch_one(&pool)
+            .await
+            .expect("package");
+    assert_eq!(pkg_status, "reserved");
 }
 
 /// Remove one conversation's committed graph so the shared, never-truncated
