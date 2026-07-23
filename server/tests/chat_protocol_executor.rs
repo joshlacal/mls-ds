@@ -104,15 +104,16 @@ use chat_protocol::state_machine::{
     apply_conversation_persistence_plan, persistence_plan_for_test, plan_accept_conversation,
     plan_close, plan_commit, plan_creation, plan_leaf_recovery_cancellation,
     plan_leaf_recovery_fulfillment, plan_leaf_recovery_request, plan_leave_cancellation,
-    plan_leave_request, plan_policy, plan_reset_activation, plan_reset_request, AcceptConversation,
-    CloseConversation, CommitCommand, ControlEntryContent, ConversationHeadCasBinding,
-    ConversationKind, ConversationState, CreationCommand, CreationDecision, DeviceIdentity,
-    EventFanout, ExecutionActor, ExecutionContext, ExecutorError, LeafPersistenceColumns,
-    LeafRecoveryCancellation, LeafRecoveryFulfillment, LeafRecoveryKind,
-    LeafRecoveryRequestCommand, LeaveCancellation, LeaveRequestCommand,
-    LockedRegistrationProjection, MetadataAuthorColumns, MetadataSnapshotBinding, PrincipalId,
-    RecoveryOpenContext, RequestEntryKind, RequestEvidence, ResetActivation, ResetRequestCommand,
-    ResetRequestRow, ServerTimestamp, SpineArtifacts, TransitionEvidence, WelcomeDispositionInput,
+    plan_leave_request, plan_policy, plan_reset_activation, plan_reset_request,
+    plan_zero_leaf_leave, AcceptConversation, CloseConversation, CommitCommand,
+    ControlEntryContent, ConversationHeadCasBinding, ConversationKind, ConversationState,
+    CreationCommand, CreationDecision, DeviceIdentity, EventFanout, ExecutionActor,
+    ExecutionContext, ExecutorError, LeafPersistenceColumns, LeafRecoveryCancellation,
+    LeafRecoveryFulfillment, LeafRecoveryKind, LeafRecoveryRequestCommand, LeaveCancellation,
+    LeaveRequestCommand, LockedRegistrationProjection, MetadataAuthorColumns,
+    MetadataSnapshotBinding, PrincipalId, RecoveryOpenContext, RequestEntryKind, RequestEvidence,
+    ResetActivation, ResetRequestCommand, ResetRequestRow, ServerTimestamp, SpineArtifacts,
+    TransitionEvidence, WelcomeDispositionInput, ZeroLeafLeave,
 };
 use chat_protocol::validation::ed25519_key_id;
 use chat_protocol::wire::{validate_public_commit, MAX_PUBLIC_MESSAGE_WIRE_BYTES};
@@ -630,6 +631,7 @@ async fn build_creation_with_invitee(
             outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
         }],
         closing_leaf_periods: Vec::new(),
+        closing_participant_periods: Vec::new(),
         reset_request_row: None,
         recovery_open: None,
         welcome_dispositions: vec![],
@@ -1322,6 +1324,7 @@ async fn group_policy_add_participant_commits_state_version_plus_one() {
             outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
         }],
         closing_leaf_periods: Vec::new(),
+        closing_participant_periods: Vec::new(),
         reset_request_row: None,
         recovery_open: None,
         welcome_dispositions: vec![],
@@ -1733,6 +1736,7 @@ fn close_ctx(
             outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
         }],
         closing_leaf_periods: vec![(fixture.alice_id.clone(), leaf_period_id)],
+        closing_participant_periods: vec![],
         reset_request_row: None,
         recovery_open: None,
         welcome_dispositions: vec![],
@@ -1844,6 +1848,7 @@ async fn reset_request_commits_without_changing_the_coordinate() {
             outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
         }],
         closing_leaf_periods: vec![],
+        closing_participant_periods: vec![],
         reset_request_row: Some(ResetRequestRow {
             reset_request_id: request_id,
             reason: ResetReason::PoisonedState,
@@ -1996,6 +2001,7 @@ async fn commit_reset_request(
             outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
         }],
         closing_leaf_periods: vec![],
+        closing_participant_periods: vec![],
         reset_request_row: Some(ResetRequestRow {
             reset_request_id: request_id,
             reason: ResetReason::PoisonedState,
@@ -2204,6 +2210,7 @@ async fn reset_activation_commits_two_generation_graph_and_conflicts_on_replay()
             outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
         }],
         closing_leaf_periods: vec![(fixture.alice_id.clone(), old_leaf_period)],
+        closing_participant_periods: vec![],
         reset_request_row: None,
         recovery_open: None,
         welcome_dispositions: vec![],
@@ -2619,6 +2626,7 @@ async fn acceptance_commits_recovery_open_and_promotes_participant() {
             outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
         }],
         closing_leaf_periods: vec![],
+        closing_participant_periods: vec![],
         reset_request_row: None,
         recovery_open: Some(RecoveryOpenContext {
             participant_period_id: Some(bob_period),
@@ -2852,6 +2860,7 @@ async fn leaf_recovery_replace_request_commits_without_advancing_coordinate() {
             outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
         }],
         closing_leaf_periods: vec![],
+        closing_participant_periods: vec![],
         reset_request_row: None,
         recovery_open: Some(RecoveryOpenContext {
             participant_period_id: None,
@@ -3061,6 +3070,7 @@ async fn build_replace_recovery_request(
             outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
         }],
         closing_leaf_periods: vec![],
+        closing_participant_periods: vec![],
         reset_request_row: None,
         recovery_open: Some(RecoveryOpenContext {
             participant_period_id: None,
@@ -3204,6 +3214,7 @@ async fn leaf_recovery_cancellation_releases_reservation_and_reactivates_package
             outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
         }],
         closing_leaf_periods: vec![],
+        closing_participant_periods: vec![],
         reset_request_row: None,
         recovery_open: None,
         welcome_dispositions: vec![],
@@ -3341,6 +3352,7 @@ async fn acceptance_ctx(
             outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
         }],
         closing_leaf_periods: vec![],
+        closing_participant_periods: vec![],
         reset_request_row: None,
         recovery_open: Some(RecoveryOpenContext {
             participant_period_id: Some(bob_period),
@@ -3693,6 +3705,7 @@ async fn run_fulfillment_scenario(pool: &PgPool) -> FulfillmentScenario {
             outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
         }],
         closing_leaf_periods: vec![],
+        closing_participant_periods: vec![],
         reset_request_row: None,
         recovery_open: None,
         welcome_dispositions: vec![],
@@ -4028,6 +4041,7 @@ async fn generic_commit_commits_epoch_bump_and_reencrypts_metadata() {
             outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
         }],
         closing_leaf_periods: vec![],
+        closing_participant_periods: vec![],
         reset_request_row: None,
         recovery_open: None,
         // The epoch change supersedes the fulfillment's pending Welcome; provide its
@@ -4240,6 +4254,7 @@ async fn commit_leave_request(
             outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
         }],
         closing_leaf_periods: vec![],
+        closing_participant_periods: vec![],
         reset_request_row: None,
         recovery_open: None,
         welcome_dispositions: vec![],
@@ -4408,6 +4423,7 @@ async fn leave_cancellation_terminalizes_pending_request_and_conflicts_on_replay
             outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
         }],
         closing_leaf_periods: vec![],
+        closing_participant_periods: vec![],
         reset_request_row: None,
         recovery_open: None,
         welcome_dispositions: vec![],
@@ -4464,6 +4480,205 @@ async fn leave_cancellation_terminalizes_pending_request_and_conflicts_on_replay
         "leave cancellation replay must conflict on the head CAS, got {replay:?}"
     );
     tx2.rollback().await.expect("rollback replay");
+}
+
+#[tokio::test]
+async fn zero_leaf_leave_commits_immediate_self_removal() {
+    let (pool, _db) = setup().await;
+    let fixture = build_creation(&pool, ConversationKind::Group).await;
+    let conversation_id = fixture.conversation_id;
+    let bob_id = fixture.bob_id.clone();
+    let bob_did = fixture.bob_did.clone();
+    let bob_device = Uuid::from_bytes(*bob_id.device_id());
+
+    // Commit the creation (alice active/admin + bob pending/member, no leaf).
+    {
+        let mut tx = pool.begin().await.expect("begin creation");
+        apply_conversation_persistence_plan(&mut tx, &fixture.plan, &fixture.ctx)
+            .await
+            .expect("creation applies");
+        tx.commit().await.expect("creation COMMIT");
+    }
+
+    // Bob's existing pending participant period — the DB fact the plan can't carry
+    // (the leaver is removed from the successor hydration).
+    let bob_period: Uuid = sqlx::query_scalar(
+        "SELECT participant_period_id FROM chat.participants WHERE conversation_id=$1 AND user_did=$2 AND current_membership",
+    )
+    .bind(conversation_id)
+    .bind(&bob_did)
+    .fetch_one(&pool)
+    .await
+    .expect("bob participant period");
+
+    // Bob (pending, leafless) self-removes immediately via a zeroLeafLeave.
+    let received_at = ServerTimestamp::from_unix_millis_for_test(
+        corpus_manifest().evaluation_unix_seconds as i64 * 1_000 + 2_000,
+    )
+    .unwrap();
+    let transition_id = Uuid::new_v4();
+    let evidence =
+        TransitionEvidence::for_test_at(2, *transition_id.as_bytes(), [0x82_u8; 32], received_at)
+            .unwrap();
+    let planned = plan_zero_leaf_leave(
+        &fixture.state,
+        ZeroLeafLeave {
+            actor: bob_id.clone(),
+            transition: evidence,
+        },
+    )
+    .expect("valid zero-leaf leave plan");
+    assert_eq!(planned.resulting_state().coordinate().state_version(), 1);
+    let entry_id = Uuid::new_v4();
+    let head_cas = ConversationHeadCasBinding::for_test_edge(
+        *conversation_id.as_bytes(),
+        *entry_id.as_bytes(),
+        fixture.coordinate,
+        2,
+        received_at,
+    );
+    let plan = persistence_plan_for_test(planned, head_cas);
+    let applied_at = clock_now(&pool).await;
+    let transcript = vec![0x92_u8; 16];
+    let ctx = ExecutionContext {
+        protocol_instance_id: fixture.protocol_instance_id,
+        applied_at,
+        actor: ExecutionActor {
+            user_did: bob_did.clone(),
+            device_id: bob_device,
+            key_id: fixture.bob_key_id.clone(),
+            auth_generation: 1,
+            role: TransitionActorRole::Member,
+            device_status: "active".to_owned(),
+        },
+        entry: ControlEntryContent {
+            entry_id,
+            entry_kind: "blue.catbird.chat.defs#zeroLeafLeaveEntry".to_owned(),
+            accepted_payload_bytes: vec![0x94_u8; 8],
+            accepted_payload_sha256: Sha256::digest([0x94_u8; 8]).to_vec(),
+            signed_request_bytes: transcript.clone(),
+            unsigned_projection_bytes: vec![0x95_u8; 8],
+            signing_transcript_bytes: transcript.clone(),
+            request_digest: Sha256::digest(&transcript).to_vec(),
+            signature: vec![0x96_u8; 64],
+            server_fields_bytes: vec![0x97_u8; 8],
+            outer_entry_fingerprint: vec![0x1C_u8; 32],
+        },
+        spine: SpineArtifacts {
+            public_snapshot_bytes: vec![0xE1_u8; 16],
+            public_snapshot_sha256: Sha256::digest([0xE1_u8; 16]).to_vec(),
+            tree_summary_bytes: vec![0xE2_u8; 16],
+            tree_summary_sha256: Sha256::digest([0xE2_u8; 16]).to_vec(),
+            leaf_count: 1,
+            genesis_group_info_bytes: vec![],
+            genesis_group_info_sha256: vec![],
+        },
+        opened_leaves: vec![],
+        metadata_author: None,
+        participant_period_ids: vec![],
+        leaf_period_ids: vec![],
+        entry_recipients: entry_audience(&fixture.alice_id, &fixture.alice_did, &bob_id, &bob_did),
+        events: vec![EventFanout {
+            event_id: Uuid::new_v4(),
+            event_kind: EventKind::ConversationChanged,
+            payload_bytes: vec![0x98_u8; 8],
+            recipients: event_audience(
+                &pool,
+                &fixture.alice_id,
+                &fixture.alice_did,
+                &bob_id,
+                &bob_did,
+            )
+            .await,
+            outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+        }],
+        closing_leaf_periods: vec![],
+        closing_participant_periods: vec![(bob_id.clone(), bob_period)],
+        reset_request_row: None,
+        recovery_open: None,
+        welcome_dispositions: vec![],
+    };
+
+    let mut tx = pool.begin().await.expect("begin zero-leaf leave");
+    let applied = apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+        .await
+        .expect("zero-leaf leave applies");
+    tx.commit()
+        .await
+        .expect("zero-leaf leave COMMIT past all deferred triggers");
+    assert_eq!(applied.allocated_seq, 2);
+
+    // Coordinate advanced sv 0 -> 1 (same generation/epoch), seq 2 -> 3.
+    let (gen, sv, next_seq, lifecycle): (i64, i64, i64, String) = sqlx::query_as(
+        "SELECT current_generation,current_state_version,next_entry_seq,lifecycle FROM chat.conversations WHERE conversation_id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("head");
+    assert_eq!((gen, sv, next_seq, lifecycle.as_str()), (0, 1, 3, "active"));
+
+    // A leavePolicy generation state at sv 1.
+    let skind: String = sqlx::query_scalar(
+        "SELECT state_kind FROM chat.generation_states WHERE conversation_id=$1 AND state_version=1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("gen state");
+    assert_eq!(skind, "leavePolicy");
+
+    // Bob's participant period is closed, bound to the leave transition; no metadata.
+    let (membership, removing): (bool, Option<Uuid>) = sqlx::query_as(
+        "SELECT current_membership,removing_transition_id FROM chat.participants WHERE participant_period_id=$1",
+    )
+    .bind(bob_period)
+    .fetch_one(&pool)
+    .await
+    .expect("bob period");
+    assert!(!membership);
+    assert_eq!(removing, Some(transition_id));
+    let (tkind, meta): (String, Option<Uuid>) = sqlx::query_as(
+        "SELECT kind,metadata_snapshot_id FROM chat.transitions WHERE transition_id=$1",
+    )
+    .bind(transition_id)
+    .fetch_one(&pool)
+    .await
+    .expect("transition");
+    assert_eq!(tkind, "leavePolicy");
+    assert!(meta.is_none());
+
+    // The zeroLeafLeaveEntry landed at seq 2.
+    let entry_kind: String = sqlx::query_scalar(
+        "SELECT entry_kind FROM chat.entries WHERE conversation_id=$1 AND seq=2",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("entry");
+    assert_eq!(entry_kind, "blue.catbird.chat.defs#zeroLeafLeaveEntry");
+
+    // Replay -> head CAS conflict (sv already 1), zero residue.
+    let before: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM chat.transitions WHERE conversation_id=$1")
+            .bind(conversation_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let mut tx2 = pool.begin().await.expect("begin replay");
+    let replay = apply_conversation_persistence_plan(&mut tx2, &plan, &ctx).await;
+    assert!(
+        matches!(replay, Err(ExecutorError::Transition(_))),
+        "zero-leaf leave replay must conflict on the head CAS, got {replay:?}"
+    );
+    tx2.rollback().await.expect("rollback replay");
+    let after: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM chat.transitions WHERE conversation_id=$1")
+            .bind(conversation_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(before, after, "zero-leaf leave replay left zero residue");
 }
 
 #[tokio::test]
@@ -4585,6 +4800,7 @@ async fn generic_commit_supersedes_prior_open_recovery_request() {
             outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
         }],
         closing_leaf_periods: vec![],
+        closing_participant_periods: vec![],
         reset_request_row: None,
         recovery_open: Some(RecoveryOpenContext {
             participant_period_id: None,
@@ -4752,6 +4968,7 @@ async fn generic_commit_supersedes_prior_open_recovery_request() {
             outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
         }],
         closing_leaf_periods: vec![],
+        closing_participant_periods: vec![],
         reset_request_row: None,
         recovery_open: None,
         welcome_dispositions: vec![WelcomeDispositionInput {

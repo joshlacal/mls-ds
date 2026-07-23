@@ -13199,6 +13199,13 @@ mod executor {
         /// supply everything else (terminal seq, closing transition + fingerprint).
         /// Empty for edges that close no interval (creation / policy / reset req).
         pub(crate) closing_leaf_periods: Vec<(DeviceIdentity, Uuid)>,
+        /// For an edge that TERMINALIZES an existing participant period (a
+        /// `zeroLeafLeave` self-removal of a leafless/pending participant): the
+        /// exact active `chat.participants.participant_period_id` to close. The
+        /// removed participant is NOT in the successor hydration, so its period id
+        /// cannot come from `participant_period_ids`; the facade queries
+        /// `chat.participants` for it under lock. Empty for every other edge.
+        pub(crate) closing_participant_periods: Vec<(DeviceIdentity, Uuid)>,
         /// For a `reset request` edge: the exact `chat.reset_requests` row content
         /// the signed request carries (reason + signed material + expiry). `None`
         /// for every other edge.
@@ -13610,7 +13617,21 @@ mod executor {
                 )
                 .await
             }
-            PlanKind::ZeroLeafLeave => Err(ExecutorError::UnsupportedEffect("zeroLeafLeave")),
+            PlanKind::ZeroLeafLeave => {
+                apply_zero_leaf_leave(
+                    transaction,
+                    plan,
+                    ctx,
+                    conversation_id,
+                    transition_id,
+                    seq_i64,
+                    successor_next_entry_seq,
+                    generation,
+                    state_version,
+                    epoch,
+                )
+                .await
+            }
             PlanKind::WelcomeAcknowledgement => {
                 Err(ExecutorError::UnsupportedEffect("welcomeAcknowledgement"))
             }
@@ -15054,6 +15075,230 @@ mod executor {
             effects,
             transition_id,
             applied_at,
+        )
+        .await?;
+
+        // 7. Audience + events.
+        let recipients = build_entry_recipients(&ctx.entry_recipients)?;
+        delivery::insert_entry_recipients(
+            transaction,
+            conversation_id,
+            u64::try_from(seq_i64).unwrap(),
+            &recipients,
+        )
+        .await?;
+        let event_positions = write_events(transaction, ctx).await?;
+
+        Ok(AppliedTransition {
+            allocated_seq: u64::try_from(seq_i64).unwrap(),
+            entry_id: ctx.entry.entry_id,
+            event_positions,
+            successor_coordinate: plan.successor_coordinate().copied(),
+        })
+    }
+
+    /// Apply a `zeroLeafLeave` edge: an active but LEAFLESS participant (a pending
+    /// invitee who never joined) self-removes immediately. `stateVersion+1`, same
+    /// generation/epoch (a coordinate-only rebind, NO crypto commit and NO metadata
+    /// snapshot — `leavePolicy` is not in the metadata-required set). It closes the
+    /// participant period (releasing its invitation-quota slot, which the deferred
+    /// `enforce_invitation_quota` trigger recomputes), with no leaf/interval change
+    /// (the leaver had neither). Mirrors `apply_policy`'s coordinate/gen-state CAS
+    /// spine, but terminalizes the participant instead of adding one.
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_zero_leaf_leave(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        plan: &ConversationPersistencePlan,
+        ctx: &ExecutionContext,
+        conversation_id: Uuid,
+        transition_id: Uuid,
+        seq_i64: i64,
+        successor_next_entry_seq: i64,
+        generation: i64,
+        state_version: i64,
+        epoch: i64,
+    ) -> Result<AppliedTransition, ExecutorError> {
+        let effects = plan.effects();
+        let hydration = plan.state();
+        let coordinate = &hydration.coordinate;
+        let applied_at = ctx.applied_at;
+        let head = effects
+            .head_cas()
+            .ok_or(ExecutorError::InconsistentPlan("missing head CAS binding"))?;
+        let expected_prior = head
+            .expected_prior()
+            .ok_or(ExecutorError::InconsistentPlan(
+                "zero-leaf leave needs an expected prior",
+            ))?;
+        let expected_generation = checked_i64(expected_prior.generation())?;
+        let expected_state_version = checked_i64(expected_prior.state_version())?;
+        let expected_next_entry_seq = checked_i64(head.expected_next_entry_seq())?;
+
+        // Coordinate-only self-removal: the ONLY delta is one participant close.
+        // The leaver was leafless, so no leaf/interval/proof change; every other
+        // family is a hard error so nothing is silently dropped.
+        reject_if_present("leaf_changes", effects.leaf_changes())?;
+        reject_if_present("interval_changes", effects.interval_changes())?;
+        reject_if_present("terminal_proof_changes", effects.terminal_proof_changes())?;
+        reject_if_present(
+            "recovery_request_changes",
+            effects.recovery_request_changes(),
+        )?;
+        reject_if_present("reservation_changes", effects.reservation_changes())?;
+        reject_if_present("reset_request_changes", effects.reset_request_changes())?;
+        reject_if_present("leave_request_changes", effects.leave_request_changes())?;
+        reject_if_present("welcome_changes", effects.welcome_changes())?;
+        reject_if_present("package_transitions", effects.package_transitions())?;
+        reject_if_present("recovery_package_cas", effects.recovery_package_cas())?;
+        reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
+        if effects.metadata_change().is_some() {
+            return Err(ExecutorError::UnsupportedEffect(
+                "zero-leaf leave metadata change",
+            ));
+        }
+        if effects.revocation_target_cas().is_some() || effects.welcome_cas().is_some() {
+            return Err(ExecutorError::UnsupportedEffect(
+                "zero-leaf leave revocation/welcome CAS",
+            ));
+        }
+        // A zero-leaf leave releases (never consumes) an invitation slot, so the
+        // plan carries NO invitation-quota CAS (only Creation/Policy do); the
+        // deferred quota trigger recomputes from the closed participant row.
+        if effects.invitation_quota_cas().is_some() {
+            return Err(ExecutorError::UnsupportedEffect(
+                "zero-leaf leave invitation quota CAS",
+            ));
+        }
+        // Exactly one participant is closed (Some -> None); records are never
+        // deleted, only terminalized.
+        if effects.participant_changes().len() != 1 {
+            return Err(ExecutorError::InconsistentPlan(
+                "zero-leaf leave must change exactly one participant",
+            ));
+        }
+        let removed = effects
+            .participant_changes()
+            .iter()
+            .find_map(|change| match (change.before(), change.after()) {
+                (Some(before), None) => Some(before),
+                _ => None,
+            })
+            .ok_or(ExecutorError::InconsistentPlan(
+                "zero-leaf leave must close exactly one participant",
+            ))?;
+        let participant_period_id = ctx
+            .closing_participant_periods
+            .iter()
+            .find(|(device, _)| device.principal() == removed.principal())
+            .map(|(_, id)| *id)
+            .ok_or(ExecutorError::MissingContext(
+                "closing participant period id for the zero-leaf leaver",
+            ))?;
+
+        // 1. Head CAS advances the coordinate + counter (single seq authority).
+        transition::cas_conversation_head(
+            transaction,
+            &transition::ConversationHeadCas {
+                conversation_id,
+                expected_generation,
+                expected_state_version,
+                expected_next_entry_seq,
+                successor_generation: generation,
+                successor_state_version: state_version,
+                successor_next_entry_seq,
+                close: None,
+            },
+        )
+        .await?;
+
+        // 2. Advance the generation's state-version pointer (same generation).
+        transition::cas_generation_state_version(
+            transaction,
+            &transition::GenerationStateVersionCas {
+                conversation_id,
+                generation,
+                expected_state_version,
+                successor_state_version: state_version,
+            },
+        )
+        .await?;
+
+        // 3. Successor generation state (leavePolicy kind, coordinate-only rebind).
+        transition::insert_generation_state_row(
+            transaction,
+            &NewGenerationState {
+                conversation_id,
+                generation,
+                state_version,
+                group_id: coordinate.group_id().to_vec(),
+                epoch,
+                group_context_hash: coordinate.group_context_hash().to_vec(),
+                confirmation_tag: coordinate.confirmation_tag().to_vec(),
+                lifecycle: GenerationStateLifecycle::Active,
+                state_kind: GenerationStateKind::LeavePolicy,
+                producing_transition_id: transition_id,
+                public_snapshot_bytes: ctx.spine.public_snapshot_bytes.clone(),
+                snapshot_sha256: ctx.spine.public_snapshot_sha256.clone(),
+                tree_summary_bytes: ctx.spine.tree_summary_bytes.clone(),
+                tree_summary_sha256: ctx.spine.tree_summary_sha256.clone(),
+                leaf_count: ctx.spine.leaf_count,
+                created_at: applied_at,
+            },
+        )
+        .await?;
+
+        // 4. Entry (zeroLeafLeaveEntry) at the allocated seq.
+        let append = build_append_entry(
+            ctx,
+            conversation_id,
+            generation,
+            state_version,
+            transition_id,
+        );
+        delivery::append_entry_at(transaction, &append, u64::try_from(seq_i64).unwrap()).await?;
+
+        // 5. Transition (leavePolicy, prior -> next, no metadata snapshot).
+        transition::insert_transition_row(
+            transaction,
+            &NewTransition {
+                transition_id,
+                conversation_id,
+                kind: TransitionKind::LeavePolicy,
+                actor_did: ctx.actor.user_did.clone(),
+                actor_device_id: ctx.actor.device_id,
+                actor_key_id: ctx.actor.key_id.clone(),
+                actor_auth_generation: ctx.actor.auth_generation,
+                actor_role: ctx.actor.role,
+                actor_device_status: ctx.actor.device_status.clone(),
+                signed_request_bytes: ctx.entry.signed_request_bytes.clone(),
+                unsigned_projection_bytes: ctx.entry.unsigned_projection_bytes.clone(),
+                signing_transcript_bytes: ctx.entry.signing_transcript_bytes.clone(),
+                request_digest: ctx.entry.request_digest.clone(),
+                signature: ctx.entry.signature.clone(),
+                coordinates: TransitionCoordinates {
+                    prior: Some((expected_generation, expected_state_version)),
+                    next: Some((generation, state_version)),
+                    retired: None,
+                    successor: None,
+                },
+                reset_request_id: None,
+                close_transition_id: None,
+                metadata_snapshot_id: None,
+                entry_seq: seq_i64,
+                accepted_at: applied_at,
+            },
+        )
+        .await?;
+
+        // 6. Close the leaver's participant period (invitation-slot release).
+        transition::terminalize_participant_period(
+            transaction,
+            &transition::ParticipantTerminalization {
+                participant_period_id,
+                removing_transition_id: transition_id,
+                removing_seq: seq_i64,
+                removed_at: applied_at,
+            },
         )
         .await?;
 
