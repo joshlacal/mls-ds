@@ -794,6 +794,74 @@ impl VerifiedCommitPublicState {
             verified_aad_sha256: None,
         })
     }
+
+    /// Synthetic ZERO-PROPOSAL commit (`sv+1`, `epoch+1`, fresh hash/tag; no
+    /// adds/removes, sender self-update only). Mirrors `for_test_remove`'s pure
+    /// public-state seam — the executor generic-commit arm is verified against this
+    /// (the real `commit-generic-public.mls` parses via `validate_public_commit`,
+    /// but `process_commit` reconstructing a NON-authoritative prior from an earlier
+    /// public commit diverges cryptographically, which is exactly why the
+    /// state-machine suite drives generic/remove commits synthetically too).
+    #[cfg(test)]
+    pub(crate) fn for_test_generic(
+        prior: &ActivePublicState,
+        next_coordinate: PublicGroupSnapshotCoordinate,
+        sender_leaf_index: u32,
+    ) -> Result<Self, PublicStateError> {
+        let prior_coordinate = prior.coordinate();
+        if prior_coordinate.conversation_id() != next_coordinate.conversation_id()
+            || prior_coordinate.generation() != next_coordinate.generation()
+            || prior_coordinate.group_id() != next_coordinate.group_id()
+            || prior_coordinate.state_version().checked_add(1)
+                != Some(next_coordinate.state_version())
+            || prior_coordinate.epoch().checked_add(1) != Some(next_coordinate.epoch())
+            || prior_coordinate.group_context_hash() == next_coordinate.group_context_hash()
+            || prior_coordinate.confirmation_tag() == next_coordinate.confirmation_tag()
+            || next_coordinate.lifecycle() != PublicGroupSnapshotLifecycle::Active
+        {
+            return Err(PublicStateError::CoordinateMismatch);
+        }
+        let prior_leaves = prior.binding.tree_summary().leaves();
+        let sender = prior_leaves
+            .iter()
+            .find(|leaf| leaf.leaf_index() == sender_leaf_index)
+            .ok_or(PublicStateError::CoordinateMismatch)?;
+        let next = ActivePublicState {
+            snapshot: prior.snapshot.clone(),
+            binding: PublicGroupSnapshotBinding::new(
+                *next_coordinate.conversation_id(),
+                next_coordinate.generation(),
+                next_coordinate.state_version(),
+                *next_coordinate.group_id(),
+                next_coordinate.epoch(),
+                *next_coordinate.group_context_hash(),
+                *next_coordinate.confirmation_tag(),
+                next_coordinate.lifecycle(),
+                *prior.binding.snapshot_sha256(),
+                PublicGroupSnapshotTreeSummary::new(
+                    *prior.binding.tree_summary().tree_hash(),
+                    prior_leaves.to_vec(),
+                ),
+            ),
+            verified_group_info_sha256: None,
+            verified_group_info_signature_key: None,
+        };
+        Ok(Self {
+            prior_coordinate: *prior_coordinate,
+            next,
+            adds: Vec::new(),
+            removes: Vec::new(),
+            sender_update: CommitSenderUpdateEffect {
+                leaf_index: sender_leaf_index,
+                basic_credential: sender.basic_credential().to_vec(),
+                signature_key: sender.signature_key().to_vec(),
+                prior_encryption_key: sender.encryption_key().to_vec(),
+                next_encryption_key: sender.encryption_key().to_vec(),
+            },
+            verified_commit_sha256: None,
+            verified_aad_sha256: None,
+        })
+    }
 }
 
 /// Validate and process a Commit against a fresh reload of the exact current

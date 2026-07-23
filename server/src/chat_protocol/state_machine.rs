@@ -9833,7 +9833,6 @@ fn plan_close_inner(
 #[cfg(test)]
 impl MetadataSnapshotBinding {
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn for_test_creation(
         conversation_id: [u8; 16],
         generation: u64,
@@ -10056,6 +10055,40 @@ impl TransitionEvidence {
                     recovery_request_id,
                     key_package_ref,
                 }),
+            },
+            commit_sha256: [0u8; 32],
+            metadata,
+        });
+        Ok(evidence)
+    }
+
+    /// A generic `signedCommitTransition` `TransitionEvidence`: the exact `Commit`
+    /// body a real zero-proposal epoch commit carries — prior/next coordinates
+    /// (`require_commit_body`), an empty Generic manifest (no participant/leaf
+    /// changes, no recovery id, no welcome — `require_commit_manifest` Generic
+    /// arm), and the mandatory metadata re-encryption. `authority = None` skips
+    /// only the crypto-digest cross-checks.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_test_commit_with_metadata(
+        seq: u64,
+        transition_id: [u8; 16],
+        outer_entry_fingerprint: [u8; 32],
+        received_at: ServerTimestamp,
+        prior: PublicGroupSnapshotCoordinate,
+        next: PublicGroupSnapshotCoordinate,
+        metadata: MetadataSnapshotBinding,
+    ) -> Result<Self, StateMachineError> {
+        let mut evidence =
+            Self::for_test_at(seq, transition_id, outer_entry_fingerprint, received_at)?;
+        evidence.body_binding = Some(TransitionBodyBinding::Commit {
+            prior,
+            next,
+            aad_digest: [0u8; 32],
+            manifest: TransitionManifestBinding {
+                participant_changes: Vec::new(),
+                leaf_changes: Vec::new(),
+                leaf_recovery_request_id: None,
+                welcome: None,
             },
             commit_sha256: [0u8; 32],
             metadata,
@@ -12975,7 +13008,7 @@ fn would_remove_last_active_admin(state: &ConversationState, principal: &Princip
 pub(crate) use executor::{
     apply_conversation_persistence_plan, AppliedTransition, ControlEntryContent, EventFanout,
     ExecutionActor, ExecutionContext, ExecutorError, LeafPersistenceColumns, MetadataAuthorColumns,
-    RecoveryOpenContext, ResetRequestRow, SpineArtifacts,
+    RecoveryOpenContext, ResetRequestRow, SpineArtifacts, WelcomeDispositionInput,
 };
 
 mod executor {
@@ -12989,6 +13022,7 @@ mod executor {
         EntryEntitlementKind, EntryRecipient, EventEntitlementKind, EventKind, EventRecipient,
         IntervalCloseKind, IntervalOpeningKind, NewApplicationInterval, NewEvent,
         NewScheduleTerminalProof, NewWelcomeBundle, NewWelcomeDelivery, OutboxWorkKind,
+        WelcomeDisposition,
     };
     use super::super::repository::transition::{
         self as transition, ConversationHeadClose, ConversationHeadKind, GenerationStateKind,
@@ -13176,6 +13210,21 @@ mod executor {
         /// (`ctx.actor`); the request id, kind, bound coordinate, and key-package
         /// ref come from the plan's `recovery_request_changes`.
         pub(crate) recovery_open: Option<RecoveryOpenContext>,
+        /// For a coordinate-changing commit that SUPERSEDES a prior-coordinate
+        /// pending Welcome: the `welcomeDisposition` event the executor appends and
+        /// binds the disposition row to (one per superseded welcome). Empty for
+        /// edges that supersede no welcome.
+        pub(crate) welcome_dispositions: Vec<WelcomeDispositionInput>,
+    }
+
+    /// The `welcomeDisposition` event + outbox the executor appends when a
+    /// coordinate change supersedes a prior-coordinate pending Welcome. The
+    /// disposition row (`terminalize_welcome_delivery`) is bound to this event's
+    /// position.
+    #[derive(Clone, Debug)]
+    pub(crate) struct WelcomeDispositionInput {
+        pub(crate) welcome_id: Uuid,
+        pub(crate) event: EventFanout,
     }
 
     /// DB-side facts a recovery-opening edge needs that the plan does not carry.
@@ -13466,9 +13515,19 @@ mod executor {
                     )
                     .await
                 } else {
-                    Err(ExecutorError::UnsupportedEffect(
-                        "commit (generic zero-add — corpus fixture gap)",
-                    ))
+                    apply_generic_commit(
+                        transaction,
+                        plan,
+                        ctx,
+                        conversation_id,
+                        transition_id,
+                        seq_i64,
+                        successor_next_entry_seq,
+                        generation,
+                        state_version,
+                        epoch,
+                    )
+                    .await
                 }
             }
             // Entry-less internal ops are dispatched (and returned) above, before
@@ -14252,6 +14311,226 @@ mod executor {
         )
         .await?;
         let event_positions = write_events(transaction, ctx).await?;
+
+        Ok(AppliedTransition {
+            allocated_seq: u64::try_from(seq_i64).unwrap(),
+            entry_id: ctx.entry.entry_id,
+            event_positions,
+            successor_coordinate: plan.successor_coordinate().copied(),
+        })
+    }
+
+    /// Apply a generic `signedCommitTransition` (zero adds / no membership change):
+    /// an epoch-only crypto commit. sv+1 AND epoch+1 with a fresh hash/tag, the
+    /// metadata re-encrypted (carry-forward), and NO leaf/interval/participant/
+    /// welcome/recovery change beyond the sender's own key rotation (which the DS
+    /// `member_devices` row does not store, so it is a no-op here). Distinguished
+    /// from a fulfillment purely by the ABSENCE of a Welcome (a fulfillment always
+    /// emits exactly one; a generic commit never does), backstopped by the
+    /// exact-empty guards below.
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_generic_commit(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        plan: &ConversationPersistencePlan,
+        ctx: &ExecutionContext,
+        conversation_id: Uuid,
+        transition_id: Uuid,
+        seq_i64: i64,
+        successor_next_entry_seq: i64,
+        generation: i64,
+        state_version: i64,
+        epoch: i64,
+    ) -> Result<AppliedTransition, ExecutorError> {
+        let effects = plan.effects();
+        let hydration = plan.state();
+        let coordinate = &hydration.coordinate; // successor (sv+1, epoch+1).
+        let applied_at = ctx.applied_at;
+        let head = effects
+            .head_cas()
+            .ok_or(ExecutorError::InconsistentPlan("missing head CAS binding"))?;
+        let expected_prior = head
+            .expected_prior()
+            .ok_or(ExecutorError::InconsistentPlan(
+                "generic commit needs a prior",
+            ))?;
+        let expected_generation = checked_i64(expected_prior.generation())?;
+        let expected_state_version = checked_i64(expected_prior.state_version())?;
+        let expected_next_entry_seq = checked_i64(head.expected_next_entry_seq())?;
+
+        // A generic (zero-proposal) commit changes ONLY the crypto coordinate + the
+        // re-encrypted metadata. Every membership/work family must be empty.
+        reject_if_present("participant_changes", effects.participant_changes())?;
+        reject_if_present("interval_changes", effects.interval_changes())?;
+        reject_if_present("terminal_proof_changes", effects.terminal_proof_changes())?;
+        reject_if_present(
+            "recovery_request_changes",
+            effects.recovery_request_changes(),
+        )?;
+        reject_if_present("reservation_changes", effects.reservation_changes())?;
+        reject_if_present("reset_request_changes", effects.reset_request_changes())?;
+        reject_if_present("leave_request_changes", effects.leave_request_changes())?;
+        // welcome_changes: NOT rejected — a coordinate-changing commit whose prior
+        // carried a pending Welcome (post-fulfillment) supersedes it; handled by
+        // write_welcome_supersessions (each must be Pending->Superseded).
+        reject_if_present("package_transitions", effects.package_transitions())?;
+        reject_if_present("recovery_package_cas", effects.recovery_package_cas())?;
+        reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
+        if effects.revocation_target_cas().is_some()
+            || effects.welcome_cas().is_some()
+            || effects.invitation_quota_cas().is_some()
+        {
+            return Err(ExecutorError::UnsupportedEffect(
+                "generic commit revocation/welcome/quota CAS",
+            ));
+        }
+        // Only the sender's own key rotation may appear as a leaf change — a
+        // (Some,Some) with NO DS row impact. Any add (None,Some) or remove
+        // (Some,None) is NOT a zero-proposal commit and is a hard error.
+        for change in effects.leaf_changes() {
+            if !matches!((change.before(), change.after()), (Some(_), Some(_))) {
+                return Err(ExecutorError::InconsistentPlan(
+                    "generic commit carries a membership leaf change (not zero-proposal)",
+                ));
+            }
+        }
+        // Metadata re-encryption is MANDATORY (DDL requires_snapshot ∋ commit).
+        let metadata = effects
+            .metadata_change()
+            .and_then(StateChange::after)
+            .ok_or(ExecutorError::InconsistentPlan(
+                "generic commit carries no metadata re-encryption",
+            ))?;
+        let author_cols = ctx
+            .metadata_author
+            .as_ref()
+            .ok_or(ExecutorError::MissingContext(
+                "generic commit metadata author",
+            ))?;
+
+        // 1. Head CAS sv+1 (the epoch bump lives in the gen_state).
+        transition::cas_conversation_head(
+            transaction,
+            &transition::ConversationHeadCas {
+                conversation_id,
+                expected_generation,
+                expected_state_version,
+                expected_next_entry_seq,
+                successor_generation: generation,
+                successor_state_version: state_version,
+                successor_next_entry_seq,
+                close: None,
+            },
+        )
+        .await?;
+
+        // 2. Generation state-version pointer CAS (same generation).
+        transition::cas_generation_state_version(
+            transaction,
+            &transition::GenerationStateVersionCas {
+                conversation_id,
+                generation,
+                expected_state_version,
+                successor_state_version: state_version,
+            },
+        )
+        .await?;
+
+        // 3. `commit`/active gen_state at the NEW epoch (fresh hash/tag).
+        transition::insert_generation_state_row(
+            transaction,
+            &NewGenerationState {
+                conversation_id,
+                generation,
+                state_version,
+                group_id: coordinate.group_id().to_vec(),
+                epoch,
+                group_context_hash: coordinate.group_context_hash().to_vec(),
+                confirmation_tag: coordinate.confirmation_tag().to_vec(),
+                lifecycle: GenerationStateLifecycle::Active,
+                state_kind: GenerationStateKind::Commit,
+                producing_transition_id: transition_id,
+                public_snapshot_bytes: ctx.spine.public_snapshot_bytes.clone(),
+                snapshot_sha256: ctx.spine.public_snapshot_sha256.clone(),
+                tree_summary_bytes: ctx.spine.tree_summary_bytes.clone(),
+                tree_summary_sha256: ctx.spine.tree_summary_sha256.clone(),
+                leaf_count: ctx.spine.leaf_count,
+                created_at: applied_at,
+            },
+        )
+        .await?;
+
+        // 4. Entry (commitEntry).
+        let append = build_append_entry(
+            ctx,
+            conversation_id,
+            generation,
+            state_version,
+            transition_id,
+        );
+        delivery::append_entry_at(transaction, &append, u64::try_from(seq_i64).unwrap()).await?;
+
+        // 5. Transition (kind commit, prior -> next).
+        transition::insert_transition_row(
+            transaction,
+            &NewTransition {
+                transition_id,
+                conversation_id,
+                kind: TransitionKind::Commit,
+                actor_did: ctx.actor.user_did.clone(),
+                actor_device_id: ctx.actor.device_id,
+                actor_key_id: ctx.actor.key_id.clone(),
+                actor_auth_generation: ctx.actor.auth_generation,
+                actor_role: ctx.actor.role,
+                actor_device_status: ctx.actor.device_status.clone(),
+                signed_request_bytes: ctx.entry.signed_request_bytes.clone(),
+                unsigned_projection_bytes: ctx.entry.unsigned_projection_bytes.clone(),
+                signing_transcript_bytes: ctx.entry.signing_transcript_bytes.clone(),
+                request_digest: ctx.entry.request_digest.clone(),
+                signature: ctx.entry.signature.clone(),
+                coordinates: TransitionCoordinates {
+                    prior: Some((expected_generation, expected_state_version)),
+                    next: Some((generation, state_version)),
+                    retired: None,
+                    successor: None,
+                },
+                reset_request_id: None,
+                close_transition_id: None,
+                metadata_snapshot_id: Some(author_cols.metadata_snapshot_id),
+                entry_seq: seq_i64,
+                accepted_at: applied_at,
+            },
+        )
+        .await?;
+
+        // 6. Metadata re-encryption snapshot (carry-forward author/origin/version).
+        write_commit_metadata_snapshot(
+            transaction,
+            metadata,
+            author_cols,
+            conversation_id,
+            generation,
+            state_version,
+            epoch,
+            &coordinate.group_id().to_vec(),
+            &coordinate.group_context_hash().to_vec(),
+            &coordinate.confirmation_tag().to_vec(),
+            transition_id,
+            applied_at,
+        )
+        .await?;
+
+        // 7. Audience + events.
+        let recipients = build_entry_recipients(&ctx.entry_recipients)?;
+        delivery::insert_entry_recipients(
+            transaction,
+            conversation_id,
+            u64::try_from(seq_i64).unwrap(),
+            &recipients,
+        )
+        .await?;
+        let event_positions = write_events(transaction, ctx).await?;
+        // Supersede any prior-coordinate pending Welcome the epoch change retired.
+        write_welcome_supersessions(transaction, ctx, effects).await?;
 
         Ok(AppliedTransition {
             allocated_seq: u64::try_from(seq_i64).unwrap(),
@@ -16332,6 +16611,95 @@ mod executor {
                 })
             })
             .collect()
+    }
+
+    /// Supersede each prior-coordinate pending Welcome the plan retired: append its
+    /// `welcomeDisposition` event and terminalize the delivery as `superseded`,
+    /// bound to that event. A coordinate-changing commit whose prior carried a
+    /// pending Welcome (e.g. an epoch commit after a leaf-recovery fulfillment)
+    /// carries these `welcome_changes` `(Pending -> Superseded)`; consuming them
+    /// keeps the durable delivery in sync with the state machine.
+    async fn write_welcome_supersessions(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        ctx: &ExecutionContext,
+        effects: &TransitionEffects,
+    ) -> Result<(), ExecutorError> {
+        for change in effects.welcome_changes() {
+            let after = match (change.before(), change.after()) {
+                (Some(before), Some(after))
+                    if before.status() == WelcomeStatus::Pending
+                        && after.status() == WelcomeStatus::Superseded =>
+                {
+                    after
+                }
+                _ => {
+                    return Err(ExecutorError::UnsupportedEffect(
+                        "welcome change is not a pending->superseded supersession",
+                    ))
+                }
+            };
+            let welcome_id = Uuid::from_bytes(*after.welcome_id());
+            let disposition = ctx
+                .welcome_dispositions
+                .iter()
+                .find(|input| input.welcome_id == welcome_id)
+                .ok_or(ExecutorError::MissingContext(
+                    "welcome disposition event for a superseded welcome",
+                ))?;
+            let position = append_one_event(transaction, ctx, &disposition.event).await?;
+            delivery::terminalize_welcome_delivery(
+                transaction,
+                welcome_id,
+                &WelcomeDisposition::Superseded,
+                ctx.applied_at,
+                position,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Append one event with its audience + outbox, returning its position.
+    async fn append_one_event(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        ctx: &ExecutionContext,
+        event: &EventFanout,
+    ) -> Result<i64, ExecutorError> {
+        let position = delivery::append_event(
+            transaction,
+            &NewEvent {
+                event_id: event.event_id,
+                event_kind: event.event_kind,
+                payload_bytes: event.payload_bytes.clone(),
+                created_at: ctx.applied_at,
+                protocol_instance_id: ctx.protocol_instance_id,
+            },
+        )
+        .await?;
+        let recipients = event
+            .recipients
+            .iter()
+            .map(|(device, kind, predecessor)| {
+                Ok(EventRecipient {
+                    user_did: device_did(device)?,
+                    device_id: device_uuid(device),
+                    entitlement_kind: *kind,
+                    audience_predecessor_position: *predecessor,
+                })
+            })
+            .collect::<Result<Vec<_>, ExecutorError>>()?;
+        delivery::insert_event_recipients(transaction, position, &recipients).await?;
+        for (outbox_id, work_kind) in &event.outbox {
+            delivery::enqueue_outbox(
+                transaction,
+                *outbox_id,
+                position,
+                *work_kind,
+                ctx.applied_at,
+            )
+            .await?;
+        }
+        Ok(position)
     }
 
     async fn write_events(
