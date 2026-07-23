@@ -184,9 +184,18 @@ async fn seed_principal(pool: &PgPool, user_did: &str) {
 }
 
 /// Seed one available KeyPackage owned by `(owner_did, owner_device_id,
-/// owner_key_id)`, returning its unique 32-byte ref and its `not_after`.
-async fn seed_key_package(
-    pool: &PgPool,
+/// owner_key_id)` **inside the caller's transaction**, returning its unique
+/// 32-byte ref and its `not_after`.
+///
+/// This is deliberately transaction-scoped (executor = `&mut Transaction`, same
+/// SQL as the row it seeds): every caller in this file rolls its transaction
+/// back, so the seeded `chat.key_packages` row must roll back with it. The prior
+/// pool-scoped variant ran on autocommit and therefore committed one
+/// `chat.key_packages` row on **every** run against the never-truncated
+/// clean-chat database — a permanent per-run leak. Sampling the clock on the
+/// same transaction keeps the seed self-contained (no `&PgPool` argument).
+async fn seed_key_package_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     owner_did: &str,
     owner_device_id: Uuid,
     owner_key_id: &str,
@@ -194,7 +203,10 @@ async fn seed_key_package(
     let key_package_ref = random_ref();
     let wrapper = random_ref();
     let init_key = random_ref();
-    let now = clock_now(pool).await;
+    let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&mut **tx)
+        .await
+        .expect("sample trusted database clock");
     let not_before = now - Duration::seconds(60);
     let not_after = now + Duration::seconds(3600);
     sqlx::query(
@@ -215,7 +227,7 @@ async fn seed_key_package(
     .bind(not_before)
     .bind(not_after)
     .bind(now)
-    .execute(pool)
+    .execute(&mut **tx)
     .await
     .expect("insert key package");
     (key_package_ref, not_after)
@@ -1160,16 +1172,18 @@ async fn leave_request_insert_and_terminalize_are_cas_guarded() {
 async fn key_package_status_cas_is_guarded_and_faithful() {
     let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
     let fixture = seed_fixture(&pool).await;
-    let (key_package_ref, _not_after) = seed_key_package(
-        &pool,
+
+    let now = clock_now(&pool).await;
+    let mut tx = pool.begin().await.unwrap();
+    // Seed the KeyPackage inside the (rolled-back) transaction so no committed
+    // row leaks; the CAS reads it via read-your-writes in the same tx.
+    let (key_package_ref, _not_after) = seed_key_package_tx(
+        &mut tx,
         &fixture.actor_did,
         fixture.actor_device_id,
         &fixture.actor_key_id,
     )
     .await;
-
-    let now = clock_now(&pool).await;
-    let mut tx = pool.begin().await.unwrap();
 
     // available -> reserved.
     cas_key_package_status(
@@ -1240,13 +1254,6 @@ async fn key_package_status_cas_is_guarded_and_faithful() {
 async fn recovery_request_and_reservation_insert_shapes_are_faithful() {
     let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
     let fixture = seed_fixture(&pool).await;
-    let (key_package_ref, _not_after) = seed_key_package(
-        &pool,
-        &fixture.actor_did,
-        fixture.actor_device_id,
-        &fixture.actor_key_id,
-    )
-    .await;
 
     let recovery_request_id = Uuid::new_v4();
     let now = clock_now(&pool).await;
@@ -1276,9 +1283,12 @@ async fn recovery_request_and_reservation_insert_shapes_are_faithful() {
         requested_at: now,
         expires_at,
     };
-    let reservation = NewReservation {
+    // The reservation FKs the reserved KeyPackage. Each transaction that inserts
+    // one seeds its own tx-scoped KeyPackage (rolled back with the tx) and binds
+    // the reservation to that row's ref, so no committed KeyPackage row leaks.
+    let make_reservation = |key_package_ref: Vec<u8>| NewReservation {
         recovery_request_id,
-        key_package_ref: key_package_ref.clone(),
+        key_package_ref,
         conversation_id: fixture.conversation_id,
         generation: 0,
         requester_did: fixture.actor_did.clone(),
@@ -1297,6 +1307,14 @@ async fn recovery_request_and_reservation_insert_shapes_are_faithful() {
     };
 
     let mut tx = pool.begin().await.unwrap();
+    let (key_package_ref, _not_after) = seed_key_package_tx(
+        &mut tx,
+        &fixture.actor_did,
+        fixture.actor_device_id,
+        &fixture.actor_key_id,
+    )
+    .await;
+    let reservation = make_reservation(key_package_ref.clone());
     insert_leaf_recovery_request(&mut tx, &recovery)
         .await
         .expect("insert leaf recovery request");
@@ -1415,6 +1433,14 @@ async fn recovery_request_and_reservation_insert_shapes_are_faithful() {
     // DB constraint cross-check B: two active reservations for the same
     // KeyPackage ref violate key_package_reservations_active_package_uq (immediate).
     let mut tx = pool.begin().await.unwrap();
+    let (key_package_ref, _not_after) = seed_key_package_tx(
+        &mut tx,
+        &fixture.actor_did,
+        fixture.actor_device_id,
+        &fixture.actor_key_id,
+    )
+    .await;
+    let reservation = make_reservation(key_package_ref);
     insert_reservation(&mut tx, &reservation)
         .await
         .expect("first active reservation");
@@ -1807,13 +1833,12 @@ async fn welcome_bundle_insert_is_faithful_and_transition_unique() {
 /// the ids the delivery/disposition writers need. `expires_at` on the delivery
 /// must equal the consumed package's `not_after` (composite package-identity FK).
 async fn seed_welcome_delivery_prereqs(
-    pool: &PgPool,
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     fixture: &Fixture,
     now: DateTime<Utc>,
 ) -> (Uuid, Uuid, Vec<u8>, DateTime<Utc>) {
-    let (key_package_ref, not_after) = seed_key_package(
-        pool,
+    let (key_package_ref, not_after) = seed_key_package_tx(
+        tx,
         &fixture.actor_did,
         fixture.actor_device_id,
         &fixture.actor_key_id,
@@ -1905,7 +1930,7 @@ async fn welcome_delivery_insert_and_disposition_terminal_race() {
 
     let mut tx = pool.begin().await.unwrap();
     let (welcome_id, recovery_request_id, key_package_ref, not_after) =
-        seed_welcome_delivery_prereqs(&pool, &mut tx, &fixture, now).await;
+        seed_welcome_delivery_prereqs(&mut tx, &fixture, now).await;
 
     let delivery = NewWelcomeDelivery {
         welcome_id,
@@ -2033,7 +2058,7 @@ async fn welcome_delivery_insert_and_disposition_terminal_race() {
     // uniqueness).
     let mut tx = pool.begin().await.unwrap();
     let (welcome_id, recovery_request_id, key_package_ref, not_after) =
-        seed_welcome_delivery_prereqs(&pool, &mut tx, &fixture, now).await;
+        seed_welcome_delivery_prereqs(&mut tx, &fixture, now).await;
     let delivery = NewWelcomeDelivery {
         welcome_id,
         recipient_did: fixture.actor_did.clone(),

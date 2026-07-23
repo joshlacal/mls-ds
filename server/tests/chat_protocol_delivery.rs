@@ -807,6 +807,52 @@ async fn outbox_row(
         .expect("read outbox work row")
 }
 
+/// Neutralise every pre-existing `chat.outbox` row before a test that asserts
+/// over a *global*, unscoped `claim_outbox_batch` scan, by parking it under a
+/// sentinel lease that expires far in the future (so it is not claimable during
+/// this test).
+///
+/// `claim_outbox_batch` claims in global `event_position` order with no per-test
+/// scoping — this is by design and its production code is review-approved. The
+/// clean-chat test database is never truncated between runs, so this suite's own
+/// committed work accumulates as claimable residue: the enqueue-uniqueness test
+/// commits two `pending` rows, and every claim test commits `leased` rows whose
+/// lease then expires relative to a later run's clock, becoming reclaimable.
+/// Because residue carries *lower* `event_position` values than a fresh run's
+/// rows, `ORDER BY event_position LIMIT n` claims the residue first and inflates
+/// (or entirely displaces) the current test's expected result — e.g.
+/// `reclaims_only_expired` observed `first.len() == 10` (its `LIMIT 10`) instead
+/// of `1` on the second run.
+///
+/// Outbox rows are immutable (a `BEFORE DELETE` trigger forbids removing them),
+/// so residue is *parked*, not deleted. The `pending -> leased` and
+/// `leased -> leased` transitions this UPDATE performs are exactly the ones the
+/// reviewed `claim_outbox_batch` / reclaim path performs and that the
+/// `outbox_lifecycle_monotonic` trigger permits; only the mutable
+/// `status`/`lease_owner`/`lease_expires_at` columns are touched (`lease_owner`
+/// is a fresh v4 UUID, as the `outbox_lease_owner_check` requires). Every
+/// non-terminal residue row lands under a lease dated years ahead, so the test's
+/// subsequent claim (sampled at `now`) sees only its own freshly enqueued work.
+/// Terminal (`delivered`/`failed`) rows are already non-claimable and left as-is.
+async fn drain_outbox(pool: &PgPool) {
+    let now = clock_now(pool).await;
+    let parked_until = now + chrono::Duration::days(3650);
+    sqlx::query(
+        r#"
+        UPDATE chat.outbox
+           SET status = 'leased',
+               lease_owner = $1,
+               lease_expires_at = $2
+         WHERE status IN ('pending', 'leased')
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(parked_until)
+    .execute(pool)
+    .await
+    .expect("park residual claimable outbox work before a global-claim test");
+}
+
 // ---------------------------------------------------------------------------
 // entry_recipients
 // ---------------------------------------------------------------------------
@@ -1512,6 +1558,9 @@ async fn enqueue_outbox_enforces_event_work_uniqueness() {
 #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn claim_outbox_batch_two_claimers_never_double_claim() {
     let pool = common::chat_protocol::setup_chat_protocol_db(6).await;
+    // Remove prior-run residue so the two claimers partition exactly this test's
+    // freshly enqueued rows (the assertions below are exact over that set).
+    drain_outbox(&pool).await;
     let instance = ensure_protocol_instance(&pool).await;
     let base = clock_now(&pool).await;
 
@@ -1601,6 +1650,9 @@ async fn claim_outbox_batch_two_claimers_never_double_claim() {
 #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn claim_outbox_batch_reclaims_only_expired_leases() {
     let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
+    // Remove prior-run residue so the global claim scans only this test's row
+    // (asserted `first.len() == 1`, and the reclaim counts, are exact).
+    drain_outbox(&pool).await;
     let instance = ensure_protocol_instance(&pool).await;
     let base = clock_now(&pool).await;
 
@@ -1677,6 +1729,9 @@ async fn claim_outbox_batch_reclaims_only_expired_leases() {
 #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn mark_outbox_delivered_requires_exact_lease_owner() {
     let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
+    // Remove prior-run residue so the claim (LIMIT 10) leases this test's single
+    // row rather than displacing it with older claimable residue.
+    drain_outbox(&pool).await;
     let instance = ensure_protocol_instance(&pool).await;
     let base = clock_now(&pool).await;
 
