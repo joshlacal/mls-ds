@@ -950,6 +950,41 @@ impl RequestEvidence {
         })
     }
 
+    /// A signed, NON-control welcome-response `RequestEvidence` (acknowledge /
+    /// reject): entry-less (`control_entry_id`/`control_seq` = None) with the
+    /// `WelcomeResponse` body binding `plan_welcome_response` requires to match the
+    /// pending welcome's coordinate + `transition_seq`. `request_id` = the welcome
+    /// id, actor = the recipient.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_test_welcome_response(
+        kind: RequestEntryKind,
+        welcome_id: [u8; 16],
+        recipient: DeviceIdentity,
+        conversation_id: [u8; 16],
+        coordinates: PublicGroupSnapshotCoordinate,
+        transition_seq: u64,
+        received_at: ServerTimestamp,
+        byte: u8,
+    ) -> Result<Self, StateMachineError> {
+        let mut evidence = Self::for_test(
+            kind,
+            1,
+            welcome_id,
+            recipient,
+            conversation_id,
+            received_at,
+            byte,
+        )?;
+        evidence.control_entry_id = None;
+        evidence.control_seq = None;
+        evidence.body_binding = Some(RequestBodyBinding::WelcomeResponse {
+            coordinates,
+            transition_seq,
+        });
+        Ok(evidence)
+    }
+
     pub(crate) fn actor(&self) -> &DeviceIdentity {
         &self.actor
     }
@@ -10259,39 +10294,6 @@ pub(crate) fn persistence_plan_for_test(
             }
         }
     }
-    // Synthesize the welcome CAS a `welcomeExpiry` plan carries (production's
-    // `bind_welcome_cas`), built from the single `Pending -> Expired` welcome
-    // change + the head lock, so the executor's welcome-cas witness is present.
-    if effects.welcome_cas.is_none() {
-        if let Some(before) = effects.welcome_changes.iter().find_map(|change| {
-            match (change.before.as_ref(), change.after.as_ref()) {
-                (Some(before), Some(after))
-                    if before.status == WelcomeStatus::Pending
-                        && after.status == WelcomeStatus::Expired =>
-                {
-                    Some(before)
-                }
-                _ => None,
-            }
-        }) {
-            effects.welcome_cas = Some(WelcomeCasBinding {
-                transaction_id: head_cas.transaction_id.clone(),
-                conversation_id: head_cas.conversation_id,
-                welcome_id: before.welcome_id,
-                recipient: before.recipient.clone(),
-                transition_seq: before.transition_seq,
-                coordinate: before.coordinate,
-                recovery_request_id: before.recovery_request_id,
-                key_package_ref: before.key_package_ref,
-                opaque_welcome_sha256: before.sha256,
-                expires_at: before.expires_at,
-                expected_status: WelcomeStatus::Pending,
-                successor_status: WelcomeStatus::Expired,
-                locked_at: head_cas.locked_at,
-                locked_row_digest: [1u8; 32],
-            });
-        }
-    }
     // Synthesize the welcome-disposition CAS binding production requires for a
     // welcome terminalization edge (expiry / acknowledge / reject), mirroring
     // `welcome_cas_from_guard`. The executor consumes it as a LOAD-BEARING witness
@@ -10408,6 +10410,20 @@ impl ConversationPersistencePlan {
             .and_then(|change| change.after.as_mut())
         {
             after.status = WelcomeStatus::Expired;
+        }
+        self
+    }
+
+    /// Corrupt the `welcome_cas` binding so it disagrees with the `welcome_changes`
+    /// delta (flip a byte of its bound welcome id). The welcome-disposition arms
+    /// validate the binding LOAD-BEARING against the delta (welcome id / recipient /
+    /// coordinate / expiry / direction), so a corrupted binding must be a hard
+    /// `InconsistentPlan` — removing that validation fails the negative test. Since
+    /// `persistence_plan_for_test` always synthesizes a MATCHING binding, this is the
+    /// only way to drive the validation red.
+    pub(crate) fn with_welcome_cas_corrupted_for_test(mut self) -> Self {
+        if let Some(binding) = self.effects.welcome_cas.as_mut() {
+            binding.welcome_id[0] ^= 0xFF;
         }
         self
     }
@@ -10586,6 +10602,15 @@ pub(crate) fn plan_welcome_expiry_for_test(
     welcome_id: [u8; 16],
 ) -> Result<PlannedTransition, StateMachineError> {
     plan_welcome_expiry(prior, welcome_id)
+}
+
+#[cfg(test)]
+pub(crate) fn plan_welcome_response_for_test(
+    prior: &ConversationState,
+    evidence: RequestEvidence,
+    successor_status: WelcomeStatus,
+) -> Result<PlannedTransition, StateMachineError> {
+    plan_welcome_response(prior, evidence, successor_status)
 }
 
 #[cfg(test)]
@@ -13171,7 +13196,7 @@ pub(crate) use executor::{
     apply_conversation_persistence_plan, AppliedTransition, ControlEntryContent, EventFanout,
     ExecutionActor, ExecutionContext, ExecutorError, LeafPersistenceColumns, MetadataAuthorColumns,
     RecoveryOpenContext, ResetRequestRow, SpineArtifacts, WelcomeDispositionInput,
-    WelcomeExpiryContext,
+    WelcomeExpiryContext, WelcomeRejectionWork, WelcomeResponseContext,
 };
 
 mod executor {
@@ -13185,7 +13210,7 @@ mod executor {
         EntryEntitlementKind, EntryRecipient, EventEntitlementKind, EventKind, EventRecipient,
         IntervalCloseKind, IntervalOpeningKind, NewApplicationInterval, NewEvent,
         NewScheduleTerminalProof, NewWelcomeBundle, NewWelcomeDelivery, OutboxWorkKind,
-        WelcomeDisposition,
+        WelcomeClientAuthorization, WelcomeDisposition, WelcomeRejectionReason,
     };
     use super::super::repository::transition::{
         self as transition, ConversationHeadClose, ConversationHeadKind, GenerationStateKind,
@@ -13347,6 +13372,27 @@ mod executor {
         pub(crate) event: EventFanout,
     }
 
+    /// For a `welcomeAcknowledgement` / `welcomeRejection` edge: the
+    /// `welcomeDisposition` event (its position binds the disposition row) plus, for
+    /// a REJECTION only, the `welcomeRejected` recovery work. The client-authored
+    /// signed authorization the disposition row binds comes from `ctx.entry` (the
+    /// signed request's bytes/digest/signature); the welcome id / recipient / bound
+    /// coordinate come from the plan's `welcome_changes`. `None` otherwise.
+    #[derive(Clone, Debug)]
+    pub(crate) struct WelcomeResponseContext {
+        pub(crate) event: EventFanout,
+        /// `Some` for a rejection (adds a `welcomeRejected` recovery work item with
+        /// the closed reason); `None` for an acknowledgement (no recovery work).
+        pub(crate) rejection: Option<WelcomeRejectionWork>,
+    }
+
+    /// The `welcomeRejected` recovery work a rejection creates.
+    #[derive(Clone, Debug)]
+    pub(crate) struct WelcomeRejectionWork {
+        pub(crate) recovery_work_id: Uuid,
+        pub(crate) reason: WelcomeRejectionReason,
+    }
+
     /// Everything the plan does NOT carry. AUDIENCE IS INPUT, NOT DERIVED: the
     /// executor never queries `chat.devices` to invent an audience.
     #[derive(Clone, Debug)]
@@ -13393,6 +13439,9 @@ mod executor {
         pub(crate) recovery_open: Option<RecoveryOpenContext>,
         /// For a `welcomeExpiry` edge (see `WelcomeExpiryContext`). `None` otherwise.
         pub(crate) welcome_expiry: Option<WelcomeExpiryContext>,
+        /// For a `welcomeAcknowledgement`/`welcomeRejection` edge (see
+        /// `WelcomeResponseContext`). `None` otherwise.
+        pub(crate) welcome_response: Option<WelcomeResponseContext>,
         /// For a coordinate-changing commit that SUPERSEDES a prior-coordinate
         /// pending Welcome: the `welcomeDisposition` event the executor appends and
         /// binds the disposition row to (one per superseded welcome). Empty for
@@ -13644,6 +13693,21 @@ mod executor {
                 )
                 .await;
             }
+            // `welcomeAcknowledgement` / `welcomeRejection` are entry-less signed
+            // non-control responses (`bind_non_control_request_authority`:
+            // `allocated_seq == None`, coordinate + seq UNCHANGED) — dispatch here.
+            PlanKind::WelcomeAcknowledgement | PlanKind::WelcomeRejection => {
+                return apply_welcome_response(
+                    transaction,
+                    plan,
+                    ctx,
+                    conversation_id,
+                    generation,
+                    state_version,
+                    epoch,
+                )
+                .await;
+            }
             _ => {}
         }
 
@@ -13858,13 +13922,11 @@ mod executor {
                 )
                 .await
             }
-            PlanKind::WelcomeAcknowledgement => {
-                Err(ExecutorError::UnsupportedEffect("welcomeAcknowledgement"))
-            }
-            PlanKind::WelcomeRejection => Err(ExecutorError::UnsupportedEffect("welcomeRejection")),
             // Entry-less; dispatched (and returned) above.
-            PlanKind::WelcomeExpiry => {
-                unreachable!("entry-less welcome expiry is dispatched before this match")
+            PlanKind::WelcomeAcknowledgement
+            | PlanKind::WelcomeRejection
+            | PlanKind::WelcomeExpiry => {
+                unreachable!("entry-less welcome disposition ops are dispatched before this match")
             }
             PlanKind::Close => {
                 apply_close(
@@ -14213,6 +14275,230 @@ mod executor {
 
         Ok(AppliedTransition {
             // No control entry / seq was allocated; echo the unchanged counter.
+            allocated_seq: u64::try_from(successor_next_entry_seq).unwrap(),
+            entry_id: ctx.entry.entry_id,
+            event_positions: vec![position],
+            successor_coordinate: plan.successor_coordinate().copied(),
+        })
+    }
+
+    /// Apply an entry-less `welcomeAcknowledgement` / `welcomeRejection`: a
+    /// client-authored signed disposition of a pending Welcome. Coordinate + seq
+    /// counter UNCHANGED (a pure prior-coordinate verify); NO entry / transition /
+    /// membership change. Terminalizes the delivery `acknowledged` (recipient
+    /// joined — NO recovery work) or `rejected` (adds a `welcomeRejected`
+    /// recovery-work item with the closed reason). The disposition row binds the
+    /// client's signed authorization (from `ctx.entry`). Unlike expiry, every
+    /// timestamp is the request instant `applied_at` (the client's action time,
+    /// which the DB requires `< expires_at`), so the disposition event uses
+    /// `applied_at` (`= terminal_at`). `welcome_cas` is validated load-bearing.
+    async fn apply_welcome_response(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        plan: &ConversationPersistencePlan,
+        ctx: &ExecutionContext,
+        conversation_id: Uuid,
+        generation: i64,
+        state_version: i64,
+        _epoch: i64,
+    ) -> Result<AppliedTransition, ExecutorError> {
+        let effects = plan.effects();
+        let applied_at = ctx.applied_at;
+        let head = effects
+            .head_cas()
+            .ok_or(ExecutorError::InconsistentPlan("missing head CAS binding"))?;
+        let expected_prior = head
+            .expected_prior()
+            .ok_or(ExecutorError::InconsistentPlan(
+                "welcome response needs an expected prior",
+            ))?;
+        let expected_generation = checked_i64(expected_prior.generation())?;
+        let expected_state_version = checked_i64(expected_prior.state_version())?;
+        let expected_next_entry_seq = checked_i64(head.expected_next_entry_seq())?;
+        let successor_next_entry_seq = checked_i64(head.successor_next_entry_seq())?;
+
+        // Only a welcome delivery CAS. Reject every other family.
+        reject_if_present("participant_changes", effects.participant_changes())?;
+        reject_if_present("leaf_changes", effects.leaf_changes())?;
+        reject_if_present("interval_changes", effects.interval_changes())?;
+        reject_if_present("terminal_proof_changes", effects.terminal_proof_changes())?;
+        reject_if_present(
+            "recovery_request_changes",
+            effects.recovery_request_changes(),
+        )?;
+        reject_if_present("reservation_changes", effects.reservation_changes())?;
+        reject_if_present("reset_request_changes", effects.reset_request_changes())?;
+        reject_if_present("leave_request_changes", effects.leave_request_changes())?;
+        reject_if_present("package_transitions", effects.package_transitions())?;
+        reject_if_present("recovery_package_cas", effects.recovery_package_cas())?;
+        reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
+        if effects.metadata_change().is_some() {
+            return Err(ExecutorError::UnsupportedEffect(
+                "welcome response metadata change",
+            ));
+        }
+        if effects.revocation_target_cas().is_some() || effects.invitation_quota_cas().is_some() {
+            return Err(ExecutorError::UnsupportedEffect(
+                "welcome response revocation/quota CAS",
+            ));
+        }
+        let welcome_cas = effects
+            .welcome_cas()
+            .ok_or(ExecutorError::InconsistentPlan(
+                "welcome response plan missing welcome CAS binding",
+            ))?;
+
+        // Pure prior-coordinate verify: coordinate + seq counter UNCHANGED.
+        if successor_next_entry_seq != expected_next_entry_seq {
+            return Err(ExecutorError::InconsistentPlan(
+                "welcome response must not advance the seq counter",
+            ));
+        }
+        if generation != expected_generation || state_version != expected_state_version {
+            return Err(ExecutorError::InconsistentPlan(
+                "welcome response must not change the coordinate",
+            ));
+        }
+
+        // Exactly one Pending -> {Acknowledged,Rejected} welcome change.
+        if effects.welcome_changes().len() != 1 {
+            return Err(ExecutorError::InconsistentPlan(
+                "welcome response must change exactly one welcome",
+            ));
+        }
+        let responded = effects
+            .welcome_changes()
+            .iter()
+            .find_map(|change| match (change.before(), change.after()) {
+                (Some(before), Some(after))
+                    if before.status() == WelcomeStatus::Pending
+                        && matches!(
+                            after.status(),
+                            WelcomeStatus::Acknowledged | WelcomeStatus::Rejected
+                        ) =>
+                {
+                    Some(after)
+                }
+                _ => None,
+            })
+            .ok_or(ExecutorError::InconsistentPlan(
+                "welcome response must acknowledge or reject a pending welcome",
+            ))?;
+        let successor_status = responded.status();
+        let welcome_id = Uuid::from_bytes(*responded.welcome_id());
+        let recipient = responded.recipient().clone();
+        let welcome_coordinate = responded.coordinate();
+        // Load-bearing welcome CAS validation (mirrors the expiry arm).
+        if welcome_cas.welcome_id() != responded.welcome_id()
+            || welcome_cas.recipient() != &recipient
+            || welcome_cas.coordinate() != welcome_coordinate
+            || welcome_cas.expires_at() != responded.expires_at()
+            || welcome_cas.expected_status() != WelcomeStatus::Pending
+            || welcome_cas.successor_status() != successor_status
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "welcome response CAS binding disagrees with the welcome change",
+            ));
+        }
+        let response = ctx
+            .welcome_response
+            .as_ref()
+            .ok_or(ExecutorError::MissingContext("welcome response context"))?;
+        // The client-authored signed authorization the disposition row binds — the
+        // signed request's bytes/digest/signature (the signature-shape trigger
+        // requires them non-NULL for acknowledged/rejected).
+        let authorization = WelcomeClientAuthorization {
+            signed_request_bytes: ctx.entry.signed_request_bytes.clone(),
+            signing_transcript_bytes: ctx.entry.signing_transcript_bytes.clone(),
+            request_digest: ctx.entry.request_digest.clone(),
+            signature: ctx.entry.signature.clone(),
+        };
+        // The disposition shape must match the successor status; a rejection carries
+        // the recovery work, an acknowledgement must not.
+        let (disposition, rejection_work): (WelcomeDisposition, Option<&WelcomeRejectionWork>) =
+            match successor_status {
+                WelcomeStatus::Acknowledged => {
+                    if response.rejection.is_some() {
+                        return Err(ExecutorError::InconsistentPlan(
+                            "welcome acknowledgement must not carry rejection recovery work",
+                        ));
+                    }
+                    (WelcomeDisposition::Acknowledged { authorization }, None)
+                }
+                WelcomeStatus::Rejected => {
+                    let rejection =
+                        response
+                            .rejection
+                            .as_ref()
+                            .ok_or(ExecutorError::MissingContext(
+                                "welcome rejection recovery work",
+                            ))?;
+                    (
+                        WelcomeDisposition::Rejected {
+                            authorization,
+                            reason: rejection.reason,
+                        },
+                        Some(rejection),
+                    )
+                }
+                _ => {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "welcome response status must be acknowledged or rejected",
+                    ))
+                }
+            };
+
+        // 1. Head CAS VERIFY (coordinate + seq counter both UNCHANGED).
+        transition::cas_conversation_head(
+            transaction,
+            &transition::ConversationHeadCas {
+                conversation_id,
+                expected_generation,
+                expected_state_version,
+                expected_next_entry_seq,
+                successor_generation: generation,
+                successor_state_version: state_version,
+                successor_next_entry_seq,
+                close: None,
+            },
+        )
+        .await?;
+
+        // 2. Append the `welcomeDisposition` event. Its `created_at` (= applied_at)
+        //    must equal the delivery terminal_at (= applied_at), so append_one_event
+        //    (which stamps applied_at) is correct here.
+        let position = append_one_event(transaction, ctx, &response.event).await?;
+
+        // 3. Terminalize the pending delivery at the request instant, binding the
+        //    client authorization (+ reason for a rejection).
+        delivery::terminalize_welcome_delivery(
+            transaction,
+            welcome_id,
+            &disposition,
+            applied_at,
+            position,
+        )
+        .await?;
+
+        // 4. A rejection additionally creates the `welcomeRejected` recovery work.
+        if let Some(rejection) = rejection_work {
+            delivery::insert_recovery_work_item(
+                transaction,
+                &delivery::NewRecoveryWorkItem {
+                    recovery_work_id: rejection.recovery_work_id,
+                    conversation_id,
+                    recipient_did: device_did(&recipient)?,
+                    recipient_device_id: device_uuid(&recipient),
+                    source_kind: delivery::RecoveryWorkSourceKind::WelcomeRejected,
+                    source_id: welcome_id,
+                    generation: checked_i64(welcome_coordinate.generation())?,
+                    state_version: checked_i64(welcome_coordinate.state_version())?,
+                    created_at: applied_at,
+                },
+            )
+            .await?;
+        }
+
+        Ok(AppliedTransition {
             allocated_seq: u64::try_from(successor_next_entry_seq).unwrap(),
             entry_id: ctx.entry.entry_id,
             event_positions: vec![position],
