@@ -9950,6 +9950,62 @@ impl TransitionEvidence {
         });
         Ok(evidence)
     }
+
+    /// An `acceptConversation` `TransitionEvidence` carrying the exact `Acceptance`
+    /// body a real acceptance produces: the coordinate-only successor `next`, the
+    /// `add` recovery binding bound to `next`, and the retained-invitation
+    /// provenance (which must match the pending participant's invitation).
+    /// `authority` stays `None`, which `require_acceptance_body` accepts while
+    /// still enforcing the request-id / conversation / target / kind /
+    /// bound-coordinate fields.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_test_acceptance(
+        seq: u64,
+        transition_id: [u8; 16],
+        outer_entry_fingerprint: [u8; 32],
+        received_at: ServerTimestamp,
+        prior: PublicGroupSnapshotCoordinate,
+        recovery_request_id: [u8; 16],
+        acceptor: DeviceIdentity,
+        invitation_transition_id: [u8; 16],
+        inviter: DeviceIdentity,
+        key_package_ref: [u8; 32],
+        requester_key_id: [u8; 32],
+        requester_auth_generation: u64,
+        package_not_after: ServerTimestamp,
+    ) -> Result<Self, StateMachineError> {
+        let next = coordinate_only_successor(&prior)?;
+        let expires_at = recovery_expiry(received_at, package_not_after)?;
+        let wrapper = vec![0xAA_u8; 32];
+        let wrapper_sha256: [u8; 32] = Sha256::digest(&wrapper).into();
+        let mut evidence =
+            Self::for_test_at(seq, transition_id, outer_entry_fingerprint, received_at)?;
+        evidence.body_binding = Some(TransitionBodyBinding::Acceptance {
+            prior,
+            next,
+            recovery_request_id,
+            invitation_provenance: InvitationBinding {
+                transition_id: invitation_transition_id,
+                inviter,
+            },
+            recovery: AcceptanceRecoveryBinding {
+                request_id: recovery_request_id,
+                conversation_id: *prior.conversation_id(),
+                target: acceptor,
+                kind: LeafRecoveryKind::Add,
+                bound_coordinate: next,
+                requester_key_id,
+                requester_auth_generation,
+                key_package_ref,
+                key_package_wrapper: wrapper,
+                key_package_wrapper_sha256: wrapper_sha256,
+                requested_at: received_at,
+                expires_at,
+                canonical_digest: [0x5A_u8; 32],
+            },
+        });
+        Ok(evidence)
+    }
 }
 
 #[cfg(test)]
@@ -12795,7 +12851,7 @@ fn would_remove_last_active_admin(state: &ConversationState, principal: &Princip
 pub(crate) use executor::{
     apply_conversation_persistence_plan, AppliedTransition, ControlEntryContent, EventFanout,
     ExecutionActor, ExecutionContext, ExecutorError, LeafPersistenceColumns, MetadataAuthorColumns,
-    ResetRequestRow, SpineArtifacts,
+    RecoveryOpenContext, ResetRequestRow, SpineArtifacts,
 };
 
 mod executor {
@@ -12812,17 +12868,20 @@ mod executor {
     };
     use super::super::repository::transition::{
         self as transition, ConversationHeadClose, ConversationHeadKind, GenerationStateKind,
-        GenerationStateLifecycle, GenerationSupersede, LeafClose, LeafOrigin, NewGeneration,
-        NewGenerationState, NewLeafPeriod, NewMetadataSnapshot, NewParticipantPeriod,
-        NewResetRequest, NewTransition, ParticipantInvitation,
-        ParticipantRole as RepoParticipantRole, ParticipantStatus as RepoParticipantStatus,
-        ResetRequestTermination, TransitionActorRole, TransitionCoordinates, TransitionKind,
-        TransitionRepositoryError,
+        GenerationStateLifecycle, GenerationSupersede, LeafClose, LeafOrigin,
+        LeafRecoveryKind as RepoLeafRecoveryKind, LeafRecoverySource, NewGeneration,
+        NewGenerationState, NewLeafPeriod, NewLeafRecoveryRequest, NewMetadataSnapshot,
+        NewParticipantPeriod, NewReservation, NewResetRequest, NewTransition,
+        PackageStatus as RepoPackageStatus, PackageSuccessor, ParticipantAcceptance,
+        ParticipantAcceptanceCas, ParticipantInvitation, ParticipantRole as RepoParticipantRole,
+        ParticipantStatus as RepoParticipantStatus, ResetRequestTermination, TransitionActorRole,
+        TransitionCoordinates, TransitionKind, TransitionRepositoryError,
     };
     use super::{
-        CloseKind, ConversationKind, DeviceIdentity, LeafHydrationRow, MetadataSnapshotBinding,
-        ParticipantHydrationRow, ParticipantRole, ParticipantStatus, PlanKind, PrincipalId,
-        PublicGroupSnapshotCoordinate, ServerTimestamp, StateChange, TransitionEffects,
+        CloseKind, ConversationKind, DeviceIdentity, LeafHydrationRow, LeafRecoveryKind,
+        MetadataSnapshotBinding, ParticipantHydrationRow, ParticipantRole, ParticipantStatus,
+        PlanKind, PrincipalId, PublicGroupSnapshotCoordinate, RecoverySource, ServerTimestamp,
+        StateChange, TransitionEffects,
     };
     use super::{ConversationPersistencePlan, ConversationStateHydration};
 
@@ -12978,6 +13037,31 @@ mod executor {
         /// the signed request carries (reason + signed material + expiry). `None`
         /// for every other edge.
         pub(crate) reset_request_row: Option<ResetRequestRow>,
+        /// For an edge that OPENS a leaf-recovery request + reservation and
+        /// reserves a key package (acceptance / leaf-recovery request): the DB-side
+        /// facts the plan does not carry. `None` for every other edge. The
+        /// requester/recipient identity is the transition/request actor
+        /// (`ctx.actor`); the request id, kind, bound coordinate, and key-package
+        /// ref come from the plan's `recovery_request_changes`.
+        pub(crate) recovery_open: Option<RecoveryOpenContext>,
+    }
+
+    /// DB-side facts a recovery-opening edge needs that the plan does not carry.
+    /// The `expires_at` the mapping trigger checks is
+    /// `LEAST(created_at + 5 min, package.not_after)`, so the executor writes
+    /// DB-clock timestamps (`created_at = requested_at = applied_at`) and needs the
+    /// reserved package's `not_after` to compute that bound exactly.
+    #[derive(Clone, Debug)]
+    pub(crate) struct RecoveryOpenContext {
+        /// The acceptor's current participant period — the acceptance CAS target.
+        /// `Some` only for the acceptance edge (a leaf-recovery request touches no
+        /// participant row).
+        pub(crate) participant_period_id: Option<Uuid>,
+        /// `chat.key_packages.not_after` of the reserved package.
+        pub(crate) package_not_after: DateTime<Utc>,
+        /// For a `replace` leaf-recovery request: the leaf period being replaced.
+        /// `None` for an `add`.
+        pub(crate) replaced_leaf_period_id: Option<Uuid>,
     }
 
     /// The exact `chat.reset_requests` row a reset-request edge persists. Sourced
@@ -13155,7 +13239,21 @@ mod executor {
             // remaining kinds (acceptConversation, metadata, commit, reset
             // request/activation, leave family, welcome dispositions, device
             // revocation, close) are the E2b-3 remainder — see the report.
-            PlanKind::Acceptance => Err(ExecutorError::UnsupportedEffect("acceptConversation")),
+            PlanKind::Acceptance => {
+                apply_acceptance(
+                    transaction,
+                    plan,
+                    ctx,
+                    conversation_id,
+                    transition_id,
+                    seq_i64,
+                    successor_next_entry_seq,
+                    generation,
+                    state_version,
+                    epoch,
+                )
+                .await
+            }
             PlanKind::Metadata => Err(ExecutorError::UnsupportedEffect("metadata")),
             PlanKind::Commit => Err(ExecutorError::UnsupportedEffect("commit")),
             // Entry-less internal ops are dispatched (and returned) above, before
@@ -14501,6 +14599,358 @@ mod executor {
             event_positions,
             successor_coordinate: plan.successor_coordinate().copied(),
         })
+    }
+
+    /// Apply an `acceptConversation` edge: promote a pending invitee to active and
+    /// atomically open the `add` leaf-recovery request + reservation bound to the
+    /// NEXT coordinate, reserving the acceptor's key package. `stateVersion+1`,
+    /// same crypto edge, no metadata / leaf / interval change.
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_acceptance(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        plan: &ConversationPersistencePlan,
+        ctx: &ExecutionContext,
+        conversation_id: Uuid,
+        transition_id: Uuid,
+        seq_i64: i64,
+        successor_next_entry_seq: i64,
+        generation: i64,
+        state_version: i64,
+        epoch: i64,
+    ) -> Result<AppliedTransition, ExecutorError> {
+        let effects = plan.effects();
+        let hydration = plan.state();
+        let coordinate = &hydration.coordinate; // next coordinate (same crypto, sv+1).
+        let applied_at = ctx.applied_at;
+        let head = effects
+            .head_cas()
+            .ok_or(ExecutorError::InconsistentPlan("missing head CAS binding"))?;
+        let expected_prior = head
+            .expected_prior()
+            .ok_or(ExecutorError::InconsistentPlan(
+                "acceptance needs an expected prior",
+            ))?;
+        let expected_generation = checked_i64(expected_prior.generation())?;
+        let expected_state_version = checked_i64(expected_prior.state_version())?;
+        let expected_next_entry_seq = checked_i64(head.expected_next_entry_seq())?;
+
+        // Acceptance carries: one pending->active participant, one new open
+        // recovery request, one new active reservation, one Available->Reserved
+        // package transition. Every other family is a hard error.
+        reject_if_present("leaf_changes", effects.leaf_changes())?;
+        reject_if_present("interval_changes", effects.interval_changes())?;
+        reject_if_present("terminal_proof_changes", effects.terminal_proof_changes())?;
+        reject_if_present("reset_request_changes", effects.reset_request_changes())?;
+        reject_if_present("leave_request_changes", effects.leave_request_changes())?;
+        reject_if_present("welcome_changes", effects.welcome_changes())?;
+        reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
+        if effects.metadata_change().is_some() {
+            return Err(ExecutorError::UnsupportedEffect(
+                "acceptance metadata change",
+            ));
+        }
+        if effects.revocation_target_cas().is_some() || effects.welcome_cas().is_some() {
+            return Err(ExecutorError::UnsupportedEffect(
+                "acceptance revocation/welcome CAS",
+            ));
+        }
+        if effects.invitation_quota_cas().is_some() {
+            return Err(ExecutorError::UnsupportedEffect(
+                "acceptance invitation quota CAS",
+            ));
+        }
+        // recovery_package_cas is the production KeyPackage CAS authority (the
+        // ~20-field bijective witness), EMPTY in the test seam; the semantic
+        // `package_transitions` (Available->Reserved) drives the executor's KP CAS,
+        // so consume this as witness (like invitation_quota_cas) rather than
+        // reject it (production always carries it, bijective with package_transitions).
+        let _recovery_package_cas_witness = effects.recovery_package_cas();
+
+        // Exactly one pending->active participant.
+        let participant_change = {
+            let changes = effects.participant_changes();
+            if changes.len() != 1 {
+                return Err(ExecutorError::InconsistentPlan(
+                    "acceptance must change exactly one participant",
+                ));
+            }
+            match (changes[0].before(), changes[0].after()) {
+                (Some(before), Some(after))
+                    if before.status() == ParticipantStatus::Pending
+                        && after.status() == ParticipantStatus::Active =>
+                {
+                    after
+                }
+                _ => {
+                    return Err(ExecutorError::UnsupportedEffect(
+                        "acceptance participant change is not pending->active",
+                    ))
+                }
+            }
+        };
+        // Exactly one new open recovery request + one new active reservation +
+        // one package transition (Available->Reserved).
+        let recovery = effects
+            .recovery_request_changes()
+            .iter()
+            .find_map(|change| match (change.before(), change.after()) {
+                (None, Some(after)) => Some(after),
+                _ => None,
+            })
+            .ok_or(ExecutorError::InconsistentPlan(
+                "acceptance adds no open recovery request",
+            ))?;
+        if effects.recovery_request_changes().len() != 1
+            || effects.reservation_changes().len() != 1
+            || effects.package_transitions().len() != 1
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "acceptance must add exactly one recovery request + reservation + package edge",
+            ));
+        }
+
+        // 1. Head CAS advances the coordinate + counter (sv+1, same generation).
+        transition::cas_conversation_head(
+            transaction,
+            &transition::ConversationHeadCas {
+                conversation_id,
+                expected_generation,
+                expected_state_version,
+                expected_next_entry_seq,
+                successor_generation: generation,
+                successor_state_version: state_version,
+                successor_next_entry_seq,
+                close: None,
+            },
+        )
+        .await?;
+
+        // 2. Advance the generation's state-version pointer (same generation).
+        transition::cas_generation_state_version(
+            transaction,
+            &transition::GenerationStateVersionCas {
+                conversation_id,
+                generation,
+                expected_state_version,
+                successor_state_version: state_version,
+            },
+        )
+        .await?;
+
+        // 3. Successor generation state (acceptConversation, identical crypto edge).
+        transition::insert_generation_state_row(
+            transaction,
+            &NewGenerationState {
+                conversation_id,
+                generation,
+                state_version,
+                group_id: coordinate.group_id().to_vec(),
+                epoch,
+                group_context_hash: coordinate.group_context_hash().to_vec(),
+                confirmation_tag: coordinate.confirmation_tag().to_vec(),
+                lifecycle: GenerationStateLifecycle::Active,
+                state_kind: GenerationStateKind::AcceptConversation,
+                producing_transition_id: transition_id,
+                public_snapshot_bytes: ctx.spine.public_snapshot_bytes.clone(),
+                snapshot_sha256: ctx.spine.public_snapshot_sha256.clone(),
+                tree_summary_bytes: ctx.spine.tree_summary_bytes.clone(),
+                tree_summary_sha256: ctx.spine.tree_summary_sha256.clone(),
+                leaf_count: ctx.spine.leaf_count,
+                created_at: applied_at,
+            },
+        )
+        .await?;
+
+        // 4. Entry (participantAcceptanceEntry) at the allocated seq.
+        let append = build_append_entry(
+            ctx,
+            conversation_id,
+            generation,
+            state_version,
+            transition_id,
+        );
+        delivery::append_entry_at(transaction, &append, u64::try_from(seq_i64).unwrap()).await?;
+
+        // 5. Transition (prior -> next).
+        transition::insert_transition_row(
+            transaction,
+            &NewTransition {
+                transition_id,
+                conversation_id,
+                kind: TransitionKind::AcceptConversation,
+                actor_did: ctx.actor.user_did.clone(),
+                actor_device_id: ctx.actor.device_id,
+                actor_key_id: ctx.actor.key_id.clone(),
+                actor_auth_generation: ctx.actor.auth_generation,
+                actor_role: ctx.actor.role,
+                actor_device_status: ctx.actor.device_status.clone(),
+                signed_request_bytes: ctx.entry.signed_request_bytes.clone(),
+                unsigned_projection_bytes: ctx.entry.unsigned_projection_bytes.clone(),
+                signing_transcript_bytes: ctx.entry.signing_transcript_bytes.clone(),
+                request_digest: ctx.entry.request_digest.clone(),
+                signature: ctx.entry.signature.clone(),
+                coordinates: TransitionCoordinates {
+                    prior: Some((expected_generation, expected_state_version)),
+                    next: Some((generation, state_version)),
+                    retired: None,
+                    successor: None,
+                },
+                reset_request_id: None,
+                close_transition_id: None,
+                metadata_snapshot_id: None,
+                entry_seq: seq_i64,
+                accepted_at: applied_at,
+            },
+        )
+        .await?;
+
+        // 6. Promote the pending participant to active with acceptance provenance.
+        let open = ctx
+            .recovery_open
+            .as_ref()
+            .ok_or(ExecutorError::MissingContext("recovery open context"))?;
+        let participant_period_id =
+            open.participant_period_id
+                .ok_or(ExecutorError::MissingContext(
+                    "acceptance participant period id",
+                ))?;
+        transition::cas_participant_pending_to_active(
+            transaction,
+            &ParticipantAcceptanceCas {
+                participant_period_id,
+                conversation_id,
+                user_did: principal_did(participant_change.principal())?,
+                acceptance: ParticipantAcceptance {
+                    acceptance_transition_id: transition_id,
+                    acceptance_entry_id: ctx.entry.entry_id,
+                    accepted_at: applied_at,
+                },
+            },
+        )
+        .await?;
+
+        // 7-9. The atomic recovery open (request + reservation + package reserve),
+        //      bound to the NEXT coordinate; requester = recipient = the acceptor.
+        write_recovery_open(transaction, ctx, recovery, conversation_id, applied_at).await?;
+
+        // 10. Audience + events.
+        let recipients = build_entry_recipients(&ctx.entry_recipients)?;
+        delivery::insert_entry_recipients(
+            transaction,
+            conversation_id,
+            u64::try_from(seq_i64).unwrap(),
+            &recipients,
+        )
+        .await?;
+        let event_positions = write_events(transaction, ctx).await?;
+
+        Ok(AppliedTransition {
+            allocated_seq: u64::try_from(seq_i64).unwrap(),
+            entry_id: ctx.entry.entry_id,
+            event_positions,
+            successor_coordinate: plan.successor_coordinate().copied(),
+        })
+    }
+
+    /// Open a leaf-recovery request + its paired reservation and reserve the
+    /// requester's key package (Available -> Reserved), all bound to
+    /// `recovery.bound_coordinate()`. Shared by the acceptance edge (source
+    /// `acceptConversation`, kind `add`, bound to the successor) and the
+    /// leaf-recovery request edge (source `requestLeafRecovery`, `add`/`replace`,
+    /// bound to the current coordinate). The requester and recipient are the same
+    /// device — the transition/request actor (`ctx.actor`). Timestamps are DB-clock:
+    /// `created_at == requested_at == applied_at` and
+    /// `expires_at == LEAST(applied_at + 5 min, package.not_after)`, exactly what
+    /// `assert_recovery_fulfillment_mapping` cross-checks.
+    async fn write_recovery_open(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        ctx: &ExecutionContext,
+        recovery: &super::RecoveryRequest,
+        conversation_id: Uuid,
+        applied_at: DateTime<Utc>,
+    ) -> Result<(), ExecutorError> {
+        let open = ctx
+            .recovery_open
+            .as_ref()
+            .ok_or(ExecutorError::MissingContext("recovery open context"))?;
+        let bound = recovery.bound_coordinate();
+        let generation = checked_i64(bound.generation())?;
+        let bound_state_version = checked_i64(bound.state_version())?;
+        let bound_epoch = checked_i64(bound.epoch())?;
+        let requested_at = applied_at;
+        let expires_at = (applied_at + chrono::Duration::minutes(5)).min(open.package_not_after);
+        let recovery_request_id = Uuid::from_bytes(*recovery.request_id());
+        let key_package_ref = recovery.key_package_ref().to_vec();
+        let recovery_kind = match recovery.kind() {
+            LeafRecoveryKind::Add => RepoLeafRecoveryKind::Add,
+            LeafRecoveryKind::Replace => RepoLeafRecoveryKind::Replace {
+                replaced_leaf_period_id: open.replaced_leaf_period_id.ok_or(
+                    ExecutorError::MissingContext("replace request replaced leaf period id"),
+                )?,
+            },
+        };
+        let source = match recovery.source() {
+            RecoverySource::Acceptance => LeafRecoverySource::AcceptConversation,
+            RecoverySource::Request => LeafRecoverySource::RequestLeafRecovery,
+        };
+        transition::insert_leaf_recovery_request(
+            transaction,
+            &NewLeafRecoveryRequest {
+                recovery_request_id,
+                conversation_id,
+                generation,
+                requester_did: ctx.actor.user_did.clone(),
+                requester_device_id: ctx.actor.device_id,
+                requester_key_id: ctx.actor.key_id.clone(),
+                requester_auth_generation: ctx.actor.auth_generation,
+                recovery_kind,
+                source,
+                bound_state_version,
+                bound_group_id: bound.group_id().to_vec(),
+                bound_epoch,
+                bound_group_context_hash: bound.group_context_hash().to_vec(),
+                bound_confirmation_tag: bound.confirmation_tag().to_vec(),
+                reservation_request_id: recovery_request_id,
+                signed_request_bytes: ctx.entry.signed_request_bytes.clone(),
+                signing_transcript_bytes: ctx.entry.signing_transcript_bytes.clone(),
+                request_digest: ctx.entry.request_digest.clone(),
+                signature: ctx.entry.signature.clone(),
+                requested_at,
+                expires_at,
+            },
+        )
+        .await?;
+        transition::insert_reservation(
+            transaction,
+            &NewReservation {
+                recovery_request_id,
+                key_package_ref: key_package_ref.clone(),
+                conversation_id,
+                generation,
+                requester_did: ctx.actor.user_did.clone(),
+                requester_device_id: ctx.actor.device_id,
+                requester_key_id: ctx.actor.key_id.clone(),
+                requester_auth_generation: ctx.actor.auth_generation,
+                recipient_did: ctx.actor.user_did.clone(),
+                recipient_device_id: ctx.actor.device_id,
+                bound_state_version,
+                bound_group_id: bound.group_id().to_vec(),
+                bound_epoch,
+                bound_group_context_hash: bound.group_context_hash().to_vec(),
+                bound_confirmation_tag: bound.confirmation_tag().to_vec(),
+                expires_at,
+                created_at: requested_at,
+            },
+        )
+        .await?;
+        transition::cas_key_package_status(
+            transaction,
+            &key_package_ref,
+            RepoPackageStatus::Available,
+            &PackageSuccessor::Reserve,
+        )
+        .await?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

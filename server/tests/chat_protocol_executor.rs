@@ -99,13 +99,14 @@ use chat_protocol::repository::transition::{
 };
 use chat_protocol::snapshot::{PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle};
 use chat_protocol::state_machine::{
-    apply_conversation_persistence_plan, persistence_plan_for_test, plan_close, plan_creation,
-    plan_policy, plan_reset_activation, plan_reset_request, CloseConversation, ControlEntryContent,
-    ConversationHeadCasBinding, ConversationKind, CreationCommand, CreationDecision,
-    DeviceIdentity, EventFanout, ExecutionActor, ExecutionContext, ExecutorError,
-    LeafPersistenceColumns, MetadataAuthorColumns, MetadataSnapshotBinding, PrincipalId,
-    RequestEntryKind, RequestEvidence, ResetActivation, ResetRequestCommand, ResetRequestRow,
-    ServerTimestamp, SpineArtifacts, TransitionEvidence,
+    apply_conversation_persistence_plan, persistence_plan_for_test, plan_accept_conversation,
+    plan_close, plan_creation, plan_policy, plan_reset_activation, plan_reset_request,
+    AcceptConversation, CloseConversation, ControlEntryContent, ConversationHeadCasBinding,
+    ConversationKind, CreationCommand, CreationDecision, DeviceIdentity, EventFanout,
+    ExecutionActor, ExecutionContext, ExecutorError, LeafPersistenceColumns, MetadataAuthorColumns,
+    MetadataSnapshotBinding, PrincipalId, RecoveryOpenContext, RequestEntryKind, RequestEvidence,
+    ResetActivation, ResetRequestCommand, ResetRequestRow, ServerTimestamp, SpineArtifacts,
+    TransitionEvidence,
 };
 use chat_protocol::validation::ed25519_key_id;
 
@@ -349,8 +350,12 @@ struct CreationApply {
     alice_key_id: String,
     bob_id: DeviceIdentity,
     bob_did: String,
+    bob_key_id: String,
     coordinate: PublicGroupSnapshotCoordinate,
     protocol_instance_id: Uuid,
+    /// The creation transition id — the invitation provenance a later acceptance
+    /// must echo (bob's pending invitation was minted by this transition).
+    creation_transition_id: [u8; 16],
 }
 
 async fn build_creation(pool: &PgPool, kind: ConversationKind) -> CreationApply {
@@ -365,7 +370,12 @@ async fn build_creation(pool: &PgPool, kind: ConversationKind) -> CreationApply 
     // Alice's MLS leaf signature key is also her device signing key here, so
     // member_devices.leaf_key_id == device_keys.key_id == actor_key_id.
     let alice_key_id = seed_actor(pool, &alice_did, alice_device, &alice_sig_key).await;
-    let _bob_key_id = seed_actor(pool, &bob_did, bob_device, &[0x62_u8; 32]).await;
+    // Bob is a FRESH principal each run; give him a fresh unique signing key so his
+    // `chat.device_keys` row (unique on `key_id`) is always present this run — a
+    // constant key would collide with a prior run's bob and be skipped, leaving
+    // this bob with no device key (which the recovery mapping trigger requires).
+    let bob_sig_key = random_ref32().to_vec();
+    let bob_key_id = seed_actor(pool, &bob_did, bob_device, &bob_sig_key).await;
     let protocol_instance_id = seed_protocol_instance(pool).await;
 
     // Fresh conversation id per run (the corpus id is fixed; rebind onto a fresh
@@ -498,6 +508,7 @@ async fn build_creation(pool: &PgPool, kind: ConversationKind) -> CreationApply 
         }],
         closing_leaf_periods: Vec::new(),
         reset_request_row: None,
+        recovery_open: None,
     };
 
     CreationApply {
@@ -511,8 +522,10 @@ async fn build_creation(pool: &PgPool, kind: ConversationKind) -> CreationApply 
         alice_key_id,
         bob_id,
         bob_did,
+        bob_key_id,
         coordinate,
         protocol_instance_id,
+        creation_transition_id: *transition_id.as_bytes(),
     }
 }
 
@@ -1186,6 +1199,7 @@ async fn group_policy_add_participant_commits_state_version_plus_one() {
         }],
         closing_leaf_periods: Vec::new(),
         reset_request_row: None,
+        recovery_open: None,
     };
 
     // 5. Apply + COMMIT the policy edge.
@@ -1595,6 +1609,7 @@ fn close_ctx(
         }],
         closing_leaf_periods: vec![(fixture.alice_id.clone(), leaf_period_id)],
         reset_request_row: None,
+        recovery_open: None,
     }
 }
 
@@ -1712,6 +1727,7 @@ async fn reset_request_commits_without_changing_the_coordinate() {
             signature,
             expires_at: applied_at + Duration::hours(24),
         }),
+        recovery_open: None,
     };
 
     let mut tx = pool.begin().await.expect("begin reset");
@@ -1862,6 +1878,7 @@ async fn commit_reset_request(
             signature,
             expires_at: applied_at + Duration::hours(24),
         }),
+        recovery_open: None,
     };
     let mut tx = pool.begin().await.expect("begin reset request");
     apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
@@ -2058,6 +2075,7 @@ async fn reset_activation_commits_two_generation_graph_and_conflicts_on_replay()
         }],
         closing_leaf_periods: vec![(fixture.alice_id.clone(), old_leaf_period)],
         reset_request_row: None,
+        recovery_open: None,
     };
 
     let mut tx = pool.begin().await.expect("begin activation");
@@ -2280,6 +2298,275 @@ async fn creation_mid_executor_metadata_conflict_rolls_back_whole_graph() {
         .await,
         0
     );
+}
+
+fn random_ref32() -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    bytes[..16].copy_from_slice(Uuid::new_v4().as_bytes());
+    bytes[16..].copy_from_slice(Uuid::new_v4().as_bytes());
+    bytes
+}
+
+/// Seed one `available` key package owned by `(owner_did, owner_device)` and
+/// return its exact `not_after` (the value the reservation's
+/// `expires_at = LEAST(created_at + 5 min, not_after)` mapping check needs).
+async fn seed_key_package(
+    pool: &PgPool,
+    owner_did: &str,
+    owner_device: Uuid,
+    owner_key_id: &str,
+    key_package_ref: &[u8],
+) -> DateTime<Utc> {
+    let now = clock_now(pool).await;
+    let not_before = now - Duration::hours(1);
+    let not_after = now + Duration::hours(24);
+    let wrapper = vec![0xC1_u8; 32];
+    let init_key = {
+        let mut key = vec![0u8; 32];
+        key[..16].copy_from_slice(Uuid::new_v4().as_bytes());
+        key[16..].copy_from_slice(Uuid::new_v4().as_bytes());
+        key
+    };
+    sqlx::query(
+        "INSERT INTO chat.key_packages(key_package_ref,wrapper_bytes,wrapper_sha256,init_key,owner_did,owner_device_id,owner_key_id,owner_auth_generation,not_before,not_after,status,created_at) \
+         VALUES($1,$2,$3,$4,$5,$6,$7,1,$8,$9,'available',$10)",
+    )
+    .bind(key_package_ref)
+    .bind(&wrapper)
+    .bind(Sha256::digest(&wrapper).to_vec())
+    .bind(&init_key)
+    .bind(owner_did)
+    .bind(owner_device)
+    .bind(owner_key_id)
+    .bind(not_before)
+    .bind(not_after)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("seed key package");
+    not_after
+}
+
+#[tokio::test]
+async fn acceptance_commits_recovery_open_and_promotes_participant() {
+    let pool = setup().await;
+    let fixture = commit_creation(&pool, ConversationKind::Group).await;
+    let conversation_id = fixture.conversation_id;
+    let bob_device = Uuid::from_bytes(*fixture.bob_id.device_id());
+
+    // bob's pending participant period (the acceptance CAS target).
+    let bob_period: Uuid = sqlx::query_scalar(
+        "SELECT participant_period_id FROM chat.participants WHERE conversation_id=$1 AND user_did=$2 AND current_membership",
+    )
+    .bind(conversation_id)
+    .bind(&fixture.bob_did)
+    .fetch_one(&pool)
+    .await
+    .expect("bob participant period");
+    let bob_key_id = fixture.bob_key_id.clone();
+
+    // The key package bob's acceptance reserves.
+    let key_package_ref = random_ref32();
+    let package_not_after = seed_key_package(
+        &pool,
+        &fixture.bob_did,
+        bob_device,
+        &bob_key_id,
+        &key_package_ref,
+    )
+    .await;
+
+    let received_at = ServerTimestamp::from_unix_millis_for_test(
+        corpus_manifest().evaluation_unix_seconds as i64 * 1_000 + 3_000,
+    )
+    .unwrap();
+    let pkg_not_after_ts = ServerTimestamp::from_unix_millis_for_test(
+        corpus_manifest().evaluation_unix_seconds as i64 * 1_000 + 3_600_000,
+    )
+    .unwrap();
+    let entry_id = Uuid::new_v4();
+    let transition_id = Uuid::new_v4();
+    let recovery_request_id = *Uuid::new_v4().as_bytes();
+    let evidence = TransitionEvidence::for_test_acceptance(
+        2,
+        *transition_id.as_bytes(),
+        [0x16_u8; 32],
+        received_at,
+        fixture.coordinate,
+        recovery_request_id,
+        fixture.bob_id.clone(),
+        fixture.creation_transition_id,
+        fixture.alice_id.clone(),
+        key_package_ref,
+        Sha256::digest([0x62_u8; 32]).into(),
+        1,
+        pkg_not_after_ts,
+    )
+    .unwrap();
+    let planned = plan_accept_conversation(
+        &fixture.state,
+        AcceptConversation {
+            actor: fixture.bob_id.clone(),
+            transition: evidence,
+            recovery_request_id,
+            key_package_ref,
+            package_not_after: pkg_not_after_ts,
+        },
+    )
+    .expect("valid acceptance plan");
+    let head_cas = ConversationHeadCasBinding::for_test_edge(
+        *conversation_id.as_bytes(),
+        *entry_id.as_bytes(),
+        fixture.coordinate,
+        2,
+        received_at,
+    );
+    let plan = persistence_plan_for_test(planned, head_cas);
+
+    let applied_at = clock_now(&pool).await;
+    let payload = vec![0xA1_u8; 12];
+    let transcript = vec![0xA2_u8; 12];
+    let ctx = ExecutionContext {
+        protocol_instance_id: fixture.protocol_instance_id,
+        applied_at,
+        actor: ExecutionActor {
+            user_did: fixture.bob_did.clone(),
+            device_id: bob_device,
+            key_id: bob_key_id.clone(),
+            auth_generation: 1,
+            role: TransitionActorRole::Member,
+            device_status: "active".to_owned(),
+        },
+        entry: ControlEntryContent {
+            entry_id,
+            entry_kind: "blue.catbird.chat.defs#participantAcceptanceEntry".to_owned(),
+            accepted_payload_bytes: payload.clone(),
+            accepted_payload_sha256: Sha256::digest(&payload).to_vec(),
+            signed_request_bytes: transcript.clone(),
+            unsigned_projection_bytes: vec![0xA3_u8; 8],
+            signing_transcript_bytes: transcript.clone(),
+            request_digest: Sha256::digest(&transcript).to_vec(),
+            signature: vec![0xA4_u8; 64],
+            server_fields_bytes: vec![0xA5_u8; 8],
+            outer_entry_fingerprint: vec![0x16_u8; 32],
+        },
+        spine: SpineArtifacts {
+            public_snapshot_bytes: vec![0xB1_u8; 16],
+            public_snapshot_sha256: Sha256::digest([0xB1_u8; 16]).to_vec(),
+            tree_summary_bytes: vec![0xB2_u8; 16],
+            tree_summary_sha256: Sha256::digest([0xB2_u8; 16]).to_vec(),
+            leaf_count: 1,
+            genesis_group_info_bytes: vec![],
+            genesis_group_info_sha256: vec![],
+        },
+        opened_leaves: vec![],
+        metadata_author: None,
+        participant_period_ids: vec![],
+        leaf_period_ids: vec![],
+        entry_recipients: entry_audience(
+            &fixture.alice_id,
+            &fixture.alice_did,
+            &fixture.bob_id,
+            &fixture.bob_did,
+        ),
+        events: vec![EventFanout {
+            event_id: Uuid::new_v4(),
+            event_kind: EventKind::ConversationChanged,
+            payload_bytes: vec![0xB4_u8; 8],
+            recipients: event_audience(
+                &pool,
+                &fixture.alice_id,
+                &fixture.alice_did,
+                &fixture.bob_id,
+                &fixture.bob_did,
+            )
+            .await,
+            outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+        }],
+        closing_leaf_periods: vec![],
+        reset_request_row: None,
+        recovery_open: Some(RecoveryOpenContext {
+            participant_period_id: Some(bob_period),
+            package_not_after,
+            replaced_leaf_period_id: None,
+        }),
+    };
+
+    let mut tx = pool.begin().await.expect("begin acceptance");
+    let applied = apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+        .await
+        .expect("acceptance applies");
+    tx.commit()
+        .await
+        .expect("acceptance COMMIT past all deferred triggers");
+    assert_eq!(applied.allocated_seq, 2);
+
+    // stateVersion+1 at the same crypto coordinate; seq 2->3.
+    let (sv, next_seq): (i64, i64) = sqlx::query_as(
+        "SELECT current_state_version,next_entry_seq FROM chat.conversations WHERE conversation_id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("head");
+    assert_eq!((sv, next_seq), (1, 3));
+    let (skind, slife): (String, String) = sqlx::query_as(
+        "SELECT state_kind,lifecycle FROM chat.generation_states WHERE conversation_id=$1 AND state_version=1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("accept state");
+    assert_eq!(
+        (skind.as_str(), slife.as_str()),
+        ("acceptConversation", "active")
+    );
+    // bob promoted to active with acceptance provenance.
+    let (status, has_accept): (String, bool) = sqlx::query_as(
+        "SELECT status, acceptance_transition_id IS NOT NULL FROM chat.participants WHERE conversation_id=$1 AND user_did=$2 AND current_membership",
+    )
+    .bind(conversation_id)
+    .bind(&fixture.bob_did)
+    .fetch_one(&pool)
+    .await
+    .expect("bob participant");
+    assert_eq!((status.as_str(), has_accept), ("active", true));
+    // The atomic recovery open: request open, reservation active, package reserved.
+    let (req_status, req_source, req_kind): (String, String, String) = sqlx::query_as(
+        "SELECT status,source,recovery_kind FROM chat.leaf_recovery_requests WHERE recovery_request_id=$1",
+    )
+    .bind(Uuid::from_bytes(recovery_request_id))
+    .fetch_one(&pool)
+    .await
+    .expect("recovery request");
+    assert_eq!(
+        (req_status.as_str(), req_source.as_str(), req_kind.as_str()),
+        ("open", "acceptConversation", "add")
+    );
+    let res_status: String = sqlx::query_scalar(
+        "SELECT status FROM chat.key_package_reservations WHERE recovery_request_id=$1",
+    )
+    .bind(Uuid::from_bytes(recovery_request_id))
+    .fetch_one(&pool)
+    .await
+    .expect("reservation");
+    assert_eq!(res_status, "active");
+    let pkg_status: String =
+        sqlx::query_scalar("SELECT status FROM chat.key_packages WHERE key_package_ref=$1")
+            .bind(key_package_ref.to_vec())
+            .fetch_one(&pool)
+            .await
+            .expect("package");
+    assert_eq!(pkg_status, "reserved");
+    // The acceptance transition (prior 0,0 -> next 0,1).
+    let (tkind, eseq): (String, i64) = sqlx::query_as(
+        "SELECT kind,entry_seq FROM chat.transitions WHERE conversation_id=$1 AND kind='acceptConversation'",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("acceptance transition");
+    assert_eq!((tkind.as_str(), eseq), ("acceptConversation", 2));
 }
 
 /// Remove one conversation's committed graph so the shared, never-truncated
