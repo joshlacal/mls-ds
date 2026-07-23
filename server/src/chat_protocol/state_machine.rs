@@ -10095,6 +10095,41 @@ pub(crate) fn persistence_plan_for_test(
             locked_row_digest: [1u8; 32],
         });
     }
+    // E2b-6b MINOR-1: synthesize the recovery-package CAS bijection production
+    // requires for any plan carrying `package_transitions` (mirroring
+    // `bind_recovery_package_cas`), so the executor's now-load-bearing bijection
+    // assert is genuinely exercised. Only request_id / key_package_ref / from / to
+    // are read by that assert (and by production's `package_cas_bijection_valid`);
+    // the remaining authority columns are provenance placeholders here.
+    if effects.recovery_package_cas.is_empty() && !effects.package_transitions.is_empty() {
+        for edge in effects.package_transitions.clone() {
+            if let Some(request) = effects
+                .recovery_request_changes
+                .iter()
+                .filter_map(|change| change.after())
+                .find(|request| request.request_id == edge.request_id)
+            {
+                effects
+                    .recovery_package_cas
+                    .push(RecoveryPackageCasBinding {
+                        transaction_id: head_cas.transaction_id.clone(),
+                        conversation_id: *request.bound_coordinate.conversation_id(),
+                        request_id: edge.request_id,
+                        target: request.target.clone(),
+                        target_key_id: [0u8; 32],
+                        target_auth_generation: 1,
+                        bound_coordinate: request.bound_coordinate,
+                        key_package_ref: edge.key_package_ref,
+                        key_package_wrapper_sha256: [0u8; 32],
+                        package_not_after: request.expires_at,
+                        claimed_at: request.received_at,
+                        expected_status: edge.from,
+                        successor_status: edge.to,
+                        locked_row_digest: [1u8; 32],
+                    });
+            }
+        }
+    }
     effects.head_cas = Some(head_cas);
     ConversationPersistencePlan {
         expected_prior: transition.expected_prior,
@@ -13156,6 +13191,49 @@ mod executor {
         }
     }
 
+    /// Make the `recovery_package_cas` binding load-bearing (E2b-6b review MINOR-1),
+    /// mirroring the invitation-quota discipline: production requires it to be
+    /// BIJECTIVE with `package_transitions` (`package_cas_bijection_valid`), and
+    /// `persistence_plan_for_test` now synthesizes it, so this asserts the
+    /// bijection rather than silently reading the witness. Additionally
+    /// cross-validates (MINOR-4) that the exact key-package ref the executor drives
+    /// through `cas_key_package_status` equals every semantic package edge's own
+    /// ref — a planner that disagreed would be a hard error, never a silent skip.
+    fn verify_recovery_package_consistency(
+        effects: &TransitionEffects,
+        driven_key_package_ref: &[u8; 32],
+    ) -> Result<(), ExecutorError> {
+        let edges = effects.package_transitions();
+        let cas = effects.recovery_package_cas();
+        if edges.len() != cas.len() {
+            return Err(ExecutorError::InconsistentPlan(
+                "recovery package CAS is not bijective with package_transitions",
+            ));
+        }
+        for edge in edges {
+            if edge.key_package_ref != *driven_key_package_ref {
+                return Err(ExecutorError::InconsistentPlan(
+                    "executor package CAS ref disagrees with a package_transitions ref",
+                ));
+            }
+            let unique = cas
+                .iter()
+                .filter(|binding| {
+                    binding.request_id == edge.request_id
+                        && binding.key_package_ref == edge.key_package_ref
+                        && binding.expected_status == edge.from
+                        && binding.successor_status == edge.to
+                })
+                .count();
+            if unique != 1 {
+                return Err(ExecutorError::InconsistentPlan(
+                    "recovery package CAS binding missing/duplicated for a package edge",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Apply one `ConversationPersistencePlan` inside the caller's transaction.
     ///
     /// Transaction-scoped: never begins or commits. Ordered per the E2b-2 design
@@ -13395,10 +13473,18 @@ mod executor {
                 "leaf recovery request revocation/welcome/quota CAS",
             ));
         }
-        // recovery_package_cas: production KeyPackage CAS authority, empty in the
-        // test seam; the semantic package_transitions drives the KP CAS. Consume
-        // as witness (see apply_acceptance).
-        let _recovery_package_cas_witness = effects.recovery_package_cas();
+        // Internal op MUST NOT change the coordinate or advance the seq counter
+        // (E2b-6b review MINOR-2: the head CAS is a pure prior-coordinate verify).
+        if successor_next_entry_seq != expected_next_entry_seq {
+            return Err(ExecutorError::InconsistentPlan(
+                "leaf recovery request must not advance the seq counter",
+            ));
+        }
+        if generation != expected_generation || state_version != expected_state_version {
+            return Err(ExecutorError::InconsistentPlan(
+                "leaf recovery request must not change the coordinate",
+            ));
+        }
 
         let recovery = effects
             .recovery_request_changes()
@@ -13418,6 +13504,7 @@ mod executor {
                 "leaf recovery request must add exactly one request + reservation + package edge",
             ));
         }
+        verify_recovery_package_consistency(effects, recovery.key_package_ref())?;
 
         // 1. Head CAS VERIFY — coordinate and seq counter both UNCHANGED
         //    (successor == expected on every column). A drifted head is a typed
@@ -13509,7 +13596,18 @@ mod executor {
                 "leaf recovery cancellation revocation/welcome/quota CAS",
             ));
         }
-        let _recovery_package_cas_witness = effects.recovery_package_cas();
+        // Internal op MUST NOT change the coordinate or advance the seq counter
+        // (E2b-6b review MINOR-2).
+        if successor_next_entry_seq != expected_next_entry_seq {
+            return Err(ExecutorError::InconsistentPlan(
+                "leaf recovery cancellation must not advance the seq counter",
+            ));
+        }
+        if generation != expected_generation || state_version != expected_state_version {
+            return Err(ExecutorError::InconsistentPlan(
+                "leaf recovery cancellation must not change the coordinate",
+            ));
+        }
 
         // Exactly one Open->Cancelled recovery request + one released reservation +
         // one package edge.
@@ -13536,6 +13634,7 @@ mod executor {
                 "cancellation must terminalize exactly one request + reservation + package edge",
             ));
         }
+        verify_recovery_package_consistency(effects, recovery.key_package_ref())?;
         let recovery_request_id = Uuid::from_bytes(*recovery.request_id());
         let key_package_ref = recovery.key_package_ref().to_vec();
         // The signed cancellation request's digest — the SAME value the released
@@ -14913,13 +15012,6 @@ mod executor {
                 "acceptance invitation quota CAS",
             ));
         }
-        // recovery_package_cas is the production KeyPackage CAS authority (the
-        // ~20-field bijective witness), EMPTY in the test seam; the semantic
-        // `package_transitions` (Available->Reserved) drives the executor's KP CAS,
-        // so consume this as witness (like invitation_quota_cas) rather than
-        // reject it (production always carries it, bijective with package_transitions).
-        let _recovery_package_cas_witness = effects.recovery_package_cas();
-
         // Exactly one pending->active participant.
         let participant_change = {
             let changes = effects.participant_changes();
@@ -14962,6 +15054,8 @@ mod executor {
                 "acceptance must add exactly one recovery request + reservation + package edge",
             ));
         }
+        // Load-bearing recovery-package CAS bijection + driven-ref cross-check.
+        verify_recovery_package_consistency(effects, recovery.key_package_ref())?;
 
         // 1. Head CAS advances the coordinate + counter (sv+1, same generation).
         transition::cas_conversation_head(

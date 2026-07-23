@@ -2667,6 +2667,30 @@ async fn acceptance_commits_recovery_open_and_promotes_participant() {
     .await
     .expect("acceptance transition");
     assert_eq!((tkind.as_str(), eseq), ("acceptConversation", 2));
+
+    // Review MINOR-3: re-apply the committed acceptance plan -> the head CAS
+    // conflicts (the head already advanced to stateVersion 1), the whole
+    // transaction rolls back with zero residue.
+    let before: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM chat.transitions WHERE conversation_id=$1")
+            .bind(conversation_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let mut tx2 = pool.begin().await.expect("begin re-apply acceptance");
+    let reapply = apply_conversation_persistence_plan(&mut tx2, &plan, &ctx).await;
+    assert!(
+        matches!(reapply, Err(ExecutorError::Transition(_))),
+        "acceptance re-apply must conflict on the head CAS, got {reapply:?}"
+    );
+    tx2.rollback().await.expect("rollback re-apply acceptance");
+    let after: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM chat.transitions WHERE conversation_id=$1")
+            .bind(conversation_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(before, after, "acceptance re-apply left zero residue");
 }
 
 #[tokio::test]
