@@ -103,12 +103,14 @@ use chat_protocol::snapshot::{PublicGroupSnapshotCoordinate, PublicGroupSnapshot
 use chat_protocol::state_machine::{
     apply_conversation_persistence_plan, persistence_plan_for_test, plan_accept_conversation,
     plan_close, plan_commit, plan_creation, plan_leaf_recovery_cancellation,
-    plan_leaf_recovery_fulfillment, plan_leaf_recovery_request, plan_policy, plan_reset_activation,
-    plan_reset_request, AcceptConversation, CloseConversation, CommitCommand, ControlEntryContent,
-    ConversationHeadCasBinding, ConversationKind, ConversationState, CreationCommand,
-    CreationDecision, DeviceIdentity, EventFanout, ExecutionActor, ExecutionContext, ExecutorError,
-    LeafPersistenceColumns, LeafRecoveryCancellation, LeafRecoveryFulfillment, LeafRecoveryKind,
-    LeafRecoveryRequestCommand, MetadataAuthorColumns, MetadataSnapshotBinding, PrincipalId,
+    plan_leaf_recovery_fulfillment, plan_leaf_recovery_request, plan_leave_cancellation,
+    plan_leave_request, plan_policy, plan_reset_activation, plan_reset_request, AcceptConversation,
+    CloseConversation, CommitCommand, ControlEntryContent, ConversationHeadCasBinding,
+    ConversationKind, ConversationState, CreationCommand, CreationDecision, DeviceIdentity,
+    EventFanout, ExecutionActor, ExecutionContext, ExecutorError, LeafPersistenceColumns,
+    LeafRecoveryCancellation, LeafRecoveryFulfillment, LeafRecoveryKind,
+    LeafRecoveryRequestCommand, LeaveCancellation, LeaveRequestCommand,
+    LockedRegistrationProjection, MetadataAuthorColumns, MetadataSnapshotBinding, PrincipalId,
     RecoveryOpenContext, RequestEntryKind, RequestEvidence, ResetActivation, ResetRequestCommand,
     ResetRequestRow, ServerTimestamp, SpineArtifacts, TransitionEvidence, WelcomeDispositionInput,
 };
@@ -4133,6 +4135,335 @@ async fn generic_commit_commits_epoch_bump_and_reencrypts_metadata() {
             .await
             .unwrap();
     assert_eq!(before, after, "generic commit replay left zero residue");
+}
+
+/// Build + COMMIT a `leaveRequest` by the active member `bob` (leafed at the
+/// fulfillment-scenario sv 2 / epoch 1 coordinate), returning the resulting
+/// in-memory state (with the pending consent) + the leave-request id + the seq
+/// the entry landed at, so the cancellation test can build on it.
+async fn commit_leave_request(
+    pool: &PgPool,
+    scenario: &FulfillmentScenario,
+    request_seq: u64,
+    received_at: ServerTimestamp,
+) -> (ConversationState, Uuid, u64) {
+    let fixture = &scenario.fixture;
+    let conversation_id = scenario.conversation_id;
+    let bob_id = scenario.bob_id.clone();
+    let bob_did = scenario.bob_did.clone();
+    let bob_device = Uuid::from_bytes(*bob_id.device_id());
+    let request_id = Uuid::new_v4();
+    let evidence = RequestEvidence::for_test(
+        RequestEntryKind::LeaveRequest,
+        request_seq,
+        *request_id.as_bytes(),
+        bob_id.clone(),
+        *conversation_id.as_bytes(),
+        received_at,
+        0x71,
+    )
+    .unwrap();
+    let registration = LockedRegistrationProjection::for_test(&evidence);
+    let planned = plan_leave_request(
+        &scenario.fulfillment_state,
+        LeaveRequestCommand {
+            actor: bob_id.clone(),
+            leave_request_id: *request_id.as_bytes(),
+            received_at,
+            evidence,
+            registration,
+        },
+    )
+    .expect("valid leave request plan");
+    let state = planned.resulting_state().clone();
+    let entry_id = Uuid::new_v4();
+    let head_cas = ConversationHeadCasBinding::for_test_edge(
+        *conversation_id.as_bytes(),
+        *entry_id.as_bytes(),
+        scenario.coordinate,
+        request_seq,
+        received_at,
+    );
+    let plan = persistence_plan_for_test(planned, head_cas);
+    let applied_at = clock_now(pool).await;
+    let transcript = vec![0x72_u8; 16];
+    let ctx = ExecutionContext {
+        protocol_instance_id: fixture.protocol_instance_id,
+        applied_at,
+        actor: ExecutionActor {
+            user_did: bob_did.clone(),
+            device_id: bob_device,
+            key_id: fixture.bob_key_id.clone(),
+            auth_generation: 1,
+            role: TransitionActorRole::Member,
+            device_status: "active".to_owned(),
+        },
+        entry: ControlEntryContent {
+            entry_id,
+            entry_kind: "blue.catbird.chat.defs#leaveRequestEntry".to_owned(),
+            accepted_payload_bytes: vec![0x74_u8; 8],
+            accepted_payload_sha256: Sha256::digest([0x74_u8; 8]).to_vec(),
+            signed_request_bytes: transcript.clone(),
+            unsigned_projection_bytes: vec![0x75_u8; 8],
+            signing_transcript_bytes: transcript.clone(),
+            request_digest: Sha256::digest(&transcript).to_vec(),
+            signature: vec![0x76_u8; 64],
+            server_fields_bytes: vec![0x77_u8; 8],
+            outer_entry_fingerprint: vec![0x1A_u8; 32],
+        },
+        spine: SpineArtifacts {
+            public_snapshot_bytes: vec![],
+            public_snapshot_sha256: vec![],
+            tree_summary_bytes: vec![],
+            tree_summary_sha256: vec![],
+            leaf_count: 2,
+            genesis_group_info_bytes: vec![],
+            genesis_group_info_sha256: vec![],
+        },
+        opened_leaves: vec![],
+        metadata_author: None,
+        participant_period_ids: vec![],
+        leaf_period_ids: vec![],
+        entry_recipients: entry_audience(&fixture.alice_id, &fixture.alice_did, &bob_id, &bob_did),
+        events: vec![EventFanout {
+            event_id: Uuid::new_v4(),
+            event_kind: EventKind::LeaveRequest,
+            payload_bytes: vec![0x78_u8; 8],
+            recipients: event_audience(
+                pool,
+                &fixture.alice_id,
+                &fixture.alice_did,
+                &bob_id,
+                &bob_did,
+            )
+            .await,
+            outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+        }],
+        closing_leaf_periods: vec![],
+        reset_request_row: None,
+        recovery_open: None,
+        welcome_dispositions: vec![],
+    };
+    let mut tx = pool.begin().await.expect("begin leave request");
+    let applied = apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+        .await
+        .expect("leave request applies");
+    tx.commit().await.expect("leave request COMMIT");
+    (state, request_id, applied.allocated_seq)
+}
+
+#[tokio::test]
+async fn leave_request_commits_pending_consent_without_advancing_coordinate() {
+    let (pool, _db) = setup().await;
+    let scenario = run_fulfillment_scenario(&pool).await;
+    let conversation_id = scenario.conversation_id;
+    let bob_did = scenario.bob_did.clone();
+    let received_at = ServerTimestamp::from_unix_millis_for_test(
+        corpus_manifest().evaluation_unix_seconds as i64 * 1_000 + 5_000,
+    )
+    .unwrap();
+    let (_state, request_id, seq) = commit_leave_request(&pool, &scenario, 4, received_at).await;
+    assert_eq!(seq, 4);
+
+    // Coordinate UNTOUCHED (still gen 0, sv 2, active); only the seq advanced 4->5.
+    let (gen, sv, next_seq, lifecycle): (i64, i64, i64, String) = sqlx::query_as(
+        "SELECT current_generation,current_state_version,next_entry_seq,lifecycle FROM chat.conversations WHERE conversation_id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("head");
+    assert_eq!((gen, sv, next_seq, lifecycle.as_str()), (0, 2, 5, "active"));
+
+    // A pending, 24h-consent leave_requests row for bob; expires_at == received_at + 24h.
+    let (status, req_did, rcv, exp): (String, String, DateTime<Utc>, DateTime<Utc>) = sqlx::query_as(
+        "SELECT status,requester_did,received_at,expires_at FROM chat.leave_requests WHERE leave_request_id=$1",
+    )
+    .bind(request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("leave request row");
+    assert_eq!(status, "pending");
+    assert_eq!(req_did, bob_did);
+    assert_eq!(exp, rcv + Duration::hours(24));
+
+    // The leaveRequestEntry at seq 4 carries NO transition (non-mutating).
+    let (entry_kind, transition): (String, Option<Uuid>) = sqlx::query_as(
+        "SELECT entry_kind,transition_id FROM chat.entries WHERE conversation_id=$1 AND seq=4",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("entry");
+    assert_eq!(entry_kind, "blue.catbird.chat.defs#leaveRequestEntry");
+    assert!(transition.is_none());
+}
+
+#[tokio::test]
+async fn leave_cancellation_terminalizes_pending_request_and_conflicts_on_replay() {
+    let (pool, _db) = setup().await;
+    let scenario = run_fulfillment_scenario(&pool).await;
+    let conversation_id = scenario.conversation_id;
+    let fixture = &scenario.fixture;
+    let bob_id = scenario.bob_id.clone();
+    let bob_did = scenario.bob_did.clone();
+    let bob_device = Uuid::from_bytes(*bob_id.device_id());
+
+    // 1. Bob opens a pending leave request (seq 4).
+    let req_received = ServerTimestamp::from_unix_millis_for_test(
+        corpus_manifest().evaluation_unix_seconds as i64 * 1_000 + 5_000,
+    )
+    .unwrap();
+    let (pending_state, request_id, _seq) =
+        commit_leave_request(&pool, &scenario, 4, req_received).await;
+
+    // 2. Bob cancels it (a later control seq 5, same coordinate).
+    let cancel_received = ServerTimestamp::from_unix_millis_for_test(
+        corpus_manifest().evaluation_unix_seconds as i64 * 1_000 + 6_000,
+    )
+    .unwrap();
+    let cancel_evidence = RequestEvidence::for_test(
+        RequestEntryKind::LeaveCancellation,
+        5,
+        *request_id.as_bytes(),
+        bob_id.clone(),
+        *conversation_id.as_bytes(),
+        cancel_received,
+        0x81,
+    )
+    .unwrap();
+    let registration = LockedRegistrationProjection::for_test(&cancel_evidence);
+    let planned = plan_leave_cancellation(
+        &pending_state,
+        LeaveCancellation {
+            actor: bob_id.clone(),
+            leave_request_id: *request_id.as_bytes(),
+            received_at: cancel_received,
+            evidence: cancel_evidence,
+            registration,
+        },
+    )
+    .expect("valid leave cancellation plan");
+    let entry_id = Uuid::new_v4();
+    let head_cas = ConversationHeadCasBinding::for_test_edge(
+        *conversation_id.as_bytes(),
+        *entry_id.as_bytes(),
+        scenario.coordinate,
+        5,
+        cancel_received,
+    );
+    let plan = persistence_plan_for_test(planned, head_cas);
+    let applied_at = clock_now(&pool).await;
+    let transcript = vec![0x82_u8; 16];
+    let ctx = ExecutionContext {
+        protocol_instance_id: fixture.protocol_instance_id,
+        applied_at,
+        actor: ExecutionActor {
+            user_did: bob_did.clone(),
+            device_id: bob_device,
+            key_id: fixture.bob_key_id.clone(),
+            auth_generation: 1,
+            role: TransitionActorRole::Member,
+            device_status: "active".to_owned(),
+        },
+        entry: ControlEntryContent {
+            entry_id,
+            entry_kind: "blue.catbird.chat.defs#leaveCancellationEntry".to_owned(),
+            accepted_payload_bytes: vec![0x84_u8; 8],
+            accepted_payload_sha256: Sha256::digest([0x84_u8; 8]).to_vec(),
+            signed_request_bytes: transcript.clone(),
+            unsigned_projection_bytes: vec![0x85_u8; 8],
+            signing_transcript_bytes: transcript.clone(),
+            request_digest: Sha256::digest(&transcript).to_vec(),
+            signature: vec![0x86_u8; 64],
+            server_fields_bytes: vec![0x87_u8; 8],
+            outer_entry_fingerprint: vec![0x1B_u8; 32],
+        },
+        spine: SpineArtifacts {
+            public_snapshot_bytes: vec![],
+            public_snapshot_sha256: vec![],
+            tree_summary_bytes: vec![],
+            tree_summary_sha256: vec![],
+            leaf_count: 2,
+            genesis_group_info_bytes: vec![],
+            genesis_group_info_sha256: vec![],
+        },
+        opened_leaves: vec![],
+        metadata_author: None,
+        participant_period_ids: vec![],
+        leaf_period_ids: vec![],
+        entry_recipients: entry_audience(&fixture.alice_id, &fixture.alice_did, &bob_id, &bob_did),
+        events: vec![EventFanout {
+            event_id: Uuid::new_v4(),
+            event_kind: EventKind::LeaveRequest,
+            payload_bytes: vec![0x88_u8; 8],
+            recipients: event_audience(
+                &pool,
+                &fixture.alice_id,
+                &fixture.alice_did,
+                &bob_id,
+                &bob_did,
+            )
+            .await,
+            outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+        }],
+        closing_leaf_periods: vec![],
+        reset_request_row: None,
+        recovery_open: None,
+        welcome_dispositions: vec![],
+    };
+    let mut tx = pool.begin().await.expect("begin leave cancellation");
+    let applied = apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+        .await
+        .expect("leave cancellation applies");
+    tx.commit().await.expect("leave cancellation COMMIT");
+    assert_eq!(applied.allocated_seq, 5);
+
+    // The request is cancelled: terminal digest == the cancellation entry's digest,
+    // terminal_at set, no terminal transition (non-mutating).
+    let (status, term_digest, term_transition, term_at): (
+        String,
+        Option<Vec<u8>>,
+        Option<Uuid>,
+        Option<DateTime<Utc>>,
+    ) = sqlx::query_as(
+        "SELECT status,terminal_request_digest,terminal_transition_id,terminal_at FROM chat.leave_requests WHERE leave_request_id=$1",
+    )
+    .bind(request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("cancelled leave request");
+    assert_eq!(status, "cancelled");
+    assert_eq!(term_digest, Some(Sha256::digest(&transcript).to_vec()));
+    assert!(term_transition.is_none());
+    assert!(term_at.is_some());
+
+    // The leaveCancellationEntry landed at seq 5, coordinate still sv 2, seq now 6.
+    let entry_kind: String = sqlx::query_scalar(
+        "SELECT entry_kind FROM chat.entries WHERE conversation_id=$1 AND seq=5",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("entry");
+    assert_eq!(entry_kind, "blue.catbird.chat.defs#leaveCancellationEntry");
+    let next_seq: i64 = sqlx::query_scalar(
+        "SELECT next_entry_seq FROM chat.conversations WHERE conversation_id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("head");
+    assert_eq!(next_seq, 6);
+
+    // Replay -> the head CAS conflicts (seq already advanced to 6), zero residue.
+    let mut tx2 = pool.begin().await.expect("begin replay");
+    let replay = apply_conversation_persistence_plan(&mut tx2, &plan, &ctx).await;
+    assert!(
+        matches!(replay, Err(ExecutorError::Transition(_))),
+        "leave cancellation replay must conflict on the head CAS, got {replay:?}"
+    );
+    tx2.rollback().await.expect("rollback replay");
 }
 
 #[tokio::test]

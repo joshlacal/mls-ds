@@ -13028,18 +13028,18 @@ mod executor {
         self as transition, ConversationHeadClose, ConversationHeadKind, GenerationStateKind,
         GenerationStateLifecycle, GenerationSupersede, LeafClose, LeafOrigin,
         LeafRecoveryKind as RepoLeafRecoveryKind, LeafRecoverySource, LeafRecoveryTermination,
-        NewGeneration, NewGenerationState, NewLeafPeriod, NewLeafRecoveryRequest,
-        NewMetadataSnapshot, NewParticipantPeriod, NewReservation, NewResetRequest, NewTransition,
-        PackageStatus as RepoPackageStatus, PackageSuccessor, ParticipantAcceptance,
-        ParticipantAcceptanceCas, ParticipantInvitation, ParticipantRole as RepoParticipantRole,
-        ParticipantStatus as RepoParticipantStatus, ReservationTermination,
-        ResetRequestTermination, TransitionActorRole, TransitionCoordinates, TransitionKind,
-        TransitionRepositoryError,
+        LeaveRequestTermination, NewGeneration, NewGenerationState, NewLeafPeriod,
+        NewLeafRecoveryRequest, NewLeaveRequest, NewMetadataSnapshot, NewParticipantPeriod,
+        NewReservation, NewResetRequest, NewTransition, PackageStatus as RepoPackageStatus,
+        PackageSuccessor, ParticipantAcceptance, ParticipantAcceptanceCas, ParticipantInvitation,
+        ParticipantRole as RepoParticipantRole, ParticipantStatus as RepoParticipantStatus,
+        ReservationTermination, ResetRequestTermination, TransitionActorRole,
+        TransitionCoordinates, TransitionKind, TransitionRepositoryError,
     };
     use super::{
         CloseKind, ConversationKind, DeviceIdentity, LeafHydrationRow, LeafRecoveryKind,
-        MetadataSnapshotBinding, PackageStatus, ParticipantHydrationRow, ParticipantRole,
-        ParticipantStatus, PlanKind, PrincipalId, PublicGroupSnapshotCoordinate,
+        LeaveRequestStatus, MetadataSnapshotBinding, PackageStatus, ParticipantHydrationRow,
+        ParticipantRole, ParticipantStatus, PlanKind, PrincipalId, PublicGroupSnapshotCoordinate,
         RecoveryRequestStatus, RecoverySource, ReservationStatus, ServerTimestamp, StateChange,
         TransitionEffects, WelcomeStatus,
     };
@@ -13582,9 +13582,33 @@ mod executor {
                 )
                 .await
             }
-            PlanKind::LeaveRequest => Err(ExecutorError::UnsupportedEffect("leaveRequest")),
+            PlanKind::LeaveRequest => {
+                apply_leave_request(
+                    transaction,
+                    plan,
+                    ctx,
+                    conversation_id,
+                    seq_i64,
+                    successor_next_entry_seq,
+                    generation,
+                    state_version,
+                    epoch,
+                )
+                .await
+            }
             PlanKind::LeaveCancellation => {
-                Err(ExecutorError::UnsupportedEffect("leaveCancellation"))
+                apply_leave_cancellation(
+                    transaction,
+                    plan,
+                    ctx,
+                    conversation_id,
+                    seq_i64,
+                    successor_next_entry_seq,
+                    generation,
+                    state_version,
+                    epoch,
+                )
+                .await
             }
             PlanKind::ZeroLeafLeave => Err(ExecutorError::UnsupportedEffect("zeroLeafLeave")),
             PlanKind::WelcomeAcknowledgement => {
@@ -15439,6 +15463,305 @@ mod executor {
                 signature: row.signature.clone(),
                 received_at: applied_at,
                 expires_at: row.expires_at,
+            },
+        )
+        .await?;
+
+        // 4. Audience + event.
+        let recipients = build_entry_recipients(&ctx.entry_recipients)?;
+        delivery::insert_entry_recipients(
+            transaction,
+            conversation_id,
+            u64::try_from(seq_i64).unwrap(),
+            &recipients,
+        )
+        .await?;
+        let event_positions = write_events(transaction, ctx).await?;
+
+        Ok(AppliedTransition {
+            allocated_seq: u64::try_from(seq_i64).unwrap(),
+            entry_id: ctx.entry.entry_id,
+            event_positions,
+            successor_coordinate: plan.successor_coordinate().copied(),
+        })
+    }
+
+    /// Apply an entry-bearing `leaveRequest` control op. Non-mutating: the head
+    /// CAS advances ONLY the seq counter (the `(generation,state_version)`
+    /// coordinate is untouched), it appends the `leaveRequestEntry`, and it inserts
+    /// a pending 24h-consent `leave_requests` row bound to the current coordinate.
+    /// The row's signed material is the entry's — `assert_leave_request_mapping`
+    /// requires the row and its `leaveRequestEntry` to carry byte-equal
+    /// `signed_request_bytes`/`request_digest`/`signature`/`received_at` — so no
+    /// side ctx row is needed; the DB `expires_at = received_at + 24h`. Mirrors
+    /// `apply_reset_request`.
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_leave_request(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        plan: &ConversationPersistencePlan,
+        ctx: &ExecutionContext,
+        conversation_id: Uuid,
+        seq_i64: i64,
+        successor_next_entry_seq: i64,
+        generation: i64,
+        state_version: i64,
+        epoch: i64,
+    ) -> Result<AppliedTransition, ExecutorError> {
+        let effects = plan.effects();
+        let hydration = plan.state();
+        let coordinate = &hydration.coordinate; // unchanged coordinate.
+        let applied_at = ctx.applied_at;
+        let head = effects
+            .head_cas()
+            .ok_or(ExecutorError::InconsistentPlan("missing head CAS binding"))?;
+        let expected_prior = head
+            .expected_prior()
+            .ok_or(ExecutorError::InconsistentPlan(
+                "leave request needs an expected prior",
+            ))?;
+        let expected_generation = checked_i64(expected_prior.generation())?;
+        let expected_state_version = checked_i64(expected_prior.state_version())?;
+        let expected_next_entry_seq = checked_i64(head.expected_next_entry_seq())?;
+
+        // Non-mutating: only a leave-request row changes. Everything else empty.
+        reject_if_present("participant_changes", effects.participant_changes())?;
+        reject_if_present("leaf_changes", effects.leaf_changes())?;
+        reject_if_present("interval_changes", effects.interval_changes())?;
+        reject_if_present("terminal_proof_changes", effects.terminal_proof_changes())?;
+        reject_if_present(
+            "recovery_request_changes",
+            effects.recovery_request_changes(),
+        )?;
+        reject_if_present("reservation_changes", effects.reservation_changes())?;
+        reject_if_present("reset_request_changes", effects.reset_request_changes())?;
+        reject_if_present("welcome_changes", effects.welcome_changes())?;
+        reject_if_present("package_transitions", effects.package_transitions())?;
+        reject_if_present("recovery_package_cas", effects.recovery_package_cas())?;
+        reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
+        if effects.metadata_change().is_some() {
+            return Err(ExecutorError::UnsupportedEffect(
+                "leave request metadata change",
+            ));
+        }
+        if effects.revocation_target_cas().is_some() || effects.welcome_cas().is_some() {
+            return Err(ExecutorError::UnsupportedEffect(
+                "leave request revocation/welcome CAS",
+            ));
+        }
+        if effects.invitation_quota_cas().is_some() {
+            return Err(ExecutorError::UnsupportedEffect(
+                "leave request invitation quota CAS",
+            ));
+        }
+        // Exactly one new pending leave request in the delta.
+        if effects.leave_request_changes().len() != 1 {
+            return Err(ExecutorError::InconsistentPlan(
+                "leave request must change exactly one request",
+            ));
+        }
+        let request = effects
+            .leave_request_changes()
+            .iter()
+            .find_map(|change| match (change.before(), change.after()) {
+                (None, Some(after)) if after.status() == LeaveRequestStatus::Pending => Some(after),
+                _ => None,
+            })
+            .ok_or(ExecutorError::InconsistentPlan(
+                "leave request must open exactly one pending request",
+            ))?;
+        let leave_request_id = Uuid::from_bytes(request.request_id);
+
+        // 1. Head CAS: advance the seq counter, coordinate UNCHANGED.
+        transition::cas_conversation_head(
+            transaction,
+            &transition::ConversationHeadCas {
+                conversation_id,
+                expected_generation,
+                expected_state_version,
+                expected_next_entry_seq,
+                successor_generation: generation,
+                successor_state_version: state_version,
+                successor_next_entry_seq,
+                close: None,
+            },
+        )
+        .await?;
+
+        // 2. The request entry (leaveRequestEntry carries no transition_id).
+        let mut append =
+            build_append_entry(ctx, conversation_id, generation, state_version, Uuid::nil());
+        append.generation = None;
+        append.state_version = None;
+        append.transition_id = None;
+        delivery::append_entry_at(transaction, &append, u64::try_from(seq_i64).unwrap()).await?;
+
+        // 3. The pending leave_requests row. Signed material is the entry's (the
+        //    entry<->row mapping trigger requires byte-equality); the bound
+        //    coordinate is the unchanged current coordinate; `expires_at` is the
+        //    DB-required `received_at + 24h`.
+        transition::insert_leave_request(
+            transaction,
+            &NewLeaveRequest {
+                leave_request_id,
+                conversation_id,
+                requester_did: ctx.actor.user_did.clone(),
+                requester_device_id: ctx.actor.device_id,
+                requester_key_id: ctx.actor.key_id.clone(),
+                requester_auth_generation: ctx.actor.auth_generation,
+                prior_generation: generation,
+                prior_state_version: state_version,
+                prior_group_id: coordinate.group_id().to_vec(),
+                prior_epoch: epoch,
+                prior_group_context_hash: coordinate.group_context_hash().to_vec(),
+                prior_confirmation_tag: coordinate.confirmation_tag().to_vec(),
+                signed_request_bytes: ctx.entry.signed_request_bytes.clone(),
+                signing_transcript_bytes: ctx.entry.signing_transcript_bytes.clone(),
+                request_digest: ctx.entry.request_digest.clone(),
+                signature: ctx.entry.signature.clone(),
+                received_at: applied_at,
+                expires_at: applied_at + chrono::Duration::hours(24),
+            },
+        )
+        .await?;
+
+        // 4. Audience + event.
+        let recipients = build_entry_recipients(&ctx.entry_recipients)?;
+        delivery::insert_entry_recipients(
+            transaction,
+            conversation_id,
+            u64::try_from(seq_i64).unwrap(),
+            &recipients,
+        )
+        .await?;
+        let event_positions = write_events(transaction, ctx).await?;
+
+        Ok(AppliedTransition {
+            allocated_seq: u64::try_from(seq_i64).unwrap(),
+            entry_id: ctx.entry.entry_id,
+            event_positions,
+            successor_coordinate: plan.successor_coordinate().copied(),
+        })
+    }
+
+    /// Apply an entry-bearing `leaveCancellation` control op. Non-mutating (the
+    /// requester withdraws their own pending leave consent): the head CAS advances
+    /// only the seq counter, it appends the `leaveCancellationEntry`, and it
+    /// terminalizes the pending `leave_requests` row as `cancelled`. The cancelled
+    /// row's `terminal_request_digest` == the cancellation entry's `request_digest`
+    /// and `terminal_at` == its `received_at` (`= applied_at`), exactly as the
+    /// cancelled-status arms of `assert_leave_request_mapping` /
+    /// `assert_control_request_entry` cross-check. No transition (non-mutating).
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_leave_cancellation(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        plan: &ConversationPersistencePlan,
+        ctx: &ExecutionContext,
+        conversation_id: Uuid,
+        seq_i64: i64,
+        successor_next_entry_seq: i64,
+        generation: i64,
+        state_version: i64,
+        _epoch: i64,
+    ) -> Result<AppliedTransition, ExecutorError> {
+        let effects = plan.effects();
+        let applied_at = ctx.applied_at;
+        let head = effects
+            .head_cas()
+            .ok_or(ExecutorError::InconsistentPlan("missing head CAS binding"))?;
+        let expected_prior = head
+            .expected_prior()
+            .ok_or(ExecutorError::InconsistentPlan(
+                "leave cancellation needs an expected prior",
+            ))?;
+        let expected_generation = checked_i64(expected_prior.generation())?;
+        let expected_state_version = checked_i64(expected_prior.state_version())?;
+        let expected_next_entry_seq = checked_i64(head.expected_next_entry_seq())?;
+
+        // Non-mutating: only a leave-request row is terminalized. Everything else empty.
+        reject_if_present("participant_changes", effects.participant_changes())?;
+        reject_if_present("leaf_changes", effects.leaf_changes())?;
+        reject_if_present("interval_changes", effects.interval_changes())?;
+        reject_if_present("terminal_proof_changes", effects.terminal_proof_changes())?;
+        reject_if_present(
+            "recovery_request_changes",
+            effects.recovery_request_changes(),
+        )?;
+        reject_if_present("reservation_changes", effects.reservation_changes())?;
+        reject_if_present("reset_request_changes", effects.reset_request_changes())?;
+        reject_if_present("welcome_changes", effects.welcome_changes())?;
+        reject_if_present("package_transitions", effects.package_transitions())?;
+        reject_if_present("recovery_package_cas", effects.recovery_package_cas())?;
+        reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
+        if effects.metadata_change().is_some() {
+            return Err(ExecutorError::UnsupportedEffect(
+                "leave cancellation metadata change",
+            ));
+        }
+        if effects.revocation_target_cas().is_some() || effects.welcome_cas().is_some() {
+            return Err(ExecutorError::UnsupportedEffect(
+                "leave cancellation revocation/welcome CAS",
+            ));
+        }
+        if effects.invitation_quota_cas().is_some() {
+            return Err(ExecutorError::UnsupportedEffect(
+                "leave cancellation invitation quota CAS",
+            ));
+        }
+        // Exactly one pending -> cancelled leave request in the delta.
+        if effects.leave_request_changes().len() != 1 {
+            return Err(ExecutorError::InconsistentPlan(
+                "leave cancellation must change exactly one request",
+            ));
+        }
+        let cancelled = effects
+            .leave_request_changes()
+            .iter()
+            .find_map(|change| match (change.before(), change.after()) {
+                (Some(before), Some(after))
+                    if before.status() == LeaveRequestStatus::Pending
+                        && after.status() == LeaveRequestStatus::Cancelled =>
+                {
+                    Some(after)
+                }
+                _ => None,
+            })
+            .ok_or(ExecutorError::InconsistentPlan(
+                "leave cancellation must cancel exactly one pending request",
+            ))?;
+        let leave_request_id = Uuid::from_bytes(cancelled.request_id);
+
+        // 1. Head CAS: advance the seq counter, coordinate UNCHANGED.
+        transition::cas_conversation_head(
+            transaction,
+            &transition::ConversationHeadCas {
+                conversation_id,
+                expected_generation,
+                expected_state_version,
+                expected_next_entry_seq,
+                successor_generation: generation,
+                successor_state_version: state_version,
+                successor_next_entry_seq,
+                close: None,
+            },
+        )
+        .await?;
+
+        // 2. The cancellation entry (leaveCancellationEntry carries no transition_id).
+        let mut append =
+            build_append_entry(ctx, conversation_id, generation, state_version, Uuid::nil());
+        append.generation = None;
+        append.state_version = None;
+        append.transition_id = None;
+        delivery::append_entry_at(transaction, &append, u64::try_from(seq_i64).unwrap()).await?;
+
+        // 3. Terminalize the pending request as `cancelled`, bound to the
+        //    cancellation entry's digest + instant (the mapping cross-check).
+        transition::terminalize_leave_request(
+            transaction,
+            leave_request_id,
+            &LeaveRequestTermination::Cancelled {
+                terminal_request_digest: ctx.entry.request_digest.clone(),
+                terminal_at: applied_at,
             },
         )
         .await?;
