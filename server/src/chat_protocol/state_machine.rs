@@ -9837,6 +9837,7 @@ impl MetadataSnapshotBinding {
     pub(crate) fn for_test_creation(
         conversation_id: [u8; 16],
         generation: u64,
+        epoch: u64,
         group_context_hash: [u8; 32],
         transition_id: [u8; 16],
         origin_seq: u64,
@@ -9858,7 +9859,7 @@ impl MetadataSnapshotBinding {
             coordinate: MetadataCryptoCoordinate {
                 conversation_id,
                 generation,
-                epoch: 0,
+                epoch,
                 group_context_hash,
             },
             origin_transition_id: transition_id,
@@ -10003,6 +10004,61 @@ impl TransitionEvidence {
                 expires_at,
                 canonical_digest: [0x5A_u8; 32],
             },
+        });
+        Ok(evidence)
+    }
+
+    /// A `signedLeafRecoveryFulfillment` `TransitionEvidence` carrying the exact
+    /// `LeafRecoveryFulfillment` body a real signed fulfillment carries: the
+    /// prior/next coordinates + recovery_request_id `require_commit_body` matches,
+    /// and the Add manifest + welcome binding `require_commit_manifest` validates
+    /// against the corpus ADD commit (single add of `target` with the reserved
+    /// `key_package_ref`, the welcome bound to that target/request/ref), plus the
+    /// mandatory metadata re-encryption snapshot the `leafRecovery` DDL arm demands.
+    /// `authority` stays `None` (the test seam), which skips the crypto-digest
+    /// cross-checks while still enforcing every coordinate/manifest/welcome field.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_test_leaf_recovery_fulfillment_with_metadata(
+        seq: u64,
+        transition_id: [u8; 16],
+        outer_entry_fingerprint: [u8; 32],
+        received_at: ServerTimestamp,
+        recovery_request_id: [u8; 16],
+        prior: PublicGroupSnapshotCoordinate,
+        next: PublicGroupSnapshotCoordinate,
+        target: DeviceIdentity,
+        key_package_ref: [u8; 32],
+        welcome_id: [u8; 16],
+        welcome_wire_bytes: Vec<u8>,
+        metadata: MetadataSnapshotBinding,
+    ) -> Result<Self, StateMachineError> {
+        let welcome_sha256: [u8; 32] = Sha256::digest(&welcome_wire_bytes).into();
+        let mut evidence =
+            Self::for_test_at(seq, transition_id, outer_entry_fingerprint, received_at)?;
+        evidence.body_binding = Some(TransitionBodyBinding::LeafRecoveryFulfillment {
+            recovery_request_id,
+            prior,
+            next,
+            aad_digest: [0u8; 32],
+            manifest: TransitionManifestBinding {
+                participant_changes: Vec::new(),
+                leaf_changes: vec![ManifestLeafChange::Add {
+                    device: target.clone(),
+                    recovery_request_id,
+                    key_package_ref,
+                }],
+                leaf_recovery_request_id: Some(recovery_request_id),
+                welcome: Some(ManifestWelcomeBinding {
+                    welcome_id,
+                    opaque_welcome: welcome_wire_bytes,
+                    sha256: welcome_sha256,
+                    recipient: target,
+                    recovery_request_id,
+                    key_package_ref,
+                }),
+            },
+            commit_sha256: [0u8; 32],
+            metadata,
         });
         Ok(evidence)
     }
@@ -10155,6 +10211,17 @@ impl ConversationPersistencePlan {
     /// arm an executable contract (removing the arm fails the negative test).
     pub(crate) fn with_invitation_quota_cleared_for_test(mut self) -> Self {
         self.effects.invitation_quota_cas = None;
+        self
+    }
+
+    /// Drop the recovery-package CAS binding, desyncing it from
+    /// `package_transitions` — production requires the two to be bijective
+    /// (`package_cas_bijection_valid`) and the executor's
+    /// `verify_recovery_package_consistency` rejects the desync as
+    /// `InconsistentPlan`. Makes that (otherwise-always-bijective-by-construction)
+    /// assert an executable contract: removing the assert fails the negative test.
+    pub(crate) fn with_recovery_package_cas_cleared_for_test(mut self) -> Self {
+        self.effects.recovery_package_cas.clear();
         self
     }
 }
@@ -12921,7 +12988,7 @@ mod executor {
         self as delivery, AppendEntry, ApplicationIntervalClose, DeliveryRepositoryError,
         EntryEntitlementKind, EntryRecipient, EventEntitlementKind, EventKind, EventRecipient,
         IntervalCloseKind, IntervalOpeningKind, NewApplicationInterval, NewEvent,
-        NewScheduleTerminalProof, OutboxWorkKind,
+        NewScheduleTerminalProof, NewWelcomeBundle, NewWelcomeDelivery, OutboxWorkKind,
     };
     use super::super::repository::transition::{
         self as transition, ConversationHeadClose, ConversationHeadKind, GenerationStateKind,
@@ -12937,9 +13004,10 @@ mod executor {
     };
     use super::{
         CloseKind, ConversationKind, DeviceIdentity, LeafHydrationRow, LeafRecoveryKind,
-        MetadataSnapshotBinding, ParticipantHydrationRow, ParticipantRole, ParticipantStatus,
-        PlanKind, PrincipalId, PublicGroupSnapshotCoordinate, RecoveryRequestStatus,
-        RecoverySource, ServerTimestamp, StateChange, TransitionEffects,
+        MetadataSnapshotBinding, PackageStatus, ParticipantHydrationRow, ParticipantRole,
+        ParticipantStatus, PlanKind, PrincipalId, PublicGroupSnapshotCoordinate,
+        RecoveryRequestStatus, RecoverySource, ServerTimestamp, StateChange, TransitionEffects,
+        WelcomeStatus,
     };
     use super::{ConversationPersistencePlan, ConversationStateHydration};
 
@@ -13049,6 +13117,12 @@ mod executor {
         pub(crate) author_role: String,
         pub(crate) author_device_status: String,
         pub(crate) author_public_key: Vec<u8>,
+        /// The author's `chat.device_keys.key_id` (base64url) — the DB string the
+        /// `MetadataSnapshotBinding` author-proof carries only as a raw 32-byte id.
+        /// For a creation/reset self-origin snapshot this equals the actor's key id;
+        /// for a commit/leafRecovery re-encryption it is the ORIGINAL author's key
+        /// id (carried forward, may differ from the fulfiller).
+        pub(crate) author_key_id: String,
         /// Fresh `chat.metadata_snapshots` primary key for this snapshot.
         pub(crate) metadata_snapshot_id: Uuid,
     }
@@ -13202,6 +13276,8 @@ mod executor {
     fn verify_recovery_package_consistency(
         effects: &TransitionEffects,
         driven_key_package_ref: &[u8; 32],
+        expected_from: PackageStatus,
+        expected_to: PackageStatus,
     ) -> Result<(), ExecutorError> {
         let edges = effects.package_transitions();
         let cas = effects.recovery_package_cas();
@@ -13214,6 +13290,15 @@ mod executor {
             if edge.key_package_ref != *driven_key_package_ref {
                 return Err(ExecutorError::InconsistentPlan(
                     "executor package CAS ref disagrees with a package_transitions ref",
+                ));
+            }
+            // E2b-6b review MINOR-2: validate the CAS DIRECTION against the semantic
+            // edge's own from/to rather than trusting the arm's hardcoded successor,
+            // so a future planner emitting the wrong direction is a hard error, never
+            // a silently mis-applied status edge.
+            if edge.from != expected_from || edge.to != expected_to {
+                return Err(ExecutorError::InconsistentPlan(
+                    "package_transitions edge direction disagrees with the executor's CAS",
                 ));
             }
             let unique = cas
@@ -13356,7 +13441,36 @@ mod executor {
                 .await
             }
             PlanKind::Metadata => Err(ExecutorError::UnsupportedEffect("metadata")),
-            PlanKind::Commit => Err(ExecutorError::UnsupportedEffect("commit")),
+            PlanKind::Commit => {
+                // Both the generic (zero-add) commit and the leaf-recovery
+                // fulfillment are `PlanKind::Commit`. A fulfillment ALWAYS emits
+                // exactly one Welcome (how the recovered target joins); a generic
+                // commit never does. Branch on that. Generic commit stays a hard
+                // `UnsupportedEffect` (blocked on the corpus zero-add fixture gap).
+                let is_fulfillment = effects
+                    .welcome_changes()
+                    .iter()
+                    .any(|change| matches!((change.before(), change.after()), (None, Some(_))));
+                if is_fulfillment {
+                    apply_leaf_recovery_fulfillment(
+                        transaction,
+                        plan,
+                        ctx,
+                        conversation_id,
+                        transition_id,
+                        seq_i64,
+                        successor_next_entry_seq,
+                        generation,
+                        state_version,
+                        epoch,
+                    )
+                    .await
+                } else {
+                    Err(ExecutorError::UnsupportedEffect(
+                        "commit (generic zero-add — corpus fixture gap)",
+                    ))
+                }
+            }
             // Entry-less internal ops are dispatched (and returned) above, before
             // the entry-bearing `allocated_seq` extraction.
             PlanKind::RecoveryRequest | PlanKind::RecoveryCancellation => {
@@ -13504,7 +13618,12 @@ mod executor {
                 "leaf recovery request must add exactly one request + reservation + package edge",
             ));
         }
-        verify_recovery_package_consistency(effects, recovery.key_package_ref())?;
+        verify_recovery_package_consistency(
+            effects,
+            recovery.key_package_ref(),
+            PackageStatus::Available,
+            PackageStatus::Reserved,
+        )?;
 
         // 1. Head CAS VERIFY — coordinate and seq counter both UNCHANGED
         //    (successor == expected on every column). A drifted head is a typed
@@ -13634,7 +13753,12 @@ mod executor {
                 "cancellation must terminalize exactly one request + reservation + package edge",
             ));
         }
-        verify_recovery_package_consistency(effects, recovery.key_package_ref())?;
+        verify_recovery_package_consistency(
+            effects,
+            recovery.key_package_ref(),
+            PackageStatus::Reserved,
+            PackageStatus::Available,
+        )?;
         let recovery_request_id = Uuid::from_bytes(*recovery.request_id());
         let key_package_ref = recovery.key_package_ref().to_vec();
         // The signed cancellation request's digest — the SAME value the released
@@ -13696,6 +13820,441 @@ mod executor {
 
         Ok(AppliedTransition {
             allocated_seq: u64::try_from(successor_next_entry_seq).unwrap(),
+            entry_id: ctx.entry.entry_id,
+            event_positions,
+            successor_coordinate: plan.successor_coordinate().copied(),
+        })
+    }
+
+    /// Apply a `signedLeafRecoveryFulfillment` edge (kind `leafRecovery`): the
+    /// epoch-changing commit that adds the recovered target by KeyPackage and emits
+    /// its Welcome. sv+1, epoch+1 (new hash/tag), same generation. Composes: head
+    /// CAS + gen-state-version CAS + `commit`/active gen_state (epoch+1) +
+    /// leafRecoveryFulfillmentEntry + transition (`leafRecovery`) + metadata
+    /// RE-ENCRYPTION snapshot + exactly one `addLeafByRecovery` (the target's leaf
+    /// period, `keyPackage` origin with join provenance, + its `add`-opened interval
+    /// at the fulfillment seq) + request `fulfilled` / reservation `consumed` /
+    /// package `consumed` + Welcome bundle + delivery (`expires_at` == consumed
+    /// package `not_after`) + audience + `welcomeAvailable` event.
+    ///
+    /// SCOPE: the single-request Add fulfillment (what the frozen corpus commit
+    /// exercises). Prior-coordinate open-request supersession (multiple
+    /// recovery/reservation/package changes) and a `replace` close are NOT composed
+    /// here — the exact-count guards below turn either into a hard `InconsistentPlan`
+    /// rather than a silent drop; they are a bounded follow-on once a corpus with a
+    /// second open request / a Remove-capable commit exists.
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_leaf_recovery_fulfillment(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        plan: &ConversationPersistencePlan,
+        ctx: &ExecutionContext,
+        conversation_id: Uuid,
+        transition_id: Uuid,
+        seq_i64: i64,
+        successor_next_entry_seq: i64,
+        generation: i64,
+        state_version: i64,
+        epoch: i64,
+    ) -> Result<AppliedTransition, ExecutorError> {
+        let effects = plan.effects();
+        let hydration = plan.state();
+        let coordinate = &hydration.coordinate; // successor (sv+1, epoch+1).
+        let applied_at = ctx.applied_at;
+        let head = effects
+            .head_cas()
+            .ok_or(ExecutorError::InconsistentPlan("missing head CAS binding"))?;
+        let expected_prior = head
+            .expected_prior()
+            .ok_or(ExecutorError::InconsistentPlan("fulfillment needs a prior"))?;
+        let expected_generation = checked_i64(expected_prior.generation())?;
+        let expected_state_version = checked_i64(expected_prior.state_version())?;
+        let expected_next_entry_seq = checked_i64(head.expected_next_entry_seq())?;
+
+        // Guards: fulfillment carries leaf / interval / welcome / recovery-request /
+        // reservation / package / metadata changes; reject the families it never has.
+        reject_if_present("participant_changes", effects.participant_changes())?;
+        reject_if_present("terminal_proof_changes", effects.terminal_proof_changes())?;
+        reject_if_present("reset_request_changes", effects.reset_request_changes())?;
+        reject_if_present("leave_request_changes", effects.leave_request_changes())?;
+        reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
+        if effects.revocation_target_cas().is_some()
+            || effects.welcome_cas().is_some()
+            || effects.invitation_quota_cas().is_some()
+        {
+            return Err(ExecutorError::UnsupportedEffect(
+                "fulfillment revocation/welcome/quota CAS",
+            ));
+        }
+        // Metadata re-encryption is MANDATORY (DDL requires_snapshot ∋ leafRecovery).
+        let metadata = effects
+            .metadata_change()
+            .and_then(StateChange::after)
+            .ok_or(ExecutorError::InconsistentPlan(
+                "fulfillment carries no metadata re-encryption",
+            ))?;
+        let author_cols = ctx
+            .metadata_author
+            .as_ref()
+            .ok_or(ExecutorError::MissingContext(
+                "fulfillment commit metadata author",
+            ))?;
+
+        // Exactly one Open->Fulfilled recovery request + one Active->Consumed
+        // reservation + one Reserved->Consumed package edge (no supersession here).
+        let fulfilled = effects
+            .recovery_request_changes()
+            .iter()
+            .find_map(|change| match (change.before(), change.after()) {
+                (Some(before), Some(after))
+                    if before.status() == RecoveryRequestStatus::Open
+                        && after.status() == RecoveryRequestStatus::Fulfilled =>
+                {
+                    Some(after)
+                }
+                _ => None,
+            })
+            .ok_or(ExecutorError::InconsistentPlan(
+                "fulfillment fulfills no open recovery request",
+            ))?;
+        if effects.recovery_request_changes().len() != 1
+            || effects.reservation_changes().len() != 1
+            || effects.package_transitions().len() != 1
+            || effects.welcome_changes().len() != 1
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "fulfillment must carry exactly one request/reservation/package/welcome change",
+            ));
+        }
+        let recovery_request_id = Uuid::from_bytes(*fulfilled.request_id());
+        let reserved_ref = *fulfilled.key_package_ref();
+        // Reserved -> Consumed package edge (bijection + driven-ref + direction).
+        verify_recovery_package_consistency(
+            effects,
+            &reserved_ref,
+            PackageStatus::Reserved,
+            PackageStatus::Consumed,
+        )?;
+        // Exactly one new pending welcome.
+        let welcome = effects
+            .welcome_changes()
+            .iter()
+            .find_map(|change| match (change.before(), change.after()) {
+                (None, Some(after)) if after.status() == WelcomeStatus::Pending => Some(after),
+                _ => None,
+            })
+            .ok_or(ExecutorError::InconsistentPlan(
+                "fulfillment adds no pending welcome",
+            ))?;
+
+        // 1. Head CAS sv+1.
+        transition::cas_conversation_head(
+            transaction,
+            &transition::ConversationHeadCas {
+                conversation_id,
+                expected_generation,
+                expected_state_version,
+                expected_next_entry_seq,
+                successor_generation: generation,
+                successor_state_version: state_version,
+                successor_next_entry_seq,
+                close: None,
+            },
+        )
+        .await?;
+
+        // 2. Generation state-version pointer CAS (same generation).
+        transition::cas_generation_state_version(
+            transaction,
+            &transition::GenerationStateVersionCas {
+                conversation_id,
+                generation,
+                expected_state_version,
+                successor_state_version: state_version,
+            },
+        )
+        .await?;
+
+        // 3. `commit`/active gen_state at the NEW epoch (fresh hash/tag).
+        transition::insert_generation_state_row(
+            transaction,
+            &NewGenerationState {
+                conversation_id,
+                generation,
+                state_version,
+                group_id: coordinate.group_id().to_vec(),
+                epoch,
+                group_context_hash: coordinate.group_context_hash().to_vec(),
+                confirmation_tag: coordinate.confirmation_tag().to_vec(),
+                lifecycle: GenerationStateLifecycle::Active,
+                state_kind: GenerationStateKind::Commit,
+                producing_transition_id: transition_id,
+                public_snapshot_bytes: ctx.spine.public_snapshot_bytes.clone(),
+                snapshot_sha256: ctx.spine.public_snapshot_sha256.clone(),
+                tree_summary_bytes: ctx.spine.tree_summary_bytes.clone(),
+                tree_summary_sha256: ctx.spine.tree_summary_sha256.clone(),
+                leaf_count: ctx.spine.leaf_count,
+                created_at: applied_at,
+            },
+        )
+        .await?;
+
+        // 4. Entry (leafRecoveryFulfillmentEntry).
+        let append = build_append_entry(
+            ctx,
+            conversation_id,
+            generation,
+            state_version,
+            transition_id,
+        );
+        delivery::append_entry_at(transaction, &append, u64::try_from(seq_i64).unwrap()).await?;
+
+        // 5. Transition (kind leafRecovery, prior -> next, carries the request).
+        transition::insert_transition_row(
+            transaction,
+            &NewTransition {
+                transition_id,
+                conversation_id,
+                kind: TransitionKind::LeafRecovery,
+                actor_did: ctx.actor.user_did.clone(),
+                actor_device_id: ctx.actor.device_id,
+                actor_key_id: ctx.actor.key_id.clone(),
+                actor_auth_generation: ctx.actor.auth_generation,
+                actor_role: ctx.actor.role,
+                actor_device_status: ctx.actor.device_status.clone(),
+                signed_request_bytes: ctx.entry.signed_request_bytes.clone(),
+                unsigned_projection_bytes: ctx.entry.unsigned_projection_bytes.clone(),
+                signing_transcript_bytes: ctx.entry.signing_transcript_bytes.clone(),
+                request_digest: ctx.entry.request_digest.clone(),
+                signature: ctx.entry.signature.clone(),
+                coordinates: TransitionCoordinates {
+                    prior: Some((expected_generation, expected_state_version)),
+                    next: Some((generation, state_version)),
+                    retired: None,
+                    successor: None,
+                },
+                reset_request_id: None,
+                close_transition_id: None,
+                metadata_snapshot_id: Some(author_cols.metadata_snapshot_id),
+                entry_seq: seq_i64,
+                accepted_at: applied_at,
+            },
+        )
+        .await?;
+
+        // 6. Metadata re-encryption snapshot (carry-forward author/origin/version).
+        write_commit_metadata_snapshot(
+            transaction,
+            metadata,
+            author_cols,
+            conversation_id,
+            generation,
+            state_version,
+            epoch,
+            &coordinate.group_id().to_vec(),
+            &coordinate.group_context_hash().to_vec(),
+            &coordinate.confirmation_tag().to_vec(),
+            transition_id,
+            applied_at,
+        )
+        .await?;
+
+        // 7. Exactly one addLeafByRecovery: the target's keyPackage-origin leaf.
+        //    NOTE: the commit's sender (the fulfiller) rotates its own encryption
+        //    key, which surfaces as a (Some,Some) leaf change — but the DS
+        //    `member_devices` row does not store the ephemeral encryption key, so a
+        //    key rotation needs NO row write and is intentionally ignored here. A
+        //    (Some,None) removal (a `replace` old-leaf close) is NOT yet composed.
+        let target = fulfilled.target().clone();
+        let mut added_leaves = 0usize;
+        for change in effects.leaf_changes() {
+            match (change.before(), change.after()) {
+                (None, Some(_)) => added_leaves += 1,
+                (Some(_), Some(_)) => {}
+                (Some(_), None) => {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "fulfillment replace-close not composed",
+                    ))
+                }
+                (None, None) => {}
+            }
+        }
+        let new_leaf_change = effects
+            .leaf_changes()
+            .iter()
+            .find_map(|change| match (change.before(), change.after()) {
+                (None, Some(after)) => Some(after),
+                _ => None,
+            })
+            .ok_or(ExecutorError::InconsistentPlan("fulfillment adds no leaf"))?;
+        if added_leaves != 1 || new_leaf_change.device() != &target {
+            return Err(ExecutorError::InconsistentPlan(
+                "fulfillment must add exactly the target's leaf",
+            ));
+        }
+        let leaf_row = hydration
+            .leaves
+            .iter()
+            .find(|row| row.device == target)
+            .ok_or(ExecutorError::InconsistentPlan(
+                "recovered leaf not in hydration",
+            ))?;
+        let leaf_cols = ctx
+            .opened_leaves
+            .iter()
+            .find(|cols| cols.device == target)
+            .ok_or(ExecutorError::MissingContext("recovered leaf columns"))?;
+        let leaf_period_id = *ctx
+            .leaf_period_ids
+            .first()
+            .ok_or(ExecutorError::MissingContext("recovered leaf period id"))?;
+        let participant_period_id = participant_period_for(ctx, hydration, target.principal())?;
+        transition::insert_leaf_period(
+            transaction,
+            &NewLeafPeriod {
+                leaf_period_id,
+                participant_period_id,
+                conversation_id,
+                generation,
+                user_did: device_did(&target)?,
+                device_id: device_uuid(&target),
+                leaf_index: checked_i64(u64::from(leaf_row.leaf_index))?,
+                basic_credential: leaf_row.basic_credential.clone(),
+                leaf_signature_key: leaf_row.signature_key.clone(),
+                leaf_key_id: leaf_cols.leaf_key_id.clone(),
+                leaf_auth_generation: leaf_cols.leaf_auth_generation,
+                origin: LeafOrigin::KeyPackage {
+                    key_package_ref: reserved_ref.to_vec(),
+                },
+                joined_state_version: state_version,
+                joined_transition_id: transition_id,
+                joined_seq: seq_i64,
+                created_at: applied_at,
+            },
+        )
+        .await?;
+
+        // 8. The target's `add`-opened interval at the fulfillment seq.
+        let interval_change = effects
+            .interval_changes()
+            .iter()
+            .find_map(|change| match (change.before(), change.after()) {
+                (None, Some(after)) => Some(after),
+                _ => None,
+            })
+            .ok_or(ExecutorError::InconsistentPlan(
+                "fulfillment opens no interval",
+            ))?;
+        if effects.interval_changes().len() != 1
+            || interval_change.opening_kind() != super::OpeningKind::Add
+            || interval_change.end().is_some()
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "fulfillment must open exactly one add interval (no replace-close composed)",
+            ));
+        }
+        let opening_context = interval_change.opening_context();
+        delivery::insert_application_interval(
+            transaction,
+            &NewApplicationInterval {
+                membership_interval_id: Uuid::from_bytes(*interval_change.opening_transition_id()),
+                conversation_id,
+                generation: checked_i64(opening_context.generation())?,
+                recipient_did: device_did(interval_change.recipient())?,
+                recipient_device_id: device_uuid(interval_change.recipient()),
+                start_seq: checked_i64(interval_change.opening_seq())?,
+                opening_kind: IntervalOpeningKind::Add,
+                opening_transition_id: Uuid::from_bytes(*interval_change.opening_transition_id()),
+                opening_outer_entry_fingerprint: interval_change
+                    .opening_outer_entry_fingerprint()
+                    .to_vec(),
+                opening_state_version: checked_i64(opening_context.state_version())?,
+                opening_group_id: opening_context.group_id().to_vec(),
+                opening_epoch: checked_i64(opening_context.epoch())?,
+                opening_group_context_hash: opening_context.group_context_hash().to_vec(),
+                opening_confirmation_tag: opening_context.confirmation_tag().to_vec(),
+                opening_leaf_period_id: leaf_period_id,
+                created_at: applied_at,
+            },
+        )
+        .await?;
+
+        // 9. Terminalize: request fulfilled, reservation consumed, package consumed.
+        transition::terminalize_leaf_recovery_request(
+            transaction,
+            recovery_request_id,
+            &LeafRecoveryTermination::Fulfilled {
+                fulfilling_transition_id: transition_id,
+                terminal_at: applied_at,
+            },
+        )
+        .await?;
+        transition::terminalize_reservation(
+            transaction,
+            recovery_request_id,
+            &ReservationTermination::Consumed {
+                consumed_transition_id: transition_id,
+                terminal_at: applied_at,
+            },
+        )
+        .await?;
+        transition::cas_key_package_status(
+            transaction,
+            &reserved_ref,
+            RepoPackageStatus::Reserved,
+            &PackageSuccessor::Consume {
+                terminal_transition_id: transition_id,
+                terminal_at: applied_at,
+            },
+        )
+        .await?;
+
+        // 10. Welcome bundle + delivery (expires_at == consumed package not_after).
+        let welcome_id = Uuid::from_bytes(*welcome.welcome_id());
+        delivery::insert_welcome_bundle(
+            transaction,
+            &NewWelcomeBundle {
+                welcome_id,
+                conversation_id,
+                transition_id,
+                entry_seq: seq_i64,
+                generation,
+                state_version,
+                group_id: coordinate.group_id().to_vec(),
+                epoch,
+                group_context_hash: coordinate.group_context_hash().to_vec(),
+                confirmation_tag: coordinate.confirmation_tag().to_vec(),
+                wrapper_bytes: welcome.opaque_welcome().to_vec(),
+                wrapper_sha256: welcome.sha256().to_vec(),
+                created_at: applied_at,
+            },
+        )
+        .await?;
+        delivery::insert_welcome_delivery(
+            transaction,
+            &NewWelcomeDelivery {
+                welcome_id,
+                recipient_did: device_did(welcome.recipient())?,
+                recipient_device_id: device_uuid(welcome.recipient()),
+                recovery_request_id,
+                key_package_ref: welcome.key_package_ref().to_vec(),
+                expires_at: server_instant(welcome.expires_at())?,
+            },
+        )
+        .await?;
+
+        // 11. Audience + events.
+        let recipients = build_entry_recipients(&ctx.entry_recipients)?;
+        delivery::insert_entry_recipients(
+            transaction,
+            conversation_id,
+            u64::try_from(seq_i64).unwrap(),
+            &recipients,
+        )
+        .await?;
+        let event_positions = write_events(transaction, ctx).await?;
+
+        Ok(AppliedTransition {
+            allocated_seq: u64::try_from(seq_i64).unwrap(),
             entry_id: ctx.entry.entry_id,
             event_positions,
             successor_coordinate: plan.successor_coordinate().copied(),
@@ -15054,8 +15613,13 @@ mod executor {
                 "acceptance must add exactly one recovery request + reservation + package edge",
             ));
         }
-        // Load-bearing recovery-package CAS bijection + driven-ref cross-check.
-        verify_recovery_package_consistency(effects, recovery.key_package_ref())?;
+        // Load-bearing recovery-package CAS bijection + driven-ref + direction check.
+        verify_recovery_package_consistency(
+            effects,
+            recovery.key_package_ref(),
+            PackageStatus::Available,
+            PackageStatus::Reserved,
+        )?;
 
         // 1. Head CAS advances the coordinate + counter (sv+1, same generation).
         transition::cas_conversation_head(
@@ -15468,6 +16032,71 @@ mod executor {
                 author_public_key: author_cols.author_public_key.clone(),
                 author_auth_generation: actor.auth_generation,
                 author_origin_seq: seq_i64,
+                author_role: author_cols.author_role.clone(),
+                author_device_status: author_cols.author_device_status.clone(),
+                created_at: applied_at,
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Persist a commit/leafRecovery metadata RE-ENCRYPTION snapshot. Per the DDL
+    /// `assert_metadata_snapshot_mapping` `commit/leafRecovery/leaveCommit` arm the
+    /// new snapshot's author / origin / metadata_version / ciphertext_size / avatar
+    /// columns must byte-equal the PRIOR snapshot's — only nonce / ciphertext /
+    /// ciphertext_sha256 are fresh (the metadata content re-encrypted for the new
+    /// epoch). So author identity is CARRIED FORWARD from the re-encryption
+    /// binding's author-proof (the ORIGINAL author — creation/metadata author, NOT
+    /// the fulfiller `ctx.actor`), with the DB `author_key_id` / `author_role` /
+    /// `author_device_status` / snapshot PK supplied by `MetadataAuthorColumns`;
+    /// `producing_transition_id` and the coordinate are this transition's successor.
+    #[allow(clippy::too_many_arguments)]
+    async fn write_commit_metadata_snapshot(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        metadata: &MetadataSnapshotBinding,
+        author_cols: &MetadataAuthorColumns,
+        conversation_id: Uuid,
+        generation: i64,
+        state_version: i64,
+        epoch: i64,
+        group_id: &[u8],
+        group_context_hash: &[u8],
+        confirmation_tag: &[u8],
+        producing_transition_id: Uuid,
+        applied_at: DateTime<Utc>,
+    ) -> Result<(), ExecutorError> {
+        let proof = &metadata.author_proof;
+        let ciphertext = metadata.ciphertext().to_vec();
+        let ciphertext_size = checked_i64(ciphertext.len() as u64)?;
+        transition::insert_metadata_snapshot(
+            transaction,
+            &NewMetadataSnapshot {
+                metadata_snapshot_id: author_cols.metadata_snapshot_id,
+                conversation_id,
+                generation,
+                state_version,
+                group_id: group_id.to_vec(),
+                epoch,
+                group_context_hash: group_context_hash.to_vec(),
+                confirmation_tag: confirmation_tag.to_vec(),
+                producing_transition_id,
+                // Carry-forward origin + version from the prior snapshot.
+                origin_transition_id: Uuid::from_bytes(*metadata.origin_transition_id()),
+                metadata_version: checked_i64(metadata.metadata_version())?,
+                // Fresh re-encryption (same ciphertext size as the prior snapshot).
+                nonce: metadata.nonce().to_vec(),
+                ciphertext_sha256: metadata.ciphertext_sha256().to_vec(),
+                ciphertext,
+                ciphertext_size,
+                avatar: None,
+                // Carry-forward author identity from the binding's author-proof.
+                author_did: principal_did(proof.author.principal())?,
+                author_device_id: device_uuid(&proof.author),
+                author_key_id: author_cols.author_key_id.clone(),
+                author_public_key: proof.signature_public_key.to_vec(),
+                author_auth_generation: checked_i64(proof.auth_generation_at_origin)?,
+                author_origin_seq: checked_i64(proof.origin_seq)?,
                 author_role: author_cols.author_role.clone(),
                 author_device_status: author_cols.author_device_status.clone(),
                 created_at: applied_at,
