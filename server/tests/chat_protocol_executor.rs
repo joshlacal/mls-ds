@@ -4135,6 +4135,348 @@ async fn generic_commit_commits_epoch_bump_and_reencrypts_metadata() {
     assert_eq!(before, after, "generic commit replay left zero residue");
 }
 
+#[tokio::test]
+async fn generic_commit_supersedes_prior_open_recovery_request() {
+    let (pool, _db) = setup().await;
+    let manifest = corpus_manifest();
+    let scenario = run_fulfillment_scenario(&pool).await;
+    let fixture = &scenario.fixture;
+    let conversation_id = scenario.conversation_id;
+    let prior = &scenario.fulfillment_state; // sv 2, epoch 1.
+
+    // 1. Open a REPLACE leaf-recovery request by alice, bound to the fulfillment
+    //    coordinate (sv 2). Seed alice's key package.
+    let alice_leaf_period: Uuid = sqlx::query_scalar(
+        "SELECT leaf_period_id FROM chat.member_devices WHERE conversation_id=$1 AND user_did=$2 AND active",
+    )
+    .bind(conversation_id)
+    .bind(&fixture.alice_did)
+    .fetch_one(&pool)
+    .await
+    .expect("alice leaf period");
+    let req_ref = random_ref32();
+    let req_pkg_not_after = seed_key_package(
+        &pool,
+        &fixture.alice_did,
+        fixture.alice_device,
+        &fixture.alice_key_id,
+        &req_ref,
+    )
+    .await;
+    let req_pkg_not_after_ts =
+        ServerTimestamp::from_unix_millis_for_test(req_pkg_not_after.timestamp_millis()).unwrap();
+    let req_received = ServerTimestamp::from_unix_millis_for_test(
+        manifest.evaluation_unix_seconds as i64 * 1_000 + 5_000,
+    )
+    .unwrap();
+    let request_id = Uuid::new_v4();
+    let req_evidence = RequestEvidence::for_test(
+        RequestEntryKind::LeafRecoveryRequest,
+        4,
+        *request_id.as_bytes(),
+        fixture.alice_id.clone(),
+        *conversation_id.as_bytes(),
+        req_received,
+        0xC1,
+    )
+    .unwrap();
+    let req_planned = plan_leaf_recovery_request(
+        prior,
+        LeafRecoveryRequestCommand {
+            actor: fixture.alice_id.clone(),
+            recovery_request_id: *request_id.as_bytes(),
+            kind: LeafRecoveryKind::Replace,
+            key_package_ref: req_ref,
+            received_at: req_received,
+            package_not_after: req_pkg_not_after_ts,
+            evidence: req_evidence,
+        },
+    )
+    .expect("valid leaf recovery request plan");
+    let request_state = req_planned.resulting_state().clone();
+    let req_head = ConversationHeadCasBinding::for_test_internal(
+        *conversation_id.as_bytes(),
+        *prior.coordinate(),
+        4,
+        req_received,
+    );
+    let req_plan = persistence_plan_for_test(req_planned, req_head);
+    let req_applied_at = clock_now(&pool).await;
+    let req_transcript = vec![0xC1_u8; 16];
+    let req_pred = device_event_predecessor(&pool, &fixture.alice_did, fixture.alice_device).await;
+    let req_ctx = ExecutionContext {
+        protocol_instance_id: fixture.protocol_instance_id,
+        applied_at: req_applied_at,
+        actor: ExecutionActor {
+            user_did: fixture.alice_did.clone(),
+            device_id: fixture.alice_device,
+            key_id: fixture.alice_key_id.clone(),
+            auth_generation: 1,
+            role: TransitionActorRole::Admin,
+            device_status: "active".to_owned(),
+        },
+        entry: ControlEntryContent {
+            entry_id: Uuid::new_v4(),
+            entry_kind: "blue.catbird.chat.defs#applicationEntry".to_owned(),
+            accepted_payload_bytes: vec![0xC1_u8; 8],
+            accepted_payload_sha256: Sha256::digest([0xC1_u8; 8]).to_vec(),
+            signed_request_bytes: req_transcript.clone(),
+            unsigned_projection_bytes: vec![0xC1_u8; 8],
+            signing_transcript_bytes: req_transcript.clone(),
+            request_digest: Sha256::digest(&req_transcript).to_vec(),
+            signature: vec![0xC1_u8; 64],
+            server_fields_bytes: vec![0xC1_u8; 8],
+            outer_entry_fingerprint: vec![0xC1_u8; 32],
+        },
+        spine: SpineArtifacts {
+            public_snapshot_bytes: vec![],
+            public_snapshot_sha256: vec![],
+            tree_summary_bytes: vec![],
+            tree_summary_sha256: vec![],
+            leaf_count: 2,
+            genesis_group_info_bytes: vec![],
+            genesis_group_info_sha256: vec![],
+        },
+        opened_leaves: vec![],
+        metadata_author: None,
+        participant_period_ids: vec![],
+        leaf_period_ids: vec![],
+        entry_recipients: vec![],
+        events: vec![EventFanout {
+            event_id: Uuid::new_v4(),
+            event_kind: EventKind::ConversationChanged,
+            payload_bytes: vec![0xC1_u8; 8],
+            recipients: vec![(
+                fixture.alice_id.clone(),
+                EventEntitlementKind::Participant,
+                req_pred,
+            )],
+            outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+        }],
+        closing_leaf_periods: vec![],
+        reset_request_row: None,
+        recovery_open: Some(RecoveryOpenContext {
+            participant_period_id: None,
+            package_not_after: req_pkg_not_after,
+            replaced_leaf_period_id: Some(alice_leaf_period),
+        }),
+        welcome_dispositions: vec![],
+    };
+    {
+        let mut tx = pool.begin().await.expect("begin request");
+        apply_conversation_persistence_plan(&mut tx, &req_plan, &req_ctx)
+            .await
+            .expect("recovery request applies");
+        tx.commit().await.expect("recovery request COMMIT");
+    }
+    // The request is OPEN, its package RESERVED before the commit.
+    let pre: (String, String) = sqlx::query_as(
+        "SELECT (SELECT status FROM chat.leaf_recovery_requests WHERE recovery_request_id=$1), \
+                (SELECT status FROM chat.key_packages WHERE key_package_ref=$2)",
+    )
+    .bind(request_id)
+    .bind(req_ref.to_vec())
+    .fetch_one(&pool)
+    .await
+    .expect("pre state");
+    assert_eq!((pre.0.as_str(), pre.1.as_str()), ("open", "reserved"));
+
+    // 2. Generic commit on the request state (sv 2 -> 3) — supersedes the open
+    //    request + its reservation + package, AND the fulfillment's pending welcome.
+    validate_public_commit(
+        &corpus_file("commit-generic-public.mls"),
+        MAX_PUBLIC_MESSAGE_WIRE_BYTES,
+    )
+    .expect("generic commit parses");
+    let successor_coord = PublicGroupSnapshotCoordinate::new(
+        *conversation_id.as_bytes(),
+        manifest.chain.generation,
+        request_state.coordinate().state_version() + 1,
+        *request_state.coordinate().group_id(),
+        request_state.coordinate().epoch() + 1,
+        [0xB1_u8; 32],
+        [0xB2_u8; 32],
+        PublicGroupSnapshotLifecycle::Active,
+    );
+    let commit = chat_protocol::public_state::VerifiedCommitPublicState::for_test_generic(
+        request_state.public_state(),
+        successor_coord,
+        0,
+    )
+    .expect("synthetic zero-proposal commit");
+    let commit_transition = Uuid::new_v4();
+    let commit_entry = Uuid::new_v4();
+    let commit_received = ServerTimestamp::from_unix_millis_for_test(
+        manifest.evaluation_unix_seconds as i64 * 1_000 + 6_000,
+    )
+    .unwrap();
+    let alice_key_id_bytes: [u8; 32] = Sha256::digest(&scenario.alice_sig_key).into();
+    let reencryption = MetadataSnapshotBinding::for_test_creation(
+        *conversation_id.as_bytes(),
+        0,
+        successor_coord.epoch(),
+        *successor_coord.group_context_hash(),
+        fixture.creation_transition_id,
+        1,
+        fixture.alice_id.clone(),
+        alice_key_id_bytes,
+        scenario.alice_sig_key.clone().try_into().unwrap(),
+        1,
+        1,
+        [0xB3_u8; 12],
+        vec![0xB4_u8; 48],
+    );
+    let commit_evidence = TransitionEvidence::for_test_commit_with_metadata(
+        4,
+        *commit_transition.as_bytes(),
+        [0x1B_u8; 32],
+        commit_received,
+        *request_state.coordinate(),
+        successor_coord,
+        reencryption,
+    )
+    .unwrap();
+    let planned = plan_commit(
+        &request_state,
+        CommitCommand {
+            actor: fixture.alice_id.clone(),
+            transition: commit_evidence,
+            commit,
+        },
+    )
+    .expect("valid generic commit plan");
+    let head_cas = ConversationHeadCasBinding::for_test_edge(
+        *conversation_id.as_bytes(),
+        *commit_entry.as_bytes(),
+        *request_state.coordinate(),
+        4,
+        commit_received,
+    );
+    let plan = persistence_plan_for_test(planned, head_cas);
+
+    let applied_at = clock_now(&pool).await;
+    let alice_pred =
+        device_event_predecessor(&pool, &fixture.alice_did, fixture.alice_device).await;
+    let bob_device = Uuid::from_bytes(*scenario.bob_id.device_id());
+    let bob_pred = device_event_predecessor(&pool, &scenario.bob_did, bob_device).await;
+    let commit_transcript = vec![0xB5_u8; 12];
+    let ctx = ExecutionContext {
+        protocol_instance_id: fixture.protocol_instance_id,
+        applied_at,
+        actor: ExecutionActor {
+            user_did: fixture.alice_did.clone(),
+            device_id: fixture.alice_device,
+            key_id: fixture.alice_key_id.clone(),
+            auth_generation: 1,
+            role: TransitionActorRole::Admin,
+            device_status: "active".to_owned(),
+        },
+        entry: ControlEntryContent {
+            entry_id: commit_entry,
+            entry_kind: "blue.catbird.chat.defs#commitEntry".to_owned(),
+            accepted_payload_bytes: vec![0xB6_u8; 12],
+            accepted_payload_sha256: Sha256::digest([0xB6_u8; 12]).to_vec(),
+            signed_request_bytes: commit_transcript.clone(),
+            unsigned_projection_bytes: vec![0xB7_u8; 8],
+            signing_transcript_bytes: commit_transcript.clone(),
+            request_digest: Sha256::digest(&commit_transcript).to_vec(),
+            signature: vec![0xB8_u8; 64],
+            server_fields_bytes: vec![0xB9_u8; 8],
+            outer_entry_fingerprint: vec![0x1B_u8; 32],
+        },
+        spine: SpineArtifacts {
+            public_snapshot_bytes: vec![0xBA_u8; 16],
+            public_snapshot_sha256: Sha256::digest([0xBA_u8; 16]).to_vec(),
+            tree_summary_bytes: vec![0xBB_u8; 16],
+            tree_summary_sha256: Sha256::digest([0xBB_u8; 16]).to_vec(),
+            leaf_count: 2,
+            genesis_group_info_bytes: vec![],
+            genesis_group_info_sha256: vec![],
+        },
+        opened_leaves: vec![],
+        metadata_author: Some(MetadataAuthorColumns {
+            author_role: "admin".to_owned(),
+            author_device_status: "active".to_owned(),
+            author_public_key: scenario.alice_sig_key.clone(),
+            author_key_id: fixture.alice_key_id.clone(),
+            metadata_snapshot_id: Uuid::new_v4(),
+        }),
+        participant_period_ids: vec![],
+        leaf_period_ids: vec![],
+        entry_recipients: entry_audience(
+            &fixture.alice_id,
+            &fixture.alice_did,
+            &scenario.bob_id,
+            &scenario.bob_did,
+        ),
+        events: vec![EventFanout {
+            event_id: Uuid::new_v4(),
+            event_kind: EventKind::ConversationChanged,
+            payload_bytes: vec![0xBC_u8; 8],
+            recipients: vec![(
+                fixture.alice_id.clone(),
+                EventEntitlementKind::Participant,
+                alice_pred,
+            )],
+            outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+        }],
+        closing_leaf_periods: vec![],
+        reset_request_row: None,
+        recovery_open: None,
+        welcome_dispositions: vec![WelcomeDispositionInput {
+            welcome_id: scenario.welcome_id,
+            event: EventFanout {
+                event_id: Uuid::new_v4(),
+                event_kind: EventKind::WelcomeDisposition,
+                payload_bytes: vec![0xBD_u8; 8],
+                recipients: vec![(
+                    scenario.bob_id.clone(),
+                    EventEntitlementKind::Welcome,
+                    bob_pred,
+                )],
+                outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+            },
+        }],
+    };
+
+    let mut tx = pool.begin().await.expect("begin generic commit");
+    apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+        .await
+        .expect("generic commit with supersession applies");
+    tx.commit()
+        .await
+        .expect("generic commit COMMIT past all deferred triggers");
+
+    // The superseded request + released reservation + re-available package.
+    let (req_status, res_status, pkg_status): (String, String, String) = sqlx::query_as(
+        "SELECT (SELECT status FROM chat.leaf_recovery_requests WHERE recovery_request_id=$1), \
+                (SELECT status FROM chat.key_package_reservations WHERE recovery_request_id=$1), \
+                (SELECT status FROM chat.key_packages WHERE key_package_ref=$2)",
+    )
+    .bind(request_id)
+    .bind(req_ref.to_vec())
+    .fetch_one(&pool)
+    .await
+    .expect("superseded state");
+    assert_eq!(
+        (
+            req_status.as_str(),
+            res_status.as_str(),
+            pkg_status.as_str()
+        ),
+        ("superseded", "released", "available")
+    );
+    // The superseding transition is recorded on the request.
+    let terminal_tid: Option<Uuid> = sqlx::query_scalar(
+        "SELECT terminal_transition_id FROM chat.leaf_recovery_requests WHERE recovery_request_id=$1",
+    )
+    .bind(request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("terminal transition");
+    assert_eq!(terminal_tid, Some(commit_transition));
+}
+
 /// Remove one conversation's committed graph so the shared, never-truncated
 /// clean-chat DB stays clean across runs. Runs inside ONE transaction: the
 /// `chat.entries` <-> `chat.transitions` provenance FKs are circular and

@@ -13040,8 +13040,8 @@ mod executor {
         CloseKind, ConversationKind, DeviceIdentity, LeafHydrationRow, LeafRecoveryKind,
         MetadataSnapshotBinding, PackageStatus, ParticipantHydrationRow, ParticipantRole,
         ParticipantStatus, PlanKind, PrincipalId, PublicGroupSnapshotCoordinate,
-        RecoveryRequestStatus, RecoverySource, ServerTimestamp, StateChange, TransitionEffects,
-        WelcomeStatus,
+        RecoveryRequestStatus, RecoverySource, ReservationStatus, ServerTimestamp, StateChange,
+        TransitionEffects, WelcomeStatus,
     };
     use super::{ConversationPersistencePlan, ConversationStateHydration};
 
@@ -13322,12 +13322,9 @@ mod executor {
     /// cross-validates (MINOR-4) that the exact key-package ref the executor drives
     /// through `cas_key_package_status` equals every semantic package edge's own
     /// ref — a planner that disagreed would be a hard error, never a silent skip.
-    fn verify_recovery_package_consistency(
-        effects: &TransitionEffects,
-        driven_key_package_ref: &[u8; 32],
-        expected_from: PackageStatus,
-        expected_to: PackageStatus,
-    ) -> Result<(), ExecutorError> {
+    /// The `recovery_package_cas` <-> `package_transitions` bijection production
+    /// requires (`package_cas_bijection_valid`), made load-bearing (E2b-6b MINOR-1).
+    fn verify_recovery_package_bijection(effects: &TransitionEffects) -> Result<(), ExecutorError> {
         let edges = effects.package_transitions();
         let cas = effects.recovery_package_cas();
         if edges.len() != cas.len() {
@@ -13336,20 +13333,6 @@ mod executor {
             ));
         }
         for edge in edges {
-            if edge.key_package_ref != *driven_key_package_ref {
-                return Err(ExecutorError::InconsistentPlan(
-                    "executor package CAS ref disagrees with a package_transitions ref",
-                ));
-            }
-            // E2b-6b review MINOR-2: validate the CAS DIRECTION against the semantic
-            // edge's own from/to rather than trusting the arm's hardcoded successor,
-            // so a future planner emitting the wrong direction is a hard error, never
-            // a silently mis-applied status edge.
-            if edge.from != expected_from || edge.to != expected_to {
-                return Err(ExecutorError::InconsistentPlan(
-                    "package_transitions edge direction disagrees with the executor's CAS",
-                ));
-            }
             let unique = cas
                 .iter()
                 .filter(|binding| {
@@ -13364,6 +13347,40 @@ mod executor {
                     "recovery package CAS binding missing/duplicated for a package edge",
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// Bijection + the OWN package edge's driven-ref (MINOR-4) and direction
+    /// (MINOR-2) — for an arm that drives exactly ONE own package edge. Any OTHER
+    /// edges (prior-bound `Reserved->Available` supersessions) are validated by
+    /// `write_prior_bound_supersessions`; here only the own edge is direction-checked.
+    fn verify_recovery_package_consistency(
+        effects: &TransitionEffects,
+        driven_key_package_ref: &[u8; 32],
+        expected_from: PackageStatus,
+        expected_to: PackageStatus,
+    ) -> Result<(), ExecutorError> {
+        verify_recovery_package_bijection(effects)?;
+        let own = effects
+            .package_transitions()
+            .iter()
+            .filter(|edge| edge.key_package_ref == *driven_key_package_ref)
+            .count();
+        if own != 1 {
+            return Err(ExecutorError::InconsistentPlan(
+                "exactly one package edge must match the executor's driven ref",
+            ));
+        }
+        let own_edge = effects
+            .package_transitions()
+            .iter()
+            .find(|edge| edge.key_package_ref == *driven_key_package_ref)
+            .expect("own edge exists");
+        if own_edge.from != expected_from || own_edge.to != expected_to {
+            return Err(ExecutorError::InconsistentPlan(
+                "the driven package edge's direction disagrees with the executor's CAS",
+            ));
         }
         Ok(())
     }
@@ -13958,8 +13975,34 @@ mod executor {
                 "fulfillment commit metadata author",
             ))?;
 
-        // Exactly one Open->Fulfilled recovery request + one Active->Consumed
-        // reservation + one Reserved->Consumed package edge (no supersession here).
+        // Exact-SHAPE: exactly ONE own Open->Fulfilled recovery request +
+        // Active->Consumed reservation + Reserved->Consumed package edge + one new
+        // pending welcome. Any OTHER recovery/reservation/package delta must be a
+        // prior-bound supersession (Open->Superseded / Active->Released /
+        // Reserved->Available), consumed by write_prior_bound_supersessions.
+        let own_fulfilled = effects
+            .recovery_request_changes()
+            .iter()
+            .filter(|change| {
+                matches!((change.before(), change.after()), (Some(b), Some(a))
+                    if b.status() == RecoveryRequestStatus::Open
+                        && a.status() == RecoveryRequestStatus::Fulfilled)
+            })
+            .count();
+        let own_consumed = effects
+            .reservation_changes()
+            .iter()
+            .filter(|change| {
+                matches!((change.before(), change.after()), (Some(b), Some(a))
+                    if b.status() == ReservationStatus::Active
+                        && a.status() == ReservationStatus::Consumed)
+            })
+            .count();
+        if own_fulfilled != 1 || own_consumed != 1 || effects.welcome_changes().len() != 1 {
+            return Err(ExecutorError::InconsistentPlan(
+                "fulfillment must carry exactly one own fulfilled request + consumed reservation + welcome",
+            ));
+        }
         let fulfilled = effects
             .recovery_request_changes()
             .iter()
@@ -13975,18 +14018,10 @@ mod executor {
             .ok_or(ExecutorError::InconsistentPlan(
                 "fulfillment fulfills no open recovery request",
             ))?;
-        if effects.recovery_request_changes().len() != 1
-            || effects.reservation_changes().len() != 1
-            || effects.package_transitions().len() != 1
-            || effects.welcome_changes().len() != 1
-        {
-            return Err(ExecutorError::InconsistentPlan(
-                "fulfillment must carry exactly one request/reservation/package/welcome change",
-            ));
-        }
         let recovery_request_id = Uuid::from_bytes(*fulfilled.request_id());
         let reserved_ref = *fulfilled.key_package_ref();
-        // Reserved -> Consumed package edge (bijection + driven-ref + direction).
+        // The OWN Reserved -> Consumed package edge (bijection + driven-ref +
+        // direction); any other edges are Reserved->Available supersessions.
         verify_recovery_package_consistency(
             effects,
             &reserved_ref,
@@ -14311,6 +14346,10 @@ mod executor {
         )
         .await?;
         let event_positions = write_events(transaction, ctx).await?;
+        // Prior-coordinate open-work supersession (a legal interleaving): the corpus
+        // fulfillment carries none, but the path composes it for the general case.
+        write_prior_bound_supersessions(transaction, effects, transition_id, applied_at).await?;
+        write_welcome_supersessions(transaction, ctx, effects).await?;
 
         Ok(AppliedTransition {
             allocated_seq: u64::try_from(seq_i64).unwrap(),
@@ -14358,23 +14397,50 @@ mod executor {
         let expected_next_entry_seq = checked_i64(head.expected_next_entry_seq())?;
 
         // A generic (zero-proposal) commit changes ONLY the crypto coordinate + the
-        // re-encrypted metadata. Every membership/work family must be empty.
+        // re-encrypted metadata + (a legal interleaving) prior-coordinate open-work
+        // SUPERSESSION. It has no membership/reset/leave change and no OWN recovery
+        // work: every recovery/reservation/package delta must be a supersession
+        // (verified by exact-shape below).
         reject_if_present("participant_changes", effects.participant_changes())?;
         reject_if_present("interval_changes", effects.interval_changes())?;
         reject_if_present("terminal_proof_changes", effects.terminal_proof_changes())?;
-        reject_if_present(
-            "recovery_request_changes",
-            effects.recovery_request_changes(),
-        )?;
-        reject_if_present("reservation_changes", effects.reservation_changes())?;
         reject_if_present("reset_request_changes", effects.reset_request_changes())?;
         reject_if_present("leave_request_changes", effects.leave_request_changes())?;
-        // welcome_changes: NOT rejected — a coordinate-changing commit whose prior
-        // carried a pending Welcome (post-fulfillment) supersedes it; handled by
-        // write_welcome_supersessions (each must be Pending->Superseded).
-        reject_if_present("package_transitions", effects.package_transitions())?;
-        reject_if_present("recovery_package_cas", effects.recovery_package_cas())?;
         reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
+        // recovery_request_changes / reservation_changes / package_transitions /
+        // welcome_changes: NOT rejected — a coordinate-changing commit supersedes
+        // prior-coordinate open work (request->Superseded, reservation->Released,
+        // package Reserved->Available) and a prior pending Welcome. Handled by
+        // write_prior_bound_supersessions + write_welcome_supersessions; every such
+        // delta MUST be a supersession shape (exact-shape checks below).
+        for change in effects.recovery_request_changes() {
+            if !matches!((change.before(), change.after()), (Some(before), Some(after))
+                if before.status() == RecoveryRequestStatus::Open
+                    && after.status() == RecoveryRequestStatus::Superseded)
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "generic commit recovery request change is not a supersession",
+                ));
+            }
+        }
+        for change in effects.reservation_changes() {
+            if !matches!((change.before(), change.after()), (Some(before), Some(after))
+                if before.status() == ReservationStatus::Active
+                    && after.status() == ReservationStatus::Released)
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "generic commit reservation change is not a release",
+                ));
+            }
+        }
+        for edge in effects.package_transitions() {
+            if edge.from != PackageStatus::Reserved || edge.to != PackageStatus::Available {
+                return Err(ExecutorError::InconsistentPlan(
+                    "generic commit package edge is not a Reserved->Available release",
+                ));
+            }
+        }
+        verify_recovery_package_bijection(effects)?;
         if effects.revocation_target_cas().is_some()
             || effects.welcome_cas().is_some()
             || effects.invitation_quota_cas().is_some()
@@ -14529,7 +14595,9 @@ mod executor {
         )
         .await?;
         let event_positions = write_events(transaction, ctx).await?;
-        // Supersede any prior-coordinate pending Welcome the epoch change retired.
+        // Supersede prior-coordinate open work (requests/reservations/packages) +
+        // any prior pending Welcome the epoch change retired.
+        write_prior_bound_supersessions(transaction, effects, transition_id, applied_at).await?;
         write_welcome_supersessions(transaction, ctx, effects).await?;
 
         Ok(AppliedTransition {
@@ -16613,6 +16681,82 @@ mod executor {
             .collect()
     }
 
+    /// Consume the prior-coordinate open-work SUPERSESSION deltas a
+    /// coordinate-changing commit carries (the planner's `resolve_prior_bound_work`
+    /// emits them; E2b-7 arm 1). For each `(Open -> Superseded)` recovery request:
+    /// terminalize `SupersededByTransition`. For each `(Active -> Released)`
+    /// reservation: terminalize `ReleasedByTransition`. For each
+    /// `Reserved -> Available` package edge: re-activate. The OWN delta of an
+    /// edge (a fulfillment's `Fulfilled`/`Consumed`/`Consumed`) has a DIFFERENT
+    /// shape and is SKIPPED here (the arm handles it), so this is safely callable
+    /// from every coordinate-changing arm. Returns the number of each family
+    /// superseded so the caller can enforce exact-shape (own + supersessions ==
+    /// total). All three are bound to the same producing transition.
+    async fn write_prior_bound_supersessions(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        effects: &TransitionEffects,
+        transition_id: Uuid,
+        applied_at: DateTime<Utc>,
+    ) -> Result<SupersessionCounts, ExecutorError> {
+        let mut counts = SupersessionCounts::default();
+        for change in effects.recovery_request_changes() {
+            if let (Some(before), Some(after)) = (change.before(), change.after()) {
+                if before.status() == RecoveryRequestStatus::Open
+                    && after.status() == RecoveryRequestStatus::Superseded
+                {
+                    transition::terminalize_leaf_recovery_request(
+                        transaction,
+                        Uuid::from_bytes(*after.request_id()),
+                        &LeafRecoveryTermination::SupersededByTransition {
+                            terminal_transition_id: transition_id,
+                            terminal_at: applied_at,
+                        },
+                    )
+                    .await?;
+                    counts.requests += 1;
+                }
+            }
+        }
+        for change in effects.reservation_changes() {
+            if let (Some(before), Some(after)) = (change.before(), change.after()) {
+                if before.status() == ReservationStatus::Active
+                    && after.status() == ReservationStatus::Released
+                {
+                    transition::terminalize_reservation(
+                        transaction,
+                        Uuid::from_bytes(after.request_id),
+                        &ReservationTermination::ReleasedByTransition {
+                            terminal_transition_id: transition_id,
+                            terminal_at: applied_at,
+                        },
+                    )
+                    .await?;
+                    counts.reservations += 1;
+                }
+            }
+        }
+        for edge in effects.package_transitions() {
+            if edge.from == PackageStatus::Reserved && edge.to == PackageStatus::Available {
+                transition::cas_key_package_status(
+                    transaction,
+                    &edge.key_package_ref,
+                    RepoPackageStatus::Reserved,
+                    &PackageSuccessor::Reactivate,
+                )
+                .await?;
+                counts.packages += 1;
+            }
+        }
+        Ok(counts)
+    }
+
+    #[derive(Default)]
+    struct SupersessionCounts {
+        requests: usize,
+        reservations: usize,
+        packages: usize,
+    }
+
     /// Supersede each prior-coordinate pending Welcome the plan retired: append its
     /// `welcomeDisposition` event and terminalize the delivery as `superseded`,
     /// bound to that event. A coordinate-changing commit whose prior carried a
@@ -16625,6 +16769,8 @@ mod executor {
         effects: &TransitionEffects,
     ) -> Result<(), ExecutorError> {
         for change in effects.welcome_changes() {
+            // Only prior-bound supersessions here; a fulfillment's OWN new welcome
+            // (None->Some Pending) is handled by its arm and skipped.
             let after = match (change.before(), change.after()) {
                 (Some(before), Some(after))
                     if before.status() == WelcomeStatus::Pending
@@ -16632,11 +16778,7 @@ mod executor {
                 {
                     after
                 }
-                _ => {
-                    return Err(ExecutorError::UnsupportedEffect(
-                        "welcome change is not a pending->superseded supersession",
-                    ))
-                }
+                _ => continue,
             };
             let welcome_id = Uuid::from_bytes(*after.welcome_id());
             let disposition = ctx
