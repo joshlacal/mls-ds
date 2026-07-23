@@ -11,8 +11,10 @@ pub(crate) const XWING_KEM_OUTPUT_BYTES: usize = 1_120;
 // production `did:web` identities. `did:web:a.co` is the shortest supported DID,
 // while `did:web:` plus a 253-byte hostname is the longest; device IDs are
 // canonical textual UUIDv4 values.
-pub(crate) const MIN_BASIC_CREDENTIAL_BYTES: usize = 12 + 1 + 36;
-pub(crate) const MAX_BASIC_CREDENTIAL_BYTES: usize = (8 + 253) + 1 + 36;
+pub(crate) const MIN_BARE_DID_BYTES: usize = 12;
+pub(crate) const MAX_BARE_DID_BYTES: usize = 8 + 253;
+pub(crate) const MIN_BASIC_CREDENTIAL_BYTES: usize = MIN_BARE_DID_BYTES + 1 + 36;
+pub(crate) const MAX_BASIC_CREDENTIAL_BYTES: usize = MAX_BARE_DID_BYTES + 1 + 36;
 const XWING_X25519_PUBLIC_KEY_OFFSET: usize = 1_184;
 const XWING_X25519_KEM_OUTPUT_OFFSET: usize = 1_088;
 const X25519_FIELD_MODULUS_LE: [u8; 32] = [
@@ -62,5 +64,15 @@ pub(crate) fn xwing_kem_output_is_valid(bytes: &[u8]) -> bool {
         && x25519_component_is_canonical_and_usable(&bytes[XWING_X25519_KEM_OUTPUT_OFFSET..])
 }
 
+mod cursor;
+pub(crate) mod dpop;
+pub mod error;
+pub(crate) mod model;
+pub(crate) mod public_state;
+pub(crate) mod relationship_policy;
+mod repository;
 pub mod snapshot;
+pub(crate) mod state_machine;
+pub(crate) mod transcript;
+pub(crate) mod validation;
 pub mod wire;

@@ -13,6 +13,8 @@ use catbird_server::db::{init_db, DbConfig};
 use sqlx::PgPool;
 use std::time::Duration;
 
+pub mod chat_protocol;
+
 #[allow(dead_code)]
 pub async fn setup_test_db() -> PgPool {
     let database_url = std::env::var("TEST_DATABASE_URL")

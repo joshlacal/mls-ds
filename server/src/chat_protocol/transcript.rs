@@ -418,7 +418,7 @@ fn cbor_schema_to_raw_json(
                 _ => {
                     return Err(AuthPrimitiveError::invalid(
                         "closed CBOR union requires exact $type",
-                    ))
+                    ));
                 }
             };
             let name = type_id
@@ -459,7 +459,7 @@ fn cbor_schema_to_raw_json(
                         _ => {
                             return Err(AuthPrimitiveError::invalid(
                                 "wrong closed CBOR object $type",
-                            ))
+                            ));
                         }
                     }
                     continue;
@@ -586,7 +586,7 @@ fn project_union(schema: &SchemaValue, input: &RawJson) -> Result<DagValue, Auth
         _ => {
             return Err(AuthPrimitiveError::invalid(
                 "closed union requires exact $type",
-            ))
+            ));
         }
     };
     let name = type_id

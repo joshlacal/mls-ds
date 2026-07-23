@@ -142,6 +142,456 @@ fn create_table_block<'a>(sql: &'a str, table: &str, next: &str) -> &'a str {
         .0
 }
 
+fn function_block<'a>(sql: &'a str, function: &str, next: &str) -> &'a str {
+    sql.split_once(function)
+        .unwrap_or_else(|| panic!("missing function marker: {function}"))
+        .1
+        .split_once(next)
+        .unwrap_or_else(|| panic!("missing end marker after {function}: {next}"))
+        .0
+}
+
+fn assert_source_contract(cluster: &str, checks: &[(&str, bool)]) {
+    let missing = checks
+        .iter()
+        .filter_map(|(contract, present)| (!present).then_some(*contract))
+        .collect::<Vec<_>>();
+    assert!(
+        missing.is_empty(),
+        "{cluster} source contract is incomplete:\n- {}",
+        missing.join("\n- ")
+    );
+}
+
+#[test]
+fn audit_delivery_audiences_require_control_entries_and_exact_provenance() {
+    let sql =
+        std::fs::read_to_string(migration_dir().join("20260722000002_chat_protocol_delivery.sql"))
+            .expect("read delivery migration");
+    let compact = compact_sql(&sql);
+    let entries = compact_sql(create_table_block(
+        &sql,
+        "entries",
+        "ALTER TABLE chat.transitions",
+    ));
+    let recipients = compact_sql(create_table_block(
+        &sql,
+        "entry_recipients",
+        "CREATE INDEX entry_recipients_device_scan_idx",
+    ));
+    let mapping = compact_sql(function_block(
+        &sql,
+        "CREATE FUNCTION chat.assert_entry_recipient_mapping(",
+        "CREATE FUNCTION chat.enforce_entry_recipient_mapping()",
+    ));
+
+    assert_source_contract(
+        "delivery audience",
+        &[
+            (
+                "entry recipients retain the closed control/intervalClose/scheduleTerminal arms",
+                recipients
+                    .contains("entitlement_kind IN ('control','intervalClose','scheduleTerminal')"),
+            ),
+            (
+                "application entries cannot acquire any entry_recipients audience row",
+                mapping.contains("JOIN chat.entries entry")
+                    && mapping.contains(
+                        "entry.entry_kind <> 'blue.catbird.chat.defs#applicationEntry'",
+                    ),
+            ),
+            (
+                "the control arm is positively checked against a non-application entry",
+                mapping.contains("recipient_kind = 'control'")
+                    && mapping.contains("entry.entry_kind")
+                    && mapping.contains("applicationEntry"),
+            ),
+            (
+                "intervalClose routing binds the exact closing transition and outer fingerprint",
+                mapping.contains("interval.closing_transition_id = entry.transition_id")
+                    && mapping.contains(
+                        "interval.closing_outer_entry_fingerprint = entry.outer_entry_fingerprint",
+                    ),
+            ),
+            (
+                "scheduleTerminal routing binds the exact terminal transition and outer fingerprint",
+                mapping.contains("proof.transition_id = entry.transition_id")
+                    && mapping
+                        .contains("proof.outer_entry_fingerprint = entry.outer_entry_fingerprint"),
+            ),
+            (
+                "entry fingerprints and signatures remain fixed-size protocol authority",
+                entries.contains("octet_length(request_digest) = 32")
+                    && entries.contains("octet_length(signature) = 64")
+                    && entries.contains("octet_length(outer_entry_fingerprint) = 32"),
+            ),
+            (
+                "schedule terminal proof completeness remains exact-device and once-per-schedule",
+                compact.contains(
+                    "PRIMARY KEY (conversation_id, recipient_did, recipient_device_id)",
+                ) && compact.contains(
+                    "CREATE FUNCTION chat.assert_conversation_terminal_schedules(target_conversation UUID)",
+                ),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn audit_inventory_items_bind_exact_device_sources_and_typed_terminal_proofs() {
+    let sql =
+        std::fs::read_to_string(migration_dir().join("20260722000002_chat_protocol_delivery.sql"))
+            .expect("read delivery migration");
+    let conversation_items = compact_sql(create_table_block(
+        &sql,
+        "inventory_conversation_items",
+        "CREATE TABLE chat.inventory_welcome_items",
+    ));
+    let welcome_items = compact_sql(create_table_block(
+        &sql,
+        "inventory_welcome_items",
+        "CREATE TABLE chat.inventory_recovery_items",
+    ));
+    let recovery_items = compact_sql(create_table_block(
+        &sql,
+        "inventory_recovery_items",
+        "CREATE TABLE chat.device_inventory_sessions",
+    ));
+    let device_items = compact_sql(create_table_block(
+        &sql,
+        "device_inventory_items",
+        "CREATE TABLE chat.subscription_tickets",
+    ));
+    let materialization = compact_sql(function_block(
+        &sql,
+        "CREATE FUNCTION chat.assert_inventory_materialization(target_session UUID)",
+        "CREATE FUNCTION chat.enforce_inventory_materialization()",
+    ));
+
+    assert_source_contract(
+        "inventory provenance",
+        &[
+            (
+                "conversation inventory items repeat their exact recipient DID/device",
+                conversation_items.contains("recipient_did TEXT NOT NULL")
+                    && conversation_items.contains("recipient_device_id UUID NOT NULL"),
+            ),
+            (
+                "conversation inventory has typed all-or-none schedule-terminal proof columns",
+                conversation_items.contains("schedule_terminal_seq BIGINT")
+                    && conversation_items.contains("schedule_terminal_transition_id UUID")
+                    && conversation_items
+                        .contains("schedule_terminal_outer_entry_fingerprint BYTEA")
+                    && conversation_items
+                        .contains("inventory_conversation_items_schedule_terminal_shape_check"),
+            ),
+            (
+                "conversation inventory proof identity has an exact composite FK",
+                conversation_items.contains(
+                    "FOREIGN KEY ( conversation_id, recipient_did, recipient_device_id, schedule_terminal_seq, schedule_terminal_transition_id, schedule_terminal_outer_entry_fingerprint ) REFERENCES chat.application_schedule_terminal_proofs",
+                ),
+            ),
+            (
+                "Welcome inventory items repeat the source recipient and bind that delivery",
+                welcome_items.contains("recipient_did TEXT NOT NULL")
+                    && welcome_items.contains("recipient_device_id UUID NOT NULL")
+                    && welcome_items.contains(
+                        "FOREIGN KEY (welcome_id, recipient_did, recipient_device_id)",
+                    ),
+            ),
+            (
+                "recovery inventory items repeat the source recipient and bind either exact source",
+                recovery_items.contains("recipient_did TEXT NOT NULL")
+                    && recovery_items.contains("recipient_device_id UUID NOT NULL")
+                    && recovery_items.contains(
+                        "leaf_recovery_request_id, recipient_did, recipient_device_id",
+                    )
+                    && recovery_items
+                        .contains("recovery_work_id, recipient_did, recipient_device_id"),
+            ),
+            (
+                "device inventory items repeat the requesting exact-device session identity",
+                device_items.contains("requester_did TEXT NOT NULL")
+                    && device_items.contains("requester_device_id UUID NOT NULL"),
+            ),
+            (
+                "materialization verifies session/device/source joins, not only hashes and counts",
+                materialization.contains("JOIN chat.inventory_sessions session")
+                    && materialization.contains("recipient_did = session.user_did")
+                    && materialization.contains("recipient_device_id = session.device_id")
+                    && materialization.contains("JOIN chat.application_schedule_terminal_proofs"),
+            ),
+            (
+                "inventory tokens remain hash-only",
+                sql.contains("token_hash BYTEA NOT NULL UNIQUE")
+                    && !sql.contains("inventory_token TEXT"),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn audit_inventory_is_bounded_gc_controlled_all_status_indexed_and_strictly_expiring() {
+    let core =
+        std::fs::read_to_string(migration_dir().join("20260722000001_chat_protocol_core.sql"))
+            .expect("read core migration");
+    let sql =
+        std::fs::read_to_string(migration_dir().join("20260722000002_chat_protocol_delivery.sql"))
+            .expect("read delivery migration");
+    let compact = compact_sql(&sql);
+    let sessions = compact_sql(create_table_block(
+        &sql,
+        "inventory_sessions",
+        "CREATE TABLE chat.inventory_conversation_items",
+    ));
+    let device_sessions = compact_sql(create_table_block(
+        &sql,
+        "device_inventory_sessions",
+        "CREATE TABLE chat.device_inventory_items",
+    ));
+    let tickets = compact_sql(create_table_block(
+        &sql,
+        "subscription_tickets",
+        "CREATE FUNCTION chat.assert_inventory_session_identity",
+    ));
+    let welcomes = compact_sql(create_table_block(
+        &sql,
+        "welcome_deliveries",
+        "CREATE INDEX welcome_deliveries_pending_device_idx",
+    ));
+
+    assert_source_contract(
+        "bounded inventory lifecycle",
+        &[
+            (
+                "item inserts do not invoke whole-session materialization rescans",
+                !sql.contains("inventory_conversation_items_materialization_deferred")
+                    && !sql.contains("inventory_welcome_items_materialization_deferred")
+                    && !sql.contains("inventory_recovery_items_materialization_deferred")
+                    && !sql.contains("device_inventory_items_materialization_deferred"),
+            ),
+            (
+                "historical schedule close fanout has a structural configured ceiling",
+                compact.contains("CREATE FUNCTION chat.max_historical_schedule_fanout()")
+                    && compact.contains(
+                        "CREATE FUNCTION chat.assert_historical_schedule_fanout(target_conversation UUID)",
+                    )
+                    && compact.contains("historical_schedule_fanout_exceeded"),
+            ),
+            (
+                "shared inventory sessions have a finite maximum lifetime",
+                sessions.contains("expires_at <= created_at + INTERVAL"),
+            ),
+            (
+                "device inventory sessions have a finite maximum lifetime",
+                device_sessions.contains("expires_at <= created_at + INTERVAL"),
+            ),
+            (
+                "expired shared/device inventory sessions have bounded SKIP LOCKED GC",
+                compact.contains(
+                    "CREATE FUNCTION chat.gc_expired_inventory_sessions(batch_limit INTEGER",
+                ) && compact.contains("FOR UPDATE SKIP LOCKED")
+                    && compact.contains("LIMIT batch_limit")
+                    && compact.contains("inventory_sessions_expiry_gc_idx")
+                    && compact.contains("device_inventory_sessions_expiry_gc_idx"),
+            ),
+            (
+                "active retained sessions per exact DID/device are capped under a device lock",
+                compact.contains(
+                    "CREATE FUNCTION chat.assert_exact_device_inventory_session_cap(",
+                ) && compact.contains("max_active_inventory_sessions")
+                    && compact.contains("FOR UPDATE"),
+            ),
+            (
+                "leaf recovery has a non-partial exact-device all-status lookup index",
+                core.contains("CREATE INDEX leaf_recovery_requests_device_all_status_idx")
+                    && core.contains(
+                        "ON chat.leaf_recovery_requests (requester_did, requester_device_id, status",
+                    ),
+            ),
+            (
+                "Welcome and recovery-work lookups have non-partial exact-device all-status indexes",
+                compact.contains("CREATE INDEX welcome_deliveries_device_all_status_idx")
+                    && compact.contains(
+                        "ON chat.welcome_deliveries (recipient_did, recipient_device_id, status",
+                    )
+                    && compact.contains("CREATE INDEX recovery_work_items_device_all_status_idx")
+                    && compact.contains(
+                        "ON chat.recovery_work_items (recipient_did, recipient_device_id, status",
+                    ),
+            ),
+            (
+                "subscription ticket consumption rejects exact expiry",
+                tickets.contains("consumed_at >= created_at AND consumed_at < expires_at")
+                    && !tickets.contains("BETWEEN created_at AND expires_at"),
+            ),
+            (
+                "non-expiry Welcome terminal decisions reject exact expiry",
+                welcomes.contains("terminal_at < expires_at")
+                    && !welcomes.contains("terminal_at <= expires_at"),
+            ),
+            (
+                "protocol-instance event fencing remains present",
+                compact.contains("events_protocol_instance_fk")
+                    && compact.contains("event_retention_instance_fk"),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn audit_blob_keys_binding_lifetimes_and_object_gc_are_unambiguous() {
+    let sql =
+        std::fs::read_to_string(migration_dir().join("20260722000003_chat_protocol_blobs.sql"))
+            .expect("read blob migration");
+    let compact = compact_sql(&sql);
+    let blobs = compact_sql(create_table_block(
+        &sql,
+        "blobs",
+        "CREATE INDEX blobs_live_owner_idx",
+    ));
+    let tickets = compact_sql(create_table_block(
+        &sql,
+        "blob_upload_tickets",
+        "ALTER TABLE chat.metadata_snapshots",
+    ));
+    let bindings = compact_sql(create_table_block(
+        &sql,
+        "blob_bindings",
+        "CREATE FUNCTION chat.assert_blob_binding_lifecycle",
+    ));
+    let lifecycle = compact_sql(function_block(
+        &sql,
+        "CREATE FUNCTION chat.enforce_blob_lifecycle_transition()",
+        "CREATE UNIQUE INDEX blob_bindings_application_entry_uq",
+    ));
+
+    assert_source_contract(
+        "blob identity and lifetime",
+        &[
+            (
+                "non-null object-store keys uniquely identify one blob row",
+                compact.contains("CREATE UNIQUE INDEX blobs_object_store_key_uq")
+                    && compact.contains("ON chat.blobs (object_store_key)")
+                    && compact.contains("WHERE object_store_key IS NOT NULL"),
+            ),
+            (
+                "upload completion rejects the exact upload expiry instant",
+                lifecycle.contains("NEW.uploaded_at >= NEW.upload_expires_at")
+                    && !lifecycle.contains("NEW.uploaded_at > NEW.upload_expires_at"),
+            ),
+            (
+                "blob-ticket consumption rejects exact expiry",
+                tickets.contains("consumed_at >= created_at AND consumed_at < expires_at")
+                    && !tickets.contains("BETWEEN created_at AND expires_at"),
+            ),
+            (
+                "completedUnbound to bound proves uploaded_at <= bound_at < unbound_expires_at",
+                blobs.contains("uploaded_at <= bound_at")
+                    && blobs.contains("bound_at < unbound_expires_at"),
+            ),
+            (
+                "the binding row carries the same strict bind-time ordering",
+                bindings.contains("blob_bindings_bound_at_check")
+                    && bindings.contains("bound_at <")
+                    && bindings.contains("unbound_expires_at"),
+            ),
+            (
+                "zero-reference object GC has explicit status/times and a claimable index",
+                blobs.contains("object_gc_status TEXT")
+                    && blobs.contains("object_gc_after TIMESTAMPTZ")
+                    && blobs.contains("object_deleted_at TIMESTAMPTZ")
+                    && compact.contains("CREATE INDEX blobs_object_gc_claim_idx")
+                    && compact.contains("WHERE object_gc_status = 'pending'"),
+            ),
+            (
+                "object GC is bounded and uses locked claims",
+                compact.contains("CREATE FUNCTION chat.claim_blob_object_gc(batch_limit INTEGER")
+                    && compact.contains("FOR UPDATE SKIP LOCKED")
+                    && compact.contains("LIMIT batch_limit"),
+            ),
+            (
+                "application/metadata binding purpose split remains closed",
+                bindings.contains("binding_kind IN ('application','metadataAvatar')")
+                    && bindings.contains("binding_kind = 'application' AND purpose = 'attachment'")
+                    && bindings
+                        .contains("binding_kind = 'metadataAvatar' AND purpose = 'metadata'"),
+            ),
+            (
+                "blob upload secrets remain hash-only",
+                tickets.contains("ticket_hash BYTEA PRIMARY KEY")
+                    && !tickets.contains("ticket_token TEXT"),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn audit_blob_accounting_is_incremental_bounded_and_cleanup_controlled() {
+    let sql =
+        std::fs::read_to_string(migration_dir().join("20260722000003_chat_protocol_blobs.sql"))
+            .expect("read blob migration");
+    let compact = compact_sql(&sql);
+    let usage = compact_sql(create_table_block(
+        &sql,
+        "blob_usage",
+        "CREATE TABLE chat.blobs",
+    ));
+    let reconciliation = compact_sql(function_block(
+        &sql,
+        "CREATE FUNCTION chat.assert_blob_usage(target_did TEXT)",
+        "CREATE FUNCTION chat.enforce_blob_usage()",
+    ));
+
+    assert_source_contract(
+        "blob accounting and cleanup",
+        &[
+            (
+                "per-row blob mutations do not rescan full owner history",
+                !reconciliation.contains("FROM chat.blobs")
+                    && !reconciliation.contains("sum(ciphertext_size)")
+                    && !reconciliation.contains("count(*) FILTER"),
+            ),
+            (
+                "usage deltas are applied atomically under the principal anchor",
+                compact.contains("CREATE FUNCTION chat.apply_blob_usage_delta(")
+                    && compact.contains("UPDATE chat.blob_usage")
+                    && compact.contains("FOR UPDATE"),
+            ),
+            (
+                "the existing 500 MiB and 100-live-unbound owner caps remain",
+                usage.contains("used_ciphertext_bytes + reserved_ciphertext_bytes <= 524288000")
+                    && usage.contains("live_unbound_count <= 100"),
+            ),
+            (
+                "active blobs have a bounded exact-device lookup index",
+                compact.contains("CREATE INDEX blobs_active_device_idx")
+                    && compact.contains("ON chat.blobs (owner_did, owner_device_id, status")
+                    && compact.contains("WHERE status IN ('prepared','completedUnbound')"),
+            ),
+            (
+                "active prepared/unbound rows per exact device have a hard cap",
+                compact.contains("CREATE FUNCTION chat.assert_blob_device_active_cap(")
+                    && compact.contains("max_active_blobs_per_device")
+                    && compact.contains("FOR UPDATE"),
+            ),
+            (
+                "terminal upload tickets have controlled bounded GC",
+                compact.contains("blob_upload_tickets_terminal_gc_idx")
+                    && compact.contains(
+                        "CREATE FUNCTION chat.gc_terminal_blob_upload_tickets(batch_limit INTEGER",
+                    )
+                    && compact.contains("FOR UPDATE SKIP LOCKED")
+                    && compact.contains("LIMIT batch_limit"),
+            ),
+            (
+                "pending-CAS lifecycle remains terminal after ticket consumption",
+                compact.contains("OLD.consumed_at IS NOT NULL AND NEW IS DISTINCT FROM OLD"),
+            ),
+        ],
+    );
+}
+
 #[test]
 fn recovery_schema_declares_closed_sources_and_collision_free_inventory_arms() {
     let sql =
