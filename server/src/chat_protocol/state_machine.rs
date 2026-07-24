@@ -10639,6 +10639,55 @@ impl ConversationPersistencePlan {
         }
         self
     }
+
+    /// ADR-019 Erratum 01 desync (leave-fulfillment): append a second leave delta
+    /// that STALES the very request the plan FULFILLS (same `request_id`), cloning
+    /// its Pending predecessor and flipping the successor to `Stale`. `apply_leave_
+    /// fulfillment`'s partition check must reject this as `InconsistentPlan` (ruling
+    /// point 3 — the fulfilled request is `fulfilled`, never `stale`); the count-only
+    /// reconciliation cannot catch it (staled+own would still equal total), so the
+    /// explicit same-request guard is load-bearing.
+    pub(crate) fn with_leave_fulfillment_own_staled_for_test(mut self) -> Self {
+        if let Some(fulfilled_before) = self
+            .effects
+            .leave_request_changes
+            .iter()
+            .find(|change| {
+                matches!(
+                    (&change.before, &change.after),
+                    (Some(b), Some(a))
+                        if b.status == LeaveRequestStatus::Pending
+                            && a.status == LeaveRequestStatus::Fulfilled
+                )
+            })
+            .and_then(|change| change.before.clone())
+        {
+            let mut staled = fulfilled_before.clone();
+            staled.status = LeaveRequestStatus::Stale;
+            self.effects.leave_request_changes.push(StateChange {
+                before: Some(fulfilled_before),
+                after: Some(staled),
+            });
+        }
+        self
+    }
+
+    /// ADR-019 Erratum 01 desync (zero-leaf-leave): flip the plan's first leave
+    /// staling from `Pending->Stale` to `Pending->Fulfilled`. A zeroLeafLeave
+    /// (leavePolicy) owns no leave request of its own, so ANY `Fulfilled` leave delta
+    /// is illegal — `apply_zero_leaf_leave` must reject it as `InconsistentPlan`
+    /// (shape guard: every leave delta must be `Pending->Stale`).
+    pub(crate) fn with_leave_staling_flipped_to_fulfilled_for_test(mut self) -> Self {
+        if let Some(after) = self
+            .effects
+            .leave_request_changes
+            .first_mut()
+            .and_then(|change| change.after.as_mut())
+        {
+            after.status = LeaveRequestStatus::Fulfilled;
+        }
+        self
+    }
 }
 
 #[cfg(test)]
@@ -16145,14 +16194,14 @@ mod executor {
 
         // Guards. Leave fulfillment carries participant/leaf/interval/leave-request/
         // metadata changes + (a legal interleaving) prior-bound recovery/welcome
-        // SUPERSESSIONS + prior-bound reset STALING. It has NO own recovery/
+        // SUPERSESSIONS + prior-bound reset/leave STALING. It has NO own recovery/
         // reservation/package edge and no terminal-proof/revocation change; those
         // recovery families flow ONLY through the shared supersession path (own
-        // counts 0, verified by the reconciliation). Its OWN leave-request edge is
-        // the single Pending->Fulfilled below (a leaveCommit/leavePolicy kind cannot
-        // durably `stale` a leave request per assert_leave_request_mapping, and the
-        // len==1 guard below rejects any second leave delta), so leave STALING never
-        // reaches this arm. Reject the families it never carries.
+        // counts 0, verified by the reconciliation). Its OWN leave-request edge is the
+        // single Pending->Fulfilled fulfilled below; per ADR-019 Erratum 01 the same
+        // leaveCommit MAY additionally stale OTHER members' predecessor-bound pending
+        // leaves (the partition check below enforces exactly-one-fulfilled + others-
+        // only Pending->Stale). Reject the families it never carries.
         reject_if_present("terminal_proof_changes", effects.terminal_proof_changes())?;
         reject_if_present("recovery_package_cas", effects.recovery_package_cas())?;
         reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
@@ -16179,28 +16228,68 @@ mod executor {
                 "leave fulfillment commit metadata author",
             ))?;
 
-        // Exactly one leave request is fulfilled.
-        if effects.leave_request_changes().len() != 1 {
-            return Err(ExecutorError::InconsistentPlan(
-                "leave fulfillment must fulfill exactly one leave request",
-            ));
-        }
-        let fulfilled = effects
-            .leave_request_changes()
-            .iter()
-            .find_map(|change| match (change.before(), change.after()) {
-                (Some(before), Some(after))
-                    if before.status() == LeaveRequestStatus::Pending
-                        && after.status() == LeaveRequestStatus::Fulfilled =>
-                {
-                    Some(after)
+        // Partition the leave-request deltas (ADR-019 Erratum 01). A leaveCommit
+        // fulfills EXACTLY ONE requester's leave (its own Pending->Fulfilled edge) and
+        // MAY additionally stale any number of OTHER members' predecessor-bound pending
+        // leaves (Pending->Stale). Reject every other shape: a non-transition delta, a
+        // request that did not start Pending, a re-binding (ruling point 4), a second
+        // Fulfilled, or a Stale that targets the fulfilled request itself (ruling point
+        // 3 — the fulfilled request is `fulfilled`, never `stale`). The Pending->Stale
+        // others flow through `write_prior_bound_staling` at the tail; reconcile
+        // own(1) + staled == total.
+        let mut fulfilled_request_id: Option<[u8; 16]> = None;
+        for change in effects.leave_request_changes() {
+            let (before, after) = match (change.before(), change.after()) {
+                (Some(before), Some(after)) => (before, after),
+                _ => {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "leave fulfillment leave-request delta must be a status transition",
+                    ))
                 }
-                _ => None,
-            })
-            .ok_or(ExecutorError::InconsistentPlan(
-                "leave fulfillment must fulfill a pending leave request",
-            ))?;
-        let leave_request_id = Uuid::from_bytes(fulfilled.request_id);
+            };
+            if before.status() != LeaveRequestStatus::Pending {
+                return Err(ExecutorError::InconsistentPlan(
+                    "leave fulfillment leave-request delta must start Pending",
+                ));
+            }
+            if before.bound_coordinate != after.bound_coordinate {
+                return Err(ExecutorError::InconsistentPlan(
+                    "leave fulfillment must not re-bind a leave request",
+                ));
+            }
+            match after.status() {
+                LeaveRequestStatus::Fulfilled => {
+                    if fulfilled_request_id.is_some() {
+                        return Err(ExecutorError::InconsistentPlan(
+                            "leave fulfillment must fulfill exactly one leave request",
+                        ));
+                    }
+                    fulfilled_request_id = Some(after.request_id);
+                }
+                LeaveRequestStatus::Stale => {}
+                _ => {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "leave fulfillment leave-request delta must be Fulfilled or Stale",
+                    ))
+                }
+            }
+        }
+        let fulfilled_request_id = fulfilled_request_id.ok_or(ExecutorError::InconsistentPlan(
+            "leave fulfillment must fulfill a pending leave request",
+        ))?;
+        // Ruling point 3: no Stale delta may target the request being fulfilled.
+        for change in effects.leave_request_changes() {
+            if let Some(after) = change.after() {
+                if after.status() == LeaveRequestStatus::Stale
+                    && after.request_id == fulfilled_request_id
+                {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "leave fulfillment must not stale the request it fulfills",
+                    ));
+                }
+            }
+        }
+        let leave_request_id = Uuid::from_bytes(fulfilled_request_id);
 
         // Exactly one participant is removed (the requester).
         if effects.participant_changes().len() != 1 {
@@ -16446,14 +16535,15 @@ mod executor {
         .await?;
         let event_positions = write_events(transaction, ctx).await?;
 
-        // 12. Shared prior-bound supersession + welcome supersession + reset STALING
-        //     + the silent-drop reconciliation (own recovery/reservation/package/
-        //     welcome edges are ALL zero for a leave fulfillment; its ONE own edge is
-        //     the Pending->Fulfilled leave request handled above — every OTHER delta
-        //     must be a supersession/staling the calls below applied). A prior-bound
-        //     pending RESET request the leaveCommit retired is staled here (reset
-        //     `stale` is DB-legal for any kind); the leave family carries only the
-        //     fulfilled own edge, so `write_prior_bound_staling` finds no leave delta.
+        // 12. Shared prior-bound supersession + welcome supersession + reset/leave
+        //     STALING + the silent-drop reconciliation (own recovery/reservation/
+        //     package/welcome edges are ALL zero for a leave fulfillment; its ONE own
+        //     leave edge is the Pending->Fulfilled handled above — every OTHER delta
+        //     must be a supersession/staling the calls below applied). Per ADR-019
+        //     Erratum 01 `write_prior_bound_staling` now also terminalizes any
+        //     Pending->Stale leaves of OTHER members the leaveCommit retired (bound to
+        //     this transition + the commit's request digest); reconcile own(1) +
+        //     staled == total.
         let mut superseded =
             write_prior_bound_supersessions(transaction, effects, transition_id, applied_at)
                 .await?;
@@ -17026,15 +17116,42 @@ mod executor {
         reject_if_present("leaf_changes", effects.leaf_changes())?;
         reject_if_present("interval_changes", effects.interval_changes())?;
         reject_if_present("terminal_proof_changes", effects.terminal_proof_changes())?;
-        // reset_request_changes / leave_request_changes: KEPT fail-closed. This arm's
-        // transition kind is `leavePolicy`, and `assert_leave_request_mapping` forbids
-        // a leaveCommit/leavePolicy terminal transition from being a leave-request
-        // `stale` authority — yet `resolve_prior_bound_work` would emit exactly that
-        // for a co-pending leave request. That planner-vs-DDL contradiction is
-        // DEFERRED to a design ruling (Concerns 1/3); reset staling is left rejected
-        // alongside it pending the same ruling, so this stays fail-closed as today.
+        // reset_request_changes: KEPT fail-closed. A leavePolicy transition staling a
+        // prior-bound reset request is DB-legal (reset `stale` accepts any kind), but
+        // ADR-019 Erratum 01 rules only on LEAVE staling; reset staling on this arm is
+        // out of scope and stays rejected pending its own ruling (the planner does not
+        // emit it in the reachable zero-leaf-leave flows).
         reject_if_present("reset_request_changes", effects.reset_request_changes())?;
-        reject_if_present("leave_request_changes", effects.leave_request_changes())?;
+        // leave_request_changes (ADR-019 Erratum 01): a zeroLeafLeave (leavePolicy)
+        // owns NO leave request of its own — it removes a leafless invitee via a
+        // zeroLeafLeaveEntry, never a leave request. Every leave delta must therefore
+        // be a Pending->Stale staling of a DIFFERENT member's predecessor-bound pending
+        // leave (own leave count 0). Validate the shape here; the own-DID exclusion is
+        // checked below once the leaver is resolved. The stale rows flow through
+        // `write_prior_bound_staling` at the tail (own 0 + staled == total).
+        for change in effects.leave_request_changes() {
+            let (before, after) = match (change.before(), change.after()) {
+                (Some(before), Some(after)) => (before, after),
+                _ => {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "zero-leaf leave leave-request delta must be a status transition",
+                    ))
+                }
+            };
+            if before.status() != LeaveRequestStatus::Pending
+                || after.status() != LeaveRequestStatus::Stale
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "zero-leaf leave leave-request delta must be Pending->Stale",
+                ));
+            }
+            // No re-binding (ruling point 4): staling never moves a request's binding.
+            if before.bound_coordinate != after.bound_coordinate {
+                return Err(ExecutorError::InconsistentPlan(
+                    "zero-leaf leave must not re-bind a leave request",
+                ));
+            }
+        }
         reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
         for change in effects.recovery_request_changes() {
             if !matches!((change.before(), change.after()), (Some(before), Some(after))
@@ -17099,6 +17216,18 @@ mod executor {
             .ok_or(ExecutorError::InconsistentPlan(
                 "zero-leaf leave must close exactly one participant",
             ))?;
+        // ADR-019 Erratum 01: a zeroLeafLeave stales only OTHER members' leaves. Any
+        // leave delta targeting the leaver's own DID is a hard InconsistentPlan (a
+        // zero-leaf leaver holds no leave request of its own).
+        for change in effects.leave_request_changes() {
+            if let Some(after) = change.after() {
+                if after.requester().principal() == removed.principal() {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "zero-leaf leave must not stale its own leave request",
+                    ));
+                }
+            }
+        }
         let participant_period_id = ctx
             .closing_participant_periods
             .iter()
@@ -17227,15 +17356,25 @@ mod executor {
         let event_positions = write_events(transaction, ctx).await?;
 
         // Supersede prior-coordinate open work the leave retired (an open recovery
-        // request / active reservation / reserved package + a prior pending Welcome).
-        // A zero-leaf leave owns NONE of these families (own == default), so every
-        // such delta MUST be a supersession the shared writers applied — reconcile
-        // rejects any that is neither. reset/leave were rejected above (count 0), so
-        // the reconciliation trivially holds for those families.
+        // request / active reservation / reserved package + a prior pending Welcome)
+        // AND stale any prior-bound pending LEAVE request of OTHER members (ADR-019
+        // Erratum 01). A zero-leaf leave owns NONE of these families (own == default),
+        // so every such delta MUST be a supersession/staling the shared writers
+        // applied — reconcile rejects any that is neither. reset was rejected above
+        // (count 0), so its family trivially reconciles.
         let mut superseded =
             write_prior_bound_supersessions(transaction, effects, transition_id, applied_at)
                 .await?;
         superseded.welcomes = write_welcome_supersessions(transaction, ctx, effects).await?;
+        let staled = write_prior_bound_staling(
+            transaction,
+            effects,
+            transition_id,
+            &ctx.entry.request_digest,
+            applied_at,
+        )
+        .await?;
+        superseded.leave_requests = staled.leave_requests;
         reconcile_coordinate_change_families(effects, &FamilyCounts::default(), &superseded)?;
 
         Ok(AppliedTransition {

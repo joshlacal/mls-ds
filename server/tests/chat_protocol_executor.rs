@@ -8007,6 +8007,32 @@ async fn commit_bob_leave_fulfillment(
     pending_state: &ConversationState,
     leave_request_id: Uuid,
 ) -> ConversationState {
+    let (plan, ctx, post_leave) =
+        build_bob_leave_fulfillment(pool, scenario, pending_state, leave_request_id).await;
+    let mut tx = pool.begin().await.expect("begin leave fulfillment");
+    apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+        .await
+        .expect("leave fulfillment applies");
+    tx.commit()
+        .await
+        .expect("leave fulfillment COMMIT past all deferred triggers");
+    post_leave
+}
+
+/// Build (but do NOT commit) alice's leaveCommit fulfilling bob's retained leave
+/// consent, returning the plan + ctx + the post-leave state. Split from
+/// `commit_bob_leave_fulfillment` so the ADR-019 desync negative can apply a
+/// CORRUPTED variant of the same plan.
+async fn build_bob_leave_fulfillment(
+    pool: &PgPool,
+    scenario: &FulfillmentScenario,
+    pending_state: &ConversationState,
+    leave_request_id: Uuid,
+) -> (
+    chat_protocol::state_machine::ConversationPersistencePlan,
+    ExecutionContext,
+    ConversationState,
+) {
     let manifest = corpus_manifest();
     let conversation_id = scenario.conversation_id;
     let bob_id = scenario.bob_id.clone();
@@ -8193,14 +8219,52 @@ async fn commit_bob_leave_fulfillment(
             },
         }],
     };
-    let mut tx = pool.begin().await.expect("begin leave fulfillment");
-    apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+    (plan, ctx, post_leave)
+}
+
+/// ADR-019 Erratum 01 desync (leave-fulfillment, ruling point 3): a leaveCommit
+/// plan that ALSO carries a `Pending->Stale` delta for the SAME request it fulfills
+/// is a hard `InconsistentPlan` — the fulfilled request is `fulfilled`, never
+/// `stale`. The count-only reconciliation cannot catch it (own + staled still equals
+/// total), so the explicit same-request guard is load-bearing. Zero residue.
+#[tokio::test]
+async fn leave_fulfillment_staling_its_own_request_is_rejected() {
+    let (pool, _db) = setup().await;
+    let manifest = corpus_manifest();
+    let scenario = run_fulfillment_scenario(&pool).await;
+    let conversation_id = scenario.conversation_id;
+    let req_received = ServerTimestamp::from_unix_millis_for_test(
+        manifest.evaluation_unix_seconds as i64 * 1_000 + 5_000,
+    )
+    .unwrap();
+    let (pending_state, leave_request_id, _seq, _plan, _ctx) =
+        commit_leave_request(&pool, &scenario, 4, req_received).await;
+    let (plan, ctx, _post) =
+        build_bob_leave_fulfillment(&pool, &scenario, &pending_state, leave_request_id).await;
+    let bad = plan.with_leave_fulfillment_own_staled_for_test();
+
+    let mut tx = pool
+        .begin()
         .await
-        .expect("leave fulfillment applies");
-    tx.commit()
-        .await
-        .expect("leave fulfillment COMMIT past all deferred triggers");
-    post_leave
+        .expect("begin corrupted leave fulfillment");
+    let result = apply_conversation_persistence_plan(&mut tx, &bad, &ctx).await;
+    assert!(
+        matches!(result, Err(ExecutorError::InconsistentPlan(_))),
+        "staling the fulfilled request must be InconsistentPlan, got {result:?}"
+    );
+    tx.rollback().await.expect("rollback");
+    // Zero residue: coordinate unchanged (sv 2), the leave request still pending.
+    let (sv, leave_status): (i64, String) = sqlx::query_as(
+        "SELECT (SELECT current_state_version FROM chat.conversations WHERE conversation_id=$1), \
+                (SELECT status FROM chat.leave_requests WHERE leave_request_id=$2)",
+    )
+    .bind(conversation_id)
+    .bind(leave_request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("residue");
+    assert_eq!((sv, leave_status.as_str()), (2, "pending"));
+    cleanup(&pool, conversation_id).await;
 }
 
 /// Arm 3 #4 (proof-only close branch, E2b-5 MINOR-2): a close AFTER a member's
@@ -9321,6 +9385,535 @@ async fn generic_commit_corrupted_leave_staling_is_rejected() {
     .await
     .expect("residue");
     assert_eq!((sv, leave_status.as_str()), (2, "pending"));
+}
+
+// ===========================================================================
+// ADR-019 Erratum 01 — leave-kind transitions stale OTHER members' pending
+// leaves. A genuine >=3-member group: alice (admin, leaf), bob (member, leaf,
+// via the recovery fulfillment scenario), carol (member, LEAFLESS, added by a
+// policy edge). Bob holds a pending leave; carol self-removes via a
+// zeroLeafLeave (leavePolicy), which must now SUCCEED while staling bob's leave.
+// ===========================================================================
+
+struct ThreeMemberLeaveSetup {
+    scenario: FulfillmentScenario,
+    carol_id: DeviceIdentity,
+    carol_did: String,
+    carol_period: Uuid,
+    leave_state: ConversationState,
+    bob_leave_request_id: Uuid,
+}
+
+/// Sorted (entry Control, event Participant+predecessor) audiences for an explicit
+/// device set — the >=3-member analogue of `entry_audience`/`event_audience`.
+async fn member_audiences(
+    pool: &PgPool,
+    members: &[(DeviceIdentity, String)],
+) -> (
+    Vec<(DeviceIdentity, EntryEntitlementKind)>,
+    Vec<(DeviceIdentity, EventEntitlementKind, Option<i64>)>,
+) {
+    let mut sorted = members.to_vec();
+    sorted
+        .sort_by(|l, r| (l.1.as_bytes(), l.0.device_id()).cmp(&(r.1.as_bytes(), r.0.device_id())));
+    let entry = sorted
+        .iter()
+        .map(|(d, _)| (d.clone(), EntryEntitlementKind::Control))
+        .collect();
+    let mut events = Vec::with_capacity(sorted.len());
+    for (device, did) in &sorted {
+        let pred = device_event_predecessor(pool, did, Uuid::from_bytes(*device.device_id())).await;
+        events.push((device.clone(), EventEntitlementKind::Participant, pred));
+    }
+    (entry, events)
+}
+
+/// Build+commit: recovery scenario (alice+bob leaves) -> policy-add carol
+/// (leafless, superseding the scenario's pending welcome) -> bob opens a pending
+/// leave request bound to the post-add coordinate. Returns the pre-zeroLeafLeave
+/// state + carol's identity/period + bob's leave-request id.
+async fn seed_three_member_bob_pending_leave(
+    pool: &PgPool,
+    scenario: FulfillmentScenario,
+) -> ThreeMemberLeaveSetup {
+    let manifest = corpus_manifest();
+    let conversation_id = scenario.conversation_id;
+    let alice_id = scenario.fixture.alice_id.clone();
+    let alice_did = scenario.fixture.alice_did.clone();
+    let alice_device = scenario.fixture.alice_device;
+    let alice_key_id = scenario.fixture.alice_key_id.clone();
+    let bob_id = scenario.bob_id.clone();
+    let bob_did = scenario.bob_did.clone();
+    let bob_device = Uuid::from_bytes(*bob_id.device_id());
+    let protocol_instance_id = scenario.fixture.protocol_instance_id;
+
+    // A fresh leafless invitee carol; seed her device_keys FK.
+    let (carol_id, carol_did) = fresh_bob();
+    let carol_device = Uuid::from_bytes(*carol_id.device_id());
+    let _ = seed_actor(pool, &carol_did, carol_device, &[0x6C_u8; 32]).await;
+    let members = [
+        (alice_id.clone(), alice_did.clone()),
+        (bob_id.clone(), bob_did.clone()),
+        (carol_id.clone(), carol_did.clone()),
+    ];
+
+    // 1. Policy edge (seq 4, sv 2 -> 3) adds carol pending/leafless AND supersedes
+    //    the scenario's pending Welcome (bound to sv 2).
+    let s0 = scenario.fulfillment_state.clone();
+    let policy_received = ServerTimestamp::from_unix_millis_for_test(
+        manifest.evaluation_unix_seconds as i64 * 1_000 + 20_000,
+    )
+    .unwrap();
+    let policy_transition = Uuid::new_v4();
+    let policy_entry = Uuid::new_v4();
+    let policy_evidence = TransitionEvidence::for_test_policy_add(
+        4,
+        *policy_transition.as_bytes(),
+        [0x12_u8; 32],
+        policy_received,
+        *s0.coordinate(),
+        vec![carol_id.principal().clone()],
+    )
+    .unwrap();
+    let policy_planned = plan_policy(&s0, alice_id.clone(), policy_evidence, [0x99_u8; 32])
+        .expect("valid policy plan adding carol");
+    let policy_state = policy_planned.resulting_state().clone();
+    let policy_head = ConversationHeadCasBinding::for_test_edge(
+        *conversation_id.as_bytes(),
+        *policy_entry.as_bytes(),
+        *s0.coordinate(),
+        4,
+        policy_received,
+    );
+    let policy_plan = persistence_plan_for_test(policy_planned, policy_head);
+    let (policy_entry_recips, _) = member_audiences(pool, &members).await;
+    // Bob receives ONLY the welcome-disposition event this tx; alice + carol receive
+    // the ConversationChanged (canonically ordered). Each device gets exactly one
+    // event so the per-device event-recipient chain trigger holds.
+    let bob_pred = device_event_predecessor(pool, &bob_did, bob_device).await;
+    let (_, policy_event_recips) = member_audiences(
+        pool,
+        &[
+            (alice_id.clone(), alice_did.clone()),
+            (carol_id.clone(), carol_did.clone()),
+        ],
+    )
+    .await;
+    let policy_applied_at = clock_now(pool).await;
+    let policy_transcript = vec![0x52_u8; 12];
+    let policy_ctx = ExecutionContext {
+        protocol_instance_id,
+        applied_at: policy_applied_at,
+        actor: ExecutionActor {
+            user_did: alice_did.clone(),
+            device_id: alice_device,
+            key_id: alice_key_id.clone(),
+            auth_generation: 1,
+            role: TransitionActorRole::Admin,
+            device_status: "active".to_owned(),
+        },
+        entry: ControlEntryContent {
+            entry_id: policy_entry,
+            entry_kind: "blue.catbird.chat.defs#policyEntry".to_owned(),
+            accepted_payload_bytes: vec![0x51_u8; 12],
+            accepted_payload_sha256: Sha256::digest([0x51_u8; 12]).to_vec(),
+            signed_request_bytes: policy_transcript.clone(),
+            unsigned_projection_bytes: vec![0x53_u8; 8],
+            signing_transcript_bytes: policy_transcript.clone(),
+            request_digest: Sha256::digest(&policy_transcript).to_vec(),
+            signature: vec![0x54_u8; 64],
+            server_fields_bytes: vec![0x55_u8; 8],
+            outer_entry_fingerprint: vec![0x12_u8; 32],
+        },
+        spine: SpineArtifacts {
+            public_snapshot_bytes: vec![0x61_u8; 16],
+            public_snapshot_sha256: Sha256::digest([0x61_u8; 16]).to_vec(),
+            tree_summary_bytes: vec![0x62_u8; 16],
+            tree_summary_sha256: Sha256::digest([0x62_u8; 16]).to_vec(),
+            leaf_count: 2,
+            genesis_group_info_bytes: vec![],
+            genesis_group_info_sha256: vec![],
+        },
+        opened_leaves: vec![],
+        metadata_author: None,
+        participant_period_ids: vec![Uuid::new_v4()],
+        leaf_period_ids: vec![],
+        entry_recipients: policy_entry_recips,
+        events: vec![EventFanout {
+            event_id: Uuid::new_v4(),
+            event_kind: EventKind::ConversationChanged,
+            payload_bytes: vec![0x71_u8; 8],
+            recipients: policy_event_recips,
+            outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+        }],
+        closing_leaf_periods: Vec::new(),
+        closing_participant_periods: Vec::new(),
+        reset_request_row: None,
+        recovery_open: None,
+        welcome_expiry: None,
+        welcome_response: None,
+        welcome_dispositions: vec![WelcomeDispositionInput {
+            welcome_id: scenario.welcome_id,
+            event: EventFanout {
+                event_id: Uuid::new_v4(),
+                event_kind: EventKind::WelcomeDisposition,
+                payload_bytes: vec![0xBD_u8; 8],
+                recipients: vec![(bob_id.clone(), EventEntitlementKind::Welcome, bob_pred)],
+                outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+            },
+        }],
+    };
+    {
+        let mut tx = pool.begin().await.expect("begin policy add carol");
+        apply_conversation_persistence_plan(&mut tx, &policy_plan, &policy_ctx)
+            .await
+            .expect("policy add carol applies");
+        tx.commit().await.expect("policy add carol COMMIT");
+    }
+    let carol_period: Uuid = sqlx::query_scalar(
+        "SELECT participant_period_id FROM chat.participants WHERE conversation_id=$1 AND user_did=$2 AND current_membership",
+    )
+    .bind(conversation_id)
+    .bind(&carol_did)
+    .fetch_one(pool)
+    .await
+    .expect("carol participant period");
+
+    // 2. Bob opens a pending leave request (seq 5) bound to the post-add coordinate
+    //    (sv 3, coordinate unchanged).
+    let leave_received = ServerTimestamp::from_unix_millis_for_test(
+        manifest.evaluation_unix_seconds as i64 * 1_000 + 21_000,
+    )
+    .unwrap();
+    let bob_leave_request_id = Uuid::new_v4();
+    let leave_evidence = RequestEvidence::for_test(
+        RequestEntryKind::LeaveRequest,
+        5,
+        *bob_leave_request_id.as_bytes(),
+        bob_id.clone(),
+        *conversation_id.as_bytes(),
+        leave_received,
+        0x71,
+    )
+    .unwrap();
+    let leave_registration = LockedRegistrationProjection::for_test(&leave_evidence);
+    let leave_planned = plan_leave_request(
+        &policy_state,
+        LeaveRequestCommand {
+            actor: bob_id.clone(),
+            leave_request_id: *bob_leave_request_id.as_bytes(),
+            received_at: leave_received,
+            evidence: leave_evidence,
+            registration: leave_registration,
+        },
+    )
+    .expect("valid bob leave request plan");
+    let leave_state = leave_planned.resulting_state().clone();
+    let leave_entry = Uuid::new_v4();
+    let leave_head = ConversationHeadCasBinding::for_test_edge(
+        *conversation_id.as_bytes(),
+        *leave_entry.as_bytes(),
+        *policy_state.coordinate(),
+        5,
+        leave_received,
+    );
+    let leave_plan = persistence_plan_for_test(leave_planned, leave_head);
+    let (leave_entry_recips, leave_event_recips) = member_audiences(pool, &members).await;
+    let leave_applied_at = clock_now(pool).await;
+    let leave_transcript = vec![0x72_u8; 16];
+    let leave_ctx = ExecutionContext {
+        protocol_instance_id,
+        applied_at: leave_applied_at,
+        actor: ExecutionActor {
+            user_did: bob_did.clone(),
+            device_id: bob_device,
+            key_id: scenario.fixture.bob_key_id.clone(),
+            auth_generation: 1,
+            role: TransitionActorRole::Member,
+            device_status: "active".to_owned(),
+        },
+        entry: ControlEntryContent {
+            entry_id: leave_entry,
+            entry_kind: "blue.catbird.chat.defs#leaveRequestEntry".to_owned(),
+            accepted_payload_bytes: vec![0x74_u8; 8],
+            accepted_payload_sha256: Sha256::digest([0x74_u8; 8]).to_vec(),
+            signed_request_bytes: leave_transcript.clone(),
+            unsigned_projection_bytes: vec![0x75_u8; 8],
+            signing_transcript_bytes: leave_transcript.clone(),
+            request_digest: Sha256::digest(&leave_transcript).to_vec(),
+            signature: vec![0x76_u8; 64],
+            server_fields_bytes: vec![0x77_u8; 8],
+            outer_entry_fingerprint: vec![0x1A_u8; 32],
+        },
+        spine: SpineArtifacts {
+            public_snapshot_bytes: vec![],
+            public_snapshot_sha256: vec![],
+            tree_summary_bytes: vec![],
+            tree_summary_sha256: vec![],
+            leaf_count: 2,
+            genesis_group_info_bytes: vec![],
+            genesis_group_info_sha256: vec![],
+        },
+        opened_leaves: vec![],
+        metadata_author: None,
+        participant_period_ids: vec![],
+        leaf_period_ids: vec![],
+        entry_recipients: leave_entry_recips,
+        events: vec![EventFanout {
+            event_id: Uuid::new_v4(),
+            event_kind: EventKind::LeaveRequest,
+            payload_bytes: vec![0x78_u8; 8],
+            recipients: leave_event_recips,
+            outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+        }],
+        closing_leaf_periods: vec![],
+        closing_participant_periods: vec![],
+        reset_request_row: None,
+        recovery_open: None,
+        welcome_expiry: None,
+        welcome_response: None,
+        welcome_dispositions: vec![],
+    };
+    {
+        let mut tx = pool.begin().await.expect("begin bob leave request");
+        apply_conversation_persistence_plan(&mut tx, &leave_plan, &leave_ctx)
+            .await
+            .expect("bob leave request applies");
+        tx.commit().await.expect("bob leave request COMMIT");
+    }
+
+    ThreeMemberLeaveSetup {
+        scenario,
+        carol_id,
+        carol_did,
+        carol_period,
+        leave_state,
+        bob_leave_request_id,
+    }
+}
+
+/// Build (do NOT commit) carol's zeroLeafLeave (seq 6, sv 3 -> 4) over the state
+/// where bob holds a pending leave request. The plan stales bob's leave. Returns
+/// the plan + ctx + the leavePolicy transition id.
+async fn build_carol_zero_leaf_leave(
+    pool: &PgPool,
+    setup: &ThreeMemberLeaveSetup,
+) -> (
+    chat_protocol::state_machine::ConversationPersistencePlan,
+    ExecutionContext,
+    Uuid,
+) {
+    let manifest = corpus_manifest();
+    let scenario = &setup.scenario;
+    let conversation_id = scenario.conversation_id;
+    let alice_id = scenario.fixture.alice_id.clone();
+    let alice_did = scenario.fixture.alice_did.clone();
+    let bob_id = scenario.bob_id.clone();
+    let bob_did = scenario.bob_did.clone();
+    let carol_id = setup.carol_id.clone();
+    let carol_did = setup.carol_did.clone();
+    let carol_device = Uuid::from_bytes(*carol_id.device_id());
+    let members = [
+        (alice_id.clone(), alice_did.clone()),
+        (bob_id.clone(), bob_did.clone()),
+        (carol_id.clone(), carol_did.clone()),
+    ];
+
+    let received_at = ServerTimestamp::from_unix_millis_for_test(
+        manifest.evaluation_unix_seconds as i64 * 1_000 + 22_000,
+    )
+    .unwrap();
+    let transition_id = Uuid::new_v4();
+    let entry_id = Uuid::new_v4();
+    let evidence =
+        TransitionEvidence::for_test_at(6, *transition_id.as_bytes(), [0x82_u8; 32], received_at)
+            .unwrap();
+    let planned = plan_zero_leaf_leave(
+        &setup.leave_state,
+        ZeroLeafLeave {
+            actor: carol_id.clone(),
+            transition: evidence,
+        },
+    )
+    .expect("valid carol zero-leaf leave plan staling bob's pending leave");
+    let head_cas = ConversationHeadCasBinding::for_test_edge(
+        *conversation_id.as_bytes(),
+        *entry_id.as_bytes(),
+        *setup.leave_state.coordinate(),
+        6,
+        received_at,
+    );
+    let plan = persistence_plan_for_test(planned, head_cas);
+    let (entry_recips, event_recips) = member_audiences(pool, &members).await;
+    let applied_at = clock_now(pool).await;
+    let transcript = vec![0x92_u8; 16];
+    let ctx = ExecutionContext {
+        protocol_instance_id: scenario.fixture.protocol_instance_id,
+        applied_at,
+        actor: ExecutionActor {
+            user_did: carol_did.clone(),
+            device_id: carol_device,
+            key_id: seed_actor_key_id(pool, &carol_did, carol_device).await,
+            auth_generation: 1,
+            role: TransitionActorRole::Member,
+            device_status: "active".to_owned(),
+        },
+        entry: ControlEntryContent {
+            entry_id,
+            entry_kind: "blue.catbird.chat.defs#zeroLeafLeaveEntry".to_owned(),
+            accepted_payload_bytes: vec![0x94_u8; 8],
+            accepted_payload_sha256: Sha256::digest([0x94_u8; 8]).to_vec(),
+            signed_request_bytes: transcript.clone(),
+            unsigned_projection_bytes: vec![0x95_u8; 8],
+            signing_transcript_bytes: transcript.clone(),
+            request_digest: Sha256::digest(&transcript).to_vec(),
+            signature: vec![0x96_u8; 64],
+            server_fields_bytes: vec![0x97_u8; 8],
+            outer_entry_fingerprint: vec![0x1C_u8; 32],
+        },
+        spine: SpineArtifacts {
+            public_snapshot_bytes: vec![0xE1_u8; 16],
+            public_snapshot_sha256: Sha256::digest([0xE1_u8; 16]).to_vec(),
+            tree_summary_bytes: vec![0xE2_u8; 16],
+            tree_summary_sha256: Sha256::digest([0xE2_u8; 16]).to_vec(),
+            leaf_count: 2,
+            genesis_group_info_bytes: vec![],
+            genesis_group_info_sha256: vec![],
+        },
+        opened_leaves: vec![],
+        metadata_author: None,
+        participant_period_ids: vec![],
+        leaf_period_ids: vec![],
+        entry_recipients: entry_recips,
+        events: vec![EventFanout {
+            event_id: Uuid::new_v4(),
+            event_kind: EventKind::ConversationChanged,
+            payload_bytes: vec![0x98_u8; 8],
+            recipients: event_recips,
+            outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+        }],
+        closing_leaf_periods: vec![],
+        closing_participant_periods: vec![(carol_id.clone(), setup.carol_period)],
+        reset_request_row: None,
+        recovery_open: None,
+        welcome_expiry: None,
+        welcome_response: None,
+        welcome_dispositions: vec![],
+    };
+    (plan, ctx, transition_id)
+}
+
+/// Re-derive carol's `device_keys.key_id` the same way `seed_actor` did (the
+/// ed25519 thumbprint of her seeded signing key), so her zeroLeafLeave ctx actor
+/// carries the exact key id her device row holds.
+async fn seed_actor_key_id(pool: &PgPool, did: &str, device: Uuid) -> String {
+    sqlx::query_scalar("SELECT key_id FROM chat.device_keys WHERE user_did=$1 AND device_id=$2")
+        .bind(did)
+        .bind(device)
+        .fetch_one(pool)
+        .await
+        .expect("carol device key id")
+}
+
+/// ADR-019 Erratum 01 (Concern 1) POSITIVE: a zeroLeafLeave (leavePolicy) by a
+/// leafless member SUCCEEDS while a DIFFERENT member holds a pending leave request,
+/// durably staling that request bound to the leavePolicy transition. This was
+/// fail-closed before the erratum (the DDL forbade a leaveCommit/leavePolicy stale
+/// authority).
+#[tokio::test]
+async fn zero_leaf_leave_stales_other_members_pending_leave_request() {
+    let (pool, _db) = setup().await;
+    let scenario = run_fulfillment_scenario(&pool).await;
+    let setup_data = seed_three_member_bob_pending_leave(&pool, scenario).await;
+    let conversation_id = setup_data.scenario.conversation_id;
+    let carol_did = setup_data.carol_did.clone();
+    let bob_leave_request_id = setup_data.bob_leave_request_id;
+    let (plan, ctx, zll_transition) = build_carol_zero_leaf_leave(&pool, &setup_data).await;
+    let zll_request_digest = ctx.entry.request_digest.clone();
+
+    let mut tx = pool.begin().await.expect("begin carol zero-leaf leave");
+    apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+        .await
+        .expect("carol zero-leaf leave staling bob's pending leave applies");
+    tx.commit()
+        .await
+        .expect("carol zero-leaf leave COMMIT past all deferred triggers");
+
+    // Coordinate advanced sv 3 -> 4 (leavePolicy, same generation/epoch).
+    let (sv, next_seq): (i64, i64) = sqlx::query_as(
+        "SELECT current_state_version,next_entry_seq FROM chat.conversations WHERE conversation_id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("head");
+    assert_eq!((sv, next_seq), (4, 7));
+    // Carol self-removed.
+    let carol_current: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.participants WHERE conversation_id=$1 AND user_did=$2 AND current_membership",
+    )
+    .bind(conversation_id)
+    .bind(&carol_did)
+    .fetch_one(&pool)
+    .await
+    .expect("carol membership");
+    assert_eq!(carol_current, 0, "carol self-removed");
+    // Bob's pending leave is STALE, bound to the leavePolicy transition + its digest.
+    let (leave_status, leave_tid, leave_digest): (String, Option<Uuid>, Option<Vec<u8>>) =
+        sqlx::query_as(
+            "SELECT status,terminal_transition_id,terminal_request_digest \
+               FROM chat.leave_requests WHERE leave_request_id=$1",
+        )
+        .bind(bob_leave_request_id)
+        .fetch_one(&pool)
+        .await
+        .expect("bob leave terminal");
+    assert_eq!(leave_status, "stale");
+    assert_eq!(leave_tid, Some(zll_transition));
+    assert_eq!(leave_digest, Some(zll_request_digest));
+    // The terminal transition is a leavePolicy — the previously-forbidden kind.
+    let tkind: String =
+        sqlx::query_scalar("SELECT kind FROM chat.transitions WHERE transition_id=$1")
+            .bind(zll_transition)
+            .fetch_one(&pool)
+            .await
+            .expect("zll transition kind");
+    assert_eq!(tkind, "leavePolicy");
+    cleanup(&pool, conversation_id).await;
+}
+
+/// ADR-019 Erratum 01 desync (zero-leaf-leave shape guard): a zeroLeafLeave plan
+/// whose leave delta is `Pending->Fulfilled` (a zeroLeafLeave owns NO leave request
+/// of its own) is a hard `InconsistentPlan` with zero residue.
+#[tokio::test]
+async fn zero_leaf_leave_carrying_a_fulfilled_leave_delta_is_rejected() {
+    let (pool, _db) = setup().await;
+    let scenario = run_fulfillment_scenario(&pool).await;
+    let setup_data = seed_three_member_bob_pending_leave(&pool, scenario).await;
+    let conversation_id = setup_data.scenario.conversation_id;
+    let bob_leave_request_id = setup_data.bob_leave_request_id;
+    let (plan, ctx, _zll) = build_carol_zero_leaf_leave(&pool, &setup_data).await;
+    let bad = plan.with_leave_staling_flipped_to_fulfilled_for_test();
+
+    let mut tx = pool.begin().await.expect("begin corrupted zero-leaf leave");
+    let result = apply_conversation_persistence_plan(&mut tx, &bad, &ctx).await;
+    assert!(
+        matches!(result, Err(ExecutorError::InconsistentPlan(_))),
+        "a Fulfilled leave delta in a zeroLeafLeave must be InconsistentPlan, got {result:?}"
+    );
+    tx.rollback().await.expect("rollback");
+    // Zero residue: coordinate still sv 3, bob's leave still pending.
+    let (sv, leave_status): (i64, String) = sqlx::query_as(
+        "SELECT (SELECT current_state_version FROM chat.conversations WHERE conversation_id=$1), \
+                (SELECT status FROM chat.leave_requests WHERE leave_request_id=$2)",
+    )
+    .bind(conversation_id)
+    .bind(bob_leave_request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("residue");
+    assert_eq!((sv, leave_status.as_str()), (3, "pending"));
+    cleanup(&pool, conversation_id).await;
 }
 
 /// Remove one conversation's committed graph so the shared, never-truncated

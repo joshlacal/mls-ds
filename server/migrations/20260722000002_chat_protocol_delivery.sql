@@ -375,8 +375,14 @@ BEGIN
            AND (
                 (request_row.status = 'fulfilled'
                     AND transition.kind IN ('leaveCommit','leavePolicy'))
-                OR (request_row.status = 'stale'
-                    AND transition.kind NOT IN ('leaveCommit','leavePolicy'))
+                -- ADR-019 Erratum 01: the coordinate-binding invariant governs — ANY
+                -- coordinate change (INCLUDING a leaveCommit/leavePolicy) may stale
+                -- OTHER members' predecessor-bound pending leave requests, so a
+                -- 'stale' leave request's terminal transition may be of any kind. The
+                -- only-others / fulfilled-not-stale distinction is enforced at the
+                -- planner/executor layer, not the DDL. The prior/digest/instant binding
+                -- above still pins the stale row to its exact terminal transition.
+                OR request_row.status = 'stale'
            )
     ) THEN
         RAISE EXCEPTION 'terminal leave transition mapping mismatch'
