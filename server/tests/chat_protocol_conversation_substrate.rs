@@ -2056,4 +2056,84 @@ mod historical_control_path {
             Err(StateMachineError::InvalidHydrationAuthority)
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Durable-row loader seam (`hydrate_historical_control_from_durable_bytes`):
+    // the state_machine.rs half of the G1b-2 evidence loader. The core.rs DB
+    // loader reads `accepted_payload_bytes` + `signed_request_bytes` from
+    // `chat.entries` (+ the `chat.device_keys` signing key), then calls this seam
+    // — which DERIVES the un-stored outer-row projection/fingerprint/server-fields
+    // and the durable row digest and re-verifies through `hydrate_historical_control`.
+    // Drift fence: byte-equality to the `hydrate_historical_control` row path for
+    // every control-entry kind (the row path is itself the certified drift fence
+    // vs the append-time minters). Pure-crypto, corpus-independent.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn historical_control_from_durable_bytes_matches_row_path_per_kind() {
+        let cases = build_cases();
+        assert_eq!(cases.len(), 13);
+        for case in &cases {
+            let auth = HistoricalRehydrationAuthority::new(case.cid, case.seq + 1_000_000).unwrap();
+            // Certified reference: the `PersistedControlRow` path.
+            let from_row = auth
+                .hydrate_historical_control(case.row(), &case.public_key)
+                .unwrap_or_else(|e| panic!("row path failed for {}: {e:?}", case.entry_kind));
+            // Loader seam: the same authority, re-derived from durable bytes only.
+            let from_bytes = auth
+                .hydrate_historical_control_from_durable_bytes(
+                    case.public_row_json.clone(),
+                    case.raw_wrapper.clone(),
+                    &case.public_key,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("durable-bytes path failed for {}: {e:?}", case.entry_kind)
+                });
+            assert_eq!(from_bytes, from_row, "kind {}", case.entry_kind);
+        }
+    }
+
+    #[test]
+    fn historical_control_from_durable_bytes_fails_closed() {
+        let cases = build_cases();
+        let case = cases
+            .iter()
+            .find(|c| c.entry_kind.ends_with("commitEntry"))
+            .expect("commit control vector present");
+        let auth = HistoricalRehydrationAuthority::new(case.cid, case.seq + 10).unwrap();
+
+        // Wrong historical key: signature verification fails during decode.
+        assert_eq!(
+            auth.hydrate_historical_control_from_durable_bytes(
+                case.public_row_json.clone(),
+                case.raw_wrapper.clone(),
+                &[0x11_u8; 32],
+            ),
+            Err(StateMachineError::InvalidHydrationAuthority)
+        );
+
+        // Tampered public row: corrupting the leading `{` breaks JSON decoding.
+        let mut tampered = case.public_row_json.clone();
+        tampered[0] ^= 0xff;
+        assert_eq!(
+            auth.hydrate_historical_control_from_durable_bytes(
+                tampered,
+                case.raw_wrapper.clone(),
+                &case.public_key,
+            ),
+            Err(StateMachineError::InvalidHydrationAuthority)
+        );
+
+        // Control-only global constraint delegated to `hydrate_historical_control`:
+        // an entry seq NOT strictly below the head fails closed.
+        let at_head = HistoricalRehydrationAuthority::new(case.cid, case.seq).unwrap();
+        assert_eq!(
+            at_head.hydrate_historical_control_from_durable_bytes(
+                case.public_row_json.clone(),
+                case.raw_wrapper.clone(),
+                &case.public_key,
+            ),
+            Err(StateMachineError::InvalidHydrationAuthority)
+        );
+    }
 }
