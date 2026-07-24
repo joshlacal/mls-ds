@@ -83,6 +83,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
+use tokio::sync::Barrier;
 use uuid::Uuid;
 
 use chat_protocol::public_state::{
@@ -8221,5 +8222,414 @@ async fn device_revocation_without_receipt_fails_the_commit_trigger() {
     assert!(
         committed.is_err(),
         "a revocation missing its revokeDevice receipt must fail enforce_device_revocation_mapping at COMMIT"
+    );
+}
+
+// ===========================================================================
+// E3 — real-Postgres concurrency races over the executor edges.
+//
+// Each case commits a coherent prior state, then applies competing edges from
+// ONE prior coordinate CONCURRENTLY: two `apply_conversation_persistence_plan`
+// futures interleave under `tokio::join!` (a Barrier lines them up at the head
+// write), and the Postgres conversation-head row lock is the serialization
+// authority. Exactly one edge commits; every loser hits a typed executor error
+// (the head CAS / head-PK conflict) and rolls back with ZERO business residue —
+// equivalent to one legal lock-ordered serialization, never an impossible
+// interleaving.
+// ===========================================================================
+
+/// Build (but do not apply) a real policy `addParticipant` edge on top of a
+/// committed creation `fixture`, returning its plan + execution context. Mirrors
+/// `group_policy_add_participant_commits_state_version_plus_one`.
+async fn build_policy_edge(
+    pool: &PgPool,
+    fixture: &CreationApply,
+) -> (
+    chat_protocol::state_machine::ConversationPersistencePlan,
+    ExecutionContext,
+) {
+    let conversation_id = fixture.conversation_id;
+    let (bob2_id, bob2_did) = fresh_bob();
+    let bob2_device = Uuid::from_bytes(*bob2_id.device_id());
+    let _ = seed_actor(pool, &bob2_did, bob2_device, &[0x63_u8; 32]).await;
+
+    let received_at = ServerTimestamp::from_unix_millis_for_test(
+        corpus_manifest().evaluation_unix_seconds as i64 * 1_000 + 2_000,
+    )
+    .unwrap();
+    let entry_id = Uuid::new_v4();
+    let transition_id = Uuid::new_v4();
+    let policy_evidence = TransitionEvidence::for_test_policy_add(
+        2,
+        *transition_id.as_bytes(),
+        [0x12_u8; 32],
+        received_at,
+        fixture.coordinate,
+        vec![bob2_id.principal().clone()],
+    )
+    .unwrap();
+    let planned = plan_policy(
+        &fixture.state,
+        fixture.alice_id.clone(),
+        policy_evidence,
+        [0x99_u8; 32],
+    )
+    .expect("valid policy plan");
+    let head_cas = ConversationHeadCasBinding::for_test_edge(
+        *conversation_id.as_bytes(),
+        *entry_id.as_bytes(),
+        fixture.coordinate,
+        2,
+        received_at,
+    );
+    let plan = persistence_plan_for_test(planned, head_cas);
+
+    let applied_at = clock_now(pool).await;
+    let payload = vec![0x51_u8; 12];
+    let transcript = vec![0x52_u8; 12];
+    let recipients_devices = [
+        (fixture.alice_id.clone(), fixture.alice_did.clone()),
+        (fixture.bob_id.clone(), fixture.bob_did.clone()),
+        (bob2_id.clone(), bob2_did.clone()),
+    ];
+    let mut sorted = recipients_devices.to_vec();
+    sorted
+        .sort_by(|l, r| (l.1.as_bytes(), l.0.device_id()).cmp(&(r.1.as_bytes(), r.0.device_id())));
+    let entry_recipients = sorted
+        .iter()
+        .map(|(d, _)| (d.clone(), EntryEntitlementKind::Control))
+        .collect();
+    let mut event_recips = Vec::new();
+    for (device, did) in &sorted {
+        let predecessor: Option<i64> = sqlx::query_scalar(
+            "SELECT max(event_position) FROM chat.event_recipients WHERE user_did=$1 AND device_id=$2",
+        )
+        .bind(did)
+        .bind(Uuid::from_bytes(*device.device_id()))
+        .fetch_one(pool)
+        .await
+        .expect("predecessor");
+        event_recips.push((
+            device.clone(),
+            EventEntitlementKind::Participant,
+            predecessor,
+        ));
+    }
+    let ctx = ExecutionContext {
+        protocol_instance_id: fixture.protocol_instance_id,
+        applied_at,
+        actor: ExecutionActor {
+            user_did: fixture.alice_did.clone(),
+            device_id: fixture.alice_device,
+            key_id: fixture.alice_key_id.clone(),
+            auth_generation: 1,
+            role: TransitionActorRole::Admin,
+            device_status: "active".to_owned(),
+        },
+        entry: ControlEntryContent {
+            entry_id,
+            entry_kind: "blue.catbird.chat.defs#policyEntry".to_owned(),
+            accepted_payload_bytes: payload.clone(),
+            accepted_payload_sha256: Sha256::digest(&payload).to_vec(),
+            signed_request_bytes: transcript.clone(),
+            unsigned_projection_bytes: vec![0x53_u8; 8],
+            signing_transcript_bytes: transcript.clone(),
+            request_digest: Sha256::digest(&transcript).to_vec(),
+            signature: vec![0x54_u8; 64],
+            server_fields_bytes: vec![0x55_u8; 8],
+            outer_entry_fingerprint: vec![0x12_u8; 32],
+        },
+        spine: SpineArtifacts {
+            public_snapshot_bytes: vec![0x61_u8; 16],
+            public_snapshot_sha256: Sha256::digest([0x61_u8; 16]).to_vec(),
+            tree_summary_bytes: vec![0x62_u8; 16],
+            tree_summary_sha256: Sha256::digest([0x62_u8; 16]).to_vec(),
+            leaf_count: 1,
+            genesis_group_info_bytes: vec![],
+            genesis_group_info_sha256: vec![],
+        },
+        opened_leaves: vec![],
+        metadata_author: None,
+        participant_period_ids: vec![Uuid::new_v4()],
+        leaf_period_ids: vec![],
+        entry_recipients,
+        events: vec![EventFanout {
+            event_id: Uuid::new_v4(),
+            event_kind: EventKind::ConversationChanged,
+            payload_bytes: vec![0x71_u8; 8],
+            recipients: event_recips,
+            outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+        }],
+        closing_leaf_periods: Vec::new(),
+        closing_participant_periods: Vec::new(),
+        reset_request_row: None,
+        recovery_open: None,
+        welcome_expiry: None,
+        welcome_response: None,
+        welcome_dispositions: vec![],
+    };
+    (plan, ctx)
+}
+
+/// Build (but do not apply) a real `closeConversation` edge on top of a committed
+/// creation `fixture`. Mirrors `direct_close_commits_terminal_graph_and_reapply_conflicts`.
+async fn build_close_edge(
+    pool: &PgPool,
+    fixture: &CreationApply,
+) -> (
+    chat_protocol::state_machine::ConversationPersistencePlan,
+    ExecutionContext,
+) {
+    let conversation_id = fixture.conversation_id;
+    let leaf_period_id: Uuid = sqlx::query_scalar(
+        "SELECT leaf_period_id FROM chat.member_devices WHERE conversation_id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_one(pool)
+    .await
+    .expect("genesis leaf period");
+    let received_at = ServerTimestamp::from_unix_millis_for_test(
+        corpus_manifest().evaluation_unix_seconds as i64 * 1_000 + 3_000,
+    )
+    .unwrap();
+    let entry_id = Uuid::new_v4();
+    let transition_id = Uuid::new_v4();
+    let close_evidence =
+        TransitionEvidence::for_test_at(2, *transition_id.as_bytes(), [0x13_u8; 32], received_at)
+            .unwrap();
+    let planned = plan_close(
+        &fixture.state,
+        CloseConversation {
+            actor: fixture.alice_id.clone(),
+            transition: close_evidence,
+        },
+    )
+    .expect("valid close plan");
+    let head_cas = ConversationHeadCasBinding::for_test_edge(
+        *conversation_id.as_bytes(),
+        *entry_id.as_bytes(),
+        fixture.coordinate,
+        2,
+        received_at,
+    );
+    let plan = persistence_plan_for_test(planned, head_cas);
+    let applied_at = clock_now(pool).await;
+    let alice_pred = device_event_predecessor(pool, &fixture.alice_did, fixture.alice_device).await;
+    let ctx = close_ctx(fixture, entry_id, applied_at, leaf_period_id, alice_pred);
+    (plan, ctx)
+}
+
+/// Two operations from ONE prior coordinate: the SAME committed-creation
+/// conversation is advanced by the SAME policy edge from two transactions at once.
+/// Exactly one commits (`stateVersion` 0 -> 1); the loser's head CAS matches no row
+/// and is a typed `ExecutorError::Transition`, rolling back with zero residue — the
+/// state advances exactly once and exactly one policy transition exists.
+#[tokio::test]
+async fn concurrent_edge_apply_from_one_coordinate_yields_one_commit() {
+    let (pool, _db) = setup().await;
+    let fixture = build_creation(&pool, ConversationKind::Group).await;
+    let conversation_id = fixture.conversation_id;
+    let mut tx = pool.begin().await.expect("begin creation");
+    apply_conversation_persistence_plan(&mut tx, &fixture.plan, &fixture.ctx)
+        .await
+        .expect("creation applies");
+    tx.commit().await.expect("creation COMMIT");
+
+    let (plan, ctx) = build_policy_edge(&pool, &fixture).await;
+
+    let barrier = Barrier::new(2);
+    let racer_a = async {
+        let mut tx = pool.begin().await.expect("begin A");
+        barrier.wait().await;
+        let result = apply_conversation_persistence_plan(&mut tx, &plan, &ctx).await;
+        let ok = result.is_ok();
+        if ok {
+            tx.commit().await.expect("A commit");
+        } else {
+            tx.rollback().await.expect("A rollback");
+            assert!(
+                matches!(result, Err(ExecutorError::Transition(_))),
+                "loser is a typed transition conflict, got {result:?}"
+            );
+        }
+        ok
+    };
+    let racer_b = async {
+        let mut tx = pool.begin().await.expect("begin B");
+        barrier.wait().await;
+        let result = apply_conversation_persistence_plan(&mut tx, &plan, &ctx).await;
+        let ok = result.is_ok();
+        if ok {
+            tx.commit().await.expect("B commit");
+        } else {
+            tx.rollback().await.expect("B rollback");
+            assert!(
+                matches!(result, Err(ExecutorError::Transition(_))),
+                "loser is a typed transition conflict, got {result:?}"
+            );
+        }
+        ok
+    };
+    let (a, b) = tokio::join!(racer_a, racer_b);
+    assert!(
+        a ^ b,
+        "exactly one policy edge commits from the shared coordinate"
+    );
+
+    let (sv, next_seq): (i64, i64) = sqlx::query_as(
+        "SELECT current_state_version,next_entry_seq FROM chat.conversations WHERE conversation_id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("head");
+    assert_eq!((sv, next_seq), (1, 3), "state advanced exactly once");
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM chat.transitions WHERE conversation_id=$1 AND kind='policy'",
+            conversation_id
+        )
+        .await,
+        1,
+        "exactly one policy transition — the loser left zero residue"
+    );
+}
+
+/// Close serializes against a competing head mutation from ONE prior coordinate:
+/// two transactions apply the same `closeConversation` edge to a DIRECT
+/// conversation at once. Exactly one commits (head -> `superseded` with the close
+/// coordinate); the loser's head CAS matches no unsuperseded row and is a typed
+/// `ExecutorError::Transition`, rolling back with zero residue — exactly one close
+/// transition, and no second head mutation is admitted after the head is closed.
+#[tokio::test]
+async fn concurrent_close_apply_yields_one_supersede_zero_residue() {
+    let (pool, _db) = setup().await;
+    let fixture = commit_creation(&pool, ConversationKind::Direct).await;
+    let conversation_id = fixture.conversation_id;
+
+    let (close_plan, close_ctx) = build_close_edge(&pool, &fixture).await;
+
+    let barrier = Barrier::new(2);
+    let racer_a = async {
+        let mut tx = pool.begin().await.expect("begin A");
+        barrier.wait().await;
+        let result = apply_conversation_persistence_plan(&mut tx, &close_plan, &close_ctx).await;
+        let ok = result.is_ok();
+        if ok {
+            tx.commit().await.expect("A commit");
+        } else {
+            tx.rollback().await.expect("A rollback");
+            assert!(
+                matches!(result, Err(ExecutorError::Transition(_))),
+                "loser is a typed transition conflict, got {result:?}"
+            );
+        }
+        ok
+    };
+    let racer_b = async {
+        let mut tx = pool.begin().await.expect("begin B");
+        barrier.wait().await;
+        let result = apply_conversation_persistence_plan(&mut tx, &close_plan, &close_ctx).await;
+        let ok = result.is_ok();
+        if ok {
+            tx.commit().await.expect("B commit");
+        } else {
+            tx.rollback().await.expect("B rollback");
+            assert!(
+                matches!(result, Err(ExecutorError::Transition(_))),
+                "loser is a typed transition conflict, got {result:?}"
+            );
+        }
+        ok
+    };
+    let (a, b) = tokio::join!(racer_a, racer_b);
+    assert!(a ^ b, "exactly one close commits");
+
+    let lifecycle: String =
+        sqlx::query_scalar("SELECT lifecycle FROM chat.conversations WHERE conversation_id=$1")
+            .bind(conversation_id)
+            .fetch_one(&pool)
+            .await
+            .expect("lifecycle");
+    assert_eq!(
+        lifecycle, "superseded",
+        "the close winner supersedes the head"
+    );
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM chat.transitions WHERE conversation_id=$1 AND kind='closeConversation'", conversation_id).await,
+        1,
+        "exactly one close transition — the loser left zero residue",
+    );
+}
+
+/// Two concurrent applies of the SAME creation plan: exactly one commits the head
+/// insert; the other collides on the conversation-head primary key and rolls back
+/// with zero residue. Exactly one conversation, one creation transition, and one
+/// creation entry exist afterwards.
+#[tokio::test]
+async fn concurrent_duplicate_creation_yields_one_commit() {
+    let (pool, _db) = setup().await;
+    let fixture = build_creation(&pool, ConversationKind::Group).await;
+    let conversation_id = fixture.conversation_id;
+
+    let barrier = Barrier::new(2);
+    let racer_a = async {
+        let mut tx = pool.begin().await.expect("begin A");
+        barrier.wait().await;
+        let result =
+            apply_conversation_persistence_plan(&mut tx, &fixture.plan, &fixture.ctx).await;
+        let ok = result.is_ok();
+        if ok {
+            tx.commit().await.expect("A commit");
+        } else {
+            tx.rollback().await.expect("A rollback");
+        }
+        ok
+    };
+    let racer_b = async {
+        let mut tx = pool.begin().await.expect("begin B");
+        barrier.wait().await;
+        let result =
+            apply_conversation_persistence_plan(&mut tx, &fixture.plan, &fixture.ctx).await;
+        let ok = result.is_ok();
+        if ok {
+            tx.commit().await.expect("B commit");
+        } else {
+            tx.rollback().await.expect("B rollback");
+        }
+        ok
+    };
+    let (a, b) = tokio::join!(racer_a, racer_b);
+    assert!(a ^ b, "exactly one creation commits");
+
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM chat.conversations WHERE conversation_id=$1",
+            conversation_id
+        )
+        .await,
+        1,
+    );
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM chat.transitions WHERE conversation_id=$1",
+            conversation_id
+        )
+        .await,
+        1,
+        "one creation transition — the loser left zero residue",
+    );
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM chat.entries WHERE conversation_id=$1",
+            conversation_id
+        )
+        .await,
+        1,
+        "one creation entry — the loser left zero residue",
     );
 }
