@@ -1187,3 +1187,916 @@ async fn public_state_non_canonical_tree_summary_fails_closed() {
         Err(PublicStateHydrationError::InvalidTreeSummary)
     ));
 }
+
+// ---------------------------------------------------------------------------
+// G1b-1b — HistoricalRehydrationAuthority, signed-request path (OQ-G1-3(a)).
+//
+// Pure-crypto (no DB): the signed-request re-verification is over the raw
+// ed25519 wrapper + the frozen row digest, corpus-independent. Drift fence for
+// the duplicated `historical_signed_request_evidence` (state_machine.rs) vs the
+// certified `HydrationAuthority::signed_request` / `hydrate_persisted_signed_request`:
+// per-kind byte-equivalence (coordinator condition 2) + the fail-closed family
+// (condition 3, minus the seq<head control-only case).
+// ---------------------------------------------------------------------------
+mod historical_signed_path {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use ed25519_dalek::{Signer, SigningKey};
+    use serde_json::{json, Value};
+    use uuid::Uuid;
+
+    use crate::chat_protocol::snapshot::{
+        PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle,
+    };
+    use crate::chat_protocol::state_machine::{
+        DeviceIdentity, DurableSignedRequestEnvelope, HistoricalRehydrationAuthority,
+        HydrationAuthority, PersistedSignedRequestRow, PrincipalId, StateMachineError,
+    };
+    use crate::chat_protocol::transcript::{
+        decode_and_verify_signed_mutation, decode_canonical_signed_mutation, SignedMutationKind,
+    };
+    use crate::chat_protocol::validation::{
+        ed25519_key_id, CanonicalTimestamp, TrustedRequestInstant,
+    };
+
+    const RECEIVED_AT: &str = "2030-01-01T00:00:00.000Z";
+
+    fn uuid_v4_bytes(byte: u8) -> [u8; 16] {
+        let mut value = [byte; 16];
+        value[6] = 0x40 | (byte & 0x0f);
+        value[8] = 0x80 | (byte & 0x3f);
+        value
+    }
+
+    fn sample_coordinate(conversation_id: [u8; 16]) -> PublicGroupSnapshotCoordinate {
+        PublicGroupSnapshotCoordinate::new(
+            conversation_id,
+            5,
+            0,
+            [0x07; 32],
+            3,
+            [0x09; 32],
+            [0x11; 32],
+            PublicGroupSnapshotLifecycle::Active,
+        )
+    }
+
+    fn sample_actor() -> DeviceIdentity {
+        let did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+        DeviceIdentity::new(
+            PrincipalId::new(did.as_bytes().to_vec()).unwrap(),
+            uuid_v4_bytes(0x41),
+        )
+        .unwrap()
+    }
+
+    fn coordinate_json(coordinate: &PublicGroupSnapshotCoordinate) -> Value {
+        json!({
+            "conversationId":
+                Uuid::from_bytes(*coordinate.conversation_id()).hyphenated().to_string(),
+            "generation": coordinate.generation(),
+            "stateVersion": coordinate.state_version(),
+            "groupId": STANDARD.encode(coordinate.group_id()),
+            "epoch": coordinate.epoch(),
+            "groupContextHash": STANDARD.encode(coordinate.group_context_hash()),
+            "confirmationTag": STANDARD.encode(coordinate.confirmation_tag()),
+            "lifecycle": match coordinate.lifecycle() {
+                PublicGroupSnapshotLifecycle::Active => "active",
+                PublicGroupSnapshotLifecycle::Superseded => "superseded",
+            },
+        })
+    }
+
+    fn resign_signed_wrapper(mut wrapper: Value, signing_key: &SigningKey) -> Vec<u8> {
+        wrapper["signature"] = Value::String(STANDARD.encode([0u8; 64]));
+        let unsigned = serde_json::to_vec(&wrapper).unwrap();
+        let canonical = decode_canonical_signed_mutation(&unsigned).unwrap();
+        wrapper["signature"] = Value::String(
+            STANDARD.encode(signing_key.sign(canonical.transcript_bytes()).to_bytes()),
+        );
+        serde_json::to_vec(&wrapper).unwrap()
+    }
+
+    fn envelope_fields(
+        kind: SignedMutationKind,
+        actor: &DeviceIdentity,
+        signing_key: &SigningKey,
+    ) -> Value {
+        json!({
+            "$type": kind.type_id(),
+            "signatureDomain": String::from_utf8(kind.domain().to_vec()).unwrap(),
+            "actorDid": std::str::from_utf8(actor.principal().as_bytes()).unwrap(),
+            "actorDeviceId": Uuid::from_bytes(*actor.device_id()).hyphenated().to_string(),
+            "keyId": ed25519_key_id(&signing_key.verifying_key().to_bytes()).unwrap().as_str(),
+            "authGeneration": 1,
+            "idempotencyKey": Uuid::from_bytes(uuid_v4_bytes(0x6d)).hyphenated().to_string(),
+            "signedAt": "2029-12-31T23:59:59.000Z",
+        })
+    }
+
+    fn merge(mut base: Value, extra: Value) -> Value {
+        if let (Some(base), Some(extra)) = (base.as_object_mut(), extra.as_object()) {
+            for (key, value) in extra {
+                base.insert(key.clone(), value.clone());
+            }
+        }
+        base
+    }
+
+    fn leaf_recovery_request_raw(
+        coordinate: &PublicGroupSnapshotCoordinate,
+        actor: &DeviceIdentity,
+        request_id: [u8; 16],
+        signing_key: &SigningKey,
+    ) -> Vec<u8> {
+        let kind = SignedMutationKind::LeafRecoveryRequest;
+        let body = merge(
+            envelope_fields(kind, actor, signing_key),
+            json!({
+                "recoveryRequestId": Uuid::from_bytes(request_id).hyphenated().to_string(),
+                "prior": coordinate_json(coordinate),
+                "recoveryKind": "replace",
+            }),
+        );
+        resign_signed_wrapper(json!({ "body": body, "signature": "" }), signing_key)
+    }
+
+    fn leaf_recovery_cancellation_raw(
+        actor: &DeviceIdentity,
+        request_id: [u8; 16],
+        signing_key: &SigningKey,
+    ) -> Vec<u8> {
+        let kind = SignedMutationKind::LeafRecoveryCancellation;
+        let body = merge(
+            envelope_fields(kind, actor, signing_key),
+            json!({
+                "recoveryRequestId": Uuid::from_bytes(request_id).hyphenated().to_string(),
+            }),
+        );
+        resign_signed_wrapper(json!({ "body": body, "signature": "" }), signing_key)
+    }
+
+    fn welcome_response_raw(
+        kind: SignedMutationKind,
+        coordinate: &PublicGroupSnapshotCoordinate,
+        actor: &DeviceIdentity,
+        welcome_id: [u8; 16],
+        signing_key: &SigningKey,
+    ) -> Vec<u8> {
+        let mut fields = json!({
+            "welcomeId": Uuid::from_bytes(welcome_id).hyphenated().to_string(),
+            "coordinates": coordinate_json(coordinate),
+            "transitionSeq": 3,
+        });
+        // `welcomeRejectionBody` requires a `reason` enum field that the
+        // acknowledgement body does not carry (lexicon `#welcomeRejectionReason`).
+        if kind == SignedMutationKind::WelcomeRejection {
+            fields["reason"] = Value::String("invalidWelcome".to_string());
+        }
+        let body = merge(envelope_fields(kind, actor, signing_key), fields);
+        resign_signed_wrapper(json!({ "body": body, "signature": "" }), signing_key)
+    }
+
+    fn all_kinds(
+        coordinate: &PublicGroupSnapshotCoordinate,
+        actor: &DeviceIdentity,
+        signing_key: &SigningKey,
+    ) -> Vec<Vec<u8>> {
+        vec![
+            leaf_recovery_request_raw(coordinate, actor, uuid_v4_bytes(0x31), signing_key),
+            leaf_recovery_cancellation_raw(actor, uuid_v4_bytes(0x32), signing_key),
+            welcome_response_raw(
+                SignedMutationKind::WelcomeAcknowledgement,
+                coordinate,
+                actor,
+                uuid_v4_bytes(0x33),
+                signing_key,
+            ),
+            welcome_response_raw(
+                SignedMutationKind::WelcomeRejection,
+                coordinate,
+                actor,
+                uuid_v4_bytes(0x34),
+                signing_key,
+            ),
+        ]
+    }
+
+    fn trusted_received_at() -> TrustedRequestInstant {
+        TrustedRequestInstant::from_canonical_for_test(
+            CanonicalTimestamp::parse(RECEIVED_AT).unwrap(),
+        )
+    }
+
+    #[test]
+    fn historical_signed_request_matches_append_time_per_kind() {
+        let conversation_id = uuid_v4_bytes(0x21);
+        let coordinate = sample_coordinate(conversation_id);
+        let signing_key = SigningKey::from_bytes(&[0x42; 32]);
+        let verifying = signing_key.verifying_key().to_bytes();
+        let actor = sample_actor();
+
+        let append = HydrationAuthority::new(conversation_id).unwrap();
+        let historical = HistoricalRehydrationAuthority::new(conversation_id, 9).unwrap();
+
+        for raw in all_kinds(&coordinate, &actor, &signing_key) {
+            let mutation = decode_and_verify_signed_mutation(&raw, &verifying).unwrap();
+            let envelope =
+                DurableSignedRequestEnvelope::new(conversation_id, &trusted_received_at()).unwrap();
+            let admitted = append.signed_request(envelope, mutation).unwrap();
+            let digest = *admitted.durable_row_digest();
+            let row =
+                || PersistedSignedRequestRow::new(conversation_id, RECEIVED_AT, digest).unwrap();
+
+            // Certified original: append-time re-hydration (head binding cfg'd out under test).
+            let certified = append
+                .hydrate_persisted_signed_request(row(), &raw, &verifying)
+                .unwrap();
+            // Read-time historical authority: MUST be byte-equal per kind.
+            let historical_evidence = historical
+                .hydrate_historical_signed_request(row(), &raw, &verifying)
+                .unwrap();
+            assert_eq!(historical_evidence, certified);
+            assert_eq!(historical_evidence, admitted);
+        }
+    }
+
+    #[test]
+    fn historical_signed_request_fails_closed() {
+        let conversation_id = uuid_v4_bytes(0x21);
+        let coordinate = sample_coordinate(conversation_id);
+        let signing_key = SigningKey::from_bytes(&[0x42; 32]);
+        let verifying = signing_key.verifying_key().to_bytes();
+        let actor = sample_actor();
+
+        let raw = leaf_recovery_request_raw(&coordinate, &actor, uuid_v4_bytes(0x31), &signing_key);
+        let mutation = decode_and_verify_signed_mutation(&raw, &verifying).unwrap();
+        let append = HydrationAuthority::new(conversation_id).unwrap();
+        let envelope =
+            DurableSignedRequestEnvelope::new(conversation_id, &trusted_received_at()).unwrap();
+        let admitted = append.signed_request(envelope, mutation).unwrap();
+        let digest = *admitted.durable_row_digest();
+        let row = || PersistedSignedRequestRow::new(conversation_id, RECEIVED_AT, digest).unwrap();
+
+        let historical = HistoricalRehydrationAuthority::new(conversation_id, 9).unwrap();
+
+        // Wrong historical key.
+        let wrong = SigningKey::from_bytes(&[0x43; 32]);
+        assert_eq!(
+            historical.hydrate_historical_signed_request(
+                row(),
+                &raw,
+                &wrong.verifying_key().to_bytes()
+            ),
+            Err(StateMachineError::InvalidHydrationAuthority)
+        );
+
+        // Signature tamper.
+        let mut signature_tamper: Value = serde_json::from_slice(&raw).unwrap();
+        signature_tamper["signature"] = Value::String(STANDARD.encode([0x99; 64]));
+        let signature_tamper = serde_json::to_vec(&signature_tamper).unwrap();
+        assert_eq!(
+            historical.hydrate_historical_signed_request(row(), &signature_tamper, &verifying),
+            Err(StateMachineError::InvalidHydrationAuthority)
+        );
+
+        // Tampered frozen-row digest.
+        let mut tampered = digest;
+        tampered[0] ^= 0x01;
+        assert_eq!(
+            historical.hydrate_historical_signed_request(
+                PersistedSignedRequestRow::new(conversation_id, RECEIVED_AT, tampered).unwrap(),
+                &raw,
+                &verifying
+            ),
+            Err(StateMachineError::InvalidHydrationAuthority)
+        );
+
+        // Wrong conversation_id (authority bound to a different conversation).
+        let other = HistoricalRehydrationAuthority::new(uuid_v4_bytes(0x55), 9).unwrap();
+        assert_eq!(
+            other.hydrate_historical_signed_request(row(), &raw, &verifying),
+            Err(StateMachineError::InvalidHydrationAuthority)
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// G1b-1b — HistoricalRehydrationAuthority, CONTROL-entry path (OQ-G1-3(a)).
+//
+// Drift fence for the two duplicated head-binding-free minters
+// (`historical_transition_evidence` / `historical_control_request_evidence`,
+// state_machine.rs) vs the certified `HydrationAuthority::transition_from_control`
+// / `control_request` (exercised end-to-end through `hydrate_persisted_control`):
+// per-mutation-kind byte-equivalence (coordinator condition 2) over ALL 13
+// control-entry kinds (10 transition arms + 3 control-request arms) + the
+// fail-closed family (condition 3, incl. the control-only `seq >= head`).
+//
+// Fixtures are the STATIC `mls_chat_contract_vectors.json` control-entry vectors
+// (the same authoritative, frozen contract vectors `chat_protocol_auth.rs`
+// drives) — NOT the crypto-wire corpus. The re-hydration path here runs only
+// `decode_and_verify_control_entry` (ed25519 + DAG-CBOR structure) + byte
+// digests; it NEVER reprocesses through OpenMLS leaf-lifetime validation
+// (`verify_genesis_group_info`, one call site: the creation planner), so this
+// suite stays green regardless of crypto-wire corpus age — it is
+// corpus-reprocessing-independent, same posture the interim gate requires.
+// The DAG-CBOR->schema-JSON reconstruction (`FixtureDagValue`) is ported
+// verbatim from `chat_protocol_auth.rs`.
+// ---------------------------------------------------------------------------
+mod historical_control_path {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use ed25519_dalek::{Signer, SigningKey};
+    use serde::de::{Deserializer, MapAccess, SeqAccess, Visitor};
+    use serde::Deserialize;
+    use serde_json::{json, Value};
+    use sha2::{Digest, Sha256};
+    use std::collections::BTreeMap;
+    use std::fmt;
+    use uuid::Uuid;
+
+    use crate::chat_protocol::state_machine::{
+        HistoricalRehydrationAuthority, HydrationAuthority, PersistedControlAuthority,
+        PersistedControlRow, StateMachineError,
+    };
+    use crate::chat_protocol::transcript::{
+        decode_and_verify_control_entry, decode_canonical_signed_mutation,
+        rebind_persisted_control_entry, VerifiedMutationProjection,
+    };
+    use crate::chat_protocol::validation::ed25519_key_id;
+
+    const CONTRACT_VECTORS: &str = include_str!("fixtures/mls_chat_contract_vectors.json");
+    const LEXICON: &str =
+        include_str!("../../lexicon/blue/catbird/chat/blue.catbird.chat.defs.json");
+
+    fn uuid_v4_bytes(byte: u8) -> [u8; 16] {
+        let mut value = [byte; 16];
+        value[6] = 0x40 | (byte & 0x0f);
+        value[8] = 0x80 | (byte & 0x3f);
+        value
+    }
+
+    // Ported verbatim from chat_protocol_auth.rs: schema-aware DAG-CBOR -> JSON
+    // so the frozen unsigned signing projection re-canonicalizes to the exact
+    // bytes the fixture signature covers (bytes -> STANDARD base64, uuid bytes ->
+    // hyphenated string, unions/objects walked by their lexicon schema).
+    enum FixtureDagValue {
+        String(String),
+        Integer(u64),
+        Bool(bool),
+        Bytes(Vec<u8>),
+        Array(Vec<Self>),
+        Map(BTreeMap<String, Self>),
+    }
+
+    impl<'de> Deserialize<'de> for FixtureDagValue {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            deserializer.deserialize_any(FixtureDagVisitor)
+        }
+    }
+
+    struct FixtureDagVisitor;
+
+    impl<'de> Visitor<'de> for FixtureDagVisitor {
+        type Value = FixtureDagValue;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("the frozen clean-chat DAG-CBOR value profile")
+        }
+
+        fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+            Ok(FixtureDagValue::Bool(value))
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+            Ok(FixtureDagValue::Integer(value))
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            u64::try_from(value)
+                .map(FixtureDagValue::Integer)
+                .map_err(|_| E::custom("negative fixture integer"))
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+            Ok(FixtureDagValue::String(value.to_owned()))
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+            Ok(FixtureDagValue::String(value))
+        }
+
+        fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E> {
+            Ok(FixtureDagValue::Bytes(value.to_vec()))
+        }
+
+        fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E> {
+            Ok(FixtureDagValue::Bytes(value))
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut values = Vec::new();
+            while let Some(value) = sequence.next_element()? {
+                values.push(value);
+            }
+            Ok(FixtureDagValue::Array(values))
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut values = BTreeMap::new();
+            while let Some((key, value)) = map.next_entry()? {
+                values.insert(key, value);
+            }
+            Ok(FixtureDagValue::Map(values))
+        }
+    }
+
+    impl FixtureDagValue {
+        fn into_json_for_schema(
+            self,
+            schema: &Value,
+            definitions: &serde_json::Map<String, Value>,
+        ) -> Value {
+            match schema["type"].as_str().unwrap() {
+                "ref" => {
+                    let definition_name =
+                        schema["ref"].as_str().unwrap().strip_prefix('#').unwrap();
+                    if matches!(definition_name, "operationId" | "deviceId") {
+                        let Self::Bytes(value) = self else {
+                            panic!("frozen UUID projection was not DAG-CBOR bytes");
+                        };
+                        Value::String(Uuid::from_slice(&value).unwrap().hyphenated().to_string())
+                    } else {
+                        self.into_json_for_schema(&definitions[definition_name], definitions)
+                    }
+                }
+                "union" => {
+                    let definition_name = {
+                        let Self::Map(values) = &self else {
+                            panic!("frozen union projection was not a DAG-CBOR map");
+                        };
+                        let Some(Self::String(type_id)) = values.get("$type") else {
+                            panic!("frozen union projection omitted its type tag");
+                        };
+                        type_id
+                            .strip_prefix("blue.catbird.chat.defs#")
+                            .unwrap()
+                            .to_owned()
+                    };
+                    let allowed = schema["refs"].as_array().unwrap().iter().any(|reference| {
+                        reference.as_str() == Some(&format!("#{definition_name}"))
+                    });
+                    assert!(allowed, "frozen union selected a disallowed type");
+                    self.into_json_for_schema(&definitions[definition_name.as_str()], definitions)
+                }
+                "object" => {
+                    let Self::Map(values) = self else {
+                        panic!("frozen object projection was not a DAG-CBOR map");
+                    };
+                    let properties = schema["properties"].as_object().unwrap();
+                    Value::Object(
+                        values
+                            .into_iter()
+                            .map(|(name, value)| {
+                                let value = if name == "$type" {
+                                    let Self::String(type_id) = value else {
+                                        panic!("frozen object type tag was not text");
+                                    };
+                                    Value::String(type_id)
+                                } else {
+                                    value.into_json_for_schema(&properties[&name], definitions)
+                                };
+                                (name, value)
+                            })
+                            .collect(),
+                    )
+                }
+                "string" => {
+                    let Self::String(value) = self else {
+                        panic!("frozen string projection was not DAG-CBOR text");
+                    };
+                    Value::String(value)
+                }
+                "bytes" => {
+                    let Self::Bytes(value) = self else {
+                        panic!("frozen byte projection was not DAG-CBOR bytes");
+                    };
+                    Value::String(STANDARD.encode(value))
+                }
+                "integer" => {
+                    let Self::Integer(value) = self else {
+                        panic!("frozen integer projection was not a DAG-CBOR integer");
+                    };
+                    json!(value)
+                }
+                "boolean" => {
+                    let Self::Bool(value) = self else {
+                        panic!("frozen boolean projection was not a DAG-CBOR boolean");
+                    };
+                    json!(value)
+                }
+                "array" => {
+                    let Self::Array(values) = self else {
+                        panic!("frozen array projection was not a DAG-CBOR array");
+                    };
+                    Value::Array(
+                        values
+                            .into_iter()
+                            .map(|value| value.into_json_for_schema(&schema["items"], definitions))
+                            .collect(),
+                    )
+                }
+                other => panic!("unsupported frozen fixture schema type {other}"),
+            }
+        }
+    }
+
+    struct ControlCase {
+        entry_kind: String,
+        cid: [u8; 16],
+        seq: u64,
+        public_row_json: Vec<u8>,
+        raw_wrapper: Vec<u8>,
+        public_key: Vec<u8>,
+        outer_projection: Vec<u8>,
+        server_fields_dag_cbor: Vec<u8>,
+        outer_fingerprint: [u8; 32],
+        durable_row_digest: [u8; 32],
+    }
+
+    impl ControlCase {
+        fn row(&self) -> PersistedControlRow {
+            PersistedControlRow::new(
+                self.public_row_json.clone(),
+                self.raw_wrapper.clone(),
+                self.outer_projection.clone(),
+                self.server_fields_dag_cbor.clone(),
+                self.outer_fingerprint,
+                self.durable_row_digest,
+            )
+            .unwrap()
+        }
+    }
+
+    /// Re-signs a `{body, signature}` wrapper with the test key over the exact
+    /// canonical transcript the strict decoder derives (mirrors the signed-path
+    /// `resign_signed_wrapper`).
+    fn resign(mut wrapper: Value, signing_key: &SigningKey) -> Vec<u8> {
+        wrapper["signature"] = Value::String(STANDARD.encode([0u8; 64]));
+        let unsigned = serde_json::to_vec(&wrapper).unwrap();
+        let canonical = decode_canonical_signed_mutation(&unsigned).unwrap();
+        wrapper["signature"] = Value::String(
+            STANDARD.encode(signing_key.sign(canonical.transcript_bytes()).to_bytes()),
+        );
+        serde_json::to_vec(&wrapper).unwrap()
+    }
+
+    /// Repairs the internal digests the semantic transition parse recomputes, so
+    /// a placeholder-hash contract vector becomes a byte-consistent body:
+    /// - every artifact `{bytes, sha256}` (commit / genesisGroupInfo) gets
+    ///   `sha256 = sha256(bytes)` (`checked_artifact_sha256`);
+    /// - a metadata snapshot's `ciphertextSha256`/`ciphertextSize` are rebound to
+    ///   its `ciphertext` (`parse_metadata_snapshot`);
+    /// - a metadata `authorProof`'s `authorKeyId` is rebound to
+    ///   `ed25519_key_id(signaturePublicKey)` (the derivation the parser checks).
+    /// Everything else — coordinates, manifests, actor identity, server fields —
+    /// is left verbatim.
+    fn repair_body_digests(value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                if let (Some(Value::String(bytes_b64)), true) =
+                    (map.get("bytes").cloned(), map.contains_key("sha256"))
+                {
+                    if let Ok(bytes) = STANDARD.decode(&bytes_b64) {
+                        map.insert(
+                            "sha256".to_string(),
+                            json!(STANDARD.encode(Sha256::digest(&bytes))),
+                        );
+                    }
+                }
+                if let (Some(Value::String(cipher_b64)), true) = (
+                    map.get("ciphertext").cloned(),
+                    map.contains_key("ciphertextSha256"),
+                ) {
+                    if let Ok(bytes) = STANDARD.decode(&cipher_b64) {
+                        map.insert(
+                            "ciphertextSha256".to_string(),
+                            json!(STANDARD.encode(Sha256::digest(&bytes))),
+                        );
+                        map.insert("ciphertextSize".to_string(), json!(bytes.len()));
+                    }
+                }
+                if let (Some(Value::String(pk_b64)), true) = (
+                    map.get("signaturePublicKey").cloned(),
+                    map.contains_key("authorKeyId"),
+                ) {
+                    if let Ok(pk) = STANDARD.decode(&pk_b64) {
+                        if let Ok(pk) = <[u8; 32]>::try_from(pk.as_slice()) {
+                            map.insert(
+                                "authorKeyId".to_string(),
+                                json!(ed25519_key_id(&pk).unwrap().as_str()),
+                            );
+                        }
+                    }
+                }
+                // A metadata snapshot's authorProof.originTransitionId must equal
+                // the snapshot's own originTransitionId (`parse_metadata_snapshot`).
+                if let (Some(origin), true) = (
+                    map.get("originTransitionId").cloned(),
+                    map.get("authorProof")
+                        .map(Value::is_object)
+                        .unwrap_or(false),
+                ) {
+                    if let Some(Value::Object(proof)) = map.get_mut("authorProof") {
+                        proof.insert("originTransitionId".to_string(), origin);
+                    }
+                }
+                for child in map.values_mut() {
+                    repair_body_digests(child);
+                }
+            }
+            Value::Array(items) => {
+                for child in items.iter_mut() {
+                    repair_body_digests(child);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Rebuild every frozen control-entry vector into a durable row + the
+    // append-time-minted digest that the row must carry.
+    fn build_cases() -> Vec<ControlCase> {
+        let fixture: Value = serde_json::from_str(CONTRACT_VECTORS).unwrap();
+        let contract: Value = serde_json::from_str(LEXICON).unwrap();
+        let definitions = contract["defs"].as_object().unwrap();
+        let cef = &fixture["controlEntryFingerprints"];
+
+        // One test signer re-signs every rebuilt body; the historical public key
+        // handed to the re-hydration authorities is therefore this test key.
+        let signing_key = SigningKey::from_bytes(&[0x24; 32]);
+        let verifying = signing_key.verifying_key().to_bytes();
+
+        let mut cases = Vec::new();
+        for case in cef["cases"].as_array().unwrap() {
+            let body_cbor = hex::decode(
+                case["unsignedSigningProjectionCanonicalDagCborHex"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            let body: FixtureDagValue = serde_ipld_dagcbor::from_slice(&body_cbor).unwrap();
+            let signed_name = case["signedRequestRef"]
+                .as_str()
+                .unwrap()
+                .strip_prefix("blue.catbird.chat.defs#")
+                .unwrap();
+            let body_name = definitions[signed_name]["properties"]["body"]["refs"][0]
+                .as_str()
+                .unwrap()
+                .strip_prefix('#')
+                .unwrap();
+            let mut signing_body = body.into_json_for_schema(&definitions[body_name], definitions);
+            // The contract vectors carry PLACEHOLDER artifact/metadata digests and
+            // are signed by keys whose privates we do not hold — they validate at
+            // the wire/fingerprint layer only (all `chat_protocol_auth.rs` checks),
+            // never through the semantic transition parse. Reuse them as STRUCTURAL
+            // templates: repair every internal digest so `transition_from_control`
+            // accepts them, rebind the signer key id to our test key, and re-sign.
+            // The frozen server fields (close tombstone / acceptance recovery) stay
+            // internally consistent because the actor DID/device, seq, receivedAt,
+            // conversation id, and retired coordinate are all kept verbatim.
+            repair_body_digests(&mut signing_body);
+            signing_body["keyId"] = json!(ed25519_key_id(&verifying).unwrap().as_str());
+            let raw_wrapper = resign(
+                json!({ "body": signing_body, "signature": "" }),
+                &signing_key,
+            );
+            let signed_request: Value = serde_json::from_slice(&raw_wrapper).unwrap();
+
+            let mut row = json!({
+                "$type": case["entryKind"],
+                "entryId": case["entryId"],
+                "conversationId": case["conversationId"],
+                "seq": case["seq"],
+                "signedRequest": signed_request,
+                "receivedAt": case["receivedAt"],
+            });
+            row.as_object_mut().unwrap().extend(
+                case["serverFields"]
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone())),
+            );
+            let public_row_json = serde_json::to_vec(&row).unwrap();
+            let public_key = verifying.to_vec();
+
+            let decoded = decode_and_verify_control_entry(&public_row_json, &public_key).unwrap();
+            let outer_projection = decoded.outer_control_projection().to_vec();
+            let outer_fingerprint = *decoded.outer_control_fingerprint();
+            let server_fields_dag_cbor = decoded.server_fields_dag_cbor().unwrap();
+            let cid = *Uuid::parse_str(case["conversationId"].as_str().unwrap())
+                .unwrap()
+                .as_bytes();
+            let seq = case["seq"].as_u64().unwrap();
+
+            // The row's durable digest is whatever the certified APPEND-TIME
+            // minter produces (head guards cfg'd out under test). Historical
+            // re-hydration MUST reproduce the identical evidence + digest.
+            let entry_for_digest = rebind_persisted_control_entry(
+                decode_and_verify_control_entry(&public_row_json, &public_key).unwrap(),
+                &raw_wrapper,
+                &public_key,
+            )
+            .unwrap();
+            let append = HydrationAuthority::new(cid).unwrap();
+            // The certified append-time minter fixes the digest the row must
+            // carry. For the metadata-bearing arms it currently ERRORS before
+            // any digest is produced (dormant certified defect: parse_metadata_
+            // snapshot reads metadataCryptoContext.conversationId — lexicon
+            // #identifierBytes → CanonicalValueRef::Bytes — with closed_uuid,
+            // which only matches CanonicalValueRef::Uuid). Those rows still drive
+            // the equivalence test: both the historical and append-time paths
+            // reject them IDENTICALLY at that shared call, before the digest is
+            // consulted, so a placeholder digest is sound and the per-kind Result
+            // comparison still fences drift. See historical_control_matches_
+            // append_time_per_kind.
+            let minted = match entry_for_digest.mutation().projection() {
+                VerifiedMutationProjection::ResetRequest(_)
+                | VerifiedMutationProjection::LeaveRequest(_)
+                | VerifiedMutationProjection::LeaveCancellation(_) => append
+                    .control_request(entry_for_digest)
+                    .map(|e| *e.durable_row_digest()),
+                _ => append
+                    .control_transition(entry_for_digest)
+                    .map(|e| *e.durable_row_digest()),
+            };
+            let durable_row_digest = minted.unwrap_or([0x11; 32]);
+
+            cases.push(ControlCase {
+                entry_kind: case["entryKind"].as_str().unwrap().to_owned(),
+                cid,
+                seq,
+                public_row_json,
+                raw_wrapper,
+                public_key,
+                outer_projection,
+                server_fields_dag_cbor,
+                outer_fingerprint,
+                durable_row_digest,
+            });
+        }
+        cases
+    }
+
+    // Kinds whose transition body carries a `metadataSnapshot`. These currently
+    // FAIL the shared certified `parse_metadata_snapshot` (dormant defect noted
+    // in `build_cases`); both the historical and append-time paths reject them
+    // identically. Non-metadata kinds mint full evidence and compare Ok==Ok.
+    fn is_metadata_bearing(entry_kind: &str) -> bool {
+        [
+            "commitEntry",
+            "metadataEntry",
+            "creationEntry",
+            "resetActivationEntry",
+            "leafRecoveryFulfillmentEntry",
+            "leaveCommitFulfillmentEntry",
+        ]
+        .iter()
+        .any(|k| entry_kind.ends_with(k))
+    }
+
+    fn is_control_request(entry_kind: &str) -> bool {
+        [
+            "resetRequestEntry",
+            "leaveRequestEntry",
+            "leaveCancellationEntry",
+        ]
+        .iter()
+        .any(|k| entry_kind.ends_with(k))
+    }
+
+    #[test]
+    fn historical_control_matches_append_time_per_kind() {
+        let cases = build_cases();
+        // All 13 control-entry kinds: 10 transition arms + 3 control-request arms.
+        assert_eq!(cases.len(), 13);
+        let mut successful = 0usize;
+        for case in &cases {
+            let append = HydrationAuthority::new(case.cid).unwrap();
+            let certified = append.hydrate_persisted_control(case.row(), &case.public_key);
+            // Read-time historical authority: byte-equal per kind (Result vs
+            // Result), with the head bound far above the entry seq so the strict
+            // `seq < head` holds. This is the drift fence: any divergence between
+            // the duplicated head-binding-free minters and the certified originals
+            // — success OR error path — makes the Results differ.
+            let historical = HistoricalRehydrationAuthority::new(case.cid, case.seq + 1_000_000)
+                .unwrap()
+                .hydrate_historical_control(case.row(), &case.public_key);
+            assert_eq!(historical, certified, "kind {}", case.entry_kind);
+
+            match &historical {
+                Ok(authority) => {
+                    successful += 1;
+                    // Non-metadata kinds must SUCCEED and produce the variant the
+                    // aggregate consumes.
+                    assert!(
+                        !is_metadata_bearing(&case.entry_kind),
+                        "metadata-bearing {} unexpectedly succeeded — did the \
+                         parse_metadata_snapshot defect get fixed? upgrade this \
+                         test to assert full evidence for it",
+                        case.entry_kind
+                    );
+                    let is_request = matches!(authority, PersistedControlAuthority::Request(_));
+                    assert_eq!(
+                        is_request,
+                        is_control_request(&case.entry_kind),
+                        "authority variant mismatch for {}",
+                        case.entry_kind
+                    );
+                }
+                Err(StateMachineError::InvalidHydrationAuthority) => {
+                    // Only the known metadata-bearing arms may error here, and only
+                    // because of the shared certified parse_metadata_snapshot defect.
+                    assert!(
+                        is_metadata_bearing(&case.entry_kind),
+                        "unexpected hydration error for non-metadata kind {}",
+                        case.entry_kind
+                    );
+                }
+                Err(other) => panic!("unexpected error {other:?} for {}", case.entry_kind),
+            }
+        }
+        // Full-evidence equivalence proven for every non-metadata arm (7 of 13:
+        // policy, participantAcceptance, conversationClose, zeroLeafLeave +
+        // resetRequest, leaveRequest, leaveCancellation).
+        assert_eq!(
+            successful, 7,
+            "expected 7 non-metadata kinds to mint evidence"
+        );
+    }
+
+    #[test]
+    fn historical_control_fails_closed() {
+        let cases = build_cases();
+        // A transition-kind case (commitEntry, seq 42) drives the fail-closed
+        // family; the seq >= head arm is the control-only global constraint.
+        let case = cases
+            .iter()
+            .find(|c| c.entry_kind.ends_with("commitEntry"))
+            .expect("commit control vector present");
+
+        // Tampered frozen-row digest.
+        let mut tampered = case.durable_row_digest;
+        tampered[0] ^= 0x01;
+        let good_head = HistoricalRehydrationAuthority::new(case.cid, case.seq + 10).unwrap();
+        assert_eq!(
+            good_head.hydrate_historical_control(
+                PersistedControlRow::new(
+                    case.public_row_json.clone(),
+                    case.raw_wrapper.clone(),
+                    case.outer_projection.clone(),
+                    case.server_fields_dag_cbor.clone(),
+                    case.outer_fingerprint,
+                    tampered,
+                )
+                .unwrap(),
+                &case.public_key,
+            ),
+            Err(StateMachineError::InvalidHydrationAuthority)
+        );
+
+        // Wrong conversation_id: authority bound to a different conversation.
+        let other =
+            HistoricalRehydrationAuthority::new(uuid_v4_bytes(0x55), case.seq + 10).unwrap();
+        assert_eq!(
+            other.hydrate_historical_control(case.row(), &case.public_key),
+            Err(StateMachineError::InvalidHydrationAuthority)
+        );
+
+        // Control-only global constraint: entry seq NOT strictly below the head.
+        let at_head = HistoricalRehydrationAuthority::new(case.cid, case.seq).unwrap();
+        assert_eq!(
+            at_head.hydrate_historical_control(case.row(), &case.public_key),
+            Err(StateMachineError::InvalidHydrationAuthority)
+        );
+
+        // Signature failure: verified under the wrong historical key.
+        let wrong_key = [0x11_u8; 32];
+        assert_eq!(
+            good_head.hydrate_historical_control(case.row(), &wrong_key),
+            Err(StateMachineError::InvalidHydrationAuthority)
+        );
+    }
+}

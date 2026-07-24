@@ -3355,6 +3355,469 @@ pub(crate) enum PersistedControlAuthority {
     Request(RequestEvidence),
 }
 
+/// Read-time authority that re-mints sealed evidence for HISTORICAL graph rows
+/// during existing-conversation hydration (G1b). It is a DISTINCT, non-
+/// substitutable counterpart of `HydrationAuthority` (OQ-G1-3 ruling (a)): the
+/// append-time authority binds each entry to the locked head
+/// (`seq == expected_next_entry_seq && received_at == locked_at &&
+/// prior == expected_prior`), which by construction only the single head entry
+/// can satisfy. Historical graph rows were produced by MANY past transitions at
+/// earlier seqs, so they are re-verified here instead — through the SAME
+/// `decode_and_verify_control_entry`/`decode_and_verify_signed_mutation`
+/// pipelines (ed25519 + DAG-CBOR structure NEVER skipped) — but bound to each
+/// entry's OWN signature-covered `seq`/`received_at`/prior plus the cheap
+/// under-lock global constraint that a control entry's `seq` is strictly below
+/// the locked head's `next_entry_seq` (a historical row cannot be at/after the
+/// head). Digest-trust without re-verification (option (b)) was REJECTED.
+pub(crate) struct HistoricalRehydrationAuthority {
+    expected_conversation_id: [u8; 16],
+    /// Upper bound for the control-entry `seq < head` global constraint. Read
+    /// only by the control-entry path (`hydrate_historical_control`); unused by
+    /// the signed-request path (signed requests carry no entry seq).
+    head_next_entry_seq: u64,
+}
+
+impl HistoricalRehydrationAuthority {
+    /// Production constructor: binds the read-time authority to an EXISTING
+    /// locked head (`prior_coordinate` = `Some`, `next_entry_seq >= 2`). The
+    /// head's `next_entry_seq` becomes the strict upper bound for historical
+    /// control-entry seqs.
+    #[cfg(not(test))]
+    #[allow(dead_code)]
+    pub(crate) fn from_locked_head(
+        head: &LockedConversationHeadGuard,
+    ) -> Result<Self, StateMachineError> {
+        if head.prior_coordinate().is_none() || head.next_entry_seq() < 2 {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
+        Ok(Self {
+            expected_conversation_id: *head.conversation_id().as_bytes(),
+            head_next_entry_seq: head.next_entry_seq(),
+        })
+    }
+
+    /// Test seam mirroring `HydrationAuthority::new`. `head_next_entry_seq` is
+    /// the strict upper bound the control-entry path enforces.
+    #[cfg(test)]
+    pub(crate) fn new(
+        expected_conversation_id: [u8; 16],
+        head_next_entry_seq: u64,
+    ) -> Result<Self, StateMachineError> {
+        if !is_uuid_v4(&expected_conversation_id) || head_next_entry_seq < 2 {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
+        Ok(Self {
+            expected_conversation_id,
+            head_next_entry_seq,
+        })
+    }
+
+    /// Re-mints a persisted non-control signed request for the historical graph.
+    /// Mirrors `HydrationAuthority::hydrate_persisted_signed_request`
+    /// (state_machine.rs) EXACTLY, minus the append-time
+    /// `received_at == locked_at` head-binding check: the stored `received_at`
+    /// (which participates in the frozen row digest) is re-derived from the
+    /// entry itself. Signed requests carry no entry seq, so the `seq < head`
+    /// constraint does not apply here. Drift fence: the cfg(test)
+    /// `historical_signed_request_matches_append_time_per_kind` equivalence test.
+    #[allow(dead_code)]
+    pub(crate) fn hydrate_historical_signed_request(
+        &self,
+        row: PersistedSignedRequestRow,
+        raw_signed_request: &[u8],
+        historical_public_key: &[u8],
+    ) -> Result<RequestEvidence, StateMachineError> {
+        let PersistedSignedRequestRow {
+            conversation_id,
+            received_at,
+            durable_row_digest,
+        } = row;
+        let envelope = DurableSignedRequestEnvelope {
+            conversation_id,
+            received_at: canonical_server_timestamp(&received_at)?,
+        };
+        let mutation = decode_and_verify_signed_mutation(raw_signed_request, historical_public_key)
+            .map_err(|_| StateMachineError::InvalidHydrationAuthority)?;
+        let evidence =
+            historical_signed_request_evidence(envelope, mutation, &self.expected_conversation_id)?;
+        if evidence.durable_row_digest != durable_row_digest {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
+        Ok(evidence)
+    }
+
+    /// Re-mints a persisted CONTROL-entry row for the historical graph. Mirrors
+    /// `HydrationAuthority::hydrate_persisted_control` (state_machine.rs) EXACTLY
+    /// through the shared crypto — `decode_and_verify_control_entry`
+    /// (transcript.rs) + the four frozen outer-row equality checks
+    /// (conversation_id / outer projection / outer fingerprint / server-fields
+    /// DAG-CBOR) + `rebind_persisted_control_entry` (transcript.rs) — then
+    /// dispatches to the head-binding-free `historical_control_request_evidence`
+    /// / `historical_transition_evidence` duplicates instead of the append-time
+    /// minters. This is the ONLY reader of `head_next_entry_seq`: a control
+    /// entry's own signature-covered `seq` must be STRICTLY below the locked
+    /// head's `next_entry_seq` (a historical row cannot be at or after the head).
+    /// Drift fence: the cfg(test)
+    /// `historical_control_matches_append_time_per_kind` equivalence test.
+    #[allow(dead_code)]
+    pub(crate) fn hydrate_historical_control(
+        &self,
+        row: PersistedControlRow,
+        historical_public_key: &[u8],
+    ) -> Result<PersistedControlAuthority, StateMachineError> {
+        let PersistedControlRow {
+            public_row_json,
+            raw_signed_wrapper,
+            outer_control_projection,
+            server_fields_dag_cbor,
+            outer_entry_fingerprint,
+            durable_row_digest,
+        } = row;
+        let decoded = decode_and_verify_control_entry(&public_row_json, historical_public_key)
+            .map_err(|_| StateMachineError::InvalidHydrationAuthority)?;
+        if decoded.conversation_id().as_bytes() != &self.expected_conversation_id
+            || decoded.outer_control_projection() != outer_control_projection
+            || decoded.outer_control_fingerprint() != &outer_entry_fingerprint
+            || decoded
+                .server_fields_dag_cbor()
+                .map_err(|_| StateMachineError::InvalidHydrationAuthority)?
+                != server_fields_dag_cbor
+        {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
+        let entry =
+            rebind_persisted_control_entry(decoded, &raw_signed_wrapper, historical_public_key)
+                .map_err(|_| StateMachineError::InvalidHydrationAuthority)?;
+        // Global under-lock constraint (control entries only — they carry a seq):
+        // a historical control entry MUST sit strictly below the locked head.
+        if entry.seq() >= self.head_next_entry_seq {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
+        match entry.mutation().projection() {
+            VerifiedMutationProjection::ResetRequest(_)
+            | VerifiedMutationProjection::LeaveRequest(_)
+            | VerifiedMutationProjection::LeaveCancellation(_) => {
+                let evidence =
+                    historical_control_request_evidence(entry, &self.expected_conversation_id)?;
+                if evidence.durable_row_digest != durable_row_digest {
+                    return Err(StateMachineError::InvalidHydrationAuthority);
+                }
+                Ok(PersistedControlAuthority::Request(evidence))
+            }
+            _ => {
+                let evidence =
+                    historical_transition_evidence(&entry, &self.expected_conversation_id)?;
+                if evidence.durable_row_digest != durable_row_digest {
+                    return Err(StateMachineError::InvalidHydrationAuthority);
+                }
+                Ok(PersistedControlAuthority::Transition(evidence))
+            }
+        }
+    }
+}
+
+/// Head-binding-free duplicate of `HydrationAuthority::signed_request`
+/// (state_machine.rs) — the request-kind match + embedded-conversation check +
+/// evidence minting, MINUS the append-time head guards (`received_at ==
+/// locked_at`; `prior == expected_prior`). Every helper (`closed_*`,
+/// `durable_signed_request_row_digest`, `request_evidence_from_verified`) is the
+/// same certified free fn the original calls. The trailing `_ =>` wildcard
+/// mirrors the original (sm `signed_request`, which is not exhaustive over
+/// `VerifiedMutationProjection`); drift is fenced by the per-kind cfg(test)
+/// equivalence test, not by exhaustiveness. Read-time only; NEVER used at append
+/// time (that path keeps its head binding).
+#[allow(dead_code)]
+fn historical_signed_request_evidence(
+    envelope: DurableSignedRequestEnvelope,
+    mutation: VerifiedSignedMutation,
+    expected_conversation_id: &[u8; 16],
+) -> Result<RequestEvidence, StateMachineError> {
+    if &envelope.conversation_id != expected_conversation_id {
+        return Err(StateMachineError::InvalidHydrationAuthority);
+    }
+    let (kind, request_id, body, body_binding) = match mutation.projection() {
+        VerifiedMutationProjection::LeafRecoveryRequest(value) => (
+            RequestEntryKind::LeafRecoveryRequest,
+            *value.recovery_request_id().as_bytes(),
+            value.body(),
+            RequestBodyBinding::LeafRecoveryRequest {
+                prior: closed_coordinate(&value.prior())?,
+                kind: match value.recovery_kind() {
+                    "add" => LeafRecoveryKind::Add,
+                    "replace" => LeafRecoveryKind::Replace,
+                    _ => return Err(StateMachineError::InvalidHydrationAuthority),
+                },
+            },
+        ),
+        VerifiedMutationProjection::LeafRecoveryCancellation(value) => (
+            RequestEntryKind::LeafRecoveryCancellation,
+            *value.recovery_request_id().as_bytes(),
+            value.body(),
+            RequestBodyBinding::LeafRecoveryCancellation,
+        ),
+        VerifiedMutationProjection::WelcomeAcknowledgement(value) => (
+            RequestEntryKind::WelcomeAcknowledgement,
+            closed_uuid(&value.body(), "welcomeId")?,
+            value.body(),
+            RequestBodyBinding::WelcomeResponse {
+                coordinates: closed_coordinate_from_field(&value.body(), "coordinates")?,
+                transition_seq: closed_integer(&value.body(), "transitionSeq")?,
+            },
+        ),
+        VerifiedMutationProjection::WelcomeRejection(value) => (
+            RequestEntryKind::WelcomeRejection,
+            closed_uuid(&value.body(), "welcomeId")?,
+            value.body(),
+            RequestBodyBinding::WelcomeResponse {
+                coordinates: closed_coordinate_from_field(&value.body(), "coordinates")?,
+                transition_seq: closed_integer(&value.body(), "transitionSeq")?,
+            },
+        ),
+        _ => return Err(StateMachineError::InvalidHydrationAuthority),
+    };
+    let embedded_conversation_id = match kind {
+        RequestEntryKind::LeafRecoveryRequest => {
+            Some(closed_coordinate_conversation_id(body, "prior")?)
+        }
+        RequestEntryKind::LeafRecoveryCancellation => None,
+        RequestEntryKind::WelcomeAcknowledgement | RequestEntryKind::WelcomeRejection => {
+            Some(closed_coordinate_conversation_id(body, "coordinates")?)
+        }
+        _ => return Err(StateMachineError::InvalidHydrationAuthority),
+    };
+    if embedded_conversation_id
+        .is_some_and(|conversation_id| &conversation_id != expected_conversation_id)
+    {
+        return Err(StateMachineError::InvalidHydrationAuthority);
+    }
+    let durable_row_digest =
+        durable_signed_request_row_digest(kind, &envelope, &request_id, &mutation)?;
+    request_evidence_from_verified(
+        kind,
+        None,
+        &envelope.conversation_id,
+        None,
+        None,
+        None,
+        &request_id,
+        envelope.received_at,
+        durable_row_digest,
+        &mutation,
+        body_binding,
+    )
+}
+
+/// Head-binding-free duplicate of `HydrationAuthority::transition_from_control`
+/// (state_machine.rs) — the full transition-kind match + route-bind check +
+/// evidence minting, MINUS the append-time head guards (`seq ==
+/// expected_next_entry_seq`; `received_at == locked_at`; `prior ==
+/// expected_prior`). Every helper (`parse_*`, `closed_coordinate`,
+/// `checked_artifact_sha256`, `commit_aad_sha256`,
+/// `transition_binding_is_route_bound`, `validate_special_server_fields`,
+/// `authenticated_entry`, `durable_control_transition_row_digest`) is the same
+/// certified free fn the original calls; the evidence fields already use
+/// `entry.seq()` / `entry.received_at()` verbatim, so removing the head guards
+/// is the ONLY difference. The trailing `_ =>` wildcard mirrors the original
+/// (not exhaustive over `VerifiedMutationProjection` — it accepts only
+/// transition kinds); drift is fenced by the per-kind cfg(test)
+/// `historical_control_matches_append_time_per_kind` equivalence test, not by
+/// exhaustiveness. Read-time only; NEVER used at append time.
+#[allow(dead_code)]
+fn historical_transition_evidence(
+    entry: &VerifiedControlEntry,
+    expected_conversation_id: &[u8; 16],
+) -> Result<TransitionEvidence, StateMachineError> {
+    if entry.conversation_id().as_bytes() != expected_conversation_id {
+        return Err(StateMachineError::InvalidHydrationAuthority);
+    }
+    let (transition_id, body_binding) = match entry.mutation().projection() {
+        VerifiedMutationProjection::Creation(value) => (
+            *value.transition_id().as_bytes(),
+            TransitionBodyBinding::Creation {
+                kind: parse_conversation_kind(value.conversation_kind())?,
+                next: closed_coordinate(&value.next())?,
+                manifest: parse_roster_manifest(&value.manifest())?,
+                group_info_sha256: checked_artifact_sha256(&value.genesis_group_info())?,
+                metadata: parse_metadata_snapshot(&value.metadata_snapshot())?,
+            },
+        ),
+        VerifiedMutationProjection::CommitTransition(value) => (
+            *value.transition_id().as_bytes(),
+            TransitionBodyBinding::Commit {
+                prior: closed_coordinate(&value.prior())?,
+                next: closed_coordinate(&value.next())?,
+                aad_digest: commit_aad_sha256(&value.aad()),
+                manifest: parse_transition_manifest(&value.manifest())?,
+                commit_sha256: checked_artifact_sha256(&value.commit())?,
+                metadata: parse_metadata_snapshot(&value.metadata_snapshot())?,
+            },
+        ),
+        VerifiedMutationProjection::PolicyTransition(value) => (
+            *value.transition_id().as_bytes(),
+            TransitionBodyBinding::Policy {
+                prior: closed_coordinate(&value.prior())?,
+                next: closed_coordinate(&value.next())?,
+                participant_changes: parse_participant_changes(value.participant_changes())?,
+            },
+        ),
+        VerifiedMutationProjection::ParticipantAcceptance(value) => (
+            *value.transition_id().as_bytes(),
+            TransitionBodyBinding::Acceptance {
+                prior: closed_coordinate(&value.prior())?,
+                next: closed_coordinate(&value.next())?,
+                recovery_request_id: *value.recovery_request_id().as_bytes(),
+                invitation_provenance: parse_invitation(&value.invitation_provenance())?,
+                recovery: parse_acceptance_recovery(&entry.server_fields())?,
+            },
+        ),
+        VerifiedMutationProjection::MetadataTransition(value) => (
+            *value.transition_id().as_bytes(),
+            TransitionBodyBinding::Metadata {
+                prior: closed_coordinate(&value.prior())?,
+                next: closed_coordinate(&value.next())?,
+                metadata: parse_metadata_snapshot(&value.metadata_snapshot())?,
+            },
+        ),
+        VerifiedMutationProjection::ResetActivation(value) => (
+            *value.transition_id().as_bytes(),
+            TransitionBodyBinding::ResetActivation {
+                kind: parse_conversation_kind(value.conversation_kind())?,
+                reset_request_id: *value.reset_request_id().as_bytes(),
+                prior: closed_coordinate(&value.prior())?,
+                retired: closed_coordinate(&value.retired())?,
+                successor: closed_coordinate(&value.successor())?,
+                manifest: parse_roster_manifest(&value.manifest())?,
+                group_info_sha256: checked_artifact_sha256(&value.genesis_group_info())?,
+                metadata: parse_metadata_snapshot(&value.metadata_snapshot())?,
+            },
+        ),
+        VerifiedMutationProjection::LeafRecoveryFulfillment(value) => (
+            *value.transition_id().as_bytes(),
+            TransitionBodyBinding::LeafRecoveryFulfillment {
+                recovery_request_id: *value.recovery_request_id().as_bytes(),
+                prior: closed_coordinate(&value.prior())?,
+                next: closed_coordinate(&value.next())?,
+                aad_digest: commit_aad_sha256(&value.aad()),
+                manifest: parse_transition_manifest(&value.manifest())?,
+                commit_sha256: checked_artifact_sha256(&value.commit())?,
+                metadata: parse_metadata_snapshot(&value.metadata_snapshot())?,
+            },
+        ),
+        VerifiedMutationProjection::ConversationClose(value) => (
+            *value.transition_id().as_bytes(),
+            TransitionBodyBinding::ConversationClose {
+                kind: parse_conversation_kind(value.conversation_kind())?,
+                prior: closed_coordinate(&value.prior())?,
+                retired: closed_coordinate(&value.retired())?,
+            },
+        ),
+        VerifiedMutationProjection::ZeroLeafLeave(value) => (
+            *value.transition_id().as_bytes(),
+            TransitionBodyBinding::ZeroLeafLeave {
+                prior: closed_coordinate(&value.prior())?,
+                next: closed_coordinate(&value.next())?,
+            },
+        ),
+        VerifiedMutationProjection::LeaveCommitFulfillment(value) => (
+            *value.transition_id().as_bytes(),
+            TransitionBodyBinding::LeaveCommitFulfillment {
+                leave_request_id: *value.leave_request_id().as_bytes(),
+                prior: closed_coordinate(&value.prior())?,
+                next: closed_coordinate(&value.next())?,
+                aad_digest: commit_aad_sha256(&value.aad()),
+                manifest: parse_transition_manifest(&value.manifest())?,
+                commit_sha256: checked_artifact_sha256(&value.commit())?,
+                metadata: parse_metadata_snapshot(&value.metadata_snapshot())?,
+            },
+        ),
+        _ => return Err(StateMachineError::InvalidHydrationAuthority),
+    };
+    if !transition_binding_is_route_bound(&body_binding, expected_conversation_id) {
+        return Err(StateMachineError::InvalidHydrationAuthority);
+    }
+    validate_special_server_fields(entry, &body_binding)?;
+    let mut evidence = TransitionEvidence {
+        seq: entry.seq(),
+        transition_id,
+        outer_entry_fingerprint: *entry.outer_control_fingerprint(),
+        outer_control_projection: entry.outer_control_projection().to_vec(),
+        server_fields_dag_cbor: entry
+            .server_fields_dag_cbor()
+            .map_err(|_| StateMachineError::InvalidHydrationAuthority)?,
+        durable_row_digest: [0; 32],
+        received_at: canonical_server_timestamp(entry.received_at())?,
+        authority: Some(authenticated_entry(
+            Some(entry.entry_id().as_bytes()),
+            Some(entry.conversation_id().as_bytes()),
+            entry.mutation(),
+        )?),
+        body_binding: Some(body_binding),
+    };
+    evidence.durable_row_digest = durable_control_transition_row_digest(&evidence)?;
+    Ok(evidence)
+}
+
+/// Head-binding-free duplicate of `HydrationAuthority::control_request`
+/// (state_machine.rs) — the request-kind match + evidence minting, MINUS the
+/// append-time head guards (`seq == expected_next_entry_seq`; `received_at ==
+/// locked_at`; `prior == expected_prior`). Reuses the same certified
+/// `request_evidence_from_verified` free fn. The trailing `_ =>` wildcard
+/// mirrors the original (not exhaustive over `VerifiedMutationProjection` — it
+/// accepts only the three control-request kinds); drift is fenced by the
+/// per-kind cfg(test) `historical_control_matches_append_time_per_kind`
+/// equivalence test, not by exhaustiveness. Read-time only; NEVER used at append
+/// time.
+#[allow(dead_code)]
+fn historical_control_request_evidence(
+    entry: VerifiedControlEntry,
+    expected_conversation_id: &[u8; 16],
+) -> Result<RequestEvidence, StateMachineError> {
+    if entry.conversation_id().as_bytes() != expected_conversation_id {
+        return Err(StateMachineError::InvalidHydrationAuthority);
+    }
+    let (kind, request_id, body_binding) = match entry.mutation().projection() {
+        VerifiedMutationProjection::ResetRequest(value) => (
+            RequestEntryKind::ResetRequest,
+            value.reset_request_id(),
+            RequestBodyBinding::ResetRequest {
+                prior: closed_coordinate(&value.prior())?,
+            },
+        ),
+        VerifiedMutationProjection::LeaveRequest(value) => (
+            RequestEntryKind::LeaveRequest,
+            value.leave_request_id(),
+            RequestBodyBinding::LeaveRequest {
+                prior: closed_coordinate(&value.prior())?,
+            },
+        ),
+        VerifiedMutationProjection::LeaveCancellation(value) => (
+            RequestEntryKind::LeaveCancellation,
+            value.leave_request_id(),
+            RequestBodyBinding::LeaveCancellation {
+                conversation_id: *value.conversation_id().as_bytes(),
+            },
+        ),
+        _ => return Err(StateMachineError::InvalidHydrationAuthority),
+    };
+    request_evidence_from_verified(
+        kind,
+        Some(entry.entry_id().as_bytes()),
+        entry.conversation_id().as_bytes(),
+        Some(entry.seq()),
+        Some(entry.outer_control_projection().to_vec()),
+        Some(
+            entry
+                .server_fields_dag_cbor()
+                .map_err(|_| StateMachineError::InvalidHydrationAuthority)?,
+        ),
+        request_id.as_bytes(),
+        canonical_server_timestamp(entry.received_at())?,
+        *entry.outer_control_fingerprint(),
+        entry.mutation(),
+        body_binding,
+    )
+}
+
 pub(crate) struct PersistedDeviceRevocationRow {
     accepted_at: CanonicalTimestamp,
     durable_row_digest: [u8; 32],
