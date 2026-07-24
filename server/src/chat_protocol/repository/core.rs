@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use super::super::{
     snapshot::{PublicGroupSnapshotBinding, PublicGroupSnapshotCoordinate},
-    state_machine::ConversationState,
+    state_machine::{ConversationState, HistoricalRehydrationAuthority, PersistedControlAuthority},
     validation::{BareDid, KeyThumbprint},
 };
 
@@ -2342,4 +2342,93 @@ fn safe_public_state_u64(value: i64) -> Result<u64, PublicStateHydrationError> {
         .ok()
         .filter(|value| *value <= MAX_PROTOCOL_INTEGER)
         .ok_or(PublicStateHydrationError::OutOfDomain)
+}
+
+// ===========================================================================
+// G1b-2 — historical control-entry evidence loader (per-transition read leg).
+//
+// Every producer / opening / origin / terminal transition id the existing-
+// conversation-state aggregate references resolves to exactly one durable
+// control entry. This loader reads that entry's bytes and re-verifies them
+// through the read-time `HistoricalRehydrationAuthority`, yielding the same
+// sealed evidence the append-time path would — but bound to each historical
+// entry's own recorded seq/receivedAt/prior (per OQ-G1-3(a)) rather than the
+// head append expectation. It is the DB read half of the loader atom; the crypto
+// half is `HistoricalRehydrationAuthority::hydrate_historical_control_from_durable_bytes`.
+// ===========================================================================
+
+/// Failure modes of the durable historical control-entry evidence loader.
+#[derive(Debug, Error)]
+pub(crate) enum ControlEvidenceLoadError {
+    /// No `chat.entries` row (with its `chat.device_keys` signing key) exists for
+    /// the requested `(conversation_id, transition_id)` under the transaction.
+    /// Fail-closed: a missing producing entry can never yield evidence.
+    #[error("clean-chat control entry is absent for the transition")]
+    EntryMissing,
+    /// The durable row failed read-time re-verification through the historical
+    /// rehydration authority (signature, conversation binding, frozen row digest,
+    /// or the strict `seq < head` constraint). Never coerced into evidence.
+    #[error("clean-chat control entry failed historical re-verification")]
+    InvalidEvidence,
+    #[error("clean-chat control evidence load database error: {0}")]
+    Database(#[from] sqlx::Error),
+}
+
+/// Load and re-verify the HISTORICAL control-entry evidence produced by one past
+/// transition of an existing conversation, for the G1b-2 state aggregate.
+///
+/// Reads the durable `chat.entries` row keyed by `(conversation_id,
+/// transition_id)` — `accepted_payload_bytes` is the canonical public control-row
+/// JSON, `signed_request_bytes` the exact signed wrapper — together with the
+/// actor's historical signing key JOINed from `chat.device_keys` on
+/// `(actor_did, actor_device_id, actor_key_id)`. The device-keys `key_id` binding
+/// pins `key_id = ed25519_key_id(signing_public_key)`, so the JOIN yields exactly
+/// the immutable key that signed the entry. The bytes are then re-verified through
+/// `HistoricalRehydrationAuthority::hydrate_historical_control_from_durable_bytes`
+/// (ed25519 + DAG-CBOR structure re-checked, conversation binding enforced, the
+/// entry's own `seq` required strictly below the locked head), so nothing the
+/// aggregate consumes is trusted from un-reverified DB state.
+///
+/// No `FOR UPDATE`: `chat.entries` is append-only and immutable (the
+/// `entries_immutable` trigger), and the caller already holds the head lock
+/// (`FOR UPDATE OF c` on `chat.conversations`) that pins the historical suffix, so
+/// a plain read is consistent. `authority` MUST be the read-time authority minted
+/// from that same locked head.
+#[allow(dead_code)]
+pub(crate) async fn load_historical_control_evidence(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &HistoricalRehydrationAuthority,
+    conversation_id: Uuid,
+    transition_id: Uuid,
+) -> Result<PersistedControlAuthority, ControlEvidenceLoadError> {
+    let row: Option<(Vec<u8>, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+        r#"
+        SELECT
+            e.accepted_payload_bytes,
+            e.signed_request_bytes,
+            dk.signing_public_key
+        FROM chat.entries e
+        JOIN chat.device_keys dk
+          ON dk.user_did = e.actor_did
+         AND dk.device_id = e.actor_device_id
+         AND dk.key_id = e.actor_key_id
+        WHERE e.conversation_id = $1
+          AND e.transition_id = $2
+        "#,
+    )
+    .bind(conversation_id)
+    .bind(transition_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+
+    let (public_row_json, raw_signed_wrapper, signing_public_key) =
+        row.ok_or(ControlEvidenceLoadError::EntryMissing)?;
+
+    authority
+        .hydrate_historical_control_from_durable_bytes(
+            public_row_json,
+            raw_signed_wrapper,
+            &signing_public_key,
+        )
+        .map_err(|_| ControlEvidenceLoadError::InvalidEvidence)
 }

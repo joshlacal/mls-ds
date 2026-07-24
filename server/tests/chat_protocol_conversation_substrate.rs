@@ -1965,6 +1965,155 @@ mod historical_control_path {
         .any(|k| entry_kind.ends_with(k))
     }
 
+    // -----------------------------------------------------------------------
+    // Real seq-1 creation-entry fixture for the DB loader atom.
+    //
+    // The frozen creation contract vector is signed at seq 45 / conversationId
+    // 11111111-1111-4111-9111-111111111111. The chat.entries contiguity trigger
+    // forces a single seeded entry to seq 1, and entries are immutable (not
+    // deletable) so each gate-DB run needs a FRESH conversationId. So the vector
+    // is reused as a STRUCTURAL creation template: digests repaired + signer key
+    // rebound to the test key (as `build_cases` does), then the top-level seq is
+    // set to 1 and every conversationId occurrence — top-level + the signed-body
+    // coordinates — is rewritten to a fresh v4, and the body re-signed. The
+    // result is a genuinely ed25519-signed, decodable creation entry the loader
+    // can re-verify.
+    // -----------------------------------------------------------------------
+
+    pub(super) struct RealCreationEntry {
+        pub(super) cid: [u8; 16],
+        pub(super) entry_id: uuid::Uuid,
+        pub(super) public_row_json: Vec<u8>,
+        pub(super) raw_wrapper: Vec<u8>,
+        pub(super) public_key: Vec<u8>,
+        pub(super) outer_entry_fingerprint: [u8; 32],
+        pub(super) actor_did: String,
+        pub(super) actor_device_id: uuid::Uuid,
+        pub(super) actor_key_id: String,
+        pub(super) head_next_entry_seq: u64,
+    }
+
+    fn rewrite_conversation_id(
+        value: &mut Value,
+        from_uuid: &str,
+        to_uuid: &str,
+        from_b64: &str,
+        to_b64: &str,
+    ) {
+        match value {
+            Value::String(text) => {
+                if text == from_uuid {
+                    *text = to_uuid.to_owned();
+                } else if text == from_b64 {
+                    *text = to_b64.to_owned();
+                }
+            }
+            Value::Array(items) => {
+                for child in items.iter_mut() {
+                    rewrite_conversation_id(child, from_uuid, to_uuid, from_b64, to_b64);
+                }
+            }
+            Value::Object(map) => {
+                for child in map.values_mut() {
+                    rewrite_conversation_id(child, from_uuid, to_uuid, from_b64, to_b64);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) fn build_real_creation_entry(fresh_cid: [u8; 16]) -> RealCreationEntry {
+        let fixture: Value = serde_json::from_str(CONTRACT_VECTORS).unwrap();
+        let contract: Value = serde_json::from_str(LEXICON).unwrap();
+        let definitions = contract["defs"].as_object().unwrap();
+        let cef = &fixture["controlEntryFingerprints"];
+
+        let signing_key = SigningKey::from_bytes(&[0x24; 32]);
+        let verifying = signing_key.verifying_key().to_bytes();
+
+        let case = cef["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["entryKind"].as_str().unwrap().ends_with("creationEntry"))
+            .expect("creation control vector present");
+
+        let body_cbor = hex::decode(
+            case["unsignedSigningProjectionCanonicalDagCborHex"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        let body: FixtureDagValue = serde_ipld_dagcbor::from_slice(&body_cbor).unwrap();
+        let signed_name = case["signedRequestRef"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("blue.catbird.chat.defs#")
+            .unwrap();
+        let body_name = definitions[signed_name]["properties"]["body"]["refs"][0]
+            .as_str()
+            .unwrap()
+            .strip_prefix('#')
+            .unwrap();
+        let mut signing_body = body.into_json_for_schema(&definitions[body_name], definitions);
+        repair_body_digests(&mut signing_body);
+        signing_body["keyId"] = json!(ed25519_key_id(&verifying).unwrap().as_str());
+
+        // Rewrite the frozen conversationId (UUID-text and, defensively, its
+        // 16-byte base64 form) to the fresh v4 throughout the signed body.
+        const FROZEN_CID: [u8; 16] = [
+            0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x41, 0x11, 0x91, 0x11, 0x11, 0x11, 0x11, 0x11,
+            0x11, 0x11,
+        ];
+        let from_uuid = Uuid::from_bytes(FROZEN_CID).hyphenated().to_string();
+        let to_uuid = Uuid::from_bytes(fresh_cid).hyphenated().to_string();
+        let from_b64 = STANDARD.encode(FROZEN_CID);
+        let to_b64 = STANDARD.encode(fresh_cid);
+        rewrite_conversation_id(&mut signing_body, &from_uuid, &to_uuid, &from_b64, &to_b64);
+
+        let actor_did = signing_body["actorDid"].as_str().unwrap().to_owned();
+        let actor_device_id =
+            Uuid::parse_str(signing_body["actorDeviceId"].as_str().unwrap()).unwrap();
+        let actor_key_id = ed25519_key_id(&verifying).unwrap().as_str().to_owned();
+
+        let raw_wrapper = resign(
+            json!({ "body": signing_body, "signature": "" }),
+            &signing_key,
+        );
+        let signed_request: Value = serde_json::from_slice(&raw_wrapper).unwrap();
+
+        let entry_id = Uuid::new_v4();
+        let row = json!({
+            "$type": case["entryKind"],
+            "entryId": entry_id.hyphenated().to_string(),
+            "conversationId": to_uuid,
+            "seq": 1,
+            "signedRequest": signed_request,
+            "receivedAt": case["receivedAt"],
+        });
+        let public_row_json = serde_json::to_vec(&row).unwrap();
+
+        // Fail fast on fixture drift: it must decode + verify under the test key,
+        // and its derived outer fingerprint is the durable column value.
+        let decoded = decode_and_verify_control_entry(&public_row_json, &verifying)
+            .expect("rewritten creation entry decodes under the test key");
+        assert_eq!(decoded.conversation_id().as_bytes(), &fresh_cid);
+        let outer_entry_fingerprint = *decoded.outer_control_fingerprint();
+
+        RealCreationEntry {
+            cid: fresh_cid,
+            entry_id,
+            public_row_json,
+            raw_wrapper,
+            public_key: verifying.to_vec(),
+            outer_entry_fingerprint,
+            actor_did,
+            actor_device_id,
+            actor_key_id,
+            head_next_entry_seq: 2,
+        }
+    }
+
     #[test]
     fn historical_control_matches_append_time_per_kind() {
         let cases = build_cases();
@@ -2135,5 +2284,345 @@ mod historical_control_path {
             ),
             Err(StateMachineError::InvalidHydrationAuthority)
         );
+    }
+}
+
+// ===========================================================================
+// G1b-2 — durable control-entry evidence loader (core.rs
+// `load_historical_control_evidence`): the DB read half of the loader atom.
+//
+// Seeds a coherent committed group graph whose seq-1 creation entry carries the
+// REAL, ed25519-signed creation-entry bytes from `build_real_creation_entry`
+// (rewritten to the graph's fresh conversationId), with the acting device's
+// `chat.device_keys` signing key set to the fixture test key so the JOINed key
+// verifies the entry. The loader reads `accepted_payload_bytes` +
+// `signed_request_bytes` + the JOINed key and re-verifies through the crypto
+// seam; its output must byte-equal the in-memory
+// `hydrate_historical_control_from_durable_bytes` over the same bytes.
+// ===========================================================================
+mod historical_control_loader {
+    use chrono::{DateTime, Utc};
+    use sha2::{Digest, Sha256};
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    use super::historical_control_path::{build_real_creation_entry, RealCreationEntry};
+    use crate::chat_protocol::repository::core::{
+        load_historical_control_evidence, ControlEvidenceLoadError,
+    };
+    use crate::chat_protocol::state_machine::HistoricalRehydrationAuthority;
+    use crate::common;
+
+    async fn clock_now(pool: &PgPool) -> DateTime<Utc> {
+        sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(pool)
+            .await
+            .expect("sample trusted database clock")
+    }
+
+    /// Seed a coherent committed GROUP conversation whose genesis (seq 1) entry
+    /// carries `entry`'s real creation bytes. The acting device's signing key is
+    /// the fixture test key that signed those bytes. Returns the fresh
+    /// `transition_id` the entry (and current generation-state) is bound to.
+    async fn seed_real_creation_graph(pool: &PgPool, entry: &RealCreationEntry) -> Uuid {
+        let conversation_id = Uuid::from_bytes(entry.cid);
+        let creation_transition_id = Uuid::new_v4();
+        let participant_period_id = Uuid::new_v4();
+        let leaf_period_id = Uuid::new_v4();
+        let metadata_snapshot_id = Uuid::new_v4();
+        let actor_did = &entry.actor_did;
+        let actor_device_id = entry.actor_device_id;
+        let actor_key_id = &entry.actor_key_id;
+        let actor_public_key = entry.public_key.clone();
+        let group_id = vec![1_u8; 32];
+        let group_context_hash = vec![2_u8; 32];
+        let confirmation_tag = vec![3_u8; 32];
+        let group_info = vec![4_u8; 8];
+        let unsigned_projection = vec![8_u8; 8];
+        let signing_transcript = vec![9_u8; 8];
+        // The entry <-> transition mapping trigger requires the entry's
+        // signed_request_bytes / request_digest / signature to EQUAL the producing
+        // transition's; both rows carry the entry's real signed wrapper. The
+        // transition's request_digest must equal sha256(signing_transcript_bytes)
+        // (transitions_signature_check), and the entry mirrors that value (its own
+        // request_digest/signature columns are shape-only and loader-ignored).
+        let signed_request = entry.raw_wrapper.clone();
+        let request_digest = Sha256::digest(&signing_transcript).to_vec();
+        let signature = vec![0x5c_u8; 64];
+        let metadata_ciphertext = vec![13_u8; 16];
+        let (snapshot, snapshot_sha256) = {
+            let snapshot = vec![0x5a_u8; 64];
+            let sha: Vec<u8> = Sha256::digest(&snapshot).to_vec();
+            (snapshot, sha)
+        };
+        let tree_summary = vec![0x26_u8; 8];
+        let tree_summary_sha = Sha256::digest(&tree_summary).to_vec();
+        let basic_credential = format!("{actor_did}#{actor_device_id}").into_bytes();
+        // Entry columns: the real bytes drive the loader; the shape-only columns
+        // (request_digest / signature / server_fields_bytes) are never read by it.
+        let entry_payload = entry.public_row_json.clone();
+        let entry_payload_sha = Sha256::digest(&entry_payload).to_vec();
+        let entry_outer_fingerprint = entry.outer_entry_fingerprint.to_vec();
+        let at = clock_now(pool).await;
+
+        let mut tx = pool.begin().await.expect("begin real creation");
+        sqlx::query(
+            "INSERT INTO chat.principals(user_did,created_at) VALUES($1,$2) ON CONFLICT DO NOTHING",
+        )
+        .bind(actor_did)
+        .bind(at)
+        .execute(&mut *tx)
+        .await
+        .expect("insert principal");
+        sqlx::query(
+            "INSERT INTO chat.devices(user_did,device_id,device_name,status,dpop_jkt,auth_generation,capabilities,created_at,updated_at) \
+             VALUES($1,$2,'loader-actor','active',$3,1,chat.protocol_capabilities(),$4,$4) ON CONFLICT DO NOTHING",
+        )
+        .bind(actor_did)
+        .bind(actor_device_id)
+        .bind(format!("{:042}A", 0_u128))
+        .bind(at)
+        .execute(&mut *tx)
+        .await
+        .expect("insert device");
+        sqlx::query(
+            "INSERT INTO chat.device_keys(user_did,device_id,key_id,signing_public_key,enrollment_auth_generation,created_at) \
+             VALUES($1,$2,$3,$4,1,$5) ON CONFLICT DO NOTHING",
+        )
+        .bind(actor_did)
+        .bind(actor_device_id)
+        .bind(actor_key_id)
+        .bind(&actor_public_key)
+        .bind(at)
+        .execute(&mut *tx)
+        .await
+        .expect("insert device key");
+        sqlx::query(
+            "INSERT INTO chat.conversations(conversation_id,kind,lifecycle,current_generation,current_state_version,next_entry_seq,created_at) VALUES($1,'group','active',0,0,2,$2)",
+        )
+        .bind(conversation_id)
+        .bind(at)
+        .execute(&mut *tx)
+        .await
+        .expect("insert conversation");
+        sqlx::query(
+            "INSERT INTO chat.generations(conversation_id,generation,group_id,lifecycle,genesis_group_info_bytes,genesis_group_info_sha256,current_state_version,activated_seq,activated_at) VALUES($1,0,$2,'active',$3,$4,0,1,$5)",
+        )
+        .bind(conversation_id)
+        .bind(&group_id)
+        .bind(&group_info)
+        .bind(Sha256::digest(&group_info).to_vec())
+        .bind(at)
+        .execute(&mut *tx)
+        .await
+        .expect("insert generation");
+        sqlx::query(
+            r#"INSERT INTO chat.transitions(
+                transition_id,conversation_id,kind,actor_did,actor_device_id,actor_key_id,
+                actor_auth_generation,actor_role,actor_device_status,signed_request_bytes,
+                unsigned_projection_bytes,signing_transcript_bytes,request_digest,signature,
+                next_generation,next_state_version,metadata_snapshot_id,entry_seq,accepted_at
+            ) VALUES($1,$2,'creation',$3,$4,$5,1,'admin','active',$6,$7,$8,$9,$10,0,0,$11,1,$12)"#,
+        )
+        .bind(creation_transition_id)
+        .bind(conversation_id)
+        .bind(actor_did)
+        .bind(actor_device_id)
+        .bind(actor_key_id)
+        .bind(&signed_request)
+        .bind(&unsigned_projection)
+        .bind(&signing_transcript)
+        .bind(&request_digest)
+        .bind(&signature)
+        .bind(metadata_snapshot_id)
+        .bind(at)
+        .execute(&mut *tx)
+        .await
+        .expect("insert creation transition");
+        sqlx::query(
+            r#"INSERT INTO chat.generation_states(
+                conversation_id,generation,state_version,group_id,epoch,group_context_hash,
+                confirmation_tag,lifecycle,state_kind,producing_transition_id,
+                public_snapshot_bytes,snapshot_sha256,tree_summary_bytes,tree_summary_sha256,
+                leaf_count,created_at
+            ) VALUES($1,0,0,$2,0,$3,$4,'active','creation',$5,$6,$7,$8,$9,1,$10)"#,
+        )
+        .bind(conversation_id)
+        .bind(&group_id)
+        .bind(&group_context_hash)
+        .bind(&confirmation_tag)
+        .bind(creation_transition_id)
+        .bind(&snapshot)
+        .bind(&snapshot_sha256)
+        .bind(&tree_summary)
+        .bind(&tree_summary_sha)
+        .bind(at)
+        .execute(&mut *tx)
+        .await
+        .expect("insert creation state");
+        sqlx::query(
+            r#"INSERT INTO chat.participants(
+                participant_period_id,conversation_id,user_did,status,role,role_transition_id,
+                role_changed_at,created_by_did,created_by_device_id,current_membership,created_at
+            ) VALUES($1,$2,$3,'active','admin',$4,$5,$3,$6,true,$5)"#,
+        )
+        .bind(participant_period_id)
+        .bind(conversation_id)
+        .bind(actor_did)
+        .bind(creation_transition_id)
+        .bind(at)
+        .bind(actor_device_id)
+        .execute(&mut *tx)
+        .await
+        .expect("insert participant");
+        sqlx::query(
+            r#"INSERT INTO chat.member_devices(
+                leaf_period_id,participant_period_id,conversation_id,generation,user_did,
+                device_id,leaf_index,basic_credential,leaf_signature_key,leaf_key_id,
+                leaf_auth_generation,origin,joined_state_version,joined_transition_id,
+                joined_seq,active,created_at
+            ) VALUES($1,$2,$3,0,$4,$5,0,$6,$7,$8,1,'genesis',0,$9,1,true,$10)"#,
+        )
+        .bind(leaf_period_id)
+        .bind(participant_period_id)
+        .bind(conversation_id)
+        .bind(actor_did)
+        .bind(actor_device_id)
+        .bind(&basic_credential)
+        .bind(&actor_public_key)
+        .bind(actor_key_id)
+        .bind(creation_transition_id)
+        .bind(at)
+        .execute(&mut *tx)
+        .await
+        .expect("insert leaf");
+        sqlx::query(
+            r#"INSERT INTO chat.metadata_snapshots(
+                metadata_snapshot_id,conversation_id,generation,state_version,group_id,epoch,
+                group_context_hash,confirmation_tag,producing_transition_id,origin_transition_id,
+                metadata_version,nonce,ciphertext,ciphertext_sha256,ciphertext_size,author_did,
+                author_device_id,author_key_id,author_public_key,author_auth_generation,
+                author_origin_seq,author_role,author_device_status,created_at
+            ) VALUES($1,$2,0,0,$3,0,$4,$5,$6,$6,1,$7,$8,$9,16,$10,$11,$12,$13,1,1,'admin','active',$14)"#,
+        )
+        .bind(metadata_snapshot_id)
+        .bind(conversation_id)
+        .bind(&group_id)
+        .bind(&group_context_hash)
+        .bind(&confirmation_tag)
+        .bind(creation_transition_id)
+        .bind(vec![14_u8; 12])
+        .bind(&metadata_ciphertext)
+        .bind(Sha256::digest(&metadata_ciphertext).to_vec())
+        .bind(actor_did)
+        .bind(actor_device_id)
+        .bind(actor_key_id)
+        .bind(&actor_public_key)
+        .bind(at)
+        .execute(&mut *tx)
+        .await
+        .expect("insert metadata");
+        sqlx::query(
+            r#"INSERT INTO chat.entries(
+                conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,
+                accepted_payload_sha256,signed_request_bytes,request_digest,signature,
+                server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,
+                actor_key_id,actor_auth_generation,generation,state_version,transition_id,received_at
+            ) VALUES($1,1,$2,'blue.catbird.chat.defs#creationEntry',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1,0,0,$13,$14)"#,
+        )
+        .bind(conversation_id)
+        .bind(entry.entry_id)
+        .bind(&entry_payload)
+        .bind(&entry_payload_sha)
+        .bind(&signed_request)
+        .bind(&request_digest)
+        .bind(&signature)
+        .bind(vec![0_u8])
+        .bind(&entry_outer_fingerprint)
+        .bind(actor_did)
+        .bind(actor_device_id)
+        .bind(actor_key_id)
+        .bind(creation_transition_id)
+        .bind(at)
+        .execute(&mut *tx)
+        .await
+        .expect("insert creation entry");
+        sqlx::query(
+            r#"INSERT INTO chat.application_intervals(
+                membership_interval_id,conversation_id,generation,recipient_did,
+                recipient_device_id,start_seq,opening_kind,opening_transition_id,
+                opening_outer_entry_fingerprint,opening_state_version,opening_group_id,
+                opening_epoch,opening_group_context_hash,opening_confirmation_tag,
+                opening_leaf_period_id,created_at
+            ) VALUES($1,$2,0,$3,$4,1,'creation',$1,$5,0,$6,0,$7,$8,$9,$10)"#,
+        )
+        .bind(creation_transition_id)
+        .bind(conversation_id)
+        .bind(actor_did)
+        .bind(actor_device_id)
+        .bind(&entry_outer_fingerprint)
+        .bind(&group_id)
+        .bind(&group_context_hash)
+        .bind(&confirmation_tag)
+        .bind(leaf_period_id)
+        .bind(at)
+        .execute(&mut *tx)
+        .await
+        .expect("insert creation interval");
+        tx.commit().await.expect("commit real creation");
+        creation_transition_id
+    }
+
+    /// The loader reads the durable entry + JOINed key and re-verifies through the
+    /// crypto seam; its output byte-equals the in-memory path over the same bytes.
+    #[tokio::test]
+    #[ignore = "requires the dedicated gate database"]
+    async fn loader_reproduces_in_memory_historical_control_evidence() {
+        let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+        let cid = Uuid::new_v4();
+        let entry = build_real_creation_entry(*cid.as_bytes());
+        let transition_id = seed_real_creation_graph(&pool, &entry).await;
+
+        let authority =
+            HistoricalRehydrationAuthority::new(entry.cid, entry.head_next_entry_seq).unwrap();
+        // In-memory reference: the same bytes straight through the crypto seam.
+        let reference = authority
+            .hydrate_historical_control_from_durable_bytes(
+                entry.public_row_json.clone(),
+                entry.raw_wrapper.clone(),
+                &entry.public_key,
+            )
+            .expect("in-memory historical control evidence");
+
+        let mut tx = pool.begin().await.expect("begin");
+        let loaded = load_historical_control_evidence(&mut tx, &authority, cid, transition_id)
+            .await
+            .expect("loader reproduces evidence");
+        tx.commit().await.expect("commit");
+
+        assert_eq!(loaded, reference);
+    }
+
+    /// A transition id with no durable entry fails closed with `EntryMissing`,
+    /// never a fabricated evidence value.
+    #[tokio::test]
+    #[ignore = "requires the dedicated gate database"]
+    async fn loader_absent_entry_fails_closed() {
+        let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+        let cid = Uuid::new_v4();
+        let entry = build_real_creation_entry(*cid.as_bytes());
+        let _seeded = seed_real_creation_graph(&pool, &entry).await;
+        let authority =
+            HistoricalRehydrationAuthority::new(entry.cid, entry.head_next_entry_seq).unwrap();
+
+        let mut tx = pool.begin().await.expect("begin");
+        let result =
+            load_historical_control_evidence(&mut tx, &authority, cid, Uuid::new_v4()).await;
+        tx.rollback().await.expect("rollback");
+
+        assert!(matches!(
+            result,
+            Err(ControlEvidenceLoadError::EntryMissing)
+        ));
     }
 }
