@@ -117,10 +117,10 @@ use chat_protocol::state_machine::{
     LeafRecoveryFulfillment, LeafRecoveryKind, LeafRecoveryRequestCommand, LeaveCancellation,
     LeaveFulfillment, LeaveRequestCommand, LockedRegistrationProjection, MetadataAuthorColumns,
     MetadataSnapshotBinding, PrincipalId, RecoveryOpenContext, RequestEntryKind, RequestEvidence,
-    ResetActivation, ResetRequestCommand, ResetRequestRow, RevocationTargetCasBinding,
-    ServerTimestamp, SpineArtifacts, TransitionEvidence, WelcomeDispositionInput,
-    WelcomeExpiryContext, WelcomeRejectionWork, WelcomeResponseContext, WelcomeStatus,
-    ZeroLeafLeave,
+    ResetActivation, ResetRequestCommand, ResetRequestRow, RevocationPackageCasBinding,
+    RevocationTargetCasBinding, ServerTimestamp, SpineArtifacts, TransitionEvidence,
+    WelcomeDispositionInput, WelcomeExpiryContext, WelcomeRejectionWork, WelcomeResponseContext,
+    WelcomeStatus, ZeroLeafLeave,
 };
 use chat_protocol::validation::ed25519_key_id;
 use chat_protocol::wire::{validate_public_commit, MAX_PUBLIC_MESSAGE_WIRE_BYTES};
@@ -8732,6 +8732,125 @@ async fn device_revocation_batch_commits_and_supersedes_target_work() {
         active_reservations, 0,
         "no active target reservations remain"
     );
+}
+
+/// The device-revocation batch's AVAILABLE-package path (step 3): a target device
+/// with an available (`conversation_id IS NULL`) key package alongside its reserved
+/// one has BOTH revoked in one transaction — the reserved by the per-conversation
+/// arm, the available by `apply_device_revocation_batch`'s
+/// `cas_key_package_status(Available, Revoke)` loop over the plan's
+/// `revoked_packages`. The available package MUST be seeded BEFORE the batch and
+/// carried in `revoked_packages` (not post-hoc), or the DEFERRED
+/// `assert_device_revocation_mapping` footprint trigger — which requires ZERO
+/// remaining available/reserved target packages — rejects the commit.
+#[tokio::test]
+async fn device_revocation_batch_revokes_available_target_package() {
+    let (pool, _db) = setup().await;
+    let s = setup_revoked_target(&pool).await;
+
+    // Seed a second, AVAILABLE (conversation_id NULL) package for the same target
+    // device — committed before the batch. Its `created_at` is set BEFORE the
+    // revocation's `accepted_at` so the revoked-shape check (`terminal_at >=
+    // created_at`) holds (the batch stamps `terminal_at = accepted_at`); a naive
+    // post-setup `seed_key_package` samples the clock AFTER accepted_at and fails
+    // that check. Without a matching revoked_packages binding it would also leave a
+    // live target package and trip the footprint trigger.
+    let available_ref = random_ref32();
+    let avail_created = s.accepted_dt - Duration::hours(1);
+    let avail_not_before = avail_created - Duration::hours(1);
+    let avail_not_after =
+        DateTime::from_timestamp_millis((avail_created + Duration::hours(24)).timestamp_millis())
+            .unwrap();
+    let avail_wrapper = vec![0xC1_u8; 32];
+    let avail_init_key = {
+        let mut key = vec![0u8; 32];
+        key[..16].copy_from_slice(Uuid::new_v4().as_bytes());
+        key[16..].copy_from_slice(Uuid::new_v4().as_bytes());
+        key
+    };
+    sqlx::query(
+        "INSERT INTO chat.key_packages(key_package_ref,wrapper_bytes,wrapper_sha256,init_key,owner_did,owner_device_id,owner_key_id,owner_auth_generation,not_before,not_after,status,created_at) \
+         VALUES($1,$2,$3,$4,$5,$6,$7,1,$8,$9,'available',$10)",
+    )
+    .bind(available_ref.to_vec())
+    .bind(&avail_wrapper)
+    .bind(Sha256::digest(&avail_wrapper).to_vec())
+    .bind(&avail_init_key)
+    .bind(&s.target_did)
+    .bind(s.target_device)
+    .bind(&s.target_key_id)
+    .bind(avail_not_before)
+    .bind(avail_not_after)
+    .bind(avail_created)
+    .execute(&pool)
+    .await
+    .expect("seed available target package");
+    let accepted_st =
+        ServerTimestamp::from_unix_millis_for_test(s.accepted_dt.timestamp_millis()).unwrap();
+    let revocation_id = s.revocation_id;
+
+    let mut tx = pool.begin().await.expect("begin revocation");
+    // Seed the idempotency receipt (needs the whole `&s`) BEFORE consuming
+    // `s.batch_plan` via into_parts below.
+    seed_revoke_receipt(&mut tx, &s).await;
+    // Rebuild the batch plan carrying the available-package revoke binding (the base
+    // setup passes an empty revoked_packages list). Reuse the same authority /
+    // target CAS / conversation plan.
+    let (authority, target_cas, empty_packages, _digest, conversations) = s.batch_plan.into_parts();
+    assert!(
+        empty_packages.is_empty(),
+        "base setup carries no available-package bindings"
+    );
+    let available_binding = RevocationPackageCasBinding::for_test_available(
+        authority.target().clone(),
+        available_ref,
+        *revocation_id.as_bytes(),
+        accepted_st,
+    );
+    let batch_plan = DeviceRevocationBatchPersistencePlan::for_test(
+        authority,
+        target_cas,
+        vec![available_binding],
+        conversations,
+    );
+    apply_device_revocation_batch(&mut tx, &batch_plan, std::slice::from_ref(&s.conv_ctx))
+        .await
+        .expect("device revocation batch with available package applies");
+    tx.commit()
+        .await
+        .expect("device revocation COMMIT past the footprint trigger");
+
+    // The available package is now revoked, bound to the revocation at accepted_at.
+    let (avail_status, avail_rev, avail_terminal): (String, Option<Uuid>, Option<DateTime<Utc>>) =
+        sqlx::query_as(
+            "SELECT status, terminal_revocation_id, terminal_at FROM chat.key_packages WHERE key_package_ref=$1",
+        )
+        .bind(available_ref.to_vec())
+        .fetch_one(&pool)
+        .await
+        .expect("available package");
+    assert_eq!(
+        (avail_status.as_str(), avail_rev, avail_terminal),
+        ("revoked", Some(revocation_id), Some(s.accepted_dt))
+    );
+    // The reserved package (per-conversation arm) is revoked too.
+    let reserved_status: String =
+        sqlx::query_scalar("SELECT status FROM chat.key_packages WHERE key_package_ref=$1")
+            .bind(s.key_package_ref.to_vec())
+            .fetch_one(&pool)
+            .await
+            .expect("reserved package");
+    assert_eq!(reserved_status, "revoked");
+    // Footprint: zero live target packages remain (what the commit trigger enforced).
+    let live_packages: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.key_packages WHERE owner_did=$1 AND owner_device_id=$2 AND status IN ('available','reserved')",
+    )
+    .bind(&s.target_did)
+    .bind(s.target_device)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(live_packages, 0, "no live target packages remain");
 }
 
 #[tokio::test]

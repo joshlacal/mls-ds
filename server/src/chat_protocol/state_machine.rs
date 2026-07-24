@@ -6435,6 +6435,42 @@ impl RevocationPackageCasBinding {
     pub(crate) fn locked_row_digest(&self) -> &[u8; 32] {
         &self.locked_row_digest
     }
+
+    /// A batch-plan binding for an AVAILABLE (conversation_id == None) target
+    /// package the device revocation revokes directly via
+    /// `apply_device_revocation_batch` step 3. That arm reads only
+    /// `conversation_id()` (to skip the Reserved ones the per-conversation arm
+    /// owns) and `key_package_ref()`; the `Revoke` CAS takes `revocation_id` +
+    /// `revoked_at` from the batch authority, not the binding — so the remaining
+    /// provenance fields are stable placeholders here. Mirrors the shape the
+    /// production `plan_device_revocation_batch` builds for a live available
+    /// package.
+    #[cfg(test)]
+    pub(crate) fn for_test_available(
+        target: DeviceIdentity,
+        key_package_ref: [u8; 32],
+        revocation_id: [u8; 16],
+        revoked_at: ServerTimestamp,
+    ) -> Self {
+        Self {
+            transaction_id: String::new(),
+            target,
+            target_key_id: [0u8; 32],
+            target_auth_generation: 1,
+            key_package_ref,
+            wrapper_sha256: [0xC1u8; 32],
+            package_not_after: revoked_at,
+            expected_status: PackageStatus::Available,
+            successor_status: PackageStatus::Revoked,
+            conversation_id: None,
+            request_id: None,
+            revocation_id,
+            revoked_at,
+            revocation_request_digest: [0u8; 32],
+            revocation_row_digest: [0u8; 32],
+            locked_row_digest: [0u8; 32],
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
