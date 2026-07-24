@@ -3816,6 +3816,211 @@ async fn acceptance_commits_recovery_open_and_promotes_participant() {
     assert_eq!(before, after, "acceptance re-apply left zero residue");
 }
 
+/// Concern-2 completeness for the arm that OWNS recovery work: bob's acceptance,
+/// executed from a coordinate where the active member alice has an OPEN
+/// leaf-recovery request, both opens bob's OWN recovery (None->Open request +
+/// None->Active reservation + Available->Reserved package) AND supersedes alice's
+/// (Open->Superseded / Active->Released / Reserved->Available). The own vs
+/// superseded partition (own counts {1,1,1}) is the load-bearing new logic; before
+/// the fix `apply_acceptance` required EXACTLY one delta per family and rejected the
+/// welcome family, so a co-open recovery request hard-errored.
+#[tokio::test]
+async fn acceptance_supersedes_prior_open_recovery_request() {
+    let (pool, _db) = setup().await;
+    let fixture = commit_creation(&pool, ConversationKind::Group).await;
+    let conversation_id = fixture.conversation_id;
+    let bob_device = Uuid::from_bytes(*fixture.bob_id.device_id());
+
+    // Alice (active) opens an entry-less recovery request bound to the creation
+    // coordinate (reserving her package), then bob accepts and supersedes it.
+    let (rr_state, alice_rid, alice_ref) = seed_alice_open_recovery(&pool, &fixture).await;
+
+    let bob_period: Uuid = sqlx::query_scalar(
+        "SELECT participant_period_id FROM chat.participants WHERE conversation_id=$1 AND user_did=$2 AND current_membership",
+    )
+    .bind(conversation_id)
+    .bind(&fixture.bob_did)
+    .fetch_one(&pool)
+    .await
+    .expect("bob participant period");
+    let bob_key_id = fixture.bob_key_id.clone();
+    let key_package_ref = random_ref32();
+    let package_not_after = seed_key_package(
+        &pool,
+        &fixture.bob_did,
+        bob_device,
+        &bob_key_id,
+        &key_package_ref,
+    )
+    .await;
+    // Acceptance at eval+3000 — AFTER alice's request (eval+2000), so the
+    // supersession's transition_follows_origin holds.
+    let received_at = ServerTimestamp::from_unix_millis_for_test(
+        corpus_manifest().evaluation_unix_seconds as i64 * 1_000 + 3_000,
+    )
+    .unwrap();
+    let pkg_not_after_ts = ServerTimestamp::from_unix_millis_for_test(
+        corpus_manifest().evaluation_unix_seconds as i64 * 1_000 + 3_600_000,
+    )
+    .unwrap();
+    let entry_id = Uuid::new_v4();
+    let transition_id = Uuid::new_v4();
+    let recovery_request_id = *Uuid::new_v4().as_bytes();
+    let evidence = TransitionEvidence::for_test_acceptance(
+        2,
+        *transition_id.as_bytes(),
+        [0x16_u8; 32],
+        received_at,
+        fixture.coordinate,
+        recovery_request_id,
+        fixture.bob_id.clone(),
+        fixture.creation_transition_id,
+        fixture.alice_id.clone(),
+        key_package_ref,
+        Sha256::digest([0x62_u8; 32]).into(),
+        1,
+        pkg_not_after_ts,
+    )
+    .unwrap();
+    let planned = plan_accept_conversation(
+        &rr_state,
+        AcceptConversation {
+            actor: fixture.bob_id.clone(),
+            transition: evidence,
+            recovery_request_id,
+            key_package_ref,
+            package_not_after: pkg_not_after_ts,
+        },
+    )
+    .expect("valid acceptance plan over a co-open recovery request");
+    let head_cas = ConversationHeadCasBinding::for_test_edge(
+        *conversation_id.as_bytes(),
+        *entry_id.as_bytes(),
+        fixture.coordinate,
+        2,
+        received_at,
+    );
+    let plan = persistence_plan_for_test(planned, head_cas);
+    let applied_at = clock_now(&pool).await;
+    let payload = vec![0xA1_u8; 12];
+    let transcript = vec![0xA2_u8; 12];
+    let ctx = ExecutionContext {
+        protocol_instance_id: fixture.protocol_instance_id,
+        applied_at,
+        actor: ExecutionActor {
+            user_did: fixture.bob_did.clone(),
+            device_id: bob_device,
+            key_id: bob_key_id.clone(),
+            auth_generation: 1,
+            role: TransitionActorRole::Member,
+            device_status: "active".to_owned(),
+        },
+        entry: ControlEntryContent {
+            entry_id,
+            entry_kind: "blue.catbird.chat.defs#participantAcceptanceEntry".to_owned(),
+            accepted_payload_bytes: payload.clone(),
+            accepted_payload_sha256: Sha256::digest(&payload).to_vec(),
+            signed_request_bytes: transcript.clone(),
+            unsigned_projection_bytes: vec![0xA3_u8; 8],
+            signing_transcript_bytes: transcript.clone(),
+            request_digest: Sha256::digest(&transcript).to_vec(),
+            signature: vec![0xA4_u8; 64],
+            server_fields_bytes: vec![0xA5_u8; 8],
+            outer_entry_fingerprint: vec![0x16_u8; 32],
+        },
+        spine: SpineArtifacts {
+            public_snapshot_bytes: vec![0xB1_u8; 16],
+            public_snapshot_sha256: Sha256::digest([0xB1_u8; 16]).to_vec(),
+            tree_summary_bytes: vec![0xB2_u8; 16],
+            tree_summary_sha256: Sha256::digest([0xB2_u8; 16]).to_vec(),
+            leaf_count: 1,
+            genesis_group_info_bytes: vec![],
+            genesis_group_info_sha256: vec![],
+        },
+        opened_leaves: vec![],
+        metadata_author: None,
+        participant_period_ids: vec![],
+        leaf_period_ids: vec![],
+        entry_recipients: entry_audience(
+            &fixture.alice_id,
+            &fixture.alice_did,
+            &fixture.bob_id,
+            &fixture.bob_did,
+        ),
+        events: vec![EventFanout {
+            event_id: Uuid::new_v4(),
+            event_kind: EventKind::ConversationChanged,
+            payload_bytes: vec![0xB4_u8; 8],
+            recipients: event_audience(
+                &pool,
+                &fixture.alice_id,
+                &fixture.alice_did,
+                &fixture.bob_id,
+                &fixture.bob_did,
+            )
+            .await,
+            outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+        }],
+        closing_leaf_periods: vec![],
+        closing_participant_periods: vec![],
+        reset_request_row: None,
+        recovery_open: Some(RecoveryOpenContext {
+            participant_period_id: Some(bob_period),
+            package_not_after,
+            replaced_leaf_period_id: None,
+        }),
+        welcome_expiry: None,
+        welcome_response: None,
+        welcome_dispositions: vec![],
+    };
+
+    let mut tx = pool.begin().await.expect("begin acceptance");
+    apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+        .await
+        .expect("acceptance that supersedes a co-open recovery request applies");
+    tx.commit()
+        .await
+        .expect("acceptance COMMIT past all deferred triggers");
+
+    // bob promoted + bob's OWN recovery opened (own edges), alice's superseded.
+    let bob_status: String = sqlx::query_scalar(
+        "SELECT status FROM chat.participants WHERE conversation_id=$1 AND user_did=$2 AND current_membership",
+    )
+    .bind(conversation_id)
+    .bind(&fixture.bob_did)
+    .fetch_one(&pool)
+    .await
+    .expect("bob participant");
+    assert_eq!(bob_status, "active");
+    let bob_req_status: String = sqlx::query_scalar(
+        "SELECT status FROM chat.leaf_recovery_requests WHERE recovery_request_id=$1",
+    )
+    .bind(Uuid::from_bytes(recovery_request_id))
+    .fetch_one(&pool)
+    .await
+    .expect("bob recovery request");
+    assert_eq!(bob_req_status, "open", "bob's own recovery is opened");
+    // Alice's prior recovery is superseded / released / reactivated.
+    let (alice_status, alice_res, alice_pkg): (String, String, String) = sqlx::query_as(
+        "SELECT (SELECT status FROM chat.leaf_recovery_requests WHERE recovery_request_id=$1), \
+                (SELECT status FROM chat.key_package_reservations WHERE recovery_request_id=$1), \
+                (SELECT status FROM chat.key_packages WHERE key_package_ref=$2)",
+    )
+    .bind(alice_rid)
+    .bind(alice_ref.to_vec())
+    .fetch_one(&pool)
+    .await
+    .expect("alice superseded recovery state");
+    assert_eq!(
+        (
+            alice_status.as_str(),
+            alice_res.as_str(),
+            alice_pkg.as_str()
+        ),
+        ("superseded", "released", "available")
+    );
+}
+
 #[tokio::test]
 async fn leaf_recovery_replace_request_commits_without_advancing_coordinate() {
     let (pool, _db) = setup().await;
@@ -9657,6 +9862,245 @@ async fn concurrent_edge_apply_from_one_coordinate_yields_one_commit() {
         1,
         "exactly one policy transition — the loser left zero residue"
     );
+}
+
+/// Seed an entry-less `replace` leaf-recovery request by the creator alice against
+/// a committed creation `fixture` (coordinate + seq UNCHANGED, reserving her key
+/// package), returning the resulting in-memory state + the request id + package ref
+/// so a following coordinate-advancing edge can supersede it. Mirrors
+/// `setup_revoked_target`'s request-seed block.
+async fn seed_alice_open_recovery(
+    pool: &PgPool,
+    fixture: &CreationApply,
+) -> (
+    chat_protocol::state_machine::ConversationState,
+    Uuid,
+    [u8; 32],
+) {
+    let conversation_id = fixture.conversation_id;
+    let alice_leaf_period: Uuid = sqlx::query_scalar(
+        "SELECT leaf_period_id FROM chat.member_devices WHERE conversation_id=$1 AND user_did=$2 AND active",
+    )
+    .bind(conversation_id)
+    .bind(&fixture.alice_did)
+    .fetch_one(pool)
+    .await
+    .expect("alice leaf period");
+    let rec_ref = random_ref32();
+    let pkg_not_after = seed_key_package(
+        pool,
+        &fixture.alice_did,
+        fixture.alice_device,
+        &fixture.alice_key_id,
+        &rec_ref,
+    )
+    .await;
+    let pkg_not_after_ts =
+        ServerTimestamp::from_unix_millis_for_test(pkg_not_after.timestamp_millis()).unwrap();
+    // Eval-based so the request precedes the eval-based coordinate-advancing edge
+    // that supersedes it (the Superseded arm of validate_recovery_work requires
+    // `transition.received_at >= request.received_at`); a clock-based (real-now)
+    // request would sort AFTER the eval-based (2023) edge and fail that check.
+    let rec_received = ServerTimestamp::from_unix_millis_for_test(
+        corpus_manifest().evaluation_unix_seconds as i64 * 1_000 + 2_000,
+    )
+    .unwrap();
+    let recovery_request_id = Uuid::new_v4();
+    let rec_evidence = RequestEvidence::for_test(
+        RequestEntryKind::LeafRecoveryRequest,
+        2,
+        *recovery_request_id.as_bytes(),
+        fixture.alice_id.clone(),
+        *conversation_id.as_bytes(),
+        rec_received,
+        0x71,
+    )
+    .unwrap();
+    let rec_planned = plan_leaf_recovery_request(
+        &fixture.state,
+        LeafRecoveryRequestCommand {
+            actor: fixture.alice_id.clone(),
+            recovery_request_id: *recovery_request_id.as_bytes(),
+            kind: LeafRecoveryKind::Replace,
+            key_package_ref: rec_ref,
+            received_at: rec_received,
+            package_not_after: pkg_not_after_ts,
+            evidence: rec_evidence,
+        },
+    )
+    .expect("valid leaf recovery request plan");
+    let rr_state = rec_planned.resulting_state().clone();
+    let rec_head = ConversationHeadCasBinding::for_test_internal(
+        *conversation_id.as_bytes(),
+        fixture.coordinate,
+        2,
+        rec_received,
+    );
+    let rec_plan = persistence_plan_for_test(rec_planned, rec_head);
+    let rec_applied_at = clock_now(pool).await;
+    let rec_transcript = vec![0x72_u8; 16];
+    let alice_pred = device_event_predecessor(pool, &fixture.alice_did, fixture.alice_device).await;
+    let rec_ctx = ExecutionContext {
+        protocol_instance_id: fixture.protocol_instance_id,
+        applied_at: rec_applied_at,
+        actor: ExecutionActor {
+            user_did: fixture.alice_did.clone(),
+            device_id: fixture.alice_device,
+            key_id: fixture.alice_key_id.clone(),
+            auth_generation: 1,
+            role: TransitionActorRole::Admin,
+            device_status: "active".to_owned(),
+        },
+        entry: ControlEntryContent {
+            entry_id: Uuid::new_v4(),
+            entry_kind: "blue.catbird.chat.defs#applicationEntry".to_owned(),
+            accepted_payload_bytes: vec![0x73_u8; 8],
+            accepted_payload_sha256: Sha256::digest([0x73_u8; 8]).to_vec(),
+            signed_request_bytes: rec_transcript.clone(),
+            unsigned_projection_bytes: vec![0x74_u8; 8],
+            signing_transcript_bytes: rec_transcript.clone(),
+            request_digest: Sha256::digest(&rec_transcript).to_vec(),
+            signature: vec![0x75_u8; 64],
+            server_fields_bytes: vec![0x76_u8; 8],
+            outer_entry_fingerprint: vec![0x17_u8; 32],
+        },
+        spine: SpineArtifacts {
+            public_snapshot_bytes: vec![],
+            public_snapshot_sha256: vec![],
+            tree_summary_bytes: vec![],
+            tree_summary_sha256: vec![],
+            leaf_count: 1,
+            genesis_group_info_bytes: vec![],
+            genesis_group_info_sha256: vec![],
+        },
+        opened_leaves: vec![],
+        metadata_author: None,
+        participant_period_ids: vec![],
+        leaf_period_ids: vec![],
+        entry_recipients: vec![],
+        events: vec![EventFanout {
+            event_id: Uuid::new_v4(),
+            event_kind: EventKind::ConversationChanged,
+            payload_bytes: vec![0x77_u8; 8],
+            recipients: vec![(
+                fixture.alice_id.clone(),
+                EventEntitlementKind::Participant,
+                alice_pred,
+            )],
+            outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+        }],
+        closing_leaf_periods: vec![],
+        closing_participant_periods: vec![],
+        reset_request_row: None,
+        recovery_open: Some(RecoveryOpenContext {
+            participant_period_id: None,
+            package_not_after: pkg_not_after,
+            replaced_leaf_period_id: Some(alice_leaf_period),
+        }),
+        welcome_expiry: None,
+        welcome_response: None,
+        welcome_dispositions: vec![],
+    };
+    let mut tx = pool.begin().await.expect("begin recovery request");
+    apply_conversation_persistence_plan(&mut tx, &rec_plan, &rec_ctx)
+        .await
+        .expect("leaf recovery request applies");
+    tx.commit().await.expect("leaf recovery request COMMIT");
+    (rr_state, recovery_request_id, rec_ref)
+}
+
+/// Concern-2 completeness: a policy `addParticipant` executed from a coordinate
+/// carrying a DIFFERENT member's OPEN leaf-recovery request no longer hard-errors —
+/// it supersedes the request / releases its reservation / reactivates its package
+/// through the same shared writers the commit/close arms use, while adding the new
+/// participant. Before the fix, `apply_policy`'s `reject_if_present` on the recovery
+/// families made this a hard `UnsupportedEffect`.
+#[tokio::test]
+async fn policy_add_supersedes_prior_open_recovery_request() {
+    let (pool, _db) = setup().await;
+    let fixture = build_creation(&pool, ConversationKind::Group).await;
+    let conversation_id = fixture.conversation_id;
+    let mut tx = pool.begin().await.expect("begin creation");
+    apply_conversation_persistence_plan(&mut tx, &fixture.plan, &fixture.ctx)
+        .await
+        .expect("creation applies");
+    tx.commit().await.expect("creation COMMIT");
+
+    let (rr_state, recovery_request_id, rec_ref) = seed_alice_open_recovery(&pool, &fixture).await;
+    let (plan, ctx) = build_policy_edge(&pool, &fixture, &rr_state, 2).await;
+
+    let mut tx = pool.begin().await.expect("begin policy");
+    apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+        .await
+        .expect("policy add over a co-open recovery request applies");
+    tx.commit()
+        .await
+        .expect("policy COMMIT past all deferred triggers");
+
+    // The other member's recovery work is superseded / released / reactivated.
+    let (rec_status, res_status, pkg_status): (String, String, String) = sqlx::query_as(
+        "SELECT (SELECT status FROM chat.leaf_recovery_requests WHERE recovery_request_id=$1), \
+                (SELECT status FROM chat.key_package_reservations WHERE recovery_request_id=$1), \
+                (SELECT status FROM chat.key_packages WHERE key_package_ref=$2)",
+    )
+    .bind(recovery_request_id)
+    .bind(rec_ref.to_vec())
+    .fetch_one(&pool)
+    .await
+    .expect("superseded recovery state");
+    assert_eq!(
+        (
+            rec_status.as_str(),
+            res_status.as_str(),
+            pkg_status.as_str()
+        ),
+        ("superseded", "released", "available")
+    );
+    // The policy still advanced the coordinate + added the participant.
+    let (sv, participants): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT current_state_version FROM chat.conversations WHERE conversation_id=$1), \
+                (SELECT count(*) FROM chat.participants WHERE conversation_id=$1 AND current_membership)",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("head + participants");
+    assert_eq!(sv, 1, "policy advanced the coordinate");
+    assert_eq!(participants, 3, "policy added the third participant");
+}
+
+/// The recovery-family silent-drop guard is load-bearing for `apply_policy` too: a
+/// policy plan carrying an extra recovery-request delta that is NOT a supersession
+/// (an injected `Open->Expired`) is a hard `InconsistentPlan` with zero residue.
+#[tokio::test]
+async fn policy_untracked_recovery_delta_is_rejected() {
+    let (pool, _db) = setup().await;
+    let fixture = build_creation(&pool, ConversationKind::Group).await;
+    let conversation_id = fixture.conversation_id;
+    let mut tx = pool.begin().await.expect("begin creation");
+    apply_conversation_persistence_plan(&mut tx, &fixture.plan, &fixture.ctx)
+        .await
+        .expect("creation applies");
+    tx.commit().await.expect("creation COMMIT");
+
+    let (rr_state, _rid, _ref) = seed_alice_open_recovery(&pool, &fixture).await;
+    let (plan, ctx) = build_policy_edge(&pool, &fixture, &rr_state, 2).await;
+    let bad = plan.with_extra_untracked_recovery_request_for_test();
+    let mut tx = pool.begin().await.expect("begin policy");
+    let result = apply_conversation_persistence_plan(&mut tx, &bad, &ctx).await;
+    assert!(
+        matches!(result, Err(ExecutorError::InconsistentPlan(_))),
+        "an untracked policy recovery delta must be InconsistentPlan, got {result:?}"
+    );
+    tx.rollback().await.expect("rollback");
+    let sv: i64 = sqlx::query_scalar(
+        "SELECT current_state_version FROM chat.conversations WHERE conversation_id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("head");
+    assert_eq!(sv, 0, "a rejected policy left zero residue");
 }
 
 /// Close serializes against a competing head mutation from ONE prior coordinate:

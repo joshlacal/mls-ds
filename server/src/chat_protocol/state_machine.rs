@@ -16768,24 +16768,50 @@ mod executor {
         let expected_state_version = checked_i64(expected_prior.state_version())?;
         let expected_next_entry_seq = checked_i64(head.expected_next_entry_seq())?;
 
-        // Policy is a coordinate-only, participant-only edge; every crypto/recovery
-        // family is a hard error so nothing is silently dropped. The prior-bound
-        // reset/leave STALING families are NOT rejected — a policy addParticipant
-        // from a coordinate carrying a pending reset/leave request supersedes that
-        // request (Pending->Stale); consumed + reconciled at the tail (kind is
-        // `policy`, DB-legal for the leave `stale` edge).
+        // Policy is a coordinate-only, participant-add edge. It carries NO leaf /
+        // interval / terminal-proof change, but `plan_policy_transition` calls
+        // `resolve_prior_bound_work` unconditionally, so it CAN carry (a legal
+        // interleaving) prior-coordinate open-work SUPERSESSIONS — a co-open
+        // leaf-recovery request (Open->Superseded) + its reservation (Active->Released)
+        // + reserved package (Reserved->Available), a prior pending Welcome
+        // (Pending->Superseded), and prior-bound reset/leave STALING (Pending->Stale).
+        // Policy owns NONE of those (own counts 0); every such delta MUST be a
+        // supersession/staling the shared writers apply at the tail, exact-shape
+        // checked here (mirroring the close/commit arms). `recovery_package_cas` is the
+        // production-shape package witness the bijection validates, NOT a rejected
+        // family. (kind is `policy`, DB-legal for the recovery/welcome/leave edges.)
         reject_if_present("leaf_changes", effects.leaf_changes())?;
         reject_if_present("interval_changes", effects.interval_changes())?;
         reject_if_present("terminal_proof_changes", effects.terminal_proof_changes())?;
-        reject_if_present(
-            "recovery_request_changes",
-            effects.recovery_request_changes(),
-        )?;
-        reject_if_present("reservation_changes", effects.reservation_changes())?;
-        reject_if_present("welcome_changes", effects.welcome_changes())?;
-        reject_if_present("package_transitions", effects.package_transitions())?;
-        reject_if_present("recovery_package_cas", effects.recovery_package_cas())?;
         reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
+        for change in effects.recovery_request_changes() {
+            if !matches!((change.before(), change.after()), (Some(before), Some(after))
+                if before.status() == RecoveryRequestStatus::Open
+                    && after.status() == RecoveryRequestStatus::Superseded)
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "policy recovery request change is not a supersession",
+                ));
+            }
+        }
+        for change in effects.reservation_changes() {
+            if !matches!((change.before(), change.after()), (Some(before), Some(after))
+                if before.status() == ReservationStatus::Active
+                    && after.status() == ReservationStatus::Released)
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "policy reservation change is not a release",
+                ));
+            }
+        }
+        for edge in effects.package_transitions() {
+            if edge.from != PackageStatus::Reserved || edge.to != PackageStatus::Available {
+                return Err(ExecutorError::InconsistentPlan(
+                    "policy package edge is not a Reserved->Available release",
+                ));
+            }
+        }
+        verify_recovery_package_bijection(effects)?;
         if effects.metadata_change().is_some() {
             return Err(ExecutorError::UnsupportedEffect("policy metadata change"));
         }
@@ -16923,12 +16949,16 @@ mod executor {
         .await?;
         let event_positions = write_events(transaction, ctx).await?;
 
-        // 8. Durably stale any prior-bound pending reset/leave request the policy
-        //    edge retired. Policy owns NO reset/leave edge, so `own` is default and
-        //    every reset/leave delta MUST be a Pending->Stale staling the call below
-        //    applied; the crypto/recovery/welcome families were rejected above (count
-        //    0), so the reconciliation trivially holds for them.
-        let mut superseded = FamilyCounts::default();
+        // 8. Supersede prior-coordinate open work the policy edge retired (an open
+        //    recovery request / active reservation / reserved package + a prior pending
+        //    Welcome) AND stale any prior-bound pending reset/leave request. Policy owns
+        //    NONE of these families (own == default), so every such delta MUST be a
+        //    supersession/staling the shared writers below applied — reconcile rejects
+        //    any that is neither (silent-drop guard).
+        let mut superseded =
+            write_prior_bound_supersessions(transaction, effects, transition_id, applied_at)
+                .await?;
+        superseded.welcomes = write_welcome_supersessions(transaction, ctx, effects).await?;
         let staled = write_prior_bound_staling(
             transaction,
             effects,
@@ -16986,23 +17016,54 @@ mod executor {
         let expected_state_version = checked_i64(expected_prior.state_version())?;
         let expected_next_entry_seq = checked_i64(head.expected_next_entry_seq())?;
 
-        // Coordinate-only self-removal: the ONLY delta is one participant close.
-        // The leaver was leafless, so no leaf/interval/proof change; every other
-        // family is a hard error so nothing is silently dropped.
+        // Coordinate-only self-removal: the leaver's OWN delta is one participant
+        // close (leafless, so no leaf/interval/proof change). But
+        // `plan_zero_leaf_leave_inner` calls `resolve_prior_bound_work`
+        // unconditionally, so it CAN carry prior-coordinate open-work SUPERSESSIONS —
+        // a co-open recovery request / reservation / reserved package + a prior
+        // pending Welcome — which are consumed via the shared writers at the tail
+        // (own counts 0), exact-shape checked here (mirroring close/policy).
         reject_if_present("leaf_changes", effects.leaf_changes())?;
         reject_if_present("interval_changes", effects.interval_changes())?;
         reject_if_present("terminal_proof_changes", effects.terminal_proof_changes())?;
-        reject_if_present(
-            "recovery_request_changes",
-            effects.recovery_request_changes(),
-        )?;
-        reject_if_present("reservation_changes", effects.reservation_changes())?;
+        // reset_request_changes / leave_request_changes: KEPT fail-closed. This arm's
+        // transition kind is `leavePolicy`, and `assert_leave_request_mapping` forbids
+        // a leaveCommit/leavePolicy terminal transition from being a leave-request
+        // `stale` authority — yet `resolve_prior_bound_work` would emit exactly that
+        // for a co-pending leave request. That planner-vs-DDL contradiction is
+        // DEFERRED to a design ruling (Concerns 1/3); reset staling is left rejected
+        // alongside it pending the same ruling, so this stays fail-closed as today.
         reject_if_present("reset_request_changes", effects.reset_request_changes())?;
         reject_if_present("leave_request_changes", effects.leave_request_changes())?;
-        reject_if_present("welcome_changes", effects.welcome_changes())?;
-        reject_if_present("package_transitions", effects.package_transitions())?;
-        reject_if_present("recovery_package_cas", effects.recovery_package_cas())?;
         reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
+        for change in effects.recovery_request_changes() {
+            if !matches!((change.before(), change.after()), (Some(before), Some(after))
+                if before.status() == RecoveryRequestStatus::Open
+                    && after.status() == RecoveryRequestStatus::Superseded)
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "zero-leaf leave recovery request change is not a supersession",
+                ));
+            }
+        }
+        for change in effects.reservation_changes() {
+            if !matches!((change.before(), change.after()), (Some(before), Some(after))
+                if before.status() == ReservationStatus::Active
+                    && after.status() == ReservationStatus::Released)
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "zero-leaf leave reservation change is not a release",
+                ));
+            }
+        }
+        for edge in effects.package_transitions() {
+            if edge.from != PackageStatus::Reserved || edge.to != PackageStatus::Available {
+                return Err(ExecutorError::InconsistentPlan(
+                    "zero-leaf leave package edge is not a Reserved->Available release",
+                ));
+            }
+        }
+        verify_recovery_package_bijection(effects)?;
         if effects.metadata_change().is_some() {
             return Err(ExecutorError::UnsupportedEffect(
                 "zero-leaf leave metadata change",
@@ -17164,6 +17225,18 @@ mod executor {
         )
         .await?;
         let event_positions = write_events(transaction, ctx).await?;
+
+        // Supersede prior-coordinate open work the leave retired (an open recovery
+        // request / active reservation / reserved package + a prior pending Welcome).
+        // A zero-leaf leave owns NONE of these families (own == default), so every
+        // such delta MUST be a supersession the shared writers applied — reconcile
+        // rejects any that is neither. reset/leave were rejected above (count 0), so
+        // the reconciliation trivially holds for those families.
+        let mut superseded =
+            write_prior_bound_supersessions(transaction, effects, transition_id, applied_at)
+                .await?;
+        superseded.welcomes = write_welcome_supersessions(transaction, ctx, effects).await?;
+        reconcile_coordinate_change_families(effects, &FamilyCounts::default(), &superseded)?;
 
         Ok(AppliedTransition {
             allocated_seq: u64::try_from(seq_i64).unwrap(),
@@ -18435,15 +18508,22 @@ mod executor {
         let expected_state_version = checked_i64(expected_prior.state_version())?;
         let expected_next_entry_seq = checked_i64(head.expected_next_entry_seq())?;
 
-        // Acceptance carries: one pending->active participant, one new open
-        // recovery request, one new active reservation, one Available->Reserved
-        // package transition. Every other family is a hard error.
+        // Acceptance OWNS: one pending->active participant, one new open recovery
+        // request (None->Open), one new active reservation (None->Active), one
+        // Available->Reserved package transition. It ALSO calls
+        // `resolve_prior_bound_work` (via `plan_accept_conversation_inner`), so it CAN
+        // carry (a legal interleaving) prior-coordinate open-work SUPERSESSIONS — a
+        // DIFFERENT member's open recovery request (Open->Superseded) + reservation
+        // (Active->Released) + reserved package (Reserved->Available), and a prior
+        // pending Welcome (Pending->Superseded) — consumed via the shared writers at
+        // the tail. The own vs superseded partition is proven by the own-counts below
+        // + the reconciliation. reset/leave staling stays fail-closed (deferred
+        // Concerns 1/3). Every family the acceptance never carries is a hard error.
         reject_if_present("leaf_changes", effects.leaf_changes())?;
         reject_if_present("interval_changes", effects.interval_changes())?;
         reject_if_present("terminal_proof_changes", effects.terminal_proof_changes())?;
         reject_if_present("reset_request_changes", effects.reset_request_changes())?;
         reject_if_present("leave_request_changes", effects.leave_request_changes())?;
-        reject_if_present("welcome_changes", effects.welcome_changes())?;
         reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
         if effects.metadata_change().is_some() {
             return Err(ExecutorError::UnsupportedEffect(
@@ -18494,15 +18574,39 @@ mod executor {
             .ok_or(ExecutorError::InconsistentPlan(
                 "acceptance adds no open recovery request",
             ))?;
-        if effects.recovery_request_changes().len() != 1
-            || effects.reservation_changes().len() != 1
-            || effects.package_transitions().len() != 1
-        {
+        // Exactly ONE own edge per family (None->Open recovery, None->Active
+        // reservation, Available->Reserved package). Any OTHER recovery/reservation/
+        // package delta must be a prior-bound supersession (Open->Superseded /
+        // Active->Released / Reserved->Available), consumed by
+        // write_prior_bound_supersessions and proven by the tail reconciliation.
+        let own_open = effects
+            .recovery_request_changes()
+            .iter()
+            .filter(|change| matches!((change.before(), change.after()), (None, Some(_))))
+            .count();
+        let own_reserved = effects
+            .reservation_changes()
+            .iter()
+            .filter(|change| {
+                matches!((change.before(), change.after()), (None, Some(a))
+                    if a.status() == ReservationStatus::Active)
+            })
+            .count();
+        let own_package = effects
+            .package_transitions()
+            .iter()
+            .filter(|edge| {
+                edge.from == PackageStatus::Available && edge.to == PackageStatus::Reserved
+            })
+            .count();
+        if own_open != 1 || own_reserved != 1 || own_package != 1 {
             return Err(ExecutorError::InconsistentPlan(
-                "acceptance must add exactly one recovery request + reservation + package edge",
+                "acceptance must add exactly one own recovery request + reservation + package edge",
             ));
         }
-        // Load-bearing recovery-package CAS bijection + driven-ref + direction check.
+        // Load-bearing recovery-package CAS bijection (over ALL edges) + the OWN
+        // package edge's driven-ref + direction; any prior-bound Reserved->Available
+        // supersession edges are validated by write_prior_bound_supersessions.
         verify_recovery_package_consistency(
             effects,
             recovery.key_package_ref(),
@@ -18644,6 +18748,31 @@ mod executor {
         )
         .await?;
         let event_positions = write_events(transaction, ctx).await?;
+
+        // 11. Supersede any prior-coordinate open work a DIFFERENT member left bound
+        //     to the retired coordinate (Open->Superseded recovery / Active->Released
+        //     reservation / Reserved->Available package + Pending->Superseded welcome).
+        //     Acceptance's OWN edges are the None->Open recovery / None->Active
+        //     reservation / Available->Reserved package applied by write_recovery_open
+        //     above (own counts {1,1,1}); write_prior_bound_supersessions SKIPS those
+        //     (they are not the supersession shape), so it consumes ONLY the other
+        //     member's work, and reconcile proves own + superseded == total.
+        let mut superseded =
+            write_prior_bound_supersessions(transaction, effects, transition_id, applied_at)
+                .await?;
+        superseded.welcomes = write_welcome_supersessions(transaction, ctx, effects).await?;
+        reconcile_coordinate_change_families(
+            effects,
+            &FamilyCounts {
+                requests: 1,
+                reservations: 1,
+                packages: 1,
+                welcomes: 0,
+                reset_requests: 0,
+                leave_requests: 0,
+            },
+            &superseded,
+        )?;
 
         Ok(AppliedTransition {
             allocated_seq: u64::try_from(seq_i64).unwrap(),
