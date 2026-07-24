@@ -45,6 +45,8 @@ pub(crate) enum InventoryRepositoryError {
     RaceOrReuse,
     #[error("inventory page materialization is invalid")]
     InvalidMaterialization,
+    #[error("device query names too many or zero DIDs")]
+    RequestTooBroad,
     #[error(transparent)]
     Cursor(#[from] CursorCodecError),
     #[error(transparent)]
@@ -56,7 +58,7 @@ impl PartialEq for InventoryRepositoryError {
         use InventoryRepositoryError::{
             BoundaryItemMismatch, Cursor, DeviceAuthorityMismatch, DomainAlreadyComplete,
             DurableRowInvalid, InvalidMaterialization, ProtocolFenceMismatch, RaceOrReuse,
-            SessionNotFound, SessionPresentationMismatch, TransactionMismatch,
+            RequestTooBroad, SessionNotFound, SessionPresentationMismatch, TransactionMismatch,
         };
         match (self, other) {
             (SessionNotFound, SessionNotFound)
@@ -68,6 +70,7 @@ impl PartialEq for InventoryRepositoryError {
             | (BoundaryItemMismatch, BoundaryItemMismatch)
             | (TransactionMismatch, TransactionMismatch)
             | (RaceOrReuse, RaceOrReuse)
+            | (RequestTooBroad, RequestTooBroad)
             | (InvalidMaterialization, InvalidMaterialization) => true,
             (Cursor(left), Cursor(right)) => left == right,
             _ => false,
@@ -1697,4 +1700,86 @@ fn canonical_transaction_id(value: &str) -> bool {
 
 fn uuid_is_canonical_v4(value: Uuid) -> bool {
     value.get_variant() == Variant::RFC4122 && value.get_version() == Some(Version::Random)
+}
+
+// ===========================================================================
+// getDevices — the bounded, fenceless multi-DID active-device query (Slice 4b).
+//
+// This is the ordinary directory read (`getDevices`), NOT `getOwnDevices` (which
+// uses the separate `device_inventory_*` as-of fence). It is deliberately
+// bounded structurally: at most `MAX_GET_DEVICES_DIDS` requested DIDs, at most
+// `MAX_DEVICES_PER_DID` active devices returned per DID, and therefore at most
+// `MAX_GET_DEVICES_TOTAL` rows in one response. The per-DID cap is applied in SQL
+// by a `ROW_NUMBER()` window so a DID that (transiently) exceeds the schema's
+// 20-active-device ceiling still returns a bounded page rather than an unbounded
+// scan.
+// ===========================================================================
+
+/// The maximum number of DIDs one `getDevices` call may name.
+pub(crate) const MAX_GET_DEVICES_DIDS: usize = 5;
+/// The maximum active devices returned for any one DID.
+pub(crate) const MAX_DEVICES_PER_DID: i64 = 20;
+/// The maximum total devices in one bounded `getDevices` response
+/// (`MAX_GET_DEVICES_DIDS * MAX_DEVICES_PER_DID`).
+pub(crate) const MAX_GET_DEVICES_TOTAL: usize = 100;
+
+/// One active device as returned by `getDevices`. Carries the addressable device
+/// identity columns; the wire `deviceView` shaping (and any capability
+/// projection) is a later adapter concern.
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub(crate) struct DeviceView {
+    pub(crate) user_did: String,
+    pub(crate) device_id: Uuid,
+    pub(crate) device_name: String,
+    pub(crate) status: String,
+    pub(crate) dpop_jkt: String,
+    pub(crate) auth_generation: i64,
+    pub(crate) created_at: DateTime<Utc>,
+}
+
+/// Return every ACTIVE, non-revoked device for the requested DIDs, bounded to at
+/// most `MAX_DEVICES_PER_DID` per DID and `MAX_GET_DEVICES_TOTAL` overall. The
+/// caller must name between one and `MAX_GET_DEVICES_DIDS` DIDs (a duplicate DID
+/// counts once against the bound after de-duplication is the caller's concern;
+/// this read rejects a request that names too many or zero DIDs). Ordering is
+/// canonical `(user_did, created_at, device_id)` so the bounded page is
+/// deterministic.
+pub(crate) async fn get_devices(
+    transaction: &mut Transaction<'_, Postgres>,
+    dids: &[String],
+) -> Result<Vec<DeviceView>, InventoryRepositoryError> {
+    if dids.is_empty() || dids.len() > MAX_GET_DEVICES_DIDS {
+        return Err(InventoryRepositoryError::RequestTooBroad);
+    }
+
+    let rows = sqlx::query_as::<_, DeviceView>(
+        r#"
+        SELECT user_did, device_id, device_name, status, dpop_jkt, auth_generation, created_at
+          FROM (
+            SELECT device.user_did,
+                   device.device_id,
+                   device.device_name,
+                   device.status,
+                   device.dpop_jkt,
+                   device.auth_generation,
+                   device.created_at,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY device.user_did
+                       ORDER BY device.created_at, device.device_id
+                   ) AS rn
+              FROM chat.devices device
+             WHERE device.user_did = ANY($1)
+               AND device.status = 'active'
+               AND device.revoked_at IS NULL
+          ) bounded
+         WHERE bounded.rn <= $2
+         ORDER BY bounded.user_did, bounded.created_at, bounded.device_id
+        "#,
+    )
+    .bind(dids)
+    .bind(MAX_DEVICES_PER_DID)
+    .fetch_all(&mut **transaction)
+    .await?;
+
+    Ok(rows)
 }
