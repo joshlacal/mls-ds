@@ -27,6 +27,12 @@ mod repository {
             "/src/chat_protocol/repository/inventory.rs"
         ));
     }
+    pub(crate) mod ticket {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/chat_protocol/repository/ticket.rs"
+        ));
+    }
 }
 
 mod cursor {
@@ -36,12 +42,23 @@ mod cursor {
     ));
 }
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, TimeZone, Utc};
+use cursor::CursorCodec;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
-use repository::inventory::{get_devices, InventoryRepositoryError, MAX_GET_DEVICES_DIDS};
+use repository::inventory::{
+    create_device_inventory_session, create_inventory_session, get_devices,
+    CreateDeviceInventorySessionRequest, CreateInventorySessionRequest, DeviceInventorySubject,
+    EventTerminalHint, IntervalSummaryTerminalHint, InventoryRepositoryError,
+    InventorySummaryTerminalHint, TombstoneTerminalHint, MAX_GET_DEVICES_DIDS,
+};
+use repository::ticket::{
+    consume_subscription_ticket, mint_subscription_ticket, ticket_hash, MintSubscriptionTicket,
+    SUBSCRIBE_EVENTS_PATH,
+};
 
 fn random_plc_did() -> String {
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
@@ -328,3 +345,431 @@ async fn get_devices_excludes_revoked_devices() {
         assert_eq!(d.user_did, did);
     }
 }
+
+// ===========================================================================
+// Inventory-session CREATE + materialize (the first-getConversations half).
+// ===========================================================================
+
+fn whole_second(dt: DateTime<Utc>) -> DateTime<Utc> {
+    Utc.timestamp_opt(dt.timestamp(), 0)
+        .single()
+        .expect("whole-second instant")
+}
+
+struct SessionDevice {
+    did: String,
+    device_id: Uuid,
+    jkt: String,
+}
+
+/// Seed an active device WITH its single device key (the CREATE path joins
+/// `device_keys`), returning the identity fields the create request binds.
+async fn seed_device_with_key(pool: &PgPool, at: DateTime<Utc>) -> SessionDevice {
+    let did = random_plc_did();
+    let device_id = Uuid::new_v4();
+    let jkt = fresh_jkt(pool).await;
+    let public_key = fresh_blob();
+    let key_id: String = sqlx::query_scalar("SELECT chat.ed25519_key_id($1)")
+        .bind(&public_key)
+        .fetch_one(pool)
+        .await
+        .expect("derive key id");
+    seed_principal(pool, &did, at).await;
+    sqlx::query(
+        "INSERT INTO chat.devices(user_did,device_id,device_name,status,dpop_jkt,auth_generation,capabilities,created_at,updated_at) \
+         VALUES($1,$2,'dev-session','active',$3,1,chat.protocol_capabilities(),$4,$4)",
+    )
+    .bind(&did)
+    .bind(device_id)
+    .bind(&jkt)
+    .bind(at)
+    .execute(pool)
+    .await
+    .expect("insert device");
+    sqlx::query(
+        "INSERT INTO chat.device_keys(user_did,device_id,key_id,signing_public_key,enrollment_auth_generation,created_at) \
+         VALUES($1,$2,$3,$4,1,$5)",
+    )
+    .bind(&did)
+    .bind(device_id)
+    .bind(&key_id)
+    .bind(&public_key)
+    .bind(at)
+    .execute(pool)
+    .await
+    .expect("insert device key");
+    SessionDevice {
+        did,
+        device_id,
+        jkt,
+    }
+}
+
+/// Ensure the protocol singleton + retention floor exist (a concurrent suite may
+/// have seeded them already) and return a `CursorCodec` bound to the singleton's
+/// exact `protocol_instance_id` + `cursor_key_id`. The codec secret is arbitrary
+/// but consistent within the codec, so cursors it issues verify against it.
+async fn ensure_fence(pool: &PgPool) -> CursorCodec {
+    let cursor_key: String = sqlx::query_scalar("SELECT chat.ed25519_key_id($1)")
+        .bind(vec![0x51u8; 32])
+        .fetch_one(pool)
+        .await
+        .expect("derive cursor key");
+    sqlx::query(
+        "INSERT INTO chat.protocol_instances(singleton,protocol_version,protocol_instance_id,cursor_key_id) \
+         VALUES(TRUE,'1',$1,$2) ON CONFLICT DO NOTHING",
+    )
+    .bind(Uuid::new_v4())
+    .bind(&cursor_key)
+    .execute(pool)
+    .await
+    .expect("seed protocol instance");
+    let (protocol_instance_id, cursor_key_id): (Uuid, String) = sqlx::query_as(
+        "SELECT protocol_instance_id, cursor_key_id FROM chat.protocol_instances WHERE singleton = TRUE",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("read protocol instance");
+    sqlx::query(
+        "INSERT INTO chat.event_retention(protocol_instance_id,retained_floor,updated_at) \
+         VALUES($1,0,clock_timestamp()) ON CONFLICT DO NOTHING",
+    )
+    .bind(protocol_instance_id)
+    .execute(pool)
+    .await
+    .expect("seed retention floor");
+    CursorCodec::new(
+        protocol_instance_id,
+        &cursor_key_id,
+        Zeroizing::new([0xC7u8; 32]),
+    )
+    .expect("codec bound to the DB protocol singleton")
+}
+
+fn empty_sha256() -> Vec<u8> {
+    Sha256::digest([]).to_vec()
+}
+
+#[tokio::test]
+#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
+async fn first_get_conversations_creates_one_session_and_fence() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
+    let codec = ensure_fence(&pool).await;
+    let now = whole_second(clock_now(&pool).await);
+    let device = seed_device_with_key(&pool, now - Duration::seconds(120)).await;
+    let session_id = Uuid::new_v4();
+
+    let mut tx = pool.begin().await.expect("begin create");
+    let created = create_inventory_session(
+        &mut tx,
+        &codec,
+        CreateInventorySessionRequest {
+            inventory_session_id: session_id,
+            user_did: &device.did,
+            device_id: device.device_id,
+            jkt: &device.jkt,
+            auth_generation: 1,
+            created_at: now,
+            expires_at: now + Duration::minutes(10),
+            conversations: vec![],
+            welcomes: vec![],
+            recovery: vec![],
+        },
+    )
+    .await
+    .expect("create an empty-device inventory session");
+    tx.commit()
+        .await
+        .expect("commit past the deferred materialization + identity triggers");
+
+    assert_eq!(created.inventory_session_id, session_id);
+    assert_eq!(created.conversation_item_count, 0);
+    assert_eq!(created.welcome_item_count, 0);
+    assert_eq!(created.recovery_item_count, 0);
+
+    // Exactly one retained session row, with the captured fence and the
+    // complete-with-zero shape (count 0, hash SHA256("")) every domain.
+    let row: (
+        Vec<u8>,
+        i64,
+        Vec<u8>,
+        Vec<u8>,
+        bool,
+        bool,
+        bool,
+        Option<i64>,
+        Option<Vec<u8>>,
+        Option<i64>,
+        Option<Vec<u8>>,
+        Option<i64>,
+        Option<Vec<u8>>,
+    ) = sqlx::query_as(
+        "SELECT token_hash, snapshot_event_position, snapshot_event_cursor_bytes, \
+                snapshot_event_cursor_sha256, conversations_complete, welcomes_complete, \
+                recovery_complete, conversation_item_count, conversation_items_sha256, \
+                welcome_item_count, welcome_items_sha256, recovery_item_count, recovery_items_sha256 \
+           FROM chat.inventory_sessions WHERE inventory_session_id = $1",
+    )
+    .bind(session_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the created session row is retained");
+
+    assert_eq!(
+        row.1 as u64, created.snapshot_event_position,
+        "the stored fence position matches the receipt"
+    );
+    assert_eq!(
+        row.2, created.snapshot_event_cursor_bytes,
+        "the stored snapshot cursor bytes match the receipt (byte-identical fence)"
+    );
+    assert_eq!(
+        row.3,
+        Sha256::digest(&created.snapshot_event_cursor_bytes).to_vec(),
+        "the stored cursor sha256 is the digest of the cursor bytes"
+    );
+    assert!(row.4 && row.5 && row.6, "every domain is complete");
+    assert_eq!(row.7, Some(0));
+    assert_eq!(row.8, Some(empty_sha256()));
+    assert_eq!(row.9, Some(0));
+    assert_eq!(row.10, Some(empty_sha256()));
+    assert_eq!(row.11, Some(0));
+    assert_eq!(row.12, Some(empty_sha256()));
+
+    // The token hash the CREATE stored is the binding hash of the opaque token it
+    // returned — the two agree, so the client's session id round-trips.
+    let token_hash: Vec<u8> =
+        cursor::opaque_binding_hash(created.inventory_session_token.as_bytes())
+            .expect("token within the opaque bound")
+            .to_vec();
+    assert_eq!(
+        row.0, token_hash,
+        "durable token_hash == hash(returned token)"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
+async fn create_then_mint_subscription_ticket_closes_the_loop() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
+    let codec = ensure_fence(&pool).await;
+    let now = whole_second(clock_now(&pool).await);
+    let device = seed_device_with_key(&pool, now - Duration::seconds(120)).await;
+    let session_id = Uuid::new_v4();
+
+    let mut tx = pool.begin().await.expect("begin create");
+    let created = create_inventory_session(
+        &mut tx,
+        &codec,
+        CreateInventorySessionRequest {
+            inventory_session_id: session_id,
+            user_did: &device.did,
+            device_id: device.device_id,
+            jkt: &device.jkt,
+            auth_generation: 1,
+            created_at: now,
+            expires_at: now + Duration::minutes(10),
+            conversations: vec![],
+            welcomes: vec![],
+            recovery: vec![],
+        },
+    )
+    .await
+    .expect("create session");
+    tx.commit().await.expect("commit create");
+
+    // A ticket mints against the session THIS code created: it is complete in all
+    // three domains and the presented cursor byte-equals the session snapshot
+    // cursor, so the deferred ticket-binding trigger accepts it at commit.
+    let opaque = fresh_blob();
+    let mint = MintSubscriptionTicket {
+        ticket_hash: ticket_hash(&opaque).to_vec(),
+        user_did: device.did.clone(),
+        device_id: device.device_id,
+        jkt: device.jkt.clone(),
+        auth_generation: 1,
+        inventory_session_id: session_id,
+        event_cursor_bytes: created.snapshot_event_cursor_bytes.clone(),
+        subscription_path: SUBSCRIBE_EVENTS_PATH.to_owned(),
+        created_at: now,
+        expires_at: now + Duration::seconds(60),
+    };
+    let mut tx = pool.begin().await.expect("begin mint");
+    let minted = mint_subscription_ticket(&mut tx, &mint)
+        .await
+        .expect("mint a ticket from a session created by create_inventory_session");
+    tx.commit()
+        .await
+        .expect("commit mint past deferred binding");
+    assert_eq!(
+        minted.event_position as u64,
+        created.snapshot_event_position
+    );
+    assert_eq!(
+        minted.event_cursor_bytes,
+        created.snapshot_event_cursor_bytes
+    );
+
+    // And the minted ticket consumes exactly once against the same fence.
+    let mut tx = pool.begin().await.expect("begin consume");
+    let consumed = consume_subscription_ticket(
+        &mut tx,
+        &ticket_hash(&opaque),
+        &created.snapshot_event_cursor_bytes,
+        SUBSCRIBE_EVENTS_PATH,
+        whole_second(clock_now(&pool).await),
+    )
+    .await
+    .expect("consume the minted ticket once");
+    tx.commit().await.expect("commit consume");
+    assert_eq!(consumed.inventory_session_id, session_id);
+}
+
+#[tokio::test]
+#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
+async fn get_own_devices_uses_separate_device_fence() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
+    let now = whole_second(clock_now(&pool).await);
+    // The requester device (with its key) plus a sibling device of the SAME
+    // principal — both are subjects of the own-device snapshot.
+    let requester = seed_device_with_key(&pool, now - Duration::seconds(120)).await;
+    let sibling = seed_active_device(&pool, &requester.did, now - Duration::seconds(90)).await;
+    let session_id = Uuid::new_v4();
+
+    let mut tx = pool.begin().await.expect("begin create");
+    let created = create_device_inventory_session(
+        &mut tx,
+        CreateDeviceInventorySessionRequest {
+            device_inventory_session_id: session_id,
+            user_did: &requester.did,
+            device_id: requester.device_id,
+            jkt: &requester.jkt,
+            auth_generation: 1,
+            fence_revision: 0,
+            created_at: now,
+            expires_at: now + Duration::minutes(10),
+            subjects: vec![
+                DeviceInventorySubject {
+                    subject_device_id: requester.device_id,
+                    payload_bytes: b"own-device-self".to_vec(),
+                },
+                DeviceInventorySubject {
+                    subject_device_id: sibling,
+                    payload_bytes: b"own-device-sibling".to_vec(),
+                },
+            ],
+        },
+    )
+    .await
+    .expect("create the separate own-device fence");
+    tx.commit()
+        .await
+        .expect("commit past device_inventory materialization + principal triggers");
+
+    assert_eq!(created.item_count, 2);
+
+    // Materialized into the SEPARATE device fence tables, not the shared session.
+    let subjects: Vec<(i64, Uuid)> = sqlx::query_as(
+        "SELECT ordinal, subject_device_id FROM chat.device_inventory_items \
+           WHERE device_inventory_session_id = $1 ORDER BY ordinal",
+    )
+    .bind(session_id)
+    .fetch_all(&pool)
+    .await
+    .expect("read materialized own-device items");
+    assert_eq!(subjects.len(), 2);
+    assert_eq!(subjects[0], (0, requester.device_id));
+    assert_eq!(subjects[1], (1, sibling));
+
+    let (complete, count): (bool, Option<i64>) = sqlx::query_as(
+        "SELECT complete, item_count FROM chat.device_inventory_sessions \
+           WHERE device_inventory_session_id = $1",
+    )
+    .bind(session_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read device fence row");
+    assert!(complete);
+    assert_eq!(count, Some(2));
+
+    // The id is NOT a shared inventory session — the two fences never collide.
+    let shared: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.inventory_sessions WHERE inventory_session_id = $1",
+    )
+    .bind(session_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count shared sessions");
+    assert_eq!(
+        shared, 0,
+        "getOwnDevices never writes the shared session fence"
+    );
+}
+
+#[test]
+fn terminal_seq_hints_carry_no_fingerprint() {
+    // The DTOs expose a `terminal_seq` (wake/navigation) and nothing else that
+    // could authorize a close: constructing each proves the field exists and is
+    // the only seq carried.
+    let tombstone = TombstoneTerminalHint {
+        conversation_id: Uuid::new_v4(),
+        terminal_seq: 7,
+    };
+    let event = EventTerminalHint {
+        conversation_id: Uuid::new_v4(),
+        terminal_seq: 7,
+    };
+    let inventory = InventorySummaryTerminalHint {
+        conversation_id: Uuid::new_v4(),
+        terminal_seq: 7,
+    };
+    let interval = IntervalSummaryTerminalHint {
+        conversation_id: Uuid::new_v4(),
+        terminal_seq: 7,
+    };
+    assert_eq!(tombstone.terminal_seq, 7);
+    assert_eq!(event.terminal_seq, 7);
+    assert_eq!(inventory.terminal_seq, 7);
+    assert_eq!(interval.terminal_seq, 7);
+
+    // No hint DTO carries an outer-entry fingerprint (a hint must never duplicate
+    // one, nor authorize a close/schedule-terminalize). Assert structurally over
+    // the hint DTO block in the production source.
+    let source = include_str!("../src/chat_protocol/repository/inventory.rs");
+    let hint_block = source
+        .split_once("terminalSeq wake/navigation hint DTOs")
+        .expect("hint DTO section exists")
+        .1;
+    for hint in [
+        "pub(crate) struct TombstoneTerminalHint",
+        "pub(crate) struct EventTerminalHint",
+        "pub(crate) struct InventorySummaryTerminalHint",
+        "pub(crate) struct IntervalSummaryTerminalHint",
+    ] {
+        let body = hint_block
+            .split_once(hint)
+            .expect("hint struct present")
+            .1
+            .split_once("\n}")
+            .expect("hint struct body closed")
+            .0;
+        assert!(body.contains("terminal_seq"), "{hint} exposes terminal_seq");
+        assert!(
+            !body.contains("fingerprint"),
+            "{hint} must NOT carry an outer-entry fingerprint"
+        );
+    }
+}
+
+// NOTE: the populated conversation-domain materialization case (remainder #8) is
+// NOT raw-seedable in isolation despite the S4a scoping report's note: the
+// `conversations` row carries an IMMEDIATE `conversations_current_state_fk` on
+// `(conversation_id, current_generation, current_state_version)` into
+// `generation_states`, whose FK chains back through `generations` to
+// `conversations` — a circular immediate FK that only the executor's coherent
+// creation graph (deferred-constraint transaction) can satisfy. The populated
+// conversation domain therefore shares the executor-seed dependency with the
+// pending-Welcome and recovery domains and is built beside the executor harness,
+// not here. The empty-domain and ticket-loop cases above prove the CREATE
+// transaction (fence capture, token derivation, ordinal/digest/completion, and
+// the deferred materialization + identity triggers) end-to-end.
