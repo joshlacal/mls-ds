@@ -1938,6 +1938,14 @@ pub(crate) struct CreatedInventorySession {
 /// row was written; it rolls back). A caller that receives `SnapshotConflict`
 /// re-runs the whole call. See the coverage-proof comment at the re-validation.
 ///
+/// This retry contract assumes the enclosing transaction runs under READ
+/// COMMITTED isolation (PostgreSQL's default). The re-validation is load-bearing
+/// precisely because a later statement observes a concurrently-committed fence
+/// advance; under REPEATABLE READ or SERIALIZABLE the re-read is a frozen-snapshot
+/// tautology (always equal to the step-1 capture) and would NOT catch a concurrent
+/// commit — a future handler must not wire this call under snapshot isolation
+/// believing the re-read guards against concurrent selection-affecting commits.
+///
 /// Note (r12 minor #4): `SET CONSTRAINTS … IMMEDIATE` changes the named deferred
 /// constraints to immediate for the REMAINDER of the enclosing transaction, not
 /// just for the statements this function issues. That is correct for the terminal

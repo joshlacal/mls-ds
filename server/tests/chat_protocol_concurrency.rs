@@ -26,9 +26,10 @@
 //!
 //! The production repository modules are gated `#[cfg(not(test))]`, so — mirroring
 //! the sibling repository harnesses — this test `include!`s them directly. Live
-//! cases require the dedicated clean-chat database and are `#[ignore]`d by default:
+//! cases run under the standard whole-suite gate: they hard-fail (panic in
+//! `setup_chat_protocol_db`) without `TEST_DATABASE_URL` rather than skipping:
 //!   TEST_DATABASE_URL=postgres://localhost/catbird_chat_protocol_test_20260722 \
-//!   cargo test --test chat_protocol_concurrency -- --ignored --test-threads=1
+//!   cargo test --test chat_protocol_concurrency -- --test-threads=1
 
 #![allow(dead_code)]
 
@@ -455,7 +456,6 @@ fn coherent_application_send(base: &BaseConversation, salt: u8) -> ApplicationSe
 /// full multi-row races are proven at the executor level in
 /// `tests/chat_protocol_executor.rs`, not claimed here.
 #[tokio::test]
-#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn two_terminal_authorities_on_one_work_row_serialize_to_one_winner() {
     let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
     let protocol_instance_id = seed_protocol_instance(&pool).await;
@@ -534,7 +534,6 @@ async fn two_terminal_authorities_on_one_work_row_serialize_to_one_winner() {
 /// never the same seq and never a gap — the head `SELECT ... FOR UPDATE` seq
 /// allocator serializes them. `next_entry_seq` ends at 4.
 #[tokio::test]
-#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn concurrent_application_appends_get_unique_contiguous_seqs() {
     let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
     let base = seed_base(&pool).await;
@@ -589,7 +588,6 @@ async fn concurrent_application_appends_get_unique_contiguous_seqs() {
 /// claims disjoint; `FOR UPDATE SKIP LOCKED` only adds liveness — a worker skips a
 /// row another already locked instead of blocking on it.
 #[tokio::test]
-#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn two_outbox_workers_never_double_claim() {
     let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
     let protocol_instance_id = seed_protocol_instance(&pool).await;

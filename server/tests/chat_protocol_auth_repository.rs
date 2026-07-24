@@ -1,7 +1,13 @@
 //! Repository-boundary tests for clean chat authentication.
 //!
 //! Database cases remain ignored until the schema owner clears the dedicated
-//! `catbird_chat_protocol_test_20260722` database gate.
+//! `catbird_chat_protocol_test_20260722` database gate. They stay `#[ignore]`d
+//! (not de-ignored into the standard whole-suite gate) because each seeds
+//! replay/idempotency rows that collide on a shared, never-truncated database;
+//! they need a pristine schema per run, which the standard harness does not
+//! provide. Run them explicitly against a freshly-migrated dedicated database:
+//!   TEST_DATABASE_URL=postgres://localhost/catbird_chat_protocol_test_20260722 \
+//!   cargo test --test chat_protocol_auth_repository -- --ignored --test-threads=1
 
 mod common;
 

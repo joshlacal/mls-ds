@@ -13,9 +13,11 @@
 //!
 //! Like the sibling repository harnesses this `include!`s the production module
 //! directly (it is self-contained: only `chrono`/`sqlx`/`uuid`). The live cases
-//! are `#[ignore]`d by default. Run with:
+//! run under the standard whole-suite gate: they hard-fail (panic in
+//! `setup_chat_protocol_db`) without `TEST_DATABASE_URL` rather than skipping.
+//! Run with:
 //!   TEST_DATABASE_URL=postgres://localhost/catbird_chat_protocol_test_20260722 \
-//!   cargo test --test chat_protocol_blobs -- --include-ignored --test-threads=1
+//!   cargo test --test chat_protocol_blobs -- --test-threads=1
 
 #![allow(dead_code)]
 
@@ -329,7 +331,6 @@ fn prepare_request(
 }
 
 #[tokio::test]
-#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
 async fn prepare_upload_delete_lifecycle_keeps_usage_reconciled() {
     let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(2).await;
     let mut tx = pool.begin().await.expect("begin");
@@ -407,7 +408,6 @@ async fn prepare_upload_delete_lifecycle_keeps_usage_reconciled() {
 }
 
 #[tokio::test]
-#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
 async fn upload_ticket_is_single_use_and_expires_after_five_minutes() {
     let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(2).await;
     let mut tx = pool.begin().await.expect("begin");
@@ -486,7 +486,6 @@ async fn upload_ticket_is_single_use_and_expires_after_five_minutes() {
 }
 
 #[tokio::test]
-#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
 async fn unbound_blobs_expire_after_one_hour_and_release_quota() {
     let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(2).await;
     let mut tx = pool.begin().await.expect("begin");
@@ -552,7 +551,6 @@ async fn unbound_blobs_expire_after_one_hour_and_release_quota() {
 }
 
 #[tokio::test]
-#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
 async fn usage_delta_rejects_over_cap_bytes_and_over_cap_live_unbound() {
     let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(2).await;
 
@@ -586,7 +584,6 @@ async fn usage_delta_rejects_over_cap_bytes_and_over_cap_live_unbound() {
 }
 
 #[tokio::test]
-#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
 async fn two_senders_race_to_bind_one_blob_and_exactly_one_wins() {
     // The bind race resolves at the blob status CAS: `completedUnbound -> bound`
     // matches exactly one row, so the second concurrent binder conflicts.
@@ -649,7 +646,6 @@ async fn two_senders_race_to_bind_one_blob_and_exactly_one_wins() {
 }
 
 #[tokio::test]
-#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
 async fn only_the_signing_owner_device_may_delete_a_completed_unbound_blob() {
     let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(2).await;
     let mut tx = pool.begin().await.expect("begin");
@@ -747,7 +743,6 @@ async fn only_the_signing_owner_device_may_delete_a_completed_unbound_blob() {
 }
 
 #[tokio::test]
-#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
 async fn database_check_backstops_media_per_purpose_and_size_relation() {
     // The dumb writer is trusted, but the sealed DDL is the ultimate authority:
     // a raw prepared insert that violates media-per-purpose or the AEAD relation
@@ -884,7 +879,6 @@ async fn count_where(tx: &mut Transaction<'_, Postgres>, sql: &str, conversation
 }
 
 #[tokio::test]
-#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
 async fn stale_send_writes_only_a_tombstone_with_no_entry_seq_blob_or_event() {
     let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(2).await;
     let mut tx = pool.begin().await.expect("begin");
@@ -978,7 +972,6 @@ async fn stale_send_writes_only_a_tombstone_with_no_entry_seq_blob_or_event() {
 }
 
 #[tokio::test]
-#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
 async fn stale_send_exact_replay_returns_stale_and_never_later_succeeds() {
     let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(2).await;
     let mut tx = pool.begin().await.expect("begin");
@@ -1024,7 +1017,6 @@ async fn stale_send_exact_replay_returns_stale_and_never_later_succeeds() {
 }
 
 #[tokio::test]
-#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
 async fn stale_send_changed_bytes_under_same_message_id_conflicts() {
     let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(2).await;
     let mut tx = pool.begin().await.expect("begin");
@@ -1079,7 +1071,6 @@ async fn stale_send_changed_bytes_under_same_message_id_conflicts() {
 // ===========================================================================
 
 #[tokio::test]
-#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
 async fn descriptor_and_aad_bytes_are_stored_opaquely_without_inner_parsing() {
     let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(2).await;
     let mut tx = pool.begin().await.expect("begin");
@@ -1344,7 +1335,6 @@ fn coherent_app_send(
 }
 
 #[tokio::test]
-#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
 async fn application_binding_is_readable_by_the_exact_device_and_denied_to_a_sibling() {
     let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(2).await;
     let mut tx = pool.begin().await.expect("begin");
@@ -1457,7 +1447,6 @@ async fn application_binding_is_readable_by_the_exact_device_and_denied_to_a_sib
 }
 
 #[tokio::test]
-#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
 async fn attachment_read_predicate_matches_the_exact_device_interval_span() {
     // Isolates the interval-spanning read predicate (the same predicate the delivery
     // read path proves): a binding at seq 5 is visible to a reader ONLY when its

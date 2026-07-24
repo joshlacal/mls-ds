@@ -8,10 +8,12 @@
 //!
 //! The production repository module is gated `#[cfg(not(test))]` (see
 //! `src/chat_protocol/repository/mod.rs`), so — mirroring the sibling
-//! repository harnesses — this test `include!`s it directly. Live cases require
-//! the dedicated clean-chat database and are `#[ignore]`d by default; run with
+//! repository harnesses — this test `include!`s it directly. Live cases run
+//! under the standard whole-suite gate: they hard-fail (panic in
+//! `setup_chat_protocol_db`) without `TEST_DATABASE_URL` rather than skipping.
+//! Run with:
 //!   TEST_DATABASE_URL=postgres://localhost/catbird_chat_protocol_test_20260722 \
-//!   cargo test --test chat_protocol_delivery -- --ignored
+//!   cargo test --test chat_protocol_delivery -- --test-threads=1
 
 #![allow(dead_code)]
 
@@ -492,7 +494,6 @@ fn to_application_send(send: CoherentSend) -> ApplicationSend {
 /// An EXACT replay returns the ORIGINAL seq with no new entry; the same message id
 /// under DIFFERENT signed bytes conflicts.
 #[tokio::test]
-#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn application_send_accepts_appends_entry_and_is_idempotent() {
     let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
     let fixture = seed_fixture(&pool).await;
@@ -568,7 +569,6 @@ async fn application_send_accepts_appends_entry_and_is_idempotent() {
 /// leaves `next_entry_seq` untouched. A later `Accept`-intent replay can NEVER
 /// succeed — it returns the stored `Stale` outcome and appends nothing.
 #[tokio::test]
-#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn application_send_stale_tombstones_without_entry_and_never_succeeds() {
     let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
     let fixture = seed_fixture(&pool).await;
@@ -631,7 +631,6 @@ async fn application_send_stale_tombstones_without_entry_and_never_succeeds() {
 /// start at the conversation's current `next_entry_seq` (2, past the genesis)
 /// and leave the append counter and committed log contiguous.
 #[tokio::test]
-#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn append_allocates_unique_and_contiguous_seqs() {
     let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
     let fixture = seed_fixture(&pool).await;
@@ -677,7 +676,6 @@ async fn append_allocates_unique_and_contiguous_seqs() {
 /// and can only proceed after the first commits — yielding distinct, adjacent
 /// seqs with no gap or duplicate.
 #[tokio::test]
-#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn concurrent_appends_serialize_without_gap_or_dup() {
     let pool = common::chat_protocol::setup_chat_protocol_db(5).await;
     let fixture = seed_fixture(&pool).await;
@@ -739,7 +737,6 @@ async fn concurrent_appends_serialize_without_gap_or_dup() {
 /// The append-log primary key `(conversation_id, seq)` rejects a second row at
 /// an already-occupied seq — the invariant the row-lock allocation upholds.
 #[tokio::test]
-#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn primary_key_rejects_duplicate_seq() {
     let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
     let fixture = seed_fixture(&pool).await;
@@ -801,7 +798,6 @@ async fn primary_key_rejects_duplicate_seq() {
 /// the `FOR UPDATE` head lock finds no row and the allocator refuses to invent
 /// a seq.
 #[tokio::test]
-#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn append_reports_missing_conversation() {
     let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
     let received_at = clock_now(&pool).await;
@@ -1013,7 +1009,6 @@ async fn drain_outbox(pool: &PgPool) {
 /// the deferred `entry_recipients_mapping_deferred` guard is satisfied because
 /// seq 1 is a non-application control entry.
 #[tokio::test]
-#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn entry_recipients_control_arm_freezes_and_commits() {
     let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
     let fixture = seed_fixture(&pool).await;
@@ -1051,7 +1046,6 @@ async fn entry_recipients_control_arm_freezes_and_commits() {
 /// A control entry with no audience is a caller bug: the primitive refuses an
 /// empty recipient list rather than writing zero rows.
 #[tokio::test]
-#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn entry_recipients_reject_empty_audience() {
     let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
     let fixture = seed_fixture(&pool).await;
@@ -1069,7 +1063,6 @@ async fn entry_recipients_reject_empty_audience() {
 /// The primitive enforces canonical `(DID,device)` input order and rejects both
 /// out-of-order and duplicate tuples rather than silently sorting/deduping.
 #[tokio::test]
-#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn entry_recipients_reject_noncanonical_or_duplicate_input() {
     let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
     let fixture = seed_fixture(&pool).await;
@@ -1106,7 +1099,6 @@ async fn entry_recipients_reject_noncanonical_or_duplicate_input() {
 /// The `(conversation,seq,DID,device)` primary key rejects a second frozen row
 /// for the same exact device at the same entry — audience rows are immutable.
 #[tokio::test]
-#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn entry_recipients_duplicate_pk_rejected() {
     let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
     let fixture = seed_fixture(&pool).await;
@@ -1154,7 +1146,6 @@ async fn entry_recipients_duplicate_pk_rejected() {
 /// the two immediate foreign keys reject an audience row aimed at a
 /// non-existent seq or a non-existent device.
 #[tokio::test]
-#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn entry_recipients_reject_missing_entry_or_device_fk() {
     let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
     let fixture = seed_fixture(&pool).await;
@@ -1224,7 +1215,6 @@ async fn entry_recipients_reject_missing_entry_or_device_fk() {
 /// insert is accepted while the commit is rejected, proving both the primitive
 /// and the schema guard.
 #[tokio::test]
-#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn entry_recipients_interval_kinds_written_but_guarded_at_commit() {
     let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
     let fixture = seed_fixture(&pool).await;
@@ -1283,7 +1273,6 @@ fn new_event(instance: Uuid, kind: EventKind, created_at: DateTime<Utc>, salt: u
 /// The DB-allocated `event_position` identity is strictly increasing across
 /// sequential appends (gaps are allowed, order is not).
 #[tokio::test]
-#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn append_event_allocates_strictly_increasing_positions() {
     let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
     let instance = ensure_protocol_instance(&pool).await;
@@ -1306,7 +1295,6 @@ async fn append_event_allocates_strictly_increasing_positions() {
 /// Each of the ten closed `event_kind` values round-trips through the primitive,
 /// and the caller-supplied `created_at` is stored verbatim (never `now()`).
 #[tokio::test]
-#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn append_event_roundtrips_every_kind_and_caller_timestamp() {
     let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
     let instance = ensure_protocol_instance(&pool).await;
@@ -1354,7 +1342,6 @@ async fn append_event_roundtrips_every_kind_and_caller_timestamp() {
 /// mismatch is impossible through the primitive; the DB CHECK independently
 /// rejects a hand-rolled row whose stored hash does not match its payload.
 #[tokio::test]
-#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn append_event_hash_is_api_computed_and_db_enforced() {
     let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
     let instance = ensure_protocol_instance(&pool).await;
@@ -1413,7 +1400,6 @@ fn event_recipient(did: &str, device: Uuid, predecessor: Option<i64>) -> EventRe
 /// points at the same device's immediately preceding event_position. A valid
 /// chain commits.
 #[tokio::test]
-#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn event_recipients_valid_predecessor_chain_commits() {
     let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
     let fixture = seed_fixture(&pool).await;
@@ -1481,7 +1467,6 @@ async fn event_recipients_valid_predecessor_chain_commits() {
 /// matching `event_recipients(user_did,device_id,event_position)` row, so the
 /// deferred self-referential foreign key rejects the chain at commit.
 #[tokio::test]
-#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn event_recipients_cross_device_predecessor_rejected_at_commit() {
     let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
     let fixture = seed_fixture(&pool).await;
@@ -1544,7 +1529,6 @@ async fn event_recipients_cross_device_predecessor_rejected_at_commit() {
 /// The `audience_predecessor_position < event_position` CHECK is immediate: a
 /// predecessor at or beyond the row's own position is refused at insert.
 #[tokio::test]
-#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn event_recipients_non_earlier_predecessor_rejected() {
     let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
     let fixture = seed_fixture(&pool).await;
@@ -1583,7 +1567,6 @@ async fn event_recipients_non_earlier_predecessor_rejected() {
 /// The `(event_position,user_did,device_id)` primary key rejects a second
 /// audience row for the same exact device at the same event.
 #[tokio::test]
-#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn event_recipients_duplicate_pk_rejected() {
     let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
     let fixture = seed_fixture(&pool).await;
@@ -1639,7 +1622,6 @@ async fn event_recipients_duplicate_pk_rejected() {
 /// `outbox_event_work_uq` uniqueness prevents a double enqueue for the same
 /// work kind, while a different work kind for the same event is allowed.
 #[tokio::test]
-#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn enqueue_outbox_enforces_event_work_uniqueness() {
     let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
     let instance = ensure_protocol_instance(&pool).await;
@@ -1706,7 +1688,6 @@ async fn enqueue_outbox_enforces_event_work_uniqueness() {
 /// connections, a shared barrier) partition the pending rows via
 /// `FOR UPDATE SKIP LOCKED` and never claim the same row twice.
 #[tokio::test]
-#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn claim_outbox_batch_two_claimers_never_double_claim() {
     let pool = common::chat_protocol::setup_chat_protocol_db(6).await;
     // Remove prior-run residue so the two claimers partition exactly this test's
@@ -1798,7 +1779,6 @@ async fn claim_outbox_batch_two_claimers_never_double_claim() {
 /// A lease that has expired relative to the caller's `now` is reclaimable by a
 /// fresh worker; a still-valid lease is not.
 #[tokio::test]
-#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn claim_outbox_batch_reclaims_only_expired_leases() {
     let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
     // Remove prior-run residue so the global claim scans only this test's row
@@ -1877,7 +1857,6 @@ async fn claim_outbox_batch_reclaims_only_expired_leases() {
 /// owner can terminalize the row. A stale or non-owner caller updates zero rows
 /// and is reported as an error, leaving the row untouched.
 #[tokio::test]
-#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn mark_outbox_delivered_requires_exact_lease_owner() {
     let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
     // Remove prior-run residue so the claim (LIMIT 10) leases this test's single

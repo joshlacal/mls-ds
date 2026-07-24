@@ -236,7 +236,6 @@ fn mint_request(
 }
 
 #[tokio::test]
-#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
 async fn mint_binds_the_session_fence_and_ticket_is_consumable_once() {
     let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
     let now = clock_now(&pool).await;
@@ -303,7 +302,6 @@ async fn mint_binds_the_session_fence_and_ticket_is_consumable_once() {
 }
 
 #[tokio::test]
-#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
 async fn mint_rejects_incomplete_session() {
     let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
     let now = clock_now(&pool).await;
@@ -336,7 +334,6 @@ async fn mint_rejects_incomplete_session() {
 }
 
 #[tokio::test]
-#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
 async fn mint_rejects_cursor_that_does_not_match_the_session() {
     let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
     let now = clock_now(&pool).await;
@@ -369,7 +366,6 @@ async fn mint_rejects_cursor_that_does_not_match_the_session() {
 }
 
 #[tokio::test]
-#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
 async fn consume_rejects_an_expired_ticket() {
     let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
     let now = clock_now(&pool).await;
@@ -416,7 +412,6 @@ async fn consume_rejects_an_expired_ticket() {
 }
 
 #[tokio::test]
-#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
 async fn concurrent_consumes_never_double_claim() {
     let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
     let now = clock_now(&pool).await;

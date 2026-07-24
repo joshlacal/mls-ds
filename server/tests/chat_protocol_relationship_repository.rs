@@ -1,7 +1,14 @@
 //! Repository-boundary tests for clean-chat relationship projections.
 //!
 //! Database cases stay ignored until the root task authorizes a freshly
-//! migrated, dedicated `catbird_chat_protocol_test_20260722` database.
+//! migrated, dedicated `catbird_chat_protocol_test_20260722` database. They
+//! stay `#[ignore]`d (not de-ignored into the standard whole-suite gate)
+//! because they hydrate durable relationship-projection state that must be read
+//! back "after restart" against a pristine schema; a shared, never-truncated
+//! database would carry residue between runs. Run them explicitly against a
+//! freshly-migrated dedicated database:
+//!   TEST_DATABASE_URL=postgres://localhost/catbird_chat_protocol_test_20260722 \
+//!   cargo test --test chat_protocol_relationship_repository -- --ignored --test-threads=1
 
 #![allow(dead_code)]
 

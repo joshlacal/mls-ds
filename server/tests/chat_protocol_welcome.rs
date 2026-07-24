@@ -18,10 +18,11 @@
 //! precise remainder.
 //!
 //! Like the sibling repository harnesses this `include!`s the production modules
-//! directly (they are `pub(crate)`). The live cases are `#[ignore]`d by default.
-//! Run with:
+//! directly (they are `pub(crate)`). The live cases run under the standard
+//! whole-suite gate: they hard-fail (panic in `setup_chat_protocol_db`) without
+//! `TEST_DATABASE_URL` rather than skipping. Run with:
 //!   TEST_DATABASE_URL=postgres://localhost/catbird_chat_protocol_test_20260722 \
-//!   cargo test --test chat_protocol_welcome -- --include-ignored --test-threads=1
+//!   cargo test --test chat_protocol_welcome -- --test-threads=1
 
 #![allow(dead_code)]
 
@@ -323,7 +324,6 @@ async fn clock_now(pool: &PgPool) -> chrono::DateTime<Utc> {
 }
 
 #[tokio::test]
-#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
 async fn claim_due_welcome_deliveries_query_is_schema_valid_and_skip_locked() {
     let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
     let now = clock_now(&pool).await;
@@ -349,7 +349,6 @@ async fn claim_due_welcome_deliveries_query_is_schema_valid_and_skip_locked() {
 }
 
 #[tokio::test]
-#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
 async fn recovery_work_view_read_is_schema_valid_and_device_empty() {
     let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
     // A fresh, never-seeded device enumerates nothing through the device-scoped
@@ -367,7 +366,6 @@ async fn recovery_work_view_read_is_schema_valid_and_device_empty() {
 }
 
 #[tokio::test]
-#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
 async fn leaf_recovery_inbox_read_is_schema_valid_and_device_empty() {
     let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
     // The flat inbox union assembles the open-request join + the recovery-work
@@ -396,7 +394,6 @@ async fn leaf_recovery_inbox_read_is_schema_valid_and_device_empty() {
 /// (welcome/conversation/recovery-request), the exact recipient device, and the
 /// bound coordinate/seq of the fulfillment transition.
 #[tokio::test]
-#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
 async fn claim_returns_the_seeded_due_welcome_delivery() {
     let (pool, _guard) = executor_seed::setup().await;
     let scenario = executor_seed::run_fulfillment_scenario(&pool).await;
@@ -434,7 +431,6 @@ async fn claim_returns_the_seeded_due_welcome_delivery() {
 /// the second worker's `FOR UPDATE OF wd SKIP LOCKED` skips exactly the row the
 /// first worker already holds, so the due set is partitioned, never duplicated.
 #[tokio::test]
-#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
 async fn two_workers_never_double_claim_the_seeded_delivery() {
     let (pool, _guard) = executor_seed::setup().await;
     let _scenario = executor_seed::run_fulfillment_scenario(&pool).await;

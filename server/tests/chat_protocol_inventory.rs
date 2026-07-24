@@ -303,7 +303,6 @@ async fn seed_revoked_device(pool: &PgPool, did: &str, created_at: DateTime<Utc>
 }
 
 #[tokio::test]
-#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
 async fn get_devices_rejects_zero_or_too_many_dids() {
     let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
 
@@ -326,7 +325,6 @@ async fn get_devices_rejects_zero_or_too_many_dids() {
 }
 
 #[tokio::test]
-#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
 async fn get_devices_returns_active_devices_scoped_to_requested_dids() {
     let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
     let now = clock_now(&pool).await;
@@ -372,7 +370,6 @@ async fn get_devices_returns_active_devices_scoped_to_requested_dids() {
 }
 
 #[tokio::test]
-#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
 async fn get_devices_excludes_revoked_devices() {
     let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
     let now = clock_now(&pool).await;
@@ -516,7 +513,6 @@ fn empty_sha256() -> Vec<u8> {
 }
 
 #[tokio::test]
-#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
 async fn first_get_conversations_creates_one_session_and_fence() {
     let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
     let codec = ensure_fence(&pool).await;
@@ -614,7 +610,6 @@ async fn first_get_conversations_creates_one_session_and_fence() {
 }
 
 #[tokio::test]
-#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
 async fn create_then_mint_subscription_ticket_closes_the_loop() {
     let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
     let codec = ensure_fence(&pool).await;
@@ -691,7 +686,6 @@ async fn create_then_mint_subscription_ticket_closes_the_loop() {
 }
 
 #[tokio::test]
-#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
 async fn get_own_devices_uses_separate_device_fence() {
     let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
     let now = whole_second(clock_now(&pool).await);
@@ -857,7 +851,6 @@ fn terminal_seq_hints_carry_no_fingerprint() {
 /// supplied payload, and a payload for a non-member conversation, both reject; the
 /// exact member set materializes with a repository-assigned ordinal.
 #[tokio::test]
-#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
 async fn create_selects_and_bijection_binds_the_member_conversation() {
     let (pool, _guard) = executor_seed::setup().await;
     let scenario = executor_seed::run_fulfillment_scenario(&pool).await;

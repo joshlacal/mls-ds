@@ -203,7 +203,6 @@ async fn count(tx: &mut Transaction<'_, Postgres>, sql: &str, id: Uuid) -> i64 {
 }
 
 #[tokio::test]
-#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
 async fn blob_and_quota_boundary_rolls_back_but_the_stale_tombstone_survives() {
     let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(2).await;
     let mut tx = pool.begin().await.expect("begin outer");
@@ -315,7 +314,6 @@ async fn blob_and_quota_boundary_rolls_back_but_the_stale_tombstone_survives() {
 }
 
 #[tokio::test]
-#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
 async fn entry_allocation_and_message_send_roll_back_completely() {
     let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(2).await;
     let mut tx = pool.begin().await.expect("begin outer");
@@ -391,7 +389,6 @@ async fn entry_allocation_and_message_send_roll_back_completely() {
 }
 
 #[tokio::test]
-#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
 async fn accepted_send_and_stale_tombstone_are_mutually_exclusive_durability() {
     // The two idempotency outcomes: an ACCEPTED send is business state that rolls
     // back with a business failure, while a STALE tombstone is the explicit

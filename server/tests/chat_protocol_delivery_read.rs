@@ -16,10 +16,11 @@
 //!
 //! The production repository module is gated `#[cfg(not(test))]` (see
 //! `src/chat_protocol/repository/mod.rs`), so — mirroring the sibling repository
-//! harnesses — this test `include!`s it directly. Live cases require the
-//! dedicated clean-chat database and are `#[ignore]`d by default:
+//! harnesses — this test `include!`s it directly. Live cases run under the
+//! standard whole-suite gate: they hard-fail (panic in `setup_chat_protocol_db`)
+//! without `TEST_DATABASE_URL` rather than skipping:
 //!   TEST_DATABASE_URL=postgres://localhost/catbird_chat_protocol_test_20260722 \
-//!   cargo test --test chat_protocol_delivery_read -- --ignored --test-threads=1
+//!   cargo test --test chat_protocol_delivery_read -- --test-threads=1
 
 #![allow(dead_code)]
 
@@ -538,7 +539,6 @@ fn load_contract_vectors() -> Value {
 /// exact Task-1 `applicationEntryFingerprint` golden supplies the committed
 /// scalars. The control projection is rejected on an application row.
 #[tokio::test]
-#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn application_projection_returns_exactly_the_five_golden_fields() {
     let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
     let fixture = seed_fixture(&pool).await;
@@ -621,7 +621,6 @@ async fn application_projection_returns_exactly_the_five_golden_fields() {
 /// `controlEntryFingerprints` golden. The application projection is rejected on a
 /// control row.
 #[tokio::test]
-#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn thirteen_control_projections_preserve_serverfields_and_golden_fingerprint() {
     let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
     let fixture = seed_fixture(&pool).await;
@@ -726,7 +725,6 @@ async fn thirteen_control_projections_preserve_serverfields_and_golden_fingerpri
 /// transcript-layer golden's job; this proves the read never collapses the
 /// distinction.)
 #[tokio::test]
-#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn control_projection_is_one_field_sensitive_through_delivery() {
     let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
     let fixture = seed_fixture(&pool).await;
@@ -837,7 +835,6 @@ async fn control_projection_is_one_field_sensitive_through_delivery() {
 /// later CALLER-visible row, never the unfiltered global log. The genesis
 /// creation control at seq 1 is unentitled to the caller and never surfaces.
 #[tokio::test]
-#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn get_entries_is_gap_safe_and_hides_unentitled_rows() {
     let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
     let fixture = seed_fixture(&pool).await;
@@ -990,7 +987,6 @@ async fn get_entries_is_gap_safe_and_hides_unentitled_rows() {
 /// sees the control entry (via its own entry_recipients row) but NOT the
 /// application entry.
 #[tokio::test]
-#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn application_visibility_binds_one_device_sibling_sees_control_only() {
     let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
     let fixture = seed_fixture(&pool).await;
@@ -1080,7 +1076,6 @@ async fn application_visibility_binds_one_device_sibling_sees_control_only() {
 /// the exact signed closing control at `terminalSeq` while an unentitled device
 /// gets nothing.
 #[tokio::test]
-#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn interval_read_opening_binding_all_or_none_close_and_former_device_row() {
     let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
     let fixture = seed_fixture(&pool).await;
@@ -1229,7 +1224,6 @@ async fn interval_read_opening_binding_all_or_none_close_and_former_device_row()
 /// same-DID sibling (or any other device) reads `None`. No cross-device listing
 /// exists.
 #[tokio::test]
-#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn schedule_terminal_proof_is_exact_device_zero_or_one() {
     let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
     let fixture = seed_fixture(&pool).await;
@@ -1325,7 +1319,6 @@ async fn schedule_terminal_proof_is_exact_device_zero_or_one() {
 /// log's high-water mark, independent of the caller's `afterSeq` cursor and of
 /// what the caller can see. It advances as entries are appended.
 #[tokio::test]
-#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn snapshot_seq_is_next_entry_seq_minus_one_not_an_entry_cursor() {
     let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
     let fixture = seed_fixture(&pool).await;
