@@ -39,7 +39,8 @@ use uuid::Uuid;
 
 use repository::delivery::{
     append_entry, append_event, claim_outbox_batch, enqueue_outbox, insert_entry_recipients,
-    insert_event_recipients, mark_outbox_delivered, AppendEntry, DeliveryRepositoryError,
+    insert_event_recipients, mark_outbox_delivered, resolve_application_send, AppendEntry,
+    ApplicationSend, ApplicationSendDisposition, ApplicationSendOutcome, DeliveryRepositoryError,
     EntryEntitlementKind, EntryRecipient, EventEntitlementKind, EventKind, EventRecipient,
     NewEvent, OutboxWorkKind,
 };
@@ -472,9 +473,159 @@ async fn insert_accepted_message_send(
     .expect("insert accepted message send");
 }
 
+/// The production `ApplicationSend` mirrors the test `CoherentSend` field-for-field.
+fn to_application_send(send: CoherentSend) -> ApplicationSend {
+    ApplicationSend {
+        entry: send.entry,
+        signing_transcript_bytes: send.signing_transcript_bytes,
+        outcome_bytes: send.outcome_bytes,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Arm 6 (message send — accepted): `resolve_application_send(Accept)` appends one
+/// `applicationEntry` at the self-allocated seq (past the genesis, so 2) + an
+/// `accepted` `message_sends` row bound to it, and advances only `next_entry_seq`.
+/// An EXACT replay returns the ORIGINAL seq with no new entry; the same message id
+/// under DIFFERENT signed bytes conflicts.
+#[tokio::test]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+async fn application_send_accepts_appends_entry_and_is_idempotent() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let fixture = seed_fixture(&pool).await;
+    let received_at = clock_now(&pool).await;
+    let send = to_application_send(coherent_application_send(&fixture, received_at, 0x21));
+    let message_id = send
+        .entry
+        .message_id
+        .expect("application send carries a message id");
+
+    let mut tx = pool.begin().await.expect("begin accept");
+    let outcome = resolve_application_send(&mut tx, &send, ApplicationSendDisposition::Accept)
+        .await
+        .expect("accepted send resolves");
+    tx.commit()
+        .await
+        .expect("accept COMMIT past deferred mapping");
+    assert_eq!(outcome, ApplicationSendOutcome::Accepted { seq: 2 });
+    assert_eq!(next_entry_seq(&pool, fixture.conversation_id).await, 3);
+
+    // The applicationEntry at seq 2 carries the message id.
+    let (kind, mid): (String, Option<Uuid>) = sqlx::query_as(
+        "SELECT entry_kind,message_id FROM chat.entries WHERE conversation_id=$1 AND seq=2",
+    )
+    .bind(fixture.conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("application entry");
+    assert_eq!(kind, APPLICATION_ENTRY_KIND);
+    assert_eq!(mid, Some(message_id));
+    // The accepted message_sends row is bound to that seq with the mirrored envelope.
+    let (status, accepted_seq, digest): (String, Option<i64>, Vec<u8>) = sqlx::query_as(
+        "SELECT status,accepted_entry_seq,request_digest FROM chat.message_sends WHERE conversation_id=$1 AND message_id=$2",
+    )
+    .bind(fixture.conversation_id)
+    .bind(message_id)
+    .fetch_one(&pool)
+    .await
+    .expect("message_sends row");
+    assert_eq!((status.as_str(), accepted_seq), ("accepted", Some(2)));
+    assert_eq!(digest, send.entry.request_digest);
+
+    // Exact replay -> the ORIGINAL seq, no new entry, counter unchanged.
+    let mut tx2 = pool.begin().await.expect("begin replay");
+    let replay = resolve_application_send(&mut tx2, &send, ApplicationSendDisposition::Accept)
+        .await
+        .expect("replay resolves");
+    tx2.commit().await.expect("replay COMMIT");
+    assert_eq!(replay, ApplicationSendOutcome::Accepted { seq: 2 });
+    assert_eq!(next_entry_seq(&pool, fixture.conversation_id).await, 3);
+    assert_eq!(
+        committed_entry_seqs(&pool, fixture.conversation_id).await,
+        vec![1, 2]
+    );
+
+    // Same message id, DIFFERENT signed content -> MessageSendConflict, zero residue.
+    let mut conflicting = send.clone();
+    conflicting.entry.request_digest = Sha256::digest([0xFE_u8; 8]).to_vec();
+    let mut tx3 = pool.begin().await.expect("begin conflict");
+    let conflict =
+        resolve_application_send(&mut tx3, &conflicting, ApplicationSendDisposition::Accept).await;
+    assert!(
+        matches!(conflict, Err(DeliveryRepositoryError::MessageSendConflict)),
+        "a reused message id with different bytes must conflict, got {conflict:?}"
+    );
+    tx3.rollback().await.expect("rollback conflict");
+    assert_eq!(next_entry_seq(&pool, fixture.conversation_id).await, 3);
+}
+
+/// Arm 6 (message send — stale tombstone): `resolve_application_send(Stale)` records
+/// a durable `stale` `message_sends` row with NO entry / NO seq (the explicitly-
+/// committed rejection path — it COMMITS even though the business is a refusal), and
+/// leaves `next_entry_seq` untouched. A later `Accept`-intent replay can NEVER
+/// succeed — it returns the stored `Stale` outcome and appends nothing.
+#[tokio::test]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
+async fn application_send_stale_tombstones_without_entry_and_never_succeeds() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let fixture = seed_fixture(&pool).await;
+    let received_at = clock_now(&pool).await;
+    let send = to_application_send(coherent_application_send(&fixture, received_at, 0x31));
+    let message_id = send
+        .entry
+        .message_id
+        .expect("application send carries a message id");
+
+    let mut tx = pool.begin().await.expect("begin stale");
+    let outcome = resolve_application_send(&mut tx, &send, ApplicationSendDisposition::Stale)
+        .await
+        .expect("stale send resolves");
+    tx.commit()
+        .await
+        .expect("stale COMMIT past deferred mapping");
+    assert_eq!(outcome, ApplicationSendOutcome::Stale);
+    // Counter untouched (no entry appended).
+    assert_eq!(next_entry_seq(&pool, fixture.conversation_id).await, 2);
+    let (status, accepted_seq): (String, Option<i64>) = sqlx::query_as(
+        "SELECT status,accepted_entry_seq FROM chat.message_sends WHERE conversation_id=$1 AND message_id=$2",
+    )
+    .bind(fixture.conversation_id)
+    .bind(message_id)
+    .fetch_one(&pool)
+    .await
+    .expect("stale message_sends row");
+    assert_eq!((status.as_str(), accepted_seq), ("stale", None));
+    let entry_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.entries WHERE conversation_id=$1 AND message_id=$2",
+    )
+    .bind(fixture.conversation_id)
+    .bind(message_id)
+    .fetch_one(&pool)
+    .await
+    .expect("no application entry for a stale send");
+    assert_eq!(entry_count, 0);
+
+    // An Accept-intent replay of a stale send stays Stale — it can never succeed.
+    let mut tx2 = pool.begin().await.expect("begin stale replay");
+    let replay = resolve_application_send(&mut tx2, &send, ApplicationSendDisposition::Accept)
+        .await
+        .expect("stale replay resolves");
+    tx2.commit().await.expect("stale replay COMMIT");
+    assert_eq!(replay, ApplicationSendOutcome::Stale);
+    assert_eq!(next_entry_seq(&pool, fixture.conversation_id).await, 2);
+    let entry_count_after: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.entries WHERE conversation_id=$1 AND message_id=$2",
+    )
+    .bind(fixture.conversation_id)
+    .bind(message_id)
+    .fetch_one(&pool)
+    .await
+    .expect("still no entry after the accept replay");
+    assert_eq!(entry_count_after, 0);
+}
 
 /// K sequential appends in one transaction allocate unique, gap-free seqs that
 /// start at the conversation's current `next_entry_seq` (2, past the genesis)

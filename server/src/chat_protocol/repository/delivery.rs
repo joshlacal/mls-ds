@@ -57,6 +57,15 @@ pub(crate) enum DeliveryRepositoryError {
     /// exactly as `transition::TransitionRepositoryError::CompareAndSetConflict`
     /// is used for the migration-1 families.
     CompareAndSetConflict,
+    /// An application send reused an existing `(conversation_id, message_id)` with a
+    /// DIFFERENT signed request (the stored `request_digest` disagrees). The
+    /// message-id idempotency key binds one signed message; a second distinct
+    /// message under the same id is rejected rather than overwriting the durable
+    /// outcome. (An EXACT replay is idempotent and returns the stored outcome.)
+    MessageSendConflict,
+    /// An application send carried no `message_id`. Every send is idempotency-keyed
+    /// by `(conversation_id, message_id)`, so the id is mandatory.
+    MissingMessageId,
 }
 
 impl From<sqlx::Error> for DeliveryRepositoryError {
@@ -240,6 +249,155 @@ pub(crate) async fn append_entry_at(
     .execute(&mut **transaction)
     .await?;
     Ok(seq)
+}
+
+// ===========================================================================
+// Application message send (Task E2b-7 arm 6).
+//
+// A message send is NOT a coordinate-changing transition: it appends one
+// `applicationEntry` at a self-allocated seq (via `append_entry`) and advances
+// only `next_entry_seq` — the crypto coordinate is untouched. It is
+// idempotency-keyed by `(conversation_id, message_id)` in `chat.message_sends`.
+// The audience of an application entry is INTERVAL-DERIVED (a reader sees it iff
+// its application interval spans the seq), so this writes NO `entry_recipients`.
+// ===========================================================================
+
+/// One application send: the `applicationEntry` envelope (`entry`, whose
+/// `message_id` is the idempotency key and whose `signed_request_bytes` /
+/// `request_digest` / `signature` / `received_at` the durable `message_sends` row
+/// must mirror exactly — `assert_message_send_mapping`), plus the
+/// `signing_transcript_bytes` the digest covers and the server-authored
+/// `outcome_bytes` returned to the sender.
+#[derive(Clone, Debug)]
+pub(crate) struct ApplicationSend {
+    pub(crate) entry: AppendEntry,
+    pub(crate) signing_transcript_bytes: Vec<u8>,
+    pub(crate) outcome_bytes: Vec<u8>,
+}
+
+/// The caller's per-attempt determination from the sender's LIVE leaf/interval:
+/// `Accept` when the sender may still write, `Stale` when its lease/interval has
+/// been superseded (the send is durably tombstoned but never becomes an entry).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ApplicationSendDisposition {
+    Accept,
+    Stale,
+}
+
+/// The DURABLE outcome of a send, stable across replays regardless of the
+/// caller's later disposition: an `Accepted` send keeps its allocated `seq`
+/// forever; a `Stale` send can never later succeed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ApplicationSendOutcome {
+    Accepted { seq: u64 },
+    Stale,
+}
+
+/// Resolve an application send idempotently on `(conversation_id, message_id)`.
+///
+/// * FIRST resolution: apply `disposition` — `Accept` appends the
+///   `applicationEntry` at a fresh seq (`append_entry`) and records an `accepted`
+///   `message_sends` row bound to it; `Stale` records a `stale` tombstone row with
+///   NO entry / NO seq (the explicitly-committed rejection path — it COMMITS even
+///   though the business outcome is a refusal).
+/// * REPLAY (a row already exists): return the STORED outcome, ignoring the
+///   caller's disposition — an accepted send re-returns its original seq, a stale
+///   send stays stale. A replay whose `request_digest` disagrees with the stored
+///   one is a distinct message reusing the id → `MessageSendConflict`.
+///
+/// The two `chat.message_sends` ↔ `chat.entries` foreign keys are DEFERRED, so the
+/// entry + accepted row (written here in the caller's transaction) are reconciled
+/// by `assert_message_send_mapping` at COMMIT.
+pub(crate) async fn resolve_application_send(
+    transaction: &mut Transaction<'_, Postgres>,
+    send: &ApplicationSend,
+    disposition: ApplicationSendDisposition,
+) -> Result<ApplicationSendOutcome, DeliveryRepositoryError> {
+    let message_id = send
+        .entry
+        .message_id
+        .ok_or(DeliveryRepositoryError::MissingMessageId)?;
+
+    // Idempotency: a resolved send returns its durable outcome; a mismatching
+    // digest under the same id is a conflict.
+    let existing: Option<(String, Option<i64>, Vec<u8>)> = sqlx::query_as(
+        r#"
+        SELECT status, accepted_entry_seq, request_digest
+          FROM chat.message_sends
+         WHERE conversation_id = $1 AND message_id = $2
+        "#,
+    )
+    .bind(send.entry.conversation_id)
+    .bind(message_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    if let Some((status, accepted_entry_seq, request_digest)) = existing {
+        if request_digest != send.entry.request_digest {
+            return Err(DeliveryRepositoryError::MessageSendConflict);
+        }
+        return match status.as_str() {
+            "accepted" => {
+                let seq_i64 =
+                    accepted_entry_seq.ok_or(DeliveryRepositoryError::CompareAndSetConflict)?;
+                let seq = u64::try_from(seq_i64)
+                    .map_err(|_| DeliveryRepositoryError::SequenceOverflow)?;
+                Ok(ApplicationSendOutcome::Accepted { seq })
+            }
+            _ => Ok(ApplicationSendOutcome::Stale),
+        };
+    }
+
+    match disposition {
+        ApplicationSendDisposition::Accept => {
+            let seq = append_entry(transaction, &send.entry).await?;
+            insert_message_send_row(transaction, send, message_id, "accepted", Some(seq)).await?;
+            Ok(ApplicationSendOutcome::Accepted { seq })
+        }
+        ApplicationSendDisposition::Stale => {
+            insert_message_send_row(transaction, send, message_id, "stale", None).await?;
+            Ok(ApplicationSendOutcome::Stale)
+        }
+    }
+}
+
+/// Insert the `chat.message_sends` row mirroring the send's signed envelope. Every
+/// crypto column equals the `applicationEntry`'s so the deferred
+/// `assert_message_send_mapping` invariant holds; `accepted_entry_seq` is the
+/// allocated seq for an `accepted` row and `NULL` for a `stale` tombstone
+/// (`message_sends_status_shape_check`).
+async fn insert_message_send_row(
+    transaction: &mut Transaction<'_, Postgres>,
+    send: &ApplicationSend,
+    message_id: Uuid,
+    status: &str,
+    accepted_entry_seq: Option<u64>,
+) -> Result<(), DeliveryRepositoryError> {
+    let accepted_seq_i64 = accepted_entry_seq
+        .map(|seq| i64::try_from(seq).map_err(|_| DeliveryRepositoryError::SequenceOverflow))
+        .transpose()?;
+    sqlx::query(
+        r#"
+        INSERT INTO chat.message_sends(
+            conversation_id, message_id, signed_request_bytes, signing_transcript_bytes,
+            request_digest, signature, status, accepted_entry_seq, outcome_bytes,
+            outcome_sha256, received_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        "#,
+    )
+    .bind(send.entry.conversation_id)
+    .bind(message_id)
+    .bind(&send.entry.signed_request_bytes)
+    .bind(&send.signing_transcript_bytes)
+    .bind(&send.entry.request_digest)
+    .bind(&send.entry.signature)
+    .bind(status)
+    .bind(accepted_seq_i64)
+    .bind(&send.outcome_bytes)
+    .bind(Sha256::digest(&send.outcome_bytes).to_vec())
+    .bind(send.entry.received_at)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
 }
 
 // ===========================================================================
