@@ -15,3 +15,9 @@ pub(crate) mod inventory;
 #[cfg(not(test))]
 pub(crate) mod relationship;
 pub(crate) mod transition;
+// `welcome` (Slice 4b) is the welcome-expiry worker claim + recovery-inbox read
+// surface. Like `delivery`/`inventory` it is unconditionally compiled so both
+// the production build and the `#[path]`-including integration harness resolve
+// `super::repository::{delivery,welcome}`.
+#[allow(dead_code)]
+pub(crate) mod welcome;
