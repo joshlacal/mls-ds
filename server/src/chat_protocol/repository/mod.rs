@@ -18,6 +18,14 @@ pub(crate) mod core;
 // they were already compiled, so this is behaviour-neutral for production; it
 // only additionally makes them available to the test configuration.
 pub(crate) mod delivery;
+// `device_directory` (Task 4 / seal 2b) is the read-only deviceView/
+// addressableDevice/ownDeviceView projection surface (key identity + pinned
+// capability + live key-package counts) the H1 device handlers need for their
+// outputs. Unconditionally compiled so both the production build and the
+// `#[path]`-including harness resolve it; self-contained (`chrono`/`sqlx`/`uuid`).
+// `#[allow(dead_code)]` until the H1 endpoint handlers (seal 3) call in.
+#[allow(dead_code)]
+pub(crate) mod device_directory;
 pub(crate) mod inventory;
 // `key_packages` (Task 4 / OQ-9) is the certified key-package persistence sink
 // used by the enrollDevice/replenishKeyPackages handlers. Unconditionally
