@@ -27,6 +27,65 @@
 
 mod common;
 
+// Full production-module prelude (mirrors `chat_protocol_executor.rs`) so the
+// shared `common::executor_seed` fulfillment-graph builders — which reference
+// `crate::chat_protocol::*` — compile in this crate and can seed a coherent
+// pending-Welcome / recovery graph for the populated live tests below.
+#[path = "../src/chat_protocol/model.rs"]
+mod model;
+#[path = "../src/chat_protocol/transcript.rs"]
+mod transcript;
+#[path = "../src/chat_protocol/validation.rs"]
+mod validation;
+
+mod chat_protocol {
+    pub mod validation {
+        pub use crate::validation::*;
+    }
+    pub mod transcript {
+        pub use crate::transcript::*;
+    }
+    pub mod snapshot {
+        pub use catbird_server::chat_protocol::snapshot::*;
+    }
+    pub mod wire {
+        pub use catbird_server::chat_protocol::wire::*;
+    }
+    pub mod public_state {
+        #![allow(dead_code)]
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/chat_protocol/public_state.rs"
+        ));
+    }
+    pub mod repository {
+        pub mod transition {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/transition.rs"
+            ));
+        }
+        pub mod delivery {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/delivery.rs"
+            ));
+        }
+    }
+    pub mod state_machine {
+        #![allow(dead_code)]
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/chat_protocol/state_machine.rs"
+        ));
+    }
+}
+
+#[path = "common/executor_seed.rs"]
+mod executor_seed;
+
 // `welcome` reads `super::delivery::RecoveryWorkSourceKind`, so BOTH production
 // modules are inlined here exactly as they are laid out under `repository/`.
 mod repository {
@@ -322,4 +381,85 @@ async fn leaf_recovery_inbox_read_is_schema_valid_and_device_empty() {
         "a device with no inbox items enumerates nothing"
     );
     tx.rollback().await.expect("rollback read");
+}
+
+// ===========================================================================
+// Part 4 — populated live tests (Seal C), driven by the shared
+// `common::executor_seed` fulfillment graph. Each runs on a fresh per-run
+// database (its own `FreshDbGuard`) so the seeded corpus identity + the one
+// pending Welcome the fulfillment emits are the only rows in scope.
+// ===========================================================================
+
+/// Remainder case #1: a real committed leaf-recovery fulfillment leaves exactly
+/// one pending `chat.welcome_deliveries` row; observed past its `expires_at`, the
+/// worker claim returns exactly that row, carrying the seeded delivery identity
+/// (welcome/conversation/recovery-request), the exact recipient device, and the
+/// bound coordinate/seq of the fulfillment transition.
+#[tokio::test]
+#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
+async fn claim_returns_the_seeded_due_welcome_delivery() {
+    let (pool, _guard) = executor_seed::setup().await;
+    let scenario = executor_seed::run_fulfillment_scenario(&pool).await;
+
+    // The seeded delivery's `expires_at` is the consumed Add KeyPackage
+    // `not_after` (~24h out); observe well past it so the row is due.
+    let observed_at = clock_now(&pool).await + chrono::Duration::hours(48);
+    let mut tx = pool.begin().await.expect("begin claim");
+    let claimed = claim_due_welcome_deliveries(&mut tx, observed_at, 32)
+        .await
+        .expect("claim executes against the seeded schema");
+    assert_eq!(
+        claimed.len(),
+        1,
+        "exactly the one seeded pending delivery is due on the fresh DB"
+    );
+    let due = &claimed[0];
+    assert_eq!(due.welcome_id, scenario.welcome_id);
+    assert_eq!(due.conversation_id, scenario.conversation_id);
+    assert_eq!(due.recovery_request_id, scenario.recovery_request_id);
+    assert_eq!(due.recipient_did, scenario.bob_did);
+    assert_eq!(
+        due.recipient_device_id,
+        Uuid::from_bytes(*scenario.bob_id.device_id())
+    );
+    assert!(due.expires_at <= observed_at);
+    // The fulfillment committed at entry seq 3 / state_version 2 (run_fulfillment
+    // scenario proves allocated_seq == 3 and the sv-2 commit gen state).
+    assert_eq!(due.transition_seq, 3);
+    assert_eq!(due.state_version, 2);
+    tx.rollback().await.expect("rollback claim");
+}
+
+/// Remainder case #3: two concurrent workers never double-claim one delivery —
+/// the second worker's `FOR UPDATE OF wd SKIP LOCKED` skips exactly the row the
+/// first worker already holds, so the due set is partitioned, never duplicated.
+#[tokio::test]
+#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
+async fn two_workers_never_double_claim_the_seeded_delivery() {
+    let (pool, _guard) = executor_seed::setup().await;
+    let _scenario = executor_seed::run_fulfillment_scenario(&pool).await;
+    let observed_at = clock_now(&pool).await + chrono::Duration::hours(48);
+
+    // Worker 1 claims + locks the one due delivery, holding its transaction open.
+    let mut tx1 = pool.begin().await.expect("begin worker 1");
+    let claimed1 = claim_due_welcome_deliveries(&mut tx1, observed_at, 32)
+        .await
+        .expect("worker 1 claims");
+    assert_eq!(
+        claimed1.len(),
+        1,
+        "worker 1 claims and locks the one due delivery"
+    );
+
+    // Worker 2, concurrent, must SKIP LOCKED the row worker 1 holds and see none.
+    let mut tx2 = pool.begin().await.expect("begin worker 2");
+    let claimed2 = claim_due_welcome_deliveries(&mut tx2, observed_at, 32)
+        .await
+        .expect("worker 2 claims");
+    assert!(
+        claimed2.is_empty(),
+        "worker 2 never double-claims the delivery worker 1 holds"
+    );
+    tx2.rollback().await.expect("rollback worker 2");
+    tx1.rollback().await.expect("rollback worker 1");
 }
