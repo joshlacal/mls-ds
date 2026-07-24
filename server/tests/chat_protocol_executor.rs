@@ -5770,6 +5770,617 @@ async fn leave_fulfillment_commits_remove_and_supersedes_pending_welcome() {
     assert_eq!(before, after, "leave fulfillment replay left zero residue");
 }
 
+/// The uncommitted `replace` leaf-recovery fulfillment plan + ctx (create +
+/// acceptance + add-fulfillment + the bob `replace` request are already COMMITTED).
+/// Extracted so a desync negative can apply a MUTATED ctx against the same state.
+struct BuiltReplaceFulfillment {
+    plan: chat_protocol::state_machine::ConversationPersistencePlan,
+    ctx: ExecutionContext,
+    conversation_id: Uuid,
+    bob_did: String,
+    bob_signature_key: Vec<u8>,
+    bob_old_leaf_period: Uuid,
+    replace_transition: Uuid,
+    replace_request_id: Uuid,
+    replace_welcome_id: Uuid,
+    scenario_welcome_id: Uuid,
+    new_ref: [u8; 32],
+    new_package_not_after: DateTime<Utc>,
+}
+
+async fn build_replace_fulfillment(pool: &PgPool) -> BuiltReplaceFulfillment {
+    let pool = pool.clone();
+    let manifest = corpus_manifest();
+    let scenario = run_fulfillment_scenario(&pool).await;
+    let conversation_id = scenario.conversation_id;
+    let bob_id = scenario.bob_id.clone();
+    let bob_did = scenario.bob_did.clone();
+    let bob_device = Uuid::from_bytes(*bob_id.device_id());
+    let bob_key_id = scenario.fixture.bob_key_id.clone();
+    let alice_id = scenario.fixture.alice_id.clone();
+    let alice_did = scenario.fixture.alice_did.clone();
+    let alice_device = scenario.fixture.alice_device;
+    let alice_key_id = scenario.fixture.alice_key_id.clone();
+    let creation_transition_id = scenario.fixture.creation_transition_id;
+    let protocol_instance_id = scenario.fixture.protocol_instance_id;
+    let scenario_welcome_id = scenario.welcome_id;
+
+    // Bob's current (add-fulfillment) leaf period — the OLD leaf a `replace` closes.
+    let bob_old_leaf_period: Uuid = sqlx::query_scalar(
+        "SELECT leaf_period_id FROM chat.member_devices WHERE conversation_id=$1 AND user_did=$2 AND active",
+    )
+    .bind(conversation_id)
+    .bind(&bob_did)
+    .fetch_one(&pool)
+    .await
+    .expect("bob old leaf period");
+
+    // 1. Bob opens a REPLACE recovery request for his own leaf (bound to sv 2),
+    //    reserving a FRESH key package. A leaf recovery keeps the device's signing
+    //    identity, so the fresh package is owned by bob's EXISTING key. Internal op
+    //    — the coordinate + seq counter are byte-untouched.
+    let new_ref = random_ref32();
+    let new_package_not_after =
+        seed_key_package(&pool, &bob_did, bob_device, &bob_key_id, &new_ref).await;
+    let req_received = ServerTimestamp::from_unix_millis_for_test(
+        manifest.evaluation_unix_seconds as i64 * 1_000 + 5_000,
+    )
+    .unwrap();
+    let pkg_not_after_ts =
+        ServerTimestamp::from_unix_millis_for_test(new_package_not_after.timestamp_millis())
+            .unwrap();
+    let replace_request_id = Uuid::new_v4();
+    let req_evidence = RequestEvidence::for_test(
+        RequestEntryKind::LeafRecoveryRequest,
+        4,
+        *replace_request_id.as_bytes(),
+        bob_id.clone(),
+        *conversation_id.as_bytes(),
+        req_received,
+        0x81,
+    )
+    .unwrap();
+    let req_planned = plan_leaf_recovery_request(
+        &scenario.fulfillment_state,
+        LeafRecoveryRequestCommand {
+            actor: bob_id.clone(),
+            recovery_request_id: *replace_request_id.as_bytes(),
+            kind: LeafRecoveryKind::Replace,
+            key_package_ref: new_ref,
+            received_at: req_received,
+            package_not_after: pkg_not_after_ts,
+            evidence: req_evidence,
+        },
+    )
+    .expect("valid bob replace request plan");
+    let requested_state = req_planned.resulting_state().clone();
+    let req_head = ConversationHeadCasBinding::for_test_internal(
+        *conversation_id.as_bytes(),
+        scenario.coordinate,
+        4,
+        req_received,
+    );
+    let req_plan = persistence_plan_for_test(req_planned, req_head);
+    let req_applied_at = clock_now(&pool).await;
+    let req_transcript = vec![0x82_u8; 16];
+    let bob_pred_req = device_event_predecessor(&pool, &bob_did, bob_device).await;
+    let req_ctx = ExecutionContext {
+        protocol_instance_id,
+        applied_at: req_applied_at,
+        actor: ExecutionActor {
+            user_did: bob_did.clone(),
+            device_id: bob_device,
+            key_id: bob_key_id.clone(),
+            auth_generation: 1,
+            role: TransitionActorRole::Member,
+            device_status: "active".to_owned(),
+        },
+        entry: ControlEntryContent {
+            entry_id: Uuid::new_v4(),
+            entry_kind: "blue.catbird.chat.defs#applicationEntry".to_owned(),
+            accepted_payload_bytes: vec![0x83_u8; 8],
+            accepted_payload_sha256: Sha256::digest([0x83_u8; 8]).to_vec(),
+            signed_request_bytes: req_transcript.clone(),
+            unsigned_projection_bytes: vec![0x84_u8; 8],
+            signing_transcript_bytes: req_transcript.clone(),
+            request_digest: Sha256::digest(&req_transcript).to_vec(),
+            signature: vec![0x85_u8; 64],
+            server_fields_bytes: vec![0x86_u8; 8],
+            outer_entry_fingerprint: vec![0x18_u8; 32],
+        },
+        spine: SpineArtifacts {
+            public_snapshot_bytes: vec![],
+            public_snapshot_sha256: vec![],
+            tree_summary_bytes: vec![],
+            tree_summary_sha256: vec![],
+            leaf_count: 2,
+            genesis_group_info_bytes: vec![],
+            genesis_group_info_sha256: vec![],
+        },
+        opened_leaves: vec![],
+        metadata_author: None,
+        participant_period_ids: vec![],
+        leaf_period_ids: vec![],
+        entry_recipients: vec![],
+        events: vec![EventFanout {
+            event_id: Uuid::new_v4(),
+            event_kind: EventKind::ConversationChanged,
+            payload_bytes: vec![0x87_u8; 8],
+            recipients: vec![(
+                bob_id.clone(),
+                EventEntitlementKind::Participant,
+                bob_pred_req,
+            )],
+            outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+        }],
+        closing_leaf_periods: vec![],
+        closing_participant_periods: vec![],
+        reset_request_row: None,
+        recovery_open: Some(RecoveryOpenContext {
+            participant_period_id: None,
+            package_not_after: new_package_not_after,
+            replaced_leaf_period_id: Some(bob_old_leaf_period),
+        }),
+        welcome_expiry: None,
+        welcome_response: None,
+        welcome_dispositions: vec![],
+    };
+    {
+        let mut tx = pool.begin().await.expect("begin replace request");
+        apply_conversation_persistence_plan(&mut tx, &req_plan, &req_ctx)
+            .await
+            .expect("replace request applies");
+        tx.commit()
+            .await
+            .expect("replace request COMMIT past all deferred triggers");
+    }
+
+    // 2. Alice fulfills the `replace` with a synthetic rotation commit (bob's old
+    //    leaf removed + a fresh bob leaf carrying `new_ref`), sv 2 -> 3, epoch 1 -> 2.
+    let alice_leaf_index = requested_state
+        .leaf(&alice_id)
+        .expect("alice leaf")
+        .leaf_index();
+    let bob_leaf_index = requested_state
+        .leaf(&bob_id)
+        .expect("bob leaf")
+        .leaf_index();
+    let successor_coord = PublicGroupSnapshotCoordinate::new(
+        *conversation_id.as_bytes(),
+        manifest.chain.generation,
+        requested_state.coordinate().state_version() + 1,
+        *requested_state.coordinate().group_id(),
+        requested_state.coordinate().epoch() + 1,
+        [0xB1_u8; 32],
+        [0xB2_u8; 32],
+        PublicGroupSnapshotLifecycle::Active,
+    );
+    assert_eq!(successor_coord.state_version(), 3);
+    assert_eq!(successor_coord.epoch(), 2);
+    let new_encryption_key = vec![0xB6_u8; 32];
+    let commit = chat_protocol::public_state::VerifiedCommitPublicState::for_test_replace(
+        requested_state.public_state(),
+        successor_coord,
+        alice_leaf_index,
+        bob_leaf_index,
+        new_encryption_key,
+        new_ref,
+    )
+    .expect("synthetic sealed replace evidence");
+    let welcome_wire = corpus_file("welcome.mls");
+    let welcome = chat_protocol::public_state::VerifiedRecoveryWelcome::for_test_bound(
+        welcome_wire.clone(),
+        new_ref,
+    );
+    let replace_welcome_id = Uuid::new_v4();
+    let replace_transition = Uuid::new_v4();
+    let replace_entry = Uuid::new_v4();
+    let replace_received = ServerTimestamp::from_unix_millis_for_test(
+        manifest.evaluation_unix_seconds as i64 * 1_000 + 6_000,
+    )
+    .unwrap();
+    let alice_key_id_bytes: [u8; 32] = Sha256::digest(&scenario.alice_sig_key).into();
+    let reencryption = MetadataSnapshotBinding::for_test_creation(
+        *conversation_id.as_bytes(),
+        0,
+        successor_coord.epoch(),
+        *successor_coord.group_context_hash(),
+        creation_transition_id,
+        1,
+        alice_id.clone(),
+        alice_key_id_bytes,
+        scenario.alice_sig_key.clone().try_into().unwrap(),
+        1,
+        1,
+        [0xB7_u8; 12],
+        vec![0xB8_u8; 48],
+    );
+    let fulfill_evidence =
+        TransitionEvidence::for_test_leaf_recovery_replace_fulfillment_with_metadata(
+            4,
+            *replace_transition.as_bytes(),
+            [0x1E_u8; 32],
+            replace_received,
+            *replace_request_id.as_bytes(),
+            *requested_state.coordinate(),
+            successor_coord,
+            bob_id.clone(),
+            new_ref,
+            *replace_welcome_id.as_bytes(),
+            welcome_wire.clone(),
+            reencryption,
+        )
+        .unwrap();
+    let planned = plan_leaf_recovery_fulfillment(
+        &requested_state,
+        LeafRecoveryFulfillment {
+            actor: alice_id.clone(),
+            target: bob_id.clone(),
+            recovery_request_id: *replace_request_id.as_bytes(),
+            welcome_id: *replace_welcome_id.as_bytes(),
+            transition: fulfill_evidence,
+            commit,
+            welcome,
+        },
+    )
+    .expect("valid replace fulfillment plan");
+    let head_cas = ConversationHeadCasBinding::for_test_edge(
+        *conversation_id.as_bytes(),
+        *replace_entry.as_bytes(),
+        *requested_state.coordinate(),
+        4,
+        replace_received,
+    );
+    let plan = persistence_plan_for_test(planned, head_cas);
+
+    // Participant periods in hydration (sorted-DID) order — bob's participant
+    // period is UNCHANGED by a rotation (the new leaf reuses it).
+    let mut participant_rows: Vec<(String, Uuid)> = sqlx::query_as(
+        "SELECT user_did,participant_period_id FROM chat.participants WHERE conversation_id=$1 AND current_membership",
+    )
+    .bind(conversation_id)
+    .fetch_all(&pool)
+    .await
+    .expect("participant periods");
+    participant_rows.sort_by(|l, r| l.0.as_bytes().cmp(r.0.as_bytes()));
+    let participant_period_ids: Vec<Uuid> = participant_rows.iter().map(|(_, id)| *id).collect();
+
+    let applied_at = clock_now(&pool).await;
+    let payload = vec![0xBA_u8; 12];
+    let transcript = vec![0xBB_u8; 12];
+    let alice_pred = device_event_predecessor(&pool, &alice_did, alice_device).await;
+    let bob_pred = device_event_predecessor(&pool, &bob_did, bob_device).await;
+    let ctx = ExecutionContext {
+        protocol_instance_id,
+        applied_at,
+        actor: ExecutionActor {
+            user_did: alice_did.clone(),
+            device_id: alice_device,
+            key_id: alice_key_id.clone(),
+            auth_generation: 1,
+            role: TransitionActorRole::Admin,
+            device_status: "active".to_owned(),
+        },
+        entry: ControlEntryContent {
+            entry_id: replace_entry,
+            entry_kind: "blue.catbird.chat.defs#leafRecoveryFulfillmentEntry".to_owned(),
+            accepted_payload_bytes: payload.clone(),
+            accepted_payload_sha256: Sha256::digest(&payload).to_vec(),
+            signed_request_bytes: transcript.clone(),
+            unsigned_projection_bytes: vec![0xBC_u8; 8],
+            signing_transcript_bytes: transcript.clone(),
+            request_digest: Sha256::digest(&transcript).to_vec(),
+            signature: vec![0xBD_u8; 64],
+            server_fields_bytes: vec![0xBE_u8; 8],
+            outer_entry_fingerprint: vec![0x1E_u8; 32],
+        },
+        spine: SpineArtifacts {
+            public_snapshot_bytes: vec![0xC1_u8; 16],
+            public_snapshot_sha256: Sha256::digest([0xC1_u8; 16]).to_vec(),
+            tree_summary_bytes: vec![0xC2_u8; 16],
+            tree_summary_sha256: Sha256::digest([0xC2_u8; 16]).to_vec(),
+            leaf_count: 2,
+            genesis_group_info_bytes: vec![],
+            genesis_group_info_sha256: vec![],
+        },
+        // The rotated-in leaf's persistence columns: bob's SAME signing identity.
+        opened_leaves: vec![LeafPersistenceColumns {
+            device: bob_id.clone(),
+            leaf_key_id: bob_key_id.clone(),
+            leaf_auth_generation: 1,
+        }],
+        metadata_author: Some(MetadataAuthorColumns {
+            author_role: "admin".to_owned(),
+            author_device_status: "active".to_owned(),
+            author_public_key: scenario.alice_sig_key.clone(),
+            author_key_id: alice_key_id.clone(),
+            metadata_snapshot_id: Uuid::new_v4(),
+        }),
+        participant_period_ids,
+        // The FRESH leaf period for bob's rotated-in leaf.
+        leaf_period_ids: vec![Uuid::new_v4()],
+        // Alice (remaining) fetches the control entry; bob's OLD interval close
+        // routes to him via the `intervalClose` entitlement the interval-close
+        // provenance trigger requires at the fulfillment seq.
+        entry_recipients: vec![
+            (alice_id.clone(), EntryEntitlementKind::Control),
+            (bob_id.clone(), EntryEntitlementKind::IntervalClose),
+        ],
+        // The remaining member (alice) observes the rotation via WelcomeAvailable;
+        // bob's single event this transition is the WelcomeDisposition below (the
+        // per-device event predecessor chain forbids a device in two events at once).
+        events: vec![EventFanout {
+            event_id: Uuid::new_v4(),
+            event_kind: EventKind::WelcomeAvailable,
+            payload_bytes: vec![0xBF_u8; 8],
+            recipients: vec![(
+                alice_id.clone(),
+                EventEntitlementKind::Participant,
+                alice_pred,
+            )],
+            outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+        }],
+        // The OLD leaf period closed by the rotation.
+        closing_leaf_periods: vec![(bob_id.clone(), bob_old_leaf_period)],
+        closing_participant_periods: vec![],
+        reset_request_row: None,
+        recovery_open: None,
+        welcome_expiry: None,
+        welcome_response: None,
+        // The epoch change supersedes the scenario's prior pending Welcome for bob.
+        welcome_dispositions: vec![WelcomeDispositionInput {
+            welcome_id: scenario_welcome_id,
+            event: EventFanout {
+                event_id: Uuid::new_v4(),
+                event_kind: EventKind::WelcomeDisposition,
+                payload_bytes: vec![0xC5_u8; 8],
+                recipients: vec![(bob_id.clone(), EventEntitlementKind::Welcome, bob_pred)],
+                outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+            },
+        }],
+    };
+
+    let bob_signature_key = hex::decode(&manifest.identity.bob.signature_public_key_hex).unwrap();
+    BuiltReplaceFulfillment {
+        plan,
+        ctx,
+        conversation_id,
+        bob_did,
+        bob_signature_key,
+        bob_old_leaf_period,
+        replace_transition,
+        replace_request_id,
+        replace_welcome_id,
+        scenario_welcome_id,
+        new_ref,
+        new_package_not_after,
+    }
+}
+
+/// Arm 3 #1 (`replace` fulfillment): a leaf-recovery `replace` ROTATES the
+/// target's leaf in place. Because the state diff is keyed by DEVICE (not leaf
+/// index), the rotation surfaces as ONE (Some,Some) leaf change for bob (new
+/// key-package origin + HPKE key, SAME signing identity) — the executor closes
+/// bob's OLD leaf period + Replace-closes his OLD interval at the fulfillment
+/// seq, AND opens a fresh leaf period + Add interval, all past the deferred
+/// `assert_application_interval_provenance` (which requires the `replace` close
+/// to route an `intervalClose` entitlement to bob and be authored by a
+/// `leafRecovery` transition). Builds on `run_fulfillment_scenario` (bob added at
+/// sv 2 / epoch 1), opens a bob-authored `replace` request reserving a FRESH key
+/// package, then fulfills sv 2 -> 3 / epoch 1 -> 2.
+#[tokio::test]
+async fn leaf_recovery_replace_fulfillment_rotates_leaf_and_closes_prior_interval() {
+    let (pool, _db) = setup().await;
+    let BuiltReplaceFulfillment {
+        plan,
+        ctx,
+        conversation_id,
+        bob_did,
+        bob_signature_key,
+        bob_old_leaf_period,
+        replace_transition,
+        replace_request_id,
+        replace_welcome_id,
+        scenario_welcome_id,
+        new_ref,
+        new_package_not_after,
+    } = Box::pin(build_replace_fulfillment(&pool)).await;
+
+    let mut tx = pool.begin().await.expect("begin replace fulfillment");
+    let applied = apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+        .await
+        .expect("replace fulfillment applies");
+    tx.commit()
+        .await
+        .expect("replace fulfillment COMMIT past all deferred triggers");
+    assert_eq!(applied.allocated_seq, 4);
+
+    // Head at the committed successor (sv 3, seq 5); commit gen_state epoch 2, 2 leaves.
+    let (sv, next_seq): (i64, i64) = sqlx::query_as(
+        "SELECT current_state_version,next_entry_seq FROM chat.conversations WHERE conversation_id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("head");
+    assert_eq!((sv, next_seq), (3, 5));
+    let (skind, sepoch, sleaf): (String, i64, i64) = sqlx::query_as(
+        "SELECT state_kind,epoch,leaf_count FROM chat.generation_states WHERE conversation_id=$1 AND state_version=3",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("commit gen state");
+    assert_eq!((skind.as_str(), sepoch, sleaf), ("commit", 2, 2));
+
+    // Bob's OLD leaf period is closed, bound to the fulfillment transition.
+    let (old_active, old_removed): (bool, Option<Uuid>) = sqlx::query_as(
+        "SELECT active,removed_transition_id FROM chat.member_devices WHERE leaf_period_id=$1",
+    )
+    .bind(bob_old_leaf_period)
+    .fetch_one(&pool)
+    .await
+    .expect("bob old leaf");
+    assert!(!old_active);
+    assert_eq!(old_removed, Some(replace_transition));
+    // Bob's NEW active leaf carries the fresh key package + the SAME signing key.
+    let (new_active, new_origin, new_join_ref, new_sig): (bool, String, Option<Vec<u8>>, Vec<u8>) =
+        sqlx::query_as(
+            "SELECT active,origin,join_key_package_ref,leaf_signature_key FROM chat.member_devices WHERE conversation_id=$1 AND user_did=$2 AND active",
+        )
+        .bind(conversation_id)
+        .bind(&bob_did)
+        .fetch_one(&pool)
+        .await
+        .expect("bob new leaf");
+    assert!(new_active);
+    assert_eq!(
+        (new_origin.as_str(), new_join_ref),
+        ("keyPackage", Some(new_ref.to_vec()))
+    );
+    assert_eq!(new_sig, bob_signature_key);
+    // Bob's OLD interval is Replace-closed at the fulfillment seq; his NEW interval
+    // is Add-opened at the same seq.
+    let (old_start, old_end, old_kind): (i64, Option<i64>, Option<String>) = sqlx::query_as(
+        "SELECT start_seq,terminal_seq,closing_kind FROM chat.application_intervals WHERE conversation_id=$1 AND recipient_did=$2 AND terminal_seq IS NOT NULL",
+    )
+    .bind(conversation_id)
+    .bind(&bob_did)
+    .fetch_one(&pool)
+    .await
+    .expect("bob closed interval");
+    assert_eq!(old_start, 3);
+    assert_eq!(old_end, Some(4));
+    assert_eq!(old_kind.as_deref(), Some("replace"));
+    let (new_start, new_open): (i64, String) = sqlx::query_as(
+        "SELECT start_seq,opening_kind FROM chat.application_intervals WHERE conversation_id=$1 AND recipient_did=$2 AND terminal_seq IS NULL",
+    )
+    .bind(conversation_id)
+    .bind(&bob_did)
+    .fetch_one(&pool)
+    .await
+    .expect("bob open interval");
+    assert_eq!((new_start, new_open.as_str()), (4, "add"));
+
+    // Request fulfilled, reservation consumed, fresh package consumed.
+    let req_status: String = sqlx::query_scalar(
+        "SELECT status FROM chat.leaf_recovery_requests WHERE recovery_request_id=$1",
+    )
+    .bind(replace_request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("request");
+    assert_eq!(req_status, "fulfilled");
+    let res_status: String = sqlx::query_scalar(
+        "SELECT status FROM chat.key_package_reservations WHERE recovery_request_id=$1",
+    )
+    .bind(replace_request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("reservation");
+    assert_eq!(res_status, "consumed");
+    let pkg_status: String =
+        sqlx::query_scalar("SELECT status FROM chat.key_packages WHERE key_package_ref=$1")
+            .bind(new_ref.to_vec())
+            .fetch_one(&pool)
+            .await
+            .expect("package");
+    assert_eq!(pkg_status, "consumed");
+    // A fresh pending Welcome for bob; the scenario's prior Welcome is superseded.
+    let (new_del_status, new_expires): (String, DateTime<Utc>) =
+        sqlx::query_as("SELECT status,expires_at FROM chat.welcome_deliveries WHERE welcome_id=$1")
+            .bind(replace_welcome_id)
+            .fetch_one(&pool)
+            .await
+            .expect("new delivery");
+    assert_eq!(new_del_status, "pending");
+    assert_eq!(new_expires, new_package_not_after);
+    let prior_welcome_status: String =
+        sqlx::query_scalar("SELECT status FROM chat.welcome_deliveries WHERE welcome_id=$1")
+            .bind(scenario_welcome_id)
+            .fetch_one(&pool)
+            .await
+            .expect("prior welcome");
+    assert_eq!(prior_welcome_status, "superseded");
+    // The re-encryption metadata snapshot for the fulfillment transition.
+    let snap_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.metadata_snapshots WHERE producing_transition_id=$1",
+    )
+    .bind(replace_transition)
+    .fetch_one(&pool)
+    .await
+    .expect("snapshot");
+    assert_eq!(snap_count, 1);
+
+    // Replay -> head CAS conflict (head already at sv 3), zero residue.
+    let before: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM chat.transitions WHERE conversation_id=$1")
+            .bind(conversation_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let mut tx2 = pool.begin().await.expect("begin replay");
+    let replay = apply_conversation_persistence_plan(&mut tx2, &plan, &ctx).await;
+    assert!(
+        matches!(replay, Err(ExecutorError::Transition(_))),
+        "replace fulfillment replay must conflict on the head CAS, got {replay:?}"
+    );
+    tx2.rollback().await.expect("rollback replay");
+    let after: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM chat.transitions WHERE conversation_id=$1")
+            .bind(conversation_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        before, after,
+        "replace fulfillment replay left zero residue"
+    );
+}
+
+/// Desync negative for the `replace` composition: with the OLD leaf period absent
+/// from `ctx.closing_leaf_periods`, the executor must HARD-ERROR (`MissingContext`)
+/// rather than silently opening bob's new leaf while leaving the old one active —
+/// the exact half-rotation silent-bug this arm guards against. The whole
+/// transaction rolls back (zero residue).
+#[tokio::test]
+async fn leaf_recovery_replace_fulfillment_without_old_leaf_period_is_rejected() {
+    let (pool, _db) = setup().await;
+    let built = Box::pin(build_replace_fulfillment(&pool)).await;
+    let conversation_id = built.conversation_id;
+    let plan = built.plan;
+    let mut ctx = built.ctx;
+    // Drop the OLD leaf period the rotation must close.
+    ctx.closing_leaf_periods.clear();
+
+    let before: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM chat.transitions WHERE conversation_id=$1")
+            .bind(conversation_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("begin rejected replace fulfillment");
+    let result = apply_conversation_persistence_plan(&mut tx, &plan, &ctx).await;
+    assert!(
+        matches!(result, Err(ExecutorError::MissingContext(_))),
+        "replace fulfillment without the old leaf period must hard-error, got {result:?}"
+    );
+    tx.rollback().await.expect("rollback rejected replace");
+    let after: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM chat.transitions WHERE conversation_id=$1")
+            .bind(conversation_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        before, after,
+        "rejected replace fulfillment left zero residue"
+    );
+}
+
 #[tokio::test]
 async fn generic_commit_supersedes_prior_open_recovery_request() {
     let (pool, _db) = setup().await;

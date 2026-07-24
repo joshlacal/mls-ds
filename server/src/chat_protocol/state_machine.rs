@@ -10097,6 +10097,62 @@ impl TransitionEvidence {
         Ok(evidence)
     }
 
+    /// The `replace`-shaped leaf-recovery fulfillment `TransitionEvidence`: like
+    /// `for_test_leaf_recovery_fulfillment_with_metadata`, but the manifest ALSO
+    /// carries a `ManifestLeafChange::Remove(target)` for the rotated leaf, so
+    /// `require_commit_manifest`'s `manifest_removed == commit.removes()` invariant
+    /// (a `replace` commit removes the target's OLD leaf) holds. The `Recovery`
+    /// form still requires exactly one Add for the target; the Remove is validated
+    /// only against the commit's removes.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_test_leaf_recovery_replace_fulfillment_with_metadata(
+        seq: u64,
+        transition_id: [u8; 16],
+        outer_entry_fingerprint: [u8; 32],
+        received_at: ServerTimestamp,
+        recovery_request_id: [u8; 16],
+        prior: PublicGroupSnapshotCoordinate,
+        next: PublicGroupSnapshotCoordinate,
+        target: DeviceIdentity,
+        key_package_ref: [u8; 32],
+        welcome_id: [u8; 16],
+        welcome_wire_bytes: Vec<u8>,
+        metadata: MetadataSnapshotBinding,
+    ) -> Result<Self, StateMachineError> {
+        let welcome_sha256: [u8; 32] = Sha256::digest(&welcome_wire_bytes).into();
+        let mut evidence =
+            Self::for_test_at(seq, transition_id, outer_entry_fingerprint, received_at)?;
+        evidence.body_binding = Some(TransitionBodyBinding::LeafRecoveryFulfillment {
+            recovery_request_id,
+            prior,
+            next,
+            aad_digest: [0u8; 32],
+            manifest: TransitionManifestBinding {
+                participant_changes: Vec::new(),
+                leaf_changes: vec![
+                    ManifestLeafChange::Remove(target.clone()),
+                    ManifestLeafChange::Add {
+                        device: target.clone(),
+                        recovery_request_id,
+                        key_package_ref,
+                    },
+                ],
+                leaf_recovery_request_id: Some(recovery_request_id),
+                welcome: Some(ManifestWelcomeBinding {
+                    welcome_id,
+                    opaque_welcome: welcome_wire_bytes,
+                    sha256: welcome_sha256,
+                    recipient: target,
+                    recovery_request_id,
+                    key_package_ref,
+                }),
+            },
+            commit_sha256: [0u8; 32],
+            metadata,
+        });
+        Ok(evidence)
+    }
+
     /// A generic `signedCommitTransition` `TransitionEvidence`: the exact `Commit`
     /// body a real zero-proposal epoch commit carries — prior/next coordinates
     /// (`require_commit_body`), an empty Generic manifest (no participant/leaf
@@ -13225,11 +13281,11 @@ mod executor {
         TransitionCoordinates, TransitionKind, TransitionRepositoryError,
     };
     use super::{
-        CloseKind, ConversationKind, DeviceIdentity, LeafHydrationRow, LeafRecoveryKind,
-        LeaveRequestStatus, MetadataSnapshotBinding, PackageStatus, ParticipantHydrationRow,
-        ParticipantRole, ParticipantStatus, PlanKind, PrincipalId, PublicGroupSnapshotCoordinate,
-        RecoveryRequestStatus, RecoverySource, ReservationStatus, ServerTimestamp, StateChange,
-        TransitionEffects, WelcomeStatus,
+        CloseKind, ConversationKind, DeviceIdentity, LeafHydrationRow, LeafRecord,
+        LeafRecoveryKind, LeaveRequestStatus, MetadataSnapshotBinding, PackageStatus,
+        ParticipantHydrationRow, ParticipantRole, ParticipantStatus, PlanKind, PrincipalId,
+        PublicGroupSnapshotCoordinate, RecoveryRequestStatus, RecoverySource, ReservationStatus,
+        ServerTimestamp, StateChange, TransitionEffects, WelcomeStatus,
     };
     use super::{ConversationPersistencePlan, ConversationStateHydration};
 
@@ -14770,7 +14826,20 @@ mod executor {
                         && a.status() == ReservationStatus::Consumed)
             })
             .count();
-        if own_fulfilled != 1 || own_consumed != 1 || effects.welcome_changes().len() != 1 {
+        // Exactly ONE own NEW pending welcome. A `replace` fulfillment ALSO
+        // supersedes the target's prior-bound pending welcome (a (Some,Some)
+        // Pending->Superseded change consumed by write_welcome_supersessions +
+        // reconcile), so the total welcome-change count is NOT constrained here —
+        // only the own new-pending count is.
+        let own_new_welcomes = effects
+            .welcome_changes()
+            .iter()
+            .filter(|change| {
+                matches!((change.before(), change.after()), (None, Some(a))
+                    if a.status() == WelcomeStatus::Pending)
+            })
+            .count();
+        if own_fulfilled != 1 || own_consumed != 1 || own_new_welcomes != 1 {
             return Err(ExecutorError::InconsistentPlan(
                 "fulfillment must carry exactly one own fulfilled request + consumed reservation + welcome",
             ));
@@ -14924,39 +14993,46 @@ mod executor {
         )
         .await?;
 
-        // 7. Exactly one addLeafByRecovery: the target's keyPackage-origin leaf.
-        //    NOTE: the commit's sender (the fulfiller) rotates its own encryption
-        //    key, which surfaces as a (Some,Some) leaf change — but the DS
-        //    `member_devices` row does not store the ephemeral encryption key, so a
-        //    key rotation needs NO row write and is intentionally ignored here. A
-        //    (Some,None) removal (a `replace` old-leaf close) is NOT yet composed.
+        // 7. The target's recovered leaf. An `add` fulfillment opens a fresh
+        //    (None,Some) leaf for a target that had none; a `replace` fulfillment
+        //    ROTATES an existing target leaf — because the diff is keyed by DEVICE
+        //    (not leaf index), the rotation surfaces as ONE (Some,Some) change for
+        //    the target (the whole `LeafRecord` differs: new signature/encryption
+        //    key + key-package origin), which must close the OLD leaf period and
+        //    open a fresh one. A NON-target (Some,Some) is the committer's own
+        //    tolerated key rotation — the DS `member_devices` row stores no
+        //    ephemeral encryption key, so it needs no write. Any other leaf delta
+        //    (a non-target add, or a full removal) is a hard error.
         let target = fulfilled.target().clone();
-        let mut added_leaves = 0usize;
+        let mut target_leaf: Option<(bool, &LeafRecord)> = None;
         for change in effects.leaf_changes() {
             match (change.before(), change.after()) {
-                (None, Some(_)) => added_leaves += 1,
+                (None, Some(after)) if after.device() == &target => {
+                    if target_leaf.replace((false, after)).is_some() {
+                        return Err(ExecutorError::InconsistentPlan(
+                            "fulfillment carries more than one target leaf change",
+                        ));
+                    }
+                }
+                (Some(_), Some(after)) if after.device() == &target => {
+                    if target_leaf.replace((true, after)).is_some() {
+                        return Err(ExecutorError::InconsistentPlan(
+                            "fulfillment carries more than one target leaf change",
+                        ));
+                    }
+                }
                 (Some(_), Some(_)) => {}
-                (Some(_), None) => {
+                (None, Some(_)) | (Some(_), None) | (None, None) => {
                     return Err(ExecutorError::InconsistentPlan(
-                        "fulfillment replace-close not composed",
+                        "fulfillment carries an unexpected leaf change",
                     ))
                 }
-                (None, None) => {}
             }
         }
-        let new_leaf_change = effects
-            .leaf_changes()
-            .iter()
-            .find_map(|change| match (change.before(), change.after()) {
-                (None, Some(after)) => Some(after),
-                _ => None,
-            })
-            .ok_or(ExecutorError::InconsistentPlan("fulfillment adds no leaf"))?;
-        if added_leaves != 1 || new_leaf_change.device() != &target {
-            return Err(ExecutorError::InconsistentPlan(
-                "fulfillment must add exactly the target's leaf",
-            ));
-        }
+        let (is_replace, new_leaf_change) = target_leaf.ok_or(ExecutorError::InconsistentPlan(
+            "fulfillment carries no target leaf change",
+        ))?;
+        debug_assert_eq!(new_leaf_change.device(), &target);
         let leaf_row = hydration
             .leaves
             .iter()
@@ -14974,6 +15050,23 @@ mod executor {
             .first()
             .ok_or(ExecutorError::MissingContext("recovered leaf period id"))?;
         let participant_period_id = participant_period_for(ctx, hydration, target.principal())?;
+        // A `replace` closes the target's OLD leaf period FIRST (a single active
+        // leaf per device), sourcing the period id from ctx.closing_leaf_periods,
+        // before the fresh period below reuses the vacated slot.
+        if is_replace {
+            let old_leaf_period = closing_leaf_period(ctx, &target)?;
+            transition::close_leaf_period(
+                transaction,
+                &LeafClose {
+                    leaf_period_id: old_leaf_period,
+                    removed_state_version: state_version,
+                    removed_transition_id: transition_id,
+                    removed_seq: seq_i64,
+                    removed_at: applied_at,
+                },
+            )
+            .await?;
+        }
         transition::insert_leaf_period(
             transaction,
             &NewLeafPeriod {
@@ -14999,50 +15092,97 @@ mod executor {
         )
         .await?;
 
-        // 8. The target's `add`-opened interval at the fulfillment seq.
-        let interval_change = effects
-            .interval_changes()
-            .iter()
-            .find_map(|change| match (change.before(), change.after()) {
-                (None, Some(after)) => Some(after),
-                _ => None,
-            })
-            .ok_or(ExecutorError::InconsistentPlan(
-                "fulfillment opens no interval",
-            ))?;
-        if effects.interval_changes().len() != 1
-            || interval_change.opening_kind() != super::OpeningKind::Add
-            || interval_change.end().is_some()
-        {
+        // 8. Intervals. The target's fresh `add` interval opens at the fulfillment
+        //    seq (keyed on the new opening seq). A `replace` ADDITIONALLY carries
+        //    the target's PRIOR interval as a (Some,Some) close (keyed on the old
+        //    opening seq), `Replace`-closed inclusively at the fulfillment seq —
+        //    the removed old leaf period sources the close. Every interval change
+        //    must be consumed; the counts are asserted against the request kind.
+        let mut opened_intervals = 0usize;
+        let mut closed_intervals = 0usize;
+        for change in effects.interval_changes() {
+            match (change.before(), change.after()) {
+                (None, Some(after)) => {
+                    if after.recipient() != &target
+                        || after.opening_kind() != super::OpeningKind::Add
+                        || after.end().is_some()
+                    {
+                        return Err(ExecutorError::InconsistentPlan(
+                            "fulfillment opens an unexpected interval",
+                        ));
+                    }
+                    let opening_context = after.opening_context();
+                    delivery::insert_application_interval(
+                        transaction,
+                        &NewApplicationInterval {
+                            membership_interval_id: Uuid::from_bytes(
+                                *after.opening_transition_id(),
+                            ),
+                            conversation_id,
+                            generation: checked_i64(opening_context.generation())?,
+                            recipient_did: device_did(after.recipient())?,
+                            recipient_device_id: device_uuid(after.recipient()),
+                            start_seq: checked_i64(after.opening_seq())?,
+                            opening_kind: IntervalOpeningKind::Add,
+                            opening_transition_id: Uuid::from_bytes(*after.opening_transition_id()),
+                            opening_outer_entry_fingerprint: after
+                                .opening_outer_entry_fingerprint()
+                                .to_vec(),
+                            opening_state_version: checked_i64(opening_context.state_version())?,
+                            opening_group_id: opening_context.group_id().to_vec(),
+                            opening_epoch: checked_i64(opening_context.epoch())?,
+                            opening_group_context_hash: opening_context
+                                .group_context_hash()
+                                .to_vec(),
+                            opening_confirmation_tag: opening_context.confirmation_tag().to_vec(),
+                            opening_leaf_period_id: leaf_period_id,
+                            created_at: applied_at,
+                        },
+                    )
+                    .await?;
+                    opened_intervals += 1;
+                }
+                (Some(_), Some(after)) => {
+                    let end = after.end().ok_or(ExecutorError::InconsistentPlan(
+                        "fulfillment replace-close carries no interval end",
+                    ))?;
+                    if after.recipient() != &target || end.kind() != CloseKind::Replace {
+                        return Err(ExecutorError::InconsistentPlan(
+                            "fulfillment closes an unexpected interval",
+                        ));
+                    }
+                    let old_leaf_period = closing_leaf_period(ctx, after.recipient())?;
+                    delivery::close_application_interval(
+                        transaction,
+                        &ApplicationIntervalClose {
+                            membership_interval_id: Uuid::from_bytes(
+                                *after.opening_transition_id(),
+                            ),
+                            terminal_seq: checked_i64(end.seq())?,
+                            closing_state_version: state_version,
+                            closing_transition_id: Uuid::from_bytes(*end.transition_id()),
+                            closing_outer_entry_fingerprint: end.outer_entry_fingerprint().to_vec(),
+                            closing_kind: repo_interval_close_kind(end.kind()),
+                            closing_leaf_period_id: old_leaf_period,
+                            removed_at: applied_at,
+                        },
+                    )
+                    .await?;
+                    closed_intervals += 1;
+                }
+                (Some(_), None) | (None, None) => {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "fulfillment carries an unexpected interval change",
+                    ))
+                }
+            }
+        }
+        let expected_closed = usize::from(is_replace);
+        if opened_intervals != 1 || closed_intervals != expected_closed {
             return Err(ExecutorError::InconsistentPlan(
-                "fulfillment must open exactly one add interval (no replace-close composed)",
+                "fulfillment interval changes do not match the request kind",
             ));
         }
-        let opening_context = interval_change.opening_context();
-        delivery::insert_application_interval(
-            transaction,
-            &NewApplicationInterval {
-                membership_interval_id: Uuid::from_bytes(*interval_change.opening_transition_id()),
-                conversation_id,
-                generation: checked_i64(opening_context.generation())?,
-                recipient_did: device_did(interval_change.recipient())?,
-                recipient_device_id: device_uuid(interval_change.recipient()),
-                start_seq: checked_i64(interval_change.opening_seq())?,
-                opening_kind: IntervalOpeningKind::Add,
-                opening_transition_id: Uuid::from_bytes(*interval_change.opening_transition_id()),
-                opening_outer_entry_fingerprint: interval_change
-                    .opening_outer_entry_fingerprint()
-                    .to_vec(),
-                opening_state_version: checked_i64(opening_context.state_version())?,
-                opening_group_id: opening_context.group_id().to_vec(),
-                opening_epoch: checked_i64(opening_context.epoch())?,
-                opening_group_context_hash: opening_context.group_context_hash().to_vec(),
-                opening_confirmation_tag: opening_context.confirmation_tag().to_vec(),
-                opening_leaf_period_id: leaf_period_id,
-                created_at: applied_at,
-            },
-        )
-        .await?;
 
         // 9. Terminalize: request fulfilled, reservation consumed, package consumed.
         transition::terminalize_leaf_recovery_request(

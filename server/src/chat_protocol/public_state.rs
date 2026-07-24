@@ -862,6 +862,120 @@ impl VerifiedCommitPublicState {
             verified_aad_sha256: None,
         })
     }
+
+    /// Synthetic REPLACE commit (`sv+1`, `epoch+1`, fresh hash/tag): a leaf
+    /// recovery that ROTATES the same principal's leaf in place — the old leaf is
+    /// REMOVED and a fresh leaf for the same basic credential is ADDED (reusing the
+    /// vacated slot), carrying the recovery request's key package. A leaf recovery
+    /// keeps the device's SIGNING identity key (the DS `member_devices` signing-key
+    /// FK requires a registered device key); only the HPKE encryption key and the
+    /// key-package origin rotate. The removed leaf's index/credential/signature key
+    /// are sourced from the prior leaf at `replaced_leaf_index` (so the planner's
+    /// `Replace` arm, which cross-checks the remove against `prior.leaf(target)`,
+    /// accepts it); the add reuses that index and signature key with the caller's
+    /// fresh encryption key and key-package ref. Because the credential AND the
+    /// signature key are unchanged and both leaves occupy `replaced_leaf_index`,
+    /// `materialize_next_leaves(prior, commit, Some(target))` reproduces exactly the
+    /// `next` tree summary this constructs. Mirrors `for_test_remove`'s pure
+    /// public-state seam (`process_commit` reconstructing a non-authoritative prior
+    /// diverges cryptographically, so the state-machine suite drives replace
+    /// fulfillments synthetically too).
+    #[cfg(test)]
+    pub(crate) fn for_test_replace(
+        prior: &ActivePublicState,
+        next_coordinate: PublicGroupSnapshotCoordinate,
+        sender_leaf_index: u32,
+        replaced_leaf_index: u32,
+        new_encryption_key: Vec<u8>,
+        new_key_package_ref: [u8; 32],
+    ) -> Result<Self, PublicStateError> {
+        let prior_coordinate = prior.coordinate();
+        if prior_coordinate.conversation_id() != next_coordinate.conversation_id()
+            || prior_coordinate.generation() != next_coordinate.generation()
+            || prior_coordinate.group_id() != next_coordinate.group_id()
+            || prior_coordinate.state_version().checked_add(1)
+                != Some(next_coordinate.state_version())
+            || prior_coordinate.epoch().checked_add(1) != Some(next_coordinate.epoch())
+            || prior_coordinate.group_context_hash() == next_coordinate.group_context_hash()
+            || prior_coordinate.confirmation_tag() == next_coordinate.confirmation_tag()
+            || next_coordinate.lifecycle() != PublicGroupSnapshotLifecycle::Active
+            || replaced_leaf_index == sender_leaf_index
+        {
+            return Err(PublicStateError::CoordinateMismatch);
+        }
+        let prior_leaves = prior.binding.tree_summary().leaves();
+        let sender = prior_leaves
+            .iter()
+            .find(|leaf| leaf.leaf_index() == sender_leaf_index)
+            .ok_or(PublicStateError::CoordinateMismatch)?;
+        let replaced = prior_leaves
+            .iter()
+            .find(|leaf| leaf.leaf_index() == replaced_leaf_index)
+            .ok_or(PublicStateError::CoordinateMismatch)?;
+        // A leaf recovery keeps the owner's basic credential AND signing key; only
+        // the HPKE encryption key and the key-package origin change.
+        let target_credential = replaced.basic_credential().to_vec();
+        let target_signature_key = replaced.signature_key().to_vec();
+        let removes = vec![CommitRemoveEffect {
+            leaf_index: replaced_leaf_index,
+            basic_credential: target_credential.clone(),
+            signature_key: target_signature_key.clone(),
+        }];
+        let adds = vec![CommitAddEffect {
+            leaf_index: replaced_leaf_index,
+            basic_credential: target_credential.clone(),
+            signature_key: target_signature_key.clone(),
+            encryption_key: new_encryption_key.clone(),
+            key_package_ref: new_key_package_ref,
+        }];
+        let mut next_leaves = prior_leaves
+            .iter()
+            .filter(|leaf| leaf.leaf_index() != replaced_leaf_index)
+            .cloned()
+            .collect::<Vec<_>>();
+        next_leaves.push(PublicGroupSnapshotLeaf::new(
+            replaced_leaf_index,
+            target_credential,
+            target_signature_key,
+            new_encryption_key,
+        ));
+        next_leaves.sort_by_key(PublicGroupSnapshotLeaf::leaf_index);
+        let next = ActivePublicState {
+            snapshot: prior.snapshot.clone(),
+            binding: PublicGroupSnapshotBinding::new(
+                *next_coordinate.conversation_id(),
+                next_coordinate.generation(),
+                next_coordinate.state_version(),
+                *next_coordinate.group_id(),
+                next_coordinate.epoch(),
+                *next_coordinate.group_context_hash(),
+                *next_coordinate.confirmation_tag(),
+                next_coordinate.lifecycle(),
+                *prior.binding.snapshot_sha256(),
+                PublicGroupSnapshotTreeSummary::new(
+                    *prior.binding.tree_summary().tree_hash(),
+                    next_leaves,
+                ),
+            ),
+            verified_group_info_sha256: None,
+            verified_group_info_signature_key: None,
+        };
+        Ok(Self {
+            prior_coordinate: *prior_coordinate,
+            next,
+            adds,
+            removes,
+            sender_update: CommitSenderUpdateEffect {
+                leaf_index: sender_leaf_index,
+                basic_credential: sender.basic_credential().to_vec(),
+                signature_key: sender.signature_key().to_vec(),
+                prior_encryption_key: sender.encryption_key().to_vec(),
+                next_encryption_key: sender.encryption_key().to_vec(),
+            },
+            verified_commit_sha256: None,
+            verified_aad_sha256: None,
+        })
+    }
 }
 
 /// Validate and process a Commit against a fresh reload of the exact current
@@ -953,6 +1067,22 @@ impl VerifiedRecoveryWelcome {
 
     pub(crate) fn key_package_ref(&self) -> &[u8; 32] {
         &self.key_package_ref
+    }
+
+    /// Bind an already-trusted Welcome blob to a reserved key package for pure
+    /// planner/executor tests. Production always arrives via
+    /// `verify_recovery_welcome`, which cross-checks the INNER key-package refs;
+    /// the planner and executor consume only `wire_bytes` + `key_package_ref`, so
+    /// a synthetic bound Welcome exercises those paths for a FRESH reserved package
+    /// that no corpus Welcome (bound to the already-consumed corpus ref) can name —
+    /// the exact shape a `replace` fulfillment requires.
+    #[cfg(test)]
+    pub(crate) fn for_test_bound(wire_bytes: Vec<u8>, key_package_ref: [u8; 32]) -> Self {
+        Self {
+            inner_bytes: wire_bytes.clone(),
+            wire_bytes,
+            key_package_ref,
+        }
     }
 }
 
