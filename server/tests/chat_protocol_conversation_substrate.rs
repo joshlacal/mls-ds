@@ -1922,27 +1922,22 @@ mod historical_control_path {
             .unwrap();
             let append = HydrationAuthority::new(cid).unwrap();
             // The certified append-time minter fixes the digest the row must
-            // carry. For the metadata-bearing arms it currently ERRORS before
-            // any digest is produced (dormant certified defect: parse_metadata_
-            // snapshot reads metadataCryptoContext.conversationId — lexicon
-            // #identifierBytes → CanonicalValueRef::Bytes — with closed_uuid,
-            // which only matches CanonicalValueRef::Uuid). Those rows still drive
-            // the equivalence test: both the historical and append-time paths
-            // reject them IDENTICALLY at that shared call, before the digest is
-            // consulted, so a placeholder digest is sound and the per-kind Result
-            // comparison still fences drift. See historical_control_matches_
-            // append_time_per_kind.
-            let minted = match entry_for_digest.mutation().projection() {
+            // carry. Every one of the 13 control-entry kinds — including the 6
+            // metadata-bearing arms healed by the parse_metadata_snapshot fix
+            // (metadataCryptoContext.conversationId read as exact-16 bytes) —
+            // mints successfully here.
+            let durable_row_digest = match entry_for_digest.mutation().projection() {
                 VerifiedMutationProjection::ResetRequest(_)
                 | VerifiedMutationProjection::LeaveRequest(_)
-                | VerifiedMutationProjection::LeaveCancellation(_) => append
+                | VerifiedMutationProjection::LeaveCancellation(_) => *append
                     .control_request(entry_for_digest)
-                    .map(|e| *e.durable_row_digest()),
-                _ => append
+                    .unwrap()
+                    .durable_row_digest(),
+                _ => *append
                     .control_transition(entry_for_digest)
-                    .map(|e| *e.durable_row_digest()),
+                    .unwrap()
+                    .durable_row_digest(),
             };
-            let durable_row_digest = minted.unwrap_or([0x11; 32]);
 
             cases.push(ControlCase {
                 entry_kind: case["entryKind"].as_str().unwrap().to_owned(),
@@ -1960,23 +1955,6 @@ mod historical_control_path {
         cases
     }
 
-    // Kinds whose transition body carries a `metadataSnapshot`. These currently
-    // FAIL the shared certified `parse_metadata_snapshot` (dormant defect noted
-    // in `build_cases`); both the historical and append-time paths reject them
-    // identically. Non-metadata kinds mint full evidence and compare Ok==Ok.
-    fn is_metadata_bearing(entry_kind: &str) -> bool {
-        [
-            "commitEntry",
-            "metadataEntry",
-            "creationEntry",
-            "resetActivationEntry",
-            "leafRecoveryFulfillmentEntry",
-            "leaveCommitFulfillmentEntry",
-        ]
-        .iter()
-        .any(|k| entry_kind.ends_with(k))
-    }
-
     fn is_control_request(entry_kind: &str) -> bool {
         [
             "resetRequestEntry",
@@ -1992,59 +1970,38 @@ mod historical_control_path {
         let cases = build_cases();
         // All 13 control-entry kinds: 10 transition arms + 3 control-request arms.
         assert_eq!(cases.len(), 13);
-        let mut successful = 0usize;
         for case in &cases {
             let append = HydrationAuthority::new(case.cid).unwrap();
-            let certified = append.hydrate_persisted_control(case.row(), &case.public_key);
-            // Read-time historical authority: byte-equal per kind (Result vs
-            // Result), with the head bound far above the entry seq so the strict
-            // `seq < head` holds. This is the drift fence: any divergence between
-            // the duplicated head-binding-free minters and the certified originals
-            // — success OR error path — makes the Results differ.
+            // Certified append-time re-hydration (head binding cfg'd out under
+            // test). Every kind mints full evidence — the 6 metadata-bearing arms
+            // are healed by the parse_metadata_snapshot fix.
+            let certified = append
+                .hydrate_persisted_control(case.row(), &case.public_key)
+                .unwrap_or_else(|e| {
+                    panic!("append-time hydrate failed for {}: {e:?}", case.entry_kind)
+                });
+            // Read-time historical authority: MUST be byte-equal per kind, with
+            // the head bound far above the entry seq so the strict `seq < head`
+            // holds. This is the drift fence — any divergence between the
+            // duplicated head-binding-free minters and the certified originals in
+            // ANY arm makes the evidence differ.
             let historical = HistoricalRehydrationAuthority::new(case.cid, case.seq + 1_000_000)
                 .unwrap()
-                .hydrate_historical_control(case.row(), &case.public_key);
+                .hydrate_historical_control(case.row(), &case.public_key)
+                .unwrap_or_else(|e| {
+                    panic!("historical hydrate failed for {}: {e:?}", case.entry_kind)
+                });
             assert_eq!(historical, certified, "kind {}", case.entry_kind);
 
-            match &historical {
-                Ok(authority) => {
-                    successful += 1;
-                    // Non-metadata kinds must SUCCEED and produce the variant the
-                    // aggregate consumes.
-                    assert!(
-                        !is_metadata_bearing(&case.entry_kind),
-                        "metadata-bearing {} unexpectedly succeeded — did the \
-                         parse_metadata_snapshot defect get fixed? upgrade this \
-                         test to assert full evidence for it",
-                        case.entry_kind
-                    );
-                    let is_request = matches!(authority, PersistedControlAuthority::Request(_));
-                    assert_eq!(
-                        is_request,
-                        is_control_request(&case.entry_kind),
-                        "authority variant mismatch for {}",
-                        case.entry_kind
-                    );
-                }
-                Err(StateMachineError::InvalidHydrationAuthority) => {
-                    // Only the known metadata-bearing arms may error here, and only
-                    // because of the shared certified parse_metadata_snapshot defect.
-                    assert!(
-                        is_metadata_bearing(&case.entry_kind),
-                        "unexpected hydration error for non-metadata kind {}",
-                        case.entry_kind
-                    );
-                }
-                Err(other) => panic!("unexpected error {other:?} for {}", case.entry_kind),
-            }
+            // The variant is the one the aggregate consumes for this kind.
+            let is_request = matches!(historical, PersistedControlAuthority::Request(_));
+            assert_eq!(
+                is_request,
+                is_control_request(&case.entry_kind),
+                "authority variant mismatch for {}",
+                case.entry_kind
+            );
         }
-        // Full-evidence equivalence proven for every non-metadata arm (7 of 13:
-        // policy, participantAcceptance, conversationClose, zeroLeafLeave +
-        // resetRequest, leaveRequest, leaveCancellation).
-        assert_eq!(
-            successful, 7,
-            "expected 7 non-metadata kinds to mint evidence"
-        );
     }
 
     #[test]

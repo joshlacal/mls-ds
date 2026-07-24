@@ -4184,7 +4184,18 @@ fn parse_metadata_snapshot(
         return Err(StateMachineError::InvalidHydrationAuthority);
     };
     let coordinate = MetadataCryptoCoordinate {
-        conversation_id: closed_uuid(&coordinate, "conversationId")?,
+        // The metadata crypto context binds conversationId as the compact 16-byte
+        // form (lexicon `#identifierBytes`: "Exact 16 UUID bytes corresponding to
+        // the canonical outer UUIDv4 text"), NOT the canonical text `#operationId`
+        // that transport coordinates (`#conversationCoordinates`) carry — so it
+        // projects to `CanonicalValueRef::Bytes`, not `Uuid`, and must be read as
+        // exact-16 bytes (reading it with `closed_uuid` never matched and left
+        // parse_metadata_snapshot unable to admit any metadata snapshot). The
+        // required correspondence — these 16 bytes ARE the outer conversation's
+        // UUIDv4 — is enforced bytes-to-bytes downstream by
+        // `metadata_coordinate_matches` (see `metadata.coordinate.conversation_id
+        // == *coordinate.conversation_id()`), so no re-check is needed here.
+        conversation_id: closed_fixed_bytes::<16>(&coordinate, "conversationId")?,
         generation: closed_integer(&coordinate, "generation")?,
         epoch: closed_integer(&coordinate, "epoch")?,
         group_context_hash: closed_fixed_bytes(&coordinate, "groupContextHash")?,
