@@ -28,6 +28,16 @@ mod repository {
             "/src/chat_protocol/repository/blobs.rs"
         ));
     }
+    // The application-send + stale-tombstone writer (Slice 4a) lives in
+    // `delivery.rs`; the stale-send five-property proofs compose it. It is
+    // self-contained (chrono/sha2/sqlx/uuid), so it is `include!`d standalone
+    // exactly like the sibling repository harnesses.
+    pub(crate) mod delivery {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/chat_protocol/repository/delivery.rs"
+        ));
+    }
 }
 
 use chrono::{DateTime, Duration, Utc};
@@ -791,4 +801,353 @@ async fn database_check_backstops_media_per_purpose_and_size_relation() {
         Err(BlobRepositoryError::Database(_))
     ));
     tx.rollback().await.expect("rollback size");
+}
+
+// ===========================================================================
+// Part 3 — stale send: the sole durable terminal tombstone (Slice 5, item 4).
+//
+// A stale send (the sender's live lease/interval was superseded before its
+// message committed) branches BEFORE seq allocation and writes ONLY its terminal
+// `chat.message_sends` row — no entry, no seq, no blob binding, no event. The
+// send can never later succeed, and an exact replay returns the stored stale
+// outcome while changed bytes conflict. The writer under test is the Slice-4a
+// `resolve_application_send`.
+// ===========================================================================
+
+use repository::delivery::{
+    resolve_application_send, AppendEntry, ApplicationSend, ApplicationSendDisposition,
+    ApplicationSendOutcome, DeliveryRepositoryError,
+};
+
+async fn seed_bare_conversation(tx: &mut Transaction<'_, Postgres>) -> Uuid {
+    let conversation_id = Uuid::new_v4();
+    let now = clock_now(tx).await;
+    sqlx::query(
+        "INSERT INTO chat.conversations(conversation_id,kind,lifecycle,current_generation,current_state_version,next_entry_seq,created_at) \
+         VALUES($1,'group','active',0,0,1,$2)",
+    )
+    .bind(conversation_id)
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .expect("insert bare conversation");
+    conversation_id
+}
+
+/// Build a coherent `ApplicationSend` for `conversation_id`/`message_id`. The
+/// `request_digest` is the SHA-256 of the signing transcript so the
+/// `message_sends_signature_check` relation holds.
+fn application_send(
+    conversation_id: Uuid,
+    message_id: Uuid,
+    actor_did: &str,
+    actor_device_id: Uuid,
+    actor_key_id: &str,
+    transcript_seed: u8,
+    received_at: DateTime<Utc>,
+) -> ApplicationSend {
+    let signing_transcript_bytes = vec![transcript_seed; 48];
+    let request_digest = Sha256::digest(&signing_transcript_bytes).to_vec();
+    ApplicationSend {
+        entry: AppendEntry {
+            conversation_id,
+            entry_id: Uuid::new_v4(),
+            entry_kind: "blue.catbird.chat.defs#applicationEntry".to_owned(),
+            accepted_payload_bytes: vec![1_u8; 8],
+            accepted_payload_sha256: Sha256::digest([1_u8; 8]).to_vec(),
+            signed_request_bytes: vec![2_u8; 16],
+            request_digest,
+            signature: vec![3_u8; 64],
+            server_fields_bytes: vec![0_u8],
+            outer_entry_fingerprint: vec![4_u8; 32],
+            actor_did: actor_did.to_owned(),
+            actor_device_id,
+            actor_key_id: actor_key_id.to_owned(),
+            actor_auth_generation: 1,
+            generation: None,
+            state_version: None,
+            transition_id: None,
+            message_id: Some(message_id),
+            received_at,
+        },
+        signing_transcript_bytes,
+        outcome_bytes: vec![9_u8; 8],
+    }
+}
+
+async fn count_where(tx: &mut Transaction<'_, Postgres>, sql: &str, conversation_id: Uuid) -> i64 {
+    sqlx::query_scalar(sql)
+        .bind(conversation_id)
+        .fetch_one(&mut **tx)
+        .await
+        .expect("count")
+}
+
+#[tokio::test]
+#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
+async fn stale_send_writes_only_a_tombstone_with_no_entry_seq_blob_or_event() {
+    let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let mut tx = pool.begin().await.expect("begin");
+    let owner = random_plc_did();
+    let (device_id, key_id) = seed_owner_tx(&mut tx, &owner).await;
+    let conversation_id = seed_bare_conversation(&mut tx).await;
+    let message_id = Uuid::new_v4();
+    let now = clock_now(&mut tx).await;
+    let send = application_send(
+        conversation_id,
+        message_id,
+        &owner,
+        device_id,
+        &key_id,
+        0x11,
+        now,
+    );
+
+    let outcome = resolve_application_send(&mut tx, &send, ApplicationSendDisposition::Stale)
+        .await
+        .expect("stale resolves");
+    assert_eq!(outcome, ApplicationSendOutcome::Stale);
+
+    // Exactly one durable tombstone: status 'stale', NO accepted seq.
+    let (status, accepted_entry_seq): (String, Option<i64>) = sqlx::query_as(
+        "SELECT status, accepted_entry_seq FROM chat.message_sends WHERE conversation_id=$1 AND message_id=$2",
+    )
+    .bind(conversation_id)
+    .bind(message_id)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("tombstone row");
+    assert_eq!(status, "stale");
+    assert_eq!(accepted_entry_seq, None);
+
+    // ZERO entry / seq / blob-binding / event residue for this conversation.
+    let entries = count_where(
+        &mut tx,
+        "SELECT count(*) FROM chat.entries WHERE conversation_id=$1",
+        conversation_id,
+    )
+    .await;
+    assert_eq!(entries, 0, "a stale send appends no entry");
+    let next_seq: i64 = sqlx::query_scalar(
+        "SELECT next_entry_seq FROM chat.conversations WHERE conversation_id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("head seq");
+    assert_eq!(next_seq, 1, "a stale send allocates no seq");
+    let bindings = count_where(
+        &mut tx,
+        "SELECT count(*) FROM chat.blob_bindings WHERE conversation_id=$1",
+        conversation_id,
+    )
+    .await;
+    assert_eq!(bindings, 0, "a stale send binds no blob");
+    // No event residue: `chat.events` is keyed by `protocol_instance_id`, not
+    // `conversation_id`, and the stale writer touches ONLY `chat.message_sends`
+    // (the entry/seq/binding counts above confirm no other conversation-scoped
+    // side effect exists).
+    //
+    // The deferred `assert_message_send_mapping` accepts a stale row precisely
+    // BECAUSE it carries zero entries (its `ELSIF entry_count <> 0` arm), so the
+    // tombstone is commit-coherent by construction; we do not fire SET CONSTRAINTS
+    // here because a bare conversation intentionally lacks the full generation /
+    // state graph a real send would have.
+    tx.rollback().await.expect("rollback");
+}
+
+#[tokio::test]
+#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
+async fn stale_send_exact_replay_returns_stale_and_never_later_succeeds() {
+    let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let mut tx = pool.begin().await.expect("begin");
+    let owner = random_plc_did();
+    let (device_id, key_id) = seed_owner_tx(&mut tx, &owner).await;
+    let conversation_id = seed_bare_conversation(&mut tx).await;
+    let message_id = Uuid::new_v4();
+    let now = clock_now(&mut tx).await;
+    let send = application_send(
+        conversation_id,
+        message_id,
+        &owner,
+        device_id,
+        &key_id,
+        0x22,
+        now,
+    );
+
+    // First resolution stales.
+    assert_eq!(
+        resolve_application_send(&mut tx, &send, ApplicationSendDisposition::Stale)
+            .await
+            .expect("first stale"),
+        ApplicationSendOutcome::Stale
+    );
+    // Exact replay returns the stored stale outcome, ignoring the caller's later
+    // disposition — the message can never later succeed.
+    assert_eq!(
+        resolve_application_send(&mut tx, &send, ApplicationSendDisposition::Accept)
+            .await
+            .expect("replay ignores disposition"),
+        ApplicationSendOutcome::Stale
+    );
+    // Still no entry appended (the Accept disposition did NOT create one).
+    let entries = count_where(
+        &mut tx,
+        "SELECT count(*) FROM chat.entries WHERE conversation_id=$1",
+        conversation_id,
+    )
+    .await;
+    assert_eq!(entries, 0);
+    tx.rollback().await.expect("rollback");
+}
+
+#[tokio::test]
+#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
+async fn stale_send_changed_bytes_under_same_message_id_conflicts() {
+    let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let mut tx = pool.begin().await.expect("begin");
+    let owner = random_plc_did();
+    let (device_id, key_id) = seed_owner_tx(&mut tx, &owner).await;
+    let conversation_id = seed_bare_conversation(&mut tx).await;
+    let message_id = Uuid::new_v4();
+    let now = clock_now(&mut tx).await;
+    let send = application_send(
+        conversation_id,
+        message_id,
+        &owner,
+        device_id,
+        &key_id,
+        0x33,
+        now,
+    );
+    resolve_application_send(&mut tx, &send, ApplicationSendDisposition::Stale)
+        .await
+        .expect("first stale");
+
+    // A different message reusing the id (different transcript => different
+    // request_digest) is a conflict, not a replay.
+    let changed = application_send(
+        conversation_id,
+        message_id,
+        &owner,
+        device_id,
+        &key_id,
+        0x44,
+        now,
+    );
+    let result =
+        resolve_application_send(&mut tx, &changed, ApplicationSendDisposition::Stale).await;
+    assert!(matches!(
+        result,
+        Err(DeliveryRepositoryError::MessageSendConflict)
+    ));
+    tx.rollback().await.expect("rollback");
+}
+
+// ===========================================================================
+// Part 4 — ciphertext-blind boundary (Slice 5, item 2), mls-ds portion.
+//
+// The delivery service stores every descriptor / AAD as opaque BYTEA and never
+// decrypts or parses the encrypted inner application fields. The shared-Rust
+// client authority (catbird-mls) owns the reaction / atprotoRecord / externalLink
+// / blurhash grammars and their parity fixtures; those are CROSS-REPO evidence
+// for the completion gate and are deliberately NOT duplicated here. This test
+// proves opaque carriage: descriptor bytes that HAPPEN to contain an `at://`
+// URI and reaction-shaped bytes round-trip byte-for-byte with no interpretation.
+// ===========================================================================
+
+#[tokio::test]
+#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
+async fn descriptor_and_aad_bytes_are_stored_opaquely_without_inner_parsing() {
+    let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let mut tx = pool.begin().await.expect("begin");
+    let owner = random_plc_did();
+    let (device_id, key_id) = seed_owner_tx(&mut tx, &owner).await;
+    let conversation_id = seed_bare_conversation(&mut tx).await;
+    let now = clock_now(&mut tx).await;
+
+    // Prepare + complete a real bound-eligible blob so the binding's immediate
+    // identity/window FKs are satisfiable.
+    let request = prepare_request(
+        &owner,
+        device_id,
+        &key_id,
+        BlobPurpose::Attachment,
+        BlobMediaType::ImagePng,
+        1_000,
+        now,
+    );
+    let blob_id = request.blob_id;
+    let ct = request.ciphertext_size;
+    let pt = request.plaintext_size;
+    let ct_sha = request.ciphertext_sha256.clone();
+    let ticket = request.ticket_hash.clone();
+    prepare_blob(&mut tx, &request).await.expect("prepare");
+    complete_upload(
+        &mut tx,
+        blob_id,
+        &owner,
+        device_id,
+        ct,
+        &ticket,
+        now + Duration::seconds(10),
+        "objectstore/key/opaque",
+    )
+    .await
+    .expect("complete");
+    cas_bind_blob(
+        &mut tx,
+        blob_id,
+        &owner,
+        device_id,
+        now + Duration::seconds(20),
+    )
+    .await
+    .expect("bind blob status");
+
+    // Descriptor bytes that embed an at:// URI and reaction-shaped bytes; the
+    // server must never parse them — it stores the exact bytes.
+    let descriptor_bytes =
+        b"at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.feed.post/xyz \xF0\x9F\x91\x8D".to_vec();
+    let aad_bytes = b"externalLink=https://example.com/\\ \x00control".to_vec();
+    let binding = repository::blobs::NewBlobBinding {
+        blob_id,
+        binding_kind: repository::blobs::BindingKind::Application,
+        conversation_id,
+        entry_seq: Some(1),
+        message_id: Some(Uuid::new_v4()),
+        metadata_origin_transition_id: None,
+        metadata_version: None,
+        owner_did: owner.clone(),
+        owner_device_id: device_id,
+        descriptor_bytes: descriptor_bytes.clone(),
+        descriptor_sha256: Sha256::digest(&descriptor_bytes).to_vec(),
+        aad_bytes: aad_bytes.clone(),
+        aad_sha256: Sha256::digest(&aad_bytes).to_vec(),
+        ciphertext_sha256: ct_sha,
+        plaintext_size: pt,
+        ciphertext_size: ct,
+        purpose: BlobPurpose::Attachment,
+        bound_at: now + Duration::seconds(20),
+        uploaded_at: now + Duration::seconds(10),
+        unbound_expires_at: now + Duration::seconds(10) + Duration::hours(1),
+    };
+    repository::blobs::insert_blob_binding(&mut tx, &binding)
+        .await
+        .expect("insert opaque binding");
+
+    // Round-trip: the stored bytes equal the input bytes exactly (no normalization,
+    // no percent-decoding, no grammar validation).
+    let (stored_descriptor, stored_aad): (Vec<u8>, Vec<u8>) = sqlx::query_as(
+        "SELECT descriptor_bytes, aad_bytes FROM chat.blob_bindings WHERE blob_id=$1",
+    )
+    .bind(blob_id)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("read binding bytes");
+    assert_eq!(stored_descriptor, descriptor_bytes);
+    assert_eq!(stored_aad, aad_bytes);
+
+    tx.rollback().await.expect("rollback");
 }
