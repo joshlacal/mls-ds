@@ -448,10 +448,12 @@ fn coherent_application_send(base: &BaseConversation, salt: u8) -> ApplicationSe
 /// Two terminal authorities contend for ONE leased outbox row: two workers each
 /// try to mark the same row `delivered` under the SAME lease. Exactly one CAS
 /// commits (`leased -> delivered`); the other matches no leased row and is the
-/// typed `OutboxLeaseMismatch`, rolling back with zero residue. This is the shape
-/// of every single-row terminal-authority race the executor composes (device
-/// revoke vs mutation, reservation expiry vs fulfillment, two terminal authorities
-/// on one work row): exactly one winner, no double terminalization.
+/// typed `OutboxLeaseMismatch`, rolling back with zero residue. This is the
+/// single-row CAS that serializes two terminal authorities on one row — the exact
+/// mechanism the executor's multi-row terminal races (device revoke vs mutation,
+/// reservation expiry vs fulfillment) reduce to at their contended row; those
+/// full multi-row races are proven at the executor level in
+/// `tests/chat_protocol_executor.rs`, not claimed here.
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn two_terminal_authorities_on_one_work_row_serialize_to_one_winner() {
@@ -581,8 +583,11 @@ async fn concurrent_application_appends_get_unique_contiguous_seqs() {
 }
 
 /// Two outbox workers never double-claim: with several due rows, two concurrent
-/// `claim_outbox_batch` leases partition the queue (`FOR UPDATE SKIP LOCKED`), so
-/// no outbox row is claimed by both workers.
+/// `claim_outbox_batch` calls end up with disjoint claim sets. The row lock a
+/// claiming UPDATE takes plus its status filter (a row leased by one worker no
+/// longer matches the other's `pending`/expired-lease predicate) is what makes the
+/// claims disjoint; `FOR UPDATE SKIP LOCKED` only adds liveness — a worker skips a
+/// row another already locked instead of blocking on it.
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn two_outbox_workers_never_double_claim() {
