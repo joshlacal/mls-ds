@@ -49,6 +49,12 @@ pub(crate) enum InventoryRepositoryError {
         "supplied conversation items do not match the repository's membership-guarded selection"
     )]
     InconsistentConversationSelection,
+    #[error("supplied Welcome items do not match the repository's pending-delivery selection")]
+    InconsistentWelcomeSelection,
+    #[error(
+        "supplied recovery items do not match the repository's open-request/pending-work selection"
+    )]
+    InconsistentRecoverySelection,
     #[error("inventory fence advanced during selection; retry the session create")]
     SnapshotConflict,
     #[error("device query names too many or zero DIDs")]
@@ -63,9 +69,10 @@ impl PartialEq for InventoryRepositoryError {
     fn eq(&self, other: &Self) -> bool {
         use InventoryRepositoryError::{
             BoundaryItemMismatch, Cursor, DeviceAuthorityMismatch, DomainAlreadyComplete,
-            DurableRowInvalid, InconsistentConversationSelection, InvalidMaterialization,
-            ProtocolFenceMismatch, RaceOrReuse, RequestTooBroad, SessionNotFound,
-            SessionPresentationMismatch, SnapshotConflict, TransactionMismatch,
+            DurableRowInvalid, InconsistentConversationSelection, InconsistentRecoverySelection,
+            InconsistentWelcomeSelection, InvalidMaterialization, ProtocolFenceMismatch,
+            RaceOrReuse, RequestTooBroad, SessionNotFound, SessionPresentationMismatch,
+            SnapshotConflict, TransactionMismatch,
         };
         match (self, other) {
             (SessionNotFound, SessionNotFound)
@@ -79,6 +86,8 @@ impl PartialEq for InventoryRepositoryError {
             | (RaceOrReuse, RaceOrReuse)
             | (RequestTooBroad, RequestTooBroad)
             | (InconsistentConversationSelection, InconsistentConversationSelection)
+            | (InconsistentWelcomeSelection, InconsistentWelcomeSelection)
+            | (InconsistentRecoverySelection, InconsistentRecoverySelection)
             | (SnapshotConflict, SnapshotConflict)
             | (InvalidMaterialization, InvalidMaterialization) => true,
             (Cursor(left), Cursor(right)) => left == right,
@@ -1847,21 +1856,29 @@ pub(crate) struct ScheduleTerminalProofRef {
     pub(crate) terminal_seq: i64,
 }
 
-/// One pending-Welcome snapshot item, keyed by its `welcome_deliveries` row.
+/// One pending-Welcome snapshot item, keyed by its `welcome_deliveries` row. The
+/// caller echoes only the `welcome_id`; the repository selects the device's
+/// pending deliveries itself and derives the payload from the persisted
+/// `welcome_bundles.wrapper_bytes` (server-derived — the caller never supplies
+/// Welcome wire bytes).
 #[derive(Clone, Debug)]
 pub(crate) struct WelcomeInventoryItem {
     pub(crate) welcome_id: Uuid,
-    pub(crate) payload_bytes: Vec<u8>,
 }
 
 /// One recovery-domain snapshot item: either an open leaf-recovery request the
 /// device signed, or a recovery-work item addressed to the device. The
 /// `item_kind` discriminant and 17-byte prefixed item key are derived here.
+///
+/// Payload sourcing is per-arm (per the ratified per-arm contract): the
+/// `LeafRecoveryRequest` arm's payload is server-derived from the persisted
+/// `leaf_recovery_requests.signed_request_bytes`, so the caller echoes only the
+/// request id; the `RecoveryWork` arm has no persisted wire source, so the caller
+/// supplies the payload bytes (bijection-bound like the conversation arm).
 #[derive(Clone, Debug)]
 pub(crate) enum RecoveryInventoryItem {
     LeafRecoveryRequest {
         recovery_request_id: Uuid,
-        payload_bytes: Vec<u8>,
     },
     RecoveryWork {
         recovery_work_id: Uuid,
@@ -1873,15 +1890,27 @@ pub(crate) enum RecoveryInventoryItem {
 /// `create_inventory_session` call. Every item's recipient is the session's exact
 /// `(user_did, device_id)`; the function binds them so.
 ///
-/// Conversation-domain contract (selection-owning, ratified 2026-07-24): the
-/// repository SELECTS the membership-guarded conversation set itself (active
-/// `member_devices` for this device, under the fence) and binds `conversations` to
-/// that set by exact bijection — the caller supplies one payload per conversation
-/// id and cannot add, omit, or substitute a conversation. Only the per-conversation
-/// Task-4 wire encoding stays caller-supplied. `welcomes` / `recovery` remain
-/// caller-input in this interim (existence + exact-device-targeting FK-fail-closed);
-/// their full selection-ownership (Welcome payload from `welcome_bundles`, recovery
-/// from `leaf_recovery_requests`) is the routed remainder.
+/// Selection-owning contract (ratified 2026-07-24; welcome/recovery arms landed
+/// 4c): the repository SELECTS every shared domain's authoritative, status-current,
+/// device-scoped row set itself under the captured fence, and binds the caller's
+/// echoed items to that set by exact BIJECTION — the caller can never add, omit, or
+/// substitute a row. Per-arm payload sourcing:
+/// - conversation: repo selects active `member_devices`; caller supplies the Task-4
+///   wire payload per selected id (no persisted source). Bijection failure →
+///   `InconsistentConversationSelection`.
+/// - Welcome: repo selects `status='pending'` `welcome_deliveries`; the payload is
+///   server-derived from `welcome_bundles.wrapper_bytes`. The caller echoes only the
+///   `welcome_id` set. Bijection failure → `InconsistentWelcomeSelection`.
+/// - recovery / leafRecoveryRequest: repo selects `status='open'`
+///   `leaf_recovery_requests`; payload server-derived from `signed_request_bytes`.
+/// - recovery / recoveryWork: repo selects `status='pending'` `recovery_work_items`;
+///   caller supplies the payload per selected id (no persisted wire). Either recovery
+///   arm's bijection failure → `InconsistentRecoverySelection`.
+///
+/// Terminal rows (acknowledged/expired Welcomes, fulfilled/cancelled requests,
+/// completed/superseded work) are history — served only by the read/log paths, never
+/// materialized into this bootstrap snapshot. Ordinals + `payload_sha256` are
+/// repository-owned for every arm.
 #[derive(Clone, Debug)]
 pub(crate) struct CreateInventorySessionRequest<'a> {
     pub(crate) inventory_session_id: Uuid,
@@ -1896,7 +1925,13 @@ pub(crate) struct CreateInventorySessionRequest<'a> {
     /// or the call fails with `InconsistentConversationSelection`. Ordinals are
     /// repository-assigned (`conversation_id` ascending), not this vec's order.
     pub(crate) conversations: Vec<ConversationInventoryItem>,
+    /// The echoed `welcome_id` set; MUST equal the device's pending-delivery
+    /// selection exactly (bijection). Payload is server-derived, not carried here.
     pub(crate) welcomes: Vec<WelcomeInventoryItem>,
+    /// The echoed recovery items; the leafRecoveryRequest ids MUST equal the open
+    /// request selection and the recoveryWork ids MUST equal the pending work
+    /// selection (bijection across both arms). Request payload is server-derived;
+    /// work payload is carried here.
     pub(crate) recovery: Vec<RecoveryInventoryItem>,
 }
 
@@ -2140,19 +2175,18 @@ pub(crate) async fn create_inventory_session(
     .execute(&mut **transaction)
     .await?;
 
-    // 5. Materialize each domain with canonical ordinals 0..count-1.
+    // 5. Repository-owned SELECTION for every shared domain under the captured
+    //    fence, a SINGLE fence re-validation covering all of them, then
+    //    materialization with canonical ordinals 0..count-1. The repository owns
+    //    WHICH rows (device-scoped, status-current) each domain contains and the
+    //    ordinals + payload_sha256; payload BYTES are per-arm (conversation/work =
+    //    caller Task-4 wire; Welcome/request = server-derived persisted source).
     //
-    // 5a. Conversation domain — the repository OWNS the visible set. Select, under
-    //     the captured fence, the conversations this device is a CURRENT member of
-    //     (an active `chat.member_devices` leaf), and bind the caller's supplied
-    //     payloads to that set by exact bijection: a selected conversation with no
-    //     supplied payload, or a supplied payload for a conversation the device is
-    //     not a current member of (or a duplicate), is a hard error. This makes a
-    //     non-member conversation unmaterializable (closes the r12 membership
-    //     Important) and makes status-currency + completeness repository-owned;
-    //     the ordinals are assigned in the repository's canonical order
-    //     (`conversation_id` ascending), not caller order. Only the per-conversation
-    //     Task-4 wire encoding stays caller-supplied.
+    // 5a. Conversation domain — select the conversations this device is a CURRENT
+    //     member of (an active `chat.member_devices` leaf), and bind the caller's
+    //     supplied payloads to that set by exact bijection: a selected conversation
+    //     with no supplied payload, a supplied payload for a non-member conversation,
+    //     or a duplicate id, is a hard error. Ordinals ascend by `conversation_id`.
     let selected_conversation_ids: Vec<Uuid> = sqlx::query_scalar(
         r#"
         SELECT DISTINCT conversation_id
@@ -2185,31 +2219,146 @@ pub(crate) async fn create_inventory_session(
         return Err(InventoryRepositoryError::InconsistentConversationSelection);
     }
 
-    // 5b. Optimistic fence re-validation (ratified 2026-07-24 locking ruling). The
-    //     device-scoped selections above run WITHOUT `FOR UPDATE` on their source
-    //     rows — locking them would span every conversation of the device and
-    //     invert the transition executor's head→family lock order (a deadlock
-    //     surface). Instead, re-read the fence anchors captured in step 1 and
-    //     require them UNCHANGED immediately before the materialization inserts; if
-    //     any moved, a selection-affecting mutation may have interleaved, so fail
-    //     with the retryable `SnapshotConflict` (the transaction has written only
-    //     the still-incomplete session row, which rolls back with zero residue —
-    //     the caller re-runs `create_inventory_session`).
+    // 5b. Welcome domain — select the device's `status='pending'` deliveries and
+    //     derive each payload from the persisted `welcome_bundles.wrapper_bytes`
+    //     (server-derived; the caller echoes only the `welcome_id` set). Terminal
+    //     deliveries (acknowledged/rejected/expired/superseded) are history and are
+    //     excluded here. Ordinals ascend by `welcome_id`.
+    let selected_welcomes: Vec<(Uuid, Vec<u8>)> = sqlx::query_as(
+        r#"
+        SELECT wd.welcome_id, wb.wrapper_bytes
+          FROM chat.welcome_deliveries wd
+          JOIN chat.welcome_bundles wb ON wb.welcome_id = wd.welcome_id
+         WHERE wd.recipient_did = $1
+           AND wd.recipient_device_id = $2
+           AND wd.status = 'pending'
+         ORDER BY wd.welcome_id
+        "#,
+    )
+    .bind(request.user_did)
+    .bind(request.device_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+
+    let mut echoed_welcomes: std::collections::BTreeSet<Uuid> = std::collections::BTreeSet::new();
+    for item in &request.welcomes {
+        if !echoed_welcomes.insert(item.welcome_id) {
+            return Err(InventoryRepositoryError::InconsistentWelcomeSelection);
+        }
+    }
+    if echoed_welcomes.len() != selected_welcomes.len()
+        || !selected_welcomes
+            .iter()
+            .all(|(welcome_id, _)| echoed_welcomes.contains(welcome_id))
+    {
+        return Err(InventoryRepositoryError::InconsistentWelcomeSelection);
+    }
+
+    // 5c. Recovery domain, leafRecoveryRequest arm — select the device's
+    //     `status='open'` requests and derive each payload from the persisted
+    //     `leaf_recovery_requests.signed_request_bytes` (server-derived; the caller
+    //     echoes only the request id). Terminal requests (fulfilled/cancelled/
+    //     expired/superseded) are excluded. Ordinals ascend by `recovery_request_id`.
+    let selected_requests: Vec<(Uuid, Vec<u8>)> = sqlx::query_as(
+        r#"
+        SELECT recovery_request_id, signed_request_bytes
+          FROM chat.leaf_recovery_requests
+         WHERE requester_did = $1
+           AND requester_device_id = $2
+           AND status = 'open'
+         ORDER BY recovery_request_id
+        "#,
+    )
+    .bind(request.user_did)
+    .bind(request.device_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+
+    // 5d. Recovery domain, recoveryWork arm — select the device's `status='pending'`
+    //     work items; the caller supplies the payload per selected id (no persisted
+    //     wire, so bijection-bound like the conversation arm). Terminal work
+    //     (completed/superseded) is excluded. Ordinals ascend by `recovery_work_id`.
+    let selected_work_ids: Vec<Uuid> = sqlx::query_scalar(
+        r#"
+        SELECT recovery_work_id
+          FROM chat.recovery_work_items
+         WHERE recipient_did = $1
+           AND recipient_device_id = $2
+           AND status = 'pending'
+         ORDER BY recovery_work_id
+        "#,
+    )
+    .bind(request.user_did)
+    .bind(request.device_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+
+    let mut echoed_requests: std::collections::BTreeSet<Uuid> = std::collections::BTreeSet::new();
+    let mut supplied_work: std::collections::BTreeMap<Uuid, &Vec<u8>> =
+        std::collections::BTreeMap::new();
+    for item in &request.recovery {
+        match item {
+            RecoveryInventoryItem::LeafRecoveryRequest {
+                recovery_request_id,
+            } => {
+                if !echoed_requests.insert(*recovery_request_id) {
+                    return Err(InventoryRepositoryError::InconsistentRecoverySelection);
+                }
+            }
+            RecoveryInventoryItem::RecoveryWork {
+                recovery_work_id,
+                payload_bytes,
+            } => {
+                if supplied_work
+                    .insert(*recovery_work_id, payload_bytes)
+                    .is_some()
+                {
+                    return Err(InventoryRepositoryError::InconsistentRecoverySelection);
+                }
+            }
+        }
+    }
+    if echoed_requests.len() != selected_requests.len()
+        || !selected_requests
+            .iter()
+            .all(|(id, _)| echoed_requests.contains(id))
+        || supplied_work.len() != selected_work_ids.len()
+        || !selected_work_ids
+            .iter()
+            .all(|id| supplied_work.contains_key(id))
+    {
+        return Err(InventoryRepositoryError::InconsistentRecoverySelection);
+    }
+
+    // 5e. Optimistic fence re-validation (ratified 2026-07-24 locking ruling),
+    //     extended 4c to run ONCE after ALL domain selections. The device-scoped
+    //     selections above (conversation membership, pending Welcome deliveries, open
+    //     leaf-recovery requests, pending recovery work) run WITHOUT `FOR UPDATE` on
+    //     their source rows — locking them would span every conversation/delivery of
+    //     the device and invert the transition executor's head->family lock order (a
+    //     deadlock surface). Instead, re-read the fence anchors captured in step 1
+    //     and require them UNCHANGED immediately before the materialization inserts;
+    //     if any moved, a selection-affecting mutation may have interleaved, so fail
+    //     with the retryable `SnapshotConflict` (the transaction has written only the
+    //     still-incomplete session row, which rolls back with zero residue — the
+    //     caller re-runs `create_inventory_session`).
     //
-    //     COVERAGE PROOF (the re-validated anchor set covers the selection read
-    //     set). Every mutation class that can change a selection result is visible
-    //     through a re-validated anchor:
-    //       * welcome-delivery status, recovery request/work terminalization via a
-    //         transition, membership/participant change, and conversation lifecycle
-    //         all append a `chat.events` row (`welcomeDisposition` / `leafRecovery`
-    //         / `leaveRequest` / `conversationChanged` / `conversationClosed`),
-    //         advancing the global head — caught here.
+    //     COVERAGE PROOF (the single re-validated anchor set covers EVERY domain's
+    //     selection read set). Every mutation class that can change any selection
+    //     result is visible through a re-validated anchor:
+    //       * Welcome-delivery status change, leaf-recovery request/work
+    //         terminalization via a transition, membership/participant change, and
+    //         conversation lifecycle each append a `chat.events` row
+    //         (`welcomeDisposition` / `leafRecovery` / `leaveRequest` /
+    //         `conversationChanged` / `conversationClosed`), advancing the global
+    //         head — caught here. This is exactly the write path for the pending->
+    //         terminal transitions the welcome/recovery selections filter on.
     //       * device revocation (auth domain, no `chat.events` kind) revokes the
     //         target via `UPDATE chat.devices` (transition.rs / auth.rs), which
     //         takes the row lock this function already holds `FOR UPDATE` on the
-    //         SESSION device (step 2). Every selection is scoped to that one device,
-    //         so a revocation able to change any selection must lock that row and
-    //         therefore blocks until this transaction ends — covered by the lock,
+    //         SESSION device (step 2). Every selection is device-scoped to that one
+    //         device, so a revocation able to change any selection must lock that row
+    //         and therefore blocks until this transaction ends — covered by the lock,
     //         not the head. No selection reads another device's revocation state.
     //     The retention floor is pinned `FOR UPDATE` in step 1 (cannot move); the
     //     head is the only anchor a concurrent committer can advance, so re-reading
@@ -2233,6 +2382,7 @@ pub(crate) async fn create_inventory_session(
         return Err(InventoryRepositoryError::SnapshotConflict);
     }
 
+    // 5f. Materialize the conversation domain (caller payload).
     for (ordinal, conversation_id) in selected_conversation_ids.iter().enumerate() {
         let ordinal =
             i64::try_from(ordinal).map_err(|_| InventoryRepositoryError::InvalidMaterialization)?;
@@ -2270,10 +2420,11 @@ pub(crate) async fn create_inventory_session(
         .await?;
     }
 
-    for (ordinal, item) in request.welcomes.iter().enumerate() {
+    // 5g. Materialize the Welcome domain (server-derived payload = wrapper_bytes).
+    for (ordinal, (welcome_id, wrapper_bytes)) in selected_welcomes.iter().enumerate() {
         let ordinal =
             i64::try_from(ordinal).map_err(|_| InventoryRepositoryError::InvalidMaterialization)?;
-        let payload_sha256: [u8; 32] = Sha256::digest(&item.payload_bytes).into();
+        let payload_sha256: [u8; 32] = Sha256::digest(wrapper_bytes).into();
         sqlx::query(
             r#"
             INSERT INTO chat.inventory_welcome_items(
@@ -2284,48 +2435,51 @@ pub(crate) async fn create_inventory_session(
         )
         .bind(request.inventory_session_id)
         .bind(ordinal)
-        .bind(item.welcome_id)
+        .bind(*welcome_id)
         .bind(request.user_did)
         .bind(request.device_id)
-        .bind(&item.payload_bytes)
+        .bind(wrapper_bytes)
         .bind(payload_sha256.as_slice())
         .execute(&mut **transaction)
         .await?;
     }
 
-    for (ordinal, item) in request.recovery.iter().enumerate() {
-        let ordinal =
-            i64::try_from(ordinal).map_err(|_| InventoryRepositoryError::InvalidMaterialization)?;
-        let (item_kind, request_id, work_id, item_key, payload) = match item {
-            RecoveryInventoryItem::LeafRecoveryRequest {
-                recovery_request_id,
-                payload_bytes,
-            } => {
-                let mut key = vec![0x00u8];
-                key.extend_from_slice(recovery_request_id.as_bytes());
-                (
-                    "leafRecoveryRequest",
-                    Some(*recovery_request_id),
-                    None,
-                    key,
-                    payload_bytes,
-                )
-            }
-            RecoveryInventoryItem::RecoveryWork {
-                recovery_work_id,
-                payload_bytes,
-            } => {
-                let mut key = vec![0x01u8];
-                key.extend_from_slice(recovery_work_id.as_bytes());
-                (
-                    "recoveryWork",
-                    None,
-                    Some(*recovery_work_id),
-                    key,
-                    payload_bytes,
-                )
-            }
-        };
+    // 5h. Materialize the recovery domain into one canonical ordinal sequence: the
+    //     leafRecoveryRequest arm first (0x00-prefixed item keys, server-derived
+    //     `signed_request_bytes`), then the recoveryWork arm (0x01-prefixed keys,
+    //     caller payload). This yields ordinals ascending in item-key order.
+    let mut recovery_ordinal: i64 = 0;
+    for (recovery_request_id, signed_request_bytes) in &selected_requests {
+        let mut item_key = vec![0x00u8];
+        item_key.extend_from_slice(recovery_request_id.as_bytes());
+        let payload_sha256: [u8; 32] = Sha256::digest(signed_request_bytes).into();
+        sqlx::query(
+            r#"
+            INSERT INTO chat.inventory_recovery_items(
+                inventory_session_id, ordinal, item_kind, leaf_recovery_request_id,
+                recovery_work_id, recipient_did, recipient_device_id,
+                item_key_bytes, payload_bytes, payload_sha256
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+            "#,
+        )
+        .bind(request.inventory_session_id)
+        .bind(recovery_ordinal)
+        .bind("leafRecoveryRequest")
+        .bind(Some(*recovery_request_id))
+        .bind(Option::<Uuid>::None)
+        .bind(request.user_did)
+        .bind(request.device_id)
+        .bind(&item_key)
+        .bind(signed_request_bytes)
+        .bind(payload_sha256.as_slice())
+        .execute(&mut **transaction)
+        .await?;
+        recovery_ordinal += 1;
+    }
+    for recovery_work_id in &selected_work_ids {
+        let payload = supplied_work[recovery_work_id];
+        let mut item_key = vec![0x01u8];
+        item_key.extend_from_slice(recovery_work_id.as_bytes());
         let payload_sha256: [u8; 32] = Sha256::digest(payload).into();
         sqlx::query(
             r#"
@@ -2337,10 +2491,10 @@ pub(crate) async fn create_inventory_session(
             "#,
         )
         .bind(request.inventory_session_id)
-        .bind(ordinal)
-        .bind(item_kind)
-        .bind(request_id)
-        .bind(work_id)
+        .bind(recovery_ordinal)
+        .bind("recoveryWork")
+        .bind(Option::<Uuid>::None)
+        .bind(Some(*recovery_work_id))
         .bind(request.user_did)
         .bind(request.device_id)
         .bind(&item_key)
@@ -2348,6 +2502,7 @@ pub(crate) async fn create_inventory_session(
         .bind(payload_sha256.as_slice())
         .execute(&mut **transaction)
         .await?;
+        recovery_ordinal += 1;
     }
 
     // 6. Record per-domain completion evidence from the exact projection the

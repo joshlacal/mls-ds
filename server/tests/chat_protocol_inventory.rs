@@ -106,8 +106,8 @@ use repository::inventory::{
     create_device_inventory_session, create_inventory_session, get_devices,
     ConversationInventoryItem, CreateDeviceInventorySessionRequest, CreateInventorySessionRequest,
     DeviceInventorySubject, EventTerminalHint, IntervalSummaryTerminalHint,
-    InventoryRepositoryError, InventorySummaryTerminalHint, TombstoneTerminalHint,
-    MAX_GET_DEVICES_DIDS,
+    InventoryRepositoryError, InventorySummaryTerminalHint, RecoveryInventoryItem,
+    TombstoneTerminalHint, WelcomeInventoryItem, MAX_GET_DEVICES_DIDS,
 };
 use repository::ticket::{
     consume_subscription_ticket, mint_subscription_ticket, ticket_hash, MintSubscriptionTicket,
@@ -938,4 +938,340 @@ async fn create_selects_and_bijection_binds_the_member_conversation() {
         assert_eq!(created.welcome_item_count, 0);
         assert_eq!(created.recovery_item_count, 0);
     }
+}
+
+/// Read a seeded device's inventory-session identity fields (jkt + auth generation)
+/// straight from `chat.devices`, so a test binds the exact durable authority the
+/// create path re-validates.
+async fn device_session_identity(pool: &PgPool, did: &str, device_id: Uuid) -> (String, u64) {
+    let (jkt, auth_generation): (String, i64) = sqlx::query_as(
+        "SELECT dpop_jkt, auth_generation FROM chat.devices WHERE user_did = $1 AND device_id = $2",
+    )
+    .bind(did)
+    .bind(device_id)
+    .fetch_one(pool)
+    .await
+    .expect("seeded device identity");
+    (
+        jkt,
+        u64::try_from(auth_generation).expect("auth generation fits u64"),
+    )
+}
+
+/// 4c Welcome arm: the repository SELECTS the device's `status='pending'`
+/// welcome_deliveries and derives each payload from the persisted
+/// `welcome_bundles.wrapper_bytes` (server-derived). The caller echoes only the
+/// `welcome_id`; a missing or foreign echo rejects. The SAME device's FULFILLED
+/// (terminal) leaf-recovery request is a status-subset negative: it is excluded
+/// from the recovery selection, so echoing it rejects.
+#[tokio::test]
+async fn create_selects_and_derives_the_pending_welcome_and_excludes_terminal_recovery() {
+    let (pool, _guard) = executor_seed::setup().await;
+    let scenario = executor_seed::run_fulfillment_scenario(&pool).await;
+    let codec = ensure_fence(&pool).await;
+
+    let bob_did = scenario.bob_did.clone();
+    let bob_device = Uuid::from_bytes(*scenario.bob_id.device_id());
+    let (bob_jkt, bob_auth_gen) = device_session_identity(&pool, &bob_did, bob_device).await;
+    let conversation_id = scenario.conversation_id;
+    let welcome_id = scenario.welcome_id;
+    let now = whole_second(clock_now(&pool).await) + Duration::seconds(1);
+
+    // The exact server-derived Welcome payload the materialization must reproduce.
+    let wrapper_bytes: Vec<u8> =
+        sqlx::query_scalar("SELECT wrapper_bytes FROM chat.welcome_bundles WHERE welcome_id = $1")
+            .bind(welcome_id)
+            .fetch_one(&pool)
+            .await
+            .expect("welcome bundle wrapper bytes");
+
+    let base = |welcomes: Vec<WelcomeInventoryItem>, recovery: Vec<RecoveryInventoryItem>| {
+        CreateInventorySessionRequest {
+            inventory_session_id: Uuid::new_v4(),
+            user_did: &bob_did,
+            device_id: bob_device,
+            jkt: &bob_jkt,
+            auth_generation: bob_auth_gen,
+            created_at: now,
+            expires_at: now + Duration::minutes(10),
+            conversations: vec![ConversationInventoryItem {
+                conversation_id,
+                payload_bytes: vec![0xCD; 12],
+                schedule_terminal: None,
+            }],
+            welcomes,
+            recovery,
+        }
+    };
+
+    // (a) A pending delivery exists but the caller echoes no Welcome id → reject.
+    {
+        let mut tx = pool.begin().await.expect("begin welcome reject-empty");
+        let err = create_inventory_session(&mut tx, &codec, base(vec![], vec![]))
+            .await
+            .expect_err("a pending Welcome with no echoed id must reject");
+        assert_eq!(err, InventoryRepositoryError::InconsistentWelcomeSelection);
+        tx.rollback().await.expect("rollback welcome reject-empty");
+    }
+
+    // (b) A Welcome id the device does not own → reject.
+    {
+        let mut tx = pool.begin().await.expect("begin welcome reject-foreign");
+        let err = create_inventory_session(
+            &mut tx,
+            &codec,
+            base(
+                vec![WelcomeInventoryItem {
+                    welcome_id: Uuid::new_v4(),
+                }],
+                vec![],
+            ),
+        )
+        .await
+        .expect_err("a foreign Welcome id must reject");
+        assert_eq!(err, InventoryRepositoryError::InconsistentWelcomeSelection);
+        tx.rollback()
+            .await
+            .expect("rollback welcome reject-foreign");
+    }
+
+    // (c) Status-subset negative: the FULFILLED recovery request is terminal, so it
+    //     is NOT in the open selection; echoing it rejects.
+    {
+        let mut tx = pool.begin().await.expect("begin terminal-request reject");
+        let err = create_inventory_session(
+            &mut tx,
+            &codec,
+            base(
+                vec![WelcomeInventoryItem { welcome_id }],
+                vec![RecoveryInventoryItem::LeafRecoveryRequest {
+                    recovery_request_id: scenario.recovery_request_id,
+                }],
+            ),
+        )
+        .await
+        .expect_err("a fulfilled (terminal) request is not in the open selection");
+        assert_eq!(err, InventoryRepositoryError::InconsistentRecoverySelection);
+        tx.rollback()
+            .await
+            .expect("rollback terminal-request reject");
+    }
+
+    // (d) Echoing exactly the pending Welcome materializes it with the server-derived
+    //     wrapper payload; the terminal request contributes zero recovery items.
+    let session_id = {
+        let mut tx = pool.begin().await.expect("begin welcome accept");
+        let created = create_inventory_session(
+            &mut tx,
+            &codec,
+            base(vec![WelcomeInventoryItem { welcome_id }], vec![]),
+        )
+        .await
+        .expect("the pending Welcome materializes");
+        tx.commit().await.expect("commit past deferred triggers");
+        assert_eq!(created.conversation_item_count, 1);
+        assert_eq!(created.welcome_item_count, 1);
+        assert_eq!(created.recovery_item_count, 0);
+        created.inventory_session_id
+    };
+    let materialized: Vec<u8> = sqlx::query_scalar(
+        "SELECT payload_bytes FROM chat.inventory_welcome_items \
+         WHERE inventory_session_id = $1 AND welcome_id = $2",
+    )
+    .bind(session_id)
+    .bind(welcome_id)
+    .fetch_one(&pool)
+    .await
+    .expect("materialized welcome payload");
+    assert_eq!(
+        materialized, wrapper_bytes,
+        "Welcome payload is the server-derived welcome_bundles.wrapper_bytes"
+    );
+}
+
+/// 4c leafRecoveryRequest arm: at the pre-fulfillment (accepted) state bob owns one
+/// OPEN leaf-recovery request and is not yet a member. The repository selects it by
+/// `status='open'` and derives the payload from the persisted
+/// `signed_request_bytes` (server-derived); the caller echoes only the request id.
+#[tokio::test]
+async fn create_selects_and_derives_the_open_leaf_recovery_request() {
+    let (pool, _guard) = executor_seed::setup().await;
+    let built = executor_seed::build_fulfillment(&pool).await;
+    let codec = ensure_fence(&pool).await;
+
+    let bob_did = built.bob_did.clone();
+    let bob_device = Uuid::from_bytes(*built.bob_id.device_id());
+    let (bob_jkt, bob_auth_gen) = device_session_identity(&pool, &bob_did, bob_device).await;
+    let request_id = built.recovery_request_id;
+    let now = whole_second(clock_now(&pool).await) + Duration::seconds(1);
+
+    // The seed leaves the request OPEN and bob a non-member (fulfillment unapplied).
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM chat.leaf_recovery_requests WHERE recovery_request_id = $1",
+    )
+    .bind(request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("request status");
+    assert_eq!(status, "open");
+    let signed_request_bytes: Vec<u8> = sqlx::query_scalar(
+        "SELECT signed_request_bytes FROM chat.leaf_recovery_requests WHERE recovery_request_id = $1",
+    )
+    .bind(request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("signed request bytes");
+
+    let session_id = {
+        let mut tx = pool.begin().await.expect("begin open-request accept");
+        let created = create_inventory_session(
+            &mut tx,
+            &codec,
+            CreateInventorySessionRequest {
+                inventory_session_id: Uuid::new_v4(),
+                user_did: &bob_did,
+                device_id: bob_device,
+                jkt: &bob_jkt,
+                auth_generation: bob_auth_gen,
+                created_at: now,
+                expires_at: now + Duration::minutes(10),
+                conversations: vec![],
+                welcomes: vec![],
+                recovery: vec![RecoveryInventoryItem::LeafRecoveryRequest {
+                    recovery_request_id: request_id,
+                }],
+            },
+        )
+        .await
+        .expect("the open request materializes");
+        tx.commit().await.expect("commit past deferred triggers");
+        assert_eq!(created.conversation_item_count, 0);
+        assert_eq!(created.welcome_item_count, 0);
+        assert_eq!(created.recovery_item_count, 1);
+        created.inventory_session_id
+    };
+    let materialized: Vec<u8> = sqlx::query_scalar(
+        "SELECT payload_bytes FROM chat.inventory_recovery_items \
+         WHERE inventory_session_id = $1 AND leaf_recovery_request_id = $2",
+    )
+    .bind(session_id)
+    .bind(request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("materialized recovery request payload");
+    assert_eq!(
+        materialized, signed_request_bytes,
+        "request payload is the server-derived signed_request_bytes"
+    );
+}
+
+/// 4c recoveryWork arm bijection: two of the three fail-closed shapes need no seeded
+/// work row. A recoveryWork payload for an id not in the (empty) pending selection
+/// rejects (payload-for-unselected), and a duplicated work id rejects. The third
+/// shape (a selected pending work item the caller omits) needs a populated pending
+/// `recovery_work_items` row — see the report's deferral (welcome-expiry seed).
+#[tokio::test]
+async fn create_recovery_work_bijection_rejects_unselected_and_duplicate() {
+    let (pool, _guard) = executor_seed::setup().await;
+    let device = seed_device_with_key(&pool, clock_now(&pool).await).await;
+    let codec = ensure_fence(&pool).await;
+    let now = whole_second(clock_now(&pool).await) + Duration::seconds(1);
+    let work_id = Uuid::new_v4();
+
+    let make = |recovery: Vec<RecoveryInventoryItem>| CreateInventorySessionRequest {
+        inventory_session_id: Uuid::new_v4(),
+        user_did: &device.did,
+        device_id: device.device_id,
+        jkt: &device.jkt,
+        auth_generation: 1,
+        created_at: now,
+        expires_at: now + Duration::minutes(10),
+        conversations: vec![],
+        welcomes: vec![],
+        recovery,
+    };
+
+    // payload-for-unselected.
+    {
+        let mut tx = pool.begin().await.expect("begin work unselected");
+        let err = create_inventory_session(
+            &mut tx,
+            &codec,
+            make(vec![RecoveryInventoryItem::RecoveryWork {
+                recovery_work_id: work_id,
+                payload_bytes: vec![0x01],
+            }]),
+        )
+        .await
+        .expect_err("a work payload for an unselected id must reject");
+        assert_eq!(err, InventoryRepositoryError::InconsistentRecoverySelection);
+        tx.rollback().await.expect("rollback work unselected");
+    }
+    // duplicate id.
+    {
+        let mut tx = pool.begin().await.expect("begin work duplicate");
+        let err = create_inventory_session(
+            &mut tx,
+            &codec,
+            make(vec![
+                RecoveryInventoryItem::RecoveryWork {
+                    recovery_work_id: work_id,
+                    payload_bytes: vec![0x01],
+                },
+                RecoveryInventoryItem::RecoveryWork {
+                    recovery_work_id: work_id,
+                    payload_bytes: vec![0x02],
+                },
+            ]),
+        )
+        .await
+        .expect_err("a duplicate work id must reject");
+        assert_eq!(err, InventoryRepositoryError::InconsistentRecoverySelection);
+        tx.rollback().await.expect("rollback work duplicate");
+    }
+}
+
+/// 4c same-DID sibling exclusion: a SECOND device of bob's DID owns none of the
+/// primary device's pending Welcome / membership / recovery rows, so its snapshot is
+/// empty — the `(recipient_did, recipient_device_id)` scoping excludes same-DID
+/// siblings, not merely cross-DID devices.
+#[tokio::test]
+async fn create_excludes_same_did_sibling_pending_welcome() {
+    let (pool, _guard) = executor_seed::setup().await;
+    let scenario = executor_seed::run_fulfillment_scenario(&pool).await;
+    let codec = ensure_fence(&pool).await;
+
+    let bob_did = scenario.bob_did.clone();
+    let sibling_device = Uuid::new_v4();
+    let sibling_key = fresh_blob();
+    let sibling_jkt =
+        executor_seed::seed_actor(&pool, &bob_did, sibling_device, &sibling_key).await;
+    let now = whole_second(clock_now(&pool).await) + Duration::seconds(1);
+
+    let mut tx = pool.begin().await.expect("begin sibling");
+    let created = create_inventory_session(
+        &mut tx,
+        &codec,
+        CreateInventorySessionRequest {
+            inventory_session_id: Uuid::new_v4(),
+            user_did: &bob_did,
+            device_id: sibling_device,
+            jkt: &sibling_jkt,
+            auth_generation: 1,
+            created_at: now,
+            expires_at: now + Duration::minutes(10),
+            conversations: vec![],
+            welcomes: vec![],
+            recovery: vec![],
+        },
+    )
+    .await
+    .expect("sibling device with no owned rows materializes an empty snapshot");
+    tx.commit().await.expect("commit sibling");
+    assert_eq!(created.conversation_item_count, 0);
+    assert_eq!(
+        created.welcome_item_count, 0,
+        "the primary device's pending Welcome is not visible to a same-DID sibling"
+    );
+    assert_eq!(created.recovery_item_count, 0);
 }
