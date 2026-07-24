@@ -1,6 +1,13 @@
 //! PostgreSQL boundaries for clean-chat protocol authority.
 
 pub(crate) mod auth;
+// `blobs` (Slice 5) owns the migration-3 ciphertext-blob custody surface: the
+// dumb row writers plus the closed prepare/upload/bind/delete/expiry transaction
+// semantics. Like `delivery`/`inventory`/`welcome`/`ticket` it is unconditionally
+// compiled so both the production build and the `#[path]`-including integration
+// harness resolve `super::repository::blobs`. Not yet wired to a handler (Task 4).
+#[allow(dead_code)]
+pub(crate) mod blobs;
 #[cfg(not(test))]
 pub(crate) mod core;
 // `delivery` and `transition` are the dumb-SQL writers the E2b-2 transition
