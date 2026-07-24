@@ -268,6 +268,17 @@ fn into_admission(outcome: AuthorizationOutcome) -> Admission {
     }
 }
 
+/// A fresh `200 OK` JSON response carrying the exact serialized output bytes.
+/// The same bytes are the ones recorded for idempotent replay, so a later replay
+/// is byte-identical.
+pub(crate) fn json_ok(response_bytes: Vec<u8>) -> Response {
+    let mut response = Response::new(axum::body::Body::from(response_bytes));
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    response
+}
+
 /// Render a completed idempotency record verbatim (OQ-3): the stored status and
 /// exact stored response bytes, with the endpoint content-type.
 pub(crate) fn replay_response(completed: &CompletedIdempotentResponse) -> Response {

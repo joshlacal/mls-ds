@@ -18,8 +18,8 @@
 //     certified `chat.key_packages` surface (repository/key_packages.rs:112 live
 //     count `status IN ('available','reserved')`; repository/transition.rs:1468
 //     `cas_key_package_status` matches on `status = $2` only). The time-windowed
-//     `expires_at > NOW()` predicate belongs to the LEGACY `public.key_packages`
-//     table (handlers/mls_chat/get_key_packages.rs) and is deliberately NOT
+//     `expires_at > NOW()` predicate belongs to the LEGACY key_packages table in
+//     the `public` schema (handlers/mls_chat/get_key_packages.rs) and is NOT
 //     copied. Counts filter to the exact status literals so a future
 //     `key_packages` status can never silently inflate a live count.
 //   - The device's key is a per-device singleton: `chat.device_keys` PRIMARY KEY

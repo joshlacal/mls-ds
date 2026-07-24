@@ -22,7 +22,13 @@ use crate::chat_protocol::validation::ValidatedChatNsid;
 use crate::storage::DbPool;
 
 mod context;
+mod device_views;
+mod enroll_device;
 mod errors;
+mod get_devices;
+mod get_own_devices;
+mod rebind_device_authentication;
+mod replenish_key_packages;
 mod runtime;
 
 use errors::ChatFailure;
@@ -42,6 +48,9 @@ where
 {
     let mut router = Router::new();
     for &endpoint in ChatEndpoint::ALL {
+        if is_implemented(endpoint) {
+            continue;
+        }
         let path = xrpc_path(endpoint);
         let handler = move |State(runtime): State<Arc<ChatRuntime>>| async move {
             not_implemented(endpoint, &runtime)
@@ -52,7 +61,51 @@ where
             router.route(&path, post(handler))
         };
     }
-    router
+    router.merge(implemented_routes::<S>())
+}
+
+/// Whether `endpoint` has a real handler in this slice (H1 device lifecycle).
+/// Everything else — including `revokeDevice`, whose production revocation glue
+/// is a later slice — stays on the shared cutover-gated not-implemented stub.
+fn is_implemented(endpoint: ChatEndpoint) -> bool {
+    matches!(
+        endpoint,
+        ChatEndpoint::EnrollDevice
+            | ChatEndpoint::ReplenishKeyPackages
+            | ChatEndpoint::RebindDeviceAuthentication
+            | ChatEndpoint::GetDevices
+            | ChatEndpoint::GetOwnDevices
+    )
+}
+
+/// Register the real H1 device-lifecycle handlers.
+fn implemented_routes<S>() -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+    DbPool: FromRef<S>,
+    Arc<ChatRuntime>: FromRef<S>,
+{
+    Router::new()
+        .route(
+            &xrpc_path(ChatEndpoint::EnrollDevice),
+            post(enroll_device::handle),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::ReplenishKeyPackages),
+            post(replenish_key_packages::handle),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::RebindDeviceAuthentication),
+            post(rebind_device_authentication::handle),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::GetDevices),
+            get(get_devices::handle),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::GetOwnDevices),
+            get(get_own_devices::handle),
+        )
 }
 
 fn xrpc_path(endpoint: ChatEndpoint) -> String {
