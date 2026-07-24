@@ -1509,9 +1509,9 @@ pub(crate) async fn cas_key_package_status(
 // ===========================================================================
 
 /// The immutable `chat.device_revocations` row a signed `revokeDevice` accepts,
-/// carried column-for-column from the sealed DDL. The `request_digest =
-/// sha256(signing_transcript_bytes)` and time-window CHECKs are the DB's
-/// authority; the caller hands down the exact signed bytes.
+/// carried column-for-column from the sealed DDL (all 14 columns). The
+/// `request_digest = sha256(signing_transcript_bytes)` and time-window CHECKs are
+/// the DB's authority; the caller hands down the exact signed bytes.
 #[derive(Clone, Debug)]
 pub(crate) struct NewDeviceRevocation {
     pub(crate) revocation_id: Uuid,

@@ -895,6 +895,52 @@ impl DeviceRevocationEvidence {
     }
 }
 
+#[cfg(test)]
+impl DeviceRevocationEvidence {
+    /// Build a production-shape `DeviceRevocationEvidence` from its 12 signed
+    /// fields; the `durable_row_digest` is computed (never supplied) exactly as
+    /// `device_revocation_at` does, and the result must pass
+    /// `validate_device_revocation_evidence` — a test seam for the entry-less
+    /// executor revocation arm, mirroring the `for_test_*` family.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_test(
+        revocation_id: [u8; 16],
+        actor: DeviceIdentity,
+        target: DeviceIdentity,
+        actor_key_id: [u8; 32],
+        actor_auth_generation: u64,
+        expected_target_auth_generation: u64,
+        signed_at: ServerTimestamp,
+        accepted_at: ServerTimestamp,
+        request_digest: [u8; 32],
+        signature: [u8; 64],
+        signed_request_bytes: Vec<u8>,
+        signing_transcript_bytes: Vec<u8>,
+    ) -> Self {
+        let mut evidence = Self {
+            revocation_id,
+            actor,
+            target,
+            actor_key_id,
+            actor_auth_generation,
+            expected_target_auth_generation,
+            signed_at,
+            accepted_at,
+            request_digest,
+            signature,
+            signed_request_bytes,
+            signing_transcript_bytes,
+            durable_row_digest: [0; 32],
+        };
+        evidence.durable_row_digest = device_revocation_row_digest(&evidence);
+        debug_assert!(
+            validate_device_revocation_evidence(&evidence),
+            "for_test device revocation evidence must be valid"
+        );
+        evidence
+    }
+}
+
 impl RequestEvidence {
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
@@ -6558,6 +6604,27 @@ impl RevocationTargetCasBinding {
     }
 }
 
+#[cfg(test)]
+impl RevocationTargetCasBinding {
+    /// The batch-level `active -> revoked` registration CAS a test drives once,
+    /// mirroring the binding `plan_device_revocation_batch` produces.
+    pub(crate) fn for_test(
+        target: DeviceIdentity,
+        expected_auth_generation: u64,
+        locked_at: ServerTimestamp,
+    ) -> Self {
+        Self {
+            transaction_id: "e2b7-revocation-test".to_owned(),
+            target,
+            expected_auth_generation,
+            expected_status: PersistedRegistrationStatus::Active,
+            successor_status: PersistedRegistrationStatus::Revoked,
+            locked_at,
+            locked_row_digest: [1u8; 32],
+        }
+    }
+}
+
 impl RecoveryPackageCasBinding {
     pub(crate) fn transaction_id(&self) -> &str {
         &self.transaction_id
@@ -7253,6 +7320,25 @@ impl DeviceRevocationBatchPersistencePlan {
             self.fanout_manifest_digest,
             self.conversations,
         )
+    }
+
+    /// Assemble a batch plan from its parts for the executor batch test (the
+    /// production constructor `plan_device_revocation_batch` consumes repository
+    /// lock guards). The `fanout_manifest_digest` is a provenance placeholder.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        authority: DeviceRevocationEvidence,
+        target_cas: RevocationTargetCasBinding,
+        revoked_packages: Vec<RevocationPackageCasBinding>,
+        conversations: Vec<ConversationPersistencePlan>,
+    ) -> Self {
+        Self {
+            authority,
+            target_cas,
+            revoked_packages,
+            fanout_manifest_digest: [1u8; 32],
+            conversations,
+        }
     }
 }
 
@@ -10628,6 +10714,57 @@ pub(crate) fn plan_device_revocation(
     plan_device_revocation_inner(prior, evidence)
 }
 
+/// The per-conversation revocation `ConversationPersistencePlan` a test drives
+/// through the entry-less `apply_device_revocation` arm. Sets the entry-less
+/// head CAS + `DeviceRevocation` authority and synthesizes the
+/// `revocation_package_cas` bijection production requires (mirroring
+/// `bind_device_revocation_authority` + `bind_revocation_package_cas`), so the
+/// executor's load-bearing `revocation_package_cas_bijection_valid` check is
+/// genuinely exercised. Only identity/coordinate/status columns are read by the
+/// arm; the digest columns are provenance placeholders.
+#[cfg(test)]
+pub(crate) fn device_revocation_plan_for_test(
+    transition: PlannedTransition,
+    head_cas: ConversationHeadCasBinding,
+    evidence: DeviceRevocationEvidence,
+) -> ConversationPersistencePlan {
+    let mut effects = transition.effects;
+    debug_assert_eq!(effects.kind, PlanKind::DeviceRevocation);
+    for edge in effects.package_transitions.clone() {
+        debug_assert_eq!(edge.from, PackageStatus::Reserved);
+        debug_assert_eq!(edge.to, PackageStatus::Revoked);
+        effects
+            .revocation_package_cas
+            .push(RevocationPackageCasBinding {
+                transaction_id: head_cas.transaction_id.clone(),
+                target: evidence.target.clone(),
+                target_key_id: [0u8; 32],
+                target_auth_generation: evidence.expected_target_auth_generation,
+                key_package_ref: edge.key_package_ref,
+                wrapper_sha256: [0u8; 32],
+                package_not_after: evidence.accepted_at,
+                expected_status: PackageStatus::Reserved,
+                successor_status: PackageStatus::Revoked,
+                conversation_id: Some(head_cas.conversation_id),
+                request_id: Some(edge.request_id),
+                revocation_id: evidence.revocation_id,
+                revoked_at: evidence.accepted_at,
+                revocation_request_digest: evidence.request_digest,
+                revocation_row_digest: evidence.durable_row_digest,
+                locked_row_digest: [1u8; 32],
+            });
+    }
+    effects.authority = Some(PlanAuthority::DeviceRevocation(evidence));
+    effects.head_cas = Some(head_cas);
+    ConversationPersistencePlan {
+        expected_prior: transition.expected_prior,
+        retired_coordinate: transition.retired_coordinate,
+        successor_coordinate: transition.successor_coordinate,
+        state: ConversationStateHydration::from_state(transition.state),
+        effects,
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn plan_leaf_recovery_fulfillment(
     prior: &ConversationState,
@@ -13249,10 +13386,11 @@ fn would_remove_last_active_admin(state: &ConversationState, principal: &Princip
 // ===========================================================================
 
 pub(crate) use executor::{
-    apply_conversation_persistence_plan, AppliedTransition, ControlEntryContent, EventFanout,
-    ExecutionActor, ExecutionContext, ExecutorError, LeafPersistenceColumns, MetadataAuthorColumns,
-    RecoveryOpenContext, ResetRequestRow, SpineArtifacts, WelcomeDispositionInput,
-    WelcomeExpiryContext, WelcomeRejectionWork, WelcomeResponseContext,
+    apply_conversation_persistence_plan, apply_device_revocation_batch, AppliedTransition,
+    ControlEntryContent, EventFanout, ExecutionActor, ExecutionContext, ExecutorError,
+    LeafPersistenceColumns, MetadataAuthorColumns, RecoveryOpenContext, ResetRequestRow,
+    SpineArtifacts, WelcomeDispositionInput, WelcomeExpiryContext, WelcomeRejectionWork,
+    WelcomeResponseContext,
 };
 
 mod executor {
@@ -13269,25 +13407,28 @@ mod executor {
         WelcomeClientAuthorization, WelcomeDisposition, WelcomeRejectionReason,
     };
     use super::super::repository::transition::{
-        self as transition, ConversationHeadClose, ConversationHeadKind, GenerationStateKind,
-        GenerationStateLifecycle, GenerationSupersede, LeafClose, LeafOrigin,
-        LeafRecoveryKind as RepoLeafRecoveryKind, LeafRecoverySource, LeafRecoveryTermination,
-        LeaveRequestTermination, NewGeneration, NewGenerationState, NewLeafPeriod,
-        NewLeafRecoveryRequest, NewLeaveRequest, NewMetadataSnapshot, NewParticipantPeriod,
-        NewReservation, NewResetRequest, NewTransition, PackageStatus as RepoPackageStatus,
-        PackageSuccessor, ParticipantAcceptance, ParticipantAcceptanceCas, ParticipantInvitation,
-        ParticipantRole as RepoParticipantRole, ParticipantStatus as RepoParticipantStatus,
-        ReservationTermination, ResetRequestTermination, TransitionActorRole,
-        TransitionCoordinates, TransitionKind, TransitionRepositoryError,
+        self as transition, cas_registration_revoke, insert_device_revocation,
+        ConversationHeadClose, ConversationHeadKind, GenerationStateKind, GenerationStateLifecycle,
+        GenerationSupersede, LeafClose, LeafOrigin, LeafRecoveryKind as RepoLeafRecoveryKind,
+        LeafRecoverySource, LeafRecoveryTermination, LeaveRequestTermination, NewDeviceRevocation,
+        NewGeneration, NewGenerationState, NewLeafPeriod, NewLeafRecoveryRequest, NewLeaveRequest,
+        NewMetadataSnapshot, NewParticipantPeriod, NewReservation, NewResetRequest, NewTransition,
+        PackageStatus as RepoPackageStatus, PackageSuccessor, ParticipantAcceptance,
+        ParticipantAcceptanceCas, ParticipantInvitation, ParticipantRole as RepoParticipantRole,
+        ParticipantStatus as RepoParticipantStatus, RegistrationRevoke, ReservationTermination,
+        ResetRequestTermination, TransitionActorRole, TransitionCoordinates, TransitionKind,
+        TransitionRepositoryError,
     };
     use super::{
-        CloseKind, ConversationKind, DeviceIdentity, LeafHydrationRow, LeafRecord,
-        LeafRecoveryKind, LeaveRequestStatus, MetadataSnapshotBinding, PackageStatus,
-        ParticipantHydrationRow, ParticipantRole, ParticipantStatus, PlanKind, PrincipalId,
+        revocation_package_cas_bijection_valid, CloseKind, ConversationKind, DeviceIdentity,
+        DeviceRevocationBatchPersistencePlan, LeafHydrationRow, LeafRecord, LeafRecoveryKind,
+        LeaveRequestStatus, MetadataSnapshotBinding, PackageStatus, ParticipantHydrationRow,
+        ParticipantRole, ParticipantStatus, PlanAuthority, PlanKind, PrincipalId,
         PublicGroupSnapshotCoordinate, RecoveryRequestStatus, RecoverySource, ReservationStatus,
         ServerTimestamp, StateChange, TransitionEffects, WelcomeStatus,
     };
     use super::{ConversationPersistencePlan, ConversationStateHydration};
+    use super::{Engine, URL_SAFE_NO_PAD};
 
     /// Failures the executor surfaces. Repository errors propagate typed; the
     /// executor's own contract violations (an effect family the current
@@ -13764,6 +13905,25 @@ mod executor {
                 )
                 .await;
             }
+            // `deviceRevocation` is entry-less and coordinate-UNCHANGED (a global
+            // signed authority op; `bind_device_revocation_authority`:
+            // `allocated_seq == None`, successor coordinate == prior). It closes
+            // NO leaf / interval — it only supersedes the target's own recovery
+            // requests / reservations / welcomes and revokes their packages, all
+            // bound to the revocation id. Dispatch here before the entry-bearing
+            // `allocated_seq` extraction would `InconsistentPlan` on its `None` seq.
+            PlanKind::DeviceRevocation => {
+                return apply_device_revocation(
+                    transaction,
+                    plan,
+                    ctx,
+                    conversation_id,
+                    generation,
+                    state_version,
+                    epoch,
+                )
+                .await;
+            }
             _ => {}
         }
 
@@ -13905,7 +14065,10 @@ mod executor {
             PlanKind::RecoveryRequest | PlanKind::RecoveryCancellation => {
                 unreachable!("entry-less recovery ops are dispatched before this match")
             }
-            PlanKind::DeviceRevocation => Err(ExecutorError::UnsupportedEffect("deviceRevocation")),
+            // Entry-less; dispatched (and returned) above.
+            PlanKind::DeviceRevocation => {
+                unreachable!("entry-less device revocation is dispatched before this match")
+            }
             PlanKind::ResetRequest => {
                 apply_reset_request(
                     transaction,
@@ -14336,6 +14499,295 @@ mod executor {
             event_positions: vec![position],
             successor_coordinate: plan.successor_coordinate().copied(),
         })
+    }
+
+    /// Apply an entry-less `deviceRevocation` op for ONE conversation. The
+    /// coordinate + seq counter are UNCHANGED (a pure prior-coordinate verify);
+    /// there is NO MLS Remove and NO interval close. It supersedes the TARGET's
+    /// own open recovery requests (Open->Superseded), releases their reservations
+    /// (Active->Released), revokes their reserved packages (Reserved->Revoked),
+    /// and supersedes their pending welcomes (Pending->Superseded) — ALL bound to
+    /// the revocation id at `terminal_at == accepted_at`. The immutable
+    /// `device_revocations` row + the registration revoke are batch-level
+    /// (`apply_device_revocation_batch`); this arm owns only the per-conversation
+    /// work terminalizations. Modeled on `apply_leaf_recovery_request`.
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_device_revocation(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        plan: &ConversationPersistencePlan,
+        ctx: &ExecutionContext,
+        conversation_id: Uuid,
+        generation: i64,
+        state_version: i64,
+        _epoch: i64,
+    ) -> Result<AppliedTransition, ExecutorError> {
+        let effects = plan.effects();
+        let head = effects
+            .head_cas()
+            .ok_or(ExecutorError::InconsistentPlan("missing head CAS binding"))?;
+        let expected_prior = head
+            .expected_prior()
+            .ok_or(ExecutorError::InconsistentPlan(
+                "device revocation needs a prior",
+            ))?;
+        let expected_generation = checked_i64(expected_prior.generation())?;
+        let expected_state_version = checked_i64(expected_prior.state_version())?;
+        let expected_next_entry_seq = checked_i64(head.expected_next_entry_seq())?;
+        let successor_next_entry_seq = checked_i64(head.successor_next_entry_seq())?;
+
+        // The revocation identity comes from the plan authority — the revocation
+        // id + accepted_at every terminalization binds (all `terminal_at`).
+        let evidence = match effects.authority() {
+            Some(PlanAuthority::DeviceRevocation(evidence)) => evidence,
+            _ => {
+                return Err(ExecutorError::InconsistentPlan(
+                    "device revocation plan missing revocation authority",
+                ))
+            }
+        };
+        let revocation_id = Uuid::from_bytes(*evidence.revocation_id());
+        let accepted_at = server_instant(evidence.accepted_at())?;
+
+        // Only the target's own work is terminalized; every other family empty.
+        // recovery_request / reservation / package / welcome deltas are the
+        // revocation-bound supersessions (handled below); everything else is a
+        // hard error, never a silent drop.
+        reject_if_present("participant_changes", effects.participant_changes())?;
+        reject_if_present("leaf_changes", effects.leaf_changes())?;
+        reject_if_present("interval_changes", effects.interval_changes())?;
+        reject_if_present("terminal_proof_changes", effects.terminal_proof_changes())?;
+        reject_if_present("reset_request_changes", effects.reset_request_changes())?;
+        reject_if_present("leave_request_changes", effects.leave_request_changes())?;
+        reject_if_present("recovery_package_cas", effects.recovery_package_cas())?;
+        if effects.metadata_change().is_some() {
+            return Err(ExecutorError::UnsupportedEffect(
+                "device revocation metadata change",
+            ));
+        }
+        if effects.welcome_cas().is_some()
+            || effects.revocation_target_cas().is_some()
+            || effects.invitation_quota_cas().is_some()
+        {
+            return Err(ExecutorError::UnsupportedEffect(
+                "device revocation welcome/target/quota CAS",
+            ));
+        }
+        // Internal op MUST NOT change the coordinate or advance the seq counter.
+        if successor_next_entry_seq != expected_next_entry_seq {
+            return Err(ExecutorError::InconsistentPlan(
+                "device revocation must not advance the seq counter",
+            ));
+        }
+        if generation != expected_generation || state_version != expected_state_version {
+            return Err(ExecutorError::InconsistentPlan(
+                "device revocation must not change the coordinate",
+            ));
+        }
+        // The package edges are Reserved->Revoked, load-bearing-bound to the
+        // `revocation_package_cas` witnesses (bijective per the plan seam). An
+        // empty package set (a target with only welcomes) is legal.
+        if !effects.package_transitions().is_empty()
+            && !revocation_package_cas_bijection_valid(effects)
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "device revocation package CAS is not bijective with the Reserved->Revoked edges",
+            ));
+        }
+
+        // 1. Head CAS VERIFY (coordinate + seq counter both UNCHANGED).
+        transition::cas_conversation_head(
+            transaction,
+            &transition::ConversationHeadCas {
+                conversation_id,
+                expected_generation,
+                expected_state_version,
+                expected_next_entry_seq,
+                successor_generation: generation,
+                successor_state_version: state_version,
+                successor_next_entry_seq,
+                close: None,
+            },
+        )
+        .await?;
+
+        // 2. Revocation-bound terminalizations of the target's OWN work.
+        let mut superseded =
+            write_revocation_bound_supersessions(transaction, effects, revocation_id, accepted_at)
+                .await?;
+        // 3. The target's pending welcomes (Pending->Superseded), each bound to a
+        //    `welcomeDisposition` event (stamped at ctx.applied_at == accepted_at).
+        superseded.welcomes = write_welcome_supersessions(transaction, ctx, effects).await?;
+        // 4. Silent-drop guard: a device revocation FULFILLS nothing (own == 0),
+        //    so every delta MUST be a revocation-bound supersession.
+        reconcile_coordinate_change_families(effects, &FamilyCounts::default(), &superseded)?;
+
+        // 5. No control entry (internal op) -> no entry recipients; only events.
+        let event_positions = write_events(transaction, ctx).await?;
+
+        Ok(AppliedTransition {
+            // No control entry / seq was allocated; echo the unchanged counter.
+            allocated_seq: u64::try_from(successor_next_entry_seq).unwrap(),
+            entry_id: ctx.entry.entry_id,
+            event_positions,
+            successor_coordinate: plan.successor_coordinate().copied(),
+        })
+    }
+
+    /// Terminalize the target's OWN open recovery requests / active reservations /
+    /// reserved packages, all bound to `revocation_id` at `terminal_at`. Mirrors
+    /// `write_prior_bound_supersessions` but binds a REVOCATION (not a transition)
+    /// and drives packages Reserved->**Revoked** (not Reserved->Available). Returns
+    /// the per-family counts (welcomes left 0 — the caller adds them) so the caller
+    /// reconciles `own + superseded == total`. A delta that is NOT one of these
+    /// exact shapes is skipped here and caught by that reconciliation, never
+    /// silently dropped.
+    async fn write_revocation_bound_supersessions(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        effects: &TransitionEffects,
+        revocation_id: Uuid,
+        terminal_at: DateTime<Utc>,
+    ) -> Result<FamilyCounts, ExecutorError> {
+        let mut counts = FamilyCounts::default();
+        for change in effects.recovery_request_changes() {
+            if let (Some(before), Some(after)) = (change.before(), change.after()) {
+                if before.status() == RecoveryRequestStatus::Open
+                    && after.status() == RecoveryRequestStatus::Superseded
+                {
+                    transition::terminalize_leaf_recovery_request(
+                        transaction,
+                        Uuid::from_bytes(*after.request_id()),
+                        &LeafRecoveryTermination::SupersededByRevocation {
+                            terminal_revocation_id: revocation_id,
+                            terminal_at,
+                        },
+                    )
+                    .await?;
+                    counts.requests += 1;
+                }
+            }
+        }
+        for change in effects.reservation_changes() {
+            if let (Some(before), Some(after)) = (change.before(), change.after()) {
+                if before.status() == ReservationStatus::Active
+                    && after.status() == ReservationStatus::Released
+                {
+                    transition::terminalize_reservation(
+                        transaction,
+                        Uuid::from_bytes(after.request_id),
+                        &ReservationTermination::ReleasedByRevocation {
+                            terminal_revocation_id: revocation_id,
+                            terminal_at,
+                        },
+                    )
+                    .await?;
+                    counts.reservations += 1;
+                }
+            }
+        }
+        for edge in effects.package_transitions() {
+            if edge.from == PackageStatus::Reserved && edge.to == PackageStatus::Revoked {
+                transition::cas_key_package_status(
+                    transaction,
+                    &edge.key_package_ref,
+                    RepoPackageStatus::Reserved,
+                    &PackageSuccessor::Revoke {
+                        terminal_revocation_id: revocation_id,
+                        terminal_at,
+                    },
+                )
+                .await?;
+                counts.packages += 1;
+            }
+        }
+        Ok(counts)
+    }
+
+    /// Apply a device-revocation BATCH: insert the immutable `device_revocations`
+    /// row + revoke the target registration ONCE, revoke every AVAILABLE target
+    /// package (the reserved ones are revoked per-conversation by
+    /// `apply_device_revocation`), then drive each conversation's entry-less
+    /// revocation plan. Bounded integration: the loop over `plan.conversations()`
+    /// is exactly the fanout the production `plan_device_revocation_batch`
+    /// assembles; a single-conversation caller passes one context. The
+    /// `revokeDevice` idempotency receipt the DEFERRED
+    /// `enforce_device_revocation_mapping` COMMIT trigger requires is written by
+    /// the request handler (the test seeds it), not here.
+    pub(crate) async fn apply_device_revocation_batch(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        plan: &DeviceRevocationBatchPersistencePlan,
+        conversation_ctxs: &[ExecutionContext],
+    ) -> Result<Vec<AppliedTransition>, ExecutorError> {
+        let evidence = plan.authority();
+        let revocation_id = Uuid::from_bytes(*evidence.revocation_id());
+        let accepted_at = server_instant(evidence.accepted_at())?;
+
+        // 1. The immutable device_revocations row (the terminal_revocation_id FK
+        //    target for every work-row terminalization below).
+        insert_device_revocation(
+            transaction,
+            &NewDeviceRevocation {
+                revocation_id,
+                actor_did: device_did(evidence.actor())?,
+                actor_device_id: device_uuid(evidence.actor()),
+                actor_key_id: URL_SAFE_NO_PAD.encode(evidence.actor_key_id()),
+                actor_auth_generation: checked_i64(evidence.actor_auth_generation())?,
+                target_did: device_did(evidence.target())?,
+                target_device_id: device_uuid(evidence.target()),
+                target_auth_generation: checked_i64(evidence.expected_target_auth_generation())?,
+                accepted_request_bytes: evidence.signed_request_bytes().to_vec(),
+                signing_transcript_bytes: evidence.signing_transcript_bytes().to_vec(),
+                request_digest: evidence.request_digest().to_vec(),
+                signature: evidence.signature().to_vec(),
+                signed_at: server_instant(evidence.signed_at())?,
+                accepted_at,
+            },
+        )
+        .await?;
+
+        // 2. The target registration revoke (devices active -> revoked + its key).
+        let target_cas = plan.target_cas();
+        cas_registration_revoke(
+            transaction,
+            &RegistrationRevoke {
+                target_did: device_did(target_cas.target())?,
+                target_device_id: device_uuid(target_cas.target()),
+                expected_auth_generation: checked_i64(target_cas.expected_auth_generation())?,
+                revocation_id,
+                revoked_at: accepted_at,
+            },
+        )
+        .await?;
+
+        // 3. Revoke the AVAILABLE target packages (conversation_id == None); the
+        //    Reserved ones (conversation_id == Some) are revoked by the
+        //    per-conversation arm, so revoking them here too would double-CAS.
+        for binding in plan.revoked_packages() {
+            if binding.conversation_id().is_none() {
+                transition::cas_key_package_status(
+                    transaction,
+                    binding.key_package_ref(),
+                    RepoPackageStatus::Available,
+                    &PackageSuccessor::Revoke {
+                        terminal_revocation_id: revocation_id,
+                        terminal_at: accepted_at,
+                    },
+                )
+                .await?;
+            }
+        }
+
+        // 4. Drive each conversation's entry-less revocation plan.
+        if plan.conversations().len() != conversation_ctxs.len() {
+            return Err(ExecutorError::InconsistentPlan(
+                "device revocation batch needs one execution context per conversation",
+            ));
+        }
+        let mut applied = Vec::with_capacity(plan.conversations().len());
+        for (conversation, ctx) in plan.conversations().iter().zip(conversation_ctxs) {
+            applied
+                .push(apply_conversation_persistence_plan(transaction, conversation, ctx).await?);
+        }
+        Ok(applied)
     }
 
     /// Apply an entry-less `welcomeAcknowledgement` / `welcomeRejection`: a

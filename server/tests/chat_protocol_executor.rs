@@ -102,21 +102,24 @@ use chat_protocol::repository::transition::{
 };
 use chat_protocol::snapshot::{PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle};
 use chat_protocol::state_machine::{
-    apply_conversation_persistence_plan, persistence_plan_for_test, plan_accept_conversation,
-    plan_close, plan_commit, plan_creation, plan_leaf_recovery_cancellation,
-    plan_leaf_recovery_fulfillment, plan_leaf_recovery_request, plan_leave_cancellation,
-    plan_leave_fulfillment, plan_leave_request, plan_policy, plan_reset_activation,
-    plan_reset_request, plan_welcome_expiry_for_test, plan_welcome_response_for_test,
-    plan_zero_leaf_leave, AcceptConversation, CloseConversation, CommitCommand,
-    ControlEntryContent, ConversationHeadCasBinding, ConversationKind, ConversationState,
-    CreationCommand, CreationDecision, DeviceIdentity, EventFanout, ExecutionActor,
+    apply_conversation_persistence_plan, apply_device_revocation_batch,
+    device_revocation_plan_for_test, persistence_plan_for_test, plan_accept_conversation,
+    plan_close, plan_commit, plan_creation, plan_device_revocation,
+    plan_leaf_recovery_cancellation, plan_leaf_recovery_fulfillment, plan_leaf_recovery_request,
+    plan_leave_cancellation, plan_leave_fulfillment, plan_leave_request, plan_policy,
+    plan_reset_activation, plan_reset_request, plan_welcome_expiry_for_test,
+    plan_welcome_response_for_test, plan_zero_leaf_leave, AcceptConversation, CloseConversation,
+    CommitCommand, ControlEntryContent, ConversationHeadCasBinding, ConversationKind,
+    ConversationState, CreationCommand, CreationDecision, DeviceIdentity,
+    DeviceRevocationBatchPersistencePlan, DeviceRevocationEvidence, EventFanout, ExecutionActor,
     ExecutionContext, ExecutorError, LeafPersistenceColumns, LeafRecoveryCancellation,
     LeafRecoveryFulfillment, LeafRecoveryKind, LeafRecoveryRequestCommand, LeaveCancellation,
     LeaveFulfillment, LeaveRequestCommand, LockedRegistrationProjection, MetadataAuthorColumns,
     MetadataSnapshotBinding, PrincipalId, RecoveryOpenContext, RequestEntryKind, RequestEvidence,
-    ResetActivation, ResetRequestCommand, ResetRequestRow, ServerTimestamp, SpineArtifacts,
-    TransitionEvidence, WelcomeDispositionInput, WelcomeExpiryContext, WelcomeRejectionWork,
-    WelcomeResponseContext, WelcomeStatus, ZeroLeafLeave,
+    ResetActivation, ResetRequestCommand, ResetRequestRow, RevocationTargetCasBinding,
+    ServerTimestamp, SpineArtifacts, TransitionEvidence, WelcomeDispositionInput,
+    WelcomeExpiryContext, WelcomeRejectionWork, WelcomeResponseContext, WelcomeStatus,
+    ZeroLeafLeave,
 };
 use chat_protocol::validation::ed25519_key_id;
 use chat_protocol::wire::{validate_public_commit, MAX_PUBLIC_MESSAGE_WIRE_BYTES};
@@ -7761,4 +7764,462 @@ async fn cleanup(pool: &PgPool, conversation_id: Uuid) {
         }
     }
     let _ = tx.commit().await;
+}
+
+// ---------------------------------------------------------------------------
+// Device revocation (arm 5) — the entry-less per-conversation arm driven by the
+// batch entry point, committed past the DEFERRED enforce_device_revocation_mapping.
+// ---------------------------------------------------------------------------
+
+/// Everything the revocation batch test needs: the assembled batch plan + the
+/// entry-less conversation context + the ids a SELECT-verify uses. Alice is a
+/// self-revoke target (actor == target) whose `replace` leaf-recovery request
+/// opened one request + reservation + reserved package (Request-origin, so the
+/// revocation's `expected_target_auth_generation` binds `origin.auth_generation`).
+struct RevocationSetup {
+    batch_plan: DeviceRevocationBatchPersistencePlan,
+    conv_ctx: ExecutionContext,
+    target_did: String,
+    target_device: Uuid,
+    target_key_id: String,
+    conversation_id: Uuid,
+    revocation_id: Uuid,
+    recovery_request_id: Uuid,
+    key_package_ref: [u8; 32],
+    accepted_dt: DateTime<Utc>,
+    signing_transcript: Vec<u8>,
+    signed_request: Vec<u8>,
+    request_digest: Vec<u8>,
+    signature: Vec<u8>,
+}
+
+/// Create a group, have alice open a `replace` leaf-recovery request (opening her
+/// request + reservation + reserved package, coordinate UNCHANGED), then assemble
+/// a self-revoke batch of alice against the post-request state. `accepted_at` is
+/// DB-clock-based (the corpus eval instant, 2023, predates the real `created_at`
+/// of the seeded devices, which would fail the trigger's
+/// `actor.created_at <= accepted_at` check).
+async fn setup_revoked_target(pool: &PgPool) -> RevocationSetup {
+    let fixture = commit_creation(pool, ConversationKind::Group).await;
+    let conversation_id = fixture.conversation_id;
+    let alice_id = fixture.alice_id.clone();
+    let alice_did = fixture.alice_did.clone();
+    let alice_device = fixture.alice_device;
+    let alice_key_id = fixture.alice_key_id.clone();
+    let alice_sig_key =
+        hex::decode(&corpus_manifest().identity.alice.signature_public_key_hex).unwrap();
+
+    // Alice's genesis leaf period (the leaf a `replace` request recovers).
+    let alice_leaf_period: Uuid = sqlx::query_scalar(
+        "SELECT leaf_period_id FROM chat.member_devices WHERE conversation_id=$1 AND user_did=$2",
+    )
+    .bind(conversation_id)
+    .bind(&alice_did)
+    .fetch_one(pool)
+    .await
+    .expect("alice leaf period");
+
+    // Alice opens a `replace` leaf-recovery request (entry-less; coordinate + seq
+    // counter UNCHANGED, still gen0/sv0/next_seq 2).
+    let key_package_ref = random_ref32();
+    let package_not_after = seed_key_package(
+        pool,
+        &alice_did,
+        alice_device,
+        &alice_key_id,
+        &key_package_ref,
+    )
+    .await;
+    // DB-clock-based so the request's expires_at (received_at + 5 min) stays AFTER
+    // the revocation's accepted_at (also DB-clock, sampled ~ms later). With an
+    // eval-based (2023) received_at, plan_device_revocation would terminalize the
+    // request as EXPIRED (accepted_at >= expires_at), not revocation-superseded.
+    let req_received =
+        ServerTimestamp::from_unix_millis_for_test(clock_now(pool).await.timestamp_millis())
+            .unwrap();
+    let pkg_not_after_ts =
+        ServerTimestamp::from_unix_millis_for_test(package_not_after.timestamp_millis()).unwrap();
+    let recovery_request_id = Uuid::new_v4();
+    let req_evidence = RequestEvidence::for_test(
+        RequestEntryKind::LeafRecoveryRequest,
+        2,
+        *recovery_request_id.as_bytes(),
+        alice_id.clone(),
+        *conversation_id.as_bytes(),
+        req_received,
+        0x71,
+    )
+    .unwrap();
+    let req_planned = plan_leaf_recovery_request(
+        &fixture.state,
+        LeafRecoveryRequestCommand {
+            actor: alice_id.clone(),
+            recovery_request_id: *recovery_request_id.as_bytes(),
+            kind: LeafRecoveryKind::Replace,
+            key_package_ref,
+            received_at: req_received,
+            package_not_after: pkg_not_after_ts,
+            evidence: req_evidence,
+        },
+    )
+    .expect("valid leaf recovery request plan");
+    let post_request_state = req_planned.resulting_state().clone();
+    let req_head = ConversationHeadCasBinding::for_test_internal(
+        *conversation_id.as_bytes(),
+        fixture.coordinate,
+        2,
+        req_received,
+    );
+    let req_plan = persistence_plan_for_test(req_planned, req_head);
+    let req_applied_at = clock_now(pool).await;
+    let req_transcript = vec![0x72_u8; 16];
+    let alice_pred = device_event_predecessor(pool, &alice_did, alice_device).await;
+    let req_ctx = ExecutionContext {
+        protocol_instance_id: fixture.protocol_instance_id,
+        applied_at: req_applied_at,
+        actor: ExecutionActor {
+            user_did: alice_did.clone(),
+            device_id: alice_device,
+            key_id: alice_key_id.clone(),
+            auth_generation: 1,
+            role: TransitionActorRole::Admin,
+            device_status: "active".to_owned(),
+        },
+        entry: ControlEntryContent {
+            entry_id: Uuid::new_v4(),
+            entry_kind: "blue.catbird.chat.defs#applicationEntry".to_owned(),
+            accepted_payload_bytes: vec![0x73_u8; 8],
+            accepted_payload_sha256: Sha256::digest([0x73_u8; 8]).to_vec(),
+            signed_request_bytes: req_transcript.clone(),
+            unsigned_projection_bytes: vec![0x74_u8; 8],
+            signing_transcript_bytes: req_transcript.clone(),
+            request_digest: Sha256::digest(&req_transcript).to_vec(),
+            signature: vec![0x75_u8; 64],
+            server_fields_bytes: vec![0x76_u8; 8],
+            outer_entry_fingerprint: vec![0x17_u8; 32],
+        },
+        spine: SpineArtifacts {
+            public_snapshot_bytes: vec![],
+            public_snapshot_sha256: vec![],
+            tree_summary_bytes: vec![],
+            tree_summary_sha256: vec![],
+            leaf_count: 1,
+            genesis_group_info_bytes: vec![],
+            genesis_group_info_sha256: vec![],
+        },
+        opened_leaves: vec![],
+        metadata_author: None,
+        participant_period_ids: vec![],
+        leaf_period_ids: vec![],
+        entry_recipients: vec![],
+        events: vec![EventFanout {
+            event_id: Uuid::new_v4(),
+            event_kind: EventKind::ConversationChanged,
+            payload_bytes: vec![0x77_u8; 8],
+            recipients: vec![(
+                alice_id.clone(),
+                EventEntitlementKind::Participant,
+                alice_pred,
+            )],
+            outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+        }],
+        closing_leaf_periods: vec![],
+        closing_participant_periods: vec![],
+        reset_request_row: None,
+        recovery_open: Some(RecoveryOpenContext {
+            participant_period_id: None,
+            package_not_after,
+            replaced_leaf_period_id: Some(alice_leaf_period),
+        }),
+        welcome_expiry: None,
+        welcome_response: None,
+        welcome_dispositions: vec![],
+    };
+    {
+        let mut tx = pool.begin().await.expect("begin leaf recovery request");
+        apply_conversation_persistence_plan(&mut tx, &req_plan, &req_ctx)
+            .await
+            .expect("leaf recovery request applies");
+        tx.commit().await.expect("leaf recovery request COMMIT");
+    }
+
+    // Self-revoke alice against the post-request state. `accepted_at` is
+    // millisecond-aligned DB-clock (after the seeded devices' created_at).
+    let now = clock_now(pool).await;
+    let accepted_dt = DateTime::from_timestamp_millis(now.timestamp_millis()).unwrap();
+    let accepted_st =
+        ServerTimestamp::from_unix_millis_for_test(accepted_dt.timestamp_millis()).unwrap();
+    // The device key id is base64url(sha256(pubkey)); its raw 32 bytes ARE the
+    // revocation actor_key_id (which the batch re-encodes back to `alice_key_id`).
+    let actor_key_id: [u8; 32] = Sha256::digest(&alice_sig_key).into();
+    let revocation_id = Uuid::new_v4();
+    let signing_transcript = vec![0x7b_u8; 24];
+    let request_digest: [u8; 32] = Sha256::digest(&signing_transcript).into();
+    let signature = [0x5a_u8; 64];
+    let signed_request = vec![0x7c_u8; 24];
+    let evidence = DeviceRevocationEvidence::for_test(
+        *revocation_id.as_bytes(),
+        alice_id.clone(),
+        alice_id.clone(),
+        actor_key_id,
+        1,
+        1,
+        accepted_st,
+        accepted_st,
+        request_digest,
+        signature,
+        signed_request.clone(),
+        signing_transcript.clone(),
+    );
+    let revocation_planned = plan_device_revocation(&post_request_state, evidence.clone())
+        .expect("valid revocation plan");
+    let head_cas = ConversationHeadCasBinding::for_test_internal(
+        *conversation_id.as_bytes(),
+        *post_request_state.coordinate(),
+        2,
+        accepted_st,
+    );
+    let conv_plan = device_revocation_plan_for_test(revocation_planned, head_cas, evidence.clone());
+    let target_cas = RevocationTargetCasBinding::for_test(alice_id.clone(), 1, accepted_st);
+    let batch_plan = DeviceRevocationBatchPersistencePlan::for_test(
+        evidence,
+        target_cas,
+        vec![],
+        vec![conv_plan],
+    );
+
+    let conv_ctx = ExecutionContext {
+        protocol_instance_id: fixture.protocol_instance_id,
+        applied_at: accepted_dt,
+        actor: ExecutionActor {
+            user_did: alice_did.clone(),
+            device_id: alice_device,
+            key_id: alice_key_id.clone(),
+            auth_generation: 1,
+            role: TransitionActorRole::Admin,
+            device_status: "active".to_owned(),
+        },
+        // Entry-less: the arm reads only `entry.entry_id`, but the field is required.
+        entry: ControlEntryContent {
+            entry_id: Uuid::new_v4(),
+            entry_kind: "blue.catbird.chat.defs#applicationEntry".to_owned(),
+            accepted_payload_bytes: vec![0x7d_u8; 8],
+            accepted_payload_sha256: Sha256::digest([0x7d_u8; 8]).to_vec(),
+            signed_request_bytes: signed_request.clone(),
+            unsigned_projection_bytes: vec![0x7e_u8; 8],
+            signing_transcript_bytes: signing_transcript.clone(),
+            request_digest: request_digest.to_vec(),
+            signature: signature.to_vec(),
+            server_fields_bytes: vec![0x7f_u8; 8],
+            outer_entry_fingerprint: vec![0x1a_u8; 32],
+        },
+        spine: SpineArtifacts {
+            public_snapshot_bytes: vec![],
+            public_snapshot_sha256: vec![],
+            tree_summary_bytes: vec![],
+            tree_summary_sha256: vec![],
+            leaf_count: 1,
+            genesis_group_info_bytes: vec![],
+            genesis_group_info_sha256: vec![],
+        },
+        opened_leaves: vec![],
+        metadata_author: None,
+        participant_period_ids: vec![],
+        leaf_period_ids: vec![],
+        entry_recipients: vec![],
+        events: vec![],
+        closing_leaf_periods: vec![],
+        closing_participant_periods: vec![],
+        reset_request_row: None,
+        recovery_open: None,
+        welcome_expiry: None,
+        welcome_response: None,
+        welcome_dispositions: vec![],
+    };
+
+    RevocationSetup {
+        batch_plan,
+        conv_ctx,
+        target_did: alice_did,
+        target_device: alice_device,
+        target_key_id: alice_key_id,
+        conversation_id,
+        revocation_id,
+        recovery_request_id,
+        key_package_ref,
+        accepted_dt,
+        signing_transcript,
+        signed_request,
+        request_digest: request_digest.to_vec(),
+        signature: signature.to_vec(),
+    }
+}
+
+/// Seed the `revokeDevice` idempotency receipt the DEFERRED mapping trigger
+/// requires (production's request handler writes this via record_completed_idempotency).
+async fn seed_revoke_receipt(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, s: &RevocationSetup) {
+    let response_bytes = b"revokeDevice-ok".to_vec();
+    let response_sha256 = Sha256::digest(&response_bytes).to_vec();
+    sqlx::query(
+        r#"
+        INSERT INTO chat.idempotency_records(
+            principal_did, endpoint_nsid, operation_id, request_digest,
+            accepted_request_bytes, signing_transcript_bytes, signature,
+            completed_status, response_bytes, response_sha256, event_position,
+            historical_jkt, current_jkt, completed_at
+        ) VALUES($1,'blue.catbird.chat.revokeDevice',$2,$3,$4,$5,$6,200,$7,$8,NULL,$9,NULL,$10)
+        "#,
+    )
+    .bind(&s.target_did)
+    .bind(s.revocation_id)
+    .bind(&s.request_digest)
+    .bind(&s.signed_request)
+    .bind(&s.signing_transcript)
+    .bind(&s.signature)
+    .bind(&response_bytes)
+    .bind(&response_sha256)
+    .bind(&s.target_key_id)
+    .bind(s.accepted_dt)
+    .execute(&mut **tx)
+    .await
+    .expect("seed revokeDevice receipt");
+}
+
+#[tokio::test]
+async fn device_revocation_batch_commits_and_supersedes_target_work() {
+    let (pool, _db) = setup().await;
+    let s = setup_revoked_target(&pool).await;
+
+    let mut tx = pool.begin().await.expect("begin revocation");
+    seed_revoke_receipt(&mut tx, &s).await;
+    let applied =
+        apply_device_revocation_batch(&mut tx, &s.batch_plan, std::slice::from_ref(&s.conv_ctx))
+            .await
+            .expect("device revocation batch applies");
+    tx.commit()
+        .await
+        .expect("device revocation COMMIT past enforce_device_revocation_mapping");
+    assert_eq!(applied.len(), 1);
+    // Entry-less: the seq counter is echoed unchanged (still 2).
+    assert_eq!(applied[0].allocated_seq, 2);
+
+    // The target registration is revoked, bound to the revocation.
+    let (dev_status, dev_rev): (String, Option<Uuid>) = sqlx::query_as(
+        "SELECT status, revocation_id FROM chat.devices WHERE user_did=$1 AND device_id=$2",
+    )
+    .bind(&s.target_did)
+    .bind(s.target_device)
+    .fetch_one(&pool)
+    .await
+    .expect("target device");
+    assert_eq!(
+        (dev_status.as_str(), dev_rev),
+        ("revoked", Some(s.revocation_id))
+    );
+    let key_rev: Option<Uuid> = sqlx::query_scalar(
+        "SELECT revocation_id FROM chat.device_keys WHERE user_did=$1 AND device_id=$2",
+    )
+    .bind(&s.target_did)
+    .bind(s.target_device)
+    .fetch_one(&pool)
+    .await
+    .expect("target device key");
+    assert_eq!(key_rev, Some(s.revocation_id));
+
+    // The target's own work is superseded/released/revoked, all revocation-bound.
+    let (req_status, req_rev): (String, Option<Uuid>) = sqlx::query_as(
+        "SELECT status, terminal_revocation_id FROM chat.leaf_recovery_requests WHERE recovery_request_id=$1",
+    )
+    .bind(s.recovery_request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("recovery request");
+    assert_eq!(
+        (req_status.as_str(), req_rev),
+        ("superseded", Some(s.revocation_id))
+    );
+    let (res_status, res_rev): (String, Option<Uuid>) = sqlx::query_as(
+        "SELECT status, terminal_revocation_id FROM chat.key_package_reservations WHERE recovery_request_id=$1",
+    )
+    .bind(s.recovery_request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("reservation");
+    assert_eq!(
+        (res_status.as_str(), res_rev),
+        ("released", Some(s.revocation_id))
+    );
+    let (pkg_status, pkg_rev, pkg_terminal): (String, Option<Uuid>, Option<DateTime<Utc>>) =
+        sqlx::query_as(
+            "SELECT status, terminal_revocation_id, terminal_at FROM chat.key_packages WHERE key_package_ref=$1",
+        )
+        .bind(s.key_package_ref.to_vec())
+        .fetch_one(&pool)
+        .await
+        .expect("package");
+    assert_eq!(
+        (pkg_status.as_str(), pkg_rev, pkg_terminal),
+        ("revoked", Some(s.revocation_id), Some(s.accepted_dt))
+    );
+
+    // Coordinate + seq counter byte-untouched (entry-less op).
+    let (gen, sv, next_seq): (i64, i64, i64) = sqlx::query_as(
+        "SELECT current_generation,current_state_version,next_entry_seq FROM chat.conversations WHERE conversation_id=$1",
+    )
+    .bind(s.conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("head");
+    assert_eq!((gen, sv, next_seq), (0, 0, 2));
+
+    // Full target-footprint completeness (what the COMMIT trigger enforced).
+    let live_packages: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.key_packages WHERE owner_did=$1 AND owner_device_id=$2 AND status IN ('available','reserved')",
+    )
+    .bind(&s.target_did)
+    .bind(s.target_device)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(live_packages, 0, "no live target packages remain");
+    let open_requests: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.leaf_recovery_requests WHERE requester_did=$1 AND requester_device_id=$2 AND status='open'",
+    )
+    .bind(&s.target_did)
+    .bind(s.target_device)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(open_requests, 0, "no open target requests remain");
+    let active_reservations: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.key_package_reservations WHERE recipient_did=$1 AND recipient_device_id=$2 AND status='active'",
+    )
+    .bind(&s.target_did)
+    .bind(s.target_device)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        active_reservations, 0,
+        "no active target reservations remain"
+    );
+}
+
+#[tokio::test]
+async fn device_revocation_without_receipt_fails_the_commit_trigger() {
+    let (pool, _db) = setup().await;
+    let s = setup_revoked_target(&pool).await;
+
+    // Apply the whole batch but DO NOT seed the revokeDevice receipt: the writers
+    // all succeed (the mapping trigger is DEFERRED), but COMMIT RAISEs because the
+    // target-footprint provenance (the receipt) is missing.
+    let mut tx = pool.begin().await.expect("begin revocation");
+    apply_device_revocation_batch(&mut tx, &s.batch_plan, std::slice::from_ref(&s.conv_ctx))
+        .await
+        .expect("batch applies (the mapping trigger is deferred to COMMIT)");
+    let committed = tx.commit().await;
+    assert!(
+        committed.is_err(),
+        "a revocation missing its revokeDevice receipt must fail enforce_device_revocation_mapping at COMMIT"
+    );
 }
