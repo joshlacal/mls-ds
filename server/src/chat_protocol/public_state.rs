@@ -798,7 +798,7 @@ impl VerifiedCommitPublicState {
     /// Synthetic ZERO-PROPOSAL commit (`sv+1`, `epoch+1`, fresh hash/tag; no
     /// adds/removes, sender self-update only). Mirrors `for_test_remove`'s pure
     /// public-state seam — the executor generic-commit arm is verified against this
-    /// (the real `commit-generic-public.mls` parses via `validate_public_commit`,
+    /// (the real `commit-generic-public-mls` parses via `validate_public_commit`,
     /// but `process_commit` reconstructing a NON-authoritative prior from an earlier
     /// public commit diverges cryptographically, which is exactly why the
     /// state-machine suite drives generic/remove commits synthetically too).
