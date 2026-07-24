@@ -1151,3 +1151,453 @@ async fn descriptor_and_aad_bytes_are_stored_opaquely_without_inner_parsing() {
 
     tx.rollback().await.expect("rollback");
 }
+
+// ===========================================================================
+// Part 5 — application binding + attachment reads against device intervals
+// (Slice 5, item 3 and the binding portion of item 1).
+//
+// A coherent creation graph (conversation + genesis leaf + open interval) plus an
+// accepted application entry at seq 2 is seeded in-transaction; a prepared blob is
+// completed and bound to that entry via `bind_application_blob`. The whole graph
+// is proven commit-coherent with `SET CONSTRAINTS ALL IMMEDIATE`. The attachment
+// read then qualifies ONLY through the caller's exact device interval spanning the
+// binding seq — a same-DID sibling (no interval), a pre-join device, a gapped
+// device, a strictly-before-terminal device, and a re-Add-without-backfill device
+// all read `None`; only the exact recipient device with a spanning interval reads
+// the opaque view.
+// ===========================================================================
+
+use repository::blobs::{
+    bind_application_blob, insert_blob_binding, read_application_attachment, BindingKind,
+    NewBlobBinding,
+};
+
+struct CreationGraph {
+    conversation_id: Uuid,
+    actor_did: String,
+    actor_device_id: Uuid,
+    actor_key_id: String,
+    actor_public_key: Vec<u8>,
+    leaf_period_id: Uuid,
+    creation_transition_id: Uuid,
+    group_id: Vec<u8>,
+    group_context_hash: Vec<u8>,
+    confirmation_tag: Vec<u8>,
+    creation_fingerprint: Vec<u8>,
+    accepted_at: DateTime<Utc>,
+}
+
+/// Seed a coherent genesis conversation (creator active/admin/sole-leaf, one open
+/// application interval at start_seq 1, next_entry_seq=2) INSIDE the caller's
+/// transaction. Mirrors the proven `seed_fixture` graph; rolls back with the test.
+async fn seed_creation_graph_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    actor_did: &str,
+) -> CreationGraph {
+    let now = clock_now(tx).await;
+    sqlx::query("INSERT INTO chat.principals(user_did,created_at) VALUES($1,$2)")
+        .bind(actor_did)
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .expect("principal");
+    let actor_device_id = Uuid::new_v4();
+    let actor_public_key = random_ref();
+    let actor_key_id: String = sqlx::query_scalar("SELECT chat.ed25519_key_id($1)")
+        .bind(&actor_public_key)
+        .fetch_one(&mut **tx)
+        .await
+        .expect("key id");
+    sqlx::query(
+        "INSERT INTO chat.devices(user_did,device_id,device_name,status,dpop_jkt,auth_generation,capabilities,created_at,updated_at) \
+         VALUES($1,$2,'creator','active',$3,1,chat.protocol_capabilities(),$4,$4)",
+    )
+    .bind(actor_did).bind(actor_device_id).bind(&actor_key_id).bind(now)
+    .execute(&mut **tx).await.expect("device");
+    sqlx::query(
+        "INSERT INTO chat.device_keys(user_did,device_id,key_id,signing_public_key,enrollment_auth_generation,created_at) \
+         VALUES($1,$2,$3,$4,1,$5)",
+    )
+    .bind(actor_did).bind(actor_device_id).bind(&actor_key_id).bind(&actor_public_key).bind(now)
+    .execute(&mut **tx).await.expect("device key");
+
+    let conversation_id = Uuid::new_v4();
+    let creation_transition_id = Uuid::new_v4();
+    let creation_entry_id = Uuid::new_v4();
+    let participant_period_id = Uuid::new_v4();
+    let leaf_period_id = Uuid::new_v4();
+    let metadata_snapshot_id = Uuid::new_v4();
+    let group_id = vec![1_u8; 32];
+    let group_context_hash = vec![2_u8; 32];
+    let confirmation_tag = vec![3_u8; 32];
+    let group_info = vec![4_u8; 8];
+    let snapshot = vec![5_u8; 8];
+    let tree_summary = vec![6_u8; 8];
+    let signed_request = vec![7_u8; 8];
+    let unsigned_projection = vec![8_u8; 8];
+    let signing_transcript = vec![9_u8; 8];
+    let request_digest = Sha256::digest(&signing_transcript).to_vec();
+    let signature = vec![10_u8; 64];
+    let accepted_payload = vec![11_u8; 8];
+    let creation_fingerprint = vec![12_u8; 32];
+    let metadata_ciphertext = vec![13_u8; 16];
+    let basic_credential = format!("{actor_did}#{actor_device_id}").into_bytes();
+
+    sqlx::query(
+        "INSERT INTO chat.conversations(conversation_id,kind,lifecycle,current_generation,current_state_version,next_entry_seq,created_at) VALUES($1,'group','active',0,0,2,$2)",
+    ).bind(conversation_id).bind(now).execute(&mut **tx).await.expect("conversation");
+    sqlx::query(
+        "INSERT INTO chat.generations(conversation_id,generation,group_id,lifecycle,genesis_group_info_bytes,genesis_group_info_sha256,current_state_version,activated_seq,activated_at) VALUES($1,0,$2,'active',$3,$4,0,1,$5)",
+    ).bind(conversation_id).bind(&group_id).bind(&group_info).bind(Sha256::digest(&group_info).to_vec()).bind(now).execute(&mut **tx).await.expect("generation");
+    sqlx::query(
+        r#"INSERT INTO chat.transitions(transition_id,conversation_id,kind,actor_did,actor_device_id,actor_key_id,actor_auth_generation,actor_role,actor_device_status,signed_request_bytes,unsigned_projection_bytes,signing_transcript_bytes,request_digest,signature,next_generation,next_state_version,metadata_snapshot_id,entry_seq,accepted_at) VALUES($1,$2,'creation',$3,$4,$5,1,'admin','active',$6,$7,$8,$9,$10,0,0,$11,1,$12)"#,
+    ).bind(creation_transition_id).bind(conversation_id).bind(actor_did).bind(actor_device_id).bind(&actor_key_id).bind(&signed_request).bind(&unsigned_projection).bind(&signing_transcript).bind(&request_digest).bind(&signature).bind(metadata_snapshot_id).bind(now).execute(&mut **tx).await.expect("transition");
+    sqlx::query(
+        r#"INSERT INTO chat.generation_states(conversation_id,generation,state_version,group_id,epoch,group_context_hash,confirmation_tag,lifecycle,state_kind,producing_transition_id,public_snapshot_bytes,snapshot_sha256,tree_summary_bytes,tree_summary_sha256,leaf_count,created_at) VALUES($1,0,0,$2,0,$3,$4,'active','creation',$5,$6,$7,$8,$9,1,$10)"#,
+    ).bind(conversation_id).bind(&group_id).bind(&group_context_hash).bind(&confirmation_tag).bind(creation_transition_id).bind(&snapshot).bind(Sha256::digest(&snapshot).to_vec()).bind(&tree_summary).bind(Sha256::digest(&tree_summary).to_vec()).bind(now).execute(&mut **tx).await.expect("state");
+    sqlx::query(
+        r#"INSERT INTO chat.participants(participant_period_id,conversation_id,user_did,status,role,role_transition_id,role_changed_at,created_by_did,created_by_device_id,current_membership,created_at) VALUES($1,$2,$3,'active','admin',$4,$5,$3,$6,true,$5)"#,
+    ).bind(participant_period_id).bind(conversation_id).bind(actor_did).bind(creation_transition_id).bind(now).bind(actor_device_id).execute(&mut **tx).await.expect("participant");
+    sqlx::query(
+        r#"INSERT INTO chat.member_devices(leaf_period_id,participant_period_id,conversation_id,generation,user_did,device_id,leaf_index,basic_credential,leaf_signature_key,leaf_key_id,leaf_auth_generation,origin,joined_state_version,joined_transition_id,joined_seq,active,created_at) VALUES($1,$2,$3,0,$4,$5,0,$6,$7,$8,1,'genesis',0,$9,1,true,$10)"#,
+    ).bind(leaf_period_id).bind(participant_period_id).bind(conversation_id).bind(actor_did).bind(actor_device_id).bind(&basic_credential).bind(&actor_public_key).bind(&actor_key_id).bind(creation_transition_id).bind(now).execute(&mut **tx).await.expect("leaf");
+    sqlx::query(
+        r#"INSERT INTO chat.metadata_snapshots(metadata_snapshot_id,conversation_id,generation,state_version,group_id,epoch,group_context_hash,confirmation_tag,producing_transition_id,origin_transition_id,metadata_version,nonce,ciphertext,ciphertext_sha256,ciphertext_size,author_did,author_device_id,author_key_id,author_public_key,author_auth_generation,author_origin_seq,author_role,author_device_status,created_at) VALUES($1,$2,0,0,$3,0,$4,$5,$6,$6,1,$7,$8,$9,16,$10,$11,$12,$13,1,1,'admin','active',$14)"#,
+    ).bind(metadata_snapshot_id).bind(conversation_id).bind(&group_id).bind(&group_context_hash).bind(&confirmation_tag).bind(creation_transition_id).bind(vec![14_u8; 12]).bind(&metadata_ciphertext).bind(Sha256::digest(&metadata_ciphertext).to_vec()).bind(actor_did).bind(actor_device_id).bind(&actor_key_id).bind(&actor_public_key).bind(now).execute(&mut **tx).await.expect("metadata");
+    sqlx::query(
+        r#"INSERT INTO chat.entries(conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,accepted_payload_sha256,signed_request_bytes,request_digest,signature,server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,actor_key_id,actor_auth_generation,generation,state_version,transition_id,received_at) VALUES($1,1,$2,'blue.catbird.chat.defs#creationEntry',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1,0,0,$13,$14)"#,
+    ).bind(conversation_id).bind(creation_entry_id).bind(&accepted_payload).bind(Sha256::digest(&accepted_payload).to_vec()).bind(&signed_request).bind(&request_digest).bind(&signature).bind(vec![0_u8]).bind(&creation_fingerprint).bind(actor_did).bind(actor_device_id).bind(&actor_key_id).bind(creation_transition_id).bind(now).execute(&mut **tx).await.expect("creation entry");
+    sqlx::query(
+        r#"INSERT INTO chat.application_intervals(membership_interval_id,conversation_id,generation,recipient_did,recipient_device_id,start_seq,opening_kind,opening_transition_id,opening_outer_entry_fingerprint,opening_state_version,opening_group_id,opening_epoch,opening_group_context_hash,opening_confirmation_tag,opening_leaf_period_id,created_at) VALUES($1,$2,0,$3,$4,1,'creation',$1,$5,0,$6,0,$7,$8,$9,$10)"#,
+    ).bind(creation_transition_id).bind(conversation_id).bind(actor_did).bind(actor_device_id).bind(&creation_fingerprint).bind(&group_id).bind(&group_context_hash).bind(&confirmation_tag).bind(leaf_period_id).bind(now).execute(&mut **tx).await.expect("interval");
+
+    CreationGraph {
+        conversation_id,
+        actor_did: actor_did.to_owned(),
+        actor_device_id,
+        actor_key_id,
+        actor_public_key,
+        leaf_period_id,
+        creation_transition_id,
+        group_id,
+        group_context_hash,
+        confirmation_tag,
+        creation_fingerprint,
+        accepted_at: now,
+    }
+}
+
+/// Build the accepted application `ApplicationSend` for the creator at seq 2.
+fn coherent_app_send(
+    graph: &CreationGraph,
+    salt: u8,
+    received_at: DateTime<Utc>,
+) -> ApplicationSend {
+    let signing_transcript_bytes = vec![salt ^ 0x5a; 16];
+    let request_digest = Sha256::digest(&signing_transcript_bytes).to_vec();
+    ApplicationSend {
+        entry: AppendEntry {
+            conversation_id: graph.conversation_id,
+            entry_id: Uuid::new_v4(),
+            entry_kind: "blue.catbird.chat.defs#applicationEntry".to_owned(),
+            accepted_payload_bytes: vec![salt; 8],
+            accepted_payload_sha256: Sha256::digest([salt; 8]).to_vec(),
+            signed_request_bytes: vec![salt ^ 0x33; 8],
+            request_digest,
+            signature: vec![salt; 64],
+            server_fields_bytes: vec![salt; 1],
+            outer_entry_fingerprint: vec![salt; 32],
+            actor_did: graph.actor_did.clone(),
+            actor_device_id: graph.actor_device_id,
+            actor_key_id: graph.actor_key_id.clone(),
+            actor_auth_generation: 1,
+            generation: Some(0),
+            state_version: Some(0),
+            transition_id: None,
+            message_id: Some(Uuid::new_v4()),
+            received_at,
+        },
+        signing_transcript_bytes,
+        outcome_bytes: vec![salt ^ 0x0f; 8],
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
+async fn application_binding_is_readable_by_the_exact_device_and_denied_to_a_sibling() {
+    let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let mut tx = pool.begin().await.expect("begin");
+    let owner = random_plc_did();
+    let graph = seed_creation_graph_tx(&mut tx, &owner).await;
+    let now = graph.accepted_at;
+
+    // Append the accepted application entry at seq 2.
+    let send = coherent_app_send(&graph, 0x21, now);
+    let message_id = send.entry.message_id.unwrap();
+    let outcome = resolve_application_send(&mut tx, &send, ApplicationSendDisposition::Accept)
+        .await
+        .expect("accept send");
+    assert_eq!(outcome, ApplicationSendOutcome::Accepted { seq: 2 });
+
+    // Prepare + complete + bind a blob to that application entry.
+    let request = prepare_request(
+        &owner,
+        graph.actor_device_id,
+        &graph.actor_key_id,
+        BlobPurpose::Attachment,
+        BlobMediaType::ImagePng,
+        1_000,
+        now,
+    );
+    let blob_id = request.blob_id;
+    let ct = request.ciphertext_size;
+    let pt = request.plaintext_size;
+    let ct_sha = request.ciphertext_sha256.clone();
+    let ticket = request.ticket_hash.clone();
+    prepare_blob(&mut tx, &request).await.expect("prepare");
+    let uploaded_at = now + Duration::seconds(10);
+    complete_upload(
+        &mut tx,
+        blob_id,
+        &owner,
+        graph.actor_device_id,
+        ct,
+        &ticket,
+        uploaded_at,
+        "objectstore/key/attach",
+    )
+    .await
+    .expect("complete");
+    let descriptor_bytes = vec![0xAB_u8; 40];
+    let aad_bytes = vec![0xCD_u8; 24];
+    let binding = NewBlobBinding {
+        blob_id,
+        binding_kind: BindingKind::Application,
+        conversation_id: graph.conversation_id,
+        entry_seq: Some(2),
+        message_id: Some(message_id),
+        metadata_origin_transition_id: None,
+        metadata_version: None,
+        owner_did: owner.clone(),
+        owner_device_id: graph.actor_device_id,
+        descriptor_bytes: descriptor_bytes.clone(),
+        descriptor_sha256: Sha256::digest(&descriptor_bytes).to_vec(),
+        aad_bytes: aad_bytes.clone(),
+        aad_sha256: Sha256::digest(&aad_bytes).to_vec(),
+        ciphertext_sha256: ct_sha,
+        plaintext_size: pt,
+        ciphertext_size: ct,
+        purpose: BlobPurpose::Attachment,
+        bound_at: now + Duration::seconds(20),
+        uploaded_at,
+        unbound_expires_at: uploaded_at + Duration::hours(1),
+    };
+    bind_application_blob(&mut tx, &binding)
+        .await
+        .expect("bind application blob");
+
+    // The exact recipient device with an open interval spanning seq 2 sees the blob.
+    let view = read_application_attachment(&mut tx, blob_id, &owner, graph.actor_device_id)
+        .await
+        .expect("read")
+        .expect("exact device sees the attachment");
+    assert_eq!(view.blob_id, blob_id);
+    assert_eq!(view.entry_seq, 2);
+    assert_eq!(view.object_store_key, "objectstore/key/attach");
+    assert_eq!(view.descriptor_bytes, descriptor_bytes);
+    assert_eq!(view.aad_bytes, aad_bytes);
+
+    // A same-DID SIBLING device (no interval) is denied — DID match is never enough.
+    let sibling_device = Uuid::new_v4();
+    let sibling_pk = random_ref();
+    let sibling_key: String = sqlx::query_scalar("SELECT chat.ed25519_key_id($1)")
+        .bind(&sibling_pk)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("sibling key id");
+    sqlx::query(
+        "INSERT INTO chat.devices(user_did,device_id,device_name,status,dpop_jkt,auth_generation,capabilities,created_at,updated_at) VALUES($1,$2,'sibling','active',$3,1,chat.protocol_capabilities(),$4,$4)",
+    ).bind(&owner).bind(sibling_device).bind(&sibling_key).bind(now).execute(&mut *tx).await.expect("sibling device");
+    sqlx::query(
+        "INSERT INTO chat.device_keys(user_did,device_id,key_id,signing_public_key,enrollment_auth_generation,created_at) VALUES($1,$2,$3,$4,1,$5)",
+    ).bind(&owner).bind(sibling_device).bind(&sibling_key).bind(&sibling_pk).bind(now).execute(&mut *tx).await.expect("sibling key");
+    let sibling_view = read_application_attachment(&mut tx, blob_id, &owner, sibling_device)
+        .await
+        .expect("sibling read runs");
+    assert!(
+        sibling_view.is_none(),
+        "a same-DID sibling with no interval is denied"
+    );
+
+    // Prove the WHOLE graph (accepted send mapping + blob binding lifecycle + interval
+    // schedules) is commit-coherent.
+    set_constraints_immediate(&mut tx).await;
+    tx.rollback().await.expect("rollback");
+}
+
+#[tokio::test]
+#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
+async fn attachment_read_predicate_matches_the_exact_device_interval_span() {
+    // Isolates the interval-spanning read predicate (the same predicate the delivery
+    // read path proves): a binding at seq 5 is visible to a reader ONLY when its
+    // interval spans seq 5 inclusively. Extra reader intervals point their opening
+    // leaf at the genesis leaf to satisfy the immediate FK; the deferred identity
+    // FKs are intentionally NOT fired (this is a read-predicate isolation test, and
+    // the binding's full write coherence is proven by the sibling positive above).
+    let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let mut tx = pool.begin().await.expect("begin");
+    let owner = random_plc_did();
+    let graph = seed_creation_graph_tx(&mut tx, &owner).await;
+    let now = graph.accepted_at;
+    let binding_seq: i64 = 5;
+
+    // A bound blob + an application binding at seq 5 (deferred entry FKs left unfired).
+    let request = prepare_request(
+        &owner,
+        graph.actor_device_id,
+        &graph.actor_key_id,
+        BlobPurpose::Attachment,
+        BlobMediaType::ImagePng,
+        800,
+        now,
+    );
+    let blob_id = request.blob_id;
+    let ct = request.ciphertext_size;
+    let pt = request.plaintext_size;
+    let ct_sha = request.ciphertext_sha256.clone();
+    let ticket = request.ticket_hash.clone();
+    prepare_blob(&mut tx, &request).await.expect("prepare");
+    let uploaded_at = now + Duration::seconds(10);
+    complete_upload(
+        &mut tx,
+        blob_id,
+        &owner,
+        graph.actor_device_id,
+        ct,
+        &ticket,
+        uploaded_at,
+        "objectstore/key/pred",
+    )
+    .await
+    .expect("complete");
+    cas_bind_blob(
+        &mut tx,
+        blob_id,
+        &owner,
+        graph.actor_device_id,
+        now + Duration::seconds(20),
+    )
+    .await
+    .expect("bind status");
+    let descriptor = vec![0x01_u8; 8];
+    let aad = vec![0x02_u8; 8];
+    insert_blob_binding(
+        &mut tx,
+        &NewBlobBinding {
+            blob_id,
+            binding_kind: BindingKind::Application,
+            conversation_id: graph.conversation_id,
+            entry_seq: Some(binding_seq),
+            message_id: Some(Uuid::new_v4()),
+            metadata_origin_transition_id: None,
+            metadata_version: None,
+            owner_did: owner.clone(),
+            owner_device_id: graph.actor_device_id,
+            descriptor_bytes: descriptor.clone(),
+            descriptor_sha256: Sha256::digest(&descriptor).to_vec(),
+            aad_bytes: aad.clone(),
+            aad_sha256: Sha256::digest(&aad).to_vec(),
+            ciphertext_sha256: ct_sha,
+            plaintext_size: pt,
+            ciphertext_size: ct,
+            purpose: BlobPurpose::Attachment,
+            bound_at: now + Duration::seconds(20),
+            uploaded_at,
+            unbound_expires_at: uploaded_at + Duration::hours(1),
+        },
+    )
+    .await
+    .expect("insert binding");
+
+    // Helper: insert a predicate-only interval for a fresh reader device.
+    async fn seed_reader_interval(
+        tx: &mut Transaction<'_, Postgres>,
+        graph: &CreationGraph,
+        start_seq: i64,
+        terminal_seq: Option<i64>,
+    ) -> Uuid {
+        let now = graph.accepted_at;
+        let reader = Uuid::new_v4();
+        let pk = random_ref();
+        let key: String = sqlx::query_scalar("SELECT chat.ed25519_key_id($1)")
+            .bind(&pk)
+            .fetch_one(&mut **tx)
+            .await
+            .expect("reader key id");
+        sqlx::query("INSERT INTO chat.devices(user_did,device_id,device_name,status,dpop_jkt,auth_generation,capabilities,created_at,updated_at) VALUES($1,$2,'reader','active',$3,1,chat.protocol_capabilities(),$4,$4)").bind(&graph.actor_did).bind(reader).bind(&key).bind(now).execute(&mut **tx).await.expect("reader device");
+        sqlx::query("INSERT INTO chat.device_keys(user_did,device_id,key_id,signing_public_key,enrollment_auth_generation,created_at) VALUES($1,$2,$3,$4,1,$5)").bind(&graph.actor_did).bind(reader).bind(&key).bind(&pk).bind(now).execute(&mut **tx).await.expect("reader key");
+        // membership_interval_id must equal opening_transition_id (id_check); use a
+        // fresh v4 for both. The opening/closing transition provenance FKs are
+        // DEFERRED and intentionally left unfired in this read-predicate isolation.
+        let interval_id = Uuid::new_v4();
+        let closing_id = Uuid::new_v4();
+        if let Some(terminal) = terminal_seq {
+            // Finite interval: full close columns (deferred close FKs left unfired).
+            sqlx::query(
+                r#"INSERT INTO chat.application_intervals(membership_interval_id,conversation_id,generation,recipient_did,recipient_device_id,start_seq,opening_kind,opening_transition_id,opening_outer_entry_fingerprint,opening_state_version,opening_group_id,opening_epoch,opening_group_context_hash,opening_confirmation_tag,opening_leaf_period_id,terminal_seq,closing_state_version,closing_transition_id,closing_outer_entry_fingerprint,closing_kind,closing_leaf_period_id,removed_at,created_at) VALUES($1,$2,0,$3,$4,$5,'creation',$1,$6,0,$7,0,$8,$9,$10,$11,1,$12,$13,'remove',$10,$14,$14)"#,
+            ).bind(interval_id).bind(graph.conversation_id).bind(&graph.actor_did).bind(reader).bind(start_seq).bind(&graph.creation_fingerprint).bind(&graph.group_id).bind(&graph.group_context_hash).bind(&graph.confirmation_tag).bind(graph.leaf_period_id).bind(terminal).bind(closing_id).bind(vec![0x77_u8; 32]).bind(now).execute(&mut **tx).await.expect("finite interval");
+        } else {
+            sqlx::query(
+                r#"INSERT INTO chat.application_intervals(membership_interval_id,conversation_id,generation,recipient_did,recipient_device_id,start_seq,opening_kind,opening_transition_id,opening_outer_entry_fingerprint,opening_state_version,opening_group_id,opening_epoch,opening_group_context_hash,opening_confirmation_tag,opening_leaf_period_id,created_at) VALUES($1,$2,0,$3,$4,$5,'creation',$1,$6,0,$7,0,$8,$9,$10,$11)"#,
+            ).bind(interval_id).bind(graph.conversation_id).bind(&graph.actor_did).bind(reader).bind(start_seq).bind(&graph.creation_fingerprint).bind(&graph.group_id).bind(&graph.group_context_hash).bind(&graph.confirmation_tag).bind(graph.leaf_period_id).bind(now).execute(&mut **tx).await.expect("open interval");
+        }
+        reader
+    }
+
+    // Open interval spanning seq 5 => visible.
+    let spanning = seed_reader_interval(&mut tx, &graph, 1, None).await;
+    assert!(
+        read_application_attachment(&mut tx, blob_id, &owner, spanning)
+            .await
+            .expect("read")
+            .is_some()
+    );
+
+    // Pre-join: interval opens AFTER seq 5 (start_seq 6) => denied.
+    let pre_join = seed_reader_interval(&mut tx, &graph, 6, None).await;
+    assert!(
+        read_application_attachment(&mut tx, blob_id, &owner, pre_join)
+            .await
+            .expect("read")
+            .is_none()
+    );
+
+    // Gap: a finite interval ENTIRELY before seq 5 ([1,4]) => denied.
+    let gapped = seed_reader_interval(&mut tx, &graph, 1, Some(4)).await;
+    assert!(
+        read_application_attachment(&mut tx, blob_id, &owner, gapped)
+            .await
+            .expect("read")
+            .is_none()
+    );
+
+    // Removed-device terminal boundary is INCLUSIVE: terminal_seq == 5 => still visible.
+    let boundary = seed_reader_interval(&mut tx, &graph, 1, Some(5)).await;
+    assert!(
+        read_application_attachment(&mut tx, blob_id, &owner, boundary)
+            .await
+            .expect("read")
+            .is_some()
+    );
+
+    // Strictly-before terminal boundary: terminal_seq == 4 => denied.
+    let before = seed_reader_interval(&mut tx, &graph, 1, Some(4)).await;
+    assert!(
+        read_application_attachment(&mut tx, blob_id, &owner, before)
+            .await
+            .expect("read")
+            .is_none()
+    );
+
+    tx.rollback().await.expect("rollback");
+}
