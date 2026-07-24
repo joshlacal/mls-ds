@@ -410,7 +410,7 @@ mod repository {
 }
 
 use async_trait::async_trait;
-use chrono::{DateTime, SecondsFormat, TimeDelta, TimeZone, Utc};
+use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 use relationship_policy::{
     AdmissionOperation, AdmissionRequest, AllocatedProjectionRevisionGuard, HttpRelationshipSource,
     ProjectionClock, ProjectionOperationScope, ProjectionScope, PublicGet, PublicResponse,
@@ -888,12 +888,33 @@ fn persistence_at(value: DateTime<Utc>) -> TrustedRelationshipPersistenceInstant
 }
 
 struct StepClock {
+    base: DateTime<Utc>,
     calls: AtomicUsize,
 }
 
 impl StepClock {
+    /// Anchor to a near-`now` instant rather than a fixed calendar date: the
+    /// fallback loader's freshness guard rejects snapshots whose `completed_at`
+    /// is more than 60s older than its own wall-clock observation, so a
+    /// hardcoded past base would make the after-restart hydration tests fail
+    /// whenever the suite runs.
     fn new() -> Self {
+        Self::anchored(Utc::now())
+    }
+
+    /// Anchor `seconds` before now, used to seed a snapshot the loader's
+    /// freshness guard must reject as stale (see the backdated-scope witness in
+    /// `traffic_fallback_hydrates_exact_scope_and_freshness_after_restart`).
+    fn backdated(seconds: i64) -> Self {
+        Self::anchored(Utc::now() - TimeDelta::seconds(seconds))
+    }
+
+    /// Truncate the base to whole milliseconds for determinism within a run;
+    /// per-call millisecond stepping preserves canonical ordering.
+    fn anchored(instant: DateTime<Utc>) -> Self {
+        let submillisecond_nanos = instant.timestamp_subsec_nanos() % 1_000_000;
         Self {
+            base: instant - TimeDelta::nanoseconds(i64::from(submillisecond_nanos)),
             calls: AtomicUsize::new(0),
         }
     }
@@ -901,8 +922,7 @@ impl StepClock {
 
 impl ProjectionClock for StepClock {
     fn now(&self) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 7, 22, 12, 0, 0).unwrap()
-            + TimeDelta::milliseconds(self.calls.fetch_add(1, Ordering::SeqCst) as i64)
+        self.base + TimeDelta::milliseconds(self.calls.fetch_add(1, Ordering::SeqCst) as i64)
     }
 }
 
@@ -1305,6 +1325,39 @@ async fn traffic_fallback_hydrates_exact_scope_and_freshness_after_restart() {
     persist_principal_read_set(&pool, &scope.members).await;
     let wrong_members = (200..232).map(did).collect::<Vec<_>>();
     persist_principal_read_set(&pool, &wrong_members).await;
+
+    // Seed a second traffic snapshot under a DISTINCT scope whose `completed_at`
+    // is backdated 61s so the loader's post-lock freshness guard
+    // (`observed_at - completed_at > 60s`) must reject it as stale. This gives
+    // the freshness-rejection assertion below a genuinely stale row to drop,
+    // replacing the unsatisfiable `stale_time_witness` block left over from the
+    // removed injectable-now loader signature.
+    let mut backdated_members = (300..332).map(did).collect::<Vec<_>>();
+    backdated_members.sort();
+    let backdated_live = relationship_policy::collect_traffic_projection(
+        &authority,
+        &StepClock::backdated(61),
+        allocated_revision(&pool).await,
+        backdated_members[0].clone(),
+        backdated_members,
+    )
+    .await
+    .unwrap();
+    let backdated_scope = backdated_live.scope().clone();
+    let backdated_persisted = backdated_live
+        .export_persisted_fallback(
+            allocated_revision(&pool).await,
+            &authority,
+            &persistence_at(backdated_live.completed_at()),
+        )
+        .unwrap();
+    let mut backdated_transaction = pool.begin().await.unwrap();
+    persist_traffic_projection(&mut backdated_transaction, backdated_persisted)
+        .await
+        .unwrap();
+    backdated_transaction.commit().await.unwrap();
+    persist_principal_read_set(&pool, &backdated_scope.members).await;
+
     pool.close().await;
 
     let restarted = common::chat_protocol::setup_chat_protocol_db(2).await;
@@ -1331,20 +1384,22 @@ async fn traffic_fallback_hydrates_exact_scope_and_freshness_after_restart() {
     );
     assert_ne!(wrong_scope, scope);
 
-    // Freshness is now enforced from the loader's own post-lock observation
-    // clock; the loader no longer accepts an injected instant (the prior
-    // `trusted_now + 61s` argument was removed from the production signature).
-    let (stale_time_witness, stale_time_scope) =
-        lock_traffic_scope(&mut load_transaction, &scope.members).await;
-    assert_eq!(stale_time_scope, scope);
-    assert!(load_fallback_traffic_projection(
-        &mut load_transaction,
-        stale_time_witness,
-        &authority,
-    )
-    .await
-    .unwrap()
-    .is_none());
+    // Freshness is enforced from the loader's own post-lock observation clock
+    // (`observed_at - completed_at > 60s`); the loader no longer accepts an
+    // injected instant. Exercise the rejection path by locking the distinct
+    // scope seeded above whose `completed_at` is backdated 61s: the guard must
+    // drop it even though its scope, read-set, and witness transaction are all
+    // exact.
+    let (backdated_witness, backdated_lock_scope) =
+        lock_traffic_scope(&mut load_transaction, &backdated_scope.members).await;
+    assert_eq!(backdated_lock_scope, backdated_scope);
+    assert!(
+        load_fallback_traffic_projection(&mut load_transaction, backdated_witness, &authority)
+            .await
+            .unwrap()
+            .is_none(),
+        "loader must reject a snapshot whose completed_at is older than the 60s freshness bound"
+    );
 
     let (exact_witness, exact_scope) =
         lock_traffic_scope(&mut load_transaction, &scope.members).await;
