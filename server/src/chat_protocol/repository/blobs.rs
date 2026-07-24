@@ -85,6 +85,12 @@ pub(crate) enum BlobRepositoryError {
     /// (purpose=attachment) and a metadata snapshot only
     /// `#metadataAvatarBinding` (purpose=metadata).
     PurposeBindingMismatch,
+    /// A bound blob reachable through an application binding had a NULL
+    /// `object_store_key`. The `blobs_status_shape_check` guarantees a `bound`
+    /// blob carries its object key, so a NULL here is a storage-invariant
+    /// violation (corruption), never a "missing optional" — it is surfaced as a
+    /// hard error rather than silently coerced to an empty key.
+    ObjectStoreKeyMissing,
 }
 
 impl From<sqlx::Error> for BlobRepositoryError {
@@ -622,11 +628,19 @@ pub(crate) struct AttachmentBlobView {
 
 /// Read one application-attachment blob for an EXACT caller device. The binding
 /// qualifies ONLY through this device's `chat.application_intervals` spanning the
-/// binding's `entry_seq` (inclusive `[start_seq, terminal_seq]`, mirroring the
-/// delivery read predicate). A same-DID sibling with no interval at that seq, a
+/// binding's `entry_seq`. A same-DID sibling with no interval at that seq, a
 /// pre-join device, a gap device, and a re-Added device without history backfill
 /// all fail the interval join and read `None` — the DID matching is never
 /// sufficient. Returns `None` when not visible.
+///
+/// DRIFT GUARD: the `EXISTS (... application_intervals ...)` interval-spanning
+/// predicate below is byte-identical to the delivery read predicate in
+/// `repository/delivery.rs` (`getEntries` visible-CTE, the
+/// `entry.seq >= interval.start_seq AND (interval.terminal_seq IS NULL OR
+/// entry.seq <= interval.terminal_seq)` clause). Both sites carry a matching
+/// cross-reference comment; if you change the inclusive `[start_seq, terminal_seq]`
+/// semantics here, change it there too (and vice versa) so per-device application
+/// visibility never diverges between the entry log and blob custody.
 pub(crate) async fn read_application_attachment(
     transaction: &mut Transaction<'_, Postgres>,
     blob_id: Uuid,
@@ -668,27 +682,33 @@ pub(crate) async fn read_application_attachment(
     .bind(caller_device_id)
     .fetch_optional(&mut **transaction)
     .await?;
-    Ok(row.map(
-        |(
-            blob_id,
-            object_store_key,
-            ciphertext_size,
-            plaintext_size,
-            ciphertext_sha256,
-            descriptor_bytes,
-            aad_bytes,
-            entry_seq,
-        )| AttachmentBlobView {
-            blob_id,
-            object_store_key: object_store_key.unwrap_or_default(),
-            ciphertext_size,
-            plaintext_size,
-            ciphertext_sha256,
-            descriptor_bytes,
-            aad_bytes,
-            entry_seq,
-        },
-    ))
+    let Some((
+        blob_id,
+        object_store_key,
+        ciphertext_size,
+        plaintext_size,
+        ciphertext_sha256,
+        descriptor_bytes,
+        aad_bytes,
+        entry_seq,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    // A bound blob (the only kind an application binding can point to) always
+    // carries its object key per `blobs_status_shape_check`; a NULL is a storage
+    // invariant violation, not an absent optional, so it is a hard error.
+    let object_store_key = object_store_key.ok_or(BlobRepositoryError::ObjectStoreKeyMissing)?;
+    Ok(Some(AttachmentBlobView {
+        blob_id,
+        object_store_key,
+        ciphertext_size,
+        plaintext_size,
+        ciphertext_sha256,
+        descriptor_bytes,
+        aad_bytes,
+        entry_seq,
+    }))
 }
 
 // ===========================================================================
@@ -905,7 +925,10 @@ pub(crate) async fn expire_due_blobs(
     now: DateTime<Utc>,
     batch_limit: i64,
 ) -> Result<Vec<ExpiredBlob>, BlobRepositoryError> {
-    let claimed: Vec<(Uuid, String, String, i64)> = sqlx::query_as(
+    // `uploaded_at` is NOT mutated by the expiry UPDATE, so the prior shape
+    // (`completedUnbound` iff uploaded) is returned directly in the RETURNING
+    // clause — no per-row follow-up probe. This is the single set-based claim.
+    let claimed: Vec<(Uuid, String, bool, i64)> = sqlx::query_as(
         r#"
         WITH due AS (
             SELECT c.blob_id
@@ -924,7 +947,7 @@ pub(crate) async fn expire_due_blobs(
                END
           FROM due
          WHERE b.blob_id = due.blob_id
-        RETURNING b.blob_id, b.owner_did, b.status, b.ciphertext_size
+        RETURNING b.blob_id, b.owner_did, (b.uploaded_at IS NOT NULL), b.ciphertext_size
         "#,
     )
     .bind(now)
@@ -932,17 +955,10 @@ pub(crate) async fn expire_due_blobs(
     .fetch_all(&mut **transaction)
     .await?;
 
-    // The RETURNING status is the NEW ('expired') status; recover the prior
-    // status from whether the row carried an object (uploaded => completedUnbound).
-    // Re-read prior status precisely from expired_at == unbound vs upload window.
     let mut expired = Vec::with_capacity(claimed.len());
-    for (blob_id, owner_did, _new_status, ciphertext_size) in claimed {
-        // Determine which shape expired by inspecting the stamped columns.
-        let prior_completed: bool =
-            sqlx::query_scalar("SELECT uploaded_at IS NOT NULL FROM chat.blobs WHERE blob_id = $1")
-                .bind(blob_id)
-                .fetch_one(&mut **transaction)
-                .await?;
+    for (blob_id, owner_did, prior_completed, ciphertext_size) in claimed {
+        // A completedUnbound blob counted toward `used`; a never-uploaded prepared
+        // blob counted toward `reserved`. Both leave the live set on expiry.
         let (used_delta, reserved_delta) = if prior_completed {
             (-ciphertext_size, 0)
         } else {

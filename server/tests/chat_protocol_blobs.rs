@@ -903,6 +903,23 @@ async fn stale_send_writes_only_a_tombstone_with_no_entry_seq_blob_or_event() {
         now,
     );
 
+    // Baseline the (non-conversation-scoped) event + outbox tables so a stale-branch
+    // event/outbox-emit regression is caught by a nonzero delta. The suite runs
+    // --test-threads=1, so no concurrent committer moves these counts across the
+    // single resolve call.
+    async fn events_plus_outbox(tx: &mut Transaction<'_, Postgres>) -> i64 {
+        let events: i64 = sqlx::query_scalar("SELECT count(*) FROM chat.events")
+            .fetch_one(&mut **tx)
+            .await
+            .expect("count events");
+        let outbox: i64 = sqlx::query_scalar("SELECT count(*) FROM chat.outbox")
+            .fetch_one(&mut **tx)
+            .await
+            .expect("count outbox");
+        events + outbox
+    }
+    let event_outbox_before = events_plus_outbox(&mut tx).await;
+
     let outcome = resolve_application_send(&mut tx, &send, ApplicationSendDisposition::Stale)
         .await
         .expect("stale resolves");
@@ -943,10 +960,14 @@ async fn stale_send_writes_only_a_tombstone_with_no_entry_seq_blob_or_event() {
     )
     .await;
     assert_eq!(bindings, 0, "a stale send binds no blob");
-    // No event residue: `chat.events` is keyed by `protocol_instance_id`, not
-    // `conversation_id`, and the stale writer touches ONLY `chat.message_sends`
-    // (the entry/seq/binding counts above confirm no other conversation-scoped
-    // side effect exists).
+    // ZERO event / outbox residue: the stale writer emits neither. `chat.events`
+    // is keyed by `protocol_instance_id` (not `conversation_id`), so this is a
+    // global baseline-delta assertion rather than a conversation-scoped count.
+    let event_outbox_after = events_plus_outbox(&mut tx).await;
+    assert_eq!(
+        event_outbox_after, event_outbox_before,
+        "a stale send emits no event or outbox work"
+    );
     //
     // The deferred `assert_message_send_mapping` accepts a stale row precisely
     // BECAUSE it carries zero entries (its `ELSIF entry_count <> 0` arm), so the
@@ -1519,13 +1540,8 @@ async fn attachment_read_predicate_matches_the_exact_device_interval_span() {
     .await
     .expect("insert binding");
 
-    // Helper: insert a predicate-only interval for a fresh reader device.
-    async fn seed_reader_interval(
-        tx: &mut Transaction<'_, Postgres>,
-        graph: &CreationGraph,
-        start_seq: i64,
-        terminal_seq: Option<i64>,
-    ) -> Uuid {
+    // Helper: create a fresh predicate-only reader device.
+    async fn seed_reader_device(tx: &mut Transaction<'_, Postgres>, graph: &CreationGraph) -> Uuid {
         let now = graph.accepted_at;
         let reader = Uuid::new_v4();
         let pk = random_ref();
@@ -1536,6 +1552,18 @@ async fn attachment_read_predicate_matches_the_exact_device_interval_span() {
             .expect("reader key id");
         sqlx::query("INSERT INTO chat.devices(user_did,device_id,device_name,status,dpop_jkt,auth_generation,capabilities,created_at,updated_at) VALUES($1,$2,'reader','active',$3,1,chat.protocol_capabilities(),$4,$4)").bind(&graph.actor_did).bind(reader).bind(&key).bind(now).execute(&mut **tx).await.expect("reader device");
         sqlx::query("INSERT INTO chat.device_keys(user_did,device_id,key_id,signing_public_key,enrollment_auth_generation,created_at) VALUES($1,$2,$3,$4,1,$5)").bind(&graph.actor_did).bind(reader).bind(&key).bind(&pk).bind(now).execute(&mut **tx).await.expect("reader key");
+        reader
+    }
+
+    // Helper: insert one predicate-only interval for an EXISTING reader device.
+    async fn add_reader_interval(
+        tx: &mut Transaction<'_, Postgres>,
+        graph: &CreationGraph,
+        reader: Uuid,
+        start_seq: i64,
+        terminal_seq: Option<i64>,
+    ) {
+        let now = graph.accepted_at;
         // membership_interval_id must equal opening_transition_id (id_check); use a
         // fresh v4 for both. The opening/closing transition provenance FKs are
         // DEFERRED and intentionally left unfired in this read-predicate isolation.
@@ -1551,6 +1579,17 @@ async fn attachment_read_predicate_matches_the_exact_device_interval_span() {
                 r#"INSERT INTO chat.application_intervals(membership_interval_id,conversation_id,generation,recipient_did,recipient_device_id,start_seq,opening_kind,opening_transition_id,opening_outer_entry_fingerprint,opening_state_version,opening_group_id,opening_epoch,opening_group_context_hash,opening_confirmation_tag,opening_leaf_period_id,created_at) VALUES($1,$2,0,$3,$4,$5,'creation',$1,$6,0,$7,0,$8,$9,$10,$11)"#,
             ).bind(interval_id).bind(graph.conversation_id).bind(&graph.actor_did).bind(reader).bind(start_seq).bind(&graph.creation_fingerprint).bind(&graph.group_id).bind(&graph.group_context_hash).bind(&graph.confirmation_tag).bind(graph.leaf_period_id).bind(now).execute(&mut **tx).await.expect("open interval");
         }
+    }
+
+    // Helper: fresh device + one interval (the common single-interval case).
+    async fn seed_reader_interval(
+        tx: &mut Transaction<'_, Postgres>,
+        graph: &CreationGraph,
+        start_seq: i64,
+        terminal_seq: Option<i64>,
+    ) -> Uuid {
+        let reader = seed_reader_device(tx, graph).await;
+        add_reader_interval(tx, graph, reader, start_seq, terminal_seq).await;
         reader
     }
 
@@ -1597,6 +1636,21 @@ async fn attachment_read_predicate_matches_the_exact_device_interval_span() {
             .await
             .expect("read")
             .is_none()
+    );
+
+    // Re-Add WITHOUT backfill: ONE device removed at seq 4 and re-added at seq 6
+    // holds two intervals [1,4] and [6,open]. Seq 5 falls in the gap between them,
+    // so the re-added device does NOT inherit the seq-5 attachment (no history
+    // backfill) — denied.
+    let re_added = seed_reader_device(&mut tx, &graph).await;
+    add_reader_interval(&mut tx, &graph, re_added, 1, Some(4)).await;
+    add_reader_interval(&mut tx, &graph, re_added, 6, None).await;
+    assert!(
+        read_application_attachment(&mut tx, blob_id, &owner, re_added)
+            .await
+            .expect("read")
+            .is_none(),
+        "a re-Added device does not inherit an attachment from the gap before it rejoined"
     );
 
     tx.rollback().await.expect("rollback");

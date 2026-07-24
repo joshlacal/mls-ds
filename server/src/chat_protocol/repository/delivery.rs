@@ -1695,6 +1695,13 @@ pub(crate) async fn get_entries(
         .ok_or(DeliveryRepositoryError::SequenceOverflow)?;
 
     let mut rows: Vec<DeliveredEntryRow> = sqlx::query_as(
+        // DRIFT GUARD: the application-interval EXISTS predicate below
+        // (`entry.seq >= interval.start_seq AND (interval.terminal_seq IS NULL OR
+        // entry.seq <= interval.terminal_seq)`) is the canonical per-device
+        // application-visibility rule. `repository/blobs.rs::read_application_attachment`
+        // carries a byte-identical copy for blob custody and a matching
+        // cross-reference comment; change both sites together so entry-log and
+        // blob visibility never diverge.
         r#"
         WITH visible AS (
             SELECT entry.seq
