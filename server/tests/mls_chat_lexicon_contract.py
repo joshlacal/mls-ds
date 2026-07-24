@@ -40,7 +40,7 @@ PROTOCOL_PATH = STACK_ROOT / "docs/CHAT_PROTOCOL.md"
 APPLICATION_PROTOCOL_PATH = STACK_ROOT / "docs/CHAT_APPLICATION_PROTOCOL.md"
 APPLICATION_MANIFEST_PATH = STACK_ROOT / "docs/generated-artifacts/chat-application-v1/manifest.json"
 APPLICATION_MANIFEST_INPUT_ENV = "CATBIRD_CHAT_APPLICATION_FIXTURE_INPUT"
-FROZEN_APPLICATION_MANIFEST_SHA256 = "d596ec1cd9819c86cfa0a7e0592f60ab340bf81d362d9833e1bb6dfc816dddda"
+FROZEN_APPLICATION_MANIFEST_SHA256 = "7ad20d054b9d2c0c7d6ab39aeed19cd9ffa6a59c1cbaa3d7fd6fd5cb5aa15440"
 TASK1_DOC_PATHS = (
     STACK_ROOT / ".superpowers/sdd/mls-chat-task-1-semantic-repair-brief.md",
     STACK_ROOT / ".superpowers/sdd/mls-chat-task-1-report.md",
