@@ -1,12 +1,18 @@
-//! Non-forgeable lock witnesses for clean-chat state planning.
-//!
-//! Constructors intentionally remain private to this module. The future SQL
-//! repository implementation must construct these values only from rows read
-//! under `FOR UPDATE` in the caller-owned transaction and must retain that
-//! transaction through application of the resulting persistence plan.
+// Non-forgeable lock witnesses for clean-chat state planning.
+//
+// Constructors intentionally remain private to this module. The production SQL
+// hydrators below construct these values only from rows read under `FOR UPDATE`
+// in the caller-owned transaction and must retain that transaction through
+// application of the resulting persistence plan.
+//
+// Regular `//` comments (not `//!`) so the `include!`-based integration harness
+// (`tests/chat_protocol_conversation_substrate.rs`) can inline this file as a
+// module, matching the sibling repository writers.
 
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
+use sqlx::{Postgres, Transaction};
+use thiserror::Error;
 use uuid::Uuid;
 
 use super::super::{
@@ -1601,4 +1607,216 @@ fn canonical_transaction_id(value: &str) -> bool {
 
 fn uuid_is_canonical_v4(value: Uuid) -> bool {
     value.get_variant() == uuid::Variant::RFC4122 && value.get_version_num() == 4
+}
+
+// ===========================================================================
+// T4-H2-pre G2 — production hydrator for the EXISTING-conversation head lock.
+//
+// ADDITION under the coordinator grant "T4-H2-pre G2 FORK RULING" (Option 2):
+// it locks and hydrates a `LockedConversationHeadGuard` for an EXISTING
+// conversation (`prior_coordinate == Some(current coordinate)`) from ONE
+// deterministic locked read. This is the reusable head-lock primitive that G1's
+// aggregate (`seal_locked_conversation`) embeds and that the existing-conversation
+// planners consume. The bare guard's constructor `from_locked_row` is
+// module-private, so the hydrator must live in this module. The CREATION/absence
+// head (`prior_coordinate == None`) is a separate variant landing with G3.
+// ===========================================================================
+
+/// Failure modes of [`hydrate_locked_conversation_head`].
+// `#[allow(dead_code)]` on the G2 additions until the H2 conversation handlers
+// call the hydrator in (the "unused until wired" convention the H1 repository
+// modules use); the live-DB suite already exercises every arm.
+#[allow(dead_code)]
+#[derive(Debug, Error)]
+pub(crate) enum ConversationHeadHydrationError {
+    /// No live `chat.conversations` row (with its current `chat.generation_states`
+    /// row) exists for the requested id under the transaction. Fail-closed: an
+    /// absent conversation can never yield an existing-head witness.
+    #[error("clean-chat conversation head is absent")]
+    ConversationMissing,
+    /// A stored column fell outside the protocol integer/byte-length domain the
+    /// guard requires (safe-integer range or 32-byte crypto column).
+    #[error("clean-chat conversation head column is out of domain")]
+    OutOfDomain,
+    /// The current generation-state lifecycle string was neither `active` nor
+    /// `superseded`. Never defaulted — an unknown value fails closed.
+    #[error("clean-chat conversation head lifecycle is not canonical")]
+    NonCanonicalLifecycle,
+    /// The locked row-set did not satisfy the guard invariant (e.g. a
+    /// caller-supplied `locked_at` that is not a whole millisecond, or a
+    /// non-canonical conversation id).
+    #[error("clean-chat conversation head guard invariant was violated")]
+    GuardInvariant,
+    #[error("clean-chat conversation head database error: {0}")]
+    Database(#[from] sqlx::Error),
+}
+
+/// Transaction-local identity digest over exactly the guard-exposed columns of a
+/// locked conversation head, in this module's domain-separated, length-prefixed
+/// `*_digest` style.
+///
+/// This is NOT a durable cross-transaction commitment: it exists only so a head
+/// re-derived from the SAME locked read compares equal under the
+/// `HydrationAuthority` head-equality checks. `LockedConversationHeadGuard::from_locked_row`
+/// accepts any non-zero digest (it does not recompute one), so this function is
+/// the sole definition of the head witness's identity within a transaction.
+#[allow(dead_code)]
+fn conversation_head_guard_digest(
+    transaction_id: &str,
+    conversation_id: Uuid,
+    prior_coordinate: Option<&PublicGroupSnapshotCoordinate>,
+    next_entry_seq: u64,
+    locked_at: DateTime<Utc>,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"CATBIRD-CHAT-LOCKED-CONVERSATION-HEAD\0");
+    digest.update((transaction_id.len() as u64).to_be_bytes());
+    digest.update(transaction_id.as_bytes());
+    digest.update(conversation_id.as_bytes());
+    match prior_coordinate {
+        None => digest.update([0]),
+        Some(coordinate) => {
+            digest.update([1]);
+            digest.update(coordinate.generation().to_be_bytes());
+            digest.update(coordinate.state_version().to_be_bytes());
+            digest.update(coordinate.group_id());
+            digest.update(coordinate.epoch().to_be_bytes());
+            digest.update(coordinate.group_context_hash());
+            digest.update(coordinate.confirmation_tag());
+            digest.update([match coordinate.lifecycle() {
+                super::super::snapshot::PublicGroupSnapshotLifecycle::Active => 1,
+                super::super::snapshot::PublicGroupSnapshotLifecycle::Superseded => 2,
+            }]);
+        }
+    }
+    digest.update(next_entry_seq.to_be_bytes());
+    digest.update(locked_at.timestamp_millis().to_be_bytes());
+    digest.finalize().into()
+}
+
+/// Lock and hydrate the head of an EXISTING conversation.
+///
+/// Serialization + freshness (coordinator ruling "T4-H2-pre G2 FORK RULING"):
+///   * `FOR UPDATE OF c` on `chat.conversations` is the head lock — the SAME
+///     single-row serialization point the append-log allocator takes
+///     (`repository::delivery::append_entry`, delivery.rs). Every head-advancing
+///     transition UPDATEs `chat.conversations` (`repository::transition` head
+///     CAS, transition.rs), so a concurrent advancer blocks on this row lock and
+///     the lock pins WHICH `chat.generation_states` row is current for the life
+///     of the transaction.
+///   * `chat.generation_states` is read as a plain (unlocked) row because it is
+///     INSERT-ONLY: the `generation_states_immutable` trigger (BEFORE UPDATE OR
+///     DELETE, migration `20260722000001_chat_protocol_core.sql`) forbids
+///     mutation, and lifecycle supersession is written to
+///     `chat.generations`/`chat.conversations`, never to `generation_states`. So
+///     the row selected by the `c`-pinned `current_generation` /
+///     `current_state_version` has immutable content under the `c` lock.
+///
+/// `locked_at` is the caller's single canonical trusted request instant (a whole
+/// millisecond), shared with the entry `received_at` and every sibling guard so
+/// the planner's head/entry/authority equality checks hold; a sub-millisecond or
+/// otherwise non-canonical value fails guard construction with `GuardInvariant`.
+#[allow(dead_code)]
+pub(crate) async fn hydrate_locked_conversation_head(
+    transaction: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    locked_at: DateTime<Utc>,
+) -> Result<LockedConversationHeadGuard, ConversationHeadHydrationError> {
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+
+    #[allow(clippy::type_complexity)]
+    let row: Option<(i64, i64, i64, Vec<u8>, i64, Vec<u8>, Vec<u8>, String)> = sqlx::query_as(
+        r#"
+        SELECT
+            c.current_generation,
+            c.current_state_version,
+            c.next_entry_seq,
+            gs.group_id,
+            gs.epoch,
+            gs.group_context_hash,
+            gs.confirmation_tag,
+            gs.lifecycle
+        FROM chat.conversations c
+        JOIN chat.generation_states gs
+          ON gs.conversation_id = c.conversation_id
+         AND gs.generation = c.current_generation
+         AND gs.state_version = c.current_state_version
+        WHERE c.conversation_id = $1
+        FOR UPDATE OF c
+        "#,
+    )
+    .bind(conversation_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let (
+        current_generation,
+        current_state_version,
+        stored_next_entry_seq,
+        group_id,
+        epoch,
+        group_context_hash,
+        confirmation_tag,
+        lifecycle,
+    ) = row.ok_or(ConversationHeadHydrationError::ConversationMissing)?;
+
+    let generation = safe_protocol_u64(current_generation)?;
+    let state_version = safe_protocol_u64(current_state_version)?;
+    let epoch = safe_protocol_u64(epoch)?;
+    let next_entry_seq = u64::try_from(stored_next_entry_seq)
+        .ok()
+        .filter(|value| (1..=MAX_PROTOCOL_INTEGER).contains(value))
+        .ok_or(ConversationHeadHydrationError::OutOfDomain)?;
+    let group_id: [u8; 32] = group_id
+        .try_into()
+        .map_err(|_| ConversationHeadHydrationError::OutOfDomain)?;
+    let group_context_hash: [u8; 32] = group_context_hash
+        .try_into()
+        .map_err(|_| ConversationHeadHydrationError::OutOfDomain)?;
+    let confirmation_tag: [u8; 32] = confirmation_tag
+        .try_into()
+        .map_err(|_| ConversationHeadHydrationError::OutOfDomain)?;
+    let lifecycle = match lifecycle.as_str() {
+        "active" => super::super::snapshot::PublicGroupSnapshotLifecycle::Active,
+        "superseded" => super::super::snapshot::PublicGroupSnapshotLifecycle::Superseded,
+        _ => return Err(ConversationHeadHydrationError::NonCanonicalLifecycle),
+    };
+
+    let prior_coordinate = PublicGroupSnapshotCoordinate::new(
+        *conversation_id.as_bytes(),
+        generation,
+        state_version,
+        group_id,
+        epoch,
+        group_context_hash,
+        confirmation_tag,
+        lifecycle,
+    );
+
+    let durable_row_digest = conversation_head_guard_digest(
+        &transaction_id,
+        conversation_id,
+        Some(&prior_coordinate),
+        next_entry_seq,
+        locked_at,
+    );
+
+    LockedConversationHeadGuard::from_locked_row(
+        transaction_id,
+        conversation_id,
+        Some(prior_coordinate),
+        next_entry_seq,
+        locked_at,
+        durable_row_digest,
+    )
+    .ok_or(ConversationHeadHydrationError::GuardInvariant)
+}
+
+#[allow(dead_code)]
+fn safe_protocol_u64(value: i64) -> Result<u64, ConversationHeadHydrationError> {
+    u64::try_from(value)
+        .ok()
+        .filter(|value| *value <= MAX_PROTOCOL_INTEGER)
+        .ok_or(ConversationHeadHydrationError::OutOfDomain)
 }
