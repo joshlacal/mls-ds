@@ -45,6 +45,10 @@ pub(crate) enum InventoryRepositoryError {
     RaceOrReuse,
     #[error("inventory page materialization is invalid")]
     InvalidMaterialization,
+    #[error(
+        "supplied conversation items do not match the repository's membership-guarded selection"
+    )]
+    InconsistentConversationSelection,
     #[error("device query names too many or zero DIDs")]
     RequestTooBroad,
     #[error(transparent)]
@@ -57,8 +61,9 @@ impl PartialEq for InventoryRepositoryError {
     fn eq(&self, other: &Self) -> bool {
         use InventoryRepositoryError::{
             BoundaryItemMismatch, Cursor, DeviceAuthorityMismatch, DomainAlreadyComplete,
-            DurableRowInvalid, InvalidMaterialization, ProtocolFenceMismatch, RaceOrReuse,
-            RequestTooBroad, SessionNotFound, SessionPresentationMismatch, TransactionMismatch,
+            DurableRowInvalid, InconsistentConversationSelection, InvalidMaterialization,
+            ProtocolFenceMismatch, RaceOrReuse, RequestTooBroad, SessionNotFound,
+            SessionPresentationMismatch, TransactionMismatch,
         };
         match (self, other) {
             (SessionNotFound, SessionNotFound)
@@ -71,6 +76,7 @@ impl PartialEq for InventoryRepositoryError {
             | (TransactionMismatch, TransactionMismatch)
             | (RaceOrReuse, RaceOrReuse)
             | (RequestTooBroad, RequestTooBroad)
+            | (InconsistentConversationSelection, InconsistentConversationSelection)
             | (InvalidMaterialization, InvalidMaterialization) => true,
             (Cursor(left), Cursor(right)) => left == right,
             _ => false,
@@ -1860,9 +1866,19 @@ pub(crate) enum RecoveryInventoryItem {
     },
 }
 
-/// The authenticated identity + session window + materialized domain contents for
-/// a `create_inventory_session` call. Every item's recipient is the session's
-/// exact `(user_did, device_id)`; the function binds them so.
+/// The authenticated identity + session window + domain contents for a
+/// `create_inventory_session` call. Every item's recipient is the session's exact
+/// `(user_did, device_id)`; the function binds them so.
+///
+/// Conversation-domain contract (selection-owning, ratified 2026-07-24): the
+/// repository SELECTS the membership-guarded conversation set itself (active
+/// `member_devices` for this device, under the fence) and binds `conversations` to
+/// that set by exact bijection — the caller supplies one payload per conversation
+/// id and cannot add, omit, or substitute a conversation. Only the per-conversation
+/// Task-4 wire encoding stays caller-supplied. `welcomes` / `recovery` remain
+/// caller-input in this interim (existence + exact-device-targeting FK-fail-closed);
+/// their full selection-ownership (Welcome payload from `welcome_bundles`, recovery
+/// from `leaf_recovery_requests`) is the routed remainder.
 #[derive(Clone, Debug)]
 pub(crate) struct CreateInventorySessionRequest<'a> {
     pub(crate) inventory_session_id: Uuid,
@@ -1872,6 +1888,10 @@ pub(crate) struct CreateInventorySessionRequest<'a> {
     pub(crate) auth_generation: u64,
     pub(crate) created_at: DateTime<Utc>,
     pub(crate) expires_at: DateTime<Utc>,
+    /// One payload per conversation the device is a current member of. The set of
+    /// ids MUST equal the repository's membership selection exactly (bijection),
+    /// or the call fails with `InconsistentConversationSelection`. Ordinals are
+    /// repository-assigned (`conversation_id` ascending), not this vec's order.
     pub(crate) conversations: Vec<ConversationInventoryItem>,
     pub(crate) welcomes: Vec<WelcomeInventoryItem>,
     pub(crate) recovery: Vec<RecoveryInventoryItem>,
@@ -2103,9 +2123,54 @@ pub(crate) async fn create_inventory_session(
     .await?;
 
     // 5. Materialize each domain with canonical ordinals 0..count-1.
-    for (ordinal, item) in request.conversations.iter().enumerate() {
+    //
+    // 5a. Conversation domain — the repository OWNS the visible set. Select, under
+    //     the captured fence, the conversations this device is a CURRENT member of
+    //     (an active `chat.member_devices` leaf), and bind the caller's supplied
+    //     payloads to that set by exact bijection: a selected conversation with no
+    //     supplied payload, or a supplied payload for a conversation the device is
+    //     not a current member of (or a duplicate), is a hard error. This makes a
+    //     non-member conversation unmaterializable (closes the r12 membership
+    //     Important) and makes status-currency + completeness repository-owned;
+    //     the ordinals are assigned in the repository's canonical order
+    //     (`conversation_id` ascending), not caller order. Only the per-conversation
+    //     Task-4 wire encoding stays caller-supplied.
+    let selected_conversation_ids: Vec<Uuid> = sqlx::query_scalar(
+        r#"
+        SELECT DISTINCT conversation_id
+          FROM chat.member_devices
+         WHERE user_did = $1 AND device_id = $2 AND active
+         ORDER BY conversation_id
+        "#,
+    )
+    .bind(request.user_did)
+    .bind(request.device_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+
+    let mut supplied_conversations: std::collections::BTreeMap<Uuid, &ConversationInventoryItem> =
+        std::collections::BTreeMap::new();
+    for item in &request.conversations {
+        if supplied_conversations
+            .insert(item.conversation_id, item)
+            .is_some()
+        {
+            // A duplicate conversation id in the caller's set.
+            return Err(InventoryRepositoryError::InconsistentConversationSelection);
+        }
+    }
+    if supplied_conversations.len() != selected_conversation_ids.len()
+        || !selected_conversation_ids
+            .iter()
+            .all(|id| supplied_conversations.contains_key(id))
+    {
+        return Err(InventoryRepositoryError::InconsistentConversationSelection);
+    }
+
+    for (ordinal, conversation_id) in selected_conversation_ids.iter().enumerate() {
         let ordinal =
             i64::try_from(ordinal).map_err(|_| InventoryRepositoryError::InvalidMaterialization)?;
+        let item = supplied_conversations[conversation_id];
         let payload_sha256: [u8; 32] = Sha256::digest(&item.payload_bytes).into();
         let (transition_id, fingerprint, terminal_seq) = match &item.schedule_terminal {
             Some(proof) => (
@@ -2127,7 +2192,7 @@ pub(crate) async fn create_inventory_session(
         )
         .bind(request.inventory_session_id)
         .bind(ordinal)
-        .bind(item.conversation_id)
+        .bind(*conversation_id)
         .bind(request.user_did)
         .bind(request.device_id)
         .bind(transition_id)

@@ -17,8 +17,61 @@ mod common;
 
 #[path = "../src/chat_protocol/model.rs"]
 mod model;
+#[path = "../src/chat_protocol/transcript.rs"]
+mod transcript;
 #[path = "../src/chat_protocol/validation.rs"]
 mod validation;
+
+// Full production-module prelude (mirrors `chat_protocol_executor.rs`) so the
+// shared `common::executor_seed` fulfillment-graph builders compile here and can
+// seed a coherent conversation + membership graph for the populated CREATE test.
+mod chat_protocol {
+    pub mod validation {
+        pub use crate::validation::*;
+    }
+    pub mod transcript {
+        pub use crate::transcript::*;
+    }
+    pub mod snapshot {
+        pub use catbird_server::chat_protocol::snapshot::*;
+    }
+    pub mod wire {
+        pub use catbird_server::chat_protocol::wire::*;
+    }
+    pub mod public_state {
+        #![allow(dead_code)]
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/chat_protocol/public_state.rs"
+        ));
+    }
+    pub mod repository {
+        pub mod transition {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/transition.rs"
+            ));
+        }
+        pub mod delivery {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/delivery.rs"
+            ));
+        }
+    }
+    pub mod state_machine {
+        #![allow(dead_code)]
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/chat_protocol/state_machine.rs"
+        ));
+    }
+}
+
+#[path = "common/executor_seed.rs"]
+mod executor_seed;
 
 mod repository {
     pub(crate) mod inventory {
@@ -51,9 +104,10 @@ use zeroize::Zeroizing;
 
 use repository::inventory::{
     create_device_inventory_session, create_inventory_session, get_devices,
-    CreateDeviceInventorySessionRequest, CreateInventorySessionRequest, DeviceInventorySubject,
-    EventTerminalHint, IntervalSummaryTerminalHint, InventoryRepositoryError,
-    InventorySummaryTerminalHint, TombstoneTerminalHint, MAX_GET_DEVICES_DIDS,
+    ConversationInventoryItem, CreateDeviceInventorySessionRequest, CreateInventorySessionRequest,
+    DeviceInventorySubject, EventTerminalHint, IntervalSummaryTerminalHint,
+    InventoryRepositoryError, InventorySummaryTerminalHint, TombstoneTerminalHint,
+    MAX_GET_DEVICES_DIDS,
 };
 use repository::ticket::{
     consume_subscription_ticket, mint_subscription_ticket, ticket_hash, MintSubscriptionTicket,
@@ -789,3 +843,106 @@ fn terminal_seq_hints_carry_no_fingerprint() {
 // cases above prove the CREATE transaction (fence capture, token derivation,
 // ordinal/digest/completion, and the deferred materialization + identity
 // triggers) end-to-end.
+
+// ===========================================================================
+// Populated conversation-domain selection + bijection (Seal B), driven by the
+// shared `common::executor_seed` fulfillment graph on a fresh per-run DB. The
+// committed creation makes alice a CURRENT member of exactly the seeded
+// conversation, so the repository's membership selection returns exactly it.
+// ===========================================================================
+
+/// The repository OWNS the conversation set: it selects the conversations the
+/// device is a current member of (active `member_devices`) under the fence and
+/// binds the caller's payloads by exact bijection. A member conversation with no
+/// supplied payload, and a payload for a non-member conversation, both reject; the
+/// exact member set materializes with a repository-assigned ordinal.
+#[tokio::test]
+#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
+async fn create_selects_and_bijection_binds_the_member_conversation() {
+    let (pool, _guard) = executor_seed::setup().await;
+    let scenario = executor_seed::run_fulfillment_scenario(&pool).await;
+    let codec = ensure_fence(&pool).await;
+    // `create_inventory_session` requires a whole-second `created_at` (the cursor
+    // codec rejects sub-second instants). Alice's member device was seeded mid-way
+    // through this same wall-clock second and `chat.devices` is immutable, so use
+    // the START of the NEXT whole second: it is >= the device's `created_at` (the
+    // deferred identity trigger's requirement) and still a whole second.
+    let now = whole_second(clock_now(&pool).await) + Duration::seconds(1);
+
+    // Alice (creator/admin) is a current member of exactly the seeded conversation;
+    // her device was seeded active with dpop_jkt == its key id.
+    let alice_did = scenario.fixture.alice_did.clone();
+    let alice_device = scenario.fixture.alice_device;
+    let alice_jkt = scenario.fixture.alice_key_id.clone();
+    let conversation_id = scenario.conversation_id;
+
+    let base = |conversations: Vec<ConversationInventoryItem>| CreateInventorySessionRequest {
+        inventory_session_id: Uuid::new_v4(),
+        user_did: &alice_did,
+        device_id: alice_device,
+        jkt: &alice_jkt,
+        auth_generation: 1,
+        created_at: now,
+        expires_at: now + Duration::minutes(10),
+        conversations,
+        welcomes: vec![],
+        recovery: vec![],
+    };
+
+    // (a) Supplying NO conversation payload for a member conversation → reject.
+    {
+        let mut tx = pool.begin().await.expect("begin reject-empty");
+        let err = create_inventory_session(&mut tx, &codec, base(vec![]))
+            .await
+            .expect_err("a member conversation with no supplied payload must reject");
+        assert_eq!(
+            err,
+            InventoryRepositoryError::InconsistentConversationSelection
+        );
+        tx.rollback().await.expect("rollback reject-empty");
+    }
+
+    // (b) A payload for a conversation the device is NOT a member of → reject.
+    {
+        let mut tx = pool.begin().await.expect("begin reject-nonmember");
+        let err = create_inventory_session(
+            &mut tx,
+            &codec,
+            base(vec![ConversationInventoryItem {
+                conversation_id: Uuid::new_v4(),
+                payload_bytes: vec![0x01, 0x02, 0x03],
+                schedule_terminal: None,
+            }]),
+        )
+        .await
+        .expect_err("a payload for a non-member conversation must reject");
+        assert_eq!(
+            err,
+            InventoryRepositoryError::InconsistentConversationSelection
+        );
+        tx.rollback().await.expect("rollback reject-nonmember");
+    }
+
+    // (c) Supplying exactly the member conversation materializes it (count 1),
+    //     committing past the deferred materialization + identity triggers.
+    {
+        let mut tx = pool.begin().await.expect("begin accept");
+        let created = create_inventory_session(
+            &mut tx,
+            &codec,
+            base(vec![ConversationInventoryItem {
+                conversation_id,
+                payload_bytes: vec![0xAB; 16],
+                schedule_terminal: None,
+            }]),
+        )
+        .await
+        .expect("the exact member conversation materializes");
+        tx.commit()
+            .await
+            .expect("commit past deferred materialization + identity triggers");
+        assert_eq!(created.conversation_item_count, 1);
+        assert_eq!(created.welcome_item_count, 0);
+        assert_eq!(created.recovery_item_count, 0);
+    }
+}
