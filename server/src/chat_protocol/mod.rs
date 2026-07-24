@@ -70,7 +70,7 @@ pub mod error;
 pub(crate) mod model;
 pub(crate) mod public_state;
 pub(crate) mod relationship_policy;
-mod repository;
+pub(crate) mod repository;
 pub mod snapshot;
 pub(crate) mod state_machine;
 pub(crate) mod transcript;

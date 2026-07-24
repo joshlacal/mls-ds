@@ -1,4 +1,5 @@
 // Handler modules for API endpoints
+pub mod chat;
 pub mod ds;
 mod federation_mode_admin;
 mod federation_peers_admin;

@@ -73,6 +73,10 @@ struct AppState {
     ack_signer: Option<Arc<federation::AckSigner>>,
     device_client: Arc<federation::DeviceRecordClient>,
     blob_store: blob_store::BlobStore,
+    // Clean-cutover chat (`blue.catbird.chat.*`) shared runtime: cutover gate +
+    // trusted Nest verifier. Extracted by chat handlers via
+    // `State<Arc<ChatRuntime>>` through `#[derive(FromRef)]`.
+    chat_runtime: Arc<catbird_server::handlers::chat::ChatRuntime>,
 }
 
 fn receipt_did_document_router<S>(document: Option<serde_json::Value>) -> Router<S>
@@ -128,6 +132,12 @@ const DOUBLE_MLS_ARTIFACT_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 const TRIPLE_MLS_ARTIFACT_BODY_LIMIT_BYTES: usize = 44 * 1024 * 1024;
 const DEVICE_REGISTRATION_BODY_LIMIT_BYTES: usize = 20 * 1024 * 1024;
 const KEY_PACKAGE_BATCH_BODY_LIMIT_BYTES: usize = 10 * 1024 * 1024;
+// Clean-chat enroll/replenish carry up to 100 KeyPackages
+// (`blue.catbird.chat.defs#keyPackageArtifact.bytes` maxLength 65536 ×
+// `keyPackages` maxLength 100), which base64-expand (4/3) to ~8.4 MiB of JSON
+// plus the signed-request envelope; 12 MiB gives headroom without truncating a
+// valid maximal batch (OQ-10).
+const CHAT_KEY_PACKAGE_BATCH_BODY_LIMIT_BYTES: usize = 12 * 1024 * 1024;
 const INGRESS_BODY_BUDGET_MIB: usize = 64;
 const BYTES_PER_INGRESS_PERMIT: usize = 1024 * 1024;
 const DEFAULT_REQUEST_BODY_READ_TIMEOUT_MS: u64 = 15_000;
@@ -230,6 +240,9 @@ fn request_body_limit(path: &str) -> usize {
         "/xrpc/blue.catbird.mlsChat.registerDevice" => DEVICE_REGISTRATION_BODY_LIMIT_BYTES,
         "/xrpc/blue.catbird.mlsChat.publishKeyPackages"
         | "/xrpc/blue.catbird.mlsChat.syncKeyPackages" => KEY_PACKAGE_BATCH_BODY_LIMIT_BYTES,
+        "/xrpc/blue.catbird.chat.enrollDevice" | "/xrpc/blue.catbird.chat.replenishKeyPackages" => {
+            CHAT_KEY_PACKAGE_BATCH_BODY_LIMIT_BYTES
+        }
         // These routes carry one potentially large MLS byte string. Federation
         // peers receive the same allowance as local clients so forwarding does
         // not truncate an otherwise valid message, Welcome, or commit.
@@ -896,6 +909,16 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Clean-cutover chat runtime. Pre-cutover this needs no Nest configuration;
+    // once CHAT_CUTOVER_ENABLED is set the verifier config becomes mandatory and
+    // its absence fails startup loudly rather than silently 500-ing requests.
+    let chat_runtime = Arc::new(
+        catbird_server::handlers::chat::ChatRuntime::from_env().unwrap_or_else(|error| {
+            tracing::error!("clean-chat runtime configuration rejected: {error}");
+            std::process::exit(1);
+        }),
+    );
+
     let app_state = AppState {
         db_pool: db_pool.clone(),
         sse_state,
@@ -915,6 +938,7 @@ async fn main() -> anyhow::Result<()> {
         ack_signer,
         device_client,
         blob_store: blob_store.clone(),
+        chat_runtime,
     };
 
     // Start federation queue worker (only when federation is enabled)
@@ -1316,6 +1340,13 @@ async fn main() -> anyhow::Result<()> {
     // generated XRPC layer validate Content-Type and throw on empty headers before
     // they can inspect the status code. Applying this to the merged app covers all
     // three sub-routers without having to patch every handler.
+    // Clean-cutover chat router (`blue.catbird.chat.*`), isolated from the
+    // superseded mlsChat namespace. Merged into base so it inherits the shared
+    // idempotency/body-budget/content-type/logging middleware stack.
+    let chat_router =
+        catbird_server::handlers::chat::chat_router::<AppState>().with_state(app_state.clone());
+    let base_router = base_router.merge(chat_router);
+
     let app = merge_application_routers(
         base_router,
         mls_chat_router,
@@ -1378,6 +1409,30 @@ mod tests {
     async fn consume_body(body: Bytes) -> StatusCode {
         let _ = body;
         StatusCode::NO_CONTENT
+    }
+
+    #[test]
+    fn clean_chat_body_limit_tiers_match_declared_artifact_sizes() {
+        // enroll/replenish carry up to 100 KeyPackages
+        // (`blue.catbird.chat.defs#keyPackageArtifact.bytes` maxLength 65536 ×
+        // `keyPackages` maxLength 100), base64-expanded — the 12 MiB tier (OQ-10).
+        assert_eq!(
+            request_body_limit("/xrpc/blue.catbird.chat.enrollDevice"),
+            CHAT_KEY_PACKAGE_BATCH_BODY_LIMIT_BYTES
+        );
+        assert_eq!(
+            request_body_limit("/xrpc/blue.catbird.chat.replenishKeyPackages"),
+            CHAT_KEY_PACKAGE_BATCH_BODY_LIMIT_BYTES
+        );
+        // Small signed-body procedures fall through to the default tier.
+        assert_eq!(
+            request_body_limit("/xrpc/blue.catbird.chat.rebindDeviceAuthentication"),
+            DEFAULT_REQUEST_BODY_LIMIT_BYTES
+        );
+        assert_eq!(
+            request_body_limit("/xrpc/blue.catbird.chat.revokeDevice"),
+            DEFAULT_REQUEST_BODY_LIMIT_BYTES
+        );
     }
 
     #[tokio::test]
