@@ -1781,5 +1781,14 @@ pub(crate) async fn get_devices(
     .fetch_all(&mut **transaction)
     .await?;
 
+    // The `<= MAX_GET_DEVICES_DIDS` DID bound and the per-DID `ROW_NUMBER()` cap of
+    // `MAX_DEVICES_PER_DID` structurally bound the response to `MAX_GET_DEVICES_TOTAL`
+    // rows. Assert that invariant defensively: an over-count could only come from a
+    // schema/window regression, and a directory read must never return an unbounded
+    // page.
+    if rows.len() > MAX_GET_DEVICES_TOTAL {
+        return Err(InventoryRepositoryError::RequestTooBroad);
+    }
+
     Ok(rows)
 }

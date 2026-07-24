@@ -36,7 +36,8 @@ mod cursor {
     ));
 }
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -96,6 +97,137 @@ async fn seed_active_device(pool: &PgPool, did: &str, at: DateTime<Utc>) -> Uuid
     .execute(pool)
     .await
     .expect("insert active device");
+    device_id
+}
+
+fn fresh_blob() -> Vec<u8> {
+    let mut b = Uuid::new_v4().as_bytes().to_vec();
+    b.extend_from_slice(Uuid::new_v4().as_bytes());
+    b
+}
+
+/// Seed a coherent REVOKED device (self-revocation) for `did`: an active device
+/// with its single device key, then the full revocation graph the deferred
+/// `assert_device_revocation_mapping` trigger requires — a `revokeDevice`
+/// idempotency receipt, the `device_revocations` row, and the target device/key
+/// terminalization. `get_devices` must exclude the result (status `<> 'active'`
+/// / `revoked_at IS NOT NULL`).
+async fn seed_revoked_device(pool: &PgPool, did: &str, created_at: DateTime<Utc>) -> Uuid {
+    let device_id = Uuid::new_v4();
+    let jkt = fresh_jkt(pool).await;
+    let public_key = fresh_blob();
+    let key_id: String = sqlx::query_scalar("SELECT chat.ed25519_key_id($1)")
+        .bind(&public_key)
+        .fetch_one(pool)
+        .await
+        .expect("derive key id");
+
+    sqlx::query(
+        "INSERT INTO chat.devices(user_did,device_id,device_name,status,dpop_jkt,auth_generation,capabilities,created_at,updated_at) \
+         VALUES($1,$2,'dev-revoked','active',$3,1,chat.protocol_capabilities(),$4,$4)",
+    )
+    .bind(did)
+    .bind(device_id)
+    .bind(&jkt)
+    .bind(created_at)
+    .execute(pool)
+    .await
+    .expect("insert active device to revoke");
+    sqlx::query(
+        "INSERT INTO chat.device_keys(user_did,device_id,key_id,signing_public_key,enrollment_auth_generation,created_at) \
+         VALUES($1,$2,$3,$4,1,$5)",
+    )
+    .bind(did)
+    .bind(device_id)
+    .bind(&key_id)
+    .bind(&public_key)
+    .bind(created_at)
+    .execute(pool)
+    .await
+    .expect("insert device key");
+
+    // Self-revocation: the actor is the same device/key as the target. The
+    // revocation is accepted strictly after creation so every `created_at <=
+    // accepted_at` binding holds.
+    let accepted_at = created_at + Duration::seconds(30);
+    let revocation_id = Uuid::new_v4();
+    let accepted_request_bytes = fresh_blob();
+    let signing_transcript_bytes = fresh_blob();
+    let request_digest: [u8; 32] = Sha256::digest(&signing_transcript_bytes).into();
+    let signature = [3_u8; 64];
+    let response = br#"{"revoked":true}"#;
+    let response_sha256: [u8; 32] = Sha256::digest(response).into();
+
+    let mut tx = pool.begin().await.expect("begin revocation");
+    sqlx::query(
+        r#"
+        INSERT INTO chat.idempotency_records (
+            principal_did, endpoint_nsid, operation_id, request_digest,
+            accepted_request_bytes, signing_transcript_bytes, signature,
+            completed_status, response_bytes, response_sha256,
+            historical_jkt, completed_at
+        ) VALUES ($1,'blue.catbird.chat.revokeDevice',$2,$3,$4,$5,$6,200,$7,$8,$9,$10)
+        "#,
+    )
+    .bind(did)
+    .bind(revocation_id)
+    .bind(request_digest.as_slice())
+    .bind(&accepted_request_bytes)
+    .bind(&signing_transcript_bytes)
+    .bind(signature.as_slice())
+    .bind(response.as_slice())
+    .bind(response_sha256.as_slice())
+    .bind(&jkt)
+    .bind(accepted_at)
+    .execute(&mut *tx)
+    .await
+    .expect("insert revokeDevice receipt");
+    sqlx::query(
+        r#"
+        INSERT INTO chat.device_revocations (
+            revocation_id, actor_did, actor_device_id, actor_key_id,
+            actor_auth_generation, target_did, target_device_id,
+            target_auth_generation, accepted_request_bytes,
+            signing_transcript_bytes, request_digest, signature,
+            signed_at, accepted_at
+        ) VALUES ($1,$2,$3,$4,1,$2,$3,1,$5,$6,$7,$8,$9,$9)
+        "#,
+    )
+    .bind(revocation_id)
+    .bind(did)
+    .bind(device_id)
+    .bind(&key_id)
+    .bind(&accepted_request_bytes)
+    .bind(&signing_transcript_bytes)
+    .bind(request_digest.as_slice())
+    .bind(signature.as_slice())
+    .bind(accepted_at)
+    .execute(&mut *tx)
+    .await
+    .expect("insert device revocation");
+    sqlx::query(
+        "UPDATE chat.devices SET status='revoked', updated_at=$3, revoked_at=$3, revocation_id=$4 \
+         WHERE user_did=$1 AND device_id=$2",
+    )
+    .bind(did)
+    .bind(device_id)
+    .bind(accepted_at)
+    .bind(revocation_id)
+    .execute(&mut *tx)
+    .await
+    .expect("revoke target device");
+    sqlx::query(
+        "UPDATE chat.device_keys SET revoked_at=$3, revocation_id=$4 WHERE user_did=$1 AND device_id=$2",
+    )
+    .bind(did)
+    .bind(device_id)
+    .bind(accepted_at)
+    .bind(revocation_id)
+    .execute(&mut *tx)
+    .await
+    .expect("revoke target device key");
+    tx.commit().await.expect("commit revocation");
+
     device_id
 }
 
@@ -166,4 +298,33 @@ async fn get_devices_returns_active_devices_scoped_to_requested_dids() {
         3,
         "exactly the three active in-scope devices"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires the dedicated clean-chat PostgreSQL database"]
+async fn get_devices_excludes_revoked_devices() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let now = clock_now(&pool).await;
+
+    let did = random_plc_did();
+    seed_principal(&pool, &did, now).await;
+    let active = seed_active_device(&pool, &did, now).await;
+    let revoked = seed_revoked_device(&pool, &did, now).await;
+
+    let mut tx = pool.begin().await.expect("begin");
+    let devices = get_devices(&mut tx, &[did.clone()])
+        .await
+        .expect("get_devices executes");
+    tx.rollback().await.expect("rollback");
+
+    let returned: std::collections::HashSet<Uuid> = devices.iter().map(|d| d.device_id).collect();
+    assert!(returned.contains(&active), "the active device is returned");
+    assert!(
+        !returned.contains(&revoked),
+        "a revoked device must be excluded by the status/revoked_at predicate"
+    );
+    for d in &devices {
+        assert_eq!(d.status, "active", "every returned device is active");
+        assert_eq!(d.user_did, did);
+    }
 }

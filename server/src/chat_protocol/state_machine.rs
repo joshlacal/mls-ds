@@ -19588,10 +19588,15 @@ mod executor {
     ///
     /// The leave-request `stale` terminal edge binds the STALING transition's own
     /// request digest (`assert_leave_request_mapping` requires
-    /// `terminal_request_digest == transition.request_digest` and the terminal
-    /// transition kind to be NOT `leaveCommit`/`leavePolicy`); the reset-request
-    /// `stale` edge needs only the transition id + instant. Returns the per-family
-    /// staled counts for the caller's reconciliation.
+    /// `terminal_request_digest == transition.request_digest`). Per ADR-019
+    /// Erratum 01 the terminal transition may be of ANY kind, INCLUDING
+    /// `leaveCommit`/`leavePolicy`: the coordinate-binding invariant governs, so a
+    /// coordinate-advancing leave-kind transition stales OTHER members'
+    /// predecessor-bound pending leave requests (the `fulfilled`-not-`stale`
+    /// distinction for the request the transition fulfills is enforced here in the
+    /// executor, not the DDL). The reset-request `stale` edge needs only the
+    /// transition id + instant. Returns the per-family staled counts for the
+    /// caller's reconciliation.
     async fn write_prior_bound_staling(
         transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         effects: &TransitionEffects,
