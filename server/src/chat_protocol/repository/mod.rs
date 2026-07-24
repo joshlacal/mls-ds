@@ -21,3 +21,7 @@ pub(crate) mod transition;
 // `super::repository::{delivery,welcome}`.
 #[allow(dead_code)]
 pub(crate) mod welcome;
+// `ticket` (Slice 4c) is the subscription-ticket mint + one-use consume surface
+// on the NEW `chat.subscription_tickets` table. Not yet wired to a handler.
+#[allow(dead_code)]
+pub(crate) mod ticket;
