@@ -48,8 +48,6 @@ pub(crate) enum TicketRepositoryError {
     /// The subscription path presented at consume did not match the ticket's
     /// bound path.
     PathMismatch,
-    /// A session/ticket integer fell outside the protocol's safe-integer range.
-    SafeIntegerOverflow,
     /// No unexpired, unconsumed ticket matched the consume CAS. The follow-up
     /// classification distinguishes the exact reason.
     TicketNotFound,

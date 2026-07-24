@@ -154,6 +154,23 @@ fn map_row_rejects_completed_missing_terminal_fields() {
 }
 
 #[test]
+fn map_row_rejects_superseded_missing_terminal_fields() {
+    // 'superseded' requires exactly one terminal id + a terminal instant; a bare
+    // superseded row is not a legal member of the union.
+    assert!(matches!(
+        map_row(&base_row("superseded")),
+        Err(WelcomeRepositoryError::MalformedRecoveryWorkVariant)
+    ));
+    // A terminal instant with neither terminal id also rejects.
+    let mut at_only = base_row("superseded");
+    at_only.terminal_at = Some(Utc::now());
+    assert!(matches!(
+        map_row(&at_only),
+        Err(WelcomeRepositoryError::MalformedRecoveryWorkVariant)
+    ));
+}
+
+#[test]
 fn map_row_rejects_both_terminal_ids_set() {
     let mut both = base_row("superseded");
     both.terminal_transition_id = Some(Uuid::new_v4());

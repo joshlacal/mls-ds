@@ -45,8 +45,10 @@ use super::delivery::RecoveryWorkSourceKind;
 pub(crate) enum WelcomeRepositoryError {
     /// A database error escaped the transaction/query.
     Database(sqlx::Error),
-    /// A claimed or read row carried an `expires_at` / coordinate integer outside
-    /// the protocol's safe-integer range, so it cannot be returned as a `u64`.
+    /// A claimed or read row carried a negative `generation`, `state_version`, or
+    /// `transition_seq`. Those columns are schema-checked safe integers, so a
+    /// negative value can only mean corruption; the row is rejected rather than
+    /// surfaced as a nonsensical coordinate.
     SafeIntegerOverflow,
     /// A `chat.recovery_work_items` row could not be mapped to exactly one closed
     /// `recoveryWorkView` variant: its `(status, terminal_transition_id,
