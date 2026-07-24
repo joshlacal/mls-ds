@@ -8918,3 +8918,82 @@ async fn concurrent_reset_activation_yields_one_commit_zero_residue() {
         "the winning activation consumed the request"
     );
 }
+
+/// Duplicate DIRECT creation returns the typed `existingDirectConversationResult`,
+/// not a second conversation. `concurrent_duplicate_creation_yields_one_commit`
+/// covers the raw head-PK collision for a group; this covers the planner's
+/// dedicated direct-pair short-circuit: given an existing active direct
+/// conversation for a pair, a fresh creation command for that SAME unordered pair
+/// resolves to `CreationDecision::ExistingDirect` carrying the EXISTING
+/// conversation's id + coordinate, with no new plan produced.
+#[tokio::test]
+async fn duplicate_direct_creation_returns_typed_existing_direct_result() {
+    let (pool, _db) = setup().await;
+    let fixture = build_creation(&pool, ConversationKind::Direct).await;
+    let manifest = corpus_manifest();
+
+    // A fresh creation command for the SAME (alice, bob) direct pair.
+    let new_conversation = Uuid::new_v4();
+    let template = verified_genesis(&manifest);
+    let coordinate =
+        coordinate_with_conversation(&genesis_coordinate(&manifest), *new_conversation.as_bytes());
+    let public_state = ActivePublicState::for_test(&template, coordinate);
+    let transition_id = Uuid::new_v4();
+    let received_at = ServerTimestamp::from_unix_millis_for_test(
+        manifest.evaluation_unix_seconds as i64 * 1_000 + 5_000,
+    )
+    .unwrap();
+    let alice_sig_key: Vec<u8> =
+        hex::decode(&manifest.identity.alice.signature_public_key_hex).unwrap();
+    let alice_key_id_bytes: [u8; 32] = Sha256::digest(&alice_sig_key).into();
+    let metadata = MetadataSnapshotBinding::for_test_creation(
+        *new_conversation.as_bytes(),
+        0,
+        0,
+        *coordinate.group_context_hash(),
+        *transition_id.as_bytes(),
+        1,
+        fixture.alice_id.clone(),
+        alice_key_id_bytes,
+        alice_sig_key.clone().try_into().unwrap(),
+        1,
+        1,
+        [0x77_u8; 12],
+        vec![0x88_u8; 48],
+    );
+    let evidence = TransitionEvidence::for_test_creation_with_metadata(
+        1,
+        *transition_id.as_bytes(),
+        [0x11_u8; 32],
+        received_at,
+        ConversationKind::Direct,
+        coordinate,
+        fixture.alice_id.clone(),
+        metadata,
+    )
+    .unwrap();
+    let command = CreationCommand {
+        kind: ConversationKind::Direct,
+        creator: fixture.alice_id.clone(),
+        invitees: vec![fixture.bob_id.principal().clone()],
+        transition: evidence,
+        public_state,
+    };
+
+    // The existing direct state short-circuits: typed ExistingDirect, no new plan.
+    let decision = plan_creation(Some(&fixture.state), command).expect("planner decides");
+    match decision {
+        CreationDecision::ExistingDirect {
+            conversation_id, ..
+        } => {
+            assert_eq!(
+                conversation_id,
+                *fixture.conversation_id.as_bytes(),
+                "existingDirectConversationResult points at the existing direct conversation",
+            );
+        }
+        CreationDecision::Create(_) => {
+            panic!("a duplicate direct pair must short-circuit to ExistingDirect, not Create")
+        }
+    }
+}
