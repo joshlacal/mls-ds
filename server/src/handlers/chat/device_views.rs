@@ -151,6 +151,15 @@ pub(super) fn extract_key_packages(
 /// an invalid key package, an over-limit device is the inventory limit, an empty
 /// batch is a malformed request, and a revoked/absent owner is the device-state
 /// code. Storage faults never carry a protocol code.
+///
+/// Reachable-code note (M-3): this is a SHARED superset mapper, not every arm is
+/// reachable from every caller. On the fresh-enroll path the device + key are
+/// inserted active in the same transaction before `publish_key_packages`, so
+/// `OwnerRevoked`/`OwnerKeyMissing` (→ `DeviceRevoked`/`DeviceNotRegistered`,
+/// which enrollDevice does not declare) cannot fire there; if a future change
+/// ever made one reachable for a caller that does not declare it,
+/// `ChatFailure::protocol` downgrades it to `InvariantViolation`/500 (OQ-11) — no
+/// undeclared code can cross the boundary.
 pub(super) fn key_package_failure(
     endpoint: ChatEndpoint,
     error: KeyPackageRepositoryError,

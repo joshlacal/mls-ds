@@ -298,6 +298,13 @@ pub(crate) fn replay_response(completed: &CompletedIdempotentResponse) -> Respon
 /// at the call site. Codes the endpoint does not declare are downgraded to an
 /// internal invariant violation by [`ChatFailure::protocol`] (OQ-11); storage
 /// and corrupt-record failures never carry a protocol code.
+///
+/// Reachable-code note (M-3): this is a SHARED superset used by every admit
+/// class, so a given endpoint reaches only the subset its auth flow can produce
+/// (e.g. `DeviceAlreadyExists` is reachable only from the enrollment bootstrap;
+/// `RequestBindingMismatch`→`InvalidRequest` from a signed idempotency-key reuse
+/// with a mutated body). Any pair the caller does not declare is downgraded by
+/// `ChatFailure::protocol`, so this superset can never leak an undeclared code.
 pub(crate) fn auth_repository_failure(
     endpoint: ChatEndpoint,
     error: AuthRepositoryError,

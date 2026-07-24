@@ -204,11 +204,12 @@ fn requester_auth_generation(
 }
 
 /// The OQ-8 ceiling surface: HTTP 503 + `Retry-After`. getOwnDevices declares no
-/// retryable protocol code, so no wire vocabulary is emitted.
+/// retryable protocol code, so no wire vocabulary is emitted — only a
+/// transport-generic name matching the 503 status (Inf-1).
 fn retry_ceiling_response() -> Response {
     let mut response = (
         StatusCode::SERVICE_UNAVAILABLE,
-        axum::Json(serde_json::json!({ "error": "InternalServerError" })),
+        axum::Json(serde_json::json!({ "error": "ServiceUnavailable" })),
     )
         .into_response();
     response

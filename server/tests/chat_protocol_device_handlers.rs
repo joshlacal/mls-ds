@@ -149,17 +149,25 @@ fn xrpc(nsid: &str) -> String {
 }
 
 async fn send(router: Router, request: Request<Body>) -> (StatusCode, Value) {
-    let response = router.oneshot(request).await.expect("router response");
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("collect response body");
+    let (status, bytes) = send_raw(router, request).await;
     let value = if bytes.is_empty() {
         Value::Null
     } else {
         serde_json::from_slice(&bytes).unwrap_or(Value::Null)
     };
     (status, value)
+}
+
+/// Like [`send`] but returns the exact response bytes, so a test can assert
+/// byte-identical idempotent replay (not merely structurally-equal JSON) — the
+/// OQ-3 verbatim-replay contract (M-1).
+async fn send_raw(router: Router, request: Request<Body>) -> (StatusCode, Vec<u8>) {
+    let response = router.oneshot(request).await.expect("router response");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("collect response body");
+    (status, bytes.to_vec())
 }
 
 fn get(nsid: &str) -> Request<Body> {
@@ -658,6 +666,21 @@ async fn enroll_device_happy_path_publishes_batch_and_conforms_to_read_back() {
     assert_eq!(device["status"], "active");
     assert_eq!(device["deviceId"], device_id.to_string());
 
+    // Full-field-set conformance (M-4): the enroll deviceView carries exactly the
+    // declared deviceView fields — no missing field, no extra.
+    let device_obj = device.as_object().expect("device object");
+    for field in DEVICE_VIEW_FIELDS {
+        assert!(
+            device_obj.contains_key(*field),
+            "deviceView missing {field}"
+        );
+    }
+    assert_eq!(
+        device_obj.len(),
+        DEVICE_VIEW_FIELDS.len(),
+        "no extra deviceView fields"
+    );
+
     // RULED conformance: the post-enroll device_directory read must report exactly
     // the counts the response returned.
     let mut tx = pool.begin().await.expect("begin read-back");
@@ -676,6 +699,28 @@ async fn enroll_device_happy_path_publishes_batch_and_conforms_to_read_back() {
         device["reservedPackageCount"].as_i64().unwrap(),
         view.reserved_package_count
     );
+    // M-4: assert the WHOLE deviceView field set against the stored row (parity
+    // with the rebind read-back), not just the counts — keyId, signaturePublicKey,
+    // dpopJkt, status, authGeneration, and createdAt must equal the persisted
+    // device (Option A builds this view by hand, so this pins every hand-set field
+    // to the certified projection).
+    assert_eq!(view.key_id, device["keyId"].as_str().unwrap());
+    assert_eq!(view.dpop_jkt, device["dpopJkt"].as_str().unwrap());
+    assert_eq!(view.status, device["status"].as_str().unwrap());
+    assert_eq!(
+        view.auth_generation,
+        device["authGeneration"].as_i64().unwrap()
+    );
+    assert_eq!(
+        device["signaturePublicKey"]["$bytes"].as_str().unwrap(),
+        STANDARD.encode(&view.signing_public_key),
+        "returned signaturePublicKey == stored signing key"
+    );
+    assert_eq!(
+        device["createdAt"],
+        jacquard_created_at(&view),
+        "returned createdAt == stored created_at"
+    );
     tx.rollback().await.ok();
 }
 
@@ -686,11 +731,19 @@ async fn enroll_device_replay_returns_verbatim_stored_bytes() {
     let scenario = EnrollScenario::build(2);
     // Same enrollment body, fresh grant each time (response-loss retry). The second
     // call is an idempotent replay returning the exact stored response bytes.
-    let (status_1, body_1) = send(router_with(pool.clone(), true), scenario.fresh_request()).await;
-    assert_eq!(status_1, StatusCode::OK, "first enroll: {body_1}");
-    let (status_2, body_2) = send(router_with(pool.clone(), true), scenario.fresh_request()).await;
-    assert_eq!(status_2, StatusCode::OK, "replay enroll: {body_2}");
-    assert_eq!(body_1, body_2, "replay returns the exact stored response");
+    let (status_1, bytes_1) =
+        send_raw(router_with(pool.clone(), true), scenario.fresh_request()).await;
+    assert_eq!(status_1, StatusCode::OK, "first enroll status");
+    let (status_2, bytes_2) =
+        send_raw(router_with(pool.clone(), true), scenario.fresh_request()).await;
+    assert_eq!(status_2, StatusCode::OK, "replay enroll status");
+    // OQ-3 verbatim contract (M-1): assert byte-for-byte equality, not merely a
+    // structural JSON compare (two different serializations parsing to the same
+    // Value would pass a Value-compare but violate the byte-stable replay contract).
+    assert_eq!(
+        bytes_1, bytes_2,
+        "idempotent replay returns byte-identical stored response"
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -794,8 +847,19 @@ fn query_request(scenario: &EnrollScenario, nsid: &str, query_suffix: &str) -> R
 }
 
 /// Build a signed replenishment body carrying `count` fresh, real key packages
-/// signed under the device's registered key.
+/// signed under the device's registered key, with a fresh random idempotency key.
 fn replenishment_wrapper(scenario: &EnrollScenario, count: usize) -> Vec<u8> {
+    replenishment_wrapper_keyed(scenario, count, &uuid::Uuid::new_v4().to_string())
+}
+
+/// Like [`replenishment_wrapper`] but with a caller-pinned `idempotency_key`, so a
+/// test can send two DIFFERENT bodies under the SAME key to exercise the
+/// request-binding-mismatch path (M-2).
+fn replenishment_wrapper_keyed(
+    scenario: &EnrollScenario,
+    count: usize,
+    idempotency_key: &str,
+) -> Vec<u8> {
     let credential = format!("{}#{}", scenario.did, scenario.device_id);
     let now = chrono::Utc::now().timestamp();
     let mut built: Vec<MlsKeyPackage> = (0..count)
@@ -835,7 +899,7 @@ fn replenishment_wrapper(scenario: &EnrollScenario, count: usize) -> Vec<u8> {
         "keyId": key_id,
         "keyPackages": packages,
         "signaturePublicKey": STANDARD.encode(scenario.device_signing.verifying_key().as_bytes()),
-        "idempotencyKey": uuid::Uuid::new_v4().to_string(),
+        "idempotencyKey": idempotency_key,
         "signedAt": canonical_timestamp(0),
     });
     sign_chat_body(body, &scenario.device_signing)
@@ -944,6 +1008,49 @@ async fn replenish_key_packages_adds_to_inventory_and_matches_wire_golden() {
         "read-back == returned count"
     );
     tx.rollback().await.ok();
+}
+
+#[tokio::test]
+#[ignore]
+async fn replenish_same_idempotency_key_different_body_is_invalid_request() {
+    // Negative idempotency at the handler boundary (M-2): a second signed request
+    // that reuses a completed idempotency key but carries a DIFFERENT body must not
+    // replay the stored response — the repository rejects the conflicting reuse and
+    // the handler surfaces the declared `IdempotencyConflict` (the observed repo
+    // mapping for a same-key/different-body reuse; `IdempotencyConflict` is declared
+    // by replenishKeyPackages). This locks the handler↔repo mapping one layer above
+    // the certified `chat_protocol_auth` coverage.
+    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let scenario = enroll_fresh_device(&pool, 2).await;
+    let idempotency_key = uuid::Uuid::new_v4().to_string();
+    let nsid = "blue.catbird.chat.replenishKeyPackages";
+
+    // First request under key K: three fresh packages, succeeds.
+    let first = replenishment_wrapper_keyed(&scenario, 3, &idempotency_key);
+    let (status, body) = send(
+        router_with(pool.clone(), true),
+        signed_request(&scenario, nsid, &first),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "first replenish: {body}");
+
+    // Same key K, a DIFFERENT body (two distinct fresh packages) with a fresh DPoP
+    // grant: not a verbatim replay, so the binding check rejects it.
+    let second = replenishment_wrapper_keyed(&scenario, 2, &idempotency_key);
+    let (status, body) = send(
+        router_with(pool.clone(), true),
+        signed_request(&scenario, nsid, &second),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "mismatched-body replay status: {body}"
+    );
+    assert_eq!(
+        body["error"], "IdempotencyConflict",
+        "mismatched-body replay error"
+    );
 }
 
 #[tokio::test]

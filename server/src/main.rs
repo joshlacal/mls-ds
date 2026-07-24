@@ -1635,6 +1635,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clean_chat_enroll_body_limit_tier_is_enforced_through_merged_router() {
+        // M-5: the 12 MiB key-package-batch tier (OQ-10) is not merely returned by
+        // `request_body_limit` — it is actually ENFORCED by the merged router's
+        // body-limit layer. `chat_router` is merged into the base router before
+        // `merge_application_routers`, so register the enroll route on the base
+        // router exactly as production assembly does.
+        let base_router =
+            Router::new().route("/xrpc/blue.catbird.chat.enrollDevice", post(consume_body));
+        let app = merge_application_routers(
+            base_router,
+            Router::new(),
+            Router::new(),
+            lazy_test_pool(),
+            test_ingress_policy(),
+        );
+
+        // Over the 12 MiB tier → 413.
+        let over = app
+            .clone()
+            .oneshot(
+                Request::post("/xrpc/blue.catbird.chat.enrollDevice")
+                    .body(Body::from(vec![
+                        0_u8;
+                        CHAT_KEY_PACKAGE_BATCH_BODY_LIMIT_BYTES + 1
+                    ]))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(over.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // Above the 4 MiB default but within the 12 MiB tier → admitted (204),
+        // proving the elevated tier is applied to this route, not the default.
+        let within = app
+            .clone()
+            .oneshot(
+                Request::post("/xrpc/blue.catbird.chat.enrollDevice")
+                    .body(Body::from(vec![0_u8; 4 * 1024 * 1024 + 1]))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(within.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
     async fn idempotency_policy_preserves_optional_contract_and_enrollment_bypass() {
         let mls_chat_router = Router::new()
             .route("/xrpc/blue.catbird.mlsChat.testPolicy", post(consume_body))
