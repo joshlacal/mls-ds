@@ -6719,6 +6719,166 @@ async fn zero_leaf_leave_commits_immediate_self_removal() {
     assert_eq!(before, after, "zero-leaf leave replay left zero residue");
 }
 
+/// Concern-2 completeness for the third arm: a zeroLeafLeave (bob, pending/leafless,
+/// self-removing) executed from a coordinate where the active member alice has an
+/// OPEN leaf-recovery request supersedes it — request superseded / reservation
+/// released / package reactivated — while still removing bob. zeroLeafLeave owns
+/// none of the recovery families (own == default), same as policy; its LEAVE-request
+/// staling half stays fail-closed (deferred Concerns 1/3), untouched here.
+#[tokio::test]
+async fn zero_leaf_leave_supersedes_prior_open_recovery_request() {
+    let (pool, _db) = setup().await;
+    let fixture = build_creation(&pool, ConversationKind::Group).await;
+    let conversation_id = fixture.conversation_id;
+    let bob_id = fixture.bob_id.clone();
+    let bob_did = fixture.bob_did.clone();
+    let bob_device = Uuid::from_bytes(*bob_id.device_id());
+    {
+        let mut tx = pool.begin().await.expect("begin creation");
+        apply_conversation_persistence_plan(&mut tx, &fixture.plan, &fixture.ctx)
+            .await
+            .expect("creation applies");
+        tx.commit().await.expect("creation COMMIT");
+    }
+
+    // Alice (active) opens an entry-less recovery request (eval+2000), then bob's
+    // zeroLeafLeave (eval+3000, strictly after) supersedes it.
+    let (rr_state, alice_rid, alice_ref) = seed_alice_open_recovery(&pool, &fixture).await;
+
+    let bob_period: Uuid = sqlx::query_scalar(
+        "SELECT participant_period_id FROM chat.participants WHERE conversation_id=$1 AND user_did=$2 AND current_membership",
+    )
+    .bind(conversation_id)
+    .bind(&bob_did)
+    .fetch_one(&pool)
+    .await
+    .expect("bob participant period");
+    let received_at = ServerTimestamp::from_unix_millis_for_test(
+        corpus_manifest().evaluation_unix_seconds as i64 * 1_000 + 3_000,
+    )
+    .unwrap();
+    let transition_id = Uuid::new_v4();
+    let evidence =
+        TransitionEvidence::for_test_at(2, *transition_id.as_bytes(), [0x82_u8; 32], received_at)
+            .unwrap();
+    let planned = plan_zero_leaf_leave(
+        &rr_state,
+        ZeroLeafLeave {
+            actor: bob_id.clone(),
+            transition: evidence,
+        },
+    )
+    .expect("valid zero-leaf leave plan over a co-open recovery request");
+    let entry_id = Uuid::new_v4();
+    let head_cas = ConversationHeadCasBinding::for_test_edge(
+        *conversation_id.as_bytes(),
+        *entry_id.as_bytes(),
+        fixture.coordinate,
+        2,
+        received_at,
+    );
+    let plan = persistence_plan_for_test(planned, head_cas);
+    let applied_at = clock_now(&pool).await;
+    let transcript = vec![0x92_u8; 16];
+    let ctx = ExecutionContext {
+        protocol_instance_id: fixture.protocol_instance_id,
+        applied_at,
+        actor: ExecutionActor {
+            user_did: bob_did.clone(),
+            device_id: bob_device,
+            key_id: fixture.bob_key_id.clone(),
+            auth_generation: 1,
+            role: TransitionActorRole::Member,
+            device_status: "active".to_owned(),
+        },
+        entry: ControlEntryContent {
+            entry_id,
+            entry_kind: "blue.catbird.chat.defs#zeroLeafLeaveEntry".to_owned(),
+            accepted_payload_bytes: vec![0x94_u8; 8],
+            accepted_payload_sha256: Sha256::digest([0x94_u8; 8]).to_vec(),
+            signed_request_bytes: transcript.clone(),
+            unsigned_projection_bytes: vec![0x95_u8; 8],
+            signing_transcript_bytes: transcript.clone(),
+            request_digest: Sha256::digest(&transcript).to_vec(),
+            signature: vec![0x96_u8; 64],
+            server_fields_bytes: vec![0x97_u8; 8],
+            outer_entry_fingerprint: vec![0x1C_u8; 32],
+        },
+        spine: SpineArtifacts {
+            public_snapshot_bytes: vec![0xE1_u8; 16],
+            public_snapshot_sha256: Sha256::digest([0xE1_u8; 16]).to_vec(),
+            tree_summary_bytes: vec![0xE2_u8; 16],
+            tree_summary_sha256: Sha256::digest([0xE2_u8; 16]).to_vec(),
+            leaf_count: 1,
+            genesis_group_info_bytes: vec![],
+            genesis_group_info_sha256: vec![],
+        },
+        opened_leaves: vec![],
+        metadata_author: None,
+        participant_period_ids: vec![],
+        leaf_period_ids: vec![],
+        entry_recipients: entry_audience(&fixture.alice_id, &fixture.alice_did, &bob_id, &bob_did),
+        events: vec![EventFanout {
+            event_id: Uuid::new_v4(),
+            event_kind: EventKind::ConversationChanged,
+            payload_bytes: vec![0x98_u8; 8],
+            recipients: event_audience(
+                &pool,
+                &fixture.alice_id,
+                &fixture.alice_did,
+                &bob_id,
+                &bob_did,
+            )
+            .await,
+            outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+        }],
+        closing_leaf_periods: vec![],
+        closing_participant_periods: vec![(bob_id.clone(), bob_period)],
+        reset_request_row: None,
+        recovery_open: None,
+        welcome_expiry: None,
+        welcome_response: None,
+        welcome_dispositions: vec![],
+    };
+
+    let mut tx = pool.begin().await.expect("begin zero-leaf leave");
+    apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+        .await
+        .expect("zero-leaf leave over a co-open recovery request applies");
+    tx.commit()
+        .await
+        .expect("zero-leaf leave COMMIT past all deferred triggers");
+
+    // bob removed + alice's recovery superseded / released / reactivated.
+    let bob_current: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.participants WHERE conversation_id=$1 AND user_did=$2 AND current_membership",
+    )
+    .bind(conversation_id)
+    .bind(&bob_did)
+    .fetch_one(&pool)
+    .await
+    .expect("bob membership");
+    assert_eq!(bob_current, 0, "bob self-removed");
+    let (alice_status, alice_res, alice_pkg): (String, String, String) = sqlx::query_as(
+        "SELECT (SELECT status FROM chat.leaf_recovery_requests WHERE recovery_request_id=$1), \
+                (SELECT status FROM chat.key_package_reservations WHERE recovery_request_id=$1), \
+                (SELECT status FROM chat.key_packages WHERE key_package_ref=$2)",
+    )
+    .bind(alice_rid)
+    .bind(alice_ref.to_vec())
+    .fetch_one(&pool)
+    .await
+    .expect("alice superseded recovery state");
+    assert_eq!(
+        (
+            alice_status.as_str(),
+            alice_res.as_str(),
+            alice_pkg.as_str()
+        ),
+        ("superseded", "released", "available")
+    );
+}
+
 #[tokio::test]
 async fn leave_fulfillment_commits_remove_and_supersedes_pending_welcome() {
     let (pool, _db) = setup().await;
