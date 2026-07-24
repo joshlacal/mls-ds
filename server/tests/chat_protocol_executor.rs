@@ -4021,6 +4021,194 @@ async fn acceptance_supersedes_prior_open_recovery_request() {
     );
 }
 
+/// Review follow-up: acceptance's kind (`acceptConversation`) is DB-legal as the
+/// terminal authority for a reset-request `stale` edge (reset staling has no kind
+/// restriction), so a bob acceptance executed while the active member alice has a
+/// co-pending reset request STALES it — exactly like apply_policy. Before the fix
+/// `apply_acceptance` rejected reset_request_changes (mis-bundled into the deferred
+/// leave-kind Concern 1/3), hard-erroring this reachable, fail-closed case.
+#[tokio::test]
+async fn acceptance_stales_prior_pending_reset_request() {
+    let (pool, _db) = setup().await;
+    let fixture = commit_creation(&pool, ConversationKind::Group).await;
+    let conversation_id = fixture.conversation_id;
+    let bob_device = Uuid::from_bytes(*fixture.bob_id.device_id());
+
+    // Alice (active) files a reset request (control entry, seq 2, eval+2000); bob's
+    // acceptance (seq 3, eval+3000, coordinate still sv 0) stales it.
+    let reset_received = ServerTimestamp::from_unix_millis_for_test(
+        corpus_manifest().evaluation_unix_seconds as i64 * 1_000 + 2_000,
+    )
+    .unwrap();
+    let (reset_state, reset_request_id) =
+        commit_reset_request(&pool, &fixture, 2, reset_received).await;
+
+    let bob_period: Uuid = sqlx::query_scalar(
+        "SELECT participant_period_id FROM chat.participants WHERE conversation_id=$1 AND user_did=$2 AND current_membership",
+    )
+    .bind(conversation_id)
+    .bind(&fixture.bob_did)
+    .fetch_one(&pool)
+    .await
+    .expect("bob participant period");
+    let bob_key_id = fixture.bob_key_id.clone();
+    let key_package_ref = random_ref32();
+    let package_not_after = seed_key_package(
+        &pool,
+        &fixture.bob_did,
+        bob_device,
+        &bob_key_id,
+        &key_package_ref,
+    )
+    .await;
+    let received_at = ServerTimestamp::from_unix_millis_for_test(
+        corpus_manifest().evaluation_unix_seconds as i64 * 1_000 + 3_000,
+    )
+    .unwrap();
+    let pkg_not_after_ts = ServerTimestamp::from_unix_millis_for_test(
+        corpus_manifest().evaluation_unix_seconds as i64 * 1_000 + 3_600_000,
+    )
+    .unwrap();
+    let entry_id = Uuid::new_v4();
+    let transition_id = Uuid::new_v4();
+    let recovery_request_id = *Uuid::new_v4().as_bytes();
+    let evidence = TransitionEvidence::for_test_acceptance(
+        3,
+        *transition_id.as_bytes(),
+        [0x16_u8; 32],
+        received_at,
+        fixture.coordinate,
+        recovery_request_id,
+        fixture.bob_id.clone(),
+        fixture.creation_transition_id,
+        fixture.alice_id.clone(),
+        key_package_ref,
+        Sha256::digest([0x62_u8; 32]).into(),
+        1,
+        pkg_not_after_ts,
+    )
+    .unwrap();
+    let planned = plan_accept_conversation(
+        &reset_state,
+        AcceptConversation {
+            actor: fixture.bob_id.clone(),
+            transition: evidence,
+            recovery_request_id,
+            key_package_ref,
+            package_not_after: pkg_not_after_ts,
+        },
+    )
+    .expect("valid acceptance plan over a co-pending reset request");
+    let head_cas = ConversationHeadCasBinding::for_test_edge(
+        *conversation_id.as_bytes(),
+        *entry_id.as_bytes(),
+        fixture.coordinate,
+        3,
+        received_at,
+    );
+    let plan = persistence_plan_for_test(planned, head_cas);
+    let applied_at = clock_now(&pool).await;
+    let payload = vec![0xA1_u8; 12];
+    let transcript = vec![0xA2_u8; 12];
+    let ctx = ExecutionContext {
+        protocol_instance_id: fixture.protocol_instance_id,
+        applied_at,
+        actor: ExecutionActor {
+            user_did: fixture.bob_did.clone(),
+            device_id: bob_device,
+            key_id: bob_key_id.clone(),
+            auth_generation: 1,
+            role: TransitionActorRole::Member,
+            device_status: "active".to_owned(),
+        },
+        entry: ControlEntryContent {
+            entry_id,
+            entry_kind: "blue.catbird.chat.defs#participantAcceptanceEntry".to_owned(),
+            accepted_payload_bytes: payload.clone(),
+            accepted_payload_sha256: Sha256::digest(&payload).to_vec(),
+            signed_request_bytes: transcript.clone(),
+            unsigned_projection_bytes: vec![0xA3_u8; 8],
+            signing_transcript_bytes: transcript.clone(),
+            request_digest: Sha256::digest(&transcript).to_vec(),
+            signature: vec![0xA4_u8; 64],
+            server_fields_bytes: vec![0xA5_u8; 8],
+            outer_entry_fingerprint: vec![0x16_u8; 32],
+        },
+        spine: SpineArtifacts {
+            public_snapshot_bytes: vec![0xB1_u8; 16],
+            public_snapshot_sha256: Sha256::digest([0xB1_u8; 16]).to_vec(),
+            tree_summary_bytes: vec![0xB2_u8; 16],
+            tree_summary_sha256: Sha256::digest([0xB2_u8; 16]).to_vec(),
+            leaf_count: 1,
+            genesis_group_info_bytes: vec![],
+            genesis_group_info_sha256: vec![],
+        },
+        opened_leaves: vec![],
+        metadata_author: None,
+        participant_period_ids: vec![],
+        leaf_period_ids: vec![],
+        entry_recipients: entry_audience(
+            &fixture.alice_id,
+            &fixture.alice_did,
+            &fixture.bob_id,
+            &fixture.bob_did,
+        ),
+        events: vec![EventFanout {
+            event_id: Uuid::new_v4(),
+            event_kind: EventKind::ConversationChanged,
+            payload_bytes: vec![0xB4_u8; 8],
+            recipients: event_audience(
+                &pool,
+                &fixture.alice_id,
+                &fixture.alice_did,
+                &fixture.bob_id,
+                &fixture.bob_did,
+            )
+            .await,
+            outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+        }],
+        closing_leaf_periods: vec![],
+        closing_participant_periods: vec![],
+        reset_request_row: None,
+        recovery_open: Some(RecoveryOpenContext {
+            participant_period_id: Some(bob_period),
+            package_not_after,
+            replaced_leaf_period_id: None,
+        }),
+        welcome_expiry: None,
+        welcome_response: None,
+        welcome_dispositions: vec![],
+    };
+
+    let mut tx = pool.begin().await.expect("begin acceptance");
+    apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+        .await
+        .expect("acceptance that stales a co-pending reset request applies");
+    tx.commit()
+        .await
+        .expect("acceptance COMMIT past all deferred triggers");
+
+    // bob promoted, alice's reset request staled bound to the acceptance transition.
+    let bob_status: String = sqlx::query_scalar(
+        "SELECT status FROM chat.participants WHERE conversation_id=$1 AND user_did=$2 AND current_membership",
+    )
+    .bind(conversation_id)
+    .bind(&fixture.bob_did)
+    .fetch_one(&pool)
+    .await
+    .expect("bob participant");
+    assert_eq!(bob_status, "active");
+    let (reset_status, reset_tid): (String, Option<Uuid>) = sqlx::query_as(
+        "SELECT status,terminal_transition_id FROM chat.reset_requests WHERE reset_request_id=$1",
+    )
+    .bind(reset_request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("reset terminal");
+    assert_eq!(reset_status, "stale");
+    assert_eq!(reset_tid, Some(transition_id));
+}
+
 #[tokio::test]
 async fn leaf_recovery_replace_request_commits_without_advancing_coordinate() {
     let (pool, _db) = setup().await;

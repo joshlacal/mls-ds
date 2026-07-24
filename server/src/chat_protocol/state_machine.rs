@@ -18514,16 +18514,19 @@ mod executor {
         // `resolve_prior_bound_work` (via `plan_accept_conversation_inner`), so it CAN
         // carry (a legal interleaving) prior-coordinate open-work SUPERSESSIONS — a
         // DIFFERENT member's open recovery request (Open->Superseded) + reservation
-        // (Active->Released) + reserved package (Reserved->Available), and a prior
-        // pending Welcome (Pending->Superseded) — consumed via the shared writers at
-        // the tail. The own vs superseded partition is proven by the own-counts below
-        // + the reconciliation. reset/leave staling stays fail-closed (deferred
-        // Concerns 1/3). Every family the acceptance never carries is a hard error.
+        // (Active->Released) + reserved package (Reserved->Available), a prior pending
+        // Welcome (Pending->Superseded), AND a prior-bound pending reset/leave request
+        // (Pending->Stale). The own vs superseded partition is proven by the own-counts
+        // below + the reconciliation; acceptance owns NO reset/leave edge (own 0 for
+        // both). The `acceptConversation` kind is DB-LEGAL as the terminal authority
+        // for both stale edges — reset staling has no kind restriction, and
+        // `assert_leave_request_mapping` forbids only `leaveCommit`/`leavePolicy` (the
+        // deferred Concerns 1/3 wall applies to zero-leaf-leave + leave-fulfillment
+        // ONLY, not acceptance). So reset/leave staling is wired here exactly like
+        // apply_policy. Every family the acceptance never carries is a hard error.
         reject_if_present("leaf_changes", effects.leaf_changes())?;
         reject_if_present("interval_changes", effects.interval_changes())?;
         reject_if_present("terminal_proof_changes", effects.terminal_proof_changes())?;
-        reject_if_present("reset_request_changes", effects.reset_request_changes())?;
-        reject_if_present("leave_request_changes", effects.leave_request_changes())?;
         reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
         if effects.metadata_change().is_some() {
             return Err(ExecutorError::UnsupportedEffect(
@@ -18761,6 +18764,19 @@ mod executor {
             write_prior_bound_supersessions(transaction, effects, transition_id, applied_at)
                 .await?;
         superseded.welcomes = write_welcome_supersessions(transaction, ctx, effects).await?;
+        // Stale any prior-bound pending reset/leave request the acceptance retired
+        // (own 0 — acceptance creates/consumes neither; kind `acceptConversation` is
+        // DB-legal for both stale edges), exactly like apply_policy.
+        let staled = write_prior_bound_staling(
+            transaction,
+            effects,
+            transition_id,
+            &ctx.entry.request_digest,
+            applied_at,
+        )
+        .await?;
+        superseded.reset_requests = staled.reset_requests;
+        superseded.leave_requests = staled.leave_requests;
         reconcile_coordinate_change_families(
             effects,
             &FamilyCounts {
