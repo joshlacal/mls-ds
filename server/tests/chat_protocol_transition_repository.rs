@@ -59,20 +59,20 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use repository::transition::{
-    cas_key_package_status, cas_participant_pending_to_active, close_leaf_period,
-    insert_generation_state_row, insert_leaf_period, insert_leaf_recovery_request,
-    insert_leave_request, insert_metadata_snapshot, insert_participant_period, insert_reservation,
-    insert_reset_request, insert_transition_row, terminalize_leaf_recovery_request,
-    terminalize_leave_request, terminalize_participant_period, terminalize_reservation,
-    terminalize_reset_request, GenerationStateKind, GenerationStateLifecycle, LeafClose,
-    LeafOrigin, LeafRecoveryKind, LeafRecoverySource, LeafRecoveryTermination,
-    LeaveRequestTermination, MetadataAvatarBinding, NewGenerationState, NewLeafPeriod,
-    NewLeafRecoveryRequest, NewLeaveRequest, NewMetadataSnapshot, NewParticipantPeriod,
-    NewReservation, NewResetRequest, NewTransition, PackageStatus, PackageSuccessor,
-    ParticipantAcceptance, ParticipantAcceptanceCas, ParticipantInvitation, ParticipantRole,
-    ParticipantStatus, ParticipantTerminalization, ReservationTermination, ResetReason,
-    ResetRequestTermination, TransitionActorRole, TransitionCoordinates, TransitionKind,
-    TransitionRepositoryError,
+    cas_key_package_status, cas_participant_pending_to_active, cas_registration_revoke,
+    close_leaf_period, insert_device_revocation, insert_generation_state_row, insert_leaf_period,
+    insert_leaf_recovery_request, insert_leave_request, insert_metadata_snapshot,
+    insert_participant_period, insert_reservation, insert_reset_request, insert_transition_row,
+    terminalize_leaf_recovery_request, terminalize_leave_request, terminalize_participant_period,
+    terminalize_reservation, terminalize_reset_request, GenerationStateKind,
+    GenerationStateLifecycle, LeafClose, LeafOrigin, LeafRecoveryKind, LeafRecoverySource,
+    LeafRecoveryTermination, LeaveRequestTermination, MetadataAvatarBinding, NewDeviceRevocation,
+    NewGenerationState, NewLeafPeriod, NewLeafRecoveryRequest, NewLeaveRequest,
+    NewMetadataSnapshot, NewParticipantPeriod, NewReservation, NewResetRequest, NewTransition,
+    PackageStatus, PackageSuccessor, ParticipantAcceptance, ParticipantAcceptanceCas,
+    ParticipantInvitation, ParticipantRole, ParticipantStatus, ParticipantTerminalization,
+    RegistrationRevoke, ReservationTermination, ResetReason, ResetRequestTermination,
+    TransitionActorRole, TransitionCoordinates, TransitionKind, TransitionRepositoryError,
 };
 
 use repository::delivery::{
@@ -2219,5 +2219,226 @@ async fn recovery_work_item_insert_and_terminalize_are_cas_guarded() {
         ),
         "a second work item for the same source_id must violate recovery_work_items_source_uq"
     );
+    tx.rollback().await.unwrap();
+}
+
+/// The signed material + identities a device revocation binds. Seeded fresh
+/// (in-tx) so the never-truncated clean-chat DB stays independent between runs.
+struct RevocationPrereqs {
+    revocation_id: Uuid,
+    did: String,
+    device_id: Uuid,
+    key_id: String,
+    auth_generation: i64,
+    accepted_at: DateTime<Utc>,
+    accepted_request_bytes: Vec<u8>,
+    signing_transcript_bytes: Vec<u8>,
+    request_digest: Vec<u8>,
+    signature: Vec<u8>,
+}
+
+/// Seed a principal + one active device + its single device key **inside the
+/// caller's transaction** (self-revoke: actor == target), and optionally the
+/// `revokeDevice` idempotency receipt the `enforce_device_revocation_mapping`
+/// COMMIT trigger requires. Everything rolls back with the caller's tx.
+async fn seed_revocation_prereqs_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    with_receipt: bool,
+) -> RevocationPrereqs {
+    let did = random_plc_did();
+    let device_id = Uuid::new_v4();
+    let public_key = random_ref();
+    let key_id: String = sqlx::query_scalar("SELECT chat.ed25519_key_id($1)")
+        .bind(&public_key)
+        .fetch_one(&mut **tx)
+        .await
+        .expect("derive key id");
+    let accepted_at: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&mut **tx)
+        .await
+        .expect("sample clock");
+    let created_at = accepted_at - Duration::hours(1);
+
+    sqlx::query("INSERT INTO chat.principals(user_did,created_at) VALUES($1,$2)")
+        .bind(&did)
+        .bind(created_at)
+        .execute(&mut **tx)
+        .await
+        .expect("seed principal");
+    sqlx::query(
+        "INSERT INTO chat.devices(user_did,device_id,device_name,status,dpop_jkt,auth_generation,capabilities,created_at,updated_at) \
+         VALUES($1,$2,'target','active',$3,1,chat.protocol_capabilities(),$4,$4)",
+    )
+    .bind(&did)
+    .bind(device_id)
+    .bind(&key_id)
+    .bind(created_at)
+    .execute(&mut **tx)
+    .await
+    .expect("seed device");
+    sqlx::query(
+        "INSERT INTO chat.device_keys(user_did,device_id,key_id,signing_public_key,enrollment_auth_generation,created_at) \
+         VALUES($1,$2,$3,$4,1,$5)",
+    )
+    .bind(&did)
+    .bind(device_id)
+    .bind(&key_id)
+    .bind(&public_key)
+    .bind(created_at)
+    .execute(&mut **tx)
+    .await
+    .expect("seed device key");
+
+    let revocation_id = Uuid::new_v4();
+    let signing_transcript_bytes = random_ref();
+    let request_digest = Sha256::digest(&signing_transcript_bytes).to_vec();
+    let accepted_request_bytes = random_ref();
+    let signature = vec![0x5a_u8; 64];
+
+    if with_receipt {
+        let response_bytes = b"revokeDevice-ok".to_vec();
+        let response_sha256 = Sha256::digest(&response_bytes).to_vec();
+        sqlx::query(
+            r#"
+            INSERT INTO chat.idempotency_records(
+                principal_did, endpoint_nsid, operation_id, request_digest,
+                accepted_request_bytes, signing_transcript_bytes, signature,
+                completed_status, response_bytes, response_sha256, event_position,
+                historical_jkt, current_jkt, completed_at
+            ) VALUES($1,'blue.catbird.chat.revokeDevice',$2,$3,$4,$5,$6,200,$7,$8,NULL,$9,NULL,$10)
+            "#,
+        )
+        .bind(&did)
+        .bind(revocation_id)
+        .bind(&request_digest)
+        .bind(&accepted_request_bytes)
+        .bind(&signing_transcript_bytes)
+        .bind(&signature)
+        .bind(&response_bytes)
+        .bind(&response_sha256)
+        // revokeDevice requires historical_jkt NOT NULL / current_jkt NULL; the
+        // device key id is a valid base64url-sha256 thumbprint.
+        .bind(&key_id)
+        .bind(accepted_at)
+        .execute(&mut **tx)
+        .await
+        .expect("seed revokeDevice receipt");
+    }
+
+    RevocationPrereqs {
+        revocation_id,
+        did,
+        device_id,
+        key_id,
+        auth_generation: 1,
+        accepted_at,
+        accepted_request_bytes,
+        signing_transcript_bytes,
+        request_digest,
+        signature,
+    }
+}
+
+fn new_device_revocation(p: &RevocationPrereqs) -> NewDeviceRevocation {
+    NewDeviceRevocation {
+        revocation_id: p.revocation_id,
+        // Self-revoke: actor device == target device (a first-class spec op).
+        actor_did: p.did.clone(),
+        actor_device_id: p.device_id,
+        actor_key_id: p.key_id.clone(),
+        actor_auth_generation: p.auth_generation,
+        target_did: p.did.clone(),
+        target_device_id: p.device_id,
+        target_auth_generation: p.auth_generation,
+        accepted_request_bytes: p.accepted_request_bytes.clone(),
+        signing_transcript_bytes: p.signing_transcript_bytes.clone(),
+        request_digest: p.request_digest.clone(),
+        signature: p.signature.clone(),
+        signed_at: p.accepted_at,
+        accepted_at: p.accepted_at,
+    }
+}
+
+fn registration_revoke(p: &RevocationPrereqs) -> RegistrationRevoke {
+    RegistrationRevoke {
+        target_did: p.did.clone(),
+        target_device_id: p.device_id,
+        expected_auth_generation: p.auth_generation,
+        revocation_id: p.revocation_id,
+        revoked_at: p.accepted_at,
+    }
+}
+
+#[tokio::test]
+async fn device_revocation_insert_and_registration_revoke_commit_past_the_mapping_trigger() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+
+    // Fire the DEFERRED `enforce_device_revocation_mapping` trigger via
+    // `SET CONSTRAINTS ALL IMMEDIATE` inside a rolled-back tx — the full footprint
+    // is present, so the check passes; nothing commits, so nothing leaks.
+    let mut tx = pool.begin().await.unwrap();
+    let p = seed_revocation_prereqs_tx(&mut tx, true).await;
+    insert_device_revocation(&mut tx, &new_device_revocation(&p))
+        .await
+        .expect("insert revocation row");
+    cas_registration_revoke(&mut tx, &registration_revoke(&p))
+        .await
+        .expect("revoke registration");
+
+    // Committed state as the trigger sees it: registration revoked, key revoked.
+    let (status, revoked_at, rev_id): (String, Option<DateTime<Utc>>, Option<Uuid>) = sqlx::query_as(
+        "SELECT status, revoked_at, revocation_id FROM chat.devices WHERE user_did=$1 AND device_id=$2",
+    )
+    .bind(&p.did)
+    .bind(p.device_id)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("target device row");
+    assert_eq!(status, "revoked");
+    assert_eq!(revoked_at, Some(p.accepted_at));
+    assert_eq!(rev_id, Some(p.revocation_id));
+    let (key_revoked_at, key_rev_id): (Option<DateTime<Utc>>, Option<Uuid>) = sqlx::query_as(
+        "SELECT revoked_at, revocation_id FROM chat.device_keys WHERE user_did=$1 AND device_id=$2",
+    )
+    .bind(&p.did)
+    .bind(p.device_id)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("target device key row");
+    assert_eq!(key_revoked_at, Some(p.accepted_at));
+    assert_eq!(key_rev_id, Some(p.revocation_id));
+
+    sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
+        .execute(&mut *tx)
+        .await
+        .expect("full target footprint satisfies enforce_device_revocation_mapping");
+    tx.rollback().await.unwrap();
+
+    // Negative: an identical revocation WITHOUT the `revokeDevice` receipt fails
+    // the mapping trigger (provenance is missing) at the deferred check.
+    let mut tx = pool.begin().await.unwrap();
+    let p = seed_revocation_prereqs_tx(&mut tx, false).await;
+    insert_device_revocation(&mut tx, &new_device_revocation(&p))
+        .await
+        .expect("insert revocation row");
+    cas_registration_revoke(&mut tx, &registration_revoke(&p))
+        .await
+        .expect("revoke registration");
+    let deferred = sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
+        .execute(&mut *tx)
+        .await;
+    assert!(
+        deferred.is_err(),
+        "a revocation missing its revokeDevice receipt must fail enforce_device_revocation_mapping"
+    );
+    tx.rollback().await.unwrap();
+
+    // Negative: the registration revoke CAS conflicts if the device is not active
+    // at the expected auth generation (wrong generation matches no row).
+    let mut tx = pool.begin().await.unwrap();
+    let p = seed_revocation_prereqs_tx(&mut tx, true).await;
+    let mut wrong = registration_revoke(&p);
+    wrong.expected_auth_generation = 999;
+    conflict(cas_registration_revoke(&mut tx, &wrong).await);
     tx.rollback().await.unwrap();
 }

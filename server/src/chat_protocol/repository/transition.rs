@@ -1492,6 +1492,153 @@ pub(crate) async fn cas_key_package_status(
 }
 
 // ===========================================================================
+// Family 6b — chat.device_revocations + the target-registration revoke.
+//
+// A device revocation is a global authority op: one signed `revokeDevice`
+// inserts an immutable `chat.device_revocations` row and revokes the target's
+// registration (`chat.devices` active -> revoked + its single `chat.device_keys`
+// row). The `terminal_revocation_id` FKs on the work tables
+// (`key_packages` / `key_package_reservations` / `leaf_recovery_requests`) point
+// at the `device_revocations` row, and the DEFERRED
+// `enforce_device_revocation_mapping` COMMIT trigger requires the full target
+// footprint (revoked registration + exactly one revoked device key + a
+// `revokeDevice` idempotency receipt + no live/available/reserved target
+// packages, no open target requests, no active target reservations). These two
+// writers own the registration side; the work-row terminalizations reuse the
+// `SupersededByRevocation` / `ReleasedByRevocation` / `Revoke` arms above.
+// ===========================================================================
+
+/// The immutable `chat.device_revocations` row a signed `revokeDevice` accepts,
+/// carried column-for-column from the sealed DDL. The `request_digest =
+/// sha256(signing_transcript_bytes)` and time-window CHECKs are the DB's
+/// authority; the caller hands down the exact signed bytes.
+#[derive(Clone, Debug)]
+pub(crate) struct NewDeviceRevocation {
+    pub(crate) revocation_id: Uuid,
+    pub(crate) actor_did: String,
+    pub(crate) actor_device_id: Uuid,
+    pub(crate) actor_key_id: String,
+    pub(crate) actor_auth_generation: i64,
+    pub(crate) target_did: String,
+    pub(crate) target_device_id: Uuid,
+    pub(crate) target_auth_generation: i64,
+    pub(crate) accepted_request_bytes: Vec<u8>,
+    pub(crate) signing_transcript_bytes: Vec<u8>,
+    pub(crate) request_digest: Vec<u8>,
+    pub(crate) signature: Vec<u8>,
+    pub(crate) signed_at: DateTime<Utc>,
+    pub(crate) accepted_at: DateTime<Utc>,
+}
+
+/// Insert the immutable revocation row. A duplicate `revocation_id` (PK) or a
+/// second revocation of the same target (`device_revocations_one_per_target_uq`)
+/// propagates as a `Database` error — the row is append-only and a replay is a
+/// conflict, not a silent overwrite.
+pub(crate) async fn insert_device_revocation(
+    transaction: &mut Transaction<'_, Postgres>,
+    revocation: &NewDeviceRevocation,
+) -> Result<(), TransitionRepositoryError> {
+    sqlx::query(
+        r#"
+        INSERT INTO chat.device_revocations(
+            revocation_id, actor_did, actor_device_id, actor_key_id,
+            actor_auth_generation, target_did, target_device_id,
+            target_auth_generation, accepted_request_bytes,
+            signing_transcript_bytes, request_digest, signature,
+            signed_at, accepted_at
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+        "#,
+    )
+    .bind(revocation.revocation_id)
+    .bind(&revocation.actor_did)
+    .bind(revocation.actor_device_id)
+    .bind(&revocation.actor_key_id)
+    .bind(revocation.actor_auth_generation)
+    .bind(&revocation.target_did)
+    .bind(revocation.target_device_id)
+    .bind(revocation.target_auth_generation)
+    .bind(&revocation.accepted_request_bytes)
+    .bind(&revocation.signing_transcript_bytes)
+    .bind(&revocation.request_digest)
+    .bind(&revocation.signature)
+    .bind(revocation.signed_at)
+    .bind(revocation.accepted_at)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+/// The target-registration revoke a `device_revocations` insert authorizes. The
+/// `devices` row goes `active -> revoked` and both it and the single
+/// `device_keys` row bind `(revocation_id, revoked_at)`; the deferred
+/// `devices_revocation_fk` / `device_keys_revocation_fk` require these to equal
+/// the revocation row's `(revocation_id, target_auth_generation, accepted_at)`,
+/// so `revoked_at` MUST be the revocation's `accepted_at` and the device's
+/// `auth_generation` is left unchanged (it equals `expected_auth_generation`).
+#[derive(Clone, Debug)]
+pub(crate) struct RegistrationRevoke {
+    pub(crate) target_did: String,
+    pub(crate) target_device_id: Uuid,
+    pub(crate) expected_auth_generation: i64,
+    pub(crate) revocation_id: Uuid,
+    pub(crate) revoked_at: DateTime<Utc>,
+}
+
+/// Revoke the target device + its key. Two compare-and-sets: the `devices` row
+/// must be `active` at `expected_auth_generation`, and the `device_keys` row
+/// must be un-revoked; each must match exactly one row or the whole edge is a
+/// typed `CompareAndSetConflict`.
+pub(crate) async fn cas_registration_revoke(
+    transaction: &mut Transaction<'_, Postgres>,
+    revoke: &RegistrationRevoke,
+) -> Result<(), TransitionRepositoryError> {
+    let device = sqlx::query(
+        r#"
+        UPDATE chat.devices
+           SET status = 'revoked',
+               revoked_at = $4,
+               revocation_id = $5,
+               updated_at = $4
+         WHERE user_did = $1
+           AND device_id = $2
+           AND status = 'active'
+           AND auth_generation = $3
+        "#,
+    )
+    .bind(&revoke.target_did)
+    .bind(revoke.target_device_id)
+    .bind(revoke.expected_auth_generation)
+    .bind(revoke.revoked_at)
+    .bind(revoke.revocation_id)
+    .execute(&mut **transaction)
+    .await?;
+    if device.rows_affected() != 1 {
+        return Err(TransitionRepositoryError::CompareAndSetConflict);
+    }
+
+    let key = sqlx::query(
+        r#"
+        UPDATE chat.device_keys
+           SET revoked_at = $3,
+               revocation_id = $4
+         WHERE user_did = $1
+           AND device_id = $2
+           AND revoked_at IS NULL
+        "#,
+    )
+    .bind(&revoke.target_did)
+    .bind(revoke.target_device_id)
+    .bind(revoke.revoked_at)
+    .bind(revoke.revocation_id)
+    .execute(&mut **transaction)
+    .await?;
+    if key.rows_affected() != 1 {
+        return Err(TransitionRepositoryError::CompareAndSetConflict);
+    }
+    Ok(())
+}
+
+// ===========================================================================
 // Family 7 — append-only coordinate-spine rows the executor needs:
 // chat.generation_states and chat.transitions.
 // ===========================================================================
