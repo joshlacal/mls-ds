@@ -403,7 +403,7 @@ async fn get_devices_excludes_revoked_devices() {
 // NOTE (r12 minor #3, closed as not-a-gap): this test cannot isolate WHICH of the
 // two `get_devices` predicates (`status = 'active'` vs `revoked_at IS NULL`)
 // excludes the revoked device, because the two are DDL-coupled and cannot diverge.
-// `devices_revocation_shape_check` (`20260722000001…:326-328`) enforces exactly
+// `devices_revocation_shape_check` (`20260722000001…:326-330`) enforces exactly
 // `(status = 'active' AND revoked_at IS NULL AND revocation_id IS NULL)
 //  OR (status = 'revoked' AND revoked_at IS NOT NULL ...)`, so a row with
 // `status = 'revoked'` and `revoked_at IS NULL` (or the converse) is unseedable.

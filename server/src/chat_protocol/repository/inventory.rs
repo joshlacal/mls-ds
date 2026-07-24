@@ -49,6 +49,8 @@ pub(crate) enum InventoryRepositoryError {
         "supplied conversation items do not match the repository's membership-guarded selection"
     )]
     InconsistentConversationSelection,
+    #[error("inventory fence advanced during selection; retry the session create")]
+    SnapshotConflict,
     #[error("device query names too many or zero DIDs")]
     RequestTooBroad,
     #[error(transparent)]
@@ -63,7 +65,7 @@ impl PartialEq for InventoryRepositoryError {
             BoundaryItemMismatch, Cursor, DeviceAuthorityMismatch, DomainAlreadyComplete,
             DurableRowInvalid, InconsistentConversationSelection, InvalidMaterialization,
             ProtocolFenceMismatch, RaceOrReuse, RequestTooBroad, SessionNotFound,
-            SessionPresentationMismatch, TransactionMismatch,
+            SessionPresentationMismatch, SnapshotConflict, TransactionMismatch,
         };
         match (self, other) {
             (SessionNotFound, SessionNotFound)
@@ -77,6 +79,7 @@ impl PartialEq for InventoryRepositoryError {
             | (RaceOrReuse, RaceOrReuse)
             | (RequestTooBroad, RequestTooBroad)
             | (InconsistentConversationSelection, InconsistentConversationSelection)
+            | (SnapshotConflict, SnapshotConflict)
             | (InvalidMaterialization, InvalidMaterialization) => true,
             (Cursor(left), Cursor(right)) => left == right,
             _ => false,
@@ -1928,6 +1931,13 @@ pub(crate) struct CreatedInventorySession {
 /// malformed materialization or a stale device authority fails here rather than
 /// at COMMIT.
 ///
+/// Retry contract: the device-scoped domain selections run without `FOR UPDATE` on
+/// their source rows; the captured event fence is re-validated immediately before
+/// the materialization inserts, and a fence that advanced returns the retryable
+/// `SnapshotConflict` with zero durable residue (only the still-incomplete session
+/// row was written; it rolls back). A caller that receives `SnapshotConflict`
+/// re-runs the whole call. See the coverage-proof comment at the re-validation.
+///
 /// Note (r12 minor #4): `SET CONSTRAINTS … IMMEDIATE` changes the named deferred
 /// constraints to immediate for the REMAINDER of the enclosing transaction, not
 /// just for the statements this function issues. That is correct for the terminal
@@ -2165,6 +2175,54 @@ pub(crate) async fn create_inventory_session(
             .all(|id| supplied_conversations.contains_key(id))
     {
         return Err(InventoryRepositoryError::InconsistentConversationSelection);
+    }
+
+    // 5b. Optimistic fence re-validation (ratified 2026-07-24 locking ruling). The
+    //     device-scoped selections above run WITHOUT `FOR UPDATE` on their source
+    //     rows — locking them would span every conversation of the device and
+    //     invert the transition executor's head→family lock order (a deadlock
+    //     surface). Instead, re-read the fence anchors captured in step 1 and
+    //     require them UNCHANGED immediately before the materialization inserts; if
+    //     any moved, a selection-affecting mutation may have interleaved, so fail
+    //     with the retryable `SnapshotConflict` (the transaction has written only
+    //     the still-incomplete session row, which rolls back with zero residue —
+    //     the caller re-runs `create_inventory_session`).
+    //
+    //     COVERAGE PROOF (the re-validated anchor set covers the selection read
+    //     set). Every mutation class that can change a selection result is visible
+    //     through a re-validated anchor:
+    //       * welcome-delivery status, recovery request/work terminalization via a
+    //         transition, membership/participant change, and conversation lifecycle
+    //         all append a `chat.events` row (`welcomeDisposition` / `leafRecovery`
+    //         / `leaveRequest` / `conversationChanged` / `conversationClosed`),
+    //         advancing the global head — caught here.
+    //       * device revocation (auth domain, no `chat.events` kind) revokes the
+    //         target via `UPDATE chat.devices` (transition.rs / auth.rs), which
+    //         takes the row lock this function already holds `FOR UPDATE` on the
+    //         SESSION device (step 2). Every selection is scoped to that one device,
+    //         so a revocation able to change any selection must lock that row and
+    //         therefore blocks until this transaction ends — covered by the lock,
+    //         not the head. No selection reads another device's revocation state.
+    //     The retention floor is pinned `FOR UPDATE` in step 1 (cannot move); the
+    //     head is the only anchor a concurrent committer can advance, so re-reading
+    //     it is the load-bearing check.
+    let revalidated_head: Option<i64> = sqlx::query_scalar(
+        r#"
+        SELECT max(event_position)
+          FROM chat.events
+         WHERE protocol_instance_id = $1
+        "#,
+    )
+    .bind(protocol.protocol_instance_id)
+    .fetch_one(&mut **transaction)
+    .await?;
+    let revalidated_head = match revalidated_head {
+        Some(position) => database_protocol_integer(position)
+            .map_err(|_| InventoryRepositoryError::ProtocolFenceMismatch)?,
+        None => 0,
+    };
+    if revalidated_head != snapshot_event_position {
+        return Err(InventoryRepositoryError::SnapshotConflict);
     }
 
     for (ordinal, conversation_id) in selected_conversation_ids.iter().enumerate() {
