@@ -88,7 +88,9 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use chat_protocol::repository::core::{
-    hydrate_locked_conversation_head, ConversationHeadHydrationError,
+    hydrate_locked_conversation_head, hydrate_locked_creation_head,
+    hydrate_locked_direct_conversation_lookup, ConversationHeadHydrationError,
+    CreationHeadHydrationError, DirectConversationLookupError, LockedDirectLookupOutcome,
 };
 use chat_protocol::snapshot::PublicGroupSnapshotLifecycle;
 
@@ -516,4 +518,451 @@ async fn concurrent_head_hydration_blocks_on_for_update() {
         seq_b, 2,
         "B observes the same committed head after unblocking"
     );
+}
+
+// ===========================================================================
+// G3 — direct-pair absence-CAS lookup + creation/absence head variant.
+// ===========================================================================
+
+async fn seed_principal(pool: &PgPool, did: &str) {
+    let at = clock_now(pool).await;
+    sqlx::query(
+        "INSERT INTO chat.principals(user_did,created_at) VALUES($1,$2) ON CONFLICT DO NOTHING",
+    )
+    .bind(did)
+    .bind(at)
+    .execute(pool)
+    .await
+    .expect("insert principal");
+}
+
+fn canonical_pair(a: &str, b: &str) -> (String, String) {
+    if a < b {
+        (a.to_owned(), b.to_owned())
+    } else {
+        (b.to_owned(), a.to_owned())
+    }
+}
+
+/// No active direct conversation for the pair → `Absent`, under the principals lock.
+#[tokio::test]
+#[ignore = "requires the dedicated gate database"]
+async fn direct_lookup_absent_when_no_active_direct_conversation() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let (low, high) = canonical_pair(&random_plc_did(), &random_plc_did());
+    seed_principal(&pool, &low).await;
+    seed_principal(&pool, &high).await;
+    let locked_at = clock_now_millis(&pool).await;
+
+    let mut tx = pool.begin().await.expect("begin");
+    let guard = hydrate_locked_direct_conversation_lookup(&mut tx, &low, &high, locked_at)
+        .await
+        .expect("direct lookup");
+    tx.commit().await.expect("commit");
+
+    assert_eq!(guard.did_low(), low);
+    assert_eq!(guard.did_high(), high);
+    assert!(matches!(guard.outcome(), LockedDirectLookupOutcome::Absent));
+}
+
+/// A non-canonical pair (low !< high) is rejected before any DB access.
+#[tokio::test]
+#[ignore = "requires the dedicated gate database"]
+async fn direct_lookup_rejects_non_canonical_pair() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let did = random_plc_did();
+    let locked_at = clock_now_millis(&pool).await;
+
+    let mut tx = pool.begin().await.expect("begin");
+    let result = hydrate_locked_direct_conversation_lookup(&mut tx, &did, &did, locked_at).await;
+    tx.rollback().await.expect("rollback");
+
+    assert!(matches!(
+        result,
+        Err(DirectConversationLookupError::NonCanonicalPair)
+    ));
+}
+
+/// MUTUAL EXCLUSION (absence-CAS): the lookup's `chat.principals FOR UPDATE` on
+/// the canonical pair is a real serialization point — a second lookup on the same
+/// pair BLOCKS until the first transaction releases the principal-row locks.
+#[tokio::test]
+#[ignore = "requires the dedicated gate database"]
+async fn direct_lookup_blocks_on_principals_pair_for_update() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let (low, high) = canonical_pair(&random_plc_did(), &random_plc_did());
+    seed_principal(&pool, &low).await;
+    seed_principal(&pool, &high).await;
+
+    // A locks the principals pair and holds its transaction open.
+    let mut tx_a = pool.begin().await.expect("begin A");
+    let locked_at_a = clock_now_millis(&pool).await;
+    let _guard_a = hydrate_locked_direct_conversation_lookup(&mut tx_a, &low, &high, locked_at_a)
+        .await
+        .expect("A locks the pair");
+
+    // B contends for the same pair; it must block until A releases.
+    let pool_b = pool.clone();
+    let (low_b, high_b) = (low.clone(), high.clone());
+    let mut b = tokio::spawn(async move {
+        let mut tx_b = pool_b.begin().await.expect("begin B");
+        let locked_at_b = clock_now_millis(&pool_b).await;
+        let guard =
+            hydrate_locked_direct_conversation_lookup(&mut tx_b, &low_b, &high_b, locked_at_b)
+                .await
+                .expect("B locks the pair after A releases");
+        tx_b.commit().await.expect("B commits");
+        matches!(guard.outcome(), LockedDirectLookupOutcome::Absent)
+    });
+
+    match tokio::time::timeout(Duration::from_millis(1000), &mut b).await {
+        Err(_elapsed) => { /* blocked on the principals pair — the property under test */ }
+        Ok(_) => panic!("B must block on the principals pair FOR UPDATE while A holds it"),
+    }
+
+    tx_a.commit().await.expect("A commits");
+    assert!(b.await.expect("B joins"), "B sees the pair still absent");
+}
+
+/// The creation/absence head witnesses an absent conversation id and mints the
+/// `prior=None`, `next_entry_seq=1` creation head.
+#[tokio::test]
+#[ignore = "requires the dedicated gate database"]
+async fn creation_head_hydrates_absent_conversation() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let conversation_id = Uuid::new_v4();
+    let locked_at = clock_now_millis(&pool).await;
+
+    let mut tx = pool.begin().await.expect("begin");
+    let head = hydrate_locked_creation_head(&mut tx, conversation_id, locked_at)
+        .await
+        .expect("creation head");
+    tx.commit().await.expect("commit");
+
+    assert_eq!(head.conversation_id(), conversation_id);
+    assert_eq!(head.next_entry_seq(), 1);
+    assert!(
+        head.prior_coordinate().is_none(),
+        "a creation head carries no prior coordinate"
+    );
+}
+
+/// CONFLICT-based exclusion (fork ruling): once a conversation id is taken, the
+/// creation head fails closed with `ConversationExists` — a second creator for an
+/// existing id can never mint a creation witness. (The concurrent arbiter for two
+/// racing fresh creates is the executor's INSERT: the `chat.conversations` PK and
+/// the `conversations_active_direct_pair_uq` partial unique index.)
+#[tokio::test]
+#[ignore = "requires the dedicated gate database"]
+async fn creation_head_rejects_existing_conversation_id() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let base = seed_base(&pool).await;
+    let locked_at = clock_now_millis(&pool).await;
+
+    let mut tx = pool.begin().await.expect("begin");
+    let result = hydrate_locked_creation_head(&mut tx, base.conversation_id, locked_at).await;
+    tx.rollback().await.expect("rollback");
+
+    assert!(matches!(
+        result,
+        Err(CreationHeadHydrationError::ConversationExists)
+    ));
+}
+
+/// Seed a coherent committed ACTIVE DIRECT conversation for `(creator, recipient)`:
+/// the creator is an active admin with a genesis leaf, the recipient is a pending
+/// admin with NO leaf (satisfying the direct roster invariant: exactly two current
+/// admin participants, one active, per `chat.enforce_roster_invariants`). Returns
+/// (conversation_id, did_low, did_high).
+async fn commit_coherent_direct_creation(
+    pool: &PgPool,
+    creator: &str,
+    creator_device_id: Uuid,
+    creator_key_id: &str,
+    creator_public_key: &[u8],
+    recipient: &str,
+) -> (Uuid, String, String) {
+    let (did_low, did_high) = canonical_pair(creator, recipient);
+    let conversation_id = Uuid::new_v4();
+    let creation_transition_id = Uuid::new_v4();
+    let creation_entry_id = Uuid::new_v4();
+    let creator_period_id = Uuid::new_v4();
+    let recipient_period_id = Uuid::new_v4();
+    let leaf_period_id = Uuid::new_v4();
+    let metadata_snapshot_id = Uuid::new_v4();
+    let group_id = vec![0x21_u8; 32];
+    let group_context_hash = vec![0x22_u8; 32];
+    let confirmation_tag = vec![0x23_u8; 32];
+    let group_info = vec![0x24_u8; 8];
+    let snapshot = vec![0x25_u8; 8];
+    let tree_summary = vec![0x26_u8; 8];
+    let signed_request = vec![0x27_u8; 8];
+    let unsigned_projection = vec![0x28_u8; 8];
+    let signing_transcript = vec![0x29_u8; 8];
+    let request_digest = Sha256::digest(&signing_transcript).to_vec();
+    let signature = vec![0x2a_u8; 64];
+    let accepted_payload = vec![0x2b_u8; 8];
+    let creation_fingerprint = vec![0x2c_u8; 32];
+    let metadata_ciphertext = vec![0x2d_u8; 16];
+    let basic_credential = format!("{creator}#{creator_device_id}").into_bytes();
+    let at = clock_now(pool).await;
+
+    let mut tx = pool.begin().await.expect("begin direct creation");
+    sqlx::query(
+        "INSERT INTO chat.principals(user_did,created_at) VALUES($1,$2) ON CONFLICT DO NOTHING",
+    )
+    .bind(recipient)
+    .bind(at)
+    .execute(&mut *tx)
+    .await
+    .expect("insert recipient principal");
+    sqlx::query(
+        "INSERT INTO chat.conversations(conversation_id,kind,lifecycle,current_generation,current_state_version,next_entry_seq,direct_did_low,direct_did_high,created_at) VALUES($1,'direct','active',0,0,2,$2,$3,$4)",
+    )
+    .bind(conversation_id)
+    .bind(&did_low)
+    .bind(&did_high)
+    .bind(at)
+    .execute(&mut *tx)
+    .await
+    .expect("insert direct conversation");
+    sqlx::query(
+        "INSERT INTO chat.generations(conversation_id,generation,group_id,lifecycle,genesis_group_info_bytes,genesis_group_info_sha256,current_state_version,activated_seq,activated_at) VALUES($1,0,$2,'active',$3,$4,0,1,$5)",
+    )
+    .bind(conversation_id)
+    .bind(&group_id)
+    .bind(&group_info)
+    .bind(Sha256::digest(&group_info).to_vec())
+    .bind(at)
+    .execute(&mut *tx)
+    .await
+    .expect("insert generation");
+    sqlx::query(
+        r#"INSERT INTO chat.transitions(
+            transition_id,conversation_id,kind,actor_did,actor_device_id,actor_key_id,
+            actor_auth_generation,actor_role,actor_device_status,signed_request_bytes,
+            unsigned_projection_bytes,signing_transcript_bytes,request_digest,signature,
+            next_generation,next_state_version,metadata_snapshot_id,entry_seq,accepted_at
+        ) VALUES($1,$2,'creation',$3,$4,$5,1,'admin','active',$6,$7,$8,$9,$10,0,0,$11,1,$12)"#,
+    )
+    .bind(creation_transition_id)
+    .bind(conversation_id)
+    .bind(creator)
+    .bind(creator_device_id)
+    .bind(creator_key_id)
+    .bind(&signed_request)
+    .bind(&unsigned_projection)
+    .bind(&signing_transcript)
+    .bind(&request_digest)
+    .bind(&signature)
+    .bind(metadata_snapshot_id)
+    .bind(at)
+    .execute(&mut *tx)
+    .await
+    .expect("insert creation transition");
+    sqlx::query(
+        r#"INSERT INTO chat.generation_states(
+            conversation_id,generation,state_version,group_id,epoch,group_context_hash,
+            confirmation_tag,lifecycle,state_kind,producing_transition_id,
+            public_snapshot_bytes,snapshot_sha256,tree_summary_bytes,tree_summary_sha256,
+            leaf_count,created_at
+        ) VALUES($1,0,0,$2,0,$3,$4,'active','creation',$5,$6,$7,$8,$9,1,$10)"#,
+    )
+    .bind(conversation_id)
+    .bind(&group_id)
+    .bind(&group_context_hash)
+    .bind(&confirmation_tag)
+    .bind(creation_transition_id)
+    .bind(&snapshot)
+    .bind(Sha256::digest(&snapshot).to_vec())
+    .bind(&tree_summary)
+    .bind(Sha256::digest(&tree_summary).to_vec())
+    .bind(at)
+    .execute(&mut *tx)
+    .await
+    .expect("insert creation state");
+    // Creator: active admin (genesis provenance, no invitation).
+    sqlx::query(
+        r#"INSERT INTO chat.participants(
+            participant_period_id,conversation_id,user_did,status,role,role_transition_id,
+            role_changed_at,created_by_did,created_by_device_id,current_membership,created_at
+        ) VALUES($1,$2,$3,'active','admin',$4,$5,$3,$6,true,$5)"#,
+    )
+    .bind(creator_period_id)
+    .bind(conversation_id)
+    .bind(creator)
+    .bind(creation_transition_id)
+    .bind(at)
+    .bind(creator_device_id)
+    .execute(&mut *tx)
+    .await
+    .expect("insert creator participant");
+    sqlx::query(
+        r#"INSERT INTO chat.member_devices(
+            leaf_period_id,participant_period_id,conversation_id,generation,user_did,
+            device_id,leaf_index,basic_credential,leaf_signature_key,leaf_key_id,
+            leaf_auth_generation,origin,joined_state_version,joined_transition_id,
+            joined_seq,active,created_at
+        ) VALUES($1,$2,$3,0,$4,$5,0,$6,$7,$8,1,'genesis',0,$9,1,true,$10)"#,
+    )
+    .bind(leaf_period_id)
+    .bind(creator_period_id)
+    .bind(conversation_id)
+    .bind(creator)
+    .bind(creator_device_id)
+    .bind(&basic_credential)
+    .bind(creator_public_key)
+    .bind(creator_key_id)
+    .bind(creation_transition_id)
+    .bind(at)
+    .execute(&mut *tx)
+    .await
+    .expect("insert creator leaf");
+    sqlx::query(
+        r#"INSERT INTO chat.metadata_snapshots(
+            metadata_snapshot_id,conversation_id,generation,state_version,group_id,epoch,
+            group_context_hash,confirmation_tag,producing_transition_id,origin_transition_id,
+            metadata_version,nonce,ciphertext,ciphertext_sha256,ciphertext_size,author_did,
+            author_device_id,author_key_id,author_public_key,author_auth_generation,
+            author_origin_seq,author_role,author_device_status,created_at
+        ) VALUES($1,$2,0,0,$3,0,$4,$5,$6,$6,1,$7,$8,$9,16,$10,$11,$12,$13,1,1,'admin','active',$14)"#,
+    )
+    .bind(metadata_snapshot_id)
+    .bind(conversation_id)
+    .bind(&group_id)
+    .bind(&group_context_hash)
+    .bind(&confirmation_tag)
+    .bind(creation_transition_id)
+    .bind(vec![0x2e_u8; 12])
+    .bind(&metadata_ciphertext)
+    .bind(Sha256::digest(&metadata_ciphertext).to_vec())
+    .bind(creator)
+    .bind(creator_device_id)
+    .bind(creator_key_id)
+    .bind(creator_public_key)
+    .bind(at)
+    .execute(&mut *tx)
+    .await
+    .expect("insert metadata");
+    sqlx::query(
+        r#"INSERT INTO chat.entries(
+            conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,
+            accepted_payload_sha256,signed_request_bytes,request_digest,signature,
+            server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,
+            actor_key_id,actor_auth_generation,generation,state_version,transition_id,received_at
+        ) VALUES($1,1,$2,'blue.catbird.chat.defs#creationEntry',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1,0,0,$13,$14)"#,
+    )
+    .bind(conversation_id)
+    .bind(creation_entry_id)
+    .bind(&accepted_payload)
+    .bind(Sha256::digest(&accepted_payload).to_vec())
+    .bind(&signed_request)
+    .bind(&request_digest)
+    .bind(&signature)
+    .bind(vec![0_u8])
+    .bind(&creation_fingerprint)
+    .bind(creator)
+    .bind(creator_device_id)
+    .bind(creator_key_id)
+    .bind(creation_transition_id)
+    .bind(at)
+    .execute(&mut *tx)
+    .await
+    .expect("insert creation entry");
+    // Recipient: pending admin, invited by the creator (invitation bound to the
+    // genesis creation entry), NO leaf. Inserted after the entry so the immediate
+    // invitation_entry_id -> chat.entries FK is satisfied.
+    sqlx::query(
+        r#"INSERT INTO chat.participants(
+            participant_period_id,conversation_id,user_did,status,role,role_transition_id,
+            role_changed_at,created_by_did,created_by_device_id,invitation_transition_id,
+            invitation_entry_id,invited_at,current_membership,created_at
+        ) VALUES($1,$2,$3,'pending','admin',$4,$5,$6,$7,$4,$8,$5,true,$5)"#,
+    )
+    .bind(recipient_period_id)
+    .bind(conversation_id)
+    .bind(recipient)
+    .bind(creation_transition_id)
+    .bind(at)
+    .bind(creator)
+    .bind(creator_device_id)
+    .bind(creation_entry_id)
+    .execute(&mut *tx)
+    .await
+    .expect("insert recipient participant");
+    sqlx::query(
+        r#"INSERT INTO chat.application_intervals(
+            membership_interval_id,conversation_id,generation,recipient_did,
+            recipient_device_id,start_seq,opening_kind,opening_transition_id,
+            opening_outer_entry_fingerprint,opening_state_version,opening_group_id,
+            opening_epoch,opening_group_context_hash,opening_confirmation_tag,
+            opening_leaf_period_id,created_at
+        ) VALUES($1,$2,0,$3,$4,1,'creation',$1,$5,0,$6,0,$7,$8,$9,$10)"#,
+    )
+    .bind(creation_transition_id)
+    .bind(conversation_id)
+    .bind(creator)
+    .bind(creator_device_id)
+    .bind(&creation_fingerprint)
+    .bind(&group_id)
+    .bind(&group_context_hash)
+    .bind(&confirmation_tag)
+    .bind(leaf_period_id)
+    .bind(at)
+    .execute(&mut *tx)
+    .await
+    .expect("insert creation interval");
+    tx.commit().await.expect("commit direct creation");
+    (conversation_id, did_low, did_high)
+}
+
+/// An ACTIVE direct conversation for the pair → `Existing` carrying that
+/// conversation's current coordinate (lifecycle Active) and a non-zero head digest.
+#[tokio::test]
+#[ignore = "requires the dedicated gate database"]
+async fn direct_lookup_existing_returns_active_direct_coordinate() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let (creator, creator_device_id, creator_key_id) = seed_actor(&pool).await;
+    let creator_public_key: Vec<u8> =
+        sqlx::query_scalar("SELECT signing_public_key FROM chat.device_keys WHERE key_id=$1")
+            .bind(&creator_key_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read creator public key");
+    let recipient = random_plc_did();
+    let (conversation_id, did_low, did_high) = commit_coherent_direct_creation(
+        &pool,
+        &creator,
+        creator_device_id,
+        &creator_key_id,
+        &creator_public_key,
+        &recipient,
+    )
+    .await;
+    let locked_at = clock_now_millis(&pool).await;
+
+    let mut tx = pool.begin().await.expect("begin");
+    let guard = hydrate_locked_direct_conversation_lookup(&mut tx, &did_low, &did_high, locked_at)
+        .await
+        .expect("direct lookup");
+    tx.commit().await.expect("commit");
+
+    match guard.outcome() {
+        LockedDirectLookupOutcome::Existing {
+            conversation_id: found,
+            coordinate,
+            locked_head_digest,
+        } => {
+            assert_eq!(*found, conversation_id);
+            assert_eq!(coordinate.conversation_id(), conversation_id.as_bytes());
+            assert_eq!(coordinate.generation(), 0);
+            assert_eq!(coordinate.state_version(), 0);
+            assert_eq!(coordinate.group_id(), &[0x21_u8; 32]);
+            assert_eq!(coordinate.lifecycle(), PublicGroupSnapshotLifecycle::Active);
+            assert_ne!(locked_head_digest, &[0_u8; 32]);
+        }
+        LockedDirectLookupOutcome::Absent => {
+            panic!("an active direct conversation must be Existing")
+        }
+    }
 }

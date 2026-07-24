@@ -1820,3 +1820,263 @@ fn safe_protocol_u64(value: i64) -> Result<u64, ConversationHeadHydrationError> 
         .filter(|value| *value <= MAX_PROTOCOL_INTEGER)
         .ok_or(ConversationHeadHydrationError::OutOfDomain)
 }
+
+// ===========================================================================
+// T4-H2-pre G3 — direct-pair absence-CAS lookup + the creation/absence head
+// variant (coordinator grant "T4-H2-pre G2 FORK RULING": the creation head +
+// its conflict-based exclusion test land with G3).
+//
+// ADDITIONS ONLY. `from_locked_lookup` / `from_locked_row` / `direct_lookup_guard_digest`
+// are module-private, so both hydrators live here.
+// ===========================================================================
+
+/// Failure modes of [`hydrate_locked_direct_conversation_lookup`].
+#[allow(dead_code)]
+#[derive(Debug, Error)]
+pub(crate) enum DirectConversationLookupError {
+    /// The two DIDs are not a canonical `did_low < did_high` bare-DID pair.
+    #[error("clean-chat direct-pair dids are not a canonical low<high pair")]
+    NonCanonicalPair,
+    /// A stored column of an existing direct conversation fell outside the
+    /// protocol integer/byte-length domain.
+    #[error("clean-chat direct conversation column is out of domain")]
+    OutOfDomain,
+    /// The existing direct conversation's current lifecycle string was neither
+    /// `active` nor `superseded`. Never defaulted — fail closed.
+    #[error("clean-chat direct conversation lifecycle is not canonical")]
+    NonCanonicalLifecycle,
+    /// The locked lookup did not satisfy the guard invariant.
+    #[error("clean-chat direct lookup guard invariant was violated")]
+    GuardInvariant,
+    #[error("clean-chat direct lookup database error: {0}")]
+    Database(#[from] sqlx::Error),
+}
+
+/// Lock the canonical `(did_low, did_high)` principal pair and, under those
+/// locks, determine whether an ACTIVE direct conversation already exists for the
+/// pair (the absence-CAS witness feeding createConversation's direct arm).
+///
+/// Serialization (coordinator ruling "T4-H2-pre G2 FORK RULING" / G3 confirm):
+/// the absence-CAS point is `chat.principals FOR UPDATE` on the two DIDs in
+/// canonical order — the same parent-lock pattern `chat.enforce_invitation_quota`
+/// documents (migration `20260722000001_chat_protocol_core.sql`,
+/// `PERFORM 1 FROM chat.principals WHERE user_did IN (...) ORDER BY user_did FOR
+/// UPDATE`). Two concurrent creators of the same pair contend on those rows, so
+/// the "absent" observation and the subsequent create are race-free; the partial
+/// unique index `conversations_active_direct_pair_uq` (one active direct row per
+/// `(direct_did_low, direct_did_high)`) is the ultimate arbiter.
+///
+/// `locked_at` is the caller's single canonical whole-ms trusted request instant
+/// (shared with the sibling guards and cross-checked in `plan_creation`).
+#[allow(dead_code)]
+pub(crate) async fn hydrate_locked_direct_conversation_lookup(
+    transaction: &mut Transaction<'_, Postgres>,
+    did_low: &str,
+    did_high: &str,
+    locked_at: DateTime<Utc>,
+) -> Result<LockedDirectConversationLookupGuard, DirectConversationLookupError> {
+    if BareDid::parse(did_low).is_err() || BareDid::parse(did_high).is_err() || did_low >= did_high
+    {
+        return Err(DirectConversationLookupError::NonCanonicalPair);
+    }
+
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+
+    // Absence-CAS serialization: lock both principals in canonical DID order.
+    sqlx::query(
+        r#"
+        SELECT user_did
+          FROM chat.principals
+         WHERE user_did IN ($1, $2)
+         ORDER BY user_did
+           FOR UPDATE
+        "#,
+    )
+    .bind(did_low)
+    .bind(did_high)
+    .fetch_all(&mut **transaction)
+    .await?;
+
+    // Under those locks, read the (at most one) active direct conversation for
+    // the pair together with its current coordinate columns.
+    #[allow(clippy::type_complexity)]
+    let existing: Option<(Uuid, i64, i64, i64, Vec<u8>, i64, Vec<u8>, Vec<u8>, String)> =
+        sqlx::query_as(
+            r#"
+        SELECT
+            c.conversation_id,
+            c.current_generation,
+            c.current_state_version,
+            c.next_entry_seq,
+            gs.group_id,
+            gs.epoch,
+            gs.group_context_hash,
+            gs.confirmation_tag,
+            gs.lifecycle
+        FROM chat.conversations c
+        JOIN chat.generation_states gs
+          ON gs.conversation_id = c.conversation_id
+         AND gs.generation = c.current_generation
+         AND gs.state_version = c.current_state_version
+        WHERE c.kind = 'direct'
+          AND c.lifecycle = 'active'
+          AND c.direct_did_low = $1
+          AND c.direct_did_high = $2
+        "#,
+        )
+        .bind(did_low)
+        .bind(did_high)
+        .fetch_optional(&mut **transaction)
+        .await?;
+
+    let outcome = match existing {
+        None => LockedDirectLookupOutcome::Absent,
+        Some((
+            conversation_id,
+            current_generation,
+            current_state_version,
+            stored_next_entry_seq,
+            group_id,
+            epoch,
+            group_context_hash,
+            confirmation_tag,
+            lifecycle,
+        )) => {
+            let domain = |value: i64| -> Result<u64, DirectConversationLookupError> {
+                u64::try_from(value)
+                    .ok()
+                    .filter(|value| *value <= MAX_PROTOCOL_INTEGER)
+                    .ok_or(DirectConversationLookupError::OutOfDomain)
+            };
+            let generation = domain(current_generation)?;
+            let state_version = domain(current_state_version)?;
+            let epoch = domain(epoch)?;
+            let next_entry_seq = u64::try_from(stored_next_entry_seq)
+                .ok()
+                .filter(|value| (1..=MAX_PROTOCOL_INTEGER).contains(value))
+                .ok_or(DirectConversationLookupError::OutOfDomain)?;
+            let group_id: [u8; 32] = group_id
+                .try_into()
+                .map_err(|_| DirectConversationLookupError::OutOfDomain)?;
+            let group_context_hash: [u8; 32] = group_context_hash
+                .try_into()
+                .map_err(|_| DirectConversationLookupError::OutOfDomain)?;
+            let confirmation_tag: [u8; 32] = confirmation_tag
+                .try_into()
+                .map_err(|_| DirectConversationLookupError::OutOfDomain)?;
+            let lifecycle = match lifecycle.as_str() {
+                "active" => super::super::snapshot::PublicGroupSnapshotLifecycle::Active,
+                "superseded" => super::super::snapshot::PublicGroupSnapshotLifecycle::Superseded,
+                _ => return Err(DirectConversationLookupError::NonCanonicalLifecycle),
+            };
+            let coordinate = PublicGroupSnapshotCoordinate::new(
+                *conversation_id.as_bytes(),
+                generation,
+                state_version,
+                group_id,
+                epoch,
+                group_context_hash,
+                confirmation_tag,
+                lifecycle,
+            );
+            // Bind the existing head: the same transaction-local head identity a
+            // G2 hydration of this conversation would mint.
+            let locked_head_digest = conversation_head_guard_digest(
+                &transaction_id,
+                conversation_id,
+                Some(&coordinate),
+                next_entry_seq,
+                locked_at,
+            );
+            LockedDirectLookupOutcome::Existing {
+                conversation_id,
+                coordinate,
+                locked_head_digest,
+            }
+        }
+    };
+
+    let durable_row_digest =
+        direct_lookup_guard_digest(&transaction_id, did_low, did_high, locked_at, &outcome);
+
+    LockedDirectConversationLookupGuard::from_locked_lookup(
+        transaction_id,
+        did_low.to_owned(),
+        did_high.to_owned(),
+        locked_at,
+        outcome,
+        durable_row_digest,
+    )
+    .ok_or(DirectConversationLookupError::GuardInvariant)
+}
+
+/// Failure modes of [`hydrate_locked_creation_head`].
+#[allow(dead_code)]
+#[derive(Debug, Error)]
+pub(crate) enum CreationHeadHydrationError {
+    /// A `chat.conversations` row already exists for the proposed id — creation
+    /// cannot proceed (fail-closed; the caller chose a colliding id or is racing).
+    #[error("clean-chat conversation id already exists")]
+    ConversationExists,
+    /// The creation-head guard invariant was violated (e.g. a non-canonical
+    /// conversation id or a non-whole-millisecond `locked_at`).
+    #[error("clean-chat creation-head guard invariant was violated")]
+    GuardInvariant,
+    #[error("clean-chat creation-head database error: {0}")]
+    Database(#[from] sqlx::Error),
+}
+
+/// Witness the ABSENCE of `conversation_id` under the transaction and mint the
+/// CREATION head guard (`prior_coordinate == None`, `next_entry_seq == 1`) that
+/// createConversation feeds to `from_locked_creation_head`.
+///
+/// Exclusion is CONFLICT-based, not a blocking row lock (fork ruling): a
+/// `FOR UPDATE` of an absent row locks nothing, so this only witnesses absence.
+/// The executor's INSERT is the arbiter — the `chat.conversations` primary key
+/// for a group, and additionally the `conversations_active_direct_pair_uq`
+/// partial unique index for a direct conversation. For a direct creation the
+/// caller ALSO holds the G3 principals-pair lock from
+/// [`hydrate_locked_direct_conversation_lookup`], which serializes the racing
+/// creators before they reach the insert.
+///
+/// `locked_at` is the caller's single canonical whole-ms trusted request instant.
+#[allow(dead_code)]
+pub(crate) async fn hydrate_locked_creation_head(
+    transaction: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    locked_at: DateTime<Utc>,
+) -> Result<LockedConversationHeadGuard, CreationHeadHydrationError> {
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+
+    let existing: Option<Uuid> = sqlx::query_scalar(
+        r#"
+        SELECT conversation_id
+          FROM chat.conversations
+         WHERE conversation_id = $1
+           FOR UPDATE
+        "#,
+    )
+    .bind(conversation_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    if existing.is_some() {
+        return Err(CreationHeadHydrationError::ConversationExists);
+    }
+
+    let durable_row_digest =
+        conversation_head_guard_digest(&transaction_id, conversation_id, None, 1, locked_at);
+
+    LockedConversationHeadGuard::from_locked_row(
+        transaction_id,
+        conversation_id,
+        None,
+        1,
+        locked_at,
+        durable_row_digest,
+    )
+    .ok_or(CreationHeadHydrationError::GuardInvariant)
+}
