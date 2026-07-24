@@ -87,12 +87,16 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use chat_protocol::public_state::encode_public_tree_summary;
 use chat_protocol::repository::core::{
     hydrate_locked_conversation_head, hydrate_locked_creation_head,
-    hydrate_locked_direct_conversation_lookup, ConversationHeadHydrationError,
-    CreationHeadHydrationError, DirectConversationLookupError, LockedDirectLookupOutcome,
+    hydrate_locked_direct_conversation_lookup, hydrate_locked_public_state,
+    ConversationHeadHydrationError, CreationHeadHydrationError, DirectConversationLookupError,
+    LockedDirectLookupOutcome, PublicStateHydrationError,
 };
-use chat_protocol::snapshot::PublicGroupSnapshotLifecycle;
+use chat_protocol::snapshot::{
+    PublicGroupSnapshotLeaf, PublicGroupSnapshotLifecycle, PublicGroupSnapshotTreeSummary,
+};
 
 // ---------------------------------------------------------------------------
 // Harness (seeders adapted verbatim from tests/chat_protocol_concurrency.rs so a
@@ -180,6 +184,30 @@ async fn seed_actor(pool: &PgPool) -> (String, Uuid, String) {
 /// Seed a coherent committed GROUP conversation (genesis creation at seq 1,
 /// generation 0 / state_version 0, `next_entry_seq` 2, lifecycle `active`).
 async fn seed_base(pool: &PgPool) -> BaseConversation {
+    let (snapshot, snapshot_sha256) = canonical_snapshot();
+    let (tree_summary_bytes, tree_summary_sha256) = canonical_tree_summary();
+    seed_base_with_public_state(
+        pool,
+        &snapshot,
+        &snapshot_sha256,
+        &tree_summary_bytes,
+        &tree_summary_sha256,
+    )
+    .await
+}
+
+/// Seed the base GROUP conversation with caller-supplied public-state columns so
+/// the fail-closed coherence case can inject a non-canonical tree summary.
+/// (A mismatched snapshot digest is unpersistable: the DDL constraint
+/// `generation_states_snapshot_hash_check` rejects it at insert.) `seed_base`
+/// supplies the canonical, self-consistent values.
+async fn seed_base_with_public_state(
+    pool: &PgPool,
+    snapshot: &[u8],
+    snapshot_sha256: &[u8],
+    tree_summary_bytes: &[u8],
+    tree_summary_sha256: &[u8],
+) -> BaseConversation {
     let (actor_did, actor_device_id, actor_key_id) = seed_actor(pool).await;
     let actor_public_key: Vec<u8> =
         sqlx::query_scalar("SELECT signing_public_key FROM chat.device_keys WHERE key_id=$1")
@@ -193,6 +221,10 @@ async fn seed_base(pool: &PgPool) -> BaseConversation {
         actor_device_id,
         &actor_key_id,
         &actor_public_key,
+        snapshot,
+        snapshot_sha256,
+        tree_summary_bytes,
+        tree_summary_sha256,
     )
     .await;
     BaseConversation {
@@ -203,12 +235,46 @@ async fn seed_base(pool: &PgPool) -> BaseConversation {
     }
 }
 
+/// A non-empty public-snapshot blob and its exact SHA-256. The G1 snapshot-leg
+/// guard only checks this digest and never decodes the blob (that is
+/// `load_persisted_active_snapshot`'s job), so opaque bytes suffice here.
+fn canonical_snapshot() -> (Vec<u8>, [u8; 32]) {
+    let snapshot = vec![0x5A_u8; 64];
+    let sha: [u8; 32] = Sha256::digest(&snapshot).into();
+    (snapshot, sha)
+}
+
+/// A CANONICAL one-leaf public tree summary (the exact encoding
+/// `decode_public_tree_summary` accepts) and its SHA-256. Lengths follow the
+/// production caps: 49-byte basic credential, 32-byte Ed25519 signature key,
+/// 1216-byte X-Wing encryption key.
+fn canonical_tree_summary() -> (Vec<u8>, [u8; 32]) {
+    let summary = PublicGroupSnapshotTreeSummary::new(
+        [0x33_u8; 32],
+        vec![PublicGroupSnapshotLeaf::new(
+            0,
+            vec![0x44_u8; 49],
+            vec![0x45_u8; 32],
+            vec![0x46_u8; 1216],
+        )],
+    );
+    let (bytes, sha) = encode_public_tree_summary(&summary)
+        .expect("canonical tree summary encodes")
+        .into_parts();
+    (bytes, sha)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn commit_coherent_group_creation(
     pool: &PgPool,
     principal: &str,
     actor_device_id: Uuid,
     actor_key_id: &str,
     actor_public_key: &[u8],
+    snapshot: &[u8],
+    snapshot_sha256: &[u8],
+    tree_summary_bytes: &[u8],
+    tree_summary_sha256: &[u8],
 ) -> Uuid {
     let conversation_id = Uuid::new_v4();
     let creation_transition_id = Uuid::new_v4();
@@ -220,8 +286,6 @@ async fn commit_coherent_group_creation(
     let group_context_hash = vec![2_u8; 32];
     let confirmation_tag = vec![3_u8; 32];
     let group_info = vec![4_u8; 8];
-    let snapshot = vec![5_u8; 8];
-    let tree_summary = vec![6_u8; 8];
     let signed_request = vec![7_u8; 8];
     let unsigned_projection = vec![8_u8; 8];
     let signing_transcript = vec![9_u8; 8];
@@ -289,10 +353,10 @@ async fn commit_coherent_group_creation(
     .bind(&group_context_hash)
     .bind(&confirmation_tag)
     .bind(creation_transition_id)
-    .bind(&snapshot)
-    .bind(Sha256::digest(&snapshot).to_vec())
-    .bind(&tree_summary)
-    .bind(Sha256::digest(&tree_summary).to_vec())
+    .bind(snapshot)
+    .bind(snapshot_sha256)
+    .bind(tree_summary_bytes)
+    .bind(tree_summary_sha256)
     .bind(accepted_at)
     .execute(&mut *tx)
     .await
@@ -965,4 +1029,161 @@ async fn direct_lookup_existing_returns_active_direct_coordinate() {
             panic!("an active direct conversation must be Existing")
         }
     }
+}
+
+// ===========================================================================
+// G1 (snapshot leg) — locked public-state witness of the current generation.
+// ===========================================================================
+
+/// The hydrator assembles the current coordinate from the `chat.conversations`
+/// head + `chat.generation_states` crypto columns, carries the persisted snapshot
+/// blob verbatim, re-decodes the canonical tree summary, and mints a non-zero
+/// transaction-local generation-row digest.
+#[tokio::test]
+#[ignore = "requires the dedicated gate database"]
+async fn public_state_hydrates_the_current_generation_witness() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let base = seed_base(&pool).await;
+    let (expected_snapshot, expected_snapshot_sha) = canonical_snapshot();
+    let (expected_tree_bytes, expected_tree_sha) = canonical_tree_summary();
+    let locked_at = clock_now_millis(&pool).await;
+
+    let mut tx = pool.begin().await.expect("begin");
+    let guard = hydrate_locked_public_state(&mut tx, base.conversation_id, locked_at)
+        .await
+        .expect("public state hydrates");
+    tx.commit().await.expect("commit");
+
+    let (
+        txid,
+        conversation_id,
+        coordinate,
+        snapshot,
+        binding,
+        encoded_tree,
+        tree_sha,
+        at,
+        gen_digest,
+    ) = guard.into_parts();
+    assert!(
+        !txid.is_empty(),
+        "the guard carries its locking transaction id"
+    );
+    assert_eq!(conversation_id, base.conversation_id);
+    assert_eq!(
+        coordinate.conversation_id(),
+        base.conversation_id.as_bytes()
+    );
+    assert_eq!(coordinate.generation(), 0);
+    assert_eq!(coordinate.state_version(), 0);
+    assert_eq!(coordinate.epoch(), 0);
+    assert_eq!(coordinate.group_id(), &[1_u8; 32]);
+    assert_eq!(coordinate.group_context_hash(), &[2_u8; 32]);
+    assert_eq!(coordinate.confirmation_tag(), &[3_u8; 32]);
+    assert_eq!(coordinate.lifecycle(), PublicGroupSnapshotLifecycle::Active);
+    assert_eq!(
+        snapshot, expected_snapshot,
+        "snapshot blob carried verbatim"
+    );
+    assert_eq!(binding.coordinate(), &coordinate);
+    assert_eq!(binding.snapshot_sha256(), &expected_snapshot_sha);
+    assert_eq!(encoded_tree, expected_tree_bytes);
+    assert_eq!(tree_sha, expected_tree_sha);
+    assert_eq!(at.timestamp_millis(), locked_at.timestamp_millis());
+    assert_ne!(
+        gen_digest, [0_u8; 32],
+        "transaction-local generation-row digest"
+    );
+}
+
+/// Absence is fail-closed: no `chat.conversations` row yields `ConversationMissing`,
+/// never a fabricated public-state witness.
+#[tokio::test]
+#[ignore = "requires the dedicated gate database"]
+async fn absent_conversation_public_state_is_conversation_missing() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let locked_at = clock_now_millis(&pool).await;
+
+    let mut tx = pool.begin().await.expect("begin");
+    let result = hydrate_locked_public_state(&mut tx, Uuid::new_v4(), locked_at).await;
+    tx.rollback().await.expect("rollback");
+
+    assert!(matches!(
+        result,
+        Err(PublicStateHydrationError::ConversationMissing)
+    ));
+}
+
+/// MUTUAL EXCLUSION: the public-state hydrator's `FOR UPDATE OF c` on
+/// `chat.conversations` is the same real serialization point as the head lock — a
+/// second transaction hydrating the SAME conversation's public state BLOCKS until
+/// the first releases the row lock, then completes. There is no lock-free
+/// hydration path.
+#[tokio::test]
+#[ignore = "requires the dedicated gate database"]
+async fn concurrent_public_state_hydration_blocks_on_for_update() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let base = seed_base(&pool).await;
+    let conversation_id = base.conversation_id;
+
+    // A acquires the public-state lock first (in this task) and holds its
+    // transaction open, so B necessarily contends against a held `c` row lock.
+    let mut tx_a = pool.begin().await.expect("begin A");
+    let locked_at_a = clock_now_millis(&pool).await;
+    let _guard_a = hydrate_locked_public_state(&mut tx_a, conversation_id, locked_at_a)
+        .await
+        .expect("A acquires the public-state lock");
+
+    let pool_b = pool.clone();
+    let mut b = tokio::spawn(async move {
+        let mut tx_b = pool_b.begin().await.expect("begin B");
+        let locked_at_b = clock_now_millis(&pool_b).await;
+        let guard_b = hydrate_locked_public_state(&mut tx_b, conversation_id, locked_at_b)
+            .await
+            .expect("B acquires the public-state lock after A releases");
+        tx_b.commit().await.expect("B commits");
+        let (_txid, _cid, coordinate, _snap, _binding, _tsb, _tss, _at, digest) =
+            guard_b.into_parts();
+        (coordinate.state_version(), digest != [0_u8; 32])
+    });
+
+    // While A holds the lock, B cannot finish — it is blocked on `FOR UPDATE OF c`.
+    match tokio::time::timeout(Duration::from_millis(1000), &mut b).await {
+        Err(_elapsed) => { /* still blocked — the property under test */ }
+        Ok(_) => panic!("B must block on FOR UPDATE while A holds the conversation head"),
+    }
+
+    tx_a.commit().await.expect("A commits");
+    let (state_version, non_zero_digest) = b.await.expect("B task joins");
+    assert_eq!(state_version, 0, "B observes the same committed generation");
+    assert!(non_zero_digest, "B seals a non-zero generation-row digest");
+}
+
+/// Fail-closed: a stored tree summary that is not the exact canonical encoding is
+/// rejected even when its own digest column is self-consistent.
+#[tokio::test]
+#[ignore = "requires the dedicated gate database"]
+async fn public_state_non_canonical_tree_summary_fails_closed() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let (snapshot, snapshot_sha) = canonical_snapshot();
+    let non_canonical_tree = vec![0x6_u8; 8];
+    let self_consistent_sha: [u8; 32] = Sha256::digest(&non_canonical_tree).into();
+    let base = seed_base_with_public_state(
+        &pool,
+        &snapshot,
+        &snapshot_sha,
+        &non_canonical_tree,
+        &self_consistent_sha,
+    )
+    .await;
+    let locked_at = clock_now_millis(&pool).await;
+
+    let mut tx = pool.begin().await.expect("begin");
+    let result = hydrate_locked_public_state(&mut tx, base.conversation_id, locked_at).await;
+    tx.rollback().await.expect("rollback");
+
+    assert!(matches!(
+        result,
+        Err(PublicStateHydrationError::InvalidTreeSummary)
+    ));
 }

@@ -2080,3 +2080,266 @@ pub(crate) async fn hydrate_locked_creation_head(
     )
     .ok_or(CreationHeadHydrationError::GuardInvariant)
 }
+
+// ===========================================================================
+// T4-H2-pre G1 (snapshot leg) — production hydrator for the locked public-state
+// witness of an EXISTING conversation's current generation.
+//
+// ADDITION under the H2-pre grant. It locks and hydrates a
+// `LockedPublicStateHydrationGuard` from ONE deterministic locked read, sealing
+// through the existing `seal_locked_public_state_hydration` seam (pub(super), so
+// the hydrator must live in this module). This is the reusable snapshot leg the
+// G1 aggregate (`hydrate_locked_conversation_state`) embeds to build its
+// `active_public_state` + `locked_snapshot_digest`, and that the read-only
+// getConversationState assembly (G7) reuses. `load_persisted_active_snapshot`
+// (public_state.rs) then decodes the sealed guard into an `ActivePublicState`.
+//
+// Lock scope is IDENTICAL to G2's ratified head lock: `FOR UPDATE OF c` on
+// `chat.conversations` is the single-row serialization point; the current
+// `chat.generation_states` row is a plain read because that table is INSERT-ONLY
+// (the `generation_states_immutable` trigger forbids UPDATE/DELETE; lifecycle
+// supersession writes `chat.generations`/`chat.conversations`, never
+// `generation_states`), so the `c`-pinned current gen-state row has immutable
+// content under the lock. No new lock-scope ruling is required.
+// ===========================================================================
+
+/// Failure modes of [`hydrate_locked_public_state`].
+// `#[allow(dead_code)]` until the H2 conversation handlers / the G1 aggregate
+// call the hydrator (the "unused until wired" convention); the live-DB suite
+// exercises every arm.
+#[allow(dead_code)]
+#[derive(Debug, Error)]
+pub(crate) enum PublicStateHydrationError {
+    /// No live `chat.conversations` row (with its current `chat.generation_states`
+    /// row) exists for the requested id under the transaction. Fail-closed: an
+    /// absent conversation can never yield a public-state witness.
+    #[error("clean-chat conversation public state is absent")]
+    ConversationMissing,
+    /// A stored column fell outside the protocol integer/byte-length domain the
+    /// guard requires (safe-integer range or 32-byte crypto column).
+    #[error("clean-chat public state column is out of domain")]
+    OutOfDomain,
+    /// The current generation-state lifecycle string was neither `active` nor
+    /// `superseded`. Never defaulted — an unknown value fails closed.
+    #[error("clean-chat public state lifecycle is not canonical")]
+    NonCanonicalLifecycle,
+    /// The stored canonical tree-summary bytes were not the exact canonical
+    /// encoding, or their digest did not match the stored tree-summary digest.
+    #[error("clean-chat persisted tree summary is invalid")]
+    InvalidTreeSummary,
+    /// The locked row-set did not satisfy the guard invariant (e.g. a
+    /// caller-supplied `locked_at` that is not a whole millisecond, or an empty
+    /// snapshot column).
+    #[error("clean-chat public state guard invariant was violated")]
+    GuardInvariant,
+    #[error("clean-chat public state database error: {0}")]
+    Database(#[from] sqlx::Error),
+}
+
+/// Transaction-local identity digest over exactly the guard-exposed generation
+/// columns, in this module's domain-separated, length-prefixed `*_digest` style.
+///
+/// This is NOT a durable cross-transaction commitment: it exists only as the
+/// `locked_generation_row_digest` witness that the sealed guard was produced from
+/// the SAME locked read. `seal_locked_public_state_hydration` accepts any
+/// non-zero digest (it does not recompute one), so this function is the sole
+/// definition of the public-state witness's identity within a transaction.
+#[allow(dead_code)]
+fn public_state_hydration_guard_digest(
+    transaction_id: &str,
+    coordinate: &PublicGroupSnapshotCoordinate,
+    snapshot_sha256: &[u8; 32],
+    tree_summary_sha256: &[u8; 32],
+    locked_at: DateTime<Utc>,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"CATBIRD-CHAT-LOCKED-PUBLIC-STATE\0");
+    digest.update((transaction_id.len() as u64).to_be_bytes());
+    digest.update(transaction_id.as_bytes());
+    digest.update(coordinate.conversation_id());
+    digest.update(coordinate.generation().to_be_bytes());
+    digest.update(coordinate.state_version().to_be_bytes());
+    digest.update(coordinate.group_id());
+    digest.update(coordinate.epoch().to_be_bytes());
+    digest.update(coordinate.group_context_hash());
+    digest.update(coordinate.confirmation_tag());
+    digest.update([match coordinate.lifecycle() {
+        super::super::snapshot::PublicGroupSnapshotLifecycle::Active => 1,
+        super::super::snapshot::PublicGroupSnapshotLifecycle::Superseded => 2,
+    }]);
+    digest.update(snapshot_sha256);
+    digest.update(tree_summary_sha256);
+    digest.update(locked_at.timestamp_millis().to_be_bytes());
+    digest.finalize().into()
+}
+
+/// Lock and hydrate the public-state witness of an EXISTING conversation's
+/// current generation.
+///
+/// Serialization + freshness are exactly the G2 head lock (see the module
+/// section header): `FOR UPDATE OF c` on `chat.conversations` pins the current
+/// `chat.generation_states` row, read plain because that table is INSERT-ONLY.
+///
+/// Snapshot-digest coherence is enforced BEFORE this hydrator by the
+/// `generation_states_snapshot_hash_check` DDL constraint (the stored
+/// `snapshot_sha256` must equal `sha256(public_snapshot_bytes)`, so a spliced
+/// blob is unpersistable) and re-verified WITHIN
+/// `seal_locked_public_state_hydration`, which recomputes `sha256(snapshot)` and
+/// rejects any binding whose `snapshot_sha256` disagrees. The stored tree-summary
+/// bytes are re-decoded canonically against their stored digest here
+/// (`decode_public_tree_summary`, `InvalidTreeSummary`), so a non-canonical row
+/// fails closed rather than entering a witness. `load_persisted_active_snapshot`
+/// later decodes the sealed guard's snapshot blob into the verified
+/// `ActivePublicState`.
+///
+/// `locked_at` is the caller's single canonical whole-ms trusted request instant,
+/// shared with the sibling head/authority guards; a sub-millisecond value fails
+/// guard construction with `GuardInvariant`.
+#[allow(dead_code)]
+pub(crate) async fn hydrate_locked_public_state(
+    transaction: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    locked_at: DateTime<Utc>,
+) -> Result<LockedPublicStateHydrationGuard, PublicStateHydrationError> {
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+
+    #[allow(clippy::type_complexity)]
+    let row: Option<(
+        i64,
+        i64,
+        Vec<u8>,
+        i64,
+        Vec<u8>,
+        Vec<u8>,
+        String,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+    )> = sqlx::query_as(
+        r#"
+        SELECT
+            c.current_generation,
+            c.current_state_version,
+            gs.group_id,
+            gs.epoch,
+            gs.group_context_hash,
+            gs.confirmation_tag,
+            gs.lifecycle,
+            gs.public_snapshot_bytes,
+            gs.snapshot_sha256,
+            gs.tree_summary_bytes,
+            gs.tree_summary_sha256
+        FROM chat.conversations c
+        JOIN chat.generation_states gs
+          ON gs.conversation_id = c.conversation_id
+         AND gs.generation = c.current_generation
+         AND gs.state_version = c.current_state_version
+        WHERE c.conversation_id = $1
+        FOR UPDATE OF c
+        "#,
+    )
+    .bind(conversation_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let (
+        current_generation,
+        current_state_version,
+        group_id,
+        epoch,
+        group_context_hash,
+        confirmation_tag,
+        lifecycle,
+        public_snapshot_bytes,
+        snapshot_sha256,
+        tree_summary_bytes,
+        tree_summary_sha256,
+    ) = row.ok_or(PublicStateHydrationError::ConversationMissing)?;
+
+    let generation = safe_public_state_u64(current_generation)?;
+    let state_version = safe_public_state_u64(current_state_version)?;
+    let epoch = safe_public_state_u64(epoch)?;
+    let group_id: [u8; 32] = group_id
+        .try_into()
+        .map_err(|_| PublicStateHydrationError::OutOfDomain)?;
+    let group_context_hash: [u8; 32] = group_context_hash
+        .try_into()
+        .map_err(|_| PublicStateHydrationError::OutOfDomain)?;
+    let confirmation_tag: [u8; 32] = confirmation_tag
+        .try_into()
+        .map_err(|_| PublicStateHydrationError::OutOfDomain)?;
+    let snapshot_sha256: [u8; 32] = snapshot_sha256
+        .try_into()
+        .map_err(|_| PublicStateHydrationError::OutOfDomain)?;
+    let tree_summary_sha256: [u8; 32] = tree_summary_sha256
+        .try_into()
+        .map_err(|_| PublicStateHydrationError::OutOfDomain)?;
+    let lifecycle = match lifecycle.as_str() {
+        "active" => super::super::snapshot::PublicGroupSnapshotLifecycle::Active,
+        "superseded" => super::super::snapshot::PublicGroupSnapshotLifecycle::Superseded,
+        _ => return Err(PublicStateHydrationError::NonCanonicalLifecycle),
+    };
+
+    // The stored canonical tree summary must re-decode against its stored digest;
+    // this rejects a mismatched digest or any non-canonical encoding.
+    let tree_summary = super::super::public_state::decode_public_tree_summary(
+        &tree_summary_bytes,
+        &tree_summary_sha256,
+    )
+    .map_err(|_| PublicStateHydrationError::InvalidTreeSummary)?;
+
+    let coordinate = PublicGroupSnapshotCoordinate::new(
+        *conversation_id.as_bytes(),
+        generation,
+        state_version,
+        group_id,
+        epoch,
+        group_context_hash,
+        confirmation_tag,
+        lifecycle,
+    );
+
+    let binding = PublicGroupSnapshotBinding::new(
+        *conversation_id.as_bytes(),
+        generation,
+        state_version,
+        group_id,
+        epoch,
+        group_context_hash,
+        confirmation_tag,
+        lifecycle,
+        snapshot_sha256,
+        tree_summary,
+    );
+
+    let locked_generation_row_digest = public_state_hydration_guard_digest(
+        &transaction_id,
+        &coordinate,
+        &snapshot_sha256,
+        &tree_summary_sha256,
+        locked_at,
+    );
+
+    seal_locked_public_state_hydration(
+        transaction_id,
+        conversation_id,
+        coordinate,
+        public_snapshot_bytes,
+        binding,
+        tree_summary_bytes,
+        tree_summary_sha256,
+        locked_at,
+        locked_generation_row_digest,
+    )
+    .ok_or(PublicStateHydrationError::GuardInvariant)
+}
+
+#[allow(dead_code)]
+fn safe_public_state_u64(value: i64) -> Result<u64, PublicStateHydrationError> {
+    u64::try_from(value)
+        .ok()
+        .filter(|value| *value <= MAX_PROTOCOL_INTEGER)
+        .ok_or(PublicStateHydrationError::OutOfDomain)
+}
