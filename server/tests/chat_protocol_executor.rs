@@ -7730,6 +7730,534 @@ async fn generic_commit_supersedes_prior_open_recovery_request() {
     assert_eq!(terminal_tid, Some(commit_transition));
 }
 
+/// Seed a PENDING reset request (alice) + a PENDING leave request (bob) bound to
+/// the fulfillment coordinate (sv 2, non-mutating), then build (but do NOT apply)
+/// the UNCOMMITTED generic commit (sv 2 -> 3) whose planner stales BOTH. Returns
+/// the commit plan + ctx + the two request ids + the commit transition id, so the
+/// positive test can apply it and the reconciliation negatives can apply a
+/// CORRUPTED copy. `pool` is cloned in so the caller keeps its own handle.
+async fn seed_reset_leave_then_build_commit(
+    pool: PgPool,
+    scenario: &FulfillmentScenario,
+) -> (
+    chat_protocol::state_machine::ConversationPersistencePlan,
+    ExecutionContext,
+    Uuid,
+    Uuid,
+    Uuid,
+) {
+    let manifest = corpus_manifest();
+    let fixture = &scenario.fixture;
+    let conversation_id = scenario.conversation_id;
+    let alice_id = fixture.alice_id.clone();
+    let alice_did = fixture.alice_did.clone();
+    let alice_device = fixture.alice_device;
+    let alice_key_id = fixture.alice_key_id.clone();
+    let bob_id = scenario.bob_id.clone();
+    let bob_did = scenario.bob_did.clone();
+    let bob_device = Uuid::from_bytes(*bob_id.device_id());
+    let protocol_instance_id = fixture.protocol_instance_id;
+
+    // 1. Alice opens a reset request (seq 4) bound to the fulfillment coordinate
+    //    (sv 2) — non-mutating, coordinate unchanged.
+    let reset_received = ServerTimestamp::from_unix_millis_for_test(
+        manifest.evaluation_unix_seconds as i64 * 1_000 + 5_000,
+    )
+    .unwrap();
+    let reset_request_id = Uuid::new_v4();
+    let reset_evidence = RequestEvidence::for_test(
+        RequestEntryKind::ResetRequest,
+        4,
+        *reset_request_id.as_bytes(),
+        alice_id.clone(),
+        *conversation_id.as_bytes(),
+        reset_received,
+        0x91,
+    )
+    .unwrap();
+    let reset_planned = plan_reset_request(
+        &scenario.fulfillment_state,
+        ResetRequestCommand {
+            actor: alice_id.clone(),
+            reset_request_id: *reset_request_id.as_bytes(),
+            received_at: reset_received,
+            evidence: reset_evidence,
+        },
+    )
+    .expect("valid reset request plan");
+    let reset_state = reset_planned.resulting_state().clone();
+    let reset_entry = Uuid::new_v4();
+    let reset_head = ConversationHeadCasBinding::for_test_edge(
+        *conversation_id.as_bytes(),
+        *reset_entry.as_bytes(),
+        scenario.coordinate,
+        4,
+        reset_received,
+    );
+    let reset_plan = persistence_plan_for_test(reset_planned, reset_head);
+    let reset_applied_at = clock_now(&pool).await;
+    let reset_transcript = vec![0x92_u8; 16];
+    let reset_digest = Sha256::digest(&reset_transcript).to_vec();
+    let reset_signature = vec![0x93_u8; 64];
+    let alice_pred_reset = device_event_predecessor(&pool, &alice_did, alice_device).await;
+    let reset_ctx = ExecutionContext {
+        protocol_instance_id,
+        applied_at: reset_applied_at,
+        actor: ExecutionActor {
+            user_did: alice_did.clone(),
+            device_id: alice_device,
+            key_id: alice_key_id.clone(),
+            auth_generation: 1,
+            role: TransitionActorRole::Admin,
+            device_status: "active".to_owned(),
+        },
+        entry: ControlEntryContent {
+            entry_id: reset_entry,
+            entry_kind: "blue.catbird.chat.defs#resetRequestEntry".to_owned(),
+            accepted_payload_bytes: vec![0x94_u8; 8],
+            accepted_payload_sha256: Sha256::digest([0x94_u8; 8]).to_vec(),
+            signed_request_bytes: reset_transcript.clone(),
+            unsigned_projection_bytes: vec![0x95_u8; 8],
+            signing_transcript_bytes: reset_transcript.clone(),
+            request_digest: reset_digest.clone(),
+            signature: reset_signature.clone(),
+            server_fields_bytes: vec![0x96_u8; 8],
+            outer_entry_fingerprint: vec![0x1A_u8; 32],
+        },
+        spine: SpineArtifacts {
+            public_snapshot_bytes: vec![],
+            public_snapshot_sha256: vec![],
+            tree_summary_bytes: vec![],
+            tree_summary_sha256: vec![],
+            leaf_count: 2,
+            genesis_group_info_bytes: vec![],
+            genesis_group_info_sha256: vec![],
+        },
+        opened_leaves: vec![],
+        metadata_author: None,
+        participant_period_ids: vec![],
+        leaf_period_ids: vec![],
+        entry_recipients: vec![(alice_id.clone(), EntryEntitlementKind::Control)],
+        events: vec![EventFanout {
+            event_id: Uuid::new_v4(),
+            event_kind: EventKind::ResetRequested,
+            payload_bytes: vec![0x97_u8; 8],
+            recipients: vec![(
+                alice_id.clone(),
+                EventEntitlementKind::Participant,
+                alice_pred_reset,
+            )],
+            outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+        }],
+        closing_leaf_periods: vec![],
+        closing_participant_periods: vec![],
+        reset_request_row: Some(ResetRequestRow {
+            reset_request_id,
+            reason: ResetReason::PoisonedState,
+            signed_request_bytes: reset_transcript.clone(),
+            signing_transcript_bytes: reset_transcript.clone(),
+            request_digest: reset_digest.clone(),
+            signature: reset_signature.clone(),
+            expires_at: reset_applied_at + Duration::hours(24),
+        }),
+        recovery_open: None,
+        welcome_expiry: None,
+        welcome_response: None,
+        welcome_dispositions: vec![],
+    };
+    {
+        let mut tx = pool.begin().await.expect("begin reset request");
+        apply_conversation_persistence_plan(&mut tx, &reset_plan, &reset_ctx)
+            .await
+            .expect("reset request applies");
+        tx.commit().await.expect("reset request COMMIT");
+    }
+
+    // 2. Bob opens a leave request (seq 5) against the reset state — still bound to
+    //    sv 2, coordinate unchanged, BOTH requests now pending.
+    let leave_received = ServerTimestamp::from_unix_millis_for_test(
+        manifest.evaluation_unix_seconds as i64 * 1_000 + 6_000,
+    )
+    .unwrap();
+    let leave_request_id = Uuid::new_v4();
+    let leave_evidence = RequestEvidence::for_test(
+        RequestEntryKind::LeaveRequest,
+        5,
+        *leave_request_id.as_bytes(),
+        bob_id.clone(),
+        *conversation_id.as_bytes(),
+        leave_received,
+        0x71,
+    )
+    .unwrap();
+    let leave_registration = LockedRegistrationProjection::for_test(&leave_evidence);
+    let leave_planned = plan_leave_request(
+        &reset_state,
+        LeaveRequestCommand {
+            actor: bob_id.clone(),
+            leave_request_id: *leave_request_id.as_bytes(),
+            received_at: leave_received,
+            evidence: leave_evidence,
+            registration: leave_registration,
+        },
+    )
+    .expect("valid leave request plan");
+    let leave_state = leave_planned.resulting_state().clone();
+    let leave_entry = Uuid::new_v4();
+    let leave_head = ConversationHeadCasBinding::for_test_edge(
+        *conversation_id.as_bytes(),
+        *leave_entry.as_bytes(),
+        scenario.coordinate,
+        5,
+        leave_received,
+    );
+    let leave_plan = persistence_plan_for_test(leave_planned, leave_head);
+    let leave_applied_at = clock_now(&pool).await;
+    let leave_transcript = vec![0x72_u8; 16];
+    let leave_ctx = ExecutionContext {
+        protocol_instance_id,
+        applied_at: leave_applied_at,
+        actor: ExecutionActor {
+            user_did: bob_did.clone(),
+            device_id: bob_device,
+            key_id: fixture.bob_key_id.clone(),
+            auth_generation: 1,
+            role: TransitionActorRole::Member,
+            device_status: "active".to_owned(),
+        },
+        entry: ControlEntryContent {
+            entry_id: leave_entry,
+            entry_kind: "blue.catbird.chat.defs#leaveRequestEntry".to_owned(),
+            accepted_payload_bytes: vec![0x74_u8; 8],
+            accepted_payload_sha256: Sha256::digest([0x74_u8; 8]).to_vec(),
+            signed_request_bytes: leave_transcript.clone(),
+            unsigned_projection_bytes: vec![0x75_u8; 8],
+            signing_transcript_bytes: leave_transcript.clone(),
+            request_digest: Sha256::digest(&leave_transcript).to_vec(),
+            signature: vec![0x76_u8; 64],
+            server_fields_bytes: vec![0x77_u8; 8],
+            outer_entry_fingerprint: vec![0x1A_u8; 32],
+        },
+        spine: SpineArtifacts {
+            public_snapshot_bytes: vec![],
+            public_snapshot_sha256: vec![],
+            tree_summary_bytes: vec![],
+            tree_summary_sha256: vec![],
+            leaf_count: 2,
+            genesis_group_info_bytes: vec![],
+            genesis_group_info_sha256: vec![],
+        },
+        opened_leaves: vec![],
+        metadata_author: None,
+        participant_period_ids: vec![],
+        leaf_period_ids: vec![],
+        entry_recipients: entry_audience(&alice_id, &alice_did, &bob_id, &bob_did),
+        events: vec![EventFanout {
+            event_id: Uuid::new_v4(),
+            event_kind: EventKind::LeaveRequest,
+            payload_bytes: vec![0x78_u8; 8],
+            recipients: event_audience(&pool, &alice_id, &alice_did, &bob_id, &bob_did).await,
+            outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+        }],
+        closing_leaf_periods: vec![],
+        closing_participant_periods: vec![],
+        reset_request_row: None,
+        recovery_open: None,
+        welcome_expiry: None,
+        welcome_response: None,
+        welcome_dispositions: vec![],
+    };
+    {
+        let mut tx = pool.begin().await.expect("begin leave request");
+        apply_conversation_persistence_plan(&mut tx, &leave_plan, &leave_ctx)
+            .await
+            .expect("leave request applies");
+        tx.commit().await.expect("leave request COMMIT");
+    }
+    // Both requests are pending before the commit.
+    let (pre_reset, pre_leave): (String, String) = sqlx::query_as(
+        "SELECT (SELECT status FROM chat.reset_requests WHERE reset_request_id=$1), \
+                (SELECT status FROM chat.leave_requests WHERE leave_request_id=$2)",
+    )
+    .bind(reset_request_id)
+    .bind(leave_request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("pre state");
+    assert_eq!(
+        (pre_reset.as_str(), pre_leave.as_str()),
+        ("pending", "pending")
+    );
+
+    // 3. Generic commit on the leave state (sv 2 -> 3, epoch 1 -> 2, seq 6). It
+    //    stales BOTH pending requests and supersedes the fulfillment's pending
+    //    welcome.
+    validate_public_commit(
+        &corpus_file("commit-generic-public.mls"),
+        MAX_PUBLIC_MESSAGE_WIRE_BYTES,
+    )
+    .expect("generic commit parses");
+    let successor_coord = PublicGroupSnapshotCoordinate::new(
+        *conversation_id.as_bytes(),
+        manifest.chain.generation,
+        leave_state.coordinate().state_version() + 1,
+        *leave_state.coordinate().group_id(),
+        leave_state.coordinate().epoch() + 1,
+        [0xB1_u8; 32],
+        [0xB2_u8; 32],
+        PublicGroupSnapshotLifecycle::Active,
+    );
+    let commit = chat_protocol::public_state::VerifiedCommitPublicState::for_test_generic(
+        leave_state.public_state(),
+        successor_coord,
+        0,
+    )
+    .expect("synthetic zero-proposal commit");
+    let commit_transition = Uuid::new_v4();
+    let commit_entry = Uuid::new_v4();
+    let commit_received = ServerTimestamp::from_unix_millis_for_test(
+        manifest.evaluation_unix_seconds as i64 * 1_000 + 7_000,
+    )
+    .unwrap();
+    let alice_key_id_bytes: [u8; 32] = Sha256::digest(&scenario.alice_sig_key).into();
+    let reencryption = MetadataSnapshotBinding::for_test_creation(
+        *conversation_id.as_bytes(),
+        0,
+        successor_coord.epoch(),
+        *successor_coord.group_context_hash(),
+        fixture.creation_transition_id,
+        1,
+        alice_id.clone(),
+        alice_key_id_bytes,
+        scenario.alice_sig_key.clone().try_into().unwrap(),
+        1,
+        1,
+        [0xB3_u8; 12],
+        vec![0xB4_u8; 48],
+    );
+    let commit_evidence = TransitionEvidence::for_test_commit_with_metadata(
+        6,
+        *commit_transition.as_bytes(),
+        [0x1B_u8; 32],
+        commit_received,
+        *leave_state.coordinate(),
+        successor_coord,
+        reencryption,
+    )
+    .unwrap();
+    let planned = plan_commit(
+        &leave_state,
+        CommitCommand {
+            actor: alice_id.clone(),
+            transition: commit_evidence,
+            commit,
+        },
+    )
+    .expect("valid generic commit plan");
+    let head_cas = ConversationHeadCasBinding::for_test_edge(
+        *conversation_id.as_bytes(),
+        *commit_entry.as_bytes(),
+        *leave_state.coordinate(),
+        6,
+        commit_received,
+    );
+    let plan = persistence_plan_for_test(planned, head_cas);
+    let applied_at = clock_now(&pool).await;
+    let alice_pred = device_event_predecessor(&pool, &alice_did, alice_device).await;
+    let bob_pred = device_event_predecessor(&pool, &bob_did, bob_device).await;
+    let commit_transcript = vec![0xB5_u8; 12];
+    let commit_request_digest = Sha256::digest(&commit_transcript).to_vec();
+    let ctx = ExecutionContext {
+        protocol_instance_id,
+        applied_at,
+        actor: ExecutionActor {
+            user_did: alice_did.clone(),
+            device_id: alice_device,
+            key_id: alice_key_id.clone(),
+            auth_generation: 1,
+            role: TransitionActorRole::Admin,
+            device_status: "active".to_owned(),
+        },
+        entry: ControlEntryContent {
+            entry_id: commit_entry,
+            entry_kind: "blue.catbird.chat.defs#commitEntry".to_owned(),
+            accepted_payload_bytes: vec![0xB6_u8; 12],
+            accepted_payload_sha256: Sha256::digest([0xB6_u8; 12]).to_vec(),
+            signed_request_bytes: commit_transcript.clone(),
+            unsigned_projection_bytes: vec![0xB7_u8; 8],
+            signing_transcript_bytes: commit_transcript.clone(),
+            request_digest: commit_request_digest.clone(),
+            signature: vec![0xB8_u8; 64],
+            server_fields_bytes: vec![0xB9_u8; 8],
+            outer_entry_fingerprint: vec![0x1B_u8; 32],
+        },
+        spine: SpineArtifacts {
+            public_snapshot_bytes: vec![0xBA_u8; 16],
+            public_snapshot_sha256: Sha256::digest([0xBA_u8; 16]).to_vec(),
+            tree_summary_bytes: vec![0xBB_u8; 16],
+            tree_summary_sha256: Sha256::digest([0xBB_u8; 16]).to_vec(),
+            leaf_count: 2,
+            genesis_group_info_bytes: vec![],
+            genesis_group_info_sha256: vec![],
+        },
+        opened_leaves: vec![],
+        metadata_author: Some(MetadataAuthorColumns {
+            author_role: "admin".to_owned(),
+            author_device_status: "active".to_owned(),
+            author_public_key: scenario.alice_sig_key.clone(),
+            author_key_id: alice_key_id.clone(),
+            metadata_snapshot_id: Uuid::new_v4(),
+        }),
+        participant_period_ids: vec![],
+        leaf_period_ids: vec![],
+        entry_recipients: entry_audience(&alice_id, &alice_did, &bob_id, &bob_did),
+        events: vec![EventFanout {
+            event_id: Uuid::new_v4(),
+            event_kind: EventKind::ConversationChanged,
+            payload_bytes: vec![0xBC_u8; 8],
+            recipients: vec![(
+                alice_id.clone(),
+                EventEntitlementKind::Participant,
+                alice_pred,
+            )],
+            outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+        }],
+        closing_leaf_periods: vec![],
+        closing_participant_periods: vec![],
+        reset_request_row: None,
+        recovery_open: None,
+        welcome_expiry: None,
+        welcome_response: None,
+        welcome_dispositions: vec![WelcomeDispositionInput {
+            welcome_id: scenario.welcome_id,
+            event: EventFanout {
+                event_id: Uuid::new_v4(),
+                event_kind: EventKind::WelcomeDisposition,
+                payload_bytes: vec![0xBD_u8; 8],
+                recipients: vec![(bob_id.clone(), EventEntitlementKind::Welcome, bob_pred)],
+                outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+            },
+        }],
+    };
+
+    let _ = commit_request_digest;
+    (
+        plan,
+        ctx,
+        reset_request_id,
+        leave_request_id,
+        commit_transition,
+    )
+}
+
+/// A coordinate-advancing generic commit executed from a coordinate carrying a
+/// PENDING reset request (alice) AND a PENDING leave request (bob) durably STALES
+/// both — the executor consumes the planner's `(Pending -> Stale)` reset/leave
+/// deltas via `write_prior_bound_staling` instead of hard-erroring. Both terminal
+/// edges are bound to the commit transition; the leave `stale` edge additionally
+/// binds the commit's request digest (the DB `assert_leave_request_mapping` stale
+/// arm requires digest + terminal transition of a NON-leaveCommit/leavePolicy kind,
+/// which the `commit` kind satisfies).
+#[tokio::test]
+async fn generic_commit_stales_prior_pending_reset_and_leave_requests() {
+    let (pool, _db) = setup().await;
+    let scenario = run_fulfillment_scenario(&pool).await;
+    let (plan, ctx, reset_request_id, leave_request_id, commit_transition) =
+        seed_reset_leave_then_build_commit(pool.clone(), &scenario).await;
+    let commit_request_digest = ctx.entry.request_digest.clone();
+
+    let mut tx = pool.begin().await.expect("begin generic commit");
+    apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+        .await
+        .expect("generic commit that stales reset + leave requests applies");
+    tx.commit()
+        .await
+        .expect("generic commit COMMIT past all deferred triggers");
+
+    // Both requests are STALE, each bound to the commit transition; the leave
+    // request additionally carries the commit's request digest as its terminal.
+    let (reset_status, reset_tid): (String, Option<Uuid>) = sqlx::query_as(
+        "SELECT status,terminal_transition_id FROM chat.reset_requests WHERE reset_request_id=$1",
+    )
+    .bind(reset_request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("reset terminal");
+    assert_eq!(reset_status, "stale");
+    assert_eq!(reset_tid, Some(commit_transition));
+    let (leave_status, leave_tid, leave_digest): (String, Option<Uuid>, Option<Vec<u8>>) =
+        sqlx::query_as(
+            "SELECT status,terminal_transition_id,terminal_request_digest \
+               FROM chat.leave_requests WHERE leave_request_id=$1",
+        )
+        .bind(leave_request_id)
+        .fetch_one(&pool)
+        .await
+        .expect("leave terminal");
+    assert_eq!(leave_status, "stale");
+    assert_eq!(leave_tid, Some(commit_transition));
+    assert_eq!(leave_digest, Some(commit_request_digest));
+}
+
+/// The reset-family half of the silent-drop guard is load-bearing: a plan whose
+/// reset staling is corrupted to a non-`Pending->Stale` shape (which
+/// `write_prior_bound_staling` skips) is a hard `InconsistentPlan`, with ZERO
+/// residue — the commit never lands and the reset request stays pending.
+#[tokio::test]
+async fn generic_commit_corrupted_reset_staling_is_rejected() {
+    let (pool, _db) = setup().await;
+    let scenario = run_fulfillment_scenario(&pool).await;
+    let (plan, ctx, reset_request_id, _leave, _tid) =
+        seed_reset_leave_then_build_commit(pool.clone(), &scenario).await;
+    let bad = plan.with_reset_staling_corrupted_for_test();
+    let mut tx = pool.begin().await.expect("begin");
+    let result = apply_conversation_persistence_plan(&mut tx, &bad, &ctx).await;
+    assert!(
+        matches!(result, Err(ExecutorError::InconsistentPlan(_))),
+        "a corrupted reset staling must be InconsistentPlan, got {result:?}"
+    );
+    tx.rollback().await.expect("rollback");
+    let (sv, reset_status): (i64, String) = sqlx::query_as(
+        "SELECT (SELECT current_state_version FROM chat.conversations WHERE conversation_id=$1), \
+                (SELECT status FROM chat.reset_requests WHERE reset_request_id=$2)",
+    )
+    .bind(scenario.conversation_id)
+    .bind(reset_request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("residue");
+    assert_eq!((sv, reset_status.as_str()), (2, "pending"));
+}
+
+/// The leave-family half of the same guard: a corrupted leave staling
+/// (`Pending->Stale` -> `Pending->Expired`) is likewise a hard `InconsistentPlan`
+/// with zero residue.
+#[tokio::test]
+async fn generic_commit_corrupted_leave_staling_is_rejected() {
+    let (pool, _db) = setup().await;
+    let scenario = run_fulfillment_scenario(&pool).await;
+    let (plan, ctx, _reset, leave_request_id, _tid) =
+        seed_reset_leave_then_build_commit(pool.clone(), &scenario).await;
+    let bad = plan.with_leave_staling_corrupted_for_test();
+    let mut tx = pool.begin().await.expect("begin");
+    let result = apply_conversation_persistence_plan(&mut tx, &bad, &ctx).await;
+    assert!(
+        matches!(result, Err(ExecutorError::InconsistentPlan(_))),
+        "a corrupted leave staling must be InconsistentPlan, got {result:?}"
+    );
+    tx.rollback().await.expect("rollback");
+    let (sv, leave_status): (i64, String) = sqlx::query_as(
+        "SELECT (SELECT current_state_version FROM chat.conversations WHERE conversation_id=$1), \
+                (SELECT status FROM chat.leave_requests WHERE leave_request_id=$2)",
+    )
+    .bind(scenario.conversation_id)
+    .bind(leave_request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("residue");
+    assert_eq!((sv, leave_status.as_str()), (2, "pending"));
+}
+
 /// Remove one conversation's committed graph so the shared, never-truncated
 /// clean-chat DB stays clean across runs. Runs inside ONE transaction: the
 /// `chat.entries` <-> `chat.transitions` provenance FKs are circular and

@@ -10556,6 +10556,40 @@ impl ConversationPersistencePlan {
         self
     }
 
+    /// Corrupt the plan's first reset-request staling into a non-staling shape
+    /// (`Pending->Stale` -> `Pending->Expired`). `write_prior_bound_staling` SKIPS
+    /// it (it consumes only the exact `Pending->Stale` edge), so a coordinate-
+    /// advancing arm must catch it in `reconcile_coordinate_change_families` rather
+    /// than silently leave the durable reset request un-terminalized — removing the
+    /// reset-family reconciliation fails the negative test.
+    pub(crate) fn with_reset_staling_corrupted_for_test(mut self) -> Self {
+        if let Some(after) = self
+            .effects
+            .reset_request_changes
+            .first_mut()
+            .and_then(|change| change.after.as_mut())
+        {
+            after.status = ResetRequestStatus::Expired;
+        }
+        self
+    }
+
+    /// Corrupt the plan's first leave-request staling into a non-staling shape
+    /// (`Pending->Stale` -> `Pending->Expired`), exercising the leave-family half of
+    /// the silent-drop guard exactly as `with_reset_staling_corrupted_for_test` does
+    /// for the reset family.
+    pub(crate) fn with_leave_staling_corrupted_for_test(mut self) -> Self {
+        if let Some(after) = self
+            .effects
+            .leave_request_changes
+            .first_mut()
+            .and_then(|change| change.after.as_mut())
+        {
+            after.status = LeaveRequestStatus::Expired;
+        }
+        self
+    }
+
     /// Corrupt the `welcome_cas` binding so it disagrees with the `welcome_changes`
     /// delta (flip a byte of its bound welcome id). The welcome-disposition arms
     /// validate the binding LOAD-BEARING against the delta (welcome id / recipient /
@@ -13425,7 +13459,7 @@ mod executor {
         LeaveRequestStatus, MetadataSnapshotBinding, PackageStatus, ParticipantHydrationRow,
         ParticipantRole, ParticipantStatus, PlanAuthority, PlanKind, PrincipalId,
         PublicGroupSnapshotCoordinate, RecoveryRequestStatus, RecoverySource, ReservationStatus,
-        ServerTimestamp, StateChange, TransitionEffects, WelcomeStatus,
+        ResetRequestStatus, ServerTimestamp, StateChange, TransitionEffects, WelcomeStatus,
     };
     use super::{ConversationPersistencePlan, ConversationStateHydration};
     use super::{Engine, URL_SAFE_NO_PAD};
@@ -13992,26 +14026,36 @@ mod executor {
                 // PARTITION PROOF (exhaustive + mutually exclusive by construction —
                 // the planners are the authority):
                 //   * A LEAVE fulfillment is the ONLY `Commit` whose planner
-                //     (`plan_leave_fulfillment_inner`) terminalizes a leave request,
-                //     so `leave_request_changes` is non-empty IFF leave fulfillment;
-                //     it removes members and emits NO new Welcome.
+                //     (`plan_leave_fulfillment_inner`) terminalizes a leave request as
+                //     FULFILLED (`Pending->Fulfilled`); it removes members and emits NO
+                //     new Welcome. The discriminator matches that exact edge — NOT any
+                //     leave-request delta: EVERY coordinate-advancing commit (generic /
+                //     recovery / leave) may ALSO carry a prior-bound `Pending->Stale`
+                //     leave staling (a co-pending leave request the coordinate change
+                //     retired), which must NOT be read as a fulfillment.
                 //   * A leaf-recovery fulfillment (`plan_leaf_recovery_fulfillment_inner`)
                 //     ALWAYS emits exactly one NEW Welcome (`None->Some`, how the
-                //     recovered target joins) and NEVER touches a leave request.
+                //     recovered target joins) and NEVER FULFILLS a leave request (though
+                //     it may stale one).
                 //   * A generic zero-proposal commit (`plan_commit_inner`) does
-                //     NEITHER — no leave request, no `None->Some` welcome (its only
+                //     NEITHER — no leave FULFILLMENT, no `None->Some` welcome (its only
                 //     welcome delta is a prior-bound `Pending->Superseded`).
-                // The two predicates are therefore disjoint (leave-request-change vs.
-                // new-welcome are never both set) and exhaustive (their negation is
-                // exactly the generic commit). Each branch's own exact-shape guards
-                // (leave requires exactly one leave-request + participant close;
-                // recovery requires exactly one own request/reservation/package/new
-                // welcome; generic rejects every membership/leave delta) HARD-error a
-                // mis-partitioned plan rather than mis-applying it — the discriminator
-                // is backstopped, never load-bearing alone. This extends the
-                // recovery-vs-generic `is_fulfillment` note: the Welcome-presence
-                // discriminator is now the SECOND cut, after the leave-request cut.
-                let is_leave_fulfillment = !effects.leave_request_changes().is_empty();
+                // The two predicates are therefore disjoint (a Pending->Fulfilled leave
+                // edge vs. a None->Some welcome are never both set) and exhaustive
+                // (their negation is exactly the generic commit). Each branch's own
+                // exact-shape guards (leave requires exactly one leave-request +
+                // participant close; recovery requires exactly one own request/
+                // reservation/package/new welcome; generic rejects every membership
+                // delta) HARD-error a mis-partitioned plan rather than mis-applying it —
+                // the discriminator is backstopped, never load-bearing alone.
+                let is_leave_fulfillment = effects.leave_request_changes().iter().any(|change| {
+                    matches!(
+                        (change.before(), change.after()),
+                        (Some(before), Some(after))
+                            if before.status() == LeaveRequestStatus::Pending
+                                && after.status() == LeaveRequestStatus::Fulfilled
+                    )
+                });
                 let is_recovery_fulfillment = effects
                     .welcome_changes()
                     .iter()
@@ -15227,11 +15271,10 @@ mod executor {
         let expected_next_entry_seq = checked_i64(head.expected_next_entry_seq())?;
 
         // Guards: fulfillment carries leaf / interval / welcome / recovery-request /
-        // reservation / package / metadata changes; reject the families it never has.
+        // reservation / package / metadata changes + (a legal interleaving)
+        // prior-bound reset/leave STALING; reject the families it never has.
         reject_if_present("participant_changes", effects.participant_changes())?;
         reject_if_present("terminal_proof_changes", effects.terminal_proof_changes())?;
-        reject_if_present("reset_request_changes", effects.reset_request_changes())?;
-        reject_if_present("leave_request_changes", effects.leave_request_changes())?;
         reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
         if effects.revocation_target_cas().is_some()
             || effects.welcome_cas().is_some()
@@ -15716,10 +15759,23 @@ mod executor {
             write_prior_bound_supersessions(transaction, effects, transition_id, applied_at)
                 .await?;
         superseded.welcomes = write_welcome_supersessions(transaction, ctx, effects).await?;
+        // Durably stale any prior-bound pending reset/leave request the coordinate
+        // change retired (this arm owns none — kind is `leafRecovery`, DB-legal for
+        // the leave `stale` edge).
+        let staled = write_prior_bound_staling(
+            transaction,
+            effects,
+            transition_id,
+            &ctx.entry.request_digest,
+            applied_at,
+        )
+        .await?;
+        superseded.reset_requests = staled.reset_requests;
+        superseded.leave_requests = staled.leave_requests;
         // Silent-drop guard: this arm's OWN edges are exactly one fulfilled request +
         // consumed reservation + Reserved->Consumed package + new pending welcome; every
-        // OTHER delta MUST be a supersession the calls above applied. Reject any delta
-        // that is neither (e.g. an Open->Expired request) rather than dropping it.
+        // OTHER delta MUST be a supersession/staling the calls above applied. Reject any
+        // delta that is neither (e.g. an Open->Expired request) rather than dropping it.
         reconcile_coordinate_change_families(
             effects,
             &FamilyCounts {
@@ -15727,6 +15783,8 @@ mod executor {
                 reservations: 1,
                 packages: 1,
                 welcomes: 1,
+                reset_requests: 0,
+                leave_requests: 0,
             },
             &superseded,
         )?;
@@ -15778,14 +15836,13 @@ mod executor {
 
         // A generic (zero-proposal) commit changes ONLY the crypto coordinate + the
         // re-encrypted metadata + (a legal interleaving) prior-coordinate open-work
-        // SUPERSESSION. It has no membership/reset/leave change and no OWN recovery
-        // work: every recovery/reservation/package delta must be a supersession
-        // (verified by exact-shape below).
+        // SUPERSESSION + prior-bound reset/leave STALING. It has no membership change
+        // and no OWN recovery/reset/leave work: every recovery/reservation/package
+        // delta must be a supersession and every reset/leave delta a Pending->Stale
+        // staling (verified by exact-shape below).
         reject_if_present("participant_changes", effects.participant_changes())?;
         reject_if_present("interval_changes", effects.interval_changes())?;
         reject_if_present("terminal_proof_changes", effects.terminal_proof_changes())?;
-        reject_if_present("reset_request_changes", effects.reset_request_changes())?;
-        reject_if_present("leave_request_changes", effects.leave_request_changes())?;
         reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
         // recovery_request_changes / reservation_changes / package_transitions /
         // welcome_changes: NOT rejected — a coordinate-changing commit supersedes
@@ -15981,12 +16038,24 @@ mod executor {
             write_prior_bound_supersessions(transaction, effects, transition_id, applied_at)
                 .await?;
         superseded.welcomes = write_welcome_supersessions(transaction, ctx, effects).await?;
+        // Durably stale any prior-bound pending reset/leave request the epoch change
+        // retired (kind is `commit`, DB-legal for the leave `stale` edge).
+        let staled = write_prior_bound_staling(
+            transaction,
+            effects,
+            transition_id,
+            &ctx.entry.request_digest,
+            applied_at,
+        )
+        .await?;
+        superseded.reset_requests = staled.reset_requests;
+        superseded.leave_requests = staled.leave_requests;
         // Silent-drop guard: a generic commit has NO own recovery/reservation/package/
-        // welcome edge — every such delta MUST be a supersession the calls above
-        // applied. The per-delta shape loops above already reject a malformed
+        // welcome/reset/leave edge — every such delta MUST be a supersession/staling the
+        // calls above applied. The per-delta shape loops above already reject a malformed
         // recovery/reservation/package delta; this additionally catches a malformed
-        // welcome delta (e.g. Pending->Expired) that `write_welcome_supersessions`
-        // skips, closing the last silent-drop path.
+        // welcome delta (e.g. Pending->Expired) or a non-Pending->Stale reset/leave delta
+        // that the writers skip, closing the last silent-drop path.
         reconcile_coordinate_change_families(effects, &FamilyCounts::default(), &superseded)?;
 
         Ok(AppliedTransition {
@@ -16040,12 +16109,15 @@ mod executor {
 
         // Guards. Leave fulfillment carries participant/leaf/interval/leave-request/
         // metadata changes + (a legal interleaving) prior-bound recovery/welcome
-        // SUPERSESSIONS. It has NO own recovery/reservation/package edge and no
-        // reset/terminal-proof/revocation change; those recovery families flow
-        // ONLY through the shared supersession path (own counts 0, verified by the
-        // reconciliation). Reject the families it never carries.
+        // SUPERSESSIONS + prior-bound reset STALING. It has NO own recovery/
+        // reservation/package edge and no terminal-proof/revocation change; those
+        // recovery families flow ONLY through the shared supersession path (own
+        // counts 0, verified by the reconciliation). Its OWN leave-request edge is
+        // the single Pending->Fulfilled below (a leaveCommit/leavePolicy kind cannot
+        // durably `stale` a leave request per assert_leave_request_mapping, and the
+        // len==1 guard below rejects any second leave delta), so leave STALING never
+        // reaches this arm. Reject the families it never carries.
         reject_if_present("terminal_proof_changes", effects.terminal_proof_changes())?;
-        reject_if_present("reset_request_changes", effects.reset_request_changes())?;
         reject_if_present("recovery_package_cas", effects.recovery_package_cas())?;
         reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
         if effects.revocation_target_cas().is_some()
@@ -16338,15 +16410,36 @@ mod executor {
         .await?;
         let event_positions = write_events(transaction, ctx).await?;
 
-        // 12. Shared prior-bound supersession + welcome supersession + the
-        //     silent-drop reconciliation (own recovery/reservation/package/welcome
-        //     edges are ALL zero for a leave fulfillment — every such delta must be
-        //     a supersession the calls below applied).
+        // 12. Shared prior-bound supersession + welcome supersession + reset STALING
+        //     + the silent-drop reconciliation (own recovery/reservation/package/
+        //     welcome edges are ALL zero for a leave fulfillment; its ONE own edge is
+        //     the Pending->Fulfilled leave request handled above — every OTHER delta
+        //     must be a supersession/staling the calls below applied). A prior-bound
+        //     pending RESET request the leaveCommit retired is staled here (reset
+        //     `stale` is DB-legal for any kind); the leave family carries only the
+        //     fulfilled own edge, so `write_prior_bound_staling` finds no leave delta.
         let mut superseded =
             write_prior_bound_supersessions(transaction, effects, transition_id, applied_at)
                 .await?;
         superseded.welcomes = write_welcome_supersessions(transaction, ctx, effects).await?;
-        reconcile_coordinate_change_families(effects, &FamilyCounts::default(), &superseded)?;
+        let staled = write_prior_bound_staling(
+            transaction,
+            effects,
+            transition_id,
+            &ctx.entry.request_digest,
+            applied_at,
+        )
+        .await?;
+        superseded.reset_requests = staled.reset_requests;
+        superseded.leave_requests = staled.leave_requests;
+        reconcile_coordinate_change_families(
+            effects,
+            &FamilyCounts {
+                leave_requests: 1,
+                ..FamilyCounts::default()
+            },
+            &superseded,
+        )?;
 
         Ok(AppliedTransition {
             allocated_seq: u64::try_from(seq_i64).unwrap(),
@@ -16639,8 +16732,12 @@ mod executor {
         let expected_state_version = checked_i64(expected_prior.state_version())?;
         let expected_next_entry_seq = checked_i64(head.expected_next_entry_seq())?;
 
-        // Policy is a coordinate-only, participant-only edge; every other family
-        // is a hard error so nothing is silently dropped.
+        // Policy is a coordinate-only, participant-only edge; every crypto/recovery
+        // family is a hard error so nothing is silently dropped. The prior-bound
+        // reset/leave STALING families are NOT rejected — a policy addParticipant
+        // from a coordinate carrying a pending reset/leave request supersedes that
+        // request (Pending->Stale); consumed + reconciled at the tail (kind is
+        // `policy`, DB-legal for the leave `stale` edge).
         reject_if_present("leaf_changes", effects.leaf_changes())?;
         reject_if_present("interval_changes", effects.interval_changes())?;
         reject_if_present("terminal_proof_changes", effects.terminal_proof_changes())?;
@@ -16649,8 +16746,6 @@ mod executor {
             effects.recovery_request_changes(),
         )?;
         reject_if_present("reservation_changes", effects.reservation_changes())?;
-        reject_if_present("reset_request_changes", effects.reset_request_changes())?;
-        reject_if_present("leave_request_changes", effects.leave_request_changes())?;
         reject_if_present("welcome_changes", effects.welcome_changes())?;
         reject_if_present("package_transitions", effects.package_transitions())?;
         reject_if_present("recovery_package_cas", effects.recovery_package_cas())?;
@@ -16791,6 +16886,24 @@ mod executor {
         )
         .await?;
         let event_positions = write_events(transaction, ctx).await?;
+
+        // 8. Durably stale any prior-bound pending reset/leave request the policy
+        //    edge retired. Policy owns NO reset/leave edge, so `own` is default and
+        //    every reset/leave delta MUST be a Pending->Stale staling the call below
+        //    applied; the crypto/recovery/welcome families were rejected above (count
+        //    0), so the reconciliation trivially holds for them.
+        let mut superseded = FamilyCounts::default();
+        let staled = write_prior_bound_staling(
+            transaction,
+            effects,
+            transition_id,
+            &ctx.entry.request_digest,
+            applied_at,
+        )
+        .await?;
+        superseded.reset_requests = staled.reset_requests;
+        superseded.leave_requests = staled.leave_requests;
+        reconcile_coordinate_change_families(effects, &FamilyCounts::default(), &superseded)?;
 
         Ok(AppliedTransition {
             allocated_seq: u64::try_from(seq_i64).unwrap(),
@@ -17064,11 +17177,12 @@ mod executor {
         // party's (direct 1:1) leaf-recovery request is open — superseding it +
         // releasing the reservation + reactivating the package. Those deltas are
         // consumed below via the shared write_prior_bound_supersessions +
-        // write_welcome_supersessions + reconcile (own counts 0). Families the close
-        // genuinely never carries stay fail-closed.
+        // write_welcome_supersessions + write_prior_bound_staling + reconcile (own
+        // counts 0). A close is likewise reachable while a pending reset/leave request
+        // is bound to the prior coordinate — staled below (kind is `closeConversation`,
+        // DB-legal for the leave `stale` edge). Families the close genuinely never
+        // carries stay fail-closed.
         reject_if_present("participant_changes", effects.participant_changes())?;
-        reject_if_present("leave_request_changes", effects.leave_request_changes())?;
-        reject_if_present("reset_request_changes", effects.reset_request_changes())?;
         reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
         // Every recovery/reservation/package delta a close carries MUST be a
         // prior-bound supersession (request Open->Superseded, reservation
@@ -17313,14 +17427,25 @@ mod executor {
 
         // 10. Supersede prior-coordinate open work the close retired: an open
         //     leaf-recovery request (Open->Superseded) + its reservation
-        //     (Active->Released) + reserved package (Reserved->Available), and any
-        //     prior pending welcome. The close has ZERO own recovery/welcome edges,
-        //     so own == default and every such delta MUST be a supersession the
-        //     calls below applied — reconcile rejects any that is neither.
+        //     (Active->Released) + reserved package (Reserved->Available), any prior
+        //     pending welcome, and any prior-bound pending reset/leave request
+        //     (Pending->Stale). The close has ZERO own recovery/welcome/reset/leave
+        //     edges, so own == default and every such delta MUST be a supersession/
+        //     staling the calls below applied — reconcile rejects any that is neither.
         let mut superseded =
             write_prior_bound_supersessions(transaction, effects, transition_id, applied_at)
                 .await?;
         superseded.welcomes = write_welcome_supersessions(transaction, ctx, effects).await?;
+        let staled = write_prior_bound_staling(
+            transaction,
+            effects,
+            transition_id,
+            &ctx.entry.request_digest,
+            applied_at,
+        )
+        .await?;
+        superseded.reset_requests = staled.reset_requests;
+        superseded.leave_requests = staled.leave_requests;
         reconcile_coordinate_change_families(effects, &FamilyCounts::default(), &superseded)?;
 
         Ok(AppliedTransition {
@@ -17821,15 +17946,18 @@ mod executor {
         let retired_state_version = checked_i64(retired.state_version())?;
         let expected_next_entry_seq = checked_i64(head.expected_next_entry_seq())?;
 
-        // Reset activation carries no participant/leave change and no OWN recovery
-        // edge. It DOES supersede prior-coordinate open work: a retired generation's
-        // pending welcome / open recovery request / active reservation / reserved
-        // package are all resolved to superseded/released by the plan and consumed
-        // below via write_prior_bound_supersessions + write_welcome_supersessions +
-        // reconcile (own counts 0). Families the reset genuinely never carries stay
-        // fail-closed.
+        // Reset activation carries no participant change and no OWN recovery edge.
+        // Its ONE own request edge is the named reset request it CONSUMES
+        // (Pending->Consumed, step 11 below). It DOES supersede prior-coordinate open
+        // work: a retired generation's pending welcome / open recovery request /
+        // active reservation / reserved package are all resolved to superseded/
+        // released by the plan and consumed below via write_prior_bound_supersessions
+        // + write_welcome_supersessions + reconcile (own counts 0 for those). It also
+        // stales a prior-bound pending LEAVE request the retirement retired
+        // (Pending->Stale; kind is `resetActivation`, DB-legal for the leave `stale`
+        // edge — the one-pending index means no SECOND reset request can be staled).
+        // Families the reset genuinely never carries stay fail-closed.
         reject_if_present("participant_changes", effects.participant_changes())?;
-        reject_if_present("leave_request_changes", effects.leave_request_changes())?;
         reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
         reject_if_present("terminal_proof_changes", effects.terminal_proof_changes())?;
         // Every recovery/reservation/package delta a reset carries MUST be a
@@ -18200,15 +18328,35 @@ mod executor {
 
         // 13. Supersede prior-coordinate open work the reset retired: the retired
         //     generation's pending welcome(s) + any open recovery request / active
-        //     reservation / reserved package bound to the prior coordinate. The reset
-        //     has ZERO own recovery/welcome edges, so own == default and every such
-        //     delta MUST be a supersession the calls below applied — reconcile
-        //     rejects any that is neither (silent-drop guard).
+        //     reservation / reserved package bound to the prior coordinate, and stale
+        //     any prior-bound pending LEAVE request. The reset has ZERO own recovery/
+        //     welcome/leave edges (its ONE own request edge is the reset request
+        //     CONSUMED in step 11, counted as own below), so every recovery/welcome/
+        //     leave delta MUST be a supersession/staling the calls below applied —
+        //     reconcile rejects any that is neither (silent-drop guard). The reset
+        //     loop in write_prior_bound_staling skips the own Pending->Consumed edge.
         let mut superseded =
             write_prior_bound_supersessions(transaction, effects, transition_id, applied_at)
                 .await?;
         superseded.welcomes = write_welcome_supersessions(transaction, ctx, effects).await?;
-        reconcile_coordinate_change_families(effects, &FamilyCounts::default(), &superseded)?;
+        let staled = write_prior_bound_staling(
+            transaction,
+            effects,
+            transition_id,
+            &ctx.entry.request_digest,
+            applied_at,
+        )
+        .await?;
+        superseded.reset_requests = staled.reset_requests;
+        superseded.leave_requests = staled.leave_requests;
+        reconcile_coordinate_change_families(
+            effects,
+            &FamilyCounts {
+                reset_requests: 1,
+                ..FamilyCounts::default()
+            },
+            &superseded,
+        )?;
 
         Ok(AppliedTransition {
             allocated_seq: u64::try_from(seq_i64).unwrap(),
@@ -19108,6 +19256,70 @@ mod executor {
         Ok(counts)
     }
 
+    /// Durably stale each prior-coordinate PENDING reset/leave request the plan
+    /// retired. `resolve_prior_bound_work` marks a `Pending` reset request `Stale`
+    /// and a `Pending` leave request `Stale` when a coordinate-advancing transition
+    /// supersedes the coordinate they were bound to; this consumes exactly those
+    /// `(Pending -> Stale)` deltas. A reset/leave delta of any OTHER shape (the
+    /// arm's OWN `Pending -> Consumed` reset-activation edge, or `Pending ->
+    /// Fulfilled` leave-fulfillment edge) is SKIPPED here and handled by the arm,
+    /// with `reconcile_coordinate_change_families` proving `own + staled == total`
+    /// per family so nothing is silently dropped.
+    ///
+    /// The leave-request `stale` terminal edge binds the STALING transition's own
+    /// request digest (`assert_leave_request_mapping` requires
+    /// `terminal_request_digest == transition.request_digest` and the terminal
+    /// transition kind to be NOT `leaveCommit`/`leavePolicy`); the reset-request
+    /// `stale` edge needs only the transition id + instant. Returns the per-family
+    /// staled counts for the caller's reconciliation.
+    async fn write_prior_bound_staling(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        effects: &TransitionEffects,
+        transition_id: Uuid,
+        staling_request_digest: &[u8],
+        applied_at: DateTime<Utc>,
+    ) -> Result<FamilyCounts, ExecutorError> {
+        let mut counts = FamilyCounts::default();
+        for change in effects.reset_request_changes() {
+            if let (Some(before), Some(after)) = (change.before(), change.after()) {
+                if before.status() == ResetRequestStatus::Pending
+                    && after.status() == ResetRequestStatus::Stale
+                {
+                    transition::terminalize_reset_request(
+                        transaction,
+                        Uuid::from_bytes(after.request_id),
+                        &ResetRequestTermination::Stale {
+                            terminal_transition_id: transition_id,
+                            terminal_at: applied_at,
+                        },
+                    )
+                    .await?;
+                    counts.reset_requests += 1;
+                }
+            }
+        }
+        for change in effects.leave_request_changes() {
+            if let (Some(before), Some(after)) = (change.before(), change.after()) {
+                if before.status() == LeaveRequestStatus::Pending
+                    && after.status() == LeaveRequestStatus::Stale
+                {
+                    transition::terminalize_leave_request(
+                        transaction,
+                        Uuid::from_bytes(after.request_id),
+                        &LeaveRequestTermination::Stale {
+                            terminal_request_digest: staling_request_digest.to_vec(),
+                            terminal_transition_id: transition_id,
+                            terminal_at: applied_at,
+                        },
+                    )
+                    .await?;
+                    counts.leave_requests += 1;
+                }
+            }
+        }
+        Ok(counts)
+    }
+
     /// The per-family count of deltas a coordinate-changing arm actually
     /// consumed. Used for both the applied SUPERSESSIONS (what
     /// `write_prior_bound_supersessions` / `write_welcome_supersessions` wrote) and
@@ -19119,6 +19331,8 @@ mod executor {
         reservations: usize,
         packages: usize,
         welcomes: usize,
+        reset_requests: usize,
+        leave_requests: usize,
     }
 
     /// The silent-drop guard for every coordinate-changing arm (fulfillment,
@@ -19156,6 +19370,16 @@ mod executor {
         if own.welcomes + superseded.welcomes != effects.welcome_changes().len() {
             return Err(ExecutorError::InconsistentPlan(
                 "welcome delta neither applied as own nor superseded (silent-drop guard)",
+            ));
+        }
+        if own.reset_requests + superseded.reset_requests != effects.reset_request_changes().len() {
+            return Err(ExecutorError::InconsistentPlan(
+                "reset request delta neither applied as own nor staled (silent-drop guard)",
+            ));
+        }
+        if own.leave_requests + superseded.leave_requests != effects.leave_request_changes().len() {
+            return Err(ExecutorError::InconsistentPlan(
+                "leave request delta neither applied as own nor staled (silent-drop guard)",
             ));
         }
         Ok(())
