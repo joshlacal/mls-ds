@@ -16608,6 +16608,15 @@ mod executor {
         // Close is coordinate-retire + interval/leaf teardown; it carries no
         // participant/metadata/recovery/reservation/welcome change on the simple
         // (creator-only / direct) terminal path. Anything else is a hard error.
+        //
+        // NAMED REMAINDER (arm 3 #3, close branch): unlike reset activation, `close`
+        // does NOT route prior-bound open work through write_prior_bound_supersessions.
+        // This is UNREACHABLE-by-fixture, not a gap: a close is single-member-admin /
+        // direct-pair only, so it cannot carry another member's open recovery work,
+        // and it cannot carry its OWN pending welcome (a pending welcome requires a
+        // recovery fulfillment, i.e. >=2 members). These reject_if_present guards are
+        // STRICTER than supersession (they fail closed on any such delta) and cannot
+        // silently drop — so there is no reachable scenario to compose or test.
         reject_if_present("participant_changes", effects.participant_changes())?;
         reject_if_present(
             "recovery_request_changes",
@@ -17325,18 +17334,15 @@ mod executor {
         let retired_state_version = checked_i64(retired.state_version())?;
         let expected_next_entry_seq = checked_i64(head.expected_next_entry_seq())?;
 
-        // Reset activation carries no participant/leave/welcome change on the
-        // simple path; recovery supersession would appear as recovery/reservation
-        // deltas, which this slice does not yet compose.
+        // Reset activation carries no participant/leave change and no OWN recovery
+        // edge. It DOES supersede prior-coordinate open work: a retired generation's
+        // pending welcome / open recovery request / active reservation / reserved
+        // package are all resolved to superseded/released by the plan and consumed
+        // below via write_prior_bound_supersessions + write_welcome_supersessions +
+        // reconcile (own counts 0). Families the reset genuinely never carries stay
+        // fail-closed.
         reject_if_present("participant_changes", effects.participant_changes())?;
         reject_if_present("leave_request_changes", effects.leave_request_changes())?;
-        reject_if_present("welcome_changes", effects.welcome_changes())?;
-        reject_if_present(
-            "recovery_request_changes",
-            effects.recovery_request_changes(),
-        )?;
-        reject_if_present("reservation_changes", effects.reservation_changes())?;
-        reject_if_present("package_transitions", effects.package_transitions())?;
         reject_if_present("recovery_package_cas", effects.recovery_package_cas())?;
         reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
         reject_if_present("terminal_proof_changes", effects.terminal_proof_changes())?;
@@ -17670,6 +17676,18 @@ mod executor {
         )
         .await?;
         let event_positions = write_events(transaction, ctx).await?;
+
+        // 13. Supersede prior-coordinate open work the reset retired: the retired
+        //     generation's pending welcome(s) + any open recovery request / active
+        //     reservation / reserved package bound to the prior coordinate. The reset
+        //     has ZERO own recovery/welcome edges, so own == default and every such
+        //     delta MUST be a supersession the calls below applied — reconcile
+        //     rejects any that is neither (silent-drop guard).
+        let mut superseded =
+            write_prior_bound_supersessions(transaction, effects, transition_id, applied_at)
+                .await?;
+        superseded.welcomes = write_welcome_supersessions(transaction, ctx, effects).await?;
+        reconcile_coordinate_change_families(effects, &FamilyCounts::default(), &superseded)?;
 
         Ok(AppliedTransition {
             allocated_seq: u64::try_from(seq_i64).unwrap(),
