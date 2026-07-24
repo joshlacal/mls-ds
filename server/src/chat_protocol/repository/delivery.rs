@@ -66,6 +66,11 @@ pub(crate) enum DeliveryRepositoryError {
     /// An application send carried no `message_id`. Every send is idempotency-keyed
     /// by `(conversation_id, message_id)`, so the id is mandatory.
     MissingMessageId,
+    /// A projection was requested on the wrong entry kind: an application
+    /// projection on a control row, or a control projection on an application
+    /// row. The two closed projection shapes are disjoint, so a caller that asks
+    /// for the wrong one is a bug, not an empty projection.
+    EntryKindMismatch,
 }
 
 impl From<sqlx::Error> for DeliveryRepositoryError {
@@ -1511,4 +1516,486 @@ pub(crate) async fn terminalize_recovery_work_item(
         return Err(DeliveryRepositoryError::CompareAndSetConflict);
     }
     Ok(())
+}
+
+// ===========================================================================
+// Delivery read path (Task 2 Slice 4a).
+//
+// These are the READ-side counterparts of the append-log + audience + interval
+// writers above: they return exactly what the executor wrote, on the exact
+// entitlement seams the writers froze, and never re-derive, filter-by-current-
+// membership, or synthesize provenance. Each function is one snapshot-consistent
+// SQL statement (or is composed by the caller inside one read-only
+// repeatable-read transaction), all `chat.*` qualified.
+//
+// The entitlement rules are the schema's, restated verbatim in SQL:
+//   * an APPLICATION entry is visible to a device ONLY through that exact
+//     device's `chat.application_intervals` row spanning the entry's seq;
+//   * a CONTROL entry is visible to a device ONLY through an exact
+//     `chat.entry_recipients` row at that seq. A same-DID sibling that lacks
+//     the interval/recipient row sees nothing through it.
+//
+// No production handler consumes these yet (the `getEntries` / inventory
+// handlers land in a later slice), so the read surface carries the narrowest
+// local `#[allow(dead_code)]` sanctioned by `src/lib.rs` rather than a blanket
+// crate allow. The delivery writers above are already reachable through the
+// unconditionally-compiled transition executor.
+// ===========================================================================
+
+/// The closed `blue.catbird.chat.defs#applicationEntry` type identifier. An
+/// entry with this kind is application traffic; every other kind is a control
+/// entry. Matches `chat.entries.entries_kind_check`'s application arm.
+pub(crate) const APPLICATION_ENTRY_KIND: &str = "blue.catbird.chat.defs#applicationEntry";
+
+/// One `chat.entries` row read back on the delivery seam. It carries ONLY the
+/// columns the two public projections (`#applicationEntry` /
+/// `#conversationEntry`) and their outer fingerprint need — never the derived
+/// unsigned actor / coordinate / message-id index columns, which the brief
+/// forbids from re-appearing as duplicated projection fields. The outer
+/// fingerprint is carried alongside (not inside) the projection so a caller can
+/// assert the recomputed projection fingerprint equals the frozen column.
+#[derive(Clone, Debug, sqlx::FromRow)]
+#[allow(dead_code)]
+pub(crate) struct DeliveredEntryRow {
+    pub(crate) conversation_id: Uuid,
+    pub(crate) seq: i64,
+    pub(crate) entry_id: Uuid,
+    pub(crate) entry_kind: String,
+    pub(crate) signed_request_bytes: Vec<u8>,
+    pub(crate) request_digest: Vec<u8>,
+    pub(crate) signature: Vec<u8>,
+    pub(crate) server_fields_bytes: Vec<u8>,
+    pub(crate) outer_entry_fingerprint: Vec<u8>,
+    pub(crate) received_at: DateTime<Utc>,
+}
+
+/// The closed `#applicationEntry` projection: EXACTLY the five logical fields
+/// `{entryId, conversationId, seq, signedRequest, receivedAt}`. The signed
+/// request is carried as its exact stored bytes (`signed_request_bytes`); there
+/// is no duplicated unsigned actor / device / coordinate / messageId /
+/// applicationMessage / blobBindings field. The type itself is the closed shape.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct ApplicationEntryProjection {
+    pub(crate) entry_id: Uuid,
+    pub(crate) conversation_id: Uuid,
+    pub(crate) seq: u64,
+    pub(crate) signed_request_bytes: Vec<u8>,
+    pub(crate) received_at: DateTime<Utc>,
+}
+
+/// The closed `#conversationEntry` control projection: EXACTLY
+/// `{entryKind, entryId, conversationId, seq, requestDigest, signature,
+/// serverFields, receivedAt}`. `server_fields_bytes` is the exact stored
+/// canonical DAG-CBOR of the kind-appropriate `serverFields` (`{}`,
+/// `{recovery}`, or `{tombstone}`); no unsigned surrogate is duplicated.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct ControlEntryProjection {
+    pub(crate) entry_kind: String,
+    pub(crate) entry_id: Uuid,
+    pub(crate) conversation_id: Uuid,
+    pub(crate) seq: u64,
+    pub(crate) request_digest: Vec<u8>,
+    pub(crate) signature: Vec<u8>,
+    pub(crate) server_fields_bytes: Vec<u8>,
+    pub(crate) received_at: DateTime<Utc>,
+}
+
+#[allow(dead_code)]
+impl DeliveredEntryRow {
+    /// True iff this row is application traffic (as opposed to a control entry).
+    pub(crate) fn is_application(&self) -> bool {
+        self.entry_kind == APPLICATION_ENTRY_KIND
+    }
+
+    /// The exact frozen 32-byte outer-entry fingerprint column.
+    pub(crate) fn outer_entry_fingerprint(&self) -> &[u8] {
+        &self.outer_entry_fingerprint
+    }
+
+    /// Project an application row to its closed five-field `#applicationEntry`.
+    /// Returns an error for a control row (whose projection is the control shape).
+    pub(crate) fn application_projection(
+        &self,
+    ) -> Result<ApplicationEntryProjection, DeliveryRepositoryError> {
+        if !self.is_application() {
+            return Err(DeliveryRepositoryError::EntryKindMismatch);
+        }
+        Ok(ApplicationEntryProjection {
+            entry_id: self.entry_id,
+            conversation_id: self.conversation_id,
+            seq: u64::try_from(self.seq).map_err(|_| DeliveryRepositoryError::SequenceOverflow)?,
+            signed_request_bytes: self.signed_request_bytes.clone(),
+            received_at: self.received_at,
+        })
+    }
+
+    /// Project a control row to its closed `#conversationEntry` control shape.
+    /// Returns an error for an application row.
+    pub(crate) fn control_projection(
+        &self,
+    ) -> Result<ControlEntryProjection, DeliveryRepositoryError> {
+        if self.is_application() {
+            return Err(DeliveryRepositoryError::EntryKindMismatch);
+        }
+        Ok(ControlEntryProjection {
+            entry_kind: self.entry_kind.clone(),
+            entry_id: self.entry_id,
+            conversation_id: self.conversation_id,
+            seq: u64::try_from(self.seq).map_err(|_| DeliveryRepositoryError::SequenceOverflow)?,
+            request_digest: self.request_digest.clone(),
+            signature: self.signature.clone(),
+            server_fields_bytes: self.server_fields_bytes.clone(),
+            received_at: self.received_at,
+        })
+    }
+}
+
+/// One gap-safe page of caller-visible entries, plus its continuation cursor.
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub(crate) struct EntriesPage {
+    /// The caller-visible entries in this page, strictly ascending by seq, at
+    /// most `limit` rows.
+    pub(crate) entries: Vec<DeliveredEntryRow>,
+    /// The next `afterSeq` cursor: `afterSeq` unchanged when the page is empty,
+    /// otherwise the greatest seq returned in this page.
+    pub(crate) next_after_seq: u64,
+    /// True iff at least one later caller-visible entry exists beyond this page.
+    pub(crate) has_more: bool,
+}
+
+/// `getEntries` gap-safe paging over the append log.
+///
+/// `after_seq` is a GLOBAL conversation scan position, never an entitlement-local
+/// cursor: it may name a seq the caller cannot see. The single `visible` CTE
+/// filters `seq > after_seq` by the exact entitlement seams — an application
+/// entry qualifies ONLY through this device's `chat.application_intervals`
+/// spanning its seq; a control entry ONLY through an exact `chat.entry_recipients`
+/// row — so hidden rows are simply skipped, never surfaced and never used to
+/// bound the page. The visible set is ordered by seq and `limit + 1` rows are
+/// fetched: the extra row (if present) proves a later caller-visible entry exists
+/// (`has_more`) and is dropped from the returned page. `next_after_seq` is
+/// `after_seq` when the page is empty, else the greatest returned seq. The global
+/// log is NEVER limited before entitlement filtering.
+#[allow(dead_code)]
+pub(crate) async fn get_entries(
+    transaction: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    caller_did: &str,
+    caller_device_id: Uuid,
+    after_seq: u64,
+    limit: i64,
+) -> Result<EntriesPage, DeliveryRepositoryError> {
+    let after_seq_i64 =
+        i64::try_from(after_seq).map_err(|_| DeliveryRepositoryError::SequenceOverflow)?;
+    let fetch = limit
+        .checked_add(1)
+        .ok_or(DeliveryRepositoryError::SequenceOverflow)?;
+
+    let mut rows: Vec<DeliveredEntryRow> = sqlx::query_as(
+        r#"
+        WITH visible AS (
+            SELECT entry.seq
+              FROM chat.entries AS entry
+             WHERE entry.conversation_id = $1
+               AND entry.seq > $2
+               AND (
+                 (
+                   entry.entry_kind = $5
+                   AND EXISTS (
+                     SELECT 1
+                       FROM chat.application_intervals AS interval
+                      WHERE interval.conversation_id = entry.conversation_id
+                        AND interval.recipient_did = $3
+                        AND interval.recipient_device_id = $4
+                        AND entry.seq >= interval.start_seq
+                        AND (interval.terminal_seq IS NULL
+                             OR entry.seq <= interval.terminal_seq)
+                   )
+                 )
+                 OR
+                 (
+                   entry.entry_kind <> $5
+                   AND EXISTS (
+                     SELECT 1
+                       FROM chat.entry_recipients AS recipient
+                      WHERE recipient.conversation_id = entry.conversation_id
+                        AND recipient.seq = entry.seq
+                        AND recipient.user_did = $3
+                        AND recipient.device_id = $4
+                   )
+                 )
+               )
+             ORDER BY entry.seq
+             LIMIT $6
+        )
+        SELECT entry.conversation_id, entry.seq, entry.entry_id, entry.entry_kind,
+               entry.signed_request_bytes, entry.request_digest, entry.signature,
+               entry.server_fields_bytes, entry.outer_entry_fingerprint,
+               entry.received_at
+          FROM chat.entries AS entry
+          JOIN visible ON visible.seq = entry.seq
+         WHERE entry.conversation_id = $1
+         ORDER BY entry.seq
+        "#,
+    )
+    .bind(conversation_id)
+    .bind(after_seq_i64)
+    .bind(caller_did)
+    .bind(caller_device_id)
+    .bind(APPLICATION_ENTRY_KIND)
+    .bind(fetch)
+    .fetch_all(&mut **transaction)
+    .await?;
+
+    let limit_usize =
+        usize::try_from(limit).map_err(|_| DeliveryRepositoryError::SequenceOverflow)?;
+    let has_more = rows.len() > limit_usize;
+    if has_more {
+        rows.truncate(limit_usize);
+    }
+    let next_after_seq = match rows.last() {
+        Some(row) => {
+            u64::try_from(row.seq).map_err(|_| DeliveryRepositoryError::SequenceOverflow)?
+        }
+        None => after_seq,
+    };
+    Ok(EntriesPage {
+        entries: rows,
+        next_after_seq,
+        has_more,
+    })
+}
+
+/// `conversationState.snapshotSeq`: the greatest seq that HAS BEEN allocated in
+/// the conversation, i.e. `next_entry_seq - 1`, read from the conversation head.
+///
+/// This is a public-state datum, NOT an entry cursor or entitlement boundary: it
+/// reflects the whole append log's high-water mark regardless of what the caller
+/// can see, and must be read in the same snapshot as the caller's observed
+/// public state (the caller composes both inside one read-only repeatable-read
+/// transaction). Returns `None` when no conversation head exists.
+#[allow(dead_code)]
+pub(crate) async fn conversation_snapshot_seq(
+    transaction: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+) -> Result<Option<u64>, DeliveryRepositoryError> {
+    let next_entry_seq: Option<i64> = sqlx::query_scalar(
+        r#"
+        SELECT next_entry_seq
+          FROM chat.conversations
+         WHERE conversation_id = $1
+        "#,
+    )
+    .bind(conversation_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+
+    match next_entry_seq {
+        Some(next) => {
+            let snapshot = next
+                .checked_sub(1)
+                .ok_or(DeliveryRepositoryError::SequenceOverflow)?;
+            Ok(Some(
+                u64::try_from(snapshot).map_err(|_| DeliveryRepositoryError::SequenceOverflow)?,
+            ))
+        }
+        None => Ok(None),
+    }
+}
+
+/// One `chat.application_intervals` row read back for an exact device: the whole
+/// immutable five-field opening binding, the exact verified opening context, and
+/// the all-or-none finite close (every closing column present together, or all
+/// NULL for an open interval). Columns are carried verbatim; the caller compares
+/// the five opening fields and, for a finite interval, the exact
+/// `{closingTransitionId, closingOuterEntryFingerprint, closingKind}` and
+/// `terminalSeq`.
+#[derive(Clone, Debug, sqlx::FromRow)]
+#[allow(dead_code)]
+pub(crate) struct ApplicationIntervalRow {
+    pub(crate) membership_interval_id: Uuid,
+    pub(crate) conversation_id: Uuid,
+    pub(crate) generation: i64,
+    pub(crate) recipient_did: String,
+    pub(crate) recipient_device_id: Uuid,
+    pub(crate) start_seq: i64,
+    pub(crate) opening_kind: String,
+    pub(crate) opening_transition_id: Uuid,
+    pub(crate) opening_outer_entry_fingerprint: Vec<u8>,
+    pub(crate) opening_state_version: i64,
+    pub(crate) opening_group_id: Vec<u8>,
+    pub(crate) opening_epoch: i64,
+    pub(crate) opening_group_context_hash: Vec<u8>,
+    pub(crate) opening_confirmation_tag: Vec<u8>,
+    pub(crate) opening_leaf_period_id: Uuid,
+    pub(crate) terminal_seq: Option<i64>,
+    pub(crate) closing_state_version: Option<i64>,
+    pub(crate) closing_transition_id: Option<Uuid>,
+    pub(crate) closing_outer_entry_fingerprint: Option<Vec<u8>>,
+    pub(crate) closing_kind: Option<String>,
+    pub(crate) closing_leaf_period_id: Option<Uuid>,
+    pub(crate) removed_at: Option<DateTime<Utc>>,
+    pub(crate) created_at: DateTime<Utc>,
+}
+
+#[allow(dead_code)]
+impl ApplicationIntervalRow {
+    /// True iff the interval is finite (closed). A finite interval has ALL of
+    /// `terminal_seq`, `closing_state_version`, `closing_transition_id`,
+    /// `closing_outer_entry_fingerprint`, `closing_kind`, `closing_leaf_period_id`,
+    /// and `removed_at` present; an open interval has all of them NULL. Anything
+    /// else violates `application_intervals_close_shape_check` and the schema
+    /// forbids it — this predicate keys on `terminal_seq` and the caller may
+    /// assert the all-or-none coherence explicitly.
+    pub(crate) fn is_finite(&self) -> bool {
+        self.terminal_seq.is_some()
+    }
+
+    /// True iff the closing columns are internally coherent (all present or all
+    /// absent) — the read-side echo of the schema's all-or-none close shape.
+    pub(crate) fn close_columns_are_all_or_none(&self) -> bool {
+        let present = [
+            self.terminal_seq.is_some(),
+            self.closing_state_version.is_some(),
+            self.closing_transition_id.is_some(),
+            self.closing_outer_entry_fingerprint.is_some(),
+            self.closing_kind.is_some(),
+            self.closing_leaf_period_id.is_some(),
+            self.removed_at.is_some(),
+        ];
+        present.iter().all(|&present| present) || present.iter().all(|&present| !present)
+    }
+}
+
+/// Read every `chat.application_intervals` row bound to one EXACT recipient
+/// DID/device, ordered by opening seq.
+///
+/// One reducer interval set binds one exact `(recipient_did, recipient_device_id)`
+/// tuple, and every row repeats it; a same-DID sibling is a DIFFERENT set and is
+/// never returned here. This never routes another device's interval and never
+/// synthesizes an opening or close.
+#[allow(dead_code)]
+pub(crate) async fn fetch_device_application_intervals(
+    transaction: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    recipient_did: &str,
+    recipient_device_id: Uuid,
+) -> Result<Vec<ApplicationIntervalRow>, DeliveryRepositoryError> {
+    let rows = sqlx::query_as(
+        r#"
+        SELECT membership_interval_id, conversation_id, generation, recipient_did,
+               recipient_device_id, start_seq, opening_kind, opening_transition_id,
+               opening_outer_entry_fingerprint, opening_state_version, opening_group_id,
+               opening_epoch, opening_group_context_hash, opening_confirmation_tag,
+               opening_leaf_period_id, terminal_seq, closing_state_version,
+               closing_transition_id, closing_outer_entry_fingerprint, closing_kind,
+               closing_leaf_period_id, removed_at, created_at
+          FROM chat.application_intervals
+         WHERE conversation_id = $1
+           AND recipient_did = $2
+           AND recipient_device_id = $3
+         ORDER BY start_seq
+        "#,
+    )
+    .bind(conversation_id)
+    .bind(recipient_did)
+    .bind(recipient_device_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    Ok(rows)
+}
+
+/// One `chat.application_schedule_terminal_proofs` row read back for an exact
+/// device: the exact Terminal entry reference and its 32-byte outer fingerprint.
+#[derive(Clone, Debug, sqlx::FromRow)]
+#[allow(dead_code)]
+pub(crate) struct ScheduleTerminalProofRow {
+    pub(crate) conversation_id: Uuid,
+    pub(crate) recipient_did: String,
+    pub(crate) recipient_device_id: Uuid,
+    pub(crate) terminal_seq: i64,
+    pub(crate) transition_id: Uuid,
+    pub(crate) outer_entry_fingerprint: Vec<u8>,
+    pub(crate) received_at: DateTime<Utc>,
+}
+
+/// Exact-device authenticated lookup of the schedule terminal proof: ZERO or ONE
+/// proof per `(conversation, recipient_did, recipient_device_id)` (the primary
+/// key). No cross-device proof listing exists; a same-DID sibling device with no
+/// proof of its own returns `None`.
+#[allow(dead_code)]
+pub(crate) async fn fetch_schedule_terminal_proof(
+    transaction: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    recipient_did: &str,
+    recipient_device_id: Uuid,
+) -> Result<Option<ScheduleTerminalProofRow>, DeliveryRepositoryError> {
+    let row = sqlx::query_as(
+        r#"
+        SELECT conversation_id, recipient_did, recipient_device_id, terminal_seq,
+               transition_id, outer_entry_fingerprint, received_at
+          FROM chat.application_schedule_terminal_proofs
+         WHERE conversation_id = $1
+           AND recipient_did = $2
+           AND recipient_device_id = $3
+        "#,
+    )
+    .bind(conversation_id)
+    .bind(recipient_did)
+    .bind(recipient_device_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    Ok(row)
+}
+
+/// Fetch the signed control entry at an EXACT seq for an EXACT device, gated by a
+/// `chat.entry_recipients` row for that device at that seq.
+///
+/// This is the read that keeps a former device entitled to its interval's signed
+/// closing control at `terminal_seq`: when an interval ends, the writer retains an
+/// exact `entry_recipients` row (`intervalClose` / `scheduleTerminal` arm) so the
+/// former device can still fetch the closing/Terminal control here even though its
+/// application interval no longer spans that seq. Application entries are never
+/// returned (their audience is interval-derived, never `entry_recipients`).
+/// Returns `None` when the device has no recipient row at that seq.
+#[allow(dead_code)]
+pub(crate) async fn fetch_control_entry_for_device(
+    transaction: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    seq: u64,
+    user_did: &str,
+    device_id: Uuid,
+) -> Result<Option<DeliveredEntryRow>, DeliveryRepositoryError> {
+    let seq_i64 = i64::try_from(seq).map_err(|_| DeliveryRepositoryError::SequenceOverflow)?;
+    let row = sqlx::query_as(
+        r#"
+        SELECT entry.conversation_id, entry.seq, entry.entry_id, entry.entry_kind,
+               entry.signed_request_bytes, entry.request_digest, entry.signature,
+               entry.server_fields_bytes, entry.outer_entry_fingerprint,
+               entry.received_at
+          FROM chat.entries AS entry
+         WHERE entry.conversation_id = $1
+           AND entry.seq = $2
+           AND entry.entry_kind <> $5
+           AND EXISTS (
+             SELECT 1
+               FROM chat.entry_recipients AS recipient
+              WHERE recipient.conversation_id = entry.conversation_id
+                AND recipient.seq = entry.seq
+                AND recipient.user_did = $3
+                AND recipient.device_id = $4
+           )
+        "#,
+    )
+    .bind(conversation_id)
+    .bind(seq_i64)
+    .bind(user_did)
+    .bind(device_id)
+    .bind(APPLICATION_ENTRY_KIND)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    Ok(row)
 }
