@@ -634,10 +634,14 @@ pub(crate) struct AttachmentBlobView {
 /// sufficient. Returns `None` when not visible.
 ///
 /// DRIFT GUARD: the `EXISTS (... application_intervals ...)` interval-spanning
-/// predicate below is byte-identical to the delivery read predicate in
+/// predicate below is SEMANTICALLY IDENTICAL — the same inclusive
+/// `[start_seq, terminal_seq]` bounds — to the delivery read predicate in
 /// `repository/delivery.rs` (`getEntries` visible-CTE, the
 /// `entry.seq >= interval.start_seq AND (interval.terminal_seq IS NULL OR
-/// entry.seq <= interval.terminal_seq)` clause). Both sites carry a matching
+/// entry.seq <= interval.terminal_seq)` clause). It is NOT a byte-for-byte
+/// copy: the probed seq is this binding's `entry_seq` here versus the log
+/// row's `entry.seq` there — the operand names differ while the bound
+/// semantics must not. Both sites carry a matching
 /// cross-reference comment; if you change the inclusive `[start_seq, terminal_seq]`
 /// semantics here, change it there too (and vice versa) so per-device application
 /// visibility never diverges between the entry log and blob custody.

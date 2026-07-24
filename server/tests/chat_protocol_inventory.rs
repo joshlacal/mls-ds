@@ -346,6 +346,17 @@ async fn get_devices_excludes_revoked_devices() {
     }
 }
 
+// NOTE (r12 minor #3, closed as not-a-gap): this test cannot isolate WHICH of the
+// two `get_devices` predicates (`status = 'active'` vs `revoked_at IS NULL`)
+// excludes the revoked device, because the two are DDL-coupled and cannot diverge.
+// `devices_revocation_shape_check` (`20260722000001…:326-328`) enforces exactly
+// `(status = 'active' AND revoked_at IS NULL AND revocation_id IS NULL)
+//  OR (status = 'revoked' AND revoked_at IS NOT NULL ...)`, so a row with
+// `status = 'revoked'` and `revoked_at IS NULL` (or the converse) is unseedable.
+// Predicate isolation is therefore not a coverage gap here — the redundancy is
+// DDL-guaranteed, and behavioral exclusion (proved above) is the only observable
+// property.
+
 // ===========================================================================
 // Inventory-session CREATE + materialize (the first-getConversations half).
 // ===========================================================================
@@ -761,15 +772,20 @@ fn terminal_seq_hints_carry_no_fingerprint() {
     }
 }
 
-// NOTE: the populated conversation-domain materialization case (remainder #8) is
-// NOT raw-seedable in isolation despite the S4a scoping report's note: the
-// `conversations` row carries an IMMEDIATE `conversations_current_state_fk` on
-// `(conversation_id, current_generation, current_state_version)` into
-// `generation_states`, whose FK chains back through `generations` to
-// `conversations` — a circular immediate FK that only the executor's coherent
-// creation graph (deferred-constraint transaction) can satisfy. The populated
-// conversation domain therefore shares the executor-seed dependency with the
-// pending-Welcome and recovery domains and is built beside the executor harness,
-// not here. The empty-domain and ticket-loop cases above prove the CREATE
-// transaction (fence capture, token derivation, ordinal/digest/completion, and
-// the deferred materialization + identity triggers) end-to-end.
+// NOTE (r12 correction): the populated conversation-domain materialization case
+// (remainder #8) IS raw-seedable in a single transaction — the earlier claim that
+// `conversations_current_state_fk` is an IMMEDIATE circular FK was wrong. That FK
+// on `(conversation_id, current_generation, current_state_version)` into
+// `generation_states` is `DEFERRABLE INITIALLY DEFERRED`
+// (`20260722000001…:922-926`); it exists precisely to break the
+// conversations⇄generations⇄generation_states cycle. The two immediate legs
+// (`generations_conversation_fk`, `generation_states_generation_fk`) are satisfied
+// by insert order (conversation → generation → generation_states), and the
+// deferred leg resolves at COMMIT. Raw seeding is therefore possible, only
+// laborious to assemble coherently. The populated conversation/welcome/recovery
+// materialization path is exercised beside the executor harness via the shared
+// `common::executor_seed` fulfillment graph (Seal A), which produces a coherent
+// conversation + generation graph directly. The empty-domain and ticket-loop
+// cases above prove the CREATE transaction (fence capture, token derivation,
+// ordinal/digest/completion, and the deferred materialization + identity
+// triggers) end-to-end.

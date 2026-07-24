@@ -1907,6 +1907,14 @@ pub(crate) struct CreatedInventorySession {
 /// `assert_inventory_session_identity` triggers are forced IMMEDIATE so a
 /// malformed materialization or a stale device authority fails here rather than
 /// at COMMIT.
+///
+/// Note (r12 minor #4): `SET CONSTRAINTS … IMMEDIATE` changes the named deferred
+/// constraints to immediate for the REMAINDER of the enclosing transaction, not
+/// just for the statements this function issues. That is correct for the terminal
+/// create handlers (they are the last mutation in their transaction), but any
+/// future caller that composes further deferred work after `create_inventory_session`
+/// in the same transaction must account for the constraints already being immediate
+/// (or re-defer them explicitly).
 pub(crate) async fn create_inventory_session(
     transaction: &mut Transaction<'_, Postgres>,
     codec: &CursorCodec,
