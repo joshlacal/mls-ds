@@ -19,6 +19,14 @@ pub(crate) mod core;
 // only additionally makes them available to the test configuration.
 pub(crate) mod delivery;
 pub(crate) mod inventory;
+// `key_packages` (Task 4 / OQ-9) is the certified key-package persistence sink
+// used by the enrollDevice/replenishKeyPackages handlers. Unconditionally
+// compiled so both the production build and the `#[path]`-including integration
+// harness resolve `super::repository::key_packages`; self-contained
+// (`chrono`/`sha2`/`sqlx`/`uuid`), so the harness includes only this file.
+// `#[allow(dead_code)]` until the H1 endpoint handlers (next seal) call in.
+#[allow(dead_code)]
+pub(crate) mod key_packages;
 #[cfg(not(test))]
 pub(crate) mod relationship;
 pub(crate) mod transition;
