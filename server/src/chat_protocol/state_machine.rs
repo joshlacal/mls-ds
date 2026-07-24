@@ -1159,6 +1159,41 @@ impl HydrationAuthority {
         })
     }
 
+    /// Bootstraps the hydration authority from an EXISTING conversation's
+    /// locked head (`prior_coordinate` = `Some`, `next_entry_seq >= 2`). This is
+    /// the read-time counterpart of `from_locked_creation_head`: the aggregate
+    /// hydrator needs an authority carrying the locked head binding BEFORE the
+    /// `LockedConversationStateGuard` exists, so `from_locked_conversation`
+    /// (which reads the finished guard's `locked_graph_digest`) cannot serve —
+    /// it is circular. The graph/snapshot digests are therefore `None` here;
+    /// they are only known once the aggregate has been assembled and sealed.
+    /// The historical graph rows are re-verified by the DISTINCT read-time
+    /// `HistoricalRehydrationAuthority`, never by this append-time authority.
+    #[cfg(not(test))]
+    #[allow(dead_code)]
+    pub(crate) fn from_locked_existing_head(
+        head: &LockedConversationHeadGuard,
+    ) -> Result<Self, StateMachineError> {
+        if head.prior_coordinate().is_none()
+            || head.next_entry_seq() < 2
+            || head.durable_row_digest() == &[0; 32]
+        {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
+        Ok(Self {
+            expected_conversation_id: *head.conversation_id().as_bytes(),
+            locked: LockedHydrationBinding {
+                transaction_id: head.transaction_id().to_owned(),
+                expected_prior: head.prior_coordinate().copied(),
+                expected_next_entry_seq: head.next_entry_seq(),
+                locked_at: ServerTimestamp::from_unix_millis(head.locked_at().timestamp_millis())?,
+                locked_head_digest: *head.durable_row_digest(),
+                locked_graph_digest: None,
+                locked_snapshot_digest: None,
+            },
+        })
+    }
+
     #[cfg(not(test))]
     fn require_same_locked_conversation(
         &self,
