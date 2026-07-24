@@ -16605,30 +16605,53 @@ mod executor {
         let expected_state_version = checked_i64(expected_prior.state_version())?;
         let expected_next_entry_seq = checked_i64(head.expected_next_entry_seq())?;
 
-        // Close is coordinate-retire + interval/leaf teardown; it carries no
-        // participant/metadata/recovery/reservation/welcome change on the simple
-        // (creator-only / direct) terminal path. Anything else is a hard error.
-        //
-        // NAMED REMAINDER (arm 3 #3, close branch): unlike reset activation, `close`
-        // does NOT route prior-bound open work through write_prior_bound_supersessions.
-        // This is UNREACHABLE-by-fixture, not a gap: a close is single-member-admin /
-        // direct-pair only, so it cannot carry another member's open recovery work,
-        // and it cannot carry its OWN pending welcome (a pending welcome requires a
-        // recovery fulfillment, i.e. >=2 members). These reject_if_present guards are
-        // STRICTER than supersession (they fail closed on any such delta) and cannot
-        // silently drop — so there is no reachable scenario to compose or test.
+        // Close is coordinate-retire + interval/leaf teardown. It carries NO own
+        // recovery/welcome edge, but it DOES supersede prior-coordinate open work:
+        // `plan_close_inner` calls `resolve_prior_bound_work` unconditionally, and a
+        // close IS reachable while the actor's own (group-of-1 admin) or the other
+        // party's (direct 1:1) leaf-recovery request is open — superseding it +
+        // releasing the reservation + reactivating the package. Those deltas are
+        // consumed below via the shared write_prior_bound_supersessions +
+        // write_welcome_supersessions + reconcile (own counts 0). Families the close
+        // genuinely never carries stay fail-closed.
         reject_if_present("participant_changes", effects.participant_changes())?;
-        reject_if_present(
-            "recovery_request_changes",
-            effects.recovery_request_changes(),
-        )?;
-        reject_if_present("reservation_changes", effects.reservation_changes())?;
         reject_if_present("leave_request_changes", effects.leave_request_changes())?;
         reject_if_present("reset_request_changes", effects.reset_request_changes())?;
-        reject_if_present("welcome_changes", effects.welcome_changes())?;
-        reject_if_present("package_transitions", effects.package_transitions())?;
-        reject_if_present("recovery_package_cas", effects.recovery_package_cas())?;
         reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
+        // Every recovery/reservation/package delta a close carries MUST be a
+        // prior-bound supersession (request Open->Superseded, reservation
+        // Active->Released, package Reserved->Available) — exact-shape checked here
+        // (mirroring the generic-commit arm) and consumed below. `recovery_package_cas`
+        // is the production-shape package witness the bijection validates, NOT a
+        // rejected family.
+        for change in effects.recovery_request_changes() {
+            if !matches!((change.before(), change.after()), (Some(before), Some(after))
+                if before.status() == RecoveryRequestStatus::Open
+                    && after.status() == RecoveryRequestStatus::Superseded)
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "close recovery request change is not a supersession",
+                ));
+            }
+        }
+        for change in effects.reservation_changes() {
+            if !matches!((change.before(), change.after()), (Some(before), Some(after))
+                if before.status() == ReservationStatus::Active
+                    && after.status() == ReservationStatus::Released)
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "close reservation change is not a release",
+                ));
+            }
+        }
+        for edge in effects.package_transitions() {
+            if edge.from != PackageStatus::Reserved || edge.to != PackageStatus::Available {
+                return Err(ExecutorError::InconsistentPlan(
+                    "close package edge is not a Reserved->Available release",
+                ));
+            }
+        }
+        verify_recovery_package_bijection(effects)?;
         if effects.metadata_change().is_some() {
             return Err(ExecutorError::UnsupportedEffect("close metadata change"));
         }
@@ -16835,6 +16858,18 @@ mod executor {
         )
         .await?;
         let event_positions = write_events(transaction, ctx).await?;
+
+        // 10. Supersede prior-coordinate open work the close retired: an open
+        //     leaf-recovery request (Open->Superseded) + its reservation
+        //     (Active->Released) + reserved package (Reserved->Available), and any
+        //     prior pending welcome. The close has ZERO own recovery/welcome edges,
+        //     so own == default and every such delta MUST be a supersession the
+        //     calls below applied — reconcile rejects any that is neither.
+        let mut superseded =
+            write_prior_bound_supersessions(transaction, effects, transition_id, applied_at)
+                .await?;
+        superseded.welcomes = write_welcome_supersessions(transaction, ctx, effects).await?;
+        reconcile_coordinate_change_families(effects, &FamilyCounts::default(), &superseded)?;
 
         Ok(AppliedTransition {
             allocated_seq: u64::try_from(seq_i64).unwrap(),
@@ -17343,9 +17378,43 @@ mod executor {
         // fail-closed.
         reject_if_present("participant_changes", effects.participant_changes())?;
         reject_if_present("leave_request_changes", effects.leave_request_changes())?;
-        reject_if_present("recovery_package_cas", effects.recovery_package_cas())?;
         reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
         reject_if_present("terminal_proof_changes", effects.terminal_proof_changes())?;
+        // Every recovery/reservation/package delta a reset carries MUST be a
+        // prior-bound supersession (mirroring the generic-commit / close arms):
+        // request Open->Superseded, reservation Active->Released, package
+        // Reserved->Available. `recovery_package_cas` is the production-shape witness
+        // the bijection validates, NOT a rejected family — so a reset that retires a
+        // generation with an OPEN recovery request (reserved package) is composed,
+        // not hard-errored.
+        for change in effects.recovery_request_changes() {
+            if !matches!((change.before(), change.after()), (Some(before), Some(after))
+                if before.status() == RecoveryRequestStatus::Open
+                    && after.status() == RecoveryRequestStatus::Superseded)
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "reset recovery request change is not a supersession",
+                ));
+            }
+        }
+        for change in effects.reservation_changes() {
+            if !matches!((change.before(), change.after()), (Some(before), Some(after))
+                if before.status() == ReservationStatus::Active
+                    && after.status() == ReservationStatus::Released)
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "reset reservation change is not a release",
+                ));
+            }
+        }
+        for edge in effects.package_transitions() {
+            if edge.from != PackageStatus::Reserved || edge.to != PackageStatus::Available {
+                return Err(ExecutorError::InconsistentPlan(
+                    "reset package edge is not a Reserved->Available release",
+                ));
+            }
+        }
+        verify_recovery_package_bijection(effects)?;
         if effects.revocation_target_cas().is_some() || effects.welcome_cas().is_some() {
             return Err(ExecutorError::UnsupportedEffect(
                 "reset revocation/welcome CAS",

@@ -1752,6 +1752,137 @@ fn close_ctx(
     }
 }
 
+/// Arm 3 #3 close-gap fix (review finding): a close is REACHABLE while a
+/// leaf-recovery request is open — here a direct 1:1 whose active party opened a
+/// `replace` request for her leaf, then closes (a group-of-1 admin closing after
+/// her own request is the same shape). `plan_close` calls
+/// `resolve_prior_bound_work` unconditionally, so the close plan carries the
+/// request (Open->Superseded) + reservation (Active->Released) + package
+/// (Reserved->Available). Before the fix `apply_close` `reject_if_present`
+/// HARD-ERRORED this legal close; now it composes the shared supersession and the
+/// close SUCCEEDS (request superseded / reservation released / package available).
+#[tokio::test]
+async fn close_supersedes_pending_leaf_recovery_request() {
+    let (pool, _db) = setup().await;
+    let fixture = commit_creation(&pool, ConversationKind::Direct).await;
+    let conversation_id = fixture.conversation_id;
+
+    // Alice (the active party) opens a `replace` leaf-recovery request for her leaf.
+    let committed = commit_replace_recovery_request(&pool, &fixture, 0x71).await;
+    let request_id = committed.request_id;
+    let key_package_ref = committed.key_package_ref;
+
+    let leaf_period_id: Uuid = sqlx::query_scalar(
+        "SELECT leaf_period_id FROM chat.member_devices WHERE conversation_id=$1 AND user_did=$2",
+    )
+    .bind(conversation_id)
+    .bind(&fixture.alice_did)
+    .fetch_one(&pool)
+    .await
+    .expect("alice leaf period");
+
+    // Alice closes the group WHILE the recovery request is pending (close entry seq 2).
+    let close_received = ServerTimestamp::from_unix_millis_for_test(
+        corpus_manifest().evaluation_unix_seconds as i64 * 1_000 + 5_000,
+    )
+    .unwrap();
+    let entry_id = Uuid::new_v4();
+    let close_transition = Uuid::new_v4();
+    // The close entry fingerprint MUST equal `close_ctx`'s entry outer fingerprint
+    // ([0x13; 32]) — the interval-close provenance FK binds them.
+    let close_evidence = TransitionEvidence::for_test_at(
+        2,
+        *close_transition.as_bytes(),
+        [0x13_u8; 32],
+        close_received,
+    )
+    .unwrap();
+    let planned = plan_close(
+        &committed.state,
+        CloseConversation {
+            actor: fixture.alice_id.clone(),
+            transition: close_evidence,
+        },
+    )
+    .expect("valid close plan with a pending recovery request");
+    let head_cas = ConversationHeadCasBinding::for_test_edge(
+        *conversation_id.as_bytes(),
+        *entry_id.as_bytes(),
+        fixture.coordinate,
+        2,
+        close_received,
+    );
+    let plan = persistence_plan_for_test(planned, head_cas);
+    let applied_at = clock_now(&pool).await;
+    let alice_pred =
+        device_event_predecessor(&pool, &fixture.alice_did, fixture.alice_device).await;
+    let ctx = close_ctx(&fixture, entry_id, applied_at, leaf_period_id, alice_pred);
+
+    let mut tx = pool.begin().await.expect("begin close");
+    let applied = apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+        .await
+        .expect("close with a pending recovery request applies");
+    tx.commit()
+        .await
+        .expect("close COMMIT past all deferred triggers");
+    assert_eq!(applied.allocated_seq, 2);
+
+    // The conversation is closed DESPITE the pending request.
+    let lifecycle: String =
+        sqlx::query_scalar("SELECT lifecycle FROM chat.conversations WHERE conversation_id=$1")
+            .bind(conversation_id)
+            .fetch_one(&pool)
+            .await
+            .expect("head");
+    assert_eq!(lifecycle, "superseded");
+    // The prior-bound recovery work is superseded/released/reactivated.
+    let req_status: String = sqlx::query_scalar(
+        "SELECT status FROM chat.leaf_recovery_requests WHERE recovery_request_id=$1",
+    )
+    .bind(request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("request");
+    assert_eq!(req_status, "superseded");
+    let res_status: String = sqlx::query_scalar(
+        "SELECT status FROM chat.key_package_reservations WHERE recovery_request_id=$1",
+    )
+    .bind(request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("reservation");
+    assert_eq!(res_status, "released");
+    let pkg_status: String =
+        sqlx::query_scalar("SELECT status FROM chat.key_packages WHERE key_package_ref=$1")
+            .bind(key_package_ref.to_vec())
+            .fetch_one(&pool)
+            .await
+            .expect("package");
+    assert_eq!(pkg_status, "available");
+
+    // Replay -> head CAS conflict (head already superseded), zero residue.
+    let before: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM chat.transitions WHERE conversation_id=$1")
+            .bind(conversation_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let mut tx2 = pool.begin().await.expect("begin replay");
+    let replay = apply_conversation_persistence_plan(&mut tx2, &plan, &ctx).await;
+    assert!(
+        matches!(replay, Err(ExecutorError::Transition(_))),
+        "close replay must conflict on the head CAS, got {replay:?}"
+    );
+    tx2.rollback().await.expect("rollback replay");
+    let after: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM chat.transitions WHERE conversation_id=$1")
+            .bind(conversation_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(before, after, "close replay left zero residue");
+}
+
 #[tokio::test]
 async fn reset_request_commits_without_changing_the_coordinate() {
     let (pool, _db) = setup().await;
