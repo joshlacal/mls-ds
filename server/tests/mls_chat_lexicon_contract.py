@@ -40,7 +40,7 @@ PROTOCOL_PATH = STACK_ROOT / "docs/CHAT_PROTOCOL.md"
 APPLICATION_PROTOCOL_PATH = STACK_ROOT / "docs/CHAT_APPLICATION_PROTOCOL.md"
 APPLICATION_MANIFEST_PATH = STACK_ROOT / "docs/generated-artifacts/chat-application-v1/manifest.json"
 APPLICATION_MANIFEST_INPUT_ENV = "CATBIRD_CHAT_APPLICATION_FIXTURE_INPUT"
-FROZEN_APPLICATION_MANIFEST_SHA256 = "7ad20d054b9d2c0c7d6ab39aeed19cd9ffa6a59c1cbaa3d7fd6fd5cb5aa15440"
+FROZEN_APPLICATION_MANIFEST_SHA256 = "94488c344f17f1a41d54c6a34261f8fb06b15d57604f0ae8c7aa15fb0317694d"
 TASK1_DOC_PATHS = (
     STACK_ROOT / ".superpowers/sdd/mls-chat-task-1-semantic-repair-brief.md",
     STACK_ROOT / ".superpowers/sdd/mls-chat-task-1-report.md",
@@ -1976,7 +1976,7 @@ def validate_application_provenance(generator: dict[str, Any]) -> None:
                 authority_paths.add(path.relative_to(STACK_ROOT).as_posix())
     expected_authority_paths = sorted(authority_paths)
     authority_sources = generator["authoritySources"]
-    assert len(authority_sources) == len(expected_authority_paths) == 558
+    assert len(authority_sources) == len(expected_authority_paths) == 593
     assert [source["path"] for source in authority_sources] == expected_authority_paths
     assert len(set(expected_authority_paths)) == len(expected_authority_paths)
     authority_bytes: list[tuple[str, bytes]] = []
