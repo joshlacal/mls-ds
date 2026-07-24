@@ -8244,6 +8244,8 @@ async fn device_revocation_without_receipt_fails_the_commit_trigger() {
 async fn build_policy_edge(
     pool: &PgPool,
     fixture: &CreationApply,
+    state: &chat_protocol::state_machine::ConversationState,
+    seq: u64,
 ) -> (
     chat_protocol::state_machine::ConversationPersistencePlan,
     ExecutionContext,
@@ -8253,14 +8255,16 @@ async fn build_policy_edge(
     let bob2_device = Uuid::from_bytes(*bob2_id.device_id());
     let _ = seed_actor(pool, &bob2_did, bob2_device, &[0x63_u8; 32]).await;
 
+    // A receivedAt strictly after any prior edge at a lower seq (so an edge that
+    // follows a committed reset request at seq 2 is monotonically later).
     let received_at = ServerTimestamp::from_unix_millis_for_test(
-        corpus_manifest().evaluation_unix_seconds as i64 * 1_000 + 2_000,
+        corpus_manifest().evaluation_unix_seconds as i64 * 1_000 + (seq as i64) * 1_000 + 2_000,
     )
     .unwrap();
     let entry_id = Uuid::new_v4();
     let transition_id = Uuid::new_v4();
     let policy_evidence = TransitionEvidence::for_test_policy_add(
-        2,
+        seq,
         *transition_id.as_bytes(),
         [0x12_u8; 32],
         received_at,
@@ -8269,7 +8273,7 @@ async fn build_policy_edge(
     )
     .unwrap();
     let planned = plan_policy(
-        &fixture.state,
+        state,
         fixture.alice_id.clone(),
         policy_evidence,
         [0x99_u8; 32],
@@ -8279,7 +8283,7 @@ async fn build_policy_edge(
         *conversation_id.as_bytes(),
         *entry_id.as_bytes(),
         fixture.coordinate,
-        2,
+        seq,
         received_at,
     );
     let plan = persistence_plan_for_test(planned, head_cas);
@@ -8435,7 +8439,7 @@ async fn concurrent_edge_apply_from_one_coordinate_yields_one_commit() {
         .expect("creation applies");
     tx.commit().await.expect("creation COMMIT");
 
-    let (plan, ctx) = build_policy_edge(&pool, &fixture).await;
+    let (plan, ctx) = build_policy_edge(&pool, &fixture, &fixture.state, 2).await;
 
     let barrier = Barrier::new(2);
     let racer_a = async {
@@ -8631,5 +8635,286 @@ async fn concurrent_duplicate_creation_yields_one_commit() {
         .await,
         1,
         "one creation entry — the loser left zero residue",
+    );
+}
+
+/// Build (but do not apply) a real reset ACTIVATION edge on top of a committed
+/// creation `fixture`: commits the non-mutating reset request at seq 2, then
+/// constructs the activation plan/ctx that retires generation 0 and forms
+/// generation 1 at seq 3. Mirrors
+/// `reset_activation_commits_two_generation_graph_and_conflicts_on_replay`.
+async fn build_reset_activation_edge(
+    pool: &PgPool,
+    fixture: &CreationApply,
+) -> (
+    chat_protocol::state_machine::ConversationPersistencePlan,
+    ExecutionContext,
+    Uuid,
+) {
+    let conversation_id = fixture.conversation_id;
+    let manifest = corpus_manifest();
+    let req_received = ServerTimestamp::from_unix_millis_for_test(
+        manifest.evaluation_unix_seconds as i64 * 1_000 + 3_000,
+    )
+    .unwrap();
+    let (reset_state, request_id) = commit_reset_request(pool, fixture, 2, req_received).await;
+
+    let old_leaf_period: Uuid = sqlx::query_scalar(
+        "SELECT leaf_period_id FROM chat.member_devices WHERE conversation_id=$1 AND generation=0",
+    )
+    .bind(conversation_id)
+    .fetch_one(pool)
+    .await
+    .expect("old leaf period");
+    let participant_rows: Vec<(String, Uuid)> = sqlx::query_as(
+        "SELECT user_did,participant_period_id FROM chat.participants WHERE conversation_id=$1 AND current_membership",
+    )
+    .bind(conversation_id)
+    .fetch_all(pool)
+    .await
+    .expect("participant periods");
+
+    let successor_coordinate = PublicGroupSnapshotCoordinate::new(
+        *conversation_id.as_bytes(),
+        fixture.coordinate.generation() + 1,
+        0,
+        [0x71; 32],
+        0,
+        [0x72; 32],
+        [0x73; 32],
+        PublicGroupSnapshotLifecycle::Active,
+    );
+    let successor_public_state =
+        ActivePublicState::for_test(&verified_genesis(&manifest), successor_coordinate);
+    let retired_coordinate = PublicGroupSnapshotCoordinate::new(
+        *conversation_id.as_bytes(),
+        fixture.coordinate.generation(),
+        fixture.coordinate.state_version() + 1,
+        *fixture.coordinate.group_id(),
+        fixture.coordinate.epoch(),
+        *fixture.coordinate.group_context_hash(),
+        *fixture.coordinate.confirmation_tag(),
+        PublicGroupSnapshotLifecycle::Superseded,
+    );
+
+    let act_received = ServerTimestamp::from_unix_millis_for_test(
+        manifest.evaluation_unix_seconds as i64 * 1_000 + 4_000,
+    )
+    .unwrap();
+    let transition_id = Uuid::new_v4();
+    let entry_id = Uuid::new_v4();
+    let alice_sig_key: Vec<u8> =
+        hex::decode(&manifest.identity.alice.signature_public_key_hex).unwrap();
+    let nonce = [0x78_u8; 12];
+    let ciphertext = vec![0x79_u8; 48];
+    let metadata = MetadataSnapshotBinding::for_test_creation(
+        *conversation_id.as_bytes(),
+        1,
+        0,
+        [0x72; 32],
+        *transition_id.as_bytes(),
+        3,
+        fixture.alice_id.clone(),
+        Sha256::digest(&alice_sig_key).into(),
+        alice_sig_key.clone().try_into().unwrap(),
+        1,
+        2,
+        nonce,
+        ciphertext,
+    );
+    let evidence = TransitionEvidence::for_test_reset_activation_with_metadata(
+        3,
+        *transition_id.as_bytes(),
+        [0x15_u8; 32],
+        act_received,
+        ConversationKind::Group,
+        *request_id.as_bytes(),
+        fixture.coordinate,
+        retired_coordinate,
+        successor_coordinate,
+        fixture.alice_id.clone(),
+        metadata,
+    )
+    .unwrap();
+    let planned = plan_reset_activation(
+        &reset_state,
+        ResetActivation {
+            actor: fixture.alice_id.clone(),
+            reset_request_id: *request_id.as_bytes(),
+            transition: evidence,
+            successor_public_state,
+        },
+    )
+    .expect("valid reset activation plan");
+    let head_cas = ConversationHeadCasBinding::for_test_edge(
+        *conversation_id.as_bytes(),
+        *entry_id.as_bytes(),
+        fixture.coordinate,
+        3,
+        act_received,
+    );
+    let plan = persistence_plan_for_test(planned, head_cas);
+
+    let mut sorted_participants = participant_rows.clone();
+    sorted_participants.sort_by(|l, r| l.0.as_bytes().cmp(r.0.as_bytes()));
+    let participant_period_ids: Vec<Uuid> = sorted_participants.iter().map(|(_, id)| *id).collect();
+
+    let applied_at = clock_now(pool).await;
+    let payload = vec![0x81_u8; 12];
+    let transcript = vec![0x82_u8; 12];
+    let pred = device_event_predecessor(pool, &fixture.alice_did, fixture.alice_device).await;
+    let ctx = ExecutionContext {
+        protocol_instance_id: fixture.protocol_instance_id,
+        applied_at,
+        actor: ExecutionActor {
+            user_did: fixture.alice_did.clone(),
+            device_id: fixture.alice_device,
+            key_id: fixture.alice_key_id.clone(),
+            auth_generation: 1,
+            role: TransitionActorRole::Admin,
+            device_status: "active".to_owned(),
+        },
+        entry: ControlEntryContent {
+            entry_id,
+            entry_kind: "blue.catbird.chat.defs#resetActivationEntry".to_owned(),
+            accepted_payload_bytes: payload.clone(),
+            accepted_payload_sha256: Sha256::digest(&payload).to_vec(),
+            signed_request_bytes: transcript.clone(),
+            unsigned_projection_bytes: vec![0x83_u8; 8],
+            signing_transcript_bytes: transcript.clone(),
+            request_digest: Sha256::digest(&transcript).to_vec(),
+            signature: vec![0x84_u8; 64],
+            server_fields_bytes: vec![0x85_u8; 8],
+            outer_entry_fingerprint: vec![0x15_u8; 32],
+        },
+        spine: SpineArtifacts {
+            public_snapshot_bytes: vec![0x91_u8; 16],
+            public_snapshot_sha256: Sha256::digest([0x91_u8; 16]).to_vec(),
+            tree_summary_bytes: vec![0x92_u8; 16],
+            tree_summary_sha256: Sha256::digest([0x92_u8; 16]).to_vec(),
+            leaf_count: 1,
+            genesis_group_info_bytes: vec![0x93_u8; 16],
+            genesis_group_info_sha256: Sha256::digest([0x93_u8; 16]).to_vec(),
+        },
+        opened_leaves: vec![LeafPersistenceColumns {
+            device: fixture.alice_id.clone(),
+            leaf_key_id: fixture.alice_key_id.clone(),
+            leaf_auth_generation: 1,
+        }],
+        metadata_author: Some(MetadataAuthorColumns {
+            author_role: "admin".to_owned(),
+            author_device_status: "active".to_owned(),
+            author_public_key: alice_sig_key,
+            author_key_id: fixture.alice_key_id.clone(),
+            metadata_snapshot_id: Uuid::new_v4(),
+        }),
+        participant_period_ids,
+        leaf_period_ids: vec![Uuid::new_v4()],
+        entry_recipients: vec![(
+            fixture.alice_id.clone(),
+            EntryEntitlementKind::IntervalClose,
+        )],
+        events: vec![EventFanout {
+            event_id: Uuid::new_v4(),
+            event_kind: EventKind::ConversationChanged,
+            payload_bytes: vec![0x94_u8; 8],
+            recipients: vec![(
+                fixture.alice_id.clone(),
+                EventEntitlementKind::Participant,
+                pred,
+            )],
+            outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+        }],
+        closing_leaf_periods: vec![(fixture.alice_id.clone(), old_leaf_period)],
+        closing_participant_periods: vec![],
+        reset_request_row: None,
+        recovery_open: None,
+        welcome_expiry: None,
+        welcome_response: None,
+        welcome_dispositions: vec![],
+    };
+    (plan, ctx, request_id)
+}
+
+/// Two reset ACTIVATIONS race from ONE prior coordinate: two transactions apply
+/// the same activation edge (retire generation 0, form generation 1) at once.
+/// Exactly one commits (head -> generation 1, the reset request `consumed`); the
+/// loser's head CAS matches no row at the old coordinate and is a typed
+/// `ExecutorError::Transition`, rolling back with zero residue — exactly one
+/// activation transition and exactly one active generation-1 leaf.
+#[tokio::test]
+async fn concurrent_reset_activation_yields_one_commit_zero_residue() {
+    let (pool, _db) = setup().await;
+    let fixture = commit_creation(&pool, ConversationKind::Group).await;
+    let conversation_id = fixture.conversation_id;
+    let (plan, ctx, request_id) = build_reset_activation_edge(&pool, &fixture).await;
+
+    let barrier = Barrier::new(2);
+    let racer_a = async {
+        let mut tx = pool.begin().await.expect("begin A");
+        barrier.wait().await;
+        let result = apply_conversation_persistence_plan(&mut tx, &plan, &ctx).await;
+        let ok = result.is_ok();
+        if ok {
+            tx.commit().await.expect("A commit");
+        } else {
+            tx.rollback().await.expect("A rollback");
+            assert!(
+                matches!(result, Err(ExecutorError::Transition(_))),
+                "loser is a typed transition conflict, got {result:?}"
+            );
+        }
+        ok
+    };
+    let racer_b = async {
+        let mut tx = pool.begin().await.expect("begin B");
+        barrier.wait().await;
+        let result = apply_conversation_persistence_plan(&mut tx, &plan, &ctx).await;
+        let ok = result.is_ok();
+        if ok {
+            tx.commit().await.expect("B commit");
+        } else {
+            tx.rollback().await.expect("B rollback");
+            assert!(
+                matches!(result, Err(ExecutorError::Transition(_))),
+                "loser is a typed transition conflict, got {result:?}"
+            );
+        }
+        ok
+    };
+    let (a, b) = tokio::join!(racer_a, racer_b);
+    assert!(a ^ b, "exactly one reset activation commits");
+
+    let (gen, sv, lifecycle): (i64, i64, String) = sqlx::query_as(
+        "SELECT current_generation,current_state_version,lifecycle FROM chat.conversations WHERE conversation_id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("head");
+    assert_eq!(
+        (gen, sv, lifecycle.as_str()),
+        (1, 0, "active"),
+        "the successor generation is live exactly once"
+    );
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM chat.transitions WHERE conversation_id=$1 AND kind='resetActivation'", conversation_id).await,
+        1,
+        "exactly one activation transition — the loser left zero residue",
+    );
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM chat.member_devices WHERE conversation_id=$1 AND generation=1 AND active", conversation_id).await,
+        1,
+        "exactly one active generation-1 leaf",
+    );
+    let req_status: String =
+        sqlx::query_scalar("SELECT status FROM chat.reset_requests WHERE reset_request_id=$1")
+            .bind(request_id)
+            .fetch_one(&pool)
+            .await
+            .expect("reset request status");
+    assert_eq!(
+        req_status, "consumed",
+        "the winning activation consumed the request"
     );
 }
