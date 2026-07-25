@@ -2364,8 +2364,9 @@ mod historical_control_loader {
     use super::historical_control_path::{build_real_creation_entry, RealCreationEntry};
     use crate::chat_protocol::repository::core::{
         load_historical_control_evidence, load_interval_hydration_rows,
-        load_participant_hydration_rows, ControlEvidenceLoadError, IntervalHydrationError,
-        ParticipantHydrationError,
+        load_participant_hydration_rows, load_producer_transition_evidence,
+        ControlEvidenceLoadError, IntervalHydrationError, ParticipantHydrationError,
+        ProducerHydrationError,
     };
     use crate::chat_protocol::snapshot::PublicGroupSnapshotLifecycle;
     use crate::chat_protocol::state_machine::{
@@ -2883,6 +2884,107 @@ mod historical_control_loader {
         assert!(matches!(
             IntervalHydrationError::from(ControlEvidenceLoadError::InvalidEvidence),
             IntervalHydrationError::InvalidProvenance
+        ));
+    }
+
+    /// The current-state producer leg reads `generation_states.producing_transition_id`
+    /// for the current coordinate and re-verifies it as a transition. On the
+    /// genesis seed that is the creation transition; the evidence byte-equals the
+    /// directly loaded historical control transition (same loader atom, same key).
+    #[tokio::test]
+    #[ignore = "requires the dedicated gate database"]
+    async fn producer_leg_hydrates_the_genesis_creation_transition() {
+        let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+        let cid = Uuid::new_v4();
+        let entry = build_real_creation_entry(*cid.as_bytes());
+        let creation = seed_real_creation_graph(&pool, &entry).await;
+        let authority =
+            HistoricalRehydrationAuthority::new(entry.cid, entry.head_next_entry_seq).unwrap();
+
+        let mut tx = pool.begin().await.expect("begin");
+        let reference = load_historical_control_evidence(&mut tx, &authority, cid, creation)
+            .await
+            .expect("producer evidence loads")
+            .into_transition()
+            .expect("producer is a transition");
+        let producer = load_producer_transition_evidence(&mut tx, &authority, cid)
+            .await
+            .expect("genesis producer hydrates");
+        tx.commit().await.expect("commit");
+
+        assert_eq!(
+            producer, reference,
+            "current-state producer re-verified byte-for-byte"
+        );
+    }
+
+    /// A read-time authority bound to a DIFFERENT conversation must reject the
+    /// producer's transition: the re-verified entry carries its own
+    /// conversation_id, which the authority requires to equal the locked one.
+    /// Fails closed with `InvalidProvenance`.
+    #[tokio::test]
+    #[ignore = "requires the dedicated gate database"]
+    async fn producer_leg_fails_closed_when_authority_binds_a_foreign_conversation() {
+        let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+        let cid = Uuid::new_v4();
+        let entry = build_real_creation_entry(*cid.as_bytes());
+        let _creation = seed_real_creation_graph(&pool, &entry).await;
+
+        let foreign_cid = *Uuid::new_v4().as_bytes();
+        let authority =
+            HistoricalRehydrationAuthority::new(foreign_cid, entry.head_next_entry_seq).unwrap();
+        let mut tx = pool.begin().await.expect("begin");
+        let result = load_producer_transition_evidence(&mut tx, &authority, cid).await;
+        tx.rollback().await.expect("rollback");
+
+        assert!(matches!(
+            result,
+            Err(ProducerHydrationError::InvalidProvenance)
+        ));
+    }
+
+    /// A conversation id with no row (hence no current generation-state) fails
+    /// closed with `ConversationMissing`, never a fabricated producer.
+    #[tokio::test]
+    #[ignore = "requires the dedicated gate database"]
+    async fn producer_leg_fails_closed_when_conversation_is_absent() {
+        let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+        let cid = Uuid::new_v4();
+        let entry = build_real_creation_entry(*cid.as_bytes());
+        let _creation = seed_real_creation_graph(&pool, &entry).await;
+
+        let absent = Uuid::new_v4();
+        let authority =
+            HistoricalRehydrationAuthority::new(*absent.as_bytes(), entry.head_next_entry_seq)
+                .unwrap();
+        let mut tx = pool.begin().await.expect("begin");
+        let result = load_producer_transition_evidence(&mut tx, &authority, absent).await;
+        tx.rollback().await.expect("rollback");
+
+        assert!(matches!(
+            result,
+            Err(ProducerHydrationError::ConversationMissing)
+        ));
+    }
+
+    /// The producer leg maps the loader-atom failure modes fail-closed: an absent
+    /// producing entry to `ProvenanceMissing`, a re-verification failure to
+    /// `InvalidProvenance`. In a coherent graph the absence path is not provokable
+    /// by mutating a genesis generation-state: `producing_transition_id` is NOT
+    /// NULL + UUID-v4-checked and is set to a real accepted transition, every
+    /// accepted transition carries an entry (the entry<->transition mapping), and
+    /// `chat.entries` is append-only + immutable — so the mapping is exercised
+    /// directly here (the sealed `loader_absent_entry_fails_closed` already proves
+    /// the underlying loader-atom absence).
+    #[test]
+    fn producer_provenance_load_errors_map_fail_closed() {
+        assert!(matches!(
+            ProducerHydrationError::from(ControlEvidenceLoadError::EntryMissing),
+            ProducerHydrationError::ProvenanceMissing
+        ));
+        assert!(matches!(
+            ProducerHydrationError::from(ControlEvidenceLoadError::InvalidEvidence),
+            ProducerHydrationError::InvalidProvenance
         ));
     }
 }

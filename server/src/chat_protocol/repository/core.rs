@@ -24,6 +24,7 @@ use super::super::{
         ConversationState, DeviceIdentity, HistoricalRehydrationAuthority, IntervalEndHydrationRow,
         IntervalHydrationRow, LeafHydrationRow, OpeningKind, ParticipantHydrationRow,
         ParticipantRole, ParticipantStatus, PersistedControlAuthority, PrincipalId,
+        TransitionEvidence,
     },
     validation::{BareDid, KeyThumbprint},
 };
@@ -2994,4 +2995,103 @@ fn interval_u64(value: i64) -> Result<u64, IntervalHydrationError> {
 
 fn interval_bytes32(value: Vec<u8>) -> Result<[u8; 32], IntervalHydrationError> {
     <[u8; 32]>::try_from(value.as_slice()).map_err(|_| IntervalHydrationError::OutOfDomain)
+}
+
+// ===========================================================================
+// G1b-2 — current-state producer evidence leg
+// (chat.generation_states.producing_transition_id).
+//
+// The aggregate's `producer` field is the `TransitionEvidence` that produced the
+// conversation's CURRENT generation-state. `chat.generation_states` records that
+// transition id per (generation, state_version) in `producing_transition_id`
+// (NOT NULL; core.sql). This leg reads it for the current coordinate — pinned by
+// the head lock the caller holds — and re-verifies the transition through the
+// sealed loader atom, exactly as the participant/interval legs re-verify their
+// own provenance transitions. `validate_state`'s `current_state_producer_matches`
+// re-checks this field against the state's own producer at hydration, so any
+// residual disagreement fails closed downstream (availability, not integrity).
+// ===========================================================================
+
+/// Failure modes of [`load_producer_transition_evidence`].
+#[allow(dead_code)]
+#[derive(Debug, Error)]
+pub(crate) enum ProducerHydrationError {
+    /// No conversation (or no current generation-state matching its
+    /// `(current_generation, current_state_version)`) exists under the lock.
+    /// Fail closed: a missing current generation-state can never yield a
+    /// producer.
+    #[error("clean-chat conversation is absent for producer hydration")]
+    ConversationMissing,
+    /// The producing transition's control entry was absent. Fail closed: a
+    /// producing transition without a durable entry can never yield evidence.
+    #[error("clean-chat producer provenance is absent")]
+    ProvenanceMissing,
+    /// The producing transition failed read-time re-verification, or the verified
+    /// evidence was a control request rather than a coordinate transition. Never
+    /// coerced into evidence it does not attest.
+    #[error("clean-chat producer provenance failed re-verification")]
+    InvalidProvenance,
+    #[error("clean-chat producer hydration database error: {0}")]
+    Database(#[from] sqlx::Error),
+}
+
+impl From<ControlEvidenceLoadError> for ProducerHydrationError {
+    fn from(error: ControlEvidenceLoadError) -> Self {
+        match error {
+            ControlEvidenceLoadError::EntryMissing => ProducerHydrationError::ProvenanceMissing,
+            ControlEvidenceLoadError::InvalidEvidence => ProducerHydrationError::InvalidProvenance,
+            ControlEvidenceLoadError::Database(error) => ProducerHydrationError::Database(error),
+        }
+    }
+}
+
+/// Load and re-verify the `TransitionEvidence` that produced the CURRENT
+/// generation-state of an existing conversation — the G1b-2 aggregate's
+/// `producer` field.
+///
+/// Reads `chat.generation_states.producing_transition_id` for the conversation's
+/// current `(generation, state_version)` (joined from `chat.conversations`), then
+/// re-loads + re-verifies that transition's durable control entry through
+/// [`load_historical_control_evidence`] and narrows it to the transition arm via
+/// [`PersistedControlAuthority::into_transition`]. The producer of a coordinate
+/// generation-state is always a coordinate transition (creation / commit /
+/// policy / acceptance / metadata / reset-activation / …), never a control
+/// request, so the request arm fails closed.
+///
+/// `authority` MUST be the read-time authority minted from the SAME locked head
+/// as the rest of the aggregate. No `FOR UPDATE`: the caller already holds the
+/// head lock (`FOR UPDATE OF c` on `chat.conversations`) that pins the current
+/// generation-state row and the immutable `chat.entries` suffix.
+#[allow(dead_code)]
+pub(crate) async fn load_producer_transition_evidence(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &HistoricalRehydrationAuthority,
+    conversation_id: Uuid,
+) -> Result<TransitionEvidence, ProducerHydrationError> {
+    let row: Option<(Uuid,)> = sqlx::query_as(
+        r#"
+        SELECT gs.producing_transition_id
+        FROM chat.conversations c
+        JOIN chat.generation_states gs
+          ON gs.conversation_id = c.conversation_id
+         AND gs.generation = c.current_generation
+         AND gs.state_version = c.current_state_version
+        WHERE c.conversation_id = $1
+        "#,
+    )
+    .bind(conversation_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+
+    let (producing_transition_id,) = row.ok_or(ProducerHydrationError::ConversationMissing)?;
+
+    load_historical_control_evidence(
+        transaction,
+        authority,
+        conversation_id,
+        producing_transition_id,
+    )
+    .await?
+    .into_transition()
+    .map_err(|_| ProducerHydrationError::InvalidProvenance)
 }
