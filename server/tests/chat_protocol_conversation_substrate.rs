@@ -3055,6 +3055,388 @@ mod historical_control_loader {
             ProducerHydrationError::InvalidProvenance
         ));
     }
+
+    // -----------------------------------------------------------------------
+    // G1b-2 sub-seal — leaf-recovery work hydration leg (the recovery PAIR).
+    //
+    // Seeds a coherent OPEN leaf-recovery request + its ACTIVE key-package
+    // reservation on the genesis real-creation graph: a genuinely ed25519-signed
+    // `requestLeafRecovery` mutation (signed by the SAME test key that signed the
+    // creation entry, so its requester `keyId` JOINs the seeded `chat.device_keys`
+    // row) whose `prior` coordinate binds the fresh conversation id. The loader
+    // pairs the two tables 1:1, re-mints the request ORIGIN through the signed-path
+    // loader seam, and byte-equals the direct in-memory re-mint. The terminal
+    // (`fulfilled`/`consumed`) and `acceptConversation` arms are the NEXT-STEP
+    // follow-up — this leg fails CLOSED on them (`UnsupportedTerminal` /
+    // `UnsupportedSource`), asserted live here so the scope boundary is real.
+    // -----------------------------------------------------------------------
+    mod recovery_leg {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use chrono::{DateTime, Utc};
+        use ed25519_dalek::{Signer, SigningKey};
+        use serde_json::{json, Value};
+        use sha2::{Digest, Sha256};
+        use sqlx::PgPool;
+        use uuid::Uuid;
+
+        use super::super::historical_control_path::{build_real_creation_entry, RealCreationEntry};
+        use super::seed_real_creation_graph;
+        use crate::chat_protocol::repository::core::{
+            load_recovery_work_hydration_rows, RecoveryHydrationError,
+        };
+        use crate::chat_protocol::state_machine::{
+            DeviceIdentity, HistoricalRehydrationAuthority, LeafRecoveryKind, PrincipalId,
+            RecoveryOriginHydrationRow, RecoveryRequestStatus, RecoverySource, ReservationStatus,
+        };
+        use crate::chat_protocol::transcript::{
+            decode_canonical_signed_mutation, SignedMutationKind,
+        };
+        use crate::chat_protocol::validation::ed25519_key_id;
+        use crate::common;
+
+        // Fixed millisecond instants (the state machine's `CanonicalTimestamp`
+        // grammar is `...T...Z` at millisecond precision, which round-trips
+        // losslessly through Postgres microsecond storage). `EXPIRES_AT` is
+        // exactly `LEAST(REQUESTED_AT + 5min, KP.not_after)`, the expiry the
+        // deferred `assert_recovery_fulfillment_mapping` constraint requires.
+        const REQUESTED_AT: &str = "2030-01-01T00:00:00.000Z";
+        const EXPIRES_AT: &str = "2030-01-01T00:05:00.000Z";
+        const KP_NOT_BEFORE: &str = "2029-12-31T23:59:00.000Z";
+        const KP_NOT_AFTER: &str = "2030-01-01T00:11:00.000Z";
+        const SIGNED_AT: &str = "2029-12-31T23:59:59.000Z";
+
+        fn instant(text: &str) -> DateTime<Utc> {
+            DateTime::parse_from_rfc3339(text)
+                .expect("canonical instant")
+                .with_timezone(&Utc)
+        }
+
+        fn uuid_v4_bytes(byte: u8) -> [u8; 16] {
+            let mut value = [byte; 16];
+            value[6] = 0x40 | (byte & 0x0f);
+            value[8] = 0x80 | (byte & 0x3f);
+            value
+        }
+
+        fn genesis_coordinate_json(cid: [u8; 16]) -> Value {
+            // Matches `seed_real_creation_graph`'s genesis active coordinate.
+            json!({
+                "conversationId": Uuid::from_bytes(cid).hyphenated().to_string(),
+                "generation": 0,
+                "stateVersion": 0,
+                "groupId": STANDARD.encode([1_u8; 32]),
+                "epoch": 0,
+                "groupContextHash": STANDARD.encode([2_u8; 32]),
+                "confirmationTag": STANDARD.encode([3_u8; 32]),
+                "lifecycle": "active",
+            })
+        }
+
+        /// The exact bytes of a genuinely-signed `requestLeafRecovery` mutation and
+        /// the shape-only transcript/digest/signature columns the DB CHECK needs.
+        struct SignedRecoveryRequest {
+            raw_wrapper: Vec<u8>,
+            signing_transcript: Vec<u8>,
+            request_digest: Vec<u8>,
+            signature: Vec<u8>,
+        }
+
+        fn build_signed_recovery_request(
+            entry: &RealCreationEntry,
+            request_id: [u8; 16],
+        ) -> SignedRecoveryRequest {
+            let signing_key = SigningKey::from_bytes(&[0x24; 32]);
+            let verifying = signing_key.verifying_key().to_bytes();
+            // The creation entry signed with this same key, so its device-keys row
+            // carries exactly this verifying key under `entry.actor_key_id`.
+            assert_eq!(entry.public_key, verifying.to_vec());
+            assert_eq!(
+                entry.actor_key_id,
+                ed25519_key_id(&verifying).unwrap().as_str()
+            );
+
+            let kind = SignedMutationKind::LeafRecoveryRequest;
+            let body = json!({
+                "$type": kind.type_id(),
+                "signatureDomain": String::from_utf8(kind.domain().to_vec()).unwrap(),
+                "actorDid": entry.actor_did,
+                "actorDeviceId": entry.actor_device_id.hyphenated().to_string(),
+                "keyId": ed25519_key_id(&verifying).unwrap().as_str(),
+                "authGeneration": 1,
+                "idempotencyKey": Uuid::from_bytes(uuid_v4_bytes(0x6d)).hyphenated().to_string(),
+                "signedAt": SIGNED_AT,
+                "recoveryRequestId": Uuid::from_bytes(request_id).hyphenated().to_string(),
+                "prior": genesis_coordinate_json(entry.cid),
+                "recoveryKind": "replace",
+            });
+            let mut wrapper = json!({ "body": body, "signature": "" });
+            wrapper["signature"] = Value::String(STANDARD.encode([0u8; 64]));
+            let unsigned = serde_json::to_vec(&wrapper).unwrap();
+            let canonical = decode_canonical_signed_mutation(&unsigned).unwrap();
+            let signing_transcript = canonical.transcript_bytes().to_vec();
+            let signature = signing_key.sign(&signing_transcript).to_bytes();
+            wrapper["signature"] = Value::String(STANDARD.encode(signature));
+            let raw_wrapper = serde_json::to_vec(&wrapper).unwrap();
+            SignedRecoveryRequest {
+                raw_wrapper,
+                request_digest: Sha256::digest(&signing_transcript).to_vec(),
+                signature: signature.to_vec(),
+                signing_transcript,
+            }
+        }
+
+        struct RecoverySeed {
+            request_id: [u8; 16],
+            key_package_ref: [u8; 32],
+            raw_wrapper: Vec<u8>,
+        }
+
+        /// Seed an OPEN leaf-recovery request + its ACTIVE key-package reservation
+        /// on top of a committed genesis graph, coherent under the deferred
+        /// `assert_recovery_fulfillment_mapping` constraint. `source` drives only
+        /// the request's `source` column (the loader classifies it before touching
+        /// the bytes, so `acceptConversation` reuses the same signed request).
+        ///
+        /// The genesis creator is already a leaf, so the request is a `replace`
+        /// (its `replaced_leaf_period_id` is the creator's `leaf_period_id`, which
+        /// the constraint requires to reference a live member device); an `add`
+        /// would be rejected because the requester's leaf already exists.
+        async fn seed_recovery_pair(
+            pool: &PgPool,
+            entry: &RealCreationEntry,
+            source: &str,
+        ) -> RecoverySeed {
+            seed_real_creation_graph(pool, entry).await;
+            let conversation_id = Uuid::from_bytes(entry.cid);
+            // The gate DB is shared and never reset (rows are immutable), so every
+            // recovery identifier is fresh per run (derived from a fresh request id)
+            // to avoid PK / UNIQUE collisions across tests.
+            let request_uuid = Uuid::new_v4();
+            let request_id = *request_uuid.as_bytes();
+            let key_package_ref =
+                Sha256::digest([b"recovery-kp".as_ref(), &request_id].concat()).to_vec();
+            let init_key =
+                Sha256::digest([b"recovery-init".as_ref(), &request_id].concat()).to_vec();
+            let wrapper_bytes = vec![0x79_u8; 32];
+            let signed = build_signed_recovery_request(entry, request_id);
+
+            // The creator's live leaf period, to bind the `replace` request.
+            let replaced_leaf_period_id: Uuid = sqlx::query_scalar(
+                "SELECT leaf_period_id FROM chat.member_devices \
+                 WHERE conversation_id=$1 AND user_did=$2 AND device_id=$3 AND active",
+            )
+            .bind(conversation_id)
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .fetch_one(pool)
+            .await
+            .expect("creator leaf period");
+
+            let mut tx = pool.begin().await.expect("begin recovery pair");
+            sqlx::query(
+                r#"INSERT INTO chat.key_packages(
+                    key_package_ref,wrapper_bytes,wrapper_sha256,init_key,owner_did,
+                    owner_device_id,owner_key_id,owner_auth_generation,not_before,not_after,
+                    status,created_at
+                ) VALUES($1,$2,$3,$4,$5,$6,$7,1,$8,$9,'reserved',$10)"#,
+            )
+            .bind(&key_package_ref)
+            .bind(&wrapper_bytes)
+            .bind(Sha256::digest(&wrapper_bytes).to_vec())
+            .bind(&init_key)
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .bind(&entry.actor_key_id)
+            .bind(instant(KP_NOT_BEFORE))
+            .bind(instant(KP_NOT_AFTER))
+            .bind(instant(REQUESTED_AT))
+            .execute(&mut *tx)
+            .await
+            .expect("insert key package");
+            sqlx::query(
+                r#"INSERT INTO chat.key_package_reservations(
+                    recovery_request_id,key_package_ref,conversation_id,generation,requester_did,
+                    requester_device_id,requester_key_id,requester_auth_generation,recipient_did,
+                    recipient_device_id,bound_state_version,bound_group_id,bound_epoch,
+                    bound_group_context_hash,bound_confirmation_tag,purpose,expires_at,status,created_at
+                ) VALUES($1,$2,$3,0,$4,$5,$6,1,$4,$5,0,$7,0,$8,$9,'leafRecovery',$10,'active',$11)"#,
+            )
+            .bind(request_uuid)
+            .bind(&key_package_ref)
+            .bind(conversation_id)
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .bind(&entry.actor_key_id)
+            .bind(vec![1_u8; 32])
+            .bind(vec![2_u8; 32])
+            .bind(vec![3_u8; 32])
+            .bind(instant(EXPIRES_AT))
+            .bind(instant(REQUESTED_AT))
+            .execute(&mut *tx)
+            .await
+            .expect("insert reservation");
+            sqlx::query(
+                r#"INSERT INTO chat.leaf_recovery_requests(
+                    recovery_request_id,conversation_id,generation,requester_did,requester_device_id,
+                    requester_key_id,requester_auth_generation,recovery_kind,source,bound_state_version,
+                    bound_group_id,bound_epoch,bound_group_context_hash,bound_confirmation_tag,
+                    reservation_request_id,replaced_leaf_period_id,status,signed_request_bytes,
+                    signing_transcript_bytes,request_digest,signature,requested_at,expires_at
+                ) VALUES($1,$2,0,$3,$4,$5,1,'replace',$6,0,$7,0,$8,$9,$1,$10,'open',$11,$12,$13,$14,$15,$16)"#,
+            )
+            .bind(request_uuid)
+            .bind(conversation_id)
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .bind(&entry.actor_key_id)
+            .bind(source)
+            .bind(vec![1_u8; 32])
+            .bind(vec![2_u8; 32])
+            .bind(vec![3_u8; 32])
+            .bind(replaced_leaf_period_id)
+            .bind(&signed.raw_wrapper)
+            .bind(&signed.signing_transcript)
+            .bind(&signed.request_digest)
+            .bind(&signed.signature)
+            .bind(instant(REQUESTED_AT))
+            .bind(instant(EXPIRES_AT))
+            .execute(&mut *tx)
+            .await
+            .expect("insert leaf recovery request");
+            tx.commit().await.expect("commit recovery pair");
+
+            RecoverySeed {
+                request_id,
+                key_package_ref: <[u8; 32]>::try_from(key_package_ref.as_slice()).unwrap(),
+                raw_wrapper: signed.raw_wrapper,
+            }
+        }
+
+        /// The open recovery pair hydrates 1:1: the reservation supplies the
+        /// request's `key_package_ref` + `package_not_after`, and the request origin
+        /// re-mints byte-equal to the direct in-memory signed-path re-hydration.
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn recovery_pair_hydrates_the_open_request() {
+            let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+            let cid = Uuid::new_v4();
+            let entry = build_real_creation_entry(*cid.as_bytes());
+            let seed = seed_recovery_pair(&pool, &entry, "requestLeafRecovery").await;
+            let authority =
+                HistoricalRehydrationAuthority::new(entry.cid, entry.head_next_entry_seq).unwrap();
+
+            let reference = authority
+                .hydrate_historical_signed_request_from_durable_bytes(
+                    entry.cid,
+                    REQUESTED_AT,
+                    &seed.raw_wrapper,
+                    &entry.public_key,
+                )
+                .expect("in-memory recovery origin");
+
+            let mut tx = pool.begin().await.expect("begin");
+            let (requests, reservations) =
+                load_recovery_work_hydration_rows(&mut tx, &authority, cid)
+                    .await
+                    .expect("recovery pair hydrates");
+            tx.commit().await.expect("commit");
+
+            let target = DeviceIdentity::new(
+                PrincipalId::new(entry.actor_did.clone().into_bytes()).unwrap(),
+                *entry.actor_device_id.as_bytes(),
+            )
+            .unwrap();
+
+            assert_eq!(requests.len(), 1);
+            assert_eq!(reservations.len(), 1);
+            let request = &requests[0];
+            let reservation = &reservations[0];
+
+            assert_eq!(request.request_id, seed.request_id);
+            assert_eq!(request.target, target);
+            assert_eq!(request.kind, LeafRecoveryKind::Replace);
+            assert_eq!(request.source, RecoverySource::Request);
+            assert_eq!(request.status, RecoveryRequestStatus::Open);
+            assert_eq!(request.key_package_ref, seed.key_package_ref);
+            assert!(request.terminal.is_none());
+            assert_eq!(
+                request.origin,
+                RecoveryOriginHydrationRow::Request(reference)
+            );
+
+            assert_eq!(reservation.request_id, seed.request_id);
+            assert_eq!(reservation.target, target);
+            assert_eq!(reservation.key_package_ref, seed.key_package_ref);
+            assert_eq!(reservation.status, ReservationStatus::Active);
+            assert!(reservation.terminal.is_none());
+            // The pair binds the same coordinate + received_at (the 1:1 fields
+            // `validate_recovery_work` cross-checks at assembly).
+            assert_eq!(reservation.bound_coordinate, request.bound_coordinate);
+            assert_eq!(reservation.received_at, request.received_at);
+            assert_eq!(reservation.expires_at, request.expires_at);
+        }
+
+        /// The recovery leg fails CLOSED when the read-time authority binds a
+        /// different conversation: the signed request's embedded `prior`
+        /// conversation id mismatches, so the origin re-verification rejects it
+        /// (`InvalidProvenance`) — never a fabricated origin.
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn recovery_pair_fails_closed_when_authority_binds_a_foreign_conversation() {
+            let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+            let cid = Uuid::new_v4();
+            let entry = build_real_creation_entry(*cid.as_bytes());
+            let _seed = seed_recovery_pair(&pool, &entry, "requestLeafRecovery").await;
+            // Authority bound to a different conversation than the seeded rows.
+            let foreign = Uuid::new_v4();
+            let authority =
+                HistoricalRehydrationAuthority::new(*foreign.as_bytes(), entry.head_next_entry_seq)
+                    .unwrap();
+
+            let mut tx = pool.begin().await.expect("begin");
+            let result = load_recovery_work_hydration_rows(&mut tx, &authority, cid).await;
+            tx.rollback().await.expect("rollback");
+
+            assert!(matches!(
+                result,
+                Err(RecoveryHydrationError::InvalidProvenance)
+            ));
+        }
+
+        /// The `acceptConversation` source (an `Acceptance` transition origin) is
+        /// the NEXT-STEP follow-up: the leg fails CLOSED (`UnsupportedSource`)
+        /// rather than mis-minting a signed-request origin for it.
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn recovery_pair_fails_closed_on_accept_conversation_source() {
+            let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+            let cid = Uuid::new_v4();
+            let entry = build_real_creation_entry(*cid.as_bytes());
+            let _seed = seed_recovery_pair(&pool, &entry, "acceptConversation").await;
+            let authority =
+                HistoricalRehydrationAuthority::new(entry.cid, entry.head_next_entry_seq).unwrap();
+
+            let mut tx = pool.begin().await.expect("begin");
+            let result = load_recovery_work_hydration_rows(&mut tx, &authority, cid).await;
+            tx.rollback().await.expect("rollback");
+
+            assert!(matches!(
+                result,
+                Err(RecoveryHydrationError::UnsupportedSource)
+            ));
+        }
+
+        // NOTE: the terminal-status fail-closed (`UnsupportedTerminal`, a non-`open`
+        // request / non-`active` reservation) is NOT live-exercised here: the
+        // deferred `assert_recovery_fulfillment_mapping` constraint requires a
+        // FULLY coherent terminal graph (a real `leafRecovery` fulfilling
+        // transition, a matching `consumed` key package, a `welcome_deliveries`
+        // row, and a removed member device) to even COMMIT a `fulfilled`/`consumed`
+        // pair. That coherent terminal seed is the same one the terminal
+        // `WorkTerminalHydrationRow` reconstruction follow-up must build, so the
+        // fail-closed boundary is asserted there. The status match arm fails closed
+        // structurally in the meantime (it never fabricates a terminal).
+    }
 }
 
 // ===========================================================================

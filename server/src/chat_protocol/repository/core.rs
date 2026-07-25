@@ -9,7 +9,9 @@
 // (`tests/chat_protocol_conversation_substrate.rs`) can inline this file as a
 // module, matching the sibling repository writers.
 
-use chrono::{DateTime, Utc};
+use std::collections::BTreeMap;
+
+use chrono::{DateTime, SecondsFormat, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::{Postgres, Transaction};
 use thiserror::Error;
@@ -22,9 +24,11 @@ use super::super::{
     state_machine::{
         classify_acceptance, classify_invitation, classify_role_producer, CloseKind,
         ConversationState, DeviceIdentity, HistoricalRehydrationAuthority, IntervalEndHydrationRow,
-        IntervalHydrationRow, LeafHydrationRow, OpeningKind, ParticipantHydrationRow,
-        ParticipantRole, ParticipantStatus, PersistedControlAuthority, PrincipalId,
-        TransitionEvidence,
+        IntervalHydrationRow, LeafHydrationRow, LeafRecoveryKind, OpeningKind,
+        ParticipantHydrationRow, ParticipantRole, ParticipantStatus, PersistedControlAuthority,
+        PrincipalId, RecoveryOriginHydrationRow, RecoveryRequestHydrationRow,
+        RecoveryRequestStatus, RecoveryReservationHydrationRow, RecoverySource, ReservationStatus,
+        ServerTimestamp, TransitionEvidence,
     },
     validation::{BareDid, KeyThumbprint},
 };
@@ -3094,4 +3098,423 @@ pub(crate) async fn load_producer_transition_evidence(
     .await?
     .into_transition()
     .map_err(|_| ProducerHydrationError::InvalidProvenance)
+}
+
+// ===========================================================================
+// G1b-2 sub-seal — leaf-recovery work hydration leg (the recovery PAIR).
+//
+// `chat.leaf_recovery_requests` and `chat.key_package_reservations` are a
+// mutually-1:1 set (each request row's `reservation_request_id` equals its own
+// `recovery_request_id`, and the two tables carry reciprocal FKs), and
+// `validate_recovery_work` (state_machine.rs) pairs them 1:1 by `request_id`,
+// cross-checking coordinate / target / key_package_ref / received_at /
+// expires_at / terminal. The request row alone cannot produce a
+// `RecoveryRequestHydrationRow` — its `key_package_ref` lives ONLY on the paired
+// reservation — so this leg loads BOTH tables together and pairs them by
+// `recovery_request_id`, failing closed (`PairMismatch`) on any break in the
+// correspondence.
+//
+// The request ORIGIN is a HISTORICAL signed request: for `source =
+// 'requestLeafRecovery'` it is a `RequestEvidence` re-minted from the row's OWN
+// `signed_request_bytes` + `requested_at` under the requester's historical
+// signing key (JOINed from `chat.device_keys`), through the certified
+// `HistoricalRehydrationAuthority::hydrate_historical_signed_request_from_durable_bytes`
+// seam (ed25519 re-verified, conversation binding enforced).
+//
+// SCOPE (NEXT-STEP follow-ups, fail-closed until reconstructed + tested): the
+// `acceptConversation` source (an `Acceptance` `TransitionEvidence` origin) and
+// the TERMINAL reconstruction of non-`open` requests / non-`active` reservations
+// (`WorkTerminalHydrationRow`: fulfilling / cancellation / expiry /
+// device-revocation evidence) each need their own bespoke real-signed /
+// real-close / device-revocation coherent seed to exercise the populated arm, so
+// shipping them untested would be REJECT-class. This leg reconstructs the
+// `open` / `active` (terminal `None`) arm fully and fails CLOSED
+// (`UnsupportedSource` / `UnsupportedTerminal`) on the others — never fabricating
+// a terminal or an origin it cannot re-verify.
+//
+// `validate_recovery_work` at assembly is the drift fence: it re-derives the 1:1
+// pairing, the expiry, and every cross-field equality against the hydrated rows,
+// so any residual disagreement fails closed downstream (availability, not
+// integrity).
+// ===========================================================================
+
+/// Failure modes of [`load_recovery_work_hydration_rows`].
+#[allow(dead_code)]
+#[derive(Debug, Error)]
+pub(crate) enum RecoveryHydrationError {
+    /// A stored recovery/reservation column fell outside the protocol domain (a
+    /// DID/UUID grammar violation, a non-32-byte crypto field, an out-of-range
+    /// integer, or an unrecognized kind token).
+    #[error("clean-chat recovery column is out of domain")]
+    OutOfDomain,
+    /// A request's origin signed request failed read-time re-verification. Never
+    /// coerced into evidence it does not attest.
+    #[error("clean-chat recovery origin failed re-verification")]
+    InvalidProvenance,
+    /// The request and reservation collections did not correspond 1:1 by
+    /// `recovery_request_id` (a request without its reservation, a reservation
+    /// without its request, unequal counts, or a duplicate). Fail closed.
+    #[error("clean-chat recovery request/reservation pairing is not 1:1")]
+    PairMismatch,
+    /// The request's `source` is `acceptConversation`, whose `Acceptance`
+    /// transition origin is the NEXT-STEP follow-up of this leg. Fail closed until
+    /// that arm is reconstructed + tested.
+    #[error("clean-chat recovery acceptConversation source is not yet reconstructed")]
+    UnsupportedSource,
+    /// The request/reservation carries a terminal status (non-`open` request or
+    /// non-`active` reservation) whose `WorkTerminalHydrationRow` reconstruction
+    /// is the NEXT-STEP follow-up. Fail closed until that arm is reconstructed +
+    /// tested.
+    #[error("clean-chat recovery terminal status is not yet reconstructed")]
+    UnsupportedTerminal,
+    #[error("clean-chat recovery hydration database error: {0}")]
+    Database(#[from] sqlx::Error),
+}
+
+/// A reservation paired to its request during recovery-work hydration; carries
+/// the `key_package_ref` the request row lacks.
+struct PairedReservation {
+    key_package_ref: [u8; 32],
+    row: RecoveryReservationHydrationRow,
+}
+
+/// Load the leaf-recovery work of an existing conversation as a validated 1:1
+/// `(requests, reservations)` pair. See the module header for the origin /
+/// terminal reconstruction scope.
+///
+/// `authority` MUST be the read-time authority minted from the SAME locked head
+/// as the rest of the aggregate. No `FOR UPDATE`: the caller already holds the
+/// head lock (`FOR UPDATE OF c` on `chat.conversations`) that pins the current
+/// generation and the immutable `chat.entries` / projection suffix.
+#[allow(dead_code)]
+pub(crate) async fn load_recovery_work_hydration_rows(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &HistoricalRehydrationAuthority,
+    conversation_id: Uuid,
+) -> Result<
+    (
+        Vec<RecoveryRequestHydrationRow>,
+        Vec<RecoveryReservationHydrationRow>,
+    ),
+    RecoveryHydrationError,
+> {
+    let conversation_bytes = *conversation_id.as_bytes();
+
+    // Reservations, with the bound key package's `not_after` (the reservation row
+    // carries no origin evidence; `package_not_after` is the KP lifetime).
+    #[allow(clippy::type_complexity)]
+    let reservation_rows: Vec<(
+        Uuid,
+        String,
+        Uuid,
+        i64,
+        i64,
+        Vec<u8>,
+        i64,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        DateTime<Utc>,
+        DateTime<Utc>,
+        String,
+        DateTime<Utc>,
+    )> = sqlx::query_as(
+        r#"
+        SELECT
+            r.recovery_request_id,
+            r.recipient_did,
+            r.recipient_device_id,
+            r.generation,
+            r.bound_state_version,
+            r.bound_group_id,
+            r.bound_epoch,
+            r.bound_group_context_hash,
+            r.bound_confirmation_tag,
+            r.key_package_ref,
+            r.created_at,
+            r.expires_at,
+            r.status,
+            kp.not_after
+        FROM chat.key_package_reservations r
+        JOIN chat.key_packages kp
+          ON kp.key_package_ref = r.key_package_ref
+         AND kp.owner_did = r.recipient_did
+         AND kp.owner_device_id = r.recipient_device_id
+        WHERE r.conversation_id = $1
+        "#,
+    )
+    .bind(conversation_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+
+    let mut reservations_by_id: BTreeMap<[u8; 16], PairedReservation> = BTreeMap::new();
+    for (
+        recovery_request_id,
+        recipient_did,
+        recipient_device_id,
+        generation,
+        bound_state_version,
+        bound_group_id,
+        bound_epoch,
+        bound_group_context_hash,
+        bound_confirmation_tag,
+        key_package_ref,
+        created_at,
+        expires_at,
+        status,
+        not_after,
+    ) in reservation_rows
+    {
+        let request_id = *recovery_request_id.as_bytes();
+        let target = recovery_device(recipient_did, recipient_device_id)?;
+        let bound_coordinate = recovery_coordinate(
+            conversation_bytes,
+            generation,
+            bound_state_version,
+            bound_group_id,
+            bound_epoch,
+            bound_group_context_hash,
+            bound_confirmation_tag,
+        )?;
+        let key_package_ref = recovery_bytes32(key_package_ref)?;
+        let status = match status.as_str() {
+            "active" => ReservationStatus::Active,
+            "consumed" | "expired" | "released" => {
+                return Err(RecoveryHydrationError::UnsupportedTerminal)
+            }
+            _ => return Err(RecoveryHydrationError::OutOfDomain),
+        };
+        let row = RecoveryReservationHydrationRow {
+            request_id,
+            target,
+            bound_coordinate,
+            key_package_ref,
+            received_at: recovery_timestamp(created_at)?,
+            expires_at: recovery_timestamp(expires_at)?,
+            package_not_after: recovery_timestamp(not_after)?,
+            status,
+            terminal: None,
+        };
+        if reservations_by_id
+            .insert(
+                request_id,
+                PairedReservation {
+                    key_package_ref,
+                    row,
+                },
+            )
+            .is_some()
+        {
+            return Err(RecoveryHydrationError::PairMismatch);
+        }
+    }
+
+    // Requests, with the requester's historical signing key for the origin re-mint.
+    #[allow(clippy::type_complexity)]
+    let request_rows: Vec<(
+        Uuid,
+        String,
+        Uuid,
+        String,
+        String,
+        i64,
+        i64,
+        Vec<u8>,
+        i64,
+        Vec<u8>,
+        Vec<u8>,
+        String,
+        Vec<u8>,
+        DateTime<Utc>,
+        DateTime<Utc>,
+        Vec<u8>,
+    )> = sqlx::query_as(
+        r#"
+        SELECT
+            lr.recovery_request_id,
+            lr.requester_did,
+            lr.requester_device_id,
+            lr.recovery_kind,
+            lr.source,
+            lr.generation,
+            lr.bound_state_version,
+            lr.bound_group_id,
+            lr.bound_epoch,
+            lr.bound_group_context_hash,
+            lr.bound_confirmation_tag,
+            lr.status,
+            lr.signed_request_bytes,
+            lr.requested_at,
+            lr.expires_at,
+            dk.signing_public_key
+        FROM chat.leaf_recovery_requests lr
+        JOIN chat.device_keys dk
+          ON dk.user_did = lr.requester_did
+         AND dk.device_id = lr.requester_device_id
+         AND dk.key_id = lr.requester_key_id
+        WHERE lr.conversation_id = $1
+        "#,
+    )
+    .bind(conversation_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+
+    let mut requests: Vec<RecoveryRequestHydrationRow> = Vec::with_capacity(request_rows.len());
+    let mut paired: usize = 0;
+    for (
+        recovery_request_id,
+        requester_did,
+        requester_device_id,
+        recovery_kind,
+        source,
+        generation,
+        bound_state_version,
+        bound_group_id,
+        bound_epoch,
+        bound_group_context_hash,
+        bound_confirmation_tag,
+        status,
+        signed_request_bytes,
+        requested_at,
+        expires_at,
+        signing_public_key,
+    ) in request_rows
+    {
+        let request_id = *recovery_request_id.as_bytes();
+        let target = recovery_device(requester_did, requester_device_id)?;
+        let kind = match recovery_kind.as_str() {
+            "add" => LeafRecoveryKind::Add,
+            "replace" => LeafRecoveryKind::Replace,
+            _ => return Err(RecoveryHydrationError::OutOfDomain),
+        };
+        let source = match source.as_str() {
+            "requestLeafRecovery" => RecoverySource::Request,
+            "acceptConversation" => return Err(RecoveryHydrationError::UnsupportedSource),
+            _ => return Err(RecoveryHydrationError::OutOfDomain),
+        };
+        let bound_coordinate = recovery_coordinate(
+            conversation_bytes,
+            generation,
+            bound_state_version,
+            bound_group_id,
+            bound_epoch,
+            bound_group_context_hash,
+            bound_confirmation_tag,
+        )?;
+        let status = match status.as_str() {
+            "open" => RecoveryRequestStatus::Open,
+            "fulfilled" | "cancelled" | "expired" | "superseded" => {
+                return Err(RecoveryHydrationError::UnsupportedTerminal)
+            }
+            _ => return Err(RecoveryHydrationError::OutOfDomain),
+        };
+        let reservation = reservations_by_id
+            .get(&request_id)
+            .ok_or(RecoveryHydrationError::PairMismatch)?;
+        paired += 1;
+
+        let received_at_canonical = canonical_millis(requested_at);
+        let origin = authority
+            .hydrate_historical_signed_request_from_durable_bytes(
+                conversation_bytes,
+                &received_at_canonical,
+                &signed_request_bytes,
+                &signing_public_key,
+            )
+            .map_err(|_| RecoveryHydrationError::InvalidProvenance)?;
+
+        requests.push(RecoveryRequestHydrationRow {
+            request_id,
+            target,
+            kind,
+            source,
+            bound_coordinate,
+            key_package_ref: reservation.key_package_ref,
+            received_at: recovery_timestamp(requested_at)?,
+            expires_at: recovery_timestamp(expires_at)?,
+            status,
+            origin: RecoveryOriginHydrationRow::Request(origin),
+            terminal: None,
+        });
+    }
+
+    // 1:1 correspondence: every reservation was paired to exactly one request.
+    if paired != reservations_by_id.len() {
+        return Err(RecoveryHydrationError::PairMismatch);
+    }
+
+    let mut reservations: Vec<RecoveryReservationHydrationRow> = reservations_by_id
+        .into_values()
+        .map(|reservation| reservation.row)
+        .collect();
+
+    // `validate_recovery_work` requires both collections strictly increasing by
+    // `(target, request_id)`. Sort in Rust so the ordering is independent of the
+    // database's `recipient_did` collation.
+    requests.sort_by(|left, right| {
+        left.target
+            .cmp(&right.target)
+            .then_with(|| left.request_id.cmp(&right.request_id))
+    });
+    reservations.sort_by(|left, right| {
+        left.target
+            .cmp(&right.target)
+            .then_with(|| left.request_id.cmp(&right.request_id))
+    });
+
+    Ok((requests, reservations))
+}
+
+fn recovery_device(did: String, device_id: Uuid) -> Result<DeviceIdentity, RecoveryHydrationError> {
+    let principal =
+        PrincipalId::new(did.into_bytes()).map_err(|_| RecoveryHydrationError::OutOfDomain)?;
+    DeviceIdentity::new(principal, *device_id.as_bytes())
+        .map_err(|_| RecoveryHydrationError::OutOfDomain)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recovery_coordinate(
+    conversation_id: [u8; 16],
+    generation: i64,
+    state_version: i64,
+    group_id: Vec<u8>,
+    epoch: i64,
+    group_context_hash: Vec<u8>,
+    confirmation_tag: Vec<u8>,
+) -> Result<PublicGroupSnapshotCoordinate, RecoveryHydrationError> {
+    Ok(PublicGroupSnapshotCoordinate::new(
+        conversation_id,
+        recovery_u64(generation)?,
+        recovery_u64(state_version)?,
+        recovery_bytes32(group_id)?,
+        recovery_u64(epoch)?,
+        recovery_bytes32(group_context_hash)?,
+        recovery_bytes32(confirmation_tag)?,
+        PublicGroupSnapshotLifecycle::Active,
+    ))
+}
+
+fn recovery_u64(value: i64) -> Result<u64, RecoveryHydrationError> {
+    u64::try_from(value)
+        .ok()
+        .filter(|value| *value <= MAX_PROTOCOL_INTEGER)
+        .ok_or(RecoveryHydrationError::OutOfDomain)
+}
+
+fn recovery_bytes32(value: Vec<u8>) -> Result<[u8; 32], RecoveryHydrationError> {
+    <[u8; 32]>::try_from(value.as_slice()).map_err(|_| RecoveryHydrationError::OutOfDomain)
+}
+
+fn recovery_timestamp(value: DateTime<Utc>) -> Result<ServerTimestamp, RecoveryHydrationError> {
+    ServerTimestamp::from_canonical_stored(&canonical_millis(value))
+        .map_err(|_| RecoveryHydrationError::OutOfDomain)
+}
+
+/// Canonical millisecond RFC3339 form (`YYYY-MM-DDThh:mm:ss.sssZ`) that the state
+/// machine's `CanonicalTimestamp` grammar requires. Postgres stores microsecond
+/// precision; the read-time origin re-mint is self-consistent because BOTH the
+/// durable-row digest derivation and this hydration read the same truncated
+/// instant through this one formatter.
+fn canonical_millis(value: DateTime<Utc>) -> String {
+    value.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
