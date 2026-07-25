@@ -3593,3 +3593,647 @@ mod leaf_hydration_leg {
         assert!(matches!(result, Err(LeafHydrationError::TreeMismatch)));
     }
 }
+
+// ===========================================================================
+// G1b-2 — COMBINED real-GroupInfo genesis seed (Option-B scope, coordinator
+// ruling "combined-seed STOP" cb07f54c).
+//
+// The prior leaf-leg fixture pairs a REAL `did#device`/signature-key
+// `chat.member_devices` row with an OPAQUE snapshot + tree summary: it exercises
+// the leaf leg against the STORED tree summary, but the snapshot blob never
+// decodes and no real `ActivePublicState` is ever reloaded. This seed replaces
+// the opaque coordinate with the FROZEN corpus genesis:
+//
+//   * `public_snapshot_bytes` = the frozen `genesis-public-state.bin`
+//     (kind `publicGroupSnapshot`), so the production reload
+//     `load_persisted_active_snapshot` -> `decode_public_group_snapshot`
+//     hydrates a REAL `ActivePublicState` (alice's corpus one-leaf public group);
+//   * `tree_summary_bytes` = the tree summary STRUCTURALLY derived from that same
+//     snapshot (records parsed, tree hash + one leaf's basic credential /
+//     signature key / X-Wing encryption key extracted — NO OpenMLS reprocessing,
+//     NO credential-lifetime check), so the leaf leg's coherent-leaf happy path
+//     runs on the REAL authenticated tree;
+//   * the outer coordinate (group id / genesis group-context hash / genesis
+//     confirmation tag / epoch 0) = the frozen manifest `chain` values the
+//     decode re-derives and binds.
+//
+// CORPUS-LIFETIME-INDEPENDENCE (binding condition, coordinator-accepted): the
+// only crypto path here is `decode_public_group_snapshot` — structural record
+// decode + SHA-256 digest + ratchet-tree-hash + tree-summary equality, with NO
+// `now`/lifetime argument anywhere. `verify_genesis_group_info` /
+// `validate_group_info` (which DO call `validate_clean_leaf_profile(now)`) are
+// never touched, so this seed stays green regardless of corpus lifetime age —
+// the same posture the interim gate requires, and the same structural path the
+// green `chat_protocol_snapshot::frozen_public_group_snapshots_...` suite uses.
+//
+// NAMED REMAINDER (coordinator condition 3 — REJECT-class if it silently
+// disappears, same teeth as task #26): the assembly-through-`validate_state`
+// happy path and the producer / metadata provenance RE-VERIFICATION on this real
+// tree are NOT delivered here. They require the creation CONTROL entry to
+// re-verify under the actor's `chat.device_keys` row, and `device_keys` PK
+// `(user_did, device_id)` + `member_devices_signing_key_fk` pin that one key to
+// the MLS leaf key (42fc27cd… / keyId ekxBMK9K…), whose private half the corpus
+// deliberately withholds (`manifest.generator.signingKeys` = "no private key
+// material is emitted"). So a genuinely-signed creation entry whose actor is the
+// corpus genesis leaf is unbuildable until Option A lands (generator emits
+// alice's genesis creation entry signed by her real seed). Per coordinator
+// condition 4, this seed carries a PLACEHOLDER-signed creation transition/entry
+// ONLY for FK/CHECK coherence, and NO entry-verifying leg is run against it here;
+// the real-tree assembly happy path stays blocked (not faked) until Option A.
+// ===========================================================================
+mod real_tree_genesis_seed {
+    use std::{fs, path::PathBuf};
+
+    use sha2::{Digest, Sha256};
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    use super::{clock_now, clock_now_millis, random_plc_did};
+    use crate::chat_protocol::public_state::{
+        encode_public_tree_summary, load_persisted_active_snapshot,
+    };
+    use crate::chat_protocol::repository::core::{
+        hydrate_locked_public_state, load_leaf_hydration_rows, LeafHydrationError,
+    };
+    use crate::chat_protocol::snapshot::{PublicGroupSnapshotLeaf, PublicGroupSnapshotTreeSummary};
+    use crate::chat_protocol::state_machine::{DeviceIdentity, PrincipalId};
+    use crate::common;
+
+    // --- Frozen corpus access (structural decode + digest only) -------------
+
+    fn corpus_file(name: &str) -> Vec<u8> {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/generated-artifacts/mls-chat-v1/crypto-wire")
+            .join(name);
+        fs::read(path).expect("read frozen crypto-wire corpus artifact")
+    }
+
+    fn corpus_manifest() -> serde_json::Value {
+        serde_json::from_slice(&corpus_file("manifest.json")).expect("parse frozen manifest")
+    }
+
+    fn manifest_hex<const N: usize>(value: &serde_json::Value) -> [u8; N] {
+        hex::decode(value.as_str().expect("hex string"))
+            .expect("valid corpus hex")
+            .try_into()
+            .unwrap_or_else(|_| panic!("expected {N}-byte corpus value"))
+    }
+
+    /// The frozen genesis outer coordinate the decode re-derives and binds.
+    struct GenesisCoordinate {
+        group_id: [u8; 32],
+        group_context_hash: [u8; 32],
+        confirmation_tag: [u8; 32],
+        epoch: u64,
+    }
+
+    fn genesis_coordinate() -> GenesisCoordinate {
+        let manifest = corpus_manifest();
+        let chain = &manifest["chain"];
+        GenesisCoordinate {
+            group_id: manifest_hex::<32>(&chain["groupIdHex"]),
+            group_context_hash: manifest_hex::<32>(&chain["genesisGroupContextHashHex"]),
+            confirmation_tag: manifest_hex::<32>(&chain["genesisConfirmationTagHex"]),
+            epoch: chain["genesisEpoch"].as_u64().expect("genesis epoch"),
+        }
+    }
+
+    // --- Structural tree-summary derivation (no OpenMLS reprocessing) -------
+    //
+    // Decodes the frozen `CBPGSNAP` snapshot envelope and reads the tree hash
+    // (GroupContext record) + the single leaf's basic credential / signature key
+    // / X-Wing encryption key (Tree record) straight out of the stored JSON —
+    // exactly as `chat_protocol_snapshot::trusted_tree_summary` does, and NOT via
+    // any credential-lifetime-validating parse. This is the value the production
+    // `hydrate_locked_public_state` would re-decode from `tree_summary_bytes`, so
+    // seeding it makes the leaf leg run on the authenticated real tree.
+
+    fn take<'a>(bytes: &'a [u8], offset: &mut usize, length: usize) -> &'a [u8] {
+        let end = offset.checked_add(length).expect("snapshot offset");
+        let value = bytes.get(*offset..end).expect("valid snapshot slice");
+        *offset = end;
+        value
+    }
+
+    fn take_u16(bytes: &[u8], offset: &mut usize) -> u16 {
+        u16::from_be_bytes(take(bytes, offset, 2).try_into().expect("two bytes"))
+    }
+
+    fn take_u32(bytes: &[u8], offset: &mut usize) -> u32 {
+        u32::from_be_bytes(take(bytes, offset, 4).try_into().expect("four bytes"))
+    }
+
+    fn snapshot_records(bytes: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut offset = 0;
+        let _magic: [u8; 8] = take(bytes, &mut offset, 8).try_into().expect("magic");
+        let _schema = take_u16(bytes, &mut offset);
+        let openmls_len = usize::from(take_u16(bytes, &mut offset));
+        let _openmls = take(bytes, &mut offset, openmls_len).to_vec();
+        let storage_len = usize::from(take_u16(bytes, &mut offset));
+        let _storage = take(bytes, &mut offset, storage_len).to_vec();
+        let count = usize::try_from(take_u32(bytes, &mut offset)).expect("record count");
+        let mut records = Vec::with_capacity(count);
+        for _ in 0..count {
+            let key_len = usize::try_from(take_u32(bytes, &mut offset)).expect("key length");
+            let key = take(bytes, &mut offset, key_len).to_vec();
+            let value_len = usize::try_from(take_u32(bytes, &mut offset)).expect("value length");
+            let value = take(bytes, &mut offset, value_len).to_vec();
+            records.push((key, value));
+        }
+        assert_eq!(offset, bytes.len(), "frozen snapshot is exact");
+        records
+    }
+
+    fn json_bytes(value: &serde_json::Value) -> Vec<u8> {
+        value
+            .as_array()
+            .expect("byte array")
+            .iter()
+            .map(|byte| u8::try_from(byte.as_u64().expect("byte")).expect("u8"))
+            .collect()
+    }
+
+    fn structural_genesis_tree_summary(encoded: &[u8]) -> PublicGroupSnapshotTreeSummary {
+        let records = snapshot_records(encoded);
+        let group_context: serde_json::Value = records
+            .iter()
+            .find(|(key, _)| key.starts_with(b"GroupContext"))
+            .map(|(_, value)| serde_json::from_slice(value).expect("GroupContext json"))
+            .expect("GroupContext record");
+        let tree_hash: [u8; 32] = json_bytes(&group_context["tree_hash"]["vec"])
+            .try_into()
+            .expect("32-byte tree hash");
+        let tree: serde_json::Value = records
+            .iter()
+            .find(|(key, _)| key.starts_with(b"Tree"))
+            .map(|(_, value)| serde_json::from_slice(value).expect("Tree json"))
+            .expect("Tree record");
+        let leaves = tree["tree"]["leaf_nodes"]
+            .as_array()
+            .expect("leaf array")
+            .iter()
+            .enumerate()
+            .filter_map(|(leaf_index, stored)| {
+                let node = stored.get("node")?;
+                if node.is_null() {
+                    return None;
+                }
+                let payload = &node["payload"];
+                assert_eq!(payload["credential"]["credential_type"], "Basic");
+                Some(PublicGroupSnapshotLeaf::new(
+                    u32::try_from(leaf_index).expect("leaf index"),
+                    json_bytes(&payload["credential"]["serialized_credential_content"]["vec"]),
+                    json_bytes(&payload["signature_key"]["value"]["vec"]),
+                    json_bytes(&payload["encryption_key"]["key"]["vec"]),
+                ))
+            })
+            .collect();
+        PublicGroupSnapshotTreeSummary::new(tree_hash, leaves)
+    }
+
+    // --- Seeder -------------------------------------------------------------
+
+    struct RealTreeGenesis {
+        conversation_id: Uuid,
+        member_did: String,
+        member_device_id: Uuid,
+        snapshot: Vec<u8>,
+        tree_summary: PublicGroupSnapshotTreeSummary,
+        group_id: [u8; 32],
+    }
+
+    /// Seed a genesis GROUP whose current generation-state carries the FROZEN
+    /// corpus snapshot + its structurally-derived tree summary + the frozen
+    /// genesis coordinate. The sole membership row is `(member_did,
+    /// member_device_id, leaf_signature_key)`: pass the corpus leaf's own
+    /// identity + real key for the coherent happy path, or any divergent identity
+    /// / key to drive the leaf leg's `TreeMismatch` against the real tree.
+    ///
+    /// The membership `dpop_jkt` is the member's derived key id (a fresh, valid
+    /// base64url-SHA-256) so it never collides on the `(user_did, dpop_jkt)`
+    /// unique index with other seeders sharing a DID on the gate database.
+    ///
+    /// The creation transition/entry/metadata rows carry PLACEHOLDER crypto for
+    /// FK/CHECK coherence only; no entry-verifying leg is exercised against this
+    /// graph (see the NAMED REMAINDER note above).
+    async fn commit_real_tree_genesis(
+        pool: &PgPool,
+        member_did: &str,
+        member_device_id: Uuid,
+        leaf_signature_key: &[u8],
+    ) -> RealTreeGenesis {
+        let snapshot = corpus_file("genesis-public-state.bin");
+        let snapshot_sha256 = Sha256::digest(&snapshot).to_vec();
+        let tree_summary = structural_genesis_tree_summary(&snapshot);
+        let (tree_summary_bytes, tree_summary_sha256) = encode_public_tree_summary(&tree_summary)
+            .expect("structural tree summary encodes")
+            .into_parts();
+        let coordinate = genesis_coordinate();
+
+        let member_did = member_did.to_owned();
+        let member_key_id: String = sqlx::query_scalar("SELECT chat.ed25519_key_id($1)")
+            .bind(leaf_signature_key)
+            .fetch_one(pool)
+            .await
+            .expect("derive leaf key id");
+
+        let conversation_id = Uuid::new_v4();
+        let creation_transition_id = Uuid::new_v4();
+        let creation_entry_id = Uuid::new_v4();
+        let participant_period_id = Uuid::new_v4();
+        let leaf_period_id = Uuid::new_v4();
+        let metadata_snapshot_id = Uuid::new_v4();
+        let group_id = coordinate.group_id.to_vec();
+        let group_context_hash = coordinate.group_context_hash.to_vec();
+        let confirmation_tag = coordinate.confirmation_tag.to_vec();
+        let group_info = vec![4_u8; 8];
+        let signed_request = vec![7_u8; 8];
+        let unsigned_projection = vec![8_u8; 8];
+        let signing_transcript = vec![9_u8; 8];
+        let request_digest = Sha256::digest(&signing_transcript).to_vec();
+        let signature = vec![10_u8; 64];
+        let accepted_payload = vec![11_u8; 8];
+        let creation_fingerprint = vec![12_u8; 32];
+        let metadata_ciphertext = vec![13_u8; 16];
+        let basic_credential = format!("{member_did}#{member_device_id}").into_bytes();
+        let at = clock_now(pool).await;
+
+        let mut tx = pool.begin().await.expect("begin real-tree genesis");
+        sqlx::query(
+            "INSERT INTO chat.principals(user_did,created_at) VALUES($1,$2) ON CONFLICT DO NOTHING",
+        )
+        .bind(&member_did)
+        .bind(at)
+        .execute(&mut *tx)
+        .await
+        .expect("insert principal");
+        sqlx::query(
+            "INSERT INTO chat.devices(user_did,device_id,device_name,status,dpop_jkt,auth_generation,capabilities,created_at,updated_at) \
+             VALUES($1,$2,'real-tree-actor','active',$3,1,chat.protocol_capabilities(),$4,$4) ON CONFLICT DO NOTHING",
+        )
+        .bind(&member_did)
+        .bind(member_device_id)
+        .bind(&member_key_id)
+        .bind(at)
+        .execute(&mut *tx)
+        .await
+        .expect("insert device");
+        sqlx::query(
+            "INSERT INTO chat.device_keys(user_did,device_id,key_id,signing_public_key,enrollment_auth_generation,created_at) \
+             VALUES($1,$2,$3,$4,1,$5) ON CONFLICT DO NOTHING",
+        )
+        .bind(&member_did)
+        .bind(member_device_id)
+        .bind(&member_key_id)
+        .bind(leaf_signature_key)
+        .bind(at)
+        .execute(&mut *tx)
+        .await
+        .expect("insert device key");
+        sqlx::query(
+            "INSERT INTO chat.conversations(conversation_id,kind,lifecycle,current_generation,current_state_version,next_entry_seq,created_at) VALUES($1,'group','active',0,0,2,$2)",
+        )
+        .bind(conversation_id)
+        .bind(at)
+        .execute(&mut *tx)
+        .await
+        .expect("insert conversation");
+        sqlx::query(
+            "INSERT INTO chat.generations(conversation_id,generation,group_id,lifecycle,genesis_group_info_bytes,genesis_group_info_sha256,current_state_version,activated_seq,activated_at) VALUES($1,0,$2,'active',$3,$4,0,1,$5)",
+        )
+        .bind(conversation_id)
+        .bind(&group_id)
+        .bind(&group_info)
+        .bind(Sha256::digest(&group_info).to_vec())
+        .bind(at)
+        .execute(&mut *tx)
+        .await
+        .expect("insert generation");
+        sqlx::query(
+            r#"INSERT INTO chat.transitions(
+                transition_id,conversation_id,kind,actor_did,actor_device_id,actor_key_id,
+                actor_auth_generation,actor_role,actor_device_status,signed_request_bytes,
+                unsigned_projection_bytes,signing_transcript_bytes,request_digest,signature,
+                next_generation,next_state_version,metadata_snapshot_id,entry_seq,accepted_at
+            ) VALUES($1,$2,'creation',$3,$4,$5,1,'admin','active',$6,$7,$8,$9,$10,0,0,$11,1,$12)"#,
+        )
+        .bind(creation_transition_id)
+        .bind(conversation_id)
+        .bind(&member_did)
+        .bind(member_device_id)
+        .bind(&member_key_id)
+        .bind(&signed_request)
+        .bind(&unsigned_projection)
+        .bind(&signing_transcript)
+        .bind(&request_digest)
+        .bind(&signature)
+        .bind(metadata_snapshot_id)
+        .bind(at)
+        .execute(&mut *tx)
+        .await
+        .expect("insert creation transition");
+        sqlx::query(
+            r#"INSERT INTO chat.generation_states(
+                conversation_id,generation,state_version,group_id,epoch,group_context_hash,
+                confirmation_tag,lifecycle,state_kind,producing_transition_id,
+                public_snapshot_bytes,snapshot_sha256,tree_summary_bytes,tree_summary_sha256,
+                leaf_count,created_at
+            ) VALUES($1,0,0,$2,$3,$4,$5,'active','creation',$6,$7,$8,$9,$10,1,$11)"#,
+        )
+        .bind(conversation_id)
+        .bind(&group_id)
+        .bind(i64::try_from(coordinate.epoch).expect("epoch fits i64"))
+        .bind(&group_context_hash)
+        .bind(&confirmation_tag)
+        .bind(creation_transition_id)
+        .bind(&snapshot)
+        .bind(&snapshot_sha256)
+        .bind(&tree_summary_bytes)
+        .bind(tree_summary_sha256.as_slice())
+        .bind(at)
+        .execute(&mut *tx)
+        .await
+        .expect("insert creation state");
+        sqlx::query(
+            r#"INSERT INTO chat.participants(
+                participant_period_id,conversation_id,user_did,status,role,role_transition_id,
+                role_changed_at,created_by_did,created_by_device_id,current_membership,created_at
+            ) VALUES($1,$2,$3,'active','admin',$4,$5,$3,$6,true,$5)"#,
+        )
+        .bind(participant_period_id)
+        .bind(conversation_id)
+        .bind(&member_did)
+        .bind(creation_transition_id)
+        .bind(at)
+        .bind(member_device_id)
+        .execute(&mut *tx)
+        .await
+        .expect("insert participant");
+        sqlx::query(
+            r#"INSERT INTO chat.member_devices(
+                leaf_period_id,participant_period_id,conversation_id,generation,user_did,
+                device_id,leaf_index,basic_credential,leaf_signature_key,leaf_key_id,
+                leaf_auth_generation,origin,joined_state_version,joined_transition_id,
+                joined_seq,active,created_at
+            ) VALUES($1,$2,$3,0,$4,$5,0,$6,$7,$8,1,'genesis',0,$9,1,true,$10)"#,
+        )
+        .bind(leaf_period_id)
+        .bind(participant_period_id)
+        .bind(conversation_id)
+        .bind(&member_did)
+        .bind(member_device_id)
+        .bind(&basic_credential)
+        .bind(leaf_signature_key)
+        .bind(&member_key_id)
+        .bind(creation_transition_id)
+        .bind(at)
+        .execute(&mut *tx)
+        .await
+        .expect("insert leaf");
+        sqlx::query(
+            r#"INSERT INTO chat.metadata_snapshots(
+                metadata_snapshot_id,conversation_id,generation,state_version,group_id,epoch,
+                group_context_hash,confirmation_tag,producing_transition_id,origin_transition_id,
+                metadata_version,nonce,ciphertext,ciphertext_sha256,ciphertext_size,author_did,
+                author_device_id,author_key_id,author_public_key,author_auth_generation,
+                author_origin_seq,author_role,author_device_status,created_at
+            ) VALUES($1,$2,0,0,$3,$4,$5,$6,$7,$7,1,$8,$9,$10,16,$11,$12,$13,$14,1,1,'admin','active',$15)"#,
+        )
+        .bind(metadata_snapshot_id)
+        .bind(conversation_id)
+        .bind(&group_id)
+        .bind(i64::try_from(coordinate.epoch).expect("epoch fits i64"))
+        .bind(&group_context_hash)
+        .bind(&confirmation_tag)
+        .bind(creation_transition_id)
+        .bind(vec![14_u8; 12])
+        .bind(&metadata_ciphertext)
+        .bind(Sha256::digest(&metadata_ciphertext).to_vec())
+        .bind(&member_did)
+        .bind(member_device_id)
+        .bind(&member_key_id)
+        .bind(leaf_signature_key)
+        .bind(at)
+        .execute(&mut *tx)
+        .await
+        .expect("insert metadata");
+        sqlx::query(
+            r#"INSERT INTO chat.entries(
+                conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,
+                accepted_payload_sha256,signed_request_bytes,request_digest,signature,
+                server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,
+                actor_key_id,actor_auth_generation,generation,state_version,transition_id,received_at
+            ) VALUES($1,1,$2,'blue.catbird.chat.defs#creationEntry',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1,0,0,$13,$14)"#,
+        )
+        .bind(conversation_id)
+        .bind(creation_entry_id)
+        .bind(&accepted_payload)
+        .bind(Sha256::digest(&accepted_payload).to_vec())
+        .bind(&signed_request)
+        .bind(&request_digest)
+        .bind(&signature)
+        .bind(vec![0_u8])
+        .bind(&creation_fingerprint)
+        .bind(&member_did)
+        .bind(member_device_id)
+        .bind(&member_key_id)
+        .bind(creation_transition_id)
+        .bind(at)
+        .execute(&mut *tx)
+        .await
+        .expect("insert creation entry");
+        sqlx::query(
+            r#"INSERT INTO chat.application_intervals(
+                membership_interval_id,conversation_id,generation,recipient_did,
+                recipient_device_id,start_seq,opening_kind,opening_transition_id,
+                opening_outer_entry_fingerprint,opening_state_version,opening_group_id,
+                opening_epoch,opening_group_context_hash,opening_confirmation_tag,
+                opening_leaf_period_id,created_at
+            ) VALUES($1,$2,0,$3,$4,1,'creation',$1,$5,0,$6,$7,$8,$9,$10,$11)"#,
+        )
+        .bind(creation_transition_id)
+        .bind(conversation_id)
+        .bind(&member_did)
+        .bind(member_device_id)
+        .bind(&creation_fingerprint)
+        .bind(&group_id)
+        .bind(i64::try_from(coordinate.epoch).expect("epoch fits i64"))
+        .bind(&group_context_hash)
+        .bind(&confirmation_tag)
+        .bind(leaf_period_id)
+        .bind(at)
+        .execute(&mut *tx)
+        .await
+        .expect("insert creation interval");
+        tx.commit().await.expect("commit real-tree genesis");
+
+        RealTreeGenesis {
+            conversation_id,
+            member_did,
+            member_device_id,
+            snapshot,
+            tree_summary,
+            group_id: coordinate.group_id,
+        }
+    }
+
+    /// Happy path (success criterion 1): the G1a snapshot leg reloads a REAL
+    /// `ActivePublicState` from the frozen corpus snapshot — structural decode,
+    /// no lifetime reprocessing — bound to the seeded genesis coordinate.
+    #[tokio::test]
+    #[ignore = "requires the dedicated gate database"]
+    async fn snapshot_leg_reloads_a_real_active_public_state_from_the_corpus_genesis() {
+        let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+        let (member_did, member_device, leaf_key) = corpus_leaf_identity();
+        let genesis = commit_real_tree_genesis(&pool, &member_did, member_device, &leaf_key).await;
+        let locked_at = clock_now_millis(&pool).await;
+
+        let mut tx = pool.begin().await.expect("begin");
+        let guard = hydrate_locked_public_state(&mut tx, genesis.conversation_id, locked_at)
+            .await
+            .expect("public state hydrates");
+        let (_txid, _cid, _coordinate, snapshot, binding, encoded_tree, tree_sha, _at, _digest) =
+            guard.into_parts();
+        // The full production reload: DECODES the real corpus snapshot into a
+        // real active public state (never reached by the opaque-snapshot leaf
+        // fixture).
+        let state = load_persisted_active_snapshot(&snapshot, &binding, &encoded_tree, &tree_sha)
+            .expect("real corpus snapshot reloads a real ActivePublicState");
+        tx.commit().await.expect("commit");
+
+        assert_eq!(
+            state.snapshot(),
+            genesis.snapshot.as_slice(),
+            "reloaded snapshot is the exact frozen corpus bytes",
+        );
+        assert_eq!(
+            state.snapshot_sha256(),
+            &<[u8; 32]>::from(Sha256::digest(&genesis.snapshot)),
+            "snapshot digest binds the frozen corpus bytes",
+        );
+        let coordinate = state.coordinate();
+        assert_eq!(
+            coordinate.conversation_id(),
+            genesis.conversation_id.as_bytes(),
+            "bound to the freshly seeded conversation",
+        );
+        assert_eq!(coordinate.group_id(), &genesis.group_id, "corpus group id");
+        assert_eq!(coordinate.epoch(), 0, "genesis epoch");
+        assert_eq!(
+            state.binding().tree_summary().leaves().len(),
+            1,
+            "corpus genesis is a one-leaf public group",
+        );
+    }
+
+    /// Happy path (success criterion 2): the leaf leg hydrates the sole active
+    /// leaf from the REAL authenticated tree summary — crypto carried verbatim
+    /// from the corpus tree, bound to the durable member-device identity.
+    #[tokio::test]
+    #[ignore = "requires the dedicated gate database"]
+    async fn leaf_leg_hydrates_the_corpus_genesis_leaf_from_the_real_tree() {
+        let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+        let (member_did, member_device, leaf_key) = corpus_leaf_identity();
+        let genesis = commit_real_tree_genesis(&pool, &member_did, member_device, &leaf_key).await;
+        let locked_at = clock_now_millis(&pool).await;
+
+        let mut tx = pool.begin().await.expect("begin");
+        let guard = hydrate_locked_public_state(&mut tx, genesis.conversation_id, locked_at)
+            .await
+            .expect("public state hydrates");
+        let (_txid, _cid, _coordinate, _snapshot, binding, _encoded_tree, _tree_sha, _at, _digest) =
+            guard.into_parts();
+        let leaves = load_leaf_hydration_rows(&mut tx, genesis.conversation_id, &binding)
+            .await
+            .expect("leaf leg hydrates on the real tree");
+        tx.commit().await.expect("commit");
+
+        assert_eq!(leaves.len(), 1, "exactly the one active genesis leaf");
+        let leaf = &leaves[0];
+        let tree_leaf = &genesis.tree_summary.leaves()[0];
+        let expected_device = DeviceIdentity::new(
+            PrincipalId::new(genesis.member_did.clone().into_bytes()).expect("principal"),
+            *genesis.member_device_id.as_bytes(),
+        )
+        .expect("device identity");
+        assert_eq!(leaf.device, expected_device, "durable device identity");
+        assert_eq!(leaf.leaf_index, 0);
+        assert_eq!(
+            leaf.basic_credential.as_slice(),
+            tree_leaf.basic_credential(),
+            "basic credential carried from the real tree leaf",
+        );
+        assert_eq!(
+            leaf.signature_key.as_slice(),
+            tree_leaf.signature_key(),
+            "signature key carried from the real tree leaf",
+        );
+        assert_eq!(
+            leaf.encryption_key.as_slice(),
+            tree_leaf.encryption_key(),
+            "X-Wing encryption key sourced ONLY from the real tree leaf",
+        );
+        assert_eq!(
+            leaf.key_package_ref, None,
+            "genesis leaf has no join package"
+        );
+    }
+
+    /// Fail-closed (coordinator condition 2): when the durable member-device row
+    /// carries a signature key that DISAGREES with the real authenticated tree
+    /// leaf, the leg refuses to launder the mismatch and errors `TreeMismatch`.
+    #[tokio::test]
+    #[ignore = "requires the dedicated gate database"]
+    async fn leaf_leg_fails_closed_when_member_key_disagrees_with_the_real_tree() {
+        let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+        // The real corpus tree leaf carries alice's credential + MLS key; seed a
+        // membership row for a DIFFERENT device identity + key, so the durable
+        // binding disagrees with the authenticated real tree leaf on both the
+        // basic credential and the signature key.
+        let (_corpus_did, _corpus_device, corpus_key) = corpus_leaf_identity();
+        // Fresh 32 random bytes so the derived `device_keys.key_id` (globally
+        // unique) never collides with a prior run on the shared gate database.
+        let mut divergent_key = Vec::with_capacity(32);
+        divergent_key.extend_from_slice(Uuid::new_v4().as_bytes());
+        divergent_key.extend_from_slice(Uuid::new_v4().as_bytes());
+        assert_ne!(
+            divergent_key, corpus_key,
+            "the fail-closed key must differ from the real tree leaf",
+        );
+        let genesis =
+            commit_real_tree_genesis(&pool, &random_plc_did(), Uuid::new_v4(), &divergent_key)
+                .await;
+        let locked_at = clock_now_millis(&pool).await;
+
+        let mut tx = pool.begin().await.expect("begin");
+        let guard = hydrate_locked_public_state(&mut tx, genesis.conversation_id, locked_at)
+            .await
+            .expect("public state hydrates");
+        let (_txid, _cid, _coordinate, _snapshot, binding, _encoded_tree, _tree_sha, _at, _digest) =
+            guard.into_parts();
+        let result = load_leaf_hydration_rows(&mut tx, genesis.conversation_id, &binding).await;
+        tx.rollback().await.expect("rollback");
+
+        assert!(matches!(result, Err(LeafHydrationError::TreeMismatch)));
+    }
+
+    /// The real corpus genesis leaf's durable identity — bare DID, device UUID,
+    /// and Ed25519 signature key — read STRUCTURALLY from the frozen snapshot's
+    /// tree summary (the coherent happy-path membership). The leaf's basic
+    /// credential is `did#device`; split it back to seed the matching row.
+    fn corpus_leaf_identity() -> (String, Uuid, Vec<u8>) {
+        let snapshot = corpus_file("genesis-public-state.bin");
+        let tree_summary = structural_genesis_tree_summary(&snapshot);
+        let leaf = &tree_summary.leaves()[0];
+        let credential =
+            String::from_utf8(leaf.basic_credential().to_vec()).expect("utf-8 basic credential");
+        let (did, device_text) = credential
+            .split_once('#')
+            .expect("`did#device` basic credential");
+        (
+            did.to_owned(),
+            Uuid::parse_str(device_text).expect("device uuid"),
+            leaf.signature_key().to_vec(),
+        )
+    }
+}
