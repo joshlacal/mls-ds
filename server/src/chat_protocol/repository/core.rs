@@ -22,9 +22,10 @@ use super::super::{
         PublicGroupSnapshotBinding, PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle,
     },
     state_machine::{
-        classify_acceptance, classify_invitation, classify_role_producer, CloseKind,
-        ConversationState, DeviceIdentity, HistoricalRehydrationAuthority, IntervalEndHydrationRow,
-        IntervalHydrationRow, LeafHydrationRow, LeafRecoveryKind, OpeningKind,
+        classify_acceptance, classify_invitation, classify_role_producer,
+        metadata_binding_of_transition, CloseKind, ConversationState, DeviceIdentity,
+        HistoricalRehydrationAuthority, IntervalEndHydrationRow, IntervalHydrationRow,
+        LeafHydrationRow, LeafRecoveryKind, MetadataSnapshotBinding, OpeningKind,
         ParticipantHydrationRow, ParticipantRole, ParticipantStatus, PersistedControlAuthority,
         PrincipalId, RecoveryOriginHydrationRow, RecoveryRequestHydrationRow,
         RecoveryRequestStatus, RecoveryReservationHydrationRow, RecoverySource, ReservationStatus,
@@ -3098,6 +3099,161 @@ pub(crate) async fn load_producer_transition_evidence(
     .await?
     .into_transition()
     .map_err(|_| ProducerHydrationError::InvalidProvenance)
+}
+
+// ===========================================================================
+// G1b-2 sub-seal — current-metadata provenance leg (metadata + metadata_producer).
+//
+// The G1b-2 aggregate carries two COUPLED optional fields: `metadata`
+// (`Option<MetadataSnapshotBinding>`) and `metadata_producer`
+// (`Option<TransitionEvidence>`). `validate_state`'s `metadata_provenance_matches`
+// (state_machine.rs) admits only `(None, None)` or `(Some(metadata),
+// Some(producer))` where `transition_metadata(producer) == metadata`,
+// `producer.seq <= state.producer.seq`, and `producer.received_at <=
+// state.producer.received_at` (plus the coordinate authority arm) — so the pair
+// must be hydrated together.
+//
+// FAITHFULNESS (read-set-map correction, same class as the leaf leg's FINDING-1):
+// production NEVER field-reconstructs `state.metadata` from the durable
+// `chat.metadata_snapshots` columns. Every coordinate-advancing arm sets
+// `state.metadata = transition_metadata(&command.transition).cloned()` and
+// `state.metadata_producer = state.metadata.as_ref().map(|_| command.transition)`
+// (state_machine.rs:8813, :9876, and the policy/reset/recovery/leave arms) — the
+// binding is provenance-DERIVED from the producing transition's verified body.
+// The durable row's `canonical_snapshot`/`digest` are not persisted at all, and
+// `MetadataSnapshotBinding`'s fields (and the only literal ctor, the
+// `#[cfg(test)]` `for_test_creation`) are unavailable to `repository::core`. So
+// this leg reads `chat.metadata_snapshots.producing_transition_id` (pinned to the
+// current generation-state's producer — see below), re-verifies that transition
+// through the sealed loader atom, and derives the metadata binding from its body
+// via `metadata_binding_of_transition`, exactly reproducing the append-time
+// derivation. `metadata_provenance_matches` is the assembly-time drift fence.
+//
+// PRODUCER PIN: the metadata row is joined to the CURRENT generation-state's
+// `producing_transition_id`. A generation-state is produced by exactly one
+// transition, and the executor writes that state and its metadata snapshot (when
+// metadata is present) in one persistence with a shared `producing_transition_id`
+// (`metadata_snapshots_transition_uq` makes it globally unique), so
+// `chat.metadata_snapshots.producing_transition_id` for the current `(generation,
+// state_version)` always equals `chat.generation_states.producing_transition_id`.
+// Pinning the join on that equality is deterministic (there is no bare
+// `(conversation_id, generation, state_version)` unique index on
+// `chat.metadata_snapshots`) and fails toward `(None, None)` — never a
+// non-deterministic pick — should the invariant ever be violated.
+//
+// (None, None) vs fail-closed: a coherent conversation ALWAYS carries metadata —
+// `createConversation` mints a `metadata_version == 1` snapshot, every advance
+// carries one forward, and `chat.transitions.metadata_snapshot_id` FK-references
+// the row (so it cannot be orphaned/deleted). So on any conversation the caller
+// has head-locked, the current metadata row is present and this leg returns
+// `(Some, Some)`. The `(None, None)` arm is the faithful DB mirror for the
+// no-current-metadata-row case (structurally unreachable for an existing
+// conversation); it is NOT fabricated evidence, and `validate_state` is the
+// arbiter of whether a metadata-less state is legal for the coordinate. The
+// handoff's "missing metadata row" fail-closed maps to `ProvenanceMissing` (the
+// producing transition's ENTRY is absent), not the absent-snapshot-row case.
+// ===========================================================================
+
+/// Failure modes of [`load_metadata_provenance`].
+#[allow(dead_code)]
+#[derive(Debug, Error)]
+pub(crate) enum MetadataHydrationError {
+    /// The metadata snapshot's producing transition had no durable control entry.
+    /// Fail closed: a producing transition without an entry can never yield
+    /// evidence.
+    #[error("clean-chat metadata producer provenance is absent")]
+    ProvenanceMissing,
+    /// The producing transition failed read-time re-verification, was a control
+    /// request rather than a coordinate transition, or its verified body carried
+    /// NO metadata snapshot despite a durable metadata row naming it as producer
+    /// (linkage inconsistency). Never coerced into evidence it does not attest.
+    #[error("clean-chat metadata producer provenance failed re-verification")]
+    InvalidProvenance,
+    #[error("clean-chat metadata hydration database error: {0}")]
+    Database(#[from] sqlx::Error),
+}
+
+impl From<ControlEvidenceLoadError> for MetadataHydrationError {
+    fn from(error: ControlEvidenceLoadError) -> Self {
+        match error {
+            ControlEvidenceLoadError::EntryMissing => MetadataHydrationError::ProvenanceMissing,
+            ControlEvidenceLoadError::InvalidEvidence => MetadataHydrationError::InvalidProvenance,
+            ControlEvidenceLoadError::Database(error) => MetadataHydrationError::Database(error),
+        }
+    }
+}
+
+/// Load and re-verify the CURRENT metadata provenance of an existing
+/// conversation — the G1b-2 aggregate's coupled `metadata` + `metadata_producer`
+/// fields.
+///
+/// Reads `chat.metadata_snapshots.producing_transition_id` for the conversation's
+/// current `(generation, state_version)` — pinned to the current
+/// generation-state's producer (see the module comment) — then re-loads +
+/// re-verifies that transition's durable control entry through
+/// [`load_historical_control_evidence`], narrows it to the transition arm via
+/// [`PersistedControlAuthority::into_transition`] (a coordinate metadata producer
+/// is always a transition, never a control request), and derives the metadata
+/// binding from its verified body via
+/// [`metadata_binding_of_transition`] — exactly as the append-time path derives
+/// `state.metadata`. Returns `(None, None)` when no current metadata snapshot
+/// exists (the legal validator arm, structurally unreachable for a coherent
+/// conversation).
+///
+/// `authority` MUST be the read-time authority minted from the SAME locked head
+/// as the rest of the aggregate. No `FOR UPDATE`: the caller already holds the
+/// head lock (`FOR UPDATE OF c` on `chat.conversations`) that pins the current
+/// generation-state and the immutable `chat.entries`/`chat.metadata_snapshots`
+/// suffix.
+#[allow(dead_code)]
+pub(crate) async fn load_metadata_provenance(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &HistoricalRehydrationAuthority,
+    conversation_id: Uuid,
+) -> Result<(Option<MetadataSnapshotBinding>, Option<TransitionEvidence>), MetadataHydrationError> {
+    let row: Option<(Uuid,)> = sqlx::query_as(
+        r#"
+        SELECT ms.producing_transition_id
+        FROM chat.conversations c
+        JOIN chat.generation_states gs
+          ON gs.conversation_id = c.conversation_id
+         AND gs.generation = c.current_generation
+         AND gs.state_version = c.current_state_version
+        JOIN chat.metadata_snapshots ms
+          ON ms.conversation_id = c.conversation_id
+         AND ms.generation = c.current_generation
+         AND ms.state_version = c.current_state_version
+         AND ms.producing_transition_id = gs.producing_transition_id
+        WHERE c.conversation_id = $1
+        "#,
+    )
+    .bind(conversation_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+
+    let Some((producing_transition_id,)) = row else {
+        // No current metadata snapshot: the legal `(None, None)` validator arm.
+        return Ok((None, None));
+    };
+
+    let producer = load_historical_control_evidence(
+        transaction,
+        authority,
+        conversation_id,
+        producing_transition_id,
+    )
+    .await?
+    .into_transition()
+    .map_err(|_| MetadataHydrationError::InvalidProvenance)?;
+
+    // Derive the metadata binding from the re-verified producer body, mirroring
+    // the append-time `state.metadata = transition_metadata(&producer).cloned()`.
+    // A metadata snapshot row whose producing transition body carries NO metadata
+    // is a fail-closed linkage inconsistency, never a silent `None`.
+    let metadata = metadata_binding_of_transition(&producer)
+        .ok_or(MetadataHydrationError::InvalidProvenance)?;
+
+    Ok((Some(metadata), Some(producer)))
 }
 
 // ===========================================================================

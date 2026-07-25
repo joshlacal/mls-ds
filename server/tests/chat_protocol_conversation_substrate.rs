@@ -2431,15 +2431,15 @@ mod historical_control_loader {
 
     use super::historical_control_path::{build_real_creation_entry, RealCreationEntry};
     use crate::chat_protocol::repository::core::{
-        load_historical_control_evidence, load_interval_hydration_rows,
+        load_historical_control_evidence, load_interval_hydration_rows, load_metadata_provenance,
         load_participant_hydration_rows, load_producer_transition_evidence,
-        ControlEvidenceLoadError, IntervalHydrationError, ParticipantHydrationError,
-        ProducerHydrationError,
+        ControlEvidenceLoadError, IntervalHydrationError, MetadataHydrationError,
+        ParticipantHydrationError, ProducerHydrationError,
     };
     use crate::chat_protocol::snapshot::PublicGroupSnapshotLifecycle;
     use crate::chat_protocol::state_machine::{
-        DeviceIdentity, HistoricalRehydrationAuthority, OpeningKind, ParticipantRole,
-        ParticipantStatus, PrincipalId,
+        metadata_binding_of_transition, DeviceIdentity, HistoricalRehydrationAuthority,
+        MetadataSnapshotBinding, OpeningKind, ParticipantRole, ParticipantStatus, PrincipalId,
     };
     use crate::common;
 
@@ -3053,6 +3053,129 @@ mod historical_control_loader {
         assert!(matches!(
             ProducerHydrationError::from(ControlEvidenceLoadError::InvalidEvidence),
             ProducerHydrationError::InvalidProvenance
+        ));
+    }
+
+    /// The metadata provenance leg reads `metadata_snapshots.producing_transition_id`
+    /// for the current coordinate (pinned to the generation-state producer),
+    /// re-verifies it as a transition, and DERIVES the metadata binding from that
+    /// transition's verified body — exactly as the append-time path sets
+    /// `state.metadata = transition_metadata(&producer).cloned()`. On the genesis
+    /// seed the producer is the creation transition; the leg's producer byte-equals
+    /// the directly loaded historical control transition and the leg's metadata
+    /// byte-equals that transition's body metadata (`metadata_version == 1`).
+    #[tokio::test]
+    #[ignore = "requires the dedicated gate database"]
+    async fn metadata_leg_hydrates_the_genesis_creation_metadata() {
+        let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+        let cid = Uuid::new_v4();
+        let entry = build_real_creation_entry(*cid.as_bytes());
+        let creation = seed_real_creation_graph(&pool, &entry).await;
+        let authority =
+            HistoricalRehydrationAuthority::new(entry.cid, entry.head_next_entry_seq).unwrap();
+
+        let mut tx = pool.begin().await.expect("begin");
+        let reference_producer =
+            load_historical_control_evidence(&mut tx, &authority, cid, creation)
+                .await
+                .expect("producer evidence loads")
+                .into_transition()
+                .expect("producer is a transition");
+        let reference_metadata = metadata_binding_of_transition(&reference_producer)
+            .expect("genesis creation body carries metadata");
+
+        let (metadata, metadata_producer) = load_metadata_provenance(&mut tx, &authority, cid)
+            .await
+            .expect("genesis metadata provenance hydrates");
+        tx.commit().await.expect("commit");
+
+        assert_eq!(
+            metadata_producer,
+            Some(reference_producer),
+            "metadata producer re-verified byte-for-byte"
+        );
+        assert_eq!(
+            metadata
+                .as_ref()
+                .map(MetadataSnapshotBinding::metadata_version),
+            Some(1),
+            "genesis metadata is version 1"
+        );
+        assert_eq!(
+            metadata,
+            Some(reference_metadata),
+            "metadata binding derived from the producer body byte-for-byte"
+        );
+    }
+
+    /// A read-time authority bound to a DIFFERENT conversation must reject the
+    /// metadata producer's transition: the re-verified entry carries its own
+    /// conversation_id, which the authority requires to equal the locked one.
+    /// Fails closed with `InvalidProvenance`.
+    #[tokio::test]
+    #[ignore = "requires the dedicated gate database"]
+    async fn metadata_leg_fails_closed_when_authority_binds_a_foreign_conversation() {
+        let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+        let cid = Uuid::new_v4();
+        let entry = build_real_creation_entry(*cid.as_bytes());
+        let _creation = seed_real_creation_graph(&pool, &entry).await;
+
+        let foreign_cid = *Uuid::new_v4().as_bytes();
+        let authority =
+            HistoricalRehydrationAuthority::new(foreign_cid, entry.head_next_entry_seq).unwrap();
+        let mut tx = pool.begin().await.expect("begin");
+        let result = load_metadata_provenance(&mut tx, &authority, cid).await;
+        tx.rollback().await.expect("rollback");
+
+        assert!(matches!(
+            result,
+            Err(MetadataHydrationError::InvalidProvenance)
+        ));
+    }
+
+    /// A conversation id with no current metadata snapshot yields the legal
+    /// `(None, None)` validator arm — never a fabricated binding or producer. On a
+    /// coherent conversation this arm is structurally unreachable (creation always
+    /// mints metadata and `chat.transitions.metadata_snapshot_id` FK-pins it), so
+    /// the absence is modeled here with a conversation id that has no rows at all.
+    #[tokio::test]
+    #[ignore = "requires the dedicated gate database"]
+    async fn metadata_leg_returns_none_when_no_metadata_snapshot_exists() {
+        let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+        let cid = Uuid::new_v4();
+        let entry = build_real_creation_entry(*cid.as_bytes());
+        let _creation = seed_real_creation_graph(&pool, &entry).await;
+
+        let absent = Uuid::new_v4();
+        let authority =
+            HistoricalRehydrationAuthority::new(*absent.as_bytes(), entry.head_next_entry_seq)
+                .unwrap();
+        let mut tx = pool.begin().await.expect("begin");
+        let (metadata, metadata_producer) = load_metadata_provenance(&mut tx, &authority, absent)
+            .await
+            .expect("absent metadata resolves to the (None, None) arm");
+        tx.rollback().await.expect("rollback");
+
+        assert!(metadata.is_none() && metadata_producer.is_none());
+    }
+
+    /// The metadata leg maps the loader-atom failure modes fail-closed: an absent
+    /// producing entry to `ProvenanceMissing`, a re-verification failure to
+    /// `InvalidProvenance`. The absence path is not provokable by mutating a
+    /// coherent graph (`producing_transition_id` is NOT NULL + UUID-checked +
+    /// FK/uniqueness-pinned to a real accepted transition whose entry exists, and
+    /// `chat.entries` is append-only + immutable), so the mapping is exercised
+    /// directly (the sealed `loader_absent_entry_fails_closed` proves the
+    /// underlying loader-atom absence).
+    #[test]
+    fn metadata_provenance_load_errors_map_fail_closed() {
+        assert!(matches!(
+            MetadataHydrationError::from(ControlEvidenceLoadError::EntryMissing),
+            MetadataHydrationError::ProvenanceMissing
+        ));
+        assert!(matches!(
+            MetadataHydrationError::from(ControlEvidenceLoadError::InvalidEvidence),
+            MetadataHydrationError::InvalidProvenance
         ));
     }
 

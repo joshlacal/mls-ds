@@ -12539,6 +12539,39 @@ fn transition_metadata(evidence: &TransitionEvidence) -> Option<&MetadataSnapsho
     }
 }
 
+/// Read-time accessor exposing the metadata snapshot binding a coordinate
+/// transition's verified body carries, for the G1b-2 metadata hydration leg
+/// (`repository::core::load_metadata_provenance`).
+///
+/// Thin `pub(crate)` wrapper over the module-private [`transition_metadata`]
+/// classifier — forced in-module because both that fn and every field of
+/// [`MetadataSnapshotBinding`] are private here, so `repository::core` cannot
+/// introspect a re-minted transition's metadata directly. It lets the core leg
+/// derive an existing conversation's `state.metadata` from its re-verified
+/// producing transition EXACTLY as every production coordinate-advancing arm
+/// does: `state.metadata = transition_metadata(&command.transition).cloned()`
+/// (creation `commit_creation`, and the commit / policy / reset-activation /
+/// leaf-recovery-fulfillment / leave-fulfillment arms all set it that way, e.g.
+/// state_machine.rs:8813 and :9876). The binding is thus PROVENANCE-DERIVED from
+/// its producer, never field-reconstructed from the durable `chat.metadata_snapshots`
+/// columns (its `canonical_snapshot`/`digest` are not persisted at all, and the
+/// only field-literal constructor, `for_test_creation`, is `#[cfg(test)]`).
+///
+/// DRIFT FENCE (unchanged, not edited): `validate_state`'s
+/// [`metadata_provenance_matches`] re-checks
+/// `state.metadata == transition_metadata(state.metadata_producer)` at hydration,
+/// which this derivation satisfies by construction, so any residual disagreement
+/// fails closed downstream (availability, not integrity — the OQ-G1-3 philosophy).
+/// Returns `None` when the transition body carries no metadata; the core leg
+/// treats that as a fail-closed linkage inconsistency when a durable metadata
+/// snapshot row nonetheless names the transition as its producer.
+#[allow(dead_code)] // wired by the G1b-2 aggregate.
+pub(crate) fn metadata_binding_of_transition(
+    evidence: &TransitionEvidence,
+) -> Option<MetadataSnapshotBinding> {
+    transition_metadata(evidence).cloned()
+}
+
 fn creation_manifest_matches(
     evidence: &TransitionEvidence,
     manifest: &RosterManifestBinding,
