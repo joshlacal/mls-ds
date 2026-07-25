@@ -2626,3 +2626,158 @@ mod historical_control_loader {
         ));
     }
 }
+
+// ===========================================================================
+// G1b-2 sub-seal 1a — leaf-membership hydration leg (FINDING-1 correction:
+// leaf crypto is authoritative in the tree summary, NOT chat.member_devices).
+//
+// The genesis coherent-leaf seed builds a tree summary whose single leaf's
+// basic_credential + signature_key MATCH the genesis member_devices row (unlike
+// `canonical_tree_summary`, built for the snapshot-leg test, whose opaque leaf
+// crypto deliberately does not). The loader binds the durable member_devices row
+// to the authenticated tree leaf and carries the tree leaf's crypto verbatim.
+// ===========================================================================
+mod leaf_hydration_leg {
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    use super::{
+        canonical_snapshot, clock_now_millis, commit_coherent_group_creation, seed_actor, seed_base,
+    };
+    use crate::chat_protocol::public_state::encode_public_tree_summary;
+    use crate::chat_protocol::repository::core::{
+        hydrate_locked_public_state, load_leaf_hydration_rows, LeafHydrationError,
+    };
+    use crate::chat_protocol::snapshot::{PublicGroupSnapshotLeaf, PublicGroupSnapshotTreeSummary};
+    use crate::chat_protocol::state_machine::{DeviceIdentity, PrincipalId};
+    use crate::common;
+
+    struct CoherentLeafGroup {
+        conversation_id: Uuid,
+        actor_did: String,
+        actor_device_id: Uuid,
+        signature_key: Vec<u8>,
+        encryption_key: Vec<u8>,
+    }
+
+    /// Seed a genesis GROUP whose one tree-summary leaf carries the SAME
+    /// basic_credential (`did#device_id`) and signature key (the actor's Ed25519
+    /// public key) as its `chat.member_devices` row, so the leg's durable-vs-tree
+    /// correspondence holds. `encryption_key` lives ONLY in the tree leaf.
+    async fn seed_coherent_leaf_group(pool: &PgPool) -> CoherentLeafGroup {
+        let (actor_did, actor_device_id, actor_key_id) = seed_actor(pool).await;
+        let actor_public_key: Vec<u8> =
+            sqlx::query_scalar("SELECT signing_public_key FROM chat.device_keys WHERE key_id=$1")
+                .bind(&actor_key_id)
+                .fetch_one(pool)
+                .await
+                .expect("read actor public key");
+        let basic_credential = format!("{actor_did}#{actor_device_id}").into_bytes();
+        let encryption_key = vec![0x46_u8; 1216];
+        let (snapshot, snapshot_sha256) = canonical_snapshot();
+        let summary = PublicGroupSnapshotTreeSummary::new(
+            [0x33_u8; 32],
+            vec![PublicGroupSnapshotLeaf::new(
+                0,
+                basic_credential.clone(),
+                actor_public_key.clone(),
+                encryption_key.clone(),
+            )],
+        );
+        let (tree_summary_bytes, tree_summary_sha256) = encode_public_tree_summary(&summary)
+            .expect("coherent tree summary encodes")
+            .into_parts();
+        let conversation_id = commit_coherent_group_creation(
+            pool,
+            &actor_did,
+            actor_device_id,
+            &actor_key_id,
+            &actor_public_key,
+            &snapshot,
+            &snapshot_sha256,
+            &tree_summary_bytes,
+            &tree_summary_sha256,
+        )
+        .await;
+        CoherentLeafGroup {
+            conversation_id,
+            actor_did,
+            actor_device_id,
+            signature_key: actor_public_key,
+            encryption_key,
+        }
+    }
+
+    /// Happy path: the active leaf hydrates from the authenticated tree summary
+    /// (crypto verbatim), bound to the durable member_devices device identity,
+    /// with the genesis `join_key_package_ref` absent.
+    #[tokio::test]
+    #[ignore = "requires the dedicated gate database"]
+    async fn leaf_leg_hydrates_the_genesis_leaf_from_the_tree_summary() {
+        let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+        let group = seed_coherent_leaf_group(&pool).await;
+        let locked_at = clock_now_millis(&pool).await;
+
+        let mut tx = pool.begin().await.expect("begin");
+        let guard = hydrate_locked_public_state(&mut tx, group.conversation_id, locked_at)
+            .await
+            .expect("public state hydrates");
+        let (_txid, _cid, _coordinate, _snapshot, binding, _encoded_tree, _tree_sha, _at, _digest) =
+            guard.into_parts();
+        let leaves = load_leaf_hydration_rows(&mut tx, group.conversation_id, &binding)
+            .await
+            .expect("leaf leg hydrates");
+        tx.commit().await.expect("commit");
+
+        assert_eq!(leaves.len(), 1, "exactly the one active genesis leaf");
+        let leaf = &leaves[0];
+        let expected_device = DeviceIdentity::new(
+            PrincipalId::new(group.actor_did.clone().into_bytes()).expect("principal"),
+            *group.actor_device_id.as_bytes(),
+        )
+        .expect("device identity");
+        assert_eq!(leaf.device, expected_device, "durable device identity");
+        assert_eq!(leaf.leaf_index, 0);
+        assert_eq!(
+            leaf.basic_credential,
+            format!("{}#{}", group.actor_did, group.actor_device_id).into_bytes(),
+            "basic credential carried from the tree leaf",
+        );
+        assert_eq!(
+            leaf.signature_key, group.signature_key,
+            "signature key carried from the tree leaf",
+        );
+        assert_eq!(
+            leaf.encryption_key, group.encryption_key,
+            "encryption key sourced ONLY from the tree leaf (no member_devices column)",
+        );
+        assert_eq!(
+            leaf.key_package_ref, None,
+            "genesis leaf has no join package"
+        );
+    }
+
+    /// Fail-closed: when the persisted tree summary's leaf crypto does NOT match
+    /// the durable member_devices row (the `seed_base` fixture pairs an opaque
+    /// tree leaf with a real `did#device_id` membership row), the leg errors with
+    /// `TreeMismatch` rather than laundering a leaf whose durable binding and
+    /// authenticated tree disagree.
+    #[tokio::test]
+    #[ignore = "requires the dedicated gate database"]
+    async fn leaf_leg_fails_closed_when_tree_summary_disagrees_with_member_devices() {
+        let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+        let base = seed_base(&pool).await;
+        let locked_at = clock_now_millis(&pool).await;
+
+        let mut tx = pool.begin().await.expect("begin");
+        let guard = hydrate_locked_public_state(&mut tx, base.conversation_id, locked_at)
+            .await
+            .expect("public state hydrates");
+        let (_txid, _cid, _coordinate, _snapshot, binding, _encoded_tree, _tree_sha, _at, _digest) =
+            guard.into_parts();
+        let result = load_leaf_hydration_rows(&mut tx, base.conversation_id, &binding).await;
+        tx.rollback().await.expect("rollback");
+
+        assert!(matches!(result, Err(LeafHydrationError::TreeMismatch)));
+    }
+}

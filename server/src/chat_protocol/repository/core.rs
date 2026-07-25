@@ -17,7 +17,10 @@ use uuid::Uuid;
 
 use super::super::{
     snapshot::{PublicGroupSnapshotBinding, PublicGroupSnapshotCoordinate},
-    state_machine::{ConversationState, HistoricalRehydrationAuthority, PersistedControlAuthority},
+    state_machine::{
+        ConversationState, DeviceIdentity, HistoricalRehydrationAuthority, LeafHydrationRow,
+        PersistedControlAuthority, PrincipalId,
+    },
     validation::{BareDid, KeyThumbprint},
 };
 
@@ -2431,4 +2434,133 @@ pub(crate) async fn load_historical_control_evidence(
             &signing_public_key,
         )
         .map_err(|_| ControlEvidenceLoadError::InvalidEvidence)
+}
+
+// ===========================================================================
+// G1b-2 — leaf-membership hydration leg (chat.member_devices + tree summary).
+//
+// READ-SET-MAP CORRECTION (coordinator ruling "T4-H2-pre G1b-2 aggregate-leg
+// RULINGS", FINDING-1; same class as G2's chat.conversation_heads ->
+// chat.conversations): the read-set map lists `leaves[].encryption_key` as a
+// `chat.member_devices` column, but NO encryption_key column exists in that
+// table — or anywhere in `20260722000001_chat_protocol_core.sql`. The
+// authoritative source for a leaf's crypto material (leaf_index /
+// basic_credential / signature_key / ENCRYPTION_KEY) is the TREE SUMMARY of the
+// current public snapshot, exactly as the append-time
+// `state_machine::singleton_genesis_leaf` derives it and as
+// `state_machine::validate_state` re-checks by positionally byte-comparing
+// `state.leaves` against `public_state.binding().tree_summary().leaves()`.
+// `chat.member_devices` supplies ONLY the durable device identity + the join
+// KeyPackage ref + the active/leaf_index correspondence.
+// ===========================================================================
+
+/// Failure modes of [`load_leaf_hydration_rows`].
+#[allow(dead_code)]
+#[derive(Debug, Error)]
+pub(crate) enum LeafHydrationError {
+    /// A stored `chat.member_devices` column fell outside the protocol domain
+    /// (leaf-index range, DID/UUID grammar, or a non-32-byte KeyPackage ref).
+    #[error("clean-chat member device column is out of domain")]
+    OutOfDomain,
+    /// The active `chat.member_devices` set did not correspond one-for-one, in
+    /// leaf-index order, with the current authenticated tree-summary leaves
+    /// (count, index, basic credential, or signature key disagreed). Fail
+    /// closed: the durable membership binding and the authenticated public tree
+    /// MUST agree, and the tree is the crypto authority.
+    #[error("clean-chat member devices do not match the public tree summary")]
+    TreeMismatch,
+    #[error("clean-chat leaf hydration database error: {0}")]
+    Database(#[from] sqlx::Error),
+}
+
+/// Load the active leaf-membership rows of an existing conversation, binding
+/// each durable `chat.member_devices` row to its authenticated public tree leaf.
+///
+/// Leaf crypto (leaf_index / basic_credential / signature_key / encryption_key)
+/// is taken from `binding`'s tree summary — the authenticated source per the
+/// FINDING-1 correction above and `validate_state`'s positional byte-equality
+/// gate. `chat.member_devices` supplies the device identity `(user_did,
+/// device_id)` and the optional join KeyPackage ref; the row's own leaf_index /
+/// basic_credential / leaf_signature_key MUST equal the tree leaf's (in
+/// leaf-index order), or the leg fails closed with `TreeMismatch`.
+///
+/// `binding` MUST be the snapshot leg of the SAME locked read — i.e. the
+/// digest-verified `PublicGroupSnapshotBinding` sealed by
+/// `hydrate_locked_public_state` (the aggregate passes its `ActivePublicState`'s
+/// `binding()`). The tree summary it carries was decoded and digest-checked
+/// against the stored generation row, so only its per-leaf crypto is needed here
+/// (not the full snapshot-blob reload).
+///
+/// No `FOR UPDATE`: the caller already holds the head lock (`FOR UPDATE OF c` on
+/// `chat.conversations`) that pins the current generation and its immutable
+/// `chat.member_devices` suffix, and `binding` was hydrated under that same lock.
+#[allow(dead_code)]
+pub(crate) async fn load_leaf_hydration_rows(
+    transaction: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    binding: &PublicGroupSnapshotBinding,
+) -> Result<Vec<LeafHydrationRow>, LeafHydrationError> {
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(String, Uuid, i64, Vec<u8>, Vec<u8>, Option<Vec<u8>>)> = sqlx::query_as(
+        r#"
+        SELECT
+            md.user_did,
+            md.device_id,
+            md.leaf_index,
+            md.basic_credential,
+            md.leaf_signature_key,
+            md.join_key_package_ref
+        FROM chat.member_devices md
+        WHERE md.conversation_id = $1
+          AND md.active
+        ORDER BY md.leaf_index
+        "#,
+    )
+    .bind(conversation_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+
+    let public_leaves = binding.tree_summary().leaves();
+    if rows.len() != public_leaves.len() {
+        return Err(LeafHydrationError::TreeMismatch);
+    }
+
+    let mut leaves = Vec::with_capacity(rows.len());
+    for (
+        (user_did, device_id, leaf_index, basic_credential, signature_key, join_key_package_ref),
+        public_leaf,
+    ) in rows.into_iter().zip(public_leaves)
+    {
+        let leaf_index = u32::try_from(leaf_index).map_err(|_| LeafHydrationError::OutOfDomain)?;
+        let principal =
+            PrincipalId::new(user_did.into_bytes()).map_err(|_| LeafHydrationError::OutOfDomain)?;
+        let device = DeviceIdentity::new(principal, *device_id.as_bytes())
+            .map_err(|_| LeafHydrationError::OutOfDomain)?;
+        // The durable membership row and the authenticated tree leaf must agree
+        // on this position's crypto identity; the tree is authoritative, so its
+        // values (never the row's) are carried into the hydrated leaf.
+        if leaf_index != public_leaf.leaf_index()
+            || basic_credential != public_leaf.basic_credential()
+            || signature_key != public_leaf.signature_key()
+            || device.basic_credential() != public_leaf.basic_credential()
+        {
+            return Err(LeafHydrationError::TreeMismatch);
+        }
+        let key_package_ref = match join_key_package_ref {
+            None => None,
+            Some(bytes) => Some(
+                <[u8; 32]>::try_from(bytes.as_slice())
+                    .map_err(|_| LeafHydrationError::OutOfDomain)?,
+            ),
+        };
+        leaves.push(LeafHydrationRow {
+            device,
+            leaf_index: public_leaf.leaf_index(),
+            basic_credential: public_leaf.basic_credential().to_vec(),
+            signature_key: public_leaf.signature_key().to_vec(),
+            encryption_key: public_leaf.encryption_key().to_vec(),
+            key_package_ref,
+        });
+    }
+    Ok(leaves)
 }
