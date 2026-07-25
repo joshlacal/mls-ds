@@ -25,11 +25,12 @@ use super::super::{
         classify_acceptance, classify_invitation, classify_role_producer,
         metadata_binding_of_transition, CloseKind, ConversationState, DeviceIdentity,
         HistoricalRehydrationAuthority, IntervalEndHydrationRow, IntervalHydrationRow,
-        LeafHydrationRow, LeafRecoveryKind, MetadataSnapshotBinding, OpeningKind,
-        ParticipantHydrationRow, ParticipantRole, ParticipantStatus, PersistedControlAuthority,
-        PrincipalId, RecoveryOriginHydrationRow, RecoveryRequestHydrationRow,
-        RecoveryRequestStatus, RecoveryReservationHydrationRow, RecoverySource, ReservationStatus,
-        ServerTimestamp, TransitionEvidence,
+        LeafHydrationRow, LeafRecoveryKind, LeaveRequestHydrationRow, LeaveRequestStatus,
+        MetadataSnapshotBinding, OpeningKind, ParticipantHydrationRow, ParticipantRole,
+        ParticipantStatus, PersistedControlAuthority, PrincipalId, RecoveryOriginHydrationRow,
+        RecoveryRequestHydrationRow, RecoveryRequestStatus, RecoveryReservationHydrationRow,
+        RecoverySource, RequestEvidence, ReservationStatus, ResetRequestHydrationRow,
+        ResetRequestStatus, ServerTimestamp, TransitionEvidence,
     },
     validation::{BareDid, KeyThumbprint},
 };
@@ -3673,4 +3674,499 @@ fn recovery_timestamp(value: DateTime<Utc>) -> Result<ServerTimestamp, RecoveryH
 /// instant through this one formatter.
 fn canonical_millis(value: DateTime<Utc>) -> String {
     value.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+// ===========================================================================
+// G1b-2 sub-seal — reset/leave request hydration leg (chat.reset_requests +
+// chat.leave_requests, pending arm).
+//
+// ORIGIN IS A CONTROL REQUEST, NOT A SIGNED REQUEST (corrected 2b-map,
+// coordinator ruling "T4-H2-pre G1b-2 reset/leave origin RULING"). Unlike the
+// leaf-recovery origin (a standalone signed request via the signed-path seam),
+// a reset/leave request's origin is a `resetRequestEntry` / `leaveRequestEntry`
+// CONTROL entry: `state_machine::historical_control_request_evidence` handles
+// only Reset/Leave/LeaveCancellation, and `validate_request_evidence` classifies
+// those three as `is_control = true`, REQUIRING `control_entry_id` / `control_seq`
+// = `Some`. So the origin `RequestEvidence` is re-minted through the CONTROL
+// pipeline (`hydrate_historical_control_from_durable_bytes` ->
+// `PersistedControlAuthority::into_request`), not the signed-request seam.
+//
+// JOIN RULING (coordinator, self-verifying, uniqueness-assumption-free). No
+// column links a `chat.entries` row to its `chat.reset_requests` /
+// `chat.leave_requests` projection: request entries carry `transition_id = NULL`
+// and their `entry_id` derives from the ExecutionContext, so the existing
+// `(conversation_id, transition_id)` loader atom cannot reach them. The two rows
+// share only `request_digest` + `signed_request_bytes`, and there is NO unique
+// constraint on `request_digest`. So the origin entry is located by
+// `(conversation_id, entry_kind, request_digest)` under THREE mandatory guards:
+//   (a) EXACTLY ONE match — 0 => fail-closed missing, >1 => fail-closed ambiguous
+//       (NEVER pick one);
+//   (b) the located entry's `signed_request_bytes` MUST byte-equal the projection
+//       row's `signed_request_bytes` — this pins the binding INDEPENDENTLY of
+//       digest uniqueness (a `request_digest` value is not unique on its own);
+//   (c) full control-pipeline re-verification (ed25519 + DAG-CBOR re-checked,
+//       conversation binding enforced, entry seq strictly below the locked head)
+//       through the shared historical-rehydration seam — nothing is trusted from
+//       un-reverified DB state.
+//
+// DEFENSE-IN-DEPTH / STRUCTURAL-GUARD DISCLOSURE (for the reviewer): the (a)/(b)
+// fail-closed arms — 0-match `OriginMissing`, >1-match `OriginAmbiguous`, and
+// byte-mismatch `BindingMismatch` — are NOT constructible on a coherent gate DB.
+// The reciprocal deferred mapping triggers force an EXACTLY-1:1 entry<->row
+// correspondence at commit:
+//   - `chat.assert_reset_request_mapping` / `chat.assert_leave_request_mapping`
+//     (delivery.sql:273 / :335) require EXACTLY ONE `resetRequestEntry` /
+//     `leaveRequestEntry` matching the row on `signed_request_bytes` +
+//     `request_digest` + `signature` + actor identity + `received_at`
+//     (`request_entry_count <> 1` raises 23514);
+//   - `chat.assert_control_request_entry` (delivery.sql:408) requires the reverse
+//     (each request entry maps to EXACTLY ONE projection row on the same columns).
+// Therefore a projection row with 0 entries (=> `OriginMissing`) and a row with 2
+// matching entries (=> `OriginAmbiguous`) both fail the deferred trigger at
+// commit, and an entry whose `signed_request_bytes` differ but whose
+// `request_digest` collides (=> `BindingMismatch`) needs a SHA-256 preimage
+// collision (`request_digest = digest(signing_transcript_bytes, 'sha256')`,
+// reset_requests.sql:1380). The loader's EXACTLY-ONE + byte-binding checks are the
+// application-level backstop for those DB invariants and are unit-tested as a
+// PURE decision (`resolve_single_control_request_origin`) over synthetic row sets
+// — the only faithful way to exercise arms the coherent seed cannot reach (same
+// class + resolution as the participant leg's structurally-guarded absence arm).
+//
+// SCOPE (pending arm only; the terminal arms are the terminal-family follow-up,
+// REJECT-class if shipped untested): a non-`pending` reset (`stale` / `consumed`
+// / `expired`) or leave (`fulfilled` / `cancelled` / `expired` / `stale`) carries
+// a terminal whose `WorkTerminalHydrationRow` reconstruction (a resetActivation /
+// leaveCommit transition, a leaveCancellation control request, or an expiry
+// instant) needs its own bespoke coherent terminal seed; the leg fails CLOSED
+// (`UnsupportedTerminal`) on those rather than fabricate a terminal. The pending
+// arm (terminal `None`) is reconstructed fully. `validate_reset_work` /
+// `validate_leave_work` at assembly are the drift fences (they re-run
+// `validate_request_evidence` + `require_request_prior` + the coordinate/expiry
+// checks over every hydrated row).
+//
+// No `FOR UPDATE`: the caller already holds the head lock (`FOR UPDATE OF c` on
+// `chat.conversations`) that pins the historical suffix, and `chat.entries` /
+// `chat.reset_requests` / `chat.leave_requests` are immutable-suffix under it.
+// ===========================================================================
+
+const RESET_REQUEST_ENTRY_KIND: &str = "blue.catbird.chat.defs#resetRequestEntry";
+const LEAVE_REQUEST_ENTRY_KIND: &str = "blue.catbird.chat.defs#leaveRequestEntry";
+
+/// Failure modes of [`load_reset_request_hydration_rows`] /
+/// [`load_leave_request_hydration_rows`].
+#[allow(dead_code)]
+#[derive(Debug, Error)]
+pub(crate) enum ResetLeaveHydrationError {
+    /// A stored reset/leave column fell outside the protocol domain (a DID/UUID
+    /// grammar violation, a non-32-byte crypto field, an out-of-range integer, or
+    /// an unrecognized status token).
+    #[error("clean-chat reset/leave column is out of domain")]
+    OutOfDomain,
+    /// No `chat.entries` control request row matched the projection row's
+    /// `(conversation_id, entry_kind, request_digest)`. Fail closed: a request
+    /// without its origin entry can never yield evidence. Structurally guarded by
+    /// the reciprocal entry<->row mapping triggers (see module header).
+    #[error("clean-chat reset/leave origin control entry is absent")]
+    OriginMissing,
+    /// More than one `chat.entries` control request row matched the projection
+    /// row's `(conversation_id, entry_kind, request_digest)`. Fail closed — NEVER
+    /// pick one. Structurally guarded (see module header).
+    #[error("clean-chat reset/leave origin control entry is ambiguous")]
+    OriginAmbiguous,
+    /// The located origin entry's `signed_request_bytes` did not byte-equal the
+    /// projection row's `signed_request_bytes`. Fail closed: the binding is pinned
+    /// by exact bytes, not by the (non-unique) `request_digest`. Structurally
+    /// guarded (see module header).
+    #[error("clean-chat reset/leave origin signed bytes do not match the projection")]
+    BindingMismatch,
+    /// The located origin entry failed read-time control re-verification, or was a
+    /// coordinate transition rather than a control request. Never coerced into
+    /// evidence it does not attest.
+    #[error("clean-chat reset/leave origin failed re-verification")]
+    InvalidOrigin,
+    /// The request carries a terminal status (non-`pending`) whose
+    /// `WorkTerminalHydrationRow` reconstruction is the NEXT-STEP follow-up. Fail
+    /// closed until that arm is reconstructed + tested.
+    #[error("clean-chat reset/leave terminal status is not yet reconstructed")]
+    UnsupportedTerminal,
+    #[error("clean-chat reset/leave hydration database error: {0}")]
+    Database(#[from] sqlx::Error),
+}
+
+/// The `(accepted_payload_bytes, signed_request_bytes, signing_public_key)` of a
+/// single located origin control entry.
+type LocatedOriginEntry = (Vec<u8>, Vec<u8>, Vec<u8>);
+
+/// Apply JOIN-ruling guards (a) EXACTLY-ONE and (b) byte-binding to the set of
+/// `chat.entries` rows located by `(conversation_id, entry_kind, request_digest)`.
+///
+/// Pure decision extracted from [`load_control_request_origin`] so the fail-closed
+/// arms — which the reciprocal DB mapping triggers make un-constructible on a
+/// coherent gate DB (module header) — are still faithfully exercised. Never picks
+/// among multiple matches; never trusts a digest match without exact bytes.
+pub(crate) fn resolve_single_control_request_origin(
+    rows: Vec<LocatedOriginEntry>,
+    expected_signed_request_bytes: &[u8],
+) -> Result<LocatedOriginEntry, ResetLeaveHydrationError> {
+    let mut located = rows.into_iter();
+    let entry = match (located.next(), located.next()) {
+        (Some(entry), None) => entry,
+        (None, _) => return Err(ResetLeaveHydrationError::OriginMissing),
+        (Some(_), Some(_)) => return Err(ResetLeaveHydrationError::OriginAmbiguous),
+    };
+    if entry.1.as_slice() != expected_signed_request_bytes {
+        return Err(ResetLeaveHydrationError::BindingMismatch);
+    }
+    Ok(entry)
+}
+
+/// Locate + re-verify a pending reset/leave request's ORIGIN control entry per the
+/// JOIN ruling, returning its re-minted `RequestEvidence`.
+///
+/// The origin is found by `(conversation_id, entry_kind, request_digest)` with the
+/// entries-lookup variant this leg introduces (keyed off `request_digest` /
+/// `entry_kind`, since request entries carry `transition_id = NULL` and the
+/// `(conversation_id, transition_id)` atom cannot reach them), gated by the three
+/// JOIN-ruling guards, then re-minted through the shared control-rehydration seam
+/// and narrowed to the request arm via
+/// [`PersistedControlAuthority::into_request`].
+async fn load_control_request_origin(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &HistoricalRehydrationAuthority,
+    conversation_id: Uuid,
+    entry_kind: &str,
+    request_digest: &[u8],
+    projection_signed_request_bytes: &[u8],
+) -> Result<RequestEvidence, ResetLeaveHydrationError> {
+    let rows: Vec<LocatedOriginEntry> = sqlx::query_as(
+        r#"
+        SELECT
+            e.accepted_payload_bytes,
+            e.signed_request_bytes,
+            dk.signing_public_key
+        FROM chat.entries e
+        JOIN chat.device_keys dk
+          ON dk.user_did = e.actor_did
+         AND dk.device_id = e.actor_device_id
+         AND dk.key_id = e.actor_key_id
+        WHERE e.conversation_id = $1
+          AND e.entry_kind = $2
+          AND e.request_digest = $3
+        "#,
+    )
+    .bind(conversation_id)
+    .bind(entry_kind)
+    .bind(request_digest)
+    .fetch_all(&mut **transaction)
+    .await?;
+
+    let (public_row_json, raw_signed_wrapper, signing_public_key) =
+        resolve_single_control_request_origin(rows, projection_signed_request_bytes)?;
+
+    authority
+        .hydrate_historical_control_from_durable_bytes(
+            public_row_json,
+            raw_signed_wrapper,
+            &signing_public_key,
+        )
+        .and_then(PersistedControlAuthority::into_request)
+        .map_err(|_| ResetLeaveHydrationError::InvalidOrigin)
+}
+
+/// Load the PENDING reset requests of an existing conversation, each bound to its
+/// re-verified control-request origin. See the module header for the JOIN ruling
+/// and the terminal-arm scope.
+///
+/// `authority` MUST be the read-time authority minted from the SAME locked head as
+/// the rest of the aggregate.
+#[allow(dead_code)]
+pub(crate) async fn load_reset_request_hydration_rows(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &HistoricalRehydrationAuthority,
+    conversation_id: Uuid,
+) -> Result<Vec<ResetRequestHydrationRow>, ResetLeaveHydrationError> {
+    let conversation_bytes = *conversation_id.as_bytes();
+
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(
+        Uuid,
+        String,
+        Uuid,
+        i64,
+        i64,
+        Vec<u8>,
+        i64,
+        Vec<u8>,
+        Vec<u8>,
+        String,
+        Vec<u8>,
+        Vec<u8>,
+        DateTime<Utc>,
+        DateTime<Utc>,
+    )> = sqlx::query_as(
+        r#"
+        SELECT
+            reset_request_id,
+            requester_did,
+            requester_device_id,
+            prior_generation,
+            prior_state_version,
+            prior_group_id,
+            prior_epoch,
+            prior_group_context_hash,
+            prior_confirmation_tag,
+            status,
+            request_digest,
+            signed_request_bytes,
+            received_at,
+            expires_at
+        FROM chat.reset_requests
+        WHERE conversation_id = $1
+        "#,
+    )
+    .bind(conversation_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+
+    let mut requests: Vec<ResetRequestHydrationRow> = Vec::with_capacity(rows.len());
+    for (
+        reset_request_id,
+        requester_did,
+        requester_device_id,
+        prior_generation,
+        prior_state_version,
+        prior_group_id,
+        prior_epoch,
+        prior_group_context_hash,
+        prior_confirmation_tag,
+        status,
+        request_digest,
+        signed_request_bytes,
+        received_at,
+        expires_at,
+    ) in rows
+    {
+        let request_id = *reset_request_id.as_bytes();
+        let requester = reset_leave_device(requester_did, requester_device_id)?;
+        let bound_coordinate = reset_leave_coordinate(
+            conversation_bytes,
+            prior_generation,
+            prior_state_version,
+            prior_group_id,
+            prior_epoch,
+            prior_group_context_hash,
+            prior_confirmation_tag,
+        )?;
+        let status = match status.as_str() {
+            "pending" => ResetRequestStatus::Pending,
+            "stale" | "consumed" | "expired" => {
+                return Err(ResetLeaveHydrationError::UnsupportedTerminal)
+            }
+            _ => return Err(ResetLeaveHydrationError::OutOfDomain),
+        };
+        let origin = load_control_request_origin(
+            transaction,
+            authority,
+            conversation_id,
+            RESET_REQUEST_ENTRY_KIND,
+            &request_digest,
+            &signed_request_bytes,
+        )
+        .await?;
+
+        requests.push(ResetRequestHydrationRow {
+            request_id,
+            requester,
+            bound_coordinate,
+            received_at: reset_leave_timestamp(received_at)?,
+            expires_at: reset_leave_timestamp(expires_at)?,
+            status,
+            origin,
+            terminal: None,
+        });
+    }
+
+    // `validate_reset_work` requires the collection strictly increasing by
+    // `request_id`. Sort in Rust so the ordering is independent of the database's
+    // `reset_request_id` collation.
+    requests.sort_by(|left, right| left.request_id.cmp(&right.request_id));
+    Ok(requests)
+}
+
+/// Load the PENDING leave requests of an existing conversation, each bound to its
+/// re-verified control-request origin. See the module header for the JOIN ruling
+/// and the terminal-arm scope.
+///
+/// `authority` MUST be the read-time authority minted from the SAME locked head as
+/// the rest of the aggregate.
+#[allow(dead_code)]
+pub(crate) async fn load_leave_request_hydration_rows(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &HistoricalRehydrationAuthority,
+    conversation_id: Uuid,
+) -> Result<Vec<LeaveRequestHydrationRow>, ResetLeaveHydrationError> {
+    let conversation_bytes = *conversation_id.as_bytes();
+
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(
+        Uuid,
+        String,
+        Uuid,
+        i64,
+        i64,
+        Vec<u8>,
+        i64,
+        Vec<u8>,
+        Vec<u8>,
+        String,
+        Vec<u8>,
+        Vec<u8>,
+        DateTime<Utc>,
+        DateTime<Utc>,
+    )> = sqlx::query_as(
+        r#"
+        SELECT
+            leave_request_id,
+            requester_did,
+            requester_device_id,
+            prior_generation,
+            prior_state_version,
+            prior_group_id,
+            prior_epoch,
+            prior_group_context_hash,
+            prior_confirmation_tag,
+            status,
+            request_digest,
+            signed_request_bytes,
+            received_at,
+            expires_at
+        FROM chat.leave_requests
+        WHERE conversation_id = $1
+        "#,
+    )
+    .bind(conversation_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+
+    let mut requests: Vec<LeaveRequestHydrationRow> = Vec::with_capacity(rows.len());
+    for (
+        leave_request_id,
+        requester_did,
+        requester_device_id,
+        prior_generation,
+        prior_state_version,
+        prior_group_id,
+        prior_epoch,
+        prior_group_context_hash,
+        prior_confirmation_tag,
+        status,
+        request_digest,
+        signed_request_bytes,
+        received_at,
+        expires_at,
+    ) in rows
+    {
+        let request_id = *leave_request_id.as_bytes();
+        let requester = reset_leave_device(requester_did, requester_device_id)?;
+        let bound_coordinate = reset_leave_coordinate(
+            conversation_bytes,
+            prior_generation,
+            prior_state_version,
+            prior_group_id,
+            prior_epoch,
+            prior_group_context_hash,
+            prior_confirmation_tag,
+        )?;
+        let status = match status.as_str() {
+            "pending" => LeaveRequestStatus::Pending,
+            "fulfilled" | "cancelled" | "expired" | "stale" => {
+                return Err(ResetLeaveHydrationError::UnsupportedTerminal)
+            }
+            _ => return Err(ResetLeaveHydrationError::OutOfDomain),
+        };
+        let origin = load_control_request_origin(
+            transaction,
+            authority,
+            conversation_id,
+            LEAVE_REQUEST_ENTRY_KIND,
+            &request_digest,
+            &signed_request_bytes,
+        )
+        .await?;
+
+        requests.push(LeaveRequestHydrationRow {
+            request_id,
+            requester,
+            bound_coordinate,
+            received_at: reset_leave_timestamp(received_at)?,
+            expires_at: reset_leave_timestamp(expires_at)?,
+            status,
+            origin,
+            terminal: None,
+        });
+    }
+
+    // `validate_leave_work` requires the collection strictly increasing by
+    // `(requester, request_id)`. Sort in Rust so the ordering is independent of the
+    // database's `requester_did` collation.
+    requests.sort_by(|left, right| {
+        left.requester
+            .cmp(&right.requester)
+            .then_with(|| left.request_id.cmp(&right.request_id))
+    });
+    Ok(requests)
+}
+
+fn reset_leave_device(
+    did: String,
+    device_id: Uuid,
+) -> Result<DeviceIdentity, ResetLeaveHydrationError> {
+    let principal =
+        PrincipalId::new(did.into_bytes()).map_err(|_| ResetLeaveHydrationError::OutOfDomain)?;
+    DeviceIdentity::new(principal, *device_id.as_bytes())
+        .map_err(|_| ResetLeaveHydrationError::OutOfDomain)
+}
+
+/// Reconstruct a pending request's `bound_coordinate` from its `prior_*` columns.
+/// A pending reset/leave request binds the CURRENT active head (validated by
+/// `validate_reset_work` / `validate_leave_work` as `bound_coordinate ==
+/// state.coordinate`), so the reconstructed lifecycle is `Active`.
+#[allow(clippy::too_many_arguments)]
+fn reset_leave_coordinate(
+    conversation_id: [u8; 16],
+    generation: i64,
+    state_version: i64,
+    group_id: Vec<u8>,
+    epoch: i64,
+    group_context_hash: Vec<u8>,
+    confirmation_tag: Vec<u8>,
+) -> Result<PublicGroupSnapshotCoordinate, ResetLeaveHydrationError> {
+    Ok(PublicGroupSnapshotCoordinate::new(
+        conversation_id,
+        reset_leave_u64(generation)?,
+        reset_leave_u64(state_version)?,
+        reset_leave_bytes32(group_id)?,
+        reset_leave_u64(epoch)?,
+        reset_leave_bytes32(group_context_hash)?,
+        reset_leave_bytes32(confirmation_tag)?,
+        PublicGroupSnapshotLifecycle::Active,
+    ))
+}
+
+fn reset_leave_u64(value: i64) -> Result<u64, ResetLeaveHydrationError> {
+    u64::try_from(value)
+        .ok()
+        .filter(|value| *value <= MAX_PROTOCOL_INTEGER)
+        .ok_or(ResetLeaveHydrationError::OutOfDomain)
+}
+
+fn reset_leave_bytes32(value: Vec<u8>) -> Result<[u8; 32], ResetLeaveHydrationError> {
+    <[u8; 32]>::try_from(value.as_slice()).map_err(|_| ResetLeaveHydrationError::OutOfDomain)
+}
+
+fn reset_leave_timestamp(
+    value: DateTime<Utc>,
+) -> Result<ServerTimestamp, ResetLeaveHydrationError> {
+    ServerTimestamp::from_canonical_stored(&canonical_millis(value))
+        .map_err(|_| ResetLeaveHydrationError::OutOfDomain)
 }

@@ -3372,6 +3372,24 @@ impl PersistedControlAuthority {
             }
         }
     }
+
+    /// Downcast a re-hydrated durable control row to its request arm for
+    /// reset/leave request-origin hydration (G1b-2). A pending reset/leave
+    /// request's origin is a CONTROL request (a `resetRequestEntry` /
+    /// `leaveRequestEntry` — `validate_request_evidence` classifies these as
+    /// `is_control`, requiring `control_entry_id`/`control_seq` = `Some`), never a
+    /// coordinate transition, so the transition arm fails closed. Called by the
+    /// `repository::core` reset/leave loader, which cannot inspect
+    /// `RequestEvidence` internals (they are module-private here).
+    #[allow(dead_code)] // wired by the G1b-2 aggregate.
+    pub(crate) fn into_request(self) -> Result<RequestEvidence, StateMachineError> {
+        match self {
+            PersistedControlAuthority::Request(evidence) => Ok(evidence),
+            PersistedControlAuthority::Transition(_) => {
+                Err(StateMachineError::InvalidHydrationAuthority)
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

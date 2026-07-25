@@ -3560,6 +3560,523 @@ mod historical_control_loader {
         // fail-closed boundary is asserted there. The status match arm fails closed
         // structurally in the meantime (it never fabricates a terminal).
     }
+
+    // -----------------------------------------------------------------------
+    // G1b-2 sub-seal — reset/leave request hydration leg (pending arm).
+    //
+    // The reset/leave origin is a CONTROL request (a `resetRequestEntry` /
+    // `leaveRequestEntry` in `chat.entries`, `transition_id = NULL`), NOT a
+    // standalone signed request — so it is re-minted through the control pipeline
+    // and located by the JOIN ruling `(conversation_id, entry_kind,
+    // request_digest)` + byte-equal `signed_request_bytes` (see the
+    // `load_reset_request_hydration_rows` module header).
+    //
+    // The seed appends a real, ed25519-signed reset/leave request entry at seq 2
+    // on top of the genesis creation graph (seq 1), signed by the SAME test key as
+    // the creation actor (so the requester is a live registered device and the
+    // `chat.device_keys` JOIN yields the verifying key), plus its coherent
+    // `chat.reset_requests` / `chat.leave_requests` projection row — byte-matching
+    // the entry as the reciprocal deferred mapping triggers require. The head is
+    // advanced to `next_entry_seq = 3` so the request entry (seq 2) sits strictly
+    // below the locked head.
+    //
+    // The structurally-guarded JOIN-ruling fail-closed arms (0-match
+    // `OriginMissing`, >1-match `OriginAmbiguous`, byte-mismatch `BindingMismatch`)
+    // are NOT constructible on a coherent gate DB (the reciprocal 1:1 entry<->row
+    // mapping triggers, see the loader module header), so they are exercised as a
+    // PURE decision test over synthetic row sets
+    // (`resolve_single_control_request_origin_covers_join_ruling_arms`) — the same
+    // structural-guard resolution the participant leg uses. The constructible
+    // live arms — the pending happy path, the foreign-conversation
+    // `InvalidOrigin`, and the empty collection — are live on the gate DB.
+    // -----------------------------------------------------------------------
+    mod reset_leave_leg {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use chrono::{DateTime, Duration, Utc};
+        use ed25519_dalek::{Signer, SigningKey};
+        use serde_json::{json, Value};
+        use sha2::{Digest, Sha256};
+        use sqlx::PgPool;
+        use uuid::Uuid;
+
+        use super::super::historical_control_path::{build_real_creation_entry, RealCreationEntry};
+        use super::seed_real_creation_graph;
+        use crate::chat_protocol::repository::core::{
+            load_leave_request_hydration_rows, load_reset_request_hydration_rows,
+            resolve_single_control_request_origin, ResetLeaveHydrationError,
+        };
+        use crate::chat_protocol::state_machine::{
+            DeviceIdentity, HistoricalRehydrationAuthority, LeaveRequestStatus,
+            PersistedControlAuthority, PrincipalId, ResetRequestStatus,
+        };
+        use crate::chat_protocol::transcript::{
+            decode_and_verify_control_entry, decode_canonical_signed_mutation, SignedMutationKind,
+        };
+        use crate::chat_protocol::validation::ed25519_key_id;
+        use crate::common;
+
+        const RESET_ENTRY_KIND: &str = "blue.catbird.chat.defs#resetRequestEntry";
+        const LEAVE_ENTRY_KIND: &str = "blue.catbird.chat.defs#leaveRequestEntry";
+        const RECEIVED_AT: &str = "2030-02-01T00:00:00.000Z";
+        const SIGNED_AT: &str = "2030-01-31T23:59:59.000Z";
+
+        fn instant(text: &str) -> DateTime<Utc> {
+            DateTime::parse_from_rfc3339(text)
+                .expect("canonical instant")
+                .with_timezone(&Utc)
+        }
+
+        fn uuid_v4_bytes(byte: u8) -> [u8; 16] {
+            let mut value = [byte; 16];
+            value[6] = 0x40 | (byte & 0x0f);
+            value[8] = 0x80 | (byte & 0x3f);
+            value
+        }
+
+        /// The genesis active coordinate `seed_real_creation_graph` commits — the
+        /// `prior` a pending reset/leave request binds (its `bound_coordinate ==
+        /// state.coordinate`).
+        fn genesis_coordinate_json(cid: [u8; 16]) -> Value {
+            json!({
+                "conversationId": Uuid::from_bytes(cid).hyphenated().to_string(),
+                "generation": 0,
+                "stateVersion": 0,
+                "groupId": STANDARD.encode([1_u8; 32]),
+                "epoch": 0,
+                "groupContextHash": STANDARD.encode([2_u8; 32]),
+                "confirmationTag": STANDARD.encode([3_u8; 32]),
+                "lifecycle": "active",
+            })
+        }
+
+        /// A genuinely-signed reset/leave request CONTROL entry: the outer control
+        /// row envelope (`accepted_payload_bytes`) + the inner signed mutation
+        /// wrapper (`signed_request_bytes`) + the shape/mapping columns the seed's
+        /// entry and projection rows must carry byte-identically.
+        struct RealControlRequestEntry {
+            request_id: [u8; 16],
+            entry_id: Uuid,
+            seq: u64,
+            public_row_json: Vec<u8>,
+            raw_wrapper: Vec<u8>,
+            signing_transcript: Vec<u8>,
+            request_digest: Vec<u8>,
+            signature: Vec<u8>,
+            outer_entry_fingerprint: Vec<u8>,
+        }
+
+        /// Build a real reset (`kind = ResetRequest`) or leave (`kind =
+        /// LeaveRequest`) request entry, signed by the creation actor's test key,
+        /// bound to the genesis coordinate, at `seq`. Mirrors
+        /// `build_signed_recovery_request`'s direct-body construction wrapped in the
+        /// `build_real_creation_entry`-style control envelope.
+        fn build_real_control_request_entry(
+            entry: &RealCreationEntry,
+            kind: SignedMutationKind,
+            entry_kind: &str,
+            seq: u64,
+        ) -> RealControlRequestEntry {
+            let signing_key = SigningKey::from_bytes(&[0x24; 32]);
+            let verifying = signing_key.verifying_key().to_bytes();
+            // The creation entry signed with this same key, so its device-keys row
+            // carries exactly this verifying key under `entry.actor_key_id`.
+            assert_eq!(entry.public_key, verifying.to_vec());
+            assert_eq!(
+                entry.actor_key_id,
+                ed25519_key_id(&verifying).unwrap().as_str()
+            );
+
+            let request_uuid = Uuid::new_v4();
+            let request_id = *request_uuid.as_bytes();
+            let request_id_field = if matches!(kind, SignedMutationKind::ResetRequest) {
+                "resetRequestId"
+            } else {
+                "leaveRequestId"
+            };
+            let mut body = serde_json::Map::new();
+            body.insert("$type".into(), json!(kind.type_id()));
+            body.insert(
+                "signatureDomain".into(),
+                json!(String::from_utf8(kind.domain().to_vec()).unwrap()),
+            );
+            body.insert(
+                request_id_field.into(),
+                json!(request_uuid.hyphenated().to_string()),
+            );
+            body.insert("actorDid".into(), json!(entry.actor_did));
+            body.insert(
+                "actorDeviceId".into(),
+                json!(entry.actor_device_id.hyphenated().to_string()),
+            );
+            body.insert(
+                "keyId".into(),
+                json!(ed25519_key_id(&verifying).unwrap().as_str()),
+            );
+            body.insert("authGeneration".into(), json!(1));
+            body.insert("prior".into(), genesis_coordinate_json(entry.cid));
+            if matches!(kind, SignedMutationKind::ResetRequest) {
+                body.insert("reason".into(), json!("manualRecovery"));
+            }
+            body.insert(
+                "idempotencyKey".into(),
+                json!(Uuid::from_bytes(uuid_v4_bytes(0x7a))
+                    .hyphenated()
+                    .to_string()),
+            );
+            body.insert("signedAt".into(), json!(SIGNED_AT));
+
+            // Sign the inner mutation over the exact canonical transcript the strict
+            // decoder derives (mirrors `build_signed_recovery_request`).
+            let mut wrapper = json!({ "body": Value::Object(body), "signature": "" });
+            wrapper["signature"] = Value::String(STANDARD.encode([0u8; 64]));
+            let unsigned = serde_json::to_vec(&wrapper).unwrap();
+            let canonical = decode_canonical_signed_mutation(&unsigned).unwrap();
+            let signing_transcript = canonical.transcript_bytes().to_vec();
+            let signature = signing_key.sign(&signing_transcript).to_bytes();
+            wrapper["signature"] = Value::String(STANDARD.encode(signature));
+            let raw_wrapper = serde_json::to_vec(&wrapper).unwrap();
+            let signed_request: Value = serde_json::from_slice(&raw_wrapper).unwrap();
+
+            // Wrap in the control-entry envelope (empty serverFields, like creation).
+            let entry_id = Uuid::new_v4();
+            let row = json!({
+                "$type": entry_kind,
+                "entryId": entry_id.hyphenated().to_string(),
+                "conversationId": Uuid::from_bytes(entry.cid).hyphenated().to_string(),
+                "seq": seq,
+                "signedRequest": signed_request,
+                "receivedAt": RECEIVED_AT,
+            });
+            let public_row_json = serde_json::to_vec(&row).unwrap();
+
+            // Fail fast on drift: it must decode + verify under the test key, bound
+            // to the fresh conversation; the outer fingerprint is the durable column.
+            let decoded = decode_and_verify_control_entry(&public_row_json, &verifying)
+                .expect("request entry decodes under the test key");
+            assert_eq!(decoded.conversation_id().as_bytes(), &entry.cid);
+
+            RealControlRequestEntry {
+                request_id,
+                entry_id,
+                seq,
+                public_row_json,
+                raw_wrapper,
+                request_digest: Sha256::digest(&signing_transcript).to_vec(),
+                signature: signature.to_vec(),
+                signing_transcript,
+                outer_entry_fingerprint: decoded.outer_control_fingerprint().to_vec(),
+            }
+        }
+
+        /// Append a pending reset/leave request (entry at seq 2 + coherent
+        /// projection row) on top of a committed genesis graph, advancing the head
+        /// to `next_entry_seq = 3`. Returns the built request entry (its bytes are
+        /// the in-memory re-mint reference).
+        async fn seed_control_request(
+            pool: &PgPool,
+            entry: &RealCreationEntry,
+            kind: SignedMutationKind,
+            entry_kind: &str,
+        ) -> RealControlRequestEntry {
+            seed_real_creation_graph(pool, entry).await;
+            let conversation_id = Uuid::from_bytes(entry.cid);
+            let request = build_real_control_request_entry(entry, kind, entry_kind, 2);
+            let request_uuid = Uuid::from_bytes(request.request_id);
+            let received_at = instant(RECEIVED_AT);
+            let expires_at = received_at + Duration::hours(24);
+            let payload_sha = Sha256::digest(&request.public_row_json).to_vec();
+
+            let mut tx = pool.begin().await.expect("begin control request");
+            // The request entry: transition_id / generation / state_version NULL
+            // (apply_reset_request / apply_leave_request set exactly these), request
+            // digest + signature = the real signed material (the reciprocal mapping
+            // trigger requires the entry and projection row to byte-match).
+            sqlx::query(
+                r#"INSERT INTO chat.entries(
+                    conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,
+                    accepted_payload_sha256,signed_request_bytes,request_digest,signature,
+                    server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,
+                    actor_key_id,actor_auth_generation,generation,state_version,transition_id,received_at
+                ) VALUES($1,2,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,1,NULL,NULL,NULL,$14)"#,
+            )
+            .bind(conversation_id)
+            .bind(request.entry_id)
+            .bind(entry_kind)
+            .bind(&request.public_row_json)
+            .bind(&payload_sha)
+            .bind(&request.raw_wrapper)
+            .bind(&request.request_digest)
+            .bind(&request.signature)
+            .bind(vec![0_u8])
+            .bind(&request.outer_entry_fingerprint)
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .bind(&entry.actor_key_id)
+            .bind(received_at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert request entry");
+
+            if matches!(kind, SignedMutationKind::ResetRequest) {
+                sqlx::query(
+                    r#"INSERT INTO chat.reset_requests(
+                        reset_request_id,conversation_id,requester_did,requester_device_id,
+                        requester_key_id,requester_auth_generation,prior_generation,prior_state_version,
+                        prior_group_id,prior_epoch,prior_group_context_hash,prior_confirmation_tag,
+                        reason,status,signed_request_bytes,signing_transcript_bytes,request_digest,
+                        signature,received_at,expires_at
+                    ) VALUES($1,$2,$3,$4,$5,1,0,0,$6,0,$7,$8,'manualRecovery','pending',$9,$10,$11,$12,$13,$14)"#,
+                )
+                .bind(request_uuid)
+                .bind(conversation_id)
+                .bind(&entry.actor_did)
+                .bind(entry.actor_device_id)
+                .bind(&entry.actor_key_id)
+                .bind(vec![1_u8; 32])
+                .bind(vec![2_u8; 32])
+                .bind(vec![3_u8; 32])
+                .bind(&request.raw_wrapper)
+                .bind(&request.signing_transcript)
+                .bind(&request.request_digest)
+                .bind(&request.signature)
+                .bind(received_at)
+                .bind(expires_at)
+                .execute(&mut *tx)
+                .await
+                .expect("insert reset request");
+            } else {
+                sqlx::query(
+                    r#"INSERT INTO chat.leave_requests(
+                        leave_request_id,conversation_id,requester_did,requester_device_id,
+                        requester_key_id,requester_auth_generation,prior_generation,prior_state_version,
+                        prior_group_id,prior_epoch,prior_group_context_hash,prior_confirmation_tag,
+                        status,signed_request_bytes,signing_transcript_bytes,request_digest,
+                        signature,received_at,expires_at
+                    ) VALUES($1,$2,$3,$4,$5,1,0,0,$6,0,$7,$8,'pending',$9,$10,$11,$12,$13,$14)"#,
+                )
+                .bind(request_uuid)
+                .bind(conversation_id)
+                .bind(&entry.actor_did)
+                .bind(entry.actor_device_id)
+                .bind(&entry.actor_key_id)
+                .bind(vec![1_u8; 32])
+                .bind(vec![2_u8; 32])
+                .bind(vec![3_u8; 32])
+                .bind(&request.raw_wrapper)
+                .bind(&request.signing_transcript)
+                .bind(&request.request_digest)
+                .bind(&request.signature)
+                .bind(received_at)
+                .bind(expires_at)
+                .execute(&mut *tx)
+                .await
+                .expect("insert leave request");
+            }
+
+            // Advance the head so the request entry (seq 2) is strictly below it.
+            sqlx::query(
+                "UPDATE chat.conversations SET next_entry_seq = 3 WHERE conversation_id = $1",
+            )
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await
+            .expect("advance head");
+            tx.commit().await.expect("commit control request");
+            request
+        }
+
+        fn creator_device(entry: &RealCreationEntry) -> DeviceIdentity {
+            DeviceIdentity::new(
+                PrincipalId::new(entry.actor_did.clone().into_bytes()).unwrap(),
+                *entry.actor_device_id.as_bytes(),
+            )
+            .unwrap()
+        }
+
+        /// The pure JOIN-ruling decision covers every fail-closed arm the coherent
+        /// gate DB cannot construct (the reciprocal entry<->row mapping triggers
+        /// force EXACTLY-1:1): 0-match => missing, >1-match => ambiguous (never
+        /// picks), digest-hit-but-byte-mismatch => binding mismatch, and the
+        /// single-exact-byte match => the located entry.
+        #[test]
+        fn resolve_single_control_request_origin_covers_join_ruling_arms() {
+            let signed = b"the-exact-signed-wrapper".to_vec();
+            let located = |signed: &[u8]| {
+                (
+                    b"payload".to_vec(),
+                    signed.to_vec(),
+                    b"signing-key".to_vec(),
+                )
+            };
+
+            // 0 matches -> fail-closed missing.
+            assert!(matches!(
+                resolve_single_control_request_origin(Vec::new(), &signed),
+                Err(ResetLeaveHydrationError::OriginMissing)
+            ));
+            // >1 match -> fail-closed ambiguous (NEVER picks one).
+            assert!(matches!(
+                resolve_single_control_request_origin(
+                    vec![located(&signed), located(&signed)],
+                    &signed,
+                ),
+                Err(ResetLeaveHydrationError::OriginAmbiguous)
+            ));
+            // Exactly 1 but bytes differ (digest hit only) -> binding mismatch.
+            assert!(matches!(
+                resolve_single_control_request_origin(vec![located(b"other-bytes")], &signed),
+                Err(ResetLeaveHydrationError::BindingMismatch)
+            ));
+            // Exactly 1, exact bytes -> the located entry.
+            let (payload, bytes, key) =
+                resolve_single_control_request_origin(vec![located(&signed)], &signed)
+                    .expect("single exact-byte match resolves");
+            assert_eq!(payload, b"payload");
+            assert_eq!(bytes, signed);
+            assert_eq!(key, b"signing-key");
+        }
+
+        /// The pending reset request hydrates: its control-request origin re-mints
+        /// byte-equal to the direct in-memory control-path re-hydration, bound to
+        /// the genesis active coordinate, terminal `None`.
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn reset_request_leg_hydrates_the_pending_request() {
+            let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+            let cid = Uuid::new_v4();
+            let entry = build_real_creation_entry(*cid.as_bytes());
+            let request = seed_control_request(
+                &pool,
+                &entry,
+                SignedMutationKind::ResetRequest,
+                RESET_ENTRY_KIND,
+            )
+            .await;
+            let authority =
+                HistoricalRehydrationAuthority::new(entry.cid, request.seq + 1).unwrap();
+
+            let reference = authority
+                .hydrate_historical_control_from_durable_bytes(
+                    request.public_row_json.clone(),
+                    request.raw_wrapper.clone(),
+                    &entry.public_key,
+                )
+                .expect("in-memory control authority")
+                .into_request()
+                .expect("reset origin is a control request");
+
+            let mut tx = pool.begin().await.expect("begin");
+            let rows = load_reset_request_hydration_rows(&mut tx, &authority, cid)
+                .await
+                .expect("reset request hydrates");
+            tx.commit().await.expect("commit");
+
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
+            assert_eq!(row.request_id, request.request_id);
+            assert_eq!(row.requester, creator_device(&entry));
+            assert_eq!(row.status, ResetRequestStatus::Pending);
+            assert!(row.terminal.is_none());
+            assert_eq!(row.origin, reference);
+        }
+
+        /// The pending leave request hydrates the same way through the leave table +
+        /// `leaveRequestEntry` origin.
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn leave_request_leg_hydrates_the_pending_request() {
+            let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+            let cid = Uuid::new_v4();
+            let entry = build_real_creation_entry(*cid.as_bytes());
+            let request = seed_control_request(
+                &pool,
+                &entry,
+                SignedMutationKind::LeaveRequest,
+                LEAVE_ENTRY_KIND,
+            )
+            .await;
+            let authority =
+                HistoricalRehydrationAuthority::new(entry.cid, request.seq + 1).unwrap();
+
+            let reference = authority
+                .hydrate_historical_control_from_durable_bytes(
+                    request.public_row_json.clone(),
+                    request.raw_wrapper.clone(),
+                    &entry.public_key,
+                )
+                .expect("in-memory control authority")
+                .into_request()
+                .expect("leave origin is a control request");
+
+            let mut tx = pool.begin().await.expect("begin");
+            let rows = load_leave_request_hydration_rows(&mut tx, &authority, cid)
+                .await
+                .expect("leave request hydrates");
+            tx.commit().await.expect("commit");
+
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
+            assert_eq!(row.request_id, request.request_id);
+            assert_eq!(row.requester, creator_device(&entry));
+            assert_eq!(row.status, LeaveRequestStatus::Pending);
+            assert!(row.terminal.is_none());
+            assert_eq!(row.origin, reference);
+        }
+
+        /// The reset leg fails CLOSED when the read-time authority binds a different
+        /// conversation: the located origin entry's own conversation id mismatches
+        /// at re-verification (`InvalidOrigin`) — never a fabricated origin.
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn reset_request_leg_fails_closed_when_authority_binds_a_foreign_conversation() {
+            let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+            let cid = Uuid::new_v4();
+            let entry = build_real_creation_entry(*cid.as_bytes());
+            let _request = seed_control_request(
+                &pool,
+                &entry,
+                SignedMutationKind::ResetRequest,
+                RESET_ENTRY_KIND,
+            )
+            .await;
+            let foreign = Uuid::new_v4();
+            let authority = HistoricalRehydrationAuthority::new(*foreign.as_bytes(), 3).unwrap();
+
+            let mut tx = pool.begin().await.expect("begin");
+            let result = load_reset_request_hydration_rows(&mut tx, &authority, cid).await;
+            tx.rollback().await.expect("rollback");
+
+            assert!(matches!(
+                result,
+                Err(ResetLeaveHydrationError::InvalidOrigin)
+            ));
+        }
+
+        /// A conversation with no reset/leave requests hydrates an EMPTY collection
+        /// (not an error) — the natural no-pending case.
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn reset_and_leave_legs_hydrate_empty_when_no_requests() {
+            let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+            let cid = Uuid::new_v4();
+            let entry = build_real_creation_entry(*cid.as_bytes());
+            seed_real_creation_graph(&pool, &entry).await;
+            let authority =
+                HistoricalRehydrationAuthority::new(entry.cid, entry.head_next_entry_seq).unwrap();
+
+            let mut tx = pool.begin().await.expect("begin");
+            let reset = load_reset_request_hydration_rows(&mut tx, &authority, cid)
+                .await
+                .expect("empty reset collection");
+            let leave = load_leave_request_hydration_rows(&mut tx, &authority, cid)
+                .await
+                .expect("empty leave collection");
+            tx.commit().await.expect("commit");
+
+            assert!(reset.is_empty());
+            assert!(leave.is_empty());
+        }
+    }
 }
 
 // ===========================================================================
