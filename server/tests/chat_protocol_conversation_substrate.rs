@@ -1478,6 +1478,74 @@ mod historical_signed_path {
             Err(StateMachineError::InvalidHydrationAuthority)
         );
     }
+
+    /// Drift fence for the production loader seam
+    /// `hydrate_historical_signed_request_from_durable_bytes`: for every signed
+    /// kind, deriving the durable-row digest from the bytes (loader path) is
+    /// byte-equal to the row path that is handed the digest from its durable row,
+    /// which is in turn byte-equal to append-time admission. It also fails closed
+    /// under a wrong key and a foreign-conversation authority, exactly like the
+    /// row path (the seam re-verifies through `hydrate_historical_signed_request`).
+    #[test]
+    fn historical_signed_request_from_durable_bytes_matches_row_path() {
+        let conversation_id = uuid_v4_bytes(0x21);
+        let coordinate = sample_coordinate(conversation_id);
+        let signing_key = SigningKey::from_bytes(&[0x42; 32]);
+        let verifying = signing_key.verifying_key().to_bytes();
+        let actor = sample_actor();
+
+        let append = HydrationAuthority::new(conversation_id).unwrap();
+        let historical = HistoricalRehydrationAuthority::new(conversation_id, 9).unwrap();
+
+        for raw in all_kinds(&coordinate, &actor, &signing_key) {
+            let mutation = decode_and_verify_signed_mutation(&raw, &verifying).unwrap();
+            let envelope =
+                DurableSignedRequestEnvelope::new(conversation_id, &trusted_received_at()).unwrap();
+            let admitted = append.signed_request(envelope, mutation).unwrap();
+            let digest = *admitted.durable_row_digest();
+            let row = PersistedSignedRequestRow::new(conversation_id, RECEIVED_AT, digest).unwrap();
+
+            // Row path: the digest is supplied from the durable row.
+            let row_path = historical
+                .hydrate_historical_signed_request(row, &raw, &verifying)
+                .unwrap();
+            // Loader path: the digest is DERIVED from the bytes, not supplied.
+            let from_bytes = historical
+                .hydrate_historical_signed_request_from_durable_bytes(
+                    conversation_id,
+                    RECEIVED_AT,
+                    &raw,
+                    &verifying,
+                )
+                .unwrap();
+            assert_eq!(from_bytes, row_path);
+            assert_eq!(from_bytes, admitted);
+        }
+
+        // Wrong key fails closed.
+        let raw = leaf_recovery_request_raw(&coordinate, &actor, uuid_v4_bytes(0x31), &signing_key);
+        let wrong = SigningKey::from_bytes(&[0x43; 32]);
+        assert_eq!(
+            historical.hydrate_historical_signed_request_from_durable_bytes(
+                conversation_id,
+                RECEIVED_AT,
+                &raw,
+                &wrong.verifying_key().to_bytes()
+            ),
+            Err(StateMachineError::InvalidHydrationAuthority)
+        );
+        // Foreign-conversation authority fails closed.
+        let other = HistoricalRehydrationAuthority::new(uuid_v4_bytes(0x55), 9).unwrap();
+        assert_eq!(
+            other.hydrate_historical_signed_request_from_durable_bytes(
+                conversation_id,
+                RECEIVED_AT,
+                &raw,
+                &verifying
+            ),
+            Err(StateMachineError::InvalidHydrationAuthority)
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

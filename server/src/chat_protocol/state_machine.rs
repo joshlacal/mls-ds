@@ -3615,6 +3615,54 @@ impl HistoricalRehydrationAuthority {
         Ok(evidence)
     }
 
+    /// Production loader entry point for a HISTORICAL NON-control signed request —
+    /// the signed-path analogue of `hydrate_historical_control_from_durable_bytes`.
+    /// Re-hydrates directly from a durable projection row's own bytes
+    /// (`signed_request_bytes` as the raw wrapper, `requested_at`/`received_at` as
+    /// the canonical stored instant) under the historical signing key JOINed from
+    /// `chat.device_keys`.
+    ///
+    /// The `durable_row_digest` is NOT a stored column on the signed-request
+    /// projection tables (`chat.leaf_recovery_requests` etc.); it is DERIVED here by
+    /// minting candidate evidence through the SAME head-binding-free minter
+    /// (`historical_signed_request_evidence`) that `hydrate_historical_signed_request`
+    /// dispatches to, then the assembled `PersistedSignedRequestRow` is re-verified
+    /// by `hydrate_historical_signed_request` itself — whose independent re-decode +
+    /// `durable_row_digest` equality are the loader-consistency guards over this
+    /// derivation (the digest is derived, not independently stored, so that equality
+    /// is self-consistency — the integrity boundary is the ed25519 verification
+    /// re-run inside `decode_and_verify_signed_mutation`, which is NEVER skipped).
+    /// Forced into state_machine.rs because the digest minter is module-private;
+    /// additive companion to `hydrate_historical_signed_request`, touching no
+    /// existing fn. Drift fence: the cfg(test)
+    /// `historical_signed_request_from_durable_bytes_matches_row_path` equivalence
+    /// test (byte-equal to the `hydrate_historical_signed_request` row path).
+    #[allow(dead_code)]
+    pub(crate) fn hydrate_historical_signed_request_from_durable_bytes(
+        &self,
+        conversation_id: [u8; 16],
+        received_at: &str,
+        raw_signed_request: &[u8],
+        historical_public_key: &[u8],
+    ) -> Result<RequestEvidence, StateMachineError> {
+        let parsed = CanonicalTimestamp::parse(received_at)
+            .map_err(|_| StateMachineError::InvalidHydrationAuthority)?;
+        let mutation = decode_and_verify_signed_mutation(raw_signed_request, historical_public_key)
+            .map_err(|_| StateMachineError::InvalidHydrationAuthority)?;
+        // Candidate digest via the SAME dispatch `hydrate_historical_signed_request`
+        // uses (same conversation_id + received_at envelope + mutation bytes), so
+        // the digest re-computed inside the re-verification below is identical.
+        let envelope = DurableSignedRequestEnvelope {
+            conversation_id,
+            received_at: canonical_server_timestamp(&parsed)?,
+        };
+        let durable_row_digest =
+            historical_signed_request_evidence(envelope, mutation, &self.expected_conversation_id)?
+                .durable_row_digest;
+        let row = PersistedSignedRequestRow::new(conversation_id, received_at, durable_row_digest)?;
+        self.hydrate_historical_signed_request(row, raw_signed_request, historical_public_key)
+    }
+
     /// Re-mints a persisted CONTROL-entry row for the historical graph. Mirrors
     /// `HydrationAuthority::hydrate_persisted_control` (state_machine.rs) EXACTLY
     /// through the shared crypto — `decode_and_verify_control_entry`
