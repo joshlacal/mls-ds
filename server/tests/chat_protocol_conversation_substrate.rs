@@ -1514,8 +1514,9 @@ mod historical_control_path {
     use uuid::Uuid;
 
     use crate::chat_protocol::state_machine::{
-        HistoricalRehydrationAuthority, HydrationAuthority, PersistedControlAuthority,
-        PersistedControlRow, StateMachineError,
+        classify_acceptance, classify_role_producer, HistoricalRehydrationAuthority,
+        HydrationAuthority, ParticipantRole, PersistedControlAuthority, PersistedControlRow,
+        PrincipalId, StateMachineError,
     };
     use crate::chat_protocol::transcript::{
         decode_and_verify_control_entry, decode_canonical_signed_mutation,
@@ -2285,6 +2286,60 @@ mod historical_control_path {
             Err(StateMachineError::InvalidHydrationAuthority)
         );
     }
+
+    /// The G1b-2 participant classifiers fail closed on a real, fully re-verified
+    /// control transition whose body does NOT attest the queried provenance: a
+    /// policy transition that neither changes nor adds a stranger's role is not
+    /// that stranger's role producer, and an acceptance is neither a role
+    /// producer nor a foreign principal's acceptance. (The Some-arm — a policy
+    /// role change that IS the producer — needs the multi-participant real-signed
+    /// fixture and is the mandatory G1b-2 follow-up sub-seal.)
+    #[test]
+    fn participant_classifiers_reject_non_attesting_evidence() {
+        let cases = build_cases();
+        let stranger = PrincipalId::new(b"did:plc:strangerstrangerst00".to_vec()).unwrap();
+
+        let policy = cases
+            .iter()
+            .find(|c| c.entry_kind.ends_with("policyEntry"))
+            .expect("policy control vector present");
+        let policy_evidence = match HistoricalRehydrationAuthority::new(policy.cid, policy.seq + 1)
+            .unwrap()
+            .hydrate_historical_control(policy.row(), &policy.public_key)
+            .expect("policy entry re-hydrates")
+        {
+            PersistedControlAuthority::Transition(evidence) => evidence,
+            PersistedControlAuthority::Request(_) => panic!("policy entry is a transition"),
+        };
+        // A policy without a matching change for this stranger is not its role
+        // producer.
+        assert!(
+            classify_role_producer(policy_evidence, &stranger, ParticipantRole::Member).is_err()
+        );
+
+        let acceptance = cases
+            .iter()
+            .find(|c| c.entry_kind.ends_with("participantAcceptanceEntry"))
+            .expect("acceptance control vector present");
+        let acceptance_evidence =
+            match HistoricalRehydrationAuthority::new(acceptance.cid, acceptance.seq + 1)
+                .unwrap()
+                .hydrate_historical_control(acceptance.row(), &acceptance.public_key)
+                .expect("acceptance entry re-hydrates")
+            {
+                PersistedControlAuthority::Transition(evidence) => evidence,
+                PersistedControlAuthority::Request(_) => panic!("acceptance entry is a transition"),
+            };
+        // An acceptance is an unexpected kind for a role producer.
+        assert!(classify_role_producer(
+            acceptance_evidence.clone(),
+            &stranger,
+            ParticipantRole::Member
+        )
+        .is_err());
+        // ...and it is not a foreign principal's acceptance.
+        assert!(classify_acceptance(acceptance_evidence, &stranger).is_err());
+    }
 }
 
 // ===========================================================================
@@ -2308,9 +2363,12 @@ mod historical_control_loader {
 
     use super::historical_control_path::{build_real_creation_entry, RealCreationEntry};
     use crate::chat_protocol::repository::core::{
-        load_historical_control_evidence, ControlEvidenceLoadError,
+        load_historical_control_evidence, load_participant_hydration_rows,
+        ControlEvidenceLoadError, ParticipantHydrationError,
     };
-    use crate::chat_protocol::state_machine::HistoricalRehydrationAuthority;
+    use crate::chat_protocol::state_machine::{
+        HistoricalRehydrationAuthority, ParticipantRole, ParticipantStatus,
+    };
     use crate::common;
 
     async fn clock_now(pool: &PgPool) -> DateTime<Utc> {
@@ -2623,6 +2681,97 @@ mod historical_control_loader {
         assert!(matches!(
             result,
             Err(ControlEvidenceLoadError::EntryMissing)
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // G1b-2 sub-seal 1b — participant-membership hydration leg.
+    //
+    // The genesis real-creation graph seeds exactly ONE participant: the creator,
+    // status=active / role=admin / role_transition_id=creation, invitation +
+    // acceptance NULL (see `seed_real_creation_graph`). So the None-provenance
+    // arms of the classifiers are live-exercised here; the Some-arms
+    // (policy-role-change producer, invitation, acceptance) require the richer
+    // multi-participant real-signed fixture that is the MANDATORY G1b-2 follow-up
+    // sub-seal. Fail-closed cases constructible on the genesis graph (dangling
+    // provenance id, evidence bound to a foreign conversation) are exercised now;
+    // the "policy without matching change" classifier failure is exercised
+    // directly in `historical_control_path` against a real policy vector.
+    // -----------------------------------------------------------------------
+
+    /// The genesis admin participant hydrates from its real creation evidence:
+    /// role established by creation (`role_producer == None`), no invitation, no
+    /// acceptance.
+    #[tokio::test]
+    #[ignore = "requires the dedicated gate database"]
+    async fn participant_leg_hydrates_the_genesis_admin() {
+        let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+        let cid = Uuid::new_v4();
+        let entry = build_real_creation_entry(*cid.as_bytes());
+        let _creation = seed_real_creation_graph(&pool, &entry).await;
+        let authority =
+            HistoricalRehydrationAuthority::new(entry.cid, entry.head_next_entry_seq).unwrap();
+
+        let mut tx = pool.begin().await.expect("begin");
+        let participants = load_participant_hydration_rows(&mut tx, &authority, cid)
+            .await
+            .expect("genesis participant hydrates");
+        tx.commit().await.expect("commit");
+
+        assert_eq!(participants.len(), 1);
+        let participant = &participants[0];
+        assert_eq!(participant.principal.as_bytes(), entry.actor_did.as_bytes());
+        assert_eq!(participant.status, ParticipantStatus::Active);
+        assert_eq!(participant.role, ParticipantRole::Admin);
+        assert!(participant.role_producer.is_none());
+        assert!(participant.invitation.is_none());
+        assert!(participant.acceptance.is_none());
+    }
+
+    /// The participant leg fails CLOSED on a provenance transition that has no
+    /// durable entry (`ProvenanceMissing`) and on one that fails read-time
+    /// re-verification (`InvalidProvenance`) — never a fabricated provenance. The
+    /// absence path is otherwise structurally guarded in a coherent roster by
+    /// `participants_role_transition_fk` (role_transition_id MUST reference a real
+    /// transition) plus the entry<->transition mapping (every accepted transition
+    /// has an entry), so it cannot be provoked by mutating a coherent genesis
+    /// graph; the sealed `loader_absent_entry_fails_closed` proves the underlying
+    /// `load_historical_control_evidence` absence, and this asserts the loader's
+    /// fail-closed mapping of it.
+    #[test]
+    fn participant_provenance_load_errors_map_fail_closed() {
+        assert!(matches!(
+            ParticipantHydrationError::from(ControlEvidenceLoadError::EntryMissing),
+            ParticipantHydrationError::ProvenanceMissing
+        ));
+        assert!(matches!(
+            ParticipantHydrationError::from(ControlEvidenceLoadError::InvalidEvidence),
+            ParticipantHydrationError::InvalidProvenance
+        ));
+    }
+
+    /// A read-time authority bound to a DIFFERENT conversation must reject the
+    /// participant's provenance: the re-verified entry carries its own
+    /// conversation_id, which the authority requires to equal the locked one.
+    /// Fails closed with `InvalidProvenance` (never coerced into evidence).
+    #[tokio::test]
+    #[ignore = "requires the dedicated gate database"]
+    async fn participant_leg_fails_closed_when_provenance_binds_a_foreign_conversation() {
+        let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+        let cid = Uuid::new_v4();
+        let entry = build_real_creation_entry(*cid.as_bytes());
+        let _creation = seed_real_creation_graph(&pool, &entry).await;
+
+        let foreign_cid = *Uuid::new_v4().as_bytes();
+        let authority =
+            HistoricalRehydrationAuthority::new(foreign_cid, entry.head_next_entry_seq).unwrap();
+        let mut tx = pool.begin().await.expect("begin");
+        let result = load_participant_hydration_rows(&mut tx, &authority, cid).await;
+        tx.rollback().await.expect("rollback");
+
+        assert!(matches!(
+            result,
+            Err(ParticipantHydrationError::InvalidProvenance)
         ));
     }
 }

@@ -3355,6 +3355,175 @@ pub(crate) enum PersistedControlAuthority {
     Request(RequestEvidence),
 }
 
+impl PersistedControlAuthority {
+    /// Downcast a re-hydrated durable control row to its transition arm for
+    /// participant-provenance hydration (G1b-2). A participant's role,
+    /// invitation, and acceptance provenance are ALWAYS coordinate control
+    /// transitions (creation / policy / acceptance); a non-coordinate signed
+    /// request can never be one, so the request arm fails closed. Called by the
+    /// `repository::core` participant loader, which cannot inspect
+    /// `TransitionEvidence` internals (they are module-private here).
+    #[allow(dead_code)] // wired by the G1b-2 aggregate.
+    pub(crate) fn into_transition(self) -> Result<TransitionEvidence, StateMachineError> {
+        match self {
+            PersistedControlAuthority::Transition(evidence) => Ok(evidence),
+            PersistedControlAuthority::Request(_) => {
+                Err(StateMachineError::InvalidHydrationAuthority)
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// G1b-2 participant-provenance classifiers (FINDING-2 ruling + SHAPE RULING A2,
+// "T4-H2-pre G1b-2 aggregate-leg RULINGS"). `TransitionEvidence::body_binding`/
+// `authority` are module-private, so the role/invitation/acceptance
+// classification cannot run in `repository::core`; these additive free fns
+// introspect the re-verified historical evidence and are consumed per
+// participant by the core loader. Each resolves the hydrated provenance field or
+// FAILS CLOSED — sealed evidence is never coerced into a provenance it does not
+// attest.
+//
+// SHAPE RULING A2: these DUPLICATE the establishing/role-change decision
+// additively rather than lifting a shared helper out of the validator; the
+// UNCHANGED validator chain (`validate_state` -> `participant_provenance_matches`
+// -> `participant_role_provenance_matches`/`invitation_matches_participant`/
+// `acceptance_matches_participant`) is itself the DRIFT FENCE — it directly
+// re-validates every hydrated `role_producer`/`invitation`/`acceptance` against
+// the row + evidence at each hydration, so any classifier disagreement fails
+// closed downstream (availability, not integrity — OQ-G1-3 philosophy). Each fn
+// below names its certified original as that fence.
+// ---------------------------------------------------------------------------
+
+/// Classify a participant's `role_transition_id` evidence into its hydrated
+/// `role_producer`:
+/// - a `Policy` body carrying exactly one `ChangeRole(principal -> role)` for
+///   this participant is a genuine role-change producer -> `Some(evidence)`;
+/// - an establishing body — `Creation`, or a `Policy` that only `Add`s this
+///   principal (the invitation-borne initial role) — carries no role producer
+///   -> `None`;
+/// - anything else (a policy that neither changes nor adds this principal's
+///   role, or an unexpected transition kind) fails closed.
+///
+/// A `Creation` body is `None` regardless of the specific role: a
+/// creation-established role is never a `ChangeRole` producer (the genesis
+/// roster includes the creator at active/admin and each invitee at its initial
+/// role — `RosterManifestBinding.participants`). An invited member's
+/// `role_transition_id` stays equal to its invitation transition (creation or
+/// policy-add) through acceptance, so it also classifies `None`. Certified
+/// original / drift fence: `participant_role_provenance_matches` (this file) —
+/// it re-derives the initial role from the invitation and re-checks `Some`
+/// against a single `Policy` `ChangeRole(principal->role)`, failing closed on any
+/// disagreement with this classifier's output.
+#[allow(dead_code)] // wired by the G1b-2 aggregate.
+pub(crate) fn classify_role_producer(
+    evidence: TransitionEvidence,
+    principal: &PrincipalId,
+    role: ParticipantRole,
+) -> Result<Option<TransitionEvidence>, StateMachineError> {
+    match evidence.body_binding.as_ref() {
+        Some(TransitionBodyBinding::Creation { .. }) => Ok(None),
+        Some(TransitionBodyBinding::Policy {
+            participant_changes,
+            ..
+        }) => {
+            let role_changes = participant_changes
+                .iter()
+                .filter(|change| {
+                    matches!(change, ManifestParticipantChange::ChangeRole(changed, changed_role)
+                        if changed == principal && *changed_role == role)
+                })
+                .count();
+            let adds = participant_changes
+                .iter()
+                .filter(|change| {
+                    matches!(change, ManifestParticipantChange::Add(added) if added == principal)
+                })
+                .count();
+            if role_changes == 1 {
+                Ok(Some(evidence))
+            } else if role_changes == 0 && adds == 1 {
+                Ok(None)
+            } else {
+                Err(StateMachineError::InvalidHydrationAuthority)
+            }
+        }
+        _ => Err(StateMachineError::InvalidHydrationAuthority),
+    }
+}
+
+/// Resolve a participant's invitation provenance from its
+/// `invitation_transition_id` evidence and the durable inviter identity
+/// (`created_by_did` / `created_by_device_id`). Requires the transition body to
+/// actually record the invitation of this `principal`: a `Creation` roster entry
+/// whose sealed invitation binding names this transition and inviter, or a
+/// `Policy` that `Add`s this principal. Fails closed otherwise. Certified
+/// original / drift fence: `invitation_matches_participant` (this file), which
+/// re-checks the returned invitation against the row + evidence at hydration.
+#[allow(dead_code)] // wired by the G1b-2 aggregate.
+pub(crate) fn classify_invitation(
+    evidence: TransitionEvidence,
+    principal: &PrincipalId,
+    inviter: DeviceIdentity,
+) -> Result<InvitationHydrationRow, StateMachineError> {
+    let records_invitation = match evidence.body_binding.as_ref() {
+        Some(TransitionBodyBinding::Creation { manifest, .. }) => {
+            manifest.participants.iter().any(|participant| {
+                &participant.principal == principal
+                    && participant.status == ParticipantStatus::Pending
+                    && participant.invitation.as_ref().is_some_and(|binding| {
+                        binding.transition_id == *evidence.transition_id()
+                            && binding.inviter == inviter
+                    })
+            })
+        }
+        Some(TransitionBodyBinding::Policy {
+            participant_changes,
+            ..
+        }) => {
+            participant_changes
+                .iter()
+                .filter(|change| {
+                    matches!(change, ManifestParticipantChange::Add(added) if added == principal)
+                })
+                .count()
+                == 1
+        }
+        _ => false,
+    };
+    if !records_invitation {
+        return Err(StateMachineError::InvalidHydrationAuthority);
+    }
+    Ok(InvitationHydrationRow {
+        transition: evidence,
+        inviter,
+    })
+}
+
+/// Resolve a participant's acceptance evidence from its
+/// `acceptance_transition_id`. Requires the transition to be a
+/// `ParticipantAcceptance` whose authenticated actor principal is this
+/// `principal`. Fails closed otherwise. Certified original / drift fence:
+/// `acceptance_matches_participant` (this file), which re-checks the returned
+/// acceptance against the row + evidence at hydration.
+#[allow(dead_code)] // wired by the G1b-2 aggregate.
+pub(crate) fn classify_acceptance(
+    evidence: TransitionEvidence,
+    principal: &PrincipalId,
+) -> Result<TransitionEvidence, StateMachineError> {
+    let records_acceptance = matches!(
+        evidence.body_binding.as_ref(),
+        Some(TransitionBodyBinding::Acceptance { .. })
+    ) && evidence.authority.as_ref().is_some_and(|authority| {
+        authority.kind == SignedMutationKind::ParticipantAcceptance
+            && authority.actor.principal() == principal
+    });
+    if !records_acceptance {
+        return Err(StateMachineError::InvalidHydrationAuthority);
+    }
+    Ok(evidence)
+}
+
 /// Read-time authority that re-mints sealed evidence for HISTORICAL graph rows
 /// during existing-conversation hydration (G1b). It is a DISTINCT, non-
 /// substitutable counterpart of `HydrationAuthority` (OQ-G1-3 ruling (a)): the

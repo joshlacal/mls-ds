@@ -18,8 +18,9 @@ use uuid::Uuid;
 use super::super::{
     snapshot::{PublicGroupSnapshotBinding, PublicGroupSnapshotCoordinate},
     state_machine::{
-        ConversationState, DeviceIdentity, HistoricalRehydrationAuthority, LeafHydrationRow,
-        PersistedControlAuthority, PrincipalId,
+        classify_acceptance, classify_invitation, classify_role_producer, ConversationState,
+        DeviceIdentity, HistoricalRehydrationAuthority, LeafHydrationRow, ParticipantHydrationRow,
+        ParticipantRole, ParticipantStatus, PersistedControlAuthority, PrincipalId,
     },
     validation::{BareDid, KeyThumbprint},
 };
@@ -2563,4 +2564,207 @@ pub(crate) async fn load_leaf_hydration_rows(
         });
     }
     Ok(leaves)
+}
+
+// ===========================================================================
+// G1b-2 sub-seal 1b — participant-membership hydration leg (chat.participants +
+// per-participant historical provenance evidence).
+//
+// Each current-membership `chat.participants` row carries the participant's
+// principal / status / role plus the transition ids that produced its role,
+// invitation, and acceptance. The durable columns alone are not sealed evidence,
+// so this leg re-loads and re-verifies each referenced control entry through
+// `load_historical_control_evidence` (ed25519 + DAG-CBOR re-checked, bound to the
+// locked conversation and strictly below the head), then classifies the verified
+// evidence into the hydrated provenance shape via the module-private
+// `state_machine` classifiers (FINDING-2 ruling). `chat.member_devices` and the
+// leaves leg are orthogonal — this leg touches only participant rows.
+// ===========================================================================
+
+/// Failure modes of [`load_participant_hydration_rows`].
+#[allow(dead_code)]
+#[derive(Debug, Error)]
+pub(crate) enum ParticipantHydrationError {
+    /// A stored `chat.participants` column fell outside the protocol domain (a
+    /// DID or UUID grammar violation, or an unrecognized status/role token).
+    #[error("clean-chat participant column is out of domain")]
+    OutOfDomain,
+    /// A participant's referenced provenance transition (role / invitation /
+    /// acceptance) has no durable `chat.entries` row. Fail closed: absent
+    /// provenance can never yield evidence.
+    #[error("clean-chat participant provenance entry is absent")]
+    ProvenanceMissing,
+    /// A provenance transition failed read-time re-verification, or the verified
+    /// evidence did not attest the participant's claimed role / invitation /
+    /// acceptance. Never coerced into a provenance it does not attest.
+    #[error("clean-chat participant provenance failed re-verification")]
+    InvalidProvenance,
+    #[error("clean-chat participant hydration database error: {0}")]
+    Database(#[from] sqlx::Error),
+}
+
+impl From<ControlEvidenceLoadError> for ParticipantHydrationError {
+    fn from(error: ControlEvidenceLoadError) -> Self {
+        match error {
+            ControlEvidenceLoadError::EntryMissing => ParticipantHydrationError::ProvenanceMissing,
+            ControlEvidenceLoadError::InvalidEvidence => {
+                ParticipantHydrationError::InvalidProvenance
+            }
+            ControlEvidenceLoadError::Database(error) => ParticipantHydrationError::Database(error),
+        }
+    }
+}
+
+/// Load the current-membership participant rows of an existing conversation,
+/// binding each to its re-verified historical provenance evidence for the
+/// G1b-2 state aggregate.
+///
+/// Reads `chat.participants WHERE current_membership` and, per row, re-loads the
+/// referenced provenance transitions through
+/// [`load_historical_control_evidence`] (so the aggregate never trusts un-
+/// reverified DB state) and classifies the verified evidence:
+/// - `role_producer`: [`classify_role_producer`] over the `role_transition_id`
+///   entry — `Some` for a policy role change, `None` for a creation / policy-add
+///   established role, fail-closed otherwise;
+/// - `invitation`: for a non-NULL `invitation_transition_id`,
+///   [`classify_invitation`] over that entry with the durable inviter identity
+///   (`created_by_did` / `created_by_device_id`);
+/// - `acceptance`: for a non-NULL `acceptance_transition_id`,
+///   [`classify_acceptance`] over that entry.
+///
+/// The rows are returned sorted by principal (matching the state-machine roster
+/// invariant that the aggregate's `hydrate_conversation_state` re-checks via
+/// `binary_search`), independent of the database's `user_did` text collation.
+///
+/// `authority` MUST be the read-time authority minted from the SAME locked head
+/// as the rest of the aggregate. No `FOR UPDATE`: the caller already holds the
+/// head lock (`FOR UPDATE OF c` on `chat.conversations`) that pins the current
+/// membership suffix, and `chat.entries` is append-only + immutable.
+#[allow(dead_code)]
+pub(crate) async fn load_participant_hydration_rows(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &HistoricalRehydrationAuthority,
+    conversation_id: Uuid,
+) -> Result<Vec<ParticipantHydrationRow>, ParticipantHydrationError> {
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(
+        String,
+        String,
+        String,
+        Uuid,
+        Option<Uuid>,
+        String,
+        Uuid,
+        Option<Uuid>,
+    )> = sqlx::query_as(
+        r#"
+        SELECT
+            p.user_did,
+            p.status,
+            p.role,
+            p.role_transition_id,
+            p.invitation_transition_id,
+            p.created_by_did,
+            p.created_by_device_id,
+            p.acceptance_transition_id
+        FROM chat.participants p
+        WHERE p.conversation_id = $1
+          AND p.current_membership
+        "#,
+    )
+    .bind(conversation_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+
+    let mut participants = Vec::with_capacity(rows.len());
+    for (
+        user_did,
+        status,
+        role,
+        role_transition_id,
+        invitation_transition_id,
+        created_by_did,
+        created_by_device_id,
+        acceptance_transition_id,
+    ) in rows
+    {
+        let principal = PrincipalId::new(user_did.into_bytes())
+            .map_err(|_| ParticipantHydrationError::OutOfDomain)?;
+        let status = match status.as_str() {
+            "pending" => ParticipantStatus::Pending,
+            "active" => ParticipantStatus::Active,
+            _ => return Err(ParticipantHydrationError::OutOfDomain),
+        };
+        let role = match role.as_str() {
+            "member" => ParticipantRole::Member,
+            "admin" => ParticipantRole::Admin,
+            _ => return Err(ParticipantHydrationError::OutOfDomain),
+        };
+
+        let role_evidence = load_historical_control_evidence(
+            transaction,
+            authority,
+            conversation_id,
+            role_transition_id,
+        )
+        .await?
+        .into_transition()
+        .map_err(|_| ParticipantHydrationError::InvalidProvenance)?;
+        let role_producer = classify_role_producer(role_evidence, &principal, role)
+            .map_err(|_| ParticipantHydrationError::InvalidProvenance)?;
+
+        let invitation = match invitation_transition_id {
+            None => None,
+            Some(invitation_transition_id) => {
+                let inviter_principal = PrincipalId::new(created_by_did.into_bytes())
+                    .map_err(|_| ParticipantHydrationError::OutOfDomain)?;
+                let inviter =
+                    DeviceIdentity::new(inviter_principal, *created_by_device_id.as_bytes())
+                        .map_err(|_| ParticipantHydrationError::OutOfDomain)?;
+                let evidence = load_historical_control_evidence(
+                    transaction,
+                    authority,
+                    conversation_id,
+                    invitation_transition_id,
+                )
+                .await?
+                .into_transition()
+                .map_err(|_| ParticipantHydrationError::InvalidProvenance)?;
+                Some(
+                    classify_invitation(evidence, &principal, inviter)
+                        .map_err(|_| ParticipantHydrationError::InvalidProvenance)?,
+                )
+            }
+        };
+
+        let acceptance = match acceptance_transition_id {
+            None => None,
+            Some(acceptance_transition_id) => {
+                let evidence = load_historical_control_evidence(
+                    transaction,
+                    authority,
+                    conversation_id,
+                    acceptance_transition_id,
+                )
+                .await?
+                .into_transition()
+                .map_err(|_| ParticipantHydrationError::InvalidProvenance)?;
+                Some(
+                    classify_acceptance(evidence, &principal)
+                        .map_err(|_| ParticipantHydrationError::InvalidProvenance)?,
+                )
+            }
+        };
+
+        participants.push(ParticipantHydrationRow {
+            principal,
+            status,
+            role,
+            role_producer,
+            invitation,
+            acceptance,
+        });
+    }
+    participants.sort_by(|left, right| left.principal.cmp(&right.principal));
+    Ok(participants)
 }
