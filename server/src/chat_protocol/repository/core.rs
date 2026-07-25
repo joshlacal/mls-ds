@@ -16,10 +16,13 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use super::super::{
-    snapshot::{PublicGroupSnapshotBinding, PublicGroupSnapshotCoordinate},
+    snapshot::{
+        PublicGroupSnapshotBinding, PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle,
+    },
     state_machine::{
-        classify_acceptance, classify_invitation, classify_role_producer, ConversationState,
-        DeviceIdentity, HistoricalRehydrationAuthority, LeafHydrationRow, ParticipantHydrationRow,
+        classify_acceptance, classify_invitation, classify_role_producer, CloseKind,
+        ConversationState, DeviceIdentity, HistoricalRehydrationAuthority, IntervalEndHydrationRow,
+        IntervalHydrationRow, LeafHydrationRow, OpeningKind, ParticipantHydrationRow,
         ParticipantRole, ParticipantStatus, PersistedControlAuthority, PrincipalId,
     },
     validation::{BareDid, KeyThumbprint},
@@ -2767,4 +2770,228 @@ pub(crate) async fn load_participant_hydration_rows(
     }
     participants.sort_by(|left, right| left.principal.cmp(&right.principal));
     Ok(participants)
+}
+
+// ===========================================================================
+// G1b-2 sub-seal 2a — application-interval hydration leg (chat.application_intervals
+// + per-boundary historical transition evidence).
+//
+// Each `chat.application_intervals` row records one recipient device's access
+// interval: the opening transition (creation / leafRecoveryFulfillment /
+// resetActivation) plus, once the interval closes, the closing transition and
+// its close kind. The opening/closing coordinates are FK-bound to
+// `chat.generation_states`, so the durable snapshot columns are authentic; the
+// opening/closing evidence, however, is not sealed by the row alone, so this leg
+// re-loads and re-verifies each referenced control entry through
+// `load_historical_control_evidence` (ed25519 + DAG-CBOR re-checked, bound to the
+// locked conversation and strictly below the head) and downcasts it to a
+// transition (`into_transition`; an interval boundary is always a coordinate
+// control transition, never a signed request). The reconstructed
+// `opening_context` coordinate carries the Active lifecycle: an interval opens
+// into an active generation state, and `validate_intervals` (the assembly-time
+// drift fence) requires `opening_context.lifecycle() == Active`.
+// ===========================================================================
+
+/// Failure modes of [`load_interval_hydration_rows`].
+#[allow(dead_code)]
+#[derive(Debug, Error)]
+pub(crate) enum IntervalHydrationError {
+    /// A stored `chat.application_intervals` column fell outside the protocol
+    /// domain (a DID/UUID grammar violation, a non-32-byte crypto column, an
+    /// out-of-range generation/seq, or an unrecognized opening/closing kind).
+    #[error("clean-chat application interval column is out of domain")]
+    OutOfDomain,
+    /// An interval boundary's referenced transition (opening or closing) has no
+    /// durable `chat.entries` row. Fail closed: absent provenance can never
+    /// yield evidence.
+    #[error("clean-chat application interval provenance entry is absent")]
+    ProvenanceMissing,
+    /// A boundary transition failed read-time re-verification, or the verified
+    /// evidence was a signed request rather than a coordinate control
+    /// transition. Never coerced into interval provenance.
+    #[error("clean-chat application interval provenance failed re-verification")]
+    InvalidProvenance,
+    #[error("clean-chat application interval hydration database error: {0}")]
+    Database(#[from] sqlx::Error),
+}
+
+impl From<ControlEvidenceLoadError> for IntervalHydrationError {
+    fn from(error: ControlEvidenceLoadError) -> Self {
+        match error {
+            ControlEvidenceLoadError::EntryMissing => IntervalHydrationError::ProvenanceMissing,
+            ControlEvidenceLoadError::InvalidEvidence => IntervalHydrationError::InvalidProvenance,
+            ControlEvidenceLoadError::Database(error) => IntervalHydrationError::Database(error),
+        }
+    }
+}
+
+/// Load the access-interval rows of an existing conversation, binding each to its
+/// re-verified historical boundary evidence for the G1b-2 state aggregate.
+///
+/// Reads `chat.application_intervals` and, per row, re-loads the opening (and, if
+/// closed, the closing) transition through [`load_historical_control_evidence`]
+/// (so the aggregate never trusts un-reverified DB state), downcasting each to a
+/// [`TransitionEvidence`](super::super::state_machine::TransitionEvidence) via
+/// `into_transition`. The `opening_context` coordinate is reconstructed from the
+/// row's FK-bound `chat.generation_states` columns at the Active lifecycle.
+///
+/// The rows are returned sorted by `(recipient, opening seq)` — the exact key
+/// `validate_intervals` requires strictly increasing — using the durable
+/// `start_seq` (equal to the opening entry's seq by the row's opening-provenance
+/// FK), independent of the database's `recipient_did` text collation.
+///
+/// `authority` MUST be the read-time authority minted from the SAME locked head
+/// as the rest of the aggregate. No `FOR UPDATE`: the caller already holds the
+/// head lock (`FOR UPDATE OF c` on `chat.conversations`) that pins the interval
+/// suffix, and `chat.entries` is append-only + immutable.
+#[allow(dead_code)]
+pub(crate) async fn load_interval_hydration_rows(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &HistoricalRehydrationAuthority,
+    conversation_id: Uuid,
+) -> Result<Vec<IntervalHydrationRow>, IntervalHydrationError> {
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(
+        String,
+        Uuid,
+        i64,
+        i64,
+        String,
+        Uuid,
+        i64,
+        Vec<u8>,
+        i64,
+        Vec<u8>,
+        Vec<u8>,
+        Option<Uuid>,
+        Option<String>,
+    )> = sqlx::query_as(
+        r#"
+        SELECT
+            ai.recipient_did,
+            ai.recipient_device_id,
+            ai.generation,
+            ai.start_seq,
+            ai.opening_kind,
+            ai.opening_transition_id,
+            ai.opening_state_version,
+            ai.opening_group_id,
+            ai.opening_epoch,
+            ai.opening_group_context_hash,
+            ai.opening_confirmation_tag,
+            ai.closing_transition_id,
+            ai.closing_kind
+        FROM chat.application_intervals ai
+        WHERE ai.conversation_id = $1
+        "#,
+    )
+    .bind(conversation_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+
+    let mut intervals: Vec<(DeviceIdentity, i64, IntervalHydrationRow)> =
+        Vec::with_capacity(rows.len());
+    for (
+        recipient_did,
+        recipient_device_id,
+        generation,
+        start_seq,
+        opening_kind,
+        opening_transition_id,
+        opening_state_version,
+        opening_group_id,
+        opening_epoch,
+        opening_group_context_hash,
+        opening_confirmation_tag,
+        closing_transition_id,
+        closing_kind,
+    ) in rows
+    {
+        let principal = PrincipalId::new(recipient_did.into_bytes())
+            .map_err(|_| IntervalHydrationError::OutOfDomain)?;
+        let recipient = DeviceIdentity::new(principal, *recipient_device_id.as_bytes())
+            .map_err(|_| IntervalHydrationError::OutOfDomain)?;
+        let generation = interval_u64(generation)?;
+        let opening_kind = match opening_kind.as_str() {
+            "creation" => OpeningKind::Creation,
+            "add" => OpeningKind::Add,
+            "reset" => OpeningKind::Reset,
+            _ => return Err(IntervalHydrationError::OutOfDomain),
+        };
+        let opening_context = PublicGroupSnapshotCoordinate::new(
+            *conversation_id.as_bytes(),
+            generation,
+            interval_u64(opening_state_version)?,
+            interval_bytes32(opening_group_id)?,
+            interval_u64(opening_epoch)?,
+            interval_bytes32(opening_group_context_hash)?,
+            interval_bytes32(opening_confirmation_tag)?,
+            PublicGroupSnapshotLifecycle::Active,
+        );
+
+        let opening = load_historical_control_evidence(
+            transaction,
+            authority,
+            conversation_id,
+            opening_transition_id,
+        )
+        .await?
+        .into_transition()
+        .map_err(|_| IntervalHydrationError::InvalidProvenance)?;
+
+        // The DDL close-shape check guarantees closing_transition_id and
+        // closing_kind are jointly NULL (open) or jointly present (closed).
+        let end = match (closing_transition_id, closing_kind) {
+            (None, None) => None,
+            (Some(closing_transition_id), Some(closing_kind)) => {
+                let kind = match closing_kind.as_str() {
+                    "remove" => CloseKind::Remove,
+                    "replace" => CloseKind::Replace,
+                    "reset" => CloseKind::Reset,
+                    "terminal" => CloseKind::Terminal,
+                    _ => return Err(IntervalHydrationError::OutOfDomain),
+                };
+                let evidence = load_historical_control_evidence(
+                    transaction,
+                    authority,
+                    conversation_id,
+                    closing_transition_id,
+                )
+                .await?
+                .into_transition()
+                .map_err(|_| IntervalHydrationError::InvalidProvenance)?;
+                Some(IntervalEndHydrationRow { evidence, kind })
+            }
+            _ => return Err(IntervalHydrationError::OutOfDomain),
+        };
+
+        intervals.push((
+            recipient.clone(),
+            start_seq,
+            IntervalHydrationRow {
+                recipient,
+                generation,
+                opening,
+                opening_kind,
+                opening_context,
+                end,
+            },
+        ));
+    }
+    // `validate_intervals` requires strictly increasing `(recipient, opening seq)`.
+    // Sort by the durable `start_seq` (equal to the opening evidence seq) so the
+    // ordering is independent of the database's `recipient_did` collation.
+    intervals.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    Ok(intervals.into_iter().map(|(_, _, row)| row).collect())
+}
+
+fn interval_u64(value: i64) -> Result<u64, IntervalHydrationError> {
+    u64::try_from(value)
+        .ok()
+        .filter(|value| *value <= MAX_PROTOCOL_INTEGER)
+        .ok_or(IntervalHydrationError::OutOfDomain)
+}
+
+fn interval_bytes32(value: Vec<u8>) -> Result<[u8; 32], IntervalHydrationError> {
+    <[u8; 32]>::try_from(value.as_slice()).map_err(|_| IntervalHydrationError::OutOfDomain)
 }

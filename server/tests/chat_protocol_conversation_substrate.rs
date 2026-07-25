@@ -2363,11 +2363,14 @@ mod historical_control_loader {
 
     use super::historical_control_path::{build_real_creation_entry, RealCreationEntry};
     use crate::chat_protocol::repository::core::{
-        load_historical_control_evidence, load_participant_hydration_rows,
-        ControlEvidenceLoadError, ParticipantHydrationError,
+        load_historical_control_evidence, load_interval_hydration_rows,
+        load_participant_hydration_rows, ControlEvidenceLoadError, IntervalHydrationError,
+        ParticipantHydrationError,
     };
+    use crate::chat_protocol::snapshot::PublicGroupSnapshotLifecycle;
     use crate::chat_protocol::state_machine::{
-        HistoricalRehydrationAuthority, ParticipantRole, ParticipantStatus,
+        DeviceIdentity, HistoricalRehydrationAuthority, OpeningKind, ParticipantRole,
+        ParticipantStatus, PrincipalId,
     };
     use crate::common;
 
@@ -2772,6 +2775,114 @@ mod historical_control_loader {
         assert!(matches!(
             result,
             Err(ParticipantHydrationError::InvalidProvenance)
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // G1b-2 sub-seal 2a — application-interval hydration leg.
+    //
+    // The genesis real-creation graph seeds exactly ONE application interval:
+    // the creator's OPEN interval, opening_kind='creation', opening_transition
+    // = the creation entry, no close. So the open-interval / Creation-opening
+    // path is live-exercised here; closed intervals and the Add/Reset opening
+    // kinds require the richer multi-transition fixtures that populate later
+    // legs. Fail-closed cases constructible on the genesis graph (opening
+    // evidence bound to a foreign conversation) are exercised now.
+    // -----------------------------------------------------------------------
+
+    /// The genesis creation interval hydrates from its real opening evidence:
+    /// recipient = the creator device, opening_kind = Creation, the opening
+    /// context is the Active genesis coordinate, and the interval is still open
+    /// (`end == None`). The opening evidence byte-equals the directly loaded
+    /// historical control transition.
+    #[tokio::test]
+    #[ignore = "requires the dedicated gate database"]
+    async fn interval_leg_hydrates_the_genesis_creation_interval() {
+        let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+        let cid = Uuid::new_v4();
+        let entry = build_real_creation_entry(*cid.as_bytes());
+        let creation = seed_real_creation_graph(&pool, &entry).await;
+        let authority =
+            HistoricalRehydrationAuthority::new(entry.cid, entry.head_next_entry_seq).unwrap();
+
+        let mut tx = pool.begin().await.expect("begin");
+        let reference = load_historical_control_evidence(&mut tx, &authority, cid, creation)
+            .await
+            .expect("opening evidence loads")
+            .into_transition()
+            .expect("opening is a transition");
+        let intervals = load_interval_hydration_rows(&mut tx, &authority, cid)
+            .await
+            .expect("genesis interval hydrates");
+        tx.commit().await.expect("commit");
+
+        assert_eq!(
+            intervals.len(),
+            1,
+            "exactly the one genesis creation interval"
+        );
+        let interval = &intervals[0];
+        let expected_recipient = DeviceIdentity::new(
+            PrincipalId::new(entry.actor_did.clone().into_bytes()).expect("principal"),
+            *entry.actor_device_id.as_bytes(),
+        )
+        .expect("device identity");
+        assert_eq!(interval.recipient, expected_recipient, "creator device");
+        assert_eq!(interval.generation, 0);
+        assert_eq!(interval.opening_kind, OpeningKind::Creation);
+        assert!(interval.end.is_none(), "genesis interval is still open");
+        assert_eq!(interval.opening, reference, "opening evidence re-verified");
+        let context = &interval.opening_context;
+        assert_eq!(context.conversation_id(), &entry.cid);
+        assert_eq!(context.generation(), 0);
+        assert_eq!(context.state_version(), 0);
+        assert_eq!(context.epoch(), 0);
+        assert_eq!(context.group_id(), &[1_u8; 32]);
+        assert_eq!(context.group_context_hash(), &[2_u8; 32]);
+        assert_eq!(context.confirmation_tag(), &[3_u8; 32]);
+        assert_eq!(context.lifecycle(), PublicGroupSnapshotLifecycle::Active);
+    }
+
+    /// A read-time authority bound to a DIFFERENT conversation must reject the
+    /// interval's opening provenance: the re-verified entry carries its own
+    /// conversation_id, which the authority requires to equal the locked one.
+    /// Fails closed with `InvalidProvenance` (never coerced into evidence).
+    #[tokio::test]
+    #[ignore = "requires the dedicated gate database"]
+    async fn interval_leg_fails_closed_when_opening_provenance_binds_a_foreign_conversation() {
+        let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+        let cid = Uuid::new_v4();
+        let entry = build_real_creation_entry(*cid.as_bytes());
+        let _creation = seed_real_creation_graph(&pool, &entry).await;
+
+        let foreign_cid = *Uuid::new_v4().as_bytes();
+        let authority =
+            HistoricalRehydrationAuthority::new(foreign_cid, entry.head_next_entry_seq).unwrap();
+        let mut tx = pool.begin().await.expect("begin");
+        let result = load_interval_hydration_rows(&mut tx, &authority, cid).await;
+        tx.rollback().await.expect("rollback");
+
+        assert!(matches!(
+            result,
+            Err(IntervalHydrationError::InvalidProvenance)
+        ));
+    }
+
+    /// The interval leg maps the loader-atom failure modes fail-closed: an absent
+    /// boundary entry to `ProvenanceMissing`, a re-verification failure to
+    /// `InvalidProvenance`. The absence path is otherwise structurally guarded in
+    /// a coherent graph by `application_intervals_opening_transition_fk` +
+    /// the entry<->transition mapping, so it cannot be provoked by mutating a
+    /// coherent genesis interval.
+    #[test]
+    fn interval_provenance_load_errors_map_fail_closed() {
+        assert!(matches!(
+            IntervalHydrationError::from(ControlEvidenceLoadError::EntryMissing),
+            IntervalHydrationError::ProvenanceMissing
+        ));
+        assert!(matches!(
+            IntervalHydrationError::from(ControlEvidenceLoadError::InvalidEvidence),
+            IntervalHydrationError::InvalidProvenance
         ));
     }
 }
