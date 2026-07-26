@@ -89,7 +89,8 @@ use chat_protocol::public_state::ActivePublicState;
 use chat_protocol::repository::delivery::WelcomeRejectionReason;
 use chat_protocol::repository::delivery::{
     append_entry_at, AppendEntry, DeliveryRepositoryError, EntryEntitlementKind,
-    EventEntitlementKind, EventKind, OutboxWorkKind,
+    EventEntitlementKind, EventKind, EventRecipient, NewEvent, NewRecoveryWorkItem, OutboxWorkKind,
+    RecoveryWorkSourceKind,
 };
 use chat_protocol::repository::transition::ResetReason;
 use chat_protocol::repository::transition::{
@@ -10314,9 +10315,13 @@ const PRE_V4_CHAT_MIGRATIONS: [&str; 3] = [
 ];
 const WELCOME_PROVENANCE_PREFLIGHT_MIGRATION: &str =
     "20260725000001_prepare_welcome_provenance_backfill.sql";
+const WELCOME_PROVENANCE_QUARANTINE_MIGRATION: &str =
+    "20260725000002_refine_welcome_provenance_quarantine.sql";
 const WELCOME_PROVENANCE_MIGRATION: &str = "20260726000001_welcome_supersession_provenance.sql";
 const WELCOME_PROVENANCE_POSTFLIGHT_MIGRATION: &str =
     "20260726000002_restore_welcome_provenance_deferred_triggers.sql";
+const WELCOME_PROVENANCE_FINALIZER_MIGRATION: &str =
+    "20260726000003_finalize_welcome_provenance_triggers.sql";
 
 struct PreV4WelcomeHistory {
     welcome_id: Uuid,
@@ -10492,6 +10497,246 @@ async fn apply_manual_migration(pool: &PgPool, filename: &str) {
         .unwrap_or_else(|error| panic!("commit {filename}: {error}"));
 }
 
+/// Exercise the exact pre-v4 Welcome terminalization order: fanout first, then
+/// delivery CAS + the historical nine-column disposition INSERT, and only then
+/// the required recovery-work row. This intentionally does not call the current
+/// writer because its two v4 provenance columns do not exist at this boundary.
+#[derive(Clone, Copy)]
+enum PreV4WelcomeTerminalKind {
+    Expired,
+    Rejected,
+}
+
+struct PreV4WelcomeTerminalization {
+    terminal_at: DateTime<Utc>,
+    event_position: i64,
+    recovery_work_id: Uuid,
+}
+
+async fn commit_pre_v4_welcome_terminalization(
+    pool: &PgPool,
+    scenario: &FulfillmentScenario,
+    kind: PreV4WelcomeTerminalKind,
+) -> Result<PreV4WelcomeTerminalization, DeliveryRepositoryError> {
+    let welcome_id = scenario.welcome_id;
+    let recipient_device_id = Uuid::from_bytes(*scenario.bob_id.device_id());
+    let expires_at: DateTime<Utc> =
+        sqlx::query_scalar("SELECT expires_at FROM chat.welcome_deliveries WHERE welcome_id=$1")
+            .bind(welcome_id)
+            .fetch_one(pool)
+            .await?;
+    let terminal_at = match kind {
+        PreV4WelcomeTerminalKind::Expired => expires_at,
+        PreV4WelcomeTerminalKind::Rejected => expires_at - Duration::seconds(1),
+    };
+    let (winner_kind, source_kind) = match kind {
+        PreV4WelcomeTerminalKind::Expired => ("expired", RecoveryWorkSourceKind::WelcomeExpired),
+        PreV4WelcomeTerminalKind::Rejected => ("rejected", RecoveryWorkSourceKind::WelcomeRejected),
+    };
+    let predecessor = device_event_predecessor(pool, &scenario.bob_did, recipient_device_id).await;
+    let event_id = Uuid::new_v4();
+    let outbox_id = Uuid::new_v4();
+    let recovery_work_id = Uuid::new_v4();
+    let mut tx = pool.begin().await?;
+
+    let event_position = chat_protocol::repository::delivery::append_event(
+        &mut tx,
+        &NewEvent {
+            event_id,
+            event_kind: EventKind::WelcomeDisposition,
+            payload_bytes: vec![0xE1; 8],
+            created_at: terminal_at,
+            protocol_instance_id: scenario.fixture.protocol_instance_id,
+        },
+    )
+    .await?;
+    chat_protocol::repository::delivery::insert_event_recipients(
+        &mut tx,
+        event_position,
+        &[EventRecipient {
+            user_did: scenario.bob_did.clone(),
+            device_id: recipient_device_id,
+            entitlement_kind: EventEntitlementKind::Welcome,
+            audience_predecessor_position: predecessor,
+        }],
+    )
+    .await?;
+    chat_protocol::repository::delivery::enqueue_outbox(
+        &mut tx,
+        outbox_id,
+        event_position,
+        OutboxWorkKind::Stream,
+        terminal_at,
+    )
+    .await?;
+
+    let updated = sqlx::query(
+        "UPDATE chat.welcome_deliveries \
+            SET status=$2, terminal_at=$3 \
+          WHERE welcome_id=$1 AND status='pending'",
+    )
+    .bind(welcome_id)
+    .bind(winner_kind)
+    .bind(terminal_at)
+    .execute(&mut *tx)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(DeliveryRepositoryError::CompareAndSetConflict);
+    }
+
+    // Historical v1-v3 writer shape. Under migration A this INSERT fires the
+    // recovery assertion before the next statement can materialize its work.
+    let transcript = vec![0xE2; 24];
+    let digest = Sha256::digest(&transcript).to_vec();
+    let (signed_request, signing_transcript, request_digest, signature, rejection_reason): (
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<&str>,
+    ) = match kind {
+        PreV4WelcomeTerminalKind::Expired => (None, None, None, None, None),
+        PreV4WelcomeTerminalKind::Rejected => (
+            Some(transcript.clone()),
+            Some(transcript),
+            Some(digest),
+            Some(vec![0xE3; 64]),
+            Some("noMatchingKeyPackage"),
+        ),
+    };
+    sqlx::query(
+        "INSERT INTO chat.welcome_dispositions( \
+            welcome_id,winner_kind,signed_request_bytes,signing_transcript_bytes, \
+            request_digest,signature,rejection_reason,terminal_at,event_position \
+         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+    )
+    .bind(welcome_id)
+    .bind(winner_kind)
+    .bind(signed_request)
+    .bind(signing_transcript)
+    .bind(request_digest)
+    .bind(signature)
+    .bind(rejection_reason)
+    .bind(terminal_at)
+    .bind(event_position)
+    .execute(&mut *tx)
+    .await?;
+
+    chat_protocol::repository::delivery::insert_recovery_work_item(
+        &mut tx,
+        &NewRecoveryWorkItem {
+            recovery_work_id,
+            conversation_id: scenario.conversation_id,
+            recipient_did: scenario.bob_did.clone(),
+            recipient_device_id,
+            source_kind,
+            source_id: welcome_id,
+            generation: i64::try_from(scenario.coordinate.generation())
+                .expect("test generation fits BIGINT"),
+            state_version: i64::try_from(scenario.coordinate.state_version())
+                .expect("test state version fits BIGINT"),
+            created_at: terminal_at,
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(PreV4WelcomeTerminalization {
+        terminal_at,
+        event_position,
+        recovery_work_id,
+    })
+}
+
+#[tokio::test]
+async fn old_schema_welcome_expiry_commits_during_preflight_quarantine() {
+    let (pool, _guard) = fresh_pre_v4_upgrade_db().await;
+    let scenario = run_fulfillment_scenario(&pool).await;
+    apply_manual_migration(&pool, WELCOME_PROVENANCE_PREFLIGHT_MIGRATION).await;
+    apply_manual_migration(&pool, WELCOME_PROVENANCE_QUARANTINE_MIGRATION).await;
+
+    let terminalization =
+        commit_pre_v4_welcome_terminalization(&pool, &scenario, PreV4WelcomeTerminalKind::Expired)
+            .await
+            .expect("old writer must cross the pre-v4 quarantine without changing statement order");
+    assert_pre_v4_welcome_terminalization(
+        &pool,
+        &scenario,
+        &terminalization,
+        "expired",
+        "welcomeExpired",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn old_schema_welcome_rejection_commits_during_preflight_quarantine() {
+    let (pool, _guard) = fresh_pre_v4_upgrade_db().await;
+    let scenario = run_fulfillment_scenario(&pool).await;
+    apply_manual_migration(&pool, WELCOME_PROVENANCE_PREFLIGHT_MIGRATION).await;
+    apply_manual_migration(&pool, WELCOME_PROVENANCE_QUARANTINE_MIGRATION).await;
+
+    let terminalization =
+        commit_pre_v4_welcome_terminalization(&pool, &scenario, PreV4WelcomeTerminalKind::Rejected)
+            .await
+            .expect("old rejection writer must cross the pre-v4 quarantine");
+    assert_pre_v4_welcome_terminalization(
+        &pool,
+        &scenario,
+        &terminalization,
+        "rejected",
+        "welcomeRejected",
+    )
+    .await;
+}
+
+async fn assert_pre_v4_welcome_terminalization(
+    pool: &PgPool,
+    scenario: &FulfillmentScenario,
+    terminalization: &PreV4WelcomeTerminalization,
+    winner_kind: &str,
+    source_kind: &str,
+) {
+    let row: (
+        String,
+        DateTime<Utc>,
+        i64,
+        String,
+        String,
+        Uuid,
+        DateTime<Utc>,
+    ) = sqlx::query_as(
+        "SELECT disposition.winner_kind,disposition.terminal_at, \
+                disposition.event_position,event.event_kind,work.source_kind, \
+                work.recovery_work_id,work.created_at \
+           FROM chat.welcome_dispositions disposition \
+           JOIN chat.events event \
+             ON event.event_position=disposition.event_position \
+           JOIN chat.event_recipients recipient \
+             ON recipient.event_position=event.event_position \
+            AND recipient.user_did=$2 AND recipient.device_id=$3 \
+            AND recipient.entitlement_kind='welcome' \
+           JOIN chat.outbox outbox \
+             ON outbox.event_position=event.event_position \
+            AND outbox.work_kind='stream' \
+           JOIN chat.recovery_work_items work \
+             ON work.source_id=disposition.welcome_id \
+          WHERE disposition.welcome_id=$1",
+    )
+    .bind(scenario.welcome_id)
+    .bind(&scenario.bob_did)
+    .bind(Uuid::from_bytes(*scenario.bob_id.device_id()))
+    .fetch_one(pool)
+    .await
+    .expect("read committed old-writer disposition graph");
+    assert_eq!(row.0, winner_kind);
+    assert_eq!(row.1, terminalization.terminal_at);
+    assert_eq!(row.2, terminalization.event_position);
+    assert_eq!(row.3, "welcomeDisposition");
+    assert_eq!(row.4, source_kind);
+    assert_eq!(row.5, terminalization.recovery_work_id);
+    assert_eq!(row.6, terminalization.terminal_at);
+}
+
 async fn welcome_disposition_triggers_are_initially_deferred(pool: &PgPool) -> bool {
     let states: Vec<bool> = sqlx::query_scalar(
         "SELECT tginitdeferred FROM pg_trigger \
@@ -10517,26 +10762,58 @@ async fn welcome_disposition_triggers_are_initially_deferred(pool: &PgPool) -> b
     states[0]
 }
 
+async fn assert_welcome_disposition_trigger_catalog(
+    pool: &PgPool,
+    expected_update_event: bool,
+    expected_initially_deferred: bool,
+    label: &str,
+) {
+    let states: Vec<(String, bool, bool, bool, bool, bool, String)> = sqlx::query_as(
+        "SELECT tgname,tgdeferrable,tginitdeferred, \
+                (tgtype & 4)=4,(tgtype & 8)=8,(tgtype & 16)=16,tgenabled::text \
+           FROM pg_trigger \
+          WHERE tgrelid='chat.welcome_dispositions'::regclass \
+            AND tgname IN ( \
+                'welcome_dispositions_delivery_cas_deferred', \
+                'welcome_dispositions_recovery_work_deferred' \
+            ) \
+          ORDER BY tgname",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_else(|error| panic!("{label}: read Welcome trigger catalog: {error}"));
+    assert_eq!(states.len(), 2, "{label}: exact trigger count");
+    for (name, deferrable, initially_deferred, insert, delete, update, enabled) in states {
+        assert!(deferrable, "{label}: {name} must be DEFERRABLE");
+        assert_eq!(
+            initially_deferred, expected_initially_deferred,
+            "{label}: {name} initial timing"
+        );
+        assert!(insert, "{label}: {name} must cover INSERT");
+        assert!(delete, "{label}: {name} must cover DELETE");
+        assert_eq!(
+            update, expected_update_event,
+            "{label}: {name} UPDATE event"
+        );
+        assert_eq!(enabled, "O", "{label}: {name} enabled state");
+    }
+}
+
 async fn apply_welcome_provenance_bridge(pool: &PgPool) {
     apply_manual_migration(pool, WELCOME_PROVENANCE_PREFLIGHT_MIGRATION).await;
-    assert!(
-        !welcome_disposition_triggers_are_initially_deferred(pool).await,
-        "preflight must make both triggers INITIALLY IMMEDIATE"
-    );
+    assert_welcome_disposition_trigger_catalog(pool, true, false, "preflight A").await;
+    apply_manual_migration(pool, WELCOME_PROVENANCE_QUARANTINE_MIGRATION).await;
+    assert_welcome_disposition_trigger_catalog(pool, false, true, "quarantine A2").await;
     apply_manual_migration(pool, WELCOME_PROVENANCE_MIGRATION).await;
     apply_manual_migration(pool, WELCOME_PROVENANCE_POSTFLIGHT_MIGRATION).await;
-    assert!(
-        welcome_disposition_triggers_are_initially_deferred(pool).await,
-        "postflight must restore both triggers INITIALLY DEFERRED"
-    );
+    apply_manual_migration(pool, WELCOME_PROVENANCE_FINALIZER_MIGRATION).await;
+    assert_welcome_disposition_trigger_catalog(pool, true, true, "finalizer D").await;
 }
 
 async fn assert_failed_frozen_upgrade_is_atomic(pool: &PgPool, label: &str) {
     apply_manual_migration(pool, WELCOME_PROVENANCE_PREFLIGHT_MIGRATION).await;
-    assert!(
-        !welcome_disposition_triggers_are_initially_deferred(pool).await,
-        "{label}: preflight must remain fail-closed and INITIALLY IMMEDIATE"
-    );
+    apply_manual_migration(pool, WELCOME_PROVENANCE_QUARANTINE_MIGRATION).await;
+    assert_welcome_disposition_trigger_catalog(pool, false, true, label).await;
     let sql = migration_text(WELCOME_PROVENANCE_MIGRATION);
     let mut tx = pool
         .begin()
@@ -10571,10 +10848,7 @@ async fn assert_failed_frozen_upgrade_is_atomic(pool: &PgPool, label: &str) {
         trigger_state, "O",
         "{label}: immutable trigger must remain enabled"
     );
-    assert!(
-        !welcome_disposition_triggers_are_initially_deferred(pool).await,
-        "{label}: failed v4 must preserve the installed immediate-trigger quarantine"
-    );
+    assert_welcome_disposition_trigger_catalog(pool, false, true, label).await;
 }
 
 struct RuntimeMigrationSource {
@@ -10624,6 +10898,7 @@ async fn installed_v4_sqlx_migrator_applies_older_preflight_and_newer_postflight
             PRE_V4_CHAT_MIGRATIONS[1],
             PRE_V4_CHAT_MIGRATIONS[2],
             WELCOME_PROVENANCE_MIGRATION,
+            WELCOME_PROVENANCE_POSTFLIGHT_MIGRATION,
         ],
     );
     let initial_migrator = sqlx::migrate::Migrator::new(initially_installed.path.as_path())
@@ -10653,13 +10928,15 @@ async fn installed_v4_sqlx_migrator_applies_older_preflight_and_newer_postflight
             PRE_V4_CHAT_MIGRATIONS[1],
             PRE_V4_CHAT_MIGRATIONS[2],
             WELCOME_PROVENANCE_PREFLIGHT_MIGRATION,
+            WELCOME_PROVENANCE_QUARANTINE_MIGRATION,
             WELCOME_PROVENANCE_MIGRATION,
             WELCOME_PROVENANCE_POSTFLIGHT_MIGRATION,
+            WELCOME_PROVENANCE_FINALIZER_MIGRATION,
         ],
     );
     let bridged_migrator = sqlx::migrate::Migrator::new(bridged_source.path.as_path())
         .await
-        .expect("resolve six-file bridged migration source");
+        .expect("resolve eight-file bridged migration source");
     bridged_migrator
         .run(&pool)
         .await
@@ -10674,8 +10951,10 @@ async fn installed_v4_sqlx_migrator_applies_older_preflight_and_newer_postflight
         20260722000002,
         20260722000003,
         20260725000001,
+        20260725000002,
         20260726000001,
         20260726000002,
+        20260726000003,
     ])
     .fetch_all(&pool)
     .await
@@ -10687,8 +10966,10 @@ async fn installed_v4_sqlx_migrator_applies_older_preflight_and_newer_postflight
             20260722000002,
             20260722000003,
             20260725000001,
+            20260725000002,
             20260726000001,
             20260726000002,
+            20260726000003,
         ],
         "SQLx must apply the missing lower preflight even after v4 is installed"
     );
@@ -10702,10 +10983,7 @@ async fn installed_v4_sqlx_migrator_applies_older_preflight_and_newer_postflight
         frozen_checksum_after, frozen_checksum_before,
         "bridge application must not replace or rewrite the frozen-v4 ledger row"
     );
-    assert!(
-        welcome_disposition_triggers_are_initially_deferred(&pool).await,
-        "postflight must leave the installed-v4 schema in its production deferred state"
-    );
+    assert_welcome_disposition_trigger_catalog(&pool, true, true, "bridged SQLx ledger").await;
 }
 
 async fn corrupt_history_to_zero_candidates(pool: &PgPool, welcome_id: Uuid) {

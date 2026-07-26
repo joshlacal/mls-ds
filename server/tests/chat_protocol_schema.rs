@@ -14,29 +14,35 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{Executor, PgPool};
 
 const TEST_DATABASE_NAME: &str = "catbird_chat_protocol_test_20260722";
-const MIGRATION_VERSIONS: [i64; 6] = [
+const MIGRATION_VERSIONS: [i64; 8] = [
     20260722000001,
     20260722000002,
     20260722000003,
     20260725000001,
+    20260725000002,
     20260726000001,
     20260726000002,
+    20260726000003,
 ];
-const MIGRATION_FILES: [&str; 6] = [
+const MIGRATION_FILES: [&str; 8] = [
     "20260722000001_chat_protocol_core.sql",
     "20260722000002_chat_protocol_delivery.sql",
     "20260722000003_chat_protocol_blobs.sql",
     "20260725000001_prepare_welcome_provenance_backfill.sql",
+    "20260725000002_refine_welcome_provenance_quarantine.sql",
     "20260726000001_welcome_supersession_provenance.sql",
     "20260726000002_restore_welcome_provenance_deferred_triggers.sql",
+    "20260726000003_finalize_welcome_provenance_triggers.sql",
 ];
-const MIGRATION_DESCRIPTIONS: [&str; 6] = [
+const MIGRATION_DESCRIPTIONS: [&str; 8] = [
     "chat protocol core",
     "chat protocol delivery",
     "chat protocol blobs",
     "prepare welcome provenance backfill",
+    "refine welcome provenance quarantine",
     "welcome supersession provenance",
     "restore welcome provenance deferred triggers",
+    "finalize welcome provenance triggers",
 ];
 
 // These are regenerated only from a reviewed, freshly applied migration
@@ -711,6 +717,10 @@ fn welcome_supersession_schema_declares_exact_exclusive_durable_sources() {
         migration_dir().join("20260725000001_prepare_welcome_provenance_backfill.sql"),
     )
     .expect("read Welcome provenance preflight migration");
+    let quarantine = std::fs::read_to_string(
+        migration_dir().join("20260725000002_refine_welcome_provenance_quarantine.sql"),
+    )
+    .expect("read Welcome provenance quarantine migration");
     let sql = std::fs::read_to_string(
         migration_dir().join("20260726000001_welcome_supersession_provenance.sql"),
     )
@@ -719,9 +729,15 @@ fn welcome_supersession_schema_declares_exact_exclusive_durable_sources() {
         migration_dir().join("20260726000002_restore_welcome_provenance_deferred_triggers.sql"),
     )
     .expect("read Welcome provenance postflight migration");
+    let finalizer = std::fs::read_to_string(
+        migration_dir().join("20260726000003_finalize_welcome_provenance_triggers.sql"),
+    )
+    .expect("read Welcome provenance finalizer migration");
     let preflight = compact_sql(&preflight);
+    let quarantine = compact_sql(&quarantine);
     let compact = compact_sql(&sql);
     let postflight = compact_sql(&postflight);
+    let finalizer = compact_sql(&finalizer);
 
     for required in [
         "CREATE CONSTRAINT TRIGGER welcome_dispositions_delivery_cas_deferred",
@@ -734,6 +750,22 @@ fn welcome_supersession_schema_declares_exact_exclusive_durable_sources() {
         assert!(
             preflight.contains(required),
             "missing Welcome provenance preflight invariant: {required}"
+        );
+    }
+
+    for required in [
+        "trigger_row.tgenabled = 'O'",
+        "trigger_row.tgtype = 27",
+        "function_namespace.nspname = 'chat'",
+        "function_row.proname = 'enforce_immutable_identity'",
+        "CREATE CONSTRAINT TRIGGER welcome_dispositions_delivery_cas_deferred",
+        "AFTER INSERT OR DELETE ON chat.welcome_dispositions",
+        "DEFERRABLE INITIALLY DEFERRED",
+        "CREATE CONSTRAINT TRIGGER welcome_dispositions_recovery_work_deferred",
+    ] {
+        assert!(
+            quarantine.contains(required),
+            "missing Welcome provenance quarantine invariant: {required}"
         );
     }
 
@@ -781,6 +813,25 @@ fn welcome_supersession_schema_declares_exact_exclusive_durable_sources() {
         assert!(
             postflight.contains(required),
             "missing Welcome provenance postflight invariant: {required}"
+        );
+    }
+
+    for required in [
+        "format_type(atttypid, atttypmod) = 'uuid'",
+        "welcome_dispositions_terminal_source_shape_check",
+        "welcome_dispositions_terminal_transition_fk",
+        "welcome_dispositions_terminal_revocation_fk",
+        "FOR target_welcome IN SELECT welcome_id FROM chat.welcome_dispositions ORDER BY welcome_id",
+        "PERFORM chat.assert_welcome_disposition_cas(target_welcome)",
+        "PERFORM chat.assert_recovery_work_integrity(target_welcome)",
+        "CREATE CONSTRAINT TRIGGER welcome_dispositions_delivery_cas_deferred",
+        "AFTER INSERT OR UPDATE OR DELETE ON chat.welcome_dispositions",
+        "DEFERRABLE INITIALLY DEFERRED",
+        "CREATE CONSTRAINT TRIGGER welcome_dispositions_recovery_work_deferred",
+    ] {
+        assert!(
+            finalizer.contains(required),
+            "missing Welcome provenance finalizer invariant: {required}"
         );
     }
 }
@@ -1023,7 +1074,7 @@ async fn reset_chat(pool: &PgPool) {
             .bind(MIGRATION_VERSIONS.as_slice())
             .execute(pool)
             .await
-            .expect("remove only the six chat-protocol ledger rows");
+            .expect("remove only the eight chat-protocol ledger rows");
     }
 }
 
@@ -1121,6 +1172,8 @@ async fn fresh_pool() -> PgPool {
             CORE_TABLES.as_slice(),
             DELIVERY_TABLES.as_slice(),
             BLOB_TABLES.as_slice(),
+            &[],
+            &[],
             &[],
             &[],
             &[],
@@ -1459,7 +1512,7 @@ async fn clean_chat_schema_is_exact_isolated_and_fail_closed() {
             .iter()
             .map(|name| (*name).to_owned())
             .collect(),
-        "clean schema must be exactly six ordered files"
+        "clean schema must be exactly eight ordered files"
     );
 
     for (version, suffix, expected) in [
@@ -1485,12 +1538,22 @@ async fn clean_chat_schema_is_exact_isolated_and_fail_closed() {
         ),
         (
             MIGRATION_VERSIONS[4],
-            "welcome_supersession_provenance",
+            "refine_welcome_provenance_quarantine",
             &[],
         ),
         (
             MIGRATION_VERSIONS[5],
+            "welcome_supersession_provenance",
+            &[],
+        ),
+        (
+            MIGRATION_VERSIONS[6],
             "restore_welcome_provenance_deferred_triggers",
+            &[],
+        ),
+        (
+            MIGRATION_VERSIONS[7],
+            "finalize_welcome_provenance_triggers",
             &[],
         ),
     ] {

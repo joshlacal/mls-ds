@@ -121,7 +121,7 @@ fn every_clean_table_reference_is_schema_qualified() {
 }
 
 #[test]
-fn exactly_six_clean_migration_files_are_the_only_migration_boundary() {
+fn exactly_eight_clean_migration_files_and_deploy_gate_are_the_only_migration_boundary() {
     let migration_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations");
     let mut clean_migrations = fs::read_dir(migration_root)
         .expect("read migration directory")
@@ -133,8 +133,10 @@ fn exactly_six_clean_migration_files_are_the_only_migration_boundary() {
                 .is_some_and(|name| {
                     name.starts_with("202607220000")
                         || name == "20260725000001_prepare_welcome_provenance_backfill.sql"
+                        || name == "20260725000002_refine_welcome_provenance_quarantine.sql"
                         || name == "20260726000001_welcome_supersession_provenance.sql"
                         || name == "20260726000002_restore_welcome_provenance_deferred_triggers.sql"
+                        || name == "20260726000003_finalize_welcome_provenance_triggers.sql"
                 })
         })
         .collect::<Vec<_>>();
@@ -151,8 +153,10 @@ fn exactly_six_clean_migration_files_are_the_only_migration_boundary() {
             "20260722000002_chat_protocol_delivery.sql",
             "20260722000003_chat_protocol_blobs.sql",
             "20260725000001_prepare_welcome_provenance_backfill.sql",
+            "20260725000002_refine_welcome_provenance_quarantine.sql",
             "20260726000001_welcome_supersession_provenance.sql",
             "20260726000002_restore_welcome_provenance_deferred_triggers.sql",
+            "20260726000003_finalize_welcome_provenance_triggers.sql",
         ]
     );
 
@@ -161,4 +165,39 @@ fn exactly_six_clean_migration_files_are_the_only_migration_boundary() {
         assert!(!source.to_ascii_lowercase().contains("search_path"));
         assert!(!source.contains("public."));
     }
+
+    let deploy = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("deploy.sh"),
+    )
+    .expect("read host deployment script");
+    let prerequisite = deploy
+        .find("[1/7] Verifying deployment prerequisites")
+        .expect("prerequisite gate");
+    let pull = deploy.find("[2/7] Pulling latest code").expect("pull step");
+    let stop = deploy
+        .find("sudo systemctl stop \"$SERVICE_NAME\"")
+        .expect("maintenance stop");
+    let bootstrap = deploy
+        .rfind("\"$MLS_ROOT/server/scripts/bootstrap-sqlx-migrations.sh\"")
+        .expect("bootstrap invocation");
+    let migration = deploy
+        .rfind("\"$MLS_ROOT/server/scripts/run-migrations.sh\"")
+        .expect("migration invocation");
+    let start = deploy
+        .find("sudo systemctl start \"$SERVICE_NAME\"")
+        .expect("post-migration start");
+    assert!(
+        prerequisite < pull && stop < bootstrap && bootstrap < migration && migration < start,
+        "deployment must preflight first, stop before bootstrap/migration, and start only afterward"
+    );
+    assert!(
+        !deploy.contains("systemctl restart"),
+        "deployment must not restart across the migration sequence"
+    );
+    assert!(
+        deploy.matches("remains stopped").count() >= 3,
+        "bootstrap, migration, and start failures must explicitly leave the service stopped"
+    );
 }
