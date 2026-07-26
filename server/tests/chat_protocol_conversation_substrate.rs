@@ -3208,10 +3208,13 @@ mod historical_control_loader {
             load_recovery_work_hydration_rows, select_fulfilled_recovery_terminal,
             FulfilledRecoveryTerminalColumns, RecoveryHydrationError,
         };
+        use crate::chat_protocol::snapshot::{
+            PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle,
+        };
         use crate::chat_protocol::state_machine::{
-            DeviceIdentity, HistoricalRehydrationAuthority, LeafRecoveryKind, PrincipalId,
-            RecoveryOriginHydrationRow, RecoveryRequestStatus, RecoverySource, ReservationStatus,
-            WorkTerminalHydrationRow,
+            recovery_fulfillment_terminal_matches, DeviceIdentity, HistoricalRehydrationAuthority,
+            LeafRecoveryKind, PrincipalId, RecoveryOriginHydrationRow, RecoveryRequestStatus,
+            RecoverySource, ReservationStatus, ServerTimestamp, WorkTerminalHydrationRow,
         };
         use crate::chat_protocol::transcript::{
             decode_and_verify_control_entry, decode_canonical_signed_mutation, SignedMutationKind,
@@ -3480,6 +3483,18 @@ mod historical_control_loader {
             entry: &RealCreationEntry,
             seed: &RecoverySeed,
         ) -> RealLeafRecoveryFulfillmentEntry {
+            build_real_leaf_recovery_fulfillment_entry_with_mutation(entry, seed, |_| {})
+        }
+
+        /// Rebuild and sign a fulfillment after applying one body substitution.
+        /// Adversarial predicate cases use this seam so every candidate still
+        /// crosses canonical decoding, Ed25519 verification, and historical
+        /// transition re-hydration before it is treated as evidence.
+        fn build_real_leaf_recovery_fulfillment_entry_with_mutation(
+            entry: &RealCreationEntry,
+            seed: &RecoverySeed,
+            mutate_body: impl FnOnce(&mut Value),
+        ) -> RealLeafRecoveryFulfillmentEntry {
             let signing_key = SigningKey::from_bytes(&[0x24; 32]);
             let verifying = signing_key.verifying_key().to_bytes();
             assert_eq!(entry.public_key, verifying.to_vec());
@@ -3545,7 +3560,7 @@ mod historical_control_loader {
                     "keyPackageRef": STANDARD.encode(seed.key_package_ref),
                 }),
             ];
-            let body = json!({
+            let mut body = json!({
                 "$type": SignedMutationKind::LeafRecoveryFulfillment.type_id(),
                 "signatureDomain": String::from_utf8(
                     SignedMutationKind::LeafRecoveryFulfillment.domain().to_vec()
@@ -3595,6 +3610,7 @@ mod historical_control_loader {
                 "idempotencyKey": idempotency_key.hyphenated().to_string(),
                 "signedAt": FULFILLMENT_SIGNED_AT,
             });
+            mutate_body(&mut body);
             let mut wrapper = json!({ "body": body, "signature": STANDARD.encode([0_u8; 64]) });
             let unsigned = serde_json::to_vec(&wrapper).unwrap();
             let unsigned_canonical = decode_canonical_signed_mutation(&unsigned)
@@ -3986,6 +4002,293 @@ mod historical_control_loader {
             );
         }
 
+        /// Characterize the exact signed-body predicate used by fulfilled
+        /// recovery hydration. Scalar/coordinate substitutions exercise its
+        /// read-side inputs, while the Welcome cases rebuild and sign canonical
+        /// evidence whose malformed binding is still independently decoded and
+        /// historically reverified. The wrong-kind candidate is the real signed
+        /// Creation transition, not a synthetic authority/body enum.
+        #[test]
+        fn recovery_fulfillment_terminal_predicate_rejects_binding_substitutions() {
+            let cid = Uuid::new_v4();
+            let entry = build_real_creation_entry(*cid.as_bytes());
+            let seed = RecoverySeed {
+                request_id: *Uuid::new_v4().as_bytes(),
+                key_package_ref: Sha256::digest(Uuid::new_v4().as_bytes()).into(),
+                raw_wrapper: Vec::new(),
+                creation_transition_id: Uuid::new_v4(),
+                replaced_leaf_period_id: Uuid::new_v4(),
+            };
+            let authority = HistoricalRehydrationAuthority::new(entry.cid, 3).unwrap();
+            let fulfillment = build_real_leaf_recovery_fulfillment_entry(&entry, &seed);
+            let evidence = authority
+                .hydrate_historical_control_from_durable_bytes(
+                    fulfillment.public_row_json.clone(),
+                    fulfillment.raw_wrapper.clone(),
+                    &entry.public_key,
+                )
+                .expect("baseline fulfillment re-verifies")
+                .into_transition()
+                .expect("baseline fulfillment is a transition");
+            let target = DeviceIdentity::new(
+                PrincipalId::new(entry.actor_did.clone().into_bytes()).unwrap(),
+                *entry.actor_device_id.as_bytes(),
+            )
+            .unwrap();
+            let bound_coordinate = PublicGroupSnapshotCoordinate::new(
+                entry.cid,
+                0,
+                0,
+                [1; 32],
+                0,
+                [2; 32],
+                [3; 32],
+                PublicGroupSnapshotLifecycle::Active,
+            );
+            let terminal_at = ServerTimestamp::from_canonical_stored(FULFILLED_AT).unwrap();
+            fn terminal_matches(
+                candidate: &crate::chat_protocol::state_machine::TransitionEvidence,
+                request_id: &[u8; 16],
+                candidate_target: &DeviceIdentity,
+                kind: LeafRecoveryKind,
+                coordinate: &PublicGroupSnapshotCoordinate,
+                key_package_ref: &[u8; 32],
+                at: ServerTimestamp,
+            ) -> bool {
+                recovery_fulfillment_terminal_matches(
+                    candidate,
+                    request_id,
+                    candidate_target,
+                    kind,
+                    coordinate,
+                    key_package_ref,
+                    at,
+                )
+            }
+
+            assert!(terminal_matches(
+                &evidence,
+                &seed.request_id,
+                &target,
+                LeafRecoveryKind::Replace,
+                &bound_coordinate,
+                &seed.key_package_ref,
+                terminal_at,
+            ));
+
+            let foreign_coordinate = PublicGroupSnapshotCoordinate::new(
+                *Uuid::new_v4().as_bytes(),
+                0,
+                0,
+                [1; 32],
+                0,
+                [2; 32],
+                [3; 32],
+                PublicGroupSnapshotLifecycle::Active,
+            );
+            let stale_coordinate = PublicGroupSnapshotCoordinate::new(
+                entry.cid,
+                0,
+                1,
+                [1; 32],
+                1,
+                [4; 32],
+                [5; 32],
+                PublicGroupSnapshotLifecycle::Active,
+            );
+            let wrong_request_id = *Uuid::new_v4().as_bytes();
+            let wrong_target =
+                DeviceIdentity::new(target.principal().clone(), *Uuid::new_v4().as_bytes())
+                    .unwrap();
+            let wrong_key_package_ref = [0xa5; 32];
+            let wrong_terminal_at =
+                ServerTimestamp::from_canonical_stored("2030-01-01T00:01:01.000Z").unwrap();
+            let scalar_and_coordinate_cases = [
+                (
+                    "foreign conversation authority",
+                    &seed.request_id,
+                    &target,
+                    LeafRecoveryKind::Replace,
+                    &foreign_coordinate,
+                    &seed.key_package_ref,
+                    terminal_at,
+                ),
+                (
+                    "stale prior coordinate",
+                    &seed.request_id,
+                    &target,
+                    LeafRecoveryKind::Replace,
+                    &stale_coordinate,
+                    &seed.key_package_ref,
+                    terminal_at,
+                ),
+                (
+                    "wrong recovery request id",
+                    &wrong_request_id,
+                    &target,
+                    LeafRecoveryKind::Replace,
+                    &bound_coordinate,
+                    &seed.key_package_ref,
+                    terminal_at,
+                ),
+                (
+                    "wrong target device",
+                    &seed.request_id,
+                    &wrong_target,
+                    LeafRecoveryKind::Replace,
+                    &bound_coordinate,
+                    &seed.key_package_ref,
+                    terminal_at,
+                ),
+                (
+                    "wrong key-package ref",
+                    &seed.request_id,
+                    &target,
+                    LeafRecoveryKind::Replace,
+                    &bound_coordinate,
+                    &wrong_key_package_ref,
+                    terminal_at,
+                ),
+                (
+                    "wrong Add-vs-Replace shape",
+                    &seed.request_id,
+                    &target,
+                    LeafRecoveryKind::Add,
+                    &bound_coordinate,
+                    &seed.key_package_ref,
+                    terminal_at,
+                ),
+                (
+                    "wrong terminal timestamp",
+                    &seed.request_id,
+                    &target,
+                    LeafRecoveryKind::Replace,
+                    &bound_coordinate,
+                    &seed.key_package_ref,
+                    wrong_terminal_at,
+                ),
+            ];
+            for (label, request_id, candidate_target, kind, coordinate, key_package_ref, at) in
+                scalar_and_coordinate_cases
+            {
+                assert!(
+                    !terminal_matches(
+                        &evidence,
+                        request_id,
+                        candidate_target,
+                        kind,
+                        coordinate,
+                        key_package_ref,
+                        at,
+                    ),
+                    "{label} must fail closed"
+                );
+            }
+
+            let creation_evidence = authority
+                .hydrate_historical_control_from_durable_bytes(
+                    entry.public_row_json.clone(),
+                    entry.raw_wrapper.clone(),
+                    &entry.public_key,
+                )
+                .expect("real signed Creation evidence re-verifies")
+                .into_transition()
+                .expect("Creation is a transition");
+            assert!(
+                !terminal_matches(
+                    &creation_evidence,
+                    &seed.request_id,
+                    &target,
+                    LeafRecoveryKind::Replace,
+                    &bound_coordinate,
+                    &seed.key_package_ref,
+                    terminal_at,
+                ),
+                "wrong signed mutation/body kind must fail closed"
+            );
+
+            enum WelcomeBindingMutation {
+                Recipient,
+                Request,
+                KeyPackage,
+            }
+            let malformed_welcome_mutations = [
+                ("recipient", WelcomeBindingMutation::Recipient),
+                ("request", WelcomeBindingMutation::Request),
+                ("key-package", WelcomeBindingMutation::KeyPackage),
+            ];
+            for (label, mutation) in malformed_welcome_mutations {
+                let malformed = build_real_leaf_recovery_fulfillment_entry_with_mutation(
+                    &entry,
+                    &seed,
+                    |body| match mutation {
+                        WelcomeBindingMutation::Recipient => {
+                            body["manifest"]["welcomeBundle"]["deliveries"][0]
+                                ["recipientDeviceId"] =
+                                Value::String(Uuid::new_v4().hyphenated().to_string());
+                        }
+                        WelcomeBindingMutation::Request => {
+                            body["manifest"]["welcomeBundle"]["deliveries"][0]["provenance"]
+                                ["recoveryRequestId"] =
+                                Value::String(Uuid::new_v4().hyphenated().to_string());
+                        }
+                        WelcomeBindingMutation::KeyPackage => {
+                            body["manifest"]["welcomeBundle"]["deliveries"][0]["provenance"]
+                                ["keyPackageRef"] = Value::String(STANDARD.encode([0xb6; 32]));
+                        }
+                    },
+                );
+                let malformed_evidence = authority
+                    .hydrate_historical_control_from_durable_bytes(
+                        malformed.public_row_json,
+                        malformed.raw_wrapper,
+                        &entry.public_key,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("signed malformed Welcome {label} must reverify: {error:?}")
+                    })
+                    .into_transition()
+                    .expect("malformed Welcome fulfillment remains a transition");
+                assert!(
+                    !terminal_matches(
+                        &malformed_evidence,
+                        &seed.request_id,
+                        &target,
+                        LeafRecoveryKind::Replace,
+                        &bound_coordinate,
+                        &seed.key_package_ref,
+                        terminal_at,
+                    ),
+                    "malformed Welcome {label} binding must fail closed"
+                );
+            }
+        }
+
+        /// A coherent fulfilled graph read under a foreign conversation
+        /// authority fails at terminal evidence reconstruction, before the
+        /// request origin can be accepted under that authority.
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn recovery_pair_rejects_foreign_fulfillment_evidence_as_invalid_terminal() {
+            let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+            let cid = Uuid::new_v4();
+            let entry = build_real_creation_entry(*cid.as_bytes());
+            let seed = seed_recovery_pair(&pool, &entry, "requestLeafRecovery").await;
+            let fulfillment = build_real_leaf_recovery_fulfillment_entry(&entry, &seed);
+            commit_recovery_fulfillment_graph(&pool, &entry, &seed, &fulfillment).await;
+
+            let authority =
+                HistoricalRehydrationAuthority::new(*Uuid::new_v4().as_bytes(), 3).unwrap();
+            let mut tx = pool.begin().await.expect("fresh hydration transaction");
+            let result = load_recovery_work_hydration_rows(&mut tx, &authority, cid).await;
+            tx.rollback().await.expect("rollback");
+
+            assert!(matches!(
+                result,
+                Err(RecoveryHydrationError::InvalidTerminal)
+            ));
+        }
+
         /// The fulfilled/consumed status arms select only one exact transition
         /// terminal across request, reservation, package, and durable transition.
         /// These malformed combinations are structurally prohibited from
@@ -4191,16 +4494,11 @@ mod historical_control_loader {
             ));
         }
 
-        // NOTE: the terminal-status fail-closed (`UnsupportedTerminal`, a non-`open`
-        // request / non-`active` reservation) is NOT live-exercised here: the
-        // deferred `assert_recovery_fulfillment_mapping` constraint requires a
-        // FULLY coherent terminal graph (a real `leafRecovery` fulfilling
-        // transition, a matching `consumed` key package, a `welcome_deliveries`
-        // row, and a removed member device) to even COMMIT a `fulfilled`/`consumed`
-        // pair. That coherent terminal seed is the same one the terminal
-        // `WorkTerminalHydrationRow` reconstruction follow-up must build, so the
-        // fail-closed boundary is asserted there. The status match arm fails closed
-        // structurally in the meantime (it never fabricates a terminal).
+        // Fulfilled/consumed terminal reconstruction is live-exercised above by a
+        // fully coherent graph crossing every deferred fulfillment/Welcome
+        // mapping. The remaining cancelled/released, expired, and
+        // superseded/released status families stay fail-closed behind
+        // `UnsupportedTerminal` until their separately owned signed fixtures land.
     }
 
     // -----------------------------------------------------------------------
