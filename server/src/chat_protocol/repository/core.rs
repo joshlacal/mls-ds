@@ -3113,7 +3113,7 @@ pub(crate) async fn load_producer_transition_evidence(
 }
 
 // ===========================================================================
-// G1b-2 sub-seal — current-metadata provenance leg (metadata + metadata_producer).
+// G1b-2 sub-seal — retained-metadata provenance leg (metadata + metadata_producer).
 //
 // The G1b-2 aggregate carries two COUPLED optional fields: `metadata`
 // (`Option<MetadataSnapshotBinding>`) and `metadata_producer`
@@ -3134,41 +3134,31 @@ pub(crate) async fn load_producer_transition_evidence(
 // The durable row's `canonical_snapshot`/`digest` are not persisted at all, and
 // `MetadataSnapshotBinding`'s fields (and the only literal ctor, the
 // `#[cfg(test)]` `for_test_creation`) are unavailable to `repository::core`. So
-// this leg reads `chat.metadata_snapshots.producing_transition_id` (pinned to the
-// current generation-state's producer — see below), re-verifies that transition
-// through the sealed loader atom, and derives the metadata binding from its body
-// via `metadata_binding_of_transition`, exactly reproducing the append-time
-// derivation. `metadata_provenance_matches` is the assembly-time drift fence.
+// this leg selects the greatest same-generation snapshot producer whose immutable
+// entry sequence does not exceed the current producer's sequence, re-verifies
+// that transition through the sealed loader atom, and derives the metadata
+// binding from its body via `metadata_binding_of_transition`. Sequence is the
+// canonical order; mutable wall-clock fields never select a predecessor.
 //
-// PRODUCER PIN: the metadata row is joined to the CURRENT generation-state's
-// `producing_transition_id`. A generation-state is produced by exactly one
-// transition, and the executor writes that state and its metadata snapshot (when
-// metadata is present) in one persistence with a shared `producing_transition_id`
-// (`metadata_snapshots_transition_uq` makes it globally unique), so
-// `chat.metadata_snapshots.producing_transition_id` for the current `(generation,
-// state_version)` always equals `chat.generation_states.producing_transition_id`.
-// Pinning the join on that equality is deterministic (there is no bare
-// `(conversation_id, generation, state_version)` unique index on
-// `chat.metadata_snapshots`) and fails toward `(None, None)` — never a
-// non-deterministic pick — should the invariant ever be violated.
+// The current-transition catalog is deliberately closed. Snapshot-producing
+// transitions must select themselves. Policy, acceptance, leave-policy, and
+// close retain a strictly earlier snapshot producer. Reset activation's mandatory
+// successor-generation snapshot prevents fallback across the reset boundary.
 //
-// (None, None) vs fail-closed: a coherent conversation ALWAYS carries metadata —
-// `createConversation` mints a `metadata_version == 1` snapshot, every advance
-// carries one forward, and `chat.transitions.metadata_snapshot_id` FK-references
-// the row (so it cannot be orphaned/deleted). So on any conversation the caller
-// has head-locked, the current metadata row is present and this leg returns
-// `(Some, Some)`. The `(None, None)` arm is the faithful DB mirror for the
-// no-current-metadata-row case (structurally unreachable for an existing
-// conversation); it is NOT fabricated evidence, and `validate_state` is the
-// arbiter of whether a metadata-less state is legal for the coordinate. The
-// handoff's "missing metadata row" fail-closed maps to `ProvenanceMissing` (the
-// producing transition's ENTRY is absent), not the absent-snapshot-row case.
+// `(None, None)` is valid only when the conversation lookup itself is absent.
+// Once a conversation row exists, a missing same-generation candidate is
+// `ProvenanceMissing`; malformed head/catalog/lifecycle shapes are
+// `OutOfDomain`.
 // ===========================================================================
 
 /// Failure modes of [`load_metadata_provenance`].
 #[allow(dead_code)]
 #[derive(Debug, Error)]
 pub(crate) enum MetadataHydrationError {
+    /// The current head, transition kind, lifecycle, or selected predecessor is
+    /// outside the closed retained-metadata catalog shape.
+    #[error("clean-chat metadata provenance is outside the protocol domain")]
+    OutOfDomain,
     /// The metadata snapshot's producing transition had no durable control entry.
     /// Fail closed: a producing transition without an entry can never yield
     /// evidence.
@@ -3194,22 +3184,133 @@ impl From<ControlEvidenceLoadError> for MetadataHydrationError {
     }
 }
 
-/// Load and re-verify the CURRENT metadata provenance of an existing
-/// conversation — the G1b-2 aggregate's coupled `metadata` + `metadata_producer`
-/// fields.
+#[derive(Clone, Copy)]
+pub(crate) struct RetainedMetadataHead<'a> {
+    pub(crate) conversation_lifecycle: &'a str,
+    pub(crate) generation_state_lifecycle: &'a str,
+    pub(crate) current_generation: u64,
+    pub(crate) current_kind: &'a str,
+    pub(crate) current_transition_id: Uuid,
+    pub(crate) current_seq: u64,
+    pub(crate) current_accepted_at: DateTime<Utc>,
+    pub(crate) close_transition_id: Option<Uuid>,
+    pub(crate) close_seq: Option<u64>,
+    pub(crate) closed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RetainedMetadataCandidate {
+    pub(crate) transition_id: Uuid,
+    pub(crate) generation: u64,
+    pub(crate) seq: u64,
+    #[allow(dead_code)] // carried only to prove that selection never orders by time
+    pub(crate) accepted_at: DateTime<Utc>,
+}
+
+/// Apply the closed retained-metadata catalog ruling to the current head and
+/// the greatest same-generation snapshot producer at or before it.
+pub(crate) fn select_retained_metadata_producer(
+    head: RetainedMetadataHead<'_>,
+    candidates: Vec<RetainedMetadataCandidate>,
+) -> Result<Uuid, MetadataHydrationError> {
+    if head.current_seq == 0 || head.current_seq > MAX_PROTOCOL_INTEGER {
+        return Err(MetadataHydrationError::OutOfDomain);
+    }
+    if candidates.is_empty() {
+        return Err(MetadataHydrationError::ProvenanceMissing);
+    }
+    if candidates.iter().any(|candidate| {
+        candidate.generation != head.current_generation
+            || candidate.seq == 0
+            || candidate.seq > head.current_seq
+            || candidate.seq > MAX_PROTOCOL_INTEGER
+    }) {
+        return Err(MetadataHydrationError::OutOfDomain);
+    }
+    let candidate = candidates
+        .into_iter()
+        .max_by_key(|candidate| candidate.seq)
+        .ok_or(MetadataHydrationError::ProvenanceMissing)?;
+
+    match (head.conversation_lifecycle, head.generation_state_lifecycle) {
+        ("active", "active") => {
+            if head.current_kind == "closeConversation"
+                || head.close_transition_id.is_some()
+                || head.close_seq.is_some()
+                || head.closed_at.is_some()
+            {
+                return Err(MetadataHydrationError::OutOfDomain);
+            }
+        }
+        ("superseded", "superseded") => {
+            if head.current_kind != "closeConversation"
+                || head.close_transition_id != Some(head.current_transition_id)
+                || head.close_seq != Some(head.current_seq)
+                || head.closed_at != Some(head.current_accepted_at)
+                || candidate.seq >= head.current_seq
+            {
+                return Err(MetadataHydrationError::OutOfDomain);
+            }
+        }
+        _ => return Err(MetadataHydrationError::OutOfDomain),
+    }
+
+    match head.current_kind {
+        "creation" | "commit" | "metadata" | "leafRecovery" | "leaveCommit" | "resetActivation" => {
+            if candidate.transition_id != head.current_transition_id
+                || candidate.seq != head.current_seq
+            {
+                return Err(MetadataHydrationError::OutOfDomain);
+            }
+        }
+        "policy" | "acceptConversation" | "leavePolicy" | "closeConversation" => {
+            if candidate.transition_id == head.current_transition_id
+                || candidate.seq >= head.current_seq
+            {
+                return Err(MetadataHydrationError::OutOfDomain);
+            }
+        }
+        _ => return Err(MetadataHydrationError::OutOfDomain),
+    }
+
+    Ok(candidate.transition_id)
+}
+
+/// Narrow a reverified catalog row to a metadata-producing transition and
+/// derive the binding solely from its signed body.
+pub(crate) fn derive_retained_metadata_provenance(
+    producer: PersistedControlAuthority,
+) -> Result<(MetadataSnapshotBinding, TransitionEvidence), MetadataHydrationError> {
+    let producer = producer
+        .into_transition()
+        .map_err(|_| MetadataHydrationError::InvalidProvenance)?;
+    let metadata = metadata_binding_of_transition(&producer)
+        .ok_or(MetadataHydrationError::InvalidProvenance)?;
+    Ok((metadata, producer))
+}
+
+#[derive(sqlx::FromRow)]
+struct RetainedMetadataHeadRow {
+    conversation_lifecycle: String,
+    current_generation: i64,
+    close_transition_id: Option<Uuid>,
+    close_seq: Option<i64>,
+    closed_at: Option<DateTime<Utc>>,
+    generation_state_lifecycle: Option<String>,
+    current_transition_id: Option<Uuid>,
+    current_transition_kind: Option<String>,
+    current_seq: Option<i64>,
+    current_accepted_at: Option<DateTime<Utc>>,
+}
+
+/// Load and re-verify the metadata provenance retained at the current head.
 ///
-/// Reads `chat.metadata_snapshots.producing_transition_id` for the conversation's
-/// current `(generation, state_version)` — pinned to the current
-/// generation-state's producer (see the module comment) — then re-loads +
-/// re-verifies that transition's durable control entry through
-/// [`load_historical_control_evidence`], narrows it to the transition arm via
-/// [`PersistedControlAuthority::into_transition`] (a coordinate metadata producer
-/// is always a transition, never a control request), and derives the metadata
-/// binding from its verified body via
-/// [`metadata_binding_of_transition`] — exactly as the append-time path derives
-/// `state.metadata`. Returns `(None, None)` when no current metadata snapshot
-/// exists (the legal validator arm, structurally unreachable for a coherent
-/// conversation).
+/// The selected producer is the greatest transition sequence at or before the
+/// current producer among metadata snapshots in the pinned current generation.
+/// Timestamps never order candidates. Snapshot-producing current transitions
+/// select themselves; the closed snapshotless family selects a strictly earlier
+/// producer. The selected immutable transition is then reverified and its
+/// metadata binding is derived exclusively from its verified body.
 ///
 /// `authority` MUST be the read-time authority minted from the SAME locked head
 /// as the rest of the aggregate. No `FOR UPDATE`: the caller already holds the
@@ -3222,19 +3323,27 @@ pub(crate) async fn load_metadata_provenance(
     authority: &HistoricalRehydrationAuthority,
     conversation_id: Uuid,
 ) -> Result<(Option<MetadataSnapshotBinding>, Option<TransitionEvidence>), MetadataHydrationError> {
-    let row: Option<(Uuid,)> = sqlx::query_as(
+    let row: Option<RetainedMetadataHeadRow> = sqlx::query_as(
         r#"
-        SELECT ms.producing_transition_id
+        SELECT
+            c.lifecycle AS conversation_lifecycle,
+            c.current_generation,
+            c.close_transition_id,
+            c.close_seq,
+            c.closed_at,
+            gs.lifecycle AS generation_state_lifecycle,
+            gs.producing_transition_id AS current_transition_id,
+            current_transition.kind AS current_transition_kind,
+            current_transition.entry_seq AS current_seq,
+            current_transition.accepted_at AS current_accepted_at
         FROM chat.conversations c
-        JOIN chat.generation_states gs
+        LEFT JOIN chat.generation_states gs
           ON gs.conversation_id = c.conversation_id
          AND gs.generation = c.current_generation
          AND gs.state_version = c.current_state_version
-        JOIN chat.metadata_snapshots ms
-          ON ms.conversation_id = c.conversation_id
-         AND ms.generation = c.current_generation
-         AND ms.state_version = c.current_state_version
-         AND ms.producing_transition_id = gs.producing_transition_id
+        LEFT JOIN chat.transitions current_transition
+          ON current_transition.conversation_id = c.conversation_id
+         AND current_transition.transition_id = gs.producing_transition_id
         WHERE c.conversation_id = $1
         "#,
     )
@@ -3242,10 +3351,78 @@ pub(crate) async fn load_metadata_provenance(
     .fetch_optional(&mut **transaction)
     .await?;
 
-    let Some((producing_transition_id,)) = row else {
-        // No current metadata snapshot: the legal `(None, None)` validator arm.
+    let Some(row) = row else {
+        // `(None, None)` is valid only for an absent conversation lookup.
         return Ok((None, None));
     };
+
+    let (
+        Some(generation_state_lifecycle),
+        Some(current_transition_id),
+        Some(current_transition_kind),
+        Some(current_seq),
+        Some(current_accepted_at),
+    ) = (
+        row.generation_state_lifecycle,
+        row.current_transition_id,
+        row.current_transition_kind,
+        row.current_seq,
+        row.current_accepted_at,
+    )
+    else {
+        return Err(MetadataHydrationError::ProvenanceMissing);
+    };
+    let current_generation = metadata_u64(row.current_generation)?;
+    let current_seq = metadata_positive_u64(current_seq)?;
+    let close_seq = row.close_seq.map(metadata_positive_u64).transpose()?;
+
+    let candidates: Vec<(Uuid, i64, i64, DateTime<Utc>)> = sqlx::query_as(
+        r#"
+        SELECT
+            metadata.producing_transition_id,
+            producer.next_generation AS producer_generation,
+            producer.entry_seq,
+            producer.accepted_at
+        FROM chat.metadata_snapshots metadata
+        JOIN chat.transitions producer
+          ON producer.conversation_id = metadata.conversation_id
+         AND producer.transition_id = metadata.producing_transition_id
+        WHERE metadata.conversation_id = $1
+          AND metadata.generation = $2
+          AND producer.entry_seq <= $3
+        "#,
+    )
+    .bind(conversation_id)
+    .bind(row.current_generation)
+    .bind(i64::try_from(current_seq).map_err(|_| MetadataHydrationError::OutOfDomain)?)
+    .fetch_all(&mut **transaction)
+    .await?;
+    let candidates = candidates
+        .into_iter()
+        .map(|(transition_id, generation, seq, accepted_at)| {
+            Ok::<_, MetadataHydrationError>(RetainedMetadataCandidate {
+                transition_id,
+                generation: metadata_u64(generation)?,
+                seq: metadata_positive_u64(seq)?,
+                accepted_at,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let producing_transition_id = select_retained_metadata_producer(
+        RetainedMetadataHead {
+            conversation_lifecycle: &row.conversation_lifecycle,
+            generation_state_lifecycle: &generation_state_lifecycle,
+            current_generation,
+            current_kind: &current_transition_kind,
+            current_transition_id,
+            current_seq,
+            current_accepted_at,
+            close_transition_id: row.close_transition_id,
+            close_seq,
+            closed_at: row.closed_at,
+        },
+        candidates,
+    )?;
 
     let producer = load_historical_control_evidence(
         transaction,
@@ -3253,18 +3430,26 @@ pub(crate) async fn load_metadata_provenance(
         conversation_id,
         producing_transition_id,
     )
-    .await?
-    .into_transition()
-    .map_err(|_| MetadataHydrationError::InvalidProvenance)?;
-
-    // Derive the metadata binding from the re-verified producer body, mirroring
-    // the append-time `state.metadata = transition_metadata(&producer).cloned()`.
-    // A metadata snapshot row whose producing transition body carries NO metadata
-    // is a fail-closed linkage inconsistency, never a silent `None`.
-    let metadata = metadata_binding_of_transition(&producer)
-        .ok_or(MetadataHydrationError::InvalidProvenance)?;
+    .await?;
+    // A request arm or transition body carrying no metadata is a fail-closed
+    // linkage inconsistency, never a silent `None`.
+    let (metadata, producer) = derive_retained_metadata_provenance(producer)?;
 
     Ok((Some(metadata), Some(producer)))
+}
+
+fn metadata_u64(value: i64) -> Result<u64, MetadataHydrationError> {
+    u64::try_from(value)
+        .ok()
+        .filter(|value| *value <= MAX_PROTOCOL_INTEGER)
+        .ok_or(MetadataHydrationError::OutOfDomain)
+}
+
+fn metadata_positive_u64(value: i64) -> Result<u64, MetadataHydrationError> {
+    u64::try_from(value)
+        .ok()
+        .filter(|value| (1..=MAX_PROTOCOL_INTEGER).contains(value))
+        .ok_or(MetadataHydrationError::OutOfDomain)
 }
 
 // ===========================================================================

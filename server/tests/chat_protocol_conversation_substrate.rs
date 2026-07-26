@@ -2519,10 +2519,12 @@ mod historical_control_loader {
     use super::historical_control_path::{build_real_creation_entry, RealCreationEntry};
     use crate::chat_protocol::public_state::encode_public_tree_summary;
     use crate::chat_protocol::repository::core::{
-        load_historical_control_evidence, load_interval_hydration_rows, load_metadata_provenance,
-        load_participant_hydration_rows, load_producer_transition_evidence,
+        derive_retained_metadata_provenance, load_historical_control_evidence,
+        load_interval_hydration_rows, load_metadata_provenance, load_participant_hydration_rows,
+        load_producer_transition_evidence, select_retained_metadata_producer,
         ControlEvidenceLoadError, IntervalHydrationError, MetadataHydrationError,
-        ParticipantHydrationError, ProducerHydrationError,
+        ParticipantHydrationError, ProducerHydrationError, RetainedMetadataCandidate,
+        RetainedMetadataHead,
     };
     use crate::chat_protocol::snapshot::{
         PublicGroupSnapshotLeaf, PublicGroupSnapshotLifecycle, PublicGroupSnapshotTreeSummary,
@@ -3179,14 +3181,13 @@ mod historical_control_loader {
         ));
     }
 
-    /// The metadata provenance leg reads `metadata_snapshots.producing_transition_id`
-    /// for the current coordinate (pinned to the generation-state producer),
-    /// re-verifies it as a transition, and DERIVES the metadata binding from that
-    /// transition's verified body — exactly as the append-time path sets
-    /// `state.metadata = transition_metadata(&producer).cloned()`. On the genesis
-    /// seed the producer is the creation transition; the leg's producer byte-equals
-    /// the directly loaded historical control transition and the leg's metadata
-    /// byte-equals that transition's body metadata (`metadata_version == 1`).
+    /// The metadata provenance leg selects the greatest same-generation snapshot
+    /// producer not later than the current producer, re-verifies it as a
+    /// transition, and DERIVES the metadata binding from that transition's
+    /// verified body. On the genesis seed the producer is the creation
+    /// transition; the leg's producer byte-equals the directly loaded historical
+    /// control transition and the leg's metadata byte-equals that transition's
+    /// body metadata (`metadata_version == 1`).
     #[tokio::test]
     #[ignore = "requires the dedicated gate database"]
     async fn metadata_leg_hydrates_the_genesis_creation_metadata() {
@@ -3256,14 +3257,12 @@ mod historical_control_loader {
         ));
     }
 
-    /// A conversation id with no current metadata snapshot yields the legal
-    /// `(None, None)` validator arm — never a fabricated binding or producer. On a
-    /// coherent conversation this arm is structurally unreachable (creation always
-    /// mints metadata and `chat.transitions.metadata_snapshot_id` FK-pins it), so
-    /// the absence is modeled here with a conversation id that has no rows at all.
+    /// Only an absent conversation lookup yields `(None, None)` — never a
+    /// fabricated binding or producer. An existing conversation with no
+    /// same-generation candidate is instead fail-closed by the selector.
     #[tokio::test]
     #[ignore = "requires the dedicated gate database"]
-    async fn metadata_leg_returns_none_when_no_metadata_snapshot_exists() {
+    async fn metadata_leg_returns_none_only_when_the_conversation_is_absent() {
         let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
         let cid = Uuid::new_v4();
         let entry = build_real_creation_entry(*cid.as_bytes());
@@ -3276,7 +3275,7 @@ mod historical_control_loader {
         let mut tx = pool.begin().await.expect("begin");
         let (metadata, metadata_producer) = load_metadata_provenance(&mut tx, &authority, absent)
             .await
-            .expect("absent metadata resolves to the (None, None) arm");
+            .expect("absent conversation resolves to the (None, None) arm");
         tx.rollback().await.expect("rollback");
 
         assert!(metadata.is_none() && metadata_producer.is_none());
@@ -3300,6 +3299,214 @@ mod historical_control_loader {
             MetadataHydrationError::from(ControlEvidenceLoadError::InvalidEvidence),
             MetadataHydrationError::InvalidProvenance
         ));
+    }
+
+    /// This pure boundary characterizes catalog shapes that deferred constraints
+    /// make impossible to commit. Production selection must remain closed over
+    /// transition kind, same-generation sequence, and terminal lifecycle shape.
+    #[test]
+    fn retained_metadata_selector_is_closed_over_kind_sequence_and_lifecycle() {
+        let current_transition_id = Uuid::new_v4();
+        let retained_transition_id = Uuid::new_v4();
+        let accepted_at = DateTime::parse_from_rfc3339("2030-01-01T00:00:02.000Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let active = RetainedMetadataHead {
+            conversation_lifecycle: "active",
+            generation_state_lifecycle: "active",
+            current_generation: 0,
+            current_kind: "acceptConversation",
+            current_transition_id,
+            current_seq: 2,
+            current_accepted_at: accepted_at,
+            close_transition_id: None,
+            close_seq: None,
+            closed_at: None,
+        };
+        let retained = RetainedMetadataCandidate {
+            transition_id: retained_transition_id,
+            generation: 0,
+            seq: 1,
+            accepted_at,
+        };
+        for snapshotless_kind in ["policy", "acceptConversation", "leavePolicy"] {
+            assert_eq!(
+                select_retained_metadata_producer(
+                    RetainedMetadataHead {
+                        current_kind: snapshotless_kind,
+                        ..active
+                    },
+                    vec![retained],
+                )
+                .unwrap(),
+                retained_transition_id,
+                "{snapshotless_kind} retains the earlier producer"
+            );
+        }
+
+        let current_snapshot = RetainedMetadataCandidate {
+            transition_id: current_transition_id,
+            generation: 0,
+            seq: 2,
+            accepted_at,
+        };
+        for snapshot_kind in [
+            "creation",
+            "commit",
+            "metadata",
+            "leafRecovery",
+            "leaveCommit",
+            "resetActivation",
+        ] {
+            assert_eq!(
+                select_retained_metadata_producer(
+                    RetainedMetadataHead {
+                        current_kind: snapshot_kind,
+                        ..active
+                    },
+                    vec![retained, current_snapshot],
+                )
+                .unwrap(),
+                current_transition_id,
+                "{snapshot_kind} selects its own snapshot"
+            );
+        }
+
+        assert!(matches!(
+            select_retained_metadata_producer(active, Vec::new()),
+            Err(MetadataHydrationError::ProvenanceMissing)
+        ));
+        for snapshot_kind in [
+            "creation",
+            "commit",
+            "metadata",
+            "leafRecovery",
+            "leaveCommit",
+            "resetActivation",
+        ] {
+            assert!(matches!(
+                select_retained_metadata_producer(
+                    RetainedMetadataHead {
+                        current_kind: snapshot_kind,
+                        ..active
+                    },
+                    vec![retained],
+                ),
+                Err(MetadataHydrationError::OutOfDomain)
+            ));
+        }
+        for candidate in [
+            RetainedMetadataCandidate {
+                transition_id: current_transition_id,
+                generation: 0,
+                seq: 2,
+                accepted_at,
+            },
+            RetainedMetadataCandidate {
+                transition_id: Uuid::new_v4(),
+                generation: 0,
+                seq: 3,
+                accepted_at,
+            },
+            RetainedMetadataCandidate {
+                transition_id: retained_transition_id,
+                generation: 1,
+                seq: 1,
+                accepted_at,
+            },
+        ] {
+            assert!(matches!(
+                select_retained_metadata_producer(active, vec![candidate]),
+                Err(MetadataHydrationError::OutOfDomain)
+            ));
+        }
+        assert!(matches!(
+            select_retained_metadata_producer(
+                RetainedMetadataHead {
+                    current_kind: "unknownKind",
+                    ..active
+                },
+                vec![retained],
+            ),
+            Err(MetadataHydrationError::OutOfDomain)
+        ));
+
+        let closed = RetainedMetadataHead {
+            conversation_lifecycle: "superseded",
+            generation_state_lifecycle: "superseded",
+            current_kind: "closeConversation",
+            close_transition_id: Some(current_transition_id),
+            close_seq: Some(2),
+            closed_at: Some(accepted_at),
+            ..active
+        };
+        assert_eq!(
+            select_retained_metadata_producer(closed, vec![retained]).unwrap(),
+            retained_transition_id
+        );
+        for malformed in [
+            RetainedMetadataHead {
+                conversation_lifecycle: "active",
+                ..closed
+            },
+            RetainedMetadataHead {
+                generation_state_lifecycle: "active",
+                ..closed
+            },
+            RetainedMetadataHead {
+                current_kind: "policy",
+                ..closed
+            },
+            RetainedMetadataHead {
+                close_transition_id: Some(Uuid::new_v4()),
+                ..closed
+            },
+            RetainedMetadataHead {
+                close_seq: Some(3),
+                ..closed
+            },
+            RetainedMetadataHead {
+                closed_at: Some(
+                    DateTime::parse_from_rfc3339("2030-01-01T00:00:03.000Z")
+                        .unwrap()
+                        .with_timezone(&Utc),
+                ),
+                ..closed
+            },
+        ] {
+            assert!(matches!(
+                select_retained_metadata_producer(malformed, vec![retained]),
+                Err(MetadataHydrationError::OutOfDomain)
+            ));
+        }
+
+        let newer_by_sequence = RetainedMetadataCandidate {
+            transition_id: Uuid::new_v4(),
+            generation: 0,
+            seq: 2,
+            accepted_at: DateTime::parse_from_rfc3339("2029-01-01T00:00:00.000Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let misleading_later_time = RetainedMetadataCandidate {
+            accepted_at: DateTime::parse_from_rfc3339("2031-01-01T00:00:00.000Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            ..retained
+        };
+        assert_eq!(
+            select_retained_metadata_producer(
+                RetainedMetadataHead {
+                    current_kind: "policy",
+                    current_seq: 3,
+                    ..active
+                },
+                vec![misleading_later_time, newer_by_sequence],
+            )
+            .unwrap(),
+            newer_by_sequence.transition_id,
+            "entry sequence, never accepted_at, chooses the retained predecessor"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -4061,31 +4268,9 @@ mod historical_control_loader {
             let producer = load_producer_transition_evidence(&mut tx, &historical, cid)
                 .await
                 .expect("producer");
-            // This is a recovery-validator aggregate proof only. Acceptance
-            // retains the prior metadata, but the separately owned metadata
-            // loader currently only searches the current state version. Splice
-            // the exact reverified creation producer so this test reaches the
-            // recovery validator without fabricating metadata evidence. Full
-            // locked production aggregate hydration remains deferred to the
-            // separately sealed retained-metadata repair.
-            let creation_transition_id = {
-                let wrapper: Value = serde_json::from_slice(&entry.raw_wrapper).unwrap();
-                Uuid::parse_str(wrapper["body"]["transitionId"].as_str().unwrap()).unwrap()
-            };
-            let metadata_producer = super::load_historical_control_evidence(
-                &mut tx,
-                &historical,
-                cid,
-                creation_transition_id,
-            )
-            .await
-            .expect("retained metadata producer")
-            .into_transition()
-            .expect("creation metadata producer is a transition");
-            let metadata = crate::chat_protocol::state_machine::metadata_binding_of_transition(
-                &metadata_producer,
-            )
-            .expect("creation carries retained metadata");
+            let (metadata, metadata_producer) = load_metadata_provenance(&mut tx, &historical, cid)
+                .await
+                .expect("retained metadata provenance");
             let participants = load_participant_hydration_rows(&mut tx, &historical, cid)
                 .await
                 .expect("participants");
@@ -4111,8 +4296,8 @@ mod historical_control_loader {
                 coordinate,
                 producer,
                 public_state: Some(public_state),
-                metadata: Some(metadata),
-                metadata_producer: Some(metadata_producer),
+                metadata,
+                metadata_producer,
                 participants,
                 leaves,
                 intervals,
@@ -7003,16 +7188,21 @@ mod historical_control_loader {
                 HistoricalRehydrationAuthority::new(entry.cid, entry.head_next_entry_seq).unwrap();
 
             let mut tx = pool.begin().await.expect("fresh acceptance load");
-            let reference = super::load_historical_control_evidence(
+            let acceptance_authority = super::load_historical_control_evidence(
                 &mut tx,
                 &authority,
                 cid,
                 acceptance.transition_id,
             )
             .await
-            .expect("acceptance evidence loads")
-            .into_transition()
-            .expect("acceptance is a transition");
+            .expect("acceptance evidence loads");
+            assert!(matches!(
+                super::derive_retained_metadata_provenance(acceptance_authority.clone()),
+                Err(super::MetadataHydrationError::InvalidProvenance)
+            ));
+            let reference = acceptance_authority
+                .into_transition()
+                .expect("acceptance is a transition");
             let target = DeviceIdentity::new(
                 PrincipalId::new(invitee.did.clone().into_bytes()).unwrap(),
                 *invitee.device_id.as_bytes(),
@@ -7226,6 +7416,18 @@ mod historical_control_loader {
             assert_eq!(reservations[0].bound_coordinate, request.bound_coordinate);
 
             let aggregate = load_acceptance_aggregate(&pool, &entry).await;
+            let expected_metadata = super::metadata_binding_of_transition(&creation_reference)
+                .expect("creation transition carries retained metadata");
+            assert_eq!(
+                aggregate.metadata_producer.as_ref(),
+                Some(&creation_reference),
+                "acceptance head retains the byte-equal creation producer"
+            );
+            assert_eq!(
+                aggregate.metadata.as_ref(),
+                Some(&expected_metadata),
+                "acceptance head derives metadata from the retained creation body"
+            );
             let aggregate_authority =
                 crate::chat_protocol::state_machine::HydrationAuthority::new(entry.cid).unwrap();
             crate::chat_protocol::state_machine::hydrate_conversation_state(
