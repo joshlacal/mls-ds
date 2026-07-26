@@ -4708,6 +4708,9 @@ pub(crate) async fn load_work_terminal_hydration_row(
             })?
             .into_transition()
             .map_err(|_| WorkTerminalHydrationError::InvalidEvidence)?;
+            if evidence.transition_id() != transition_id.as_bytes() {
+                return Err(WorkTerminalHydrationError::InvalidEvidence);
+            }
             Ok(WorkTerminalHydrationRow::Transition(evidence))
         }
         WorkTerminalLocator::Request { kind, source } => match source {

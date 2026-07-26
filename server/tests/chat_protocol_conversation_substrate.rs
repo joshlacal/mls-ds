@@ -2168,6 +2168,21 @@ mod historical_control_path {
         let to_b64 = STANDARD.encode(fresh_cid);
         rewrite_conversation_id(&mut signing_body, &from_uuid, &to_uuid, &from_b64, &to_b64);
 
+        // `chat.transitions.transition_id` is globally unique. Rebind the
+        // frozen creation vector's signed transition id (UUID text and its AAD
+        // byte encoding) so every independently committed fixture remains both
+        // unique and direct-cause exact.
+        let frozen_transition_id =
+            Uuid::parse_str(signing_body["transitionId"].as_str().unwrap()).unwrap();
+        let fresh_transition_id = Uuid::new_v4();
+        rewrite_conversation_id(
+            &mut signing_body,
+            &frozen_transition_id.hyphenated().to_string(),
+            &fresh_transition_id.hyphenated().to_string(),
+            &STANDARD.encode(frozen_transition_id.as_bytes()),
+            &STANDARD.encode(fresh_transition_id.as_bytes()),
+        );
+
         let frozen_actor_device_id = signing_body["actorDeviceId"].as_str().unwrap().to_owned();
         let fresh_actor_device_id = Uuid::new_v4().hyphenated().to_string();
         rewrite_exact_text(
@@ -2496,6 +2511,7 @@ mod historical_control_path {
 // ===========================================================================
 mod historical_control_loader {
     use chrono::{DateTime, Utc};
+    use serde_json::Value;
     use sha2::{Digest, Sha256};
     use sqlx::PgPool;
     use uuid::Uuid;
@@ -2528,9 +2544,32 @@ mod historical_control_loader {
     /// carries `entry`'s real creation bytes. The acting device's signing key is
     /// the fixture test key that signed those bytes. Returns the fresh
     /// `transition_id` the entry (and current generation-state) is bound to.
+    fn signed_creation_transition_id(entry: &RealCreationEntry) -> Uuid {
+        let wrapper: Value =
+            serde_json::from_slice(&entry.raw_wrapper).expect("creation wrapper JSON");
+        Uuid::parse_str(
+            wrapper["body"]["transitionId"]
+                .as_str()
+                .expect("creation transitionId"),
+        )
+        .expect("creation transitionId UUID")
+    }
+
     async fn seed_real_creation_graph(pool: &PgPool, entry: &RealCreationEntry) -> Uuid {
+        seed_real_creation_graph_with_transition_id(
+            pool,
+            entry,
+            signed_creation_transition_id(entry),
+        )
+        .await
+    }
+
+    async fn seed_real_creation_graph_with_transition_id(
+        pool: &PgPool,
+        entry: &RealCreationEntry,
+        creation_transition_id: Uuid,
+    ) -> Uuid {
         let conversation_id = Uuid::from_bytes(entry.cid);
-        let creation_transition_id = Uuid::new_v4();
         let participant_period_id = Uuid::new_v4();
         let leaf_period_id = Uuid::new_v4();
         let metadata_snapshot_id = Uuid::new_v4();
@@ -6469,7 +6508,7 @@ mod historical_control_loader {
         use ed25519_dalek::Signer;
         use serde_json::{json, Value};
         use sha2::{Digest, Sha256};
-        use sqlx::PgPool;
+        use sqlx::{PgPool, Postgres, Transaction};
         use uuid::Uuid;
 
         use super::super::historical_control_path::{build_real_creation_entry, RealCreationEntry};
@@ -6525,16 +6564,32 @@ mod historical_control_loader {
         /// `prior` a pending reset/leave request binds (its `bound_coordinate ==
         /// state.coordinate`).
         fn genesis_coordinate_json(cid: [u8; 16]) -> Value {
+            active_coordinate_json(cid, 0)
+        }
+
+        fn active_coordinate_json(cid: [u8; 16], state_version: u64) -> Value {
+            let (epoch, context_byte, confirmation_byte) = match state_version {
+                0 => (0, 2, 3),
+                1 => (1, 4, 5),
+                2 => (2, 6, 7),
+                _ => panic!("test commit coordinate outside fixture domain"),
+            };
             json!({
                 "conversationId": Uuid::from_bytes(cid).hyphenated().to_string(),
                 "generation": 0,
-                "stateVersion": 0,
+                "stateVersion": state_version,
                 "groupId": STANDARD.encode([1_u8; 32]),
-                "epoch": 0,
-                "groupContextHash": STANDARD.encode([2_u8; 32]),
-                "confirmationTag": STANDARD.encode([3_u8; 32]),
+                "epoch": epoch,
+                "groupContextHash": STANDARD.encode([context_byte; 32]),
+                "confirmationTag": STANDARD.encode([confirmation_byte; 32]),
                 "lifecycle": "active",
             })
+        }
+
+        fn active_aad_coordinate_json(cid: [u8; 16], state_version: u64) -> Value {
+            let mut coordinate = active_coordinate_json(cid, state_version);
+            coordinate["conversationId"] = json!(STANDARD.encode(cid));
+            coordinate
         }
 
         /// A genuinely-signed reset/leave request CONTROL entry: the outer control
@@ -6570,21 +6625,29 @@ mod historical_control_loader {
             entry: &RealCreationEntry,
             origin_transition_id: Uuid,
         ) -> RealStalingCommit {
+            build_real_commit(entry, origin_transition_id, 3, STALE_AT, 0, 1)
+        }
+
+        fn build_real_commit(
+            entry: &RealCreationEntry,
+            origin_transition_id: Uuid,
+            entry_seq: u64,
+            received_at: &str,
+            prior_state_version: u64,
+            next_state_version: u64,
+        ) -> RealStalingCommit {
             let signing_key = entry.signing_key();
             let transition_id = Uuid::new_v4();
             let entry_id = Uuid::new_v4();
-            let commit_bytes = [0x91_u8; 8];
-            let metadata_ciphertext = [0x92_u8; 16];
-            let next = json!({
-                "conversationId": Uuid::from_bytes(entry.cid).hyphenated().to_string(),
-                "generation": 0,
-                "stateVersion": 1,
-                "groupId": STANDARD.encode([1_u8; 32]),
-                "epoch": 1,
-                "groupContextHash": STANDARD.encode([4_u8; 32]),
-                "confirmationTag": STANDARD.encode([5_u8; 32]),
-                "lifecycle": "active",
-            });
+            let commit_bytes = [0x90_u8.wrapping_add(next_state_version as u8); 8];
+            let metadata_ciphertext = [0x91_u8.wrapping_add(next_state_version as u8); 16];
+            let prior = active_coordinate_json(entry.cid, prior_state_version);
+            let next = active_coordinate_json(entry.cid, next_state_version);
+            let (_, next_context_byte, next_confirmation_byte) = match next_state_version {
+                1 => (1_u64, 4_u8, 5_u8),
+                2 => (2_u64, 6_u8, 7_u8),
+                _ => panic!("test commit successor outside fixture domain"),
+            };
             let body = json!({
                 "$type": SignedMutationKind::CommitTransition.type_id(),
                 "signatureDomain": String::from_utf8(
@@ -6595,23 +6658,14 @@ mod historical_control_loader {
                 "actorDeviceId": entry.actor_device_id.hyphenated().to_string(),
                 "keyId": entry.actor_key_id,
                 "authGeneration": 1,
-                "prior": genesis_coordinate_json(entry.cid),
+                "prior": prior,
                 "next": next,
                 "aad": {
                     "protocolVersion": "1",
                     "conversationId": STANDARD.encode(entry.cid),
                     "generation": 0,
                     "transitionId": STANDARD.encode(transition_id.as_bytes()),
-                    "prior": {
-                        "conversationId": STANDARD.encode(entry.cid),
-                        "generation": 0,
-                        "stateVersion": 0,
-                        "groupId": STANDARD.encode([1_u8; 32]),
-                        "epoch": 0,
-                        "groupContextHash": STANDARD.encode([2_u8; 32]),
-                        "confirmationTag": STANDARD.encode([3_u8; 32]),
-                        "lifecycle": "active",
-                    },
+                    "prior": active_aad_coordinate_json(entry.cid, prior_state_version),
                 },
                 "manifest": {
                     "participantChanges": [],
@@ -6628,9 +6682,9 @@ mod historical_control_loader {
                         "conversationId": STANDARD.encode(entry.cid),
                         "generation": 0,
                         "groupId": STANDARD.encode([1_u8; 32]),
-                        "epoch": 1,
-                        "groupContextHash": STANDARD.encode([4_u8; 32]),
-                        "confirmationTag": STANDARD.encode([5_u8; 32]),
+                        "epoch": next_state_version,
+                        "groupContextHash": STANDARD.encode([next_context_byte; 32]),
+                        "confirmationTag": STANDARD.encode([next_confirmation_byte; 32]),
                     },
                     "originTransitionId": origin_transition_id.hyphenated().to_string(),
                     "metadataVersion": 1,
@@ -6666,9 +6720,9 @@ mod historical_control_loader {
                 "$type": "blue.catbird.chat.defs#commitEntry",
                 "entryId": entry_id.hyphenated().to_string(),
                 "conversationId": Uuid::from_bytes(entry.cid).hyphenated().to_string(),
-                "seq": 3,
+                "seq": entry_seq,
                 "signedRequest": wrapper,
-                "receivedAt": STALE_AT,
+                "receivedAt": received_at,
             }))
             .unwrap();
             let decoded = decode_and_verify_control_entry(
@@ -6714,21 +6768,56 @@ mod historical_control_loader {
             entry_kind: &str,
             seq: u64,
         ) -> RealControlRequestEntry {
-            build_real_control_request_entry_with_id(
+            build_real_leave_cancellation_entry_at(
+                entry,
+                leave_request_id,
+                entry_kind,
+                seq,
+                RECEIVED_AT,
+            )
+        }
+
+        pub(super) fn build_real_leave_cancellation_entry_at(
+            entry: &RealCreationEntry,
+            leave_request_id: [u8; 16],
+            entry_kind: &str,
+            seq: u64,
+            received_at: &str,
+        ) -> RealControlRequestEntry {
+            build_real_control_request_entry_with_id_at(
                 entry,
                 SignedMutationKind::LeaveCancellation,
                 entry_kind,
                 seq,
                 Uuid::from_bytes(leave_request_id),
+                received_at,
             )
         }
 
-        fn build_real_control_request_entry_with_id(
+        pub(super) fn build_real_control_request_entry_with_id(
             entry: &RealCreationEntry,
             kind: SignedMutationKind,
             entry_kind: &str,
             seq: u64,
             request_uuid: Uuid,
+        ) -> RealControlRequestEntry {
+            build_real_control_request_entry_with_id_at(
+                entry,
+                kind,
+                entry_kind,
+                seq,
+                request_uuid,
+                RECEIVED_AT,
+            )
+        }
+
+        fn build_real_control_request_entry_with_id_at(
+            entry: &RealCreationEntry,
+            kind: SignedMutationKind,
+            entry_kind: &str,
+            seq: u64,
+            request_uuid: Uuid,
+            received_at: &str,
         ) -> RealControlRequestEntry {
             let signing_key = entry.signing_key();
             let verifying = signing_key.verifying_key().to_bytes();
@@ -6805,7 +6894,7 @@ mod historical_control_loader {
                 "conversationId": Uuid::from_bytes(entry.cid).hyphenated().to_string(),
                 "seq": seq,
                 "signedRequest": signed_request,
-                "receivedAt": RECEIVED_AT,
+                "receivedAt": received_at,
             });
             let public_row_json = serde_json::to_vec(&row).unwrap();
 
@@ -6945,26 +7034,34 @@ mod historical_control_loader {
             request
         }
 
-        async fn commit_staling_transition(
-            pool: &PgPool,
+        fn fixture_coordinate_columns(state_version: u64) -> (i64, Vec<u8>, Vec<u8>) {
+            match state_version {
+                0 => (0, vec![2_u8; 32], vec![3_u8; 32]),
+                1 => (1, vec![4_u8; 32], vec![5_u8; 32]),
+                2 => (2, vec![6_u8; 32], vec![7_u8; 32]),
+                _ => panic!("test commit coordinate outside fixture domain"),
+            }
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        async fn insert_real_commit(
+            transaction: &mut Transaction<'_, Postgres>,
             entry: &RealCreationEntry,
-            request: &RealControlRequestEntry,
-            kind: SignedMutationKind,
-        ) -> RealStalingCommit {
+            transition: &RealStalingCommit,
+            origin_transition_id: Uuid,
+            entry_seq: i64,
+            at: DateTime<Utc>,
+            prior_state_version: i64,
+            next_state_version: i64,
+        ) {
             let cid = Uuid::from_bytes(entry.cid);
-            let origin_transition_id: Uuid = sqlx::query_scalar(
-                r#"SELECT producing_transition_id FROM chat.generation_states
-                   WHERE conversation_id=$1 AND generation=0 AND state_version=0"#,
-            )
-            .bind(cid)
-            .fetch_one(pool)
-            .await
-            .expect("creation transition id");
-            let transition = build_real_staling_commit(entry, origin_transition_id);
-            let at = instant(STALE_AT);
             let metadata_snapshot_id = Uuid::new_v4();
-            let public_snapshot = vec![0x94_u8; 64];
-            let metadata_ciphertext = vec![0x92_u8; 16];
+            let public_snapshot =
+                vec![0x93_u8.wrapping_add(u8::try_from(next_state_version).unwrap()); 64];
+            let metadata_ciphertext =
+                vec![0x91_u8.wrapping_add(u8::try_from(next_state_version).unwrap()); 16];
+            let (next_epoch, next_context_hash, next_confirmation_tag) =
+                fixture_coordinate_columns(u64::try_from(next_state_version).unwrap());
             let basic_credential =
                 format!("{}#{}", entry.actor_did, entry.actor_device_id).into_bytes();
             let tree = PublicGroupSnapshotTreeSummary::new(
@@ -6980,22 +7077,28 @@ mod historical_control_loader {
                 .expect("staling tree summary canonical")
                 .into_parts();
 
-            let mut tx = pool.begin().await.expect("begin staling transition");
             sqlx::query(
-                r#"UPDATE chat.conversations SET current_state_version=1,next_entry_seq=4
+                r#"UPDATE chat.conversations
+                   SET current_state_version=$2,next_entry_seq=$3
                    WHERE conversation_id=$1 AND current_generation=0
-                     AND current_state_version=0 AND next_entry_seq=3"#,
+                     AND current_state_version=$4 AND next_entry_seq=$5"#,
             )
             .bind(cid)
-            .execute(&mut *tx)
+            .bind(next_state_version)
+            .bind(entry_seq + 1)
+            .bind(prior_state_version)
+            .bind(entry_seq)
+            .execute(&mut **transaction)
             .await
             .expect("advance conversation through staling Commit");
             sqlx::query(
-                r#"UPDATE chat.generations SET current_state_version=1
-                   WHERE conversation_id=$1 AND generation=0 AND current_state_version=0"#,
+                r#"UPDATE chat.generations SET current_state_version=$2
+                   WHERE conversation_id=$1 AND generation=0 AND current_state_version=$3"#,
             )
             .bind(cid)
-            .execute(&mut *tx)
+            .bind(next_state_version)
+            .bind(prior_state_version)
+            .execute(&mut **transaction)
             .await
             .expect("advance generation through staling Commit");
             sqlx::query(
@@ -7006,7 +7109,7 @@ mod historical_control_loader {
                     prior_generation,prior_state_version,next_generation,next_state_version,
                     metadata_snapshot_id,entry_seq,accepted_at
                 ) VALUES($1,$2,'commit',$3,$4,$5,1,'admin','active',$6,$7,$8,$9,$10,
-                    0,0,0,1,$11,3,$12)"#,
+                    0,$11,0,$12,$13,$14,$15)"#,
             )
             .bind(transition.transition_id)
             .bind(cid)
@@ -7018,9 +7121,12 @@ mod historical_control_loader {
             .bind(&transition.signing_transcript)
             .bind(&transition.request_digest)
             .bind(&transition.signature)
+            .bind(prior_state_version)
+            .bind(next_state_version)
             .bind(metadata_snapshot_id)
+            .bind(entry_seq)
             .bind(at)
-            .execute(&mut *tx)
+            .execute(&mut **transaction)
             .await
             .expect("insert staling transition");
             sqlx::query(
@@ -7029,19 +7135,21 @@ mod historical_control_loader {
                     confirmation_tag,lifecycle,state_kind,producing_transition_id,
                     public_snapshot_bytes,snapshot_sha256,tree_summary_bytes,tree_summary_sha256,
                     leaf_count,created_at
-                ) VALUES($1,0,1,$2,1,$3,$4,'active','commit',$5,$6,$7,$8,$9,1,$10)"#,
+                ) VALUES($1,0,$2,$3,$4,$5,$6,'active','commit',$7,$8,$9,$10,$11,1,$12)"#,
             )
             .bind(cid)
+            .bind(next_state_version)
             .bind(vec![1_u8; 32])
-            .bind(vec![4_u8; 32])
-            .bind(vec![5_u8; 32])
+            .bind(next_epoch)
+            .bind(&next_context_hash)
+            .bind(&next_confirmation_tag)
             .bind(transition.transition_id)
             .bind(&public_snapshot)
             .bind(Sha256::digest(&public_snapshot).to_vec())
             .bind(&tree_summary)
             .bind(tree_summary_sha256.to_vec())
             .bind(at)
-            .execute(&mut *tx)
+            .execute(&mut **transaction)
             .await
             .expect("insert staling generation state");
             sqlx::query(
@@ -7052,17 +7160,25 @@ mod historical_control_loader {
                     ciphertext_size,author_did,author_device_id,author_key_id,author_public_key,
                     author_auth_generation,author_origin_seq,author_role,author_device_status,
                     created_at
-                ) VALUES($1,$2,0,1,$3,1,$4,$5,$6,$7,1,$8,$9,$10,16,$11,$12,$13,$14,
-                    1,1,'admin','active',$15)"#,
+                ) VALUES($1,$2,0,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,16,$14,$15,$16,$17,
+                    1,1,'admin','active',$18)"#,
             )
             .bind(metadata_snapshot_id)
             .bind(cid)
+            .bind(next_state_version)
             .bind(vec![1_u8; 32])
-            .bind(vec![4_u8; 32])
-            .bind(vec![5_u8; 32])
+            .bind(next_epoch)
+            .bind(&next_context_hash)
+            .bind(&next_confirmation_tag)
             .bind(transition.transition_id)
             .bind(origin_transition_id)
-            .bind(vec![0x93_u8; 12])
+            .bind(1_i64)
+            .bind(vec![
+                0x92_u8.wrapping_add(
+                    u8::try_from(next_state_version).unwrap()
+                );
+                12
+            ])
             .bind(&metadata_ciphertext)
             .bind(Sha256::digest(&metadata_ciphertext).to_vec())
             .bind(&entry.actor_did)
@@ -7070,7 +7186,7 @@ mod historical_control_loader {
             .bind(&entry.actor_key_id)
             .bind(&entry.public_key)
             .bind(at)
-            .execute(&mut *tx)
+            .execute(&mut **transaction)
             .await
             .expect("insert staling metadata");
             sqlx::query(
@@ -7080,10 +7196,11 @@ mod historical_control_loader {
                     server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,
                     actor_key_id,actor_auth_generation,generation,state_version,transition_id,
                     received_at
-                ) VALUES($1,3,$2,'blue.catbird.chat.defs#commitEntry',$3,$4,$5,$6,$7,$8,$9,
-                    $10,$11,$12,1,0,1,$13,$14)"#,
+                ) VALUES($1,$2,$3,'blue.catbird.chat.defs#commitEntry',$4,$5,$6,$7,$8,$9,$10,
+                    $11,$12,$13,1,0,$14,$15,$16)"#,
             )
             .bind(cid)
+            .bind(entry_seq)
             .bind(transition.entry_id)
             .bind(&transition.public_row_json)
             .bind(Sha256::digest(&transition.public_row_json).to_vec())
@@ -7095,22 +7212,65 @@ mod historical_control_loader {
             .bind(&entry.actor_did)
             .bind(entry.actor_device_id)
             .bind(&entry.actor_key_id)
+            .bind(next_state_version)
             .bind(transition.transition_id)
             .bind(at)
-            .execute(&mut *tx)
+            .execute(&mut **transaction)
             .await
             .expect("insert staling entry");
             sqlx::query(
                 r#"INSERT INTO chat.entry_recipients(
                     conversation_id,seq,user_did,device_id,entitlement_kind
-                ) VALUES($1,3,$2,$3,'control')"#,
+                ) VALUES($1,$2,$3,$4,'control')"#,
             )
             .bind(cid)
+            .bind(entry_seq)
             .bind(&entry.actor_did)
             .bind(entry.actor_device_id)
-            .execute(&mut *tx)
+            .execute(&mut **transaction)
             .await
             .expect("route staling entry");
+        }
+
+        async fn commit_staling_transition(
+            pool: &PgPool,
+            entry: &RealCreationEntry,
+            request: &RealControlRequestEntry,
+            kind: SignedMutationKind,
+        ) -> RealStalingCommit {
+            commit_staling_transition_at(pool, entry, request, kind, STALE_AT).await
+        }
+
+        async fn commit_staling_transition_at(
+            pool: &PgPool,
+            entry: &RealCreationEntry,
+            request: &RealControlRequestEntry,
+            kind: SignedMutationKind,
+            terminal_at: &str,
+        ) -> RealStalingCommit {
+            let cid = Uuid::from_bytes(entry.cid);
+            let origin_transition_id: Uuid = sqlx::query_scalar(
+                r#"SELECT producing_transition_id FROM chat.generation_states
+                   WHERE conversation_id=$1 AND generation=0 AND state_version=0"#,
+            )
+            .bind(cid)
+            .fetch_one(pool)
+            .await
+            .expect("creation transition id");
+            let transition = build_real_commit(entry, origin_transition_id, 3, terminal_at, 0, 1);
+            let at = instant(terminal_at);
+            let mut tx = pool.begin().await.expect("begin staling transition");
+            insert_real_commit(
+                &mut tx,
+                entry,
+                &transition,
+                origin_transition_id,
+                3,
+                at,
+                0,
+                1,
+            )
+            .await;
 
             if kind == SignedMutationKind::ResetRequest {
                 terminalize_reset_request(
@@ -7140,6 +7300,178 @@ mod historical_control_loader {
                 .await
                 .expect("staling graph crosses every deferred constraint");
             transition
+        }
+
+        async fn commit_followup_transition(
+            pool: &PgPool,
+            entry: &RealCreationEntry,
+        ) -> RealStalingCommit {
+            let cid = Uuid::from_bytes(entry.cid);
+            let origin_transition_id: Uuid = sqlx::query_scalar(
+                r#"SELECT origin_transition_id FROM chat.metadata_snapshots
+                   WHERE conversation_id=$1 AND generation=0 AND state_version=1"#,
+            )
+            .bind(cid)
+            .fetch_one(pool)
+            .await
+            .expect("metadata origin transition id");
+            const FOLLOWUP_AT: &str = "2030-02-01T00:02:00.000Z";
+            let transition = build_real_commit(entry, origin_transition_id, 4, FOLLOWUP_AT, 1, 2);
+            let mut tx = pool.begin().await.expect("begin followup transition");
+            insert_real_commit(
+                &mut tx,
+                entry,
+                &transition,
+                origin_transition_id,
+                4,
+                instant(FOLLOWUP_AT),
+                1,
+                2,
+            )
+            .await;
+            tx.commit()
+                .await
+                .expect("followup graph crosses every deferred constraint");
+            transition
+        }
+
+        /// Commit a DDL-valid stale row whose terminal transition is seq 2 and
+        /// whose genuine signed request origin is seq 3. The mapper deliberately
+        /// does not compare terminal sequence to origin sequence, leaving the
+        /// aggregate validator to reject this otherwise exact graph.
+        async fn commit_transition_before_stale_request(
+            pool: &PgPool,
+            entry: &RealCreationEntry,
+            kind: SignedMutationKind,
+            entry_kind: &str,
+        ) -> RealControlRequestEntry {
+            let origin_transition_id = seed_real_creation_graph(pool, entry).await;
+            let transition = build_real_commit(entry, origin_transition_id, 2, STALE_AT, 0, 1);
+            let request = build_real_control_request_entry(entry, kind, entry_kind, 3);
+            let cid = Uuid::from_bytes(entry.cid);
+            let received_at = instant(RECEIVED_AT);
+            let expires_at = received_at + Duration::hours(24);
+            let terminal_at = instant(STALE_AT);
+            let payload_sha = Sha256::digest(&request.public_row_json).to_vec();
+
+            let mut tx = pool
+                .begin()
+                .await
+                .expect("begin transition-before-request graph");
+            insert_real_commit(
+                &mut tx,
+                entry,
+                &transition,
+                origin_transition_id,
+                2,
+                terminal_at,
+                0,
+                1,
+            )
+            .await;
+            sqlx::query(
+                r#"INSERT INTO chat.entries(
+                    conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,
+                    accepted_payload_sha256,signed_request_bytes,request_digest,signature,
+                    server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,
+                    actor_key_id,actor_auth_generation,generation,state_version,transition_id,
+                    received_at
+                ) VALUES($1,3,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,1,NULL,NULL,NULL,$14)"#,
+            )
+            .bind(cid)
+            .bind(request.entry_id)
+            .bind(entry_kind)
+            .bind(&request.public_row_json)
+            .bind(&payload_sha)
+            .bind(&request.raw_wrapper)
+            .bind(&request.request_digest)
+            .bind(&request.signature)
+            .bind(vec![0_u8])
+            .bind(&request.outer_entry_fingerprint)
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .bind(&entry.actor_key_id)
+            .bind(received_at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert later request entry");
+
+            if kind == SignedMutationKind::ResetRequest {
+                sqlx::query(
+                    r#"INSERT INTO chat.reset_requests(
+                        reset_request_id,conversation_id,requester_did,requester_device_id,
+                        requester_key_id,requester_auth_generation,prior_generation,
+                        prior_state_version,prior_group_id,prior_epoch,prior_group_context_hash,
+                        prior_confirmation_tag,reason,status,signed_request_bytes,
+                        signing_transcript_bytes,request_digest,signature,terminal_transition_id,
+                        received_at,expires_at,terminal_at
+                    ) VALUES($1,$2,$3,$4,$5,1,0,0,$6,0,$7,$8,'manualRecovery','stale',
+                        $9,$10,$11,$12,$13,$14,$15,$16)"#,
+                )
+                .bind(Uuid::from_bytes(request.request_id))
+                .bind(cid)
+                .bind(&entry.actor_did)
+                .bind(entry.actor_device_id)
+                .bind(&entry.actor_key_id)
+                .bind(vec![1_u8; 32])
+                .bind(vec![2_u8; 32])
+                .bind(vec![3_u8; 32])
+                .bind(&request.raw_wrapper)
+                .bind(&request.signing_transcript)
+                .bind(&request.request_digest)
+                .bind(&request.signature)
+                .bind(transition.transition_id)
+                .bind(received_at)
+                .bind(expires_at)
+                .bind(terminal_at)
+                .execute(&mut *tx)
+                .await
+                .expect("insert later stale reset row");
+            } else {
+                sqlx::query(
+                    r#"INSERT INTO chat.leave_requests(
+                        leave_request_id,conversation_id,requester_did,requester_device_id,
+                        requester_key_id,requester_auth_generation,prior_generation,
+                        prior_state_version,prior_group_id,prior_epoch,prior_group_context_hash,
+                        prior_confirmation_tag,status,signed_request_bytes,
+                        signing_transcript_bytes,request_digest,signature,terminal_request_digest,
+                        terminal_transition_id,received_at,expires_at,terminal_at
+                    ) VALUES($1,$2,$3,$4,$5,1,0,0,$6,0,$7,$8,'stale',$9,$10,$11,$12,
+                        $13,$14,$15,$16,$17)"#,
+                )
+                .bind(Uuid::from_bytes(request.request_id))
+                .bind(cid)
+                .bind(&entry.actor_did)
+                .bind(entry.actor_device_id)
+                .bind(&entry.actor_key_id)
+                .bind(vec![1_u8; 32])
+                .bind(vec![2_u8; 32])
+                .bind(vec![3_u8; 32])
+                .bind(&request.raw_wrapper)
+                .bind(&request.signing_transcript)
+                .bind(&request.request_digest)
+                .bind(&request.signature)
+                .bind(&transition.request_digest)
+                .bind(transition.transition_id)
+                .bind(received_at)
+                .bind(expires_at)
+                .bind(terminal_at)
+                .execute(&mut *tx)
+                .await
+                .expect("insert later stale leave row");
+            }
+            sqlx::query(
+                r#"UPDATE chat.conversations SET next_entry_seq=4
+                   WHERE conversation_id=$1 AND current_state_version=1 AND next_entry_seq=3"#,
+            )
+            .bind(cid)
+            .execute(&mut *tx)
+            .await
+            .expect("advance head past later request");
+            tx.commit()
+                .await
+                .expect("commit transition-before-request graph");
+            request
         }
 
         pub(super) async fn load_aggregate_hydration(
@@ -7656,18 +7988,27 @@ mod historical_control_loader {
                 (SignedMutationKind::ResetRequest, RESET_ENTRY_KIND),
                 (SignedMutationKind::LeaveRequest, LEAVE_ENTRY_KIND),
             ] {
+                // Wrong prior: the subject request is production-valid and
+                // terminalized by the first Commit consuming state0. A second
+                // genuine committed Commit consumes state1. Replacing only the
+                // terminal with that independently loaded current producer keeps
+                // request id/requester/origin/TTL and seq/time valid, isolating
+                // the consumed-coordinate predicate.
                 let cid = Uuid::new_v4();
                 let entry = build_real_creation_entry(*cid.as_bytes());
                 let request = seed_control_request(&pool, &entry, kind, entry_kind).await;
                 commit_staling_transition(&pool, &entry, &request, kind).await;
+                commit_followup_transition(&pool, &entry).await;
                 let rows = load_aggregate_hydration(&pool, &entry).await;
                 let authority = HydrationAuthority::new(entry.cid).expect("aggregate authority");
-
+                assert_aggregate_hydrates(&entry, rows.clone());
                 let mut wrong_prior = rows.clone();
                 if kind == SignedMutationKind::ResetRequest {
-                    wrong_prior.reset_requests[0].bound_coordinate = wrong_prior.coordinate;
+                    wrong_prior.reset_requests[0].terminal =
+                        Some(WorkTerminalHydrationRow::Transition(rows.producer.clone()));
                 } else {
-                    wrong_prior.leave_requests[0].bound_coordinate = wrong_prior.coordinate;
+                    wrong_prior.leave_requests[0].terminal =
+                        Some(WorkTerminalHydrationRow::Transition(rows.producer.clone()));
                 }
                 assert!(matches!(
                     crate::chat_protocol::state_machine::hydrate_conversation_state(
@@ -7677,33 +8018,78 @@ mod historical_control_loader {
                     Err(crate::chat_protocol::state_machine::StateMachineError::InvariantViolation)
                 ));
 
-                let too_early =
-                    WorkTerminalHydrationRow::Transition(rows.intervals[0].opening.clone());
-                let mut wrong_sequence = rows.clone();
+                // Wrong sequence: this entire graph commits across the deferred
+                // mapper. The transition at seq2 genuinely consumes state0; the
+                // later signed request at seq3 is unchanged and bound to state0.
+                // Fresh loaders therefore succeed, while aggregate validation
+                // rejects only terminal.seq > origin.seq.
+                let sequence_cid = Uuid::new_v4();
+                let sequence_entry = build_real_creation_entry(*sequence_cid.as_bytes());
+                commit_transition_before_stale_request(&pool, &sequence_entry, kind, entry_kind)
+                    .await;
+                let wrong_sequence = load_aggregate_hydration(&pool, &sequence_entry).await;
+                let sequence_authority =
+                    HydrationAuthority::new(sequence_entry.cid).expect("sequence authority");
                 if kind == SignedMutationKind::ResetRequest {
-                    wrong_sequence.reset_requests[0].terminal = Some(too_early);
+                    let request = &wrong_sequence.reset_requests[0];
+                    let Some(WorkTerminalHydrationRow::Transition(terminal)) = &request.terminal
+                    else {
+                        panic!("stale reset terminal");
+                    };
+                    assert!(terminal.seq() <= request.origin.control_seq().unwrap());
                 } else {
-                    wrong_sequence.leave_requests[0].terminal = Some(too_early);
+                    let request = &wrong_sequence.leave_requests[0];
+                    let Some(WorkTerminalHydrationRow::Transition(terminal)) = &request.terminal
+                    else {
+                        panic!("stale leave terminal");
+                    };
+                    assert!(terminal.seq() <= request.origin.control_seq().unwrap());
                 }
                 assert!(matches!(
                     crate::chat_protocol::state_machine::hydrate_conversation_state(
-                        &authority,
+                        &sequence_authority,
                         wrong_sequence,
                     ),
                     Err(crate::chat_protocol::state_machine::StateMachineError::InvariantViolation)
                 ));
 
-                let mut wrong_ttl = rows;
+                // Wrong TTL: DDL pins the terminal row, transition accepted_at,
+                // and control envelope receivedAt to the exact same instant but
+                // does not impose the consent window. Commit at expires_at; the
+                // request retains its exact 24-hour expiry and every other
+                // terminal predicate remains valid.
+                let ttl_cid = Uuid::new_v4();
+                let ttl_entry = build_real_creation_entry(*ttl_cid.as_bytes());
+                let ttl_request = seed_control_request(&pool, &ttl_entry, kind, entry_kind).await;
+                commit_staling_transition_at(
+                    &pool,
+                    &ttl_entry,
+                    &ttl_request,
+                    kind,
+                    "2030-02-02T00:00:00.000Z",
+                )
+                .await;
+                let wrong_ttl = load_aggregate_hydration(&pool, &ttl_entry).await;
+                let ttl_authority = HydrationAuthority::new(ttl_entry.cid).expect("TTL authority");
                 if kind == SignedMutationKind::ResetRequest {
-                    wrong_ttl.reset_requests[0].expires_at =
-                        ServerTimestamp::from_canonical_stored(STALE_AT).unwrap();
+                    let request = &wrong_ttl.reset_requests[0];
+                    let Some(WorkTerminalHydrationRow::Transition(terminal)) = &request.terminal
+                    else {
+                        panic!("stale reset terminal");
+                    };
+                    assert_eq!(terminal.received_at(), request.expires_at);
                 } else {
-                    wrong_ttl.leave_requests[0].expires_at =
-                        ServerTimestamp::from_canonical_stored(STALE_AT).unwrap();
+                    let request = &wrong_ttl.leave_requests[0];
+                    let Some(WorkTerminalHydrationRow::Transition(terminal)) = &request.terminal
+                    else {
+                        panic!("stale leave terminal");
+                    };
+                    assert_eq!(terminal.received_at(), request.expires_at);
                 }
                 assert!(matches!(
                     crate::chat_protocol::state_machine::hydrate_conversation_state(
-                        &authority, wrong_ttl,
+                        &ttl_authority,
+                        wrong_ttl,
                     ),
                     Err(crate::chat_protocol::state_machine::StateMachineError::InvariantViolation)
                 ));
@@ -7790,8 +8176,9 @@ mod historical_control_loader {
             trusted_received_at, RECEIVED_AT as SIGNED_REQUEST_RECEIVED_AT,
         };
         use super::reset_leave_leg::{
-            build_real_leave_cancellation_entry, seed_control_request, LEAVE_ENTRY_KIND,
-            RESET_ENTRY_KIND,
+            build_real_control_request_entry_with_id, build_real_leave_cancellation_entry,
+            build_real_leave_cancellation_entry_at, load_aggregate_hydration, seed_control_request,
+            RealControlRequestEntry, LEAVE_ENTRY_KIND, RESET_ENTRY_KIND,
         };
         use super::seed_real_creation_graph;
         use crate::chat_protocol::repository::core::{
@@ -7808,9 +8195,8 @@ mod historical_control_loader {
             },
         };
         use crate::chat_protocol::state_machine::{
-            DeviceIdentity, DurableSignedRequestEnvelope, HistoricalRehydrationAuthority,
-            HydrationAuthority, LeaveRequestStatus, RequestEntryKind, ServerTimestamp,
-            WorkTerminalHydrationRow,
+            DurableSignedRequestEnvelope, HistoricalRehydrationAuthority, HydrationAuthority,
+            LeaveRequestStatus, RequestEntryKind, ServerTimestamp, WorkTerminalHydrationRow,
         };
         use crate::chat_protocol::transcript::{
             decode_and_verify_control_entry, decode_and_verify_signed_mutation,
@@ -7837,6 +8223,203 @@ mod historical_control_loader {
             DateTime::parse_from_rfc3339(text)
                 .expect("canonical instant")
                 .with_timezone(&Utc)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        async fn append_control_entry_fixture(
+            transaction: &mut Transaction<'_, Postgres>,
+            signer: &RealCreationEntry,
+            control: &RealControlRequestEntry,
+            entry_kind: &str,
+            seq: u64,
+            stored_signed_request_bytes: &[u8],
+            stored_request_digest: &[u8],
+            received_at: DateTime<Utc>,
+        ) {
+            let decoded =
+                decode_and_verify_control_entry(&control.public_row_json, &signer.public_key)
+                    .expect("fixture control envelope verifies");
+            append_entry_at(
+                transaction,
+                &AppendEntry {
+                    conversation_id: Uuid::from_bytes(signer.cid),
+                    entry_id: control.entry_id,
+                    entry_kind: entry_kind.to_owned(),
+                    accepted_payload_bytes: control.public_row_json.clone(),
+                    accepted_payload_sha256: Sha256::digest(&control.public_row_json).to_vec(),
+                    signed_request_bytes: stored_signed_request_bytes.to_vec(),
+                    request_digest: stored_request_digest.to_vec(),
+                    signature: control.signature.clone(),
+                    server_fields_bytes: decoded.server_fields_dag_cbor().unwrap(),
+                    outer_entry_fingerprint: control.outer_entry_fingerprint.clone(),
+                    actor_did: signer.actor_did.clone(),
+                    actor_device_id: signer.actor_device_id,
+                    actor_key_id: signer.actor_key_id.clone(),
+                    actor_auth_generation: 1,
+                    generation: None,
+                    state_version: None,
+                    transition_id: None,
+                    message_id: None,
+                    received_at,
+                },
+                seq,
+            )
+            .await
+            .expect("append control fixture");
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        async fn commit_cancelled_leave_entry(
+            pool: &PgPool,
+            signer: &RealCreationEntry,
+            leave: &RealControlRequestEntry,
+            cancellation: &RealControlRequestEntry,
+            stored_signed_request_bytes: &[u8],
+            stored_request_digest: &[u8],
+            entry_received_at: DateTime<Utc>,
+            terminal_at: DateTime<Utc>,
+        ) {
+            let cid = Uuid::from_bytes(signer.cid);
+            let mut tx = pool.begin().await.expect("begin cancelled leave fixture");
+            cas_conversation_head(
+                &mut tx,
+                &ConversationHeadCas {
+                    conversation_id: cid,
+                    expected_generation: 0,
+                    expected_state_version: 0,
+                    expected_next_entry_seq: 3,
+                    successor_generation: 0,
+                    successor_state_version: 0,
+                    successor_next_entry_seq: 4,
+                    close: None,
+                },
+            )
+            .await
+            .expect("advance cancellation fixture head");
+            append_control_entry_fixture(
+                &mut tx,
+                signer,
+                cancellation,
+                "blue.catbird.chat.defs#leaveCancellationEntry",
+                3,
+                stored_signed_request_bytes,
+                stored_request_digest,
+                entry_received_at,
+            )
+            .await;
+            terminalize_leave_request(
+                &mut tx,
+                Uuid::from_bytes(leave.request_id),
+                &LeaveRequestTermination::Cancelled {
+                    terminal_request_digest: stored_request_digest.to_vec(),
+                    terminal_at,
+                },
+            )
+            .await
+            .expect("terminalize cancellation fixture");
+            tx.commit()
+                .await
+                .expect("commit complete cancelled leave fixture");
+        }
+
+        async fn commit_cancellation_before_leave_origin(
+            pool: &PgPool,
+            entry: &RealCreationEntry,
+        ) -> RealControlRequestEntry {
+            const CANCELLATION_ENTRY_KIND: &str = "blue.catbird.chat.defs#leaveCancellationEntry";
+            seed_real_creation_graph(pool, entry).await;
+            let request_id = Uuid::new_v4();
+            let cancellation = build_real_leave_cancellation_entry(
+                entry,
+                *request_id.as_bytes(),
+                CANCELLATION_ENTRY_KIND,
+                2,
+            );
+            let leave = build_real_control_request_entry_with_id(
+                entry,
+                SignedMutationKind::LeaveRequest,
+                LEAVE_ENTRY_KIND,
+                3,
+                request_id,
+            );
+            let cid = Uuid::from_bytes(entry.cid);
+            let received_at = instant("2030-02-01T00:00:00.000Z");
+            let expires_at = instant("2030-02-02T00:00:00.000Z");
+
+            let mut tx = pool
+                .begin()
+                .await
+                .expect("begin cancellation-before-origin graph");
+            cas_conversation_head(
+                &mut tx,
+                &ConversationHeadCas {
+                    conversation_id: cid,
+                    expected_generation: 0,
+                    expected_state_version: 0,
+                    expected_next_entry_seq: 2,
+                    successor_generation: 0,
+                    successor_state_version: 0,
+                    successor_next_entry_seq: 4,
+                    close: None,
+                },
+            )
+            .await
+            .expect("advance head over cancellation and origin");
+            append_control_entry_fixture(
+                &mut tx,
+                entry,
+                &cancellation,
+                CANCELLATION_ENTRY_KIND,
+                2,
+                &cancellation.raw_wrapper,
+                &cancellation.request_digest,
+                received_at,
+            )
+            .await;
+            append_control_entry_fixture(
+                &mut tx,
+                entry,
+                &leave,
+                LEAVE_ENTRY_KIND,
+                3,
+                &leave.raw_wrapper,
+                &leave.request_digest,
+                received_at,
+            )
+            .await;
+            sqlx::query(
+                r#"INSERT INTO chat.leave_requests(
+                    leave_request_id,conversation_id,requester_did,requester_device_id,
+                    requester_key_id,requester_auth_generation,prior_generation,
+                    prior_state_version,prior_group_id,prior_epoch,prior_group_context_hash,
+                    prior_confirmation_tag,status,signed_request_bytes,signing_transcript_bytes,
+                    request_digest,signature,terminal_request_digest,received_at,expires_at,
+                    terminal_at
+                ) VALUES($1,$2,$3,$4,$5,1,0,0,$6,0,$7,$8,'cancelled',$9,$10,$11,$12,
+                    $13,$14,$15,$14)"#,
+            )
+            .bind(request_id)
+            .bind(cid)
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .bind(&entry.actor_key_id)
+            .bind(vec![1_u8; 32])
+            .bind(vec![2_u8; 32])
+            .bind(vec![3_u8; 32])
+            .bind(&leave.raw_wrapper)
+            .bind(&leave.signing_transcript)
+            .bind(&leave.request_digest)
+            .bind(&leave.signature)
+            .bind(&cancellation.request_digest)
+            .bind(received_at)
+            .bind(expires_at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert cancelled leave with earlier terminal");
+            tx.commit()
+                .await
+                .expect("commit cancellation-before-origin graph");
+            leave
         }
 
         fn build_real_device_revocation(
@@ -8202,6 +8785,49 @@ mod historical_control_loader {
             assert_eq!(loaded, WorkTerminalHydrationRow::Transition(expected));
         }
 
+        /// A locator names the durable direct cause, not merely an entry lookup
+        /// key. The frozen DDL permits a complete committed graph whose transition
+        /// and entry columns use X while the genuinely signed control body attests
+        /// Y; the shared atom must reject that mismatch after re-verification.
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn transition_terminal_rejects_committed_durable_id_signed_as_another_transition() {
+            let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(2).await;
+            let cid = Uuid::new_v4();
+            let entry = build_real_creation_entry(*cid.as_bytes());
+            let signed_transition_id = super::signed_creation_transition_id(&entry);
+            let durable_transition_id = Uuid::new_v4();
+            assert_ne!(durable_transition_id, signed_transition_id);
+            super::seed_real_creation_graph_with_transition_id(
+                &pool,
+                &entry,
+                durable_transition_id,
+            )
+            .await;
+            let authority =
+                HistoricalRehydrationAuthority::new(entry.cid, entry.head_next_entry_seq).unwrap();
+
+            let mut tx = pool
+                .begin()
+                .await
+                .expect("begin fresh mismatched transition read");
+            let loaded = load_work_terminal_hydration_row(
+                &mut tx,
+                &authority,
+                cid,
+                WorkTerminalLocator::Transition {
+                    transition_id: durable_transition_id,
+                },
+            )
+            .await;
+            tx.rollback().await.expect("rollback read transaction");
+
+            assert!(matches!(
+                loaded,
+                Err(WorkTerminalHydrationError::InvalidEvidence)
+            ));
+        }
+
         #[tokio::test]
         #[ignore = "requires the dedicated gate database"]
         async fn expiry_terminal_preserves_only_the_typed_timestamp_arm() {
@@ -8331,63 +8957,17 @@ mod historical_control_loader {
                 .into_request()
                 .expect("leave cancellation is a control request");
 
-            let mut tx = pool.begin().await.expect("begin");
-            let payload_sha = Sha256::digest(&cancellation.public_row_json).to_vec();
-            cas_conversation_head(
-                &mut tx,
-                &ConversationHeadCas {
-                    conversation_id: cid,
-                    expected_generation: 0,
-                    expected_state_version: 0,
-                    expected_next_entry_seq: 3,
-                    successor_generation: 0,
-                    successor_state_version: 0,
-                    successor_next_entry_seq: 4,
-                    close: None,
-                },
+            commit_cancelled_leave_entry(
+                &pool,
+                &entry,
+                &leave,
+                &cancellation,
+                &cancellation.raw_wrapper,
+                &cancellation.request_digest,
+                instant("2030-02-01T00:00:00.000Z"),
+                instant("2030-02-01T00:00:00.000Z"),
             )
-            .await
-            .expect("production head CAS");
-            append_entry_at(
-                &mut tx,
-                &AppendEntry {
-                    conversation_id: cid,
-                    entry_id: cancellation.entry_id,
-                    entry_kind: CANCELLATION_ENTRY_KIND.to_owned(),
-                    accepted_payload_bytes: cancellation.public_row_json.clone(),
-                    accepted_payload_sha256: payload_sha,
-                    signed_request_bytes: cancellation.raw_wrapper.clone(),
-                    request_digest: cancellation.request_digest.clone(),
-                    signature: cancellation.signature.clone(),
-                    server_fields_bytes: vec![0_u8],
-                    outer_entry_fingerprint: cancellation.outer_entry_fingerprint.clone(),
-                    actor_did: entry.actor_did.clone(),
-                    actor_device_id: entry.actor_device_id,
-                    actor_key_id: entry.actor_key_id.clone(),
-                    actor_auth_generation: 1,
-                    generation: None,
-                    state_version: None,
-                    transition_id: None,
-                    message_id: None,
-                    received_at: instant("2030-02-01T00:00:00.000Z"),
-                },
-                3,
-            )
-            .await
-            .expect("production cancellation entry writer");
-            terminalize_leave_request(
-                &mut tx,
-                Uuid::from_bytes(leave.request_id),
-                &LeaveRequestTermination::Cancelled {
-                    terminal_request_digest: cancellation.request_digest.clone(),
-                    terminal_at: instant("2030-02-01T00:00:00.000Z"),
-                },
-            )
-            .await
-            .expect("production cancelled leave writer");
-            tx.commit()
-                .await
-                .expect("commit complete production-valid cancelled leave mapping");
+            .await;
 
             let mut tx = pool
                 .begin()
@@ -8427,70 +9007,8 @@ mod historical_control_loader {
             );
             let aggregate = super::reset_leave_leg::load_aggregate_hydration(&pool, &entry).await;
             let authority = HydrationAuthority::new(entry.cid).expect("aggregate authority");
-            crate::chat_protocol::state_machine::hydrate_conversation_state(
-                &authority,
-                aggregate.clone(),
-            )
-            .expect("cancelled leave passes production aggregate hydration");
-
-            let mut wrong_target = aggregate.clone();
-            wrong_target.leave_requests[0].request_id = *Uuid::new_v4().as_bytes();
-            assert!(matches!(
-                crate::chat_protocol::state_machine::hydrate_conversation_state(
-                    &authority,
-                    wrong_target,
-                ),
-                Err(crate::chat_protocol::state_machine::StateMachineError::InvariantViolation)
-            ));
-
-            let original_origin = aggregate.leave_requests[0].origin.clone();
-            let mut wrong_kind = aggregate.clone();
-            wrong_kind.leave_requests[0].terminal =
-                Some(WorkTerminalHydrationRow::Request(original_origin.clone()));
-            assert!(matches!(
-                crate::chat_protocol::state_machine::hydrate_conversation_state(
-                    &authority, wrong_kind,
-                ),
-                Err(crate::chat_protocol::state_machine::StateMachineError::InvariantViolation)
-            ));
-
-            let mut wrong_principal = aggregate.clone();
-            wrong_principal.leave_requests[0].requester = DeviceIdentity::new(
-                crate::chat_protocol::state_machine::PrincipalId::new(
-                    b"did:plc:abcdefghijklmnopqrstuvwx".to_vec(),
-                )
-                .unwrap(),
-                *Uuid::new_v4().as_bytes(),
-            )
-            .unwrap();
-            assert!(matches!(
-                crate::chat_protocol::state_machine::hydrate_conversation_state(
-                    &authority,
-                    wrong_principal,
-                ),
-                Err(crate::chat_protocol::state_machine::StateMachineError::InvariantViolation)
-            ));
-
-            let mut wrong_sequence = aggregate.clone();
-            wrong_sequence.leave_requests[0].origin = expected.clone();
-            wrong_sequence.leave_requests[0].terminal =
-                Some(WorkTerminalHydrationRow::Request(original_origin));
-            assert!(matches!(
-                crate::chat_protocol::state_machine::hydrate_conversation_state(
-                    &authority,
-                    wrong_sequence,
-                ),
-                Err(crate::chat_protocol::state_machine::StateMachineError::InvariantViolation)
-            ));
-
-            let mut wrong_ttl = aggregate;
-            wrong_ttl.leave_requests[0].expires_at = expected.received_at();
-            assert!(matches!(
-                crate::chat_protocol::state_machine::hydrate_conversation_state(
-                    &authority, wrong_ttl,
-                ),
-                Err(crate::chat_protocol::state_machine::StateMachineError::InvariantViolation)
-            ));
+            crate::chat_protocol::state_machine::hydrate_conversation_state(&authority, aggregate)
+                .expect("cancelled leave passes production aggregate hydration");
 
             // The frozen DDL intentionally permits more than one committed
             // leaveCancellationEntry to map to the same cancelled leave row.
@@ -8571,6 +9089,502 @@ mod historical_control_loader {
             read.rollback().await.expect("rollback read transaction");
             assert!(matches!(
                 ambiguous,
+                Err(crate::chat_protocol::repository::core::ResetLeaveHydrationError::InvalidTerminal)
+            ));
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn cancelled_leave_aggregate_isolates_target_sequence_ttl_kind_and_principal() {
+            const CANCELLATION_ENTRY_KIND: &str = "blue.catbird.chat.defs#leaveCancellationEntry";
+            let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(2).await;
+
+            // Wrong target is commit-valid: DDL maps actor/digest/time but cannot
+            // inspect the genuinely signed cancellation body's leaveRequestId.
+            let target_cid = Uuid::new_v4();
+            let target_entry = build_real_creation_entry(*target_cid.as_bytes());
+            let target_leave = seed_control_request(
+                &pool,
+                &target_entry,
+                SignedMutationKind::LeaveRequest,
+                LEAVE_ENTRY_KIND,
+            )
+            .await;
+            let wrong_target_cancellation = build_real_leave_cancellation_entry(
+                &target_entry,
+                *Uuid::new_v4().as_bytes(),
+                CANCELLATION_ENTRY_KIND,
+                3,
+            );
+            commit_cancelled_leave_entry(
+                &pool,
+                &target_entry,
+                &target_leave,
+                &wrong_target_cancellation,
+                &wrong_target_cancellation.raw_wrapper,
+                &wrong_target_cancellation.request_digest,
+                instant("2030-02-01T00:00:00.000Z"),
+                instant("2030-02-01T00:00:00.000Z"),
+            )
+            .await;
+            let wrong_target = load_aggregate_hydration(&pool, &target_entry).await;
+            let target_authority =
+                HydrationAuthority::new(target_entry.cid).expect("target authority");
+            let Some(WorkTerminalHydrationRow::Request(target_terminal)) =
+                &wrong_target.leave_requests[0].terminal
+            else {
+                panic!("cancelled target terminal");
+            };
+            assert_ne!(
+                target_terminal.request_id(),
+                &wrong_target.leave_requests[0].request_id
+            );
+            assert!(matches!(
+                crate::chat_protocol::state_machine::hydrate_conversation_state(
+                    &target_authority,
+                    wrong_target,
+                ),
+                Err(crate::chat_protocol::state_machine::StateMachineError::InvariantViolation)
+            ));
+
+            // Wrong sequence is also commit-valid: the cancellation entry is seq2
+            // and the exact signed leave origin is seq3. All immutable request
+            // fields and the cancellation's target/principal/time remain exact.
+            let sequence_cid = Uuid::new_v4();
+            let sequence_entry = build_real_creation_entry(*sequence_cid.as_bytes());
+            commit_cancellation_before_leave_origin(&pool, &sequence_entry).await;
+            let wrong_sequence = load_aggregate_hydration(&pool, &sequence_entry).await;
+            let sequence_authority =
+                HydrationAuthority::new(sequence_entry.cid).expect("sequence authority");
+            let sequence_request = &wrong_sequence.leave_requests[0];
+            let Some(WorkTerminalHydrationRow::Request(sequence_terminal)) =
+                &sequence_request.terminal
+            else {
+                panic!("cancelled sequence terminal");
+            };
+            assert!(
+                sequence_terminal.control_seq().unwrap()
+                    <= sequence_request.origin.control_seq().unwrap()
+            );
+            assert!(matches!(
+                crate::chat_protocol::state_machine::hydrate_conversation_state(
+                    &sequence_authority,
+                    wrong_sequence,
+                ),
+                Err(crate::chat_protocol::state_machine::StateMachineError::InvariantViolation)
+            ));
+
+            // Wrong TTL commits because DDL equates the terminal row and entry
+            // column times but does not compare them with the consent expiry. The
+            // signed outer envelope also carries expires_at exactly, so the loader
+            // succeeds and only the strict aggregate time window rejects it.
+            let ttl_cid = Uuid::new_v4();
+            let ttl_entry = build_real_creation_entry(*ttl_cid.as_bytes());
+            let ttl_leave = seed_control_request(
+                &pool,
+                &ttl_entry,
+                SignedMutationKind::LeaveRequest,
+                LEAVE_ENTRY_KIND,
+            )
+            .await;
+            let ttl_cancellation = build_real_leave_cancellation_entry_at(
+                &ttl_entry,
+                ttl_leave.request_id,
+                CANCELLATION_ENTRY_KIND,
+                3,
+                "2030-02-02T00:00:00.000Z",
+            );
+            let expires_at = instant("2030-02-02T00:00:00.000Z");
+            commit_cancelled_leave_entry(
+                &pool,
+                &ttl_entry,
+                &ttl_leave,
+                &ttl_cancellation,
+                &ttl_cancellation.raw_wrapper,
+                &ttl_cancellation.request_digest,
+                expires_at,
+                expires_at,
+            )
+            .await;
+            let wrong_ttl = load_aggregate_hydration(&pool, &ttl_entry).await;
+            let ttl_authority = HydrationAuthority::new(ttl_entry.cid).expect("TTL authority");
+            let ttl_request = &wrong_ttl.leave_requests[0];
+            let Some(WorkTerminalHydrationRow::Request(ttl_terminal)) = &ttl_request.terminal
+            else {
+                panic!("cancelled TTL terminal");
+            };
+            assert_eq!(ttl_terminal.received_at(), ttl_request.expires_at);
+            assert!(matches!(
+                crate::chat_protocol::state_machine::hydrate_conversation_state(
+                    &ttl_authority,
+                    wrong_ttl,
+                ),
+                Err(crate::chat_protocol::state_machine::StateMachineError::InvariantViolation)
+            ));
+
+            // Wrong kind cannot commit as the cancelled row's direct mapping:
+            // the reciprocal mapper requires leaveCancellationEntry. Produce the
+            // independently verified same-conversation/same-target/later Reset
+            // evidence in a fresh transaction, then splice only the terminal.
+            let kind_cid = Uuid::new_v4();
+            let kind_entry = build_real_creation_entry(*kind_cid.as_bytes());
+            let kind_leave = seed_control_request(
+                &pool,
+                &kind_entry,
+                SignedMutationKind::LeaveRequest,
+                LEAVE_ENTRY_KIND,
+            )
+            .await;
+            let valid_kind_cancellation = build_real_leave_cancellation_entry(
+                &kind_entry,
+                kind_leave.request_id,
+                CANCELLATION_ENTRY_KIND,
+                3,
+            );
+            commit_cancelled_leave_entry(
+                &pool,
+                &kind_entry,
+                &kind_leave,
+                &valid_kind_cancellation,
+                &valid_kind_cancellation.raw_wrapper,
+                &valid_kind_cancellation.request_digest,
+                instant("2030-02-01T00:00:00.000Z"),
+                instant("2030-02-01T00:00:00.000Z"),
+            )
+            .await;
+            let mut wrong_kind = load_aggregate_hydration(&pool, &kind_entry).await;
+            let reset_evidence_entry = build_real_control_request_entry_with_id(
+                &kind_entry,
+                SignedMutationKind::ResetRequest,
+                RESET_ENTRY_KIND,
+                4,
+                Uuid::from_bytes(kind_leave.request_id),
+            );
+            let mut kind_tx = pool.begin().await.expect("begin wrong-kind evidence");
+            append_control_entry_fixture(
+                &mut kind_tx,
+                &kind_entry,
+                &reset_evidence_entry,
+                RESET_ENTRY_KIND,
+                4,
+                &reset_evidence_entry.raw_wrapper,
+                &reset_evidence_entry.request_digest,
+                instant("2030-02-01T00:00:00.000Z"),
+            )
+            .await;
+            let kind_historical = HistoricalRehydrationAuthority::new(kind_entry.cid, 5).unwrap();
+            let wrong_kind_terminal = load_work_terminal_hydration_row(
+                &mut kind_tx,
+                &kind_historical,
+                kind_cid,
+                WorkTerminalLocator::Request {
+                    kind: RequestEntryKind::ResetRequest,
+                    source: WorkTerminalRequestSource::Control {
+                        request_digest: &reset_evidence_entry.request_digest,
+                        signed_request_bytes: &reset_evidence_entry.raw_wrapper,
+                    },
+                },
+            )
+            .await
+            .expect("production-load wrong-kind evidence");
+            kind_tx
+                .rollback()
+                .await
+                .expect("rollback schema-impossible wrong-kind mapping");
+            wrong_kind.leave_requests[0].terminal = Some(wrong_kind_terminal);
+            let kind_authority = HydrationAuthority::new(kind_entry.cid).expect("kind authority");
+            assert!(matches!(
+                crate::chat_protocol::state_machine::hydrate_conversation_state(
+                    &kind_authority,
+                    wrong_kind,
+                ),
+                Err(crate::chat_protocol::state_machine::StateMachineError::InvariantViolation)
+            ));
+
+            // Wrong principal is likewise excluded by the reciprocal mapper.
+            // Register a distinct real signer in the same conversation, load its
+            // genuine same-target cancellation from a fresh transaction, and
+            // splice only that terminal onto the unchanged durable request.
+            let principal_cid = Uuid::new_v4();
+            let principal_entry = build_real_creation_entry(*principal_cid.as_bytes());
+            let principal_leave = seed_control_request(
+                &pool,
+                &principal_entry,
+                SignedMutationKind::LeaveRequest,
+                LEAVE_ENTRY_KIND,
+            )
+            .await;
+            let valid_principal_cancellation = build_real_leave_cancellation_entry(
+                &principal_entry,
+                principal_leave.request_id,
+                CANCELLATION_ENTRY_KIND,
+                3,
+            );
+            commit_cancelled_leave_entry(
+                &pool,
+                &principal_entry,
+                &principal_leave,
+                &valid_principal_cancellation,
+                &valid_principal_cancellation.raw_wrapper,
+                &valid_principal_cancellation.request_digest,
+                instant("2030-02-01T00:00:00.000Z"),
+                instant("2030-02-01T00:00:00.000Z"),
+            )
+            .await;
+            let mut wrong_principal = load_aggregate_hydration(&pool, &principal_entry).await;
+            let mut other_signer = build_real_creation_entry(*Uuid::new_v4().as_bytes());
+            other_signer.cid = principal_entry.cid;
+            assert_ne!(other_signer.actor_did, principal_entry.actor_did);
+            let registered_at = instant("2030-01-31T23:59:58.000Z");
+            let mut registration = pool.begin().await.expect("begin other signer registration");
+            sqlx::query("INSERT INTO chat.principals(user_did,created_at) VALUES($1,$2)")
+                .bind(&other_signer.actor_did)
+                .bind(registered_at)
+                .execute(&mut *registration)
+                .await
+                .expect("insert other principal");
+            sqlx::query(
+                r#"INSERT INTO chat.devices(
+                    user_did,device_id,device_name,status,dpop_jkt,auth_generation,
+                    capabilities,created_at,updated_at
+                ) VALUES($1,$2,'other-cancellation-signer','active',$3,1,
+                    chat.protocol_capabilities(),$4,$4)"#,
+            )
+            .bind(&other_signer.actor_did)
+            .bind(other_signer.actor_device_id)
+            .bind(&other_signer.actor_key_id)
+            .bind(registered_at)
+            .execute(&mut *registration)
+            .await
+            .expect("insert other signer device");
+            sqlx::query(
+                r#"INSERT INTO chat.device_keys(
+                    user_did,device_id,key_id,signing_public_key,
+                    enrollment_auth_generation,created_at
+                ) VALUES($1,$2,$3,$4,1,$5)"#,
+            )
+            .bind(&other_signer.actor_did)
+            .bind(other_signer.actor_device_id)
+            .bind(&other_signer.actor_key_id)
+            .bind(&other_signer.public_key)
+            .bind(registered_at)
+            .execute(&mut *registration)
+            .await
+            .expect("insert other signer key");
+            registration
+                .commit()
+                .await
+                .expect("commit other signer registration");
+            let other_cancellation = build_real_leave_cancellation_entry(
+                &other_signer,
+                principal_leave.request_id,
+                CANCELLATION_ENTRY_KIND,
+                4,
+            );
+            let mut principal_tx = pool.begin().await.expect("begin other-principal evidence");
+            append_control_entry_fixture(
+                &mut principal_tx,
+                &other_signer,
+                &other_cancellation,
+                CANCELLATION_ENTRY_KIND,
+                4,
+                &other_cancellation.raw_wrapper,
+                &other_cancellation.request_digest,
+                instant("2030-02-01T00:00:00.000Z"),
+            )
+            .await;
+            let principal_historical =
+                HistoricalRehydrationAuthority::new(principal_entry.cid, 5).unwrap();
+            let wrong_principal_terminal = load_work_terminal_hydration_row(
+                &mut principal_tx,
+                &principal_historical,
+                principal_cid,
+                WorkTerminalLocator::Request {
+                    kind: RequestEntryKind::LeaveCancellation,
+                    source: WorkTerminalRequestSource::Control {
+                        request_digest: &other_cancellation.request_digest,
+                        signed_request_bytes: &other_cancellation.raw_wrapper,
+                    },
+                },
+            )
+            .await
+            .expect("production-load wrong-principal evidence");
+            principal_tx
+                .rollback()
+                .await
+                .expect("rollback schema-impossible wrong-principal mapping");
+            wrong_principal.leave_requests[0].terminal = Some(wrong_principal_terminal);
+            let principal_authority =
+                HydrationAuthority::new(principal_entry.cid).expect("principal authority");
+            assert!(matches!(
+                crate::chat_protocol::state_machine::hydrate_conversation_state(
+                    &principal_authority,
+                    wrong_principal,
+                ),
+                Err(crate::chat_protocol::state_machine::StateMachineError::InvariantViolation)
+            ));
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn cancelled_leave_loader_rejects_committed_time_digest_and_signed_bytes_drift() {
+            const CANCELLATION_ENTRY_KIND: &str = "blue.catbird.chat.defs#leaveCancellationEntry";
+            let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(2).await;
+
+            // The mapper compares terminal_at to the entry column, not the signed
+            // outer envelope. Commit a different column/terminal instant; fresh
+            // hydration must compare the re-verified evidence time and reject it.
+            let time_cid = Uuid::new_v4();
+            let time_entry = build_real_creation_entry(*time_cid.as_bytes());
+            let time_leave = seed_control_request(
+                &pool,
+                &time_entry,
+                SignedMutationKind::LeaveRequest,
+                LEAVE_ENTRY_KIND,
+            )
+            .await;
+            let time_cancellation = build_real_leave_cancellation_entry(
+                &time_entry,
+                time_leave.request_id,
+                CANCELLATION_ENTRY_KIND,
+                3,
+            );
+            let wrong_terminal_at = instant("2030-02-01T00:01:00.000Z");
+            commit_cancelled_leave_entry(
+                &pool,
+                &time_entry,
+                &time_leave,
+                &time_cancellation,
+                &time_cancellation.raw_wrapper,
+                &time_cancellation.request_digest,
+                wrong_terminal_at,
+                wrong_terminal_at,
+            )
+            .await;
+            let mut time_read = pool.begin().await.expect("begin wrong-time read");
+            let wrong_time = load_leave_request_hydration_rows(
+                &mut time_read,
+                &HistoricalRehydrationAuthority::new(time_entry.cid, 4).unwrap(),
+                time_cid,
+            )
+            .await;
+            time_read
+                .rollback()
+                .await
+                .expect("rollback wrong-time read");
+            assert!(matches!(
+                wrong_time,
+                Err(crate::chat_protocol::repository::core::ResetLeaveHydrationError::InvalidTerminal)
+            ));
+
+            // Stored digest D is the mapper's direct key and can differ from the
+            // genuinely signed wrapper's digest A. The fetch succeeds by D, then
+            // the signed-authority digest comparison must reject it.
+            let digest_cid = Uuid::new_v4();
+            let digest_entry = build_real_creation_entry(*digest_cid.as_bytes());
+            let digest_leave = seed_control_request(
+                &pool,
+                &digest_entry,
+                SignedMutationKind::LeaveRequest,
+                LEAVE_ENTRY_KIND,
+            )
+            .await;
+            let digest_cancellation = build_real_leave_cancellation_entry(
+                &digest_entry,
+                digest_leave.request_id,
+                CANCELLATION_ENTRY_KIND,
+                3,
+            );
+            let stored_digest = vec![0xd5_u8; 32];
+            assert_ne!(stored_digest, digest_cancellation.request_digest);
+            commit_cancelled_leave_entry(
+                &pool,
+                &digest_entry,
+                &digest_leave,
+                &digest_cancellation,
+                &digest_cancellation.raw_wrapper,
+                &stored_digest,
+                instant("2030-02-01T00:00:00.000Z"),
+                instant("2030-02-01T00:00:00.000Z"),
+            )
+            .await;
+            let mut digest_read = pool.begin().await.expect("begin wrong-digest read");
+            let wrong_digest = load_leave_request_hydration_rows(
+                &mut digest_read,
+                &HistoricalRehydrationAuthority::new(digest_entry.cid, 4).unwrap(),
+                digest_cid,
+            )
+            .await;
+            digest_read
+                .rollback()
+                .await
+                .expect("rollback wrong-digest read");
+            assert!(matches!(
+                wrong_digest,
+                Err(crate::chat_protocol::repository::core::ResetLeaveHydrationError::InvalidTerminal)
+            ));
+
+            // The mapper does not compare accepted_payload_bytes with the stored
+            // signed_request_bytes. Keep envelope/digest/signature A, but store a
+            // separately valid same-key/same-target cancellation wrapper B with a
+            // different idempotency key. Historical rebinding must reject A/B.
+            let bytes_cid = Uuid::new_v4();
+            let bytes_entry = build_real_creation_entry(*bytes_cid.as_bytes());
+            let bytes_leave = seed_control_request(
+                &pool,
+                &bytes_entry,
+                SignedMutationKind::LeaveRequest,
+                LEAVE_ENTRY_KIND,
+            )
+            .await;
+            let bytes_cancellation = build_real_leave_cancellation_entry(
+                &bytes_entry,
+                bytes_leave.request_id,
+                CANCELLATION_ENTRY_KIND,
+                3,
+            );
+            let mut wrapper_b: Value =
+                serde_json::from_slice(&bytes_cancellation.raw_wrapper).unwrap();
+            wrapper_b["body"]["idempotencyKey"] = json!(Uuid::new_v4().hyphenated().to_string());
+            wrapper_b["signature"] = Value::String(STANDARD.encode([0_u8; 64]));
+            let unsigned_b = serde_json::to_vec(&wrapper_b).unwrap();
+            let canonical_b = decode_canonical_signed_mutation(&unsigned_b).unwrap();
+            wrapper_b["signature"] = Value::String(
+                STANDARD.encode(
+                    bytes_entry
+                        .signing_key()
+                        .sign(canonical_b.transcript_bytes())
+                        .to_bytes(),
+                ),
+            );
+            let signed_bytes_b = serde_json::to_vec(&wrapper_b).unwrap();
+            decode_and_verify_signed_mutation(&signed_bytes_b, &bytes_entry.public_key)
+                .expect("alternate same-target cancellation wrapper verifies");
+            assert_ne!(signed_bytes_b, bytes_cancellation.raw_wrapper);
+            commit_cancelled_leave_entry(
+                &pool,
+                &bytes_entry,
+                &bytes_leave,
+                &bytes_cancellation,
+                &signed_bytes_b,
+                &bytes_cancellation.request_digest,
+                instant("2030-02-01T00:00:00.000Z"),
+                instant("2030-02-01T00:00:00.000Z"),
+            )
+            .await;
+            let mut bytes_read = pool.begin().await.expect("begin wrong-bytes read");
+            let wrong_bytes = load_leave_request_hydration_rows(
+                &mut bytes_read,
+                &HistoricalRehydrationAuthority::new(bytes_entry.cid, 4).unwrap(),
+                bytes_cid,
+            )
+            .await;
+            bytes_read
+                .rollback()
+                .await
+                .expect("rollback wrong-bytes read");
+            assert!(matches!(
+                wrong_bytes,
                 Err(crate::chat_protocol::repository::core::ResetLeaveHydrationError::InvalidTerminal)
             ));
         }
