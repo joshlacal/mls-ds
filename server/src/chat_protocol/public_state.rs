@@ -705,15 +705,19 @@ impl VerifiedCommitPublicState {
 
     /// Restore the one exact frozen ADD transition used by persistence tests.
     ///
-    /// The caller must first restore `next` through the snapshot/binding path.
-    /// This test-only seam then derives effects from the two independently bound
-    /// trees and accepts only one added leaf plus the sender self-update.
+    /// The caller must first restore `expected_prior` and `next` through the
+    /// snapshot/binding path. This test-only seam requires the supplied prior
+    /// to equal that exact restored artifact, pins both sender encryption keys,
+    /// and accepts only one added leaf plus the sender self-update.
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn for_test_add_from_frozen_snapshot(
         prior: &ActivePublicState,
+        expected_prior: &ActivePublicState,
         next: ActivePublicState,
         sender_leaf_index: u32,
+        expected_prior_sender_encryption_key: &[u8],
+        expected_next_sender_encryption_key: &[u8],
         expected_added_basic_credential: &[u8],
         expected_added_signature_key: &[u8],
         added_key_package_ref: [u8; 32],
@@ -722,7 +726,9 @@ impl VerifiedCommitPublicState {
     ) -> Result<Self, PublicStateError> {
         let prior_coordinate = prior.coordinate();
         let next_coordinate = next.coordinate();
-        if prior_coordinate.conversation_id() != next_coordinate.conversation_id()
+        if prior.snapshot != expected_prior.snapshot
+            || prior.binding != expected_prior.binding
+            || prior_coordinate.conversation_id() != next_coordinate.conversation_id()
             || prior_coordinate.generation() != next_coordinate.generation()
             || prior_coordinate.group_id() != next_coordinate.group_id()
             || prior_coordinate.state_version().checked_add(1)
@@ -754,6 +760,9 @@ impl VerifiedCommitPublicState {
             .ok_or(PublicStateError::CoordinateMismatch)?;
         if prior_sender.basic_credential() != next_sender.basic_credential()
             || prior_sender.signature_key() != next_sender.signature_key()
+            || prior_sender.encryption_key() != expected_prior_sender_encryption_key
+            || next_sender.encryption_key() != expected_next_sender_encryption_key
+            || expected_prior_sender_encryption_key == expected_next_sender_encryption_key
         {
             return Err(PublicStateError::CoordinateMismatch);
         }

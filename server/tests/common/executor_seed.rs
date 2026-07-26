@@ -757,26 +757,18 @@ pub fn committed_coordinate(
     )
 }
 
-/// Process the frozen corpus ADD commit against the accepted state's public state,
-/// producing the verified committed public state the fulfillment consumes.
+/// Restore the frozen corpus ADD snapshot against the accepted state's exact
+/// manifest-bound genesis snapshot, producing the verified committed public
+/// state the fulfillment consumes.
 pub fn verified_add_commit(
     state: &crate::chat_protocol::state_machine::ConversationState,
     manifest: &CorpusManifest,
-    conversation_id: [u8; 16],
 ) -> crate::chat_protocol::public_state::VerifiedCommitPublicState {
     let sender_leaf_index = state
         .leaf(&alice(manifest))
         .expect("Alice sender leaf")
         .leaf_index();
-    frozen_public_state::restore_add_commit(
-        state.public_state(),
-        committed_coordinate(
-            manifest,
-            conversation_id,
-            state.coordinate().state_version() + 1,
-        ),
-        sender_leaf_index,
-    )
+    frozen_public_state::restore_add_commit(state.public_state(), sender_leaf_index)
 }
 
 /// A committed fulfillment scenario (creation → acceptance → fulfillment, all
@@ -934,9 +926,9 @@ pub async fn build_fulfillment(pool: &PgPool) -> BuiltFulfillment {
         tx.commit().await.expect("acceptance COMMIT");
     }
 
-    // 3. Build the fulfillment: process the corpus ADD commit + welcome against the
-    //    accepted state, then plan the fulfillment.
-    let commit = verified_add_commit(&accepted_state, &manifest, *conversation_id.as_bytes());
+    // 3. Build the fulfillment: restore the corpus ADD snapshot and bind the
+    //    Welcome against the accepted state, then plan the fulfillment.
+    let commit = verified_add_commit(&accepted_state, &manifest);
     let welcome = verify_recovery_welcome(&corpus_file("welcome.mls"), corpus_ref, 1_048_576)
         .expect("one-recipient Welcome is request-bound");
     let welcome_wire = welcome.wire_bytes().to_vec();

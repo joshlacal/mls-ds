@@ -168,9 +168,6 @@ struct CorpusChain {
     genesis_epoch: u64,
     genesis_group_context_hash_hex: String,
     genesis_confirmation_tag_hex: String,
-    committed_epoch: u64,
-    committed_group_context_hash_hex: String,
-    committed_confirmation_tag_hex: String,
     group_id_hex: String,
     inner_key_package_ref_hex: String,
 }
@@ -225,19 +222,6 @@ fn genesis_coordinate(manifest: &CorpusManifest) -> PublicGroupSnapshotCoordinat
         manifest.chain.genesis_epoch,
         hex_array(&manifest.chain.genesis_group_context_hash_hex),
         hex_array(&manifest.chain.genesis_confirmation_tag_hex),
-    )
-}
-
-fn committed_coordinate(
-    manifest: &CorpusManifest,
-    state_version: u64,
-) -> PublicGroupSnapshotCoordinate {
-    coordinate(
-        manifest,
-        state_version,
-        manifest.chain.committed_epoch,
-        hex_array(&manifest.chain.committed_group_context_hash_hex),
-        hex_array(&manifest.chain.committed_confirmation_tag_hex),
     )
 }
 
@@ -886,11 +870,7 @@ fn verified_add_commit(
         .leaf(&alice(&manifest))
         .expect("Alice sender leaf")
         .leaf_index();
-    frozen_public_state::restore_add_commit(
-        state.public_state(),
-        committed_coordinate(&manifest, state.coordinate().state_version() + 1),
-        sender_leaf_index,
-    )
+    frozen_public_state::restore_add_commit(state.public_state(), sender_leaf_index)
 }
 
 fn added_direct() -> chat_protocol::state_machine::ConversationState {

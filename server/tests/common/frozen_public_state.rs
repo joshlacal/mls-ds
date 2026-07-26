@@ -277,10 +277,28 @@ pub fn restore_genesis() -> ActivePublicState {
 
 pub fn restore_add_commit(
     prior: &ActivePublicState,
-    next_coordinate: PublicGroupSnapshotCoordinate,
     sender_leaf_index: u32,
 ) -> VerifiedCommitPublicState {
     let manifest = manifest();
+    let expected_prior = restore(
+        artifact(&manifest, "genesis-public-state.bin"),
+        coordinate(
+            &manifest,
+            *prior.coordinate().conversation_id(),
+            prior.coordinate().state_version(),
+            false,
+        ),
+    );
+    let next_coordinate = coordinate(
+        &manifest,
+        *prior.coordinate().conversation_id(),
+        prior
+            .coordinate()
+            .state_version()
+            .checked_add(1)
+            .expect("frozen Add state version"),
+        true,
+    );
     let next = restore(
         artifact(&manifest, "committed-public-state.bin"),
         next_coordinate,
@@ -296,10 +314,31 @@ pub fn restore_add_commit(
         hex_array(&manifest.chain.commit_aad_sha256_hex),
         "frozen Commit AAD is manifest-bound"
     );
+    let expected_prior_sender_encryption_key = expected_prior
+        .binding()
+        .tree_summary()
+        .leaves()
+        .iter()
+        .find(|leaf| leaf.leaf_index() == sender_leaf_index)
+        .expect("frozen prior sender leaf")
+        .encryption_key()
+        .to_vec();
+    let expected_next_sender_encryption_key = next
+        .binding()
+        .tree_summary()
+        .leaves()
+        .iter()
+        .find(|leaf| leaf.leaf_index() == sender_leaf_index)
+        .expect("frozen next sender leaf")
+        .encryption_key()
+        .to_vec();
     VerifiedCommitPublicState::for_test_add_from_frozen_snapshot(
         prior,
+        &expected_prior,
         next,
         sender_leaf_index,
+        &expected_prior_sender_encryption_key,
+        &expected_next_sender_encryption_key,
         manifest.identity.bob.credential_identity.as_bytes(),
         &hex::decode(&manifest.identity.bob.signature_public_key_hex).expect("Bob signature key"),
         hex_array(&manifest.chain.inner_key_package_ref_hex),
@@ -307,4 +346,142 @@ pub fn restore_add_commit(
         aad_sha256,
     )
     .expect("restore strict manifest-bound frozen Add commit")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chat_protocol::public_state::PublicStateError;
+
+    fn frozen_commit_evidence(manifest: &Manifest) -> ([u8; 32], [u8; 32]) {
+        let commit_bytes = artifact(manifest, "commit-public.mls");
+        let parsed = validate_public_commit(&commit_bytes, MAX_PUBLIC_MESSAGE_WIRE_BYTES)
+            .expect("frozen Commit parses");
+        (
+            Sha256::digest(&commit_bytes).into(),
+            Sha256::digest(parsed.aad()).into(),
+        )
+    }
+
+    #[test]
+    fn frozen_add_rejects_non_manifest_prior_coordinate() {
+        let manifest = manifest();
+        let genesis = restore_genesis();
+        let tampered_coordinate = PublicGroupSnapshotCoordinate::new(
+            *genesis.coordinate().conversation_id(),
+            genesis.coordinate().generation(),
+            genesis.coordinate().state_version(),
+            *genesis.coordinate().group_id(),
+            genesis.coordinate().epoch(),
+            [0xa5; 32],
+            [0xa6; 32],
+            PublicGroupSnapshotLifecycle::Active,
+        );
+        let tampered_prior = ActivePublicState::for_test(&genesis, tampered_coordinate);
+        let next_coordinate = coordinate(
+            &manifest,
+            *tampered_prior.coordinate().conversation_id(),
+            tampered_prior.coordinate().state_version() + 1,
+            true,
+        );
+        let next = restore(
+            artifact(&manifest, "committed-public-state.bin"),
+            next_coordinate,
+        );
+        let sender_leaf_index = tampered_prior.binding().tree_summary().leaves()[0].leaf_index();
+        let next_sender_encryption_key = next
+            .binding()
+            .tree_summary()
+            .leaves()
+            .iter()
+            .find(|leaf| leaf.leaf_index() == sender_leaf_index)
+            .expect("frozen next sender")
+            .encryption_key()
+            .to_vec();
+        let (commit_sha256, aad_sha256) = frozen_commit_evidence(&manifest);
+
+        assert!(matches!(
+            VerifiedCommitPublicState::for_test_add_from_frozen_snapshot(
+                &tampered_prior,
+                &genesis,
+                next,
+                sender_leaf_index,
+                genesis.binding().tree_summary().leaves()[0].encryption_key(),
+                &next_sender_encryption_key,
+                manifest.identity.bob.credential_identity.as_bytes(),
+                &hex::decode(&manifest.identity.bob.signature_public_key_hex)
+                    .expect("Bob signature key"),
+                hex_array(&manifest.chain.inner_key_package_ref_hex),
+                commit_sha256,
+                aad_sha256,
+            ),
+            Err(PublicStateError::CoordinateMismatch)
+        ));
+    }
+
+    #[test]
+    fn frozen_add_rejects_unchanged_sender_encryption_key() {
+        let manifest = manifest();
+        let prior = restore_genesis();
+        let exact_next_coordinate = coordinate(
+            &manifest,
+            *prior.coordinate().conversation_id(),
+            prior.coordinate().state_version() + 1,
+            true,
+        );
+        let exact_next = restore(
+            artifact(&manifest, "committed-public-state.bin"),
+            exact_next_coordinate,
+        );
+        let sender = &prior.binding().tree_summary().leaves()[0];
+        let bob = exact_next
+            .binding()
+            .tree_summary()
+            .leaves()
+            .iter()
+            .find(|leaf| {
+                leaf.basic_credential() == manifest.identity.bob.credential_identity.as_bytes()
+            })
+            .expect("Bob leaf");
+        let synthetic_coordinate = PublicGroupSnapshotCoordinate::new(
+            *exact_next.coordinate().conversation_id(),
+            exact_next.coordinate().generation(),
+            exact_next.coordinate().state_version() + 1,
+            *exact_next.coordinate().group_id(),
+            exact_next.coordinate().epoch() + 1,
+            [0xb5; 32],
+            [0xb6; 32],
+            PublicGroupSnapshotLifecycle::Active,
+        );
+        let synthetic_next = VerifiedCommitPublicState::for_test_replace(
+            &exact_next,
+            synthetic_coordinate,
+            bob.leaf_index(),
+            sender.leaf_index(),
+            sender.encryption_key().to_vec(),
+            [0xb7; 32],
+        )
+        .expect("build adversarial unchanged-sender tree")
+        .into_next();
+        let synthetic_next = ActivePublicState::for_test(&synthetic_next, exact_next_coordinate);
+        let (commit_sha256, aad_sha256) = frozen_commit_evidence(&manifest);
+
+        assert!(matches!(
+            VerifiedCommitPublicState::for_test_add_from_frozen_snapshot(
+                &prior,
+                &prior,
+                synthetic_next,
+                sender.leaf_index(),
+                sender.encryption_key(),
+                sender.encryption_key(),
+                manifest.identity.bob.credential_identity.as_bytes(),
+                &hex::decode(&manifest.identity.bob.signature_public_key_hex)
+                    .expect("Bob signature key"),
+                hex_array(&manifest.chain.inner_key_package_ref_hex),
+                commit_sha256,
+                aad_sha256,
+            ),
+            Err(PublicStateError::CoordinateMismatch)
+        ));
+    }
 }
