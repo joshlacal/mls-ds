@@ -22,10 +22,7 @@ use sqlx::PgPool;
 use tokio::sync::Barrier;
 use uuid::Uuid;
 
-use crate::chat_protocol::public_state::{
-    process_commit, verify_genesis_group_info, verify_recovery_welcome, ActivePublicState,
-    GenesisGroupInfoExpectations,
-};
+use crate::chat_protocol::public_state::{verify_recovery_welcome, ActivePublicState};
 use crate::chat_protocol::repository::delivery::WelcomeRejectionReason;
 use crate::chat_protocol::repository::delivery::{
     append_entry_at, AppendEntry, DeliveryRepositoryError, EntryEntitlementKind,
@@ -59,7 +56,8 @@ use crate::chat_protocol::state_machine::{
     WelcomeStatus, ZeroLeafLeave,
 };
 use crate::chat_protocol::validation::ed25519_key_id;
-use crate::chat_protocol::wire::{validate_public_commit, MAX_PUBLIC_MESSAGE_WIRE_BYTES};
+#[path = "frozen_public_state.rs"]
+mod frozen_public_state;
 
 /// Drops a uniquely-named per-run executor database (best-effort) when it falls
 /// out of scope. Every executor test binds this guard so its private DB is torn
@@ -276,20 +274,9 @@ pub fn alice(manifest: &CorpusManifest) -> DeviceIdentity {
     .unwrap()
 }
 pub fn verified_genesis(manifest: &CorpusManifest) -> ActivePublicState {
-    verify_genesis_group_info(
-        &corpus_file("group-info.mls"),
-        GenesisGroupInfoExpectations {
-            coordinate: genesis_coordinate(manifest),
-            expected_basic_credential: manifest.identity.alice.credential_identity.as_bytes(),
-            expected_signature_key: &hex::decode(&manifest.identity.alice.signature_public_key_hex)
-                .expect("signature key"),
-            now_unix_seconds: manifest.evaluation_unix_seconds,
-            max_wire_bytes: 1_048_576,
-            max_ratchet_tree_bytes: 1_048_576,
-            max_members: 100,
-        },
-    )
-    .expect("frozen GroupInfo verifies and binds")
+    let state = frozen_public_state::restore_genesis();
+    assert_eq!(state.coordinate(), &genesis_coordinate(manifest));
+    state
 }
 
 /// Idempotently seed a principal + active device + device-key row (committed).
@@ -777,23 +764,19 @@ pub fn verified_add_commit(
     manifest: &CorpusManifest,
     conversation_id: [u8; 16],
 ) -> crate::chat_protocol::public_state::VerifiedCommitPublicState {
-    let commit_bytes = corpus_file("commit-public.mls");
-    let parsed = validate_public_commit(&commit_bytes, MAX_PUBLIC_MESSAGE_WIRE_BYTES)
-        .expect("frozen Commit parses");
-    let aad = parsed.aad().to_vec();
-    process_commit(
+    let sender_leaf_index = state
+        .leaf(&alice(manifest))
+        .expect("Alice sender leaf")
+        .leaf_index();
+    frozen_public_state::restore_add_commit(
         state.public_state(),
-        &commit_bytes,
-        &aad,
         committed_coordinate(
             manifest,
             conversation_id,
             state.coordinate().state_version() + 1,
         ),
-        manifest.evaluation_unix_seconds,
-        100,
+        sender_leaf_index,
     )
-    .expect("frozen Commit processes against the rebound accepted state")
 }
 
 /// A committed fulfillment scenario (creation → acceptance → fulfillment, all

@@ -66,7 +66,11 @@ mod chat_protocol {
     }
 }
 
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
@@ -75,10 +79,9 @@ use base64::{
 
 use chat_protocol::{
     public_state::{
-        decode_public_tree_summary, encode_public_tree_summary, process_commit,
-        rebind_active_snapshot, verify_genesis_group_info, verify_recovery_welcome,
-        verify_reset_successor_group_info, GenesisGroupInfoExpectations, PublicStateError,
-        ResetSuccessorGroupInfoExpectations,
+        decode_public_tree_summary, encode_public_tree_summary, rebind_active_snapshot,
+        verify_genesis_group_info, verify_recovery_welcome, verify_reset_successor_group_info,
+        GenesisGroupInfoExpectations, PublicStateError, ResetSuccessorGroupInfoExpectations,
     },
     snapshot::{
         PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle, PublicGroupSnapshotTreeSummary,
@@ -107,13 +110,22 @@ use chat_protocol::{
         ed25519_key_id, BareDid, CanonicalTimestamp, CanonicalUuidV4, KeyThumbprint,
         TrustedRequestInstant,
     },
-    wire::{validate_public_commit, MAX_PUBLIC_MESSAGE_WIRE_BYTES},
+    wire::{
+        validate_group_info, GroupInfoValidationPolicy, MAX_GROUP_INFO_WIRE_BYTES,
+        XWING_CIPHERSUITE,
+    },
 };
 use ed25519_dalek::{Signer, SigningKey};
+use openmls::prelude::{tls_codec::Serialize as TlsSerialize, *};
+use openmls_basic_credential::SignatureKeyPair;
+use openmls_traits::OpenMlsProvider;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
+
+#[path = "common/frozen_public_state.rs"]
+mod frozen_public_state;
 
 const GENESIS_SEQ: u64 = 1;
 const ACCEPT_SEQ: u64 = 2;
@@ -146,7 +158,6 @@ struct CorpusActor {
     actor_did: String,
     device_id: String,
     credential_identity: String,
-    signature_public_key_hex: String,
 }
 
 #[derive(Deserialize)]
@@ -656,21 +667,101 @@ fn leave_requires_sealed_active_registration_for_exact_request_key_generation() 
 }
 
 fn verified_genesis() -> chat_protocol::public_state::ActivePublicState {
+    frozen_public_state::restore_genesis()
+}
+
+struct FreshActorGroupInfo {
+    bytes: Vec<u8>,
+    signature_key: Vec<u8>,
+    now_unix_seconds: u64,
+    coordinate: PublicGroupSnapshotCoordinate,
+}
+
+fn fresh_actor_group_info() -> FreshActorGroupInfo {
     let manifest = corpus_manifest();
-    verify_genesis_group_info(
-        &corpus_file("group-info.mls"),
-        GenesisGroupInfoExpectations {
-            coordinate: genesis_coordinate(&manifest),
-            expected_basic_credential: manifest.identity.alice.credential_identity.as_bytes(),
-            expected_signature_key: &hex::decode(&manifest.identity.alice.signature_public_key_hex)
-                .expect("signature key"),
-            now_unix_seconds: manifest.evaluation_unix_seconds,
-            max_wire_bytes: 1_048_576,
-            max_ratchet_tree_bytes: 1_048_576,
-            max_members: 100,
+    let credential = manifest.identity.alice.credential_identity.as_bytes();
+    let provider = openmls_libcrux_crypto::Provider::new().expect("fresh GroupInfo provider");
+    let signer =
+        SignatureKeyPair::new(XWING_CIPHERSUITE.signature_algorithm()).expect("fresh signer");
+    signer
+        .store(provider.storage())
+        .expect("store fresh signer");
+    let signature_key = signer.to_public_vec();
+    let now_unix_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_secs();
+    let capabilities = Capabilities::new(
+        Some(&[ProtocolVersion::Mls10]),
+        Some(&[XWING_CIPHERSUITE]),
+        Some(&[]),
+        Some(&[]),
+        Some(&[CredentialType::Basic]),
+    );
+    let config = MlsGroupCreateConfig::builder()
+        .ciphersuite(XWING_CIPHERSUITE)
+        .wire_format_policy(openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
+        .use_ratchet_tree_extension(true)
+        .capabilities(capabilities)
+        .lifetime(Lifetime::init(
+            now_unix_seconds - 60,
+            now_unix_seconds + 3_600,
+        ))
+        .build();
+    let group = MlsGroup::new_with_group_id(
+        &provider,
+        &signer,
+        &config,
+        GroupId::from_slice(&[0xd0; 32]),
+        CredentialWithKey {
+            credential: BasicCredential::new(credential.to_vec()).into(),
+            signature_key: signature_key.clone().into(),
         },
     )
-    .expect("frozen GroupInfo verifies and binds")
+    .expect("create fresh actor-only group");
+    let bytes = group
+        .export_group_info(provider.crypto(), &signer, true)
+        .expect("export fresh actor-only GroupInfo")
+        .tls_serialize_detached()
+        .expect("serialize fresh actor-only GroupInfo");
+    let validated = validate_group_info(
+        &bytes,
+        GroupInfoValidationPolicy {
+            expected_basic_credential: credential,
+            expected_signature_key: &signature_key,
+            now_unix_seconds,
+            max_bytes: MAX_GROUP_INFO_WIRE_BYTES,
+            max_ratchet_tree_bytes: 1_048_576,
+            max_members: 1,
+        },
+    )
+    .expect("derive fresh GroupInfo coordinate");
+    let coordinate = PublicGroupSnapshotCoordinate::new(
+        hex_array(&manifest.identifiers.conversation_id_hex),
+        0,
+        0,
+        validated.group_id().try_into().expect("32-byte group id"),
+        validated.epoch(),
+        *validated.group_context_hash(),
+        *validated.confirmation_tag(),
+        PublicGroupSnapshotLifecycle::Active,
+    );
+    FreshActorGroupInfo {
+        bytes,
+        signature_key,
+        now_unix_seconds,
+        coordinate,
+    }
+}
+
+#[test]
+fn already_expired_frozen_genesis_restores_through_persisted_binding() {
+    let manifest = corpus_manifest();
+    let state = frozen_public_state::restore_genesis();
+    assert_eq!(state.coordinate(), &genesis_coordinate(&manifest));
+    assert_eq!(state.binding().snapshot_sha256(), state.snapshot_sha256());
+    assert_eq!(state.binding().tree_summary().leaves().len(), 1);
+    assert_eq!(state.verified_group_info_sha256(), None);
 }
 
 #[test]
@@ -791,19 +882,15 @@ fn verified_add_commit(
     state: &chat_protocol::state_machine::ConversationState,
 ) -> chat_protocol::public_state::VerifiedCommitPublicState {
     let manifest = corpus_manifest();
-    let commit_bytes = corpus_file("commit-public.mls");
-    let parsed = validate_public_commit(&commit_bytes, MAX_PUBLIC_MESSAGE_WIRE_BYTES)
-        .expect("frozen Commit parses");
-    let aad = parsed.aad().to_vec();
-    process_commit(
+    let sender_leaf_index = state
+        .leaf(&alice(&manifest))
+        .expect("Alice sender leaf")
+        .leaf_index();
+    frozen_public_state::restore_add_commit(
         state.public_state(),
-        &commit_bytes,
-        &aad,
         committed_coordinate(&manifest, state.coordinate().state_version() + 1),
-        manifest.evaluation_unix_seconds,
-        100,
+        sender_leaf_index,
     )
-    .expect("frozen Commit processes against rebound accepted state")
 }
 
 fn added_direct() -> chat_protocol::state_machine::ConversationState {
@@ -997,27 +1084,25 @@ fn group_info_binding_is_digest_first_and_exact_coordinate_bound() {
         Err(PublicStateError::SnapshotDigestMismatch)
     );
 
+    let fresh = fresh_actor_group_info();
     let wrong_coordinate = PublicGroupSnapshotCoordinate::new(
-        *state.coordinate().conversation_id(),
+        *fresh.coordinate.conversation_id(),
         0,
         0,
         [0x55; 32],
         0,
-        *state.coordinate().group_context_hash(),
-        *state.coordinate().confirmation_tag(),
+        *fresh.coordinate.group_context_hash(),
+        *fresh.coordinate.confirmation_tag(),
         PublicGroupSnapshotLifecycle::Active,
     );
     assert!(matches!(
         verify_genesis_group_info(
-            &corpus_file("group-info.mls"),
+            &fresh.bytes,
             GenesisGroupInfoExpectations {
                 coordinate: wrong_coordinate,
                 expected_basic_credential: manifest.identity.alice.credential_identity.as_bytes(),
-                expected_signature_key: &hex::decode(
-                    &manifest.identity.alice.signature_public_key_hex
-                )
-                .unwrap(),
-                now_unix_seconds: manifest.evaluation_unix_seconds,
+                expected_signature_key: &fresh.signature_key,
+                now_unix_seconds: fresh.now_unix_seconds,
                 max_wire_bytes: 1_048_576,
                 max_ratchet_tree_bytes: 1_048_576,
                 max_members: 100,
@@ -1030,9 +1115,9 @@ fn group_info_binding_is_digest_first_and_exact_coordinate_bound() {
 #[test]
 fn reset_successor_requires_a_real_actor_only_fresh_generation_group_info() {
     let manifest = corpus_manifest();
-    let genesis = genesis_coordinate(&manifest);
+    let fresh = fresh_actor_group_info();
     let prior = PublicGroupSnapshotCoordinate::new(
-        *genesis.conversation_id(),
+        *fresh.coordinate.conversation_id(),
         0,
         7,
         [0xa1; 32],
@@ -1045,21 +1130,20 @@ fn reset_successor_requires_a_real_actor_only_fresh_generation_group_info() {
         *prior.conversation_id(),
         1,
         0,
-        *genesis.group_id(),
+        *fresh.coordinate.group_id(),
         0,
-        *genesis.group_context_hash(),
-        *genesis.confirmation_tag(),
+        *fresh.coordinate.group_context_hash(),
+        *fresh.coordinate.confirmation_tag(),
         PublicGroupSnapshotLifecycle::Active,
     );
-    let key = hex::decode(&manifest.identity.alice.signature_public_key_hex).unwrap();
     let verified = verify_reset_successor_group_info(
-        &corpus_file("group-info.mls"),
+        &fresh.bytes,
         &prior,
         ResetSuccessorGroupInfoExpectations {
             coordinate: successor,
             expected_basic_credential: manifest.identity.alice.credential_identity.as_bytes(),
-            expected_signature_key: &key,
-            now_unix_seconds: manifest.evaluation_unix_seconds,
+            expected_signature_key: &fresh.signature_key,
+            now_unix_seconds: fresh.now_unix_seconds,
             max_wire_bytes: 1_048_576,
             max_ratchet_tree_bytes: 1_048_576,
             max_members: 100,
@@ -1080,13 +1164,13 @@ fn reset_successor_requires_a_real_actor_only_fresh_generation_group_info() {
     );
     assert_eq!(
         verify_reset_successor_group_info(
-            &corpus_file("group-info.mls"),
+            &fresh.bytes,
             &same_group_prior,
             ResetSuccessorGroupInfoExpectations {
                 coordinate: successor,
                 expected_basic_credential: manifest.identity.alice.credential_identity.as_bytes(),
-                expected_signature_key: &key,
-                now_unix_seconds: manifest.evaluation_unix_seconds,
+                expected_signature_key: &fresh.signature_key,
+                now_unix_seconds: fresh.now_unix_seconds,
                 max_wire_bytes: 1_048_576,
                 max_ratchet_tree_bytes: 1_048_576,
                 max_members: 100,

@@ -76,20 +76,13 @@ mod chat_protocol {
     }
 }
 
-use std::{fs, path::PathBuf};
-
 use chrono::{DateTime, Duration, Utc};
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tokio::sync::Barrier;
 use uuid::Uuid;
 
-use chat_protocol::public_state::{
-    process_commit, verify_genesis_group_info, verify_recovery_welcome, ActivePublicState,
-    GenesisGroupInfoExpectations,
-};
+use chat_protocol::public_state::ActivePublicState;
 use chat_protocol::repository::delivery::WelcomeRejectionReason;
 use chat_protocol::repository::delivery::{
     append_entry_at, AppendEntry, DeliveryRepositoryError, EntryEntitlementKind,
@@ -122,7 +115,6 @@ use chat_protocol::state_machine::{
     WelcomeDispositionInput, WelcomeExpiryContext, WelcomeRejectionWork, WelcomeResponseContext,
     WelcomeStatus, ZeroLeafLeave,
 };
-use chat_protocol::validation::ed25519_key_id;
 use chat_protocol::wire::{validate_public_commit, MAX_PUBLIC_MESSAGE_WIRE_BYTES};
 
 // ---------------------------------------------------------------------------

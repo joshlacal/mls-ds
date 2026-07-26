@@ -703,6 +703,115 @@ impl VerifiedCommitPublicState {
         self.next
     }
 
+    /// Restore the one exact frozen ADD transition used by persistence tests.
+    ///
+    /// The caller must first restore `next` through the snapshot/binding path.
+    /// This test-only seam then derives effects from the two independently bound
+    /// trees and accepts only one added leaf plus the sender self-update.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_test_add_from_frozen_snapshot(
+        prior: &ActivePublicState,
+        next: ActivePublicState,
+        sender_leaf_index: u32,
+        expected_added_basic_credential: &[u8],
+        expected_added_signature_key: &[u8],
+        added_key_package_ref: [u8; 32],
+        verified_commit_sha256: [u8; 32],
+        verified_aad_sha256: [u8; 32],
+    ) -> Result<Self, PublicStateError> {
+        let prior_coordinate = prior.coordinate();
+        let next_coordinate = next.coordinate();
+        if prior_coordinate.conversation_id() != next_coordinate.conversation_id()
+            || prior_coordinate.generation() != next_coordinate.generation()
+            || prior_coordinate.group_id() != next_coordinate.group_id()
+            || prior_coordinate.state_version().checked_add(1)
+                != Some(next_coordinate.state_version())
+            || prior_coordinate.epoch().checked_add(1) != Some(next_coordinate.epoch())
+            || prior_coordinate.group_context_hash() == next_coordinate.group_context_hash()
+            || prior_coordinate.confirmation_tag() == next_coordinate.confirmation_tag()
+            || prior_coordinate.lifecycle() != PublicGroupSnapshotLifecycle::Active
+            || next_coordinate.lifecycle() != PublicGroupSnapshotLifecycle::Active
+            || added_key_package_ref == [0; 32]
+            || verified_commit_sha256 == [0; 32]
+            || verified_aad_sha256 == [0; 32]
+        {
+            return Err(PublicStateError::CoordinateMismatch);
+        }
+
+        let prior_leaves = prior.binding.tree_summary().leaves();
+        let next_leaves = next.binding.tree_summary().leaves();
+        if prior_leaves.len().checked_add(1) != Some(next_leaves.len()) {
+            return Err(PublicStateError::CoordinateMismatch);
+        }
+        let prior_sender = prior_leaves
+            .iter()
+            .find(|leaf| leaf.leaf_index() == sender_leaf_index)
+            .ok_or(PublicStateError::CoordinateMismatch)?;
+        let next_sender = next_leaves
+            .iter()
+            .find(|leaf| leaf.leaf_index() == sender_leaf_index)
+            .ok_or(PublicStateError::CoordinateMismatch)?;
+        if prior_sender.basic_credential() != next_sender.basic_credential()
+            || prior_sender.signature_key() != next_sender.signature_key()
+        {
+            return Err(PublicStateError::CoordinateMismatch);
+        }
+
+        for prior_leaf in prior_leaves {
+            let next_leaf = next_leaves
+                .iter()
+                .find(|leaf| leaf.leaf_index() == prior_leaf.leaf_index())
+                .ok_or(PublicStateError::CoordinateMismatch)?;
+            if prior_leaf.basic_credential() != next_leaf.basic_credential()
+                || prior_leaf.signature_key() != next_leaf.signature_key()
+                || (prior_leaf.leaf_index() != sender_leaf_index
+                    && prior_leaf.encryption_key() != next_leaf.encryption_key())
+            {
+                return Err(PublicStateError::CoordinateMismatch);
+            }
+        }
+        let added = next_leaves
+            .iter()
+            .filter(|next_leaf| {
+                !prior_leaves
+                    .iter()
+                    .any(|prior_leaf| prior_leaf.leaf_index() == next_leaf.leaf_index())
+            })
+            .collect::<Vec<_>>();
+        if added.len() != 1
+            || added[0].basic_credential() != expected_added_basic_credential
+            || added[0].signature_key() != expected_added_signature_key
+        {
+            return Err(PublicStateError::CoordinateMismatch);
+        }
+        let added = added[0];
+        let add_effect = CommitAddEffect {
+            leaf_index: added.leaf_index(),
+            basic_credential: added.basic_credential().to_vec(),
+            signature_key: added.signature_key().to_vec(),
+            encryption_key: added.encryption_key().to_vec(),
+            key_package_ref: added_key_package_ref,
+        };
+        let sender_update = CommitSenderUpdateEffect {
+            leaf_index: sender_leaf_index,
+            basic_credential: prior_sender.basic_credential().to_vec(),
+            signature_key: prior_sender.signature_key().to_vec(),
+            prior_encryption_key: prior_sender.encryption_key().to_vec(),
+            next_encryption_key: next_sender.encryption_key().to_vec(),
+        };
+
+        Ok(Self {
+            prior_coordinate: *prior_coordinate,
+            next,
+            adds: vec![add_effect],
+            removes: Vec::new(),
+            sender_update,
+            verified_commit_sha256: Some(verified_commit_sha256),
+            verified_aad_sha256: Some(verified_aad_sha256),
+        })
+    }
+
     /// Construct internally coherent effect evidence for pure planner tests.
     /// Production has no route around `process_commit`.
     #[cfg(test)]
