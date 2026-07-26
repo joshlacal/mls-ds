@@ -18,6 +18,10 @@ use sqlx::{Postgres, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
 
+use super::super::transcript::{
+    decode_and_verify_signed_mutation, decode_canonical_signed_mutation, CanonicalValueRef,
+    VerifiedMutationProjection,
+};
 use super::super::{
     snapshot::{
         PublicGroupSnapshotBinding, PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle,
@@ -32,7 +36,8 @@ use super::super::{
         PrincipalId, RecoveryOriginHydrationRow, RecoveryRequestHydrationRow,
         RecoveryRequestStatus, RecoveryReservationHydrationRow, RecoverySource, RequestEntryKind,
         RequestEvidence, ReservationStatus, ResetRequestHydrationRow, ResetRequestStatus,
-        ServerTimestamp, TransitionEvidence, WorkTerminalHydrationRow,
+        ServerTimestamp, TransitionEvidence, WelcomeHydrationRow, WelcomeStatus,
+        WorkTerminalHydrationRow,
     },
     validation::{BareDid, KeyThumbprint},
 };
@@ -3935,6 +3940,630 @@ fn recovery_timestamp(value: DateTime<Utc>) -> Result<ServerTimestamp, RecoveryH
 /// instant through this one formatter.
 fn canonical_millis(value: DateTime<Utc>) -> String {
     value.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+// ===========================================================================
+// T4-H2-pre terminal-family sub-seal C — Welcome hydration.
+//
+// A Welcome is the exact join of one immutable bundle and one delivery. The
+// bundle supplies its creation transition sequence, successor coordinate, and
+// opaque artifact; the delivery supplies the recipient, recovery/package
+// binding, expiry, and status. Terminal dispositions are direct causes only:
+// no timestamp or coordinate candidate search is permitted.
+// ===========================================================================
+
+#[allow(dead_code)]
+#[derive(Debug, Error)]
+pub(crate) enum WelcomeHydrationError {
+    #[error("clean-chat Welcome durable column is out of domain")]
+    OutOfDomain,
+    #[error("clean-chat Welcome terminal columns do not match the selected status")]
+    TerminalMismatch,
+    #[error("clean-chat Welcome terminal evidence failed re-verification")]
+    InvalidTerminal,
+    #[error("clean-chat Welcome hydration database error: {0}")]
+    Database(#[from] sqlx::Error),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct WelcomeTerminalColumns<'a> {
+    pub(crate) status: &'a str,
+    pub(crate) expires_at: DateTime<Utc>,
+    pub(crate) delivery_terminal_at: Option<DateTime<Utc>>,
+    pub(crate) disposition_present: bool,
+    pub(crate) disposition_matches_welcome: bool,
+    pub(crate) winner_kind: Option<&'a str>,
+    pub(crate) signed_request_bytes: Option<&'a [u8]>,
+    pub(crate) signing_transcript_bytes: Option<&'a [u8]>,
+    pub(crate) request_digest: Option<&'a [u8]>,
+    pub(crate) signature: Option<&'a [u8]>,
+    pub(crate) rejection_reason: Option<&'a str>,
+    pub(crate) disposition_terminal_at: Option<DateTime<Utc>>,
+    pub(crate) event_position: Option<i64>,
+    pub(crate) terminal_transition_id: Option<Uuid>,
+    pub(crate) terminal_revocation_id: Option<Uuid>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WelcomeTerminalSelection {
+    Pending,
+    Acknowledged {
+        terminal_at: DateTime<Utc>,
+    },
+    Rejected {
+        terminal_at: DateTime<Utc>,
+    },
+    Expired {
+        terminal_at: DateTime<Utc>,
+    },
+    Transition {
+        transition_id: Uuid,
+        terminal_at: DateTime<Utc>,
+    },
+    DeviceRevocation {
+        revocation_id: Uuid,
+        terminal_at: DateTime<Utc>,
+    },
+}
+
+/// Select the only legal disposition/cause shape for each durable Welcome
+/// status. Evidence is reconstructed only after this pure ruling succeeds.
+pub(crate) fn select_welcome_terminal(
+    columns: WelcomeTerminalColumns<'_>,
+) -> Result<WelcomeTerminalSelection, WelcomeHydrationError> {
+    let no_signed_fields = columns.signed_request_bytes.is_none()
+        && columns.signing_transcript_bytes.is_none()
+        && columns.request_digest.is_none()
+        && columns.signature.is_none();
+    let exact_signed_fields = columns
+        .signed_request_bytes
+        .is_some_and(|value| !value.is_empty())
+        && columns
+            .signing_transcript_bytes
+            .is_some_and(|value| !value.is_empty())
+        && columns
+            .request_digest
+            .is_some_and(|value| value.len() == 32)
+        && columns.signature.is_some_and(|value| value.len() == 64);
+    let no_disposition = !columns.disposition_present
+        && !columns.disposition_matches_welcome
+        && columns.winner_kind.is_none()
+        && no_signed_fields
+        && columns.rejection_reason.is_none()
+        && columns.disposition_terminal_at.is_none()
+        && columns.event_position.is_none()
+        && columns.terminal_transition_id.is_none()
+        && columns.terminal_revocation_id.is_none();
+    let shared_terminal = columns.disposition_present
+        && columns.disposition_matches_welcome
+        && columns
+            .event_position
+            .and_then(|value| u64::try_from(value).ok())
+            .is_some_and(|value| (1..=MAX_PROTOCOL_INTEGER).contains(&value))
+        && columns.delivery_terminal_at.is_some()
+        && columns.delivery_terminal_at == columns.disposition_terminal_at;
+
+    match columns.status {
+        "pending" if columns.delivery_terminal_at.is_none() && no_disposition => {
+            Ok(WelcomeTerminalSelection::Pending)
+        }
+        "acknowledged"
+            if shared_terminal
+                && columns.winner_kind == Some("acknowledged")
+                && exact_signed_fields
+                && columns.rejection_reason.is_none()
+                && columns.terminal_transition_id.is_none()
+                && columns.terminal_revocation_id.is_none()
+                && columns
+                    .delivery_terminal_at
+                    .is_some_and(|value| value < columns.expires_at) =>
+        {
+            Ok(WelcomeTerminalSelection::Acknowledged {
+                terminal_at: columns.delivery_terminal_at.unwrap(),
+            })
+        }
+        "rejected"
+            if shared_terminal
+                && columns.winner_kind == Some("rejected")
+                && exact_signed_fields
+                && matches!(
+                    columns.rejection_reason,
+                    Some(
+                        "noMatchingKeyPackage"
+                            | "invalidWelcome"
+                            | "unsupportedCipherSuite"
+                            | "coordinateMismatch"
+                            | "localStateConflict"
+                    )
+                )
+                && columns.terminal_transition_id.is_none()
+                && columns.terminal_revocation_id.is_none()
+                && columns
+                    .delivery_terminal_at
+                    .is_some_and(|value| value < columns.expires_at) =>
+        {
+            Ok(WelcomeTerminalSelection::Rejected {
+                terminal_at: columns.delivery_terminal_at.unwrap(),
+            })
+        }
+        "expired"
+            if shared_terminal
+                && columns.winner_kind == Some("expired")
+                && no_signed_fields
+                && columns.rejection_reason.is_none()
+                && columns.terminal_transition_id.is_none()
+                && columns.terminal_revocation_id.is_none()
+                && columns.delivery_terminal_at == Some(columns.expires_at) =>
+        {
+            Ok(WelcomeTerminalSelection::Expired {
+                terminal_at: columns.expires_at,
+            })
+        }
+        "superseded"
+            if shared_terminal
+                && columns.winner_kind == Some("superseded")
+                && no_signed_fields
+                && columns.rejection_reason.is_none()
+                && columns
+                    .delivery_terminal_at
+                    .is_some_and(|value| value < columns.expires_at)
+                && columns.terminal_transition_id.is_some()
+                && columns.terminal_revocation_id.is_none() =>
+        {
+            Ok(WelcomeTerminalSelection::Transition {
+                transition_id: columns.terminal_transition_id.unwrap(),
+                terminal_at: columns.delivery_terminal_at.unwrap(),
+            })
+        }
+        "superseded"
+            if shared_terminal
+                && columns.winner_kind == Some("superseded")
+                && no_signed_fields
+                && columns.rejection_reason.is_none()
+                && columns
+                    .delivery_terminal_at
+                    .is_some_and(|value| value < columns.expires_at)
+                && columns.terminal_transition_id.is_none()
+                && columns.terminal_revocation_id.is_some() =>
+        {
+            Ok(WelcomeTerminalSelection::DeviceRevocation {
+                revocation_id: columns.terminal_revocation_id.unwrap(),
+                terminal_at: columns.delivery_terminal_at.unwrap(),
+            })
+        }
+        "pending" | "acknowledged" | "rejected" | "expired" | "superseded" => {
+            Err(WelcomeHydrationError::TerminalMismatch)
+        }
+        _ => Err(WelcomeHydrationError::OutOfDomain),
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct DurableWelcomeHydrationRow {
+    welcome_id: Uuid,
+    conversation_id: Uuid,
+    entry_seq: i64,
+    generation: i64,
+    state_version: i64,
+    group_id: Vec<u8>,
+    epoch: i64,
+    group_context_hash: Vec<u8>,
+    confirmation_tag: Vec<u8>,
+    wrapper_bytes: Vec<u8>,
+    wrapper_sha256: Vec<u8>,
+    recipient_did: String,
+    recipient_device_id: Uuid,
+    recovery_request_id: Uuid,
+    key_package_ref: Vec<u8>,
+    expires_at: DateTime<Utc>,
+    status: String,
+    delivery_terminal_at: Option<DateTime<Utc>>,
+    disposition_welcome_id: Option<Uuid>,
+    winner_kind: Option<String>,
+    signed_request_bytes: Option<Vec<u8>>,
+    signing_transcript_bytes: Option<Vec<u8>>,
+    request_digest: Option<Vec<u8>>,
+    signature: Option<Vec<u8>>,
+    rejection_reason: Option<String>,
+    disposition_terminal_at: Option<DateTime<Utc>>,
+    event_position: Option<i64>,
+    terminal_transition_id: Option<Uuid>,
+    terminal_revocation_id: Option<Uuid>,
+}
+
+/// Load every Welcome for one conversation from its exact bundle/delivery row
+/// pair. Terminal dispositions are selected by their direct durable cause
+/// columns; pending rows require the complete disposition shape to be absent.
+#[allow(dead_code)]
+pub(crate) async fn load_welcome_hydration_rows(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &HistoricalRehydrationAuthority,
+    conversation_id: Uuid,
+) -> Result<Vec<WelcomeHydrationRow>, WelcomeHydrationError> {
+    let rows: Vec<DurableWelcomeHydrationRow> = sqlx::query_as(
+        r#"
+        SELECT
+            bundle.welcome_id,
+            bundle.conversation_id,
+            bundle.entry_seq,
+            bundle.generation,
+            bundle.state_version,
+            bundle.group_id,
+            bundle.epoch,
+            bundle.group_context_hash,
+            bundle.confirmation_tag,
+            bundle.wrapper_bytes,
+            bundle.wrapper_sha256,
+            delivery.recipient_did,
+            delivery.recipient_device_id,
+            delivery.recovery_request_id,
+            delivery.key_package_ref,
+            delivery.expires_at,
+            delivery.status,
+            delivery.terminal_at AS delivery_terminal_at,
+            disposition.welcome_id AS disposition_welcome_id,
+            disposition.winner_kind,
+            disposition.signed_request_bytes,
+            disposition.signing_transcript_bytes,
+            disposition.request_digest,
+            disposition.signature,
+            disposition.rejection_reason,
+            disposition.terminal_at AS disposition_terminal_at,
+            disposition.event_position,
+            disposition.terminal_transition_id,
+            disposition.terminal_revocation_id
+        FROM chat.welcome_bundles bundle
+        JOIN chat.welcome_deliveries delivery
+          ON delivery.welcome_id = bundle.welcome_id
+        LEFT JOIN chat.welcome_dispositions disposition
+          ON disposition.welcome_id = delivery.welcome_id
+        WHERE bundle.conversation_id = $1
+        "#,
+    )
+    .bind(conversation_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+
+    let mut welcomes = Vec::with_capacity(rows.len());
+    for row in rows {
+        if row.conversation_id != conversation_id
+            || !uuid_is_canonical_v4(row.welcome_id)
+            || !uuid_is_canonical_v4(row.recovery_request_id)
+            || row.wrapper_bytes.is_empty()
+        {
+            return Err(WelcomeHydrationError::OutOfDomain);
+        }
+        let transition_seq = welcome_positive_u64(row.entry_seq)?;
+        let coordinate = welcome_coordinate(
+            *row.conversation_id.as_bytes(),
+            row.generation,
+            row.state_version,
+            row.group_id,
+            row.epoch,
+            row.group_context_hash,
+            row.confirmation_tag,
+        )?;
+        let sha256 = welcome_bytes32(row.wrapper_sha256)?;
+        if <[u8; 32]>::from(Sha256::digest(&row.wrapper_bytes)) != sha256 {
+            return Err(WelcomeHydrationError::OutOfDomain);
+        }
+        let recipient = welcome_device(row.recipient_did, row.recipient_device_id)?;
+        let recovery_request_id = *row.recovery_request_id.as_bytes();
+        let key_package_ref = welcome_bytes32(row.key_package_ref)?;
+        let expires_at = welcome_timestamp(row.expires_at)?;
+
+        let selection = select_welcome_terminal(WelcomeTerminalColumns {
+            status: &row.status,
+            expires_at: row.expires_at,
+            delivery_terminal_at: row.delivery_terminal_at,
+            disposition_present: row.disposition_welcome_id.is_some(),
+            disposition_matches_welcome: row.disposition_welcome_id == Some(row.welcome_id),
+            winner_kind: row.winner_kind.as_deref(),
+            signed_request_bytes: row.signed_request_bytes.as_deref(),
+            signing_transcript_bytes: row.signing_transcript_bytes.as_deref(),
+            request_digest: row.request_digest.as_deref(),
+            signature: row.signature.as_deref(),
+            rejection_reason: row.rejection_reason.as_deref(),
+            disposition_terminal_at: row.disposition_terminal_at,
+            event_position: row.event_position,
+            terminal_transition_id: row.terminal_transition_id,
+            terminal_revocation_id: row.terminal_revocation_id,
+        })?;
+        let (status, terminal) = match selection {
+            WelcomeTerminalSelection::Pending => (WelcomeStatus::Pending, None),
+            WelcomeTerminalSelection::Acknowledged { terminal_at }
+            | WelcomeTerminalSelection::Rejected { terminal_at } => {
+                let expected_kind =
+                    if matches!(selection, WelcomeTerminalSelection::Acknowledged { .. }) {
+                        RequestEntryKind::WelcomeAcknowledgement
+                    } else {
+                        RequestEntryKind::WelcomeRejection
+                    };
+                let raw = row
+                    .signed_request_bytes
+                    .as_deref()
+                    .ok_or(WelcomeHydrationError::TerminalMismatch)?;
+                let transcript = row
+                    .signing_transcript_bytes
+                    .as_deref()
+                    .ok_or(WelcomeHydrationError::TerminalMismatch)?;
+                let request_digest: [u8; 32] = row
+                    .request_digest
+                    .as_deref()
+                    .and_then(|value| value.try_into().ok())
+                    .ok_or(WelcomeHydrationError::TerminalMismatch)?;
+                let signature: [u8; 64] = row
+                    .signature
+                    .as_deref()
+                    .and_then(|value| value.try_into().ok())
+                    .ok_or(WelcomeHydrationError::TerminalMismatch)?;
+                let canonical = decode_canonical_signed_mutation(raw)
+                    .map_err(|_| WelcomeHydrationError::InvalidTerminal)?;
+                let recipient_did = std::str::from_utf8(recipient.principal().as_bytes())
+                    .map_err(|_| WelcomeHydrationError::OutOfDomain)?;
+                let signing_public_key: Vec<u8> = sqlx::query_scalar(
+                    r#"SELECT signing_public_key
+                       FROM chat.device_keys
+                       WHERE user_did=$1 AND device_id=$2 AND key_id=$3"#,
+                )
+                .bind(recipient_did)
+                .bind(Uuid::from_bytes(*recipient.device_id()))
+                .bind(canonical.key_id().as_str())
+                .fetch_optional(&mut **transaction)
+                .await?
+                .ok_or(WelcomeHydrationError::InvalidTerminal)?;
+                if <[u8; 32]>::from(Sha256::digest(transcript)) != request_digest {
+                    return Err(WelcomeHydrationError::InvalidTerminal);
+                }
+                let terminal = load_work_terminal_hydration_row(
+                    transaction,
+                    authority,
+                    conversation_id,
+                    WorkTerminalLocator::Request {
+                        kind: expected_kind,
+                        source: WorkTerminalRequestSource::Signed {
+                            received_at: terminal_at,
+                            signed_request_bytes: raw,
+                            signing_transcript_bytes: transcript,
+                            request_digest,
+                            signature,
+                            signing_public_key: &signing_public_key,
+                        },
+                    },
+                )
+                .await
+                .map_err(|_| WelcomeHydrationError::InvalidTerminal)?;
+                let WorkTerminalHydrationRow::Request(ref evidence) = terminal else {
+                    return Err(WelcomeHydrationError::InvalidTerminal);
+                };
+                let terminal_timestamp = welcome_timestamp(terminal_at)?;
+                if evidence.kind() != expected_kind
+                    || evidence.conversation_id() != conversation_id.as_bytes()
+                    || evidence.request_id() != row.welcome_id.as_bytes()
+                    || evidence.actor() != &recipient
+                    || evidence.received_at() != terminal_timestamp
+                    || !welcome_response_body_matches(
+                        raw,
+                        &signing_public_key,
+                        expected_kind,
+                        *row.welcome_id.as_bytes(),
+                        &coordinate,
+                        transition_seq,
+                    )
+                {
+                    return Err(WelcomeHydrationError::InvalidTerminal);
+                }
+                let status = if expected_kind == RequestEntryKind::WelcomeAcknowledgement {
+                    WelcomeStatus::Acknowledged
+                } else {
+                    WelcomeStatus::Rejected
+                };
+                (status, Some(terminal))
+            }
+            WelcomeTerminalSelection::Expired { terminal_at } => {
+                let terminal = load_work_terminal_hydration_row(
+                    transaction,
+                    authority,
+                    conversation_id,
+                    WorkTerminalLocator::Expiry { terminal_at },
+                )
+                .await
+                .map_err(|_| WelcomeHydrationError::InvalidTerminal)?;
+                (WelcomeStatus::Expired, Some(terminal))
+            }
+            WelcomeTerminalSelection::Transition {
+                transition_id,
+                terminal_at,
+            } => {
+                let terminal = load_work_terminal_hydration_row(
+                    transaction,
+                    authority,
+                    conversation_id,
+                    WorkTerminalLocator::Transition { transition_id },
+                )
+                .await
+                .map_err(|_| WelcomeHydrationError::InvalidTerminal)?;
+                let WorkTerminalHydrationRow::Transition(ref evidence) = terminal else {
+                    return Err(WelcomeHydrationError::InvalidTerminal);
+                };
+                if evidence.transition_id() != transition_id.as_bytes()
+                    || evidence.seq() <= transition_seq
+                    || evidence.received_at() != welcome_timestamp(terminal_at)?
+                {
+                    return Err(WelcomeHydrationError::InvalidTerminal);
+                }
+                (WelcomeStatus::Superseded, Some(terminal))
+            }
+            WelcomeTerminalSelection::DeviceRevocation {
+                revocation_id,
+                terminal_at,
+            } => {
+                let terminal = load_work_terminal_hydration_row(
+                    transaction,
+                    authority,
+                    conversation_id,
+                    WorkTerminalLocator::DeviceRevocation { revocation_id },
+                )
+                .await
+                .map_err(|_| WelcomeHydrationError::InvalidTerminal)?;
+                let WorkTerminalHydrationRow::DeviceRevocation(ref evidence) = terminal else {
+                    return Err(WelcomeHydrationError::InvalidTerminal);
+                };
+                if evidence.revocation_id() != revocation_id.as_bytes()
+                    || evidence.target() != &recipient
+                    || evidence.accepted_at() != welcome_timestamp(terminal_at)?
+                {
+                    return Err(WelcomeHydrationError::InvalidTerminal);
+                }
+                (WelcomeStatus::Superseded, Some(terminal))
+            }
+        };
+
+        welcomes.push(WelcomeHydrationRow {
+            welcome_id: *row.welcome_id.as_bytes(),
+            recipient,
+            transition_seq,
+            coordinate,
+            recovery_request_id,
+            key_package_ref,
+            opaque_welcome: row.wrapper_bytes,
+            sha256,
+            expires_at,
+            status,
+            terminal,
+        });
+    }
+    welcomes.sort_by_key(|welcome| welcome.welcome_id);
+    Ok(welcomes)
+}
+
+fn welcome_device(did: String, device_id: Uuid) -> Result<DeviceIdentity, WelcomeHydrationError> {
+    if !uuid_is_canonical_v4(device_id) {
+        return Err(WelcomeHydrationError::OutOfDomain);
+    }
+    DeviceIdentity::new(
+        PrincipalId::new(did.into_bytes()).map_err(|_| WelcomeHydrationError::OutOfDomain)?,
+        *device_id.as_bytes(),
+    )
+    .map_err(|_| WelcomeHydrationError::OutOfDomain)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn welcome_coordinate(
+    conversation_id: [u8; 16],
+    generation: i64,
+    state_version: i64,
+    group_id: Vec<u8>,
+    epoch: i64,
+    group_context_hash: Vec<u8>,
+    confirmation_tag: Vec<u8>,
+) -> Result<PublicGroupSnapshotCoordinate, WelcomeHydrationError> {
+    Ok(PublicGroupSnapshotCoordinate::new(
+        conversation_id,
+        welcome_u64(generation)?,
+        welcome_u64(state_version)?,
+        welcome_bytes32(group_id)?,
+        welcome_u64(epoch)?,
+        welcome_bytes32(group_context_hash)?,
+        welcome_bytes32(confirmation_tag)?,
+        PublicGroupSnapshotLifecycle::Active,
+    ))
+}
+
+fn welcome_u64(value: i64) -> Result<u64, WelcomeHydrationError> {
+    u64::try_from(value)
+        .ok()
+        .filter(|value| *value <= MAX_PROTOCOL_INTEGER)
+        .ok_or(WelcomeHydrationError::OutOfDomain)
+}
+
+fn welcome_positive_u64(value: i64) -> Result<u64, WelcomeHydrationError> {
+    u64::try_from(value)
+        .ok()
+        .filter(|value| (1..=MAX_PROTOCOL_INTEGER).contains(value))
+        .ok_or(WelcomeHydrationError::OutOfDomain)
+}
+
+fn welcome_bytes32(value: Vec<u8>) -> Result<[u8; 32], WelcomeHydrationError> {
+    value
+        .try_into()
+        .map_err(|_| WelcomeHydrationError::OutOfDomain)
+}
+
+fn welcome_timestamp(value: DateTime<Utc>) -> Result<ServerTimestamp, WelcomeHydrationError> {
+    ServerTimestamp::from_canonical_stored(&canonical_millis(value))
+        .map_err(|_| WelcomeHydrationError::OutOfDomain)
+}
+
+fn welcome_response_body_matches(
+    raw: &[u8],
+    signing_public_key: &[u8],
+    expected_kind: RequestEntryKind,
+    welcome_id: [u8; 16],
+    coordinate: &PublicGroupSnapshotCoordinate,
+    transition_seq: u64,
+) -> bool {
+    let Ok(mutation) = decode_and_verify_signed_mutation(raw, signing_public_key) else {
+        return false;
+    };
+    let body = match (expected_kind, mutation.projection()) {
+        (
+            RequestEntryKind::WelcomeAcknowledgement,
+            VerifiedMutationProjection::WelcomeAcknowledgement(body),
+        ) => body.body(),
+        (
+            RequestEntryKind::WelcomeRejection,
+            VerifiedMutationProjection::WelcomeRejection(body),
+        ) => body.body(),
+        _ => return false,
+    };
+    let Some(CanonicalValueRef::Uuid(signed_welcome_id)) = body.get("welcomeId") else {
+        return false;
+    };
+    let Some(CanonicalValueRef::Integer(signed_transition_seq)) = body.get("transitionSeq") else {
+        return false;
+    };
+    let Some(CanonicalValueRef::Object(signed_coordinate)) = body.get("coordinates") else {
+        return false;
+    };
+    signed_welcome_id.as_bytes() == &welcome_id
+        && signed_transition_seq == transition_seq
+        && canonical_welcome_coordinate_matches(signed_coordinate, coordinate)
+}
+
+fn canonical_welcome_coordinate_matches(
+    value: super::super::transcript::ClosedObjectRef<'_>,
+    expected: &PublicGroupSnapshotCoordinate,
+) -> bool {
+    matches!(
+        (
+            value.get("conversationId"),
+            value.get("generation"),
+            value.get("stateVersion"),
+            value.get("groupId"),
+            value.get("epoch"),
+            value.get("groupContextHash"),
+            value.get("confirmationTag"),
+            value.get("lifecycle"),
+        ),
+        (
+            Some(CanonicalValueRef::Uuid(conversation_id)),
+            Some(CanonicalValueRef::Integer(generation)),
+            Some(CanonicalValueRef::Integer(state_version)),
+            Some(CanonicalValueRef::Bytes(group_id)),
+            Some(CanonicalValueRef::Integer(epoch)),
+            Some(CanonicalValueRef::Bytes(group_context_hash)),
+            Some(CanonicalValueRef::Bytes(confirmation_tag)),
+            Some(CanonicalValueRef::Text("active")),
+        ) if conversation_id.as_bytes() == expected.conversation_id()
+            && generation == expected.generation()
+            && state_version == expected.state_version()
+            && group_id == expected.group_id()
+            && epoch == expected.epoch()
+            && group_context_hash == expected.group_context_hash()
+            && confirmation_tag == expected.confirmation_tag()
+            && expected.lifecycle() == PublicGroupSnapshotLifecycle::Active
+    )
 }
 
 // ===========================================================================

@@ -3199,14 +3199,16 @@ mod historical_control_loader {
         use ed25519_dalek::{Signer, SigningKey};
         use serde_json::{json, Value};
         use sha2::{Digest, Sha256};
-        use sqlx::PgPool;
+        use sqlx::{PgPool, Postgres, Transaction};
         use uuid::Uuid;
 
         use super::super::historical_control_path::{build_real_creation_entry, RealCreationEntry};
         use super::seed_real_creation_graph;
         use crate::chat_protocol::repository::core::{
-            load_recovery_work_hydration_rows, select_fulfilled_recovery_terminal,
-            FulfilledRecoveryTerminalColumns, RecoveryHydrationError,
+            load_recovery_work_hydration_rows, load_welcome_hydration_rows,
+            select_fulfilled_recovery_terminal, select_welcome_terminal,
+            FulfilledRecoveryTerminalColumns, RecoveryHydrationError, WelcomeTerminalColumns,
+            WelcomeTerminalSelection,
         };
         use crate::chat_protocol::snapshot::{
             PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle,
@@ -3214,7 +3216,8 @@ mod historical_control_loader {
         use crate::chat_protocol::state_machine::{
             recovery_fulfillment_terminal_matches, DeviceIdentity, HistoricalRehydrationAuthority,
             LeafRecoveryKind, PrincipalId, RecoveryOriginHydrationRow, RecoveryRequestStatus,
-            RecoverySource, ReservationStatus, ServerTimestamp, WorkTerminalHydrationRow,
+            RecoverySource, ReservationStatus, ServerTimestamp, WelcomeStatus,
+            WorkTerminalHydrationRow,
         };
         use crate::chat_protocol::transcript::{
             decode_and_verify_control_entry, decode_canonical_signed_mutation, SignedMutationKind,
@@ -3495,6 +3498,44 @@ mod historical_control_loader {
             seed: &RecoverySeed,
             mutate_body: impl FnOnce(&mut Value),
         ) -> RealLeafRecoveryFulfillmentEntry {
+            build_real_leaf_recovery_fulfillment_entry_with_shape(
+                entry,
+                seed,
+                2,
+                genesis_coordinate_json(entry.cid),
+                next_coordinate_json(entry.cid),
+                json!({
+                    "conversationId": STANDARD.encode(entry.cid),
+                    "generation": 0,
+                    "stateVersion": 0,
+                    "groupId": STANDARD.encode([1_u8; 32]),
+                    "epoch": 0,
+                    "groupContextHash": STANDARD.encode([2_u8; 32]),
+                    "confirmationTag": STANDARD.encode([3_u8; 32]),
+                    "lifecycle": "active",
+                }),
+                1,
+                [4_u8; 32],
+                [5_u8; 32],
+                FULFILLED_AT,
+                mutate_body,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn build_real_leaf_recovery_fulfillment_entry_with_shape(
+            entry: &RealCreationEntry,
+            seed: &RecoverySeed,
+            seq: u64,
+            prior: Value,
+            next: Value,
+            aad_prior: Value,
+            next_epoch: u64,
+            next_group_context_hash: [u8; 32],
+            next_confirmation_tag: [u8; 32],
+            received_at: &str,
+            mutate_body: impl FnOnce(&mut Value),
+        ) -> RealLeafRecoveryFulfillmentEntry {
             let signing_key = SigningKey::from_bytes(&[0x24; 32]);
             let verifying = signing_key.verifying_key().to_bytes();
             assert_eq!(entry.public_key, verifying.to_vec());
@@ -3507,26 +3548,14 @@ mod historical_control_loader {
             let commit_bytes = [0x31_u8; 8];
             let metadata_ciphertext = [0x32_u8; 16];
             let opaque_welcome = vec![0x41_u8; 8];
-            let prior = genesis_coordinate_json(entry.cid);
-            let next = next_coordinate_json(entry.cid);
-            let aad_prior = json!({
-                "conversationId": STANDARD.encode(entry.cid),
-                "generation": 0,
-                "stateVersion": 0,
-                "groupId": STANDARD.encode([1_u8; 32]),
-                "epoch": 0,
-                "groupContextHash": STANDARD.encode([2_u8; 32]),
-                "confirmationTag": STANDARD.encode([3_u8; 32]),
-                "lifecycle": "active",
-            });
             let metadata_snapshot = json!({
                 "coordinate": {
                     "conversationId": STANDARD.encode(entry.cid),
                     "generation": 0,
                     "groupId": STANDARD.encode([1_u8; 32]),
-                    "epoch": 1,
-                    "groupContextHash": STANDARD.encode([4_u8; 32]),
-                    "confirmationTag": STANDARD.encode([5_u8; 32]),
+                    "epoch": next_epoch,
+                    "groupContextHash": STANDARD.encode(next_group_context_hash),
+                    "confirmationTag": STANDARD.encode(next_confirmation_tag),
                 },
                 "originTransitionId": seed.creation_transition_id.hyphenated().to_string(),
                 "metadataVersion": 1,
@@ -3626,9 +3655,9 @@ mod historical_control_loader {
                 "$type": "blue.catbird.chat.defs#leafRecoveryFulfillmentEntry",
                 "entryId": entry_id.hyphenated().to_string(),
                 "conversationId": Uuid::from_bytes(entry.cid).hyphenated().to_string(),
-                "seq": 2,
+                "seq": seq,
                 "signedRequest": wrapper,
-                "receivedAt": FULFILLED_AT,
+                "receivedAt": received_at,
             }))
             .unwrap();
             let decoded = decode_and_verify_control_entry(&public_row_json, &verifying)
@@ -4287,6 +4316,1107 @@ mod historical_control_loader {
                 result,
                 Err(RecoveryHydrationError::InvalidTerminal)
             ));
+        }
+
+        mod welcome_leg {
+            use super::*;
+
+            const WELCOME_TERMINAL_AT: &str = "2030-01-01T00:10:00.000Z";
+            const LATER_TRANSITION_AT: &str = "2030-01-01T00:02:00.000Z";
+
+            struct SignedWelcomeResponse {
+                raw_wrapper: Vec<u8>,
+                signing_transcript: Vec<u8>,
+                request_digest: Vec<u8>,
+                signature: Vec<u8>,
+            }
+
+            struct SignedWelcomeRevocation {
+                revocation_id: Uuid,
+                raw_wrapper: Vec<u8>,
+                signing_transcript: Vec<u8>,
+                request_digest: Vec<u8>,
+                signature: Vec<u8>,
+            }
+
+            fn build_signed_welcome_revocation(
+                entry: &RealCreationEntry,
+            ) -> SignedWelcomeRevocation {
+                let signing_key = SigningKey::from_bytes(&[0x24; 32]);
+                let revocation_id = Uuid::new_v4();
+                let body = json!({
+                    "$type": SignedMutationKind::DeviceRevocation.type_id(),
+                    "signatureDomain": String::from_utf8(
+                        SignedMutationKind::DeviceRevocation.domain().to_vec()
+                    ).unwrap(),
+                    "actorDid": entry.actor_did,
+                    "actorDeviceId": entry.actor_device_id.hyphenated().to_string(),
+                    "keyId": entry.actor_key_id,
+                    "authGeneration": 1,
+                    "targetDeviceId": entry.actor_device_id.hyphenated().to_string(),
+                    "targetAuthGeneration": 1,
+                    "idempotencyKey": revocation_id.hyphenated().to_string(),
+                    "signedAt": "2030-01-01T00:09:59.000Z",
+                });
+                let mut wrapper = json!({ "body": body, "signature": STANDARD.encode([0_u8; 64]) });
+                let unsigned = serde_json::to_vec(&wrapper).unwrap();
+                let canonical = decode_canonical_signed_mutation(&unsigned)
+                    .expect("unsigned Welcome revocation canonicalizes");
+                let signing_transcript = canonical.transcript_bytes().to_vec();
+                let signature = signing_key.sign(&signing_transcript).to_bytes();
+                wrapper["signature"] = Value::String(STANDARD.encode(signature));
+                let raw_wrapper = serde_json::to_vec(&wrapper).unwrap();
+                SignedWelcomeRevocation {
+                    revocation_id,
+                    raw_wrapper,
+                    request_digest: Sha256::digest(&signing_transcript).to_vec(),
+                    signature: signature.to_vec(),
+                    signing_transcript,
+                }
+            }
+
+            async fn insert_uncommitted_superseded_disposition(
+                transaction: &mut Transaction<'_, Postgres>,
+                entry: &RealCreationEntry,
+                fulfillment: &RealLeafRecoveryFulfillmentEntry,
+                terminal_at: DateTime<Utc>,
+                terminal_transition_id: Option<Uuid>,
+                terminal_revocation_id: Option<Uuid>,
+            ) {
+                sqlx::query(
+                    r#"INSERT INTO chat.protocol_instances(
+                        singleton,protocol_instance_id,cursor_key_id,created_at
+                    ) VALUES(TRUE,$1,$2,$3)
+                    ON CONFLICT (singleton) DO NOTHING"#,
+                )
+                .bind(Uuid::new_v4())
+                .bind(&entry.actor_key_id)
+                .bind(terminal_at)
+                .execute(&mut **transaction)
+                .await
+                .expect("ensure supersession protocol instance");
+                let protocol_instance_id: Uuid =
+                    sqlx::query_scalar("SELECT protocol_instance_id FROM chat.protocol_instances")
+                        .fetch_one(&mut **transaction)
+                        .await
+                        .expect("supersession protocol instance");
+                let payload = vec![0x83_u8; 8];
+                let event_position: i64 = sqlx::query_scalar(
+                    r#"INSERT INTO chat.events(
+                        event_id,event_kind,payload_bytes,payload_sha256,created_at,
+                        protocol_instance_id
+                    ) VALUES($1,'welcomeDisposition',$2,$3,$4,$5)
+                    RETURNING event_position"#,
+                )
+                .bind(Uuid::new_v4())
+                .bind(&payload)
+                .bind(Sha256::digest(&payload).to_vec())
+                .bind(terminal_at)
+                .bind(protocol_instance_id)
+                .fetch_one(&mut **transaction)
+                .await
+                .expect("insert supersession event");
+                sqlx::query(
+                    "UPDATE chat.welcome_deliveries SET status='superseded',terminal_at=$2 \
+                     WHERE welcome_id=$1 AND status='pending'",
+                )
+                .bind(fulfillment.welcome_id)
+                .bind(terminal_at)
+                .execute(&mut **transaction)
+                .await
+                .expect("supersede pending Welcome");
+                sqlx::query(
+                    r#"INSERT INTO chat.welcome_dispositions(
+                        welcome_id,winner_kind,signed_request_bytes,signing_transcript_bytes,
+                        request_digest,signature,rejection_reason,terminal_at,event_position,
+                        terminal_transition_id,terminal_revocation_id
+                    ) VALUES($1,'superseded',NULL,NULL,NULL,NULL,NULL,$2,$3,$4,$5)"#,
+                )
+                .bind(fulfillment.welcome_id)
+                .bind(terminal_at)
+                .bind(event_position)
+                .bind(terminal_transition_id)
+                .bind(terminal_revocation_id)
+                .execute(&mut **transaction)
+                .await
+                .expect("insert direct-cause supersession disposition");
+            }
+
+            async fn insert_uncommitted_signed_disposition(
+                transaction: &mut Transaction<'_, Postgres>,
+                entry: &RealCreationEntry,
+                fulfillment: &RealLeafRecoveryFulfillmentEntry,
+                winner: &str,
+                response: &SignedWelcomeResponse,
+                stored_signature: &[u8],
+            ) {
+                let terminal_at = instant(WELCOME_TERMINAL_AT);
+                sqlx::query(
+                    r#"INSERT INTO chat.protocol_instances(
+                        singleton,protocol_instance_id,cursor_key_id,created_at
+                    ) VALUES(TRUE,$1,$2,$3)
+                    ON CONFLICT (singleton) DO NOTHING"#,
+                )
+                .bind(Uuid::new_v4())
+                .bind(&entry.actor_key_id)
+                .bind(terminal_at)
+                .execute(&mut **transaction)
+                .await
+                .expect("ensure malformed-response protocol instance");
+                let protocol_instance_id: Uuid =
+                    sqlx::query_scalar("SELECT protocol_instance_id FROM chat.protocol_instances")
+                        .fetch_one(&mut **transaction)
+                        .await
+                        .expect("malformed-response protocol instance");
+                let payload = vec![0x84_u8; 8];
+                let event_position: i64 = sqlx::query_scalar(
+                    r#"INSERT INTO chat.events(
+                        event_id,event_kind,payload_bytes,payload_sha256,created_at,
+                        protocol_instance_id
+                    ) VALUES($1,'welcomeDisposition',$2,$3,$4,$5)
+                    RETURNING event_position"#,
+                )
+                .bind(Uuid::new_v4())
+                .bind(&payload)
+                .bind(Sha256::digest(&payload).to_vec())
+                .bind(terminal_at)
+                .bind(protocol_instance_id)
+                .fetch_one(&mut **transaction)
+                .await
+                .expect("insert malformed-response event");
+                sqlx::query(
+                    "UPDATE chat.welcome_deliveries SET status=$2,terminal_at=$3 \
+                     WHERE welcome_id=$1 AND status='pending'",
+                )
+                .bind(fulfillment.welcome_id)
+                .bind(winner)
+                .bind(terminal_at)
+                .execute(&mut **transaction)
+                .await
+                .expect("terminalize malformed-response Welcome");
+                sqlx::query(
+                    r#"INSERT INTO chat.welcome_dispositions(
+                        welcome_id,winner_kind,signed_request_bytes,signing_transcript_bytes,
+                        request_digest,signature,rejection_reason,terminal_at,event_position,
+                        terminal_transition_id,terminal_revocation_id
+                    ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,NULL,NULL)"#,
+                )
+                .bind(fulfillment.welcome_id)
+                .bind(winner)
+                .bind(&response.raw_wrapper)
+                .bind(&response.signing_transcript)
+                .bind(&response.request_digest)
+                .bind(stored_signature)
+                .bind((winner == "rejected").then_some("invalidWelcome"))
+                .bind(terminal_at)
+                .bind(event_position)
+                .execute(&mut **transaction)
+                .await
+                .expect("insert malformed signed disposition");
+            }
+
+            fn build_signed_welcome_response(
+                entry: &RealCreationEntry,
+                fulfillment: &RealLeafRecoveryFulfillmentEntry,
+                kind: SignedMutationKind,
+            ) -> SignedWelcomeResponse {
+                assert!(matches!(
+                    kind,
+                    SignedMutationKind::WelcomeAcknowledgement
+                        | SignedMutationKind::WelcomeRejection
+                ));
+                let signing_key = SigningKey::from_bytes(&[0x24; 32]);
+                let mut body = json!({
+                    "$type": kind.type_id(),
+                    "signatureDomain": String::from_utf8(kind.domain().to_vec()).unwrap(),
+                    "actorDid": entry.actor_did,
+                    "actorDeviceId": entry.actor_device_id.hyphenated().to_string(),
+                    "keyId": entry.actor_key_id,
+                    "authGeneration": 1,
+                    "idempotencyKey": Uuid::new_v4().hyphenated().to_string(),
+                    "signedAt": "2030-01-01T00:09:59.000Z",
+                    "welcomeId": fulfillment.welcome_id.hyphenated().to_string(),
+                    "coordinates": next_coordinate_json(entry.cid),
+                    "transitionSeq": 2,
+                });
+                if kind == SignedMutationKind::WelcomeRejection {
+                    body["reason"] = Value::String("invalidWelcome".to_owned());
+                }
+                let mut wrapper = json!({ "body": body, "signature": STANDARD.encode([0_u8; 64]) });
+                let unsigned = serde_json::to_vec(&wrapper).unwrap();
+                let canonical = decode_canonical_signed_mutation(&unsigned)
+                    .expect("unsigned Welcome response canonicalizes");
+                let signature = signing_key.sign(canonical.transcript_bytes()).to_bytes();
+                wrapper["signature"] = Value::String(STANDARD.encode(signature));
+                let raw_wrapper = serde_json::to_vec(&wrapper).unwrap();
+                let verified = decode_canonical_signed_mutation(&raw_wrapper)
+                    .expect("signed Welcome response canonicalizes");
+                SignedWelcomeResponse {
+                    raw_wrapper,
+                    signing_transcript: verified.transcript_bytes().to_vec(),
+                    request_digest: verified.request_digest().to_vec(),
+                    signature: verified.signature().to_vec(),
+                }
+            }
+
+            fn build_later_coordinate_consuming_transition(
+                entry: &RealCreationEntry,
+                seed: &RecoverySeed,
+            ) -> RealLeafRecoveryFulfillmentEntry {
+                build_real_leaf_recovery_fulfillment_entry_with_shape(
+                    entry,
+                    seed,
+                    3,
+                    next_coordinate_json(entry.cid),
+                    json!({
+                        "conversationId": Uuid::from_bytes(entry.cid).hyphenated().to_string(),
+                        "generation": 0,
+                        "stateVersion": 2,
+                        "groupId": STANDARD.encode([1_u8; 32]),
+                        "epoch": 2,
+                        "groupContextHash": STANDARD.encode([6_u8; 32]),
+                        "confirmationTag": STANDARD.encode([7_u8; 32]),
+                        "lifecycle": "active",
+                    }),
+                    json!({
+                        "conversationId": STANDARD.encode(entry.cid),
+                        "generation": 0,
+                        "stateVersion": 1,
+                        "groupId": STANDARD.encode([1_u8; 32]),
+                        "epoch": 1,
+                        "groupContextHash": STANDARD.encode([4_u8; 32]),
+                        "confirmationTag": STANDARD.encode([5_u8; 32]),
+                        "lifecycle": "active",
+                    }),
+                    2,
+                    [6_u8; 32],
+                    [7_u8; 32],
+                    LATER_TRANSITION_AT,
+                    |_| {},
+                )
+            }
+
+            async fn insert_uncommitted_later_transition(
+                transaction: &mut Transaction<'_, Postgres>,
+                entry: &RealCreationEntry,
+                transition: &RealLeafRecoveryFulfillmentEntry,
+            ) {
+                let cid = Uuid::from_bytes(entry.cid);
+                let at = instant(LATER_TRANSITION_AT);
+                let metadata_snapshot_id = Uuid::new_v4();
+                sqlx::query(
+                    r#"INSERT INTO chat.transitions(
+                        transition_id,conversation_id,kind,actor_did,actor_device_id,actor_key_id,
+                        actor_auth_generation,actor_role,actor_device_status,signed_request_bytes,
+                        unsigned_projection_bytes,signing_transcript_bytes,request_digest,signature,
+                        prior_generation,prior_state_version,next_generation,next_state_version,
+                        metadata_snapshot_id,entry_seq,accepted_at
+                    ) VALUES($1,$2,'leafRecovery',$3,$4,$5,1,'admin','active',$6,$7,$8,$9,$10,
+                        0,1,0,2,$11,3,$12)"#,
+                )
+                .bind(transition.transition_id)
+                .bind(cid)
+                .bind(&entry.actor_did)
+                .bind(entry.actor_device_id)
+                .bind(&entry.actor_key_id)
+                .bind(&transition.raw_wrapper)
+                .bind(&transition.canonical_projection)
+                .bind(&transition.signing_transcript)
+                .bind(&transition.request_digest)
+                .bind(&transition.signature)
+                .bind(metadata_snapshot_id)
+                .bind(at)
+                .execute(&mut **transaction)
+                .await
+                .expect("insert later consuming transition");
+                sqlx::query(
+                    r#"INSERT INTO chat.entries(
+                        conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,
+                        accepted_payload_sha256,signed_request_bytes,request_digest,signature,
+                        server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,
+                        actor_key_id,actor_auth_generation,generation,state_version,transition_id,
+                        received_at
+                    ) VALUES($1,3,$2,'blue.catbird.chat.defs#leafRecoveryFulfillmentEntry',
+                        $3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1,0,2,$13,$14)"#,
+                )
+                .bind(cid)
+                .bind(transition.entry_id)
+                .bind(&transition.public_row_json)
+                .bind(Sha256::digest(&transition.public_row_json).to_vec())
+                .bind(&transition.raw_wrapper)
+                .bind(&transition.request_digest)
+                .bind(&transition.signature)
+                .bind(&transition.server_fields_dag_cbor)
+                .bind(transition.outer_entry_fingerprint.to_vec())
+                .bind(&entry.actor_did)
+                .bind(entry.actor_device_id)
+                .bind(&entry.actor_key_id)
+                .bind(transition.transition_id)
+                .bind(at)
+                .execute(&mut **transaction)
+                .await
+                .expect("insert later consuming entry");
+            }
+
+            async fn commit_signed_welcome_disposition(
+                pool: &PgPool,
+                entry: &RealCreationEntry,
+                fulfillment: &RealLeafRecoveryFulfillmentEntry,
+                kind: SignedMutationKind,
+                response: &SignedWelcomeResponse,
+            ) {
+                let winner = match kind {
+                    SignedMutationKind::WelcomeAcknowledgement => "acknowledged",
+                    SignedMutationKind::WelcomeRejection => "rejected",
+                    _ => unreachable!(),
+                };
+                let at = instant(WELCOME_TERMINAL_AT);
+                let cid = Uuid::from_bytes(entry.cid);
+                sqlx::query(
+                    r#"INSERT INTO chat.protocol_instances(
+                        singleton,protocol_instance_id,cursor_key_id,created_at
+                    ) VALUES(TRUE,$1,$2,$3)
+                    ON CONFLICT (singleton) DO NOTHING"#,
+                )
+                .bind(Uuid::new_v4())
+                .bind(&entry.actor_key_id)
+                .bind(at)
+                .execute(pool)
+                .await
+                .expect("ensure singleton protocol instance");
+                let protocol_instance_id: Uuid =
+                    sqlx::query_scalar("SELECT protocol_instance_id FROM chat.protocol_instances")
+                        .fetch_one(pool)
+                        .await
+                        .expect("singleton protocol instance");
+                let payload = vec![0x81_u8; 8];
+
+                let mut tx = pool.begin().await.expect("begin Welcome disposition");
+                sqlx::query(
+                    "UPDATE chat.welcome_deliveries SET status=$2,terminal_at=$3 \
+                     WHERE welcome_id=$1 AND status='pending'",
+                )
+                .bind(fulfillment.welcome_id)
+                .bind(winner)
+                .bind(at)
+                .execute(&mut *tx)
+                .await
+                .expect("terminalize pending Welcome");
+                let event_position: i64 = sqlx::query_scalar(
+                    r#"INSERT INTO chat.events(
+                        event_id,event_kind,payload_bytes,payload_sha256,created_at,
+                        protocol_instance_id
+                    ) VALUES($1,'welcomeDisposition',$2,$3,$4,$5)
+                    RETURNING event_position"#,
+                )
+                .bind(Uuid::new_v4())
+                .bind(&payload)
+                .bind(Sha256::digest(&payload).to_vec())
+                .bind(at)
+                .bind(protocol_instance_id)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("insert disposition event");
+                let audience_predecessor_position: Option<i64> = sqlx::query_scalar(
+                    r#"SELECT MAX(event_position)
+                       FROM chat.event_recipients
+                       WHERE user_did=$1 AND device_id=$2"#,
+                )
+                .bind(&entry.actor_did)
+                .bind(entry.actor_device_id)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("read current event-recipient predecessor");
+                sqlx::query(
+                    r#"INSERT INTO chat.event_recipients(
+                        event_position,user_did,device_id,entitlement_kind,
+                        audience_predecessor_position
+                    ) VALUES($1,$2,$3,'welcome',$4)"#,
+                )
+                .bind(event_position)
+                .bind(&entry.actor_did)
+                .bind(entry.actor_device_id)
+                .bind(audience_predecessor_position)
+                .execute(&mut *tx)
+                .await
+                .expect("insert disposition event recipient");
+                sqlx::query(
+                    r#"INSERT INTO chat.outbox(
+                        outbox_id,event_position,work_kind,status,next_attempt_at,created_at
+                    ) VALUES($1,$2,'stream','pending',$3,$3)"#,
+                )
+                .bind(Uuid::new_v4())
+                .bind(event_position)
+                .bind(at)
+                .execute(&mut *tx)
+                .await
+                .expect("insert disposition outbox");
+                sqlx::query(
+                    r#"INSERT INTO chat.welcome_dispositions(
+                        welcome_id,winner_kind,signed_request_bytes,signing_transcript_bytes,
+                        request_digest,signature,rejection_reason,terminal_at,event_position,
+                        terminal_transition_id,terminal_revocation_id
+                    ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,NULL,NULL)"#,
+                )
+                .bind(fulfillment.welcome_id)
+                .bind(winner)
+                .bind(&response.raw_wrapper)
+                .bind(&response.signing_transcript)
+                .bind(&response.request_digest)
+                .bind(&response.signature)
+                .bind((winner == "rejected").then_some("invalidWelcome"))
+                .bind(at)
+                .bind(event_position)
+                .execute(&mut *tx)
+                .await
+                .expect("insert signed Welcome disposition");
+                if winner == "rejected" {
+                    sqlx::query(
+                        r#"INSERT INTO chat.recovery_work_items(
+                            recovery_work_id,conversation_id,recipient_did,recipient_device_id,
+                            source_kind,source_id,generation,state_version,status,created_at
+                        ) VALUES($1,$2,$3,$4,'welcomeRejected',$5,0,1,'pending',$6)"#,
+                    )
+                    .bind(Uuid::new_v4())
+                    .bind(cid)
+                    .bind(&entry.actor_did)
+                    .bind(entry.actor_device_id)
+                    .bind(fulfillment.welcome_id)
+                    .bind(at)
+                    .execute(&mut *tx)
+                    .await
+                    .expect("insert rejected-Welcome recovery work");
+                }
+                tx.commit()
+                    .await
+                    .expect("signed Welcome disposition crosses deferred mappings");
+            }
+
+            async fn commit_expired_welcome_disposition(
+                pool: &PgPool,
+                entry: &RealCreationEntry,
+                fulfillment: &RealLeafRecoveryFulfillmentEntry,
+            ) {
+                let at = instant(KP_NOT_AFTER);
+                let cid = Uuid::from_bytes(entry.cid);
+                sqlx::query(
+                    r#"INSERT INTO chat.protocol_instances(
+                        singleton,protocol_instance_id,cursor_key_id,created_at
+                    ) VALUES(TRUE,$1,$2,$3)
+                    ON CONFLICT (singleton) DO NOTHING"#,
+                )
+                .bind(Uuid::new_v4())
+                .bind(&entry.actor_key_id)
+                .bind(at)
+                .execute(pool)
+                .await
+                .expect("ensure singleton protocol instance");
+                let protocol_instance_id: Uuid =
+                    sqlx::query_scalar("SELECT protocol_instance_id FROM chat.protocol_instances")
+                        .fetch_one(pool)
+                        .await
+                        .expect("singleton protocol instance");
+                let payload = vec![0x82_u8; 8];
+                let mut tx = pool.begin().await.expect("begin Welcome expiry");
+                sqlx::query(
+                    "UPDATE chat.welcome_deliveries SET status='expired',terminal_at=$2 \
+                     WHERE welcome_id=$1 AND status='pending'",
+                )
+                .bind(fulfillment.welcome_id)
+                .bind(at)
+                .execute(&mut *tx)
+                .await
+                .expect("expire pending Welcome");
+                let event_position: i64 = sqlx::query_scalar(
+                    r#"INSERT INTO chat.events(
+                        event_id,event_kind,payload_bytes,payload_sha256,created_at,
+                        protocol_instance_id
+                    ) VALUES($1,'welcomeDisposition',$2,$3,$4,$5)
+                    RETURNING event_position"#,
+                )
+                .bind(Uuid::new_v4())
+                .bind(&payload)
+                .bind(Sha256::digest(&payload).to_vec())
+                .bind(at)
+                .bind(protocol_instance_id)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("insert expiry event");
+                let predecessor: Option<i64> = sqlx::query_scalar(
+                    r#"SELECT MAX(event_position) FROM chat.event_recipients
+                       WHERE user_did=$1 AND device_id=$2"#,
+                )
+                .bind(&entry.actor_did)
+                .bind(entry.actor_device_id)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("read expiry audience predecessor");
+                sqlx::query(
+                    r#"INSERT INTO chat.event_recipients(
+                        event_position,user_did,device_id,entitlement_kind,
+                        audience_predecessor_position
+                    ) VALUES($1,$2,$3,'welcome',$4)"#,
+                )
+                .bind(event_position)
+                .bind(&entry.actor_did)
+                .bind(entry.actor_device_id)
+                .bind(predecessor)
+                .execute(&mut *tx)
+                .await
+                .expect("insert expiry recipient");
+                sqlx::query(
+                    r#"INSERT INTO chat.outbox(
+                        outbox_id,event_position,work_kind,status,next_attempt_at,created_at
+                    ) VALUES($1,$2,'stream','pending',$3,$3)"#,
+                )
+                .bind(Uuid::new_v4())
+                .bind(event_position)
+                .bind(at)
+                .execute(&mut *tx)
+                .await
+                .expect("insert expiry outbox");
+                sqlx::query(
+                    r#"INSERT INTO chat.welcome_dispositions(
+                        welcome_id,winner_kind,signed_request_bytes,signing_transcript_bytes,
+                        request_digest,signature,rejection_reason,terminal_at,event_position,
+                        terminal_transition_id,terminal_revocation_id
+                    ) VALUES($1,'expired',NULL,NULL,NULL,NULL,NULL,$2,$3,NULL,NULL)"#,
+                )
+                .bind(fulfillment.welcome_id)
+                .bind(at)
+                .bind(event_position)
+                .execute(&mut *tx)
+                .await
+                .expect("insert expiry disposition");
+                sqlx::query(
+                    r#"INSERT INTO chat.recovery_work_items(
+                        recovery_work_id,conversation_id,recipient_did,recipient_device_id,
+                        source_kind,source_id,generation,state_version,status,created_at
+                    ) VALUES($1,$2,$3,$4,'welcomeExpired',$5,0,1,'pending',$6)"#,
+                )
+                .bind(Uuid::new_v4())
+                .bind(cid)
+                .bind(&entry.actor_did)
+                .bind(entry.actor_device_id)
+                .bind(fulfillment.welcome_id)
+                .bind(at)
+                .execute(&mut *tx)
+                .await
+                .expect("insert expired-Welcome recovery work");
+                tx.commit()
+                    .await
+                    .expect("expired Welcome crosses deferred mappings");
+            }
+
+            #[test]
+            fn welcome_terminal_selector_requires_exact_status_and_direct_cause() {
+                let terminal_at = instant("2030-01-01T00:10:00.000Z");
+                let other_at = instant("2030-01-01T00:10:01.000Z");
+                let expires_at = instant(KP_NOT_AFTER);
+                let transition_id = Uuid::new_v4();
+                let revocation_id = Uuid::new_v4();
+                let signed = [0x31_u8; 8];
+                let transcript = [0x32_u8; 8];
+                let digest = [0x33_u8; 32];
+                let signature = [0x34_u8; 64];
+
+                let pending = WelcomeTerminalColumns {
+                    status: "pending",
+                    expires_at,
+                    delivery_terminal_at: None,
+                    disposition_present: false,
+                    disposition_matches_welcome: false,
+                    winner_kind: None,
+                    signed_request_bytes: None,
+                    signing_transcript_bytes: None,
+                    request_digest: None,
+                    signature: None,
+                    rejection_reason: None,
+                    disposition_terminal_at: None,
+                    event_position: None,
+                    terminal_transition_id: None,
+                    terminal_revocation_id: None,
+                };
+                assert_eq!(
+                    select_welcome_terminal(pending).unwrap(),
+                    WelcomeTerminalSelection::Pending
+                );
+
+                let acknowledged = WelcomeTerminalColumns {
+                    status: "acknowledged",
+                    delivery_terminal_at: Some(terminal_at),
+                    disposition_present: true,
+                    disposition_matches_welcome: true,
+                    winner_kind: Some("acknowledged"),
+                    signed_request_bytes: Some(&signed),
+                    signing_transcript_bytes: Some(&transcript),
+                    request_digest: Some(&digest),
+                    signature: Some(&signature),
+                    disposition_terminal_at: Some(terminal_at),
+                    event_position: Some(1),
+                    ..pending
+                };
+                assert_eq!(
+                    select_welcome_terminal(acknowledged).unwrap(),
+                    WelcomeTerminalSelection::Acknowledged { terminal_at }
+                );
+                let rejected = WelcomeTerminalColumns {
+                    status: "rejected",
+                    winner_kind: Some("rejected"),
+                    rejection_reason: Some("invalidWelcome"),
+                    ..acknowledged
+                };
+                assert_eq!(
+                    select_welcome_terminal(rejected).unwrap(),
+                    WelcomeTerminalSelection::Rejected { terminal_at }
+                );
+                let expired = WelcomeTerminalColumns {
+                    status: "expired",
+                    delivery_terminal_at: Some(expires_at),
+                    disposition_present: true,
+                    disposition_matches_welcome: true,
+                    winner_kind: Some("expired"),
+                    disposition_terminal_at: Some(expires_at),
+                    event_position: Some(1),
+                    ..pending
+                };
+                assert_eq!(
+                    select_welcome_terminal(expired).unwrap(),
+                    WelcomeTerminalSelection::Expired {
+                        terminal_at: expires_at
+                    }
+                );
+                let superseded_transition = WelcomeTerminalColumns {
+                    status: "superseded",
+                    delivery_terminal_at: Some(terminal_at),
+                    disposition_present: true,
+                    disposition_matches_welcome: true,
+                    winner_kind: Some("superseded"),
+                    disposition_terminal_at: Some(terminal_at),
+                    event_position: Some(1),
+                    terminal_transition_id: Some(transition_id),
+                    ..pending
+                };
+                assert_eq!(
+                    select_welcome_terminal(superseded_transition).unwrap(),
+                    WelcomeTerminalSelection::Transition {
+                        transition_id,
+                        terminal_at,
+                    }
+                );
+                let superseded_revocation = WelcomeTerminalColumns {
+                    terminal_transition_id: None,
+                    terminal_revocation_id: Some(revocation_id),
+                    ..superseded_transition
+                };
+                assert_eq!(
+                    select_welcome_terminal(superseded_revocation).unwrap(),
+                    WelcomeTerminalSelection::DeviceRevocation {
+                        revocation_id,
+                        terminal_at,
+                    }
+                );
+
+                let malformed = [
+                    WelcomeTerminalColumns {
+                        disposition_present: true,
+                        ..pending
+                    },
+                    WelcomeTerminalColumns {
+                        signed_request_bytes: None,
+                        ..acknowledged
+                    },
+                    WelcomeTerminalColumns {
+                        winner_kind: Some("rejected"),
+                        ..acknowledged
+                    },
+                    WelcomeTerminalColumns {
+                        rejection_reason: Some("invalidWelcome"),
+                        ..acknowledged
+                    },
+                    WelcomeTerminalColumns {
+                        rejection_reason: None,
+                        ..rejected
+                    },
+                    WelcomeTerminalColumns {
+                        delivery_terminal_at: Some(other_at),
+                        ..acknowledged
+                    },
+                    WelcomeTerminalColumns {
+                        terminal_transition_id: Some(transition_id),
+                        ..acknowledged
+                    },
+                    WelcomeTerminalColumns {
+                        signed_request_bytes: Some(&signed),
+                        ..expired
+                    },
+                    WelcomeTerminalColumns {
+                        delivery_terminal_at: Some(terminal_at),
+                        ..expired
+                    },
+                    WelcomeTerminalColumns {
+                        terminal_transition_id: None,
+                        ..superseded_transition
+                    },
+                    WelcomeTerminalColumns {
+                        terminal_revocation_id: Some(revocation_id),
+                        ..superseded_transition
+                    },
+                    WelcomeTerminalColumns {
+                        disposition_terminal_at: Some(other_at),
+                        ..superseded_transition
+                    },
+                    WelcomeTerminalColumns {
+                        status: "acknowledged",
+                        ..superseded_transition
+                    },
+                ];
+                for columns in malformed {
+                    assert!(matches!(
+                        select_welcome_terminal(columns),
+                        Err(crate::chat_protocol::repository::core::WelcomeHydrationError::TerminalMismatch)
+                    ));
+                }
+            }
+
+            /// Removing the Welcome query, omitting pending rows, or projecting
+            /// bundle/delivery columns from the wrong source makes this live
+            /// loader test fail. Every expected value is hand-derived from the
+            /// committed fixture rather than from the loader under test.
+            #[tokio::test]
+            #[ignore = "requires the dedicated gate database"]
+            async fn empty_and_pending_welcome_rows_hydrate_exact_bundle() {
+                let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+
+                let empty_cid = Uuid::new_v4();
+                let empty_entry = build_real_creation_entry(*empty_cid.as_bytes());
+                seed_real_creation_graph(&pool, &empty_entry).await;
+                let empty_authority = HistoricalRehydrationAuthority::new(empty_entry.cid, 2)
+                    .expect("empty conversation authority");
+                let mut empty_tx = pool.begin().await.expect("begin empty load");
+                let empty = load_welcome_hydration_rows(&mut empty_tx, &empty_authority, empty_cid)
+                    .await
+                    .expect("conversation without Welcomes hydrates empty");
+                empty_tx.rollback().await.expect("rollback empty load");
+                assert!(empty.is_empty());
+
+                let cid = Uuid::new_v4();
+                let entry = build_real_creation_entry(*cid.as_bytes());
+                let seed = seed_recovery_pair(&pool, &entry, "requestLeafRecovery").await;
+                let fulfillment = build_real_leaf_recovery_fulfillment_entry(&entry, &seed);
+                commit_recovery_fulfillment_graph(&pool, &entry, &seed, &fulfillment).await;
+                let authority =
+                    HistoricalRehydrationAuthority::new(entry.cid, 3).expect("fulfilled authority");
+
+                let mut tx = pool.begin().await.expect("begin pending load");
+                let rows = load_welcome_hydration_rows(&mut tx, &authority, cid)
+                    .await
+                    .expect("pending Welcome hydrates");
+                tx.rollback().await.expect("rollback pending load");
+
+                assert_eq!(rows.len(), 1);
+                let row = &rows[0];
+                assert_eq!(row.welcome_id, *fulfillment.welcome_id.as_bytes());
+                assert_eq!(
+                    row.recipient,
+                    DeviceIdentity::new(
+                        PrincipalId::new(entry.actor_did.clone().into_bytes()).unwrap(),
+                        *entry.actor_device_id.as_bytes(),
+                    )
+                    .unwrap()
+                );
+                assert_eq!(row.transition_seq, 2);
+                assert_eq!(
+                    row.coordinate,
+                    PublicGroupSnapshotCoordinate::new(
+                        entry.cid,
+                        0,
+                        1,
+                        [1; 32],
+                        1,
+                        [4; 32],
+                        [5; 32],
+                        PublicGroupSnapshotLifecycle::Active,
+                    )
+                );
+                assert_eq!(row.recovery_request_id, seed.request_id);
+                assert_eq!(row.key_package_ref, seed.key_package_ref);
+                assert_eq!(row.opaque_welcome, fulfillment.opaque_welcome);
+                assert_eq!(
+                    row.sha256,
+                    <[u8; 32]>::from(Sha256::digest(&fulfillment.opaque_welcome))
+                );
+                assert_eq!(
+                    row.expires_at,
+                    ServerTimestamp::from_canonical_stored(KP_NOT_AFTER).unwrap()
+                );
+                assert_eq!(row.status, WelcomeStatus::Pending);
+                assert!(row.terminal.is_none());
+            }
+
+            #[tokio::test]
+            #[ignore = "requires the dedicated gate database"]
+            async fn signed_acknowledgement_and_rejection_hydrate_request_terminals() {
+                let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+                for (kind, expected_status) in [
+                    (
+                        SignedMutationKind::WelcomeAcknowledgement,
+                        WelcomeStatus::Acknowledged,
+                    ),
+                    (
+                        SignedMutationKind::WelcomeRejection,
+                        WelcomeStatus::Rejected,
+                    ),
+                ] {
+                    let cid = Uuid::new_v4();
+                    let entry = build_real_creation_entry(*cid.as_bytes());
+                    let seed = seed_recovery_pair(&pool, &entry, "requestLeafRecovery").await;
+                    let fulfillment = build_real_leaf_recovery_fulfillment_entry(&entry, &seed);
+                    commit_recovery_fulfillment_graph(&pool, &entry, &seed, &fulfillment).await;
+                    let response = build_signed_welcome_response(&entry, &fulfillment, kind);
+                    commit_signed_welcome_disposition(&pool, &entry, &fulfillment, kind, &response)
+                        .await;
+
+                    let authority =
+                        HistoricalRehydrationAuthority::new(entry.cid, 3).expect("authority");
+                    let mut tx = pool.begin().await.expect("begin terminal load");
+                    let rows = load_welcome_hydration_rows(&mut tx, &authority, cid)
+                        .await
+                        .expect("signed Welcome terminal hydrates");
+                    tx.rollback().await.expect("rollback terminal load");
+
+                    assert_eq!(rows.len(), 1);
+                    assert_eq!(rows[0].status, expected_status);
+                    let Some(WorkTerminalHydrationRow::Request(evidence)) =
+                        rows[0].terminal.as_ref()
+                    else {
+                        panic!("signed Welcome terminal must be Request evidence");
+                    };
+                    let expected_kind = match kind {
+                        SignedMutationKind::WelcomeAcknowledgement => {
+                            crate::chat_protocol::state_machine::RequestEntryKind::WelcomeAcknowledgement
+                        }
+                        SignedMutationKind::WelcomeRejection => {
+                            crate::chat_protocol::state_machine::RequestEntryKind::WelcomeRejection
+                        }
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(evidence.kind(), expected_kind);
+                    assert_eq!(evidence.conversation_id(), &entry.cid);
+                    assert_eq!(evidence.request_id(), fulfillment.welcome_id.as_bytes());
+                    assert_eq!(
+                        evidence.actor(),
+                        &DeviceIdentity::new(
+                            PrincipalId::new(entry.actor_did.clone().into_bytes()).unwrap(),
+                            *entry.actor_device_id.as_bytes(),
+                        )
+                        .unwrap()
+                    );
+                    assert_eq!(
+                        evidence.received_at(),
+                        ServerTimestamp::from_canonical_stored(WELCOME_TERMINAL_AT).unwrap()
+                    );
+                }
+            }
+
+            #[tokio::test]
+            #[ignore = "requires the dedicated gate database"]
+            async fn signed_welcome_terminal_rejects_wrong_kind_and_signature_tamper() {
+                let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+                for tamper_signature in [false, true] {
+                    let cid = Uuid::new_v4();
+                    let entry = build_real_creation_entry(*cid.as_bytes());
+                    let seed = seed_recovery_pair(&pool, &entry, "requestLeafRecovery").await;
+                    let fulfillment = build_real_leaf_recovery_fulfillment_entry(&entry, &seed);
+                    commit_recovery_fulfillment_graph(&pool, &entry, &seed, &fulfillment).await;
+                    let signed_kind = if tamper_signature {
+                        SignedMutationKind::WelcomeAcknowledgement
+                    } else {
+                        SignedMutationKind::WelcomeRejection
+                    };
+                    let response = build_signed_welcome_response(&entry, &fulfillment, signed_kind);
+                    let mut stored_signature = response.signature.clone();
+                    if tamper_signature {
+                        stored_signature[0] ^= 0x01;
+                    }
+
+                    let authority =
+                        HistoricalRehydrationAuthority::new(entry.cid, 3).expect("authority");
+                    let mut tx = pool.begin().await.expect("begin malformed response");
+                    insert_uncommitted_signed_disposition(
+                        &mut tx,
+                        &entry,
+                        &fulfillment,
+                        "acknowledged",
+                        &response,
+                        &stored_signature,
+                    )
+                    .await;
+                    let result = load_welcome_hydration_rows(&mut tx, &authority, cid).await;
+                    tx.rollback().await.expect("rollback malformed response");
+                    assert!(
+                        matches!(
+                            result,
+                            Err(crate::chat_protocol::repository::core::WelcomeHydrationError::InvalidTerminal)
+                        ),
+                        "wrong signed kind or durable signature tamper must fail closed"
+                    );
+                }
+            }
+
+            #[tokio::test]
+            #[ignore = "requires the dedicated gate database"]
+            async fn expired_welcome_hydrates_exact_expiry_terminal() {
+                let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+                let cid = Uuid::new_v4();
+                let entry = build_real_creation_entry(*cid.as_bytes());
+                let seed = seed_recovery_pair(&pool, &entry, "requestLeafRecovery").await;
+                let fulfillment = build_real_leaf_recovery_fulfillment_entry(&entry, &seed);
+                commit_recovery_fulfillment_graph(&pool, &entry, &seed, &fulfillment).await;
+                commit_expired_welcome_disposition(&pool, &entry, &fulfillment).await;
+
+                let authority =
+                    HistoricalRehydrationAuthority::new(entry.cid, 3).expect("authority");
+                let mut tx = pool.begin().await.expect("begin expiry load");
+                let rows = load_welcome_hydration_rows(&mut tx, &authority, cid)
+                    .await
+                    .expect("expired Welcome terminal hydrates");
+                tx.rollback().await.expect("rollback expiry load");
+
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].status, WelcomeStatus::Expired);
+                let Some(WorkTerminalHydrationRow::Expiry(terminal_at)) = rows[0].terminal.as_ref()
+                else {
+                    panic!("expired Welcome terminal must be Expiry evidence");
+                };
+                assert_eq!(
+                    terminal_at,
+                    &ServerTimestamp::from_canonical_stored(KP_NOT_AFTER).unwrap()
+                );
+            }
+
+            #[tokio::test]
+            #[ignore = "requires the dedicated gate database"]
+            async fn transition_supersession_uses_only_the_direct_transition_cause() {
+                let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+                let cid = Uuid::new_v4();
+                let entry = build_real_creation_entry(*cid.as_bytes());
+                let seed = seed_recovery_pair(&pool, &entry, "requestLeafRecovery").await;
+                let fulfillment = build_real_leaf_recovery_fulfillment_entry(&entry, &seed);
+                commit_recovery_fulfillment_graph(&pool, &entry, &seed, &fulfillment).await;
+                let later = build_later_coordinate_consuming_transition(&entry, &seed);
+
+                let authority =
+                    HistoricalRehydrationAuthority::new(entry.cid, 4).expect("authority");
+                let mut tx = pool.begin().await.expect("begin transition supersession");
+                insert_uncommitted_later_transition(&mut tx, &entry, &later).await;
+                insert_uncommitted_superseded_disposition(
+                    &mut tx,
+                    &entry,
+                    &fulfillment,
+                    instant(LATER_TRANSITION_AT),
+                    Some(later.transition_id),
+                    None,
+                )
+                .await;
+                let rows = load_welcome_hydration_rows(&mut tx, &authority, cid)
+                    .await
+                    .expect("transition-superseded Welcome hydrates");
+                tx.rollback()
+                    .await
+                    .expect("rollback deliberately uncommitted supersession");
+
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].status, WelcomeStatus::Superseded);
+                let Some(WorkTerminalHydrationRow::Transition(evidence)) =
+                    rows[0].terminal.as_ref()
+                else {
+                    panic!("transition supersession must hydrate Transition evidence");
+                };
+                assert_eq!(evidence.transition_id(), later.transition_id.as_bytes());
+                assert!(evidence.seq() > rows[0].transition_seq);
+                assert_eq!(
+                    evidence.received_at(),
+                    ServerTimestamp::from_canonical_stored(LATER_TRANSITION_AT).unwrap()
+                );
+            }
+
+            #[tokio::test]
+            #[ignore = "requires the dedicated gate database"]
+            async fn revocation_supersession_uses_only_the_direct_revocation_cause() {
+                let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+                let cid = Uuid::new_v4();
+                let entry = build_real_creation_entry(*cid.as_bytes());
+                let seed = seed_recovery_pair(&pool, &entry, "requestLeafRecovery").await;
+                let fulfillment = build_real_leaf_recovery_fulfillment_entry(&entry, &seed);
+                commit_recovery_fulfillment_graph(&pool, &entry, &seed, &fulfillment).await;
+                let revocation = build_signed_welcome_revocation(&entry);
+                let terminal_at = instant(WELCOME_TERMINAL_AT);
+
+                let authority =
+                    HistoricalRehydrationAuthority::new(entry.cid, 3).expect("authority");
+                let mut tx = pool.begin().await.expect("begin revocation supersession");
+                sqlx::query(
+                    r#"INSERT INTO chat.device_revocations(
+                        revocation_id,actor_did,actor_device_id,actor_key_id,
+                        actor_auth_generation,target_did,target_device_id,
+                        target_auth_generation,accepted_request_bytes,
+                        signing_transcript_bytes,request_digest,signature,signed_at,accepted_at
+                    ) VALUES($1,$2,$3,$4,1,$2,$3,1,$5,$6,$7,$8,$9,$10)"#,
+                )
+                .bind(revocation.revocation_id)
+                .bind(&entry.actor_did)
+                .bind(entry.actor_device_id)
+                .bind(&entry.actor_key_id)
+                .bind(&revocation.raw_wrapper)
+                .bind(&revocation.signing_transcript)
+                .bind(&revocation.request_digest)
+                .bind(&revocation.signature)
+                .bind(instant("2030-01-01T00:09:59.000Z"))
+                .bind(terminal_at)
+                .execute(&mut *tx)
+                .await
+                .expect("insert exact uncommitted revocation cause");
+                insert_uncommitted_superseded_disposition(
+                    &mut tx,
+                    &entry,
+                    &fulfillment,
+                    terminal_at,
+                    None,
+                    Some(revocation.revocation_id),
+                )
+                .await;
+                let rows = load_welcome_hydration_rows(&mut tx, &authority, cid)
+                    .await
+                    .expect("revocation-superseded Welcome hydrates");
+                tx.rollback()
+                    .await
+                    .expect("rollback deliberate self-revocation fixture");
+
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].status, WelcomeStatus::Superseded);
+                let Some(WorkTerminalHydrationRow::DeviceRevocation(evidence)) =
+                    rows[0].terminal.as_ref()
+                else {
+                    panic!("revocation supersession must hydrate DeviceRevocation evidence");
+                };
+                assert_eq!(
+                    evidence.revocation_id(),
+                    revocation.revocation_id.as_bytes()
+                );
+                assert_eq!(
+                    evidence.target(),
+                    &DeviceIdentity::new(
+                        PrincipalId::new(entry.actor_did.clone().into_bytes()).unwrap(),
+                        *entry.actor_device_id.as_bytes(),
+                    )
+                    .unwrap()
+                );
+                assert_eq!(
+                    evidence.accepted_at(),
+                    ServerTimestamp::from_canonical_stored(WELCOME_TERMINAL_AT).unwrap()
+                );
+            }
         }
 
         /// The fulfilled/consumed status arms select only one exact transition
