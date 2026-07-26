@@ -4797,6 +4797,8 @@ fn work_terminal_from_reset_leave_error(
         ResetLeaveHydrationError::Database(error) => WorkTerminalHydrationError::Database(error),
         ResetLeaveHydrationError::BindingMismatch
         | ResetLeaveHydrationError::InvalidOrigin
+        | ResetLeaveHydrationError::TerminalMismatch
+        | ResetLeaveHydrationError::InvalidTerminal
         | ResetLeaveHydrationError::UnsupportedTerminal => {
             WorkTerminalHydrationError::InvalidEvidence
         }
@@ -5019,6 +5021,14 @@ pub(crate) enum ResetLeaveHydrationError {
     /// evidence it does not attest.
     #[error("clean-chat reset/leave origin failed re-verification")]
     InvalidOrigin,
+    /// A recognized terminal status carried a different optional-column shape
+    /// than its closed durable arm permits.
+    #[error("clean-chat reset/leave terminal columns do not match the status")]
+    TerminalMismatch,
+    /// The exact durable terminal evidence could not be re-verified or did not
+    /// match the terminal columns that selected it.
+    #[error("clean-chat reset/leave terminal evidence is invalid")]
+    InvalidTerminal,
     /// The request carries a terminal status (non-`pending`) whose
     /// `WorkTerminalHydrationRow` reconstruction is the NEXT-STEP follow-up. Fail
     /// closed until that arm is reconstructed + tested.
@@ -5026,6 +5036,171 @@ pub(crate) enum ResetLeaveHydrationError {
     UnsupportedTerminal,
     #[error("clean-chat reset/leave hydration database error: {0}")]
     Database(#[from] sqlx::Error),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ResetTerminalColumns {
+    pub(crate) status: &'static str,
+    pub(crate) terminal_transition_id: Option<Uuid>,
+    pub(crate) terminal_at: Option<DateTime<Utc>>,
+    pub(crate) expires_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResetTerminalSelection {
+    Pending,
+    Transition {
+        transition_id: Uuid,
+        terminal_at: DateTime<Utc>,
+    },
+    Expiry {
+        terminal_at: DateTime<Utc>,
+    },
+}
+
+pub(crate) fn select_reset_terminal(
+    columns: ResetTerminalColumns,
+) -> Result<ResetTerminalSelection, ResetLeaveHydrationError> {
+    match columns.status {
+        "pending" if columns.terminal_transition_id.is_none() && columns.terminal_at.is_none() => {
+            Ok(ResetTerminalSelection::Pending)
+        }
+        "expired"
+            if columns.terminal_transition_id.is_none()
+                && columns.terminal_at == Some(columns.expires_at) =>
+        {
+            Ok(ResetTerminalSelection::Expiry {
+                terminal_at: columns.expires_at,
+            })
+        }
+        "stale" | "consumed"
+            if columns.terminal_transition_id.is_some() && columns.terminal_at.is_some() =>
+        {
+            if columns.status == "consumed" {
+                Err(ResetLeaveHydrationError::UnsupportedTerminal)
+            } else {
+                Ok(ResetTerminalSelection::Transition {
+                    transition_id: columns.terminal_transition_id.expect("shape checked"),
+                    terminal_at: columns.terminal_at.expect("shape checked"),
+                })
+            }
+        }
+        "pending" | "stale" | "consumed" | "expired" => {
+            Err(ResetLeaveHydrationError::TerminalMismatch)
+        }
+        _ => Err(ResetLeaveHydrationError::OutOfDomain),
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct LeaveTerminalColumns<'a> {
+    pub(crate) status: &'static str,
+    pub(crate) terminal_request_digest: Option<&'a [u8]>,
+    pub(crate) terminal_transition_id: Option<Uuid>,
+    pub(crate) terminal_at: Option<DateTime<Utc>>,
+    pub(crate) expires_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LeaveTerminalSelection {
+    Pending,
+    Transition {
+        terminal_request_digest: [u8; 32],
+        transition_id: Uuid,
+        terminal_at: DateTime<Utc>,
+    },
+    Cancellation {
+        terminal_request_digest: [u8; 32],
+        terminal_at: DateTime<Utc>,
+    },
+    Expiry {
+        terminal_at: DateTime<Utc>,
+    },
+}
+
+pub(crate) fn select_leave_terminal(
+    columns: LeaveTerminalColumns<'_>,
+) -> Result<LeaveTerminalSelection, ResetLeaveHydrationError> {
+    match columns.status {
+        "pending"
+            if columns.terminal_request_digest.is_none()
+                && columns.terminal_transition_id.is_none()
+                && columns.terminal_at.is_none() =>
+        {
+            Ok(LeaveTerminalSelection::Pending)
+        }
+        "expired"
+            if columns.terminal_request_digest.is_none()
+                && columns.terminal_transition_id.is_none()
+                && columns.terminal_at == Some(columns.expires_at) =>
+        {
+            Ok(LeaveTerminalSelection::Expiry {
+                terminal_at: columns.expires_at,
+            })
+        }
+        "stale" | "fulfilled"
+            if columns.terminal_transition_id.is_some()
+                && columns.terminal_at.is_some()
+                && columns
+                    .terminal_request_digest
+                    .is_some_and(|digest| digest.len() == 32) =>
+        {
+            if columns.status == "fulfilled" {
+                Err(ResetLeaveHydrationError::UnsupportedTerminal)
+            } else {
+                Ok(LeaveTerminalSelection::Transition {
+                    terminal_request_digest: columns
+                        .terminal_request_digest
+                        .expect("shape checked")
+                        .try_into()
+                        .expect("length checked"),
+                    transition_id: columns.terminal_transition_id.expect("shape checked"),
+                    terminal_at: columns.terminal_at.expect("shape checked"),
+                })
+            }
+        }
+        "cancelled"
+            if columns.terminal_transition_id.is_none()
+                && columns.terminal_at.is_some()
+                && columns
+                    .terminal_request_digest
+                    .is_some_and(|digest| digest.len() == 32) =>
+        {
+            Ok(LeaveTerminalSelection::Cancellation {
+                terminal_request_digest: columns
+                    .terminal_request_digest
+                    .expect("shape checked")
+                    .try_into()
+                    .expect("length checked"),
+                terminal_at: columns.terminal_at.expect("shape checked"),
+            })
+        }
+        "pending" | "fulfilled" | "cancelled" | "expired" | "stale" => {
+            Err(ResetLeaveHydrationError::TerminalMismatch)
+        }
+        _ => Err(ResetLeaveHydrationError::OutOfDomain),
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct DurableLeaveRequestHydrationRow {
+    leave_request_id: Uuid,
+    requester_did: String,
+    requester_device_id: Uuid,
+    prior_generation: i64,
+    prior_state_version: i64,
+    prior_group_id: Vec<u8>,
+    prior_epoch: i64,
+    prior_group_context_hash: Vec<u8>,
+    prior_confirmation_tag: Vec<u8>,
+    status: String,
+    request_digest: Vec<u8>,
+    signed_request_bytes: Vec<u8>,
+    received_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+    terminal_request_digest: Option<Vec<u8>>,
+    terminal_transition_id: Option<Uuid>,
+    terminal_at: Option<DateTime<Utc>>,
 }
 
 /// The `(accepted_payload_bytes, signed_request_bytes, signing_public_key)` of a
@@ -5108,6 +5283,61 @@ async fn load_control_request_origin(
         .map_err(|_| ResetLeaveHydrationError::InvalidOrigin)
 }
 
+/// Load a control terminal identified only by its durable request digest.
+/// Unlike origin rows, the owning leave projection has no duplicate copy of the
+/// signed bytes. Fetch every matching immutable entry and require exactly one
+/// before full control-entry re-verification; never select a candidate.
+async fn load_control_request_terminal_by_digest(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &HistoricalRehydrationAuthority,
+    conversation_id: Uuid,
+    entry_kind: &str,
+    request_digest: &[u8],
+    expected_kind: RequestEntryKind,
+) -> Result<RequestEvidence, ResetLeaveHydrationError> {
+    let rows: Vec<LocatedOriginEntry> = sqlx::query_as(
+        r#"
+        SELECT
+            e.accepted_payload_bytes,
+            e.signed_request_bytes,
+            dk.signing_public_key
+        FROM chat.entries e
+        JOIN chat.device_keys dk
+          ON dk.user_did = e.actor_did
+         AND dk.device_id = e.actor_device_id
+         AND dk.key_id = e.actor_key_id
+        WHERE e.conversation_id = $1
+          AND e.entry_kind = $2
+          AND e.request_digest = $3
+        "#,
+    )
+    .bind(conversation_id)
+    .bind(entry_kind)
+    .bind(request_digest)
+    .fetch_all(&mut **transaction)
+    .await?;
+
+    let (public_row_json, raw_signed_wrapper, signing_public_key) =
+        resolve_single_terminal_candidate(rows).map_err(|error| match error {
+            WorkTerminalHydrationError::Database(error) => {
+                ResetLeaveHydrationError::Database(error)
+            }
+            _ => ResetLeaveHydrationError::InvalidTerminal,
+        })?;
+    let evidence = authority
+        .hydrate_historical_control_from_durable_bytes(
+            public_row_json,
+            raw_signed_wrapper,
+            &signing_public_key,
+        )
+        .and_then(PersistedControlAuthority::into_request)
+        .map_err(|_| ResetLeaveHydrationError::InvalidTerminal)?;
+    if evidence.kind() != expected_kind {
+        return Err(ResetLeaveHydrationError::InvalidTerminal);
+    }
+    Ok(evidence)
+}
+
 /// Load the PENDING reset requests of an existing conversation, each bound to its
 /// re-verified control-request origin. See the module header for the JOIN ruling
 /// and the terminal-arm scope.
@@ -5138,6 +5368,8 @@ pub(crate) async fn load_reset_request_hydration_rows(
         Vec<u8>,
         DateTime<Utc>,
         DateTime<Utc>,
+        Option<Uuid>,
+        Option<DateTime<Utc>>,
     )> = sqlx::query_as(
         r#"
         SELECT
@@ -5154,7 +5386,9 @@ pub(crate) async fn load_reset_request_hydration_rows(
             request_digest,
             signed_request_bytes,
             received_at,
-            expires_at
+            expires_at,
+            terminal_transition_id,
+            terminal_at
         FROM chat.reset_requests
         WHERE conversation_id = $1
         "#,
@@ -5179,6 +5413,8 @@ pub(crate) async fn load_reset_request_hydration_rows(
         signed_request_bytes,
         received_at,
         expires_at,
+        terminal_transition_id,
+        terminal_at,
     ) in rows
     {
         let request_id = *reset_request_id.as_bytes();
@@ -5192,12 +5428,22 @@ pub(crate) async fn load_reset_request_hydration_rows(
             prior_group_context_hash,
             prior_confirmation_tag,
         )?;
-        let status = match status.as_str() {
-            "pending" => ResetRequestStatus::Pending,
-            "stale" | "consumed" | "expired" => {
-                return Err(ResetLeaveHydrationError::UnsupportedTerminal)
-            }
-            _ => return Err(ResetLeaveHydrationError::OutOfDomain),
+        let selection = select_reset_terminal(ResetTerminalColumns {
+            status: match status.as_str() {
+                "pending" => "pending",
+                "stale" => "stale",
+                "consumed" => "consumed",
+                "expired" => "expired",
+                _ => return Err(ResetLeaveHydrationError::OutOfDomain),
+            },
+            terminal_transition_id,
+            terminal_at,
+            expires_at,
+        })?;
+        let status = match selection {
+            ResetTerminalSelection::Pending => ResetRequestStatus::Pending,
+            ResetTerminalSelection::Transition { .. } => ResetRequestStatus::Stale,
+            ResetTerminalSelection::Expiry { .. } => ResetRequestStatus::Expired,
         };
         let origin = load_control_request_origin(
             transaction,
@@ -5209,6 +5455,50 @@ pub(crate) async fn load_reset_request_hydration_rows(
         )
         .await?;
 
+        let terminal = match selection {
+            ResetTerminalSelection::Pending => None,
+            ResetTerminalSelection::Transition {
+                transition_id,
+                terminal_at,
+            } => {
+                let terminal = load_work_terminal_hydration_row(
+                    transaction,
+                    authority,
+                    conversation_id,
+                    WorkTerminalLocator::Transition { transition_id },
+                )
+                .await
+                .map_err(|error| match error {
+                    WorkTerminalHydrationError::Database(error) => {
+                        ResetLeaveHydrationError::Database(error)
+                    }
+                    _ => ResetLeaveHydrationError::InvalidTerminal,
+                })?;
+                let WorkTerminalHydrationRow::Transition(evidence) = &terminal else {
+                    return Err(ResetLeaveHydrationError::InvalidTerminal);
+                };
+                if evidence.received_at() != reset_leave_timestamp(terminal_at)? {
+                    return Err(ResetLeaveHydrationError::InvalidTerminal);
+                }
+                Some(terminal)
+            }
+            ResetTerminalSelection::Expiry { terminal_at } => Some(
+                load_work_terminal_hydration_row(
+                    transaction,
+                    authority,
+                    conversation_id,
+                    WorkTerminalLocator::Expiry { terminal_at },
+                )
+                .await
+                .map_err(|error| match error {
+                    WorkTerminalHydrationError::Database(error) => {
+                        ResetLeaveHydrationError::Database(error)
+                    }
+                    _ => ResetLeaveHydrationError::InvalidTerminal,
+                })?,
+            ),
+        };
+
         requests.push(ResetRequestHydrationRow {
             request_id,
             requester,
@@ -5217,7 +5507,7 @@ pub(crate) async fn load_reset_request_hydration_rows(
             expires_at: reset_leave_timestamp(expires_at)?,
             status,
             origin,
-            terminal: None,
+            terminal,
         });
     }
 
@@ -5242,23 +5532,7 @@ pub(crate) async fn load_leave_request_hydration_rows(
 ) -> Result<Vec<LeaveRequestHydrationRow>, ResetLeaveHydrationError> {
     let conversation_bytes = *conversation_id.as_bytes();
 
-    #[allow(clippy::type_complexity)]
-    let rows: Vec<(
-        Uuid,
-        String,
-        Uuid,
-        i64,
-        i64,
-        Vec<u8>,
-        i64,
-        Vec<u8>,
-        Vec<u8>,
-        String,
-        Vec<u8>,
-        Vec<u8>,
-        DateTime<Utc>,
-        DateTime<Utc>,
-    )> = sqlx::query_as(
+    let rows: Vec<DurableLeaveRequestHydrationRow> = sqlx::query_as(
         r#"
         SELECT
             leave_request_id,
@@ -5274,7 +5548,10 @@ pub(crate) async fn load_leave_request_hydration_rows(
             request_digest,
             signed_request_bytes,
             received_at,
-            expires_at
+            expires_at,
+            terminal_request_digest,
+            terminal_transition_id,
+            terminal_at
         FROM chat.leave_requests
         WHERE conversation_id = $1
         "#,
@@ -5284,7 +5561,7 @@ pub(crate) async fn load_leave_request_hydration_rows(
     .await?;
 
     let mut requests: Vec<LeaveRequestHydrationRow> = Vec::with_capacity(rows.len());
-    for (
+    for DurableLeaveRequestHydrationRow {
         leave_request_id,
         requester_did,
         requester_device_id,
@@ -5299,7 +5576,10 @@ pub(crate) async fn load_leave_request_hydration_rows(
         signed_request_bytes,
         received_at,
         expires_at,
-    ) in rows
+        terminal_request_digest,
+        terminal_transition_id,
+        terminal_at,
+    } in rows
     {
         let request_id = *leave_request_id.as_bytes();
         let requester = reset_leave_device(requester_did, requester_device_id)?;
@@ -5312,12 +5592,25 @@ pub(crate) async fn load_leave_request_hydration_rows(
             prior_group_context_hash,
             prior_confirmation_tag,
         )?;
-        let status = match status.as_str() {
-            "pending" => LeaveRequestStatus::Pending,
-            "fulfilled" | "cancelled" | "expired" | "stale" => {
-                return Err(ResetLeaveHydrationError::UnsupportedTerminal)
-            }
-            _ => return Err(ResetLeaveHydrationError::OutOfDomain),
+        let selection = select_leave_terminal(LeaveTerminalColumns {
+            status: match status.as_str() {
+                "pending" => "pending",
+                "fulfilled" => "fulfilled",
+                "cancelled" => "cancelled",
+                "expired" => "expired",
+                "stale" => "stale",
+                _ => return Err(ResetLeaveHydrationError::OutOfDomain),
+            },
+            terminal_request_digest: terminal_request_digest.as_deref(),
+            terminal_transition_id,
+            terminal_at,
+            expires_at,
+        })?;
+        let status = match selection {
+            LeaveTerminalSelection::Pending => LeaveRequestStatus::Pending,
+            LeaveTerminalSelection::Transition { .. } => LeaveRequestStatus::Stale,
+            LeaveTerminalSelection::Cancellation { .. } => LeaveRequestStatus::Cancelled,
+            LeaveTerminalSelection::Expiry { .. } => LeaveRequestStatus::Expired,
         };
         let origin = load_control_request_origin(
             transaction,
@@ -5329,6 +5622,78 @@ pub(crate) async fn load_leave_request_hydration_rows(
         )
         .await?;
 
+        let terminal = match selection {
+            LeaveTerminalSelection::Pending => None,
+            LeaveTerminalSelection::Transition {
+                terminal_request_digest,
+                transition_id,
+                terminal_at,
+            } => {
+                let terminal = load_work_terminal_hydration_row(
+                    transaction,
+                    authority,
+                    conversation_id,
+                    WorkTerminalLocator::Transition { transition_id },
+                )
+                .await
+                .map_err(|error| match error {
+                    WorkTerminalHydrationError::Database(error) => {
+                        ResetLeaveHydrationError::Database(error)
+                    }
+                    _ => ResetLeaveHydrationError::InvalidTerminal,
+                })?;
+                let WorkTerminalHydrationRow::Transition(evidence) = &terminal else {
+                    return Err(ResetLeaveHydrationError::InvalidTerminal);
+                };
+                if evidence.received_at() != reset_leave_timestamp(terminal_at)?
+                    || evidence
+                        .signed_authority()
+                        .is_none_or(|signed| signed.request_digest() != &terminal_request_digest)
+                {
+                    return Err(ResetLeaveHydrationError::InvalidTerminal);
+                }
+                Some(terminal)
+            }
+            LeaveTerminalSelection::Cancellation {
+                terminal_request_digest,
+                terminal_at,
+            } => {
+                let evidence = load_control_request_terminal_by_digest(
+                    transaction,
+                    authority,
+                    conversation_id,
+                    "blue.catbird.chat.defs#leaveCancellationEntry",
+                    &terminal_request_digest,
+                    RequestEntryKind::LeaveCancellation,
+                )
+                .await?;
+                let terminal_at = reset_leave_timestamp(terminal_at)?;
+                if evidence.received_at() != terminal_at
+                    || evidence
+                        .signed_authority()
+                        .is_none_or(|signed| signed.request_digest() != &terminal_request_digest)
+                {
+                    return Err(ResetLeaveHydrationError::InvalidTerminal);
+                }
+                Some(WorkTerminalHydrationRow::Request(evidence))
+            }
+            LeaveTerminalSelection::Expiry { terminal_at } => Some(
+                load_work_terminal_hydration_row(
+                    transaction,
+                    authority,
+                    conversation_id,
+                    WorkTerminalLocator::Expiry { terminal_at },
+                )
+                .await
+                .map_err(|error| match error {
+                    WorkTerminalHydrationError::Database(error) => {
+                        ResetLeaveHydrationError::Database(error)
+                    }
+                    _ => ResetLeaveHydrationError::InvalidTerminal,
+                })?,
+            ),
+        };
+
         requests.push(LeaveRequestHydrationRow {
             request_id,
             requester,
@@ -5337,7 +5702,7 @@ pub(crate) async fn load_leave_request_hydration_rows(
             expires_at: reset_leave_timestamp(expires_at)?,
             status,
             origin,
-            terminal: None,
+            terminal,
         });
     }
 

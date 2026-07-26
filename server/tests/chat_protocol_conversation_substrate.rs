@@ -2196,6 +2196,16 @@ mod historical_control_path {
         signing_body["next"]["groupId"] = json!(STANDARD.encode([1_u8; 32]));
         signing_body["next"]["groupContextHash"] = json!(STANDARD.encode([2_u8; 32]));
         signing_body["next"]["confirmationTag"] = json!(STANDARD.encode([3_u8; 32]));
+        signing_body["metadataSnapshot"]["coordinate"]["conversationId"] =
+            json!(STANDARD.encode(fresh_cid));
+        signing_body["metadataSnapshot"]["coordinate"]["generation"] = json!(0);
+        signing_body["metadataSnapshot"]["coordinate"]["groupId"] =
+            json!(STANDARD.encode([1_u8; 32]));
+        signing_body["metadataSnapshot"]["coordinate"]["epoch"] = json!(0);
+        signing_body["metadataSnapshot"]["coordinate"]["groupContextHash"] =
+            json!(STANDARD.encode([2_u8; 32]));
+        signing_body["metadataSnapshot"]["coordinate"]["confirmationTag"] =
+            json!(STANDARD.encode([3_u8; 32]));
         signing_body["manifest"]["actorLeaf"]["userDid"] = json!(&actor_did);
         signing_body["manifest"]["actorLeaf"]["deviceId"] =
             json!(actor_device_id.hyphenated().to_string());
@@ -2491,13 +2501,16 @@ mod historical_control_loader {
     use uuid::Uuid;
 
     use super::historical_control_path::{build_real_creation_entry, RealCreationEntry};
+    use crate::chat_protocol::public_state::encode_public_tree_summary;
     use crate::chat_protocol::repository::core::{
         load_historical_control_evidence, load_interval_hydration_rows, load_metadata_provenance,
         load_participant_hydration_rows, load_producer_transition_evidence,
         ControlEvidenceLoadError, IntervalHydrationError, MetadataHydrationError,
         ParticipantHydrationError, ProducerHydrationError,
     };
-    use crate::chat_protocol::snapshot::PublicGroupSnapshotLifecycle;
+    use crate::chat_protocol::snapshot::{
+        PublicGroupSnapshotLeaf, PublicGroupSnapshotLifecycle, PublicGroupSnapshotTreeSummary,
+    };
     use crate::chat_protocol::state_machine::{
         metadata_binding_of_transition, DeviceIdentity, HistoricalRehydrationAuthority,
         MetadataSnapshotBinding, OpeningKind, ParticipantRole, ParticipantStatus, PrincipalId,
@@ -2546,9 +2559,19 @@ mod historical_control_loader {
             let sha: Vec<u8> = Sha256::digest(&snapshot).to_vec();
             (snapshot, sha)
         };
-        let tree_summary = vec![0x26_u8; 8];
-        let tree_summary_sha = Sha256::digest(&tree_summary).to_vec();
         let basic_credential = format!("{actor_did}#{actor_device_id}").into_bytes();
+        let tree = PublicGroupSnapshotTreeSummary::new(
+            [0x63_u8; 32],
+            vec![PublicGroupSnapshotLeaf::new(
+                0,
+                basic_credential.clone(),
+                actor_public_key.clone(),
+                vec![0x64_u8; 1_216],
+            )],
+        );
+        let (tree_summary, tree_summary_sha) = encode_public_tree_summary(&tree)
+            .expect("genesis tree summary is canonical")
+            .into_parts();
         // Entry columns: the real bytes drive the loader; the shape-only columns
         // (request_digest / signature / server_fields_bytes) are never read by it.
         let entry_payload = entry.public_row_json.clone();
@@ -6451,13 +6474,27 @@ mod historical_control_loader {
 
         use super::super::historical_control_path::{build_real_creation_entry, RealCreationEntry};
         use super::seed_real_creation_graph;
+        use crate::chat_protocol::public_state::{encode_public_tree_summary, ActivePublicState};
         use crate::chat_protocol::repository::core::{
-            load_leave_request_hydration_rows, load_reset_request_hydration_rows,
-            resolve_single_control_request_origin, ResetLeaveHydrationError,
+            hydrate_locked_public_state, load_interval_hydration_rows, load_leaf_hydration_rows,
+            load_leave_request_hydration_rows, load_metadata_provenance,
+            load_participant_hydration_rows, load_producer_transition_evidence,
+            load_recovery_work_hydration_rows, load_reset_request_hydration_rows,
+            load_welcome_hydration_rows, resolve_single_control_request_origin,
+            select_leave_terminal, select_reset_terminal, LeaveTerminalColumns,
+            ResetLeaveHydrationError, ResetTerminalColumns,
+        };
+        use crate::chat_protocol::repository::transition::{
+            terminalize_leave_request, terminalize_reset_request, LeaveRequestTermination,
+            ResetRequestTermination,
+        };
+        use crate::chat_protocol::snapshot::{
+            PublicGroupSnapshotLeaf, PublicGroupSnapshotTreeSummary,
         };
         use crate::chat_protocol::state_machine::{
-            DeviceIdentity, HistoricalRehydrationAuthority, LeaveRequestStatus,
-            PersistedControlAuthority, PrincipalId, ResetRequestStatus,
+            ConversationKind, ConversationStateHydration, DeviceIdentity,
+            HistoricalRehydrationAuthority, HydrationAuthority, LeaveRequestStatus, PrincipalId,
+            ResetRequestStatus, ServerTimestamp, WorkTerminalHydrationRow,
         };
         use crate::chat_protocol::transcript::{
             decode_and_verify_control_entry, decode_canonical_signed_mutation, SignedMutationKind,
@@ -6469,6 +6506,7 @@ mod historical_control_loader {
         pub(super) const LEAVE_ENTRY_KIND: &str = "blue.catbird.chat.defs#leaveRequestEntry";
         const RECEIVED_AT: &str = "2030-02-01T00:00:00.000Z";
         const SIGNED_AT: &str = "2030-01-31T23:59:59.000Z";
+        const STALE_AT: &str = "2030-02-01T00:01:00.000Z";
 
         fn instant(text: &str) -> DateTime<Utc> {
             DateTime::parse_from_rfc3339(text)
@@ -6513,6 +6551,143 @@ mod historical_control_loader {
             pub(super) request_digest: Vec<u8>,
             pub(super) signature: Vec<u8>,
             pub(super) outer_entry_fingerprint: Vec<u8>,
+        }
+
+        struct RealStalingCommit {
+            entry_id: Uuid,
+            transition_id: Uuid,
+            public_row_json: Vec<u8>,
+            raw_wrapper: Vec<u8>,
+            canonical_projection: Vec<u8>,
+            signing_transcript: Vec<u8>,
+            request_digest: Vec<u8>,
+            signature: Vec<u8>,
+            server_fields_dag_cbor: Vec<u8>,
+            outer_entry_fingerprint: Vec<u8>,
+        }
+
+        fn build_real_staling_commit(
+            entry: &RealCreationEntry,
+            origin_transition_id: Uuid,
+        ) -> RealStalingCommit {
+            let signing_key = entry.signing_key();
+            let transition_id = Uuid::new_v4();
+            let entry_id = Uuid::new_v4();
+            let commit_bytes = [0x91_u8; 8];
+            let metadata_ciphertext = [0x92_u8; 16];
+            let next = json!({
+                "conversationId": Uuid::from_bytes(entry.cid).hyphenated().to_string(),
+                "generation": 0,
+                "stateVersion": 1,
+                "groupId": STANDARD.encode([1_u8; 32]),
+                "epoch": 1,
+                "groupContextHash": STANDARD.encode([4_u8; 32]),
+                "confirmationTag": STANDARD.encode([5_u8; 32]),
+                "lifecycle": "active",
+            });
+            let body = json!({
+                "$type": SignedMutationKind::CommitTransition.type_id(),
+                "signatureDomain": String::from_utf8(
+                    SignedMutationKind::CommitTransition.domain().to_vec()
+                ).unwrap(),
+                "transitionId": transition_id.hyphenated().to_string(),
+                "actorDid": entry.actor_did,
+                "actorDeviceId": entry.actor_device_id.hyphenated().to_string(),
+                "keyId": entry.actor_key_id,
+                "authGeneration": 1,
+                "prior": genesis_coordinate_json(entry.cid),
+                "next": next,
+                "aad": {
+                    "protocolVersion": "1",
+                    "conversationId": STANDARD.encode(entry.cid),
+                    "generation": 0,
+                    "transitionId": STANDARD.encode(transition_id.as_bytes()),
+                    "prior": {
+                        "conversationId": STANDARD.encode(entry.cid),
+                        "generation": 0,
+                        "stateVersion": 0,
+                        "groupId": STANDARD.encode([1_u8; 32]),
+                        "epoch": 0,
+                        "groupContextHash": STANDARD.encode([2_u8; 32]),
+                        "confirmationTag": STANDARD.encode([3_u8; 32]),
+                        "lifecycle": "active",
+                    },
+                },
+                "manifest": {
+                    "participantChanges": [],
+                    "leafChanges": [],
+                },
+                "commit": {
+                    "framing": "mlsMessage",
+                    "contentType": "publicMessageCommit",
+                    "bytes": STANDARD.encode(commit_bytes),
+                    "sha256": STANDARD.encode(Sha256::digest(commit_bytes)),
+                },
+                "metadataSnapshot": {
+                    "coordinate": {
+                        "conversationId": STANDARD.encode(entry.cid),
+                        "generation": 0,
+                        "groupId": STANDARD.encode([1_u8; 32]),
+                        "epoch": 1,
+                        "groupContextHash": STANDARD.encode([4_u8; 32]),
+                        "confirmationTag": STANDARD.encode([5_u8; 32]),
+                    },
+                    "originTransitionId": origin_transition_id.hyphenated().to_string(),
+                    "metadataVersion": 1,
+                    "nonce": STANDARD.encode([0x93_u8; 12]),
+                    "ciphertext": STANDARD.encode(metadata_ciphertext),
+                    "ciphertextSha256": STANDARD.encode(Sha256::digest(metadata_ciphertext)),
+                    "ciphertextSize": metadata_ciphertext.len(),
+                    "authorProof": {
+                        "authorDid": entry.actor_did,
+                        "authorDeviceId": entry.actor_device_id.hyphenated().to_string(),
+                        "authorKeyId": entry.actor_key_id,
+                        "signaturePublicKey": STANDARD.encode(&entry.public_key),
+                        "authGenerationAtOrigin": 1,
+                        "originTransitionId": origin_transition_id.hyphenated().to_string(),
+                        "originSeq": 1,
+                        "roleAtOrigin": "admin",
+                        "deviceStatusAtOrigin": "active",
+                    },
+                },
+                "idempotencyKey": Uuid::new_v4().hyphenated().to_string(),
+                "signedAt": "2030-02-01T00:00:59.000Z",
+            });
+            let mut wrapper = json!({ "body": body, "signature": STANDARD.encode([0_u8; 64]) });
+            let unsigned = serde_json::to_vec(&wrapper).unwrap();
+            let canonical = decode_canonical_signed_mutation(&unsigned)
+                .expect("unsigned staling Commit canonicalizes");
+            let signature = signing_key.sign(canonical.transcript_bytes()).to_bytes();
+            wrapper["signature"] = Value::String(STANDARD.encode(signature));
+            let raw_wrapper = serde_json::to_vec(&wrapper).unwrap();
+            let canonical = decode_canonical_signed_mutation(&raw_wrapper)
+                .expect("signed staling Commit canonicalizes");
+            let public_row_json = serde_json::to_vec(&json!({
+                "$type": "blue.catbird.chat.defs#commitEntry",
+                "entryId": entry_id.hyphenated().to_string(),
+                "conversationId": Uuid::from_bytes(entry.cid).hyphenated().to_string(),
+                "seq": 3,
+                "signedRequest": wrapper,
+                "receivedAt": STALE_AT,
+            }))
+            .unwrap();
+            let decoded = decode_and_verify_control_entry(
+                &public_row_json,
+                signing_key.verifying_key().as_bytes(),
+            )
+            .expect("real staling Commit entry verifies");
+            RealStalingCommit {
+                entry_id,
+                transition_id,
+                public_row_json,
+                raw_wrapper,
+                canonical_projection: canonical.canonical_projection().to_vec(),
+                signing_transcript: canonical.transcript_bytes().to_vec(),
+                request_digest: canonical.request_digest().to_vec(),
+                signature: canonical.signature().to_vec(),
+                server_fields_dag_cbor: decoded.server_fields_dag_cbor().unwrap(),
+                outer_entry_fingerprint: decoded.outer_control_fingerprint().to_vec(),
+            }
         }
 
         /// Build a real reset (`kind = ResetRequest`) or leave (`kind =
@@ -6770,6 +6945,295 @@ mod historical_control_loader {
             request
         }
 
+        async fn commit_staling_transition(
+            pool: &PgPool,
+            entry: &RealCreationEntry,
+            request: &RealControlRequestEntry,
+            kind: SignedMutationKind,
+        ) -> RealStalingCommit {
+            let cid = Uuid::from_bytes(entry.cid);
+            let origin_transition_id: Uuid = sqlx::query_scalar(
+                r#"SELECT producing_transition_id FROM chat.generation_states
+                   WHERE conversation_id=$1 AND generation=0 AND state_version=0"#,
+            )
+            .bind(cid)
+            .fetch_one(pool)
+            .await
+            .expect("creation transition id");
+            let transition = build_real_staling_commit(entry, origin_transition_id);
+            let at = instant(STALE_AT);
+            let metadata_snapshot_id = Uuid::new_v4();
+            let public_snapshot = vec![0x94_u8; 64];
+            let metadata_ciphertext = vec![0x92_u8; 16];
+            let basic_credential =
+                format!("{}#{}", entry.actor_did, entry.actor_device_id).into_bytes();
+            let tree = PublicGroupSnapshotTreeSummary::new(
+                [0x63_u8; 32],
+                vec![PublicGroupSnapshotLeaf::new(
+                    0,
+                    basic_credential,
+                    entry.public_key.clone(),
+                    vec![0x64_u8; 1_216],
+                )],
+            );
+            let (tree_summary, tree_summary_sha256) = encode_public_tree_summary(&tree)
+                .expect("staling tree summary canonical")
+                .into_parts();
+
+            let mut tx = pool.begin().await.expect("begin staling transition");
+            sqlx::query(
+                r#"UPDATE chat.conversations SET current_state_version=1,next_entry_seq=4
+                   WHERE conversation_id=$1 AND current_generation=0
+                     AND current_state_version=0 AND next_entry_seq=3"#,
+            )
+            .bind(cid)
+            .execute(&mut *tx)
+            .await
+            .expect("advance conversation through staling Commit");
+            sqlx::query(
+                r#"UPDATE chat.generations SET current_state_version=1
+                   WHERE conversation_id=$1 AND generation=0 AND current_state_version=0"#,
+            )
+            .bind(cid)
+            .execute(&mut *tx)
+            .await
+            .expect("advance generation through staling Commit");
+            sqlx::query(
+                r#"INSERT INTO chat.transitions(
+                    transition_id,conversation_id,kind,actor_did,actor_device_id,actor_key_id,
+                    actor_auth_generation,actor_role,actor_device_status,signed_request_bytes,
+                    unsigned_projection_bytes,signing_transcript_bytes,request_digest,signature,
+                    prior_generation,prior_state_version,next_generation,next_state_version,
+                    metadata_snapshot_id,entry_seq,accepted_at
+                ) VALUES($1,$2,'commit',$3,$4,$5,1,'admin','active',$6,$7,$8,$9,$10,
+                    0,0,0,1,$11,3,$12)"#,
+            )
+            .bind(transition.transition_id)
+            .bind(cid)
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .bind(&entry.actor_key_id)
+            .bind(&transition.raw_wrapper)
+            .bind(&transition.canonical_projection)
+            .bind(&transition.signing_transcript)
+            .bind(&transition.request_digest)
+            .bind(&transition.signature)
+            .bind(metadata_snapshot_id)
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert staling transition");
+            sqlx::query(
+                r#"INSERT INTO chat.generation_states(
+                    conversation_id,generation,state_version,group_id,epoch,group_context_hash,
+                    confirmation_tag,lifecycle,state_kind,producing_transition_id,
+                    public_snapshot_bytes,snapshot_sha256,tree_summary_bytes,tree_summary_sha256,
+                    leaf_count,created_at
+                ) VALUES($1,0,1,$2,1,$3,$4,'active','commit',$5,$6,$7,$8,$9,1,$10)"#,
+            )
+            .bind(cid)
+            .bind(vec![1_u8; 32])
+            .bind(vec![4_u8; 32])
+            .bind(vec![5_u8; 32])
+            .bind(transition.transition_id)
+            .bind(&public_snapshot)
+            .bind(Sha256::digest(&public_snapshot).to_vec())
+            .bind(&tree_summary)
+            .bind(tree_summary_sha256.to_vec())
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert staling generation state");
+            sqlx::query(
+                r#"INSERT INTO chat.metadata_snapshots(
+                    metadata_snapshot_id,conversation_id,generation,state_version,group_id,epoch,
+                    group_context_hash,confirmation_tag,producing_transition_id,
+                    origin_transition_id,metadata_version,nonce,ciphertext,ciphertext_sha256,
+                    ciphertext_size,author_did,author_device_id,author_key_id,author_public_key,
+                    author_auth_generation,author_origin_seq,author_role,author_device_status,
+                    created_at
+                ) VALUES($1,$2,0,1,$3,1,$4,$5,$6,$7,1,$8,$9,$10,16,$11,$12,$13,$14,
+                    1,1,'admin','active',$15)"#,
+            )
+            .bind(metadata_snapshot_id)
+            .bind(cid)
+            .bind(vec![1_u8; 32])
+            .bind(vec![4_u8; 32])
+            .bind(vec![5_u8; 32])
+            .bind(transition.transition_id)
+            .bind(origin_transition_id)
+            .bind(vec![0x93_u8; 12])
+            .bind(&metadata_ciphertext)
+            .bind(Sha256::digest(&metadata_ciphertext).to_vec())
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .bind(&entry.actor_key_id)
+            .bind(&entry.public_key)
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert staling metadata");
+            sqlx::query(
+                r#"INSERT INTO chat.entries(
+                    conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,
+                    accepted_payload_sha256,signed_request_bytes,request_digest,signature,
+                    server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,
+                    actor_key_id,actor_auth_generation,generation,state_version,transition_id,
+                    received_at
+                ) VALUES($1,3,$2,'blue.catbird.chat.defs#commitEntry',$3,$4,$5,$6,$7,$8,$9,
+                    $10,$11,$12,1,0,1,$13,$14)"#,
+            )
+            .bind(cid)
+            .bind(transition.entry_id)
+            .bind(&transition.public_row_json)
+            .bind(Sha256::digest(&transition.public_row_json).to_vec())
+            .bind(&transition.raw_wrapper)
+            .bind(&transition.request_digest)
+            .bind(&transition.signature)
+            .bind(&transition.server_fields_dag_cbor)
+            .bind(&transition.outer_entry_fingerprint)
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .bind(&entry.actor_key_id)
+            .bind(transition.transition_id)
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert staling entry");
+            sqlx::query(
+                r#"INSERT INTO chat.entry_recipients(
+                    conversation_id,seq,user_did,device_id,entitlement_kind
+                ) VALUES($1,3,$2,$3,'control')"#,
+            )
+            .bind(cid)
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .execute(&mut *tx)
+            .await
+            .expect("route staling entry");
+
+            if kind == SignedMutationKind::ResetRequest {
+                terminalize_reset_request(
+                    &mut tx,
+                    Uuid::from_bytes(request.request_id),
+                    &ResetRequestTermination::Stale {
+                        terminal_transition_id: transition.transition_id,
+                        terminal_at: at,
+                    },
+                )
+                .await
+                .expect("terminalize stale reset");
+            } else {
+                terminalize_leave_request(
+                    &mut tx,
+                    Uuid::from_bytes(request.request_id),
+                    &LeaveRequestTermination::Stale {
+                        terminal_request_digest: transition.request_digest.clone(),
+                        terminal_transition_id: transition.transition_id,
+                        terminal_at: at,
+                    },
+                )
+                .await
+                .expect("terminalize stale leave");
+            }
+            tx.commit()
+                .await
+                .expect("staling graph crosses every deferred constraint");
+            transition
+        }
+
+        pub(super) async fn load_aggregate_hydration(
+            pool: &PgPool,
+            entry: &RealCreationEntry,
+        ) -> ConversationStateHydration {
+            let cid = Uuid::from_bytes(entry.cid);
+            let next_entry_seq: i64 = sqlx::query_scalar(
+                "SELECT next_entry_seq FROM chat.conversations WHERE conversation_id=$1",
+            )
+            .bind(cid)
+            .fetch_one(pool)
+            .await
+            .expect("read aggregate head");
+            let historical = HistoricalRehydrationAuthority::new(
+                entry.cid,
+                u64::try_from(next_entry_seq).expect("head in protocol domain"),
+            )
+            .expect("historical aggregate authority");
+
+            let mut tx = pool.begin().await.expect("begin aggregate load");
+            let guard = hydrate_locked_public_state(&mut tx, cid, instant(STALE_AT))
+                .await
+                .expect("locked public-state rows hydrate");
+            let (
+                _transaction_id,
+                _conversation_id,
+                coordinate,
+                snapshot,
+                binding,
+                _encoded_tree_summary,
+                _tree_summary_sha256,
+                _locked_at,
+                _generation_digest,
+            ) = guard.into_parts();
+            assert_eq!(&coordinate, binding.coordinate());
+            let leaves = load_leaf_hydration_rows(&mut tx, cid, &binding)
+                .await
+                .expect("aggregate leaves hydrate");
+            let public_state =
+                ActivePublicState::for_test_from_persisted_binding(snapshot, binding)
+                    .expect("snapshot remains digest-bound");
+            let producer = load_producer_transition_evidence(&mut tx, &historical, cid)
+                .await
+                .expect("aggregate producer hydrates");
+            let (metadata, metadata_producer) = load_metadata_provenance(&mut tx, &historical, cid)
+                .await
+                .expect("aggregate metadata hydrates");
+            let participants = load_participant_hydration_rows(&mut tx, &historical, cid)
+                .await
+                .expect("aggregate participants hydrate");
+            let intervals = load_interval_hydration_rows(&mut tx, &historical, cid)
+                .await
+                .expect("aggregate intervals hydrate");
+            let (recovery_requests, recovery_reservations) =
+                load_recovery_work_hydration_rows(&mut tx, &historical, cid)
+                    .await
+                    .expect("aggregate recovery work hydrates");
+            let reset_requests = load_reset_request_hydration_rows(&mut tx, &historical, cid)
+                .await
+                .expect("aggregate reset work hydrates");
+            let leave_requests = load_leave_request_hydration_rows(&mut tx, &historical, cid)
+                .await
+                .expect("aggregate leave work hydrates");
+            let welcomes = load_welcome_hydration_rows(&mut tx, &historical, cid)
+                .await
+                .expect("aggregate Welcome work hydrates");
+            tx.rollback().await.expect("rollback aggregate read");
+
+            ConversationStateHydration {
+                kind: ConversationKind::Group,
+                coordinate,
+                producer,
+                public_state: Some(public_state),
+                metadata,
+                metadata_producer,
+                participants,
+                leaves,
+                intervals,
+                terminal_proofs: Vec::new(),
+                recovery_requests,
+                recovery_reservations,
+                reset_requests,
+                leave_requests,
+                welcomes,
+            }
+        }
+
+        fn assert_aggregate_hydrates(entry: &RealCreationEntry, rows: ConversationStateHydration) {
+            let authority = HydrationAuthority::new(entry.cid).expect("aggregate authority");
+            crate::chat_protocol::state_machine::hydrate_conversation_state(&authority, rows)
+                .expect("production aggregate hydration accepts durable terminal");
+        }
+
         fn creator_device(entry: &RealCreationEntry) -> DeviceIdentity {
             DeviceIdentity::new(
                 PrincipalId::new(entry.actor_did.clone().into_bytes()).unwrap(),
@@ -6821,6 +7285,126 @@ mod historical_control_loader {
             assert_eq!(key, b"signing-key");
         }
 
+        #[test]
+        fn reset_terminal_selector_is_closed_over_every_known_status_shape() {
+            let expires_at = instant("2030-02-02T00:00:00.000Z");
+            let terminal_at = instant("2030-02-01T00:01:00.000Z");
+            let transition_id = Uuid::new_v4();
+            let columns = |status, transition, terminal| ResetTerminalColumns {
+                status,
+                terminal_transition_id: transition,
+                terminal_at: terminal,
+                expires_at,
+            };
+
+            assert!(select_reset_terminal(columns("pending", None, None)).is_ok());
+            assert!(select_reset_terminal(columns(
+                "stale",
+                Some(transition_id),
+                Some(terminal_at)
+            ))
+            .is_ok());
+            assert!(select_reset_terminal(columns("expired", None, Some(expires_at))).is_ok());
+            assert!(matches!(
+                select_reset_terminal(columns("consumed", Some(transition_id), Some(terminal_at))),
+                Err(ResetLeaveHydrationError::UnsupportedTerminal)
+            ));
+
+            for malformed in [
+                columns("pending", Some(transition_id), None),
+                columns("pending", None, Some(terminal_at)),
+                columns("stale", None, Some(terminal_at)),
+                columns("stale", Some(transition_id), None),
+                columns("consumed", None, Some(terminal_at)),
+                columns("consumed", Some(transition_id), None),
+                columns("expired", Some(transition_id), Some(expires_at)),
+                columns("expired", None, Some(terminal_at)),
+            ] {
+                assert!(matches!(
+                    select_reset_terminal(malformed),
+                    Err(ResetLeaveHydrationError::TerminalMismatch)
+                ));
+            }
+            assert!(matches!(
+                select_reset_terminal(columns("future-status", None, None)),
+                Err(ResetLeaveHydrationError::OutOfDomain)
+            ));
+        }
+
+        #[test]
+        fn leave_terminal_selector_is_closed_over_every_known_status_shape() {
+            let expires_at = instant("2030-02-02T00:00:00.000Z");
+            let terminal_at = instant("2030-02-01T00:01:00.000Z");
+            let transition_id = Uuid::new_v4();
+            let digest = [0x51_u8; 32];
+            let columns = |status, request_digest, transition, terminal| LeaveTerminalColumns {
+                status,
+                terminal_request_digest: request_digest,
+                terminal_transition_id: transition,
+                terminal_at: terminal,
+                expires_at,
+            };
+
+            assert!(select_leave_terminal(columns("pending", None, None, None)).is_ok());
+            assert!(select_leave_terminal(columns(
+                "stale",
+                Some(&digest),
+                Some(transition_id),
+                Some(terminal_at),
+            ))
+            .is_ok());
+            assert!(select_leave_terminal(columns(
+                "cancelled",
+                Some(&digest),
+                None,
+                Some(terminal_at),
+            ))
+            .is_ok());
+            assert!(
+                select_leave_terminal(columns("expired", None, None, Some(expires_at))).is_ok()
+            );
+            assert!(matches!(
+                select_leave_terminal(columns(
+                    "fulfilled",
+                    Some(&digest),
+                    Some(transition_id),
+                    Some(terminal_at),
+                )),
+                Err(ResetLeaveHydrationError::UnsupportedTerminal)
+            ));
+
+            for malformed in [
+                columns("pending", Some(&digest), None, None),
+                columns("pending", None, Some(transition_id), None),
+                columns("pending", None, None, Some(terminal_at)),
+                columns("stale", None, Some(transition_id), Some(terminal_at)),
+                columns("stale", Some(&digest), None, Some(terminal_at)),
+                columns("stale", Some(&digest), Some(transition_id), None),
+                columns("fulfilled", None, Some(transition_id), Some(terminal_at)),
+                columns("fulfilled", Some(&digest), None, Some(terminal_at)),
+                columns("cancelled", None, None, Some(terminal_at)),
+                columns(
+                    "cancelled",
+                    Some(&digest),
+                    Some(transition_id),
+                    Some(terminal_at),
+                ),
+                columns("cancelled", Some(&digest), None, None),
+                columns("expired", Some(&digest), None, Some(expires_at)),
+                columns("expired", None, Some(transition_id), Some(expires_at)),
+                columns("expired", None, None, Some(terminal_at)),
+            ] {
+                assert!(matches!(
+                    select_leave_terminal(malformed),
+                    Err(ResetLeaveHydrationError::TerminalMismatch)
+                ));
+            }
+            assert!(matches!(
+                select_leave_terminal(columns("future-status", None, None, None)),
+                Err(ResetLeaveHydrationError::OutOfDomain)
+            ));
+        }
+
         /// The pending reset request hydrates: its control-request origin re-mints
         /// byte-equal to the direct in-memory control-path re-hydration, bound to
         /// the genesis active coordinate, terminal `None`.
@@ -6865,6 +7449,62 @@ mod historical_control_loader {
             assert_eq!(row.origin, reference);
         }
 
+        /// A committed reset expiry is selected from the exact durable expiry
+        /// shape and re-enters as `Expiry(expires_at)`, never as inferred
+        /// transition evidence.
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn reset_request_leg_hydrates_the_committed_expiry_terminal() {
+            let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+            let cid = Uuid::new_v4();
+            let entry = build_real_creation_entry(*cid.as_bytes());
+            let request = seed_control_request(
+                &pool,
+                &entry,
+                SignedMutationKind::ResetRequest,
+                RESET_ENTRY_KIND,
+            )
+            .await;
+            let expires_at = instant(RECEIVED_AT) + Duration::hours(24);
+
+            let mut write = pool.begin().await.expect("begin reset expiry");
+            terminalize_reset_request(
+                &mut write,
+                Uuid::from_bytes(request.request_id),
+                &ResetRequestTermination::Expired {
+                    terminal_at: expires_at,
+                },
+            )
+            .await
+            .expect("terminalize reset as expired");
+            write
+                .commit()
+                .await
+                .expect("commit production-valid reset expiry");
+
+            let authority =
+                HistoricalRehydrationAuthority::new(entry.cid, request.seq + 1).unwrap();
+            let mut read = pool
+                .begin()
+                .await
+                .expect("begin fresh reset expiry hydration");
+            let rows = load_reset_request_hydration_rows(&mut read, &authority, cid)
+                .await
+                .expect("expired reset request hydrates");
+            read.rollback().await.expect("rollback read transaction");
+
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].status, ResetRequestStatus::Expired);
+            assert_eq!(
+                rows[0].terminal,
+                Some(WorkTerminalHydrationRow::Expiry(
+                    ServerTimestamp::from_canonical_stored("2030-02-02T00:00:00.000Z").unwrap(),
+                ))
+            );
+            let aggregate = load_aggregate_hydration(&pool, &entry).await;
+            assert_aggregate_hydrates(&entry, aggregate);
+        }
+
         /// The pending leave request hydrates the same way through the leave table +
         /// `leaveRequestEntry` origin.
         #[tokio::test]
@@ -6906,6 +7546,168 @@ mod historical_control_loader {
             assert_eq!(row.status, LeaveRequestStatus::Pending);
             assert!(row.terminal.is_none());
             assert_eq!(row.origin, reference);
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn leave_request_leg_hydrates_the_committed_expiry_terminal() {
+            let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+            let cid = Uuid::new_v4();
+            let entry = build_real_creation_entry(*cid.as_bytes());
+            let request = seed_control_request(
+                &pool,
+                &entry,
+                SignedMutationKind::LeaveRequest,
+                LEAVE_ENTRY_KIND,
+            )
+            .await;
+            let expires_at = instant(RECEIVED_AT) + Duration::hours(24);
+
+            let mut write = pool.begin().await.expect("begin leave expiry");
+            terminalize_leave_request(
+                &mut write,
+                Uuid::from_bytes(request.request_id),
+                &LeaveRequestTermination::Expired {
+                    terminal_at: expires_at,
+                },
+            )
+            .await
+            .expect("terminalize leave as expired");
+            write
+                .commit()
+                .await
+                .expect("commit production-valid leave expiry");
+
+            let authority =
+                HistoricalRehydrationAuthority::new(entry.cid, request.seq + 1).unwrap();
+            let mut read = pool
+                .begin()
+                .await
+                .expect("begin fresh leave expiry hydration");
+            let rows = load_leave_request_hydration_rows(&mut read, &authority, cid)
+                .await
+                .expect("expired leave request hydrates");
+            read.rollback().await.expect("rollback read transaction");
+
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].status, LeaveRequestStatus::Expired);
+            assert_eq!(
+                rows[0].terminal,
+                Some(WorkTerminalHydrationRow::Expiry(
+                    ServerTimestamp::from_canonical_stored("2030-02-02T00:00:00.000Z").unwrap(),
+                ))
+            );
+            let aggregate = load_aggregate_hydration(&pool, &entry).await;
+            assert_aggregate_hydrates(&entry, aggregate);
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn reset_and_leave_stale_loaders_use_the_exact_committed_transition() {
+            let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+            for (kind, entry_kind) in [
+                (SignedMutationKind::ResetRequest, RESET_ENTRY_KIND),
+                (SignedMutationKind::LeaveRequest, LEAVE_ENTRY_KIND),
+            ] {
+                let cid = Uuid::new_v4();
+                let entry = build_real_creation_entry(*cid.as_bytes());
+                let request = seed_control_request(&pool, &entry, kind, entry_kind).await;
+                let transition = commit_staling_transition(&pool, &entry, &request, kind).await;
+                let authority =
+                    HistoricalRehydrationAuthority::new(entry.cid, 4).expect("authority");
+                let mut read = pool.begin().await.expect("begin fresh stale hydration");
+                let terminal = if kind == SignedMutationKind::ResetRequest {
+                    let rows = load_reset_request_hydration_rows(&mut read, &authority, cid)
+                        .await
+                        .expect("stale reset hydrates");
+                    assert_eq!(rows.len(), 1);
+                    assert_eq!(rows[0].status, ResetRequestStatus::Stale);
+                    rows[0].terminal.clone()
+                } else {
+                    let rows = load_leave_request_hydration_rows(&mut read, &authority, cid)
+                        .await
+                        .expect("stale leave hydrates");
+                    assert_eq!(rows.len(), 1);
+                    assert_eq!(rows[0].status, LeaveRequestStatus::Stale);
+                    rows[0].terminal.clone()
+                };
+                read.rollback().await.expect("rollback read transaction");
+                let Some(WorkTerminalHydrationRow::Transition(evidence)) = terminal else {
+                    panic!("stale request must carry transition evidence");
+                };
+                assert_eq!(
+                    evidence.transition_id(),
+                    transition.transition_id.as_bytes()
+                );
+                assert_eq!(
+                    evidence.received_at(),
+                    ServerTimestamp::from_canonical_stored(STALE_AT).unwrap()
+                );
+                let aggregate = load_aggregate_hydration(&pool, &entry).await;
+                assert_aggregate_hydrates(&entry, aggregate);
+            }
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn stale_aggregate_rejects_wrong_prior_sequence_and_ttl_for_both_families() {
+            let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+            for (kind, entry_kind) in [
+                (SignedMutationKind::ResetRequest, RESET_ENTRY_KIND),
+                (SignedMutationKind::LeaveRequest, LEAVE_ENTRY_KIND),
+            ] {
+                let cid = Uuid::new_v4();
+                let entry = build_real_creation_entry(*cid.as_bytes());
+                let request = seed_control_request(&pool, &entry, kind, entry_kind).await;
+                commit_staling_transition(&pool, &entry, &request, kind).await;
+                let rows = load_aggregate_hydration(&pool, &entry).await;
+                let authority = HydrationAuthority::new(entry.cid).expect("aggregate authority");
+
+                let mut wrong_prior = rows.clone();
+                if kind == SignedMutationKind::ResetRequest {
+                    wrong_prior.reset_requests[0].bound_coordinate = wrong_prior.coordinate;
+                } else {
+                    wrong_prior.leave_requests[0].bound_coordinate = wrong_prior.coordinate;
+                }
+                assert!(matches!(
+                    crate::chat_protocol::state_machine::hydrate_conversation_state(
+                        &authority,
+                        wrong_prior,
+                    ),
+                    Err(crate::chat_protocol::state_machine::StateMachineError::InvariantViolation)
+                ));
+
+                let too_early =
+                    WorkTerminalHydrationRow::Transition(rows.intervals[0].opening.clone());
+                let mut wrong_sequence = rows.clone();
+                if kind == SignedMutationKind::ResetRequest {
+                    wrong_sequence.reset_requests[0].terminal = Some(too_early);
+                } else {
+                    wrong_sequence.leave_requests[0].terminal = Some(too_early);
+                }
+                assert!(matches!(
+                    crate::chat_protocol::state_machine::hydrate_conversation_state(
+                        &authority,
+                        wrong_sequence,
+                    ),
+                    Err(crate::chat_protocol::state_machine::StateMachineError::InvariantViolation)
+                ));
+
+                let mut wrong_ttl = rows;
+                if kind == SignedMutationKind::ResetRequest {
+                    wrong_ttl.reset_requests[0].expires_at =
+                        ServerTimestamp::from_canonical_stored(STALE_AT).unwrap();
+                } else {
+                    wrong_ttl.leave_requests[0].expires_at =
+                        ServerTimestamp::from_canonical_stored(STALE_AT).unwrap();
+                }
+                assert!(matches!(
+                    crate::chat_protocol::state_machine::hydrate_conversation_state(
+                        &authority, wrong_ttl,
+                    ),
+                    Err(crate::chat_protocol::state_machine::StateMachineError::InvariantViolation)
+                ));
+            }
         }
 
         /// The reset leg fails CLOSED when the read-time authority binds a different
@@ -6993,8 +7795,9 @@ mod historical_control_loader {
         };
         use super::seed_real_creation_graph;
         use crate::chat_protocol::repository::core::{
-            load_work_terminal_hydration_row, resolve_single_terminal_candidate,
-            WorkTerminalHydrationError, WorkTerminalLocator, WorkTerminalRequestSource,
+            load_leave_request_hydration_rows, load_work_terminal_hydration_row,
+            resolve_single_terminal_candidate, WorkTerminalHydrationError, WorkTerminalLocator,
+            WorkTerminalRequestSource,
         };
         use crate::chat_protocol::repository::{
             delivery::{append_entry_at, AppendEntry},
@@ -7005,12 +7808,13 @@ mod historical_control_loader {
             },
         };
         use crate::chat_protocol::state_machine::{
-            DurableSignedRequestEnvelope, HistoricalRehydrationAuthority, HydrationAuthority,
-            RequestEntryKind, ServerTimestamp, WorkTerminalHydrationRow,
+            DeviceIdentity, DurableSignedRequestEnvelope, HistoricalRehydrationAuthority,
+            HydrationAuthority, LeaveRequestStatus, RequestEntryKind, ServerTimestamp,
+            WorkTerminalHydrationRow,
         };
         use crate::chat_protocol::transcript::{
-            decode_and_verify_signed_mutation, decode_canonical_signed_mutation,
-            SignedMutationKind, VerifiedMutationProjection,
+            decode_and_verify_control_entry, decode_and_verify_signed_mutation,
+            decode_canonical_signed_mutation, SignedMutationKind, VerifiedMutationProjection,
         };
         use crate::chat_protocol::validation::{
             ed25519_key_id, CanonicalTimestamp, TrustedRequestInstant,
@@ -7605,7 +8409,170 @@ mod historical_control_loader {
             .expect("leave cancellation terminal reconstructs");
             tx.commit().await.expect("commit read transaction");
 
-            assert_eq!(loaded, WorkTerminalHydrationRow::Request(expected));
+            assert_eq!(loaded, WorkTerminalHydrationRow::Request(expected.clone()));
+
+            let mut tx = pool
+                .begin()
+                .await
+                .expect("begin fresh cancelled leave hydration");
+            let rows = load_leave_request_hydration_rows(&mut tx, &authority, cid)
+                .await
+                .expect("cancelled leave request hydrates");
+            tx.rollback().await.expect("rollback read transaction");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].status, LeaveRequestStatus::Cancelled);
+            assert_eq!(
+                rows[0].terminal,
+                Some(WorkTerminalHydrationRow::Request(expected.clone()))
+            );
+            let aggregate = super::reset_leave_leg::load_aggregate_hydration(&pool, &entry).await;
+            let authority = HydrationAuthority::new(entry.cid).expect("aggregate authority");
+            crate::chat_protocol::state_machine::hydrate_conversation_state(
+                &authority,
+                aggregate.clone(),
+            )
+            .expect("cancelled leave passes production aggregate hydration");
+
+            let mut wrong_target = aggregate.clone();
+            wrong_target.leave_requests[0].request_id = *Uuid::new_v4().as_bytes();
+            assert!(matches!(
+                crate::chat_protocol::state_machine::hydrate_conversation_state(
+                    &authority,
+                    wrong_target,
+                ),
+                Err(crate::chat_protocol::state_machine::StateMachineError::InvariantViolation)
+            ));
+
+            let original_origin = aggregate.leave_requests[0].origin.clone();
+            let mut wrong_kind = aggregate.clone();
+            wrong_kind.leave_requests[0].terminal =
+                Some(WorkTerminalHydrationRow::Request(original_origin.clone()));
+            assert!(matches!(
+                crate::chat_protocol::state_machine::hydrate_conversation_state(
+                    &authority, wrong_kind,
+                ),
+                Err(crate::chat_protocol::state_machine::StateMachineError::InvariantViolation)
+            ));
+
+            let mut wrong_principal = aggregate.clone();
+            wrong_principal.leave_requests[0].requester = DeviceIdentity::new(
+                crate::chat_protocol::state_machine::PrincipalId::new(
+                    b"did:plc:abcdefghijklmnopqrstuvwx".to_vec(),
+                )
+                .unwrap(),
+                *Uuid::new_v4().as_bytes(),
+            )
+            .unwrap();
+            assert!(matches!(
+                crate::chat_protocol::state_machine::hydrate_conversation_state(
+                    &authority,
+                    wrong_principal,
+                ),
+                Err(crate::chat_protocol::state_machine::StateMachineError::InvariantViolation)
+            ));
+
+            let mut wrong_sequence = aggregate.clone();
+            wrong_sequence.leave_requests[0].origin = expected.clone();
+            wrong_sequence.leave_requests[0].terminal =
+                Some(WorkTerminalHydrationRow::Request(original_origin));
+            assert!(matches!(
+                crate::chat_protocol::state_machine::hydrate_conversation_state(
+                    &authority,
+                    wrong_sequence,
+                ),
+                Err(crate::chat_protocol::state_machine::StateMachineError::InvariantViolation)
+            ));
+
+            let mut wrong_ttl = aggregate;
+            wrong_ttl.leave_requests[0].expires_at = expected.received_at();
+            assert!(matches!(
+                crate::chat_protocol::state_machine::hydrate_conversation_state(
+                    &authority, wrong_ttl,
+                ),
+                Err(crate::chat_protocol::state_machine::StateMachineError::InvariantViolation)
+            ));
+
+            // The frozen DDL intentionally permits more than one committed
+            // leaveCancellationEntry to map to the same cancelled leave row.
+            // Append a second immutable control envelope carrying the same signed
+            // cancellation/digest; the production lookup must fetch-all and fail
+            // closed rather than select either candidate.
+            let duplicate_entry_id = Uuid::new_v4();
+            let duplicate_wrapper: Value =
+                serde_json::from_slice(&cancellation.raw_wrapper).unwrap();
+            let duplicate_payload = serde_json::to_vec(&json!({
+                "$type": CANCELLATION_ENTRY_KIND,
+                "entryId": duplicate_entry_id.hyphenated().to_string(),
+                "conversationId": cid.hyphenated().to_string(),
+                "seq": 4,
+                "signedRequest": duplicate_wrapper,
+                "receivedAt": "2030-02-01T00:00:00.000Z",
+            }))
+            .unwrap();
+            let duplicate_decoded =
+                decode_and_verify_control_entry(&duplicate_payload, &entry.public_key)
+                    .expect("duplicate cancellation envelope verifies");
+            let mut write = pool.begin().await.expect("begin duplicate cancellation");
+            cas_conversation_head(
+                &mut write,
+                &ConversationHeadCas {
+                    conversation_id: cid,
+                    expected_generation: 0,
+                    expected_state_version: 0,
+                    expected_next_entry_seq: 4,
+                    successor_generation: 0,
+                    successor_state_version: 0,
+                    successor_next_entry_seq: 5,
+                    close: None,
+                },
+            )
+            .await
+            .expect("advance head for duplicate cancellation");
+            append_entry_at(
+                &mut write,
+                &AppendEntry {
+                    conversation_id: cid,
+                    entry_id: duplicate_entry_id,
+                    entry_kind: CANCELLATION_ENTRY_KIND.to_owned(),
+                    accepted_payload_bytes: duplicate_payload.clone(),
+                    accepted_payload_sha256: Sha256::digest(&duplicate_payload).to_vec(),
+                    signed_request_bytes: cancellation.raw_wrapper.clone(),
+                    request_digest: cancellation.request_digest.clone(),
+                    signature: cancellation.signature.clone(),
+                    server_fields_bytes: duplicate_decoded.server_fields_dag_cbor().unwrap(),
+                    outer_entry_fingerprint: duplicate_decoded.outer_control_fingerprint().to_vec(),
+                    actor_did: entry.actor_did.clone(),
+                    actor_device_id: entry.actor_device_id,
+                    actor_key_id: entry.actor_key_id.clone(),
+                    actor_auth_generation: 1,
+                    generation: None,
+                    state_version: None,
+                    transition_id: None,
+                    message_id: None,
+                    received_at: instant("2030-02-01T00:00:00.000Z"),
+                },
+                4,
+            )
+            .await
+            .expect("append duplicate cancellation");
+            write
+                .commit()
+                .await
+                .expect("commit DDL-permitted duplicate cancellation");
+
+            let ambiguous_authority =
+                HistoricalRehydrationAuthority::new(entry.cid, 5).expect("advanced authority");
+            let mut read = pool
+                .begin()
+                .await
+                .expect("begin ambiguous cancellation read");
+            let ambiguous =
+                load_leave_request_hydration_rows(&mut read, &ambiguous_authority, cid).await;
+            read.rollback().await.expect("rollback read transaction");
+            assert!(matches!(
+                ambiguous,
+                Err(crate::chat_protocol::repository::core::ResetLeaveHydrationError::InvalidTerminal)
+            ));
         }
 
         #[tokio::test]
