@@ -93,9 +93,9 @@ use chat_protocol::repository::delivery::{
 };
 use chat_protocol::repository::transition::ResetReason;
 use chat_protocol::repository::transition::{
-    cas_conversation_head, cas_generation_state_version, supersede_generation, ConversationHeadCas,
-    ConversationHeadClose, GenerationStateVersionCas, GenerationSupersede, TransitionActorRole,
-    TransitionRepositoryError,
+    cas_conversation_head, cas_generation_state_version, lock_active_leaf_period_bindings,
+    supersede_generation, ActiveLeafPeriodBinding, ConversationHeadCas, ConversationHeadClose,
+    GenerationStateVersionCas, GenerationSupersede, TransitionActorRole, TransitionRepositoryError,
 };
 use chat_protocol::snapshot::{PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle};
 use chat_protocol::state_machine::{
@@ -5378,12 +5378,33 @@ enum GenericRemoveCorruption {
     MissingClosingLeafContext,
     ForeignClosingLeafContext,
     DuplicateClosingLeafContext,
+    MismatchedClosingLeafPeriod,
 }
 
 #[tokio::test]
 async fn signed_generic_remove_commit_rejects_nonbijective_effect_shapes() {
     let (pool, _db) = setup().await;
     let scenario = run_fulfillment_scenario(&pool).await;
+    let alice_leaf_period: Uuid = sqlx::query_scalar(
+        "SELECT leaf_period_id FROM chat.member_devices \
+         WHERE conversation_id=$1 AND user_did=$2 AND device_id=$3 AND active",
+    )
+    .bind(scenario.conversation_id)
+    .bind(&scenario.fixture.alice_did)
+    .bind(scenario.fixture.alice_device)
+    .fetch_one(&pool)
+    .await
+    .expect("active Alice leaf period");
+    let bob_leaf_period: Uuid = sqlx::query_scalar(
+        "SELECT leaf_period_id FROM chat.member_devices \
+         WHERE conversation_id=$1 AND user_did=$2 AND device_id=$3 AND active",
+    )
+    .bind(scenario.conversation_id)
+    .bind(&scenario.bob_did)
+    .bind(Uuid::from_bytes(*scenario.bob_id.device_id()))
+    .fetch_one(&pool)
+    .await
+    .expect("active Bob leaf period");
     let cases = [
         GenericRemoveCorruption::Add,
         GenericRemoveCorruption::EmptyLeafDelta,
@@ -5396,6 +5417,7 @@ async fn signed_generic_remove_commit_rejects_nonbijective_effect_shapes() {
         GenericRemoveCorruption::MissingClosingLeafContext,
         GenericRemoveCorruption::ForeignClosingLeafContext,
         GenericRemoveCorruption::DuplicateClosingLeafContext,
+        GenericRemoveCorruption::MismatchedClosingLeafPeriod,
     ];
 
     for case in cases {
@@ -5414,6 +5436,9 @@ async fn signed_generic_remove_commit_rejects_nonbijective_effect_shapes() {
                     .ctx
                     .closing_leaf_periods
                     .push((scenario.bob_id.clone(), Uuid::new_v4()));
+            }
+            GenericRemoveCorruption::MismatchedClosingLeafPeriod => {
+                built.ctx.closing_leaf_periods = vec![(scenario.bob_id.clone(), alice_leaf_period)];
             }
             _ => {}
         }
@@ -5442,7 +5467,8 @@ async fn signed_generic_remove_commit_rejects_nonbijective_effect_shapes() {
                 .with_generic_remove_interval_coordinate_corrupted_for_test(),
             GenericRemoveCorruption::MissingClosingLeafContext
             | GenericRemoveCorruption::ForeignClosingLeafContext
-            | GenericRemoveCorruption::DuplicateClosingLeafContext => built.plan,
+            | GenericRemoveCorruption::DuplicateClosingLeafContext
+            | GenericRemoveCorruption::MismatchedClosingLeafPeriod => built.plan,
         };
         let mut tx = pool.begin().await.expect("begin corrupted generic Remove");
         let result = apply_conversation_persistence_plan(&mut tx, &plan, &built.ctx).await;
@@ -5458,6 +5484,36 @@ async fn signed_generic_remove_commit_rejects_nonbijective_effect_shapes() {
         }
         tx.rollback().await.expect("rollback corrupted plan");
     }
+
+    let swapped_bindings = [
+        ActiveLeafPeriodBinding {
+            leaf_period_id: alice_leaf_period,
+            conversation_id: scenario.conversation_id,
+            generation: 0,
+            user_did: scenario.bob_did.clone(),
+            device_id: Uuid::from_bytes(*scenario.bob_id.device_id()),
+        },
+        ActiveLeafPeriodBinding {
+            leaf_period_id: bob_leaf_period,
+            conversation_id: scenario.conversation_id,
+            generation: 0,
+            user_did: scenario.fixture.alice_did.clone(),
+            device_id: scenario.fixture.alice_device,
+        },
+    ];
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("begin swapped leaf-period binding");
+    assert!(
+        !lock_active_leaf_period_bindings(&mut tx, &swapped_bindings)
+            .await
+            .expect("lock swapped active leaf-period bindings"),
+        "two active periods swapped across devices must not match"
+    );
+    tx.rollback()
+        .await
+        .expect("rollback swapped leaf-period binding");
 
     let (state_version, transitions): (i64, i64) = sqlx::query_as(
         "SELECT current_state_version,\

@@ -14549,11 +14549,12 @@ mod executor {
     };
     use super::super::repository::transition::{
         self as transition, cas_registration_revoke, insert_device_revocation,
-        ConversationHeadClose, ConversationHeadKind, GenerationStateKind, GenerationStateLifecycle,
-        GenerationSupersede, LeafClose, LeafOrigin, LeafRecoveryKind as RepoLeafRecoveryKind,
-        LeafRecoverySource, LeafRecoveryTermination, LeaveRequestTermination, NewDeviceRevocation,
-        NewGeneration, NewGenerationState, NewLeafPeriod, NewLeafRecoveryRequest, NewLeaveRequest,
-        NewMetadataSnapshot, NewParticipantPeriod, NewReservation, NewResetRequest, NewTransition,
+        ActiveLeafPeriodBinding, ConversationHeadClose, ConversationHeadKind, GenerationStateKind,
+        GenerationStateLifecycle, GenerationSupersede, LeafClose, LeafOrigin,
+        LeafRecoveryKind as RepoLeafRecoveryKind, LeafRecoverySource, LeafRecoveryTermination,
+        LeaveRequestTermination, NewDeviceRevocation, NewGeneration, NewGenerationState,
+        NewLeafPeriod, NewLeafRecoveryRequest, NewLeaveRequest, NewMetadataSnapshot,
+        NewParticipantPeriod, NewReservation, NewResetRequest, NewTransition,
         PackageStatus as RepoPackageStatus, PackageSuccessor, ParticipantAcceptance,
         ParticipantAcceptanceCas, ParticipantInvitation, ParticipantRole as RepoParticipantRole,
         ParticipantStatus as RepoParticipantStatus, RegistrationRevoke, ReservationTermination,
@@ -17107,6 +17108,24 @@ mod executor {
             .ok_or(ExecutorError::MissingContext(
                 "generic commit metadata author",
             ))?;
+        let leaf_period_bindings = removed_devices
+            .iter()
+            .map(|device| {
+                Ok(ActiveLeafPeriodBinding {
+                    leaf_period_id: closing_leaf_period(ctx, device)?,
+                    conversation_id,
+                    generation: expected_generation,
+                    user_did: device_did(device)?,
+                    device_id: device_uuid(device),
+                })
+            })
+            .collect::<Result<Vec<_>, ExecutorError>>()?;
+        if !transition::lock_active_leaf_period_bindings(transaction, &leaf_period_bindings).await?
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "generic commit closing leaf period mismatches its removed device",
+            ));
+        }
 
         // 1. Head CAS sv+1 (the epoch bump lives in the gen_state).
         transition::cas_conversation_head(
@@ -17237,8 +17256,12 @@ mod executor {
             }
         }
         for change in effects.interval_changes() {
-            let after = change.after().expect("validated generic interval close");
-            let end = after.end().expect("validated generic interval end");
+            let after = change.after().ok_or(ExecutorError::InconsistentPlan(
+                "validated generic interval close disappeared",
+            ))?;
+            let end = after.end().ok_or(ExecutorError::InconsistentPlan(
+                "validated generic interval end disappeared",
+            ))?;
             delivery::close_application_interval(
                 transaction,
                 &ApplicationIntervalClose {

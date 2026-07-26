@@ -400,6 +400,58 @@ pub(crate) struct LeafClose {
     pub(crate) removed_at: DateTime<Utc>,
 }
 
+/// Exact durable identity expected for one active leaf period that an executor
+/// is about to close.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ActiveLeafPeriodBinding {
+    pub(crate) leaf_period_id: Uuid,
+    pub(crate) conversation_id: Uuid,
+    pub(crate) generation: i64,
+    pub(crate) user_did: String,
+    pub(crate) device_id: Uuid,
+}
+
+/// Lock the named leaf periods in deterministic UUID order and verify that
+/// every row is still the exact active conversation/generation/device tuple
+/// supplied by the caller. Missing, inactive, or mismatched rows return
+/// `Ok(false)` so the executor can surface its typed plan-contract error; SQL
+/// failures remain repository errors. The later close CAS and deferred schema
+/// constraints remain independent backstops.
+pub(crate) async fn lock_active_leaf_period_bindings(
+    transaction: &mut Transaction<'_, Postgres>,
+    expected: &[ActiveLeafPeriodBinding],
+) -> Result<bool, TransitionRepositoryError> {
+    let mut ordered = expected.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|binding| binding.leaf_period_id);
+
+    let mut locked = Vec::with_capacity(ordered.len());
+    for binding in &ordered {
+        let row: Option<(Uuid, i64, String, Uuid, bool)> = sqlx::query_as(
+            r#"
+            SELECT conversation_id, generation, user_did, device_id, active
+              FROM chat.member_devices
+             WHERE leaf_period_id = $1
+             FOR UPDATE
+            "#,
+        )
+        .bind(binding.leaf_period_id)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        locked.push(row);
+    }
+
+    Ok(ordered.iter().zip(locked).all(|(expected, row)| {
+        matches!(
+            row,
+            Some((conversation_id, generation, user_did, device_id, true))
+                if conversation_id == expected.conversation_id
+                    && generation == expected.generation
+                    && user_did == expected.user_did
+                    && device_id == expected.device_id
+        )
+    }))
+}
+
 pub(crate) async fn close_leaf_period(
     transaction: &mut Transaction<'_, Postgres>,
     close: &LeafClose,
