@@ -199,6 +199,191 @@ fn rand_byte() -> u8 {
     })
 }
 
+async fn assert_welcome_shape_update_rejects(
+    pool: &PgPool,
+    welcome_id: Uuid,
+    mutation: &str,
+    label: &str,
+) {
+    let mut tx = pool.begin().await.expect("begin Welcome shape probe");
+    sqlx::query(
+        "ALTER TABLE chat.welcome_dispositions \
+         DISABLE TRIGGER welcome_dispositions_immutable",
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("disable only Welcome disposition immutability");
+    let statement = format!("UPDATE chat.welcome_dispositions SET {mutation} WHERE welcome_id=$1");
+    let error = sqlx::query(&statement)
+        .bind(welcome_id)
+        .execute(&mut *tx)
+        .await
+        .expect_err(label);
+    let database = error
+        .as_database_error()
+        .expect("database constraint error");
+    assert_eq!(
+        database.code().as_deref(),
+        Some("23514"),
+        "{label}: {error}"
+    );
+    assert!(
+        database
+            .constraint()
+            .is_some_and(|name| name == "welcome_dispositions_terminal_source_shape_check"),
+        "{label}: unexpected constraint: {error}"
+    );
+    tx.rollback().await.expect("rollback Welcome shape probe");
+}
+
+async fn assert_welcome_source_commit_rejects(
+    pool: &PgPool,
+    welcome_id: Uuid,
+    mutation: &str,
+    source_id: Option<Uuid>,
+    label: &str,
+) {
+    let mut tx = pool.begin().await.expect("begin Welcome source probe");
+    sqlx::query(
+        "ALTER TABLE chat.welcome_dispositions \
+         DISABLE TRIGGER welcome_dispositions_immutable",
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("disable only Welcome disposition immutability");
+    let statement = format!("UPDATE chat.welcome_dispositions SET {mutation} WHERE welcome_id=$1");
+    let mut query = sqlx::query(&statement).bind(welcome_id);
+    if let Some(source_id) = source_id {
+        query = query.bind(source_id);
+    }
+    query
+        .execute(&mut *tx)
+        .await
+        .unwrap_or_else(|error| panic!("{label}: mutation must reach COMMIT: {error}"));
+    // Do not re-enable here: PostgreSQL rejects ALTER TABLE while this table
+    // has pending deferred-trigger events. The expected COMMIT failure rolls
+    // back this transactional DDL together with the malformed mutation.
+    let error = match tx.commit().await {
+        Err(error) => error,
+        Ok(()) => {
+            // The suite normally runs inside FreshDbGuard's per-test database,
+            // but restore the named trigger explicitly before failing so even
+            // an accidentally shared database cannot retain test-only DDL.
+            sqlx::query(
+                "ALTER TABLE chat.welcome_dispositions \
+                 ENABLE TRIGGER welcome_dispositions_immutable",
+            )
+            .execute(pool)
+            .await
+            .expect("restore immutable trigger after unexpected COMMIT success");
+            panic!("{label}: malformed Welcome source unexpectedly committed");
+        }
+    };
+    let database = error
+        .as_database_error()
+        .expect("database constraint error");
+    assert_eq!(
+        database.code().as_deref(),
+        Some("23514"),
+        "{label}: {error}"
+    );
+    assert!(
+        database
+            .message()
+            .contains("terminal Welcome disposition mismatch"),
+        "{label}: deferred Welcome CAS did not reject: {error}"
+    );
+}
+
+async fn commit_isolated_device_revocation(pool: &PgPool) -> (Uuid, DateTime<Utc>) {
+    let target_did = random_plc_did();
+    let target_device = Uuid::new_v4();
+    let mut signing_public_key = [0_u8; 32];
+    signing_public_key[..16].copy_from_slice(Uuid::new_v4().as_bytes());
+    signing_public_key[16..].copy_from_slice(Uuid::new_v4().as_bytes());
+    let target_key_id = seed_actor(pool, &target_did, target_device, &signing_public_key).await;
+    let accepted_at = DateTime::from_timestamp_millis(clock_now(pool).await.timestamp_millis())
+        .expect("whole-millisecond isolated revocation instant");
+    let revocation_id = Uuid::new_v4();
+    let accepted_request = vec![0x91_u8; 8];
+    let signing_transcript = vec![0x92_u8; 8];
+    let request_digest = Sha256::digest(&signing_transcript).to_vec();
+    let signature = vec![0x93_u8; 64];
+    let response = vec![0x94_u8; 8];
+    let mut tx = pool.begin().await.expect("begin isolated revocation");
+    sqlx::query(
+        r#"
+        INSERT INTO chat.idempotency_records(
+            principal_did,endpoint_nsid,operation_id,request_digest,
+            accepted_request_bytes,signing_transcript_bytes,signature,
+            completed_status,response_bytes,response_sha256,historical_jkt,completed_at
+        ) VALUES($1,'blue.catbird.chat.revokeDevice',$2,$3,$4,$5,$6,200,$7,$8,$9,$10)
+        "#,
+    )
+    .bind(&target_did)
+    .bind(revocation_id)
+    .bind(&request_digest)
+    .bind(&accepted_request)
+    .bind(&signing_transcript)
+    .bind(&signature)
+    .bind(&response)
+    .bind(Sha256::digest(&response).to_vec())
+    .bind(&target_key_id)
+    .bind(accepted_at)
+    .execute(&mut *tx)
+    .await
+    .expect("insert isolated revocation receipt");
+    sqlx::query(
+        r#"
+        INSERT INTO chat.device_revocations(
+            revocation_id,actor_did,actor_device_id,actor_key_id,
+            actor_auth_generation,target_did,target_device_id,
+            target_auth_generation,accepted_request_bytes,
+            signing_transcript_bytes,request_digest,signature,signed_at,accepted_at
+        ) VALUES($1,$2,$3,$4,1,$2,$3,1,$5,$6,$7,$8,$9,$9)
+        "#,
+    )
+    .bind(revocation_id)
+    .bind(&target_did)
+    .bind(target_device)
+    .bind(&target_key_id)
+    .bind(&accepted_request)
+    .bind(&signing_transcript)
+    .bind(&request_digest)
+    .bind(&signature)
+    .bind(accepted_at)
+    .execute(&mut *tx)
+    .await
+    .expect("insert isolated device revocation");
+    sqlx::query(
+        "UPDATE chat.devices \
+            SET status='revoked',revoked_at=$3,revocation_id=$4,updated_at=$3 \
+          WHERE user_did=$1 AND device_id=$2",
+    )
+    .bind(&target_did)
+    .bind(target_device)
+    .bind(accepted_at)
+    .bind(revocation_id)
+    .execute(&mut *tx)
+    .await
+    .expect("revoke isolated device");
+    sqlx::query(
+        "UPDATE chat.device_keys SET revoked_at=$3,revocation_id=$4 \
+          WHERE user_did=$1 AND device_id=$2",
+    )
+    .bind(&target_did)
+    .bind(target_device)
+    .bind(accepted_at)
+    .bind(revocation_id)
+    .execute(&mut *tx)
+    .await
+    .expect("revoke isolated device key");
+    tx.commit()
+        .await
+        .expect("commit complete isolated revocation footprint");
+    (revocation_id, accepted_at)
+}
+
 // ===========================================================================
 // New-writer verification (tx + read-back + ROLLBACK).
 // ===========================================================================
@@ -2285,13 +2470,97 @@ async fn reset_activation_supersedes_prior_pending_welcome() {
     .await
     .expect("head");
     assert_eq!((gen, sv, next_seq), (1, 0, 6));
-    let welcome_status: String =
-        sqlx::query_scalar("SELECT status FROM chat.welcome_deliveries WHERE welcome_id=$1")
-            .bind(scenario_welcome_id)
-            .fetch_one(&pool)
-            .await
-            .expect("welcome");
-    assert_eq!(welcome_status, "superseded");
+    let (welcome_status, terminal_transition_id, terminal_revocation_id): (
+        String,
+        Option<Uuid>,
+        Option<Uuid>,
+    ) = sqlx::query_as(
+        "SELECT delivery.status,disposition.terminal_transition_id,\
+                disposition.terminal_revocation_id \
+           FROM chat.welcome_deliveries delivery \
+           JOIN chat.welcome_dispositions disposition USING (welcome_id) \
+          WHERE delivery.welcome_id=$1",
+    )
+    .bind(scenario_welcome_id)
+    .fetch_one(&pool)
+    .await
+    .expect("welcome transition supersession");
+    assert_eq!(
+        (
+            welcome_status.as_str(),
+            terminal_transition_id,
+            terminal_revocation_id
+        ),
+        ("superseded", Some(act_transition), None)
+    );
+
+    // Test-only mutations disable only the immutable-row trigger. The shape
+    // CHECK remains immediate, and the initially-deferred source FK + exact
+    // Welcome CAS remain live through COMMIT.
+    assert_welcome_shape_update_rejects(
+        &pool,
+        scenario_welcome_id,
+        "terminal_transition_id=NULL",
+        "superseded Welcome with zero terminal sources",
+    )
+    .await;
+    assert_welcome_shape_update_rejects(
+        &pool,
+        scenario_welcome_id,
+        "terminal_revocation_id=gen_random_uuid()",
+        "superseded Welcome with both terminal sources",
+    )
+    .await;
+    assert_welcome_shape_update_rejects(
+        &pool,
+        scenario_welcome_id,
+        "winner_kind='expired'",
+        "non-superseded Welcome with a terminal source",
+    )
+    .await;
+
+    let (producer_transition_id, creation_transition_id): (Uuid, Uuid) = sqlx::query_as(
+        r#"
+        SELECT bundle.transition_id,
+               (
+                   SELECT transition_id
+                     FROM chat.transitions
+                    WHERE conversation_id=bundle.conversation_id
+                      AND kind='creation'
+               )
+          FROM chat.welcome_bundles bundle
+         WHERE bundle.welcome_id=$1
+        "#,
+    )
+    .bind(scenario_welcome_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load durable malformed-source candidates");
+    assert_welcome_source_commit_rejects(
+        &pool,
+        scenario_welcome_id,
+        "terminal_transition_id=$2,terminal_revocation_id=NULL",
+        Some(creation_transition_id),
+        "transition source with the wrong prior/full coordinate",
+    )
+    .await;
+    assert_welcome_source_commit_rejects(
+        &pool,
+        scenario_welcome_id,
+        "terminal_transition_id=$2,terminal_revocation_id=NULL",
+        Some(producer_transition_id),
+        "transition source that is not later than the Welcome entry",
+    )
+    .await;
+    assert_welcome_source_commit_rejects(
+        &pool,
+        scenario_welcome_id,
+        "terminal_at=terminal_at+interval '1 millisecond'",
+        None,
+        "transition source with the wrong terminal instant",
+    )
+    .await;
+
     // gen1 active with alice's genesis leaf; the reset request consumed.
     let g1_leaf: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM chat.member_devices WHERE conversation_id=$1 AND generation=1 AND active",
@@ -9714,6 +9983,200 @@ async fn device_revocation_batch_commits_and_supersedes_target_work() {
         active_reservations, 0,
         "no active target reservations remain"
     );
+}
+
+#[tokio::test]
+async fn device_revocation_supersedes_pending_welcome_with_exact_revocation_source() {
+    let (pool, _db) = setup().await;
+    let scenario = run_fulfillment_scenario(&pool).await;
+    let bob_device = Uuid::from_bytes(*scenario.bob_id.device_id());
+    let bob_key_id: String = sqlx::query_scalar(
+        "SELECT key_id FROM chat.device_keys \
+         WHERE user_did=$1 AND device_id=$2 AND revoked_at IS NULL",
+    )
+    .bind(&scenario.bob_did)
+    .bind(bob_device)
+    .fetch_one(&pool)
+    .await
+    .expect("bob active signing key");
+    let bob_signing_key =
+        hex::decode(&corpus_manifest().identity.bob.signature_public_key_hex).unwrap();
+    // A fully mapped revocation of a foreign device at the SAME instant gives
+    // the deferred Welcome CAS a durable wrong-target candidate. It satisfies
+    // the direct FK and the revocation's own mapping, so only recipient binding
+    // distinguishes it from the real source.
+    let (foreign_revocation_id, accepted_at) = commit_isolated_device_revocation(&pool).await;
+    let accepted_st =
+        ServerTimestamp::from_unix_millis_for_test(accepted_at.timestamp_millis()).unwrap();
+    let revocation_id = Uuid::new_v4();
+    let signing_transcript = vec![0x8A_u8; 24];
+    let request_digest: [u8; 32] = Sha256::digest(&signing_transcript).into();
+    let signed_request = vec![0x8B_u8; 24];
+    let signature = [0x8C_u8; 64];
+    let actor_key_id: [u8; 32] = Sha256::digest(&bob_signing_key).into();
+    let evidence = DeviceRevocationEvidence::for_test(
+        *revocation_id.as_bytes(),
+        scenario.bob_id.clone(),
+        scenario.bob_id.clone(),
+        actor_key_id,
+        1,
+        1,
+        accepted_st,
+        accepted_st,
+        request_digest,
+        signature,
+        signed_request.clone(),
+        signing_transcript.clone(),
+    );
+    let planned = plan_device_revocation(&scenario.fulfillment_state, evidence.clone())
+        .expect("pending Welcome target has a valid revocation plan");
+    let head_cas = ConversationHeadCasBinding::for_test_internal(
+        *scenario.conversation_id.as_bytes(),
+        scenario.coordinate,
+        4,
+        accepted_st,
+    );
+    let conversation_plan = device_revocation_plan_for_test(planned, head_cas, evidence.clone());
+    let batch_plan = DeviceRevocationBatchPersistencePlan::for_test(
+        evidence,
+        RevocationTargetCasBinding::for_test(scenario.bob_id.clone(), 1, accepted_st),
+        vec![],
+        vec![conversation_plan],
+    );
+    let bob_predecessor = device_event_predecessor(&pool, &scenario.bob_did, bob_device).await;
+    let ctx = ExecutionContext {
+        protocol_instance_id: scenario.fixture.protocol_instance_id,
+        applied_at: accepted_at,
+        actor: ExecutionActor {
+            user_did: scenario.bob_did.clone(),
+            device_id: bob_device,
+            key_id: bob_key_id.clone(),
+            auth_generation: 1,
+            role: TransitionActorRole::Member,
+            device_status: "active".to_owned(),
+        },
+        entry: ControlEntryContent {
+            entry_id: Uuid::new_v4(),
+            entry_kind: "blue.catbird.chat.defs#applicationEntry".to_owned(),
+            accepted_payload_bytes: vec![0x8D_u8; 8],
+            accepted_payload_sha256: Sha256::digest([0x8D_u8; 8]).to_vec(),
+            signed_request_bytes: signed_request.clone(),
+            unsigned_projection_bytes: vec![0x8E_u8; 8],
+            signing_transcript_bytes: signing_transcript.clone(),
+            request_digest: request_digest.to_vec(),
+            signature: signature.to_vec(),
+            server_fields_bytes: vec![0x8F_u8; 8],
+            outer_entry_fingerprint: vec![0x20_u8; 32],
+        },
+        spine: SpineArtifacts {
+            public_snapshot_bytes: vec![],
+            public_snapshot_sha256: vec![],
+            tree_summary_bytes: vec![],
+            tree_summary_sha256: vec![],
+            leaf_count: 2,
+            genesis_group_info_bytes: vec![],
+            genesis_group_info_sha256: vec![],
+        },
+        opened_leaves: vec![],
+        metadata_author: None,
+        participant_period_ids: vec![],
+        leaf_period_ids: vec![],
+        entry_recipients: vec![],
+        events: vec![],
+        closing_leaf_periods: vec![],
+        closing_participant_periods: vec![],
+        reset_request_row: None,
+        recovery_open: None,
+        welcome_expiry: None,
+        welcome_response: None,
+        welcome_dispositions: vec![WelcomeDispositionInput {
+            welcome_id: scenario.welcome_id,
+            event: EventFanout {
+                event_id: Uuid::new_v4(),
+                event_kind: EventKind::WelcomeDisposition,
+                payload_bytes: vec![0x90_u8; 8],
+                recipients: vec![(
+                    scenario.bob_id.clone(),
+                    EventEntitlementKind::Welcome,
+                    bob_predecessor,
+                )],
+                outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+            },
+        }],
+    };
+
+    let response_bytes = b"revokeDevice-welcome-ok".to_vec();
+    let mut tx = pool.begin().await.expect("begin Welcome revocation");
+    sqlx::query(
+        r#"
+        INSERT INTO chat.idempotency_records(
+            principal_did, endpoint_nsid, operation_id, request_digest,
+            accepted_request_bytes, signing_transcript_bytes, signature,
+            completed_status, response_bytes, response_sha256, event_position,
+            historical_jkt, current_jkt, completed_at
+        ) VALUES($1,'blue.catbird.chat.revokeDevice',$2,$3,$4,$5,$6,200,$7,$8,NULL,$9,NULL,$10)
+        "#,
+    )
+    .bind(&scenario.bob_did)
+    .bind(revocation_id)
+    .bind(request_digest.to_vec())
+    .bind(&signed_request)
+    .bind(&signing_transcript)
+    .bind(signature.to_vec())
+    .bind(&response_bytes)
+    .bind(Sha256::digest(&response_bytes).to_vec())
+    .bind(&bob_key_id)
+    .bind(accepted_at)
+    .execute(&mut *tx)
+    .await
+    .expect("seed Welcome revocation receipt");
+    apply_device_revocation_batch(&mut tx, &batch_plan, std::slice::from_ref(&ctx))
+        .await
+        .expect("apply Welcome revocation batch");
+    tx.commit()
+        .await
+        .expect("commit Welcome revocation provenance");
+
+    let (status, terminal_transition_id, terminal_revocation_id): (
+        String,
+        Option<Uuid>,
+        Option<Uuid>,
+    ) = sqlx::query_as(
+        "SELECT delivery.status,disposition.terminal_transition_id,\
+                disposition.terminal_revocation_id \
+           FROM chat.welcome_deliveries delivery \
+           JOIN chat.welcome_dispositions disposition USING (welcome_id) \
+          WHERE delivery.welcome_id=$1",
+    )
+    .bind(scenario.welcome_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read Welcome revocation source");
+    assert_eq!(
+        (
+            status.as_str(),
+            terminal_transition_id,
+            terminal_revocation_id
+        ),
+        ("superseded", None, Some(revocation_id))
+    );
+
+    assert_welcome_source_commit_rejects(
+        &pool,
+        scenario.welcome_id,
+        "terminal_transition_id=NULL,terminal_revocation_id=$2",
+        Some(foreign_revocation_id),
+        "revocation source targeting the wrong recipient device",
+    )
+    .await;
+    assert_welcome_source_commit_rejects(
+        &pool,
+        scenario.welcome_id,
+        "terminal_at=terminal_at+interval '1 millisecond'",
+        None,
+        "revocation source with the wrong terminal instant",
+    )
+    .await;
 }
 
 /// The device-revocation batch's AVAILABLE-package path (step 3): a target device

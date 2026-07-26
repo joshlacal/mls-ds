@@ -2080,6 +2080,93 @@ async fn welcome_delivery_insert_and_disposition_terminal_race() {
     tx.rollback().await.unwrap();
 }
 
+#[tokio::test]
+async fn welcome_supersession_disposition_persists_exact_exclusive_source_id() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let fixture = seed_fixture(&pool).await;
+    let now = clock_now(&pool).await;
+
+    let mut transition_tx = pool.begin().await.unwrap();
+    let (welcome_id, recovery_request_id, key_package_ref, not_after) =
+        seed_welcome_delivery_prereqs(&mut transition_tx, &fixture, now).await;
+    insert_welcome_delivery(
+        &mut transition_tx,
+        &NewWelcomeDelivery {
+            welcome_id,
+            recipient_did: fixture.actor_did.clone(),
+            recipient_device_id: fixture.actor_device_id,
+            recovery_request_id,
+            key_package_ref,
+            expires_at: not_after,
+        },
+    )
+    .await
+    .expect("insert transition-superseded welcome");
+    terminalize_welcome_delivery(
+        &mut transition_tx,
+        welcome_id,
+        &WelcomeDisposition::SupersededByTransition {
+            terminal_transition_id: fixture.creation_transition_id,
+        },
+        now + Duration::minutes(1),
+        1,
+    )
+    .await
+    .expect("persist transition supersession source");
+    let transition_source: (Option<Uuid>, Option<Uuid>) = sqlx::query_as(
+        "SELECT terminal_transition_id,terminal_revocation_id \
+           FROM chat.welcome_dispositions WHERE welcome_id=$1",
+    )
+    .bind(welcome_id)
+    .fetch_one(&mut *transition_tx)
+    .await
+    .expect("read transition supersession source");
+    assert_eq!(
+        transition_source,
+        (Some(fixture.creation_transition_id), None)
+    );
+    transition_tx.rollback().await.unwrap();
+
+    let mut revocation_tx = pool.begin().await.unwrap();
+    let (welcome_id, recovery_request_id, key_package_ref, not_after) =
+        seed_welcome_delivery_prereqs(&mut revocation_tx, &fixture, now).await;
+    insert_welcome_delivery(
+        &mut revocation_tx,
+        &NewWelcomeDelivery {
+            welcome_id,
+            recipient_did: fixture.actor_did.clone(),
+            recipient_device_id: fixture.actor_device_id,
+            recovery_request_id,
+            key_package_ref,
+            expires_at: not_after,
+        },
+    )
+    .await
+    .expect("insert revocation-superseded welcome");
+    let terminal_revocation_id = Uuid::new_v4();
+    terminalize_welcome_delivery(
+        &mut revocation_tx,
+        welcome_id,
+        &WelcomeDisposition::SupersededByRevocation {
+            terminal_revocation_id,
+        },
+        now + Duration::minutes(1),
+        2,
+    )
+    .await
+    .expect("persist revocation supersession source");
+    let revocation_source: (Option<Uuid>, Option<Uuid>) = sqlx::query_as(
+        "SELECT terminal_transition_id,terminal_revocation_id \
+           FROM chat.welcome_dispositions WHERE welcome_id=$1",
+    )
+    .bind(welcome_id)
+    .fetch_one(&mut *revocation_tx)
+    .await
+    .expect("read revocation supersession source");
+    assert_eq!(revocation_source, (None, Some(terminal_revocation_id)));
+    revocation_tx.rollback().await.unwrap();
+}
+
 // ===========================================================================
 // Migration-2 Family F — chat.recovery_work_items.
 // ===========================================================================

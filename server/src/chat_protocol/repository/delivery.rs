@@ -1236,7 +1236,8 @@ pub(crate) struct WelcomeClientAuthorization {
 /// `welcome_dispositions_reason_check`:
 /// * `Acknowledged` / `Rejected` bind the client authorization block (and
 ///   `Rejected` also a closed rejection reason);
-/// * `Expired` / `Superseded` are server-authored — no signature block, no reason.
+/// * `Expired` / both supersession arms are server-authored — no signature block,
+///   no reason. Each supersession arm carries its exact durable terminal source.
 #[derive(Clone, Debug)]
 pub(crate) enum WelcomeDisposition {
     Acknowledged {
@@ -1247,7 +1248,12 @@ pub(crate) enum WelcomeDisposition {
         reason: WelcomeRejectionReason,
     },
     Expired,
-    Superseded,
+    SupersededByTransition {
+        terminal_transition_id: Uuid,
+    },
+    SupersededByRevocation {
+        terminal_revocation_id: Uuid,
+    },
 }
 
 impl WelcomeDisposition {
@@ -1258,7 +1264,9 @@ impl WelcomeDisposition {
             Self::Acknowledged { .. } => "acknowledged",
             Self::Rejected { .. } => "rejected",
             Self::Expired => "expired",
-            Self::Superseded => "superseded",
+            Self::SupersededByTransition { .. } | Self::SupersededByRevocation { .. } => {
+                "superseded"
+            }
         }
     }
 
@@ -1267,14 +1275,37 @@ impl WelcomeDisposition {
             Self::Acknowledged { authorization } | Self::Rejected { authorization, .. } => {
                 Some(authorization)
             }
-            Self::Expired | Self::Superseded => None,
+            Self::Expired
+            | Self::SupersededByTransition { .. }
+            | Self::SupersededByRevocation { .. } => None,
         }
     }
 
     fn rejection_reason(&self) -> Option<&'static str> {
         match self {
             Self::Rejected { reason, .. } => Some(reason.as_str()),
-            Self::Acknowledged { .. } | Self::Expired | Self::Superseded => None,
+            Self::Acknowledged { .. }
+            | Self::Expired
+            | Self::SupersededByTransition { .. }
+            | Self::SupersededByRevocation { .. } => None,
+        }
+    }
+
+    fn terminal_transition_id(&self) -> Option<Uuid> {
+        match self {
+            Self::SupersededByTransition {
+                terminal_transition_id,
+            } => Some(*terminal_transition_id),
+            _ => None,
+        }
+    }
+
+    fn terminal_revocation_id(&self) -> Option<Uuid> {
+        match self {
+            Self::SupersededByRevocation {
+                terminal_revocation_id,
+            } => Some(*terminal_revocation_id),
+            _ => None,
         }
     }
 }
@@ -1338,8 +1369,9 @@ pub(crate) async fn terminalize_welcome_delivery(
         r#"
         INSERT INTO chat.welcome_dispositions(
             welcome_id, winner_kind, signed_request_bytes, signing_transcript_bytes,
-            request_digest, signature, rejection_reason, terminal_at, event_position
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            request_digest, signature, rejection_reason, terminal_at, event_position,
+            terminal_transition_id, terminal_revocation_id
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         "#,
     )
     .bind(welcome_id)
@@ -1351,6 +1383,8 @@ pub(crate) async fn terminalize_welcome_delivery(
     .bind(disposition.rejection_reason())
     .bind(terminal_at)
     .bind(event_position)
+    .bind(disposition.terminal_transition_id())
+    .bind(disposition.terminal_revocation_id())
     .execute(&mut **transaction)
     .await?;
 

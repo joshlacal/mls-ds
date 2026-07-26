@@ -15813,7 +15813,15 @@ mod executor {
                 .await?;
         // 3. The target's pending welcomes (Pending->Superseded), each bound to a
         //    `welcomeDisposition` event (stamped at ctx.applied_at == accepted_at).
-        superseded.welcomes = write_welcome_supersessions(transaction, ctx, effects).await?;
+        superseded.welcomes = write_welcome_supersessions(
+            transaction,
+            ctx,
+            effects,
+            WelcomeSupersessionCause::Revocation {
+                terminal_revocation_id: revocation_id,
+            },
+        )
+        .await?;
         // 4. Silent-drop guard: a device revocation FULFILLS nothing (own == 0),
         //    so every delta MUST be a revocation-bound supersession.
         reconcile_coordinate_change_families(effects, &FamilyCounts::default(), &superseded)?;
@@ -16911,7 +16919,15 @@ mod executor {
         let mut superseded =
             write_prior_bound_supersessions(transaction, effects, transition_id, applied_at)
                 .await?;
-        superseded.welcomes = write_welcome_supersessions(transaction, ctx, effects).await?;
+        superseded.welcomes = write_welcome_supersessions(
+            transaction,
+            ctx,
+            effects,
+            WelcomeSupersessionCause::Transition {
+                terminal_transition_id: transition_id,
+            },
+        )
+        .await?;
         // Durably stale any prior-bound pending reset/leave request the coordinate
         // change retired (this arm owns none — kind is `leafRecovery`, DB-legal for
         // the leave `stale` edge).
@@ -17336,7 +17352,15 @@ mod executor {
         let mut superseded =
             write_prior_bound_supersessions(transaction, effects, transition_id, applied_at)
                 .await?;
-        superseded.welcomes = write_welcome_supersessions(transaction, ctx, effects).await?;
+        superseded.welcomes = write_welcome_supersessions(
+            transaction,
+            ctx,
+            effects,
+            WelcomeSupersessionCause::Transition {
+                terminal_transition_id: transition_id,
+            },
+        )
+        .await?;
         // Durably stale any prior-bound pending reset/leave request the epoch change
         // retired (kind is `commit`, DB-legal for the leave `stale` edge).
         let staled = write_prior_bound_staling(
@@ -17761,7 +17785,15 @@ mod executor {
         let mut superseded =
             write_prior_bound_supersessions(transaction, effects, transition_id, applied_at)
                 .await?;
-        superseded.welcomes = write_welcome_supersessions(transaction, ctx, effects).await?;
+        superseded.welcomes = write_welcome_supersessions(
+            transaction,
+            ctx,
+            effects,
+            WelcomeSupersessionCause::Transition {
+                terminal_transition_id: transition_id,
+            },
+        )
+        .await?;
         let staled = write_prior_bound_staling(
             transaction,
             effects,
@@ -18262,7 +18294,15 @@ mod executor {
         let mut superseded =
             write_prior_bound_supersessions(transaction, effects, transition_id, applied_at)
                 .await?;
-        superseded.welcomes = write_welcome_supersessions(transaction, ctx, effects).await?;
+        superseded.welcomes = write_welcome_supersessions(
+            transaction,
+            ctx,
+            effects,
+            WelcomeSupersessionCause::Transition {
+                terminal_transition_id: transition_id,
+            },
+        )
+        .await?;
         let staled = write_prior_bound_staling(
             transaction,
             effects,
@@ -18579,7 +18619,15 @@ mod executor {
         let mut superseded =
             write_prior_bound_supersessions(transaction, effects, transition_id, applied_at)
                 .await?;
-        superseded.welcomes = write_welcome_supersessions(transaction, ctx, effects).await?;
+        superseded.welcomes = write_welcome_supersessions(
+            transaction,
+            ctx,
+            effects,
+            WelcomeSupersessionCause::Transition {
+                terminal_transition_id: transition_id,
+            },
+        )
+        .await?;
         let staled = write_prior_bound_staling(
             transaction,
             effects,
@@ -18897,7 +18945,15 @@ mod executor {
         let mut superseded =
             write_prior_bound_supersessions(transaction, effects, transition_id, applied_at)
                 .await?;
-        superseded.welcomes = write_welcome_supersessions(transaction, ctx, effects).await?;
+        superseded.welcomes = write_welcome_supersessions(
+            transaction,
+            ctx,
+            effects,
+            WelcomeSupersessionCause::Transition {
+                terminal_transition_id: transition_id,
+            },
+        )
+        .await?;
         let staled = write_prior_bound_staling(
             transaction,
             effects,
@@ -19800,7 +19856,15 @@ mod executor {
         let mut superseded =
             write_prior_bound_supersessions(transaction, effects, transition_id, applied_at)
                 .await?;
-        superseded.welcomes = write_welcome_supersessions(transaction, ctx, effects).await?;
+        superseded.welcomes = write_welcome_supersessions(
+            transaction,
+            ctx,
+            effects,
+            WelcomeSupersessionCause::Transition {
+                terminal_transition_id: transition_id,
+            },
+        )
+        .await?;
         let staled = write_prior_bound_staling(
             transaction,
             effects,
@@ -20116,7 +20180,15 @@ mod executor {
         let mut superseded =
             write_prior_bound_supersessions(transaction, effects, transition_id, applied_at)
                 .await?;
-        superseded.welcomes = write_welcome_supersessions(transaction, ctx, effects).await?;
+        superseded.welcomes = write_welcome_supersessions(
+            transaction,
+            ctx,
+            effects,
+            WelcomeSupersessionCause::Transition {
+                terminal_transition_id: transition_id,
+            },
+        )
+        .await?;
         // Stale any prior-bound pending reset/leave request the acceptance retired
         // (own 0 — acceptance creates/consumes neither; kind `acceptConversation` is
         // DB-legal for both stale edges), exactly like apply_policy.
@@ -20924,9 +20996,16 @@ mod executor {
         Ok(())
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum WelcomeSupersessionCause {
+        Transition { terminal_transition_id: Uuid },
+        Revocation { terminal_revocation_id: Uuid },
+    }
+
     /// Supersede each prior-coordinate pending Welcome the plan retired: append its
     /// `welcomeDisposition` event and terminalize the delivery as `superseded`,
-    /// bound to that event. A coordinate-changing commit whose prior carried a
+    /// bound to that event and to the exact transition/revocation already held by
+    /// the executor authority. A coordinate-changing commit whose prior carried a
     /// pending Welcome (e.g. an epoch commit after a leaf-recovery fulfillment)
     /// carries these `welcome_changes` `(Pending -> Superseded)`; consuming them
     /// keeps the durable delivery in sync with the state machine.
@@ -20939,6 +21018,7 @@ mod executor {
         transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         ctx: &ExecutionContext,
         effects: &TransitionEffects,
+        cause: WelcomeSupersessionCause,
     ) -> Result<usize, ExecutorError> {
         let mut superseded = 0usize;
         for change in effects.welcome_changes() {
@@ -20962,10 +21042,22 @@ mod executor {
                     "welcome disposition event for a superseded welcome",
                 ))?;
             let position = append_one_event(transaction, ctx, &disposition.event).await?;
+            let terminal_disposition = match cause {
+                WelcomeSupersessionCause::Transition {
+                    terminal_transition_id,
+                } => WelcomeDisposition::SupersededByTransition {
+                    terminal_transition_id,
+                },
+                WelcomeSupersessionCause::Revocation {
+                    terminal_revocation_id,
+                } => WelcomeDisposition::SupersededByRevocation {
+                    terminal_revocation_id,
+                },
+            };
             delivery::terminalize_welcome_delivery(
                 transaction,
                 welcome_id,
-                &WelcomeDisposition::Superseded,
+                &terminal_disposition,
                 ctx.applied_at,
                 position,
             )

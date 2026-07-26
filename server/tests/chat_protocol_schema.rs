@@ -14,28 +14,35 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{Executor, PgPool};
 
 const TEST_DATABASE_NAME: &str = "catbird_chat_protocol_test_20260722";
-const MIGRATION_VERSIONS: [i64; 3] = [20260722000001, 20260722000002, 20260722000003];
-const MIGRATION_FILES: [&str; 3] = [
+const MIGRATION_VERSIONS: [i64; 4] = [
+    20260722000001,
+    20260722000002,
+    20260722000003,
+    20260726000001,
+];
+const MIGRATION_FILES: [&str; 4] = [
     "20260722000001_chat_protocol_core.sql",
     "20260722000002_chat_protocol_delivery.sql",
     "20260722000003_chat_protocol_blobs.sql",
+    "20260726000001_welcome_supersession_provenance.sql",
 ];
-const MIGRATION_DESCRIPTIONS: [&str; 3] = [
+const MIGRATION_DESCRIPTIONS: [&str; 4] = [
     "chat protocol core",
     "chat protocol delivery",
     "chat protocol blobs",
+    "welcome supersession provenance",
 ];
 
 // These are regenerated only from a reviewed, freshly applied migration
 // snapshot. They deliberately make unreviewed catalog drift loud.
 const COLUMN_CATALOG_SHA256: &str =
-    "fbb673fe1eb495ddb5b08f0818fd566225a95a3fbf7729b384e4ef88570f002e";
+    "dac54118c1335492a399ed735734e557135fe944ed69e9df1bdf9e1d498e2a22";
 const CONSTRAINT_CATALOG_SHA256: &str =
-    "f53c8157cedc5fad401a56a2538974859c71f269ad8dc716cef2a58eda33edc6";
+    "e1b4cd1b68ecc8f79facffab07ea76d41118eb639b989e4a6354097a2b30d791";
 const INDEX_CATALOG_SHA256: &str =
     "4eb4de367adc3591c12bc758c125899818bb7f0104a65d7469102bda76616759";
 const FUNCTION_CATALOG_SHA256: &str =
-    "755000ae4667e0448fdb001be3a0448237954759a8a80f5e0c44ba32e0d8fba9";
+    "950c1ea9dab68e2eb361e4276402da302d97ef848041da9f4c68aedef3109081";
 const TRIGGER_CATALOG_SHA256: &str =
     "c179499a10d3ac474de660a6f473bd4840fac400fd742d1f343f0c5f35e2fa87";
 const SEQUENCE_CATALOG_SHA256: &str =
@@ -685,6 +692,45 @@ fn recovery_schema_declares_closed_sources_and_collision_free_inventory_arms() {
 }
 
 #[test]
+fn welcome_supersession_schema_declares_exact_exclusive_durable_sources() {
+    let sql = std::fs::read_to_string(
+        migration_dir().join("20260726000001_welcome_supersession_provenance.sql"),
+    )
+    .expect("read Welcome supersession provenance migration");
+    let compact = compact_sql(&sql);
+
+    for required in [
+        "ADD COLUMN IF NOT EXISTS terminal_transition_id UUID",
+        "ADD COLUMN IF NOT EXISTS terminal_revocation_id UUID",
+        "welcome_dispositions_terminal_source_shape_check",
+        "num_nonnulls( terminal_transition_id, terminal_revocation_id ) = 1",
+        "winner_kind <> 'superseded' AND terminal_transition_id IS NULL AND terminal_revocation_id IS NULL",
+        "welcome_dispositions_terminal_transition_fk",
+        "REFERENCES chat.transitions(transition_id) DEFERRABLE INITIALLY DEFERRED",
+        "welcome_dispositions_terminal_revocation_fk",
+        "REFERENCES chat.device_revocations(revocation_id) DEFERRABLE INITIALLY DEFERRED",
+        "candidate_count <> 1",
+        "transition_row.entry_seq > bundle.entry_seq",
+        "transition_row.accepted_at = disposition.terminal_at",
+        "transition_row.next_generation, transition_row.next_state_version",
+        "prior_state.group_id = bundle.group_id",
+        "prior_state.epoch = bundle.epoch",
+        "prior_state.group_context_hash = bundle.group_context_hash",
+        "prior_state.confirmation_tag = bundle.confirmation_tag",
+        "revocation.target_did = delivery.recipient_did",
+        "revocation.target_device_id = delivery.recipient_device_id",
+        "revocation.accepted_at = disposition.terminal_at",
+        "CREATE OR REPLACE FUNCTION chat.assert_welcome_disposition_cas",
+        "RAISE EXCEPTION 'terminal Welcome disposition mismatch'",
+    ] {
+        assert!(
+            compact.contains(required),
+            "missing Welcome supersession provenance invariant: {required}"
+        );
+    }
+}
+
+#[test]
 fn relationship_schema_declares_bounded_fallback_and_revision_fences() {
     let sql =
         std::fs::read_to_string(migration_dir().join("20260722000001_chat_protocol_core.sql"))
@@ -1016,15 +1062,13 @@ async fn fresh_pool() -> PgPool {
         tx.commit()
             .await
             .unwrap_or_else(|error| panic!("commit {filename}: {error}"));
-        cumulative.extend(
-            [
-                CORE_TABLES.as_slice(),
-                DELIVERY_TABLES.as_slice(),
-                BLOB_TABLES.as_slice(),
-            ][index]
-                .iter()
-                .map(|name| (*name).to_owned()),
-        );
+        let newly_owned_tables = [
+            CORE_TABLES.as_slice(),
+            DELIVERY_TABLES.as_slice(),
+            BLOB_TABLES.as_slice(),
+            &[],
+        ][index];
+        cumulative.extend(newly_owned_tables.iter().map(|name| (*name).to_owned()));
         assert_eq!(
             chat_tables(&pool).await,
             cumulative,
@@ -1339,7 +1383,10 @@ async fn clean_chat_schema_is_exact_isolated_and_fail_closed() {
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.contains("_chat_protocol_"))
+                .is_some_and(|name| {
+                    name.contains("_chat_protocol_")
+                        || name == "20260726000001_welcome_supersession_provenance.sql"
+                })
         })
         .map(|path| {
             path.file_name()
@@ -1354,7 +1401,7 @@ async fn clean_chat_schema_is_exact_isolated_and_fail_closed() {
             .iter()
             .map(|name| (*name).to_owned())
             .collect(),
-        "clean schema must be exactly three ordered files"
+        "clean schema must be exactly four ordered files"
     );
 
     for (version, suffix, expected) in [
@@ -1372,6 +1419,11 @@ async fn clean_chat_schema_is_exact_isolated_and_fail_closed() {
             MIGRATION_VERSIONS[2],
             "chat_protocol_blobs",
             BLOB_TABLES.as_slice(),
+        ),
+        (
+            MIGRATION_VERSIONS[3],
+            "welcome_supersession_provenance",
+            &[],
         ),
     ] {
         let sql = std::fs::read_to_string(migration_path(version, suffix))
@@ -1431,7 +1483,7 @@ async fn clean_chat_schema_is_exact_isolated_and_fail_closed() {
     .fetch_one(&pool)
     .await
     .expect("count chat FKs");
-    assert_eq!(foreign_keys, 183, "unexpected FK coverage");
+    assert_eq!(foreign_keys, 185, "unexpected FK coverage");
     assert_eq!(unvalidated_foreign_keys, 0, "all FKs must be validated");
 
     let enum_count: i64 = sqlx::query_scalar(
