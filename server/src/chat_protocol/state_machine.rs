@@ -13748,7 +13748,50 @@ fn recovery_fulfillment_matches_request(
     evidence: &TransitionEvidence,
     request: &RecoveryRequest,
 ) -> bool {
-    if !transition_consumes_coordinate(evidence, &request.bound_coordinate) {
+    recovery_fulfillment_binding_matches(
+        evidence,
+        &request.request_id,
+        &request.target,
+        request.kind,
+        &request.bound_coordinate,
+        &request.key_package_ref,
+    )
+}
+
+/// Read-time drift fence for a durable fulfilled recovery terminal. This is
+/// the same signed-body/manifest predicate used by `validate_recovery_work`,
+/// with the terminal timestamp additionally pinned to the exact transition
+/// receipt selected from the request/reservation pair.
+#[allow(dead_code)]
+pub(crate) fn recovery_fulfillment_terminal_matches(
+    evidence: &TransitionEvidence,
+    request_id: &[u8; 16],
+    target: &DeviceIdentity,
+    kind: LeafRecoveryKind,
+    bound_coordinate: &PublicGroupSnapshotCoordinate,
+    key_package_ref: &[u8; 32],
+    terminal_at: ServerTimestamp,
+) -> bool {
+    evidence.received_at() == terminal_at
+        && recovery_fulfillment_binding_matches(
+            evidence,
+            request_id,
+            target,
+            kind,
+            bound_coordinate,
+            key_package_ref,
+        )
+}
+
+fn recovery_fulfillment_binding_matches(
+    evidence: &TransitionEvidence,
+    request_id: &[u8; 16],
+    target: &DeviceIdentity,
+    kind: LeafRecoveryKind,
+    bound_coordinate: &PublicGroupSnapshotCoordinate,
+    expected_key_package_ref: &[u8; 32],
+) -> bool {
+    if !transition_consumes_coordinate(evidence, bound_coordinate) {
         return false;
     }
     let Some(authority) = evidence.authority.as_ref() else {
@@ -13765,34 +13808,34 @@ fn recovery_fulfillment_matches_request(
             next,
             manifest,
             ..
-        }) if *recovery_request_id == request.request_id
-            && prior == &request.bound_coordinate
+        }) if recovery_request_id == request_id
+            && prior == bound_coordinate
             && commit_coordinate_edge(prior, next)
-            && manifest.leaf_recovery_request_id == Some(request.request_id)
+            && manifest.leaf_recovery_request_id.as_ref() == Some(request_id)
             && manifest.participant_changes.is_empty()
             && manifest.leaf_changes.iter().filter(|change| {
                 matches!(change, ManifestLeafChange::Add {
                     device,
                     recovery_request_id,
                     key_package_ref,
-                } if device == &request.target
-                    && recovery_request_id == &request.request_id
-                    && key_package_ref == &request.key_package_ref)
+                } if device == target
+                    && recovery_request_id == request_id
+                    && key_package_ref == expected_key_package_ref)
             }).count() == 1
-            && match request.kind {
+            && match kind {
                 LeafRecoveryKind::Add => manifest.leaf_changes.iter().all(|change| {
                     !matches!(change, ManifestLeafChange::Remove(device)
-                        if device == &request.target)
+                        if device == target)
                 }),
                 LeafRecoveryKind::Replace => manifest.leaf_changes.iter().filter(|change| {
                     matches!(change, ManifestLeafChange::Remove(device)
-                        if device == &request.target)
+                        if device == target)
                 }).count() == 1,
             }
             && manifest.welcome.as_ref().is_some_and(|welcome| {
-                welcome.recipient == request.target
-                    && welcome.recovery_request_id == request.request_id
-                    && welcome.key_package_ref == request.key_package_ref
+                welcome.recipient == *target
+                    && welcome.recovery_request_id == *request_id
+                    && welcome.key_package_ref == *expected_key_package_ref
             })
     )
 }

@@ -3205,14 +3205,16 @@ mod historical_control_loader {
         use super::super::historical_control_path::{build_real_creation_entry, RealCreationEntry};
         use super::seed_real_creation_graph;
         use crate::chat_protocol::repository::core::{
-            load_recovery_work_hydration_rows, RecoveryHydrationError,
+            load_recovery_work_hydration_rows, select_fulfilled_recovery_terminal,
+            FulfilledRecoveryTerminalColumns, RecoveryHydrationError,
         };
         use crate::chat_protocol::state_machine::{
             DeviceIdentity, HistoricalRehydrationAuthority, LeafRecoveryKind, PrincipalId,
             RecoveryOriginHydrationRow, RecoveryRequestStatus, RecoverySource, ReservationStatus,
+            WorkTerminalHydrationRow,
         };
         use crate::chat_protocol::transcript::{
-            decode_canonical_signed_mutation, SignedMutationKind,
+            decode_and_verify_control_entry, decode_canonical_signed_mutation, SignedMutationKind,
         };
         use crate::chat_protocol::validation::ed25519_key_id;
         use crate::common;
@@ -3227,6 +3229,8 @@ mod historical_control_loader {
         const KP_NOT_BEFORE: &str = "2029-12-31T23:59:00.000Z";
         const KP_NOT_AFTER: &str = "2030-01-01T00:11:00.000Z";
         const SIGNED_AT: &str = "2029-12-31T23:59:59.000Z";
+        const FULFILLMENT_SIGNED_AT: &str = "2030-01-01T00:00:59.000Z";
+        const FULFILLED_AT: &str = "2030-01-01T00:01:00.000Z";
 
         fn instant(text: &str) -> DateTime<Utc> {
             DateTime::parse_from_rfc3339(text)
@@ -3312,6 +3316,8 @@ mod historical_control_loader {
             request_id: [u8; 16],
             key_package_ref: [u8; 32],
             raw_wrapper: Vec<u8>,
+            creation_transition_id: Uuid,
+            replaced_leaf_period_id: Uuid,
         }
 
         /// Seed an OPEN leaf-recovery request + its ACTIVE key-package reservation
@@ -3329,7 +3335,7 @@ mod historical_control_loader {
             entry: &RealCreationEntry,
             source: &str,
         ) -> RecoverySeed {
-            seed_real_creation_graph(pool, entry).await;
+            let creation_transition_id = seed_real_creation_graph(pool, entry).await;
             let conversation_id = Uuid::from_bytes(entry.cid);
             // The gate DB is shared and never reset (rows are immutable), so every
             // recovery identifier is fresh per run (derived from a fresh request id)
@@ -3432,6 +3438,642 @@ mod historical_control_loader {
                 request_id,
                 key_package_ref: <[u8; 32]>::try_from(key_package_ref.as_slice()).unwrap(),
                 raw_wrapper: signed.raw_wrapper,
+                creation_transition_id,
+                replaced_leaf_period_id,
+            }
+        }
+
+        struct RealLeafRecoveryFulfillmentEntry {
+            entry_id: Uuid,
+            transition_id: Uuid,
+            welcome_id: Uuid,
+            public_row_json: Vec<u8>,
+            raw_wrapper: Vec<u8>,
+            canonical_projection: Vec<u8>,
+            signing_transcript: Vec<u8>,
+            request_digest: Vec<u8>,
+            signature: Vec<u8>,
+            server_fields_dag_cbor: Vec<u8>,
+            outer_entry_fingerprint: [u8; 32],
+            opaque_welcome: Vec<u8>,
+        }
+
+        fn next_coordinate_json(cid: [u8; 16]) -> Value {
+            json!({
+                "conversationId": Uuid::from_bytes(cid).hyphenated().to_string(),
+                "generation": 0,
+                "stateVersion": 1,
+                "groupId": STANDARD.encode([1_u8; 32]),
+                "epoch": 1,
+                "groupContextHash": STANDARD.encode([4_u8; 32]),
+                "confirmationTag": STANDARD.encode([5_u8; 32]),
+                "lifecycle": "active",
+            })
+        }
+
+        /// Build a genuinely Ed25519-signed leaf-recovery fulfillment control
+        /// entry. The same-device Replace manifest is ordered by the canonical
+        /// full leaf-change key: exact DID bytes, UUID bytes, then Remove before
+        /// Add. The opaque Welcome is synthetic only at the protocol's opaque
+        /// boundary and is bound by its exact SHA-256.
+        fn build_real_leaf_recovery_fulfillment_entry(
+            entry: &RealCreationEntry,
+            seed: &RecoverySeed,
+        ) -> RealLeafRecoveryFulfillmentEntry {
+            let signing_key = SigningKey::from_bytes(&[0x24; 32]);
+            let verifying = signing_key.verifying_key().to_bytes();
+            assert_eq!(entry.public_key, verifying.to_vec());
+
+            let transition_id = Uuid::new_v4();
+            let entry_id = Uuid::new_v4();
+            let welcome_id = Uuid::new_v4();
+            let idempotency_key = Uuid::new_v4();
+            let request_id = Uuid::from_bytes(seed.request_id);
+            let commit_bytes = [0x31_u8; 8];
+            let metadata_ciphertext = [0x32_u8; 16];
+            let opaque_welcome = vec![0x41_u8; 8];
+            let prior = genesis_coordinate_json(entry.cid);
+            let next = next_coordinate_json(entry.cid);
+            let aad_prior = json!({
+                "conversationId": STANDARD.encode(entry.cid),
+                "generation": 0,
+                "stateVersion": 0,
+                "groupId": STANDARD.encode([1_u8; 32]),
+                "epoch": 0,
+                "groupContextHash": STANDARD.encode([2_u8; 32]),
+                "confirmationTag": STANDARD.encode([3_u8; 32]),
+                "lifecycle": "active",
+            });
+            let metadata_snapshot = json!({
+                "coordinate": {
+                    "conversationId": STANDARD.encode(entry.cid),
+                    "generation": 0,
+                    "groupId": STANDARD.encode([1_u8; 32]),
+                    "epoch": 1,
+                    "groupContextHash": STANDARD.encode([4_u8; 32]),
+                    "confirmationTag": STANDARD.encode([5_u8; 32]),
+                },
+                "originTransitionId": seed.creation_transition_id.hyphenated().to_string(),
+                "metadataVersion": 1,
+                "nonce": STANDARD.encode([0x26_u8; 12]),
+                "ciphertext": STANDARD.encode(metadata_ciphertext),
+                "ciphertextSha256": STANDARD.encode(Sha256::digest(metadata_ciphertext)),
+                "ciphertextSize": 16,
+                "authorProof": {
+                    "authorDid": entry.actor_did,
+                    "authorDeviceId": entry.actor_device_id.hyphenated().to_string(),
+                    "authorKeyId": entry.actor_key_id,
+                    "signaturePublicKey": STANDARD.encode(&entry.public_key),
+                    "authGenerationAtOrigin": 1,
+                    "originTransitionId": seed.creation_transition_id.hyphenated().to_string(),
+                    "originSeq": 1,
+                    "roleAtOrigin": "admin",
+                    "deviceStatusAtOrigin": "active",
+                }
+            });
+            let leaf_changes = vec![
+                json!({
+                    "$type": "blue.catbird.chat.defs#removeLeaf",
+                    "userDid": entry.actor_did,
+                    "deviceId": entry.actor_device_id.hyphenated().to_string(),
+                }),
+                json!({
+                    "$type": "blue.catbird.chat.defs#addLeafByRecovery",
+                    "userDid": entry.actor_did,
+                    "deviceId": entry.actor_device_id.hyphenated().to_string(),
+                    "recoveryRequestId": request_id.hyphenated().to_string(),
+                    "keyPackageRef": STANDARD.encode(seed.key_package_ref),
+                }),
+            ];
+            let body = json!({
+                "$type": SignedMutationKind::LeafRecoveryFulfillment.type_id(),
+                "signatureDomain": String::from_utf8(
+                    SignedMutationKind::LeafRecoveryFulfillment.domain().to_vec()
+                ).unwrap(),
+                "transitionId": transition_id.hyphenated().to_string(),
+                "actorDid": entry.actor_did,
+                "actorDeviceId": entry.actor_device_id.hyphenated().to_string(),
+                "keyId": entry.actor_key_id,
+                "authGeneration": 1,
+                "prior": prior,
+                "next": next,
+                "aad": {
+                    "protocolVersion": "1",
+                    "conversationId": STANDARD.encode(entry.cid),
+                    "generation": 0,
+                    "transitionId": STANDARD.encode(transition_id.as_bytes()),
+                    "prior": aad_prior,
+                },
+                "manifest": {
+                    "participantChanges": [],
+                    "leafChanges": leaf_changes,
+                    "leafRecoveryRequestId": request_id.hyphenated().to_string(),
+                    "welcomeBundle": {
+                        "welcomeId": welcome_id.hyphenated().to_string(),
+                        "framing": "mlsMessage",
+                        "contentType": "welcome",
+                        "opaqueWelcome": STANDARD.encode(&opaque_welcome),
+                        "sha256": STANDARD.encode(Sha256::digest(&opaque_welcome)),
+                        "deliveries": [{
+                            "recipientDid": entry.actor_did,
+                            "recipientDeviceId": entry.actor_device_id.hyphenated().to_string(),
+                            "provenance": {
+                                "recoveryRequestId": request_id.hyphenated().to_string(),
+                                "keyPackageRef": STANDARD.encode(seed.key_package_ref),
+                            }
+                        }]
+                    }
+                },
+                "commit": {
+                    "framing": "mlsMessage",
+                    "contentType": "publicMessageCommit",
+                    "bytes": STANDARD.encode(commit_bytes),
+                    "sha256": STANDARD.encode(Sha256::digest(commit_bytes)),
+                },
+                "metadataSnapshot": metadata_snapshot,
+                "recoveryRequestId": request_id.hyphenated().to_string(),
+                "idempotencyKey": idempotency_key.hyphenated().to_string(),
+                "signedAt": FULFILLMENT_SIGNED_AT,
+            });
+            let mut wrapper = json!({ "body": body, "signature": STANDARD.encode([0_u8; 64]) });
+            let unsigned = serde_json::to_vec(&wrapper).unwrap();
+            let unsigned_canonical = decode_canonical_signed_mutation(&unsigned)
+                .expect("unsigned fulfillment canonicalizes");
+            let signature = signing_key
+                .sign(unsigned_canonical.transcript_bytes())
+                .to_bytes();
+            wrapper["signature"] = Value::String(STANDARD.encode(signature));
+            let raw_wrapper = serde_json::to_vec(&wrapper).unwrap();
+            let canonical = decode_canonical_signed_mutation(&raw_wrapper)
+                .expect("signed fulfillment canonicalizes");
+            let public_row_json = serde_json::to_vec(&json!({
+                "$type": "blue.catbird.chat.defs#leafRecoveryFulfillmentEntry",
+                "entryId": entry_id.hyphenated().to_string(),
+                "conversationId": Uuid::from_bytes(entry.cid).hyphenated().to_string(),
+                "seq": 2,
+                "signedRequest": wrapper,
+                "receivedAt": FULFILLED_AT,
+            }))
+            .unwrap();
+            let decoded = decode_and_verify_control_entry(&public_row_json, &verifying)
+                .expect("real fulfillment entry verifies");
+
+            RealLeafRecoveryFulfillmentEntry {
+                entry_id,
+                transition_id,
+                welcome_id,
+                public_row_json,
+                raw_wrapper,
+                canonical_projection: canonical.canonical_projection().to_vec(),
+                signing_transcript: canonical.transcript_bytes().to_vec(),
+                request_digest: canonical.request_digest().to_vec(),
+                signature: canonical.signature().to_vec(),
+                server_fields_dag_cbor: decoded.server_fields_dag_cbor().unwrap(),
+                outer_entry_fingerprint: *decoded.outer_control_fingerprint(),
+                opaque_welcome,
+            }
+        }
+
+        /// Advance the committed open recovery pair through the complete durable
+        /// fulfillment atom. This intentionally uses the production schema as
+        /// the integration oracle: both reciprocal fulfillment/Welcome mapping
+        /// triggers run at COMMIT, and callers hydrate only in a fresh transaction.
+        async fn commit_recovery_fulfillment_graph(
+            pool: &PgPool,
+            entry: &RealCreationEntry,
+            seed: &RecoverySeed,
+            fulfillment: &RealLeafRecoveryFulfillmentEntry,
+        ) {
+            let cid = Uuid::from_bytes(entry.cid);
+            let at = instant(FULFILLED_AT);
+            let metadata_snapshot_id = Uuid::new_v4();
+            let new_leaf_period_id = Uuid::new_v4();
+            let participant_period_id: Uuid = sqlx::query_scalar(
+                "SELECT participant_period_id FROM chat.participants \
+                 WHERE conversation_id=$1 AND user_did=$2 AND current_membership",
+            )
+            .bind(cid)
+            .bind(&entry.actor_did)
+            .fetch_one(pool)
+            .await
+            .expect("active participant period");
+            let public_snapshot = vec![0x61_u8; 64];
+            let tree_summary = vec![0x62_u8; 8];
+            let metadata_ciphertext = vec![0x32_u8; 16];
+            let basic_credential =
+                format!("{}#{}", entry.actor_did, entry.actor_device_id).into_bytes();
+
+            let mut tx = pool.begin().await.expect("begin fulfillment graph");
+            sqlx::query(
+                "UPDATE chat.conversations \
+                 SET current_state_version=1,next_entry_seq=3 \
+                 WHERE conversation_id=$1 AND current_generation=0 \
+                   AND current_state_version=0 AND next_entry_seq=2",
+            )
+            .bind(cid)
+            .execute(&mut *tx)
+            .await
+            .expect("advance conversation head");
+            sqlx::query(
+                "UPDATE chat.generations SET current_state_version=1 \
+                 WHERE conversation_id=$1 AND generation=0 AND current_state_version=0",
+            )
+            .bind(cid)
+            .execute(&mut *tx)
+            .await
+            .expect("advance generation head");
+            sqlx::query(
+                r#"INSERT INTO chat.transitions(
+                    transition_id,conversation_id,kind,actor_did,actor_device_id,actor_key_id,
+                    actor_auth_generation,actor_role,actor_device_status,signed_request_bytes,
+                    unsigned_projection_bytes,signing_transcript_bytes,request_digest,signature,
+                    prior_generation,prior_state_version,next_generation,next_state_version,
+                    metadata_snapshot_id,entry_seq,accepted_at
+                ) VALUES($1,$2,'leafRecovery',$3,$4,$5,1,'admin','active',$6,$7,$8,$9,$10,
+                    0,0,0,1,$11,2,$12)"#,
+            )
+            .bind(fulfillment.transition_id)
+            .bind(cid)
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .bind(&entry.actor_key_id)
+            .bind(&fulfillment.raw_wrapper)
+            .bind(&fulfillment.canonical_projection)
+            .bind(&fulfillment.signing_transcript)
+            .bind(&fulfillment.request_digest)
+            .bind(&fulfillment.signature)
+            .bind(metadata_snapshot_id)
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert fulfillment transition");
+            sqlx::query(
+                r#"INSERT INTO chat.generation_states(
+                    conversation_id,generation,state_version,group_id,epoch,group_context_hash,
+                    confirmation_tag,lifecycle,state_kind,producing_transition_id,
+                    public_snapshot_bytes,snapshot_sha256,tree_summary_bytes,tree_summary_sha256,
+                    leaf_count,created_at
+                ) VALUES($1,0,1,$2,1,$3,$4,'active','commit',$5,$6,$7,$8,$9,1,$10)"#,
+            )
+            .bind(cid)
+            .bind(vec![1_u8; 32])
+            .bind(vec![4_u8; 32])
+            .bind(vec![5_u8; 32])
+            .bind(fulfillment.transition_id)
+            .bind(&public_snapshot)
+            .bind(Sha256::digest(&public_snapshot).to_vec())
+            .bind(&tree_summary)
+            .bind(Sha256::digest(&tree_summary).to_vec())
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert successor generation state");
+            sqlx::query(
+                r#"INSERT INTO chat.metadata_snapshots(
+                    metadata_snapshot_id,conversation_id,generation,state_version,group_id,epoch,
+                    group_context_hash,confirmation_tag,producing_transition_id,
+                    origin_transition_id,metadata_version,nonce,ciphertext,ciphertext_sha256,
+                    ciphertext_size,author_did,author_device_id,author_key_id,author_public_key,
+                    author_auth_generation,author_origin_seq,author_role,author_device_status,created_at
+                ) VALUES($1,$2,0,1,$3,1,$4,$5,$6,$7,1,$8,$9,$10,16,$11,$12,$13,$14,
+                    1,1,'admin','active',$15)"#,
+            )
+            .bind(metadata_snapshot_id)
+            .bind(cid)
+            .bind(vec![1_u8; 32])
+            .bind(vec![4_u8; 32])
+            .bind(vec![5_u8; 32])
+            .bind(fulfillment.transition_id)
+            .bind(seed.creation_transition_id)
+            .bind(vec![0x26_u8; 12])
+            .bind(&metadata_ciphertext)
+            .bind(Sha256::digest(&metadata_ciphertext).to_vec())
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .bind(&entry.actor_key_id)
+            .bind(&entry.public_key)
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert re-encrypted metadata");
+            sqlx::query(
+                r#"INSERT INTO chat.entries(
+                    conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,
+                    accepted_payload_sha256,signed_request_bytes,request_digest,signature,
+                    server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,
+                    actor_key_id,actor_auth_generation,generation,state_version,transition_id,
+                    received_at
+                ) VALUES($1,2,$2,'blue.catbird.chat.defs#leafRecoveryFulfillmentEntry',
+                    $3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1,0,1,$13,$14)"#,
+            )
+            .bind(cid)
+            .bind(fulfillment.entry_id)
+            .bind(&fulfillment.public_row_json)
+            .bind(Sha256::digest(&fulfillment.public_row_json).to_vec())
+            .bind(&fulfillment.raw_wrapper)
+            .bind(&fulfillment.request_digest)
+            .bind(&fulfillment.signature)
+            .bind(&fulfillment.server_fields_dag_cbor)
+            .bind(fulfillment.outer_entry_fingerprint.to_vec())
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .bind(&entry.actor_key_id)
+            .bind(fulfillment.transition_id)
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert fulfillment entry");
+            sqlx::query(
+                r#"INSERT INTO chat.entry_recipients(
+                    conversation_id,seq,user_did,device_id,entitlement_kind
+                ) VALUES($1,2,$2,$3,'intervalClose')"#,
+            )
+            .bind(cid)
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .execute(&mut *tx)
+            .await
+            .expect("route fulfillment to replaced interval");
+
+            sqlx::query(
+                r#"UPDATE chat.member_devices SET
+                    removed_state_version=1,removed_transition_id=$1,removed_seq=2,
+                    removed_at=$2,active=false
+                   WHERE leaf_period_id=$3 AND active"#,
+            )
+            .bind(fulfillment.transition_id)
+            .bind(at)
+            .bind(seed.replaced_leaf_period_id)
+            .execute(&mut *tx)
+            .await
+            .expect("close replaced leaf");
+            sqlx::query(
+                r#"UPDATE chat.application_intervals SET
+                    terminal_seq=2,closing_state_version=1,closing_transition_id=$1,
+                    closing_outer_entry_fingerprint=$2,closing_kind='replace',
+                    closing_leaf_period_id=$3,removed_at=$4
+                   WHERE opening_leaf_period_id=$3 AND terminal_seq IS NULL"#,
+            )
+            .bind(fulfillment.transition_id)
+            .bind(fulfillment.outer_entry_fingerprint.to_vec())
+            .bind(seed.replaced_leaf_period_id)
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("close replaced application interval");
+            sqlx::query(
+                r#"INSERT INTO chat.member_devices(
+                    leaf_period_id,participant_period_id,conversation_id,generation,user_did,
+                    device_id,leaf_index,basic_credential,leaf_signature_key,leaf_key_id,
+                    leaf_auth_generation,origin,join_key_package_ref,joined_state_version,
+                    joined_transition_id,joined_seq,active,created_at
+                ) VALUES($1,$2,$3,0,$4,$5,0,$6,$7,$8,1,'keyPackage',$9,1,$10,2,true,$11)"#,
+            )
+            .bind(new_leaf_period_id)
+            .bind(participant_period_id)
+            .bind(cid)
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .bind(&basic_credential)
+            .bind(&entry.public_key)
+            .bind(&entry.actor_key_id)
+            .bind(seed.key_package_ref.to_vec())
+            .bind(fulfillment.transition_id)
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert recovered leaf");
+            sqlx::query(
+                r#"INSERT INTO chat.application_intervals(
+                    membership_interval_id,conversation_id,generation,recipient_did,
+                    recipient_device_id,start_seq,opening_kind,opening_transition_id,
+                    opening_outer_entry_fingerprint,opening_state_version,opening_group_id,
+                    opening_epoch,opening_group_context_hash,opening_confirmation_tag,
+                    opening_leaf_period_id,created_at
+                ) VALUES($1,$2,0,$3,$4,2,'add',$1,$5,1,$6,1,$7,$8,$9,$10)"#,
+            )
+            .bind(fulfillment.transition_id)
+            .bind(cid)
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .bind(fulfillment.outer_entry_fingerprint.to_vec())
+            .bind(vec![1_u8; 32])
+            .bind(vec![4_u8; 32])
+            .bind(vec![5_u8; 32])
+            .bind(new_leaf_period_id)
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("open recovered application interval");
+
+            sqlx::query(
+                "UPDATE chat.leaf_recovery_requests SET \
+                 status='fulfilled',fulfilling_transition_id=$1,terminal_at=$2 \
+                 WHERE recovery_request_id=$3 AND status='open'",
+            )
+            .bind(fulfillment.transition_id)
+            .bind(at)
+            .bind(Uuid::from_bytes(seed.request_id))
+            .execute(&mut *tx)
+            .await
+            .expect("fulfill request");
+            sqlx::query(
+                "UPDATE chat.key_package_reservations SET \
+                 status='consumed',consumed_transition_id=$1,terminal_at=$2 \
+                 WHERE recovery_request_id=$3 AND status='active'",
+            )
+            .bind(fulfillment.transition_id)
+            .bind(at)
+            .bind(Uuid::from_bytes(seed.request_id))
+            .execute(&mut *tx)
+            .await
+            .expect("consume reservation");
+            sqlx::query(
+                "UPDATE chat.key_packages SET \
+                 status='consumed',terminal_transition_id=$1,terminal_at=$2 \
+                 WHERE key_package_ref=$3 AND status='reserved'",
+            )
+            .bind(fulfillment.transition_id)
+            .bind(at)
+            .bind(seed.key_package_ref.to_vec())
+            .execute(&mut *tx)
+            .await
+            .expect("consume key package");
+            sqlx::query(
+                r#"INSERT INTO chat.welcome_bundles(
+                    welcome_id,conversation_id,transition_id,entry_seq,generation,state_version,
+                    group_id,epoch,group_context_hash,confirmation_tag,wrapper_bytes,
+                    wrapper_sha256,created_at
+                ) VALUES($1,$2,$3,2,0,1,$4,1,$5,$6,$7,$8,$9)"#,
+            )
+            .bind(fulfillment.welcome_id)
+            .bind(cid)
+            .bind(fulfillment.transition_id)
+            .bind(vec![1_u8; 32])
+            .bind(vec![4_u8; 32])
+            .bind(vec![5_u8; 32])
+            .bind(&fulfillment.opaque_welcome)
+            .bind(Sha256::digest(&fulfillment.opaque_welcome).to_vec())
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert welcome bundle");
+            sqlx::query(
+                r#"INSERT INTO chat.welcome_deliveries(
+                    welcome_id,recipient_did,recipient_device_id,recovery_request_id,
+                    key_package_ref,expires_at,status
+                ) VALUES($1,$2,$3,$4,$5,$6,'pending')"#,
+            )
+            .bind(fulfillment.welcome_id)
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .bind(Uuid::from_bytes(seed.request_id))
+            .bind(seed.key_package_ref.to_vec())
+            .bind(instant(KP_NOT_AFTER))
+            .execute(&mut *tx)
+            .await
+            .expect("insert welcome delivery");
+
+            tx.commit()
+                .await
+                .expect("fulfillment graph crosses deferred mappings");
+        }
+
+        /// A committed fulfilled request and consumed reservation must hydrate
+        /// the exact same re-verified leafRecovery transition in a fresh
+        /// transaction. This catches the current unsupported-terminal branch.
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn recovery_pair_hydrates_the_fulfilled_transition_terminal() {
+            let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+            let cid = Uuid::new_v4();
+            let entry = build_real_creation_entry(*cid.as_bytes());
+            let seed = seed_recovery_pair(&pool, &entry, "requestLeafRecovery").await;
+            let fulfillment = build_real_leaf_recovery_fulfillment_entry(&entry, &seed);
+            commit_recovery_fulfillment_graph(&pool, &entry, &seed, &fulfillment).await;
+
+            let authority = HistoricalRehydrationAuthority::new(entry.cid, 3).unwrap();
+            let expected = authority
+                .hydrate_historical_control_from_durable_bytes(
+                    fulfillment.public_row_json.clone(),
+                    fulfillment.raw_wrapper.clone(),
+                    &entry.public_key,
+                )
+                .expect("direct fulfillment re-verification")
+                .into_transition()
+                .expect("leaf recovery fulfillment is a transition");
+
+            let mut tx = pool.begin().await.expect("fresh hydration transaction");
+            let (requests, reservations) =
+                load_recovery_work_hydration_rows(&mut tx, &authority, cid)
+                    .await
+                    .expect("fulfilled recovery pair hydrates");
+            tx.commit()
+                .await
+                .expect("commit fresh hydration transaction");
+
+            assert_eq!(requests.len(), 1);
+            assert_eq!(reservations.len(), 1);
+            assert_eq!(requests[0].status, RecoveryRequestStatus::Fulfilled);
+            assert_eq!(reservations[0].status, ReservationStatus::Consumed);
+            assert_eq!(
+                requests[0].terminal,
+                Some(WorkTerminalHydrationRow::Transition(expected.clone()))
+            );
+            assert_eq!(
+                reservations[0].terminal,
+                Some(WorkTerminalHydrationRow::Transition(expected))
+            );
+        }
+
+        /// The fulfilled/consumed status arms select only one exact transition
+        /// terminal across request, reservation, package, and durable transition.
+        /// These malformed combinations are structurally prohibited from
+        /// committing by CHECK/FK/mapping/immutability constraints, so the shared
+        /// pure selector is their read-side drift fence.
+        #[test]
+        fn recovery_fulfillment_terminal_columns_select_only_the_exact_arm() {
+            let transition_id = Uuid::new_v4();
+            let other_transition_id = Uuid::new_v4();
+            let terminal_at = instant(FULFILLED_AT);
+            let other_at = instant("2030-01-01T00:01:01.000Z");
+            let exact = FulfilledRecoveryTerminalColumns {
+                request_fulfilling_transition_id: Some(transition_id),
+                request_has_unrelated_terminal: false,
+                request_terminal_at: Some(terminal_at),
+                request_reservation_binding_matches: true,
+                reservation_status: "consumed",
+                reservation_consumed_transition_id: Some(transition_id),
+                reservation_has_unrelated_terminal: false,
+                reservation_terminal_at: Some(terminal_at),
+                package_status: "consumed",
+                package_terminal_transition_id: Some(transition_id),
+                package_terminal_revocation_id: None,
+                package_terminal_at: Some(terminal_at),
+                durable_transition_kind: Some("leafRecovery"),
+                durable_transition_accepted_at: Some(terminal_at),
+            };
+            assert_eq!(
+                select_fulfilled_recovery_terminal(exact).unwrap(),
+                (transition_id, terminal_at)
+            );
+
+            let malformed = [
+                FulfilledRecoveryTerminalColumns {
+                    request_fulfilling_transition_id: None,
+                    ..exact
+                },
+                FulfilledRecoveryTerminalColumns {
+                    request_has_unrelated_terminal: true,
+                    ..exact
+                },
+                FulfilledRecoveryTerminalColumns {
+                    request_reservation_binding_matches: false,
+                    ..exact
+                },
+                FulfilledRecoveryTerminalColumns {
+                    reservation_consumed_transition_id: Some(other_transition_id),
+                    ..exact
+                },
+                FulfilledRecoveryTerminalColumns {
+                    reservation_has_unrelated_terminal: true,
+                    ..exact
+                },
+                FulfilledRecoveryTerminalColumns {
+                    reservation_terminal_at: Some(other_at),
+                    ..exact
+                },
+                FulfilledRecoveryTerminalColumns {
+                    package_status: "reserved",
+                    ..exact
+                },
+                FulfilledRecoveryTerminalColumns {
+                    package_terminal_transition_id: Some(other_transition_id),
+                    ..exact
+                },
+                FulfilledRecoveryTerminalColumns {
+                    package_terminal_revocation_id: Some(Uuid::new_v4()),
+                    ..exact
+                },
+                FulfilledRecoveryTerminalColumns {
+                    package_terminal_at: Some(other_at),
+                    ..exact
+                },
+                FulfilledRecoveryTerminalColumns {
+                    durable_transition_kind: Some("commit"),
+                    ..exact
+                },
+                FulfilledRecoveryTerminalColumns {
+                    durable_transition_kind: None,
+                    durable_transition_accepted_at: None,
+                    ..exact
+                },
+            ];
+            for columns in malformed {
+                assert!(matches!(
+                    select_fulfilled_recovery_terminal(columns),
+                    Err(RecoveryHydrationError::TerminalMismatch)
+                ));
             }
         }
 

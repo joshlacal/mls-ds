@@ -24,15 +24,15 @@ use super::super::{
     },
     state_machine::{
         classify_acceptance, classify_invitation, classify_role_producer,
-        metadata_binding_of_transition, CloseKind, ConversationState, DeviceIdentity,
-        HistoricalRehydrationAuthority, HydrationAuthority, IntervalEndHydrationRow,
-        IntervalHydrationRow, LeafHydrationRow, LeafRecoveryKind, LeaveRequestHydrationRow,
-        LeaveRequestStatus, MetadataSnapshotBinding, OpeningKind, ParticipantHydrationRow,
-        ParticipantRole, ParticipantStatus, PersistedControlAuthority, PrincipalId,
-        RecoveryOriginHydrationRow, RecoveryRequestHydrationRow, RecoveryRequestStatus,
-        RecoveryReservationHydrationRow, RecoverySource, RequestEntryKind, RequestEvidence,
-        ReservationStatus, ResetRequestHydrationRow, ResetRequestStatus, ServerTimestamp,
-        TransitionEvidence, WorkTerminalHydrationRow,
+        metadata_binding_of_transition, recovery_fulfillment_terminal_matches, CloseKind,
+        ConversationState, DeviceIdentity, HistoricalRehydrationAuthority, HydrationAuthority,
+        IntervalEndHydrationRow, IntervalHydrationRow, LeafHydrationRow, LeafRecoveryKind,
+        LeaveRequestHydrationRow, LeaveRequestStatus, MetadataSnapshotBinding, OpeningKind,
+        ParticipantHydrationRow, ParticipantRole, ParticipantStatus, PersistedControlAuthority,
+        PrincipalId, RecoveryOriginHydrationRow, RecoveryRequestHydrationRow,
+        RecoveryRequestStatus, RecoveryReservationHydrationRow, RecoverySource, RequestEntryKind,
+        RequestEvidence, ReservationStatus, ResetRequestHydrationRow, ResetRequestStatus,
+        ServerTimestamp, TransitionEvidence, WorkTerminalHydrationRow,
     },
     validation::{BareDid, KeyThumbprint},
 };
@@ -3282,14 +3282,13 @@ pub(crate) async fn load_metadata_provenance(
 //
 // SCOPE (NEXT-STEP follow-ups, fail-closed until reconstructed + tested): the
 // `acceptConversation` source (an `Acceptance` `TransitionEvidence` origin) and
-// the TERMINAL reconstruction of non-`open` requests / non-`active` reservations
-// (`WorkTerminalHydrationRow`: fulfilling / cancellation / expiry /
-// device-revocation evidence) each need their own bespoke real-signed /
-// real-close / device-revocation coherent seed to exercise the populated arm, so
-// shipping them untested would be REJECT-class. This leg reconstructs the
-// `open` / `active` (terminal `None`) arm fully and fails CLOSED
-// (`UnsupportedSource` / `UnsupportedTerminal`) on the others — never fabricating
-// a terminal or an origin it cannot re-verify.
+// the remaining TERMINAL families (`cancelled` / `expired` / `superseded`
+// requests and `expired` / `released` reservations) each need their own later
+// real-signed / expiry / device-revocation coherent seed. This leg reconstructs
+// both `open` / `active` (terminal `None`) and `fulfilled` / `consumed` (one
+// exact re-verified leafRecovery transition) and fails CLOSED
+// (`UnsupportedSource` / `UnsupportedTerminal`) on the named remainder — never
+// fabricating a terminal or an origin it cannot re-verify.
 //
 // `validate_recovery_work` at assembly is the drift fence: it re-derives the 1:1
 // pairing, the expiry, and every cross-field equality against the hydrated rows,
@@ -3320,21 +3319,149 @@ pub(crate) enum RecoveryHydrationError {
     /// that arm is reconstructed + tested.
     #[error("clean-chat recovery acceptConversation source is not yet reconstructed")]
     UnsupportedSource,
-    /// The request/reservation carries a terminal status (non-`open` request or
-    /// non-`active` reservation) whose `WorkTerminalHydrationRow` reconstruction
-    /// is the NEXT-STEP follow-up. Fail closed until that arm is reconstructed +
-    /// tested.
+    /// The request/reservation carries a terminal status outside this sub-seal's
+    /// fulfilled/consumed arm. Cancellation is owned by the signed cancellation
+    /// fixture, expiry by the expiry fixture, and supersession/release by the
+    /// transition/device-revocation fixtures. Fail closed until each is built.
     #[error("clean-chat recovery terminal status is not yet reconstructed")]
     UnsupportedTerminal,
+    /// A status selected an incomplete, unrelated, or request/reservation-
+    /// disagreeing terminal column arm.
+    #[error("clean-chat recovery terminal columns do not match the selected status")]
+    TerminalMismatch,
+    /// The selected fulfillment transition was absent, foreign, wrong-kind, or
+    /// did not bind the exact request, target, coordinate, package, and time.
+    #[error("clean-chat recovery fulfillment terminal failed re-verification")]
+    InvalidTerminal,
     #[error("clean-chat recovery hydration database error: {0}")]
     Database(#[from] sqlx::Error),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct FulfilledRecoveryTerminalColumns<'a> {
+    pub(crate) request_fulfilling_transition_id: Option<Uuid>,
+    pub(crate) request_has_unrelated_terminal: bool,
+    pub(crate) request_terminal_at: Option<DateTime<Utc>>,
+    pub(crate) request_reservation_binding_matches: bool,
+    pub(crate) reservation_status: &'a str,
+    pub(crate) reservation_consumed_transition_id: Option<Uuid>,
+    pub(crate) reservation_has_unrelated_terminal: bool,
+    pub(crate) reservation_terminal_at: Option<DateTime<Utc>>,
+    pub(crate) package_status: &'a str,
+    pub(crate) package_terminal_transition_id: Option<Uuid>,
+    pub(crate) package_terminal_revocation_id: Option<Uuid>,
+    pub(crate) package_terminal_at: Option<DateTime<Utc>>,
+    pub(crate) durable_transition_kind: Option<&'a str>,
+    pub(crate) durable_transition_accepted_at: Option<DateTime<Utc>>,
+}
+
+/// Select the sole legal fulfilled/consumed recovery terminal arm. The schema
+/// makes most malformed combinations uncommittable; keeping this selection
+/// pure gives the read side an explicit drift fence instead of relying on
+/// optional-column coincidence.
+pub(crate) fn select_fulfilled_recovery_terminal(
+    columns: FulfilledRecoveryTerminalColumns<'_>,
+) -> Result<(Uuid, DateTime<Utc>), RecoveryHydrationError> {
+    let (Some(transition_id), Some(terminal_at)) = (
+        columns.request_fulfilling_transition_id,
+        columns.request_terminal_at,
+    ) else {
+        return Err(RecoveryHydrationError::TerminalMismatch);
+    };
+    if columns.request_has_unrelated_terminal
+        || !columns.request_reservation_binding_matches
+        || columns.reservation_status != "consumed"
+        || columns.reservation_consumed_transition_id != Some(transition_id)
+        || columns.reservation_has_unrelated_terminal
+        || columns.reservation_terminal_at != Some(terminal_at)
+        || columns.package_status != "consumed"
+        || columns.package_terminal_transition_id != Some(transition_id)
+        || columns.package_terminal_revocation_id.is_some()
+        || columns.package_terminal_at != Some(terminal_at)
+        || columns.durable_transition_kind != Some("leafRecovery")
+        || columns.durable_transition_accepted_at != Some(terminal_at)
+    {
+        return Err(RecoveryHydrationError::TerminalMismatch);
+    }
+    Ok((transition_id, terminal_at))
+}
+
+#[derive(Clone)]
+enum RecoveryReservationTerminal {
+    None,
+    Transition {
+        transition_id: Uuid,
+        terminal_at: DateTime<Utc>,
+    },
 }
 
 /// A reservation paired to its request during recovery-work hydration; carries
 /// the `key_package_ref` the request row lacks.
 struct PairedReservation {
     key_package_ref: [u8; 32],
+    package_status: String,
+    package_terminal_transition_id: Option<Uuid>,
+    package_terminal_revocation_id: Option<Uuid>,
+    package_terminal_at: Option<DateTime<Utc>>,
+    terminal: RecoveryReservationTerminal,
     row: RecoveryReservationHydrationRow,
+}
+
+#[derive(sqlx::FromRow)]
+struct DurableRecoveryReservationRow {
+    recovery_request_id: Uuid,
+    recipient_did: String,
+    recipient_device_id: Uuid,
+    generation: i64,
+    bound_state_version: i64,
+    bound_group_id: Vec<u8>,
+    bound_epoch: i64,
+    bound_group_context_hash: Vec<u8>,
+    bound_confirmation_tag: Vec<u8>,
+    key_package_ref: Vec<u8>,
+    created_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+    status: String,
+    consumed_transition_id: Option<Uuid>,
+    terminal_transition_id: Option<Uuid>,
+    terminal_revocation_id: Option<Uuid>,
+    terminal_request_digest: Option<Vec<u8>>,
+    terminal_at: Option<DateTime<Utc>>,
+    package_status: String,
+    package_terminal_transition_id: Option<Uuid>,
+    package_terminal_revocation_id: Option<Uuid>,
+    package_terminal_at: Option<DateTime<Utc>>,
+    not_after: DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct DurableRecoveryRequestRow {
+    recovery_request_id: Uuid,
+    requester_did: String,
+    requester_device_id: Uuid,
+    recovery_kind: String,
+    source: String,
+    generation: i64,
+    bound_state_version: i64,
+    bound_group_id: Vec<u8>,
+    bound_epoch: i64,
+    bound_group_context_hash: Vec<u8>,
+    bound_confirmation_tag: Vec<u8>,
+    status: String,
+    signed_request_bytes: Vec<u8>,
+    requested_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+    fulfilling_transition_id: Option<Uuid>,
+    terminal_transition_id: Option<Uuid>,
+    terminal_revocation_id: Option<Uuid>,
+    terminal_signed_request_bytes: Option<Vec<u8>>,
+    terminal_signing_transcript_bytes: Option<Vec<u8>>,
+    terminal_request_digest: Option<Vec<u8>>,
+    terminal_signature: Option<Vec<u8>>,
+    terminal_at: Option<DateTime<Utc>>,
+    fulfilling_transition_kind: Option<String>,
+    fulfilling_transition_accepted_at: Option<DateTime<Utc>>,
+    signing_public_key: Vec<u8>,
 }
 
 /// Load the leaf-recovery work of an existing conversation as a validated 1:1
@@ -3361,23 +3488,7 @@ pub(crate) async fn load_recovery_work_hydration_rows(
 
     // Reservations, with the bound key package's `not_after` (the reservation row
     // carries no origin evidence; `package_not_after` is the KP lifetime).
-    #[allow(clippy::type_complexity)]
-    let reservation_rows: Vec<(
-        Uuid,
-        String,
-        Uuid,
-        i64,
-        i64,
-        Vec<u8>,
-        i64,
-        Vec<u8>,
-        Vec<u8>,
-        Vec<u8>,
-        DateTime<Utc>,
-        DateTime<Utc>,
-        String,
-        DateTime<Utc>,
-    )> = sqlx::query_as(
+    let reservation_rows: Vec<DurableRecoveryReservationRow> = sqlx::query_as(
         r#"
         SELECT
             r.recovery_request_id,
@@ -3393,6 +3504,15 @@ pub(crate) async fn load_recovery_work_hydration_rows(
             r.created_at,
             r.expires_at,
             r.status,
+            r.consumed_transition_id,
+            r.terminal_transition_id,
+            r.terminal_revocation_id,
+            r.terminal_request_digest,
+            r.terminal_at,
+            kp.status AS package_status,
+            kp.terminal_transition_id AS package_terminal_transition_id,
+            kp.terminal_revocation_id AS package_terminal_revocation_id,
+            kp.terminal_at AS package_terminal_at,
             kp.not_after
         FROM chat.key_package_reservations r
         JOIN chat.key_packages kp
@@ -3407,7 +3527,7 @@ pub(crate) async fn load_recovery_work_hydration_rows(
     .await?;
 
     let mut reservations_by_id: BTreeMap<[u8; 16], PairedReservation> = BTreeMap::new();
-    for (
+    for DurableRecoveryReservationRow {
         recovery_request_id,
         recipient_did,
         recipient_device_id,
@@ -3421,8 +3541,17 @@ pub(crate) async fn load_recovery_work_hydration_rows(
         created_at,
         expires_at,
         status,
+        consumed_transition_id,
+        terminal_transition_id,
+        terminal_revocation_id,
+        terminal_request_digest,
+        terminal_at,
+        package_status,
+        package_terminal_transition_id,
+        package_terminal_revocation_id,
+        package_terminal_at,
         not_after,
-    ) in reservation_rows
+    } in reservation_rows
     {
         let request_id = *recovery_request_id.as_bytes();
         let target = recovery_device(recipient_did, recipient_device_id)?;
@@ -3436,11 +3565,33 @@ pub(crate) async fn load_recovery_work_hydration_rows(
             bound_confirmation_tag,
         )?;
         let key_package_ref = recovery_bytes32(key_package_ref)?;
-        let status = match status.as_str() {
-            "active" => ReservationStatus::Active,
-            "consumed" | "expired" | "released" => {
-                return Err(RecoveryHydrationError::UnsupportedTerminal)
+        let (status, terminal) = match status.as_str() {
+            "active"
+                if consumed_transition_id.is_none()
+                    && terminal_transition_id.is_none()
+                    && terminal_revocation_id.is_none()
+                    && terminal_request_digest.is_none()
+                    && terminal_at.is_none() =>
+            {
+                (ReservationStatus::Active, RecoveryReservationTerminal::None)
             }
+            "consumed"
+                if consumed_transition_id.is_some()
+                    && terminal_transition_id.is_none()
+                    && terminal_revocation_id.is_none()
+                    && terminal_request_digest.is_none()
+                    && terminal_at.is_some() =>
+            {
+                (
+                    ReservationStatus::Consumed,
+                    RecoveryReservationTerminal::Transition {
+                        transition_id: consumed_transition_id.unwrap(),
+                        terminal_at: terminal_at.unwrap(),
+                    },
+                )
+            }
+            "active" | "consumed" => return Err(RecoveryHydrationError::TerminalMismatch),
+            "expired" | "released" => return Err(RecoveryHydrationError::UnsupportedTerminal),
             _ => return Err(RecoveryHydrationError::OutOfDomain),
         };
         let row = RecoveryReservationHydrationRow {
@@ -3459,6 +3610,11 @@ pub(crate) async fn load_recovery_work_hydration_rows(
                 request_id,
                 PairedReservation {
                     key_package_ref,
+                    package_status,
+                    package_terminal_transition_id,
+                    package_terminal_revocation_id,
+                    package_terminal_at,
+                    terminal,
                     row,
                 },
             )
@@ -3469,25 +3625,7 @@ pub(crate) async fn load_recovery_work_hydration_rows(
     }
 
     // Requests, with the requester's historical signing key for the origin re-mint.
-    #[allow(clippy::type_complexity)]
-    let request_rows: Vec<(
-        Uuid,
-        String,
-        Uuid,
-        String,
-        String,
-        i64,
-        i64,
-        Vec<u8>,
-        i64,
-        Vec<u8>,
-        Vec<u8>,
-        String,
-        Vec<u8>,
-        DateTime<Utc>,
-        DateTime<Utc>,
-        Vec<u8>,
-    )> = sqlx::query_as(
+    let request_rows: Vec<DurableRecoveryRequestRow> = sqlx::query_as(
         r#"
         SELECT
             lr.recovery_request_id,
@@ -3505,12 +3643,24 @@ pub(crate) async fn load_recovery_work_hydration_rows(
             lr.signed_request_bytes,
             lr.requested_at,
             lr.expires_at,
+            lr.fulfilling_transition_id,
+            lr.terminal_transition_id,
+            lr.terminal_revocation_id,
+            lr.terminal_signed_request_bytes,
+            lr.terminal_signing_transcript_bytes,
+            lr.terminal_request_digest,
+            lr.terminal_signature,
+            lr.terminal_at,
+            ft.kind AS fulfilling_transition_kind,
+            ft.accepted_at AS fulfilling_transition_accepted_at,
             dk.signing_public_key
         FROM chat.leaf_recovery_requests lr
         JOIN chat.device_keys dk
           ON dk.user_did = lr.requester_did
          AND dk.device_id = lr.requester_device_id
          AND dk.key_id = lr.requester_key_id
+        LEFT JOIN chat.transitions ft
+          ON ft.transition_id = lr.fulfilling_transition_id
         WHERE lr.conversation_id = $1
         "#,
     )
@@ -3520,7 +3670,7 @@ pub(crate) async fn load_recovery_work_hydration_rows(
 
     let mut requests: Vec<RecoveryRequestHydrationRow> = Vec::with_capacity(request_rows.len());
     let mut paired: usize = 0;
-    for (
+    for DurableRecoveryRequestRow {
         recovery_request_id,
         requester_did,
         requester_device_id,
@@ -3536,8 +3686,18 @@ pub(crate) async fn load_recovery_work_hydration_rows(
         signed_request_bytes,
         requested_at,
         expires_at,
+        fulfilling_transition_id,
+        terminal_transition_id,
+        terminal_revocation_id,
+        terminal_signed_request_bytes,
+        terminal_signing_transcript_bytes,
+        terminal_request_digest,
+        terminal_signature,
+        terminal_at,
+        fulfilling_transition_kind,
+        fulfilling_transition_accepted_at,
         signing_public_key,
-    ) in request_rows
+    } in request_rows
     {
         let request_id = *recovery_request_id.as_bytes();
         let target = recovery_device(requester_did, requester_device_id)?;
@@ -3560,17 +3720,111 @@ pub(crate) async fn load_recovery_work_hydration_rows(
             bound_group_context_hash,
             bound_confirmation_tag,
         )?;
-        let status = match status.as_str() {
-            "open" => RecoveryRequestStatus::Open,
-            "fulfilled" | "cancelled" | "expired" | "superseded" => {
+        let reservation = reservations_by_id
+            .get(&request_id)
+            .ok_or(RecoveryHydrationError::PairMismatch)?;
+        let request_reservation_binding_matches = reservation.row.target == target
+            && reservation.row.bound_coordinate == bound_coordinate
+            && reservation.row.received_at == recovery_timestamp(requested_at)?
+            && reservation.row.expires_at == recovery_timestamp(expires_at)?;
+        let reservation_status = reservation.row.status;
+        let reservation_terminal = reservation.terminal.clone();
+        let reservation_key_package_ref = reservation.key_package_ref;
+        let package_status = reservation.package_status.clone();
+        let package_terminal_transition_id = reservation.package_terminal_transition_id;
+        let package_terminal_revocation_id = reservation.package_terminal_revocation_id;
+        let package_terminal_at = reservation.package_terminal_at;
+        paired += 1;
+
+        let request_has_signed_terminal = terminal_signed_request_bytes.is_some()
+            || terminal_signing_transcript_bytes.is_some()
+            || terminal_request_digest.is_some()
+            || terminal_signature.is_some();
+        let (status, terminal) = match status.as_str() {
+            "open"
+                if fulfilling_transition_id.is_none()
+                    && terminal_transition_id.is_none()
+                    && terminal_revocation_id.is_none()
+                    && !request_has_signed_terminal
+                    && terminal_at.is_none()
+                    && matches!(&reservation_terminal, RecoveryReservationTerminal::None)
+                    && reservation_status == ReservationStatus::Active
+                    && request_reservation_binding_matches
+                    && package_status == "reserved"
+                    && package_terminal_transition_id.is_none()
+                    && package_terminal_revocation_id.is_none()
+                    && package_terminal_at.is_none() =>
+            {
+                (RecoveryRequestStatus::Open, None)
+            }
+            "fulfilled" => {
+                let (reservation_consumed_transition_id, reservation_terminal_at) =
+                    match &reservation_terminal {
+                        RecoveryReservationTerminal::Transition {
+                            transition_id: reservation_transition_id,
+                            terminal_at: reservation_terminal_at,
+                        } => (
+                            Some(*reservation_transition_id),
+                            Some(*reservation_terminal_at),
+                        ),
+                        RecoveryReservationTerminal::None => (None, None),
+                    };
+                let (transition_id, terminal_at) =
+                    select_fulfilled_recovery_terminal(FulfilledRecoveryTerminalColumns {
+                        request_fulfilling_transition_id: fulfilling_transition_id,
+                        request_has_unrelated_terminal: terminal_transition_id.is_some()
+                            || terminal_revocation_id.is_some()
+                            || request_has_signed_terminal,
+                        request_terminal_at: terminal_at,
+                        request_reservation_binding_matches,
+                        reservation_status: match reservation_status {
+                            ReservationStatus::Active => "active",
+                            ReservationStatus::Consumed => "consumed",
+                            ReservationStatus::Expired => "expired",
+                            ReservationStatus::Released => "released",
+                        },
+                        reservation_consumed_transition_id,
+                        reservation_has_unrelated_terminal: false,
+                        reservation_terminal_at,
+                        package_status: &package_status,
+                        package_terminal_transition_id,
+                        package_terminal_revocation_id,
+                        package_terminal_at,
+                        durable_transition_kind: fulfilling_transition_kind.as_deref(),
+                        durable_transition_accepted_at: fulfilling_transition_accepted_at,
+                    })?;
+                let terminal = load_work_terminal_hydration_row(
+                    transaction,
+                    authority,
+                    conversation_id,
+                    WorkTerminalLocator::Transition { transition_id },
+                )
+                .await
+                .map_err(|_| RecoveryHydrationError::InvalidTerminal)?;
+                let WorkTerminalHydrationRow::Transition(ref evidence) = terminal else {
+                    return Err(RecoveryHydrationError::InvalidTerminal);
+                };
+                if evidence.transition_id() != transition_id.as_bytes()
+                    || !recovery_fulfillment_terminal_matches(
+                        evidence,
+                        &request_id,
+                        &target,
+                        kind,
+                        &bound_coordinate,
+                        &reservation_key_package_ref,
+                        recovery_timestamp(terminal_at)?,
+                    )
+                {
+                    return Err(RecoveryHydrationError::InvalidTerminal);
+                }
+                (RecoveryRequestStatus::Fulfilled, Some(terminal))
+            }
+            "open" => return Err(RecoveryHydrationError::TerminalMismatch),
+            "cancelled" | "expired" | "superseded" => {
                 return Err(RecoveryHydrationError::UnsupportedTerminal)
             }
             _ => return Err(RecoveryHydrationError::OutOfDomain),
         };
-        let reservation = reservations_by_id
-            .get(&request_id)
-            .ok_or(RecoveryHydrationError::PairMismatch)?;
-        paired += 1;
 
         let received_at_canonical = canonical_millis(requested_at);
         let origin = authority
@@ -3588,13 +3842,18 @@ pub(crate) async fn load_recovery_work_hydration_rows(
             kind,
             source,
             bound_coordinate,
-            key_package_ref: reservation.key_package_ref,
+            key_package_ref: reservation_key_package_ref,
             received_at: recovery_timestamp(requested_at)?,
             expires_at: recovery_timestamp(expires_at)?,
             status,
             origin: RecoveryOriginHydrationRow::Request(origin),
-            terminal: None,
+            terminal: terminal.clone(),
         });
+        reservations_by_id
+            .get_mut(&request_id)
+            .ok_or(RecoveryHydrationError::PairMismatch)?
+            .row
+            .terminal = terminal;
     }
 
     // 1:1 correspondence: every reservation was paired to exactly one request.
