@@ -40,7 +40,7 @@ PROTOCOL_PATH = STACK_ROOT / "docs/CHAT_PROTOCOL.md"
 APPLICATION_PROTOCOL_PATH = STACK_ROOT / "docs/CHAT_APPLICATION_PROTOCOL.md"
 APPLICATION_MANIFEST_PATH = STACK_ROOT / "docs/generated-artifacts/chat-application-v1/manifest.json"
 APPLICATION_MANIFEST_INPUT_ENV = "CATBIRD_CHAT_APPLICATION_FIXTURE_INPUT"
-FROZEN_APPLICATION_MANIFEST_SHA256 = "94488c344f17f1a41d54c6a34261f8fb06b15d57604f0ae8c7aa15fb0317694d"
+FROZEN_APPLICATION_MANIFEST_SHA256 = "eda170a09d9e7af7d91d6981825400a2c210fd40e41e7e2955389e0d3feac120"
 TASK1_DOC_PATHS = (
     STACK_ROOT / ".superpowers/sdd/mls-chat-task-1-semantic-repair-brief.md",
     STACK_ROOT / ".superpowers/sdd/mls-chat-task-1-report.md",
@@ -4741,6 +4741,7 @@ def validate_crypto_wire_corpus() -> None:
         "genesis-public-state.bin", "committed-public-state.bin",
         "commit-generic-public.mls", "committed-generic-public-state.bin",
         "commit-remove-public.mls", "committed-remove-public-state.bin",
+        "creation-signed-request.cbor",
     }
     actual_files = {path.name for path in CRYPTO_WIRE_ROOT.iterdir() if path.is_file()}
     assert actual_files == expected_files, f"crypto wire manifest mismatch: missing={sorted(expected_files-actual_files)}, extra={sorted(actual_files-expected_files)}"
