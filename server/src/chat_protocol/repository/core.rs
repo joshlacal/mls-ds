@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use super::super::transcript::{
     decode_and_verify_signed_mutation, decode_canonical_signed_mutation, CanonicalValueRef,
-    VerifiedMutationProjection,
+    SignedMutationKind, VerifiedMutationProjection,
 };
 use super::super::{
     snapshot::{
@@ -3280,21 +3280,22 @@ pub(crate) async fn load_metadata_provenance(
 // `recovery_request_id`, failing closed (`PairMismatch`) on any break in the
 // correspondence.
 //
-// The request ORIGIN is a HISTORICAL signed request: for `source =
-// 'requestLeafRecovery'` it is a `RequestEvidence` re-minted from the row's OWN
-// `signed_request_bytes` + `requested_at` under the requester's historical
-// signing key (JOINed from `chat.device_keys`), through the certified
-// `HistoricalRehydrationAuthority::hydrate_historical_signed_request_from_durable_bytes`
-// seam (ed25519 re-verified, conversation binding enforced).
+// The request ORIGIN is historical signed evidence. `requestLeafRecovery`
+// re-mints a `RequestEvidence` from the row's OWN `signed_request_bytes` +
+// `requested_at` under the requester's historical signing key. For
+// `acceptConversation`, the request has no direct origin-transition FK, so its
+// exact immutable participant-period acceptance provenance is joined to the
+// transition and control entry by conversation/requester/key/time/successor/
+// signed bytes; the full candidate set must contain exactly one row, and that
+// entry is re-verified through `load_historical_control_evidence`.
 //
 // SCOPE (NEXT-STEP follow-ups, fail-closed until reconstructed + tested): the
-// `acceptConversation` source (an `Acceptance` `TransitionEvidence` origin) and
-// the remaining TERMINAL families (`cancelled` / `expired` / `superseded`
+// remaining TERMINAL families (`cancelled` / `expired` / `superseded`
 // requests and `expired` / `released` reservations) each need their own later
 // real-signed / expiry / device-revocation coherent seed. This leg reconstructs
 // both `open` / `active` (terminal `None`) and `fulfilled` / `consumed` (one
 // exact re-verified leafRecovery transition) and fails CLOSED
-// (`UnsupportedSource` / `UnsupportedTerminal`) on the named remainder — never
+// (`UnsupportedTerminal`) on the named remainder — never
 // fabricating a terminal or an origin it cannot re-verify.
 //
 // `validate_recovery_work` at assembly is the drift fence: it re-derives the 1:1
@@ -3321,11 +3322,6 @@ pub(crate) enum RecoveryHydrationError {
     /// without its request, unequal counts, or a duplicate). Fail closed.
     #[error("clean-chat recovery request/reservation pairing is not 1:1")]
     PairMismatch,
-    /// The request's `source` is `acceptConversation`, whose `Acceptance`
-    /// transition origin is the NEXT-STEP follow-up of this leg. Fail closed until
-    /// that arm is reconstructed + tested.
-    #[error("clean-chat recovery acceptConversation source is not yet reconstructed")]
-    UnsupportedSource,
     /// The request/reservation carries a terminal status outside this sub-seal's
     /// fulfilled/consumed arm. Cancellation is owned by the signed cancellation
     /// fixture, expiry by the expiry fixture, and supersession/release by the
@@ -3446,6 +3442,8 @@ struct DurableRecoveryRequestRow {
     recovery_request_id: Uuid,
     requester_did: String,
     requester_device_id: Uuid,
+    requester_key_id: String,
+    requester_auth_generation: i64,
     recovery_kind: String,
     source: String,
     generation: i64,
@@ -3469,6 +3467,18 @@ struct DurableRecoveryRequestRow {
     fulfilling_transition_kind: Option<String>,
     fulfilling_transition_accepted_at: Option<DateTime<Utc>>,
     signing_public_key: Vec<u8>,
+}
+
+/// An acceptance-origin request has no direct origin-transition FK. The SQL
+/// locator therefore returns the complete immutable candidate set and this
+/// selector refuses both absence and ambiguity.
+pub(crate) fn select_single_acceptance_origin(
+    candidates: Vec<Uuid>,
+) -> Result<Uuid, RecoveryHydrationError> {
+    let [candidate] = candidates.as_slice() else {
+        return Err(RecoveryHydrationError::InvalidProvenance);
+    };
+    Ok(*candidate)
 }
 
 /// Load the leaf-recovery work of an existing conversation as a validated 1:1
@@ -3638,6 +3648,8 @@ pub(crate) async fn load_recovery_work_hydration_rows(
             lr.recovery_request_id,
             lr.requester_did,
             lr.requester_device_id,
+            lr.requester_key_id,
+            lr.requester_auth_generation,
             lr.recovery_kind,
             lr.source,
             lr.generation,
@@ -3681,6 +3693,8 @@ pub(crate) async fn load_recovery_work_hydration_rows(
         recovery_request_id,
         requester_did,
         requester_device_id,
+        requester_key_id,
+        requester_auth_generation,
         recovery_kind,
         source,
         generation,
@@ -3707,6 +3721,7 @@ pub(crate) async fn load_recovery_work_hydration_rows(
     } in request_rows
     {
         let request_id = *recovery_request_id.as_bytes();
+        let requester_did_locator = requester_did.clone();
         let target = recovery_device(requester_did, requester_device_id)?;
         let kind = match recovery_kind.as_str() {
             "add" => LeafRecoveryKind::Add,
@@ -3715,7 +3730,7 @@ pub(crate) async fn load_recovery_work_hydration_rows(
         };
         let source = match source.as_str() {
             "requestLeafRecovery" => RecoverySource::Request,
-            "acceptConversation" => return Err(RecoveryHydrationError::UnsupportedSource),
+            "acceptConversation" => RecoverySource::Acceptance,
             _ => return Err(RecoveryHydrationError::OutOfDomain),
         };
         let bound_coordinate = recovery_coordinate(
@@ -3833,15 +3848,109 @@ pub(crate) async fn load_recovery_work_hydration_rows(
             _ => return Err(RecoveryHydrationError::OutOfDomain),
         };
 
-        let received_at_canonical = canonical_millis(requested_at);
-        let origin = authority
-            .hydrate_historical_signed_request_from_durable_bytes(
-                conversation_bytes,
-                &received_at_canonical,
-                &signed_request_bytes,
-                &signing_public_key,
-            )
-            .map_err(|_| RecoveryHydrationError::InvalidProvenance)?;
+        let received_at = recovery_timestamp(requested_at)?;
+        let origin = match source {
+            RecoverySource::Request => {
+                let received_at_canonical = canonical_millis(requested_at);
+                let origin = authority
+                    .hydrate_historical_signed_request_from_durable_bytes(
+                        conversation_bytes,
+                        &received_at_canonical,
+                        &signed_request_bytes,
+                        &signing_public_key,
+                    )
+                    .map_err(|_| RecoveryHydrationError::InvalidProvenance)?;
+                RecoveryOriginHydrationRow::Request(origin)
+            }
+            RecoverySource::Acceptance => {
+                let candidates: Vec<(Uuid,)> = sqlx::query_as(
+                    r#"
+                    SELECT p.acceptance_transition_id
+                    FROM chat.participants p
+                    JOIN chat.transitions t
+                      ON t.conversation_id = p.conversation_id
+                     AND t.transition_id = p.acceptance_transition_id
+                     AND t.accepted_at = p.accepted_at
+                    JOIN chat.entries e
+                      ON e.conversation_id = t.conversation_id
+                     AND e.entry_id = p.acceptance_entry_id
+                     AND e.transition_id = t.transition_id
+                     AND e.seq = t.entry_seq
+                    WHERE p.conversation_id = $1
+                      AND p.user_did = $2
+                      AND p.acceptance_transition_id IS NOT NULL
+                      AND p.accepted_at = $3
+                      AND t.kind = 'acceptConversation'
+                      AND t.actor_did = $2
+                      AND t.actor_device_id = $4
+                      AND t.actor_key_id = $5
+                      AND t.actor_auth_generation = $6
+                      AND t.accepted_at = $3
+                      AND t.next_generation = $7
+                      AND t.next_state_version = $8
+                      AND t.signed_request_bytes = $9
+                      AND e.entry_kind =
+                          'blue.catbird.chat.defs#participantAcceptanceEntry'
+                      AND e.actor_did = $2
+                      AND e.actor_device_id = $4
+                      AND e.actor_key_id = $5
+                      AND e.actor_auth_generation = $6
+                      AND e.received_at = $3
+                      AND e.signed_request_bytes = $9
+                    "#,
+                )
+                .bind(conversation_id)
+                .bind(&requester_did_locator)
+                .bind(requested_at)
+                .bind(requester_device_id)
+                .bind(&requester_key_id)
+                .bind(requester_auth_generation)
+                .bind(generation)
+                .bind(bound_state_version)
+                .bind(&signed_request_bytes)
+                .fetch_all(&mut **transaction)
+                .await?;
+                let transition_id = select_single_acceptance_origin(
+                    candidates
+                        .into_iter()
+                        .map(|(transition_id,)| transition_id)
+                        .collect(),
+                )?;
+                let evidence = load_historical_control_evidence(
+                    transaction,
+                    authority,
+                    conversation_id,
+                    transition_id,
+                )
+                .await
+                .map_err(|_| RecoveryHydrationError::InvalidProvenance)?
+                .into_transition()
+                .map_err(|_| RecoveryHydrationError::InvalidProvenance)?;
+                let requester_key_bytes = URL_SAFE_NO_PAD
+                    .decode(&requester_key_id)
+                    .ok()
+                    .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+                    .ok_or(RecoveryHydrationError::OutOfDomain)?;
+                let requester_auth_generation = recovery_u64(requester_auth_generation)?;
+                let signed_authority = evidence
+                    .signed_authority()
+                    .ok_or(RecoveryHydrationError::InvalidProvenance)?;
+                if evidence.transition_id() != transition_id.as_bytes()
+                    || evidence.received_at() != received_at
+                    || signed_authority.kind() != SignedMutationKind::ParticipantAcceptance
+                    || signed_authority.control_conversation_id() != Some(&conversation_bytes)
+                    || signed_authority.actor() != &target
+                    || signed_authority.key_id() != &requester_key_bytes
+                    || signed_authority.auth_generation() != requester_auth_generation
+                    || signed_authority.signed_request_bytes() != signed_request_bytes
+                {
+                    return Err(RecoveryHydrationError::InvalidProvenance);
+                }
+                let evidence = classify_acceptance(evidence, target.principal())
+                    .map_err(|_| RecoveryHydrationError::InvalidProvenance)?;
+                RecoveryOriginHydrationRow::Acceptance(evidence)
+            }
+        };
 
         requests.push(RecoveryRequestHydrationRow {
             request_id,
@@ -3850,10 +3959,10 @@ pub(crate) async fn load_recovery_work_hydration_rows(
             source,
             bound_coordinate,
             key_package_ref: reservation_key_package_ref,
-            received_at: recovery_timestamp(requested_at)?,
+            received_at,
             expires_at: recovery_timestamp(expires_at)?,
             status,
-            origin: RecoveryOriginHydrationRow::Request(origin),
+            origin,
             terminal: terminal.clone(),
         });
         reservations_by_id

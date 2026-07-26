@@ -3312,9 +3312,8 @@ mod historical_control_loader {
     // row) whose `prior` coordinate binds the fresh conversation id. The loader
     // pairs the two tables 1:1, re-mints the request ORIGIN through the signed-path
     // loader seam, and byte-equals the direct in-memory re-mint. The terminal
-    // (`fulfilled`/`consumed`) and `acceptConversation` arms are the NEXT-STEP
-    // follow-up — this leg fails CLOSED on them (`UnsupportedTerminal` /
-    // `UnsupportedSource`), asserted live here so the scope boundary is real.
+    // (`fulfilled`/`consumed`) and real `acceptConversation` arms are exercised
+    // below; malformed terminal families remain fail-closed.
     // -----------------------------------------------------------------------
     mod recovery_leg {
         use base64::{
@@ -3337,8 +3336,9 @@ mod historical_control_loader {
             load_participant_hydration_rows, load_producer_transition_evidence,
             load_recovery_work_hydration_rows, load_reset_request_hydration_rows,
             load_welcome_hydration_rows, select_fulfilled_recovery_terminal,
-            select_welcome_terminal, FulfilledRecoveryTerminalColumns, RecoveryHydrationError,
-            WelcomeTerminalColumns, WelcomeTerminalSelection,
+            select_single_acceptance_origin, select_welcome_terminal,
+            FulfilledRecoveryTerminalColumns, RecoveryHydrationError, WelcomeTerminalColumns,
+            WelcomeTerminalSelection,
         };
         use crate::chat_protocol::snapshot::{
             PublicGroupSnapshotCoordinate, PublicGroupSnapshotLeaf, PublicGroupSnapshotLifecycle,
@@ -3403,6 +3403,212 @@ mod historical_control_loader {
             signing_transcript: Vec<u8>,
             request_digest: Vec<u8>,
             signature: Vec<u8>,
+        }
+
+        struct AcceptanceInvitee {
+            did: String,
+            device_id: Uuid,
+            key_id: String,
+            signing_key: SigningKey,
+            participant_period_id: Uuid,
+        }
+
+        fn creation_with_pending_invitee(
+            mut entry: RealCreationEntry,
+        ) -> (RealCreationEntry, AcceptanceInvitee) {
+            let seed: [u8; 32] =
+                Sha256::digest([b"acceptance-invitee".as_ref(), &entry.cid].concat()).into();
+            let signing_key = SigningKey::from_bytes(&seed);
+            let public_key = signing_key.verifying_key().to_bytes();
+            let key_id = ed25519_key_id(&public_key).unwrap().as_str().to_owned();
+            const PLC_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
+            let did_suffix: String = seed
+                .iter()
+                .take(24)
+                .map(|byte| PLC_ALPHABET[usize::from(*byte % 32)] as char)
+                .collect();
+            let did = format!("did:plc:{did_suffix}");
+            let device_id = Uuid::new_v4();
+            let participant_period_id = Uuid::new_v4();
+
+            let mut wrapper: Value = serde_json::from_slice(&entry.raw_wrapper).unwrap();
+            let creation_transition_id =
+                wrapper["body"]["transitionId"].as_str().unwrap().to_owned();
+            let pending = json!({
+                "userDid": &did,
+                "status": "pending",
+                "role": "member",
+                "invitationProvenance": {
+                    "invitationTransitionId": creation_transition_id,
+                    "invitedByDid": &entry.actor_did,
+                    "invitedByDeviceId": entry.actor_device_id.hyphenated().to_string(),
+                }
+            });
+            let participants = wrapper["body"]["manifest"]["participants"]
+                .as_array_mut()
+                .unwrap();
+            participants.push(pending);
+            participants.sort_by(|left, right| {
+                left["userDid"]
+                    .as_str()
+                    .unwrap()
+                    .cmp(right["userDid"].as_str().unwrap())
+            });
+            wrapper["signature"] = Value::String(STANDARD.encode([0_u8; 64]));
+            let canonical =
+                decode_canonical_signed_mutation(&serde_json::to_vec(&wrapper).unwrap()).unwrap();
+            wrapper["signature"] = Value::String(
+                STANDARD.encode(
+                    entry
+                        .signing_key()
+                        .sign(canonical.transcript_bytes())
+                        .to_bytes(),
+                ),
+            );
+            entry.raw_wrapper = serde_json::to_vec(&wrapper).unwrap();
+            let mut row: Value = serde_json::from_slice(&entry.public_row_json).unwrap();
+            row["signedRequest"] = wrapper;
+            entry.public_row_json = serde_json::to_vec(&row).unwrap();
+            entry.outer_entry_fingerprint =
+                *decode_and_verify_control_entry(&entry.public_row_json, &entry.public_key)
+                    .expect("creation with pending invitee verifies")
+                    .outer_control_fingerprint();
+
+            (
+                entry,
+                AcceptanceInvitee {
+                    did,
+                    device_id,
+                    key_id,
+                    signing_key,
+                    participant_period_id,
+                },
+            )
+        }
+
+        struct RealAcceptanceEntry {
+            entry_id: Uuid,
+            transition_id: Uuid,
+            request_id: [u8; 16],
+            key_package_ref: [u8; 32],
+            key_package_wrapper: Vec<u8>,
+            public_row_json: Vec<u8>,
+            raw_wrapper: Vec<u8>,
+            unsigned_projection: Vec<u8>,
+            signing_transcript: Vec<u8>,
+            request_digest: Vec<u8>,
+            signature: Vec<u8>,
+            server_fields: Vec<u8>,
+            outer_fingerprint: [u8; 32],
+        }
+
+        fn build_real_acceptance_entry(
+            entry: &RealCreationEntry,
+            invitee: &AcceptanceInvitee,
+            creation_transition_id: Uuid,
+        ) -> RealAcceptanceEntry {
+            let entry_id = Uuid::new_v4();
+            let transition_id = Uuid::new_v4();
+            let request_id = *Uuid::new_v4().as_bytes();
+            let key_package_ref: [u8; 32] =
+                Sha256::digest([b"acceptance-kp".as_ref(), &request_id].concat()).into();
+            let key_package_wrapper =
+                [b"genuine-acceptance-package".as_ref(), &request_id].concat();
+            let key_package_sha: [u8; 32] = Sha256::digest(&key_package_wrapper).into();
+            let prior = genesis_coordinate_json(entry.cid);
+            let mut next = prior.clone();
+            next["stateVersion"] = json!(1);
+            let body = json!({
+                "$type": SignedMutationKind::ParticipantAcceptance.type_id(),
+                "signatureDomain": String::from_utf8(
+                    SignedMutationKind::ParticipantAcceptance.domain().to_vec()
+                ).unwrap(),
+                "actorDid": &invitee.did,
+                "actorDeviceId": invitee.device_id.hyphenated().to_string(),
+                "keyId": &invitee.key_id,
+                "authGeneration": 1,
+                "idempotencyKey": Uuid::new_v4().hyphenated().to_string(),
+                "signedAt": SIGNED_AT,
+                "transitionId": transition_id.hyphenated().to_string(),
+                "prior": prior,
+                "next": next.clone(),
+                "recoveryRequestId": Uuid::from_bytes(request_id).hyphenated().to_string(),
+                "invitationProvenance": {
+                    "invitationTransitionId": creation_transition_id.hyphenated().to_string(),
+                    "invitedByDid": &entry.actor_did,
+                    "invitedByDeviceId": entry.actor_device_id.hyphenated().to_string(),
+                }
+            });
+            let mut wrapper = json!({"body": body, "signature": STANDARD.encode([0_u8; 64])});
+            let canonical =
+                decode_canonical_signed_mutation(&serde_json::to_vec(&wrapper).unwrap()).unwrap();
+            let signing_transcript = canonical.transcript_bytes().to_vec();
+            let signature = invitee.signing_key.sign(&signing_transcript).to_bytes();
+            wrapper["signature"] = Value::String(STANDARD.encode(signature));
+            let raw_wrapper = serde_json::to_vec(&wrapper).unwrap();
+            let recovery = json!({
+                "recoveryRequestId": Uuid::from_bytes(request_id).hyphenated().to_string(),
+                "conversationId": Uuid::from_bytes(entry.cid).hyphenated().to_string(),
+                "requesterDid": &invitee.did,
+                "requesterDeviceId": invitee.device_id.hyphenated().to_string(),
+                "recoveryKind": "add",
+                "boundCoordinate": next.clone(),
+                "reservation": {
+                    "recoveryRequestId": Uuid::from_bytes(request_id).hyphenated().to_string(),
+                    "conversationId": Uuid::from_bytes(entry.cid).hyphenated().to_string(),
+                    "boundCoordinate": next,
+                    "requesterDid": &invitee.did,
+                    "requesterDeviceId": invitee.device_id.hyphenated().to_string(),
+                    "requesterKeyId": &invitee.key_id,
+                    "requesterAuthGeneration": 1,
+                    "keyPackageRef": STANDARD.encode(key_package_ref),
+                    "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+                    "purpose": "leafRecovery",
+                    "status": "active",
+                    "expiresAt": EXPIRES_AT,
+                    "keyPackage": {
+                        "framing": "mlsMessage",
+                        "contentType": "keyPackage",
+                        "bytes": STANDARD.encode(&key_package_wrapper),
+                        "sha256": STANDARD.encode(key_package_sha),
+                        "keyPackageRef": STANDARD.encode(key_package_ref),
+                    }
+                },
+                "status": "open",
+                "requestedAt": REQUESTED_AT,
+                "expiresAt": EXPIRES_AT,
+            });
+            let row = json!({
+                "$type": "blue.catbird.chat.defs#participantAcceptanceEntry",
+                "entryId": entry_id.hyphenated().to_string(),
+                "conversationId": Uuid::from_bytes(entry.cid).hyphenated().to_string(),
+                "seq": 2,
+                "signedRequest": wrapper,
+                "recovery": recovery,
+                "receivedAt": REQUESTED_AT,
+            });
+            let public_row_json = serde_json::to_vec(&row).unwrap();
+            let decoded = decode_and_verify_control_entry(
+                &public_row_json,
+                &invitee.signing_key.verifying_key().to_bytes(),
+            )
+            .expect("real acceptance entry verifies");
+            let canonical = decode_canonical_signed_mutation(&raw_wrapper).unwrap();
+            RealAcceptanceEntry {
+                entry_id,
+                transition_id,
+                request_id,
+                key_package_ref,
+                key_package_wrapper,
+                public_row_json,
+                raw_wrapper,
+                unsigned_projection: canonical.canonical_projection().to_vec(),
+                signing_transcript,
+                request_digest: Sha256::digest(canonical.transcript_bytes()).to_vec(),
+                signature: signature.to_vec(),
+                server_fields: decoded.server_fields_dag_cbor().unwrap(),
+                outer_fingerprint: *decoded.outer_control_fingerprint(),
+            }
         }
 
         fn build_signed_recovery_request(
@@ -3577,6 +3783,340 @@ mod historical_control_loader {
                 raw_wrapper: signed.raw_wrapper,
                 creation_transition_id,
                 replaced_leaf_period_id,
+            }
+        }
+
+        async fn commit_real_acceptance_recovery(
+            pool: &PgPool,
+        ) -> (RealCreationEntry, AcceptanceInvitee, RealAcceptanceEntry) {
+            let cid = Uuid::new_v4();
+            let (mut entry, invitee) =
+                creation_with_pending_invitee(build_real_creation_entry(*cid.as_bytes()));
+            entry.head_next_entry_seq = 3;
+            let creation = seed_real_creation_graph(pool, &entry).await;
+            let acceptance = build_real_acceptance_entry(&entry, &invitee, creation);
+            let creation_at: DateTime<Utc> = sqlx::query_scalar(
+                "SELECT accepted_at FROM chat.transitions WHERE transition_id=$1",
+            )
+            .bind(creation)
+            .fetch_one(pool)
+            .await
+            .expect("creation accepted time");
+            let accepted_at = instant(REQUESTED_AT);
+            let mut tx = pool.begin().await.expect("begin acceptance graph");
+            sqlx::query("INSERT INTO chat.principals(user_did,created_at) VALUES($1,$2)")
+                .bind(&invitee.did)
+                .bind(creation_at)
+                .execute(&mut *tx)
+                .await
+                .expect("insert invitee principal");
+            sqlx::query(
+                "INSERT INTO chat.devices(user_did,device_id,device_name,status,dpop_jkt,auth_generation,capabilities,created_at,updated_at) \
+                 VALUES($1,$2,'acceptance-invitee','active',$3,1,chat.protocol_capabilities(),$4,$4)",
+            )
+            .bind(&invitee.did)
+            .bind(invitee.device_id)
+            .bind(&invitee.key_id)
+            .bind(creation_at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert invitee device");
+            sqlx::query(
+                "INSERT INTO chat.device_keys(user_did,device_id,key_id,signing_public_key,enrollment_auth_generation,created_at) \
+                 VALUES($1,$2,$3,$4,1,$5)",
+            )
+            .bind(&invitee.did)
+            .bind(invitee.device_id)
+            .bind(&invitee.key_id)
+            .bind(invitee.signing_key.verifying_key().to_bytes().to_vec())
+            .bind(creation_at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert invitee key");
+            sqlx::query(
+                r#"INSERT INTO chat.participants(
+                    participant_period_id,conversation_id,user_did,status,role,role_transition_id,
+                    role_changed_at,created_by_did,created_by_device_id,invitation_transition_id,
+                    invitation_entry_id,invited_at,current_membership,created_at
+                ) VALUES($1,$2,$3,'pending','member',$4,$5,$6,$7,$4,$8,$5,true,$5)"#,
+            )
+            .bind(invitee.participant_period_id)
+            .bind(cid)
+            .bind(&invitee.did)
+            .bind(creation)
+            .bind(creation_at)
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .bind(entry.entry_id)
+            .execute(&mut *tx)
+            .await
+            .expect("insert pending invitee");
+
+            let spine: (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, i64) = sqlx::query_as(
+                "SELECT public_snapshot_bytes,snapshot_sha256,tree_summary_bytes,\
+                        tree_summary_sha256,leaf_count FROM chat.generation_states \
+                  WHERE conversation_id=$1 AND generation=0 AND state_version=0",
+            )
+            .bind(cid)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("load genesis spine");
+            sqlx::query(
+                "UPDATE chat.conversations SET current_state_version=1,next_entry_seq=3 \
+                  WHERE conversation_id=$1 AND current_generation=0 AND current_state_version=0 AND next_entry_seq=2",
+            )
+            .bind(cid)
+            .execute(&mut *tx)
+            .await
+            .expect("advance conversation");
+            sqlx::query(
+                "UPDATE chat.generations SET current_state_version=1 \
+                  WHERE conversation_id=$1 AND generation=0 AND current_state_version=0",
+            )
+            .bind(cid)
+            .execute(&mut *tx)
+            .await
+            .expect("advance generation");
+            sqlx::query(
+                r#"INSERT INTO chat.generation_states(
+                    conversation_id,generation,state_version,group_id,epoch,group_context_hash,
+                    confirmation_tag,lifecycle,state_kind,producing_transition_id,
+                    public_snapshot_bytes,snapshot_sha256,tree_summary_bytes,tree_summary_sha256,
+                    leaf_count,created_at
+                ) VALUES($1,0,1,$2,0,$3,$4,'active','acceptConversation',$5,$6,$7,$8,$9,$10,$11)"#,
+            )
+            .bind(cid)
+            .bind(vec![1_u8; 32])
+            .bind(vec![2_u8; 32])
+            .bind(vec![3_u8; 32])
+            .bind(acceptance.transition_id)
+            .bind(spine.0)
+            .bind(spine.1)
+            .bind(spine.2)
+            .bind(spine.3)
+            .bind(spine.4)
+            .bind(accepted_at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert acceptance state");
+            sqlx::query(
+                r#"INSERT INTO chat.transitions(
+                    transition_id,conversation_id,kind,actor_did,actor_device_id,actor_key_id,
+                    actor_auth_generation,actor_role,actor_device_status,signed_request_bytes,
+                    unsigned_projection_bytes,signing_transcript_bytes,request_digest,signature,
+                    prior_generation,prior_state_version,next_generation,next_state_version,
+                    entry_seq,accepted_at
+                ) VALUES($1,$2,'acceptConversation',$3,$4,$5,1,'member','active',$6,$7,$8,$9,$10,0,0,0,1,2,$11)"#,
+            )
+            .bind(acceptance.transition_id)
+            .bind(cid)
+            .bind(&invitee.did)
+            .bind(invitee.device_id)
+            .bind(&invitee.key_id)
+            .bind(&acceptance.raw_wrapper)
+            .bind(&acceptance.unsigned_projection)
+            .bind(&acceptance.signing_transcript)
+            .bind(&acceptance.request_digest)
+            .bind(&acceptance.signature)
+            .bind(accepted_at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert acceptance transition");
+            sqlx::query(
+                r#"INSERT INTO chat.entries(
+                    conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,
+                    accepted_payload_sha256,signed_request_bytes,request_digest,signature,
+                    server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,
+                    actor_key_id,actor_auth_generation,generation,state_version,transition_id,received_at
+                ) VALUES($1,2,$2,'blue.catbird.chat.defs#participantAcceptanceEntry',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1,0,1,$13,$14)"#,
+            )
+            .bind(cid)
+            .bind(acceptance.entry_id)
+            .bind(&acceptance.public_row_json)
+            .bind(Sha256::digest(&acceptance.public_row_json).to_vec())
+            .bind(&acceptance.raw_wrapper)
+            .bind(&acceptance.request_digest)
+            .bind(&acceptance.signature)
+            .bind(&acceptance.server_fields)
+            .bind(acceptance.outer_fingerprint.to_vec())
+            .bind(&invitee.did)
+            .bind(invitee.device_id)
+            .bind(&invitee.key_id)
+            .bind(acceptance.transition_id)
+            .bind(accepted_at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert acceptance entry");
+            sqlx::query(
+                "UPDATE chat.participants SET status='active',acceptance_transition_id=$2,\
+                    acceptance_entry_id=$3,accepted_at=$4 \
+                  WHERE participant_period_id=$1 AND status='pending'",
+            )
+            .bind(invitee.participant_period_id)
+            .bind(acceptance.transition_id)
+            .bind(acceptance.entry_id)
+            .bind(accepted_at)
+            .execute(&mut *tx)
+            .await
+            .expect("promote invitee");
+
+            let init_key =
+                Sha256::digest([b"acceptance-init".as_ref(), &acceptance.request_id].concat())
+                    .to_vec();
+            sqlx::query(
+                r#"INSERT INTO chat.key_packages(
+                    key_package_ref,wrapper_bytes,wrapper_sha256,init_key,owner_did,
+                    owner_device_id,owner_key_id,owner_auth_generation,not_before,not_after,
+                    status,created_at
+                ) VALUES($1,$2,$3,$4,$5,$6,$7,1,$8,$9,'reserved',$10)"#,
+            )
+            .bind(acceptance.key_package_ref.to_vec())
+            .bind(&acceptance.key_package_wrapper)
+            .bind(Sha256::digest(&acceptance.key_package_wrapper).to_vec())
+            .bind(init_key)
+            .bind(&invitee.did)
+            .bind(invitee.device_id)
+            .bind(&invitee.key_id)
+            .bind(instant(KP_NOT_BEFORE))
+            .bind(instant(KP_NOT_AFTER))
+            .bind(accepted_at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert acceptance package");
+            let request_uuid = Uuid::from_bytes(acceptance.request_id);
+            sqlx::query(
+                r#"INSERT INTO chat.key_package_reservations(
+                    recovery_request_id,key_package_ref,conversation_id,generation,requester_did,
+                    requester_device_id,requester_key_id,requester_auth_generation,recipient_did,
+                    recipient_device_id,bound_state_version,bound_group_id,bound_epoch,
+                    bound_group_context_hash,bound_confirmation_tag,purpose,expires_at,status,created_at
+                ) VALUES($1,$2,$3,0,$4,$5,$6,1,$4,$5,1,$7,0,$8,$9,'leafRecovery',$10,'active',$11)"#,
+            )
+            .bind(request_uuid)
+            .bind(acceptance.key_package_ref.to_vec())
+            .bind(cid)
+            .bind(&invitee.did)
+            .bind(invitee.device_id)
+            .bind(&invitee.key_id)
+            .bind(vec![1_u8; 32])
+            .bind(vec![2_u8; 32])
+            .bind(vec![3_u8; 32])
+            .bind(instant(EXPIRES_AT))
+            .bind(accepted_at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert acceptance reservation");
+            sqlx::query(
+                r#"INSERT INTO chat.leaf_recovery_requests(
+                    recovery_request_id,conversation_id,generation,requester_did,requester_device_id,
+                    requester_key_id,requester_auth_generation,recovery_kind,source,bound_state_version,
+                    bound_group_id,bound_epoch,bound_group_context_hash,bound_confirmation_tag,
+                    reservation_request_id,status,signed_request_bytes,signing_transcript_bytes,
+                    request_digest,signature,requested_at,expires_at
+                ) VALUES($1,$2,0,$3,$4,$5,1,'add','acceptConversation',1,$6,0,$7,$8,$1,'open',$9,$10,$11,$12,$13,$14)"#,
+            )
+            .bind(request_uuid)
+            .bind(cid)
+            .bind(&invitee.did)
+            .bind(invitee.device_id)
+            .bind(&invitee.key_id)
+            .bind(vec![1_u8; 32])
+            .bind(vec![2_u8; 32])
+            .bind(vec![3_u8; 32])
+            .bind(&acceptance.raw_wrapper)
+            .bind(&acceptance.signing_transcript)
+            .bind(&acceptance.request_digest)
+            .bind(&acceptance.signature)
+            .bind(accepted_at)
+            .bind(instant(EXPIRES_AT))
+            .execute(&mut *tx)
+            .await
+            .expect("insert acceptance recovery");
+            tx.commit()
+                .await
+                .expect("commit genuine acceptance recovery graph");
+            (entry, invitee, acceptance)
+        }
+
+        async fn load_acceptance_aggregate(
+            pool: &PgPool,
+            entry: &RealCreationEntry,
+        ) -> ConversationStateHydration {
+            let cid = Uuid::from_bytes(entry.cid);
+            let historical =
+                HistoricalRehydrationAuthority::new(entry.cid, entry.head_next_entry_seq).unwrap();
+            let mut tx = pool.begin().await.expect("begin acceptance aggregate load");
+            let guard = hydrate_locked_public_state(&mut tx, cid, instant(REQUESTED_AT))
+                .await
+                .expect("locked public state");
+            let (_, _, coordinate, snapshot, binding, _, _, _, _) = guard.into_parts();
+            let leaves = load_leaf_hydration_rows(&mut tx, cid, &binding)
+                .await
+                .expect("leaf rows");
+            let public_state =
+                ActivePublicState::for_test_from_persisted_binding(snapshot, binding)
+                    .expect("bound public state");
+            let producer = load_producer_transition_evidence(&mut tx, &historical, cid)
+                .await
+                .expect("producer");
+            // Acceptance retains the prior metadata, but the separately owned
+            // metadata loader currently only searches the current state version.
+            // Splice the exact reverified creation producer so this test reaches
+            // the recovery validator without fabricating metadata evidence.
+            let creation_transition_id = {
+                let wrapper: Value = serde_json::from_slice(&entry.raw_wrapper).unwrap();
+                Uuid::parse_str(wrapper["body"]["transitionId"].as_str().unwrap()).unwrap()
+            };
+            let metadata_producer = super::load_historical_control_evidence(
+                &mut tx,
+                &historical,
+                cid,
+                creation_transition_id,
+            )
+            .await
+            .expect("retained metadata producer")
+            .into_transition()
+            .expect("creation metadata producer is a transition");
+            let metadata = crate::chat_protocol::state_machine::metadata_binding_of_transition(
+                &metadata_producer,
+            )
+            .expect("creation carries retained metadata");
+            let participants = load_participant_hydration_rows(&mut tx, &historical, cid)
+                .await
+                .expect("participants");
+            let intervals = load_interval_hydration_rows(&mut tx, &historical, cid)
+                .await
+                .expect("intervals");
+            let (recovery_requests, recovery_reservations) =
+                load_recovery_work_hydration_rows(&mut tx, &historical, cid)
+                    .await
+                    .expect("recovery work");
+            let reset_requests = load_reset_request_hydration_rows(&mut tx, &historical, cid)
+                .await
+                .expect("reset work");
+            let leave_requests = load_leave_request_hydration_rows(&mut tx, &historical, cid)
+                .await
+                .expect("leave work");
+            let welcomes = load_welcome_hydration_rows(&mut tx, &historical, cid)
+                .await
+                .expect("welcomes");
+            tx.rollback().await.expect("rollback aggregate read");
+            ConversationStateHydration {
+                kind: ConversationKind::Group,
+                coordinate,
+                producer,
+                public_state: Some(public_state),
+                metadata: Some(metadata),
+                metadata_producer: Some(metadata_producer),
+                participants,
+                leaves,
+                intervals,
+                terminal_proofs: Vec::new(),
+                recovery_requests,
+                recovery_reservations,
+                reset_requests,
+                leave_requests,
+                welcomes,
             }
         }
 
@@ -6352,6 +6892,20 @@ mod historical_control_loader {
             }
         }
 
+        #[test]
+        fn acceptance_origin_locator_requires_exactly_one_candidate() {
+            let exact = Uuid::new_v4();
+            assert_eq!(select_single_acceptance_origin(vec![exact]).unwrap(), exact);
+            assert!(matches!(
+                select_single_acceptance_origin(Vec::new()),
+                Err(RecoveryHydrationError::InvalidProvenance)
+            ));
+            assert!(matches!(
+                select_single_acceptance_origin(vec![exact, Uuid::new_v4()]),
+                Err(RecoveryHydrationError::InvalidProvenance)
+            ));
+        }
+
         /// The open recovery pair hydrates 1:1: the reservation supplies the
         /// request's `key_package_ref` + `package_not_after`, and the request origin
         /// re-mints byte-equal to the direct in-memory signed-path re-hydration.
@@ -6416,6 +6970,89 @@ mod historical_control_loader {
             assert_eq!(reservation.expires_at, request.expires_at);
         }
 
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn recovery_pair_hydrates_the_genuine_acceptance_origin() {
+            let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+            let (entry, invitee, acceptance) = commit_real_acceptance_recovery(&pool).await;
+            let cid = Uuid::from_bytes(entry.cid);
+            let authority =
+                HistoricalRehydrationAuthority::new(entry.cid, entry.head_next_entry_seq).unwrap();
+
+            let mut tx = pool.begin().await.expect("fresh acceptance load");
+            let reference = super::load_historical_control_evidence(
+                &mut tx,
+                &authority,
+                cid,
+                acceptance.transition_id,
+            )
+            .await
+            .expect("acceptance evidence loads")
+            .into_transition()
+            .expect("acceptance is a transition");
+            let (requests, reservations) =
+                load_recovery_work_hydration_rows(&mut tx, &authority, cid)
+                    .await
+                    .expect("acceptance-origin recovery hydrates");
+            tx.rollback().await.expect("rollback read transaction");
+
+            assert_eq!(requests.len(), 1);
+            assert_eq!(reservations.len(), 1);
+            let request = &requests[0];
+            assert_eq!(request.request_id, acceptance.request_id);
+            assert_eq!(request.source, RecoverySource::Acceptance);
+            assert_eq!(request.kind, LeafRecoveryKind::Add);
+            assert_eq!(
+                request.target,
+                DeviceIdentity::new(
+                    PrincipalId::new(invitee.did.clone().into_bytes()).unwrap(),
+                    *invitee.device_id.as_bytes(),
+                )
+                .unwrap()
+            );
+            assert_eq!(
+                request.origin,
+                RecoveryOriginHydrationRow::Acceptance(reference)
+            );
+            assert_eq!(request.key_package_ref, acceptance.key_package_ref);
+            assert_eq!(reservations[0].request_id, acceptance.request_id);
+            assert_eq!(reservations[0].bound_coordinate, request.bound_coordinate);
+
+            let aggregate = load_acceptance_aggregate(&pool, &entry).await;
+            let aggregate_authority =
+                crate::chat_protocol::state_machine::HydrationAuthority::new(entry.cid).unwrap();
+            crate::chat_protocol::state_machine::hydrate_conversation_state(
+                &aggregate_authority,
+                aggregate.clone(),
+            )
+            .expect("production aggregate accepts genuine acceptance-origin recovery");
+
+            let mut wrong_request_id = aggregate.clone();
+            let foreign_request_id = *Uuid::new_v4().as_bytes();
+            wrong_request_id.recovery_requests[0].request_id = foreign_request_id;
+            wrong_request_id.recovery_reservations[0].request_id = foreign_request_id;
+            assert!(matches!(
+                crate::chat_protocol::state_machine::hydrate_conversation_state(
+                    &aggregate_authority,
+                    wrong_request_id,
+                ),
+                Err(crate::chat_protocol::state_machine::StateMachineError::InvariantViolation)
+            ));
+
+            let mut wrong_package = aggregate;
+            let foreign_package_ref: [u8; 32] =
+                Sha256::digest(b"foreign-acceptance-package").into();
+            wrong_package.recovery_requests[0].key_package_ref = foreign_package_ref;
+            wrong_package.recovery_reservations[0].key_package_ref = foreign_package_ref;
+            assert!(matches!(
+                crate::chat_protocol::state_machine::hydrate_conversation_state(
+                    &aggregate_authority,
+                    wrong_package,
+                ),
+                Err(crate::chat_protocol::state_machine::StateMachineError::InvariantViolation)
+            ));
+        }
+
         /// The recovery leg fails CLOSED when the read-time authority binds a
         /// different conversation: the signed request's embedded `prior`
         /// conversation id mismatches, so the origin re-verification rejects it
@@ -6443,9 +7080,10 @@ mod historical_control_loader {
             ));
         }
 
-        /// The `acceptConversation` source (an `Acceptance` transition origin) is
-        /// the NEXT-STEP follow-up: the leg fails CLOSED (`UnsupportedSource`)
-        /// rather than mis-minting a signed-request origin for it.
+        /// An `acceptConversation` row whose durable bytes are really a
+        /// `requestLeafRecovery` mutation has no exact historical acceptance
+        /// candidate and fails closed rather than being mis-minted as either
+        /// origin variant.
         #[tokio::test]
         #[ignore = "requires the dedicated gate database"]
         async fn recovery_pair_fails_closed_on_accept_conversation_source() {
@@ -6462,7 +7100,7 @@ mod historical_control_loader {
 
             assert!(matches!(
                 result,
-                Err(RecoveryHydrationError::UnsupportedSource)
+                Err(RecoveryHydrationError::InvalidProvenance)
             ));
         }
 
