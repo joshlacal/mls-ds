@@ -6474,7 +6474,7 @@ mod historical_control_loader {
     }
 
     // -----------------------------------------------------------------------
-    // G1b-2 sub-seal — reset/leave request hydration leg (pending arm).
+    // G1b-2 sub-seal — reset/leave request hydration leg.
     //
     // The reset/leave origin is a CONTROL request (a `resetRequestEntry` /
     // `leaveRequestEntry` in `chat.entries`, `transition_id = NULL`), NOT a
@@ -6519,9 +6519,10 @@ mod historical_control_loader {
             load_leave_request_hydration_rows, load_metadata_provenance,
             load_participant_hydration_rows, load_producer_transition_evidence,
             load_recovery_work_hydration_rows, load_reset_request_hydration_rows,
-            load_welcome_hydration_rows, resolve_single_control_request_origin,
+            load_welcome_hydration_rows, load_work_terminal_hydration_row,
+            resolve_single_control_request_origin, resolve_single_fulfilled_participant,
             select_leave_terminal, select_reset_terminal, LeaveTerminalColumns,
-            ResetLeaveHydrationError, ResetTerminalColumns,
+            ResetLeaveHydrationError, ResetTerminalColumns, WorkTerminalLocator,
         };
         use crate::chat_protocol::repository::transition::{
             terminalize_leave_request, terminalize_reset_request, LeaveRequestTermination,
@@ -6532,8 +6533,9 @@ mod historical_control_loader {
         };
         use crate::chat_protocol::state_machine::{
             ConversationKind, ConversationStateHydration, DeviceIdentity,
-            HistoricalRehydrationAuthority, HydrationAuthority, LeaveRequestStatus, PrincipalId,
-            ResetRequestStatus, ServerTimestamp, WorkTerminalHydrationRow,
+            HistoricalRehydrationAuthority, HydrationAuthority, LeaveRequestStatus,
+            ParticipantRemovalEvidence, PrincipalId, ResetRequestStatus, ServerTimestamp,
+            WorkTerminalHydrationRow,
         };
         use crate::chat_protocol::transcript::{
             decode_and_verify_control_entry, decode_canonical_signed_mutation, SignedMutationKind,
@@ -6730,6 +6732,128 @@ mod historical_control_loader {
                 signing_key.verifying_key().as_bytes(),
             )
             .expect("real staling Commit entry verifies");
+            RealStalingCommit {
+                entry_id,
+                transition_id,
+                public_row_json,
+                raw_wrapper,
+                canonical_projection: canonical.canonical_projection().to_vec(),
+                signing_transcript: canonical.transcript_bytes().to_vec(),
+                request_digest: canonical.request_digest().to_vec(),
+                signature: canonical.signature().to_vec(),
+                server_fields_dag_cbor: decoded.server_fields_dag_cbor().unwrap(),
+                outer_entry_fingerprint: decoded.outer_control_fingerprint().to_vec(),
+            }
+        }
+
+        /// A real signed leave-commit fulfillment whose manifest removes the
+        /// requester participant and one same-principal leaf. The caller chooses
+        /// the removed device independently from the retained durable leaf so the
+        /// aggregate test can prove whether read-time validation enforces removal
+        /// completeness instead of merely validating the listed removals.
+        fn build_real_leave_fulfillment(
+            entry: &RealCreationEntry,
+            origin_transition_id: Uuid,
+            leave_request_id: [u8; 16],
+            removed_device_id: Uuid,
+            entry_seq: u64,
+            received_at: &str,
+        ) -> RealStalingCommit {
+            let signing_key = entry.signing_key();
+            let transition_id = Uuid::new_v4();
+            let entry_id = Uuid::new_v4();
+            let commit_bytes = [0xa1_u8; 8];
+            let metadata_ciphertext = [0xa2_u8; 16];
+            let body = json!({
+                "$type": SignedMutationKind::LeaveCommitFulfillment.type_id(),
+                "signatureDomain": String::from_utf8(
+                    SignedMutationKind::LeaveCommitFulfillment.domain().to_vec()
+                ).unwrap(),
+                "transitionId": transition_id.hyphenated().to_string(),
+                "actorDid": entry.actor_did,
+                "actorDeviceId": entry.actor_device_id.hyphenated().to_string(),
+                "keyId": entry.actor_key_id,
+                "authGeneration": 1,
+                "leaveRequestId": Uuid::from_bytes(leave_request_id).hyphenated().to_string(),
+                "prior": active_coordinate_json(entry.cid, 0),
+                "next": active_coordinate_json(entry.cid, 1),
+                "aad": {
+                    "protocolVersion": "1",
+                    "conversationId": STANDARD.encode(entry.cid),
+                    "generation": 0,
+                    "transitionId": STANDARD.encode(transition_id.as_bytes()),
+                    "prior": active_aad_coordinate_json(entry.cid, 0),
+                },
+                "manifest": {
+                    "participantChanges": [{
+                        "$type": "blue.catbird.chat.defs#removeParticipant",
+                        "userDid": entry.actor_did,
+                    }],
+                    "leafChanges": [{
+                        "$type": "blue.catbird.chat.defs#removeLeaf",
+                        "userDid": entry.actor_did,
+                        "deviceId": removed_device_id.hyphenated().to_string(),
+                    }],
+                },
+                "commit": {
+                    "framing": "mlsMessage",
+                    "contentType": "publicMessageCommit",
+                    "bytes": STANDARD.encode(commit_bytes),
+                    "sha256": STANDARD.encode(Sha256::digest(commit_bytes)),
+                },
+                "metadataSnapshot": {
+                    "coordinate": {
+                        "conversationId": STANDARD.encode(entry.cid),
+                        "generation": 0,
+                        "groupId": STANDARD.encode([1_u8; 32]),
+                        "epoch": 1,
+                        "groupContextHash": STANDARD.encode([4_u8; 32]),
+                        "confirmationTag": STANDARD.encode([5_u8; 32]),
+                    },
+                    "originTransitionId": origin_transition_id.hyphenated().to_string(),
+                    "metadataVersion": 1,
+                    "nonce": STANDARD.encode([0xa3_u8; 12]),
+                    "ciphertext": STANDARD.encode(metadata_ciphertext),
+                    "ciphertextSha256": STANDARD.encode(Sha256::digest(metadata_ciphertext)),
+                    "ciphertextSize": metadata_ciphertext.len(),
+                    "authorProof": {
+                        "authorDid": entry.actor_did,
+                        "authorDeviceId": entry.actor_device_id.hyphenated().to_string(),
+                        "authorKeyId": entry.actor_key_id,
+                        "signaturePublicKey": STANDARD.encode(&entry.public_key),
+                        "authGenerationAtOrigin": 1,
+                        "originTransitionId": origin_transition_id.hyphenated().to_string(),
+                        "originSeq": 1,
+                        "roleAtOrigin": "admin",
+                        "deviceStatusAtOrigin": "active",
+                    },
+                },
+                "idempotencyKey": Uuid::new_v4().hyphenated().to_string(),
+                "signedAt": "2030-02-01T00:01:59.000Z",
+            });
+            let mut wrapper = json!({ "body": body, "signature": STANDARD.encode([0_u8; 64]) });
+            let unsigned = serde_json::to_vec(&wrapper).unwrap();
+            let canonical = decode_canonical_signed_mutation(&unsigned)
+                .expect("unsigned leave fulfillment canonicalizes");
+            let signature = signing_key.sign(canonical.transcript_bytes()).to_bytes();
+            wrapper["signature"] = Value::String(STANDARD.encode(signature));
+            let raw_wrapper = serde_json::to_vec(&wrapper).unwrap();
+            let canonical = decode_canonical_signed_mutation(&raw_wrapper)
+                .expect("signed leave fulfillment canonicalizes");
+            let public_row_json = serde_json::to_vec(&json!({
+                "$type": "blue.catbird.chat.defs#leaveCommitFulfillmentEntry",
+                "entryId": entry_id.hyphenated().to_string(),
+                "conversationId": Uuid::from_bytes(entry.cid).hyphenated().to_string(),
+                "seq": entry_seq,
+                "signedRequest": wrapper,
+                "receivedAt": received_at,
+            }))
+            .unwrap();
+            let decoded = decode_and_verify_control_entry(
+                &public_row_json,
+                signing_key.verifying_key().as_bytes(),
+            )
+            .expect("real leave fulfillment entry verifies");
             RealStalingCommit {
                 entry_id,
                 transition_id,
@@ -7695,15 +7819,13 @@ mod historical_control_loader {
             assert!(
                 select_leave_terminal(columns("expired", None, None, Some(expires_at))).is_ok()
             );
-            assert!(matches!(
-                select_leave_terminal(columns(
-                    "fulfilled",
-                    Some(&digest),
-                    Some(transition_id),
-                    Some(terminal_at),
-                )),
-                Err(ResetLeaveHydrationError::UnsupportedTerminal)
-            ));
+            assert!(select_leave_terminal(columns(
+                "fulfilled",
+                Some(&digest),
+                Some(transition_id),
+                Some(terminal_at),
+            ))
+            .is_ok());
 
             for malformed in [
                 columns("pending", Some(&digest), None, None),
@@ -7734,6 +7856,22 @@ mod historical_control_loader {
             assert!(matches!(
                 select_leave_terminal(columns("future-status", None, None, None)),
                 Err(ResetLeaveHydrationError::OutOfDomain)
+            ));
+        }
+
+        #[test]
+        fn fulfilled_participant_selection_requires_exactly_one_historical_period() {
+            assert!(matches!(
+                resolve_single_fulfilled_participant::<u8>(vec![]),
+                Err(ResetLeaveHydrationError::InvalidTerminal)
+            ));
+            assert_eq!(
+                resolve_single_fulfilled_participant(vec![0x51_u8]).unwrap(),
+                0x51
+            );
+            assert!(matches!(
+                resolve_single_fulfilled_participant(vec![0x51_u8, 0x52]),
+                Err(ResetLeaveHydrationError::InvalidTerminal)
             ));
         }
 
@@ -8093,6 +8231,122 @@ mod historical_control_loader {
                     ),
                     Err(crate::chat_protocol::state_machine::StateMachineError::InvariantViolation)
                 ));
+            }
+        }
+
+        /// Mutation target: removing the aggregate validator's completeness
+        /// check for requester leaves must make this test fail. A genuine signed
+        /// leaveCommit terminal lists one same-principal removal, but it names a
+        /// different device while the requester's real current leaf remains in
+        /// the otherwise-valid aggregate. Listed-removal validation alone is not
+        /// enough authority to mark the leave fulfilled.
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn fulfilled_leave_rejects_a_retained_requester_leaf() {
+            let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+            let cid = Uuid::new_v4();
+            let entry = build_real_creation_entry(*cid.as_bytes());
+            let request = seed_control_request(
+                &pool,
+                &entry,
+                SignedMutationKind::LeaveRequest,
+                LEAVE_ENTRY_KIND,
+            )
+            .await;
+            commit_staling_transition(&pool, &entry, &request, SignedMutationKind::LeaveRequest)
+                .await;
+
+            let rows = load_aggregate_hydration(&pool, &entry).await;
+            assert_aggregate_hydrates(&entry, rows.clone());
+            assert_eq!(rows.leaves.len(), 1);
+            assert_eq!(rows.leaves[0].device, creator_device(&entry));
+
+            let origin_transition_id: Uuid = sqlx::query_scalar(
+                r#"SELECT origin_transition_id FROM chat.metadata_snapshots
+                   WHERE conversation_id=$1 AND generation=0 AND state_version=1"#,
+            )
+            .bind(cid)
+            .fetch_one(&pool)
+            .await
+            .expect("retained metadata origin");
+            let named_removed_device = Uuid::new_v4();
+            assert_ne!(named_removed_device, entry.actor_device_id);
+            let fulfillment = build_real_leave_fulfillment(
+                &entry,
+                origin_transition_id,
+                request.request_id,
+                named_removed_device,
+                4,
+                "2030-02-01T00:02:00.000Z",
+            );
+
+            // The reciprocal transition/state mapping makes this deliberately
+            // incomplete durable graph uncommittable. Load the real signed atom
+            // through the production DB loader inside the transaction, then roll
+            // it back and splice only that sealed terminal into the valid rows.
+            let authority =
+                HistoricalRehydrationAuthority::new(entry.cid, 5).expect("terminal authority");
+            let mut tx = pool.begin().await.expect("begin terminal atom");
+            sqlx::query(
+                r#"INSERT INTO chat.entries(
+                    conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,
+                    accepted_payload_sha256,signed_request_bytes,request_digest,signature,
+                    server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,
+                    actor_key_id,actor_auth_generation,generation,state_version,transition_id,
+                    received_at
+                ) VALUES($1,4,$2,'blue.catbird.chat.defs#leaveCommitFulfillmentEntry',
+                    $3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1,0,1,$13,$14)"#,
+            )
+            .bind(cid)
+            .bind(fulfillment.entry_id)
+            .bind(&fulfillment.public_row_json)
+            .bind(Sha256::digest(&fulfillment.public_row_json).to_vec())
+            .bind(&fulfillment.raw_wrapper)
+            .bind(&fulfillment.request_digest)
+            .bind(&fulfillment.signature)
+            .bind(&fulfillment.server_fields_dag_cbor)
+            .bind(&fulfillment.outer_entry_fingerprint)
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .bind(&entry.actor_key_id)
+            .bind(fulfillment.transition_id)
+            .bind(instant("2030-02-01T00:02:00.000Z"))
+            .execute(&mut *tx)
+            .await
+            .expect("insert uncommitted real leave terminal");
+            let terminal = load_work_terminal_hydration_row(
+                &mut tx,
+                &authority,
+                cid,
+                WorkTerminalLocator::Transition {
+                    transition_id: fulfillment.transition_id,
+                },
+            )
+            .await
+            .expect("production loader re-verifies real leave terminal");
+            tx.rollback().await.expect("rollback semantic atom");
+
+            let WorkTerminalHydrationRow::Transition(evidence) = &terminal else {
+                panic!("leave fulfillment terminal is a transition");
+            };
+            let fulfilled_participant = ParticipantRemovalEvidence::from_hydration(
+                rows.participants[0].clone(),
+                evidence.clone(),
+            );
+            let mut retained_leaf = rows;
+            retained_leaf.leave_requests[0].status = LeaveRequestStatus::Fulfilled;
+            retained_leaf.leave_requests[0].terminal = Some(terminal);
+            retained_leaf.leave_requests[0].fulfilled_participant = Some(fulfilled_participant);
+            let aggregate_authority =
+                HydrationAuthority::new(entry.cid).expect("aggregate authority");
+            match crate::chat_protocol::state_machine::hydrate_conversation_state(
+                &aggregate_authority,
+                retained_leaf,
+            ) {
+                Err(crate::chat_protocol::state_machine::StateMachineError::InvariantViolation) => {
+                }
+                Ok(_) => panic!("fulfilled leave retained the requester's durable leaf"),
+                Err(other) => panic!("unexpected aggregate failure: {other:?}"),
             }
         }
 

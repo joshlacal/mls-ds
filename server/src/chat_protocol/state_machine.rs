@@ -6210,6 +6210,26 @@ pub(crate) enum LeaveRequestStatus {
     Stale,
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) enum LeaveFulfillmentTestMutation {
+    ManifestDevices(Vec<DeviceIdentity>),
+    DropParticipantProof,
+    ProofPrincipal(PrincipalId),
+    ProofInactive,
+    ProofInvalidProvenance,
+    ProofWrongTransition,
+    ProofWrongSequence,
+    ProofWrongTime,
+    IntervalLeftOpen(DeviceIdentity),
+    IntervalClosedLater(DeviceIdentity),
+    IntervalWrongEvidence(DeviceIdentity),
+    IntervalWrongKind(DeviceIdentity),
+    IntervalOpenedAfterOrigin(DeviceIdentity),
+    DuplicatePreTerminalInterval(DeviceIdentity),
+    LaterRejoin(DeviceIdentity),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WelcomeStatus {
     Pending,
@@ -6327,6 +6347,7 @@ pub(crate) struct LeaveRequest {
     status: LeaveRequestStatus,
     origin: RequestEvidence,
     terminal: Option<WorkTerminalEvidence>,
+    fulfilled_participant: Option<ParticipantRemovalEvidence>,
 }
 
 impl LeaveRequest {
@@ -6340,6 +6361,41 @@ impl LeaveRequest {
 
     pub(crate) fn expires_at(&self) -> &ServerTimestamp {
         &self.expires_at
+    }
+}
+
+/// Historical proof retained by a fulfilled leave: the exact active
+/// participant record removed by the fulfillment and the exact transition that
+/// removed it. Both planner and repository hydration construct this sealed
+/// value; a period UUID or repository-only boolean is not sufficient authority
+/// for aggregate validation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ParticipantRemovalEvidence {
+    participant: ParticipantRecord,
+    terminal: TransitionEvidence,
+}
+
+impl ParticipantRemovalEvidence {
+    pub(crate) fn from_hydration(
+        participant: ParticipantHydrationRow,
+        terminal: TransitionEvidence,
+    ) -> Self {
+        Self {
+            participant: ParticipantRecord {
+                principal: participant.principal,
+                status: participant.status,
+                role: participant.role,
+                role_producer: participant.role_producer,
+                invitation: participant
+                    .invitation
+                    .map(|invitation| InvitationProvenance {
+                        transition: invitation.transition,
+                        inviter: invitation.inviter,
+                    }),
+                acceptance: participant.acceptance,
+            },
+            terminal,
+        }
     }
 }
 
@@ -6551,6 +6607,7 @@ pub(crate) struct LeaveRequestHydrationRow {
     pub(crate) status: LeaveRequestStatus,
     pub(crate) origin: RequestEvidence,
     pub(crate) terminal: Option<WorkTerminalHydrationRow>,
+    pub(crate) fulfilled_participant: Option<ParticipantRemovalEvidence>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6857,6 +6914,235 @@ impl ConversationState {
         state.recovery_reservations.remove(0);
         state
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_leave_fulfillment_matches(&self, request_id: &[u8; 16]) -> bool {
+        let Some(request) = self.leave_request(request_id) else {
+            return false;
+        };
+        let Some(WorkTerminalEvidence::Transition(evidence)) = request.terminal.as_ref() else {
+            return false;
+        };
+        leave_fulfillment_matches_request(self, evidence, request)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_mutate_leave_fulfillment(
+        &self,
+        request_id: &[u8; 16],
+        mutation: LeaveFulfillmentTestMutation,
+    ) -> Self {
+        let mut state = self.clone();
+        let request_index = state
+            .leave_requests
+            .iter()
+            .position(|request| &request.request_id == request_id)
+            .expect("test fulfilled leave");
+
+        match mutation {
+            LeaveFulfillmentTestMutation::ManifestDevices(devices) => {
+                let request = &state.leave_requests[request_index];
+                let WorkTerminalEvidence::Transition(old_terminal) =
+                    request.terminal.as_ref().expect("test terminal")
+                else {
+                    panic!("test leave terminal");
+                };
+                let old_terminal = old_terminal.clone();
+                let metadata = MetadataSnapshotBinding::for_test_creation(
+                    *state.coordinate.conversation_id(),
+                    state.coordinate.generation(),
+                    state.coordinate.epoch(),
+                    *state.coordinate.group_context_hash(),
+                    old_terminal.transition_id,
+                    old_terminal.seq,
+                    request.requester.clone(),
+                    [0x51; 32],
+                    [0x52; 32],
+                    1,
+                    1,
+                    [0x53; 12],
+                    vec![0x54],
+                );
+                let mut replacement = old_terminal.clone();
+                replacement.body_binding = Some(TransitionBodyBinding::LeaveCommitFulfillment {
+                    leave_request_id: request.request_id,
+                    prior: request.bound_coordinate,
+                    next: state.coordinate,
+                    aad_digest: [0; 32],
+                    manifest: TransitionManifestBinding {
+                        participant_changes: vec![ManifestParticipantChange::Remove(
+                            request.requester.principal().clone(),
+                        )],
+                        leaf_changes: devices
+                            .into_iter()
+                            .map(ManifestLeafChange::Remove)
+                            .collect(),
+                        leaf_recovery_request_id: None,
+                        welcome: None,
+                    },
+                    commit_sha256: [0; 32],
+                    metadata,
+                });
+                let request = &mut state.leave_requests[request_index];
+                request.terminal = Some(WorkTerminalEvidence::Transition(replacement.clone()));
+                request
+                    .fulfilled_participant
+                    .as_mut()
+                    .expect("test participant proof")
+                    .terminal = replacement.clone();
+                for interval in &mut state.intervals {
+                    if interval.end.as_ref().is_some_and(|end| {
+                        end.evidence == old_terminal
+                            && interval.recipient.principal() == request.requester.principal()
+                    }) {
+                        interval.end.as_mut().expect("checked end").evidence = replacement.clone();
+                    }
+                }
+            }
+            LeaveFulfillmentTestMutation::DropParticipantProof => {
+                state.leave_requests[request_index].fulfilled_participant = None;
+            }
+            LeaveFulfillmentTestMutation::ProofPrincipal(principal) => {
+                state.leave_requests[request_index]
+                    .fulfilled_participant
+                    .as_mut()
+                    .expect("test participant proof")
+                    .participant
+                    .principal = principal;
+            }
+            LeaveFulfillmentTestMutation::ProofInactive => {
+                state.leave_requests[request_index]
+                    .fulfilled_participant
+                    .as_mut()
+                    .expect("test participant proof")
+                    .participant
+                    .status = ParticipantStatus::Pending;
+            }
+            LeaveFulfillmentTestMutation::ProofInvalidProvenance => {
+                let proof = state.leave_requests[request_index]
+                    .fulfilled_participant
+                    .as_mut()
+                    .expect("test participant proof");
+                proof.participant.acceptance = None;
+            }
+            LeaveFulfillmentTestMutation::ProofWrongTransition => {
+                state.leave_requests[request_index]
+                    .fulfilled_participant
+                    .as_mut()
+                    .expect("test participant proof")
+                    .terminal
+                    .transition_id[0] ^= 0x01;
+            }
+            LeaveFulfillmentTestMutation::ProofWrongSequence => {
+                state.leave_requests[request_index]
+                    .fulfilled_participant
+                    .as_mut()
+                    .expect("test participant proof")
+                    .terminal
+                    .seq += 1;
+            }
+            LeaveFulfillmentTestMutation::ProofWrongTime => {
+                let proof = state.leave_requests[request_index]
+                    .fulfilled_participant
+                    .as_mut()
+                    .expect("test participant proof");
+                proof.terminal.received_at = proof
+                    .terminal
+                    .received_at
+                    .checked_add_millis(1)
+                    .expect("test timestamp");
+            }
+            LeaveFulfillmentTestMutation::IntervalLeftOpen(device) => {
+                state
+                    .intervals
+                    .iter_mut()
+                    .find(|interval| interval.recipient == device)
+                    .expect("test requester interval")
+                    .end = None;
+            }
+            LeaveFulfillmentTestMutation::IntervalClosedLater(device) => {
+                state
+                    .intervals
+                    .iter_mut()
+                    .find(|interval| interval.recipient == device)
+                    .expect("test requester interval")
+                    .end
+                    .as_mut()
+                    .expect("test interval end")
+                    .evidence
+                    .seq += 1;
+            }
+            LeaveFulfillmentTestMutation::IntervalWrongEvidence(device) => {
+                state
+                    .intervals
+                    .iter_mut()
+                    .find(|interval| interval.recipient == device)
+                    .expect("test requester interval")
+                    .end
+                    .as_mut()
+                    .expect("test interval end")
+                    .evidence
+                    .outer_entry_fingerprint[0] ^= 0x01;
+            }
+            LeaveFulfillmentTestMutation::IntervalWrongKind(device) => {
+                state
+                    .intervals
+                    .iter_mut()
+                    .find(|interval| interval.recipient == device)
+                    .expect("test requester interval")
+                    .end
+                    .as_mut()
+                    .expect("test interval end")
+                    .kind = CloseKind::Replace;
+            }
+            LeaveFulfillmentTestMutation::IntervalOpenedAfterOrigin(device) => {
+                let origin_seq = state.leave_requests[request_index]
+                    .origin
+                    .control_seq
+                    .expect("test origin seq");
+                state
+                    .intervals
+                    .iter_mut()
+                    .find(|interval| interval.recipient == device)
+                    .expect("test requester interval")
+                    .opening
+                    .seq = origin_seq + 1;
+            }
+            LeaveFulfillmentTestMutation::DuplicatePreTerminalInterval(device) => {
+                let interval = state
+                    .intervals
+                    .iter()
+                    .find(|interval| interval.recipient == device)
+                    .expect("test requester interval")
+                    .clone();
+                state.intervals.push(interval);
+            }
+            LeaveFulfillmentTestMutation::LaterRejoin(device) => {
+                let terminal = match state.leave_requests[request_index]
+                    .terminal
+                    .as_ref()
+                    .expect("test terminal")
+                {
+                    WorkTerminalEvidence::Transition(terminal) => terminal.clone(),
+                    _ => panic!("test leave terminal"),
+                };
+                let mut interval = state
+                    .intervals
+                    .iter()
+                    .find(|interval| interval.recipient == device)
+                    .expect("test requester interval")
+                    .clone();
+                interval.opening = terminal;
+                interval.opening.seq += 1;
+                interval.opening.transition_id[0] ^= 0x01;
+                interval.opening.outer_entry_fingerprint[0] ^= 0x01;
+                interval.opening_kind = OpeningKind::Add;
+                interval.end = None;
+                state.intervals.push(interval);
+            }
+        }
+        state
+    }
 }
 
 /// The sole state re-entry gate for rows reconstructed from durable storage.
@@ -6992,6 +7278,7 @@ pub(crate) fn hydrate_conversation_state(
                 status: row.status,
                 origin: row.origin,
                 terminal: row.terminal.map(work_terminal_from_hydration),
+                fulfilled_participant: row.fulfilled_participant,
             })
             .collect(),
         welcomes: rows
@@ -7158,6 +7445,7 @@ impl ConversationStateHydration {
                     status: row.status,
                     origin: row.origin,
                     terminal: row.terminal.map(work_terminal_to_hydration),
+                    fulfilled_participant: row.fulfilled_participant,
                 })
                 .collect(),
             welcomes: state
@@ -10511,6 +10799,7 @@ fn plan_leave_request_inner(
         status: LeaveRequestStatus::Pending,
         origin: command.evidence,
         terminal: None,
+        fulfilled_participant: None,
     });
     sort_leave_requests(&mut state.leave_requests);
     validate_state(&state)?;
@@ -10666,6 +10955,7 @@ fn plan_leave_fulfillment_inner(
     if !requester.is_active() {
         return Err(StateMachineError::NotMember);
     }
+    let fulfilled_participant = requester.clone();
     if would_remove_last_active_admin(prior, &command.requester) {
         return Err(StateMachineError::LastAdminRequired);
     }
@@ -10736,6 +11026,15 @@ fn plan_leave_fulfillment_inner(
         None,
         Some(command.leave_request_id),
     );
+    let fulfilled_request = state
+        .leave_requests
+        .iter_mut()
+        .find(|request| request.request_id == command.leave_request_id)
+        .ok_or(StateMachineError::InvariantViolation)?;
+    fulfilled_request.fulfilled_participant = Some(ParticipantRemovalEvidence {
+        participant: fulfilled_participant,
+        terminal: command.transition.clone(),
+    });
     state.coordinate = *command.commit.next().coordinate();
     state.producer = command.transition.clone();
     state.metadata = transition_metadata(&command.transition).cloned();
@@ -13925,18 +14224,69 @@ fn reset_activation_matches_request(
 }
 
 fn leave_fulfillment_matches_request(
+    state: &ConversationState,
     evidence: &TransitionEvidence,
     request: &LeaveRequest,
 ) -> bool {
     if !transition_consumes_coordinate(evidence, &request.bound_coordinate) {
         return false;
     }
-    let Some(authority) = evidence.authority.as_ref() else {
-        return true;
+    let Some(proof) = request.fulfilled_participant.as_ref() else {
+        return false;
     };
-    authority.kind == SignedMutationKind::LeaveCommitFulfillment
-        && matches!(
-            evidence.body_binding.as_ref(),
+    if proof.participant.principal != *request.requester.principal()
+        || proof.participant.status != ParticipantStatus::Active
+        || !participant_provenance_matches(state, &proof.participant)
+        || proof.terminal != *evidence
+    {
+        return false;
+    }
+    let Some(origin_seq) = request.origin.control_seq else {
+        return false;
+    };
+    let terminal_seq = evidence.seq;
+    let pre_terminal = state
+        .intervals
+        .iter()
+        .filter(|interval| {
+            interval.recipient.principal() == request.requester.principal()
+                && interval.opening.seq < terminal_seq
+                && interval
+                    .end
+                    .as_ref()
+                    .is_none_or(|end| end.evidence.seq >= terminal_seq)
+        })
+        .collect::<Vec<_>>();
+    let pre_terminal_devices = pre_terminal
+        .iter()
+        .map(|interval| interval.recipient.clone())
+        .collect::<BTreeSet<_>>();
+    if pre_terminal.is_empty()
+        || pre_terminal_devices.len() != pre_terminal.len()
+        || !pre_terminal
+            .iter()
+            .any(|interval| interval.opening.seq <= origin_seq)
+        || !pre_terminal.iter().all(|interval| {
+            interval.end.as_ref().is_some_and(|end| {
+                end.kind == CloseKind::Remove
+                    && end.evidence.seq == terminal_seq
+                    && end.evidence == *evidence
+            })
+        })
+    {
+        return false;
+    }
+    if evidence
+        .authority
+        .as_ref()
+        .is_some_and(|authority| authority.kind != SignedMutationKind::LeaveCommitFulfillment)
+    {
+        return false;
+    }
+    match evidence.body_binding.as_ref() {
+        None => evidence.authority.is_none(),
+        body => matches!(
+            body,
             Some(TransitionBodyBinding::LeaveCommitFulfillment {
                 leave_request_id,
                 prior,
@@ -13948,19 +14298,26 @@ fn leave_fulfillment_matches_request(
                 && commit_coordinate_edge(prior, next)
                 && manifest.leaf_recovery_request_id.is_none()
                 && manifest.welcome.is_none()
-                && manifest.participant_changes.iter().filter(|change| {
-                    matches!(change, ManifestParticipantChange::Remove(principal)
+                && manifest.participant_changes.len() == 1
+                && matches!(&manifest.participant_changes[0],
+                    ManifestParticipantChange::Remove(principal)
                         if principal == request.requester.principal())
-                }).count() == 1
-                && manifest.leaf_changes.iter().any(|change| {
-                    matches!(change, ManifestLeafChange::Remove(device)
-                        if device.principal() == request.requester.principal())
-                })
-                && manifest.leaf_changes.iter().all(|change| {
-                    matches!(change, ManifestLeafChange::Remove(device)
-                        if device.principal() == request.requester.principal())
-                })
-        )
+                && {
+                    let removed = manifest.leaf_changes.iter().filter_map(|change| {
+                        match change {
+                            ManifestLeafChange::Remove(device)
+                                if device.principal() == request.requester.principal() =>
+                            {
+                                Some(device.clone())
+                            }
+                            _ => None,
+                        }
+                    }).collect::<BTreeSet<_>>();
+                    manifest.leaf_changes.len() == removed.len()
+                        && removed == pre_terminal_devices
+                }
+        ),
+    }
 }
 
 fn validate_work(state: &ConversationState, terminal_state: bool) -> Result<(), StateMachineError> {
@@ -14324,6 +14681,8 @@ fn validate_leave_work(state: &ConversationState) -> Result<(), StateMachineErro
             )
             .is_err()
             || require_request_prior(&request.origin, &request.bound_coordinate).is_err()
+            || (request.status == LeaveRequestStatus::Fulfilled)
+                != request.fulfilled_participant.is_some()
         {
             return Err(StateMachineError::InvariantViolation);
         }
@@ -14350,7 +14709,7 @@ fn validate_leave_work(state: &ConversationState) -> Result<(), StateMachineErro
                 ) && transition_has_one_of_kinds(
                     evidence,
                     &[SignedMutationKind::LeaveCommitFulfillment],
-                ) && leave_fulfillment_matches_request(evidence, request))
+                ) && leave_fulfillment_matches_request(state, evidence, request))
             }),
             LeaveRequestStatus::Stale => request.terminal.as_ref().is_some_and(|terminal| {
                 matches!(terminal, WorkTerminalEvidence::Transition(evidence)

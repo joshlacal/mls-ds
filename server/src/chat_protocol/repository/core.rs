@@ -32,12 +32,12 @@ use super::super::{
         ConversationState, DeviceIdentity, HistoricalRehydrationAuthority, HydrationAuthority,
         IntervalEndHydrationRow, IntervalHydrationRow, LeafHydrationRow, LeafRecoveryKind,
         LeaveRequestHydrationRow, LeaveRequestStatus, MetadataSnapshotBinding, OpeningKind,
-        ParticipantHydrationRow, ParticipantRole, ParticipantStatus, PersistedControlAuthority,
-        PrincipalId, RecoveryOriginHydrationRow, RecoveryRequestHydrationRow,
-        RecoveryRequestStatus, RecoveryReservationHydrationRow, RecoverySource, RequestEntryKind,
-        RequestEvidence, ReservationStatus, ResetRequestHydrationRow, ResetRequestStatus,
-        ServerTimestamp, TransitionEvidence, WelcomeHydrationRow, WelcomeStatus,
-        WorkTerminalHydrationRow,
+        ParticipantHydrationRow, ParticipantRemovalEvidence, ParticipantRole, ParticipantStatus,
+        PersistedControlAuthority, PrincipalId, RecoveryOriginHydrationRow,
+        RecoveryRequestHydrationRow, RecoveryRequestStatus, RecoveryReservationHydrationRow,
+        RecoverySource, RequestEntryKind, RequestEvidence, ReservationStatus,
+        ResetRequestHydrationRow, ResetRequestStatus, ServerTimestamp, TransitionEvidence,
+        WelcomeHydrationRow, WelcomeStatus, WorkTerminalHydrationRow,
     },
     validation::{BareDid, KeyThumbprint},
 };
@@ -2632,6 +2632,102 @@ impl From<ControlEvidenceLoadError> for ParticipantHydrationError {
     }
 }
 
+#[derive(sqlx::FromRow)]
+struct DurableParticipantHydrationRow {
+    user_did: String,
+    status: String,
+    role: String,
+    role_transition_id: Uuid,
+    invitation_transition_id: Option<Uuid>,
+    created_by_did: String,
+    created_by_device_id: Uuid,
+    acceptance_transition_id: Option<Uuid>,
+}
+
+async fn hydrate_participant_row(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &HistoricalRehydrationAuthority,
+    conversation_id: Uuid,
+    row: DurableParticipantHydrationRow,
+) -> Result<ParticipantHydrationRow, ParticipantHydrationError> {
+    let principal = PrincipalId::new(row.user_did.into_bytes())
+        .map_err(|_| ParticipantHydrationError::OutOfDomain)?;
+    let status = match row.status.as_str() {
+        "pending" => ParticipantStatus::Pending,
+        "active" => ParticipantStatus::Active,
+        _ => return Err(ParticipantHydrationError::OutOfDomain),
+    };
+    let role = match row.role.as_str() {
+        "member" => ParticipantRole::Member,
+        "admin" => ParticipantRole::Admin,
+        _ => return Err(ParticipantHydrationError::OutOfDomain),
+    };
+
+    let role_evidence = load_historical_control_evidence(
+        transaction,
+        authority,
+        conversation_id,
+        row.role_transition_id,
+    )
+    .await?
+    .into_transition()
+    .map_err(|_| ParticipantHydrationError::InvalidProvenance)?;
+    let role_producer = classify_role_producer(role_evidence, &principal, role)
+        .map_err(|_| ParticipantHydrationError::InvalidProvenance)?;
+
+    let invitation = match row.invitation_transition_id {
+        None => None,
+        Some(invitation_transition_id) => {
+            let inviter_principal = PrincipalId::new(row.created_by_did.into_bytes())
+                .map_err(|_| ParticipantHydrationError::OutOfDomain)?;
+            let inviter =
+                DeviceIdentity::new(inviter_principal, *row.created_by_device_id.as_bytes())
+                    .map_err(|_| ParticipantHydrationError::OutOfDomain)?;
+            let evidence = load_historical_control_evidence(
+                transaction,
+                authority,
+                conversation_id,
+                invitation_transition_id,
+            )
+            .await?
+            .into_transition()
+            .map_err(|_| ParticipantHydrationError::InvalidProvenance)?;
+            Some(
+                classify_invitation(evidence, &principal, inviter)
+                    .map_err(|_| ParticipantHydrationError::InvalidProvenance)?,
+            )
+        }
+    };
+
+    let acceptance = match row.acceptance_transition_id {
+        None => None,
+        Some(acceptance_transition_id) => {
+            let evidence = load_historical_control_evidence(
+                transaction,
+                authority,
+                conversation_id,
+                acceptance_transition_id,
+            )
+            .await?
+            .into_transition()
+            .map_err(|_| ParticipantHydrationError::InvalidProvenance)?;
+            Some(
+                classify_acceptance(evidence, &principal)
+                    .map_err(|_| ParticipantHydrationError::InvalidProvenance)?,
+            )
+        }
+    };
+
+    Ok(ParticipantHydrationRow {
+        principal,
+        status,
+        role,
+        role_producer,
+        invitation,
+        acceptance,
+    })
+}
+
 /// Load the current-membership participant rows of an existing conversation,
 /// binding each to its re-verified historical provenance evidence for the
 /// G1b-2 state aggregate.
@@ -2663,17 +2759,7 @@ pub(crate) async fn load_participant_hydration_rows(
     authority: &HistoricalRehydrationAuthority,
     conversation_id: Uuid,
 ) -> Result<Vec<ParticipantHydrationRow>, ParticipantHydrationError> {
-    #[allow(clippy::type_complexity)]
-    let rows: Vec<(
-        String,
-        String,
-        String,
-        Uuid,
-        Option<Uuid>,
-        String,
-        Uuid,
-        Option<Uuid>,
-    )> = sqlx::query_as(
+    let rows: Vec<DurableParticipantHydrationRow> = sqlx::query_as(
         r#"
         SELECT
             p.user_did,
@@ -2694,93 +2780,9 @@ pub(crate) async fn load_participant_hydration_rows(
     .await?;
 
     let mut participants = Vec::with_capacity(rows.len());
-    for (
-        user_did,
-        status,
-        role,
-        role_transition_id,
-        invitation_transition_id,
-        created_by_did,
-        created_by_device_id,
-        acceptance_transition_id,
-    ) in rows
-    {
-        let principal = PrincipalId::new(user_did.into_bytes())
-            .map_err(|_| ParticipantHydrationError::OutOfDomain)?;
-        let status = match status.as_str() {
-            "pending" => ParticipantStatus::Pending,
-            "active" => ParticipantStatus::Active,
-            _ => return Err(ParticipantHydrationError::OutOfDomain),
-        };
-        let role = match role.as_str() {
-            "member" => ParticipantRole::Member,
-            "admin" => ParticipantRole::Admin,
-            _ => return Err(ParticipantHydrationError::OutOfDomain),
-        };
-
-        let role_evidence = load_historical_control_evidence(
-            transaction,
-            authority,
-            conversation_id,
-            role_transition_id,
-        )
-        .await?
-        .into_transition()
-        .map_err(|_| ParticipantHydrationError::InvalidProvenance)?;
-        let role_producer = classify_role_producer(role_evidence, &principal, role)
-            .map_err(|_| ParticipantHydrationError::InvalidProvenance)?;
-
-        let invitation = match invitation_transition_id {
-            None => None,
-            Some(invitation_transition_id) => {
-                let inviter_principal = PrincipalId::new(created_by_did.into_bytes())
-                    .map_err(|_| ParticipantHydrationError::OutOfDomain)?;
-                let inviter =
-                    DeviceIdentity::new(inviter_principal, *created_by_device_id.as_bytes())
-                        .map_err(|_| ParticipantHydrationError::OutOfDomain)?;
-                let evidence = load_historical_control_evidence(
-                    transaction,
-                    authority,
-                    conversation_id,
-                    invitation_transition_id,
-                )
-                .await?
-                .into_transition()
-                .map_err(|_| ParticipantHydrationError::InvalidProvenance)?;
-                Some(
-                    classify_invitation(evidence, &principal, inviter)
-                        .map_err(|_| ParticipantHydrationError::InvalidProvenance)?,
-                )
-            }
-        };
-
-        let acceptance = match acceptance_transition_id {
-            None => None,
-            Some(acceptance_transition_id) => {
-                let evidence = load_historical_control_evidence(
-                    transaction,
-                    authority,
-                    conversation_id,
-                    acceptance_transition_id,
-                )
-                .await?
-                .into_transition()
-                .map_err(|_| ParticipantHydrationError::InvalidProvenance)?;
-                Some(
-                    classify_acceptance(evidence, &principal)
-                        .map_err(|_| ParticipantHydrationError::InvalidProvenance)?,
-                )
-            }
-        };
-
-        participants.push(ParticipantHydrationRow {
-            principal,
-            status,
-            role,
-            role_producer,
-            invitation,
-            acceptance,
-        });
+    for row in rows {
+        participants
+            .push(hydrate_participant_row(transaction, authority, conversation_id, row).await?);
     }
     participants.sort_by(|left, right| left.principal.cmp(&right.principal));
     Ok(participants)
@@ -4918,7 +4920,7 @@ fn terminal_bytes64(value: Vec<u8>) -> Result<[u8; 64], WorkTerminalHydrationErr
 
 // ===========================================================================
 // G1b-2 sub-seal — reset/leave request hydration leg (chat.reset_requests +
-// chat.leave_requests, pending arm).
+// chat.leave_requests).
 //
 // ORIGIN IS A CONTROL REQUEST, NOT A SIGNED REQUEST (corrected 2b-map,
 // coordinator ruling "T4-H2-pre G1b-2 reset/leave origin RULING"). Unlike the
@@ -4972,17 +4974,14 @@ fn terminal_bytes64(value: Vec<u8>) -> Result<[u8; 64], WorkTerminalHydrationErr
 // — the only faithful way to exercise arms the coherent seed cannot reach (same
 // class + resolution as the participant leg's structurally-guarded absence arm).
 //
-// SCOPE (pending arm only; the terminal arms are the terminal-family follow-up,
-// REJECT-class if shipped untested): a non-`pending` reset (`stale` / `consumed`
-// / `expired`) or leave (`fulfilled` / `cancelled` / `expired` / `stale`) carries
-// a terminal whose `WorkTerminalHydrationRow` reconstruction (a resetActivation /
-// leaveCommit transition, a leaveCancellation control request, or an expiry
-// instant) needs its own bespoke coherent terminal seed; the leg fails CLOSED
-// (`UnsupportedTerminal`) on those rather than fabricate a terminal. The pending
-// arm (terminal `None`) is reconstructed fully. `validate_reset_work` /
-// `validate_leave_work` at assembly are the drift fences (they re-run
-// `validate_request_evidence` + `require_request_prior` + the coordinate/expiry
-// checks over every hydrated row).
+// TERMINAL SCOPE: stale/expired reset and stale/cancelled/expired/fulfilled leave
+// terminals are reconstructed from their exact durable transition, request, or
+// expiry authority. Reset `consumed` remains fail-closed behind
+// `UnsupportedTerminal` until its activation-specific proof lands. A fulfilled
+// leave additionally requires exactly one historical active participant period
+// removed by that same terminal; the state validator then proves complete
+// pre-terminal requester-leaf removal. `validate_reset_work` /
+// `validate_leave_work` at assembly remain the final drift fences.
 //
 // No `FOR UPDATE`: the caller already holds the head lock (`FOR UPDATE OF c` on
 // `chat.conversations`) that pins the historical suffix, and `chat.entries` /
@@ -5148,19 +5147,15 @@ pub(crate) fn select_leave_terminal(
                     .terminal_request_digest
                     .is_some_and(|digest| digest.len() == 32) =>
         {
-            if columns.status == "fulfilled" {
-                Err(ResetLeaveHydrationError::UnsupportedTerminal)
-            } else {
-                Ok(LeaveTerminalSelection::Transition {
-                    terminal_request_digest: columns
-                        .terminal_request_digest
-                        .expect("shape checked")
-                        .try_into()
-                        .expect("length checked"),
-                    transition_id: columns.terminal_transition_id.expect("shape checked"),
-                    terminal_at: columns.terminal_at.expect("shape checked"),
-                })
-            }
+            Ok(LeaveTerminalSelection::Transition {
+                terminal_request_digest: columns
+                    .terminal_request_digest
+                    .expect("shape checked")
+                    .try_into()
+                    .expect("length checked"),
+                transition_id: columns.terminal_transition_id.expect("shape checked"),
+                terminal_at: columns.terminal_at.expect("shape checked"),
+            })
         }
         "cancelled"
             if columns.terminal_transition_id.is_none()
@@ -5206,6 +5201,20 @@ struct DurableLeaveRequestHydrationRow {
     terminal_at: Option<DateTime<Utc>>,
 }
 
+/// Require one exact historical participant-period candidate for a fulfilled
+/// leave. The SQL predicate binds conversation, requester, active historical
+/// status, and terminal transition ID/sequence/time; this final cardinality
+/// fence never chooses among duplicate durable claims.
+pub(crate) fn resolve_single_fulfilled_participant<T>(
+    rows: Vec<T>,
+) -> Result<T, ResetLeaveHydrationError> {
+    let mut rows = rows.into_iter();
+    match (rows.next(), rows.next()) {
+        (Some(row), None) => Ok(row),
+        _ => Err(ResetLeaveHydrationError::InvalidTerminal),
+    }
+}
+
 /// The `(accepted_payload_bytes, signed_request_bytes, signing_public_key)` of a
 /// single located origin control entry.
 type LocatedOriginEntry = (Vec<u8>, Vec<u8>, Vec<u8>);
@@ -5233,7 +5242,7 @@ pub(crate) fn resolve_single_control_request_origin(
     Ok(entry)
 }
 
-/// Locate + re-verify a pending reset/leave request's ORIGIN control entry per the
+/// Locate + re-verify a reset/leave request's ORIGIN control entry per the
 /// JOIN ruling, returning its re-minted `RequestEvidence`.
 ///
 /// The origin is found by `(conversation_id, entry_kind, request_digest)` with the
@@ -5521,9 +5530,10 @@ pub(crate) async fn load_reset_request_hydration_rows(
     Ok(requests)
 }
 
-/// Load the PENDING leave requests of an existing conversation, each bound to its
-/// re-verified control-request origin. See the module header for the JOIN ruling
-/// and the terminal-arm scope.
+/// Load the leave requests of an existing conversation, each bound to its
+/// re-verified control-request origin and, when fulfilled, the exact removed
+/// historical participant period. See the module header for the JOIN ruling and
+/// terminal scope.
 ///
 /// `authority` MUST be the read-time authority minted from the SAME locked head as
 /// the rest of the aggregate.
@@ -5585,6 +5595,7 @@ pub(crate) async fn load_leave_request_hydration_rows(
     } in rows
     {
         let request_id = *leave_request_id.as_bytes();
+        let requester_did_for_proof = requester_did.clone();
         let requester = reset_leave_device(requester_did, requester_device_id)?;
         let bound_coordinate = reset_leave_coordinate(
             conversation_bytes,
@@ -5609,8 +5620,10 @@ pub(crate) async fn load_leave_request_hydration_rows(
             terminal_at,
             expires_at,
         })?;
+        let fulfilled = status == "fulfilled";
         let status = match selection {
             LeaveTerminalSelection::Pending => LeaveRequestStatus::Pending,
+            LeaveTerminalSelection::Transition { .. } if fulfilled => LeaveRequestStatus::Fulfilled,
             LeaveTerminalSelection::Transition { .. } => LeaveRequestStatus::Stale,
             LeaveTerminalSelection::Cancellation { .. } => LeaveRequestStatus::Cancelled,
             LeaveTerminalSelection::Expiry { .. } => LeaveRequestStatus::Expired,
@@ -5625,8 +5638,8 @@ pub(crate) async fn load_leave_request_hydration_rows(
         )
         .await?;
 
-        let terminal = match selection {
-            LeaveTerminalSelection::Pending => None,
+        let (terminal, fulfilled_participant) = match selection {
+            LeaveTerminalSelection::Pending => (None, None),
             LeaveTerminalSelection::Transition {
                 terminal_request_digest,
                 transition_id,
@@ -5655,7 +5668,66 @@ pub(crate) async fn load_leave_request_hydration_rows(
                 {
                     return Err(ResetLeaveHydrationError::InvalidTerminal);
                 }
-                Some(terminal)
+                let fulfilled_participant = if fulfilled {
+                    let participant_rows: Vec<DurableParticipantHydrationRow> = sqlx::query_as(
+                        r#"
+                        SELECT
+                            p.user_did,
+                            p.status,
+                            p.role,
+                            p.role_transition_id,
+                            p.invitation_transition_id,
+                            p.created_by_did,
+                            p.created_by_device_id,
+                            p.acceptance_transition_id
+                        FROM chat.participants p
+                        WHERE p.conversation_id = $1
+                          AND p.user_did = $2
+                          AND NOT p.current_membership
+                          AND p.status = 'active'
+                          AND p.removing_transition_id = $3
+                          AND p.removing_seq = $4
+                          AND p.removed_at = $5
+                        "#,
+                    )
+                    .bind(conversation_id)
+                    .bind(&requester_did_for_proof)
+                    .bind(transition_id)
+                    .bind(
+                        i64::try_from(evidence.seq())
+                            .map_err(|_| ResetLeaveHydrationError::OutOfDomain)?,
+                    )
+                    .bind(terminal_at)
+                    .fetch_all(&mut **transaction)
+                    .await?;
+                    let participant_row = resolve_single_fulfilled_participant(participant_rows)?;
+                    let participant = hydrate_participant_row(
+                        transaction,
+                        authority,
+                        conversation_id,
+                        participant_row,
+                    )
+                    .await
+                    .map_err(|error| match error {
+                        ParticipantHydrationError::Database(error) => {
+                            ResetLeaveHydrationError::Database(error)
+                        }
+                        ParticipantHydrationError::OutOfDomain => {
+                            ResetLeaveHydrationError::OutOfDomain
+                        }
+                        ParticipantHydrationError::ProvenanceMissing
+                        | ParticipantHydrationError::InvalidProvenance => {
+                            ResetLeaveHydrationError::InvalidTerminal
+                        }
+                    })?;
+                    Some(ParticipantRemovalEvidence::from_hydration(
+                        participant,
+                        evidence.clone(),
+                    ))
+                } else {
+                    None
+                };
+                (Some(terminal), fulfilled_participant)
             }
             LeaveTerminalSelection::Cancellation {
                 terminal_request_digest,
@@ -5678,22 +5750,25 @@ pub(crate) async fn load_leave_request_hydration_rows(
                 {
                     return Err(ResetLeaveHydrationError::InvalidTerminal);
                 }
-                Some(WorkTerminalHydrationRow::Request(evidence))
+                (Some(WorkTerminalHydrationRow::Request(evidence)), None)
             }
-            LeaveTerminalSelection::Expiry { terminal_at } => Some(
-                load_work_terminal_hydration_row(
-                    transaction,
-                    authority,
-                    conversation_id,
-                    WorkTerminalLocator::Expiry { terminal_at },
-                )
-                .await
-                .map_err(|error| match error {
-                    WorkTerminalHydrationError::Database(error) => {
-                        ResetLeaveHydrationError::Database(error)
-                    }
-                    _ => ResetLeaveHydrationError::InvalidTerminal,
-                })?,
+            LeaveTerminalSelection::Expiry { terminal_at } => (
+                Some(
+                    load_work_terminal_hydration_row(
+                        transaction,
+                        authority,
+                        conversation_id,
+                        WorkTerminalLocator::Expiry { terminal_at },
+                    )
+                    .await
+                    .map_err(|error| match error {
+                        WorkTerminalHydrationError::Database(error) => {
+                            ResetLeaveHydrationError::Database(error)
+                        }
+                        _ => ResetLeaveHydrationError::InvalidTerminal,
+                    })?,
+                ),
+                None,
             ),
         };
 
@@ -5706,6 +5781,7 @@ pub(crate) async fn load_leave_request_hydration_rows(
             status,
             origin,
             terminal,
+            fulfilled_participant,
         });
     }
 

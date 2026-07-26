@@ -96,12 +96,12 @@ use chat_protocol::{
         DeviceIdentity, DurableSignedRequestEnvelope, HydrationAuthority, IntervalHydrationRow,
         InvitationHydrationRow, LeafHydrationRow, LeafRecoveryCancellation,
         LeafRecoveryFulfillment, LeafRecoveryKind, LeafRecoveryRequestCommand, LeaveCancellation,
-        LeaveFulfillment, LeaveRequestCommand, LeaveRequestStatus, LockedRegistrationProjection,
-        OpeningKind, PackageStatus, ParticipantHydrationRow, ParticipantRole, ParticipantStatus,
-        PersistedRegistrationRow, PersistedRegistrationStatus, PersistedSignedRequestRow,
-        PrincipalId, RecoveryRequestStatus, RecoverySource, RequestEntryKind, RequestEvidence,
-        ReservationStatus, ResetActivation, ResetRequestCommand, ResetRequestStatus,
-        ServerTimestamp, StateMachineError, TransitionEvidence, ZeroLeafLeave,
+        LeaveFulfillment, LeaveFulfillmentTestMutation, LeaveRequestCommand, LeaveRequestStatus,
+        LockedRegistrationProjection, OpeningKind, PackageStatus, ParticipantHydrationRow,
+        ParticipantRole, ParticipantStatus, PersistedRegistrationRow, PersistedRegistrationStatus,
+        PersistedSignedRequestRow, PrincipalId, RecoveryRequestStatus, RecoverySource,
+        RequestEntryKind, RequestEvidence, ReservationStatus, ResetActivation, ResetRequestCommand,
+        ResetRequestStatus, ServerTimestamp, StateMachineError, TransitionEvidence, ZeroLeafLeave,
     },
     transcript::{
         decode_and_verify_signed_mutation, decode_canonical_signed_mutation, SignedMutationKind,
@@ -1659,6 +1659,102 @@ fn leafed_group_leave_request_and_cancellation_preserve_coordinate_and_public_st
     assert!(fulfilled.participant(bob(&manifest).principal()).is_none());
     assert!(fulfilled.leaf(&bob(&manifest)).is_none());
     assert!(fulfilled.leaf(&alice(&manifest)).is_some());
+    assert_eq!(
+        hydrate_conversation_state(fulfilled.clone()),
+        Ok(fulfilled),
+        "planner fulfillment retains the exact removed participant and closed-leaf proof"
+    );
+}
+
+#[test]
+fn fulfilled_leave_proof_matrix_is_complete_and_allows_later_rejoin() {
+    let manifest = corpus_manifest();
+    let group = added_group();
+    let request_id = uuid_v4_bytes(0x89);
+    let requested = plan_leave_request(
+        &group,
+        registered_leave_request(
+            bob(&manifest),
+            request_id,
+            fixture_received_at(4),
+            *group.coordinate().conversation_id(),
+            4,
+            0x89,
+        ),
+    )
+    .unwrap()
+    .into_state();
+    let fulfilled = plan_leave_fulfillment(
+        &requested,
+        LeaveFulfillment {
+            actor: alice(&manifest),
+            requester: bob(&manifest).principal().clone(),
+            leave_request_id: request_id,
+            transition: evidence(5, 0x8a),
+            commit: verified_remove_bob_commit(&requested),
+        },
+    )
+    .unwrap()
+    .into_state();
+    let requester = bob(&manifest);
+    let exact = fulfilled.for_test_mutate_leave_fulfillment(
+        &request_id,
+        LeaveFulfillmentTestMutation::ManifestDevices(vec![requester.clone()]),
+    );
+    assert!(
+        exact.for_test_leave_fulfillment_matches(&request_id),
+        "exact old participant period plus every pre-terminal requester leaf matches"
+    );
+
+    let nonexistent =
+        DeviceIdentity::new(requester.principal().clone(), uuid_v4_bytes(0x8b)).unwrap();
+    let foreign =
+        DeviceIdentity::new(alice(&manifest).principal().clone(), uuid_v4_bytes(0x8c)).unwrap();
+    for devices in [
+        vec![],
+        vec![requester.clone(), nonexistent],
+        vec![requester.clone(), foreign],
+        vec![requester.clone(), requester.clone()],
+    ] {
+        assert!(!fulfilled
+            .for_test_mutate_leave_fulfillment(
+                &request_id,
+                LeaveFulfillmentTestMutation::ManifestDevices(devices),
+            )
+            .for_test_leave_fulfillment_matches(&request_id));
+    }
+
+    let wrong_principal = PrincipalId::new(b"did:plc:wrongproofprincipal".to_vec()).unwrap();
+    for mutation in [
+        LeaveFulfillmentTestMutation::DropParticipantProof,
+        LeaveFulfillmentTestMutation::ProofPrincipal(wrong_principal),
+        LeaveFulfillmentTestMutation::ProofInactive,
+        LeaveFulfillmentTestMutation::ProofInvalidProvenance,
+        LeaveFulfillmentTestMutation::ProofWrongTransition,
+        LeaveFulfillmentTestMutation::ProofWrongSequence,
+        LeaveFulfillmentTestMutation::ProofWrongTime,
+        LeaveFulfillmentTestMutation::IntervalLeftOpen(requester.clone()),
+        LeaveFulfillmentTestMutation::IntervalClosedLater(requester.clone()),
+        LeaveFulfillmentTestMutation::IntervalWrongEvidence(requester.clone()),
+        LeaveFulfillmentTestMutation::IntervalWrongKind(requester.clone()),
+        LeaveFulfillmentTestMutation::IntervalOpenedAfterOrigin(requester.clone()),
+        LeaveFulfillmentTestMutation::DuplicatePreTerminalInterval(requester.clone()),
+    ] {
+        let label = format!("{mutation:?}");
+        assert!(
+            !exact
+                .for_test_mutate_leave_fulfillment(&request_id, mutation)
+                .for_test_leave_fulfillment_matches(&request_id),
+            "{label}"
+        );
+    }
+
+    assert!(exact
+        .for_test_mutate_leave_fulfillment(
+            &request_id,
+            LeaveFulfillmentTestMutation::LaterRejoin(requester),
+        )
+        .for_test_leave_fulfillment_matches(&request_id));
 }
 
 #[test]
