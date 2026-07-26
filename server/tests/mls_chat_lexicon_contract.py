@@ -1035,6 +1035,14 @@ def validate_core_definitions(documents: dict[str, dict[str, Any]]) -> None:
     assert required(finalized) == {"participantChanges", "leafChanges"}
     assert "target-device-signed" in finalized.get("description", "")
     assert "exactly one addLeafByRecovery" in finalized.get("description", "")
+    assert (
+        "userDid exact UTF-8 bytes, deviceId raw UUID bytes, operation rank"
+        in finalized.get("description", "")
+    )
+    assert (
+        "removeLeaf before addLeafByRecovery for the same (userDid, deviceId)"
+        in finalized.get("description", "")
+    )
     assert {local_ref_name(ref) for ref in defs["leafChange"]["refs"]} == {"addLeafByRecovery", "removeLeaf"}
     for removed_name in (
         "reservationPurpose", "reservationRecipient", "keyPackageReservation",

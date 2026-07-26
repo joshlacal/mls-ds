@@ -849,19 +849,25 @@ fn enforce_contract_order(
     }
     if definition_name == "transitionManifest" {
         let values = value_array(map_value(object, "leafChanges")?)?;
-        let mut prior: Option<(&[u8], &[u8; 16])> = None;
+        let mut prior: Option<(&[u8], &[u8; 16], u8)> = None;
         for value in values {
             let item = value_map(value)?;
             let did = value_did(map_value(item, "userDid")?)?.as_str().as_bytes();
             let device = value_uuid(map_value(item, "deviceId")?)?.as_bytes();
+            let operation_rank = match map_value(item, "$type")? {
+                DagValue::Text(value) if value == "blue.catbird.chat.defs#removeLeaf" => 1,
+                DagValue::Text(value) if value == "blue.catbird.chat.defs#addLeafByRecovery" => 2,
+                _ => return Err(AuthPrimitiveError::invalid("unknown leaf change operation")),
+            };
             if prior.is_some_and(|previous| {
-                (previous.0, previous.1.as_slice()) >= (did, device.as_slice())
+                (previous.0, previous.1.as_slice(), previous.2)
+                    >= (did, device.as_slice(), operation_rank)
             }) {
                 return Err(AuthPrimitiveError::invalid(
                     "leaf changes are not strictly ordered",
                 ));
             }
-            prior = Some((did, device));
+            prior = Some((did, device, operation_rank));
         }
     }
     if matches!(

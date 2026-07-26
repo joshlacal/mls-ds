@@ -658,12 +658,60 @@ fn canonical_participant_changes_reject_reversal_and_duplicates_instead_of_sorti
 }
 
 #[test]
-fn canonical_leaf_changes_reject_reversed_and_duplicate_device_tuples() {
+fn canonical_leaf_changes_accept_remove_then_add_for_same_device_replace() {
+    let device_id = "11111111-1111-4111-8111-111111111111";
+    let leaf_changes = vec![
+        remove_leaf(DID, device_id),
+        add_leaf_by_recovery(DID, device_id),
+    ];
+    assert!(
+        decode_canonical_signed_mutation(&unsigned_leaf_recovery_fulfillment_request(leaf_changes))
+            .is_ok()
+    );
+}
+
+#[test]
+fn canonical_leaf_changes_reject_add_then_remove_for_same_device_replace() {
+    let device_id = "11111111-1111-4111-8111-111111111111";
+    let leaf_changes = vec![
+        add_leaf_by_recovery(DID, device_id),
+        remove_leaf(DID, device_id),
+    ];
+    assert!(
+        decode_canonical_signed_mutation(&unsigned_leaf_recovery_fulfillment_request(leaf_changes))
+            .is_err()
+    );
+}
+
+#[test]
+fn canonical_leaf_changes_reject_duplicate_remove_for_same_device() {
+    let device_id = "11111111-1111-4111-8111-111111111111";
+    let leaf_changes = vec![remove_leaf(DID, device_id), remove_leaf(DID, device_id)];
+    assert!(
+        decode_canonical_signed_mutation(&unsigned_leaf_recovery_fulfillment_request(leaf_changes))
+            .is_err()
+    );
+}
+
+#[test]
+fn canonical_leaf_changes_reject_duplicate_add_for_same_device() {
+    let device_id = "11111111-1111-4111-8111-111111111111";
+    let leaf_changes = vec![
+        add_leaf_by_recovery(DID, device_id),
+        add_leaf_by_recovery(DID, device_id),
+    ];
+    assert!(
+        decode_canonical_signed_mutation(&unsigned_leaf_recovery_fulfillment_request(leaf_changes))
+            .is_err()
+    );
+}
+
+#[test]
+fn canonical_leaf_changes_preserve_cross_device_ordering() {
     let low = "11111111-1111-4111-8111-111111111111";
     let high = "22222222-2222-4222-8222-222222222222";
     assert!(decode_canonical_signed_mutation(&unsigned_commit_request(&[low, high])).is_ok());
     assert!(decode_canonical_signed_mutation(&unsigned_commit_request(&[high, low])).is_err());
-    assert!(decode_canonical_signed_mutation(&unsigned_commit_request(&[low, low])).is_err());
 }
 
 #[test]
@@ -1911,6 +1959,61 @@ fn unsigned_commit_request(device_ids: &[&str]) -> Vec<u8> {
         "signature": STANDARD.encode([0_u8; 64])
     }))
     .unwrap()
+}
+
+fn unsigned_leaf_recovery_fulfillment_request(leaf_changes: Vec<Value>) -> Vec<u8> {
+    let mut wrapper: Value = serde_json::from_slice(&unsigned_commit_request(&[])).unwrap();
+    let body = wrapper["body"].as_object_mut().unwrap();
+    body.insert(
+        "$type".to_owned(),
+        json!("blue.catbird.chat.defs#leafRecoveryFulfillmentBody"),
+    );
+    body.insert(
+        "signatureDomain".to_owned(),
+        json!("CATBIRD-CHAT-LEAF-RECOVERY-FULFILL\u{0}"),
+    );
+    body.insert("recoveryRequestId".to_owned(), json!(TOKEN_JTI));
+    let manifest = body["manifest"].as_object_mut().unwrap();
+    manifest.insert("leafChanges".to_owned(), Value::Array(leaf_changes));
+    manifest.insert("leafRecoveryRequestId".to_owned(), json!(TOKEN_JTI));
+    let opaque_welcome = [0x41_u8; 8];
+    manifest.insert(
+        "welcomeBundle".to_owned(),
+        json!({
+            "welcomeId": RETRY_TOKEN_JTI,
+            "framing": "mlsMessage",
+            "contentType": "welcome",
+            "opaqueWelcome": STANDARD.encode(opaque_welcome),
+            "sha256": STANDARD.encode(Sha256::digest(opaque_welcome)),
+            "deliveries": [{
+                "recipientDid": DID,
+                "recipientDeviceId": "11111111-1111-4111-8111-111111111111",
+                "provenance": {
+                    "recoveryRequestId": TOKEN_JTI,
+                    "keyPackageRef": STANDARD.encode([0x42_u8; 32]),
+                }
+            }]
+        }),
+    );
+    serde_json::to_vec(&wrapper).unwrap()
+}
+
+fn remove_leaf(user_did: &str, device_id: &str) -> Value {
+    json!({
+        "$type": "blue.catbird.chat.defs#removeLeaf",
+        "userDid": user_did,
+        "deviceId": device_id,
+    })
+}
+
+fn add_leaf_by_recovery(user_did: &str, device_id: &str) -> Value {
+    json!({
+        "$type": "blue.catbird.chat.defs#addLeafByRecovery",
+        "userDid": user_did,
+        "deviceId": device_id,
+        "recoveryRequestId": TOKEN_JTI,
+        "keyPackageRef": STANDARD.encode([0x42_u8; 32]),
+    })
 }
 
 fn coordinates(state_version: u64) -> Value {
