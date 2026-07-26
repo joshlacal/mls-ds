@@ -21,13 +21,13 @@ use super::relationship_policy::{
 
 #[cfg(not(test))]
 use super::repository::auth::{BusinessAuthorityGuard, RepositoryAuthorityClass};
+use super::repository::core::LockedConversationHeadGuard;
 #[cfg(not(test))]
 use super::repository::core::{
-    LockedConversationHeadGuard, LockedConversationStateGuard, LockedDirectConversationLookupGuard,
-    LockedDirectLookupOutcome, LockedInvitationQuotaGuard, LockedRecoveryPackageGuard,
-    LockedRecoveryPackageStatus, LockedRecoveryPackageUse, LockedRevocationFanoutGuard,
-    LockedRevocationPackageGuard, LockedRevocationTargetGuard, LockedRevocationTargetStatus,
-    LockedWelcomeGuard,
+    LockedConversationStateGuard, LockedDirectConversationLookupGuard, LockedDirectLookupOutcome,
+    LockedInvitationQuotaGuard, LockedRecoveryPackageGuard, LockedRecoveryPackageStatus,
+    LockedRecoveryPackageUse, LockedRevocationFanoutGuard, LockedRevocationPackageGuard,
+    LockedRevocationTargetGuard, LockedRevocationTargetStatus, LockedWelcomeGuard,
 };
 
 use super::{
@@ -1087,9 +1087,10 @@ pub(crate) struct HydrationAuthority {
     expected_conversation_id: [u8; 16],
     #[cfg(not(test))]
     locked: LockedHydrationBinding,
+    #[cfg(test)]
+    locked: Option<LockedHydrationBinding>,
 }
 
-#[cfg(not(test))]
 struct LockedHydrationBinding {
     transaction_id: String,
     expected_prior: Option<PublicGroupSnapshotCoordinate>,
@@ -1108,6 +1109,7 @@ impl HydrationAuthority {
         }
         Ok(Self {
             expected_conversation_id,
+            locked: None,
         })
     }
 
@@ -1169,7 +1171,6 @@ impl HydrationAuthority {
     /// they are only known once the aggregate has been assembled and sealed.
     /// The historical graph rows are re-verified by the DISTINCT read-time
     /// `HistoricalRehydrationAuthority`, never by this append-time authority.
-    #[cfg(not(test))]
     #[allow(dead_code)]
     pub(crate) fn from_locked_existing_head(
         head: &LockedConversationHeadGuard,
@@ -1182,6 +1183,7 @@ impl HydrationAuthority {
         }
         Ok(Self {
             expected_conversation_id: *head.conversation_id().as_bytes(),
+            #[cfg(not(test))]
             locked: LockedHydrationBinding {
                 transaction_id: head.transaction_id().to_owned(),
                 expected_prior: head.prior_coordinate().copied(),
@@ -1191,6 +1193,16 @@ impl HydrationAuthority {
                 locked_graph_digest: None,
                 locked_snapshot_digest: None,
             },
+            #[cfg(test)]
+            locked: Some(LockedHydrationBinding {
+                transaction_id: head.transaction_id().to_owned(),
+                expected_prior: head.prior_coordinate().copied(),
+                expected_next_entry_seq: head.next_entry_seq(),
+                locked_at: ServerTimestamp::from_unix_millis(head.locked_at().timestamp_millis())?,
+                locked_head_digest: *head.durable_row_digest(),
+                locked_graph_digest: None,
+                locked_snapshot_digest: None,
+            }),
         })
     }
 
@@ -3650,7 +3662,6 @@ impl HistoricalRehydrationAuthority {
     /// locked head (`prior_coordinate` = `Some`, `next_entry_seq >= 2`). The
     /// head's `next_entry_seq` becomes the strict upper bound for historical
     /// control-entry seqs.
-    #[cfg(not(test))]
     #[allow(dead_code)]
     pub(crate) fn from_locked_head(
         head: &LockedConversationHeadGuard,
@@ -6422,6 +6433,30 @@ impl ParticipantRemovalEvidence {
             },
             terminal,
         }
+    }
+
+    /// Lossless read-only projection used by the repository's typed locked-graph
+    /// digest. No caller can mutate or construct internal participant state
+    /// through this seam.
+    pub(crate) fn participant_hydration(&self) -> ParticipantHydrationRow {
+        ParticipantHydrationRow {
+            principal: self.participant.principal.clone(),
+            status: self.participant.status,
+            role: self.participant.role,
+            role_producer: self.participant.role_producer.clone(),
+            invitation: self.participant.invitation.as_ref().map(|invitation| {
+                InvitationHydrationRow {
+                    transition: invitation.transition.clone(),
+                    inviter: invitation.inviter.clone(),
+                }
+            }),
+            acceptance: self.participant.acceptance.clone(),
+        }
+    }
+
+    /// Exact terminal transition retained by this removal proof.
+    pub(crate) fn terminal(&self) -> &TransitionEvidence {
+        &self.terminal
     }
 }
 

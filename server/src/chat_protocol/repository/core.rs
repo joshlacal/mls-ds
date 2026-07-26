@@ -28,17 +28,17 @@ use super::super::{
     },
     state_machine::{
         acceptance_recovery_package_artifact_matches, classify_acceptance, classify_invitation,
-        classify_role_producer, metadata_binding_of_transition,
-        recovery_fulfillment_terminal_matches, CloseKind, ConversationState, DeviceIdentity,
-        HistoricalRehydrationAuthority, HydrationAuthority, IntervalEndHydrationRow,
-        IntervalHydrationRow, LeafHydrationRow, LeafRecoveryKind, LeaveRequestHydrationRow,
-        LeaveRequestStatus, MetadataSnapshotBinding, OpeningKind, ParticipantHydrationRow,
-        ParticipantRemovalEvidence, ParticipantRole, ParticipantStatus, PersistedControlAuthority,
-        PrincipalId, RecoveryOriginHydrationRow, RecoveryRequestHydrationRow,
-        RecoveryRequestStatus, RecoveryReservationHydrationRow, RecoverySource, RequestEntryKind,
-        RequestEvidence, ReservationStatus, ResetRequestHydrationRow, ResetRequestStatus,
-        ServerTimestamp, TransitionEvidence, WelcomeHydrationRow, WelcomeStatus,
-        WorkTerminalHydrationRow,
+        classify_role_producer, hydrate_conversation_state, metadata_binding_of_transition,
+        recovery_fulfillment_terminal_matches, CloseKind, ConversationKind, ConversationState,
+        ConversationStateHydration, DeviceIdentity, HistoricalRehydrationAuthority,
+        HydrationAuthority, IntervalEndHydrationRow, IntervalHydrationRow, LeafHydrationRow,
+        LeafRecoveryKind, LeaveRequestHydrationRow, LeaveRequestStatus, MetadataSnapshotBinding,
+        OpeningKind, ParticipantHydrationRow, ParticipantRemovalEvidence, ParticipantRole,
+        ParticipantStatus, PersistedControlAuthority, PrincipalId, RecoveryOriginHydrationRow,
+        RecoveryRequestHydrationRow, RecoveryRequestStatus, RecoveryReservationHydrationRow,
+        RecoverySource, RequestEntryKind, RequestEvidence, ReservationStatus,
+        ResetRequestHydrationRow, ResetRequestStatus, ServerTimestamp, StateMachineError,
+        TransitionEvidence, WelcomeHydrationRow, WelcomeStatus, WorkTerminalHydrationRow,
     },
     validation::{BareDid, KeyThumbprint},
 };
@@ -2149,6 +2149,12 @@ pub(crate) enum PublicStateHydrationError {
     /// encoding, or their digest did not match the stored tree-summary digest.
     #[error("clean-chat persisted tree summary is invalid")]
     InvalidTreeSummary,
+    /// The supplied head was not minted by this database transaction or the
+    /// immutable generation row no longer byte-equaled its pinned coordinate.
+    #[error("clean-chat public state does not match the already-locked head")]
+    LockedHeadMismatch,
+    #[error("clean-chat conversation head hydration failed: {0}")]
+    Head(ConversationHeadHydrationError),
     /// The locked row-set did not satisfy the guard invariant (e.g. a
     /// caller-supplied `locked_at` that is not a whole millisecond, or an empty
     /// snapshot column).
@@ -2223,14 +2229,34 @@ pub(crate) async fn hydrate_locked_public_state(
     conversation_id: Uuid,
     locked_at: DateTime<Utc>,
 ) -> Result<LockedPublicStateHydrationGuard, PublicStateHydrationError> {
-    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
-        .fetch_one(&mut **transaction)
-        .await?;
+    let head = hydrate_locked_conversation_head(transaction, conversation_id, locked_at)
+        .await
+        .map_err(|error| match error {
+            ConversationHeadHydrationError::ConversationMissing => {
+                PublicStateHydrationError::ConversationMissing
+            }
+            error => PublicStateHydrationError::Head(error),
+        })?;
+    hydrate_public_state_under_locked_head(transaction, &head).await
+}
 
+/// Hydrate the immutable generation row selected by an already-held head lock.
+///
+/// No second `FOR UPDATE` is issued here. The caller's conversation-head guard
+/// is the sole serialization point; this query reads only its exact
+/// generation/state-version and proves it is executing in the same transaction.
+#[allow(dead_code)]
+pub(crate) async fn hydrate_public_state_under_locked_head(
+    transaction: &mut Transaction<'_, Postgres>,
+    head: &LockedConversationHeadGuard,
+) -> Result<LockedPublicStateHydrationGuard, PublicStateHydrationError> {
+    let Some(head_coordinate) = head.prior_coordinate() else {
+        return Err(PublicStateHydrationError::LockedHeadMismatch);
+    };
+    let conversation_id = head.conversation_id();
     #[allow(clippy::type_complexity)]
     let row: Option<(
-        i64,
-        i64,
+        String,
         Vec<u8>,
         i64,
         Vec<u8>,
@@ -2243,8 +2269,7 @@ pub(crate) async fn hydrate_locked_public_state(
     )> = sqlx::query_as(
         r#"
         SELECT
-            c.current_generation,
-            c.current_state_version,
+            txid_current()::text,
             gs.group_id,
             gs.epoch,
             gs.group_context_hash,
@@ -2254,21 +2279,25 @@ pub(crate) async fn hydrate_locked_public_state(
             gs.snapshot_sha256,
             gs.tree_summary_bytes,
             gs.tree_summary_sha256
-        FROM chat.conversations c
-        JOIN chat.generation_states gs
-          ON gs.conversation_id = c.conversation_id
-         AND gs.generation = c.current_generation
-         AND gs.state_version = c.current_state_version
-        WHERE c.conversation_id = $1
-        FOR UPDATE OF c
+        FROM chat.generation_states gs
+        WHERE gs.conversation_id = $1
+          AND gs.generation = $2
+          AND gs.state_version = $3
         "#,
     )
     .bind(conversation_id)
+    .bind(
+        i64::try_from(head_coordinate.generation())
+            .map_err(|_| PublicStateHydrationError::LockedHeadMismatch)?,
+    )
+    .bind(
+        i64::try_from(head_coordinate.state_version())
+            .map_err(|_| PublicStateHydrationError::LockedHeadMismatch)?,
+    )
     .fetch_optional(&mut **transaction)
     .await?;
     let (
-        current_generation,
-        current_state_version,
+        transaction_id,
         group_id,
         epoch,
         group_context_hash,
@@ -2280,8 +2309,11 @@ pub(crate) async fn hydrate_locked_public_state(
         tree_summary_sha256,
     ) = row.ok_or(PublicStateHydrationError::ConversationMissing)?;
 
-    let generation = safe_public_state_u64(current_generation)?;
-    let state_version = safe_public_state_u64(current_state_version)?;
+    if transaction_id != head.transaction_id() {
+        return Err(PublicStateHydrationError::LockedHeadMismatch);
+    }
+    let generation = head_coordinate.generation();
+    let state_version = head_coordinate.state_version();
     let epoch = safe_public_state_u64(epoch)?;
     let group_id: [u8; 32] = group_id
         .try_into()
@@ -2322,6 +2354,9 @@ pub(crate) async fn hydrate_locked_public_state(
         confirmation_tag,
         lifecycle,
     );
+    if &coordinate != head_coordinate {
+        return Err(PublicStateHydrationError::LockedHeadMismatch);
+    }
 
     let binding = PublicGroupSnapshotBinding::new(
         *conversation_id.as_bytes(),
@@ -2341,7 +2376,7 @@ pub(crate) async fn hydrate_locked_public_state(
         &coordinate,
         &snapshot_sha256,
         &tree_summary_sha256,
-        locked_at,
+        head.locked_at(),
     );
 
     seal_locked_public_state_hydration(
@@ -2352,7 +2387,7 @@ pub(crate) async fn hydrate_locked_public_state(
         binding,
         tree_summary_bytes,
         tree_summary_sha256,
-        locked_at,
+        head.locked_at(),
         locked_generation_row_digest,
     )
     .ok_or(PublicStateHydrationError::GuardInvariant)
@@ -6280,4 +6315,661 @@ fn reset_leave_timestamp(
 ) -> Result<ServerTimestamp, ResetLeaveHydrationError> {
     ServerTimestamp::from_canonical_stored(&canonical_millis(value))
         .map_err(|_| ResetLeaveHydrationError::OutOfDomain)
+}
+
+// ===========================================================================
+// T4-H2-pre G1 — active locked conversation aggregate.
+//
+// Every leg below is read while the caller owns the conversation-row lock
+// acquired by `hydrate_locked_conversation_head`. Historical evidence is
+// reverified from durable entry bytes; no cached state or test authority enters
+// the production path. Closed/superseded state is deliberately unsupported
+// until terminal-proof hydration exists.
+// ===========================================================================
+
+#[derive(Debug, Error)]
+pub(crate) enum ConversationStateHydrationError {
+    #[error("clean-chat active aggregate head hydration failed: {0}")]
+    Head(ConversationHeadHydrationError),
+    #[error("clean-chat active aggregate public-state hydration failed: {0}")]
+    PublicState(PublicStateHydrationError),
+    #[error("clean-chat active aggregate producer hydration failed: {0}")]
+    Producer(ProducerHydrationError),
+    #[error("clean-chat active aggregate metadata hydration failed: {0}")]
+    Metadata(MetadataHydrationError),
+    #[error("clean-chat active aggregate participant hydration failed: {0}")]
+    Participants(ParticipantHydrationError),
+    #[error("clean-chat active aggregate leaf hydration failed: {0}")]
+    Leaves(LeafHydrationError),
+    #[error("clean-chat active aggregate interval hydration failed: {0}")]
+    Intervals(IntervalHydrationError),
+    #[error("clean-chat active aggregate recovery-work hydration failed: {0}")]
+    RecoveryWork(RecoveryHydrationError),
+    #[error("clean-chat active aggregate reset-work hydration failed: {0}")]
+    ResetWork(ResetLeaveHydrationError),
+    #[error("clean-chat active aggregate leave-work hydration failed: {0}")]
+    LeaveWork(ResetLeaveHydrationError),
+    #[error("clean-chat active aggregate Welcome hydration failed: {0}")]
+    Welcomes(WelcomeHydrationError),
+    #[error("clean-chat active aggregate authority construction failed: {0}")]
+    Authority(StateMachineError),
+    #[error("clean-chat active aggregate state validation failed: {0}")]
+    State(StateMachineError),
+    #[error("clean-chat active aggregate snapshot decode failed: {0}")]
+    Snapshot(super::super::public_state::PublicStateError),
+    #[error("clean-chat active aggregate read-set does not match the locked head")]
+    ReadSetMismatch,
+    #[error("clean-chat terminal or superseded lifecycle is not yet supported")]
+    TerminalLifecycleUnsupported,
+    #[error("clean-chat conversation kind or lifecycle is out of domain")]
+    ConversationDomain,
+    #[error("clean-chat active aggregate unexpectedly contains schedule terminal proofs")]
+    UnexpectedTerminalProof,
+    #[error("clean-chat active aggregate graph digest is invalid")]
+    GraphDigest,
+    #[error("clean-chat active aggregate could not be sealed")]
+    Seal,
+    #[error("clean-chat active aggregate database error: {0}")]
+    Database(#[from] sqlx::Error),
+}
+
+fn historical_authority_for_locked_head(
+    head: &LockedConversationHeadGuard,
+) -> Result<HistoricalRehydrationAuthority, StateMachineError> {
+    HistoricalRehydrationAuthority::from_locked_head(head)
+}
+
+fn hydration_authority_for_locked_head(
+    head: &LockedConversationHeadGuard,
+) -> Result<HydrationAuthority, StateMachineError> {
+    HydrationAuthority::from_locked_existing_head(head)
+}
+
+fn graph_digest_frame(digest: &mut Sha256, bytes: &[u8]) {
+    digest.update((bytes.len() as u64).to_be_bytes());
+    digest.update(bytes);
+}
+
+fn graph_digest_option<T: ?Sized>(
+    digest: &mut Sha256,
+    value: Option<&T>,
+    encode: impl FnOnce(&mut Sha256, &T),
+) {
+    match value {
+        None => digest.update([0]),
+        Some(value) => {
+            digest.update([1]);
+            encode(digest, value);
+        }
+    }
+}
+
+fn graph_digest_coordinate(digest: &mut Sha256, value: &PublicGroupSnapshotCoordinate) {
+    digest.update(value.conversation_id());
+    digest.update(value.generation().to_be_bytes());
+    digest.update(value.state_version().to_be_bytes());
+    digest.update(value.group_id());
+    digest.update(value.epoch().to_be_bytes());
+    digest.update(value.group_context_hash());
+    digest.update(value.confirmation_tag());
+    digest.update([match value.lifecycle() {
+        PublicGroupSnapshotLifecycle::Active => 1,
+        PublicGroupSnapshotLifecycle::Superseded => 2,
+    }]);
+}
+
+fn graph_digest_device(digest: &mut Sha256, value: &DeviceIdentity) {
+    graph_digest_frame(digest, value.principal().as_bytes());
+    digest.update(value.device_id());
+}
+
+fn graph_digest_transition(digest: &mut Sha256, value: &TransitionEvidence) {
+    digest.update(value.seq().to_be_bytes());
+    digest.update(value.transition_id());
+    digest.update(value.outer_entry_fingerprint());
+    graph_digest_frame(digest, value.outer_control_projection());
+    graph_digest_frame(digest, value.server_fields_dag_cbor());
+    digest.update(value.durable_row_digest());
+    digest.update(value.received_at().unix_millis().to_be_bytes());
+}
+
+fn graph_digest_request(digest: &mut Sha256, value: &RequestEvidence) {
+    digest.update([match value.kind() {
+        RequestEntryKind::LeafRecoveryRequest => 1,
+        RequestEntryKind::LeafRecoveryCancellation => 2,
+        RequestEntryKind::ResetRequest => 3,
+        RequestEntryKind::LeaveRequest => 4,
+        RequestEntryKind::LeaveCancellation => 5,
+        RequestEntryKind::WelcomeAcknowledgement => 6,
+        RequestEntryKind::WelcomeRejection => 7,
+    }]);
+    graph_digest_option(digest, value.control_entry_id(), |digest, id| {
+        digest.update(id);
+    });
+    digest.update(value.conversation_id());
+    graph_digest_option(digest, value.control_seq().as_ref(), |digest, seq| {
+        digest.update(seq.to_be_bytes());
+    });
+    graph_digest_option(
+        digest,
+        value.control_outer_entry_fingerprint(),
+        |digest, fingerprint| digest.update(fingerprint),
+    );
+    graph_digest_option(digest, value.control_outer_projection(), graph_digest_frame);
+    graph_digest_option(
+        digest,
+        value.control_server_fields_dag_cbor(),
+        graph_digest_frame,
+    );
+    digest.update(value.request_id());
+    graph_digest_device(digest, value.actor());
+    digest.update(value.received_at().unix_millis().to_be_bytes());
+    digest.update(value.durable_row_digest());
+}
+
+fn graph_digest_device_revocation(
+    digest: &mut Sha256,
+    value: &super::super::state_machine::DeviceRevocationEvidence,
+) {
+    digest.update(value.revocation_id());
+    graph_digest_device(digest, value.actor());
+    graph_digest_device(digest, value.target());
+    digest.update(value.actor_key_id());
+    digest.update(value.actor_auth_generation().to_be_bytes());
+    digest.update(value.expected_target_auth_generation().to_be_bytes());
+    digest.update(value.signed_at().unix_millis().to_be_bytes());
+    digest.update(value.accepted_at().unix_millis().to_be_bytes());
+    digest.update(value.request_digest());
+    graph_digest_frame(digest, value.signature());
+    graph_digest_frame(digest, value.signed_request_bytes());
+    graph_digest_frame(digest, value.signing_transcript_bytes());
+    digest.update(value.durable_row_digest());
+}
+
+fn graph_digest_terminal(digest: &mut Sha256, value: &WorkTerminalHydrationRow) {
+    match value {
+        WorkTerminalHydrationRow::Transition(value) => {
+            digest.update([1]);
+            graph_digest_transition(digest, value);
+        }
+        WorkTerminalHydrationRow::Request(value) => {
+            digest.update([2]);
+            graph_digest_request(digest, value);
+        }
+        WorkTerminalHydrationRow::DeviceRevocation(value) => {
+            digest.update([3]);
+            graph_digest_device_revocation(digest, value);
+        }
+        WorkTerminalHydrationRow::Expiry(value) => {
+            digest.update([4]);
+            digest.update(value.unix_millis().to_be_bytes());
+        }
+    }
+}
+
+fn graph_digest_metadata(digest: &mut Sha256, value: &MetadataSnapshotBinding) {
+    digest.update(value.coordinate_conversation_id());
+    digest.update(value.coordinate_generation().to_be_bytes());
+    digest.update(value.coordinate_epoch().to_be_bytes());
+    digest.update(value.coordinate_group_context_hash());
+    digest.update(value.origin_transition_id());
+    digest.update(value.metadata_version().to_be_bytes());
+    digest.update(value.nonce());
+    graph_digest_frame(digest, value.ciphertext());
+    digest.update(value.ciphertext_sha256());
+    graph_digest_option(digest, value.avatar_binding_digest(), |digest, value| {
+        digest.update(value)
+    });
+    graph_digest_device(digest, value.author());
+    digest.update(value.author_key_id());
+    digest.update(value.signature_public_key());
+    digest.update(value.author_auth_generation_at_origin().to_be_bytes());
+    digest.update(value.author_origin_transition_id());
+    digest.update(value.author_origin_seq().to_be_bytes());
+    graph_digest_frame(digest, value.canonical_snapshot());
+    digest.update(value.digest());
+}
+
+fn graph_digest_public_state(
+    digest: &mut Sha256,
+    value: &super::super::public_state::ActivePublicState,
+) {
+    graph_digest_coordinate(digest, value.coordinate());
+    graph_digest_frame(digest, value.snapshot());
+    digest.update(value.snapshot_sha256());
+    let tree = value.binding().tree_summary();
+    digest.update(tree.tree_hash());
+    digest.update((tree.leaves().len() as u64).to_be_bytes());
+    for leaf in tree.leaves() {
+        digest.update(leaf.leaf_index().to_be_bytes());
+        graph_digest_frame(digest, leaf.basic_credential());
+        graph_digest_frame(digest, leaf.signature_key());
+        graph_digest_frame(digest, leaf.encryption_key());
+    }
+}
+
+fn graph_digest_participant(digest: &mut Sha256, value: &ParticipantHydrationRow) {
+    graph_digest_frame(digest, value.principal.as_bytes());
+    digest.update([match value.status {
+        ParticipantStatus::Pending => 1,
+        ParticipantStatus::Active => 2,
+    }]);
+    digest.update([match value.role {
+        ParticipantRole::Member => 1,
+        ParticipantRole::Admin => 2,
+    }]);
+    graph_digest_option(
+        digest,
+        value.role_producer.as_ref(),
+        graph_digest_transition,
+    );
+    graph_digest_option(digest, value.invitation.as_ref(), |digest, invitation| {
+        graph_digest_transition(digest, &invitation.transition);
+        graph_digest_device(digest, &invitation.inviter);
+    });
+    graph_digest_option(digest, value.acceptance.as_ref(), graph_digest_transition);
+}
+
+fn graph_digest_participant_removal(
+    digest: &mut Sha256,
+    value: &super::super::state_machine::ParticipantRemovalEvidence,
+) {
+    graph_digest_participant(digest, &value.participant_hydration());
+    graph_digest_transition(digest, value.terminal());
+}
+
+#[cfg(test)]
+pub(crate) fn participant_removal_graph_digest_for_test(
+    value: &super::super::state_machine::ParticipantRemovalEvidence,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"CATBIRD-CHAT-PARTICIPANT-REMOVAL-EVIDENCE\0");
+    graph_digest_participant_removal(&mut digest, value);
+    digest.finalize().into()
+}
+
+fn graph_digest_leaf(digest: &mut Sha256, value: &LeafHydrationRow) {
+    graph_digest_device(digest, &value.device);
+    digest.update(value.leaf_index.to_be_bytes());
+    graph_digest_frame(digest, &value.basic_credential);
+    graph_digest_frame(digest, &value.signature_key);
+    graph_digest_frame(digest, &value.encryption_key);
+    graph_digest_option(digest, value.key_package_ref.as_ref(), |digest, value| {
+        digest.update(value);
+    });
+}
+
+fn graph_digest_interval(digest: &mut Sha256, value: &IntervalHydrationRow) {
+    graph_digest_device(digest, &value.recipient);
+    digest.update(value.generation.to_be_bytes());
+    graph_digest_transition(digest, &value.opening);
+    digest.update([match value.opening_kind {
+        OpeningKind::Creation => 1,
+        OpeningKind::Add => 2,
+        OpeningKind::Reset => 3,
+    }]);
+    graph_digest_coordinate(digest, &value.opening_context);
+    graph_digest_option(digest, value.end.as_ref(), |digest, end| {
+        graph_digest_transition(digest, &end.evidence);
+        digest.update([match end.kind {
+            CloseKind::Remove => 1,
+            CloseKind::Replace => 2,
+            CloseKind::Reset => 3,
+            CloseKind::Terminal => 4,
+        }]);
+    });
+}
+
+fn graph_digest_recovery_request(digest: &mut Sha256, value: &RecoveryRequestHydrationRow) {
+    digest.update(value.request_id);
+    graph_digest_device(digest, &value.target);
+    digest.update([match value.kind {
+        LeafRecoveryKind::Add => 1,
+        LeafRecoveryKind::Replace => 2,
+    }]);
+    digest.update([match value.source {
+        RecoverySource::Request => 1,
+        RecoverySource::Acceptance => 2,
+    }]);
+    graph_digest_coordinate(digest, &value.bound_coordinate);
+    digest.update(value.key_package_ref);
+    digest.update(value.received_at.unix_millis().to_be_bytes());
+    digest.update(value.expires_at.unix_millis().to_be_bytes());
+    digest.update([match value.status {
+        RecoveryRequestStatus::Open => 1,
+        RecoveryRequestStatus::Fulfilled => 2,
+        RecoveryRequestStatus::Cancelled => 3,
+        RecoveryRequestStatus::Expired => 4,
+        RecoveryRequestStatus::Superseded => 5,
+    }]);
+    match &value.origin {
+        RecoveryOriginHydrationRow::Acceptance(value) => {
+            digest.update([1]);
+            graph_digest_transition(digest, value);
+        }
+        RecoveryOriginHydrationRow::Request(value) => {
+            digest.update([2]);
+            graph_digest_request(digest, value);
+        }
+    }
+    graph_digest_option(digest, value.terminal.as_ref(), graph_digest_terminal);
+}
+
+fn graph_digest_recovery_reservation(digest: &mut Sha256, value: &RecoveryReservationHydrationRow) {
+    digest.update(value.request_id);
+    graph_digest_device(digest, &value.target);
+    graph_digest_coordinate(digest, &value.bound_coordinate);
+    digest.update(value.key_package_ref);
+    digest.update(value.received_at.unix_millis().to_be_bytes());
+    digest.update(value.expires_at.unix_millis().to_be_bytes());
+    digest.update(value.package_not_after.unix_millis().to_be_bytes());
+    digest.update([match value.status {
+        ReservationStatus::Active => 1,
+        ReservationStatus::Consumed => 2,
+        ReservationStatus::Expired => 3,
+        ReservationStatus::Released => 4,
+    }]);
+    graph_digest_option(digest, value.terminal.as_ref(), graph_digest_terminal);
+}
+
+fn graph_digest_reset(digest: &mut Sha256, value: &ResetRequestHydrationRow) {
+    digest.update(value.request_id);
+    graph_digest_device(digest, &value.requester);
+    graph_digest_coordinate(digest, &value.bound_coordinate);
+    digest.update(value.received_at.unix_millis().to_be_bytes());
+    digest.update(value.expires_at.unix_millis().to_be_bytes());
+    digest.update([match value.status {
+        ResetRequestStatus::Pending => 1,
+        ResetRequestStatus::Stale => 2,
+        ResetRequestStatus::Consumed => 3,
+        ResetRequestStatus::Expired => 4,
+    }]);
+    graph_digest_request(digest, &value.origin);
+    graph_digest_option(digest, value.terminal.as_ref(), graph_digest_terminal);
+}
+
+fn graph_digest_leave(digest: &mut Sha256, value: &LeaveRequestHydrationRow) {
+    digest.update(value.request_id);
+    graph_digest_device(digest, &value.requester);
+    graph_digest_coordinate(digest, &value.bound_coordinate);
+    digest.update(value.received_at.unix_millis().to_be_bytes());
+    digest.update(value.expires_at.unix_millis().to_be_bytes());
+    digest.update([match value.status {
+        LeaveRequestStatus::Pending => 1,
+        LeaveRequestStatus::Fulfilled => 2,
+        LeaveRequestStatus::Cancelled => 3,
+        LeaveRequestStatus::Expired => 4,
+        LeaveRequestStatus::Stale => 5,
+    }]);
+    graph_digest_request(digest, &value.origin);
+    graph_digest_option(digest, value.terminal.as_ref(), graph_digest_terminal);
+    graph_digest_option(
+        digest,
+        value.fulfilled_participant.as_ref(),
+        graph_digest_participant_removal,
+    );
+}
+
+fn graph_digest_welcome(digest: &mut Sha256, value: &WelcomeHydrationRow) {
+    digest.update(value.welcome_id);
+    graph_digest_device(digest, &value.recipient);
+    digest.update(value.transition_seq.to_be_bytes());
+    graph_digest_coordinate(digest, &value.coordinate);
+    digest.update(value.recovery_request_id);
+    digest.update(value.key_package_ref);
+    graph_digest_frame(digest, &value.opaque_welcome);
+    digest.update(value.sha256);
+    digest.update(value.expires_at.unix_millis().to_be_bytes());
+    digest.update([match value.status {
+        WelcomeStatus::Pending => 1,
+        WelcomeStatus::Acknowledged => 2,
+        WelcomeStatus::Rejected => 3,
+        WelcomeStatus::Expired => 4,
+        WelcomeStatus::Superseded => 5,
+    }]);
+    graph_digest_option(digest, value.terminal.as_ref(), graph_digest_terminal);
+}
+
+fn active_conversation_graph_digest(
+    head: &LockedConversationHeadGuard,
+    snapshot_digest: &[u8; 32],
+    rows: &ConversationStateHydration,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"CATBIRD-CHAT-ACTIVE-CONVERSATION-GRAPH\0");
+    digest.update(head.conversation_id().as_bytes());
+    graph_digest_option(
+        &mut digest,
+        head.prior_coordinate(),
+        graph_digest_coordinate,
+    );
+    digest.update(head.next_entry_seq().to_be_bytes());
+    digest.update(snapshot_digest);
+    digest.update([match rows.kind {
+        ConversationKind::Direct => 1,
+        ConversationKind::Group => 2,
+    }]);
+    graph_digest_coordinate(&mut digest, &rows.coordinate);
+    graph_digest_transition(&mut digest, &rows.producer);
+    graph_digest_option(
+        &mut digest,
+        rows.public_state.as_ref(),
+        graph_digest_public_state,
+    );
+    graph_digest_option(&mut digest, rows.metadata.as_ref(), graph_digest_metadata);
+    graph_digest_option(
+        &mut digest,
+        rows.metadata_producer.as_ref(),
+        graph_digest_transition,
+    );
+
+    digest.update((rows.participants.len() as u64).to_be_bytes());
+    for value in &rows.participants {
+        graph_digest_participant(&mut digest, value);
+    }
+    digest.update((rows.leaves.len() as u64).to_be_bytes());
+    for value in &rows.leaves {
+        graph_digest_leaf(&mut digest, value);
+    }
+    digest.update((rows.intervals.len() as u64).to_be_bytes());
+    for value in &rows.intervals {
+        graph_digest_interval(&mut digest, value);
+    }
+    digest.update((rows.terminal_proofs.len() as u64).to_be_bytes());
+    digest.update((rows.recovery_requests.len() as u64).to_be_bytes());
+    for value in &rows.recovery_requests {
+        graph_digest_recovery_request(&mut digest, value);
+    }
+    digest.update((rows.recovery_reservations.len() as u64).to_be_bytes());
+    for value in &rows.recovery_reservations {
+        graph_digest_recovery_reservation(&mut digest, value);
+    }
+    digest.update((rows.reset_requests.len() as u64).to_be_bytes());
+    for value in &rows.reset_requests {
+        graph_digest_reset(&mut digest, value);
+    }
+    digest.update((rows.leave_requests.len() as u64).to_be_bytes());
+    for value in &rows.leave_requests {
+        graph_digest_leave(&mut digest, value);
+    }
+    digest.update((rows.welcomes.len() as u64).to_be_bytes());
+    for value in &rows.welcomes {
+        graph_digest_welcome(&mut digest, value);
+    }
+    digest.finalize().into()
+}
+
+#[cfg(test)]
+pub(crate) fn active_conversation_graph_digest_for_test(
+    head: &LockedConversationHeadGuard,
+    snapshot_digest: &[u8; 32],
+    rows: &ConversationStateHydration,
+) -> [u8; 32] {
+    active_conversation_graph_digest(head, snapshot_digest, rows)
+}
+
+pub(crate) fn resolve_active_conversation_kind(
+    head_lifecycle: PublicGroupSnapshotLifecycle,
+    stored_kind: &str,
+    stored_lifecycle: &str,
+) -> Result<ConversationKind, ConversationStateHydrationError> {
+    if head_lifecycle != PublicGroupSnapshotLifecycle::Active || stored_lifecycle != "active" {
+        return Err(ConversationStateHydrationError::TerminalLifecycleUnsupported);
+    }
+    match stored_kind {
+        "direct" => Ok(ConversationKind::Direct),
+        "group" => Ok(ConversationKind::Group),
+        _ => Err(ConversationStateHydrationError::ConversationDomain),
+    }
+}
+
+pub(crate) fn certify_no_terminal_proofs(
+    terminal_proof_count: i64,
+) -> Result<
+    Vec<super::super::state_machine::TerminalProofHydrationRow>,
+    ConversationStateHydrationError,
+> {
+    if terminal_proof_count != 0 {
+        return Err(ConversationStateHydrationError::UnexpectedTerminalProof);
+    }
+    Ok(Vec::new())
+}
+
+/// Hydrate, validate, and seal one active conversation graph under the caller's
+/// transaction-local conversation-row lock.
+///
+/// The returned guard remains valid only while `transaction` remains open. This
+/// function never begins, commits, or rolls back a transaction.
+#[allow(dead_code)]
+pub(crate) async fn hydrate_locked_conversation_state(
+    transaction: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    locked_at: DateTime<Utc>,
+) -> Result<LockedConversationStateGuard, ConversationStateHydrationError> {
+    let head = hydrate_locked_conversation_head(transaction, conversation_id, locked_at)
+        .await
+        .map_err(ConversationStateHydrationError::Head)?;
+    let Some(head_coordinate) = head.prior_coordinate() else {
+        return Err(ConversationStateHydrationError::ReadSetMismatch);
+    };
+
+    let kind_and_lifecycle: Option<(String, String)> =
+        sqlx::query_as("SELECT kind,lifecycle FROM chat.conversations WHERE conversation_id=$1")
+            .bind(conversation_id)
+            .fetch_optional(&mut **transaction)
+            .await?;
+    let (kind, lifecycle) =
+        kind_and_lifecycle.ok_or(ConversationStateHydrationError::ReadSetMismatch)?;
+    let kind = resolve_active_conversation_kind(head_coordinate.lifecycle(), &kind, &lifecycle)?;
+
+    let public_guard = hydrate_public_state_under_locked_head(transaction, &head)
+        .await
+        .map_err(ConversationStateHydrationError::PublicState)?;
+    let (
+        public_transaction_id,
+        public_conversation_id,
+        coordinate,
+        snapshot,
+        binding,
+        encoded_tree_summary,
+        expected_tree_summary_sha256,
+        public_locked_at,
+        generation_row_digest,
+    ) = public_guard.into_parts();
+    if public_transaction_id != head.transaction_id()
+        || public_conversation_id != head.conversation_id()
+        || &coordinate != head_coordinate
+        || public_locked_at != head.locked_at()
+    {
+        return Err(ConversationStateHydrationError::ReadSetMismatch);
+    }
+    let snapshot_digest = *binding.snapshot_sha256();
+
+    let public_state = {
+        let public_guard = seal_locked_public_state_hydration(
+            public_transaction_id,
+            public_conversation_id,
+            coordinate,
+            snapshot,
+            binding,
+            encoded_tree_summary,
+            expected_tree_summary_sha256,
+            public_locked_at,
+            generation_row_digest,
+        )
+        .ok_or(ConversationStateHydrationError::ReadSetMismatch)?;
+        super::super::public_state::load_persisted_active_snapshot(public_guard)
+            .map_err(ConversationStateHydrationError::Snapshot)?
+    };
+
+    let historical = historical_authority_for_locked_head(&head)
+        .map_err(ConversationStateHydrationError::Authority)?;
+    let hydration = hydration_authority_for_locked_head(&head)
+        .map_err(ConversationStateHydrationError::Authority)?;
+    let producer = load_producer_transition_evidence(transaction, &historical, conversation_id)
+        .await
+        .map_err(ConversationStateHydrationError::Producer)?;
+    let (metadata, metadata_producer) =
+        load_metadata_provenance(transaction, &historical, conversation_id)
+            .await
+            .map_err(ConversationStateHydrationError::Metadata)?;
+    let participants = load_participant_hydration_rows(transaction, &historical, conversation_id)
+        .await
+        .map_err(ConversationStateHydrationError::Participants)?;
+    let leaves = load_leaf_hydration_rows(transaction, conversation_id, public_state.binding())
+        .await
+        .map_err(ConversationStateHydrationError::Leaves)?;
+    let intervals = load_interval_hydration_rows(transaction, &historical, conversation_id)
+        .await
+        .map_err(ConversationStateHydrationError::Intervals)?;
+    let (recovery_requests, recovery_reservations) =
+        load_recovery_work_hydration_rows(transaction, &historical, conversation_id)
+            .await
+            .map_err(ConversationStateHydrationError::RecoveryWork)?;
+    let reset_requests =
+        load_reset_request_hydration_rows(transaction, &historical, conversation_id)
+            .await
+            .map_err(ConversationStateHydrationError::ResetWork)?;
+    let leave_requests =
+        load_leave_request_hydration_rows(transaction, &historical, conversation_id)
+            .await
+            .map_err(ConversationStateHydrationError::LeaveWork)?;
+    let welcomes = load_welcome_hydration_rows(transaction, &historical, conversation_id)
+        .await
+        .map_err(ConversationStateHydrationError::Welcomes)?;
+
+    let terminal_proof_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.application_schedule_terminal_proofs \
+         WHERE conversation_id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&mut **transaction)
+    .await?;
+    let terminal_proofs = certify_no_terminal_proofs(terminal_proof_count)?;
+
+    let rows = ConversationStateHydration {
+        kind,
+        coordinate: *public_state.coordinate(),
+        producer,
+        public_state: Some(public_state),
+        metadata,
+        metadata_producer,
+        participants,
+        leaves,
+        intervals,
+        terminal_proofs,
+        recovery_requests,
+        recovery_reservations,
+        reset_requests,
+        leave_requests,
+        welcomes,
+    };
+    let graph_digest = active_conversation_graph_digest(&head, &snapshot_digest, &rows);
+    if graph_digest == [0; 32] {
+        return Err(ConversationStateHydrationError::GraphDigest);
+    }
+    let state = hydrate_conversation_state(&hydration, rows)
+        .map_err(ConversationStateHydrationError::State)?;
+    seal_locked_conversation(state, head, graph_digest, Some(snapshot_digest))
+        .ok_or(ConversationStateHydrationError::Seal)
 }

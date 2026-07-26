@@ -10,7 +10,6 @@ use std::collections::BTreeSet;
 use sha2::Digest;
 use thiserror::Error;
 
-#[cfg(not(test))]
 use super::repository::core::LockedPublicStateHydrationGuard;
 
 use super::{
@@ -481,7 +480,6 @@ fn load_active_snapshot_from_verified_binding(
 /// canonical tree-summary artifact retained beside the locked generation row.
 /// The summary size cap and digest check happen before parsing; the decoded
 /// value must then equal the tree summary committed by the snapshot binding.
-#[cfg(not(test))]
 pub(crate) fn load_persisted_active_snapshot(
     locked: LockedPublicStateHydrationGuard,
 ) -> Result<ActivePublicState, PublicStateError> {
@@ -527,7 +525,7 @@ fn load_persisted_active_snapshot_from_parts(
 }
 
 #[cfg(test)]
-pub(crate) fn load_persisted_active_snapshot(
+pub(crate) fn load_persisted_active_snapshot_from_parts_for_test(
     snapshot: &[u8],
     binding: &PublicGroupSnapshotBinding,
     encoded_tree_summary: &[u8],

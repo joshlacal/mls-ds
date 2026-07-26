@@ -12,8 +12,8 @@ use sha2::{Digest, Sha256};
 
 use crate::chat_protocol::{
     public_state::{
-        encode_public_tree_summary, load_persisted_active_snapshot, ActivePublicState,
-        VerifiedCommitPublicState,
+        encode_public_tree_summary, load_persisted_active_snapshot_from_parts_for_test,
+        ActivePublicState, VerifiedCommitPublicState,
     },
     snapshot::{
         public_group_snapshot_sha256, PublicGroupSnapshotBinding, PublicGroupSnapshotCoordinate,
@@ -252,7 +252,7 @@ fn restore(snapshot: Vec<u8>, coordinate: PublicGroupSnapshotCoordinate) -> Acti
     );
     let encoded_summary =
         encode_public_tree_summary(binding.tree_summary()).expect("encode frozen tree summary");
-    load_persisted_active_snapshot(
+    load_persisted_active_snapshot_from_parts_for_test(
         &snapshot,
         &binding,
         encoded_summary.bytes(),
