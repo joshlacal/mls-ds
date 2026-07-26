@@ -4349,6 +4349,7 @@ pub(crate) async fn load_welcome_hydration_rows(
                         *row.welcome_id.as_bytes(),
                         &coordinate,
                         transition_seq,
+                        row.rejection_reason.as_deref(),
                     )
                 {
                     return Err(WelcomeHydrationError::InvalidTerminal);
@@ -4502,6 +4503,7 @@ fn welcome_response_body_matches(
     welcome_id: [u8; 16],
     coordinate: &PublicGroupSnapshotCoordinate,
     transition_seq: u64,
+    durable_rejection_reason: Option<&str>,
 ) -> bool {
     let Ok(mutation) = decode_and_verify_signed_mutation(raw, signing_public_key) else {
         return false;
@@ -4526,9 +4528,21 @@ fn welcome_response_body_matches(
     let Some(CanonicalValueRef::Object(signed_coordinate)) = body.get("coordinates") else {
         return false;
     };
+    let reason_matches = match expected_kind {
+        RequestEntryKind::WelcomeAcknowledgement => {
+            durable_rejection_reason.is_none() && body.get("reason").is_none()
+        }
+        RequestEntryKind::WelcomeRejection => matches!(
+            body.get("reason"),
+            Some(CanonicalValueRef::Text(signed_reason))
+                if Some(signed_reason) == durable_rejection_reason
+        ),
+        _ => false,
+    };
     signed_welcome_id.as_bytes() == &welcome_id
         && signed_transition_seq == transition_seq
         && canonical_welcome_coordinate_matches(signed_coordinate, coordinate)
+        && reason_matches
 }
 
 fn canonical_welcome_coordinate_matches(

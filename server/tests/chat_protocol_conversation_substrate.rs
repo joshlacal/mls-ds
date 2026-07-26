@@ -2059,7 +2059,14 @@ mod historical_control_path {
         pub(super) actor_did: String,
         pub(super) actor_device_id: uuid::Uuid,
         pub(super) actor_key_id: String,
+        pub(super) signing_seed: [u8; 32],
         pub(super) head_next_entry_seq: u64,
+    }
+
+    impl RealCreationEntry {
+        pub(super) fn signing_key(&self) -> SigningKey {
+            SigningKey::from_bytes(&self.signing_seed)
+        }
     }
 
     fn rewrite_conversation_id(
@@ -2091,13 +2098,34 @@ mod historical_control_path {
         }
     }
 
+    fn rewrite_exact_text(value: &mut Value, from: &str, to: &str) {
+        match value {
+            Value::String(text) if text == from => *text = to.to_owned(),
+            Value::Array(items) => {
+                for child in items {
+                    rewrite_exact_text(child, from, to);
+                }
+            }
+            Value::Object(map) => {
+                for child in map.values_mut() {
+                    rewrite_exact_text(child, from, to);
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub(super) fn build_real_creation_entry(fresh_cid: [u8; 16]) -> RealCreationEntry {
         let fixture: Value = serde_json::from_str(CONTRACT_VECTORS).unwrap();
         let contract: Value = serde_json::from_str(LEXICON).unwrap();
         let definitions = contract["defs"].as_object().unwrap();
         let cef = &fixture["controlEntryFingerprints"];
 
-        let signing_key = SigningKey::from_bytes(&[0x24; 32]);
+        let mut signing_seed_digest = Sha256::new();
+        signing_seed_digest.update(b"CATBIRD-CHAT-REAL-CREATION-FIXTURE\0");
+        signing_seed_digest.update(fresh_cid);
+        let signing_seed: [u8; 32] = signing_seed_digest.finalize().into();
+        let signing_key = SigningKey::from_bytes(&signing_seed);
         let verifying = signing_key.verifying_key().to_bytes();
 
         let case = cef["cases"]
@@ -2140,10 +2168,42 @@ mod historical_control_path {
         let to_b64 = STANDARD.encode(fresh_cid);
         rewrite_conversation_id(&mut signing_body, &from_uuid, &to_uuid, &from_b64, &to_b64);
 
+        let frozen_actor_device_id = signing_body["actorDeviceId"].as_str().unwrap().to_owned();
+        let fresh_actor_device_id = Uuid::new_v4().hyphenated().to_string();
+        rewrite_exact_text(
+            &mut signing_body,
+            &frozen_actor_device_id,
+            &fresh_actor_device_id,
+        );
+        const PLC_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
+        let fresh_actor_suffix: String = signing_seed
+            .iter()
+            .take(24)
+            .map(|byte| PLC_ALPHABET[usize::from(*byte % 32)] as char)
+            .collect();
+        let fresh_actor_did = format!("did:plc:{fresh_actor_suffix}");
+        let frozen_actor_did = signing_body["actorDid"].as_str().unwrap().to_owned();
+        rewrite_exact_text(&mut signing_body, &frozen_actor_did, &fresh_actor_did);
         let actor_did = signing_body["actorDid"].as_str().unwrap().to_owned();
         let actor_device_id =
             Uuid::parse_str(signing_body["actorDeviceId"].as_str().unwrap()).unwrap();
         let actor_key_id = ed25519_key_id(&verifying).unwrap().as_str().to_owned();
+        // The frozen vector intentionally carries placeholder roster/coordinate
+        // values. This helper seeds a live durable genesis, so bind the signed
+        // Creation body to the exact graph the repository rows retain; otherwise
+        // aggregate interval validation correctly rejects the spliced opening.
+        signing_body["conversationKind"] = json!("group");
+        signing_body["next"]["groupId"] = json!(STANDARD.encode([1_u8; 32]));
+        signing_body["next"]["groupContextHash"] = json!(STANDARD.encode([2_u8; 32]));
+        signing_body["next"]["confirmationTag"] = json!(STANDARD.encode([3_u8; 32]));
+        signing_body["manifest"]["actorLeaf"]["userDid"] = json!(&actor_did);
+        signing_body["manifest"]["actorLeaf"]["deviceId"] =
+            json!(actor_device_id.hyphenated().to_string());
+        signing_body["manifest"]["participants"] = json!([{
+            "userDid": &actor_did,
+            "status": "active",
+            "role": "admin",
+        }]);
 
         let raw_wrapper = resign(
             json!({ "body": signing_body, "signature": "" }),
@@ -2179,6 +2239,7 @@ mod historical_control_path {
             actor_did,
             actor_device_id,
             actor_key_id,
+            signing_seed,
             head_next_entry_seq: 2,
         }
     }
@@ -2510,7 +2571,7 @@ mod historical_control_loader {
         )
         .bind(actor_did)
         .bind(actor_device_id)
-        .bind(format!("{:042}A", 0_u128))
+        .bind(actor_key_id)
         .bind(at)
         .execute(&mut *tx)
         .await
@@ -3194,7 +3255,10 @@ mod historical_control_loader {
     // `UnsupportedSource`), asserted live here so the scope boundary is real.
     // -----------------------------------------------------------------------
     mod recovery_leg {
-        use base64::{engine::general_purpose::STANDARD, Engine};
+        use base64::{
+            engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+            Engine,
+        };
         use chrono::{DateTime, Utc};
         use ed25519_dalek::{Signer, SigningKey};
         use serde_json::{json, Value};
@@ -3204,20 +3268,25 @@ mod historical_control_loader {
 
         use super::super::historical_control_path::{build_real_creation_entry, RealCreationEntry};
         use super::seed_real_creation_graph;
+        use crate::chat_protocol::public_state::{encode_public_tree_summary, ActivePublicState};
         use crate::chat_protocol::repository::core::{
-            load_recovery_work_hydration_rows, load_welcome_hydration_rows,
-            select_fulfilled_recovery_terminal, select_welcome_terminal,
-            FulfilledRecoveryTerminalColumns, RecoveryHydrationError, WelcomeTerminalColumns,
-            WelcomeTerminalSelection,
+            hydrate_locked_public_state, load_interval_hydration_rows, load_leaf_hydration_rows,
+            load_leave_request_hydration_rows, load_metadata_provenance,
+            load_participant_hydration_rows, load_producer_transition_evidence,
+            load_recovery_work_hydration_rows, load_reset_request_hydration_rows,
+            load_welcome_hydration_rows, select_fulfilled_recovery_terminal,
+            select_welcome_terminal, FulfilledRecoveryTerminalColumns, RecoveryHydrationError,
+            WelcomeTerminalColumns, WelcomeTerminalSelection,
         };
         use crate::chat_protocol::snapshot::{
-            PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle,
+            PublicGroupSnapshotCoordinate, PublicGroupSnapshotLeaf, PublicGroupSnapshotLifecycle,
+            PublicGroupSnapshotTreeSummary,
         };
         use crate::chat_protocol::state_machine::{
-            recovery_fulfillment_terminal_matches, DeviceIdentity, HistoricalRehydrationAuthority,
-            LeafRecoveryKind, PrincipalId, RecoveryOriginHydrationRow, RecoveryRequestStatus,
-            RecoverySource, ReservationStatus, ServerTimestamp, WelcomeStatus,
-            WorkTerminalHydrationRow,
+            recovery_fulfillment_terminal_matches, ConversationKind, ConversationStateHydration,
+            DeviceIdentity, HistoricalRehydrationAuthority, LeafRecoveryKind, PrincipalId,
+            RecoveryOriginHydrationRow, RecoveryRequestStatus, RecoverySource, ReservationStatus,
+            ServerTimestamp, WelcomeStatus, WorkTerminalHydrationRow,
         };
         use crate::chat_protocol::transcript::{
             decode_and_verify_control_entry, decode_canonical_signed_mutation, SignedMutationKind,
@@ -3278,7 +3347,7 @@ mod historical_control_loader {
             entry: &RealCreationEntry,
             request_id: [u8; 16],
         ) -> SignedRecoveryRequest {
-            let signing_key = SigningKey::from_bytes(&[0x24; 32]);
+            let signing_key = entry.signing_key();
             let verifying = signing_key.verifying_key().to_bytes();
             // The creation entry signed with this same key, so its device-keys row
             // carries exactly this verifying key under `entry.actor_key_id`.
@@ -3464,6 +3533,23 @@ mod historical_control_loader {
             opaque_welcome: Vec<u8>,
         }
 
+        fn encoded_fixture_tree_summary(entry: &RealCreationEntry) -> (Vec<u8>, [u8; 32]) {
+            let basic_credential =
+                format!("{}#{}", entry.actor_did, entry.actor_device_id).into_bytes();
+            let tree = PublicGroupSnapshotTreeSummary::new(
+                [0x63; 32],
+                vec![PublicGroupSnapshotLeaf::new(
+                    0,
+                    basic_credential,
+                    entry.public_key.clone(),
+                    vec![0x64; 1_216],
+                )],
+            );
+            encode_public_tree_summary(&tree)
+                .expect("fixture tree summary is canonical")
+                .into_parts()
+        }
+
         fn next_coordinate_json(cid: [u8; 16]) -> Value {
             json!({
                 "conversationId": Uuid::from_bytes(cid).hyphenated().to_string(),
@@ -3536,7 +3622,7 @@ mod historical_control_loader {
             received_at: &str,
             mutate_body: impl FnOnce(&mut Value),
         ) -> RealLeafRecoveryFulfillmentEntry {
-            let signing_key = SigningKey::from_bytes(&[0x24; 32]);
+            let signing_key = entry.signing_key();
             let verifying = signing_key.verifying_key().to_bytes();
             assert_eq!(entry.public_key, verifying.to_vec());
 
@@ -3703,7 +3789,7 @@ mod historical_control_loader {
             .await
             .expect("active participant period");
             let public_snapshot = vec![0x61_u8; 64];
-            let tree_summary = vec![0x62_u8; 8];
+            let (tree_summary, tree_summary_sha256) = encoded_fixture_tree_summary(entry);
             let metadata_ciphertext = vec![0x32_u8; 16];
             let basic_credential =
                 format!("{}#{}", entry.actor_did, entry.actor_device_id).into_bytes();
@@ -3768,7 +3854,7 @@ mod historical_control_loader {
             .bind(&public_snapshot)
             .bind(Sha256::digest(&public_snapshot).to_vec())
             .bind(&tree_summary)
-            .bind(Sha256::digest(&tree_summary).to_vec())
+            .bind(tree_summary_sha256.to_vec())
             .bind(at)
             .execute(&mut *tx)
             .await
@@ -4324,6 +4410,16 @@ mod historical_control_loader {
             const WELCOME_TERMINAL_AT: &str = "2030-01-01T00:10:00.000Z";
             const LATER_TRANSITION_AT: &str = "2030-01-01T00:02:00.000Z";
 
+            #[derive(Clone, Copy, Debug)]
+            enum AggregateWelcomeArm {
+                Pending,
+                Acknowledged,
+                Rejected,
+                Expired,
+                TransitionSuperseded,
+                RevocationSuperseded,
+            }
+
             struct SignedWelcomeResponse {
                 raw_wrapper: Vec<u8>,
                 signing_transcript: Vec<u8>,
@@ -4339,10 +4435,29 @@ mod historical_control_loader {
                 signature: Vec<u8>,
             }
 
+            struct WelcomeRevocationActor {
+                device_id: Uuid,
+                key_id: String,
+                signing_key: SigningKey,
+            }
+
+            struct RealLaterCommitEntry {
+                entry_id: Uuid,
+                transition_id: Uuid,
+                public_row_json: Vec<u8>,
+                raw_wrapper: Vec<u8>,
+                canonical_projection: Vec<u8>,
+                signing_transcript: Vec<u8>,
+                request_digest: Vec<u8>,
+                signature: Vec<u8>,
+                server_fields_dag_cbor: Vec<u8>,
+                outer_entry_fingerprint: [u8; 32],
+            }
+
             fn build_signed_welcome_revocation(
                 entry: &RealCreationEntry,
+                actor: &WelcomeRevocationActor,
             ) -> SignedWelcomeRevocation {
-                let signing_key = SigningKey::from_bytes(&[0x24; 32]);
                 let revocation_id = Uuid::new_v4();
                 let body = json!({
                     "$type": SignedMutationKind::DeviceRevocation.type_id(),
@@ -4350,8 +4465,8 @@ mod historical_control_loader {
                         SignedMutationKind::DeviceRevocation.domain().to_vec()
                     ).unwrap(),
                     "actorDid": entry.actor_did,
-                    "actorDeviceId": entry.actor_device_id.hyphenated().to_string(),
-                    "keyId": entry.actor_key_id,
+                    "actorDeviceId": actor.device_id.hyphenated().to_string(),
+                    "keyId": actor.key_id,
                     "authGeneration": 1,
                     "targetDeviceId": entry.actor_device_id.hyphenated().to_string(),
                     "targetAuthGeneration": 1,
@@ -4363,7 +4478,7 @@ mod historical_control_loader {
                 let canonical = decode_canonical_signed_mutation(&unsigned)
                     .expect("unsigned Welcome revocation canonicalizes");
                 let signing_transcript = canonical.transcript_bytes().to_vec();
-                let signature = signing_key.sign(&signing_transcript).to_bytes();
+                let signature = actor.signing_key.sign(&signing_transcript).to_bytes();
                 wrapper["signature"] = Value::String(STANDARD.encode(signature));
                 let raw_wrapper = serde_json::to_vec(&wrapper).unwrap();
                 SignedWelcomeRevocation {
@@ -4373,6 +4488,187 @@ mod historical_control_loader {
                     signature: signature.to_vec(),
                     signing_transcript,
                 }
+            }
+
+            async fn seed_welcome_revocation_actor(
+                pool: &PgPool,
+                entry: &RealCreationEntry,
+            ) -> WelcomeRevocationActor {
+                let device_id = Uuid::new_v4();
+                let signing_seed: [u8; 32] = Sha256::digest(device_id.as_bytes()).into();
+                let signing_key = SigningKey::from_bytes(&signing_seed);
+                let public_key = signing_key.verifying_key().to_bytes();
+                let key_id = ed25519_key_id(&public_key).unwrap().as_str().to_owned();
+                let dpop_jkt = URL_SAFE_NO_PAD.encode(Sha256::digest(device_id.as_bytes()));
+                let created_at = instant("2029-12-31T23:58:00.000Z");
+                let mut tx = pool.begin().await.expect("begin revocation actor");
+                sqlx::query(
+                    r#"INSERT INTO chat.devices(
+                        user_did,device_id,device_name,status,dpop_jkt,auth_generation,
+                        capabilities,created_at,updated_at
+                    ) VALUES($1,$2,'welcome-revocation-actor','active',$3,1,
+                        chat.protocol_capabilities(),$4,$4)"#,
+                )
+                .bind(&entry.actor_did)
+                .bind(device_id)
+                .bind(dpop_jkt)
+                .bind(created_at)
+                .execute(&mut *tx)
+                .await
+                .expect("insert Welcome revocation actor device");
+                sqlx::query(
+                    r#"INSERT INTO chat.device_keys(
+                        user_did,device_id,key_id,signing_public_key,
+                        enrollment_auth_generation,created_at
+                    ) VALUES($1,$2,$3,$4,1,$5)"#,
+                )
+                .bind(&entry.actor_did)
+                .bind(device_id)
+                .bind(&key_id)
+                .bind(public_key.to_vec())
+                .bind(created_at)
+                .execute(&mut *tx)
+                .await
+                .expect("insert Welcome revocation actor key");
+                tx.commit().await.expect("commit Welcome revocation actor");
+                WelcomeRevocationActor {
+                    device_id,
+                    key_id,
+                    signing_key,
+                }
+            }
+
+            async fn commit_welcome_revocation_supersession(
+                pool: &PgPool,
+                entry: &RealCreationEntry,
+                fulfillment: &RealLeafRecoveryFulfillmentEntry,
+                actor: &WelcomeRevocationActor,
+                revocation: &SignedWelcomeRevocation,
+            ) {
+                let terminal_at = instant(WELCOME_TERMINAL_AT);
+                let signed_at = instant("2030-01-01T00:09:59.000Z");
+                let response_bytes = b"welcome-revocation-ok".to_vec();
+                let mut tx = pool.begin().await.expect("begin Welcome revocation graph");
+                sqlx::query(
+                    r#"INSERT INTO chat.device_revocations(
+                        revocation_id,actor_did,actor_device_id,actor_key_id,
+                        actor_auth_generation,target_did,target_device_id,
+                        target_auth_generation,accepted_request_bytes,
+                        signing_transcript_bytes,request_digest,signature,signed_at,accepted_at
+                    ) VALUES($1,$2,$3,$4,1,$2,$5,1,$6,$7,$8,$9,$10,$11)"#,
+                )
+                .bind(revocation.revocation_id)
+                .bind(&entry.actor_did)
+                .bind(actor.device_id)
+                .bind(&actor.key_id)
+                .bind(entry.actor_device_id)
+                .bind(&revocation.raw_wrapper)
+                .bind(&revocation.signing_transcript)
+                .bind(&revocation.request_digest)
+                .bind(&revocation.signature)
+                .bind(signed_at)
+                .bind(terminal_at)
+                .execute(&mut *tx)
+                .await
+                .expect("insert exact Welcome revocation");
+                sqlx::query(
+                    r#"UPDATE chat.devices
+                       SET status='revoked',revoked_at=$3,revocation_id=$4,updated_at=$3
+                       WHERE user_did=$1 AND device_id=$2 AND status='active'
+                         AND auth_generation=1"#,
+                )
+                .bind(&entry.actor_did)
+                .bind(entry.actor_device_id)
+                .bind(terminal_at)
+                .bind(revocation.revocation_id)
+                .execute(&mut *tx)
+                .await
+                .expect("revoke Welcome recipient device");
+                sqlx::query(
+                    r#"UPDATE chat.device_keys SET revoked_at=$3,revocation_id=$4
+                       WHERE user_did=$1 AND device_id=$2 AND revoked_at IS NULL"#,
+                )
+                .bind(&entry.actor_did)
+                .bind(entry.actor_device_id)
+                .bind(terminal_at)
+                .bind(revocation.revocation_id)
+                .execute(&mut *tx)
+                .await
+                .expect("revoke Welcome recipient key");
+                sqlx::query(
+                    r#"INSERT INTO chat.idempotency_records(
+                        principal_did,endpoint_nsid,operation_id,request_digest,
+                        accepted_request_bytes,signing_transcript_bytes,signature,
+                        completed_status,response_bytes,response_sha256,event_position,
+                        historical_jkt,current_jkt,completed_at
+                    ) VALUES($1,'blue.catbird.chat.revokeDevice',$2,$3,$4,$5,$6,200,
+                        $7,$8,NULL,$9,NULL,$10)"#,
+                )
+                .bind(&entry.actor_did)
+                .bind(revocation.revocation_id)
+                .bind(&revocation.request_digest)
+                .bind(&revocation.raw_wrapper)
+                .bind(&revocation.signing_transcript)
+                .bind(&revocation.signature)
+                .bind(&response_bytes)
+                .bind(Sha256::digest(&response_bytes).to_vec())
+                .bind(&actor.key_id)
+                .bind(terminal_at)
+                .execute(&mut *tx)
+                .await
+                .expect("insert Welcome revocation receipt");
+                insert_uncommitted_superseded_disposition(
+                    &mut tx,
+                    entry,
+                    fulfillment,
+                    terminal_at,
+                    None,
+                    Some(revocation.revocation_id),
+                )
+                .await;
+                let event_position: i64 = sqlx::query_scalar(
+                    "SELECT event_position FROM chat.welcome_dispositions WHERE welcome_id=$1",
+                )
+                .bind(fulfillment.welcome_id)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("Welcome revocation disposition event");
+                let predecessor: Option<i64> = sqlx::query_scalar(
+                    r#"SELECT MAX(event_position) FROM chat.event_recipients
+                       WHERE user_did=$1 AND device_id=$2"#,
+                )
+                .bind(&entry.actor_did)
+                .bind(entry.actor_device_id)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("Welcome revocation audience predecessor");
+                sqlx::query(
+                    r#"INSERT INTO chat.event_recipients(
+                        event_position,user_did,device_id,entitlement_kind,
+                        audience_predecessor_position
+                    ) VALUES($1,$2,$3,'welcome',$4)"#,
+                )
+                .bind(event_position)
+                .bind(&entry.actor_did)
+                .bind(entry.actor_device_id)
+                .bind(predecessor)
+                .execute(&mut *tx)
+                .await
+                .expect("insert Welcome revocation audience");
+                sqlx::query(
+                    r#"INSERT INTO chat.outbox(
+                        outbox_id,event_position,work_kind,status,next_attempt_at,created_at
+                    ) VALUES($1,$2,'stream','pending',$3,$3)"#,
+                )
+                .bind(Uuid::new_v4())
+                .bind(event_position)
+                .bind(terminal_at)
+                .execute(&mut *tx)
+                .await
+                .expect("insert Welcome revocation outbox");
+                tx.commit()
+                    .await
+                    .expect("Welcome revocation crosses every deferred constraint");
             }
 
             async fn insert_uncommitted_superseded_disposition(
@@ -4449,6 +4745,7 @@ mod historical_control_loader {
                 winner: &str,
                 response: &SignedWelcomeResponse,
                 stored_signature: &[u8],
+                stored_rejection_reason: Option<&str>,
             ) {
                 let terminal_at = instant(WELCOME_TERMINAL_AT);
                 sqlx::query(
@@ -4507,7 +4804,7 @@ mod historical_control_loader {
                 .bind(&response.signing_transcript)
                 .bind(&response.request_digest)
                 .bind(stored_signature)
-                .bind((winner == "rejected").then_some("invalidWelcome"))
+                .bind(stored_rejection_reason)
                 .bind(terminal_at)
                 .bind(event_position)
                 .execute(&mut **transaction)
@@ -4525,7 +4822,7 @@ mod historical_control_loader {
                     SignedMutationKind::WelcomeAcknowledgement
                         | SignedMutationKind::WelcomeRejection
                 ));
-                let signing_key = SigningKey::from_bytes(&[0x24; 32]);
+                let signing_key = entry.signing_key();
                 let mut body = json!({
                     "$type": kind.type_id(),
                     "signatureDomain": String::from_utf8(kind.domain().to_vec()).unwrap(),
@@ -4559,16 +4856,17 @@ mod historical_control_loader {
                 }
             }
 
-            fn build_later_coordinate_consuming_transition(
+            fn build_real_later_commit(
                 entry: &RealCreationEntry,
                 seed: &RecoverySeed,
-            ) -> RealLeafRecoveryFulfillmentEntry {
-                build_real_leaf_recovery_fulfillment_entry_with_shape(
-                    entry,
-                    seed,
-                    3,
-                    next_coordinate_json(entry.cid),
-                    json!({
+            ) -> RealLaterCommitEntry {
+                let signing_key = entry.signing_key();
+                let transition_id = Uuid::new_v4();
+                let entry_id = Uuid::new_v4();
+                let commit_bytes = [0x71_u8; 8];
+                let metadata_ciphertext = [0x72_u8; 16];
+                let prior = next_coordinate_json(entry.cid);
+                let next = json!({
                         "conversationId": Uuid::from_bytes(entry.cid).hyphenated().to_string(),
                         "generation": 0,
                         "stateVersion": 2,
@@ -4577,8 +4875,8 @@ mod historical_control_loader {
                         "groupContextHash": STANDARD.encode([6_u8; 32]),
                         "confirmationTag": STANDARD.encode([7_u8; 32]),
                         "lifecycle": "active",
-                    }),
-                    json!({
+                });
+                let aad_prior = json!({
                         "conversationId": STANDARD.encode(entry.cid),
                         "generation": 0,
                         "stateVersion": 1,
@@ -4587,23 +4885,137 @@ mod historical_control_loader {
                         "groupContextHash": STANDARD.encode([4_u8; 32]),
                         "confirmationTag": STANDARD.encode([5_u8; 32]),
                         "lifecycle": "active",
-                    }),
-                    2,
-                    [6_u8; 32],
-                    [7_u8; 32],
-                    LATER_TRANSITION_AT,
-                    |_| {},
+                });
+                let body = json!({
+                    "$type": SignedMutationKind::CommitTransition.type_id(),
+                    "signatureDomain": String::from_utf8(
+                        SignedMutationKind::CommitTransition.domain().to_vec()
+                    ).unwrap(),
+                    "transitionId": transition_id.hyphenated().to_string(),
+                    "actorDid": entry.actor_did,
+                    "actorDeviceId": entry.actor_device_id.hyphenated().to_string(),
+                    "keyId": entry.actor_key_id,
+                    "authGeneration": 1,
+                    "prior": prior,
+                    "next": next,
+                    "aad": {
+                        "protocolVersion": "1",
+                        "conversationId": STANDARD.encode(entry.cid),
+                        "generation": 0,
+                        "transitionId": STANDARD.encode(transition_id.as_bytes()),
+                        "prior": aad_prior,
+                    },
+                    "manifest": {
+                        "participantChanges": [],
+                        "leafChanges": [],
+                    },
+                    "commit": {
+                        "framing": "mlsMessage",
+                        "contentType": "publicMessageCommit",
+                        "bytes": STANDARD.encode(commit_bytes),
+                        "sha256": STANDARD.encode(Sha256::digest(commit_bytes)),
+                    },
+                    "metadataSnapshot": {
+                        "coordinate": {
+                            "conversationId": STANDARD.encode(entry.cid),
+                            "generation": 0,
+                            "groupId": STANDARD.encode([1_u8; 32]),
+                            "epoch": 2,
+                            "groupContextHash": STANDARD.encode([6_u8; 32]),
+                            "confirmationTag": STANDARD.encode([7_u8; 32]),
+                        },
+                        "originTransitionId": seed.creation_transition_id.hyphenated().to_string(),
+                        "metadataVersion": 1,
+                        "nonce": STANDARD.encode([0x73_u8; 12]),
+                        "ciphertext": STANDARD.encode(metadata_ciphertext),
+                        "ciphertextSha256": STANDARD.encode(Sha256::digest(metadata_ciphertext)),
+                        "ciphertextSize": metadata_ciphertext.len(),
+                        "authorProof": {
+                            "authorDid": entry.actor_did,
+                            "authorDeviceId": entry.actor_device_id.hyphenated().to_string(),
+                            "authorKeyId": entry.actor_key_id,
+                            "signaturePublicKey": STANDARD.encode(&entry.public_key),
+                            "authGenerationAtOrigin": 1,
+                            "originTransitionId":
+                                seed.creation_transition_id.hyphenated().to_string(),
+                            "originSeq": 1,
+                            "roleAtOrigin": "admin",
+                            "deviceStatusAtOrigin": "active",
+                        },
+                    },
+                    "idempotencyKey": Uuid::new_v4().hyphenated().to_string(),
+                    "signedAt": "2030-01-01T00:01:59.000Z",
+                });
+                let mut wrapper = json!({ "body": body, "signature": STANDARD.encode([0_u8; 64]) });
+                let unsigned = serde_json::to_vec(&wrapper).unwrap();
+                let canonical = decode_canonical_signed_mutation(&unsigned)
+                    .expect("unsigned later Commit canonicalizes");
+                let signature = signing_key.sign(canonical.transcript_bytes()).to_bytes();
+                wrapper["signature"] = Value::String(STANDARD.encode(signature));
+                let raw_wrapper = serde_json::to_vec(&wrapper).unwrap();
+                let canonical = decode_canonical_signed_mutation(&raw_wrapper)
+                    .expect("signed later Commit canonicalizes");
+                let public_row_json = serde_json::to_vec(&json!({
+                    "$type": "blue.catbird.chat.defs#commitEntry",
+                    "entryId": entry_id.hyphenated().to_string(),
+                    "conversationId": Uuid::from_bytes(entry.cid).hyphenated().to_string(),
+                    "seq": 3,
+                    "signedRequest": wrapper,
+                    "receivedAt": LATER_TRANSITION_AT,
+                }))
+                .unwrap();
+                let decoded = decode_and_verify_control_entry(
+                    &public_row_json,
+                    signing_key.verifying_key().as_bytes(),
                 )
+                .expect("real later Commit entry verifies");
+                RealLaterCommitEntry {
+                    entry_id,
+                    transition_id,
+                    public_row_json,
+                    raw_wrapper,
+                    canonical_projection: canonical.canonical_projection().to_vec(),
+                    signing_transcript: canonical.transcript_bytes().to_vec(),
+                    request_digest: canonical.request_digest().to_vec(),
+                    signature: canonical.signature().to_vec(),
+                    server_fields_dag_cbor: decoded.server_fields_dag_cbor().unwrap(),
+                    outer_entry_fingerprint: *decoded.outer_control_fingerprint(),
+                }
             }
 
-            async fn insert_uncommitted_later_transition(
-                transaction: &mut Transaction<'_, Postgres>,
+            async fn commit_later_transition_supersession(
+                pool: &PgPool,
                 entry: &RealCreationEntry,
-                transition: &RealLeafRecoveryFulfillmentEntry,
+                seed: &RecoverySeed,
+                fulfillment: &RealLeafRecoveryFulfillmentEntry,
+                transition: &RealLaterCommitEntry,
             ) {
                 let cid = Uuid::from_bytes(entry.cid);
                 let at = instant(LATER_TRANSITION_AT);
                 let metadata_snapshot_id = Uuid::new_v4();
+                let public_snapshot = vec![0x74_u8; 64];
+                let (tree_summary, tree_summary_sha256) = encoded_fixture_tree_summary(entry);
+                let metadata_ciphertext = vec![0x72_u8; 16];
+                let mut transaction = pool.begin().await.expect("begin later Commit graph");
+                sqlx::query(
+                    r#"UPDATE chat.conversations
+                       SET current_state_version=2,next_entry_seq=4
+                       WHERE conversation_id=$1 AND current_generation=0
+                         AND current_state_version=1 AND next_entry_seq=3"#,
+                )
+                .bind(cid)
+                .execute(&mut *transaction)
+                .await
+                .expect("advance conversation through later Commit");
+                sqlx::query(
+                    r#"UPDATE chat.generations SET current_state_version=2
+                       WHERE conversation_id=$1 AND generation=0
+                         AND current_state_version=1"#,
+                )
+                .bind(cid)
+                .execute(&mut *transaction)
+                .await
+                .expect("advance generation through later Commit");
                 sqlx::query(
                     r#"INSERT INTO chat.transitions(
                         transition_id,conversation_id,kind,actor_did,actor_device_id,actor_key_id,
@@ -4611,7 +5023,7 @@ mod historical_control_loader {
                         unsigned_projection_bytes,signing_transcript_bytes,request_digest,signature,
                         prior_generation,prior_state_version,next_generation,next_state_version,
                         metadata_snapshot_id,entry_seq,accepted_at
-                    ) VALUES($1,$2,'leafRecovery',$3,$4,$5,1,'admin','active',$6,$7,$8,$9,$10,
+                    ) VALUES($1,$2,'commit',$3,$4,$5,1,'admin','active',$6,$7,$8,$9,$10,
                         0,1,0,2,$11,3,$12)"#,
                 )
                 .bind(transition.transition_id)
@@ -4626,9 +5038,59 @@ mod historical_control_loader {
                 .bind(&transition.signature)
                 .bind(metadata_snapshot_id)
                 .bind(at)
-                .execute(&mut **transaction)
+                .execute(&mut *transaction)
                 .await
                 .expect("insert later consuming transition");
+                sqlx::query(
+                    r#"INSERT INTO chat.generation_states(
+                        conversation_id,generation,state_version,group_id,epoch,group_context_hash,
+                        confirmation_tag,lifecycle,state_kind,producing_transition_id,
+                        public_snapshot_bytes,snapshot_sha256,tree_summary_bytes,tree_summary_sha256,
+                        leaf_count,created_at
+                    ) VALUES($1,0,2,$2,2,$3,$4,'active','commit',$5,$6,$7,$8,$9,1,$10)"#,
+                )
+                .bind(cid)
+                .bind(vec![1_u8; 32])
+                .bind(vec![6_u8; 32])
+                .bind(vec![7_u8; 32])
+                .bind(transition.transition_id)
+                .bind(&public_snapshot)
+                .bind(Sha256::digest(&public_snapshot).to_vec())
+                .bind(&tree_summary)
+                .bind(tree_summary_sha256.to_vec())
+                .bind(at)
+                .execute(&mut *transaction)
+                .await
+                .expect("insert later Commit generation state");
+                sqlx::query(
+                    r#"INSERT INTO chat.metadata_snapshots(
+                        metadata_snapshot_id,conversation_id,generation,state_version,group_id,epoch,
+                        group_context_hash,confirmation_tag,producing_transition_id,
+                        origin_transition_id,metadata_version,nonce,ciphertext,ciphertext_sha256,
+                        ciphertext_size,author_did,author_device_id,author_key_id,author_public_key,
+                        author_auth_generation,author_origin_seq,author_role,author_device_status,
+                        created_at
+                    ) VALUES($1,$2,0,2,$3,2,$4,$5,$6,$7,1,$8,$9,$10,16,$11,$12,$13,$14,
+                        1,1,'admin','active',$15)"#,
+                )
+                .bind(metadata_snapshot_id)
+                .bind(cid)
+                .bind(vec![1_u8; 32])
+                .bind(vec![6_u8; 32])
+                .bind(vec![7_u8; 32])
+                .bind(transition.transition_id)
+                .bind(seed.creation_transition_id)
+                .bind(vec![0x73_u8; 12])
+                .bind(&metadata_ciphertext)
+                .bind(Sha256::digest(&metadata_ciphertext).to_vec())
+                .bind(&entry.actor_did)
+                .bind(entry.actor_device_id)
+                .bind(&entry.actor_key_id)
+                .bind(&entry.public_key)
+                .bind(at)
+                .execute(&mut *transaction)
+                .await
+                .expect("insert later Commit metadata");
                 sqlx::query(
                     r#"INSERT INTO chat.entries(
                         conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,
@@ -4636,7 +5098,7 @@ mod historical_control_loader {
                         server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,
                         actor_key_id,actor_auth_generation,generation,state_version,transition_id,
                         received_at
-                    ) VALUES($1,3,$2,'blue.catbird.chat.defs#leafRecoveryFulfillmentEntry',
+                    ) VALUES($1,3,$2,'blue.catbird.chat.defs#commitEntry',
                         $3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1,0,2,$13,$14)"#,
                 )
                 .bind(cid)
@@ -4653,9 +5115,73 @@ mod historical_control_loader {
                 .bind(&entry.actor_key_id)
                 .bind(transition.transition_id)
                 .bind(at)
-                .execute(&mut **transaction)
+                .execute(&mut *transaction)
                 .await
                 .expect("insert later consuming entry");
+                sqlx::query(
+                    r#"INSERT INTO chat.entry_recipients(
+                        conversation_id,seq,user_did,device_id,entitlement_kind
+                    ) VALUES($1,3,$2,$3,'control')"#,
+                )
+                .bind(cid)
+                .bind(&entry.actor_did)
+                .bind(entry.actor_device_id)
+                .execute(&mut *transaction)
+                .await
+                .expect("route later Commit to active control interval");
+                insert_uncommitted_superseded_disposition(
+                    &mut transaction,
+                    entry,
+                    fulfillment,
+                    at,
+                    Some(transition.transition_id),
+                    None,
+                )
+                .await;
+                let event_position: i64 = sqlx::query_scalar(
+                    "SELECT event_position FROM chat.welcome_dispositions WHERE welcome_id=$1",
+                )
+                .bind(fulfillment.welcome_id)
+                .fetch_one(&mut *transaction)
+                .await
+                .expect("later Commit Welcome disposition event");
+                let predecessor: Option<i64> = sqlx::query_scalar(
+                    r#"SELECT MAX(event_position) FROM chat.event_recipients
+                       WHERE user_did=$1 AND device_id=$2"#,
+                )
+                .bind(&entry.actor_did)
+                .bind(entry.actor_device_id)
+                .fetch_one(&mut *transaction)
+                .await
+                .expect("later Commit Welcome audience predecessor");
+                sqlx::query(
+                    r#"INSERT INTO chat.event_recipients(
+                        event_position,user_did,device_id,entitlement_kind,
+                        audience_predecessor_position
+                    ) VALUES($1,$2,$3,'welcome',$4)"#,
+                )
+                .bind(event_position)
+                .bind(&entry.actor_did)
+                .bind(entry.actor_device_id)
+                .bind(predecessor)
+                .execute(&mut *transaction)
+                .await
+                .expect("insert later Commit Welcome audience");
+                sqlx::query(
+                    r#"INSERT INTO chat.outbox(
+                        outbox_id,event_position,work_kind,status,next_attempt_at,created_at
+                    ) VALUES($1,$2,'stream','pending',$3,$3)"#,
+                )
+                .bind(Uuid::new_v4())
+                .bind(event_position)
+                .bind(at)
+                .execute(&mut *transaction)
+                .await
+                .expect("insert later Commit Welcome outbox");
+                transaction
+                    .commit()
+                    .await
+                    .expect("later Commit supersession crosses every deferred constraint");
             }
 
             async fn commit_signed_welcome_disposition(
@@ -4906,6 +5432,168 @@ mod historical_control_loader {
                 tx.commit()
                     .await
                     .expect("expired Welcome crosses deferred mappings");
+            }
+
+            async fn commit_aggregate_welcome_fixture(
+                pool: &PgPool,
+                arm: AggregateWelcomeArm,
+            ) -> RealCreationEntry {
+                let cid = Uuid::new_v4();
+                let entry = build_real_creation_entry(*cid.as_bytes());
+                let seed = seed_recovery_pair(pool, &entry, "requestLeafRecovery").await;
+                let fulfillment = build_real_leaf_recovery_fulfillment_entry(&entry, &seed);
+                commit_recovery_fulfillment_graph(pool, &entry, &seed, &fulfillment).await;
+                match arm {
+                    AggregateWelcomeArm::Pending => {}
+                    AggregateWelcomeArm::Acknowledged => {
+                        let response = build_signed_welcome_response(
+                            &entry,
+                            &fulfillment,
+                            SignedMutationKind::WelcomeAcknowledgement,
+                        );
+                        commit_signed_welcome_disposition(
+                            pool,
+                            &entry,
+                            &fulfillment,
+                            SignedMutationKind::WelcomeAcknowledgement,
+                            &response,
+                        )
+                        .await;
+                    }
+                    AggregateWelcomeArm::Rejected => {
+                        let response = build_signed_welcome_response(
+                            &entry,
+                            &fulfillment,
+                            SignedMutationKind::WelcomeRejection,
+                        );
+                        commit_signed_welcome_disposition(
+                            pool,
+                            &entry,
+                            &fulfillment,
+                            SignedMutationKind::WelcomeRejection,
+                            &response,
+                        )
+                        .await;
+                    }
+                    AggregateWelcomeArm::Expired => {
+                        commit_expired_welcome_disposition(pool, &entry, &fulfillment).await;
+                    }
+                    AggregateWelcomeArm::TransitionSuperseded => {
+                        let later = build_real_later_commit(&entry, &seed);
+                        commit_later_transition_supersession(
+                            pool,
+                            &entry,
+                            &seed,
+                            &fulfillment,
+                            &later,
+                        )
+                        .await;
+                    }
+                    AggregateWelcomeArm::RevocationSuperseded => {
+                        let actor = seed_welcome_revocation_actor(pool, &entry).await;
+                        let revocation = build_signed_welcome_revocation(&entry, &actor);
+                        commit_welcome_revocation_supersession(
+                            pool,
+                            &entry,
+                            &fulfillment,
+                            &actor,
+                            &revocation,
+                        )
+                        .await;
+                    }
+                }
+                entry
+            }
+
+            async fn load_aggregate_hydration_rows(
+                pool: &PgPool,
+                entry: &RealCreationEntry,
+            ) -> ConversationStateHydration {
+                let cid = Uuid::from_bytes(entry.cid);
+                let next_entry_seq: i64 = sqlx::query_scalar(
+                    "SELECT next_entry_seq FROM chat.conversations WHERE conversation_id=$1",
+                )
+                .bind(cid)
+                .fetch_one(pool)
+                .await
+                .expect("read aggregate head");
+                let historical = HistoricalRehydrationAuthority::new(
+                    entry.cid,
+                    u64::try_from(next_entry_seq).expect("head is in protocol domain"),
+                )
+                .expect("historical aggregate authority");
+
+                let mut tx = pool.begin().await.expect("begin aggregate load");
+                let guard = hydrate_locked_public_state(&mut tx, cid, instant(WELCOME_TERMINAL_AT))
+                    .await
+                    .expect("locked public-state rows hydrate");
+                let (
+                    _transaction_id,
+                    _conversation_id,
+                    coordinate,
+                    snapshot,
+                    binding,
+                    _encoded_tree_summary,
+                    _tree_summary_sha256,
+                    _locked_at,
+                    _generation_digest,
+                ) = guard.into_parts();
+                assert_eq!(
+                    &coordinate,
+                    binding.coordinate(),
+                    "locked coordinate and binding are one row"
+                );
+                let leaves = load_leaf_hydration_rows(&mut tx, cid, &binding)
+                    .await
+                    .expect("aggregate leaf rows hydrate");
+                let public_state =
+                    ActivePublicState::for_test_from_persisted_binding(snapshot, binding)
+                        .expect("persisted snapshot/binding pair remains digest-bound");
+                let producer = load_producer_transition_evidence(&mut tx, &historical, cid)
+                    .await
+                    .expect("aggregate producer hydrates");
+                let (metadata, metadata_producer) =
+                    load_metadata_provenance(&mut tx, &historical, cid)
+                        .await
+                        .expect("aggregate metadata hydrates");
+                let participants = load_participant_hydration_rows(&mut tx, &historical, cid)
+                    .await
+                    .expect("aggregate participants hydrate");
+                let intervals = load_interval_hydration_rows(&mut tx, &historical, cid)
+                    .await
+                    .expect("aggregate intervals hydrate");
+                let (recovery_requests, recovery_reservations) =
+                    load_recovery_work_hydration_rows(&mut tx, &historical, cid)
+                        .await
+                        .expect("aggregate recovery work hydrates");
+                let reset_requests = load_reset_request_hydration_rows(&mut tx, &historical, cid)
+                    .await
+                    .expect("aggregate reset work hydrates");
+                let leave_requests = load_leave_request_hydration_rows(&mut tx, &historical, cid)
+                    .await
+                    .expect("aggregate leave work hydrates");
+                let welcomes = load_welcome_hydration_rows(&mut tx, &historical, cid)
+                    .await
+                    .expect("aggregate Welcome work hydrates");
+                tx.rollback().await.expect("rollback aggregate read");
+
+                ConversationStateHydration {
+                    kind: ConversationKind::Group,
+                    coordinate,
+                    producer,
+                    public_state: Some(public_state),
+                    metadata,
+                    metadata_producer,
+                    participants,
+                    leaves,
+                    intervals,
+                    terminal_proofs: Vec::new(),
+                    recovery_requests,
+                    recovery_reservations,
+                    reset_requests,
+                    leave_requests,
+                    welcomes,
+                }
             }
 
             #[test]
@@ -5250,6 +5938,7 @@ mod historical_control_loader {
                         "acknowledged",
                         &response,
                         &stored_signature,
+                        None,
                     )
                     .await;
                     let result = load_welcome_hydration_rows(&mut tx, &authority, cid).await;
@@ -5262,6 +5951,45 @@ mod historical_control_loader {
                         "wrong signed kind or durable signature tamper must fail closed"
                     );
                 }
+            }
+
+            #[tokio::test]
+            #[ignore = "requires the dedicated gate database"]
+            async fn signed_rejection_reason_must_equal_the_durable_reason() {
+                let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+                let cid = Uuid::new_v4();
+                let entry = build_real_creation_entry(*cid.as_bytes());
+                let seed = seed_recovery_pair(&pool, &entry, "requestLeafRecovery").await;
+                let fulfillment = build_real_leaf_recovery_fulfillment_entry(&entry, &seed);
+                commit_recovery_fulfillment_graph(&pool, &entry, &seed, &fulfillment).await;
+                let response = build_signed_welcome_response(
+                    &entry,
+                    &fulfillment,
+                    SignedMutationKind::WelcomeRejection,
+                );
+                let authority =
+                    HistoricalRehydrationAuthority::new(entry.cid, 3).expect("authority");
+                let mut tx = pool.begin().await.expect("begin reason mismatch");
+                insert_uncommitted_signed_disposition(
+                    &mut tx,
+                    &entry,
+                    &fulfillment,
+                    "rejected",
+                    &response,
+                    &response.signature,
+                    Some("noMatchingKeyPackage"),
+                )
+                .await;
+                let result = load_welcome_hydration_rows(&mut tx, &authority, cid).await;
+                tx.rollback().await.expect("rollback reason mismatch");
+
+                assert!(
+                    matches!(
+                        result,
+                        Err(crate::chat_protocol::repository::core::WelcomeHydrationError::InvalidTerminal)
+                    ),
+                    "a validly signed body reason must not be relabelled by the durable reason"
+                );
             }
 
             #[tokio::test]
@@ -5304,27 +6032,20 @@ mod historical_control_loader {
                 let seed = seed_recovery_pair(&pool, &entry, "requestLeafRecovery").await;
                 let fulfillment = build_real_leaf_recovery_fulfillment_entry(&entry, &seed);
                 commit_recovery_fulfillment_graph(&pool, &entry, &seed, &fulfillment).await;
-                let later = build_later_coordinate_consuming_transition(&entry, &seed);
+                let later = build_real_later_commit(&entry, &seed);
+                commit_later_transition_supersession(&pool, &entry, &seed, &fulfillment, &later)
+                    .await;
 
                 let authority =
                     HistoricalRehydrationAuthority::new(entry.cid, 4).expect("authority");
-                let mut tx = pool.begin().await.expect("begin transition supersession");
-                insert_uncommitted_later_transition(&mut tx, &entry, &later).await;
-                insert_uncommitted_superseded_disposition(
-                    &mut tx,
-                    &entry,
-                    &fulfillment,
-                    instant(LATER_TRANSITION_AT),
-                    Some(later.transition_id),
-                    None,
-                )
-                .await;
+                let mut tx = pool
+                    .begin()
+                    .await
+                    .expect("fresh transition supersession load");
                 let rows = load_welcome_hydration_rows(&mut tx, &authority, cid)
                     .await
                     .expect("transition-superseded Welcome hydrates");
-                tx.rollback()
-                    .await
-                    .expect("rollback deliberately uncommitted supersession");
+                tx.rollback().await.expect("rollback read transaction");
 
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0].status, WelcomeStatus::Superseded);
@@ -5350,48 +6071,27 @@ mod historical_control_loader {
                 let seed = seed_recovery_pair(&pool, &entry, "requestLeafRecovery").await;
                 let fulfillment = build_real_leaf_recovery_fulfillment_entry(&entry, &seed);
                 commit_recovery_fulfillment_graph(&pool, &entry, &seed, &fulfillment).await;
-                let revocation = build_signed_welcome_revocation(&entry);
-                let terminal_at = instant(WELCOME_TERMINAL_AT);
+                let actor = seed_welcome_revocation_actor(&pool, &entry).await;
+                let revocation = build_signed_welcome_revocation(&entry, &actor);
+                commit_welcome_revocation_supersession(
+                    &pool,
+                    &entry,
+                    &fulfillment,
+                    &actor,
+                    &revocation,
+                )
+                .await;
 
                 let authority =
                     HistoricalRehydrationAuthority::new(entry.cid, 3).expect("authority");
-                let mut tx = pool.begin().await.expect("begin revocation supersession");
-                sqlx::query(
-                    r#"INSERT INTO chat.device_revocations(
-                        revocation_id,actor_did,actor_device_id,actor_key_id,
-                        actor_auth_generation,target_did,target_device_id,
-                        target_auth_generation,accepted_request_bytes,
-                        signing_transcript_bytes,request_digest,signature,signed_at,accepted_at
-                    ) VALUES($1,$2,$3,$4,1,$2,$3,1,$5,$6,$7,$8,$9,$10)"#,
-                )
-                .bind(revocation.revocation_id)
-                .bind(&entry.actor_did)
-                .bind(entry.actor_device_id)
-                .bind(&entry.actor_key_id)
-                .bind(&revocation.raw_wrapper)
-                .bind(&revocation.signing_transcript)
-                .bind(&revocation.request_digest)
-                .bind(&revocation.signature)
-                .bind(instant("2030-01-01T00:09:59.000Z"))
-                .bind(terminal_at)
-                .execute(&mut *tx)
-                .await
-                .expect("insert exact uncommitted revocation cause");
-                insert_uncommitted_superseded_disposition(
-                    &mut tx,
-                    &entry,
-                    &fulfillment,
-                    terminal_at,
-                    None,
-                    Some(revocation.revocation_id),
-                )
-                .await;
+                let mut tx = pool
+                    .begin()
+                    .await
+                    .expect("fresh revocation supersession load");
                 let rows = load_welcome_hydration_rows(&mut tx, &authority, cid)
                     .await
                     .expect("revocation-superseded Welcome hydrates");
-                tx.rollback()
-                    .await
-                    .expect("rollback deliberate self-revocation fixture");
+                tx.rollback().await.expect("rollback read transaction");
 
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0].status, WelcomeStatus::Superseded);
@@ -5416,6 +6116,86 @@ mod historical_control_loader {
                     evidence.accepted_at(),
                     ServerTimestamp::from_canonical_stored(WELCOME_TERMINAL_AT).unwrap()
                 );
+            }
+
+            #[tokio::test]
+            #[ignore = "requires the dedicated gate database"]
+            async fn aggregate_hydration_validates_every_welcome_arm_and_rejects_spliced_work() {
+                let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+
+                for arm in [
+                    AggregateWelcomeArm::Pending,
+                    AggregateWelcomeArm::Acknowledged,
+                    AggregateWelcomeArm::Rejected,
+                    AggregateWelcomeArm::Expired,
+                    AggregateWelcomeArm::TransitionSuperseded,
+                    AggregateWelcomeArm::RevocationSuperseded,
+                ] {
+                    let entry = commit_aggregate_welcome_fixture(&pool, arm).await;
+                    let rows = load_aggregate_hydration_rows(&pool, &entry).await;
+                    let authority =
+                        crate::chat_protocol::state_machine::HydrationAuthority::new(entry.cid)
+                            .expect("aggregate authority");
+                    crate::chat_protocol::state_machine::hydrate_conversation_state(
+                        &authority, rows,
+                    )
+                    .unwrap_or_else(|error| panic!("{arm:?} aggregate must hydrate: {error:?}"));
+                }
+
+                let base_entry =
+                    commit_aggregate_welcome_fixture(&pool, AggregateWelcomeArm::Pending).await;
+                let base = load_aggregate_hydration_rows(&pool, &base_entry).await;
+
+                let foreign_transition_entry = commit_aggregate_welcome_fixture(
+                    &pool,
+                    AggregateWelcomeArm::TransitionSuperseded,
+                )
+                .await;
+                let foreign_transition =
+                    load_aggregate_hydration_rows(&pool, &foreign_transition_entry).await;
+                let mut non_consuming = base.clone();
+                non_consuming.welcomes[0].status = WelcomeStatus::Superseded;
+                non_consuming.welcomes[0].terminal = Some(WorkTerminalHydrationRow::Transition(
+                    foreign_transition.producer,
+                ));
+                let authority =
+                    crate::chat_protocol::state_machine::HydrationAuthority::new(base_entry.cid)
+                        .expect("base aggregate authority");
+                assert!(matches!(
+                    crate::chat_protocol::state_machine::hydrate_conversation_state(
+                        &authority,
+                        non_consuming,
+                    ),
+                    Err(crate::chat_protocol::state_machine::StateMachineError::InvariantViolation)
+                ));
+
+                let foreign_revocation_entry = commit_aggregate_welcome_fixture(
+                    &pool,
+                    AggregateWelcomeArm::RevocationSuperseded,
+                )
+                .await;
+                let foreign_revocation =
+                    load_aggregate_hydration_rows(&pool, &foreign_revocation_entry).await;
+                let mut wrong_target = base.clone();
+                wrong_target.welcomes[0].status = WelcomeStatus::Superseded;
+                wrong_target.welcomes[0].terminal = foreign_revocation.welcomes[0].terminal.clone();
+                assert!(matches!(
+                    crate::chat_protocol::state_machine::hydrate_conversation_state(
+                        &authority,
+                        wrong_target,
+                    ),
+                    Err(crate::chat_protocol::state_machine::StateMachineError::InvariantViolation)
+                ));
+
+                let mut incomplete_recovery = base;
+                incomplete_recovery.recovery_reservations.clear();
+                assert!(matches!(
+                    crate::chat_protocol::state_machine::hydrate_conversation_state(
+                        &authority,
+                        incomplete_recovery,
+                    ),
+                    Err(crate::chat_protocol::state_machine::StateMachineError::InvariantViolation)
+                ));
             }
         }
 
@@ -5663,7 +6443,7 @@ mod historical_control_loader {
     pub(super) mod reset_leave_leg {
         use base64::{engine::general_purpose::STANDARD, Engine};
         use chrono::{DateTime, Duration, Utc};
-        use ed25519_dalek::{Signer, SigningKey};
+        use ed25519_dalek::Signer;
         use serde_json::{json, Value};
         use sha2::{Digest, Sha256};
         use sqlx::PgPool;
@@ -5775,7 +6555,7 @@ mod historical_control_loader {
             seq: u64,
             request_uuid: Uuid,
         ) -> RealControlRequestEntry {
-            let signing_key = SigningKey::from_bytes(&[0x24; 32]);
+            let signing_key = entry.signing_key();
             let verifying = signing_key.verifying_key().to_bytes();
             // The creation entry signed with this same key, so its device-keys row
             // carries exactly this verifying key under `entry.actor_key_id`.
@@ -6259,7 +7039,7 @@ mod historical_control_loader {
             entry: &RealCreationEntry,
             target_device_id: Uuid,
         ) -> RealDeviceRevocation {
-            let signing_key = SigningKey::from_bytes(&[0x24; 32]);
+            let signing_key = entry.signing_key();
             let verifying = signing_key.verifying_key().to_bytes();
             assert_eq!(entry.public_key, verifying);
             assert_eq!(

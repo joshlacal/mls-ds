@@ -307,6 +307,30 @@ impl ActivePublicState {
             verified_group_info_signature_key: template.verified_group_info_signature_key.clone(),
         }
     }
+
+    /// Reconstitute the exact persisted snapshot/binding pair for aggregate
+    /// hydration tests whose SQL fixture intentionally stores opaque snapshot
+    /// bytes. The production reload path still goes through
+    /// `load_persisted_active_snapshot`; this seam is test-only and accepts no
+    /// independently supplied coordinate or tree. It preserves the locked
+    /// binding verbatim and rejects any snapshot/digest splice before the
+    /// production `hydrate_conversation_state` / `validate_state` gate runs.
+    #[cfg(test)]
+    pub(crate) fn for_test_from_persisted_binding(
+        snapshot: Vec<u8>,
+        binding: PublicGroupSnapshotBinding,
+    ) -> Result<Self, PublicStateError> {
+        let snapshot_sha256: [u8; 32] = sha2::Sha256::digest(&snapshot).into();
+        if snapshot.is_empty() || binding.snapshot_sha256() != &snapshot_sha256 {
+            return Err(PublicStateError::SnapshotDigestMismatch);
+        }
+        Ok(Self {
+            snapshot,
+            binding,
+            verified_group_info_sha256: None,
+            verified_group_info_signature_key: None,
+        })
+    }
 }
 
 pub(crate) struct GenesisGroupInfoExpectations<'a> {
