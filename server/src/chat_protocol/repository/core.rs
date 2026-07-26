@@ -3185,6 +3185,17 @@ impl From<ControlEvidenceLoadError> for MetadataHydrationError {
 }
 
 #[derive(Clone, Copy)]
+pub(crate) struct RetainedMetadataCatalogHead<'a> {
+    pub(crate) conversation_lifecycle: &'a str,
+    pub(crate) generation_state_lifecycle: &'a str,
+    pub(crate) current_generation: u64,
+    pub(crate) current_transition_id: Uuid,
+    pub(crate) close_transition_id: Option<Uuid>,
+    pub(crate) close_seq: Option<u64>,
+    pub(crate) closed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Copy)]
 pub(crate) struct RetainedMetadataHead<'a> {
     pub(crate) conversation_lifecycle: &'a str,
     pub(crate) generation_state_lifecycle: &'a str,
@@ -3192,7 +3203,7 @@ pub(crate) struct RetainedMetadataHead<'a> {
     pub(crate) current_kind: &'a str,
     pub(crate) current_transition_id: Uuid,
     pub(crate) current_seq: u64,
-    pub(crate) current_accepted_at: DateTime<Utc>,
+    pub(crate) current_received_at: ServerTimestamp,
     pub(crate) close_transition_id: Option<Uuid>,
     pub(crate) close_seq: Option<u64>,
     pub(crate) closed_at: Option<DateTime<Utc>>,
@@ -3205,6 +3216,67 @@ pub(crate) struct RetainedMetadataCandidate {
     pub(crate) seq: u64,
     #[allow(dead_code)] // carried only to prove that selection never orders by time
     pub(crate) accepted_at: DateTime<Utc>,
+}
+
+/// Mint the selector anchor exclusively from the reverified immutable current
+/// control entry. The locked catalog supplies only lifecycle/close facts and the
+/// exact transition ID that the entry must attest.
+pub(crate) fn retained_metadata_head_from_current_evidence<'a>(
+    catalog: RetainedMetadataCatalogHead<'a>,
+    current: PersistedControlAuthority,
+) -> Result<(RetainedMetadataHead<'a>, TransitionEvidence), MetadataHydrationError> {
+    let current = current
+        .into_transition()
+        .map_err(|_| MetadataHydrationError::InvalidProvenance)?;
+    if Uuid::from_bytes(*current.transition_id()) != catalog.current_transition_id {
+        return Err(MetadataHydrationError::InvalidProvenance);
+    }
+    let signed_kind = current
+        .signed_authority()
+        .ok_or(MetadataHydrationError::InvalidProvenance)?
+        .kind();
+    let kind = match signed_kind {
+        SignedMutationKind::Creation => "creation",
+        SignedMutationKind::CommitTransition => "commit",
+        SignedMutationKind::PolicyTransition => "policy",
+        SignedMutationKind::ParticipantAcceptance => "acceptConversation",
+        SignedMutationKind::MetadataTransition => "metadata",
+        SignedMutationKind::ResetActivation => "resetActivation",
+        SignedMutationKind::LeafRecoveryFulfillment => "leafRecovery",
+        SignedMutationKind::ConversationClose => "closeConversation",
+        SignedMutationKind::ZeroLeafLeave => "leavePolicy",
+        SignedMutationKind::LeaveCommitFulfillment => "leaveCommit",
+        _ => return Err(MetadataHydrationError::OutOfDomain),
+    };
+    if matches!(
+        signed_kind,
+        SignedMutationKind::Creation
+            | SignedMutationKind::CommitTransition
+            | SignedMutationKind::MetadataTransition
+            | SignedMutationKind::ResetActivation
+            | SignedMutationKind::LeafRecoveryFulfillment
+            | SignedMutationKind::LeaveCommitFulfillment
+    ) && metadata_binding_of_transition(&current).is_none()
+    {
+        return Err(MetadataHydrationError::InvalidProvenance);
+    }
+    let current_seq = current.seq();
+    if current_seq == 0 || current_seq > MAX_PROTOCOL_INTEGER {
+        return Err(MetadataHydrationError::OutOfDomain);
+    }
+    let head = RetainedMetadataHead {
+        conversation_lifecycle: catalog.conversation_lifecycle,
+        generation_state_lifecycle: catalog.generation_state_lifecycle,
+        current_generation: catalog.current_generation,
+        current_kind: kind,
+        current_transition_id: catalog.current_transition_id,
+        current_seq,
+        current_received_at: current.received_at(),
+        close_transition_id: catalog.close_transition_id,
+        close_seq: catalog.close_seq,
+        closed_at: catalog.closed_at,
+    };
+    Ok((head, current))
 }
 
 /// Apply the closed retained-metadata catalog ruling to the current head and
@@ -3227,9 +3299,22 @@ pub(crate) fn select_retained_metadata_producer(
     }) {
         return Err(MetadataHydrationError::OutOfDomain);
     }
+    let greatest_seq = candidates
+        .iter()
+        .map(|candidate| candidate.seq)
+        .max()
+        .ok_or(MetadataHydrationError::ProvenanceMissing)?;
+    if candidates
+        .iter()
+        .filter(|candidate| candidate.seq == greatest_seq)
+        .count()
+        != 1
+    {
+        return Err(MetadataHydrationError::OutOfDomain);
+    }
     let candidate = candidates
         .into_iter()
-        .max_by_key(|candidate| candidate.seq)
+        .find(|candidate| candidate.seq == greatest_seq)
         .ok_or(MetadataHydrationError::ProvenanceMissing)?;
 
     match (head.conversation_lifecycle, head.generation_state_lifecycle) {
@@ -3243,10 +3328,13 @@ pub(crate) fn select_retained_metadata_producer(
             }
         }
         ("superseded", "superseded") => {
+            let current_received_at =
+                DateTime::<Utc>::from_timestamp_millis(head.current_received_at.unix_millis())
+                    .ok_or(MetadataHydrationError::OutOfDomain)?;
             if head.current_kind != "closeConversation"
                 || head.close_transition_id != Some(head.current_transition_id)
                 || head.close_seq != Some(head.current_seq)
-                || head.closed_at != Some(head.current_accepted_at)
+                || head.closed_at != Some(current_received_at)
                 || candidate.seq >= head.current_seq
             {
                 return Err(MetadataHydrationError::OutOfDomain);
@@ -3298,9 +3386,6 @@ struct RetainedMetadataHeadRow {
     closed_at: Option<DateTime<Utc>>,
     generation_state_lifecycle: Option<String>,
     current_transition_id: Option<Uuid>,
-    current_transition_kind: Option<String>,
-    current_seq: Option<i64>,
-    current_accepted_at: Option<DateTime<Utc>>,
 }
 
 /// Load and re-verify the metadata provenance retained at the current head.
@@ -3332,18 +3417,12 @@ pub(crate) async fn load_metadata_provenance(
             c.close_seq,
             c.closed_at,
             gs.lifecycle AS generation_state_lifecycle,
-            gs.producing_transition_id AS current_transition_id,
-            current_transition.kind AS current_transition_kind,
-            current_transition.entry_seq AS current_seq,
-            current_transition.accepted_at AS current_accepted_at
+            gs.producing_transition_id AS current_transition_id
         FROM chat.conversations c
         LEFT JOIN chat.generation_states gs
           ON gs.conversation_id = c.conversation_id
          AND gs.generation = c.current_generation
          AND gs.state_version = c.current_state_version
-        LEFT JOIN chat.transitions current_transition
-          ON current_transition.conversation_id = c.conversation_id
-         AND current_transition.transition_id = gs.producing_transition_id
         WHERE c.conversation_id = $1
         "#,
     )
@@ -3356,25 +3435,32 @@ pub(crate) async fn load_metadata_provenance(
         return Ok((None, None));
     };
 
-    let (
-        Some(generation_state_lifecycle),
-        Some(current_transition_id),
-        Some(current_transition_kind),
-        Some(current_seq),
-        Some(current_accepted_at),
-    ) = (
-        row.generation_state_lifecycle,
-        row.current_transition_id,
-        row.current_transition_kind,
-        row.current_seq,
-        row.current_accepted_at,
-    )
+    let (Some(generation_state_lifecycle), Some(current_transition_id)) =
+        (row.generation_state_lifecycle, row.current_transition_id)
     else {
         return Err(MetadataHydrationError::ProvenanceMissing);
     };
     let current_generation = metadata_u64(row.current_generation)?;
-    let current_seq = metadata_positive_u64(current_seq)?;
     let close_seq = row.close_seq.map(metadata_positive_u64).transpose()?;
+    let current = load_historical_control_evidence(
+        transaction,
+        authority,
+        conversation_id,
+        current_transition_id,
+    )
+    .await?;
+    let (head, _current_producer) = retained_metadata_head_from_current_evidence(
+        RetainedMetadataCatalogHead {
+            conversation_lifecycle: &row.conversation_lifecycle,
+            generation_state_lifecycle: &generation_state_lifecycle,
+            current_generation,
+            current_transition_id,
+            close_transition_id: row.close_transition_id,
+            close_seq,
+            closed_at: row.closed_at,
+        },
+        current,
+    )?;
 
     let candidates: Vec<(Uuid, i64, i64, DateTime<Utc>)> = sqlx::query_as(
         r#"
@@ -3394,7 +3480,7 @@ pub(crate) async fn load_metadata_provenance(
     )
     .bind(conversation_id)
     .bind(row.current_generation)
-    .bind(i64::try_from(current_seq).map_err(|_| MetadataHydrationError::OutOfDomain)?)
+    .bind(i64::try_from(head.current_seq).map_err(|_| MetadataHydrationError::OutOfDomain)?)
     .fetch_all(&mut **transaction)
     .await?;
     let candidates = candidates
@@ -3408,21 +3494,7 @@ pub(crate) async fn load_metadata_provenance(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let producing_transition_id = select_retained_metadata_producer(
-        RetainedMetadataHead {
-            conversation_lifecycle: &row.conversation_lifecycle,
-            generation_state_lifecycle: &generation_state_lifecycle,
-            current_generation,
-            current_kind: &current_transition_kind,
-            current_transition_id,
-            current_seq,
-            current_accepted_at,
-            close_transition_id: row.close_transition_id,
-            close_seq,
-            closed_at: row.closed_at,
-        },
-        candidates,
-    )?;
+    let producing_transition_id = select_retained_metadata_producer(head, candidates)?;
 
     let producer = load_historical_control_evidence(
         transaction,

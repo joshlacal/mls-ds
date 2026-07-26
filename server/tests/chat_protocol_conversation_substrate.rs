@@ -2521,17 +2521,19 @@ mod historical_control_loader {
     use crate::chat_protocol::repository::core::{
         derive_retained_metadata_provenance, load_historical_control_evidence,
         load_interval_hydration_rows, load_metadata_provenance, load_participant_hydration_rows,
-        load_producer_transition_evidence, select_retained_metadata_producer,
-        ControlEvidenceLoadError, IntervalHydrationError, MetadataHydrationError,
-        ParticipantHydrationError, ProducerHydrationError, RetainedMetadataCandidate,
-        RetainedMetadataHead,
+        load_producer_transition_evidence, retained_metadata_head_from_current_evidence,
+        select_retained_metadata_producer, ControlEvidenceLoadError, IntervalHydrationError,
+        MetadataHydrationError, ParticipantHydrationError, ProducerHydrationError,
+        RetainedMetadataCandidate, RetainedMetadataCatalogHead, RetainedMetadataHead,
     };
     use crate::chat_protocol::snapshot::{
         PublicGroupSnapshotLeaf, PublicGroupSnapshotLifecycle, PublicGroupSnapshotTreeSummary,
     };
     use crate::chat_protocol::state_machine::{
         metadata_binding_of_transition, DeviceIdentity, HistoricalRehydrationAuthority,
-        MetadataSnapshotBinding, OpeningKind, ParticipantRole, ParticipantStatus, PrincipalId,
+        MetadataSnapshotBinding, OpeningKind, ParticipantRole, ParticipantStatus,
+        PersistedControlAuthority, PrincipalId, RequestEntryKind, RequestEvidence, ServerTimestamp,
+        TransitionEvidence,
     };
     use crate::common;
 
@@ -3301,6 +3303,105 @@ mod historical_control_loader {
         ));
     }
 
+    /// The current selector anchor is minted from a fully reverified immutable
+    /// control entry. The durable head contributes only lifecycle, generation,
+    /// close facts, and the exact transition ID to reverify.
+    #[test]
+    fn retained_metadata_current_anchor_comes_from_reverified_evidence() {
+        let cid = Uuid::new_v4();
+        let entry = build_real_creation_entry(*cid.as_bytes());
+        let current_transition_id = signed_creation_transition_id(&entry);
+        let received_at = serde_json::from_slice::<Value>(&entry.public_row_json).unwrap()
+            ["receivedAt"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let authority =
+            HistoricalRehydrationAuthority::new(entry.cid, entry.head_next_entry_seq).unwrap();
+        let current = authority
+            .hydrate_historical_control_from_durable_bytes(
+                entry.public_row_json.clone(),
+                entry.raw_wrapper.clone(),
+                &entry.public_key,
+            )
+            .expect("creation entry re-verifies");
+
+        let catalog = RetainedMetadataCatalogHead {
+            conversation_lifecycle: "active",
+            generation_state_lifecycle: "active",
+            current_generation: 0,
+            current_transition_id,
+            close_transition_id: None,
+            close_seq: None,
+            closed_at: None,
+        };
+        let (head, evidence) =
+            retained_metadata_head_from_current_evidence(catalog, current.clone())
+                .expect("verified creation mints the selector anchor");
+
+        assert_eq!(head.current_kind, "creation");
+        assert_eq!(head.current_transition_id, current_transition_id);
+        assert_eq!(head.current_seq, 1);
+        assert_eq!(
+            head.current_received_at,
+            ServerTimestamp::from_canonical_stored(&received_at).unwrap()
+        );
+        assert_eq!(
+            Uuid::from_bytes(*evidence.transition_id()),
+            current_transition_id
+        );
+        assert_eq!(evidence.seq(), 1);
+        assert_eq!(evidence.received_at(), head.current_received_at);
+
+        assert!(matches!(
+            retained_metadata_head_from_current_evidence(
+                RetainedMetadataCatalogHead {
+                    current_transition_id: Uuid::new_v4(),
+                    ..catalog
+                },
+                current,
+            ),
+            Err(MetadataHydrationError::InvalidProvenance)
+        ));
+
+        let unsigned_transition_id = Uuid::new_v4();
+        let unsigned_transition =
+            TransitionEvidence::new(1, *unsigned_transition_id.as_bytes(), [0xA1; 32]).unwrap();
+        assert!(matches!(
+            retained_metadata_head_from_current_evidence(
+                RetainedMetadataCatalogHead {
+                    current_transition_id: unsigned_transition_id,
+                    ..catalog
+                },
+                PersistedControlAuthority::Transition(unsigned_transition),
+            ),
+            Err(MetadataHydrationError::InvalidProvenance)
+        ));
+
+        let actor = DeviceIdentity::new(
+            PrincipalId::new(entry.actor_did.into_bytes()).unwrap(),
+            *entry.actor_device_id.as_bytes(),
+        )
+        .unwrap();
+        let request = RequestEvidence::for_test(
+            RequestEntryKind::ResetRequest,
+            1,
+            *Uuid::new_v4().as_bytes(),
+            actor,
+            entry.cid,
+            ServerTimestamp::from_canonical_stored(&received_at).unwrap(),
+            0xA2,
+        )
+        .unwrap();
+        assert!(matches!(
+            retained_metadata_head_from_current_evidence(
+                catalog,
+                PersistedControlAuthority::Request(request),
+            ),
+            Err(MetadataHydrationError::InvalidProvenance)
+        ));
+    }
+
     /// This pure boundary characterizes catalog shapes that deferred constraints
     /// make impossible to commit. Production selection must remain closed over
     /// transition kind, same-generation sequence, and terminal lifecycle shape.
@@ -3318,7 +3419,8 @@ mod historical_control_loader {
             current_kind: "acceptConversation",
             current_transition_id,
             current_seq: 2,
-            current_accepted_at: accepted_at,
+            current_received_at: ServerTimestamp::from_canonical_stored("2030-01-01T00:00:02.000Z")
+                .unwrap(),
             close_transition_id: None,
             close_seq: None,
             closed_at: None,
@@ -3507,6 +3609,27 @@ mod historical_control_loader {
             newer_by_sequence.transition_id,
             "entry sequence, never accepted_at, chooses the retained predecessor"
         );
+
+        let equal_sequence_peer = RetainedMetadataCandidate {
+            transition_id: Uuid::new_v4(),
+            ..newer_by_sequence
+        };
+        for ambiguous in [
+            vec![newer_by_sequence, equal_sequence_peer],
+            vec![equal_sequence_peer, newer_by_sequence],
+        ] {
+            assert!(matches!(
+                select_retained_metadata_producer(
+                    RetainedMetadataHead {
+                        current_kind: "policy",
+                        current_seq: 3,
+                        ..active
+                    },
+                    ambiguous,
+                ),
+                Err(MetadataHydrationError::OutOfDomain)
+            ));
+        }
     }
 
     // -----------------------------------------------------------------------
