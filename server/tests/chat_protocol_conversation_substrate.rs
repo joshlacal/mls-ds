@@ -3676,6 +3676,35 @@ mod historical_control_loader {
             entry_kind: &str,
             seq: u64,
         ) -> RealControlRequestEntry {
+            build_real_control_request_entry_with_id(entry, kind, entry_kind, seq, Uuid::new_v4())
+        }
+
+        /// Build a real leaveCancellation CONTROL entry whose signed body names
+        /// the exact already-pending leave request. The request id is injected
+        /// before canonical transcript derivation and signing; the signed wrapper
+        /// is never mutated afterward.
+        pub(super) fn build_real_leave_cancellation_entry(
+            entry: &RealCreationEntry,
+            leave_request_id: [u8; 16],
+            entry_kind: &str,
+            seq: u64,
+        ) -> RealControlRequestEntry {
+            build_real_control_request_entry_with_id(
+                entry,
+                SignedMutationKind::LeaveCancellation,
+                entry_kind,
+                seq,
+                Uuid::from_bytes(leave_request_id),
+            )
+        }
+
+        fn build_real_control_request_entry_with_id(
+            entry: &RealCreationEntry,
+            kind: SignedMutationKind,
+            entry_kind: &str,
+            seq: u64,
+            request_uuid: Uuid,
+        ) -> RealControlRequestEntry {
             let signing_key = SigningKey::from_bytes(&[0x24; 32]);
             let verifying = signing_key.verifying_key().to_bytes();
             // The creation entry signed with this same key, so its device-keys row
@@ -3686,7 +3715,6 @@ mod historical_control_loader {
                 ed25519_key_id(&verifying).unwrap().as_str()
             );
 
-            let request_uuid = Uuid::new_v4();
             let request_id = *request_uuid.as_bytes();
             let request_id_field = if matches!(kind, SignedMutationKind::ResetRequest) {
                 "resetRequestId"
@@ -4110,7 +4138,7 @@ mod historical_control_loader {
             trusted_received_at, RECEIVED_AT as SIGNED_REQUEST_RECEIVED_AT,
         };
         use super::reset_leave_leg::{
-            build_real_control_request_entry, seed_control_request, LEAVE_ENTRY_KIND,
+            build_real_leave_cancellation_entry, seed_control_request, LEAVE_ENTRY_KIND,
             RESET_ENTRY_KIND,
         };
         use super::seed_real_creation_graph;
@@ -4131,7 +4159,8 @@ mod historical_control_loader {
             RequestEntryKind, ServerTimestamp, WorkTerminalHydrationRow,
         };
         use crate::chat_protocol::transcript::{
-            decode_and_verify_signed_mutation, decode_canonical_signed_mutation, SignedMutationKind,
+            decode_and_verify_signed_mutation, decode_canonical_signed_mutation,
+            SignedMutationKind, VerifiedMutationProjection,
         };
         use crate::chat_protocol::validation::{
             ed25519_key_id, CanonicalTimestamp, TrustedRequestInstant,
@@ -4618,11 +4647,24 @@ mod historical_control_loader {
                 LEAVE_ENTRY_KIND,
             )
             .await;
-            let cancellation = build_real_control_request_entry(
+            let cancellation = build_real_leave_cancellation_entry(
                 &entry,
-                SignedMutationKind::LeaveCancellation,
+                leave.request_id,
                 CANCELLATION_ENTRY_KIND,
                 3,
+            );
+            let verified_cancellation =
+                decode_and_verify_signed_mutation(&cancellation.raw_wrapper, &entry.public_key)
+                    .expect("cancellation wrapper is genuinely signed");
+            let signed_leave_request_id = match verified_cancellation.projection() {
+                VerifiedMutationProjection::LeaveCancellation(body) => {
+                    *body.leave_request_id().as_bytes()
+                }
+                _ => panic!("fixture must be a leave cancellation"),
+            };
+            assert_eq!(
+                signed_leave_request_id, leave.request_id,
+                "the signed cancellation body must name the exact pending leave request",
             );
             let authority = HistoricalRehydrationAuthority::new(entry.cid, 4).unwrap();
             let expected = authority
