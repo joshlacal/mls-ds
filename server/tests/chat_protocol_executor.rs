@@ -76,7 +76,10 @@ mod chat_protocol {
     }
 }
 
+use base64::{engine::general_purpose::STANDARD, Engine};
 use chrono::{DateTime, Duration, Utc};
+use ed25519_dalek::{Signer, SigningKey};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tokio::sync::Barrier;
@@ -106,15 +109,20 @@ use chat_protocol::state_machine::{
     CommitCommand, ControlEntryContent, ConversationHeadCasBinding, ConversationKind,
     ConversationState, CreationCommand, CreationDecision, DeviceIdentity,
     DeviceRevocationBatchPersistencePlan, DeviceRevocationEvidence, EventFanout, ExecutionActor,
-    ExecutionContext, ExecutorError, LeafPersistenceColumns, LeafRecoveryCancellation,
-    LeafRecoveryFulfillment, LeafRecoveryKind, LeafRecoveryRequestCommand, LeaveCancellation,
-    LeaveFulfillment, LeaveRequestCommand, LockedRegistrationProjection, MetadataAuthorColumns,
-    MetadataSnapshotBinding, PrincipalId, RecoveryOpenContext, RequestEntryKind, RequestEvidence,
-    ResetActivation, ResetRequestCommand, ResetRequestRow, RevocationPackageCasBinding,
-    RevocationTargetCasBinding, ServerTimestamp, SpineArtifacts, TransitionEvidence,
-    WelcomeDispositionInput, WelcomeExpiryContext, WelcomeRejectionWork, WelcomeResponseContext,
-    WelcomeStatus, ZeroLeafLeave,
+    ExecutionContext, ExecutorError, HydrationAuthority, LeafPersistenceColumns,
+    LeafRecoveryCancellation, LeafRecoveryFulfillment, LeafRecoveryKind,
+    LeafRecoveryRequestCommand, LeaveCancellation, LeaveFulfillment, LeaveRequestCommand,
+    LockedRegistrationProjection, MetadataAuthorColumns, MetadataSnapshotBinding, PrincipalId,
+    RecoveryOpenContext, RequestEntryKind, RequestEvidence, ResetActivation, ResetRequestCommand,
+    ResetRequestRow, RevocationPackageCasBinding, RevocationTargetCasBinding, ServerTimestamp,
+    SpineArtifacts, TransitionEvidence, WelcomeDispositionInput, WelcomeExpiryContext,
+    WelcomeRejectionWork, WelcomeResponseContext, WelcomeStatus, ZeroLeafLeave,
 };
+use chat_protocol::transcript::{
+    decode_and_verify_control_entry, decode_canonical_signed_mutation,
+    rebind_persisted_control_entry, VerifiedMutationProjection,
+};
+use chat_protocol::validation::ed25519_key_id;
 use chat_protocol::wire::{validate_public_commit, MAX_PUBLIC_MESSAGE_WIRE_BYTES};
 
 // ---------------------------------------------------------------------------
@@ -4942,6 +4950,525 @@ async fn build_generic_commit(pool: &PgPool, scenario: &FulfillmentScenario) -> 
         conversation_id,
         commit_transition,
     }
+}
+
+const ALICE_SIGNING_SEED: [u8; 32] = [
+    0x38, 0x8f, 0x37, 0x73, 0x57, 0x9e, 0x8a, 0x2b, 0x5d, 0x57, 0x2d, 0x3b, 0x19, 0x85, 0x55, 0xa6,
+    0x93, 0x6f, 0xb7, 0xf0, 0x13, 0xb8, 0x58, 0xe2, 0x69, 0xf6, 0x4f, 0x6e, 0x8c, 0x6b, 0x12, 0x8d,
+];
+
+fn signed_coordinate_json(coordinate: &PublicGroupSnapshotCoordinate) -> Value {
+    json!({
+        "conversationId": Uuid::from_bytes(*coordinate.conversation_id()),
+        "generation": coordinate.generation(),
+        "stateVersion": coordinate.state_version(),
+        "groupId": STANDARD.encode(coordinate.group_id()),
+        "epoch": coordinate.epoch(),
+        "groupContextHash": STANDARD.encode(coordinate.group_context_hash()),
+        "confirmationTag": STANDARD.encode(coordinate.confirmation_tag()),
+        "lifecycle": "active",
+    })
+}
+
+fn aad_prior_json(coordinate: &PublicGroupSnapshotCoordinate) -> Value {
+    json!({
+        "conversationId": STANDARD.encode(coordinate.conversation_id()),
+        "generation": coordinate.generation(),
+        "stateVersion": coordinate.state_version(),
+        "groupId": STANDARD.encode(coordinate.group_id()),
+        "epoch": coordinate.epoch(),
+        "groupContextHash": STANDARD.encode(coordinate.group_context_hash()),
+        "confirmationTag": STANDARD.encode(coordinate.confirmation_tag()),
+        "lifecycle": "active",
+    })
+}
+
+/// Build a real Ed25519-signed generic Commit carrying one canonical RemoveLeaf,
+/// mint its production `VerifiedControlEntry`/`HydrationAuthority` evidence, then
+/// pair that authority with the synthetic public-tree seam used by executor tests.
+async fn build_signed_generic_remove_commit(
+    pool: &PgPool,
+    scenario: &FulfillmentScenario,
+) -> (BuiltGenericCommit, Uuid) {
+    let mut built = build_generic_commit(pool, scenario).await;
+    let fixture = &scenario.fixture;
+    let prior = &scenario.fulfillment_state;
+    let conversation_id = scenario.conversation_id;
+    let bob_leaf = prior.leaf(&scenario.bob_id).expect("bob leaf");
+    let alice_leaf = prior.leaf(&fixture.alice_id).expect("alice leaf");
+    let successor = PublicGroupSnapshotCoordinate::new(
+        *conversation_id.as_bytes(),
+        prior.coordinate().generation(),
+        prior.coordinate().state_version() + 1,
+        *prior.coordinate().group_id(),
+        prior.coordinate().epoch() + 1,
+        [0xAB_u8; 32],
+        [0xCD_u8; 32],
+        PublicGroupSnapshotLifecycle::Active,
+    );
+    let commit_bytes = [0x31_u8; 8];
+    let ciphertext = [0xE2_u8; 48];
+    let metadata = prior.metadata().expect("prior metadata");
+    let transition_id = built.commit_transition;
+    let signed_at = "2026-07-22T14:05:09.123Z";
+    let received_at = "2026-07-22T14:05:10.123Z";
+    let signer = SigningKey::from_bytes(&ALICE_SIGNING_SEED);
+    assert_eq!(
+        signer.verifying_key().as_bytes(),
+        metadata.signature_public_key(),
+        "fixture seed must be the exact active Alice signing key"
+    );
+    assert_eq!(
+        ed25519_key_id(signer.verifying_key().as_bytes())
+            .expect("Alice key id")
+            .as_str(),
+        fixture.alice_key_id
+    );
+    let aad = json!({
+        "protocolVersion": "1",
+        "conversationId": STANDARD.encode(conversation_id.as_bytes()),
+        "generation": prior.coordinate().generation(),
+        "transitionId": STANDARD.encode(transition_id.as_bytes()),
+        "prior": aad_prior_json(prior.coordinate()),
+    });
+    let body = json!({
+        "$type": "blue.catbird.chat.defs#commitTransitionBody",
+        "signatureDomain": "CATBIRD-CHAT-COMMIT\u{0}",
+        "transitionId": transition_id,
+        "actorDid": fixture.alice_did,
+        "actorDeviceId": fixture.alice_device,
+        "keyId": fixture.alice_key_id,
+        "authGeneration": 1,
+        "prior": signed_coordinate_json(prior.coordinate()),
+        "next": signed_coordinate_json(&successor),
+        "aad": aad,
+        "manifest": {
+            "participantChanges": [],
+            "leafChanges": [{
+                "$type": "blue.catbird.chat.defs#removeLeaf",
+                "userDid": scenario.bob_did,
+                "deviceId": Uuid::from_bytes(*scenario.bob_id.device_id()),
+            }],
+        },
+        "commit": {
+            "framing": "mlsMessage",
+            "contentType": "publicMessageCommit",
+            "bytes": STANDARD.encode(commit_bytes),
+            "sha256": STANDARD.encode(Sha256::digest(commit_bytes)),
+        },
+        "metadataSnapshot": {
+            "coordinate": {
+                "conversationId": STANDARD.encode(conversation_id.as_bytes()),
+                "generation": successor.generation(),
+                "groupId": STANDARD.encode(successor.group_id()),
+                "epoch": successor.epoch(),
+                "groupContextHash": STANDARD.encode(successor.group_context_hash()),
+                "confirmationTag": STANDARD.encode(successor.confirmation_tag()),
+            },
+            "originTransitionId": Uuid::from_bytes(*metadata.origin_transition_id()),
+            "metadataVersion": metadata.metadata_version(),
+            "nonce": STANDARD.encode([0xE1_u8; 12]),
+            "ciphertext": STANDARD.encode(ciphertext),
+            "ciphertextSha256": STANDARD.encode(Sha256::digest(ciphertext)),
+            "ciphertextSize": ciphertext.len(),
+            "authorProof": {
+                "authorDid": fixture.alice_did,
+                "authorDeviceId": Uuid::from_bytes(*metadata.author().device_id()),
+                "authorKeyId": fixture.alice_key_id,
+                "signaturePublicKey": STANDARD.encode(metadata.signature_public_key()),
+                "authGenerationAtOrigin": metadata.author_auth_generation_at_origin(),
+                "originTransitionId": Uuid::from_bytes(*metadata.author_origin_transition_id()),
+                "originSeq": metadata.author_origin_seq(),
+                "roleAtOrigin": "admin",
+                "deviceStatusAtOrigin": "active",
+            },
+        },
+        "idempotencyKey": conversation_id,
+        "signedAt": signed_at,
+    });
+    let mut wrapper = json!({
+        "body": body,
+        "signature": STANDARD.encode([0_u8; 64]),
+    });
+    let unsigned = serde_json::to_vec(&wrapper).expect("unsigned wrapper");
+    let canonical =
+        decode_canonical_signed_mutation(&unsigned).expect("canonical generic Remove wrapper");
+    let signature = signer.sign(canonical.transcript_bytes()).to_bytes();
+    wrapper["signature"] = json!(STANDARD.encode(signature));
+    let signed_wrapper = serde_json::to_vec(&wrapper).expect("signed wrapper");
+    let canonical =
+        decode_canonical_signed_mutation(&signed_wrapper).expect("signed canonical wrapper");
+    let verified = chat_protocol::transcript::decode_and_verify_signed_mutation(
+        &signed_wrapper,
+        signer.verifying_key().as_bytes(),
+    )
+    .expect("real Alice signature verifies");
+    let VerifiedMutationProjection::CommitTransition(projection) = verified.projection() else {
+        unreachable!()
+    };
+    let mut exact_aad = b"CATBIRD-CHAT-MLS-AAD-COMMIT\0".to_vec();
+    exact_aad.extend_from_slice(&projection.aad().canonical_dag_cbor());
+    let aad_sha256: [u8; 32] = Sha256::digest(exact_aad).into();
+    let entry_id = built.ctx.entry.entry_id;
+    let row = json!({
+        "$type": "blue.catbird.chat.defs#commitEntry",
+        "entryId": entry_id,
+        "conversationId": conversation_id,
+        "seq": 4,
+        "signedRequest": wrapper,
+        "receivedAt": received_at,
+    });
+    let row_bytes = serde_json::to_vec(&row).expect("commit control row");
+    let verified_entry =
+        decode_and_verify_control_entry(&row_bytes, signer.verifying_key().as_bytes())
+            .expect("production commit control verification");
+    let verified_entry = rebind_persisted_control_entry(
+        verified_entry,
+        &signed_wrapper,
+        signer.verifying_key().as_bytes(),
+    )
+    .expect("bind exact accepted signed wrapper");
+    let outer_fingerprint = *verified_entry.outer_control_fingerprint();
+    let server_fields = verified_entry
+        .server_fields_dag_cbor()
+        .expect("empty server fields");
+    let authority = HydrationAuthority::new(*conversation_id.as_bytes()).unwrap();
+    let transition = authority
+        .control_transition(verified_entry)
+        .expect("production transition authority");
+    let commit = chat_protocol::public_state::VerifiedCommitPublicState::for_test_remove(
+        prior.public_state(),
+        successor,
+        alice_leaf.leaf_index(),
+        &[bob_leaf.leaf_index()],
+    )
+    .expect("coherent generic Remove public state")
+    .with_verified_bindings_for_test(Sha256::digest(commit_bytes).into(), aad_sha256)
+    .expect("bind exact signed Commit/AAD digests");
+    let planned = plan_commit(
+        prior,
+        CommitCommand {
+            actor: fixture.alice_id.clone(),
+            transition,
+            commit,
+        },
+    )
+    .expect("signed generic Remove plan");
+    let received = ServerTimestamp::from_canonical_stored(received_at).unwrap();
+    let head_cas = ConversationHeadCasBinding::for_test_edge(
+        *conversation_id.as_bytes(),
+        *entry_id.as_bytes(),
+        *prior.coordinate(),
+        4,
+        received,
+    );
+    built.plan = persistence_plan_for_test(planned, head_cas);
+    built.ctx.entry = ControlEntryContent {
+        entry_id,
+        entry_kind: "blue.catbird.chat.defs#commitEntry".to_owned(),
+        accepted_payload_bytes: row_bytes.clone(),
+        accepted_payload_sha256: Sha256::digest(&row_bytes).to_vec(),
+        signed_request_bytes: signed_wrapper,
+        unsigned_projection_bytes: canonical.canonical_projection().to_vec(),
+        signing_transcript_bytes: canonical.transcript_bytes().to_vec(),
+        request_digest: canonical.request_digest().to_vec(),
+        signature: signature.to_vec(),
+        server_fields_bytes: server_fields,
+        outer_entry_fingerprint: outer_fingerprint.to_vec(),
+    };
+    built.ctx.spine.leaf_count = 1;
+    built.ctx.entry_recipients = vec![
+        (fixture.alice_id.clone(), EntryEntitlementKind::Control),
+        (scenario.bob_id.clone(), EntryEntitlementKind::IntervalClose),
+    ];
+    let bob_leaf_period: Uuid = sqlx::query_scalar(
+        "SELECT leaf_period_id FROM chat.member_devices \
+         WHERE conversation_id=$1 AND user_did=$2 AND device_id=$3 AND active",
+    )
+    .bind(conversation_id)
+    .bind(&scenario.bob_did)
+    .bind(Uuid::from_bytes(*scenario.bob_id.device_id()))
+    .fetch_one(pool)
+    .await
+    .expect("active bob leaf period");
+    built.ctx.closing_leaf_periods = vec![(scenario.bob_id.clone(), bob_leaf_period)];
+    (built, bob_leaf_period)
+}
+
+#[tokio::test]
+async fn signed_generic_remove_commit_closes_only_removed_leaf_and_interval() {
+    let (pool, _db) = setup().await;
+    let scenario = run_fulfillment_scenario(&pool).await;
+    let (built, bob_leaf_period) = build_signed_generic_remove_commit(&pool, &scenario).await;
+    let applied_at = built.ctx.applied_at;
+    let outer_fingerprint = built.ctx.entry.outer_entry_fingerprint.clone();
+
+    let mut tx = pool.begin().await.expect("begin signed generic Remove");
+    let applied = apply_conversation_persistence_plan(&mut tx, &built.plan, &built.ctx)
+        .await
+        .expect("signed generic Remove applies");
+    tx.commit()
+        .await
+        .expect("signed generic Remove COMMIT past deferred constraints");
+    assert_eq!(applied.allocated_seq, 4);
+
+    // Verify from a fresh transaction, not from the writer's transaction view.
+    let mut verify = pool.begin().await.expect("fresh verification transaction");
+    let (state_version, next_seq): (i64, i64) = sqlx::query_as(
+        "SELECT current_state_version,next_entry_seq FROM chat.conversations \
+         WHERE conversation_id=$1",
+    )
+    .bind(built.conversation_id)
+    .fetch_one(&mut *verify)
+    .await
+    .expect("advanced head");
+    assert_eq!((state_version, next_seq), (3, 5));
+    let (state_kind, epoch, leaf_count): (String, i64, i64) = sqlx::query_as(
+        "SELECT state_kind,epoch,leaf_count FROM chat.generation_states \
+         WHERE conversation_id=$1 AND generation=0 AND state_version=3",
+    )
+    .bind(built.conversation_id)
+    .fetch_one(&mut *verify)
+    .await
+    .expect("successor generation state");
+    assert_eq!((state_kind.as_str(), epoch, leaf_count), ("commit", 2, 1));
+    let (kind, entry_seq, accepted_at): (String, i64, DateTime<Utc>) = sqlx::query_as(
+        "SELECT kind,entry_seq,accepted_at FROM chat.transitions WHERE transition_id=$1",
+    )
+    .bind(built.commit_transition)
+    .fetch_one(&mut *verify)
+    .await
+    .expect("commit transition");
+    assert_eq!(
+        (kind.as_str(), entry_seq, accepted_at),
+        ("commit", 4, applied_at)
+    );
+    let metadata_snapshots: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.metadata_snapshots WHERE producing_transition_id=$1",
+    )
+    .bind(built.commit_transition)
+    .fetch_one(&mut *verify)
+    .await
+    .expect("metadata snapshot");
+    assert_eq!(metadata_snapshots, 1);
+
+    let removed: (
+        bool,
+        Option<i64>,
+        Option<Uuid>,
+        Option<i64>,
+        Option<DateTime<Utc>>,
+    ) = sqlx::query_as(
+        "SELECT active,removed_state_version,removed_transition_id,removed_seq,removed_at \
+             FROM chat.member_devices WHERE leaf_period_id=$1",
+    )
+    .bind(bob_leaf_period)
+    .fetch_one(&mut *verify)
+    .await
+    .expect("removed leaf period");
+    assert_eq!(
+        removed,
+        (
+            false,
+            Some(3),
+            Some(built.commit_transition),
+            Some(4),
+            Some(applied_at)
+        )
+    );
+    let interval: (
+        Option<i64>,
+        Option<i64>,
+        Option<Uuid>,
+        Option<Vec<u8>>,
+        Option<String>,
+        Option<Uuid>,
+        Option<DateTime<Utc>>,
+    ) = sqlx::query_as(
+        "SELECT terminal_seq,closing_state_version,closing_transition_id,\
+                closing_outer_entry_fingerprint,closing_kind,closing_leaf_period_id,removed_at \
+         FROM chat.application_intervals \
+         WHERE conversation_id=$1 AND recipient_did=$2 AND recipient_device_id=$3",
+    )
+    .bind(built.conversation_id)
+    .bind(&scenario.bob_did)
+    .bind(Uuid::from_bytes(*scenario.bob_id.device_id()))
+    .fetch_one(&mut *verify)
+    .await
+    .expect("removed device interval");
+    assert_eq!(
+        interval,
+        (
+            Some(4),
+            Some(3),
+            Some(built.commit_transition),
+            Some(outer_fingerprint),
+            Some("remove".to_owned()),
+            Some(bob_leaf_period),
+            Some(applied_at),
+        )
+    );
+
+    let bob_participant: (bool, Option<Uuid>, Option<i64>, Option<DateTime<Utc>>) = sqlx::query_as(
+        "SELECT current_membership,removing_transition_id,removing_seq,removed_at \
+             FROM chat.participants WHERE conversation_id=$1 AND user_did=$2",
+    )
+    .bind(built.conversation_id)
+    .bind(&scenario.bob_did)
+    .fetch_one(&mut *verify)
+    .await
+    .expect("bob participant remains active");
+    assert_eq!(bob_participant, (true, None, None, None));
+    let alice_active_leaf: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.member_devices \
+         WHERE conversation_id=$1 AND user_did=$2 AND active",
+    )
+    .bind(built.conversation_id)
+    .bind(&scenario.fixture.alice_did)
+    .fetch_one(&mut *verify)
+    .await
+    .expect("remaining leaf");
+    assert_eq!(alice_active_leaf, 1);
+    let alice_open_interval: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.application_intervals \
+         WHERE conversation_id=$1 AND recipient_did=$2 AND terminal_seq IS NULL",
+    )
+    .bind(built.conversation_id)
+    .bind(&scenario.fixture.alice_did)
+    .fetch_one(&mut *verify)
+    .await
+    .expect("remaining interval");
+    assert_eq!(alice_open_interval, 1);
+    let welcome_counts: (i64, i64) = sqlx::query_as(
+        "SELECT count(*),count(*) FILTER (WHERE status='superseded') \
+         FROM chat.welcome_deliveries delivery \
+         JOIN chat.welcome_bundles bundle USING (welcome_id) \
+         WHERE bundle.conversation_id=$1",
+    )
+    .bind(built.conversation_id)
+    .fetch_one(&mut *verify)
+    .await
+    .expect("no generic-commit Welcome");
+    assert_eq!(welcome_counts, (1, 1));
+    let fulfilled_recovery: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.leaf_recovery_requests \
+         WHERE conversation_id=$1 AND status='fulfilled'",
+    )
+    .bind(built.conversation_id)
+    .fetch_one(&mut *verify)
+    .await
+    .expect("no generic recovery fulfillment");
+    assert_eq!(fulfilled_recovery, 1);
+    verify
+        .rollback()
+        .await
+        .expect("close verification transaction");
+}
+
+#[derive(Clone, Copy, Debug)]
+enum GenericRemoveCorruption {
+    Add,
+    EmptyLeafDelta,
+    MissingInterval,
+    IntervalWithoutLeaf,
+    DuplicateInterval,
+    WrongCloseKind,
+    WrongCloseFingerprint,
+    WrongIntervalCoordinate,
+    MissingClosingLeafContext,
+    ForeignClosingLeafContext,
+    DuplicateClosingLeafContext,
+}
+
+#[tokio::test]
+async fn signed_generic_remove_commit_rejects_nonbijective_effect_shapes() {
+    let (pool, _db) = setup().await;
+    let scenario = run_fulfillment_scenario(&pool).await;
+    let cases = [
+        GenericRemoveCorruption::Add,
+        GenericRemoveCorruption::EmptyLeafDelta,
+        GenericRemoveCorruption::MissingInterval,
+        GenericRemoveCorruption::IntervalWithoutLeaf,
+        GenericRemoveCorruption::DuplicateInterval,
+        GenericRemoveCorruption::WrongCloseKind,
+        GenericRemoveCorruption::WrongCloseFingerprint,
+        GenericRemoveCorruption::WrongIntervalCoordinate,
+        GenericRemoveCorruption::MissingClosingLeafContext,
+        GenericRemoveCorruption::ForeignClosingLeafContext,
+        GenericRemoveCorruption::DuplicateClosingLeafContext,
+    ];
+
+    for case in cases {
+        let (mut built, bob_leaf_period) =
+            build_signed_generic_remove_commit(&pool, &scenario).await;
+        match case {
+            GenericRemoveCorruption::MissingClosingLeafContext => {
+                built.ctx.closing_leaf_periods.clear();
+            }
+            GenericRemoveCorruption::ForeignClosingLeafContext => {
+                built.ctx.closing_leaf_periods =
+                    vec![(scenario.fixture.alice_id.clone(), bob_leaf_period)];
+            }
+            GenericRemoveCorruption::DuplicateClosingLeafContext => {
+                built
+                    .ctx
+                    .closing_leaf_periods
+                    .push((scenario.bob_id.clone(), Uuid::new_v4()));
+            }
+            _ => {}
+        }
+        let plan = match case {
+            GenericRemoveCorruption::Add => built.plan.with_generic_remove_add_for_test(),
+            GenericRemoveCorruption::EmptyLeafDelta => {
+                built.plan.with_generic_remove_empty_leaf_delta_for_test()
+            }
+            GenericRemoveCorruption::MissingInterval => {
+                built.plan.with_generic_remove_interval_dropped_for_test()
+            }
+            GenericRemoveCorruption::IntervalWithoutLeaf => {
+                built.plan.with_generic_remove_leaf_dropped_for_test()
+            }
+            GenericRemoveCorruption::DuplicateInterval => built
+                .plan
+                .with_generic_remove_interval_duplicated_for_test(),
+            GenericRemoveCorruption::WrongCloseKind => built
+                .plan
+                .with_generic_remove_close_kind_corrupted_for_test(),
+            GenericRemoveCorruption::WrongCloseFingerprint => built
+                .plan
+                .with_generic_remove_close_fingerprint_corrupted_for_test(),
+            GenericRemoveCorruption::WrongIntervalCoordinate => built
+                .plan
+                .with_generic_remove_interval_coordinate_corrupted_for_test(),
+            GenericRemoveCorruption::MissingClosingLeafContext
+            | GenericRemoveCorruption::ForeignClosingLeafContext
+            | GenericRemoveCorruption::DuplicateClosingLeafContext => built.plan,
+        };
+        let mut tx = pool.begin().await.expect("begin corrupted generic Remove");
+        let result = apply_conversation_persistence_plan(&mut tx, &plan, &built.ctx).await;
+        match case {
+            GenericRemoveCorruption::MissingClosingLeafContext => assert!(
+                matches!(result, Err(ExecutorError::MissingContext(_))),
+                "{case:?} must fail MissingContext, got {result:?}"
+            ),
+            _ => assert!(
+                matches!(result, Err(ExecutorError::InconsistentPlan(_))),
+                "{case:?} must fail InconsistentPlan, got {result:?}"
+            ),
+        }
+        tx.rollback().await.expect("rollback corrupted plan");
+    }
+
+    let (state_version, transitions): (i64, i64) = sqlx::query_as(
+        "SELECT current_state_version,\
+                (SELECT count(*) FROM chat.transitions WHERE conversation_id=$1) \
+         FROM chat.conversations WHERE conversation_id=$1",
+    )
+    .bind(scenario.conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("all adversarial cases leave zero residue");
+    assert_eq!((state_version, transitions), (2, 3));
 }
 
 #[tokio::test]

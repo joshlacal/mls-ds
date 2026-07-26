@@ -11432,6 +11432,96 @@ fn dummy_principal() -> PrincipalId {
 
 #[cfg(test)]
 impl ConversationPersistencePlan {
+    pub(crate) fn with_generic_remove_add_for_test(mut self) -> Self {
+        if let Some(before) = self
+            .effects
+            .leaf_changes
+            .iter()
+            .find_map(|change| change.before.clone())
+        {
+            self.effects.leaf_changes.push(StateChange {
+                before: None,
+                after: Some(before),
+            });
+        }
+        self
+    }
+
+    pub(crate) fn with_generic_remove_empty_leaf_delta_for_test(mut self) -> Self {
+        self.effects.leaf_changes.push(StateChange {
+            before: None,
+            after: None,
+        });
+        self
+    }
+
+    pub(crate) fn with_generic_remove_interval_dropped_for_test(mut self) -> Self {
+        self.effects.interval_changes.clear();
+        self
+    }
+
+    pub(crate) fn with_generic_remove_leaf_dropped_for_test(mut self) -> Self {
+        self.effects
+            .leaf_changes
+            .retain(|change| change.after.is_some());
+        self
+    }
+
+    pub(crate) fn with_generic_remove_interval_duplicated_for_test(mut self) -> Self {
+        if let Some(change) = self.effects.interval_changes.first().cloned() {
+            self.effects.interval_changes.push(change);
+        }
+        self
+    }
+
+    pub(crate) fn with_generic_remove_close_kind_corrupted_for_test(mut self) -> Self {
+        if let Some(end) = self
+            .effects
+            .interval_changes
+            .first_mut()
+            .and_then(|change| change.after.as_mut())
+            .and_then(|interval| interval.end.as_mut())
+        {
+            end.kind = CloseKind::Replace;
+        }
+        self
+    }
+
+    pub(crate) fn with_generic_remove_close_fingerprint_corrupted_for_test(mut self) -> Self {
+        if let Some(end) = self
+            .effects
+            .interval_changes
+            .first_mut()
+            .and_then(|change| change.after.as_mut())
+            .and_then(|interval| interval.end.as_mut())
+        {
+            end.evidence.outer_entry_fingerprint[0] ^= 0xFF;
+        }
+        self
+    }
+
+    pub(crate) fn with_generic_remove_interval_coordinate_corrupted_for_test(mut self) -> Self {
+        if let Some(after) = self
+            .effects
+            .interval_changes
+            .first_mut()
+            .and_then(|change| change.after.as_mut())
+        {
+            let coordinate = after.opening_context;
+            after.opening_context = PublicGroupSnapshotCoordinate::new(
+                *coordinate.conversation_id(),
+                coordinate.generation(),
+                coordinate.state_version() + 1,
+                *coordinate.group_id(),
+                coordinate.epoch(),
+                *coordinate.group_context_hash(),
+                *coordinate.confirmation_tag(),
+                coordinate.lifecycle(),
+            );
+        }
+        self
+    }
+
     /// Drop the invitation-quota CAS binding, producing a plan production would
     /// reject as `InvalidHydrationAuthority` and the executor rejects as
     /// `InconsistentPlan`. Used to make the executor's invitation-quota consume
@@ -14448,7 +14538,7 @@ mod executor {
     use chrono::{DateTime, Utc};
     use uuid::Uuid;
 
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
 
     use super::super::repository::delivery::{
         self as delivery, AppendEntry, ApplicationIntervalClose, DeliveryRepositoryError,
@@ -15054,16 +15144,18 @@ mod executor {
                 //     ALWAYS emits exactly one NEW Welcome (`None->Some`, how the
                 //     recovered target joins) and NEVER FULFILLS a leave request (though
                 //     it may stale one).
-                //   * A generic zero-proposal commit (`plan_commit_inner`) does
-                //     NEITHER — no leave FULFILLMENT, no `None->Some` welcome (its only
-                //     welcome delta is a prior-bound `Pending->Superseded`).
+                //   * A generic commit (`plan_commit_inner`) does NEITHER — no leave
+                //     FULFILLMENT and no `None->Some` welcome. It may canonically remove
+                //     leaves (closing their application intervals), and its only welcome
+                //     delta is a prior-bound `Pending->Superseded`.
                 // The two predicates are therefore disjoint (a Pending->Fulfilled leave
                 // edge vs. a None->Some welcome are never both set) and exhaustive
                 // (their negation is exactly the generic commit). Each branch's own
                 // exact-shape guards (leave requires exactly one leave-request +
                 // participant close; recovery requires exactly one own request/
-                // reservation/package/new welcome; generic rejects every membership
-                // delta) HARD-error a mis-partitioned plan rather than mis-applying it —
+                // reservation/package/new welcome; generic rejects participant and Add
+                // membership deltas while enforcing Remove/interval bijection) HARD-error
+                // a mis-partitioned plan rather than mis-applying it —
                 // the discriminator is backstopped, never load-bearing alone.
                 let is_leave_fulfillment = effects.leave_request_changes().iter().any(|change| {
                     matches!(
@@ -16814,14 +16906,13 @@ mod executor {
         })
     }
 
-    /// Apply a generic `signedCommitTransition` (zero adds / no membership change):
-    /// an epoch-only crypto commit. sv+1 AND epoch+1 with a fresh hash/tag, the
-    /// metadata re-encrypted (carry-forward), and NO leaf/interval/participant/
-    /// welcome/recovery change beyond the sender's own key rotation (which the DS
-    /// `member_devices` row does not store, so it is a no-op here). Distinguished
-    /// from a fulfillment purely by the ABSENCE of a Welcome (a fulfillment always
-    /// emits exactly one; a generic commit never does), backstopped by the
-    /// exact-empty guards below.
+    /// Apply a generic `signedCommitTransition` (zero Adds): an epoch-changing
+    /// crypto commit that may carry canonical RemoveLeaf effects. sv+1 AND epoch+1
+    /// with a fresh hash/tag, metadata re-encryption, exact removed leaf-period and
+    /// application-interval closes, and no participant terminalization or own
+    /// welcome/recovery work. Distinguished from a fulfillment by the ABSENCE of a
+    /// new Welcome (a recovery fulfillment always emits exactly one), backstopped
+    /// by the exact-shape and bijection guards below.
     #[allow(clippy::too_many_arguments)]
     async fn apply_generic_commit(
         transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -16851,14 +16942,11 @@ mod executor {
         let expected_state_version = checked_i64(expected_prior.state_version())?;
         let expected_next_entry_seq = checked_i64(head.expected_next_entry_seq())?;
 
-        // A generic (zero-proposal) commit changes ONLY the crypto coordinate + the
-        // re-encrypted metadata + (a legal interleaving) prior-coordinate open-work
-        // SUPERSESSION + prior-bound reset/leave STALING. It has no membership change
-        // and no OWN recovery/reset/leave work: every recovery/reservation/package
-        // delta must be a supersession and every reset/leave delta a Pending->Stale
-        // staling (verified by exact-shape below).
+        // A generic no-Add commit changes the crypto coordinate + re-encrypted
+        // metadata, MAY close signed RemoveLeaf devices and their intervals, and MAY
+        // carry legal prior-coordinate open-work supersession/staling. It has no
+        // participant change and no OWN recovery/reset/leave work.
         reject_if_present("participant_changes", effects.participant_changes())?;
-        reject_if_present("interval_changes", effects.interval_changes())?;
         reject_if_present("terminal_proof_changes", effects.terminal_proof_changes())?;
         reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
         // recovery_request_changes / reservation_changes / package_transitions /
@@ -16903,13 +16991,106 @@ mod executor {
                 "generic commit revocation/welcome/quota CAS",
             ));
         }
-        // Only the sender's own key rotation may appear as a leaf change — a
-        // (Some,Some) with NO DS row impact. Any add (None,Some) or remove
-        // (Some,None) is NOT a zero-proposal commit and is a hard error.
+        // Validate the leaf/interval/context three-way bijection before the first
+        // write. Some->None is a real signed Remove. Some->Some is tolerated only
+        // for the actor's stable leaf identity/key material (the public tree's
+        // sender encryption-key update is not stored in member_devices). Adds,
+        // empty deltas, foreign/duplicate context, and every unmatched close reject.
+        let mut removed_devices = BTreeSet::new();
         for change in effects.leaf_changes() {
-            if !matches!((change.before(), change.after()), (Some(_), Some(_))) {
+            match (change.before(), change.after()) {
+                (Some(before), None) => {
+                    if !removed_devices.insert(before.device.clone()) {
+                        return Err(ExecutorError::InconsistentPlan(
+                            "generic commit duplicates a removed leaf",
+                        ));
+                    }
+                }
+                (Some(before), Some(after))
+                    if before.device == after.device
+                        && before.leaf_index == after.leaf_index
+                        && before.basic_credential == after.basic_credential
+                        && before.signature_key == after.signature_key
+                        && before.key_package_ref == after.key_package_ref
+                        && device_did(&before.device)? == ctx.actor.user_did
+                        && device_uuid(&before.device) == ctx.actor.device_id => {}
+                (None, Some(_)) => {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "generic commit must not add a leaf",
+                    ))
+                }
+                (None, None) => {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "generic commit carries an empty leaf delta",
+                    ))
+                }
+                (Some(_), Some(_)) => {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "generic commit carries a non-sender leaf update",
+                    ))
+                }
+            }
+        }
+        let declared_closed = effects
+            .closed_intervals()
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if !effects.opened_intervals().is_empty() || declared_closed != removed_devices {
+            return Err(ExecutorError::InconsistentPlan(
+                "generic commit removed-leaf and closed-interval declarations disagree",
+            ));
+        }
+        let mut interval_devices = BTreeSet::new();
+        for change in effects.interval_changes() {
+            let (before, after) = match (change.before(), change.after()) {
+                (Some(before), Some(after)) => (before, after),
+                _ => {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "generic commit interval delta is not an exact close",
+                    ))
+                }
+            };
+            let end = after.end.as_ref().ok_or(ExecutorError::InconsistentPlan(
+                "generic commit interval close has no end",
+            ))?;
+            if before.recipient != after.recipient
+                || before.generation != after.generation
+                || before.opening != after.opening
+                || before.opening_kind != after.opening_kind
+                || before.opening_context != after.opening_context
+                || before.end.is_some()
+                || end.kind != CloseKind::Remove
+                || end.evidence != hydration.producer
+                || !removed_devices.contains(&after.recipient)
+                || !interval_devices.insert(after.recipient.clone())
+            {
                 return Err(ExecutorError::InconsistentPlan(
-                    "generic commit carries a membership leaf change (not zero-proposal)",
+                    "generic commit interval close mismatches its removed leaf",
+                ));
+            }
+        }
+        if interval_devices != removed_devices {
+            return Err(ExecutorError::InconsistentPlan(
+                "generic commit removal lacks exactly one matching interval close",
+            ));
+        }
+        let mut context_devices = BTreeSet::new();
+        let mut context_periods = BTreeSet::new();
+        for (device, period_id) in &ctx.closing_leaf_periods {
+            if !removed_devices.contains(device)
+                || !context_devices.insert(device.clone())
+                || !context_periods.insert(*period_id)
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "generic commit closing leaf context is foreign or duplicated",
+                ));
+            }
+        }
+        for device in &removed_devices {
+            if !context_devices.contains(device) {
+                return Err(ExecutorError::MissingContext(
+                    "closing leaf period id for generic Remove",
                 ));
             }
         }
@@ -17039,7 +17220,42 @@ mod executor {
         )
         .await?;
 
-        // 7. Audience + events.
+        // 7. Close every removed leaf period and its one exact Remove interval.
+        for change in effects.leaf_changes() {
+            if let (Some(before), None) = (change.before(), change.after()) {
+                transition::close_leaf_period(
+                    transaction,
+                    &LeafClose {
+                        leaf_period_id: closing_leaf_period(ctx, before.device())?,
+                        removed_state_version: state_version,
+                        removed_transition_id: transition_id,
+                        removed_seq: seq_i64,
+                        removed_at: applied_at,
+                    },
+                )
+                .await?;
+            }
+        }
+        for change in effects.interval_changes() {
+            let after = change.after().expect("validated generic interval close");
+            let end = after.end().expect("validated generic interval end");
+            delivery::close_application_interval(
+                transaction,
+                &ApplicationIntervalClose {
+                    membership_interval_id: Uuid::from_bytes(*after.opening_transition_id()),
+                    terminal_seq: checked_i64(end.seq())?,
+                    closing_state_version: state_version,
+                    closing_transition_id: Uuid::from_bytes(*end.transition_id()),
+                    closing_outer_entry_fingerprint: end.outer_entry_fingerprint().to_vec(),
+                    closing_kind: repo_interval_close_kind(end.kind()),
+                    closing_leaf_period_id: closing_leaf_period(ctx, after.recipient())?,
+                    removed_at: applied_at,
+                },
+            )
+            .await?;
+        }
+
+        // 8. Audience + events.
         let recipients = build_entry_recipients(&ctx.entry_recipients)?;
         delivery::insert_entry_recipients(
             transaction,

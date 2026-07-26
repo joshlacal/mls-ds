@@ -913,6 +913,23 @@ impl VerifiedCommitPublicState {
         })
     }
 
+    /// Bind a synthetic remove fixture to the exact signed Commit artifact and
+    /// MLS AAD digests carried by a cryptographically verified control entry.
+    /// Production obtains both bindings only from `process_commit`.
+    #[cfg(test)]
+    pub(crate) fn with_verified_bindings_for_test(
+        mut self,
+        verified_commit_sha256: [u8; 32],
+        verified_aad_sha256: [u8; 32],
+    ) -> Result<Self, PublicStateError> {
+        if verified_commit_sha256 == [0; 32] || verified_aad_sha256 == [0; 32] {
+            return Err(PublicStateError::CoordinateMismatch);
+        }
+        self.verified_commit_sha256 = Some(verified_commit_sha256);
+        self.verified_aad_sha256 = Some(verified_aad_sha256);
+        Ok(self)
+    }
+
     /// Synthetic ZERO-PROPOSAL commit (`sv+1`, `epoch+1`, fresh hash/tag; no
     /// adds/removes, sender self-update only). Mirrors `for_test_remove`'s pure
     /// public-state seam — the executor generic-commit arm is verified against this
