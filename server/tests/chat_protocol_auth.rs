@@ -686,7 +686,11 @@ fn canonical_leaf_changes_reject_add_then_remove_for_same_device_replace() {
 #[test]
 fn canonical_leaf_changes_reject_duplicate_remove_for_same_device() {
     let device_id = "11111111-1111-4111-8111-111111111111";
-    let leaf_changes = vec![remove_leaf(DID, device_id), remove_leaf(DID, device_id)];
+    let leaf_changes = vec![
+        remove_leaf(DID, device_id),
+        remove_leaf(DID, device_id),
+        add_leaf_by_recovery(DID, device_id),
+    ];
     assert!(
         decode_canonical_signed_mutation(&unsigned_leaf_recovery_fulfillment_request(leaf_changes))
             .is_err()
@@ -697,6 +701,7 @@ fn canonical_leaf_changes_reject_duplicate_remove_for_same_device() {
 fn canonical_leaf_changes_reject_duplicate_add_for_same_device() {
     let device_id = "11111111-1111-4111-8111-111111111111";
     let leaf_changes = vec![
+        remove_leaf(DID, device_id),
         add_leaf_by_recovery(DID, device_id),
         add_leaf_by_recovery(DID, device_id),
     ];
@@ -712,6 +717,30 @@ fn canonical_leaf_changes_preserve_cross_device_ordering() {
     let high = "22222222-2222-4222-8222-222222222222";
     assert!(decode_canonical_signed_mutation(&unsigned_commit_request(&[low, high])).is_ok());
     assert!(decode_canonical_signed_mutation(&unsigned_commit_request(&[high, low])).is_err());
+}
+
+#[test]
+fn canonical_leaf_changes_order_by_did_before_uuid() {
+    let low_did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+    let high_did = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+    let low_device = "11111111-1111-4111-8111-111111111111";
+    let high_device = "22222222-2222-4222-8222-222222222222";
+    let ordered = vec![
+        remove_leaf(low_did, high_device),
+        remove_leaf(high_did, low_device),
+    ];
+    let reversed = vec![
+        remove_leaf(high_did, low_device),
+        remove_leaf(low_did, high_device),
+    ];
+    assert!(
+        decode_canonical_signed_mutation(&unsigned_leaf_recovery_fulfillment_request(ordered))
+            .is_ok()
+    );
+    assert!(
+        decode_canonical_signed_mutation(&unsigned_leaf_recovery_fulfillment_request(reversed))
+            .is_err()
+    );
 }
 
 #[test]

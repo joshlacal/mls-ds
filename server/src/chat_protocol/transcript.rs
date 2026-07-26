@@ -855,8 +855,8 @@ fn enforce_contract_order(
             let did = value_did(map_value(item, "userDid")?)?.as_str().as_bytes();
             let device = value_uuid(map_value(item, "deviceId")?)?.as_bytes();
             let operation_rank = match map_value(item, "$type")? {
-                DagValue::Text(value) if value == "blue.catbird.chat.defs#removeLeaf" => 1,
-                DagValue::Text(value) if value == "blue.catbird.chat.defs#addLeafByRecovery" => 2,
+                DagValue::Text(value) if value == "blue.catbird.chat.defs#removeLeaf" => 0,
+                DagValue::Text(value) if value == "blue.catbird.chat.defs#addLeafByRecovery" => 1,
                 _ => return Err(AuthPrimitiveError::invalid("unknown leaf change operation")),
             };
             if prior.is_some_and(|previous| {
