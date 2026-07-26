@@ -1218,7 +1218,7 @@ mod historical_signed_path {
         ed25519_key_id, CanonicalTimestamp, TrustedRequestInstant,
     };
 
-    const RECEIVED_AT: &str = "2030-01-01T00:00:00.000Z";
+    pub(super) const RECEIVED_AT: &str = "2030-01-01T00:00:00.000Z";
 
     fn uuid_v4_bytes(byte: u8) -> [u8; 16] {
         let mut value = [byte; 16];
@@ -1227,7 +1227,7 @@ mod historical_signed_path {
         value
     }
 
-    fn sample_coordinate(conversation_id: [u8; 16]) -> PublicGroupSnapshotCoordinate {
+    pub(super) fn sample_coordinate(conversation_id: [u8; 16]) -> PublicGroupSnapshotCoordinate {
         PublicGroupSnapshotCoordinate::new(
             conversation_id,
             5,
@@ -1240,7 +1240,7 @@ mod historical_signed_path {
         )
     }
 
-    fn sample_actor() -> DeviceIdentity {
+    pub(super) fn sample_actor() -> DeviceIdentity {
         let did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
         DeviceIdentity::new(
             PrincipalId::new(did.as_bytes().to_vec()).unwrap(),
@@ -1356,7 +1356,7 @@ mod historical_signed_path {
         resign_signed_wrapper(json!({ "body": body, "signature": "" }), signing_key)
     }
 
-    fn all_kinds(
+    pub(super) fn all_kinds(
         coordinate: &PublicGroupSnapshotCoordinate,
         actor: &DeviceIdentity,
         signing_key: &SigningKey,
@@ -1381,7 +1381,7 @@ mod historical_signed_path {
         ]
     }
 
-    fn trusted_received_at() -> TrustedRequestInstant {
+    pub(super) fn trusted_received_at() -> TrustedRequestInstant {
         TrustedRequestInstant::from_canonical_for_test(
             CanonicalTimestamp::parse(RECEIVED_AT).unwrap(),
         )
@@ -3590,7 +3590,7 @@ mod historical_control_loader {
     // live arms — the pending happy path, the foreign-conversation
     // `InvalidOrigin`, and the empty collection — are live on the gate DB.
     // -----------------------------------------------------------------------
-    mod reset_leave_leg {
+    pub(super) mod reset_leave_leg {
         use base64::{engine::general_purpose::STANDARD, Engine};
         use chrono::{DateTime, Duration, Utc};
         use ed25519_dalek::{Signer, SigningKey};
@@ -3615,8 +3615,8 @@ mod historical_control_loader {
         use crate::chat_protocol::validation::ed25519_key_id;
         use crate::common;
 
-        const RESET_ENTRY_KIND: &str = "blue.catbird.chat.defs#resetRequestEntry";
-        const LEAVE_ENTRY_KIND: &str = "blue.catbird.chat.defs#leaveRequestEntry";
+        pub(super) const RESET_ENTRY_KIND: &str = "blue.catbird.chat.defs#resetRequestEntry";
+        pub(super) const LEAVE_ENTRY_KIND: &str = "blue.catbird.chat.defs#leaveRequestEntry";
         const RECEIVED_AT: &str = "2030-02-01T00:00:00.000Z";
         const SIGNED_AT: &str = "2030-01-31T23:59:59.000Z";
 
@@ -3653,16 +3653,16 @@ mod historical_control_loader {
         /// row envelope (`accepted_payload_bytes`) + the inner signed mutation
         /// wrapper (`signed_request_bytes`) + the shape/mapping columns the seed's
         /// entry and projection rows must carry byte-identically.
-        struct RealControlRequestEntry {
-            request_id: [u8; 16],
-            entry_id: Uuid,
-            seq: u64,
-            public_row_json: Vec<u8>,
-            raw_wrapper: Vec<u8>,
-            signing_transcript: Vec<u8>,
-            request_digest: Vec<u8>,
-            signature: Vec<u8>,
-            outer_entry_fingerprint: Vec<u8>,
+        pub(super) struct RealControlRequestEntry {
+            pub(super) request_id: [u8; 16],
+            pub(super) entry_id: Uuid,
+            pub(super) seq: u64,
+            pub(super) public_row_json: Vec<u8>,
+            pub(super) raw_wrapper: Vec<u8>,
+            pub(super) signing_transcript: Vec<u8>,
+            pub(super) request_digest: Vec<u8>,
+            pub(super) signature: Vec<u8>,
+            pub(super) outer_entry_fingerprint: Vec<u8>,
         }
 
         /// Build a real reset (`kind = ResetRequest`) or leave (`kind =
@@ -3670,7 +3670,7 @@ mod historical_control_loader {
         /// bound to the genesis coordinate, at `seq`. Mirrors
         /// `build_signed_recovery_request`'s direct-body construction wrapped in the
         /// `build_real_creation_entry`-style control envelope.
-        fn build_real_control_request_entry(
+        pub(super) fn build_real_control_request_entry(
             entry: &RealCreationEntry,
             kind: SignedMutationKind,
             entry_kind: &str,
@@ -3713,7 +3713,14 @@ mod historical_control_loader {
                 json!(ed25519_key_id(&verifying).unwrap().as_str()),
             );
             body.insert("authGeneration".into(), json!(1));
-            body.insert("prior".into(), genesis_coordinate_json(entry.cid));
+            if matches!(kind, SignedMutationKind::LeaveCancellation) {
+                body.insert(
+                    "conversationId".into(),
+                    json!(Uuid::from_bytes(entry.cid).hyphenated().to_string()),
+                );
+            } else {
+                body.insert("prior".into(), genesis_coordinate_json(entry.cid));
+            }
             if matches!(kind, SignedMutationKind::ResetRequest) {
                 body.insert("reason".into(), json!("manualRecovery"));
             }
@@ -3772,7 +3779,7 @@ mod historical_control_loader {
         /// projection row) on top of a committed genesis graph, advancing the head
         /// to `next_entry_seq = 3`. Returns the built request entry (its bytes are
         /// the in-memory re-mint reference).
-        async fn seed_control_request(
+        pub(super) async fn seed_control_request(
             pool: &PgPool,
             entry: &RealCreationEntry,
             kind: SignedMutationKind,
@@ -4075,6 +4082,704 @@ mod historical_control_loader {
 
             assert!(reset.is_empty());
             assert!(leave.is_empty());
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // T4-H2-pre terminal-family sub-seal A — shared terminal reconstruction
+    // atom. The first RED is the new global DeviceRevocation arm: a real,
+    // Ed25519-signed revokeDevice wrapper is persisted in
+    // `chat.device_revocations`, then the production loader must re-read every
+    // durable field and return evidence byte-equal to append-time admission.
+    // -----------------------------------------------------------------------
+    mod terminal_family_atom {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use chrono::{DateTime, Utc};
+        use ed25519_dalek::{Signer, SigningKey};
+        use serde_json::{json, Value};
+        use sha2::{Digest, Sha256};
+        use sqlx::{PgPool, Postgres, Transaction};
+        use uuid::Uuid;
+
+        use super::super::historical_control_path::{build_real_creation_entry, RealCreationEntry};
+        use super::super::historical_signed_path::{
+            all_kinds as all_signed_request_wrappers, sample_actor, sample_coordinate,
+            trusted_received_at, RECEIVED_AT as SIGNED_REQUEST_RECEIVED_AT,
+        };
+        use super::reset_leave_leg::{
+            build_real_control_request_entry, seed_control_request, LEAVE_ENTRY_KIND,
+            RESET_ENTRY_KIND,
+        };
+        use super::seed_real_creation_graph;
+        use crate::chat_protocol::repository::core::{
+            load_work_terminal_hydration_row, resolve_single_terminal_candidate,
+            WorkTerminalHydrationError, WorkTerminalLocator, WorkTerminalRequestSource,
+        };
+        use crate::chat_protocol::state_machine::{
+            DurableSignedRequestEnvelope, HistoricalRehydrationAuthority, HydrationAuthority,
+            RequestEntryKind, ServerTimestamp, WorkTerminalHydrationRow,
+        };
+        use crate::chat_protocol::transcript::{
+            decode_and_verify_signed_mutation, decode_canonical_signed_mutation, SignedMutationKind,
+        };
+        use crate::chat_protocol::validation::{
+            ed25519_key_id, CanonicalTimestamp, TrustedRequestInstant,
+        };
+        use crate::common;
+
+        const SIGNED_AT: &str = "2030-03-01T00:00:00.000Z";
+        const ACCEPTED_AT: &str = "2030-03-01T00:00:01.000Z";
+
+        struct RealDeviceRevocation {
+            revocation_id: Uuid,
+            raw_wrapper: Vec<u8>,
+            signing_transcript: Vec<u8>,
+            request_digest: Vec<u8>,
+            signature: Vec<u8>,
+        }
+
+        fn instant(text: &str) -> DateTime<Utc> {
+            DateTime::parse_from_rfc3339(text)
+                .expect("canonical instant")
+                .with_timezone(&Utc)
+        }
+
+        fn build_real_device_revocation(entry: &RealCreationEntry) -> RealDeviceRevocation {
+            let signing_key = SigningKey::from_bytes(&[0x24; 32]);
+            let verifying = signing_key.verifying_key().to_bytes();
+            assert_eq!(entry.public_key, verifying);
+            assert_eq!(
+                entry.actor_key_id,
+                ed25519_key_id(&verifying).unwrap().as_str()
+            );
+
+            let revocation_id = Uuid::new_v4();
+            let body = json!({
+                "$type": SignedMutationKind::DeviceRevocation.type_id(),
+                "signatureDomain":
+                    String::from_utf8(SignedMutationKind::DeviceRevocation.domain().to_vec())
+                        .unwrap(),
+                "actorDid": entry.actor_did,
+                "actorDeviceId": entry.actor_device_id.hyphenated().to_string(),
+                "keyId": entry.actor_key_id,
+                "authGeneration": 1,
+                "targetDeviceId": entry.actor_device_id.hyphenated().to_string(),
+                "targetAuthGeneration": 1,
+                "idempotencyKey": revocation_id.hyphenated().to_string(),
+                "signedAt": SIGNED_AT,
+            });
+            let mut wrapper = json!({ "body": body, "signature": "" });
+            wrapper["signature"] = Value::String(STANDARD.encode([0_u8; 64]));
+            let unsigned = serde_json::to_vec(&wrapper).unwrap();
+            let canonical = decode_canonical_signed_mutation(&unsigned).unwrap();
+            let signing_transcript = canonical.transcript_bytes().to_vec();
+            let signature = signing_key.sign(&signing_transcript).to_bytes();
+            wrapper["signature"] = Value::String(STANDARD.encode(signature));
+            let raw_wrapper = serde_json::to_vec(&wrapper).unwrap();
+
+            decode_and_verify_signed_mutation(&raw_wrapper, &verifying)
+                .expect("device-revocation wrapper is genuinely signed");
+
+            RealDeviceRevocation {
+                revocation_id,
+                raw_wrapper,
+                request_digest: Sha256::digest(&signing_transcript).to_vec(),
+                signature: signature.to_vec(),
+                signing_transcript,
+            }
+        }
+
+        async fn insert_device_revocation(
+            transaction: &mut Transaction<'_, Postgres>,
+            entry: &RealCreationEntry,
+            revocation: &RealDeviceRevocation,
+            actor_auth_generation: i64,
+            stored_signature: &[u8],
+        ) {
+            sqlx::query(
+                r#"INSERT INTO chat.device_revocations(
+                    revocation_id,actor_did,actor_device_id,actor_key_id,
+                    actor_auth_generation,target_did,target_device_id,
+                    target_auth_generation,accepted_request_bytes,
+                    signing_transcript_bytes,request_digest,signature,signed_at,accepted_at
+                ) VALUES($1,$2,$3,$4,$5,$2,$3,1,$6,$7,$8,$9,$10,$11)"#,
+            )
+            .bind(revocation.revocation_id)
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .bind(&entry.actor_key_id)
+            .bind(actor_auth_generation)
+            .bind(&revocation.raw_wrapper)
+            .bind(&revocation.signing_transcript)
+            .bind(&revocation.request_digest)
+            .bind(stored_signature)
+            .bind(instant(SIGNED_AT))
+            .bind(instant(ACCEPTED_AT))
+            .execute(&mut **transaction)
+            .await
+            .expect("insert exact durable device revocation");
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn device_revocation_terminal_reconstructs_the_exact_verified_row() {
+            let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(2).await;
+            let cid = Uuid::new_v4();
+            let entry = build_real_creation_entry(*cid.as_bytes());
+            seed_real_creation_graph(&pool, &entry).await;
+            let revocation = build_real_device_revocation(&entry);
+
+            let mutation =
+                decode_and_verify_signed_mutation(&revocation.raw_wrapper, &entry.public_key)
+                    .expect("reference mutation verifies");
+            let accepted_at = TrustedRequestInstant::from_canonical_for_test(
+                CanonicalTimestamp::parse(ACCEPTED_AT).unwrap(),
+            );
+            let expected = HydrationAuthority::new(entry.cid)
+                .unwrap()
+                .device_revocation(mutation, &accepted_at)
+                .expect("append-time revocation evidence");
+            let authority =
+                HistoricalRehydrationAuthority::new(entry.cid, entry.head_next_entry_seq).unwrap();
+
+            let mut tx = pool.begin().await.expect("begin");
+            insert_device_revocation(&mut tx, &entry, &revocation, 1, &revocation.signature).await;
+            let loaded = load_work_terminal_hydration_row(
+                &mut tx,
+                &authority,
+                cid,
+                WorkTerminalLocator::DeviceRevocation {
+                    revocation_id: revocation.revocation_id,
+                },
+            )
+            .await
+            .expect("device revocation terminal reconstructs");
+            tx.rollback()
+                .await
+                .expect("rollback deferred fixture graph");
+
+            assert_eq!(
+                loaded,
+                WorkTerminalHydrationRow::DeviceRevocation(expected),
+                "the durable row re-enters as the exact append-time evidence",
+            );
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn device_revocation_terminal_fails_closed_on_stored_signature_tamper() {
+            let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(2).await;
+            let cid = Uuid::new_v4();
+            let entry = build_real_creation_entry(*cid.as_bytes());
+            seed_real_creation_graph(&pool, &entry).await;
+            let revocation = build_real_device_revocation(&entry);
+            let authority =
+                HistoricalRehydrationAuthority::new(entry.cid, entry.head_next_entry_seq).unwrap();
+            let mut tampered_signature = revocation.signature.clone();
+            tampered_signature[0] ^= 0x01;
+
+            let mut tx = pool.begin().await.expect("begin");
+            insert_device_revocation(&mut tx, &entry, &revocation, 1, &tampered_signature).await;
+            let loaded = load_work_terminal_hydration_row(
+                &mut tx,
+                &authority,
+                cid,
+                WorkTerminalLocator::DeviceRevocation {
+                    revocation_id: revocation.revocation_id,
+                },
+            )
+            .await;
+            tx.rollback()
+                .await
+                .expect("rollback deferred fixture graph");
+
+            assert!(
+                loaded.is_err(),
+                "a signed-field mismatch between wrapper and durable row must fail closed",
+            );
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn device_revocation_terminal_fails_closed_on_durable_generation_tamper() {
+            let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(2).await;
+            let cid = Uuid::new_v4();
+            let entry = build_real_creation_entry(*cid.as_bytes());
+            seed_real_creation_graph(&pool, &entry).await;
+            let revocation = build_real_device_revocation(&entry);
+            let authority =
+                HistoricalRehydrationAuthority::new(entry.cid, entry.head_next_entry_seq).unwrap();
+
+            let mut tx = pool.begin().await.expect("begin");
+            insert_device_revocation(&mut tx, &entry, &revocation, 2, &revocation.signature).await;
+            let loaded = load_work_terminal_hydration_row(
+                &mut tx,
+                &authority,
+                cid,
+                WorkTerminalLocator::DeviceRevocation {
+                    revocation_id: revocation.revocation_id,
+                },
+            )
+            .await;
+            tx.rollback()
+                .await
+                .expect("rollback deferred fixture graph");
+
+            assert!(
+                loaded.is_err(),
+                "a durable actor-generation mismatch must fail closed",
+            );
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn transition_terminal_reconstructs_only_the_exact_verified_transition() {
+            let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(2).await;
+            let cid = Uuid::new_v4();
+            let entry = build_real_creation_entry(*cid.as_bytes());
+            let transition_id = seed_real_creation_graph(&pool, &entry).await;
+            let authority =
+                HistoricalRehydrationAuthority::new(entry.cid, entry.head_next_entry_seq).unwrap();
+
+            let mut tx = pool.begin().await.expect("begin");
+            let expected = authority
+                .hydrate_historical_control_from_durable_bytes(
+                    entry.public_row_json.clone(),
+                    entry.raw_wrapper.clone(),
+                    &entry.public_key,
+                )
+                .expect("independent in-memory control re-verification")
+                .into_transition()
+                .expect("creation is transition evidence");
+            let loaded = load_work_terminal_hydration_row(
+                &mut tx,
+                &authority,
+                cid,
+                WorkTerminalLocator::Transition { transition_id },
+            )
+            .await
+            .expect("transition terminal reconstructs");
+            tx.commit().await.expect("commit");
+
+            assert_eq!(loaded, WorkTerminalHydrationRow::Transition(expected));
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn expiry_terminal_carries_only_the_exact_persisted_server_timestamp() {
+            let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(1).await;
+            let cid = Uuid::new_v4();
+            let authority = HistoricalRehydrationAuthority::new(*cid.as_bytes(), 2).unwrap();
+            let terminal_at = instant(ACCEPTED_AT);
+            let expected = ServerTimestamp::from_canonical_stored(ACCEPTED_AT).unwrap();
+
+            let mut tx = pool.begin().await.expect("begin");
+            let loaded = load_work_terminal_hydration_row(
+                &mut tx,
+                &authority,
+                cid,
+                WorkTerminalLocator::Expiry { terminal_at },
+            )
+            .await
+            .expect("expiry terminal reconstructs");
+            tx.rollback().await.expect("rollback");
+
+            assert_eq!(loaded, WorkTerminalHydrationRow::Expiry(expected));
+            assert!(
+                !matches!(
+                    loaded,
+                    WorkTerminalHydrationRow::Transition(_)
+                        | WorkTerminalHydrationRow::Request(_)
+                        | WorkTerminalHydrationRow::DeviceRevocation(_)
+                ),
+                "expiry cannot be confused with an evidence-bearing arm",
+            );
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn control_request_terminal_uses_the_control_verifier_for_reset_and_leave() {
+            let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(2).await;
+            for (signed_kind, request_kind, entry_kind) in [
+                (
+                    SignedMutationKind::ResetRequest,
+                    RequestEntryKind::ResetRequest,
+                    RESET_ENTRY_KIND,
+                ),
+                (
+                    SignedMutationKind::LeaveRequest,
+                    RequestEntryKind::LeaveRequest,
+                    LEAVE_ENTRY_KIND,
+                ),
+            ] {
+                let cid = Uuid::new_v4();
+                let entry = build_real_creation_entry(*cid.as_bytes());
+                let request = seed_control_request(&pool, &entry, signed_kind, entry_kind).await;
+                let authority =
+                    HistoricalRehydrationAuthority::new(entry.cid, request.seq + 1).unwrap();
+                let expected = authority
+                    .hydrate_historical_control_from_durable_bytes(
+                        request.public_row_json.clone(),
+                        request.raw_wrapper.clone(),
+                        &entry.public_key,
+                    )
+                    .expect("reference control evidence")
+                    .into_request()
+                    .expect("control request");
+
+                let mut tx = pool.begin().await.expect("begin");
+                let loaded = load_work_terminal_hydration_row(
+                    &mut tx,
+                    &authority,
+                    cid,
+                    WorkTerminalLocator::Request {
+                        kind: request_kind,
+                        source: WorkTerminalRequestSource::Control {
+                            request_digest: &request.request_digest,
+                            signed_request_bytes: &request.raw_wrapper,
+                        },
+                    },
+                )
+                .await
+                .expect("control request terminal reconstructs");
+                tx.commit().await.expect("commit");
+
+                assert_eq!(loaded, WorkTerminalHydrationRow::Request(expected));
+            }
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn leave_cancellation_terminal_uses_the_control_entry_verifier() {
+            const CANCELLATION_ENTRY_KIND: &str = "blue.catbird.chat.defs#leaveCancellationEntry";
+
+            let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(2).await;
+            let cid = Uuid::new_v4();
+            let entry = build_real_creation_entry(*cid.as_bytes());
+            seed_real_creation_graph(&pool, &entry).await;
+            let cancellation = build_real_control_request_entry(
+                &entry,
+                SignedMutationKind::LeaveCancellation,
+                CANCELLATION_ENTRY_KIND,
+                2,
+            );
+            let authority = HistoricalRehydrationAuthority::new(entry.cid, 3).unwrap();
+            let expected = authority
+                .hydrate_historical_control_from_durable_bytes(
+                    cancellation.public_row_json.clone(),
+                    cancellation.raw_wrapper.clone(),
+                    &entry.public_key,
+                )
+                .expect("reference cancellation control evidence")
+                .into_request()
+                .expect("leave cancellation is a control request");
+
+            let mut tx = pool.begin().await.expect("begin");
+            let payload_sha = Sha256::digest(&cancellation.public_row_json).to_vec();
+            sqlx::query(
+                r#"INSERT INTO chat.entries(
+                    conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,
+                    accepted_payload_sha256,signed_request_bytes,request_digest,signature,
+                    server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,
+                    actor_key_id,actor_auth_generation,generation,state_version,transition_id,received_at
+                ) VALUES($1,2,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,1,NULL,NULL,NULL,$14)"#,
+            )
+            .bind(cid)
+            .bind(cancellation.entry_id)
+            .bind(CANCELLATION_ENTRY_KIND)
+            .bind(&cancellation.public_row_json)
+            .bind(&payload_sha)
+            .bind(&cancellation.raw_wrapper)
+            .bind(&cancellation.request_digest)
+            .bind(&cancellation.signature)
+            .bind(vec![0_u8])
+            .bind(&cancellation.outer_entry_fingerprint)
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .bind(&entry.actor_key_id)
+            .bind(instant("2030-02-01T00:00:00.000Z"))
+            .execute(&mut *tx)
+            .await
+            .expect("insert cancellation control entry");
+            sqlx::query("UPDATE chat.conversations SET next_entry_seq=3 WHERE conversation_id=$1")
+                .bind(cid)
+                .execute(&mut *tx)
+                .await
+                .expect("advance head in cancellation fixture");
+
+            let loaded = load_work_terminal_hydration_row(
+                &mut tx,
+                &authority,
+                cid,
+                WorkTerminalLocator::Request {
+                    kind: RequestEntryKind::LeaveCancellation,
+                    source: WorkTerminalRequestSource::Control {
+                        request_digest: &cancellation.request_digest,
+                        signed_request_bytes: &cancellation.raw_wrapper,
+                    },
+                },
+            )
+            .await
+            .expect("leave cancellation terminal reconstructs");
+            tx.rollback()
+                .await
+                .expect("rollback deferred fixture graph");
+
+            assert_eq!(loaded, WorkTerminalHydrationRow::Request(expected));
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn signed_request_terminal_uses_the_signed_verifier_for_recovery_and_welcome() {
+            let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(1).await;
+            let cid = Uuid::new_v4();
+            let signing_key = SigningKey::from_bytes(&[0x42; 32]);
+            let verifying_key = signing_key.verifying_key().to_bytes();
+            let actor = sample_actor();
+            let coordinate = sample_coordinate(*cid.as_bytes());
+            let append = HydrationAuthority::new(*cid.as_bytes()).unwrap();
+            let historical = HistoricalRehydrationAuthority::new(*cid.as_bytes(), 2).unwrap();
+
+            for (kind, raw) in [
+                RequestEntryKind::LeafRecoveryRequest,
+                RequestEntryKind::LeafRecoveryCancellation,
+                RequestEntryKind::WelcomeAcknowledgement,
+                RequestEntryKind::WelcomeRejection,
+            ]
+            .into_iter()
+            .zip(all_signed_request_wrappers(
+                &coordinate,
+                &actor,
+                &signing_key,
+            )) {
+                let mutation = decode_and_verify_signed_mutation(&raw, &verifying_key)
+                    .expect("reference signed mutation verifies");
+                let signing_transcript = mutation.transcript_bytes().to_vec();
+                let request_digest = *mutation.request_digest();
+                let signature = *mutation.signature();
+                let envelope =
+                    DurableSignedRequestEnvelope::new(*cid.as_bytes(), &trusted_received_at())
+                        .unwrap();
+                let expected = append
+                    .signed_request(envelope, mutation)
+                    .expect("append-time signed request evidence");
+
+                let mut tx = pool.begin().await.expect("begin");
+                let loaded = load_work_terminal_hydration_row(
+                    &mut tx,
+                    &historical,
+                    cid,
+                    WorkTerminalLocator::Request {
+                        kind,
+                        source: WorkTerminalRequestSource::Signed {
+                            received_at: instant(SIGNED_REQUEST_RECEIVED_AT),
+                            signed_request_bytes: &raw,
+                            signing_transcript_bytes: &signing_transcript,
+                            request_digest,
+                            signature,
+                            signing_public_key: &verifying_key,
+                        },
+                    },
+                )
+                .await
+                .expect("signed request terminal reconstructs");
+                tx.rollback().await.expect("rollback");
+
+                assert_eq!(loaded, WorkTerminalHydrationRow::Request(expected));
+            }
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn request_terminal_fails_closed_on_mismatched_path_or_signed_kind() {
+            let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(1).await;
+            let cid = Uuid::new_v4();
+            let signing_key = SigningKey::from_bytes(&[0x42; 32]);
+            let verifying_key = signing_key.verifying_key().to_bytes();
+            let actor = sample_actor();
+            let coordinate = sample_coordinate(*cid.as_bytes());
+            let raw = all_signed_request_wrappers(&coordinate, &actor, &signing_key)
+                .into_iter()
+                .next()
+                .expect("leaf-recovery request wrapper");
+            let verified = decode_and_verify_signed_mutation(&raw, &verifying_key)
+                .expect("signed fixture verifies");
+            let signing_transcript = verified.transcript_bytes().to_vec();
+            let request_digest = *verified.request_digest();
+            let signature = *verified.signature();
+            let authority = HistoricalRehydrationAuthority::new(*cid.as_bytes(), 2).unwrap();
+
+            let mut tx = pool.begin().await.expect("begin");
+            let signed_on_control_kind = load_work_terminal_hydration_row(
+                &mut tx,
+                &authority,
+                cid,
+                WorkTerminalLocator::Request {
+                    kind: RequestEntryKind::ResetRequest,
+                    source: WorkTerminalRequestSource::Signed {
+                        received_at: instant(SIGNED_REQUEST_RECEIVED_AT),
+                        signed_request_bytes: &raw,
+                        signing_transcript_bytes: &signing_transcript,
+                        request_digest,
+                        signature,
+                        signing_public_key: &verifying_key,
+                    },
+                },
+            )
+            .await;
+            assert!(matches!(
+                signed_on_control_kind,
+                Err(WorkTerminalHydrationError::RequestPathMismatch)
+            ));
+
+            let control_on_signed_kind = load_work_terminal_hydration_row(
+                &mut tx,
+                &authority,
+                cid,
+                WorkTerminalLocator::Request {
+                    kind: RequestEntryKind::LeafRecoveryRequest,
+                    source: WorkTerminalRequestSource::Control {
+                        request_digest: &[0x44; 32],
+                        signed_request_bytes: &raw,
+                    },
+                },
+            )
+            .await;
+            assert!(matches!(
+                control_on_signed_kind,
+                Err(WorkTerminalHydrationError::RequestPathMismatch)
+            ));
+
+            let wrong_signed_kind = load_work_terminal_hydration_row(
+                &mut tx,
+                &authority,
+                cid,
+                WorkTerminalLocator::Request {
+                    kind: RequestEntryKind::WelcomeAcknowledgement,
+                    source: WorkTerminalRequestSource::Signed {
+                        received_at: instant(SIGNED_REQUEST_RECEIVED_AT),
+                        signed_request_bytes: &raw,
+                        signing_transcript_bytes: &signing_transcript,
+                        request_digest,
+                        signature,
+                        signing_public_key: &verifying_key,
+                    },
+                },
+            )
+            .await;
+            tx.rollback().await.expect("rollback");
+            assert!(
+                matches!(
+                    wrong_signed_kind,
+                    Err(WorkTerminalHydrationError::InvalidEvidence)
+                ),
+                "a valid signed request of the wrong kind must not be relabelled",
+            );
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn signed_request_terminal_fails_closed_on_durable_digest_tamper() {
+            let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(1).await;
+            let cid = Uuid::new_v4();
+            let signing_key = SigningKey::from_bytes(&[0x42; 32]);
+            let verifying_key = signing_key.verifying_key().to_bytes();
+            let actor = sample_actor();
+            let coordinate = sample_coordinate(*cid.as_bytes());
+            let raw = all_signed_request_wrappers(&coordinate, &actor, &signing_key)
+                .into_iter()
+                .next()
+                .expect("leaf-recovery request wrapper");
+            let verified = decode_and_verify_signed_mutation(&raw, &verifying_key)
+                .expect("signed fixture verifies");
+            let signing_transcript = verified.transcript_bytes().to_vec();
+            let mut request_digest = *verified.request_digest();
+            request_digest[0] ^= 0x01;
+            let signature = *verified.signature();
+            let authority = HistoricalRehydrationAuthority::new(*cid.as_bytes(), 2).unwrap();
+
+            let mut tx = pool.begin().await.expect("begin");
+            let result = load_work_terminal_hydration_row(
+                &mut tx,
+                &authority,
+                cid,
+                WorkTerminalLocator::Request {
+                    kind: RequestEntryKind::LeafRecoveryRequest,
+                    source: WorkTerminalRequestSource::Signed {
+                        received_at: instant(SIGNED_REQUEST_RECEIVED_AT),
+                        signed_request_bytes: &raw,
+                        signing_transcript_bytes: &signing_transcript,
+                        request_digest,
+                        signature,
+                        signing_public_key: &verifying_key,
+                    },
+                },
+            )
+            .await;
+            tx.rollback().await.expect("rollback");
+
+            assert!(matches!(
+                result,
+                Err(WorkTerminalHydrationError::InvalidEvidence)
+            ));
+        }
+
+        #[test]
+        fn terminal_candidate_resolution_never_selects_missing_or_ambiguous_rows() {
+            assert!(matches!(
+                resolve_single_terminal_candidate::<u8>(Vec::new()),
+                Err(WorkTerminalHydrationError::EvidenceMissing)
+            ));
+            assert!(matches!(
+                resolve_single_terminal_candidate(vec![1_u8, 2_u8]),
+                Err(WorkTerminalHydrationError::EvidenceAmbiguous)
+            ));
+            assert_eq!(
+                resolve_single_terminal_candidate(vec![7_u8]).expect("single row resolves"),
+                7,
+            );
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn terminal_lookup_fails_closed_on_missing_or_wrong_conversation_evidence() {
+            let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(2).await;
+            let cid = Uuid::new_v4();
+            let entry = build_real_creation_entry(*cid.as_bytes());
+            let transition_id = seed_real_creation_graph(&pool, &entry).await;
+            let authority =
+                HistoricalRehydrationAuthority::new(entry.cid, entry.head_next_entry_seq).unwrap();
+            let foreign = Uuid::new_v4();
+
+            let mut tx = pool.begin().await.expect("begin");
+            for locator in [
+                WorkTerminalLocator::Transition {
+                    transition_id: Uuid::new_v4(),
+                },
+                WorkTerminalLocator::Transition { transition_id },
+                WorkTerminalLocator::DeviceRevocation {
+                    revocation_id: Uuid::new_v4(),
+                },
+            ] {
+                let lookup_cid = if matches!(
+                    &locator,
+                    WorkTerminalLocator::Transition {
+                        transition_id: id
+                    } if *id == transition_id
+                ) {
+                    foreign
+                } else {
+                    cid
+                };
+                let result =
+                    load_work_terminal_hydration_row(&mut tx, &authority, lookup_cid, locator)
+                        .await;
+                assert!(matches!(
+                    result,
+                    Err(WorkTerminalHydrationError::EvidenceMissing)
+                ));
+            }
+            tx.rollback().await.expect("rollback");
         }
     }
 }

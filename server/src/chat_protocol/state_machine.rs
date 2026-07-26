@@ -3110,6 +3110,61 @@ impl HydrationAuthority {
         Ok(evidence)
     }
 
+    /// Re-verifies one exact durable `chat.device_revocations` row.
+    ///
+    /// Device revocations are global and entry-less, so there is no conversation
+    /// head or control sequence to bind. Their authority is instead the strict
+    /// signed `revokeDevice` wrapper under the actor's historical key plus exact
+    /// equality against every immutable durable field. This seam deliberately
+    /// accepts no precomputed evidence or caller-supplied row digest: it re-runs
+    /// the certified signed-mutation decoder, mints through `device_revocation_at`,
+    /// and then compares the resulting evidence field-for-field with the row.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn hydrate_persisted_device_revocation_from_durable_fields(
+        revocation_id: [u8; 16],
+        actor: DeviceIdentity,
+        target: DeviceIdentity,
+        actor_key_id: [u8; 32],
+        actor_auth_generation: u64,
+        expected_target_auth_generation: u64,
+        raw_signed_request: &[u8],
+        signing_transcript_bytes: &[u8],
+        request_digest: [u8; 32],
+        signature: [u8; 64],
+        signed_at: &str,
+        accepted_at: &str,
+        historical_public_key: &[u8],
+    ) -> Result<DeviceRevocationEvidence, StateMachineError> {
+        let mutation = decode_and_verify_signed_mutation(raw_signed_request, historical_public_key)
+            .map_err(|_| StateMachineError::InvalidHydrationAuthority)?;
+        let accepted_at = canonical_server_timestamp(
+            &CanonicalTimestamp::parse(accepted_at)
+                .map_err(|_| StateMachineError::InvalidHydrationAuthority)?,
+        )?;
+        let signed_at = canonical_server_timestamp(
+            &CanonicalTimestamp::parse(signed_at)
+                .map_err(|_| StateMachineError::InvalidHydrationAuthority)?,
+        )?;
+        let evidence = Self::device_revocation_at(mutation, accepted_at)?;
+        if evidence.revocation_id != revocation_id
+            || evidence.actor != actor
+            || evidence.target != target
+            || evidence.actor_key_id != actor_key_id
+            || evidence.actor_auth_generation != actor_auth_generation
+            || evidence.expected_target_auth_generation != expected_target_auth_generation
+            || evidence.signed_at != signed_at
+            || evidence.accepted_at != accepted_at
+            || evidence.request_digest != request_digest
+            || evidence.signature != signature
+            || evidence.signed_request_bytes.as_slice() != raw_signed_request
+            || evidence.signing_transcript_bytes.as_slice() != signing_transcript_bytes
+            || !validate_device_revocation_evidence(&evidence)
+        {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
+        Ok(evidence)
+    }
+
     /// Seals one canonical persisted device/key row at a trusted read instant.
     /// Planners can consume only this projection, never caller-asserted
     /// registration booleans or loose key fields.
@@ -3679,6 +3734,39 @@ impl HistoricalRehydrationAuthority {
                 .durable_row_digest;
         let row = PersistedSignedRequestRow::new(conversation_id, received_at, durable_row_digest)?;
         self.hydrate_historical_signed_request(row, raw_signed_request, historical_public_key)
+    }
+
+    /// Exact durable-row companion for signed terminal requests. In addition to
+    /// re-running the certified signed-request hydration path, this verifies the
+    /// projection table's separately persisted transcript, digest, and signature
+    /// byte-for-byte against the decoded wrapper. A caller cannot relabel or
+    /// partially bind a valid signed wrapper by supplying divergent row columns.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn hydrate_historical_signed_request_from_exact_durable_fields(
+        &self,
+        conversation_id: [u8; 16],
+        received_at: &str,
+        raw_signed_request: &[u8],
+        signing_transcript_bytes: &[u8],
+        request_digest: [u8; 32],
+        signature: [u8; 64],
+        historical_public_key: &[u8],
+    ) -> Result<RequestEvidence, StateMachineError> {
+        let mutation = decode_and_verify_signed_mutation(raw_signed_request, historical_public_key)
+            .map_err(|_| StateMachineError::InvalidHydrationAuthority)?;
+        if mutation.accepted_wrapper_bytes() != Some(raw_signed_request)
+            || mutation.transcript_bytes() != signing_transcript_bytes
+            || mutation.request_digest() != &request_digest
+            || mutation.signature() != &signature
+        {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
+        self.hydrate_historical_signed_request_from_durable_bytes(
+            conversation_id,
+            received_at,
+            raw_signed_request,
+            historical_public_key,
+        )
     }
 
     /// Re-mints a persisted CONTROL-entry row for the historical graph. Mirrors

@@ -11,6 +11,7 @@
 
 use std::collections::BTreeMap;
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, SecondsFormat, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::{Postgres, Transaction};
@@ -24,13 +25,14 @@ use super::super::{
     state_machine::{
         classify_acceptance, classify_invitation, classify_role_producer,
         metadata_binding_of_transition, CloseKind, ConversationState, DeviceIdentity,
-        HistoricalRehydrationAuthority, IntervalEndHydrationRow, IntervalHydrationRow,
-        LeafHydrationRow, LeafRecoveryKind, LeaveRequestHydrationRow, LeaveRequestStatus,
-        MetadataSnapshotBinding, OpeningKind, ParticipantHydrationRow, ParticipantRole,
-        ParticipantStatus, PersistedControlAuthority, PrincipalId, RecoveryOriginHydrationRow,
-        RecoveryRequestHydrationRow, RecoveryRequestStatus, RecoveryReservationHydrationRow,
-        RecoverySource, RequestEvidence, ReservationStatus, ResetRequestHydrationRow,
-        ResetRequestStatus, ServerTimestamp, TransitionEvidence,
+        HistoricalRehydrationAuthority, HydrationAuthority, IntervalEndHydrationRow,
+        IntervalHydrationRow, LeafHydrationRow, LeafRecoveryKind, LeaveRequestHydrationRow,
+        LeaveRequestStatus, MetadataSnapshotBinding, OpeningKind, ParticipantHydrationRow,
+        ParticipantRole, ParticipantStatus, PersistedControlAuthority, PrincipalId,
+        RecoveryOriginHydrationRow, RecoveryRequestHydrationRow, RecoveryRequestStatus,
+        RecoveryReservationHydrationRow, RecoverySource, RequestEntryKind, RequestEvidence,
+        ReservationStatus, ResetRequestHydrationRow, ResetRequestStatus, ServerTimestamp,
+        TransitionEvidence, WorkTerminalHydrationRow,
     },
     validation::{BareDid, KeyThumbprint},
 };
@@ -3674,6 +3676,335 @@ fn recovery_timestamp(value: DateTime<Utc>) -> Result<ServerTimestamp, RecoveryH
 /// instant through this one formatter.
 fn canonical_millis(value: DateTime<Utc>) -> String {
     value.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+// ===========================================================================
+// T4-H2-pre terminal-family sub-seal A — shared WorkTerminalHydrationRow atom.
+//
+// DeviceRevocation is global and entry-less. The immutable durable row is
+// located by its UUID under an EXACTLY-ONE guard, JOINed to the actor's
+// historical signing key, and then re-entered through the state machine's
+// certified signed-mutation verifier. Every row field is compared exactly with
+// the re-minted evidence; no digest-only trust or placeholder evidence exists.
+// ===========================================================================
+
+#[allow(dead_code)]
+#[derive(Debug, Error)]
+pub(crate) enum WorkTerminalHydrationError {
+    #[error("clean-chat terminal evidence is absent")]
+    EvidenceMissing,
+    #[error("clean-chat terminal evidence is ambiguous")]
+    EvidenceAmbiguous,
+    #[error("clean-chat terminal evidence failed full re-verification")]
+    InvalidEvidence,
+    #[error("clean-chat terminal durable column is out of domain")]
+    OutOfDomain,
+    #[error("clean-chat terminal request kind does not use the supplied verifier path")]
+    RequestPathMismatch,
+    #[error("clean-chat terminal hydration database error: {0}")]
+    Database(#[from] sqlx::Error),
+}
+
+#[allow(dead_code)]
+pub(crate) enum WorkTerminalRequestSource<'a> {
+    Control {
+        request_digest: &'a [u8],
+        signed_request_bytes: &'a [u8],
+    },
+    Signed {
+        received_at: DateTime<Utc>,
+        signed_request_bytes: &'a [u8],
+        signing_transcript_bytes: &'a [u8],
+        request_digest: [u8; 32],
+        signature: [u8; 64],
+        signing_public_key: &'a [u8],
+    },
+}
+
+#[allow(dead_code)]
+pub(crate) enum WorkTerminalLocator<'a> {
+    Transition {
+        transition_id: Uuid,
+    },
+    Request {
+        kind: RequestEntryKind,
+        source: WorkTerminalRequestSource<'a>,
+    },
+    DeviceRevocation {
+        revocation_id: Uuid,
+    },
+    Expiry {
+        terminal_at: DateTime<Utc>,
+    },
+}
+
+#[derive(sqlx::FromRow)]
+struct DurableDeviceRevocationRow {
+    revocation_id: Uuid,
+    actor_did: String,
+    actor_device_id: Uuid,
+    actor_key_id: String,
+    actor_auth_generation: i64,
+    target_did: String,
+    target_device_id: Uuid,
+    target_auth_generation: i64,
+    accepted_request_bytes: Vec<u8>,
+    signing_transcript_bytes: Vec<u8>,
+    request_digest: Vec<u8>,
+    signature: Vec<u8>,
+    signed_at: DateTime<Utc>,
+    accepted_at: DateTime<Utc>,
+    signing_public_key: Vec<u8>,
+}
+
+/// Resolve an immutable terminal-evidence lookup under the binding ruling:
+/// exactly one row or fail closed. This decision is shared by locators whose DB
+/// constraints make duplicate rows structurally impossible, so the read side
+/// still never silently selects if that invariant drifts.
+pub(crate) fn resolve_single_terminal_candidate<T>(
+    rows: Vec<T>,
+) -> Result<T, WorkTerminalHydrationError> {
+    let mut rows = rows.into_iter();
+    match (rows.next(), rows.next()) {
+        (Some(row), None) => Ok(row),
+        (None, _) => Err(WorkTerminalHydrationError::EvidenceMissing),
+        (Some(_), Some(_)) => Err(WorkTerminalHydrationError::EvidenceAmbiguous),
+    }
+}
+
+/// Reconstruct one terminal-family evidence arm from its exact durable
+/// provenance. Further terminal arms extend this dispatcher; callers never
+/// construct `WorkTerminalHydrationRow` evidence directly.
+#[allow(dead_code)]
+pub(crate) async fn load_work_terminal_hydration_row(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &HistoricalRehydrationAuthority,
+    conversation_id: Uuid,
+    locator: WorkTerminalLocator<'_>,
+) -> Result<WorkTerminalHydrationRow, WorkTerminalHydrationError> {
+    match locator {
+        WorkTerminalLocator::Transition { transition_id } => {
+            let evidence = load_historical_control_evidence(
+                transaction,
+                authority,
+                conversation_id,
+                transition_id,
+            )
+            .await
+            .map_err(|error| match error {
+                ControlEvidenceLoadError::EntryMissing => {
+                    WorkTerminalHydrationError::EvidenceMissing
+                }
+                ControlEvidenceLoadError::InvalidEvidence => {
+                    WorkTerminalHydrationError::InvalidEvidence
+                }
+                ControlEvidenceLoadError::Database(error) => {
+                    WorkTerminalHydrationError::Database(error)
+                }
+            })?
+            .into_transition()
+            .map_err(|_| WorkTerminalHydrationError::InvalidEvidence)?;
+            Ok(WorkTerminalHydrationRow::Transition(evidence))
+        }
+        WorkTerminalLocator::Request { kind, source } => match source {
+            WorkTerminalRequestSource::Control {
+                request_digest,
+                signed_request_bytes,
+            } => {
+                let entry_kind = match kind {
+                    RequestEntryKind::ResetRequest => RESET_REQUEST_ENTRY_KIND,
+                    RequestEntryKind::LeaveRequest => LEAVE_REQUEST_ENTRY_KIND,
+                    RequestEntryKind::LeaveCancellation => {
+                        "blue.catbird.chat.defs#leaveCancellationEntry"
+                    }
+                    RequestEntryKind::LeafRecoveryRequest
+                    | RequestEntryKind::LeafRecoveryCancellation
+                    | RequestEntryKind::WelcomeAcknowledgement
+                    | RequestEntryKind::WelcomeRejection => {
+                        return Err(WorkTerminalHydrationError::RequestPathMismatch);
+                    }
+                };
+                let evidence = load_control_request_origin(
+                    transaction,
+                    authority,
+                    conversation_id,
+                    entry_kind,
+                    request_digest,
+                    signed_request_bytes,
+                )
+                .await
+                .map_err(work_terminal_from_reset_leave_error)?;
+                if evidence.kind() != kind {
+                    return Err(WorkTerminalHydrationError::InvalidEvidence);
+                }
+                Ok(WorkTerminalHydrationRow::Request(evidence))
+            }
+            WorkTerminalRequestSource::Signed {
+                received_at,
+                signed_request_bytes,
+                signing_transcript_bytes,
+                request_digest,
+                signature,
+                signing_public_key,
+            } => {
+                if matches!(
+                    kind,
+                    RequestEntryKind::ResetRequest
+                        | RequestEntryKind::LeaveRequest
+                        | RequestEntryKind::LeaveCancellation
+                ) {
+                    return Err(WorkTerminalHydrationError::RequestPathMismatch);
+                }
+                let evidence = authority
+                    .hydrate_historical_signed_request_from_exact_durable_fields(
+                        *conversation_id.as_bytes(),
+                        &canonical_millis(received_at),
+                        signed_request_bytes,
+                        signing_transcript_bytes,
+                        request_digest,
+                        signature,
+                        signing_public_key,
+                    )
+                    .map_err(|_| WorkTerminalHydrationError::InvalidEvidence)?;
+                if evidence.kind() != kind {
+                    return Err(WorkTerminalHydrationError::InvalidEvidence);
+                }
+                Ok(WorkTerminalHydrationRow::Request(evidence))
+            }
+        },
+        WorkTerminalLocator::DeviceRevocation { revocation_id } => {
+            load_device_revocation_terminal(transaction, revocation_id).await
+        }
+        WorkTerminalLocator::Expiry { terminal_at } => {
+            let timestamp = ServerTimestamp::from_canonical_stored(&canonical_millis(terminal_at))
+                .map_err(|_| WorkTerminalHydrationError::OutOfDomain)?;
+            Ok(WorkTerminalHydrationRow::Expiry(timestamp))
+        }
+    }
+}
+
+fn work_terminal_from_reset_leave_error(
+    error: ResetLeaveHydrationError,
+) -> WorkTerminalHydrationError {
+    match error {
+        ResetLeaveHydrationError::OriginMissing => WorkTerminalHydrationError::EvidenceMissing,
+        ResetLeaveHydrationError::OriginAmbiguous => WorkTerminalHydrationError::EvidenceAmbiguous,
+        ResetLeaveHydrationError::OutOfDomain => WorkTerminalHydrationError::OutOfDomain,
+        ResetLeaveHydrationError::Database(error) => WorkTerminalHydrationError::Database(error),
+        ResetLeaveHydrationError::BindingMismatch
+        | ResetLeaveHydrationError::InvalidOrigin
+        | ResetLeaveHydrationError::UnsupportedTerminal => {
+            WorkTerminalHydrationError::InvalidEvidence
+        }
+    }
+}
+
+async fn load_device_revocation_terminal(
+    transaction: &mut Transaction<'_, Postgres>,
+    revocation_id: Uuid,
+) -> Result<WorkTerminalHydrationRow, WorkTerminalHydrationError> {
+    let rows: Vec<DurableDeviceRevocationRow> = sqlx::query_as(
+        r#"
+        SELECT
+            rev.revocation_id,
+            rev.actor_did,
+            rev.actor_device_id,
+            rev.actor_key_id,
+            rev.actor_auth_generation,
+            rev.target_did,
+            rev.target_device_id,
+            rev.target_auth_generation,
+            rev.accepted_request_bytes,
+            rev.signing_transcript_bytes,
+            rev.request_digest,
+            rev.signature,
+            rev.signed_at,
+            rev.accepted_at,
+            actor_key.signing_public_key
+        FROM chat.device_revocations rev
+        JOIN chat.device_keys actor_key
+          ON actor_key.user_did = rev.actor_did
+         AND actor_key.device_id = rev.actor_device_id
+         AND actor_key.key_id = rev.actor_key_id
+        WHERE rev.revocation_id = $1
+        "#,
+    )
+    .bind(revocation_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+
+    let row = resolve_single_terminal_candidate(rows)?;
+    if row.revocation_id != revocation_id
+        || !uuid_is_canonical_v4(row.revocation_id)
+        || KeyThumbprint::parse(&row.actor_key_id).is_err()
+    {
+        return Err(WorkTerminalHydrationError::OutOfDomain);
+    }
+
+    let actor = terminal_device(row.actor_did, row.actor_device_id)?;
+    let target = terminal_device(row.target_did, row.target_device_id)?;
+    let actor_key_id: [u8; 32] = URL_SAFE_NO_PAD
+        .decode(&row.actor_key_id)
+        .ok()
+        .and_then(|value| value.try_into().ok())
+        .ok_or(WorkTerminalHydrationError::OutOfDomain)?;
+    let actor_auth_generation = terminal_u64(row.actor_auth_generation)?;
+    let target_auth_generation = terminal_u64(row.target_auth_generation)?;
+    let request_digest = terminal_bytes32(row.request_digest)?;
+    let signature = terminal_bytes64(row.signature)?;
+    let signed_at = canonical_millis(row.signed_at);
+    let accepted_at = canonical_millis(row.accepted_at);
+
+    HydrationAuthority::hydrate_persisted_device_revocation_from_durable_fields(
+        *row.revocation_id.as_bytes(),
+        actor,
+        target,
+        actor_key_id,
+        actor_auth_generation,
+        target_auth_generation,
+        &row.accepted_request_bytes,
+        &row.signing_transcript_bytes,
+        request_digest,
+        signature,
+        &signed_at,
+        &accepted_at,
+        &row.signing_public_key,
+    )
+    .map(WorkTerminalHydrationRow::DeviceRevocation)
+    .map_err(|_| WorkTerminalHydrationError::InvalidEvidence)
+}
+
+fn terminal_device(
+    did: String,
+    device_id: Uuid,
+) -> Result<DeviceIdentity, WorkTerminalHydrationError> {
+    if !uuid_is_canonical_v4(device_id) {
+        return Err(WorkTerminalHydrationError::OutOfDomain);
+    }
+    DeviceIdentity::new(
+        PrincipalId::new(did.into_bytes()).map_err(|_| WorkTerminalHydrationError::OutOfDomain)?,
+        *device_id.as_bytes(),
+    )
+    .map_err(|_| WorkTerminalHydrationError::OutOfDomain)
+}
+
+fn terminal_u64(value: i64) -> Result<u64, WorkTerminalHydrationError> {
+    u64::try_from(value)
+        .ok()
+        .filter(|value| (1..=MAX_PROTOCOL_INTEGER).contains(value))
+        .ok_or(WorkTerminalHydrationError::OutOfDomain)
+}
+
+fn terminal_bytes32(value: Vec<u8>) -> Result<[u8; 32], WorkTerminalHydrationError> {
+    value
+        .try_into()
+        .map_err(|_| WorkTerminalHydrationError::OutOfDomain)
+}
+
+fn terminal_bytes64(value: Vec<u8>) -> Result<[u8; 64], WorkTerminalHydrationError> {
+    value
+        .try_into()
+        .map_err(|_| WorkTerminalHydrationError::OutOfDomain)
 }
 
 // ===========================================================================
