@@ -121,7 +121,7 @@ fn every_clean_table_reference_is_schema_qualified() {
 }
 
 #[test]
-fn exactly_four_clean_migration_files_are_the_only_migration_boundary() {
+fn exactly_six_clean_migration_files_are_the_only_migration_boundary() {
     let migration_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations");
     let mut clean_migrations = fs::read_dir(migration_root)
         .expect("read migration directory")
@@ -132,7 +132,9 @@ fn exactly_four_clean_migration_files_are_the_only_migration_boundary() {
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| {
                     name.starts_with("202607220000")
+                        || name == "20260725000001_prepare_welcome_provenance_backfill.sql"
                         || name == "20260726000001_welcome_supersession_provenance.sql"
+                        || name == "20260726000002_restore_welcome_provenance_deferred_triggers.sql"
                 })
         })
         .collect::<Vec<_>>();
@@ -148,7 +150,9 @@ fn exactly_four_clean_migration_files_are_the_only_migration_boundary() {
             "20260722000001_chat_protocol_core.sql",
             "20260722000002_chat_protocol_delivery.sql",
             "20260722000003_chat_protocol_blobs.sql",
+            "20260725000001_prepare_welcome_provenance_backfill.sql",
             "20260726000001_welcome_supersession_provenance.sql",
+            "20260726000002_restore_welcome_provenance_deferred_triggers.sql",
         ]
     );
 

@@ -14,23 +14,29 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{Executor, PgPool};
 
 const TEST_DATABASE_NAME: &str = "catbird_chat_protocol_test_20260722";
-const MIGRATION_VERSIONS: [i64; 4] = [
+const MIGRATION_VERSIONS: [i64; 6] = [
     20260722000001,
     20260722000002,
     20260722000003,
+    20260725000001,
     20260726000001,
+    20260726000002,
 ];
-const MIGRATION_FILES: [&str; 4] = [
+const MIGRATION_FILES: [&str; 6] = [
     "20260722000001_chat_protocol_core.sql",
     "20260722000002_chat_protocol_delivery.sql",
     "20260722000003_chat_protocol_blobs.sql",
+    "20260725000001_prepare_welcome_provenance_backfill.sql",
     "20260726000001_welcome_supersession_provenance.sql",
+    "20260726000002_restore_welcome_provenance_deferred_triggers.sql",
 ];
-const MIGRATION_DESCRIPTIONS: [&str; 4] = [
+const MIGRATION_DESCRIPTIONS: [&str; 6] = [
     "chat protocol core",
     "chat protocol delivery",
     "chat protocol blobs",
+    "prepare welcome provenance backfill",
     "welcome supersession provenance",
+    "restore welcome provenance deferred triggers",
 ];
 
 // These are regenerated only from a reviewed, freshly applied migration
@@ -693,11 +699,43 @@ fn recovery_schema_declares_closed_sources_and_collision_free_inventory_arms() {
 
 #[test]
 fn welcome_supersession_schema_declares_exact_exclusive_durable_sources() {
+    let build_script =
+        std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("build.rs"))
+            .expect("read Cargo build script");
+    assert!(
+        build_script.contains("println!(\"cargo:rerun-if-changed=migrations\")"),
+        "compile-time SQLx migration inventory must rebuild when migrations change"
+    );
+
+    let preflight = std::fs::read_to_string(
+        migration_dir().join("20260725000001_prepare_welcome_provenance_backfill.sql"),
+    )
+    .expect("read Welcome provenance preflight migration");
     let sql = std::fs::read_to_string(
         migration_dir().join("20260726000001_welcome_supersession_provenance.sql"),
     )
     .expect("read Welcome supersession provenance migration");
+    let postflight = std::fs::read_to_string(
+        migration_dir().join("20260726000002_restore_welcome_provenance_deferred_triggers.sql"),
+    )
+    .expect("read Welcome provenance postflight migration");
+    let preflight = compact_sql(&preflight);
     let compact = compact_sql(&sql);
+    let postflight = compact_sql(&postflight);
+
+    for required in [
+        "CREATE CONSTRAINT TRIGGER welcome_dispositions_delivery_cas_deferred",
+        "AFTER INSERT OR UPDATE OR DELETE ON chat.welcome_dispositions",
+        "DEFERRABLE INITIALLY IMMEDIATE",
+        "EXECUTE FUNCTION chat.enforce_welcome_disposition_cas()",
+        "CREATE CONSTRAINT TRIGGER welcome_dispositions_recovery_work_deferred",
+        "EXECUTE FUNCTION chat.enforce_recovery_work_integrity()",
+    ] {
+        assert!(
+            preflight.contains(required),
+            "missing Welcome provenance preflight invariant: {required}"
+        );
+    }
 
     for required in [
         "ADD COLUMN IF NOT EXISTS terminal_transition_id UUID",
@@ -726,6 +764,23 @@ fn welcome_supersession_schema_declares_exact_exclusive_durable_sources() {
         assert!(
             compact.contains(required),
             "missing Welcome supersession provenance invariant: {required}"
+        );
+    }
+
+    for required in [
+        "FOR target_welcome IN SELECT welcome_id FROM chat.welcome_dispositions ORDER BY welcome_id",
+        "PERFORM chat.assert_welcome_disposition_cas(target_welcome)",
+        "PERFORM chat.assert_recovery_work_integrity(target_welcome)",
+        "CREATE CONSTRAINT TRIGGER welcome_dispositions_delivery_cas_deferred",
+        "AFTER INSERT OR UPDATE OR DELETE ON chat.welcome_dispositions",
+        "DEFERRABLE INITIALLY DEFERRED",
+        "EXECUTE FUNCTION chat.enforce_welcome_disposition_cas()",
+        "CREATE CONSTRAINT TRIGGER welcome_dispositions_recovery_work_deferred",
+        "EXECUTE FUNCTION chat.enforce_recovery_work_integrity()",
+    ] {
+        assert!(
+            postflight.contains(required),
+            "missing Welcome provenance postflight invariant: {required}"
         );
     }
 }
@@ -968,7 +1023,7 @@ async fn reset_chat(pool: &PgPool) {
             .bind(MIGRATION_VERSIONS.as_slice())
             .execute(pool)
             .await
-            .expect("remove only the three chat-protocol ledger rows");
+            .expect("remove only the six chat-protocol ledger rows");
     }
 }
 
@@ -1066,6 +1121,8 @@ async fn fresh_pool() -> PgPool {
             CORE_TABLES.as_slice(),
             DELIVERY_TABLES.as_slice(),
             BLOB_TABLES.as_slice(),
+            &[],
+            &[],
             &[],
         ][index];
         cumulative.extend(newly_owned_tables.iter().map(|name| (*name).to_owned()));
@@ -1385,6 +1442,7 @@ async fn clean_chat_schema_is_exact_isolated_and_fail_closed() {
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| {
                     name.contains("_chat_protocol_")
+                        || name.contains("welcome_provenance")
                         || name == "20260726000001_welcome_supersession_provenance.sql"
                 })
         })
@@ -1401,7 +1459,7 @@ async fn clean_chat_schema_is_exact_isolated_and_fail_closed() {
             .iter()
             .map(|name| (*name).to_owned())
             .collect(),
-        "clean schema must be exactly four ordered files"
+        "clean schema must be exactly six ordered files"
     );
 
     for (version, suffix, expected) in [
@@ -1422,7 +1480,17 @@ async fn clean_chat_schema_is_exact_isolated_and_fail_closed() {
         ),
         (
             MIGRATION_VERSIONS[3],
+            "prepare_welcome_provenance_backfill",
+            &[],
+        ),
+        (
+            MIGRATION_VERSIONS[4],
             "welcome_supersession_provenance",
+            &[],
+        ),
+        (
+            MIGRATION_VERSIONS[5],
+            "restore_welcome_provenance_deferred_triggers",
             &[],
         ),
     ] {

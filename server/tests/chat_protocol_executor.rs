@@ -9985,10 +9985,11 @@ async fn device_revocation_batch_commits_and_supersedes_target_work() {
     );
 }
 
-#[tokio::test]
-async fn device_revocation_supersedes_pending_welcome_with_exact_revocation_source() {
-    let (pool, _db) = setup().await;
-    let scenario = run_fulfillment_scenario(&pool).await;
+async fn commit_bob_welcome_revocation(
+    pool: &PgPool,
+    scenario: &FulfillmentScenario,
+    accepted_at: DateTime<Utc>,
+) -> Uuid {
     let bob_device = Uuid::from_bytes(*scenario.bob_id.device_id());
     let bob_key_id: String = sqlx::query_scalar(
         "SELECT key_id FROM chat.device_keys \
@@ -9996,16 +9997,11 @@ async fn device_revocation_supersedes_pending_welcome_with_exact_revocation_sour
     )
     .bind(&scenario.bob_did)
     .bind(bob_device)
-    .fetch_one(&pool)
+    .fetch_one(pool)
     .await
     .expect("bob active signing key");
     let bob_signing_key =
         hex::decode(&corpus_manifest().identity.bob.signature_public_key_hex).unwrap();
-    // A fully mapped revocation of a foreign device at the SAME instant gives
-    // the deferred Welcome CAS a durable wrong-target candidate. It satisfies
-    // the direct FK and the revocation's own mapping, so only recipient binding
-    // distinguishes it from the real source.
-    let (foreign_revocation_id, accepted_at) = commit_isolated_device_revocation(&pool).await;
     let accepted_st =
         ServerTimestamp::from_unix_millis_for_test(accepted_at.timestamp_millis()).unwrap();
     let revocation_id = Uuid::new_v4();
@@ -10043,7 +10039,7 @@ async fn device_revocation_supersedes_pending_welcome_with_exact_revocation_sour
         vec![],
         vec![conversation_plan],
     );
-    let bob_predecessor = device_event_predecessor(&pool, &scenario.bob_did, bob_device).await;
+    let bob_predecessor = device_event_predecessor(pool, &scenario.bob_did, bob_device).await;
     let ctx = ExecutionContext {
         protocol_instance_id: scenario.fixture.protocol_instance_id,
         applied_at: accepted_at,
@@ -10136,6 +10132,19 @@ async fn device_revocation_supersedes_pending_welcome_with_exact_revocation_sour
     tx.commit()
         .await
         .expect("commit Welcome revocation provenance");
+    revocation_id
+}
+
+#[tokio::test]
+async fn device_revocation_supersedes_pending_welcome_with_exact_revocation_source() {
+    let (pool, _db) = setup().await;
+    let scenario = run_fulfillment_scenario(&pool).await;
+    // A fully mapped revocation of a foreign device at the SAME instant gives
+    // the deferred Welcome CAS a durable wrong-target candidate. It satisfies
+    // the direct FK and the revocation's own mapping, so only recipient binding
+    // distinguishes it from the real source.
+    let (foreign_revocation_id, accepted_at) = commit_isolated_device_revocation(&pool).await;
+    let revocation_id = commit_bob_welcome_revocation(&pool, &scenario, accepted_at).await;
 
     let (status, terminal_transition_id, terminal_revocation_id): (
         String,
@@ -10296,6 +10305,744 @@ async fn device_revocation_batch_revokes_available_target_package() {
     .await
     .unwrap();
     assert_eq!(live_packages, 0, "no live target packages remain");
+}
+
+const PRE_V4_CHAT_MIGRATIONS: [&str; 3] = [
+    "20260722000001_chat_protocol_core.sql",
+    "20260722000002_chat_protocol_delivery.sql",
+    "20260722000003_chat_protocol_blobs.sql",
+];
+const WELCOME_PROVENANCE_PREFLIGHT_MIGRATION: &str =
+    "20260725000001_prepare_welcome_provenance_backfill.sql";
+const WELCOME_PROVENANCE_MIGRATION: &str = "20260726000001_welcome_supersession_provenance.sql";
+const WELCOME_PROVENANCE_POSTFLIGHT_MIGRATION: &str =
+    "20260726000002_restore_welcome_provenance_deferred_triggers.sql";
+
+struct PreV4WelcomeHistory {
+    welcome_id: Uuid,
+    source_id: Uuid,
+    recipient_did: String,
+    recipient_device_id: Uuid,
+    terminal_at: DateTime<Utc>,
+}
+
+fn migration_text(filename: &str) -> String {
+    std::fs::read_to_string(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("migrations")
+            .join(filename),
+    )
+    .unwrap_or_else(|error| panic!("read {filename}: {error}"))
+}
+
+async fn fresh_upgrade_db() -> (PgPool, FreshDbGuard) {
+    let maintenance_url = maintenance_url_from_env();
+    let admin = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&maintenance_url)
+        .await
+        .expect("connect to loopback maintenance database");
+    let db_name = format!("chat_upgrade_{}", Uuid::new_v4().simple());
+    assert!(
+        db_name.starts_with("chat_upgrade_")
+            && db_name.strip_prefix("chat_upgrade_").is_some_and(
+                |suffix| suffix.len() == 32 && suffix.bytes().all(|b| b.is_ascii_hexdigit())
+            ),
+        "scratch database name must be a validated UUID-derived identifier"
+    );
+    sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
+        .execute(&admin)
+        .await
+        .expect("create isolated upgrade database");
+    admin.close().await;
+
+    let mut db_url = url::Url::parse(&maintenance_url).expect("maintenance URL");
+    db_url.set_path(&format!("/{db_name}"));
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .connect(db_url.as_str())
+        .await
+        .expect("connect to isolated upgrade database");
+    (
+        pool,
+        FreshDbGuard {
+            maintenance_url,
+            db_name,
+        },
+    )
+}
+
+async fn fresh_pre_v4_upgrade_db() -> (PgPool, FreshDbGuard) {
+    let (pool, guard) = fresh_upgrade_db().await;
+    for filename in PRE_V4_CHAT_MIGRATIONS {
+        let sql = migration_text(filename);
+        let mut tx = pool.begin().await.expect("begin ordered pre-v4 migration");
+        sqlx::Executor::execute(&mut *tx, sql.as_str())
+            .await
+            .unwrap_or_else(|error| panic!("apply {filename}: {error}"));
+        tx.commit()
+            .await
+            .unwrap_or_else(|error| panic!("commit {filename}: {error}"));
+    }
+    (pool, guard)
+}
+
+async fn add_temporary_writer_columns(pool: &PgPool) {
+    sqlx::query(
+        "ALTER TABLE chat.welcome_dispositions \
+         ADD COLUMN terminal_transition_id UUID, \
+         ADD COLUMN terminal_revocation_id UUID",
+    )
+    .execute(pool)
+    .await
+    .expect("add nullable writer-compatibility columns");
+}
+
+async fn restore_exact_pre_v4_table_boundary(pool: &PgPool) {
+    sqlx::query(
+        "ALTER TABLE chat.welcome_dispositions \
+         DROP COLUMN terminal_transition_id, \
+         DROP COLUMN terminal_revocation_id",
+    )
+    .execute(pool)
+    .await
+    .expect("drop writer-compatibility columns before v4");
+    assert_eq!(
+        welcome_source_column_count(pool).await,
+        0,
+        "pre-v4 boundary must have neither provenance column"
+    );
+}
+
+async fn welcome_source_column_count(pool: &PgPool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns \
+          WHERE table_schema='chat' AND table_name='welcome_dispositions' \
+            AND column_name IN ('terminal_transition_id','terminal_revocation_id')",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("count Welcome source columns")
+}
+
+async fn prepare_transition_supersession_history() -> (PgPool, FreshDbGuard, PreV4WelcomeHistory) {
+    let (pool, guard) = fresh_pre_v4_upgrade_db().await;
+    let scenario = run_fulfillment_scenario(&pool).await;
+    add_temporary_writer_columns(&pool).await;
+    let built = build_generic_commit(&pool, &scenario).await;
+    let source_id = built.commit_transition;
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("begin historical transition supersession");
+    apply_conversation_persistence_plan(&mut tx, &built.plan, &built.ctx)
+        .await
+        .expect("apply historical transition supersession");
+    tx.commit()
+        .await
+        .expect("commit old-CAS-coherent transition supersession");
+    let terminal_at: DateTime<Utc> =
+        sqlx::query_scalar("SELECT terminal_at FROM chat.welcome_dispositions WHERE welcome_id=$1")
+            .bind(scenario.welcome_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read transition supersession instant");
+    restore_exact_pre_v4_table_boundary(&pool).await;
+    (
+        pool,
+        guard,
+        PreV4WelcomeHistory {
+            welcome_id: scenario.welcome_id,
+            source_id,
+            recipient_did: scenario.bob_did,
+            recipient_device_id: Uuid::from_bytes(*scenario.bob_id.device_id()),
+            terminal_at,
+        },
+    )
+}
+
+async fn prepare_revocation_supersession_history() -> (PgPool, FreshDbGuard, PreV4WelcomeHistory) {
+    let (pool, guard) = fresh_pre_v4_upgrade_db().await;
+    let scenario = run_fulfillment_scenario(&pool).await;
+    add_temporary_writer_columns(&pool).await;
+    let (_foreign_revocation_id, accepted_at) = commit_isolated_device_revocation(&pool).await;
+    let source_id = commit_bob_welcome_revocation(&pool, &scenario, accepted_at).await;
+    restore_exact_pre_v4_table_boundary(&pool).await;
+    (
+        pool,
+        guard,
+        PreV4WelcomeHistory {
+            welcome_id: scenario.welcome_id,
+            source_id,
+            recipient_did: scenario.bob_did,
+            recipient_device_id: Uuid::from_bytes(*scenario.bob_id.device_id()),
+            terminal_at: accepted_at,
+        },
+    )
+}
+
+async fn apply_manual_migration(pool: &PgPool, filename: &str) {
+    let sql = migration_text(filename);
+    let mut tx = pool.begin().await.expect("begin manual migration");
+    sqlx::Executor::execute(&mut *tx, sql.as_str())
+        .await
+        .unwrap_or_else(|error| panic!("apply {filename}: {error}"));
+    tx.commit()
+        .await
+        .unwrap_or_else(|error| panic!("commit {filename}: {error}"));
+}
+
+async fn welcome_disposition_triggers_are_initially_deferred(pool: &PgPool) -> bool {
+    let states: Vec<bool> = sqlx::query_scalar(
+        "SELECT tginitdeferred FROM pg_trigger \
+          WHERE tgrelid='chat.welcome_dispositions'::regclass \
+            AND tgname IN ( \
+                'welcome_dispositions_delivery_cas_deferred', \
+                'welcome_dispositions_recovery_work_deferred' \
+            ) \
+          ORDER BY tgname",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("read Welcome trigger deferral states");
+    assert_eq!(
+        states.len(),
+        2,
+        "both Welcome constraint triggers must exist"
+    );
+    assert_eq!(
+        states[0], states[1],
+        "Welcome constraint triggers must share one timing mode"
+    );
+    states[0]
+}
+
+async fn apply_welcome_provenance_bridge(pool: &PgPool) {
+    apply_manual_migration(pool, WELCOME_PROVENANCE_PREFLIGHT_MIGRATION).await;
+    assert!(
+        !welcome_disposition_triggers_are_initially_deferred(pool).await,
+        "preflight must make both triggers INITIALLY IMMEDIATE"
+    );
+    apply_manual_migration(pool, WELCOME_PROVENANCE_MIGRATION).await;
+    apply_manual_migration(pool, WELCOME_PROVENANCE_POSTFLIGHT_MIGRATION).await;
+    assert!(
+        welcome_disposition_triggers_are_initially_deferred(pool).await,
+        "postflight must restore both triggers INITIALLY DEFERRED"
+    );
+}
+
+async fn assert_failed_frozen_upgrade_is_atomic(pool: &PgPool, label: &str) {
+    apply_manual_migration(pool, WELCOME_PROVENANCE_PREFLIGHT_MIGRATION).await;
+    assert!(
+        !welcome_disposition_triggers_are_initially_deferred(pool).await,
+        "{label}: preflight must remain fail-closed and INITIALLY IMMEDIATE"
+    );
+    let sql = migration_text(WELCOME_PROVENANCE_MIGRATION);
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("begin expected-failure v4 migration");
+    let error = sqlx::Executor::execute(&mut *tx, sql.as_str())
+        .await
+        .expect_err(label);
+    let database = error.as_database_error().expect("database migration error");
+    assert_eq!(
+        database.code().as_deref(),
+        Some("23514"),
+        "{label}: {error}"
+    );
+    tx.rollback()
+        .await
+        .expect("rollback failed frozen v4 migration");
+    assert_eq!(
+        welcome_source_column_count(pool).await,
+        0,
+        "{label}: failed v4 persisted provenance columns"
+    );
+    let trigger_state: String = sqlx::query_scalar(
+        "SELECT tgenabled::text FROM pg_trigger \
+          WHERE tgrelid='chat.welcome_dispositions'::regclass \
+            AND tgname='welcome_dispositions_immutable' AND NOT tgisinternal",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|error| panic!("{label}: immutable trigger missing: {error}"));
+    assert_eq!(
+        trigger_state, "O",
+        "{label}: immutable trigger must remain enabled"
+    );
+    assert!(
+        !welcome_disposition_triggers_are_initially_deferred(pool).await,
+        "{label}: failed v4 must preserve the installed immediate-trigger quarantine"
+    );
+}
+
+struct RuntimeMigrationSource {
+    path: std::path::PathBuf,
+}
+
+impl RuntimeMigrationSource {
+    fn containing(label: &str, filenames: &[&str]) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "catbird_sqlx_migrations_{label}_{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir(&path).expect("create isolated runtime migration source");
+        for filename in filenames {
+            std::fs::copy(
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("migrations")
+                    .join(filename),
+                path.join(filename),
+            )
+            .unwrap_or_else(|error| panic!("copy runtime migration {filename}: {error}"));
+        }
+        Self { path }
+    }
+}
+
+impl Drop for RuntimeMigrationSource {
+    fn drop(&mut self) {
+        let safe_name = self
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("catbird_sqlx_migrations_"));
+        if safe_name {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+#[tokio::test]
+async fn installed_v4_sqlx_migrator_applies_older_preflight_and_newer_postflight() {
+    let (pool, _guard) = fresh_upgrade_db().await;
+    let initially_installed = RuntimeMigrationSource::containing(
+        "installed_v4",
+        &[
+            PRE_V4_CHAT_MIGRATIONS[0],
+            PRE_V4_CHAT_MIGRATIONS[1],
+            PRE_V4_CHAT_MIGRATIONS[2],
+            WELCOME_PROVENANCE_MIGRATION,
+        ],
+    );
+    let initial_migrator = sqlx::migrate::Migrator::new(initially_installed.path.as_path())
+        .await
+        .expect("resolve installed-v4 migration source");
+    initial_migrator
+        .run(&pool)
+        .await
+        .expect("create actual SQLx-ledger installed-v4 database");
+
+    let frozen_checksum_before: Vec<u8> = sqlx::query_scalar(
+        "SELECT checksum FROM public._sqlx_migrations WHERE version=20260726000001",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read installed frozen-v4 checksum");
+    assert_eq!(
+        hex::encode(&frozen_checksum_before),
+        "78c31ff78db5b8889fb00cb7024186a0f048975fc7a059c667e326162e3f338396d9760143367c9206802d21269484f4",
+        "installed v4 must be the frozen reviewed artifact"
+    );
+
+    let bridged_source = RuntimeMigrationSource::containing(
+        "bridged",
+        &[
+            PRE_V4_CHAT_MIGRATIONS[0],
+            PRE_V4_CHAT_MIGRATIONS[1],
+            PRE_V4_CHAT_MIGRATIONS[2],
+            WELCOME_PROVENANCE_PREFLIGHT_MIGRATION,
+            WELCOME_PROVENANCE_MIGRATION,
+            WELCOME_PROVENANCE_POSTFLIGHT_MIGRATION,
+        ],
+    );
+    let bridged_migrator = sqlx::migrate::Migrator::new(bridged_source.path.as_path())
+        .await
+        .expect("resolve six-file bridged migration source");
+    bridged_migrator
+        .run(&pool)
+        .await
+        .expect("actual SQLx migrator must install the missing lower preflight and postflight");
+
+    let applied_versions: Vec<i64> = sqlx::query_scalar(
+        "SELECT version FROM public._sqlx_migrations \
+          WHERE version=ANY($1::bigint[]) ORDER BY version",
+    )
+    .bind([
+        20260722000001_i64,
+        20260722000002,
+        20260722000003,
+        20260725000001,
+        20260726000001,
+        20260726000002,
+    ])
+    .fetch_all(&pool)
+    .await
+    .expect("read bridged SQLx ledger");
+    assert_eq!(
+        applied_versions,
+        [
+            20260722000001,
+            20260722000002,
+            20260722000003,
+            20260725000001,
+            20260726000001,
+            20260726000002,
+        ],
+        "SQLx must apply the missing lower preflight even after v4 is installed"
+    );
+    let frozen_checksum_after: Vec<u8> = sqlx::query_scalar(
+        "SELECT checksum FROM public._sqlx_migrations WHERE version=20260726000001",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("re-read frozen-v4 checksum");
+    assert_eq!(
+        frozen_checksum_after, frozen_checksum_before,
+        "bridge application must not replace or rewrite the frozen-v4 ledger row"
+    );
+    assert!(
+        welcome_disposition_triggers_are_initially_deferred(&pool).await,
+        "postflight must leave the installed-v4 schema in its production deferred state"
+    );
+}
+
+async fn corrupt_history_to_zero_candidates(pool: &PgPool, welcome_id: Uuid) {
+    let mut tx = pool.begin().await.expect("begin zero-candidate corruption");
+    for trigger in [
+        "welcome_dispositions_immutable",
+        "welcome_dispositions_delivery_cas_deferred",
+        "welcome_dispositions_recovery_work_deferred",
+    ] {
+        sqlx::query(&format!(
+            "ALTER TABLE chat.welcome_dispositions DISABLE TRIGGER {trigger}"
+        ))
+        .execute(&mut *tx)
+        .await
+        .unwrap_or_else(|error| panic!("disable scratch trigger {trigger}: {error}"));
+    }
+    sqlx::query(
+        "UPDATE chat.welcome_dispositions \
+            SET terminal_at=terminal_at+interval '1 millisecond' \
+          WHERE welcome_id=$1",
+    )
+    .bind(welcome_id)
+    .execute(&mut *tx)
+    .await
+    .expect("move historical terminal instant off every source");
+    for trigger in [
+        "welcome_dispositions_recovery_work_deferred",
+        "welcome_dispositions_delivery_cas_deferred",
+        "welcome_dispositions_immutable",
+    ] {
+        sqlx::query(&format!(
+            "ALTER TABLE chat.welcome_dispositions ENABLE TRIGGER {trigger}"
+        ))
+        .execute(&mut *tx)
+        .await
+        .unwrap_or_else(|error| panic!("restore scratch trigger {trigger}: {error}"));
+    }
+    tx.commit()
+        .await
+        .expect("commit tightly scoped zero-candidate history");
+}
+
+async fn clone_transition_candidate(pool: &PgPool, source_id: Uuid) {
+    let clone_id = Uuid::new_v4();
+    let clone_entry_id = Uuid::new_v4();
+    let clone_entry_seq: i64 = sqlx::query_scalar(
+        "SELECT max(seq)+1 FROM chat.entries \
+          WHERE conversation_id=(SELECT conversation_id FROM chat.transitions WHERE transition_id=$1)",
+    )
+    .bind(source_id)
+    .fetch_one(pool)
+    .await
+    .expect("allocate scratch duplicate-transition entry seq");
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("begin duplicate transition candidate");
+    for trigger in [
+        "transitions_entry_mapping_deferred",
+        "transitions_state_outputs_deferred",
+        "transitions_metadata_mapping_deferred",
+    ] {
+        sqlx::query(&format!(
+            "ALTER TABLE chat.transitions DISABLE TRIGGER {trigger}"
+        ))
+        .execute(&mut *tx)
+        .await
+        .unwrap_or_else(|error| panic!("disable scratch trigger {trigger}: {error}"));
+    }
+    for trigger in [
+        "entries_transition_mapping_deferred",
+        "entries_control_request_mapping_deferred",
+        "entries_message_mapping_deferred",
+        "entries_contiguity_deferred",
+    ] {
+        sqlx::query(&format!(
+            "ALTER TABLE chat.entries DISABLE TRIGGER {trigger}"
+        ))
+        .execute(&mut *tx)
+        .await
+        .unwrap_or_else(|error| panic!("disable scratch trigger {trigger}: {error}"));
+    }
+    sqlx::query(
+        r#"
+        INSERT INTO chat.entries
+        SELECT (
+            jsonb_populate_record(
+                NULL::chat.entries,
+                to_jsonb(source_row)
+                    || jsonb_build_object(
+                        'seq', $3,
+                        'entry_id', $4::text,
+                        'transition_id', $2::text
+                    )
+            )
+        ).*
+          FROM chat.entries source_row
+         WHERE source_row.transition_id=$1
+        "#,
+    )
+    .bind(source_id)
+    .bind(clone_id)
+    .bind(clone_entry_seq)
+    .bind(clone_entry_id)
+    .execute(&mut *tx)
+    .await
+    .expect("insert matching entry for second transition candidate");
+    sqlx::query(
+        r#"
+        INSERT INTO chat.transitions
+        SELECT (
+            jsonb_populate_record(
+                NULL::chat.transitions,
+                to_jsonb(source_row)
+                    || jsonb_build_object(
+                        'transition_id', $2::text,
+                        'metadata_snapshot_id', NULL,
+                        'entry_seq', $3
+                    )
+            )
+        ).*
+          FROM chat.transitions source_row
+         WHERE source_row.transition_id=$1
+        "#,
+    )
+    .bind(source_id)
+    .bind(clone_id)
+    .bind(clone_entry_seq)
+    .execute(&mut *tx)
+    .await
+    .expect("insert second transition candidate");
+    tx.commit()
+        .await
+        .expect("commit tightly scoped duplicate transition candidate");
+    // Re-enable in a separate transaction: PostgreSQL correctly rejects ALTER
+    // TABLE while the inserting transaction still has pending deferred events.
+    // This scratch-only gap has no intervening writes and never weakens a
+    // production schema.
+    let mut restore = pool
+        .begin()
+        .await
+        .expect("begin transition trigger restore");
+    for trigger in [
+        "entries_contiguity_deferred",
+        "entries_message_mapping_deferred",
+        "entries_control_request_mapping_deferred",
+        "entries_transition_mapping_deferred",
+    ] {
+        sqlx::query(&format!(
+            "ALTER TABLE chat.entries ENABLE TRIGGER {trigger}"
+        ))
+        .execute(&mut *restore)
+        .await
+        .unwrap_or_else(|error| panic!("restore scratch trigger {trigger}: {error}"));
+    }
+    for trigger in [
+        "transitions_metadata_mapping_deferred",
+        "transitions_state_outputs_deferred",
+        "transitions_entry_mapping_deferred",
+    ] {
+        sqlx::query(&format!(
+            "ALTER TABLE chat.transitions ENABLE TRIGGER {trigger}"
+        ))
+        .execute(&mut *restore)
+        .await
+        .unwrap_or_else(|error| panic!("restore scratch trigger {trigger}: {error}"));
+    }
+    restore
+        .commit()
+        .await
+        .expect("commit transition trigger restoration");
+}
+
+async fn clone_revocation_candidate(pool: &PgPool, source_id: Uuid) {
+    let clone_id = Uuid::new_v4();
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("begin duplicate revocation candidate");
+    sqlx::query(
+        "ALTER TABLE chat.device_revocations \
+         DROP CONSTRAINT device_revocations_one_per_target_uq",
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("remove scratch-only one-per-target uniqueness");
+    sqlx::query(
+        "ALTER TABLE chat.device_revocations \
+         DISABLE TRIGGER device_revocations_mapping_deferred",
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("disable scratch revocation mapping");
+    sqlx::query(
+        r#"
+        INSERT INTO chat.device_revocations
+        SELECT (
+            jsonb_populate_record(
+                NULL::chat.device_revocations,
+                to_jsonb(source_row)
+                    || jsonb_build_object('revocation_id', $2::text)
+            )
+        ).*
+          FROM chat.device_revocations source_row
+         WHERE source_row.revocation_id=$1
+        "#,
+    )
+    .bind(source_id)
+    .bind(clone_id)
+    .execute(&mut *tx)
+    .await
+    .expect("insert second revocation candidate");
+    sqlx::query(
+        "ALTER TABLE chat.device_revocations \
+         ENABLE TRIGGER device_revocations_mapping_deferred",
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("restore scratch revocation mapping");
+    tx.commit()
+        .await
+        .expect("commit tightly scoped duplicate revocation candidate");
+}
+
+async fn insert_simultaneous_revocation_candidate(pool: &PgPool, history: &PreV4WelcomeHistory) {
+    let actor_key_id: String = sqlx::query_scalar(
+        "SELECT key_id FROM chat.device_keys WHERE user_did=$1 AND device_id=$2",
+    )
+    .bind(&history.recipient_did)
+    .bind(history.recipient_device_id)
+    .fetch_one(pool)
+    .await
+    .expect("load Welcome recipient key");
+    let transcript = vec![0xA1_u8; 8];
+    let digest = Sha256::digest(&transcript).to_vec();
+    let mut tx = pool.begin().await.expect("begin simultaneous candidate");
+    sqlx::query(
+        "ALTER TABLE chat.device_revocations \
+         DISABLE TRIGGER device_revocations_mapping_deferred",
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("disable scratch revocation mapping");
+    sqlx::query(
+        r#"
+        INSERT INTO chat.device_revocations(
+            revocation_id,actor_did,actor_device_id,actor_key_id,
+            actor_auth_generation,target_did,target_device_id,
+            target_auth_generation,accepted_request_bytes,
+            signing_transcript_bytes,request_digest,signature,signed_at,accepted_at
+        ) VALUES($1,$2,$3,$4,1,$2,$3,1,$5,$6,$7,$8,$9,$9)
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(&history.recipient_did)
+    .bind(history.recipient_device_id)
+    .bind(actor_key_id)
+    .bind(vec![0xA2_u8; 8])
+    .bind(&transcript)
+    .bind(&digest)
+    .bind(vec![0xA3_u8; 64])
+    .bind(history.terminal_at)
+    .execute(&mut *tx)
+    .await
+    .expect("insert exact-recipient simultaneous revocation candidate");
+    sqlx::query(
+        "ALTER TABLE chat.device_revocations \
+         ENABLE TRIGGER device_revocations_mapping_deferred",
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("restore scratch revocation mapping");
+    tx.commit()
+        .await
+        .expect("commit tightly scoped simultaneous candidate");
+}
+
+#[tokio::test]
+async fn populated_pre_v4_upgrade_backfills_unique_transition_source() {
+    let (pool, _guard, history) = prepare_transition_supersession_history().await;
+    apply_welcome_provenance_bridge(&pool).await;
+    let sources: (Option<Uuid>, Option<Uuid>) = sqlx::query_as(
+        "SELECT terminal_transition_id,terminal_revocation_id \
+           FROM chat.welcome_dispositions WHERE welcome_id=$1",
+    )
+    .bind(history.welcome_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read transition backfill");
+    assert_eq!(sources, (Some(history.source_id), None));
+}
+
+#[tokio::test]
+async fn populated_pre_v4_upgrade_backfills_unique_revocation_source() {
+    let (pool, _guard, history) = prepare_revocation_supersession_history().await;
+    apply_welcome_provenance_bridge(&pool).await;
+    let sources: (Option<Uuid>, Option<Uuid>) = sqlx::query_as(
+        "SELECT terminal_transition_id,terminal_revocation_id \
+           FROM chat.welcome_dispositions WHERE welcome_id=$1",
+    )
+    .bind(history.welcome_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read revocation backfill");
+    assert_eq!(sources, (None, Some(history.source_id)));
+}
+
+#[tokio::test]
+async fn populated_pre_v4_upgrade_zero_candidates_aborts_atomically() {
+    let (pool, _guard, history) = prepare_transition_supersession_history().await;
+    corrupt_history_to_zero_candidates(&pool, history.welcome_id).await;
+    assert_failed_frozen_upgrade_is_atomic(&pool, "zero combined candidates").await;
+}
+
+#[tokio::test]
+async fn populated_pre_v4_upgrade_multiple_transition_candidates_aborts_atomically() {
+    let (pool, _guard, history) = prepare_transition_supersession_history().await;
+    clone_transition_candidate(&pool, history.source_id).await;
+    assert_failed_frozen_upgrade_is_atomic(&pool, "multiple transition candidates").await;
+}
+
+#[tokio::test]
+async fn populated_pre_v4_upgrade_multiple_revocation_candidates_aborts_atomically() {
+    let (pool, _guard, history) = prepare_revocation_supersession_history().await;
+    clone_revocation_candidate(&pool, history.source_id).await;
+    assert_failed_frozen_upgrade_is_atomic(&pool, "multiple revocation candidates").await;
+}
+
+#[tokio::test]
+async fn populated_pre_v4_upgrade_simultaneous_source_kinds_abort_atomically() {
+    let (pool, _guard, history) = prepare_transition_supersession_history().await;
+    insert_simultaneous_revocation_candidate(&pool, &history).await;
+    assert_failed_frozen_upgrade_is_atomic(
+        &pool,
+        "simultaneous transition and revocation candidates",
+    )
+    .await;
 }
 
 #[tokio::test]
