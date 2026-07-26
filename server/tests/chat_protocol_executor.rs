@@ -77,7 +77,7 @@ mod chat_protocol {
 }
 
 use base64::{engine::general_purpose::STANDARD, Engine};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use ed25519_dalek::{Signer, SigningKey};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -113,11 +113,12 @@ use chat_protocol::state_machine::{
     ExecutionContext, ExecutorError, HydrationAuthority, LeafPersistenceColumns,
     LeafRecoveryCancellation, LeafRecoveryFulfillment, LeafRecoveryKind,
     LeafRecoveryRequestCommand, LeaveCancellation, LeaveFulfillment, LeaveRequestCommand,
-    LockedRegistrationProjection, MetadataAuthorColumns, MetadataSnapshotBinding, PrincipalId,
-    RecoveryOpenContext, RequestEntryKind, RequestEvidence, ResetActivation, ResetRequestCommand,
-    ResetRequestRow, RevocationPackageCasBinding, RevocationTargetCasBinding, ServerTimestamp,
-    SpineArtifacts, TransitionEvidence, WelcomeDispositionInput, WelcomeExpiryContext,
-    WelcomeRejectionWork, WelcomeResponseContext, WelcomeStatus, ZeroLeafLeave,
+    LockedRegistrationProjection, MetadataAuthorColumns, MetadataSnapshotBinding,
+    PolicyPlanMutation, PrincipalId, RecoveryOpenContext, RequestEntryKind, RequestEvidence,
+    ResetActivation, ResetRequestCommand, ResetRequestRow, RevocationPackageCasBinding,
+    RevocationTargetCasBinding, ServerTimestamp, SpineArtifacts, TransitionEvidence,
+    WelcomeDispositionInput, WelcomeExpiryContext, WelcomeRejectionWork, WelcomeResponseContext,
+    WelcomeStatus, ZeroLeafLeave,
 };
 use chat_protocol::transcript::{
     decode_and_verify_control_entry, decode_canonical_signed_mutation,
@@ -164,6 +165,19 @@ async fn build_creation(pool: &PgPool, kind: ConversationKind) -> CreationApply 
     // his `chat.device_keys` row (unique on `key_id`) is always present this run.
     let (bob_id, bob_did) = fresh_bob();
     build_creation_with_invitee(pool, kind, bob_id, bob_did, random_ref32().to_vec()).await
+}
+
+/// Connect to the already-provisioned clean-chat database without creating,
+/// dropping, or migrating any database. Task 4 H2-pre runs only against this
+/// explicitly gated accumulated-row fixture.
+async fn existing_executor_pool() -> PgPool {
+    let database_url = std::env::var("TEST_DATABASE_URL")
+        .expect("TEST_DATABASE_URL must name the existing clean-chat test database");
+    common::chat_protocol::validate_chat_protocol_database_url(Some(&database_url))
+        .expect("unsafe TEST_DATABASE_URL for policy ChangeRole executor test");
+    PgPool::connect(&database_url)
+        .await
+        .expect("connect to existing clean-chat test database")
 }
 
 /// Pre-clean any leftover ACTIVE direct conversation for the fixed corpus pair
@@ -1074,6 +1088,284 @@ async fn group_policy_add_participant_commits_state_version_plus_one() {
 }
 
 #[tokio::test]
+async fn signed_policy_change_role_commits_exact_active_participant_update() {
+    let pool = existing_executor_pool().await;
+    let accepted = commit_accepted_group(&pool).await;
+    let fixture = &accepted.fixture;
+    let prior = &accepted.state;
+    let conversation_id = fixture.conversation_id;
+
+    let non_attesting_control = signed_policy_control(
+        fixture,
+        &fixture.state,
+        2,
+        vec![SignedPolicyChange::ChangeRole {
+            user_did: fixture.alice_did.clone(),
+            role: "member",
+        }],
+    );
+    let mut duplicate_wrapper: Value =
+        serde_json::from_slice(&non_attesting_control.entry.signed_request_bytes).unwrap();
+    let duplicate_arm = duplicate_wrapper["body"]["participantChanges"][0].clone();
+    duplicate_wrapper["body"]["participantChanges"]
+        .as_array_mut()
+        .unwrap()
+        .push(duplicate_arm);
+    duplicate_wrapper["signature"] = json!(STANDARD.encode([0_u8; 64]));
+    assert!(
+        decode_canonical_signed_mutation(&serde_json::to_vec(&duplicate_wrapper).unwrap()).is_err(),
+        "duplicate signed ChangeRole arms passed canonical decoding"
+    );
+    let non_attesting_old = non_attesting_control.transition;
+    let policy = build_signed_policy_apply(
+        &pool,
+        fixture,
+        prior,
+        3,
+        vec![SignedPolicyChange::ChangeRole {
+            user_did: fixture.bob_did.clone(),
+            role: "admin",
+        }],
+        vec![
+            (fixture.alice_id.clone(), fixture.alice_did.clone()),
+            (fixture.bob_id.clone(), fixture.bob_did.clone()),
+        ],
+    )
+    .await;
+    let transition_id = policy.transition_id;
+    let applied_at = policy.ctx.applied_at;
+    let plan = &policy.plan;
+    let ctx = &policy.ctx;
+
+    // All malformed effect shapes are rejected before the head CAS. These
+    // probes reuse the same coherent accepted history and leave no policy row.
+    for (mutation, expected) in [
+        (PolicyPlanMutation::Principal, "inconsistent"),
+        (PolicyPlanMutation::Status, "inconsistent"),
+        (PolicyPlanMutation::RoleProducer, "inconsistent"),
+        (
+            PolicyPlanMutation::OldRoleProducer(non_attesting_old),
+            "inconsistent",
+        ),
+        (PolicyPlanMutation::DuplicateDelta, "inconsistent"),
+        (PolicyPlanMutation::Remove, "unsupported-remove"),
+    ] {
+        assert_policy_prewrite_rejection(
+            &pool,
+            &plan.clone().with_policy_mutation_for_test(mutation),
+            ctx,
+            conversation_id,
+            expected,
+        )
+        .await;
+    }
+    for drift in ["old-role", "current-membership"] {
+        assert_policy_role_cas_conflict_rolls_back(
+            &pool,
+            plan,
+            ctx,
+            conversation_id,
+            &fixture.bob_did,
+            drift,
+        )
+        .await;
+    }
+
+    let metadata_before: Vec<serde_json::Value> = sqlx::query_scalar(
+        "SELECT to_jsonb(m) FROM chat.metadata_snapshots m \
+         WHERE conversation_id=$1 ORDER BY metadata_snapshot_id",
+    )
+    .bind(conversation_id)
+    .fetch_all(&pool)
+    .await
+    .expect("complete retained metadata before policy");
+    let participant_non_role_before: serde_json::Value = sqlx::query_scalar(
+        "SELECT to_jsonb(p) - ARRAY['role','role_transition_id','role_changed_at'] \
+         FROM chat.participants p \
+         WHERE conversation_id=$1 AND user_did=$2 AND current_membership",
+    )
+    .bind(conversation_id)
+    .bind(&fixture.bob_did)
+    .fetch_one(&pool)
+    .await
+    .expect("participant before policy");
+
+    let mut transaction = pool.begin().await.expect("begin signed ChangeRole");
+    let applied = apply_conversation_persistence_plan(&mut transaction, plan, ctx)
+        .await
+        .expect("signed ChangeRole policy applies");
+    transaction
+        .commit()
+        .await
+        .expect("signed ChangeRole COMMIT past deferred checks");
+    assert_eq!(applied.allocated_seq, 3);
+
+    let (role, role_transition_id, role_changed_at): (String, Uuid, DateTime<Utc>) =
+        sqlx::query_as(
+            "SELECT role,role_transition_id,role_changed_at FROM chat.participants \
+             WHERE conversation_id=$1 AND user_did=$2 AND current_membership",
+        )
+        .bind(conversation_id)
+        .bind(&fixture.bob_did)
+        .fetch_one(&pool)
+        .await
+        .expect("fresh transaction observes changed role");
+    assert_eq!(role, "admin");
+    assert_eq!(role_transition_id, transition_id);
+    assert_eq!(role_changed_at, applied_at);
+    let metadata_after: Vec<serde_json::Value> = sqlx::query_scalar(
+        "SELECT to_jsonb(m) FROM chat.metadata_snapshots m \
+         WHERE conversation_id=$1 ORDER BY metadata_snapshot_id",
+    )
+    .bind(conversation_id)
+    .fetch_all(&pool)
+    .await
+    .expect("complete retained metadata after policy");
+    assert_eq!(
+        metadata_after, metadata_before,
+        "policy head rewrote prior metadata snapshot/author/origin bytes"
+    );
+    let participant_non_role_after: serde_json::Value = sqlx::query_scalar(
+        "SELECT to_jsonb(p) - ARRAY['role','role_transition_id','role_changed_at'] \
+         FROM chat.participants p \
+         WHERE conversation_id=$1 AND user_did=$2 AND current_membership",
+    )
+    .bind(conversation_id)
+    .bind(&fixture.bob_did)
+    .fetch_one(&pool)
+    .await
+    .expect("participant after policy");
+    assert_eq!(
+        participant_non_role_after, participant_non_role_before,
+        "executor role update changed a non-role participant column"
+    );
+
+    // A genuinely signed mixed Add+ChangeRole body is classified in full before
+    // writes. First force the role CAS to fail and prove the Add cannot leak;
+    // then apply the same plan successfully.
+    let (third_id, third_did) = loop {
+        let candidate = fresh_bob();
+        if candidate.1.as_bytes() < fixture.bob_did.as_bytes() {
+            break candidate;
+        }
+    };
+    assert!(
+        third_did.as_bytes() < fixture.bob_did.as_bytes(),
+        "mixed Add must sort before the failing role CAS"
+    );
+    let third_device = Uuid::from_bytes(*third_id.device_id());
+    let _ = seed_actor(&pool, &third_did, third_device, &[0xA7_u8; 32]).await;
+    let mixed_changes = vec![
+        SignedPolicyChange::ChangeRole {
+            user_did: fixture.bob_did.clone(),
+            role: "member",
+        },
+        SignedPolicyChange::Add(third_did.clone()),
+    ];
+    let mixed = build_signed_policy_apply(
+        &pool,
+        fixture,
+        &policy.state,
+        4,
+        mixed_changes,
+        vec![
+            (fixture.alice_id.clone(), fixture.alice_did.clone()),
+            (fixture.bob_id.clone(), fixture.bob_did.clone()),
+            (third_id, third_did.clone()),
+        ],
+    )
+    .await;
+    let mixed_transition_id = mixed.transition_id;
+    for participant_period_ids in [vec![], vec![Uuid::new_v4(), Uuid::new_v4()]] {
+        let mut malformed_ctx = mixed.ctx.clone();
+        malformed_ctx.participant_period_ids = participant_period_ids;
+        assert_policy_prewrite_rejection(
+            &pool,
+            &mixed.plan,
+            &malformed_ctx,
+            conversation_id,
+            "inconsistent",
+        )
+        .await;
+    }
+
+    let mut mixed_conflict = pool.begin().await.expect("begin mixed CAS conflict");
+    sqlx::query(
+        "UPDATE chat.participants \
+            SET role='member',role_transition_id=$3,role_changed_at=clock_timestamp() \
+          WHERE conversation_id=$1 AND user_did=$2 AND current_membership",
+    )
+    .bind(conversation_id)
+    .bind(&fixture.bob_did)
+    .bind(Uuid::new_v4())
+    .execute(&mut *mixed_conflict)
+    .await
+    .expect("drift mixed role CAS target");
+    let mixed_result =
+        apply_conversation_persistence_plan(&mut mixed_conflict, &mixed.plan, &mixed.ctx).await;
+    assert!(matches!(
+        mixed_result,
+        Err(ExecutorError::Transition(
+            TransitionRepositoryError::CompareAndSetConflict
+        ))
+    ));
+    let staged_add: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.participants WHERE conversation_id=$1 AND user_did=$2",
+    )
+    .bind(conversation_id)
+    .bind(&third_did)
+    .fetch_one(&mut *mixed_conflict)
+    .await
+    .expect("read staged Add before rollback");
+    assert_eq!(
+        staged_add, 1,
+        "deterministically earlier Add did not execute before role CAS"
+    );
+    mixed_conflict
+        .rollback()
+        .await
+        .expect("rollback mixed CAS conflict");
+    let leaked_add: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.participants WHERE conversation_id=$1 AND user_did=$2",
+    )
+    .bind(conversation_id)
+    .bind(&third_did)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(leaked_add, 0, "mixed CAS failure leaked its Add");
+
+    let mut mixed_tx = pool.begin().await.expect("begin mixed policy");
+    apply_conversation_persistence_plan(&mut mixed_tx, &mixed.plan, &mixed.ctx)
+        .await
+        .expect("mixed Add+ChangeRole applies");
+    mixed_tx
+        .commit()
+        .await
+        .expect("mixed Add+ChangeRole COMMIT");
+    let mixed_roles: Vec<(String, String, String, Uuid)> = sqlx::query_as(
+        "SELECT user_did,status,role,role_transition_id FROM chat.participants \
+         WHERE conversation_id=$1 AND user_did IN ($2,$3) AND current_membership \
+         ORDER BY user_did",
+    )
+    .bind(conversation_id)
+    .bind(&fixture.bob_did)
+    .bind(&third_did)
+    .fetch_all(&pool)
+    .await
+    .expect("mixed participant rows");
+    assert_eq!(mixed_roles.len(), 2);
+    for (did, status, role, producer) in mixed_roles {
+        assert_eq!(producer, mixed_transition_id);
+        if did == fixture.bob_did {
+            assert_eq!((status.as_str(), role.as_str()), ("active", "member"));
+        } else {
+            assert_eq!((status.as_str(), role.as_str()), ("pending", "member"));
+        }
+    }
+}
+
+#[tokio::test]
 async fn direct_creation_commits_with_direct_pair_shape() {
     let (pool, _db) = setup().await;
     let fixture = build_creation(&pool, ConversationKind::Direct).await;
@@ -1178,6 +1470,365 @@ async fn commit_creation(pool: &PgPool, kind: ConversationKind) -> CreationApply
         .expect("creation applies");
     tx.commit().await.expect("creation COMMIT");
     fixture
+}
+
+struct AcceptedGroupFixture {
+    fixture: CreationApply,
+    state: ConversationState,
+}
+
+struct PolicyApplyFixture {
+    plan: chat_protocol::state_machine::ConversationPersistencePlan,
+    state: ConversationState,
+    ctx: ExecutionContext,
+    transition_id: Uuid,
+}
+
+async fn build_signed_policy_apply(
+    pool: &PgPool,
+    fixture: &CreationApply,
+    prior: &ConversationState,
+    seq: u64,
+    changes: Vec<SignedPolicyChange>,
+    mut audience: Vec<(DeviceIdentity, String)>,
+) -> PolicyApplyFixture {
+    let add_count = changes
+        .iter()
+        .filter(|change| matches!(change, SignedPolicyChange::Add(_)))
+        .count();
+    let signed = signed_policy_control(fixture, prior, seq, changes);
+    assert_eq!(
+        signed
+            .transition
+            .signed_authority()
+            .map(|authority| authority.kind()),
+        Some(chat_protocol::transcript::SignedMutationKind::PolicyTransition)
+    );
+    let transition_id = signed.transition_id;
+    let planned = plan_policy(
+        prior,
+        fixture.alice_id.clone(),
+        signed.transition,
+        Sha256::digest(transition_id.as_bytes()).into(),
+    )
+    .expect("genuine signed policy plan");
+    let state = planned.resulting_state().clone();
+    let head = ConversationHeadCasBinding::for_test_edge(
+        *fixture.conversation_id.as_bytes(),
+        *signed.entry.entry_id.as_bytes(),
+        *prior.coordinate(),
+        seq,
+        signed.received_at,
+    );
+    let plan = persistence_plan_for_test(planned, head);
+
+    audience.sort_by(|left, right| {
+        (left.1.as_bytes(), left.0.device_id()).cmp(&(right.1.as_bytes(), right.0.device_id()))
+    });
+    let entry_recipients = audience
+        .iter()
+        .map(|(device, _)| (device.clone(), EntryEntitlementKind::Control))
+        .collect();
+    let mut event_recipients = Vec::new();
+    for (device, did) in &audience {
+        event_recipients.push((
+            device.clone(),
+            EventEntitlementKind::Participant,
+            device_event_predecessor(pool, did, Uuid::from_bytes(*device.device_id())).await,
+        ));
+    }
+    let marker = u8::try_from(seq).unwrap();
+    let ctx = ExecutionContext {
+        protocol_instance_id: fixture.protocol_instance_id,
+        applied_at: clock_now(pool).await,
+        actor: ExecutionActor {
+            user_did: fixture.alice_did.clone(),
+            device_id: fixture.alice_device,
+            key_id: fixture.alice_key_id.clone(),
+            auth_generation: 1,
+            role: TransitionActorRole::Admin,
+            device_status: "active".to_owned(),
+        },
+        entry: signed.entry,
+        spine: SpineArtifacts {
+            public_snapshot_bytes: vec![marker; 16],
+            public_snapshot_sha256: Sha256::digest([marker; 16]).to_vec(),
+            tree_summary_bytes: vec![marker | 0x80; 16],
+            tree_summary_sha256: Sha256::digest([marker | 0x80; 16]).to_vec(),
+            leaf_count: 1,
+            genesis_group_info_bytes: vec![],
+            genesis_group_info_sha256: vec![],
+        },
+        opened_leaves: vec![],
+        metadata_author: None,
+        participant_period_ids: (0..add_count).map(|_| Uuid::new_v4()).collect(),
+        leaf_period_ids: vec![],
+        entry_recipients,
+        events: vec![EventFanout {
+            event_id: Uuid::new_v4(),
+            event_kind: EventKind::ConversationChanged,
+            payload_bytes: vec![marker; 8],
+            recipients: event_recipients,
+            outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+        }],
+        closing_leaf_periods: vec![],
+        closing_participant_periods: vec![],
+        reset_request_row: None,
+        recovery_open: None,
+        welcome_expiry: None,
+        welcome_response: None,
+        welcome_dispositions: vec![],
+    };
+    PolicyApplyFixture {
+        plan,
+        state,
+        ctx,
+        transition_id,
+    }
+}
+
+/// Commit the creation and acceptance edges needed for an active/member role
+/// target. The policy edge built on top of this fixture is independently signed
+/// and admitted through the production control-entry authority below.
+async fn commit_accepted_group(pool: &PgPool) -> AcceptedGroupFixture {
+    let fixture = commit_creation(pool, ConversationKind::Group).await;
+    let conversation_id = fixture.conversation_id;
+    let bob_device = Uuid::from_bytes(*fixture.bob_id.device_id());
+    let bob_period: Uuid = sqlx::query_scalar(
+        "SELECT participant_period_id FROM chat.participants \
+         WHERE conversation_id=$1 AND user_did=$2 AND current_membership",
+    )
+    .bind(conversation_id)
+    .bind(&fixture.bob_did)
+    .fetch_one(pool)
+    .await
+    .expect("Bob pending participant period");
+    let key_package_ref = random_ref32();
+    let package_not_after = seed_key_package(
+        pool,
+        &fixture.bob_did,
+        bob_device,
+        &fixture.bob_key_id,
+        &key_package_ref,
+    )
+    .await;
+    let package_not_after_ts =
+        ServerTimestamp::from_unix_millis_for_test(package_not_after.timestamp_millis()).unwrap();
+    let received_at = ServerTimestamp::from_unix_millis_for_test(
+        corpus_manifest().evaluation_unix_seconds as i64 * 1_000 + 3_000,
+    )
+    .unwrap();
+    let entry_id = Uuid::new_v4();
+    let transition_id = Uuid::new_v4();
+    let recovery_request_id = *Uuid::new_v4().as_bytes();
+    let evidence = TransitionEvidence::for_test_acceptance(
+        2,
+        *transition_id.as_bytes(),
+        [0x16_u8; 32],
+        received_at,
+        fixture.coordinate,
+        recovery_request_id,
+        fixture.bob_id.clone(),
+        fixture.creation_transition_id,
+        fixture.alice_id.clone(),
+        key_package_ref,
+        Sha256::digest([0x62_u8; 32]).into(),
+        1,
+        package_not_after_ts,
+    )
+    .unwrap();
+    let planned = plan_accept_conversation(
+        &fixture.state,
+        AcceptConversation {
+            actor: fixture.bob_id.clone(),
+            transition: evidence,
+            recovery_request_id,
+            key_package_ref,
+            package_not_after: package_not_after_ts,
+        },
+    )
+    .expect("coherent acceptance plan");
+    let state = planned.resulting_state().clone();
+    let head_cas = ConversationHeadCasBinding::for_test_edge(
+        *conversation_id.as_bytes(),
+        *entry_id.as_bytes(),
+        fixture.coordinate,
+        2,
+        received_at,
+    );
+    let plan = persistence_plan_for_test(planned, head_cas);
+    let ctx = acceptance_ctx(
+        pool,
+        &fixture,
+        &fixture.bob_id,
+        &fixture.bob_did,
+        &fixture.bob_key_id,
+        entry_id,
+        bob_period,
+        package_not_after,
+    )
+    .await;
+    let mut transaction = pool.begin().await.expect("begin acceptance");
+    apply_conversation_persistence_plan(&mut transaction, &plan, &ctx)
+        .await
+        .expect("acceptance applies");
+    transaction
+        .commit()
+        .await
+        .expect("acceptance COMMIT past deferred checks");
+    AcceptedGroupFixture { fixture, state }
+}
+
+async fn assert_policy_prewrite_rejection(
+    pool: &PgPool,
+    plan: &chat_protocol::state_machine::ConversationPersistencePlan,
+    ctx: &ExecutionContext,
+    conversation_id: Uuid,
+    expected: &'static str,
+) {
+    let mut transaction = pool.begin().await.expect("begin policy rejection");
+    let head_before: (i64, i64) = sqlx::query_as(
+        "SELECT current_state_version,next_entry_seq FROM chat.conversations \
+         WHERE conversation_id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&mut *transaction)
+    .await
+    .expect("read head before pre-write rejection");
+    let policy_rows_before: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.transitions \
+         WHERE conversation_id=$1 AND kind='policy'",
+    )
+    .bind(conversation_id)
+    .fetch_one(&mut *transaction)
+    .await
+    .expect("count policy rows before rejection");
+    let result = apply_conversation_persistence_plan(&mut transaction, plan, ctx).await;
+    match (expected, result) {
+        ("inconsistent", Err(ExecutorError::InconsistentPlan(_))) => {}
+        (
+            "unsupported-remove",
+            Err(ExecutorError::UnsupportedEffect("policy participant Remove")),
+        ) => {}
+        (_, other) => panic!("unexpected policy rejection for {expected}: {other:?}"),
+    }
+    let head_after: (i64, i64) = sqlx::query_as(
+        "SELECT current_state_version,next_entry_seq FROM chat.conversations \
+         WHERE conversation_id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&mut *transaction)
+    .await
+    .expect("read head after pre-write rejection");
+    assert_eq!(head_after, head_before, "pre-write rejection changed head");
+    let policy_rows_after: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.transitions \
+         WHERE conversation_id=$1 AND kind='policy'",
+    )
+    .bind(conversation_id)
+    .fetch_one(&mut *transaction)
+    .await
+    .expect("count policy rows after rejection");
+    assert_eq!(
+        policy_rows_after, policy_rows_before,
+        "pre-write rejection inserted a policy row"
+    );
+    transaction
+        .rollback()
+        .await
+        .expect("rollback policy rejection");
+}
+
+async fn assert_policy_role_cas_conflict_rolls_back(
+    pool: &PgPool,
+    plan: &chat_protocol::state_machine::ConversationPersistencePlan,
+    ctx: &ExecutionContext,
+    conversation_id: Uuid,
+    target_did: &str,
+    drift: &'static str,
+) {
+    let mut transaction = pool.begin().await.expect("begin role CAS drift");
+    match drift {
+        "old-role" => {
+            sqlx::query(
+                "UPDATE chat.participants p \
+                    SET role='admin', \
+                        role_transition_id=t.transition_id, \
+                        role_changed_at=t.accepted_at \
+                   FROM chat.transitions t \
+                  WHERE p.conversation_id=$1 AND p.user_did=$2 \
+                    AND p.current_membership AND t.conversation_id=p.conversation_id \
+                    AND t.kind='acceptConversation'",
+            )
+            .bind(conversation_id)
+            .bind(target_did)
+            .execute(&mut *transaction)
+            .await
+            .expect("drift stored old role");
+        }
+        "current-membership" => {
+            sqlx::query(
+                "UPDATE chat.participants p \
+                    SET current_membership=FALSE, \
+                        removing_transition_id=t.transition_id, \
+                        removing_seq=t.entry_seq, \
+                        removed_at=t.accepted_at \
+                   FROM chat.transitions t \
+                  WHERE p.conversation_id=$1 AND p.user_did=$2 \
+                    AND p.current_membership AND t.conversation_id=p.conversation_id \
+                    AND t.kind='acceptConversation'",
+            )
+            .bind(conversation_id)
+            .bind(target_did)
+            .execute(&mut *transaction)
+            .await
+            .expect("drift stored current-membership");
+        }
+        _ => unreachable!("unknown role CAS drift"),
+    }
+    let result = apply_conversation_persistence_plan(&mut transaction, plan, ctx).await;
+    assert!(
+        matches!(
+            result,
+            Err(ExecutorError::Transition(
+                TransitionRepositoryError::CompareAndSetConflict
+            ))
+        ),
+        "{drift} must surface the typed participant role CAS conflict, got {result:?}"
+    );
+    transaction
+        .rollback()
+        .await
+        .expect("rollback role CAS drift");
+
+    let (state_version, next_entry_seq): (i64, i64) = sqlx::query_as(
+        "SELECT current_state_version,next_entry_seq FROM chat.conversations \
+         WHERE conversation_id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_one(pool)
+    .await
+    .expect("fresh head after role CAS rollback");
+    assert_eq!((state_version, next_entry_seq), (1, 3));
+    let (role, current): (String, bool) = sqlx::query_as(
+        "SELECT role,current_membership FROM chat.participants \
+         WHERE conversation_id=$1 AND user_did=$2 AND current_membership",
+    )
+    .bind(conversation_id)
+    .bind(target_did)
+    .fetch_one(pool)
+    .await
+    .expect("fresh participant after role CAS rollback");
+    assert_eq!((role.as_str(), current), ("member", true));
+    let policy_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.transitions \
+         WHERE conversation_id=$1 AND kind='policy'",
+    )
+    .bind(conversation_id)
+    .fetch_one(pool)
+    .await
+    .expect("policy rows after role CAS rollback");
+    assert_eq!(policy_rows, 0);
 }
 
 #[tokio::test]
@@ -5238,6 +5889,151 @@ fn signed_coordinate_json(coordinate: &PublicGroupSnapshotCoordinate) -> Value {
         "confirmationTag": STANDARD.encode(coordinate.confirmation_tag()),
         "lifecycle": "active",
     })
+}
+
+struct SignedPolicyControl {
+    transition: TransitionEvidence,
+    entry: ControlEntryContent,
+    transition_id: Uuid,
+    received_at: ServerTimestamp,
+}
+
+enum SignedPolicyChange {
+    Add(String),
+    ChangeRole {
+        user_did: String,
+        role: &'static str,
+    },
+}
+
+impl SignedPolicyChange {
+    fn user_did(&self) -> &str {
+        match self {
+            Self::Add(user_did) | Self::ChangeRole { user_did, .. } => user_did,
+        }
+    }
+}
+
+fn signed_policy_control(
+    fixture: &CreationApply,
+    prior: &ConversationState,
+    seq: u64,
+    mut changes: Vec<SignedPolicyChange>,
+) -> SignedPolicyControl {
+    let transition_id = Uuid::new_v4();
+    let entry_id = Uuid::new_v4();
+    changes.sort_by(|left, right| left.user_did().as_bytes().cmp(right.user_did().as_bytes()));
+    let participant_changes: Vec<_> = changes
+        .into_iter()
+        .map(|change| match change {
+            SignedPolicyChange::Add(user_did) => json!({
+                "$type": "blue.catbird.chat.defs#addParticipant",
+                "userDid": user_did,
+                "status": "pending",
+                "role": "member",
+                "invitationProvenance": {
+                    "invitedByDid": fixture.alice_did,
+                    "invitedByDeviceId": fixture.alice_device,
+                    "invitationTransitionId": transition_id,
+                },
+            }),
+            SignedPolicyChange::ChangeRole { user_did, role } => json!({
+                "$type": "blue.catbird.chat.defs#changeParticipantRole",
+                "userDid": user_did,
+                "role": role,
+            }),
+        })
+        .collect();
+    let next = PublicGroupSnapshotCoordinate::new(
+        *prior.coordinate().conversation_id(),
+        prior.coordinate().generation(),
+        prior.coordinate().state_version() + 1,
+        *prior.coordinate().group_id(),
+        prior.coordinate().epoch(),
+        *prior.coordinate().group_context_hash(),
+        *prior.coordinate().confirmation_tag(),
+        PublicGroupSnapshotLifecycle::Active,
+    );
+    let evaluation_millis = corpus_manifest().evaluation_unix_seconds as i64 * 1_000;
+    let received_millis = evaluation_millis + i64::try_from(seq).unwrap() * 1_000 + 1_000;
+    let signed_at = DateTime::<Utc>::from_timestamp_millis(received_millis - 500)
+        .unwrap()
+        .to_rfc3339_opts(SecondsFormat::Millis, true);
+    let received_at_text = DateTime::<Utc>::from_timestamp_millis(received_millis)
+        .unwrap()
+        .to_rfc3339_opts(SecondsFormat::Millis, true);
+    let signer = SigningKey::from_bytes(&ALICE_SIGNING_SEED);
+    assert_eq!(
+        signer.verifying_key().as_bytes(),
+        prior.metadata().unwrap().signature_public_key()
+    );
+    let body = json!({
+        "$type": "blue.catbird.chat.defs#policyTransitionBody",
+        "signatureDomain": "CATBIRD-CHAT-POLICY\u{0}",
+        "transitionId": transition_id,
+        "actorDid": fixture.alice_did,
+        "actorDeviceId": fixture.alice_device,
+        "keyId": fixture.alice_key_id,
+        "authGeneration": 1,
+        "prior": signed_coordinate_json(prior.coordinate()),
+        "next": signed_coordinate_json(&next),
+        "participantChanges": participant_changes,
+        "idempotencyKey": Uuid::new_v4(),
+        "signedAt": signed_at,
+    });
+    let mut wrapper = json!({
+        "body": body,
+        "signature": STANDARD.encode([0_u8; 64]),
+    });
+    let unsigned = serde_json::to_vec(&wrapper).unwrap();
+    let canonical = decode_canonical_signed_mutation(&unsigned).unwrap();
+    let signature = signer.sign(canonical.transcript_bytes()).to_bytes();
+    wrapper["signature"] = json!(STANDARD.encode(signature));
+    let signed_wrapper = serde_json::to_vec(&wrapper).unwrap();
+    let canonical = decode_canonical_signed_mutation(&signed_wrapper).unwrap();
+    let outer_row = json!({
+        "$type": "blue.catbird.chat.defs#policyEntry",
+        "entryId": entry_id,
+        "conversationId": fixture.conversation_id,
+        "seq": seq,
+        "signedRequest": wrapper,
+        "receivedAt": received_at_text,
+    });
+    let outer_row_bytes = serde_json::to_vec(&outer_row).unwrap();
+    let verified_entry =
+        decode_and_verify_control_entry(&outer_row_bytes, signer.verifying_key().as_bytes())
+            .unwrap();
+    let verified_entry = rebind_persisted_control_entry(
+        verified_entry,
+        &signed_wrapper,
+        signer.verifying_key().as_bytes(),
+    )
+    .unwrap();
+    let outer_fingerprint = *verified_entry.outer_control_fingerprint();
+    let server_fields = verified_entry.server_fields_dag_cbor().unwrap();
+    let authority =
+        HydrationAuthority::new(*fixture.conversation_id.as_bytes()).expect("policy authority");
+    let transition = authority
+        .control_transition(verified_entry)
+        .expect("genuine signed policy transition");
+    SignedPolicyControl {
+        transition,
+        entry: ControlEntryContent {
+            entry_id,
+            entry_kind: "blue.catbird.chat.defs#policyEntry".to_owned(),
+            accepted_payload_bytes: outer_row_bytes.clone(),
+            accepted_payload_sha256: Sha256::digest(&outer_row_bytes).to_vec(),
+            signed_request_bytes: signed_wrapper,
+            unsigned_projection_bytes: canonical.canonical_projection().to_vec(),
+            signing_transcript_bytes: canonical.transcript_bytes().to_vec(),
+            request_digest: canonical.request_digest().to_vec(),
+            signature: signature.to_vec(),
+            server_fields_bytes: server_fields,
+            outer_entry_fingerprint: outer_fingerprint.to_vec(),
+        },
+        transition_id,
+        received_at: ServerTimestamp::from_canonical_stored(&received_at_text).unwrap(),
+    }
 }
 
 fn aad_prior_json(coordinate: &PublicGroupSnapshotCoordinate) -> Value {

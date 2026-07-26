@@ -59,18 +59,19 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use repository::transition::{
-    cas_key_package_status, cas_participant_pending_to_active, cas_registration_revoke,
-    close_leaf_period, insert_device_revocation, insert_generation_state_row, insert_leaf_period,
-    insert_leaf_recovery_request, insert_leave_request, insert_metadata_snapshot,
-    insert_participant_period, insert_reservation, insert_reset_request, insert_transition_row,
-    terminalize_leaf_recovery_request, terminalize_leave_request, terminalize_participant_period,
-    terminalize_reservation, terminalize_reset_request, GenerationStateKind,
-    GenerationStateLifecycle, LeafClose, LeafOrigin, LeafRecoveryKind, LeafRecoverySource,
-    LeafRecoveryTermination, LeaveRequestTermination, MetadataAvatarBinding, NewDeviceRevocation,
-    NewGenerationState, NewLeafPeriod, NewLeafRecoveryRequest, NewLeaveRequest,
-    NewMetadataSnapshot, NewParticipantPeriod, NewReservation, NewResetRequest, NewTransition,
-    PackageStatus, PackageSuccessor, ParticipantAcceptance, ParticipantAcceptanceCas,
-    ParticipantInvitation, ParticipantRole, ParticipantStatus, ParticipantTerminalization,
+    cas_key_package_status, cas_participant_active_role, cas_participant_pending_to_active,
+    cas_registration_revoke, close_leaf_period, insert_device_revocation,
+    insert_generation_state_row, insert_leaf_period, insert_leaf_recovery_request,
+    insert_leave_request, insert_metadata_snapshot, insert_participant_period, insert_reservation,
+    insert_reset_request, insert_transition_row, terminalize_leaf_recovery_request,
+    terminalize_leave_request, terminalize_participant_period, terminalize_reservation,
+    terminalize_reset_request, GenerationStateKind, GenerationStateLifecycle, LeafClose,
+    LeafOrigin, LeafRecoveryKind, LeafRecoverySource, LeafRecoveryTermination,
+    LeaveRequestTermination, MetadataAvatarBinding, NewDeviceRevocation, NewGenerationState,
+    NewLeafPeriod, NewLeafRecoveryRequest, NewLeaveRequest, NewMetadataSnapshot,
+    NewParticipantPeriod, NewReservation, NewResetRequest, NewTransition, PackageStatus,
+    PackageSuccessor, ParticipantAcceptance, ParticipantAcceptanceCas, ParticipantInvitation,
+    ParticipantRole, ParticipantRoleCas, ParticipantStatus, ParticipantTerminalization,
     RegistrationRevoke, ReservationTermination, ResetReason, ResetRequestTermination,
     TransitionActorRole, TransitionCoordinates, TransitionKind, TransitionRepositoryError,
 };
@@ -485,6 +486,16 @@ fn delivery_conflict(result: Result<(), DeliveryRepositoryError>) {
     }
 }
 
+async fn existing_chat_protocol_db() -> PgPool {
+    let database_url = std::env::var("TEST_DATABASE_URL")
+        .expect("TEST_DATABASE_URL must name the existing clean-chat test database");
+    common::chat_protocol::validate_chat_protocol_database_url(Some(&database_url))
+        .expect("unsafe TEST_DATABASE_URL for transition repository test");
+    PgPool::connect(&database_url)
+        .await
+        .expect("connect to existing clean-chat test database")
+}
+
 // ===========================================================================
 // Family 1 — participants.
 // ===========================================================================
@@ -611,6 +622,132 @@ async fn participant_insert_accept_terminalize_are_faithful_and_cas_guarded() {
         ),
         "second current period must violate the one-current partial unique index"
     );
+    tx.rollback().await.unwrap();
+}
+
+/// Focused H2-pre repository proof. This test intentionally uses the
+/// already-provisioned schema connector so the task's no-migration safety gate
+/// is independent from the canonical migration-aware repository suite above.
+#[tokio::test]
+async fn participant_active_role_cas_is_exact_and_preserves_every_other_column() {
+    let pool = existing_chat_protocol_db().await;
+    let fixture = seed_fixture(&pool).await;
+    let invited_did = random_plc_did();
+    let pending_did = random_plc_did();
+    seed_principal(&pool, &invited_did).await;
+    seed_principal(&pool, &pending_did).await;
+
+    let now = clock_now(&pool).await;
+    let active_period_id = Uuid::new_v4();
+    let active = NewParticipantPeriod {
+        participant_period_id: active_period_id,
+        conversation_id: fixture.conversation_id,
+        user_did: invited_did.clone(),
+        status: ParticipantStatus::Active,
+        role: ParticipantRole::Member,
+        role_transition_id: fixture.creation_transition_id,
+        role_changed_at: fixture.accepted_at,
+        created_by_did: fixture.actor_did.clone(),
+        created_by_device_id: fixture.actor_device_id,
+        invitation: Some(ParticipantInvitation {
+            invitation_transition_id: fixture.creation_transition_id,
+            invitation_entry_id: fixture.creation_entry_id,
+            invited_at: fixture.accepted_at,
+        }),
+        acceptance: Some(ParticipantAcceptance {
+            acceptance_transition_id: fixture.creation_transition_id,
+            acceptance_entry_id: fixture.creation_entry_id,
+            accepted_at: fixture.accepted_at,
+        }),
+        created_at: fixture.accepted_at,
+    };
+    let pending = NewParticipantPeriod {
+        participant_period_id: Uuid::new_v4(),
+        user_did: pending_did.clone(),
+        status: ParticipantStatus::Pending,
+        acceptance: None,
+        ..active.clone()
+    };
+    let role_transition_id = Uuid::new_v4();
+    let changed_at = now + Duration::milliseconds(1);
+    let role_cas = ParticipantRoleCas {
+        conversation_id: fixture.conversation_id,
+        user_did: invited_did.clone(),
+        expected_role: ParticipantRole::Member,
+        successor_role: ParticipantRole::Admin,
+        role_transition_id,
+        role_changed_at: changed_at,
+    };
+
+    let mut tx = pool.begin().await.unwrap();
+    insert_participant_period(&mut tx, &active)
+        .await
+        .expect("insert active participant");
+    insert_participant_period(&mut tx, &pending)
+        .await
+        .expect("insert pending status probe");
+
+    let mut wrong_status = role_cas.clone();
+    wrong_status.user_did = pending_did;
+    conflict(cas_participant_active_role(&mut tx, &wrong_status).await);
+
+    let immutable_before: serde_json::Value = sqlx::query_scalar(
+        "SELECT to_jsonb(p) - ARRAY['role','role_transition_id','role_changed_at'] \
+         FROM chat.participants p WHERE participant_period_id=$1",
+    )
+    .bind(active_period_id)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    cas_participant_active_role(&mut tx, &role_cas)
+        .await
+        .expect("member -> admin role CAS");
+    let (role, producer, persisted_changed_at): (String, Uuid, DateTime<Utc>) = sqlx::query_as(
+        "SELECT role,role_transition_id,role_changed_at \
+             FROM chat.participants WHERE participant_period_id=$1",
+    )
+    .bind(active_period_id)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(role, "admin");
+    assert_eq!(producer, role_transition_id);
+    assert_eq!(persisted_changed_at, changed_at);
+    let immutable_after: serde_json::Value = sqlx::query_scalar(
+        "SELECT to_jsonb(p) - ARRAY['role','role_transition_id','role_changed_at'] \
+         FROM chat.participants p WHERE participant_period_id=$1",
+    )
+    .bind(active_period_id)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(
+        immutable_after, immutable_before,
+        "role CAS changed a non-role participant column"
+    );
+
+    conflict(cas_participant_active_role(&mut tx, &role_cas).await);
+    let mut wrong_principal = role_cas.clone();
+    wrong_principal.user_did = random_plc_did();
+    conflict(cas_participant_active_role(&mut tx, &wrong_principal).await);
+
+    terminalize_participant_period(
+        &mut tx,
+        &ParticipantTerminalization {
+            participant_period_id: active_period_id,
+            removing_transition_id: fixture.creation_transition_id,
+            removing_seq: 1,
+            removed_at: changed_at + Duration::milliseconds(1),
+        },
+    )
+    .await
+    .expect("terminalize active participant");
+    let reverse = ParticipantRoleCas {
+        expected_role: ParticipantRole::Admin,
+        successor_role: ParticipantRole::Member,
+        ..role_cas
+    };
+    conflict(cas_participant_active_role(&mut tx, &reverse).await);
     tx.rollback().await.unwrap();
 }
 

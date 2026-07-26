@@ -251,6 +251,55 @@ pub(crate) async fn cas_participant_pending_to_active(
     Ok(())
 }
 
+/// Compare-and-set one current active participant's durable role provenance.
+///
+/// The conversation head is already serialized by the composing executor. This
+/// narrower row CAS still matches the exact principal, active/current state, and
+/// old role so independently drifted membership becomes a typed conflict. Only
+/// the role triplet is updated; every other participant-period column remains
+/// untouched.
+#[derive(Clone, Debug)]
+pub(crate) struct ParticipantRoleCas {
+    pub(crate) conversation_id: Uuid,
+    pub(crate) user_did: String,
+    pub(crate) expected_role: ParticipantRole,
+    pub(crate) successor_role: ParticipantRole,
+    pub(crate) role_transition_id: Uuid,
+    pub(crate) role_changed_at: DateTime<Utc>,
+}
+
+pub(crate) async fn cas_participant_active_role(
+    transaction: &mut Transaction<'_, Postgres>,
+    cas: &ParticipantRoleCas,
+) -> Result<(), TransitionRepositoryError> {
+    let result = sqlx::query(
+        r#"
+        UPDATE chat.participants
+           SET role = $3,
+               role_transition_id = $4,
+               role_changed_at = $5
+         WHERE conversation_id = $1
+           AND user_did = $2
+           AND current_membership = TRUE
+           AND status = 'active'
+           AND role = $6
+        "#,
+    )
+    .bind(cas.conversation_id)
+    .bind(&cas.user_did)
+    .bind(cas.successor_role.as_str())
+    .bind(cas.role_transition_id)
+    .bind(cas.role_changed_at)
+    .bind(cas.expected_role.as_str())
+    .execute(&mut **transaction)
+    .await?;
+
+    if result.rows_affected() != 1 {
+        return Err(TransitionRepositoryError::CompareAndSetConflict);
+    }
+    Ok(())
+}
+
 /// Terminalize the current participant period: clear the current flag and record
 /// the removing transition / seq / timestamp. Matches only a still-current,
 /// un-removed period; a repeat attempt matches nothing (typed conflict).

@@ -8516,6 +8516,7 @@ pub(crate) struct PlannedTransition {
 /// delta originate from the same validated successor and must be committed in
 /// one transaction after the conversation-head CAS succeeds.
 #[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(test, derive(Clone))]
 pub(crate) struct ConversationPersistencePlan {
     expected_prior: Option<PublicGroupSnapshotCoordinate>,
     retired_coordinate: Option<PublicGroupSnapshotCoordinate>,
@@ -11756,7 +11757,52 @@ fn dummy_principal() -> PrincipalId {
 }
 
 #[cfg(test)]
+pub(crate) enum PolicyPlanMutation {
+    Principal,
+    Status,
+    RoleProducer,
+    OldRoleProducer(TransitionEvidence),
+    DuplicateDelta,
+    Remove,
+}
+
+#[cfg(test)]
 impl ConversationPersistencePlan {
+    pub(crate) fn with_policy_mutation_for_test(mut self, mutation: PolicyPlanMutation) -> Self {
+        if matches!(&mutation, PolicyPlanMutation::DuplicateDelta) {
+            self.effects
+                .participant_changes
+                .push(self.effects.participant_changes[0].clone());
+            return self;
+        }
+        let change = self.effects.participant_changes.first_mut().unwrap();
+        match mutation {
+            PolicyPlanMutation::Principal => {
+                change.after.as_mut().unwrap().principal =
+                    PrincipalId::new(b"did:plc:zzzzzzzzzzzzzzzzzzzzzzzz".to_vec()).unwrap();
+            }
+            PolicyPlanMutation::Status => {
+                change.after.as_mut().unwrap().status = ParticipantStatus::Pending;
+            }
+            PolicyPlanMutation::RoleProducer => {
+                change
+                    .after
+                    .as_mut()
+                    .unwrap()
+                    .role_producer
+                    .as_mut()
+                    .unwrap()
+                    .transition_id[0] ^= 0x01;
+            }
+            PolicyPlanMutation::OldRoleProducer(producer) => {
+                change.before.as_mut().unwrap().role_producer = Some(producer);
+            }
+            PolicyPlanMutation::DuplicateDelta => unreachable!(),
+            PolicyPlanMutation::Remove => change.after = None,
+        }
+        self
+    }
+
     pub(crate) fn with_generic_remove_add_for_test(mut self) -> Self {
         if let Some(before) = self
             .effects
@@ -12649,15 +12695,15 @@ fn participant_provenance_matches(
     }
 }
 
-fn participant_role_provenance_matches(
-    state: &ConversationState,
+fn initial_participant_role(
+    conversation_kind: ConversationKind,
     participant: &ParticipantRecord,
-) -> bool {
-    let initial_role = match participant.invitation.as_ref() {
+) -> Option<ParticipantRole> {
+    match participant.invitation.as_ref() {
         None => Some(ParticipantRole::Admin),
         Some(invitation) => match invitation.transition.body_binding.as_ref() {
-            Some(TransitionBodyBinding::Creation { kind, .. }) if *kind == state.kind => {
-                Some(if state.kind == ConversationKind::Direct {
+            Some(TransitionBodyBinding::Creation { kind, .. }) if *kind == conversation_kind => {
+                Some(if conversation_kind == ConversationKind::Direct {
                     ParticipantRole::Admin
                 } else {
                     ParticipantRole::Member
@@ -12673,12 +12719,24 @@ fn participant_role_provenance_matches(
             {
                 Some(ParticipantRole::Member)
             }
-            // Pure planner tests intentionally omit sealed bodies. Production
-            // hydration never admits this branch because it retains authority.
-            None if invitation.transition.authority.is_none() => Some(participant.role),
             _ => None,
         },
-    };
+    }
+}
+
+fn participant_role_provenance_matches(
+    state: &ConversationState,
+    participant: &ParticipantRecord,
+) -> bool {
+    let initial_role = initial_participant_role(state.kind, participant).or_else(|| {
+        // Pure planner tests intentionally omit sealed bodies. Production
+        // hydration never admits this branch because it retains authority.
+        participant.invitation.as_ref().and_then(|invitation| {
+            (invitation.transition.body_binding.is_none()
+                && invitation.transition.authority.is_none())
+            .then_some(participant.role)
+        })
+    });
 
     match participant.role_producer.as_ref() {
         None => initial_role == Some(participant.role),
@@ -14985,17 +15043,21 @@ mod executor {
         NewParticipantPeriod, NewReservation, NewResetRequest, NewTransition,
         PackageStatus as RepoPackageStatus, PackageSuccessor, ParticipantAcceptance,
         ParticipantAcceptanceCas, ParticipantInvitation, ParticipantRole as RepoParticipantRole,
-        ParticipantStatus as RepoParticipantStatus, RegistrationRevoke, ReservationTermination,
-        ResetRequestTermination, TransitionActorRole, TransitionCoordinates, TransitionKind,
-        TransitionRepositoryError,
+        ParticipantRoleCas, ParticipantStatus as RepoParticipantStatus, RegistrationRevoke,
+        ReservationTermination, ResetRequestTermination, TransitionActorRole,
+        TransitionCoordinates, TransitionKind, TransitionRepositoryError,
     };
     use super::{
-        revocation_package_cas_bijection_valid, CloseKind, ConversationKind, DeviceIdentity,
-        DeviceRevocationBatchPersistencePlan, LeafHydrationRow, LeafRecord, LeafRecoveryKind,
-        LeaveRequestStatus, MetadataSnapshotBinding, PackageStatus, ParticipantHydrationRow,
+        classify_role_producer, coordinate_is_in_lineage, coordinate_only_successor,
+        initial_participant_role, invitation_matches_participant,
+        revocation_package_cas_bijection_valid, validate_transition_evidence, CloseKind,
+        ConversationKind, DeviceIdentity, DeviceRevocationBatchPersistencePlan, LeafHydrationRow,
+        LeafRecord, LeafRecoveryKind, LeaveRequestStatus, ManifestParticipantChange,
+        MetadataSnapshotBinding, PackageStatus, ParticipantHydrationRow, ParticipantRecord,
         ParticipantRole, ParticipantStatus, PlanAuthority, PlanKind, PrincipalId,
         PublicGroupSnapshotCoordinate, RecoveryRequestStatus, RecoverySource, ReservationStatus,
-        ResetRequestStatus, ServerTimestamp, StateChange, TransitionEffects, WelcomeStatus,
+        ResetRequestStatus, ServerTimestamp, SignedMutationKind, StateChange,
+        TransitionBodyBinding, TransitionEffects, WelcomeStatus,
     };
     use super::{ConversationPersistencePlan, ConversationStateHydration};
     use super::{Engine, URL_SAFE_NO_PAD};
@@ -15300,6 +15362,182 @@ mod executor {
             ParticipantRole::Member => RepoParticipantRole::Member,
             ParticipantRole::Admin => RepoParticipantRole::Admin,
         }
+    }
+
+    fn old_role_provenance_matches(
+        participant: &ParticipantRecord,
+        conversation_kind: ConversationKind,
+        expected_prior: &PublicGroupSnapshotCoordinate,
+        current: &super::TransitionEvidence,
+    ) -> bool {
+        let Some(old) = participant.role_producer.as_ref() else {
+            return initial_participant_role(conversation_kind, participant)
+                == Some(participant.role)
+                && participant.invitation.as_ref().is_none_or(|invitation| {
+                    invitation_matches_participant(conversation_kind, participant, invitation)
+                });
+        };
+        if !validate_transition_evidence(old)
+            || old.seq >= current.seq
+            || old.received_at > current.received_at
+            || old.authority.as_ref().is_none_or(|authority| {
+                authority.kind != SignedMutationKind::PolicyTransition
+                    || authority.control_conversation_id != Some(*expected_prior.conversation_id())
+            })
+            || !matches!(
+                classify_role_producer(old.clone(), participant.principal(), participant.role),
+                Ok(Some(classified)) if classified == *old
+            )
+        {
+            return false;
+        }
+        matches!(old.body_binding.as_ref(),
+            Some(TransitionBodyBinding::Policy { prior, next, .. })
+                if coordinate_only_successor(prior).is_ok_and(|expected| &expected == next)
+                    && coordinate_is_in_lineage(next, expected_prior))
+    }
+
+    /// Exhaustively classify the policy's complete participant delta before the
+    /// executor performs its first write. This is the write-side counterpart to
+    /// the unchanged aggregate role-provenance validator.
+    fn validate_policy_participant_writes(
+        effects: &TransitionEffects,
+        hydration: &ConversationStateHydration,
+        ctx: &ExecutionContext,
+        expected_prior: &PublicGroupSnapshotCoordinate,
+        transition_id: Uuid,
+    ) -> Result<(), ExecutorError> {
+        let current = &hydration.producer;
+        if !validate_transition_evidence(current)
+            || current.transition_id() != transition_id.as_bytes()
+            || current.outer_entry_fingerprint() != ctx.entry.outer_entry_fingerprint.as_slice()
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "policy producer does not bind the current transition",
+            ));
+        }
+        let body_changes = match current.body_binding.as_ref() {
+            Some(TransitionBodyBinding::Policy {
+                prior,
+                next,
+                participant_changes,
+            }) if prior == expected_prior && next == &hydration.coordinate => participant_changes,
+            _ => {
+                return Err(ExecutorError::InconsistentPlan(
+                    "policy producer body does not bind the plan coordinates",
+                ))
+            }
+        };
+        if body_changes.len() != effects.participant_changes().len() {
+            return Err(ExecutorError::InconsistentPlan(
+                "policy body and participant delta counts differ",
+            ));
+        }
+
+        let signed_authority = current.authority.as_ref();
+        if let Some(authority) = signed_authority {
+            if authority.kind != SignedMutationKind::PolicyTransition
+                || authority.control_entry_id != Some(*ctx.entry.entry_id.as_bytes())
+                || authority.control_conversation_id
+                    != Some(*hydration.coordinate.conversation_id())
+                || authority.actor.principal().as_bytes() != ctx.actor.user_did.as_bytes()
+                || Uuid::from_bytes(*authority.actor.device_id()) != ctx.actor.device_id
+                || authority.signed_request_bytes != ctx.entry.signed_request_bytes
+                || authority.request_digest.as_slice() != ctx.entry.request_digest
+                || authority.signature.as_slice() != ctx.entry.signature
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "policy signed authority does not bind execution context",
+                ));
+            }
+        }
+
+        let mut add_count = 0usize;
+        for change in effects.participant_changes() {
+            match (change.before(), change.after()) {
+                (None, Some(after)) => {
+                    let matching_adds = body_changes
+                        .iter()
+                        .filter(|body| {
+                            matches!(body, ManifestParticipantChange::Add(principal)
+                                if principal == after.principal())
+                        })
+                        .count();
+                    let invitation = after.invitation.as_ref();
+                    if matching_adds != 1
+                        || after.status != ParticipantStatus::Pending
+                        || after.role != ParticipantRole::Member
+                        || after.role_producer.is_some()
+                        || after.acceptance.is_some()
+                        || !invitation.is_some_and(|invitation| {
+                            invitation.transition == *current
+                                && invitation.inviter.principal().as_bytes()
+                                    == ctx.actor.user_did.as_bytes()
+                                && Uuid::from_bytes(*invitation.inviter.device_id())
+                                    == ctx.actor.device_id
+                        })
+                    {
+                        return Err(ExecutorError::InconsistentPlan(
+                            "policy Add participant delta is not exact",
+                        ));
+                    }
+                    add_count += 1;
+                }
+                (Some(before), Some(after)) => {
+                    // A role change requires genuine signed current authority;
+                    // authority-less test evidence is never sufficient to update
+                    // an existing durable participant row.
+                    if signed_authority.is_none() {
+                        return Err(ExecutorError::InconsistentPlan(
+                            "policy ChangeRole lacks signed authority",
+                        ));
+                    }
+                    let matching_role_changes = body_changes
+                        .iter()
+                        .filter(|body| {
+                            matches!(body,
+                                ManifestParticipantChange::ChangeRole(principal, role)
+                                    if principal == after.principal() && *role == after.role)
+                        })
+                        .count();
+                    if matching_role_changes != 1
+                        || before.principal != after.principal
+                        || before.status != ParticipantStatus::Active
+                        || after.status != ParticipantStatus::Active
+                        || before.role == after.role
+                        || before.invitation != after.invitation
+                        || before.acceptance != after.acceptance
+                        || !old_role_provenance_matches(
+                            before,
+                            hydration.kind,
+                            expected_prior,
+                            current,
+                        )
+                        || after.role_producer.as_ref() != Some(current)
+                    {
+                        return Err(ExecutorError::InconsistentPlan(
+                            "policy ChangeRole participant delta is not exact",
+                        ));
+                    }
+                }
+                (Some(_), None) => {
+                    return Err(ExecutorError::UnsupportedEffect(
+                        "policy participant Remove",
+                    ))
+                }
+                (None, None) => {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "policy participant delta is empty",
+                    ))
+                }
+            }
+        }
+        if ctx.participant_period_ids.len() != add_count {
+            return Err(ExecutorError::InconsistentPlan(
+                "policy participant period ids do not match Add deltas",
+            ));
+        }
+        Ok(())
     }
 
     /// Reject any non-empty effect family the executor does not (yet) persist,
@@ -18409,13 +18647,14 @@ mod executor {
 
         // 7. Participant periods, then leaves, then intervals — every change is a
         //    pure insert for creation; a non-insert shape is a hard error.
-        write_creation_participants(
+        write_participants(
             transaction,
             ctx,
             hydration,
             effects,
             transition_id,
             applied_at,
+            false,
         )
         .await?;
         let leaf_ids = write_creation_leaves(
@@ -18488,8 +18727,9 @@ mod executor {
         let expected_generation = checked_i64(expected_prior.generation())?;
         let expected_state_version = checked_i64(expected_prior.state_version())?;
         let expected_next_entry_seq = checked_i64(head.expected_next_entry_seq())?;
+        validate_policy_participant_writes(effects, hydration, ctx, expected_prior, transition_id)?;
 
-        // Policy is a coordinate-only, participant-add edge. It carries NO leaf /
+        // Policy is a coordinate-only participant edge. It carries NO leaf /
         // interval / terminal-proof change, but `plan_policy_transition` calls
         // `resolve_prior_bound_work` unconditionally, so it CAN carry (a legal
         // interleaving) prior-coordinate open-work SUPERSESSIONS — a co-open
@@ -18648,14 +18888,16 @@ mod executor {
         )
         .await?;
 
-        // 6. The added pending participant(s) — the participant-change diff.
-        write_creation_participants(
+        // 6. Apply the already-classified pending inserts and/or exact active
+        //    role CAS updates. Role changes consume no participant-period IDs.
+        write_participants(
             transaction,
             ctx,
             hydration,
             effects,
             transition_id,
             applied_at,
+            true,
         )
         .await?;
 
@@ -20950,23 +21192,41 @@ mod executor {
         Ok(())
     }
 
-    async fn write_creation_participants(
+    #[allow(clippy::too_many_arguments)]
+    async fn write_participants(
         transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         ctx: &ExecutionContext,
         hydration: &ConversationStateHydration,
         effects: &TransitionEffects,
         transition_id: Uuid,
         applied_at: DateTime<Utc>,
+        allow_role_changes: bool,
     ) -> Result<(), ExecutorError> {
         let creator = &ctx.actor;
         let mut period_ids = ctx.participant_period_ids.iter();
         for change in effects.participant_changes() {
-            let (before, after) = (change.before(), change.after());
-            let after = match (before, after) {
+            let after = match (change.before(), change.after()) {
+                (Some(before), Some(after)) if allow_role_changes => {
+                    transition::cas_participant_active_role(
+                        transaction,
+                        &ParticipantRoleCas {
+                            conversation_id: Uuid::from_bytes(
+                                *hydration.coordinate.conversation_id(),
+                            ),
+                            user_did: principal_did(after.principal())?,
+                            expected_role: repo_participant_role(before.role()),
+                            successor_role: repo_participant_role(after.role()),
+                            role_transition_id: transition_id,
+                            role_changed_at: applied_at,
+                        },
+                    )
+                    .await?;
+                    continue;
+                }
                 (None, Some(after)) => after,
                 _ => {
                     return Err(ExecutorError::UnsupportedEffect(
-                        "participant change is not a creation insert",
+                        "participant change is not an insert or policy role change",
                     ))
                 }
             };
