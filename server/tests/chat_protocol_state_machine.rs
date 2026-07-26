@@ -87,13 +87,14 @@ use chat_protocol::{
         PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle, PublicGroupSnapshotTreeSummary,
     },
     state_machine::{
-        hydrate_conversation_state as hydrate_graph, plan_accept_conversation, plan_close,
-        plan_commit, plan_creation, plan_leaf_recovery_cancellation,
-        plan_leaf_recovery_fulfillment, plan_leaf_recovery_request, plan_leave_cancellation,
-        plan_leave_fulfillment, plan_leave_request, plan_reset_activation, plan_reset_request,
-        plan_zero_leaf_leave, AcceptConversation, CloseConversation, CommitCommand,
-        ConversationKind, ConversationStateHydration, CreationCommand, CreationDecision,
-        DeviceIdentity, DurableSignedRequestEnvelope, HydrationAuthority, IntervalHydrationRow,
+        acceptance_recovery_package_artifact_matches, hydrate_conversation_state as hydrate_graph,
+        plan_accept_conversation, plan_close, plan_commit, plan_creation,
+        plan_leaf_recovery_cancellation, plan_leaf_recovery_fulfillment,
+        plan_leaf_recovery_request, plan_leave_cancellation, plan_leave_fulfillment,
+        plan_leave_request, plan_reset_activation, plan_reset_request, plan_zero_leaf_leave,
+        AcceptConversation, CloseConversation, CommitCommand, ConversationKind,
+        ConversationStateHydration, CreationCommand, CreationDecision, DeviceIdentity,
+        DurableSignedRequestEnvelope, HydrationAuthority, IntervalHydrationRow,
         InvitationHydrationRow, LeafHydrationRow, LeafRecoveryCancellation,
         LeafRecoveryFulfillment, LeafRecoveryKind, LeafRecoveryRequestCommand, LeaveCancellation,
         LeaveFulfillment, LeaveFulfillmentTestMutation, LeaveRequestCommand, LeaveRequestStatus,
@@ -1234,6 +1235,52 @@ fn acceptance_rebinds_same_snapshot_and_opens_no_application_interval() {
         .expect("acceptance creates recovery request");
     assert_eq!(request.source(), RecoverySource::Acceptance);
     assert_eq!(request.bound_coordinate(), after.coordinate());
+}
+
+#[test]
+fn acceptance_recovery_package_comparison_rejects_wrapper_and_hash_drift() {
+    let manifest = corpus_manifest();
+    let prior = direct_creation().coordinate().clone();
+    let wrapper = vec![0xAA_u8; 32];
+    let wrapper_sha256: [u8; 32] = Sha256::digest(&wrapper).into();
+    let acceptance = TransitionEvidence::for_test_acceptance(
+        ACCEPT_SEQ,
+        uuid_v4_bytes(0x22),
+        [0x22; 32],
+        fixture_received_at(ACCEPT_SEQ),
+        prior,
+        uuid_v4_bytes(0x23),
+        bob(&manifest),
+        uuid_v4_bytes(0x11),
+        alice(&manifest),
+        hex_array(&manifest.chain.inner_key_package_ref_hex),
+        [0x44; 32],
+        1,
+        fixture_package_not_after(),
+    )
+    .expect("acceptance evidence");
+
+    assert!(acceptance_recovery_package_artifact_matches(
+        &acceptance,
+        &wrapper,
+        &wrapper_sha256,
+    ));
+
+    let mut wrong_wrapper = wrapper.clone();
+    wrong_wrapper[0] ^= 1;
+    assert!(!acceptance_recovery_package_artifact_matches(
+        &acceptance,
+        &wrong_wrapper,
+        &wrapper_sha256,
+    ));
+
+    let mut wrong_hash = wrapper_sha256;
+    wrong_hash[0] ^= 1;
+    assert!(!acceptance_recovery_package_artifact_matches(
+        &acceptance,
+        &wrapper,
+        &wrong_hash,
+    ));
 }
 
 #[test]

@@ -27,17 +27,18 @@ use super::super::{
         PublicGroupSnapshotBinding, PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle,
     },
     state_machine::{
-        classify_acceptance, classify_invitation, classify_role_producer,
-        metadata_binding_of_transition, recovery_fulfillment_terminal_matches, CloseKind,
-        ConversationState, DeviceIdentity, HistoricalRehydrationAuthority, HydrationAuthority,
-        IntervalEndHydrationRow, IntervalHydrationRow, LeafHydrationRow, LeafRecoveryKind,
-        LeaveRequestHydrationRow, LeaveRequestStatus, MetadataSnapshotBinding, OpeningKind,
-        ParticipantHydrationRow, ParticipantRemovalEvidence, ParticipantRole, ParticipantStatus,
-        PersistedControlAuthority, PrincipalId, RecoveryOriginHydrationRow,
-        RecoveryRequestHydrationRow, RecoveryRequestStatus, RecoveryReservationHydrationRow,
-        RecoverySource, RequestEntryKind, RequestEvidence, ReservationStatus,
-        ResetRequestHydrationRow, ResetRequestStatus, ServerTimestamp, TransitionEvidence,
-        WelcomeHydrationRow, WelcomeStatus, WorkTerminalHydrationRow,
+        acceptance_recovery_package_artifact_matches, classify_acceptance, classify_invitation,
+        classify_role_producer, metadata_binding_of_transition,
+        recovery_fulfillment_terminal_matches, CloseKind, ConversationState, DeviceIdentity,
+        HistoricalRehydrationAuthority, HydrationAuthority, IntervalEndHydrationRow,
+        IntervalHydrationRow, LeafHydrationRow, LeafRecoveryKind, LeaveRequestHydrationRow,
+        LeaveRequestStatus, MetadataSnapshotBinding, OpeningKind, ParticipantHydrationRow,
+        ParticipantRemovalEvidence, ParticipantRole, ParticipantStatus, PersistedControlAuthority,
+        PrincipalId, RecoveryOriginHydrationRow, RecoveryRequestHydrationRow,
+        RecoveryRequestStatus, RecoveryReservationHydrationRow, RecoverySource, RequestEntryKind,
+        RequestEvidence, ReservationStatus, ResetRequestHydrationRow, ResetRequestStatus,
+        ServerTimestamp, TransitionEvidence, WelcomeHydrationRow, WelcomeStatus,
+        WorkTerminalHydrationRow,
     },
     validation::{BareDid, KeyThumbprint},
 };
@@ -3402,6 +3403,8 @@ enum RecoveryReservationTerminal {
 /// the `key_package_ref` the request row lacks.
 struct PairedReservation {
     key_package_ref: [u8; 32],
+    package_wrapper: Vec<u8>,
+    package_wrapper_sha256: Vec<u8>,
     package_status: String,
     package_terminal_transition_id: Option<Uuid>,
     package_terminal_revocation_id: Option<Uuid>,
@@ -3435,6 +3438,8 @@ struct DurableRecoveryReservationRow {
     package_terminal_revocation_id: Option<Uuid>,
     package_terminal_at: Option<DateTime<Utc>>,
     not_after: DateTime<Utc>,
+    package_wrapper: Vec<u8>,
+    package_wrapper_sha256: Vec<u8>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -3454,6 +3459,9 @@ struct DurableRecoveryRequestRow {
     bound_confirmation_tag: Vec<u8>,
     status: String,
     signed_request_bytes: Vec<u8>,
+    signing_transcript_bytes: Vec<u8>,
+    request_digest: Vec<u8>,
+    signature: Vec<u8>,
     requested_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
     fulfilling_transition_id: Option<Uuid>,
@@ -3479,6 +3487,45 @@ pub(crate) fn select_single_acceptance_origin(
         return Err(RecoveryHydrationError::InvalidProvenance);
     };
     Ok(*candidate)
+}
+
+pub(crate) fn map_recovery_control_evidence_error(
+    error: ControlEvidenceLoadError,
+) -> RecoveryHydrationError {
+    match error {
+        ControlEvidenceLoadError::Database(error) => RecoveryHydrationError::Database(error),
+        ControlEvidenceLoadError::EntryMissing | ControlEvidenceLoadError::InvalidEvidence => {
+            RecoveryHydrationError::InvalidProvenance
+        }
+    }
+}
+
+pub(crate) fn recovery_acceptance_authority_matches_durable(
+    evidence: &TransitionEvidence,
+    transition_id: &[u8; 16],
+    received_at: ServerTimestamp,
+    conversation_id: &[u8; 16],
+    target: &DeviceIdentity,
+    requester_key_id: &[u8; 32],
+    requester_auth_generation: u64,
+    signed_request_bytes: &[u8],
+    signing_transcript_bytes: &[u8],
+    request_digest: &[u8],
+    signature: &[u8],
+) -> bool {
+    evidence.signed_authority().is_some_and(|authority| {
+        evidence.transition_id() == transition_id
+            && evidence.received_at() == received_at
+            && authority.kind() == SignedMutationKind::ParticipantAcceptance
+            && authority.control_conversation_id() == Some(conversation_id)
+            && authority.actor() == target
+            && authority.key_id() == requester_key_id
+            && authority.auth_generation() == requester_auth_generation
+            && authority.signed_request_bytes() == signed_request_bytes
+            && authority.transcript_bytes() == signing_transcript_bytes
+            && authority.request_digest() == request_digest
+            && authority.signature() == signature
+    })
 }
 
 /// Load the leaf-recovery work of an existing conversation as a validated 1:1
@@ -3530,7 +3577,9 @@ pub(crate) async fn load_recovery_work_hydration_rows(
             kp.terminal_transition_id AS package_terminal_transition_id,
             kp.terminal_revocation_id AS package_terminal_revocation_id,
             kp.terminal_at AS package_terminal_at,
-            kp.not_after
+            kp.not_after,
+            kp.wrapper_bytes AS package_wrapper,
+            kp.wrapper_sha256 AS package_wrapper_sha256
         FROM chat.key_package_reservations r
         JOIN chat.key_packages kp
           ON kp.key_package_ref = r.key_package_ref
@@ -3568,6 +3617,8 @@ pub(crate) async fn load_recovery_work_hydration_rows(
         package_terminal_revocation_id,
         package_terminal_at,
         not_after,
+        package_wrapper,
+        package_wrapper_sha256,
     } in reservation_rows
     {
         let request_id = *recovery_request_id.as_bytes();
@@ -3627,6 +3678,8 @@ pub(crate) async fn load_recovery_work_hydration_rows(
                 request_id,
                 PairedReservation {
                     key_package_ref,
+                    package_wrapper,
+                    package_wrapper_sha256,
                     package_status,
                     package_terminal_transition_id,
                     package_terminal_revocation_id,
@@ -3660,6 +3713,9 @@ pub(crate) async fn load_recovery_work_hydration_rows(
             lr.bound_confirmation_tag,
             lr.status,
             lr.signed_request_bytes,
+            lr.signing_transcript_bytes,
+            lr.request_digest,
+            lr.signature,
             lr.requested_at,
             lr.expires_at,
             lr.fulfilling_transition_id,
@@ -3705,6 +3761,9 @@ pub(crate) async fn load_recovery_work_hydration_rows(
         bound_confirmation_tag,
         status,
         signed_request_bytes,
+        signing_transcript_bytes,
+        request_digest,
+        signature,
         requested_at,
         expires_at,
         fulfilling_transition_id,
@@ -3752,6 +3811,8 @@ pub(crate) async fn load_recovery_work_hydration_rows(
         let reservation_status = reservation.row.status;
         let reservation_terminal = reservation.terminal.clone();
         let reservation_key_package_ref = reservation.key_package_ref;
+        let package_wrapper = reservation.package_wrapper.clone();
+        let package_wrapper_sha256 = reservation.package_wrapper_sha256.clone();
         let package_status = reservation.package_status.clone();
         let package_terminal_transition_id = reservation.package_terminal_transition_id;
         let package_terminal_revocation_id = reservation.package_terminal_revocation_id;
@@ -3923,7 +3984,7 @@ pub(crate) async fn load_recovery_work_hydration_rows(
                     transition_id,
                 )
                 .await
-                .map_err(|_| RecoveryHydrationError::InvalidProvenance)?
+                .map_err(map_recovery_control_evidence_error)?
                 .into_transition()
                 .map_err(|_| RecoveryHydrationError::InvalidProvenance)?;
                 let requester_key_bytes = URL_SAFE_NO_PAD
@@ -3932,18 +3993,23 @@ pub(crate) async fn load_recovery_work_hydration_rows(
                     .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
                     .ok_or(RecoveryHydrationError::OutOfDomain)?;
                 let requester_auth_generation = recovery_u64(requester_auth_generation)?;
-                let signed_authority = evidence
-                    .signed_authority()
-                    .ok_or(RecoveryHydrationError::InvalidProvenance)?;
-                if evidence.transition_id() != transition_id.as_bytes()
-                    || evidence.received_at() != received_at
-                    || signed_authority.kind() != SignedMutationKind::ParticipantAcceptance
-                    || signed_authority.control_conversation_id() != Some(&conversation_bytes)
-                    || signed_authority.actor() != &target
-                    || signed_authority.key_id() != &requester_key_bytes
-                    || signed_authority.auth_generation() != requester_auth_generation
-                    || signed_authority.signed_request_bytes() != signed_request_bytes
-                {
+                if !recovery_acceptance_authority_matches_durable(
+                    &evidence,
+                    transition_id.as_bytes(),
+                    received_at,
+                    &conversation_bytes,
+                    &target,
+                    &requester_key_bytes,
+                    requester_auth_generation,
+                    &signed_request_bytes,
+                    &signing_transcript_bytes,
+                    &request_digest,
+                    &signature,
+                ) || !acceptance_recovery_package_artifact_matches(
+                    &evidence,
+                    &package_wrapper,
+                    &package_wrapper_sha256,
+                ) {
                     return Err(RecoveryHydrationError::InvalidProvenance);
                 }
                 let evidence = classify_acceptance(evidence, target.principal())

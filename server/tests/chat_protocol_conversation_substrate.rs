@@ -3335,8 +3335,9 @@ mod historical_control_loader {
             load_leave_request_hydration_rows, load_metadata_provenance,
             load_participant_hydration_rows, load_producer_transition_evidence,
             load_recovery_work_hydration_rows, load_reset_request_hydration_rows,
-            load_welcome_hydration_rows, select_fulfilled_recovery_terminal,
-            select_single_acceptance_origin, select_welcome_terminal,
+            load_welcome_hydration_rows, map_recovery_control_evidence_error,
+            recovery_acceptance_authority_matches_durable, select_fulfilled_recovery_terminal,
+            select_single_acceptance_origin, select_welcome_terminal, ControlEvidenceLoadError,
             FulfilledRecoveryTerminalColumns, RecoveryHydrationError, WelcomeTerminalColumns,
             WelcomeTerminalSelection,
         };
@@ -3345,8 +3346,9 @@ mod historical_control_loader {
             PublicGroupSnapshotTreeSummary,
         };
         use crate::chat_protocol::state_machine::{
-            recovery_fulfillment_terminal_matches, ConversationKind, ConversationStateHydration,
-            DeviceIdentity, HistoricalRehydrationAuthority, LeafRecoveryKind, PrincipalId,
+            acceptance_recovery_package_artifact_matches, recovery_fulfillment_terminal_matches,
+            ConversationKind, ConversationStateHydration, DeviceIdentity,
+            HistoricalRehydrationAuthority, LeafRecoveryKind, PrincipalId,
             RecoveryOriginHydrationRow, RecoveryRequestStatus, RecoverySource, ReservationStatus,
             ServerTimestamp, WelcomeStatus, WorkTerminalHydrationRow,
         };
@@ -4059,10 +4061,13 @@ mod historical_control_loader {
             let producer = load_producer_transition_evidence(&mut tx, &historical, cid)
                 .await
                 .expect("producer");
-            // Acceptance retains the prior metadata, but the separately owned
-            // metadata loader currently only searches the current state version.
-            // Splice the exact reverified creation producer so this test reaches
-            // the recovery validator without fabricating metadata evidence.
+            // This is a recovery-validator aggregate proof only. Acceptance
+            // retains the prior metadata, but the separately owned metadata
+            // loader currently only searches the current state version. Splice
+            // the exact reverified creation producer so this test reaches the
+            // recovery validator without fabricating metadata evidence. Full
+            // locked production aggregate hydration remains deferred to the
+            // separately sealed retained-metadata repair.
             let creation_transition_id = {
                 let wrapper: Value = serde_json::from_slice(&entry.raw_wrapper).unwrap();
                 Uuid::parse_str(wrapper["body"]["transitionId"].as_str().unwrap()).unwrap()
@@ -6906,6 +6911,24 @@ mod historical_control_loader {
             ));
         }
 
+        #[test]
+        fn acceptance_origin_control_loader_preserves_database_errors() {
+            assert!(matches!(
+                map_recovery_control_evidence_error(ControlEvidenceLoadError::EntryMissing),
+                RecoveryHydrationError::InvalidProvenance
+            ));
+            assert!(matches!(
+                map_recovery_control_evidence_error(ControlEvidenceLoadError::InvalidEvidence),
+                RecoveryHydrationError::InvalidProvenance
+            ));
+            assert!(matches!(
+                map_recovery_control_evidence_error(ControlEvidenceLoadError::Database(
+                    sqlx::Error::RowNotFound,
+                )),
+                RecoveryHydrationError::Database(sqlx::Error::RowNotFound)
+            ));
+        }
+
         /// The open recovery pair hydrates 1:1: the reservation supplies the
         /// request's `key_package_ref` + `package_not_after`, and the request origin
         /// re-mints byte-equal to the direct in-memory signed-path re-hydration.
@@ -6990,6 +7013,190 @@ mod historical_control_loader {
             .expect("acceptance evidence loads")
             .into_transition()
             .expect("acceptance is a transition");
+            let target = DeviceIdentity::new(
+                PrincipalId::new(invitee.did.clone().into_bytes()).unwrap(),
+                *invitee.device_id.as_bytes(),
+            )
+            .unwrap();
+            let requester_key_id: [u8; 32] = URL_SAFE_NO_PAD
+                .decode(&invitee.key_id)
+                .unwrap()
+                .try_into()
+                .unwrap();
+            let received_at = ServerTimestamp::from_canonical_stored(REQUESTED_AT).unwrap();
+            assert!(recovery_acceptance_authority_matches_durable(
+                &reference,
+                acceptance.transition_id.as_bytes(),
+                received_at,
+                &entry.cid,
+                &target,
+                &requester_key_id,
+                1,
+                &acceptance.raw_wrapper,
+                &acceptance.signing_transcript,
+                &acceptance.request_digest,
+                &acceptance.signature,
+            ));
+            for (
+                transition_id,
+                candidate_received_at,
+                conversation_id,
+                candidate_target,
+                candidate_key_id,
+                candidate_auth_generation,
+            ) in [
+                (
+                    *Uuid::new_v4().as_bytes(),
+                    received_at,
+                    entry.cid,
+                    target.clone(),
+                    requester_key_id,
+                    1,
+                ),
+                (
+                    *acceptance.transition_id.as_bytes(),
+                    ServerTimestamp::from_canonical_stored("2030-01-01T00:00:00.001Z").unwrap(),
+                    entry.cid,
+                    target.clone(),
+                    requester_key_id,
+                    1,
+                ),
+                (
+                    *acceptance.transition_id.as_bytes(),
+                    received_at,
+                    *Uuid::new_v4().as_bytes(),
+                    target.clone(),
+                    requester_key_id,
+                    1,
+                ),
+                (
+                    *acceptance.transition_id.as_bytes(),
+                    received_at,
+                    entry.cid,
+                    DeviceIdentity::new(target.principal().clone(), *Uuid::new_v4().as_bytes())
+                        .unwrap(),
+                    requester_key_id,
+                    1,
+                ),
+                (
+                    *acceptance.transition_id.as_bytes(),
+                    received_at,
+                    entry.cid,
+                    target.clone(),
+                    [0xA5; 32],
+                    1,
+                ),
+                (
+                    *acceptance.transition_id.as_bytes(),
+                    received_at,
+                    entry.cid,
+                    target.clone(),
+                    requester_key_id,
+                    2,
+                ),
+            ] {
+                assert!(!recovery_acceptance_authority_matches_durable(
+                    &reference,
+                    &transition_id,
+                    candidate_received_at,
+                    &conversation_id,
+                    &candidate_target,
+                    &candidate_key_id,
+                    candidate_auth_generation,
+                    &acceptance.raw_wrapper,
+                    &acceptance.signing_transcript,
+                    &acceptance.request_digest,
+                    &acceptance.signature,
+                ));
+            }
+            for drifted in [
+                (
+                    vec![0x91],
+                    acceptance.signing_transcript.clone(),
+                    acceptance.request_digest.clone(),
+                    acceptance.signature.clone(),
+                ),
+                (
+                    acceptance.raw_wrapper.clone(),
+                    vec![0x92],
+                    acceptance.request_digest.clone(),
+                    acceptance.signature.clone(),
+                ),
+                (
+                    acceptance.raw_wrapper.clone(),
+                    acceptance.signing_transcript.clone(),
+                    vec![0x93; 32],
+                    acceptance.signature.clone(),
+                ),
+                (
+                    acceptance.raw_wrapper.clone(),
+                    acceptance.signing_transcript.clone(),
+                    acceptance.request_digest.clone(),
+                    vec![0x94; 64],
+                ),
+            ] {
+                assert!(!recovery_acceptance_authority_matches_durable(
+                    &reference,
+                    acceptance.transition_id.as_bytes(),
+                    received_at,
+                    &entry.cid,
+                    &target,
+                    &requester_key_id,
+                    1,
+                    &drifted.0,
+                    &drifted.1,
+                    &drifted.2,
+                    &drifted.3,
+                ));
+            }
+            let creation_transition_id = {
+                let wrapper: Value = serde_json::from_slice(&entry.raw_wrapper).unwrap();
+                Uuid::parse_str(wrapper["body"]["transitionId"].as_str().unwrap()).unwrap()
+            };
+            let creation_reference = super::load_historical_control_evidence(
+                &mut tx,
+                &authority,
+                cid,
+                creation_transition_id,
+            )
+            .await
+            .expect("creation evidence loads")
+            .into_transition()
+            .expect("creation is a transition");
+            let creation_authority = creation_reference.signed_authority().unwrap();
+            assert!(!recovery_acceptance_authority_matches_durable(
+                &creation_reference,
+                creation_reference.transition_id(),
+                creation_reference.received_at(),
+                creation_authority.control_conversation_id().unwrap(),
+                creation_authority.actor(),
+                creation_authority.key_id(),
+                creation_authority.auth_generation(),
+                creation_authority.signed_request_bytes(),
+                creation_authority.transcript_bytes(),
+                creation_authority.request_digest(),
+                creation_authority.signature(),
+            ));
+            let package_sha = Sha256::digest(&acceptance.key_package_wrapper).to_vec();
+            assert!(acceptance_recovery_package_artifact_matches(
+                &reference,
+                &acceptance.key_package_wrapper,
+                &package_sha,
+            ));
+            let mut wrong_wrapper = acceptance.key_package_wrapper.clone();
+            wrong_wrapper[0] ^= 1;
+            assert!(!acceptance_recovery_package_artifact_matches(
+                &reference,
+                &wrong_wrapper,
+                &package_sha,
+            ));
+            let mut wrong_wrapper_sha = package_sha.clone();
+            wrong_wrapper_sha[0] ^= 1;
+            assert!(!acceptance_recovery_package_artifact_matches(
+                &reference,
+                &acceptance.key_package_wrapper,
+                &wrong_wrapper_sha,
+            ));
             let (requests, reservations) =
                 load_recovery_work_hydration_rows(&mut tx, &authority, cid)
                     .await
@@ -7025,7 +7232,7 @@ mod historical_control_loader {
                 &aggregate_authority,
                 aggregate.clone(),
             )
-            .expect("production aggregate accepts genuine acceptance-origin recovery");
+            .expect("recovery-validator aggregate accepts genuine acceptance-origin recovery");
 
             let mut wrong_request_id = aggregate.clone();
             let foreign_request_id = *Uuid::new_v4().as_bytes();
@@ -7039,7 +7246,7 @@ mod historical_control_loader {
                 Err(crate::chat_protocol::state_machine::StateMachineError::InvariantViolation)
             ));
 
-            let mut wrong_package = aggregate;
+            let mut wrong_package = aggregate.clone();
             let foreign_package_ref: [u8; 32] =
                 Sha256::digest(b"foreign-acceptance-package").into();
             wrong_package.recovery_requests[0].key_package_ref = foreign_package_ref;
@@ -7048,6 +7255,74 @@ mod historical_control_loader {
                 crate::chat_protocol::state_machine::hydrate_conversation_state(
                     &aggregate_authority,
                     wrong_package,
+                ),
+                Err(crate::chat_protocol::state_machine::StateMachineError::InvariantViolation)
+            ));
+
+            let exact_coordinate = &aggregate.recovery_requests[0].bound_coordinate;
+            let stale_successor = PublicGroupSnapshotCoordinate::new(
+                *exact_coordinate.conversation_id(),
+                exact_coordinate.generation(),
+                exact_coordinate.state_version() - 1,
+                *exact_coordinate.group_id(),
+                exact_coordinate.epoch(),
+                *exact_coordinate.group_context_hash(),
+                *exact_coordinate.confirmation_tag(),
+                exact_coordinate.lifecycle(),
+            );
+            let mut wrong_successor = aggregate.clone();
+            wrong_successor.recovery_requests[0].bound_coordinate = stale_successor.clone();
+            wrong_successor.recovery_reservations[0].bound_coordinate = stale_successor;
+            assert!(matches!(
+                crate::chat_protocol::state_machine::hydrate_conversation_state(
+                    &aggregate_authority,
+                    wrong_successor,
+                ),
+                Err(crate::chat_protocol::state_machine::StateMachineError::InvariantViolation)
+            ));
+
+            let mut wrong_target = aggregate.clone();
+            let foreign_target =
+                DeviceIdentity::new(target.principal().clone(), *Uuid::new_v4().as_bytes())
+                    .unwrap();
+            wrong_target.recovery_requests[0].target = foreign_target.clone();
+            wrong_target.recovery_reservations[0].target = foreign_target;
+            assert!(matches!(
+                crate::chat_protocol::state_machine::hydrate_conversation_state(
+                    &aggregate_authority,
+                    wrong_target,
+                ),
+                Err(crate::chat_protocol::state_machine::StateMachineError::InvariantViolation)
+            ));
+
+            let mut wrong_expiry = aggregate.clone();
+            let early_expiry =
+                ServerTimestamp::from_canonical_stored("2030-01-01T00:04:59.000Z").unwrap();
+            wrong_expiry.recovery_requests[0].expires_at = early_expiry;
+            wrong_expiry.recovery_reservations[0].expires_at = early_expiry;
+            assert!(matches!(
+                crate::chat_protocol::state_machine::hydrate_conversation_state(
+                    &aggregate_authority,
+                    wrong_expiry,
+                ),
+                Err(crate::chat_protocol::state_machine::StateMachineError::InvariantViolation)
+            ));
+
+            let mut wrong_invitation = aggregate;
+            let invitee_row = wrong_invitation
+                .participants
+                .iter_mut()
+                .find(|participant| participant.principal == *target.principal())
+                .expect("invitee participant");
+            invitee_row
+                .invitation
+                .as_mut()
+                .expect("retained invitation")
+                .inviter = target;
+            assert!(matches!(
+                crate::chat_protocol::state_machine::hydrate_conversation_state(
+                    &aggregate_authority,
+                    wrong_invitation,
                 ),
                 Err(crate::chat_protocol::state_machine::StateMachineError::InvariantViolation)
             ));

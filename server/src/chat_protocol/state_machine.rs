@@ -3597,6 +3597,32 @@ pub(crate) fn classify_acceptance(
     Ok(evidence)
 }
 
+/// Compare the KeyPackage artifact retained by a durable reservation/package
+/// row with the artifact signed into an already reverified participant
+/// acceptance. This is a read-only drift fence; it neither constructs nor
+/// relaxes transition evidence.
+#[allow(dead_code)] // wired by recovery-work hydration.
+pub(crate) fn acceptance_recovery_package_artifact_matches(
+    evidence: &TransitionEvidence,
+    durable_wrapper: &[u8],
+    durable_wrapper_sha256: &[u8],
+) -> bool {
+    let Ok(durable_wrapper_sha256) = <[u8; 32]>::try_from(durable_wrapper_sha256) else {
+        return false;
+    };
+    validate_transition_evidence(evidence)
+        && matches!(
+            evidence.body_binding.as_ref(),
+            Some(TransitionBodyBinding::Acceptance { recovery, .. })
+                if !durable_wrapper.is_empty()
+                    && <[u8; 32]>::from(Sha256::digest(durable_wrapper))
+                        == durable_wrapper_sha256
+                    && recovery.key_package_wrapper == durable_wrapper
+                    && recovery.key_package_wrapper_sha256 == durable_wrapper_sha256
+                    && recovery.canonical_digest != [0; 32]
+        )
+}
+
 /// Read-time authority that re-mints sealed evidence for HISTORICAL graph rows
 /// during existing-conversation hydration (G1b). It is a DISTINCT, non-
 /// substitutable counterpart of `HydrationAuthority` (OQ-G1-3 ruling (a)): the
