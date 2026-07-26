@@ -3772,9 +3772,11 @@ pub(crate) fn resolve_single_terminal_candidate<T>(
     }
 }
 
-/// Reconstruct one terminal-family evidence arm from its exact durable
-/// provenance. Further terminal arms extend this dispatcher; callers never
-/// construct `WorkTerminalHydrationRow` evidence directly.
+/// Reconstruct one terminal-family evidence arm from its verified source.
+/// Evidence-bearing arms re-read or re-verify their exact durable provenance.
+/// For Expiry, the owning B-E loader remains responsible for selecting the
+/// persisted timestamp; this dispatcher validates and preserves that timestamp
+/// as the typed terminal arm. Callers never construct evidence directly.
 #[allow(dead_code)]
 pub(crate) async fn load_work_terminal_hydration_row(
     transaction: &mut Transaction<'_, Postgres>,

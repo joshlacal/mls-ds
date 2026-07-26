@@ -4093,7 +4093,10 @@ mod historical_control_loader {
     // durable field and return evidence byte-equal to append-time admission.
     // -----------------------------------------------------------------------
     mod terminal_family_atom {
-        use base64::{engine::general_purpose::STANDARD, Engine};
+        use base64::{
+            engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+            Engine,
+        };
         use chrono::{DateTime, Utc};
         use ed25519_dalek::{Signer, SigningKey};
         use serde_json::{json, Value};
@@ -4115,6 +4118,14 @@ mod historical_control_loader {
             load_work_terminal_hydration_row, resolve_single_terminal_candidate,
             WorkTerminalHydrationError, WorkTerminalLocator, WorkTerminalRequestSource,
         };
+        use crate::chat_protocol::repository::{
+            delivery::{append_entry_at, AppendEntry},
+            transition::{
+                cas_conversation_head, cas_registration_revoke, insert_device_revocation,
+                terminalize_leave_request, ConversationHeadCas, LeaveRequestTermination,
+                NewDeviceRevocation, RegistrationRevoke,
+            },
+        };
         use crate::chat_protocol::state_machine::{
             DurableSignedRequestEnvelope, HistoricalRehydrationAuthority, HydrationAuthority,
             RequestEntryKind, ServerTimestamp, WorkTerminalHydrationRow,
@@ -4132,6 +4143,7 @@ mod historical_control_loader {
 
         struct RealDeviceRevocation {
             revocation_id: Uuid,
+            target_device_id: Uuid,
             raw_wrapper: Vec<u8>,
             signing_transcript: Vec<u8>,
             request_digest: Vec<u8>,
@@ -4144,7 +4156,10 @@ mod historical_control_loader {
                 .with_timezone(&Utc)
         }
 
-        fn build_real_device_revocation(entry: &RealCreationEntry) -> RealDeviceRevocation {
+        fn build_real_device_revocation(
+            entry: &RealCreationEntry,
+            target_device_id: Uuid,
+        ) -> RealDeviceRevocation {
             let signing_key = SigningKey::from_bytes(&[0x24; 32]);
             let verifying = signing_key.verifying_key().to_bytes();
             assert_eq!(entry.public_key, verifying);
@@ -4163,7 +4178,7 @@ mod historical_control_loader {
                 "actorDeviceId": entry.actor_device_id.hyphenated().to_string(),
                 "keyId": entry.actor_key_id,
                 "authGeneration": 1,
-                "targetDeviceId": entry.actor_device_id.hyphenated().to_string(),
+                "targetDeviceId": target_device_id.hyphenated().to_string(),
                 "targetAuthGeneration": 1,
                 "idempotencyKey": revocation_id.hyphenated().to_string(),
                 "signedAt": SIGNED_AT,
@@ -4182,6 +4197,7 @@ mod historical_control_loader {
 
             RealDeviceRevocation {
                 revocation_id,
+                target_device_id,
                 raw_wrapper,
                 request_digest: Sha256::digest(&signing_transcript).to_vec(),
                 signature: signature.to_vec(),
@@ -4189,7 +4205,59 @@ mod historical_control_loader {
             }
         }
 
-        async fn insert_device_revocation(
+        async fn seed_revocation_target_device(pool: &PgPool, entry: &RealCreationEntry) -> Uuid {
+            let target_device_id = Uuid::new_v4();
+            let mut target_secret = [0_u8; 32];
+            target_secret[..16].copy_from_slice(target_device_id.as_bytes());
+            target_secret[16..].copy_from_slice(Uuid::new_v4().as_bytes());
+            let target_public_key = SigningKey::from_bytes(&target_secret)
+                .verifying_key()
+                .to_bytes();
+            let target_key_id = ed25519_key_id(&target_public_key)
+                .unwrap()
+                .as_str()
+                .to_owned();
+            let target_dpop_jkt =
+                URL_SAFE_NO_PAD.encode(Sha256::digest(target_device_id.as_bytes()));
+            let created_at = instant("2030-02-28T00:00:00.000Z");
+
+            let mut tx = pool.begin().await.expect("begin target registration");
+            sqlx::query(
+                r#"INSERT INTO chat.devices(
+                    user_did,device_id,device_name,status,dpop_jkt,auth_generation,
+                    capabilities,created_at,updated_at
+                ) VALUES($1,$2,'terminal-revocation-target','active',$3,1,
+                    chat.protocol_capabilities(),$4,$4)"#,
+            )
+            .bind(&entry.actor_did)
+            .bind(target_device_id)
+            .bind(target_dpop_jkt)
+            .bind(created_at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert isolated target device");
+            sqlx::query(
+                r#"INSERT INTO chat.device_keys(
+                    user_did,device_id,key_id,signing_public_key,
+                    enrollment_auth_generation,created_at
+                ) VALUES($1,$2,$3,$4,1,$5)"#,
+            )
+            .bind(&entry.actor_did)
+            .bind(target_device_id)
+            .bind(target_key_id)
+            .bind(target_public_key.to_vec())
+            .bind(created_at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert isolated target device key");
+            tx.commit()
+                .await
+                .expect("commit isolated target registration");
+
+            target_device_id
+        }
+
+        async fn insert_uncommitted_device_revocation_fixture(
             transaction: &mut Transaction<'_, Postgres>,
             entry: &RealCreationEntry,
             revocation: &RealDeviceRevocation,
@@ -4220,6 +4288,76 @@ mod historical_control_loader {
             .expect("insert exact durable device revocation");
         }
 
+        async fn commit_device_revocation_footprint(
+            pool: &PgPool,
+            entry: &RealCreationEntry,
+            revocation: &RealDeviceRevocation,
+        ) {
+            let accepted_at = instant(ACCEPTED_AT);
+            let mut tx = pool.begin().await.expect("begin complete revocation");
+
+            insert_device_revocation(
+                &mut tx,
+                &NewDeviceRevocation {
+                    revocation_id: revocation.revocation_id,
+                    actor_did: entry.actor_did.clone(),
+                    actor_device_id: entry.actor_device_id,
+                    actor_key_id: entry.actor_key_id.clone(),
+                    actor_auth_generation: 1,
+                    target_did: entry.actor_did.clone(),
+                    target_device_id: revocation.target_device_id,
+                    target_auth_generation: 1,
+                    accepted_request_bytes: revocation.raw_wrapper.clone(),
+                    signing_transcript_bytes: revocation.signing_transcript.clone(),
+                    request_digest: revocation.request_digest.clone(),
+                    signature: revocation.signature.clone(),
+                    signed_at: instant(SIGNED_AT),
+                    accepted_at,
+                },
+            )
+            .await
+            .expect("production revocation row writer");
+            cas_registration_revoke(
+                &mut tx,
+                &RegistrationRevoke {
+                    target_did: entry.actor_did.clone(),
+                    target_device_id: revocation.target_device_id,
+                    expected_auth_generation: 1,
+                    revocation_id: revocation.revocation_id,
+                    revoked_at: accepted_at,
+                },
+            )
+            .await
+            .expect("production registration revoke writer");
+
+            let response_bytes = b"terminal-family-revoke-ok".to_vec();
+            sqlx::query(
+                r#"INSERT INTO chat.idempotency_records(
+                    principal_did,endpoint_nsid,operation_id,request_digest,
+                    accepted_request_bytes,signing_transcript_bytes,signature,
+                    completed_status,response_bytes,response_sha256,event_position,
+                    historical_jkt,current_jkt,completed_at
+                ) VALUES($1,'blue.catbird.chat.revokeDevice',$2,$3,$4,$5,$6,200,$7,$8,NULL,$9,NULL,$10)"#,
+            )
+            .bind(&entry.actor_did)
+            .bind(revocation.revocation_id)
+            .bind(&revocation.request_digest)
+            .bind(&revocation.raw_wrapper)
+            .bind(&revocation.signing_transcript)
+            .bind(&revocation.signature)
+            .bind(&response_bytes)
+            .bind(Sha256::digest(&response_bytes).to_vec())
+            .bind(&entry.actor_key_id)
+            .bind(accepted_at)
+            .execute(&mut *tx)
+            .await
+            .expect("exact revokeDevice completion receipt");
+
+            tx.commit()
+                .await
+                .expect("commit complete production-valid revocation footprint");
+        }
+
         #[tokio::test]
         #[ignore = "requires the dedicated gate database"]
         async fn device_revocation_terminal_reconstructs_the_exact_verified_row() {
@@ -4227,7 +4365,8 @@ mod historical_control_loader {
             let cid = Uuid::new_v4();
             let entry = build_real_creation_entry(*cid.as_bytes());
             seed_real_creation_graph(&pool, &entry).await;
-            let revocation = build_real_device_revocation(&entry);
+            let target_device_id = seed_revocation_target_device(&pool, &entry).await;
+            let revocation = build_real_device_revocation(&entry, target_device_id);
 
             let mutation =
                 decode_and_verify_signed_mutation(&revocation.raw_wrapper, &entry.public_key)
@@ -4242,8 +4381,12 @@ mod historical_control_loader {
             let authority =
                 HistoricalRehydrationAuthority::new(entry.cid, entry.head_next_entry_seq).unwrap();
 
-            let mut tx = pool.begin().await.expect("begin");
-            insert_device_revocation(&mut tx, &entry, &revocation, 1, &revocation.signature).await;
+            commit_device_revocation_footprint(&pool, &entry, &revocation).await;
+
+            let mut tx = pool
+                .begin()
+                .await
+                .expect("begin fresh hydration transaction");
             let loaded = load_work_terminal_hydration_row(
                 &mut tx,
                 &authority,
@@ -4254,9 +4397,7 @@ mod historical_control_loader {
             )
             .await
             .expect("device revocation terminal reconstructs");
-            tx.rollback()
-                .await
-                .expect("rollback deferred fixture graph");
+            tx.commit().await.expect("commit read transaction");
 
             assert_eq!(
                 loaded,
@@ -4272,14 +4413,21 @@ mod historical_control_loader {
             let cid = Uuid::new_v4();
             let entry = build_real_creation_entry(*cid.as_bytes());
             seed_real_creation_graph(&pool, &entry).await;
-            let revocation = build_real_device_revocation(&entry);
+            let revocation = build_real_device_revocation(&entry, entry.actor_device_id);
             let authority =
                 HistoricalRehydrationAuthority::new(entry.cid, entry.head_next_entry_seq).unwrap();
             let mut tampered_signature = revocation.signature.clone();
             tampered_signature[0] ^= 0x01;
 
             let mut tx = pool.begin().await.expect("begin");
-            insert_device_revocation(&mut tx, &entry, &revocation, 1, &tampered_signature).await;
+            insert_uncommitted_device_revocation_fixture(
+                &mut tx,
+                &entry,
+                &revocation,
+                1,
+                &tampered_signature,
+            )
+            .await;
             let loaded = load_work_terminal_hydration_row(
                 &mut tx,
                 &authority,
@@ -4306,12 +4454,19 @@ mod historical_control_loader {
             let cid = Uuid::new_v4();
             let entry = build_real_creation_entry(*cid.as_bytes());
             seed_real_creation_graph(&pool, &entry).await;
-            let revocation = build_real_device_revocation(&entry);
+            let revocation = build_real_device_revocation(&entry, entry.actor_device_id);
             let authority =
                 HistoricalRehydrationAuthority::new(entry.cid, entry.head_next_entry_seq).unwrap();
 
             let mut tx = pool.begin().await.expect("begin");
-            insert_device_revocation(&mut tx, &entry, &revocation, 2, &revocation.signature).await;
+            insert_uncommitted_device_revocation_fixture(
+                &mut tx,
+                &entry,
+                &revocation,
+                2,
+                &revocation.signature,
+            )
+            .await;
             let loaded = load_work_terminal_hydration_row(
                 &mut tx,
                 &authority,
@@ -4366,7 +4521,7 @@ mod historical_control_loader {
 
         #[tokio::test]
         #[ignore = "requires the dedicated gate database"]
-        async fn expiry_terminal_carries_only_the_exact_persisted_server_timestamp() {
+        async fn expiry_terminal_preserves_only_the_typed_timestamp_arm() {
             let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(1).await;
             let cid = Uuid::new_v4();
             let authority = HistoricalRehydrationAuthority::new(*cid.as_bytes(), 2).unwrap();
@@ -4456,14 +4611,20 @@ mod historical_control_loader {
             let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(2).await;
             let cid = Uuid::new_v4();
             let entry = build_real_creation_entry(*cid.as_bytes());
-            seed_real_creation_graph(&pool, &entry).await;
+            let leave = seed_control_request(
+                &pool,
+                &entry,
+                SignedMutationKind::LeaveRequest,
+                LEAVE_ENTRY_KIND,
+            )
+            .await;
             let cancellation = build_real_control_request_entry(
                 &entry,
                 SignedMutationKind::LeaveCancellation,
                 CANCELLATION_ENTRY_KIND,
-                2,
+                3,
             );
-            let authority = HistoricalRehydrationAuthority::new(entry.cid, 3).unwrap();
+            let authority = HistoricalRehydrationAuthority::new(entry.cid, 4).unwrap();
             let expected = authority
                 .hydrate_historical_control_from_durable_bytes(
                     cancellation.public_row_json.clone(),
@@ -4476,37 +4637,66 @@ mod historical_control_loader {
 
             let mut tx = pool.begin().await.expect("begin");
             let payload_sha = Sha256::digest(&cancellation.public_row_json).to_vec();
-            sqlx::query(
-                r#"INSERT INTO chat.entries(
-                    conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,
-                    accepted_payload_sha256,signed_request_bytes,request_digest,signature,
-                    server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,
-                    actor_key_id,actor_auth_generation,generation,state_version,transition_id,received_at
-                ) VALUES($1,2,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,1,NULL,NULL,NULL,$14)"#,
+            cas_conversation_head(
+                &mut tx,
+                &ConversationHeadCas {
+                    conversation_id: cid,
+                    expected_generation: 0,
+                    expected_state_version: 0,
+                    expected_next_entry_seq: 3,
+                    successor_generation: 0,
+                    successor_state_version: 0,
+                    successor_next_entry_seq: 4,
+                    close: None,
+                },
             )
-            .bind(cid)
-            .bind(cancellation.entry_id)
-            .bind(CANCELLATION_ENTRY_KIND)
-            .bind(&cancellation.public_row_json)
-            .bind(&payload_sha)
-            .bind(&cancellation.raw_wrapper)
-            .bind(&cancellation.request_digest)
-            .bind(&cancellation.signature)
-            .bind(vec![0_u8])
-            .bind(&cancellation.outer_entry_fingerprint)
-            .bind(&entry.actor_did)
-            .bind(entry.actor_device_id)
-            .bind(&entry.actor_key_id)
-            .bind(instant("2030-02-01T00:00:00.000Z"))
-            .execute(&mut *tx)
             .await
-            .expect("insert cancellation control entry");
-            sqlx::query("UPDATE chat.conversations SET next_entry_seq=3 WHERE conversation_id=$1")
-                .bind(cid)
-                .execute(&mut *tx)
+            .expect("production head CAS");
+            append_entry_at(
+                &mut tx,
+                &AppendEntry {
+                    conversation_id: cid,
+                    entry_id: cancellation.entry_id,
+                    entry_kind: CANCELLATION_ENTRY_KIND.to_owned(),
+                    accepted_payload_bytes: cancellation.public_row_json.clone(),
+                    accepted_payload_sha256: payload_sha,
+                    signed_request_bytes: cancellation.raw_wrapper.clone(),
+                    request_digest: cancellation.request_digest.clone(),
+                    signature: cancellation.signature.clone(),
+                    server_fields_bytes: vec![0_u8],
+                    outer_entry_fingerprint: cancellation.outer_entry_fingerprint.clone(),
+                    actor_did: entry.actor_did.clone(),
+                    actor_device_id: entry.actor_device_id,
+                    actor_key_id: entry.actor_key_id.clone(),
+                    actor_auth_generation: 1,
+                    generation: None,
+                    state_version: None,
+                    transition_id: None,
+                    message_id: None,
+                    received_at: instant("2030-02-01T00:00:00.000Z"),
+                },
+                3,
+            )
+            .await
+            .expect("production cancellation entry writer");
+            terminalize_leave_request(
+                &mut tx,
+                Uuid::from_bytes(leave.request_id),
+                &LeaveRequestTermination::Cancelled {
+                    terminal_request_digest: cancellation.request_digest.clone(),
+                    terminal_at: instant("2030-02-01T00:00:00.000Z"),
+                },
+            )
+            .await
+            .expect("production cancelled leave writer");
+            tx.commit()
                 .await
-                .expect("advance head in cancellation fixture");
+                .expect("commit complete production-valid cancelled leave mapping");
 
+            let mut tx = pool
+                .begin()
+                .await
+                .expect("begin fresh hydration transaction");
             let loaded = load_work_terminal_hydration_row(
                 &mut tx,
                 &authority,
@@ -4521,9 +4711,7 @@ mod historical_control_loader {
             )
             .await
             .expect("leave cancellation terminal reconstructs");
-            tx.rollback()
-                .await
-                .expect("rollback deferred fixture graph");
+            tx.commit().await.expect("commit read transaction");
 
             assert_eq!(loaded, WorkTerminalHydrationRow::Request(expected));
         }
@@ -4722,6 +4910,55 @@ mod historical_control_loader {
                 result,
                 Err(WorkTerminalHydrationError::InvalidEvidence)
             ));
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn signed_request_terminal_fails_closed_on_foreign_conversation_binding() {
+            let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(1).await;
+            let signed_conversation_id = Uuid::new_v4();
+            let foreign_conversation_id = Uuid::new_v4();
+            let signing_key = SigningKey::from_bytes(&[0x42; 32]);
+            let verifying_key = signing_key.verifying_key().to_bytes();
+            let actor = sample_actor();
+            let coordinate = sample_coordinate(*signed_conversation_id.as_bytes());
+            let raw = all_signed_request_wrappers(&coordinate, &actor, &signing_key)
+                .into_iter()
+                .next()
+                .expect("real signed leaf-recovery request");
+            let verified = decode_and_verify_signed_mutation(&raw, &verifying_key)
+                .expect("foreign-bound fixture is genuinely signed");
+            let signing_transcript = verified.transcript_bytes().to_vec();
+            let request_digest = *verified.request_digest();
+            let signature = *verified.signature();
+            let foreign_authority =
+                HistoricalRehydrationAuthority::new(*foreign_conversation_id.as_bytes(), 2)
+                    .unwrap();
+
+            let mut tx = pool.begin().await.expect("begin");
+            let result = load_work_terminal_hydration_row(
+                &mut tx,
+                &foreign_authority,
+                foreign_conversation_id,
+                WorkTerminalLocator::Request {
+                    kind: RequestEntryKind::LeafRecoveryRequest,
+                    source: WorkTerminalRequestSource::Signed {
+                        received_at: instant(SIGNED_REQUEST_RECEIVED_AT),
+                        signed_request_bytes: &raw,
+                        signing_transcript_bytes: &signing_transcript,
+                        request_digest,
+                        signature,
+                        signing_public_key: &verifying_key,
+                    },
+                },
+            )
+            .await;
+            tx.rollback().await.expect("rollback");
+
+            assert!(
+                matches!(result, Err(WorkTerminalHydrationError::InvalidEvidence)),
+                "a genuinely signed request cannot cross its embedded conversation binding",
+            );
         }
 
         #[test]
