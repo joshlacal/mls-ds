@@ -21,12 +21,13 @@ use super::repository::auth::{BusinessAuthorityGuard, RepositoryAuthorityClass};
 use super::repository::core::{
     LockedConversationHeadGuard, LockedConversationStateGuard, LockedDirectConversationLookupGuard,
     LockedDirectLookupOutcome, LockedInvitationQuotaGuard, LockedRecoveryPackageGuard,
-    LockedRecoveryPackageStatus, LockedRecoveryPackageUse,
+    LockedRecoveryPackageStatus, LockedRecoveryPackageUse, LockedWelcomeClientAuthorization,
+    LockedWelcomeGuard, LockedWelcomeTerminal,
 };
 #[cfg(not(test))]
 use super::repository::core::{
     LockedRevocationFanoutGuard, LockedRevocationPackageGuard, LockedRevocationTargetGuard,
-    LockedRevocationTargetStatus, LockedWelcomeGuard,
+    LockedRevocationTargetStatus,
 };
 use super::repository::relationship::{
     consume_locked_acceptance_projection, consume_locked_creation_projection,
@@ -1086,6 +1087,18 @@ impl RequestEvidence {
 
     pub(crate) fn durable_row_digest(&self) -> &[u8; 32] {
         &self.durable_row_digest
+    }
+
+    pub(crate) fn request_digest(&self) -> &[u8; 32] {
+        &self.request_digest
+    }
+
+    pub(crate) fn signature(&self) -> &[u8; 64] {
+        &self.signature
+    }
+
+    pub(crate) fn signed_request_bytes(&self) -> &[u8] {
+        &self.signed_request_bytes
     }
 
     pub(crate) fn signed_authority(&self) -> Option<&AuthenticatedEntryEvidence> {
@@ -2854,9 +2867,153 @@ impl HydrationAuthority {
             .bind_recovery_package_cas(package_cas)
     }
 
+    /// Authenticate and exact-bind one signed Welcome endpoint request before
+    /// acting on the repository's closed pending/terminal classification.
+    pub(crate) fn compose_welcome_terminal(
+        &self,
+        locked: &LockedConversationStateGuard,
+        envelope: DurableSignedRequestEnvelope,
+        mutation: VerifiedSignedMutation,
+        registration: LockedRegistrationProjection,
+        classification: LockedWelcomeTerminal,
+    ) -> Result<WelcomeTerminalPlan, StateMachineError> {
+        match classification {
+            LockedWelcomeTerminal::PendingNotDue(guard) => {
+                let plan = match mutation.kind() {
+                    SignedMutationKind::WelcomeAcknowledgement => self
+                        .plan_welcome_acknowledgement_entry(
+                            locked,
+                            envelope,
+                            mutation,
+                            registration,
+                            guard,
+                        )?,
+                    SignedMutationKind::WelcomeRejection => self.plan_welcome_rejection_entry(
+                        locked,
+                        envelope,
+                        mutation,
+                        registration,
+                        guard,
+                    )?,
+                    _ => return Err(StateMachineError::InvalidHydrationAuthority),
+                };
+                Ok(WelcomeTerminalPlan::Planned(plan))
+            }
+            LockedWelcomeTerminal::PendingDue(guard) => {
+                let evidence = self.signed_request(envelope, mutation)?;
+                if !registration.authorizes(&evidence)
+                    || registration.transaction_id() != locked.head().transaction_id()
+                    || registration.transaction_id() != guard.transaction_id()
+                    || registration.trusted_read_at() != evidence.received_at()
+                    || ServerTimestamp::from_unix_millis(guard.locked_at().timestamp_millis())?
+                        != evidence.received_at()
+                    || !welcome_endpoint_matches(
+                        &evidence,
+                        guard.welcome_id().as_bytes(),
+                        guard.recipient_did().as_bytes(),
+                        guard.recipient_device_id().as_bytes(),
+                        guard.coordinate(),
+                        guard.transition_seq(),
+                    )
+                {
+                    return Err(StateMachineError::InvalidHydrationAuthority);
+                }
+                Ok(WelcomeTerminalPlan::DueExpiry(
+                    self.plan_welcome_expiry_entry(locked, guard)?,
+                ))
+            }
+            terminal => {
+                let accepted_wrapper = mutation
+                    .accepted_wrapper_bytes()
+                    .ok_or(StateMachineError::InvalidHydrationAuthority)?
+                    .to_vec();
+                let transcript = mutation.transcript_bytes().to_vec();
+                let request_digest = *mutation.request_digest();
+                let signature = *mutation.signature();
+                let evidence = self.signed_request(envelope, mutation)?;
+                let (transaction_id, locked_at, row, stored_authorization, stored_kind) =
+                    match &terminal {
+                        LockedWelcomeTerminal::Acknowledged {
+                            transaction_id,
+                            locked_at,
+                            row,
+                            authorization,
+                            ..
+                        } => (
+                            transaction_id,
+                            *locked_at,
+                            row,
+                            Some(authorization),
+                            Some(RequestEntryKind::WelcomeAcknowledgement),
+                        ),
+                        LockedWelcomeTerminal::Rejected {
+                            transaction_id,
+                            locked_at,
+                            row,
+                            authorization,
+                            ..
+                        } => (
+                            transaction_id,
+                            *locked_at,
+                            row,
+                            Some(authorization),
+                            Some(RequestEntryKind::WelcomeRejection),
+                        ),
+                        LockedWelcomeTerminal::Expired {
+                            transaction_id,
+                            locked_at,
+                            row,
+                            ..
+                        }
+                        | LockedWelcomeTerminal::SupersededByTransition {
+                            transaction_id,
+                            locked_at,
+                            row,
+                            ..
+                        }
+                        | LockedWelcomeTerminal::SupersededByRevocation {
+                            transaction_id,
+                            locked_at,
+                            row,
+                            ..
+                        } => (transaction_id, *locked_at, row, None, None),
+                        LockedWelcomeTerminal::PendingNotDue(_)
+                        | LockedWelcomeTerminal::PendingDue(_) => unreachable!(),
+                    };
+                if !registration.authorizes(&evidence)
+                    || registration.transaction_id() != locked.head().transaction_id()
+                    || registration.transaction_id() != transaction_id
+                    || registration.trusted_read_at() != evidence.received_at()
+                    || ServerTimestamp::from_unix_millis(locked_at.timestamp_millis())?
+                        != evidence.received_at()
+                    || !welcome_endpoint_matches(
+                        &evidence,
+                        &row.welcome_id,
+                        row.recipient.principal().as_bytes(),
+                        row.recipient.device_id(),
+                        &row.coordinate,
+                        row.transition_seq,
+                    )
+                {
+                    return Err(StateMachineError::InvalidHydrationAuthority);
+                }
+                let exact_replay = stored_kind == Some(evidence.kind())
+                    && stored_authorization.is_some_and(|stored| {
+                        stored.signed_request_bytes() == accepted_wrapper
+                            && stored.signing_transcript_bytes() == transcript
+                            && stored.request_digest() == &request_digest
+                            && stored.signature() == &signature
+                    });
+                Ok(WelcomeTerminalPlan::Terminal {
+                    classification: terminal,
+                    exact_replay,
+                })
+            }
+        }
+    }
+
     /// Consume a signed, non-control Welcome acknowledgement together with
     /// the recipient's active registration and the exact Pending Welcome row.
-    #[cfg(not(test))]
     pub(crate) fn plan_welcome_acknowledgement_entry(
         &self,
         locked: &LockedConversationStateGuard,
@@ -2878,7 +3035,6 @@ impl HydrationAuthority {
 
     /// Consume a signed, non-control Welcome rejection under the same exact
     /// row/registration authority used by acknowledgement.
-    #[cfg(not(test))]
     pub(crate) fn plan_welcome_rejection_entry(
         &self,
         locked: &LockedConversationStateGuard,
@@ -2898,7 +3054,6 @@ impl HydrationAuthority {
         )
     }
 
-    #[cfg(not(test))]
     #[allow(clippy::too_many_arguments)]
     fn plan_welcome_response_entry(
         &self,
@@ -2937,7 +3092,6 @@ impl HydrationAuthority {
     /// conversation/head and that exact Pending Welcome in canonical order.
     /// The consumed guard proves both due time and immutable delivery bytes;
     /// there is no direct SQL writer outside this state-machine route.
-    #[cfg(not(test))]
     pub(crate) fn plan_welcome_expiry_entry(
         &self,
         locked: &LockedConversationStateGuard,
@@ -4558,6 +4712,16 @@ impl PersistedSignedRequestRow {
 pub(crate) struct DurableSignedRequestEnvelope {
     conversation_id: [u8; 16],
     received_at: ServerTimestamp,
+}
+
+#[derive(Debug)]
+pub(crate) enum WelcomeTerminalPlan {
+    Planned(PlannedTransition),
+    DueExpiry(PlannedTransition),
+    Terminal {
+        classification: LockedWelcomeTerminal,
+        exact_replay: bool,
+    },
 }
 
 impl DurableSignedRequestEnvelope {
@@ -8142,6 +8306,7 @@ pub(crate) struct WelcomeCasBinding {
     successor_status: WelcomeStatus,
     locked_at: ServerTimestamp,
     locked_row_digest: [u8; 32],
+    seal: [u8; 32],
 }
 
 impl WelcomeCasBinding {
@@ -8186,6 +8351,53 @@ impl WelcomeCasBinding {
     }
     pub(crate) fn locked_row_digest(&self) -> &[u8; 32] {
         &self.locked_row_digest
+    }
+
+    pub(crate) fn verify_seal(&self) -> bool {
+        self.seal == welcome_cas_seal(self)
+    }
+}
+
+fn welcome_cas_seal(binding: &WelcomeCasBinding) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"CATBIRD-CHAT-WELCOME-CAS-BINDING\0");
+    digest.update((binding.transaction_id.len() as u64).to_be_bytes());
+    digest.update(binding.transaction_id.as_bytes());
+    digest.update(binding.conversation_id);
+    digest.update(binding.welcome_id);
+    digest.update((binding.recipient.principal().as_bytes().len() as u64).to_be_bytes());
+    digest.update(binding.recipient.principal().as_bytes());
+    digest.update(binding.recipient.device_id());
+    digest.update(binding.transition_seq.to_be_bytes());
+    digest.update(binding.coordinate.conversation_id());
+    digest.update(binding.coordinate.generation().to_be_bytes());
+    digest.update(binding.coordinate.state_version().to_be_bytes());
+    digest.update(binding.coordinate.group_id());
+    digest.update(binding.coordinate.epoch().to_be_bytes());
+    digest.update(binding.coordinate.group_context_hash());
+    digest.update(binding.coordinate.confirmation_tag());
+    digest.update([match binding.coordinate.lifecycle() {
+        PublicGroupSnapshotLifecycle::Active => 1,
+        PublicGroupSnapshotLifecycle::Superseded => 2,
+    }]);
+    digest.update(binding.recovery_request_id);
+    digest.update(binding.key_package_ref);
+    digest.update(binding.opaque_welcome_sha256);
+    digest.update(binding.expires_at.unix_millis().to_be_bytes());
+    digest.update([welcome_status_code(binding.expected_status)]);
+    digest.update([welcome_status_code(binding.successor_status)]);
+    digest.update(binding.locked_at.unix_millis().to_be_bytes());
+    digest.update(binding.locked_row_digest);
+    digest.finalize().into()
+}
+
+fn welcome_status_code(status: WelcomeStatus) -> u8 {
+    match status {
+        WelcomeStatus::Pending => 1,
+        WelcomeStatus::Acknowledged => 2,
+        WelcomeStatus::Rejected => 3,
+        WelcomeStatus::Expired => 4,
+        WelcomeStatus::Superseded => 5,
     }
 }
 
@@ -9290,7 +9502,6 @@ impl PlannedTransition {
         Ok(self)
     }
 
-    #[cfg(not(test))]
     fn bind_welcome_expiry_authority(
         mut self,
         evidence: WelcomeExpiryAuthority,
@@ -9323,7 +9534,6 @@ impl PlannedTransition {
         Ok(self)
     }
 
-    #[cfg(not(test))]
     fn bind_welcome_cas(mut self, binding: WelcomeCasBinding) -> Result<Self, StateMachineError> {
         let exact_edge = self.effects.welcome_changes.iter().any(|change| {
             matches!(
@@ -9346,6 +9556,7 @@ impl PlannedTransition {
             || self.effects.welcome_cas.is_some()
             || binding.expected_status != WelcomeStatus::Pending
             || binding.locked_row_digest == [0; 32]
+            || !binding.verify_seal()
             || self.effects.head_cas.as_ref().is_none_or(|head| {
                 head.transaction_id != binding.transaction_id
                     || head.conversation_id != binding.conversation_id
@@ -10399,7 +10610,30 @@ fn plan_welcome_expiry(
     })
 }
 
-#[cfg(not(test))]
+fn welcome_endpoint_matches(
+    evidence: &RequestEvidence,
+    welcome_id: &[u8; 16],
+    recipient_did: &[u8],
+    recipient_device_id: &[u8; 16],
+    coordinate: &PublicGroupSnapshotCoordinate,
+    transition_seq: u64,
+) -> bool {
+    matches!(
+        evidence.kind(),
+        RequestEntryKind::WelcomeAcknowledgement | RequestEntryKind::WelcomeRejection
+    ) && evidence.request_id() == welcome_id
+        && evidence.conversation_id() == coordinate.conversation_id()
+        && evidence.actor().principal().as_bytes() == recipient_did
+        && evidence.actor().device_id() == recipient_device_id
+        && matches!(
+            evidence.body_binding.as_ref(),
+            Some(RequestBodyBinding::WelcomeResponse {
+                coordinates,
+                transition_seq: signed_transition_seq,
+            }) if coordinates == coordinate && *signed_transition_seq == transition_seq
+        )
+}
+
 fn welcome_cas_from_guard(
     prior: &ConversationState,
     guard: &LockedWelcomeGuard,
@@ -10430,7 +10664,7 @@ fn welcome_cas_from_guard(
     {
         return Err(StateMachineError::InvalidHydrationAuthority);
     }
-    Ok(WelcomeCasBinding {
+    let mut binding = WelcomeCasBinding {
         transaction_id: guard.transaction_id().to_owned(),
         conversation_id: *guard.conversation_id().as_bytes(),
         welcome_id,
@@ -10445,7 +10679,10 @@ fn welcome_cas_from_guard(
         successor_status,
         locked_at,
         locked_row_digest: *guard.durable_row_digest(),
-    })
+        seal: [0; 32],
+    };
+    binding.seal = welcome_cas_seal(&binding);
+    Ok(binding)
 }
 
 fn invitation_quota_cas_from_guard(
@@ -12189,7 +12426,7 @@ pub(crate) fn persistence_plan_for_test(
                 _ => None,
             }
         }) {
-            effects.welcome_cas = Some(WelcomeCasBinding {
+            let mut binding = WelcomeCasBinding {
                 transaction_id: head_cas.transaction_id.clone(),
                 conversation_id: *after.coordinate.conversation_id(),
                 welcome_id: after.welcome_id,
@@ -12204,7 +12441,10 @@ pub(crate) fn persistence_plan_for_test(
                 successor_status: after.status,
                 locked_at: head_cas.locked_at,
                 locked_row_digest: [1u8; 32],
-            });
+                seal: [0; 32],
+            };
+            binding.seal = welcome_cas_seal(&binding);
+            effects.welcome_cas = Some(binding);
         }
     }
     effects.head_cas = Some(head_cas);
@@ -18114,7 +18354,7 @@ mod executor {
         // 3. Terminalize the pending delivery `expired` at its `expires_at`.
         delivery::terminalize_welcome_delivery(
             transaction,
-            welcome_id,
+            welcome_cas,
             &WelcomeDisposition::Expired,
             terminal_at,
             position,
@@ -18679,7 +18919,7 @@ mod executor {
         //    client authorization (+ reason for a rejection).
         delivery::terminalize_welcome_delivery(
             transaction,
-            welcome_id,
+            welcome_cas,
             &disposition,
             applied_at,
             position,
@@ -23633,7 +23873,7 @@ mod executor {
                     terminal_revocation_id,
                 },
             };
-            delivery::terminalize_welcome_delivery(
+            delivery::terminalize_welcome_delivery_for_supersession(
                 transaction,
                 welcome_id,
                 &terminal_disposition,

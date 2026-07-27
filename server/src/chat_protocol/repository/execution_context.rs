@@ -1350,16 +1350,6 @@ pub(crate) async fn hydrate_execution_context(
             vec![event(transaction, kind, payload, recipients).await?]
         }
         (None, None) => Vec::new(),
-        (None, Some(_))
-            if matches!(
-                plan.effects().kind(),
-                PlanKind::WelcomeAcknowledgement
-                    | PlanKind::WelcomeRejection
-                    | PlanKind::WelcomeExpiry
-            ) =>
-        {
-            Vec::new()
-        }
         _ => return Err(ExecutionContextHydrationError::ArtifactMismatch),
     };
 
@@ -1397,10 +1387,12 @@ pub(crate) async fn hydrate_execution_context(
     let (welcome_expiry, welcome_response) = match plan.effects().kind() {
         PlanKind::WelcomeExpiry => {
             let welcome = welcome_change.ok_or(ExecutionContextHydrationError::ArtifactMismatch)?;
-            let payload = artifacts
-                .primary_event_payload
-                .clone()
-                .ok_or(ExecutionContextHydrationError::ArtifactMismatch)?;
+            if artifacts.primary_event_payload.is_some() {
+                return Err(ExecutionContextHydrationError::ArtifactMismatch);
+            }
+            let welcome_id = Uuid::from_bytes(*welcome.welcome_id());
+            let payload =
+                super::delivery::canonical_welcome_disposition_event_payload(welcome_id, "expired");
             (
                 Some(WelcomeExpiryContext {
                     recovery_work_id: Uuid::new_v4(),
@@ -1417,10 +1409,17 @@ pub(crate) async fn hydrate_execution_context(
         }
         PlanKind::WelcomeAcknowledgement | PlanKind::WelcomeRejection => {
             let welcome = welcome_change.ok_or(ExecutionContextHydrationError::ArtifactMismatch)?;
-            let payload = artifacts
-                .primary_event_payload
-                .clone()
-                .ok_or(ExecutionContextHydrationError::ArtifactMismatch)?;
+            if artifacts.primary_event_payload.is_some() {
+                return Err(ExecutionContextHydrationError::ArtifactMismatch);
+            }
+            let welcome_id = Uuid::from_bytes(*welcome.welcome_id());
+            let status = if plan.effects().kind() == PlanKind::WelcomeAcknowledgement {
+                "acknowledged"
+            } else {
+                "rejected"
+            };
+            let payload =
+                super::delivery::canonical_welcome_disposition_event_payload(welcome_id, status);
             let rejection = if plan.effects().kind() == PlanKind::WelcomeRejection {
                 Some(WelcomeRejectionWork {
                     recovery_work_id: Uuid::new_v4(),

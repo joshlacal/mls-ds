@@ -5565,12 +5565,12 @@ mod historical_control_loader {
             load_leaf_hydration_rows, load_leave_request_hydration_rows, load_metadata_provenance,
             load_participant_hydration_rows, load_producer_transition_evidence,
             load_recovery_work_hydration_rows, load_reset_request_hydration_rows,
-            load_welcome_hydration_rows, map_recovery_control_evidence_error,
-            recovery_acceptance_authority_matches_durable, select_fulfilled_recovery_terminal,
-            select_single_acceptance_origin, select_welcome_terminal, ControlEvidenceLoadError,
-            FulfilledRecoveryTerminalColumns, InvitationQuotaHydrationError,
-            LockedConversationHeadGuard, RecoveryHydrationError, RecoveryPackageHydrationError,
-            WelcomeTerminalColumns, WelcomeTerminalSelection,
+            load_welcome_hydration_rows, lock_welcome_terminal,
+            map_recovery_control_evidence_error, recovery_acceptance_authority_matches_durable,
+            select_fulfilled_recovery_terminal, select_single_acceptance_origin,
+            select_welcome_terminal, ControlEvidenceLoadError, FulfilledRecoveryTerminalColumns,
+            InvitationQuotaHydrationError, LockedConversationHeadGuard, RecoveryHydrationError,
+            RecoveryPackageHydrationError, WelcomeTerminalColumns, WelcomeTerminalSelection,
         };
         use crate::chat_protocol::repository::delivery::{
             EntryEntitlementKind, EventEntitlementKind, EventKind, OutboxWorkKind,
@@ -5607,7 +5607,7 @@ mod historical_control_loader {
             RecoveryOriginHydrationRow, RecoveryRequestStatus, RecoverySource, ReservationStatus,
             RevocationPackageCasBinding, RevocationTargetCasBinding, ServerTimestamp,
             SpineArtifacts, TransitionEvidence, WelcomeExpiryAuthority, WelcomeStatus,
-            WorkTerminalHydrationRow,
+            WelcomeTerminalPlan, WorkTerminalHydrationRow,
         };
         use crate::chat_protocol::transcript::{
             decode_and_verify_control_entry, decode_and_verify_signed_mutation,
@@ -7116,9 +7116,42 @@ mod historical_control_loader {
             ExecutionContextArtifacts {
                 accepted_control_entry_bytes: None,
                 genesis_group_info_bytes: None,
-                primary_event_payload: Some(b"welcome-expired-g6".to_vec()),
+                primary_event_payload: None,
                 welcome_disposition_event_payloads: Vec::new(),
             }
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated append-only gate database"]
+        async fn g6_welcome_expiry_rejects_caller_supplied_event_payload() {
+            let pool = g6_gate_pool("Welcome-expiry server-owned payload RED").await;
+            let graph = commit_genuine_policy_acceptance_fulfillment_at(
+                &pool,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+            )
+            .await;
+            let (mut transaction, plan) = begin_g6_welcome_expiry_plan(&pool, &graph).await;
+            let error = hydrate_execution_context(
+                &mut transaction,
+                &plan,
+                ExecutionContextArtifacts {
+                    accepted_control_entry_bytes: None,
+                    genesis_group_info_bytes: None,
+                    primary_event_payload: Some(b"caller-owned-welcome-expiry".to_vec()),
+                    welcome_disposition_event_payloads: Vec::new(),
+                },
+            )
+            .await
+            .expect_err("caller-supplied Welcome terminal payload must be rejected");
+            assert!(matches!(
+                error,
+                ExecutionContextHydrationError::ArtifactMismatch
+            ));
+            transaction
+                .rollback()
+                .await
+                .expect("rollback caller-payload RED");
         }
 
         #[tokio::test]
@@ -10149,6 +10182,36 @@ mod historical_control_loader {
             }
             for (name, sql) in [
                 (
+                    "application_intervals.open",
+                    "SELECT COALESCE(jsonb_agg(to_jsonb(row) \
+                       ORDER BY to_jsonb(row)::text)::text,'[]') \
+                     FROM (SELECT * FROM chat.application_intervals \
+                       WHERE conversation_id=$1 AND terminal_seq IS NULL) row",
+                ),
+                (
+                    "member_devices.active",
+                    "SELECT COALESCE(jsonb_agg(to_jsonb(row) \
+                       ORDER BY to_jsonb(row)::text)::text,'[]') \
+                     FROM (SELECT * FROM chat.member_devices \
+                       WHERE conversation_id=$1 AND active) row",
+                ),
+                (
+                    "participants.current",
+                    "SELECT COALESCE(jsonb_agg(to_jsonb(row) \
+                       ORDER BY to_jsonb(row)::text)::text,'[]') \
+                     FROM (SELECT * FROM chat.participants \
+                       WHERE conversation_id=$1 AND current_membership) row",
+                ),
+            ] {
+                let rows: String = sqlx::query_scalar(sql)
+                    .bind(conversation_id)
+                    .fetch_one(&mut **tx)
+                    .await
+                    .unwrap_or_else(|error| panic!("snapshot chat.{name}: {error}"));
+                snapshot.push((name.to_owned(), rows));
+            }
+            for (name, sql) in [
+                (
                     "welcome_deliveries",
                     "SELECT COALESCE(jsonb_agg(to_jsonb(row) \
                        ORDER BY to_jsonb(row)::text)::text,'[]') \
@@ -11633,10 +11696,355 @@ mod historical_control_loader {
                 .expect("rollback wrong-leaf proof");
         }
 
+        #[derive(Clone, Copy, Eq, PartialEq)]
+        enum G6WelcomeTerminalMode {
+            Acknowledged,
+            Rejected(&'static str),
+            DueExpiry,
+        }
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum G6WelcomeTerminalRequestFailureStage {
+            Decode,
+            Authorization,
+            SignatureVerification,
+            Compositor,
+        }
+
+        struct G6WelcomeTerminalRequestNegative {
+            label: &'static str,
+            endpoint: &'static str,
+            raw_request: Vec<u8>,
+            expected_stage: G6WelcomeTerminalRequestFailureStage,
+        }
+
+        #[derive(Clone, Copy, Eq, PartialEq)]
+        enum G6WelcomeTerminalRequestMutation {
+            Unchanged,
+            ActorDid,
+            ActorDevice,
+            ActorKey,
+            AuthGeneration,
+            WelcomeId,
+            TransitionSeq,
+            CoordinateConversation,
+            CoordinateGeneration,
+            CoordinateStateVersion,
+            CoordinateGroupId,
+            CoordinateEpoch,
+            CoordinateContextHash,
+            CoordinateConfirmationTag,
+            CoordinateLifecycle,
+            RejectionReasonMismatch,
+            RejectionReasonAbsent,
+            InvalidSignature,
+        }
+
+        fn build_g6_welcome_terminal_request_negative_cases(
+            invitee: &AcceptanceInvitee,
+            sibling: &AcceptanceInvitee,
+            fulfillment: &RealLeafRecoveryFulfillmentEntry,
+            coordinate: &PublicGroupSnapshotCoordinate,
+            signed_at: &str,
+        ) -> Vec<G6WelcomeTerminalRequestNegative> {
+            use G6WelcomeTerminalRequestFailureStage as Stage;
+            use G6WelcomeTerminalRequestMutation as Mutation;
+
+            [
+                (
+                    "wrong endpoint kind",
+                    "blue.catbird.chat.rejectWelcome",
+                    Stage::Authorization,
+                    Mutation::Unchanged,
+                ),
+                (
+                    "sibling actor DID",
+                    "blue.catbird.chat.acknowledgeWelcome",
+                    Stage::Authorization,
+                    Mutation::ActorDid,
+                ),
+                (
+                    "sibling actor device",
+                    "blue.catbird.chat.acknowledgeWelcome",
+                    Stage::Authorization,
+                    Mutation::ActorDevice,
+                ),
+                (
+                    "sibling actor key",
+                    "blue.catbird.chat.acknowledgeWelcome",
+                    Stage::Authorization,
+                    Mutation::ActorKey,
+                ),
+                (
+                    "sibling authentication generation",
+                    "blue.catbird.chat.acknowledgeWelcome",
+                    Stage::Authorization,
+                    Mutation::AuthGeneration,
+                ),
+                (
+                    "wrong Welcome ID",
+                    "blue.catbird.chat.acknowledgeWelcome",
+                    Stage::Compositor,
+                    Mutation::WelcomeId,
+                ),
+                (
+                    "wrong transition sequence",
+                    "blue.catbird.chat.acknowledgeWelcome",
+                    Stage::Compositor,
+                    Mutation::TransitionSeq,
+                ),
+                (
+                    "wrong coordinate conversation",
+                    "blue.catbird.chat.acknowledgeWelcome",
+                    Stage::Compositor,
+                    Mutation::CoordinateConversation,
+                ),
+                (
+                    "wrong coordinate generation",
+                    "blue.catbird.chat.acknowledgeWelcome",
+                    Stage::Compositor,
+                    Mutation::CoordinateGeneration,
+                ),
+                (
+                    "wrong coordinate state version",
+                    "blue.catbird.chat.acknowledgeWelcome",
+                    Stage::Compositor,
+                    Mutation::CoordinateStateVersion,
+                ),
+                (
+                    "wrong coordinate group ID",
+                    "blue.catbird.chat.acknowledgeWelcome",
+                    Stage::Compositor,
+                    Mutation::CoordinateGroupId,
+                ),
+                (
+                    "wrong coordinate epoch",
+                    "blue.catbird.chat.acknowledgeWelcome",
+                    Stage::Compositor,
+                    Mutation::CoordinateEpoch,
+                ),
+                (
+                    "wrong coordinate context hash",
+                    "blue.catbird.chat.acknowledgeWelcome",
+                    Stage::Compositor,
+                    Mutation::CoordinateContextHash,
+                ),
+                (
+                    "wrong coordinate confirmation tag",
+                    "blue.catbird.chat.acknowledgeWelcome",
+                    Stage::Compositor,
+                    Mutation::CoordinateConfirmationTag,
+                ),
+                (
+                    "wrong coordinate lifecycle",
+                    "blue.catbird.chat.acknowledgeWelcome",
+                    Stage::Compositor,
+                    Mutation::CoordinateLifecycle,
+                ),
+                (
+                    "rejection reason mismatch",
+                    "blue.catbird.chat.rejectWelcome",
+                    Stage::Decode,
+                    Mutation::RejectionReasonMismatch,
+                ),
+                (
+                    "rejection reason absent",
+                    "blue.catbird.chat.rejectWelcome",
+                    Stage::Decode,
+                    Mutation::RejectionReasonAbsent,
+                ),
+                (
+                    "invalid inner signature",
+                    "blue.catbird.chat.acknowledgeWelcome",
+                    Stage::SignatureVerification,
+                    Mutation::InvalidSignature,
+                ),
+            ]
+            .into_iter()
+            .map(|(label, endpoint, expected_stage, mutation)| {
+                let mode = if matches!(
+                    mutation,
+                    Mutation::RejectionReasonMismatch | Mutation::RejectionReasonAbsent
+                ) {
+                    G6WelcomeTerminalMode::Rejected("invalidWelcome")
+                } else {
+                    G6WelcomeTerminalMode::Acknowledged
+                };
+                let mut raw_request = build_g6_signed_welcome_terminal_request_with_mutation(
+                    invitee,
+                    fulfillment,
+                    coordinate,
+                    signed_at,
+                    mode,
+                    |body| match mutation {
+                        Mutation::Unchanged
+                        | Mutation::RejectionReasonMismatch
+                        | Mutation::RejectionReasonAbsent
+                        | Mutation::InvalidSignature => {}
+                        Mutation::ActorDid => body["actorDid"] = Value::String(sibling.did.clone()),
+                        Mutation::ActorDevice => {
+                            body["actorDeviceId"] =
+                                Value::String(sibling.device_id.hyphenated().to_string())
+                        }
+                        Mutation::ActorKey => body["keyId"] = Value::String(sibling.key_id.clone()),
+                        Mutation::AuthGeneration => body["authGeneration"] = Value::from(2_u64),
+                        Mutation::WelcomeId => {
+                            body["welcomeId"] =
+                                Value::String(Uuid::new_v4().hyphenated().to_string())
+                        }
+                        Mutation::TransitionSeq => body["transitionSeq"] = Value::from(5_u64),
+                        Mutation::CoordinateConversation => {
+                            body["coordinates"]["conversationId"] =
+                                Value::String(Uuid::new_v4().hyphenated().to_string())
+                        }
+                        Mutation::CoordinateGeneration => {
+                            body["coordinates"]["generation"] =
+                                Value::from(coordinate.generation() + 1)
+                        }
+                        Mutation::CoordinateStateVersion => {
+                            body["coordinates"]["stateVersion"] =
+                                Value::from(coordinate.state_version() + 1)
+                        }
+                        Mutation::CoordinateGroupId => {
+                            body["coordinates"]["groupId"] =
+                                Value::String(STANDARD.encode([0xa1_u8; 32]))
+                        }
+                        Mutation::CoordinateEpoch => {
+                            body["coordinates"]["epoch"] = Value::from(coordinate.epoch() + 1)
+                        }
+                        Mutation::CoordinateContextHash => {
+                            body["coordinates"]["groupContextHash"] =
+                                Value::String(STANDARD.encode([0xa2_u8; 32]))
+                        }
+                        Mutation::CoordinateConfirmationTag => {
+                            body["coordinates"]["confirmationTag"] =
+                                Value::String(STANDARD.encode([0xa3_u8; 32]))
+                        }
+                        Mutation::CoordinateLifecycle => {
+                            body["coordinates"]["lifecycle"] =
+                                Value::String("superseded".to_owned())
+                        }
+                    },
+                    mutation == Mutation::InvalidSignature,
+                );
+                if mutation == Mutation::RejectionReasonMismatch {
+                    raw_request = mutate_g6_welcome_terminal_request_without_resigning(
+                        &raw_request,
+                        |body| {
+                            body["reason"] = Value::String("notAWelcomeRejectionReason".to_owned());
+                        },
+                    );
+                } else if mutation == Mutation::RejectionReasonAbsent {
+                    raw_request = mutate_g6_welcome_terminal_request_without_resigning(
+                        &raw_request,
+                        |body| {
+                            body.as_object_mut()
+                                .expect("Welcome rejection body object")
+                                .remove("reason");
+                        },
+                    );
+                }
+                G6WelcomeTerminalRequestNegative {
+                    label,
+                    endpoint,
+                    raw_request,
+                    expected_stage,
+                }
+            })
+            .collect()
+        }
+
+        fn mutate_g6_welcome_terminal_request_without_resigning(
+            raw_request: &[u8],
+            mutate_body: impl FnOnce(&mut Value),
+        ) -> Vec<u8> {
+            let mut wrapper: Value =
+                serde_json::from_slice(raw_request).expect("parse Welcome negative fixture");
+            mutate_body(&mut wrapper["body"]);
+            serde_json::to_vec(&wrapper).expect("serialize Welcome negative fixture")
+        }
+
+        fn build_g6_signed_welcome_terminal_request(
+            invitee: &AcceptanceInvitee,
+            fulfillment: &RealLeafRecoveryFulfillmentEntry,
+            coordinate: &PublicGroupSnapshotCoordinate,
+            signed_at: &str,
+            mode: G6WelcomeTerminalMode,
+        ) -> Vec<u8> {
+            build_g6_signed_welcome_terminal_request_with_mutation(
+                invitee,
+                fulfillment,
+                coordinate,
+                signed_at,
+                mode,
+                |_| {},
+                false,
+            )
+        }
+
+        fn build_g6_signed_welcome_terminal_request_with_mutation(
+            invitee: &AcceptanceInvitee,
+            fulfillment: &RealLeafRecoveryFulfillmentEntry,
+            coordinate: &PublicGroupSnapshotCoordinate,
+            signed_at: &str,
+            mode: G6WelcomeTerminalMode,
+            mutate_body: impl FnOnce(&mut Value),
+            corrupt_signature: bool,
+        ) -> Vec<u8> {
+            let kind = match mode {
+                G6WelcomeTerminalMode::Acknowledged => SignedMutationKind::WelcomeAcknowledgement,
+                G6WelcomeTerminalMode::Rejected(_) => SignedMutationKind::WelcomeRejection,
+                G6WelcomeTerminalMode::DueExpiry => SignedMutationKind::WelcomeAcknowledgement,
+            };
+            let mut body = json!({
+                "$type": kind.type_id(),
+                "signatureDomain": String::from_utf8(kind.domain().to_vec())
+                    .expect("Welcome terminal signature domain is UTF-8"),
+                "actorDid": invitee.did,
+                "actorDeviceId": invitee.device_id.hyphenated().to_string(),
+                "keyId": invitee.key_id,
+                "authGeneration": 1,
+                "idempotencyKey": Uuid::new_v4().hyphenated().to_string(),
+                "signedAt": signed_at,
+                "welcomeId": fulfillment.welcome_id.hyphenated().to_string(),
+                "coordinates": coordinate_json(coordinate),
+                "transitionSeq": 4,
+            });
+            if let G6WelcomeTerminalMode::Rejected(reason) = mode {
+                body["reason"] = Value::String(reason.to_owned());
+            }
+            mutate_body(&mut body);
+            let mut wrapper = json!({ "body": body, "signature": STANDARD.encode([0_u8; 64]) });
+            let unsigned = serde_json::to_vec(&wrapper).expect("serialize unsigned Welcome");
+            let canonical = decode_canonical_signed_mutation(&unsigned)
+                .expect("canonicalize unsigned Welcome terminal request");
+            let signature = invitee
+                .signing_key
+                .sign(canonical.transcript_bytes())
+                .to_bytes();
+            wrapper["signature"] = Value::String(if corrupt_signature {
+                STANDARD.encode([0_u8; 64])
+            } else {
+                STANDARD.encode(signature)
+            });
+            serde_json::to_vec(&wrapper).expect("serialize signed Welcome terminal request")
+        }
+
         async fn run_g6_recovery_lifecycle_uses_locked_production_planners_and_executor(
             include_reset: bool,
             delegated_reset_request: bool,
+            welcome_terminal: Option<G6WelcomeTerminalMode>,
+            welcome_terminal_request_negatives: bool,
         ) {
+            assert!(
+                !include_reset || welcome_terminal.is_none(),
+                "a terminalized Welcome cannot feed the Reset pending-Welcome branch"
+            );
+            assert!(
+                !welcome_terminal_request_negatives
+                    || welcome_terminal == Some(G6WelcomeTerminalMode::Acknowledged),
+                "the signed-request negative matrix runs against a genuine pending acknowledgement fixture"
+            );
             let pool = common::chat_protocol::setup_chat_protocol_db(6).await;
             let trusted_at: DateTime<Utc> =
                 sqlx::query_scalar("SELECT date_trunc('second', clock_timestamp())")
@@ -11718,6 +12126,65 @@ mod historical_control_loader {
                 0x56,
                 0x57,
             );
+            let welcome_terminal_observed_at = welcome_terminal.map(|mode| match mode {
+                G6WelcomeTerminalMode::DueExpiry => {
+                    package_not_after + chrono::Duration::seconds(1)
+                }
+                G6WelcomeTerminalMode::Acknowledged | G6WelcomeTerminalMode::Rejected(_) => {
+                    trusted_at
+                }
+            });
+            let welcome_terminal_trusted_text = welcome_terminal_observed_at
+                .map(|observed| observed.to_rfc3339_opts(SecondsFormat::Millis, true));
+            let welcome_terminal_signed_text = welcome_terminal_observed_at.map(|observed| {
+                (observed - chrono::Duration::milliseconds(500))
+                    .to_rfc3339_opts(SecondsFormat::Millis, true)
+            });
+            let welcome_terminal_request = welcome_terminal.map(|mode| {
+                build_g6_signed_welcome_terminal_request(
+                    &invitee,
+                    &fulfillment,
+                    committed.coordinate(),
+                    welcome_terminal_signed_text
+                        .as_deref()
+                        .expect("terminal mode has a signed instant"),
+                    mode,
+                )
+            });
+            let replay_changed_same_kind_request =
+                (welcome_terminal == Some(G6WelcomeTerminalMode::Acknowledged)).then(|| {
+                    build_g6_signed_welcome_terminal_request(
+                        &invitee,
+                        &fulfillment,
+                        committed.coordinate(),
+                        welcome_terminal_signed_text
+                            .as_deref()
+                            .expect("replay proof has a signed instant"),
+                        G6WelcomeTerminalMode::Acknowledged,
+                    )
+                });
+            let replay_changed_kind_request =
+                (welcome_terminal == Some(G6WelcomeTerminalMode::Acknowledged)).then(|| {
+                    build_g6_signed_welcome_terminal_request(
+                        &invitee,
+                        &fulfillment,
+                        committed.coordinate(),
+                        welcome_terminal_signed_text
+                            .as_deref()
+                            .expect("replay proof has a signed instant"),
+                        G6WelcomeTerminalMode::Rejected("invalidWelcome"),
+                    )
+                });
+            let welcome_terminal_trusted = welcome_terminal.map(|_| {
+                TrustedRequestInstant::from_canonical_for_test(
+                    CanonicalTimestamp::parse(
+                        welcome_terminal_trusted_text
+                            .as_deref()
+                            .expect("terminal mode has a trusted instant"),
+                    )
+                    .expect("Welcome terminal time canonical"),
+                )
+            });
             let prior_bound_recovery_at = trusted_at + chrono::Duration::seconds(1);
             let prior_bound_recovery_text =
                 prior_bound_recovery_at.to_rfc3339_opts(SecondsFormat::Millis, true);
@@ -12170,6 +12637,179 @@ mod historical_control_loader {
                 AuthorizationOutcome::FirstExecution(authority) => authority,
                 AuthorizationOutcome::CompletedReplay(_) => panic!("fresh Fulfillment replayed"),
             };
+            let welcome_terminal_authority = if let (Some(mode), Some(raw)) =
+                (welcome_terminal, welcome_terminal_request.as_ref())
+            {
+                let endpoint = match mode {
+                    G6WelcomeTerminalMode::Acknowledged => "blue.catbird.chat.acknowledgeWelcome",
+                    G6WelcomeTerminalMode::Rejected(_) => "blue.catbird.chat.rejectWelcome",
+                    G6WelcomeTerminalMode::DueExpiry => "blue.catbird.chat.acknowledgeWelcome",
+                };
+                Some(
+                    match authorize_signed_request(
+                        &pool,
+                        crate::dpop::repository_test_evidence::ordinary_device_with_binding(
+                            Uuid::new_v4(),
+                            Uuid::new_v4().as_bytes()[..12].try_into().unwrap(),
+                            endpoint,
+                            welcome_terminal_trusted_text
+                                .as_deref()
+                                .expect("terminal mode has a DPoP trusted instant"),
+                            &invitee.did,
+                            invitee.device_id,
+                            &invitee.key_id,
+                        ),
+                        decode_canonical_signed_mutation(raw)
+                            .expect("Welcome terminal canonical for authorization"),
+                    )
+                    .await
+                    .expect("authorize lifecycle Welcome terminal")
+                    {
+                        AuthorizationOutcome::FirstExecution(authority) => authority,
+                        AuthorizationOutcome::CompletedReplay(_) => {
+                            panic!("fresh Welcome terminal replayed")
+                        }
+                    },
+                )
+            } else {
+                None
+            };
+            let welcome_terminal_request_negative_cases = if welcome_terminal_request_negatives {
+                Box::pin(async {
+                    let cases = build_g6_welcome_terminal_request_negative_cases(
+                        &invitee,
+                        &decoy,
+                        &fulfillment,
+                        committed.coordinate(),
+                        welcome_terminal_signed_text
+                            .as_deref()
+                            .expect("negative matrix has signed instant"),
+                    );
+                    for case in &cases {
+                        let decoded =
+                            decode_canonical_signed_mutation(&case.raw_request);
+                        if case.expected_stage
+                            == G6WelcomeTerminalRequestFailureStage::Decode
+                        {
+                            assert!(
+                                decoded.is_err(),
+                                "{} must fail canonical decode before replay consumption",
+                                case.label
+                            );
+                            continue;
+                        }
+                        let canonical = decoded.unwrap_or_else(|error| {
+                            panic!(
+                                "{} unexpectedly failed canonical decode: {error:?}",
+                                case.label
+                            )
+                        });
+                        let authorized = authorize_signed_request(
+                            &pool,
+                            crate::dpop::repository_test_evidence::ordinary_device_with_binding(
+                                Uuid::new_v4(),
+                                Uuid::new_v4().as_bytes()[..12].try_into().unwrap(),
+                                case.endpoint,
+                                welcome_terminal_trusted_text
+                                    .as_deref()
+                                    .expect("negative matrix has DPoP trusted instant"),
+                                &invitee.did,
+                                invitee.device_id,
+                                &invitee.key_id,
+                            ),
+                            canonical,
+                        )
+                        .await;
+                        if matches!(
+                            case.expected_stage,
+                            G6WelcomeTerminalRequestFailureStage::Authorization
+                                | G6WelcomeTerminalRequestFailureStage::SignatureVerification
+                        ) {
+                            assert!(
+                                authorized.is_err(),
+                                "{} must fail route/identity/cryptographic authorization",
+                                case.label
+                            );
+                        } else {
+                            assert!(
+                                matches!(
+                                    authorized,
+                                    Ok(AuthorizationOutcome::FirstExecution(_))
+                                ),
+                                "{} must pass route/identity authorization before its {:?} rejection",
+                                case.label,
+                                case.expected_stage,
+                            );
+                        }
+                    }
+                    cases
+                    })
+                    .await
+            } else {
+                Vec::new()
+            };
+            let replay_changed_same_kind_authority =
+                if let Some(raw) = replay_changed_same_kind_request.as_ref() {
+                    Some(
+                        match authorize_signed_request(
+                            &pool,
+                            crate::dpop::repository_test_evidence::ordinary_device_with_binding(
+                                Uuid::new_v4(),
+                                Uuid::new_v4().as_bytes()[..12].try_into().unwrap(),
+                                "blue.catbird.chat.acknowledgeWelcome",
+                                welcome_terminal_trusted_text
+                                    .as_deref()
+                                    .expect("replay proof has a trusted instant"),
+                                &invitee.did,
+                                invitee.device_id,
+                                &invitee.key_id,
+                            ),
+                            decode_canonical_signed_mutation(raw)
+                                .expect("changed acknowledgement canonical"),
+                        )
+                        .await
+                        .expect("authorize changed acknowledgement replay probe")
+                        {
+                            AuthorizationOutcome::FirstExecution(authority) => authority,
+                            AuthorizationOutcome::CompletedReplay(_) => {
+                                panic!("fresh changed acknowledgement replayed")
+                            }
+                        },
+                    )
+                } else {
+                    None
+                };
+            let replay_changed_kind_authority =
+                if let Some(raw) = replay_changed_kind_request.as_ref() {
+                    Some(
+                        match authorize_signed_request(
+                            &pool,
+                            crate::dpop::repository_test_evidence::ordinary_device_with_binding(
+                                Uuid::new_v4(),
+                                Uuid::new_v4().as_bytes()[..12].try_into().unwrap(),
+                                "blue.catbird.chat.rejectWelcome",
+                                welcome_terminal_trusted_text
+                                    .as_deref()
+                                    .expect("replay proof has a trusted instant"),
+                                &invitee.did,
+                                invitee.device_id,
+                                &invitee.key_id,
+                            ),
+                            decode_canonical_signed_mutation(raw)
+                                .expect("changed-kind rejection canonical"),
+                        )
+                        .await
+                        .expect("authorize changed-kind replay probe")
+                        {
+                            AuthorizationOutcome::FirstExecution(authority) => authority,
+                            AuthorizationOutcome::CompletedReplay(_) => {
+                                panic!("fresh changed-kind request replayed")
+                            }
+                        },
+                    )
+                } else {
+                    None
+                };
             let prior_bound_recovery_authority = match authorize_signed_request(
                 &pool,
                 crate::dpop::repository_test_evidence::ordinary_device_with_binding(
@@ -14091,6 +14731,739 @@ mod historical_control_loader {
                 (0, 0, 0, 0, 0, 0, 3, 2),
                 "lifecycle proof produced no unrelated family effects"
             );
+            let welcome_terminal_context = if let (
+                Some(mode),
+                Some(raw_request),
+                Some(trusted_request),
+                Some(authority),
+            ) = (
+                welcome_terminal,
+                welcome_terminal_request.as_ref(),
+                welcome_terminal_trusted.as_ref(),
+                welcome_terminal_authority.as_ref(),
+            ) {
+                let terminal_observed_at =
+                    welcome_terminal_observed_at.expect("terminal mode has an observed instant");
+                if welcome_terminal_request_negatives {
+                    Box::pin(async {
+                    let cases = &welcome_terminal_request_negative_cases;
+                    let baseline = g6_lifecycle_durable_snapshot(
+                        &mut tx,
+                        conversation_id,
+                        &key_package_ref,
+                        protocol_instance_id,
+                        &conversation_marker,
+                    )
+                    .await;
+                    assert_eq!(
+                        baseline.len(),
+                        29,
+                        "the negative matrix must seal all 29 durable families"
+                    );
+                    for case in cases {
+                        match case.expected_stage {
+                            G6WelcomeTerminalRequestFailureStage::Decode
+                            | G6WelcomeTerminalRequestFailureStage::Authorization => {
+                                // Decode and replay-consuming authorization are
+                                // exercised before the rollback-only lifecycle
+                                // transaction takes the device/key locks.
+                            }
+                            G6WelcomeTerminalRequestFailureStage::SignatureVerification => {
+                                assert!(
+                                    decode_and_verify_signed_mutation(
+                                        &case.raw_request,
+                                        invitee.signing_key.verifying_key().as_bytes(),
+                                    )
+                                    .is_err(),
+                                    "{} must fail inner signature verification",
+                                    case.label
+                                );
+                            }
+                            G6WelcomeTerminalRequestFailureStage::Compositor => {
+                                let welcome_business =
+                                    recheck_business_authority(&mut tx, authority)
+                                        .await
+                                        .unwrap_or_else(|error| {
+                                            panic!(
+                                                "{} business-authority recheck: {error:?}",
+                                                case.label
+                                            )
+                                        });
+                                let locked = hydrate_locked_conversation_state(
+                                    &mut tx,
+                                    conversation_id,
+                                    terminal_observed_at,
+                                )
+                                .await
+                                .unwrap_or_else(|error| {
+                                    panic!("{} locked aggregate: {error:?}", case.label)
+                                });
+                                let hydration =
+                                    HydrationAuthority::from_locked_conversation(&locked)
+                                        .unwrap_or_else(|error| {
+                                            panic!(
+                                                "{} hydration authority: {error:?}",
+                                                case.label
+                                            )
+                                        });
+                                let registration = hydration
+                                    .locked_registration_from_guard(welcome_business)
+                                    .unwrap_or_else(|error| {
+                                        panic!("{} registration: {error:?}", case.label)
+                                    });
+                                let classification = lock_welcome_terminal(
+                                    &mut tx,
+                                    &locked,
+                                    fulfillment.welcome_id,
+                                )
+                                .await
+                                .unwrap_or_else(|error| {
+                                        panic!("{} pending classification: {error:?}", case.label)
+                                    });
+                                let verified = decode_and_verify_signed_mutation(
+                                    &case.raw_request,
+                                    invitee.signing_key.verifying_key().as_bytes(),
+                                )
+                                .unwrap_or_else(|error| {
+                                        panic!(
+                                            "{} unexpectedly failed signature verification: {error:?}",
+                                            case.label
+                                        )
+                                    });
+                                let composed = hydration.compose_welcome_terminal(
+                                    &locked,
+                                    DurableSignedRequestEnvelope::new(
+                                        *conversation_id.as_bytes(),
+                                        trusted_request,
+                                    )
+                                    .expect("bind negative durable envelope"),
+                                    verified,
+                                    registration,
+                                    classification,
+                                );
+                                assert!(
+                                    composed.is_err(),
+                                    "{} must fail exact-target compositor binding",
+                                    case.label
+                                );
+                            }
+                        }
+                        let after = g6_lifecycle_durable_snapshot(
+                            &mut tx,
+                            conversation_id,
+                            &key_package_ref,
+                            protocol_instance_id,
+                            &conversation_marker,
+                        )
+                        .await;
+                        assert_eq!(
+                            after, baseline,
+                            "{} must leave all 29 durable families byte-identical",
+                            case.label
+                        );
+                    }
+                    })
+                    .await;
+                    // ---- Executor-level prewrite negatives ----
+                    let exec_welcome_business = recheck_business_authority(&mut tx, authority)
+                        .await
+                        .expect("recheck for executor negatives");
+                    let exec_locked = hydrate_locked_conversation_state(
+                        &mut tx,
+                        conversation_id,
+                        terminal_observed_at,
+                    )
+                    .await
+                    .expect("lock for executor negatives");
+                    let exec_hydration = HydrationAuthority::from_locked_conversation(&exec_locked)
+                        .expect("hydration authority for executor negatives");
+                    let exec_registration = exec_hydration
+                        .locked_registration_from_guard(exec_welcome_business)
+                        .expect("locked registration for executor negatives");
+                    let exec_classification =
+                        lock_welcome_terminal(&mut tx, &exec_locked, fulfillment.welcome_id)
+                            .await
+                            .expect("lock and classify for executor negatives");
+                    let exec_mutation = decode_and_verify_signed_mutation(
+                        raw_request,
+                        invitee.signing_key.verifying_key().as_bytes(),
+                    )
+                    .expect("verify signature for executor negatives");
+                    let exec_planned = exec_hydration
+                        .compose_welcome_terminal(
+                            &exec_locked,
+                            DurableSignedRequestEnvelope::new(
+                                *conversation_id.as_bytes(),
+                                trusted_request,
+                            )
+                            .expect("envelope for executor negatives"),
+                            exec_mutation,
+                            exec_registration,
+                            exec_classification,
+                        )
+                        .expect("compose for executor negatives");
+                    let WelcomeTerminalPlan::Planned(exec_transition) = exec_planned else {
+                        panic!("executor negatives expected Planned")
+                    };
+                    let exec_plan = exec_transition
+                        .into_persistence_plan()
+                        .expect("seal plan for executor negatives");
+                    let exec_ctx = hydrate_execution_context(
+                        &mut tx,
+                        &exec_plan,
+                        ExecutionContextArtifacts {
+                            accepted_control_entry_bytes: None,
+                            genesis_group_info_bytes: None,
+                            primary_event_payload: None,
+                            welcome_disposition_event_payloads: Vec::new(),
+                        },
+                    )
+                    .await
+                    .expect("hydrate context for executor negatives");
+                    let exec_baseline = g6_lifecycle_durable_snapshot(
+                        &mut tx,
+                        conversation_id,
+                        &key_package_ref,
+                        protocol_instance_id,
+                        &conversation_marker,
+                    )
+                    .await;
+                    // Case A: CAS drift via corrupted binding.
+                    {
+                        let mut cas_plan = exec_plan.clone();
+                        let exec_ctx_clone = exec_ctx.clone();
+                        cas_plan = cas_plan.with_welcome_cas_corrupted_for_test();
+                        let result = apply_conversation_persistence_plan(
+                            &mut tx,
+                            &cas_plan,
+                            &exec_ctx_clone,
+                        )
+                        .await;
+                        assert!(
+                            result.is_err(),
+                            "corrupted CAS must fail executor prewrite: {result:?}"
+                        );
+                        let post = g6_lifecycle_durable_snapshot(
+                            &mut tx,
+                            conversation_id,
+                            &key_package_ref,
+                            protocol_instance_id,
+                            &conversation_marker,
+                        )
+                        .await;
+                        assert_eq!(
+                            post, exec_baseline,
+                            "corrupted CAS leaves 29 families byte-identical"
+                        );
+                    }
+                    // Case B: Caller primary event payload rejected at hydration.
+                    {
+                        let result = hydrate_execution_context(
+                            &mut tx,
+                            &exec_plan,
+                            ExecutionContextArtifacts {
+                                accepted_control_entry_bytes: None,
+                                genesis_group_info_bytes: None,
+                                primary_event_payload: Some(b"caller-supplied-payload".to_vec()),
+                                welcome_disposition_event_payloads: Vec::new(),
+                            },
+                        )
+                        .await;
+                        assert!(
+                            result.is_err(),
+                            "caller primary event payload must fail hydration"
+                        );
+                        let post = g6_lifecycle_durable_snapshot(
+                            &mut tx,
+                            conversation_id,
+                            &key_package_ref,
+                            protocol_instance_id,
+                            &conversation_marker,
+                        )
+                        .await;
+                        assert_eq!(
+                            post, exec_baseline,
+                            "rejected event payload leaves 29 families byte-identical"
+                        );
+                    }
+                    // Case C: Welcome disposition event payloads at hydration.
+                    {
+                        let result = hydrate_execution_context(
+                            &mut tx,
+                            &exec_plan,
+                            ExecutionContextArtifacts {
+                                accepted_control_entry_bytes: None,
+                                genesis_group_info_bytes: None,
+                                primary_event_payload: None,
+                                welcome_disposition_event_payloads: vec![(
+                                    fulfillment.welcome_id,
+                                    b"caller-disposition".to_vec(),
+                                )],
+                            },
+                        )
+                        .await;
+                        assert!(
+                            result.is_err(),
+                            "caller disposition payloads must fail hydration"
+                        );
+                        let post = g6_lifecycle_durable_snapshot(
+                            &mut tx,
+                            conversation_id,
+                            &key_package_ref,
+                            protocol_instance_id,
+                            &conversation_marker,
+                        )
+                        .await;
+                        assert_eq!(
+                            post, exec_baseline,
+                            "rejected disposition payloads leaves 29 families byte-identical"
+                        );
+                    }
+                }
+                let welcome_business = recheck_business_authority(&mut tx, authority)
+                    .await
+                    .expect("recheck lifecycle Welcome terminal authority");
+                let locked = hydrate_locked_conversation_state(
+                    &mut tx,
+                    conversation_id,
+                    terminal_observed_at,
+                )
+                .await
+                .expect("lock exact post-Fulfillment graph for Welcome terminal");
+                let hydration = HydrationAuthority::from_locked_conversation(&locked)
+                    .expect("mint lifecycle Welcome terminal hydration authority");
+                let registration = hydration
+                    .locked_registration_from_guard(welcome_business)
+                    .expect("seal lifecycle Welcome terminal registration");
+                let classification =
+                    lock_welcome_terminal(&mut tx, &locked, fulfillment.welcome_id)
+                        .await
+                        .expect("lock and classify exact pending Welcome");
+                let mutation = decode_and_verify_signed_mutation(
+                    raw_request,
+                    invitee.signing_key.verifying_key().as_bytes(),
+                )
+                .expect("verify exact signed Welcome terminal request");
+                let planned = hydration
+                    .compose_welcome_terminal(
+                        &locked,
+                        DurableSignedRequestEnvelope::new(
+                            *conversation_id.as_bytes(),
+                            trusted_request,
+                        )
+                        .expect("bind Welcome terminal durable envelope"),
+                        mutation,
+                        registration,
+                        classification,
+                    )
+                    .expect("compose exact Welcome terminal");
+                let transition = match (mode, planned) {
+                    (
+                        G6WelcomeTerminalMode::Acknowledged,
+                        WelcomeTerminalPlan::Planned(transition),
+                    ) => transition,
+                    (
+                        G6WelcomeTerminalMode::Rejected(_),
+                        WelcomeTerminalPlan::Planned(transition),
+                    ) => transition,
+                    (
+                        G6WelcomeTerminalMode::DueExpiry,
+                        WelcomeTerminalPlan::DueExpiry(transition),
+                    ) => transition,
+                    _ => panic!("pending acknowledgement must produce one planned transition"),
+                };
+                let plan = transition
+                    .into_persistence_plan()
+                    .expect("seal Welcome terminal persistence plan");
+                let context = hydrate_execution_context(
+                    &mut tx,
+                    &plan,
+                    ExecutionContextArtifacts {
+                        accepted_control_entry_bytes: None,
+                        genesis_group_info_bytes: None,
+                        primary_event_payload: None,
+                        welcome_disposition_event_payloads: Vec::new(),
+                    },
+                )
+                .await
+                .expect("hydrate server-owned Welcome terminal context");
+                sqlx::query("SET CONSTRAINTS ALL DEFERRED")
+                    .execute(&mut *tx)
+                    .await
+                    .expect("defer Welcome terminal cross-row constraints");
+                let applied = apply_conversation_persistence_plan(&mut tx, &plan, &context)
+                    .await
+                    .expect("apply genuine Welcome terminal lifecycle");
+                sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
+                    .execute(&mut *tx)
+                    .await
+                    .expect("force complete Welcome terminal graph constraints");
+                assert_eq!(applied.allocated_seq, 5);
+                assert_eq!(applied.event_positions.len(), 1);
+                assert_eq!(
+                    applied.successor_coordinate,
+                    Some(*committed.coordinate()),
+                    "Welcome terminalization preserves the complete coordinate"
+                );
+
+                let freshly_locked = hydrate_locked_conversation_state(
+                    &mut tx,
+                    conversation_id,
+                    terminal_observed_at,
+                )
+                .await
+                .expect("fresh-read terminalized Welcome aggregate");
+                let freshly_classified =
+                    lock_welcome_terminal(&mut tx, &freshly_locked, fulfillment.welcome_id)
+                        .await
+                        .expect("fresh-classify terminalized Welcome");
+                let (terminal_status, rejection_reason) = match mode {
+                    G6WelcomeTerminalMode::Acknowledged => ("acknowledged", None),
+                    G6WelcomeTerminalMode::Rejected(reason) => ("rejected", Some(reason)),
+                    G6WelcomeTerminalMode::DueExpiry => ("expired", None),
+                };
+                match (mode, freshly_classified) {
+                    (
+                        G6WelcomeTerminalMode::Acknowledged,
+                        crate::chat_protocol::repository::core::LockedWelcomeTerminal::Acknowledged {
+                            row,
+                            authorization,
+                            terminal_at,
+                            ..
+                        },
+                    ) => {
+                        assert_eq!(row.status, WelcomeStatus::Acknowledged);
+                        assert_eq!(row.welcome_id, *fulfillment.welcome_id.as_bytes());
+                        assert_eq!(row.coordinate, *committed.coordinate());
+                        assert_eq!(row.transition_seq, 4);
+                        assert_eq!(
+                            terminal_at,
+                            trusted_at,
+                            "acknowledgement terminal_at is the locked request instant"
+                        );
+                        assert_eq!(authorization.signed_request_bytes(), raw_request);
+                    }
+                    (
+                        G6WelcomeTerminalMode::Rejected(expected_reason),
+                        crate::chat_protocol::repository::core::LockedWelcomeTerminal::Rejected {
+                            row,
+                            authorization,
+                            reason,
+                            terminal_at,
+                            ..
+                        },
+                    ) => {
+                        assert_eq!(row.status, WelcomeStatus::Rejected);
+                        assert_eq!(row.welcome_id, *fulfillment.welcome_id.as_bytes());
+                        assert_eq!(row.coordinate, *committed.coordinate());
+                        assert_eq!(row.transition_seq, 4);
+                        assert_eq!(reason, expected_reason);
+                        assert_eq!(
+                            terminal_at,
+                            trusted_at,
+                            "rejection terminal_at is the locked request instant"
+                        );
+                        assert_eq!(authorization.signed_request_bytes(), raw_request);
+                    }
+                    (
+                        G6WelcomeTerminalMode::DueExpiry,
+                        crate::chat_protocol::repository::core::LockedWelcomeTerminal::Expired {
+                            row,
+                            terminal_at,
+                            ..
+                        },
+                    ) => {
+                        assert_eq!(row.status, WelcomeStatus::Expired);
+                        assert_eq!(row.welcome_id, *fulfillment.welcome_id.as_bytes());
+                        assert_eq!(row.coordinate, *committed.coordinate());
+                        assert_eq!(row.transition_seq, 4);
+                        assert_eq!(
+                            terminal_at,
+                            package_not_after,
+                            "expiry terminal_at is the immutable Welcome expiresAt, not observed T"
+                        );
+                        assert!(
+                            terminal_observed_at > terminal_at,
+                            "test must distinguish observed T from deterministic expiresAt"
+                        );
+                    }
+                    _ => panic!("fresh terminal classification must match the signed request"),
+                }
+
+                let terminal_at = match mode {
+                    G6WelcomeTerminalMode::DueExpiry => package_not_after,
+                    G6WelcomeTerminalMode::Acknowledged | G6WelcomeTerminalMode::Rejected(_) => {
+                        trusted_at
+                    }
+                };
+                let canonical_payload =
+                    crate::chat_protocol::repository::delivery::canonical_welcome_disposition_event_payload(
+                        fulfillment.welcome_id,
+                        terminal_status,
+                    );
+                let canonical_request = decode_canonical_signed_mutation(raw_request)
+                    .expect("rehydrate exact Welcome terminal request");
+                let (
+                    expected_signed_request,
+                    expected_transcript,
+                    expected_request_digest,
+                    expected_signature,
+                ): (Option<&[u8]>, Option<&[u8]>, Option<&[u8]>, Option<&[u8]>) = match mode {
+                    G6WelcomeTerminalMode::DueExpiry => (None, None, None, None),
+                    G6WelcomeTerminalMode::Acknowledged | G6WelcomeTerminalMode::Rejected(_) => (
+                        Some(raw_request.as_slice()),
+                        Some(canonical_request.transcript_bytes()),
+                        Some(canonical_request.request_digest().as_slice()),
+                        Some(canonical_request.signature().as_slice()),
+                    ),
+                };
+                let terminal_graph_exact: bool = sqlx::query_scalar(
+                    r#"SELECT count(*)=1 AND bool_and(
+                           delivery.status=$11
+                           AND delivery.terminal_at=$2
+                           AND disposition.winner_kind=$11
+                           AND disposition.signed_request_bytes IS NOT DISTINCT FROM $3
+                           AND disposition.signing_transcript_bytes IS NOT DISTINCT FROM $4
+                           AND disposition.request_digest IS NOT DISTINCT FROM $5
+                           AND disposition.signature IS NOT DISTINCT FROM $6
+                           AND disposition.rejection_reason IS NOT DISTINCT FROM $12
+                           AND disposition.terminal_at=$2
+                           AND disposition.terminal_transition_id IS NULL
+                           AND disposition.terminal_revocation_id IS NULL
+                           AND event.event_kind='welcomeDisposition'
+                           AND event.payload_bytes=$7
+                           AND event.payload_sha256=$8
+                           AND event.created_at=$2
+                           AND (SELECT count(*) FROM chat.event_recipients recipient
+                                 WHERE recipient.event_position=event.event_position)=1
+                           AND (SELECT count(*) FROM chat.event_recipients recipient
+                                 WHERE recipient.event_position=event.event_position
+                                   AND recipient.user_did=$9
+                                   AND recipient.device_id=$10
+                                   AND recipient.entitlement_kind='welcome')=1
+                           AND (SELECT count(*) FROM chat.outbox outbox
+                                 WHERE outbox.event_position=event.event_position)=1
+                           AND (SELECT count(*) FROM chat.outbox outbox
+                                 WHERE outbox.event_position=event.event_position
+                                   AND outbox.work_kind='stream'
+                                   AND outbox.status='pending'
+                                   AND outbox.next_attempt_at=$2
+                                   AND outbox.lease_owner IS NULL
+                                   AND outbox.lease_expires_at IS NULL
+                                   AND outbox.delivered_at IS NULL
+                                   AND outbox.created_at=$2)=1
+                       )
+                      FROM chat.welcome_deliveries delivery
+                      JOIN chat.welcome_dispositions disposition USING(welcome_id)
+                      JOIN chat.events event
+                        ON event.event_position=disposition.event_position
+                     WHERE delivery.welcome_id=$1"#,
+                )
+                .bind(fulfillment.welcome_id)
+                .bind(terminal_at)
+                .bind(expected_signed_request)
+                .bind(expected_transcript)
+                .bind(expected_request_digest)
+                .bind(expected_signature)
+                .bind(&canonical_payload)
+                .bind(Sha256::digest(&canonical_payload).to_vec())
+                .bind(&invitee.did)
+                .bind(invitee.device_id)
+                .bind(terminal_status)
+                .bind(rejection_reason)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("read exact Welcome terminal graph");
+                assert!(
+                    terminal_graph_exact,
+                    "Welcome terminal durable graph must exactly bind authorization, event, recipient, and outbox"
+                );
+                match mode {
+                    G6WelcomeTerminalMode::Acknowledged => {
+                        let rejected_work: i64 = sqlx::query_scalar(
+                            "SELECT count(*) FROM chat.recovery_work_items \
+                             WHERE conversation_id=$1 AND source_id=$2",
+                        )
+                        .bind(conversation_id)
+                        .bind(fulfillment.welcome_id)
+                        .fetch_one(&mut *tx)
+                        .await
+                        .expect("read acknowledgement recovery-work absence");
+                        assert_eq!(rejected_work, 0);
+                    }
+                    G6WelcomeTerminalMode::Rejected(_) => {
+                        let rejected_work_exact: bool = sqlx::query_scalar(
+                            r#"SELECT count(*)=1 AND bool_and(
+                                   recipient_did=$3
+                                   AND recipient_device_id=$4
+                                   AND source_kind='welcomeRejected'
+                                   AND source_id=$2
+                                   AND generation=$5
+                                   AND state_version=$6
+                                   AND status='pending'
+                                   AND created_at=$7
+                               )
+                              FROM chat.recovery_work_items
+                             WHERE conversation_id=$1 AND source_id=$2"#,
+                        )
+                        .bind(conversation_id)
+                        .bind(fulfillment.welcome_id)
+                        .bind(&invitee.did)
+                        .bind(invitee.device_id)
+                        .bind(i64::try_from(committed.coordinate().generation()).unwrap())
+                        .bind(i64::try_from(committed.coordinate().state_version()).unwrap())
+                        .bind(trusted_at)
+                        .fetch_one(&mut *tx)
+                        .await
+                        .expect("read exact welcomeRejected recovery work");
+                        assert!(
+                            rejected_work_exact,
+                            "rejection must create exactly one pending welcomeRejected work item bound to the historical recipient and Welcome coordinate"
+                        );
+                    }
+                    G6WelcomeTerminalMode::DueExpiry => {
+                        let expired_work_exact: bool = sqlx::query_scalar(
+                            r#"SELECT count(*)=1 AND bool_and(
+                                   recipient_did=$3
+                                   AND recipient_device_id=$4
+                                   AND source_kind='welcomeExpired'
+                                   AND source_id=$2
+                                   AND generation=$5
+                                   AND state_version=$6
+                                   AND status='pending'
+                                   AND created_at=$7
+                               )
+                              FROM chat.recovery_work_items
+                             WHERE conversation_id=$1 AND source_id=$2"#,
+                        )
+                        .bind(conversation_id)
+                        .bind(fulfillment.welcome_id)
+                        .bind(&invitee.did)
+                        .bind(invitee.device_id)
+                        .bind(i64::try_from(committed.coordinate().generation()).unwrap())
+                        .bind(i64::try_from(committed.coordinate().state_version()).unwrap())
+                        .bind(package_not_after)
+                        .fetch_one(&mut *tx)
+                        .await
+                        .expect("read exact welcomeExpired recovery work");
+                        assert!(
+                            expired_work_exact,
+                            "expiry must create exactly one pending welcomeExpired work item at expiresAt"
+                        );
+                    }
+                }
+                if mode == G6WelcomeTerminalMode::Acknowledged {
+                    let baseline = g6_lifecycle_durable_snapshot(
+                        &mut tx,
+                        conversation_id,
+                        &key_package_ref,
+                        protocol_instance_id,
+                        &conversation_marker,
+                    )
+                    .await;
+                    let changed_same_raw = replay_changed_same_kind_request
+                        .as_ref()
+                        .expect("replay proof has changed same-kind bytes");
+                    let changed_same_authority = replay_changed_same_kind_authority
+                        .as_ref()
+                        .expect("replay proof has changed same-kind authority");
+                    let changed_kind_raw = replay_changed_kind_request
+                        .as_ref()
+                        .expect("replay proof has changed-kind bytes");
+                    let changed_kind_authority = replay_changed_kind_authority
+                        .as_ref()
+                        .expect("replay proof has changed-kind authority");
+                    for (label, candidate_raw, candidate_authority, expected_exact) in [
+                        ("same signed request", raw_request, authority, true),
+                        (
+                            "fresh same-kind re-sign",
+                            changed_same_raw,
+                            changed_same_authority,
+                            false,
+                        ),
+                        (
+                            "fresh changed-kind re-sign",
+                            changed_kind_raw,
+                            changed_kind_authority,
+                            false,
+                        ),
+                    ] {
+                        let replay_business =
+                            recheck_business_authority(&mut tx, candidate_authority)
+                                .await
+                                .unwrap_or_else(|error| {
+                                    panic!("recheck {label} business authority: {error:?}")
+                                });
+                        let replay_locked = hydrate_locked_conversation_state(
+                            &mut tx,
+                            conversation_id,
+                            terminal_observed_at,
+                        )
+                        .await
+                        .unwrap_or_else(|error| {
+                            panic!("lock {label} terminal aggregate: {error:?}")
+                        });
+                        let replay_hydration =
+                            HydrationAuthority::from_locked_conversation(&replay_locked)
+                                .unwrap_or_else(|error| {
+                                    panic!("mint {label} hydration: {error:?}")
+                                });
+                        let replay_registration = replay_hydration
+                            .locked_registration_from_guard(replay_business)
+                            .unwrap_or_else(|error| panic!("seal {label} registration: {error:?}"));
+                        let replay_classification =
+                            lock_welcome_terminal(&mut tx, &replay_locked, fulfillment.welcome_id)
+                                .await
+                                .unwrap_or_else(|error| {
+                                    panic!("classify {label} terminal Welcome: {error:?}")
+                                });
+                        let replay_mutation = decode_and_verify_signed_mutation(
+                            candidate_raw,
+                            invitee.signing_key.verifying_key().as_bytes(),
+                        )
+                        .unwrap_or_else(|error| panic!("verify {label} signed request: {error:?}"));
+                        let replay_result = replay_hydration
+                            .compose_welcome_terminal(
+                                &replay_locked,
+                                DurableSignedRequestEnvelope::new(
+                                    *conversation_id.as_bytes(),
+                                    trusted_request,
+                                )
+                                .expect("bind replay durable envelope"),
+                                replay_mutation,
+                                replay_registration,
+                                replay_classification,
+                            )
+                            .unwrap_or_else(|error| {
+                                panic!("compose {label} terminal result: {error:?}")
+                            });
+                        match replay_result {
+                            WelcomeTerminalPlan::Terminal { exact_replay, .. } => {
+                                assert_eq!(
+                                    exact_replay, expected_exact,
+                                    "{label} exact-replay classification"
+                                );
+                            }
+                            _ => panic!("{label} must classify terminal without replanning"),
+                        }
+                        let after = g6_lifecycle_durable_snapshot(
+                            &mut tx,
+                            conversation_id,
+                            &key_package_ref,
+                            protocol_instance_id,
+                            &conversation_marker,
+                        )
+                        .await;
+                        assert_eq!(
+                            after, baseline,
+                            "{label} terminal classification must be read-only"
+                        );
+                    }
+                }
+                Some(context)
+            } else {
+                None
+            };
             let reset_contexts = if include_reset {
                 Some(Box::pin(async {
                 sqlx::query("SET CONSTRAINTS ALL DEFERRED")
@@ -16251,6 +17624,9 @@ mod historical_control_loader {
             ] {
                 assert_zero_g6_creation_residue(&pool, conversation_id, context).await;
             }
+            if let Some(context) = &welcome_terminal_context {
+                assert_zero_g6_creation_residue(&pool, conversation_id, context).await;
+            }
             if let Some((reset_request_context, reset_activation_context)) = &reset_contexts {
                 assert_zero_g6_creation_residue(&pool, conversation_id, reset_request_context)
                     .await;
@@ -16282,10 +17658,88 @@ mod historical_control_loader {
 
         #[tokio::test]
         #[ignore = "requires the dedicated append-only gate database"]
+        async fn g6_welcome_terminal_facade_is_production_reachable() {
+            let _production_facade = lock_welcome_terminal;
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated append-only gate database"]
         async fn g6_recovery_lifecycle_uses_locked_production_planners_and_executor() {
             Box::pin(
                 run_g6_recovery_lifecycle_uses_locked_production_planners_and_executor(
-                    false, false,
+                    false, false, None, false,
+                ),
+            )
+            .await;
+        }
+
+        async fn run_g6_welcome_acknowledgement_terminal_lifecycle() {
+            Box::pin(
+                run_g6_recovery_lifecycle_uses_locked_production_planners_and_executor(
+                    false,
+                    false,
+                    Some(G6WelcomeTerminalMode::Acknowledged),
+                    false,
+                ),
+            )
+            .await;
+        }
+
+        async fn run_g6_welcome_rejection_terminal_lifecycle() {
+            Box::pin(
+                run_g6_recovery_lifecycle_uses_locked_production_planners_and_executor(
+                    false,
+                    false,
+                    Some(G6WelcomeTerminalMode::Rejected("invalidWelcome")),
+                    false,
+                ),
+            )
+            .await;
+        }
+
+        async fn run_g6_due_welcome_expiry_terminal_lifecycle() {
+            Box::pin(
+                run_g6_recovery_lifecycle_uses_locked_production_planners_and_executor(
+                    false,
+                    false,
+                    Some(G6WelcomeTerminalMode::DueExpiry),
+                    false,
+                ),
+            )
+            .await;
+        }
+
+        async fn run_g6_terminal_replay_classification() {
+            Box::pin(
+                run_g6_recovery_lifecycle_uses_locked_production_planners_and_executor(
+                    false,
+                    false,
+                    Some(G6WelcomeTerminalMode::Acknowledged),
+                    false,
+                ),
+            )
+            .await;
+        }
+
+        async fn run_g6_welcome_terminal_prewrite_negatives() {
+            Box::pin(
+                run_g6_recovery_lifecycle_uses_locked_production_planners_and_executor(
+                    false,
+                    false,
+                    Some(G6WelcomeTerminalMode::Acknowledged),
+                    true,
+                ),
+            )
+            .await;
+        }
+
+        async fn run_g6_welcome_terminal_executor_prewrite_negatives() {
+            Box::pin(
+                run_g6_recovery_lifecycle_uses_locked_production_planners_and_executor(
+                    false,
+                    false,
+                    Some(G6WelcomeTerminalMode::Acknowledged),
+                    true,
                 ),
             )
             .await;
@@ -16293,9 +17747,47 @@ mod historical_control_loader {
 
         #[tokio::test]
         #[ignore = "requires the dedicated append-only gate database"]
+        async fn g6_welcome_acknowledgement_uses_locked_production_terminal_lifecycle() {
+            Box::pin(run_g6_welcome_acknowledgement_terminal_lifecycle()).await;
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated append-only gate database"]
+        async fn g6_welcome_rejection_uses_locked_production_terminal_lifecycle() {
+            Box::pin(run_g6_welcome_rejection_terminal_lifecycle()).await;
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated append-only gate database"]
+        async fn g6_due_welcome_uses_locked_production_expiry_lifecycle() {
+            Box::pin(run_g6_due_welcome_expiry_terminal_lifecycle()).await;
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated append-only gate database"]
+        async fn g6_terminal_replay_classification_is_exact() {
+            Box::pin(run_g6_terminal_replay_classification()).await;
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated append-only gate database"]
+        async fn g6_welcome_terminal_prewrite_rejects_malformed_authority_and_context() {
+            Box::pin(run_g6_welcome_terminal_prewrite_negatives()).await;
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated append-only gate database"]
+        async fn g6_welcome_terminal_executor_prewrite_rejects_sealed_cas_and_context_drift() {
+            Box::pin(run_g6_welcome_terminal_executor_prewrite_negatives()).await;
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated append-only gate database"]
         async fn g6_reset_lifecycle_uses_locked_production_planners_and_executor() {
             Box::pin(
-                run_g6_recovery_lifecycle_uses_locked_production_planners_and_executor(true, false),
+                run_g6_recovery_lifecycle_uses_locked_production_planners_and_executor(
+                    true, false, None, false,
+                ),
             )
             .await;
         }
@@ -16304,7 +17796,9 @@ mod historical_control_loader {
         #[ignore = "requires the dedicated append-only gate database"]
         async fn g6_delegated_reset_request_uses_member_requester_and_admin_activator() {
             Box::pin(
-                run_g6_recovery_lifecycle_uses_locked_production_planners_and_executor(true, true),
+                run_g6_recovery_lifecycle_uses_locked_production_planners_and_executor(
+                    true, true, None, false,
+                ),
             )
             .await;
         }

@@ -521,6 +521,96 @@ impl LockedWelcomeGuard {
     }
 }
 
+/// Closed result of locking one exact Welcome delivery after the conversation
+/// aggregate. Pending arms alone carry mutation authority. Terminal arms retain
+/// the historically reverified row and the exact durable client authorization
+/// (when client-authored) so callers can classify replay/conflict without
+/// manufacturing a second guard.
+#[derive(Debug)]
+pub(crate) enum LockedWelcomeTerminal {
+    PendingNotDue(LockedWelcomeGuard),
+    PendingDue(LockedWelcomeGuard),
+    Acknowledged {
+        transaction_id: String,
+        locked_at: DateTime<Utc>,
+        row: WelcomeHydrationRow,
+        authorization: LockedWelcomeClientAuthorization,
+        terminal_at: DateTime<Utc>,
+    },
+    Rejected {
+        transaction_id: String,
+        locked_at: DateTime<Utc>,
+        row: WelcomeHydrationRow,
+        authorization: LockedWelcomeClientAuthorization,
+        reason: String,
+        terminal_at: DateTime<Utc>,
+    },
+    Expired {
+        transaction_id: String,
+        locked_at: DateTime<Utc>,
+        row: WelcomeHydrationRow,
+        terminal_at: DateTime<Utc>,
+    },
+    SupersededByTransition {
+        transaction_id: String,
+        locked_at: DateTime<Utc>,
+        row: WelcomeHydrationRow,
+        transition_id: Uuid,
+        terminal_at: DateTime<Utc>,
+    },
+    SupersededByRevocation {
+        transaction_id: String,
+        locked_at: DateTime<Utc>,
+        row: WelcomeHydrationRow,
+        revocation_id: Uuid,
+        terminal_at: DateTime<Utc>,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) struct LockedWelcomeClientAuthorization {
+    signed_request_bytes: Vec<u8>,
+    signing_transcript_bytes: Vec<u8>,
+    request_digest: [u8; 32],
+    signature: [u8; 64],
+}
+
+impl LockedWelcomeClientAuthorization {
+    pub(crate) fn signed_request_bytes(&self) -> &[u8] {
+        &self.signed_request_bytes
+    }
+
+    pub(crate) fn signing_transcript_bytes(&self) -> &[u8] {
+        &self.signing_transcript_bytes
+    }
+
+    pub(crate) fn request_digest(&self) -> &[u8; 32] {
+        &self.request_digest
+    }
+
+    pub(crate) fn signature(&self) -> &[u8; 64] {
+        &self.signature
+    }
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum WelcomeLockError {
+    #[error("clean-chat Welcome is absent from the locked conversation")]
+    Missing,
+    #[error("clean-chat Welcome lock is not in the aggregate transaction")]
+    ForeignTransaction,
+    #[error("clean-chat Welcome immutable or terminal graph is inconsistent")]
+    ReadSetMismatch,
+    #[error("clean-chat Welcome locked row is out of domain")]
+    OutOfDomain,
+    #[error("clean-chat Welcome guard invariant was violated")]
+    GuardInvariant,
+    #[error("clean-chat Welcome terminal re-verification failed: {0}")]
+    Hydration(#[from] WelcomeHydrationError),
+    #[error("clean-chat Welcome lock database error: {0}")]
+    Database(#[from] sqlx::Error),
+}
+
 #[allow(clippy::too_many_arguments)]
 fn locked_welcome_digest(
     transaction_id: &str,
@@ -5560,6 +5650,363 @@ struct DurableWelcomeHydrationRow {
     event_position: Option<i64>,
     terminal_transition_id: Option<Uuid>,
     terminal_revocation_id: Option<Uuid>,
+}
+
+#[derive(sqlx::FromRow)]
+struct LockedWelcomeTerminalRow {
+    welcome_id: Uuid,
+    conversation_id: Uuid,
+    entry_seq: i64,
+    generation: i64,
+    state_version: i64,
+    group_id: Vec<u8>,
+    epoch: i64,
+    group_context_hash: Vec<u8>,
+    confirmation_tag: Vec<u8>,
+    wrapper_bytes: Vec<u8>,
+    wrapper_sha256: Vec<u8>,
+    recipient_did: String,
+    recipient_device_id: Uuid,
+    recovery_request_id: Uuid,
+    key_package_ref: Vec<u8>,
+    expires_at: DateTime<Utc>,
+    status: String,
+    delivery_terminal_at: Option<DateTime<Utc>>,
+    disposition_welcome_id: Option<Uuid>,
+    winner_kind: Option<String>,
+    signed_request_bytes: Option<Vec<u8>>,
+    signing_transcript_bytes: Option<Vec<u8>>,
+    request_digest: Option<Vec<u8>>,
+    signature: Option<Vec<u8>>,
+    rejection_reason: Option<String>,
+    disposition_terminal_at: Option<DateTime<Utc>>,
+    event_position: Option<i64>,
+    terminal_transition_id: Option<Uuid>,
+    terminal_revocation_id: Option<Uuid>,
+    event_kind: Option<String>,
+    event_payload_bytes: Option<Vec<u8>>,
+    event_created_at: Option<DateTime<Utc>>,
+    recipient_count: i64,
+    exact_recipient_count: i64,
+    outbox_count: i64,
+    exact_outbox_count: i64,
+}
+
+/// Lock and classify one exact Welcome after the caller has locked the
+/// authenticated device/business authority and the conversation aggregate.
+/// The select takes only the delivery lock; it never performs candidate
+/// discovery or acquires a conversation lock after a delivery-first claim.
+#[allow(dead_code)]
+pub(crate) async fn lock_welcome_terminal(
+    transaction: &mut Transaction<'_, Postgres>,
+    aggregate: &LockedConversationStateGuard,
+    welcome_id: Uuid,
+) -> Result<LockedWelcomeTerminal, WelcomeLockError> {
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+    if transaction_id != aggregate.head().transaction_id() {
+        return Err(WelcomeLockError::ForeignTransaction);
+    }
+    let conversation_id = aggregate.head().conversation_id();
+    let locked_at = aggregate.head().locked_at();
+    let expected = aggregate
+        .state()
+        .welcome(welcome_id.as_bytes())
+        .ok_or(WelcomeLockError::Missing)?;
+
+    let row: LockedWelcomeTerminalRow = sqlx::query_as(
+        r#"
+        SELECT
+            bundle.welcome_id,
+            bundle.conversation_id,
+            bundle.entry_seq,
+            bundle.generation,
+            bundle.state_version,
+            bundle.group_id,
+            bundle.epoch,
+            bundle.group_context_hash,
+            bundle.confirmation_tag,
+            bundle.wrapper_bytes,
+            bundle.wrapper_sha256,
+            delivery.recipient_did,
+            delivery.recipient_device_id,
+            delivery.recovery_request_id,
+            delivery.key_package_ref,
+            delivery.expires_at,
+            delivery.status,
+            delivery.terminal_at AS delivery_terminal_at,
+            disposition.welcome_id AS disposition_welcome_id,
+            disposition.winner_kind,
+            disposition.signed_request_bytes,
+            disposition.signing_transcript_bytes,
+            disposition.request_digest,
+            disposition.signature,
+            disposition.rejection_reason,
+            disposition.terminal_at AS disposition_terminal_at,
+            disposition.event_position,
+            disposition.terminal_transition_id,
+            disposition.terminal_revocation_id,
+            event.event_kind,
+            event.payload_bytes AS event_payload_bytes,
+            event.created_at AS event_created_at,
+            CASE WHEN disposition.welcome_id IS NULL THEN 0 ELSE
+              (SELECT count(*) FROM chat.event_recipients recipient
+                WHERE recipient.event_position=disposition.event_position)
+            END AS recipient_count,
+            CASE WHEN disposition.welcome_id IS NULL THEN 0 ELSE
+              (SELECT count(*) FROM chat.event_recipients recipient
+                WHERE recipient.event_position=disposition.event_position
+                  AND recipient.user_did=delivery.recipient_did
+                  AND recipient.device_id=delivery.recipient_device_id
+                  AND recipient.entitlement_kind='welcome')
+            END AS exact_recipient_count,
+            CASE WHEN disposition.welcome_id IS NULL THEN 0 ELSE
+              (SELECT count(*) FROM chat.outbox outbox
+                WHERE outbox.event_position=disposition.event_position)
+            END AS outbox_count,
+            CASE WHEN disposition.welcome_id IS NULL THEN 0 ELSE
+              (SELECT count(*) FROM chat.outbox outbox
+                WHERE outbox.event_position=disposition.event_position
+                  AND outbox.work_kind='stream'
+                  AND outbox.status='pending')
+            END AS exact_outbox_count
+        FROM chat.welcome_bundles bundle
+        JOIN chat.welcome_deliveries delivery
+          ON delivery.welcome_id=bundle.welcome_id
+        LEFT JOIN chat.welcome_dispositions disposition
+          ON disposition.welcome_id=delivery.welcome_id
+        LEFT JOIN chat.events event
+          ON event.event_position=disposition.event_position
+        WHERE bundle.conversation_id=$1 AND bundle.welcome_id=$2
+        FOR UPDATE OF delivery
+        "#,
+    )
+    .bind(conversation_id)
+    .bind(welcome_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(WelcomeLockError::Missing)?;
+
+    let transition_seq = welcome_positive_u64(row.entry_seq)?;
+    let coordinate = welcome_coordinate(
+        *conversation_id.as_bytes(),
+        row.generation,
+        row.state_version,
+        row.group_id.clone(),
+        row.epoch,
+        row.group_context_hash.clone(),
+        row.confirmation_tag.clone(),
+    )?;
+    let wrapper_sha256 = welcome_bytes32(row.wrapper_sha256.clone())?;
+    let key_package_ref = welcome_bytes32(row.key_package_ref.clone())?;
+    if row.conversation_id != conversation_id
+        || row.welcome_id != welcome_id
+        || row.recipient_did.as_bytes() != expected.recipient().principal().as_bytes()
+        || row.recipient_device_id.as_bytes() != expected.recipient().device_id()
+        || transition_seq != expected.transition_seq()
+        || coordinate != *expected.coordinate()
+        || row.recovery_request_id.as_bytes() != expected.recovery_request_id()
+        || &key_package_ref != expected.key_package_ref()
+        || row.wrapper_bytes != expected.opaque_welcome()
+        || wrapper_sha256 != *expected.sha256()
+        || <[u8; 32]>::from(Sha256::digest(&row.wrapper_bytes)) != wrapper_sha256
+        || welcome_timestamp(row.expires_at)? != expected.expires_at()
+    {
+        return Err(WelcomeLockError::ReadSetMismatch);
+    }
+
+    let selection = select_welcome_terminal(WelcomeTerminalColumns {
+        status: &row.status,
+        expires_at: row.expires_at,
+        delivery_terminal_at: row.delivery_terminal_at,
+        disposition_present: row.disposition_welcome_id.is_some(),
+        disposition_matches_welcome: row.disposition_welcome_id == Some(welcome_id),
+        winner_kind: row.winner_kind.as_deref(),
+        signed_request_bytes: row.signed_request_bytes.as_deref(),
+        signing_transcript_bytes: row.signing_transcript_bytes.as_deref(),
+        request_digest: row.request_digest.as_deref(),
+        signature: row.signature.as_deref(),
+        rejection_reason: row.rejection_reason.as_deref(),
+        disposition_terminal_at: row.disposition_terminal_at,
+        event_position: row.event_position,
+        terminal_transition_id: row.terminal_transition_id,
+        terminal_revocation_id: row.terminal_revocation_id,
+    })?;
+
+    let historical = historical_authority_for_locked_head(aggregate.head())
+        .map_err(|_| WelcomeLockError::ReadSetMismatch)?;
+    let hydrated = load_welcome_hydration_rows(transaction, &historical, conversation_id)
+        .await?
+        .into_iter()
+        .find(|candidate| candidate.welcome_id == *welcome_id.as_bytes())
+        .ok_or(WelcomeLockError::ReadSetMismatch)?;
+    if hydrated.recipient != *expected.recipient()
+        || hydrated.transition_seq != expected.transition_seq()
+        || hydrated.coordinate != *expected.coordinate()
+        || hydrated.recovery_request_id != *expected.recovery_request_id()
+        || hydrated.key_package_ref != *expected.key_package_ref()
+        || hydrated.opaque_welcome != expected.opaque_welcome()
+        || hydrated.sha256 != *expected.sha256()
+        || hydrated.expires_at != expected.expires_at()
+        || hydrated.status != expected.status()
+    {
+        return Err(WelcomeLockError::ReadSetMismatch);
+    }
+
+    let terminal_graph = |status: &str, terminal_at: DateTime<Utc>| {
+        let expected_payload =
+            super::delivery::canonical_welcome_disposition_event_payload(welcome_id, status);
+        row.event_kind.as_deref() == Some("welcomeDisposition")
+            && row.event_payload_bytes.as_deref() == Some(expected_payload.as_slice())
+            && row.event_created_at == Some(terminal_at)
+            && row.recipient_count == 1
+            && row.exact_recipient_count == 1
+            && row.outbox_count == 1
+            && row.exact_outbox_count == 1
+    };
+    let authorization = || -> Result<LockedWelcomeClientAuthorization, WelcomeLockError> {
+        Ok(LockedWelcomeClientAuthorization {
+            signed_request_bytes: row
+                .signed_request_bytes
+                .clone()
+                .ok_or(WelcomeLockError::ReadSetMismatch)?,
+            signing_transcript_bytes: row
+                .signing_transcript_bytes
+                .clone()
+                .ok_or(WelcomeLockError::ReadSetMismatch)?,
+            request_digest: row
+                .request_digest
+                .as_deref()
+                .and_then(|value| value.try_into().ok())
+                .ok_or(WelcomeLockError::ReadSetMismatch)?,
+            signature: row
+                .signature
+                .as_deref()
+                .and_then(|value| value.try_into().ok())
+                .ok_or(WelcomeLockError::ReadSetMismatch)?,
+        })
+    };
+
+    match selection {
+        WelcomeTerminalSelection::Pending => {
+            if row.event_kind.is_some()
+                || row.event_payload_bytes.is_some()
+                || row.event_created_at.is_some()
+                || row.recipient_count != 0
+                || row.exact_recipient_count != 0
+                || row.outbox_count != 0
+                || row.exact_outbox_count != 0
+            {
+                return Err(WelcomeLockError::ReadSetMismatch);
+            }
+            let durable_row_digest = locked_welcome_digest(
+                &transaction_id,
+                conversation_id,
+                welcome_id,
+                row.recipient_did.clone().as_str(),
+                row.recipient_device_id,
+                transition_seq,
+                &coordinate,
+                row.recovery_request_id,
+                &key_package_ref,
+                &row.wrapper_bytes,
+                &wrapper_sha256,
+                row.expires_at,
+                locked_at,
+            );
+            let guard = LockedWelcomeGuard::from_locked_pending_row(
+                transaction_id,
+                conversation_id,
+                welcome_id,
+                row.recipient_did,
+                row.recipient_device_id,
+                transition_seq,
+                coordinate,
+                row.recovery_request_id,
+                key_package_ref,
+                row.wrapper_bytes,
+                wrapper_sha256,
+                row.expires_at,
+                locked_at,
+                durable_row_digest,
+            )
+            .ok_or(WelcomeLockError::GuardInvariant)?;
+            if locked_at >= guard.expires_at() {
+                Ok(LockedWelcomeTerminal::PendingDue(guard))
+            } else {
+                Ok(LockedWelcomeTerminal::PendingNotDue(guard))
+            }
+        }
+        WelcomeTerminalSelection::Acknowledged { terminal_at } => {
+            if !terminal_graph("acknowledged", terminal_at) {
+                return Err(WelcomeLockError::ReadSetMismatch);
+            }
+            Ok(LockedWelcomeTerminal::Acknowledged {
+                transaction_id,
+                locked_at,
+                row: hydrated,
+                authorization: authorization()?,
+                terminal_at,
+            })
+        }
+        WelcomeTerminalSelection::Rejected { terminal_at } => {
+            if !terminal_graph("rejected", terminal_at) {
+                return Err(WelcomeLockError::ReadSetMismatch);
+            }
+            Ok(LockedWelcomeTerminal::Rejected {
+                transaction_id,
+                locked_at,
+                row: hydrated,
+                authorization: authorization()?,
+                reason: row
+                    .rejection_reason
+                    .ok_or(WelcomeLockError::ReadSetMismatch)?,
+                terminal_at,
+            })
+        }
+        WelcomeTerminalSelection::Expired { terminal_at } => {
+            if !terminal_graph("expired", terminal_at) {
+                return Err(WelcomeLockError::ReadSetMismatch);
+            }
+            Ok(LockedWelcomeTerminal::Expired {
+                transaction_id,
+                locked_at,
+                row: hydrated,
+                terminal_at,
+            })
+        }
+        WelcomeTerminalSelection::Transition {
+            transition_id,
+            terminal_at,
+        } => {
+            if !terminal_graph("superseded", terminal_at) {
+                return Err(WelcomeLockError::ReadSetMismatch);
+            }
+            Ok(LockedWelcomeTerminal::SupersededByTransition {
+                transaction_id,
+                locked_at,
+                row: hydrated,
+                transition_id,
+                terminal_at,
+            })
+        }
+        WelcomeTerminalSelection::DeviceRevocation {
+            revocation_id,
+            terminal_at,
+        } => {
+            if !terminal_graph("superseded", terminal_at) {
+                return Err(WelcomeLockError::ReadSetMismatch);
+            }
+            Ok(LockedWelcomeTerminal::SupersededByRevocation {
+                transaction_id,
+                locked_at,
+                row: hydrated,
+                revocation_id,
+                terminal_at,
+            })
+        }
+    }
 }
 
 /// Load every Welcome for one conversation from its exact bundle/delivery row

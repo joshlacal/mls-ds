@@ -63,6 +63,9 @@ pub(crate) enum DeliveryRepositoryError {
     /// message under the same id is rejected rather than overwriting the durable
     /// outcome. (An EXACT replay is idempotent and returns the stored outcome.)
     MessageSendConflict,
+    /// A repository-issued terminal authority failed its seal, transaction,
+    /// disposition, or immutable-row binding before the first write.
+    InvalidTerminalAuthority,
     /// An application send carried no `message_id`. Every send is idempotency-keyed
     /// by `(conversation_id, message_id)`, so the id is mandatory.
     MissingMessageId,
@@ -1310,6 +1313,23 @@ impl WelcomeDisposition {
     }
 }
 
+/// Canonical server-owned payload for every Welcome terminal event. Callers
+/// supply neither arbitrary bytes nor extra fields.
+pub(crate) fn canonical_welcome_disposition_event_payload(
+    welcome_id: Uuid,
+    status: &str,
+) -> Vec<u8> {
+    // `status` is selected exclusively from `WelcomeDisposition::winner_kind`;
+    // UUID's hyphenated lowercase display contains no JSON metacharacters.
+    // Spell the repository-owned projection literally so its field order and
+    // whitespace are protocol constants rather than incidental serde map order.
+    format!(
+        r#"{{"$type":"blue.catbird.chat.defs#welcomeDispositionEvent","status":"{status}","welcomeId":"{}"}}"#,
+        welcome_id.hyphenated()
+    )
+    .into_bytes()
+}
+
 /// Terminalize a pending Welcome delivery: the terminal race. In one call this
 /// compare-and-sets the delivery's status `pending -> winner_kind` (the immutable
 /// identity trigger allows only `status` + `terminal_at` to change, and the
@@ -1324,28 +1344,95 @@ impl WelcomeDisposition {
 /// `event_position` binds the disposition to its `welcomeDisposition` event.
 pub(crate) async fn terminalize_welcome_delivery(
     transaction: &mut Transaction<'_, Postgres>,
-    welcome_id: Uuid,
+    binding: &crate::chat_protocol::state_machine::WelcomeCasBinding,
     disposition: &WelcomeDisposition,
     terminal_at: DateTime<Utc>,
     event_position: i64,
 ) -> Result<(), DeliveryRepositoryError> {
-    let winner_kind = disposition.winner_kind();
+    use crate::chat_protocol::snapshot::PublicGroupSnapshotLifecycle;
+    use crate::chat_protocol::state_machine::WelcomeStatus;
 
-    // 1. CAS the pending delivery to its terminal status. The loser (a repeat or
-    //    wrong-state call) matches nothing and returns before writing a
-    //    disposition, so the delivery keeps exactly one disposition row.
+    let winner_kind = disposition.winner_kind();
+    let welcome_id = Uuid::from_bytes(*binding.welcome_id());
+    let expected_successor = match winner_kind {
+        "acknowledged" => WelcomeStatus::Acknowledged,
+        "rejected" => WelcomeStatus::Rejected,
+        "expired" => WelcomeStatus::Expired,
+        _ => return Err(DeliveryRepositoryError::InvalidTerminalAuthority),
+    };
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+    let recipient_did = std::str::from_utf8(binding.recipient().principal().as_bytes())
+        .map_err(|_| DeliveryRepositoryError::InvalidTerminalAuthority)?;
+    if !binding.verify_seal()
+        || transaction_id != binding.transaction_id()
+        || binding.expected_status() != WelcomeStatus::Pending
+        || binding.successor_status() != expected_successor
+        || binding.coordinate().lifecycle() != PublicGroupSnapshotLifecycle::Active
+        || (winner_kind == "expired"
+            && terminal_at.timestamp_millis() != binding.expires_at().unix_millis())
+        || (winner_kind != "expired"
+            && terminal_at.timestamp_millis() != binding.locked_at().unix_millis())
+    {
+        return Err(DeliveryRepositoryError::InvalidTerminalAuthority);
+    }
+    let generation = i64::try_from(binding.coordinate().generation())
+        .map_err(|_| DeliveryRepositoryError::InvalidTerminalAuthority)?;
+    let state_version = i64::try_from(binding.coordinate().state_version())
+        .map_err(|_| DeliveryRepositoryError::InvalidTerminalAuthority)?;
+    let epoch = i64::try_from(binding.coordinate().epoch())
+        .map_err(|_| DeliveryRepositoryError::InvalidTerminalAuthority)?;
+
+    // Cross-check every immutable bundle/delivery authority column in the CAS.
     let result = sqlx::query(
         r#"
-        UPDATE chat.welcome_deliveries
+        UPDATE chat.welcome_deliveries AS delivery
            SET status = $2,
                terminal_at = $3
-         WHERE welcome_id = $1
-           AND status = 'pending'
+          FROM chat.welcome_bundles AS bundle
+         WHERE delivery.welcome_id = $1
+           AND delivery.status = 'pending'
+           AND bundle.welcome_id = delivery.welcome_id
+           AND bundle.conversation_id = $4
+           AND bundle.entry_seq = $5
+           AND bundle.generation = $6
+           AND bundle.state_version = $7
+           AND bundle.group_id = $8
+           AND bundle.epoch = $9
+           AND bundle.group_context_hash = $10
+           AND bundle.confirmation_tag = $11
+           AND bundle.wrapper_sha256 = $12
+           AND delivery.recipient_did = $13
+           AND delivery.recipient_device_id = $14
+           AND delivery.recovery_request_id = $15
+           AND delivery.key_package_ref = $16
+           AND delivery.expires_at = $17
         "#,
     )
     .bind(welcome_id)
     .bind(winner_kind)
     .bind(terminal_at)
+    .bind(Uuid::from_bytes(*binding.conversation_id()))
+    .bind(
+        i64::try_from(binding.transition_seq())
+            .map_err(|_| DeliveryRepositoryError::InvalidTerminalAuthority)?,
+    )
+    .bind(generation)
+    .bind(state_version)
+    .bind(binding.coordinate().group_id().to_vec())
+    .bind(epoch)
+    .bind(binding.coordinate().group_context_hash().to_vec())
+    .bind(binding.coordinate().confirmation_tag().to_vec())
+    .bind(binding.opaque_welcome_sha256().to_vec())
+    .bind(recipient_did)
+    .bind(Uuid::from_bytes(*binding.recipient().device_id()))
+    .bind(Uuid::from_bytes(*binding.recovery_request_id()))
+    .bind(binding.key_package_ref().to_vec())
+    .bind(
+        DateTime::<Utc>::from_timestamp_millis(binding.expires_at().unix_millis())
+            .ok_or(DeliveryRepositoryError::InvalidTerminalAuthority)?,
+    )
     .execute(&mut **transaction)
     .await?;
 
@@ -1353,7 +1440,61 @@ pub(crate) async fn terminalize_welcome_delivery(
         return Err(DeliveryRepositoryError::CompareAndSetConflict);
     }
 
-    // 2. Insert the one immutable disposition row for the winning terminalization.
+    insert_welcome_disposition(
+        transaction,
+        welcome_id,
+        disposition,
+        terminal_at,
+        event_position,
+    )
+    .await
+}
+
+/// Coordinate-changing supersession remains bound to its independently
+/// reverified transition/revocation cause rather than a response/expiry guard.
+pub(crate) async fn terminalize_welcome_delivery_for_supersession(
+    transaction: &mut Transaction<'_, Postgres>,
+    welcome_id: Uuid,
+    disposition: &WelcomeDisposition,
+    terminal_at: DateTime<Utc>,
+    event_position: i64,
+) -> Result<(), DeliveryRepositoryError> {
+    if !matches!(
+        disposition,
+        WelcomeDisposition::SupersededByTransition { .. }
+            | WelcomeDisposition::SupersededByRevocation { .. }
+    ) {
+        return Err(DeliveryRepositoryError::InvalidTerminalAuthority);
+    }
+    let result = sqlx::query(
+        "UPDATE chat.welcome_deliveries SET status='superseded',terminal_at=$2 \
+         WHERE welcome_id=$1 AND status='pending'",
+    )
+    .bind(welcome_id)
+    .bind(terminal_at)
+    .execute(&mut **transaction)
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(DeliveryRepositoryError::CompareAndSetConflict);
+    }
+    insert_welcome_disposition(
+        transaction,
+        welcome_id,
+        disposition,
+        terminal_at,
+        event_position,
+    )
+    .await
+}
+
+async fn insert_welcome_disposition(
+    transaction: &mut Transaction<'_, Postgres>,
+    welcome_id: Uuid,
+    disposition: &WelcomeDisposition,
+    terminal_at: DateTime<Utc>,
+    event_position: i64,
+) -> Result<(), DeliveryRepositoryError> {
+    let winner_kind = disposition.winner_kind();
     let (signed_request_bytes, signing_transcript_bytes, request_digest, signature) =
         match disposition.authorization() {
             Some(authorization) => (
