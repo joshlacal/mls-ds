@@ -2788,25 +2788,35 @@ mod historical_control_loader {
     };
     use crate::chat_protocol::public_state::{encode_public_tree_summary, ActivePublicState};
     use crate::chat_protocol::repository::core::{
-        certify_no_terminal_proofs, derive_retained_metadata_provenance,
-        hydrate_locked_conversation_head, hydrate_locked_conversation_state,
-        hydrate_public_state_under_locked_head, load_historical_control_evidence,
-        load_interval_hydration_rows, load_metadata_provenance, load_participant_hydration_rows,
-        load_producer_transition_evidence, resolve_active_conversation_kind,
-        retained_metadata_head_from_current_evidence, select_retained_metadata_producer,
-        ControlEvidenceLoadError, ConversationStateHydrationError, IntervalHydrationError,
+        canonicalize_terminal_proof_hydration_rows, certify_no_terminal_proofs,
+        derive_retained_metadata_provenance, hydrate_locked_conversation_head,
+        hydrate_locked_conversation_state, hydrate_public_state_under_locked_head,
+        load_historical_control_evidence, load_interval_hydration_rows, load_metadata_provenance,
+        load_participant_hydration_rows, load_producer_transition_evidence,
+        load_terminal_proof_hydration_rows, match_terminal_proof_evidence,
+        resolve_conversation_hydration_kind, retained_metadata_head_from_current_evidence,
+        select_retained_metadata_producer, terminal_proof_timestamp, ControlEvidenceLoadError,
+        ConversationHydrationLifecycle, ConversationStateHydrationError, IntervalHydrationError,
         MetadataHydrationError, ParticipantHydrationError, ProducerHydrationError,
         PublicStateHydrationError, RetainedMetadataCandidate, RetainedMetadataCatalogHead,
-        RetainedMetadataHead,
+        RetainedMetadataHead, TerminalProofHydrationError,
     };
+    use crate::chat_protocol::repository::delivery::{
+        EntryEntitlementKind, EventEntitlementKind, EventKind, OutboxWorkKind,
+    };
+    use crate::chat_protocol::repository::transition::TransitionActorRole;
     use crate::chat_protocol::snapshot::{
         PublicGroupSnapshotLeaf, PublicGroupSnapshotLifecycle, PublicGroupSnapshotTreeSummary,
     };
     use crate::chat_protocol::state_machine::{
-        metadata_binding_of_transition, ConversationKind, DeviceIdentity,
-        HistoricalRehydrationAuthority, MetadataSnapshotBinding, OpeningKind, ParticipantRole,
+        apply_conversation_persistence_plan, hydrate_conversation_state,
+        metadata_binding_of_transition, persistence_plan_for_test, plan_close, CloseConversation,
+        ControlEntryContent, ConversationHeadCasBinding, ConversationKind, DeviceIdentity,
+        EventFanout, ExecutionActor, ExecutionContext, HistoricalRehydrationAuthority,
+        HydrationAuthority, MetadataSnapshotBinding, OpeningKind, ParticipantRole,
         ParticipantStatus, PersistedControlAuthority, PrincipalId, RequestEntryKind,
-        RequestEvidence, ServerTimestamp, TransitionEvidence,
+        RequestEvidence, ServerTimestamp, SpineArtifacts, TerminalProofHydrationRow,
+        TransitionEvidence,
     };
     use crate::chat_protocol::transcript::{
         decode_and_verify_control_entry, decode_and_verify_signed_mutation,
@@ -2821,27 +2831,45 @@ mod historical_control_loader {
     }
 
     #[test]
-    fn active_dispatcher_rejects_terminal_head_or_catalog_lifecycle() {
+    fn aggregate_dispatcher_requires_exact_active_or_terminal_lifecycle_pairs() {
         assert_eq!(
-            resolve_active_conversation_kind(
+            resolve_conversation_hydration_kind(
                 PublicGroupSnapshotLifecycle::Active,
                 "group",
                 "active"
             )
             .unwrap(),
-            ConversationKind::Group
+            (
+                ConversationKind::Group,
+                ConversationHydrationLifecycle::Active
+            )
         );
         assert_eq!(
-            resolve_active_conversation_kind(
+            resolve_conversation_hydration_kind(
                 PublicGroupSnapshotLifecycle::Active,
                 "direct",
                 "active",
             )
             .unwrap(),
-            ConversationKind::Direct
+            (
+                ConversationKind::Direct,
+                ConversationHydrationLifecycle::Active
+            )
+        );
+        assert_eq!(
+            resolve_conversation_hydration_kind(
+                PublicGroupSnapshotLifecycle::Superseded,
+                "group",
+                "superseded",
+            )
+            .unwrap(),
+            (
+                ConversationKind::Group,
+                ConversationHydrationLifecycle::Terminal
+            )
         );
         assert!(matches!(
-            resolve_active_conversation_kind(
+            resolve_conversation_hydration_kind(
                 PublicGroupSnapshotLifecycle::Superseded,
                 "group",
                 "active",
@@ -2849,10 +2877,10 @@ mod historical_control_loader {
             Err(ConversationStateHydrationError::TerminalLifecycleUnsupported)
         ));
         assert!(matches!(
-            resolve_active_conversation_kind(
+            resolve_conversation_hydration_kind(
                 PublicGroupSnapshotLifecycle::Active,
                 "group",
-                "closed",
+                "superseded",
             ),
             Err(ConversationStateHydrationError::TerminalLifecycleUnsupported)
         ));
@@ -2867,6 +2895,233 @@ mod historical_control_loader {
                 Err(ConversationStateHydrationError::UnexpectedTerminalProof)
             ));
         }
+    }
+
+    #[test]
+    fn terminal_proof_timestamp_rejects_sub_millisecond_aliases() {
+        let canonical = DateTime::parse_from_rfc3339("2030-03-01T00:00:01.000Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let expected = ServerTimestamp::from_unix_millis_for_test(canonical.timestamp_millis())
+            .expect("canonical timestamp");
+        assert_eq!(
+            terminal_proof_timestamp(canonical).expect("whole milliseconds are canonical"),
+            expected
+        );
+
+        for noncanonical in ["2030-03-01T00:00:01.000001Z", "2030-03-01T00:00:01.000500Z"] {
+            let value = DateTime::parse_from_rfc3339(noncanonical)
+                .unwrap()
+                .with_timezone(&Utc);
+            assert!(matches!(
+                terminal_proof_timestamp(value),
+                Err(TerminalProofHydrationError::OutOfDomain)
+            ));
+        }
+    }
+
+    #[test]
+    fn terminal_proof_matcher_requires_exact_close_authority_and_columns() {
+        let cid = Uuid::new_v4();
+        let entry = build_real_creation_entry(*cid.as_bytes());
+        let close = build_real_close_entry(&entry);
+        let historical =
+            HistoricalRehydrationAuthority::new(*cid.as_bytes(), 3).expect("historical authority");
+        let close_authority = historical
+            .hydrate_historical_control_from_durable_bytes(
+                close.public_row_json.clone(),
+                close.raw_wrapper.clone(),
+                &entry.public_key,
+            )
+            .expect("close authority");
+        let close_evidence = close_authority
+            .clone()
+            .into_transition()
+            .expect("close transition");
+        let exact = (
+            *cid.as_bytes(),
+            *cid.as_bytes(),
+            close_evidence.seq(),
+            *close_evidence.transition_id(),
+            *close_evidence.outer_entry_fingerprint(),
+            close_evidence.received_at(),
+        );
+        assert_eq!(
+            match_terminal_proof_evidence(
+                exact.0,
+                exact.1,
+                exact.2,
+                exact.3,
+                exact.4,
+                exact.5,
+                close_authority.clone(),
+            )
+            .expect("exact close proof matches"),
+            close_evidence
+        );
+
+        let low = DeviceIdentity::new(
+            PrincipalId::new(b"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".to_vec()).unwrap(),
+            *Uuid::new_v4().as_bytes(),
+        )
+        .unwrap();
+        let high = DeviceIdentity::new(
+            PrincipalId::new(b"did:plc:bbbbbbbbbbbbbbbbbbbbbbbb".to_vec()).unwrap(),
+            *Uuid::new_v4().as_bytes(),
+        )
+        .unwrap();
+        let proof = |recipient| TerminalProofHydrationRow {
+            recipient,
+            conversation_id: *cid.as_bytes(),
+            evidence: close_evidence.clone(),
+        };
+        let sorted = canonicalize_terminal_proof_hydration_rows(vec![
+            proof(high.clone()),
+            proof(low.clone()),
+        ])
+        .expect("terminal proofs sort canonically");
+        assert_eq!(sorted[0].recipient, low);
+        assert_eq!(sorted[1].recipient, high);
+        assert!(matches!(
+            canonicalize_terminal_proof_hydration_rows(vec![proof(low.clone()), proof(low)]),
+            Err(TerminalProofHydrationError::BindingMismatch)
+        ));
+
+        let other_cid = *Uuid::new_v4().as_bytes();
+        let other_transition = *Uuid::new_v4().as_bytes();
+        let later = ServerTimestamp::from_unix_millis_for_test(exact.5.unix_millis() + 1)
+            .expect("later timestamp");
+        let mismatches = [
+            (other_cid, exact.2, exact.3, exact.4, exact.5),
+            (exact.1, exact.2 + 1, exact.3, exact.4, exact.5),
+            (exact.1, exact.2, other_transition, exact.4, exact.5),
+            (exact.1, exact.2, exact.3, [0x71; 32], exact.5),
+            (exact.1, exact.2, exact.3, exact.4, later),
+        ];
+        for (proof_cid, seq, transition_id, fingerprint, received_at) in mismatches {
+            assert!(matches!(
+                match_terminal_proof_evidence(
+                    exact.0,
+                    proof_cid,
+                    seq,
+                    transition_id,
+                    fingerprint,
+                    received_at,
+                    close_authority.clone(),
+                ),
+                Err(TerminalProofHydrationError::BindingMismatch)
+            ));
+        }
+
+        let out_of_domain = [
+            ([0; 16], exact.1, exact.2, exact.3, exact.4),
+            (exact.0, [0; 16], exact.2, exact.3, exact.4),
+            (exact.0, exact.1, 0, exact.3, exact.4),
+            (exact.0, exact.1, 9_007_199_254_740_992, exact.3, exact.4),
+            (exact.0, exact.1, exact.2, [0; 16], exact.4),
+        ];
+        for (expected_cid, proof_cid, seq, transition_id, fingerprint) in out_of_domain {
+            assert!(matches!(
+                match_terminal_proof_evidence(
+                    expected_cid,
+                    proof_cid,
+                    seq,
+                    transition_id,
+                    fingerprint,
+                    exact.5,
+                    close_authority.clone(),
+                ),
+                Err(TerminalProofHydrationError::OutOfDomain)
+            ));
+        }
+        assert!(matches!(
+            match_terminal_proof_evidence(
+                exact.0,
+                exact.1,
+                exact.2,
+                exact.3,
+                [0; 32],
+                exact.5,
+                close_authority.clone(),
+            ),
+            Err(TerminalProofHydrationError::OutOfDomain)
+        ));
+
+        let creation_authority = HistoricalRehydrationAuthority::new(*cid.as_bytes(), 3)
+            .unwrap()
+            .hydrate_historical_control_from_durable_bytes(
+                entry.public_row_json.clone(),
+                entry.raw_wrapper.clone(),
+                &entry.public_key,
+            )
+            .expect("creation authority");
+        assert!(matches!(
+            match_terminal_proof_evidence(
+                exact.0,
+                exact.1,
+                exact.2,
+                exact.3,
+                exact.4,
+                exact.5,
+                creation_authority,
+            ),
+            Err(TerminalProofHydrationError::InvalidEvidence)
+        ));
+
+        let request = reset_leave_leg::build_real_control_request_entry(
+            &entry,
+            crate::chat_protocol::transcript::SignedMutationKind::ResetRequest,
+            "blue.catbird.chat.defs#resetRequestEntry",
+            2,
+        );
+        let request_authority = HistoricalRehydrationAuthority::new(*cid.as_bytes(), 3)
+            .unwrap()
+            .hydrate_historical_control_from_durable_bytes(
+                request.public_row_json,
+                request.raw_wrapper,
+                &entry.public_key,
+            )
+            .expect("request authority");
+        assert!(matches!(
+            match_terminal_proof_evidence(
+                exact.0,
+                exact.1,
+                exact.2,
+                exact.3,
+                exact.4,
+                exact.5,
+                request_authority,
+            ),
+            Err(TerminalProofHydrationError::InvalidEvidence)
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the dedicated gate database"]
+    async fn active_conversation_hydrates_zero_terminal_proofs() {
+        let database_url = std::env::var("TEST_DATABASE_URL")
+            .expect("TEST_DATABASE_URL must name the existing gate database");
+        common::chat_protocol::validate_chat_protocol_database_url(Some(&database_url))
+            .expect("unsafe TEST_DATABASE_URL for terminal-proof hydration");
+        let pool = PgPool::connect(&database_url)
+            .await
+            .expect("connect to existing gate database");
+        let cid = Uuid::new_v4();
+        let entry = build_real_creation_entry(*cid.as_bytes());
+        seed_real_creation_graph(&pool, &entry).await;
+        let locked_at = clock_now(&pool).await;
+        let mut tx = pool.begin().await.expect("begin terminal-proof read");
+        let head = hydrate_locked_conversation_head(&mut tx, cid, locked_at)
+            .await
+            .expect("lock active head");
+        let historical = HistoricalRehydrationAuthority::from_locked_head(&head)
+            .expect("mint historical authority");
+        let rows = load_terminal_proof_hydration_rows(&mut tx, &historical, cid)
+            .await
+            .expect("active conversation has no terminal proofs");
+        tx.rollback().await.expect("rollback read-only proof");
+        assert!(rows.is_empty());
+        let _closed_error_type: Option<TerminalProofHydrationError> = None;
     }
 
     /// Seed a coherent committed GROUP conversation whose genesis (seq 1) entry
@@ -2924,7 +3179,8 @@ mod historical_control_loader {
         .await
     }
 
-    async fn commit_genuine_terminal_conversation(pool: &PgPool) -> Uuid {
+    #[allow(dead_code)]
+    async fn commit_legacy_terminal_fixture(pool: &PgPool) -> Uuid {
         use base64::{engine::general_purpose::STANDARD, Engine};
 
         let cid = Uuid::new_v4();
@@ -3252,9 +3508,175 @@ mod historical_control_loader {
         cid
     }
 
+    async fn commit_genuine_terminal_conversation(pool: &PgPool) -> Uuid {
+        let cid = Uuid::new_v4();
+        let template = crate::frozen_public_state::restore_genesis();
+        let coordinate = crate::chat_protocol::snapshot::PublicGroupSnapshotCoordinate::new(
+            *cid.as_bytes(),
+            template.coordinate().generation(),
+            template.coordinate().state_version(),
+            *template.coordinate().group_id(),
+            template.coordinate().epoch(),
+            *template.coordinate().group_context_hash(),
+            *template.coordinate().confirmation_tag(),
+            template.coordinate().lifecycle(),
+        );
+        let public_state = ActivePublicState::for_test(&template, coordinate);
+        let entry = build_real_corpus_creation_entry(*cid.as_bytes());
+        seed_real_creation_graph_with_public_state(pool, &entry, &public_state).await;
+
+        let locked_at: DateTime<Utc> =
+            sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
+                .fetch_one(pool)
+                .await
+                .expect("canonical close pre-plan lock instant");
+        let mut read = pool.begin().await.expect("begin close pre-plan hydration");
+        let locked = hydrate_locked_conversation_state(&mut read, cid, locked_at)
+            .await
+            .expect("genuine active graph hydrates before close");
+        let prior = locked.state().clone();
+        read.rollback().await.expect("release pre-plan head lock");
+
+        let close = build_real_close_entry(&entry);
+        let historical =
+            HistoricalRehydrationAuthority::new(entry.cid, 3).expect("close historical authority");
+        let transition = historical
+            .hydrate_historical_control_from_durable_bytes(
+                close.public_row_json.clone(),
+                close.raw_wrapper.clone(),
+                &entry.public_key,
+            )
+            .expect("genuine close re-verifies")
+            .into_transition()
+            .expect("close is transition evidence");
+        let actor = DeviceIdentity::new(
+            PrincipalId::new(entry.actor_did.as_bytes().to_vec()).unwrap(),
+            *entry.actor_device_id.as_bytes(),
+        )
+        .unwrap();
+        let planned = plan_close(
+            &prior,
+            CloseConversation {
+                actor: actor.clone(),
+                transition,
+            },
+        )
+        .expect("genuine one-participant close plans");
+        let close_timestamp =
+            ServerTimestamp::from_canonical_stored(&close.received_at).expect("close timestamp");
+        let plan = persistence_plan_for_test(
+            planned,
+            ConversationHeadCasBinding::for_test_edge(
+                entry.cid,
+                *close.entry_id.as_bytes(),
+                *prior.coordinate(),
+                2,
+                close_timestamp,
+            ),
+        );
+
+        let prior_public = prior.public_state();
+        let tree = encode_public_tree_summary(prior_public.binding().tree_summary())
+            .expect("close predecessor tree is canonical");
+        let protocol_instance_id: Uuid =
+            sqlx::query_scalar("SELECT protocol_instance_id FROM chat.protocol_instances")
+                .fetch_one(pool)
+                .await
+                .expect("protocol instance");
+        let leaf_period_id: Uuid = sqlx::query_scalar(
+            r#"SELECT leaf_period_id FROM chat.member_devices
+               WHERE conversation_id=$1 AND user_did=$2 AND device_id=$3 AND active"#,
+        )
+        .bind(cid)
+        .bind(&entry.actor_did)
+        .bind(entry.actor_device_id)
+        .fetch_one(pool)
+        .await
+        .expect("active creator leaf period");
+        let event_predecessor: Option<i64> = sqlx::query_scalar(
+            "SELECT max(event_position) FROM chat.event_recipients \
+             WHERE user_did=$1 AND device_id=$2",
+        )
+        .bind(&entry.actor_did)
+        .bind(entry.actor_device_id)
+        .fetch_one(pool)
+        .await
+        .expect("historical schedule event predecessor");
+        let applied_at = DateTime::parse_from_rfc3339(&close.received_at)
+            .unwrap()
+            .with_timezone(&Utc);
+        let context = ExecutionContext {
+            protocol_instance_id,
+            applied_at,
+            actor: ExecutionActor {
+                user_did: entry.actor_did.clone(),
+                device_id: entry.actor_device_id,
+                key_id: entry.actor_key_id.clone(),
+                auth_generation: 1,
+                role: TransitionActorRole::Admin,
+                device_status: "active".to_owned(),
+            },
+            entry: ControlEntryContent {
+                entry_id: close.entry_id,
+                entry_kind: "blue.catbird.chat.defs#conversationCloseEntry".to_owned(),
+                accepted_payload_bytes: close.public_row_json.clone(),
+                accepted_payload_sha256: Sha256::digest(&close.public_row_json).to_vec(),
+                signed_request_bytes: close.raw_wrapper.clone(),
+                unsigned_projection_bytes: close.canonical_projection.clone(),
+                signing_transcript_bytes: close.signing_transcript.clone(),
+                request_digest: close.request_digest.clone(),
+                signature: close.signature.clone(),
+                server_fields_bytes: close.server_fields_dag_cbor.clone(),
+                outer_entry_fingerprint: close.outer_entry_fingerprint.to_vec(),
+            },
+            spine: SpineArtifacts {
+                public_snapshot_bytes: prior_public.snapshot().to_vec(),
+                public_snapshot_sha256: prior_public.snapshot_sha256().to_vec(),
+                tree_summary_bytes: tree.bytes().to_vec(),
+                tree_summary_sha256: tree.sha256().to_vec(),
+                leaf_count: i64::try_from(prior_public.binding().tree_summary().leaves().len())
+                    .unwrap(),
+                genesis_group_info_bytes: vec![],
+                genesis_group_info_sha256: vec![],
+            },
+            opened_leaves: vec![],
+            metadata_author: None,
+            participant_period_ids: vec![],
+            leaf_period_ids: vec![],
+            entry_recipients: vec![(actor.clone(), EntryEntitlementKind::ScheduleTerminal)],
+            events: vec![EventFanout {
+                event_id: Uuid::new_v4(),
+                event_kind: EventKind::ConversationClosed,
+                payload_bytes: format!("conversation-closed-{cid}").into_bytes(),
+                recipients: vec![(
+                    actor.clone(),
+                    EventEntitlementKind::HistoricalSchedule,
+                    event_predecessor,
+                )],
+                outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+            }],
+            closing_leaf_periods: vec![(actor, leaf_period_id)],
+            closing_participant_periods: vec![],
+            reset_request_row: None,
+            recovery_open: None,
+            welcome_expiry: None,
+            welcome_response: None,
+            welcome_dispositions: vec![],
+        };
+        let mut tx = pool.begin().await.expect("begin genuine close");
+        let applied = apply_conversation_persistence_plan(&mut tx, &plan, &context)
+            .await
+            .expect("production executor applies genuine close");
+        assert_eq!(applied.allocated_seq, 2);
+        tx.commit()
+            .await
+            .expect("genuine close crosses deferred constraints");
+        cid
+    }
+
     #[tokio::test]
     #[ignore = "requires the dedicated gate database"]
-    async fn terminal_aggregate_entry_point_rejects_before_public_snapshot_decode() {
+    async fn terminal_aggregate_hydrates_genuine_committed_close_graph() {
         let database_url = std::env::var("TEST_DATABASE_URL")
             .expect("TEST_DATABASE_URL must name the existing gate database");
         common::chat_protocol::validate_chat_protocol_database_url(Some(&database_url))
@@ -3289,14 +3711,125 @@ mod historical_control_loader {
                 .await
                 .expect("canonical lock instant");
         let mut tx = pool.begin().await.expect("begin terminal aggregate read");
-        let result = hydrate_locked_conversation_state(&mut tx, cid, locked_at).await;
+        let locked = hydrate_locked_conversation_state(&mut tx, cid, locked_at)
+            .await
+            .expect("terminal aggregate hydrates from durable close graph");
+        assert_eq!(
+            locked.state().coordinate().lifecycle(),
+            PublicGroupSnapshotLifecycle::Superseded
+        );
+        assert!(locked.state().active_public_state().is_none());
+        assert!(locked.state().leaves().is_empty());
+        assert_eq!(locked.state().intervals().len(), 1);
+        assert_eq!(locked.state().terminal_proofs().len(), 1);
+        assert_eq!(locked.state().terminal_proofs()[0].seq(), 2);
+        assert!(locked.locked_snapshot_digest().is_none());
+        assert_ne!(locked.locked_graph_digest(), &[0; 32]);
+        let terminal_state = locked.state().clone();
         tx.rollback()
             .await
             .expect("rollback terminal aggregate read");
-        assert!(matches!(
-            result,
-            Err(ConversationStateHydrationError::TerminalLifecycleUnsupported)
-        ));
+
+        let authority = HydrationAuthority::new(*cid.as_bytes()).expect("terminal authority");
+
+        let mut missing =
+            crate::chat_protocol::state_machine::ConversationStateHydration::for_test_from_state(
+                terminal_state.clone(),
+            );
+        missing.terminal_proofs.clear();
+        assert!(hydrate_conversation_state(&authority, missing).is_err());
+
+        let duplicate =
+            crate::chat_protocol::state_machine::ConversationStateHydration::for_test_from_state(
+                terminal_state.for_test_duplicate_terminal_proof(),
+            );
+        assert!(hydrate_conversation_state(&authority, duplicate).is_err());
+
+        let wrong_conversation =
+            crate::chat_protocol::state_machine::ConversationStateHydration::for_test_from_state(
+                terminal_state
+                    .for_test_corrupt_first_terminal_proof_conversation(*Uuid::new_v4().as_bytes()),
+            );
+        assert!(hydrate_conversation_state(&authority, wrong_conversation).is_err());
+
+        let wrong_fingerprint =
+            crate::chat_protocol::state_machine::ConversationStateHydration::for_test_from_state(
+                terminal_state.for_test_corrupt_first_terminal_proof_fingerprint(),
+            );
+        assert!(hydrate_conversation_state(&authority, wrong_fingerprint).is_err());
+
+        let mut wrong_recipient =
+            crate::chat_protocol::state_machine::ConversationStateHydration::for_test_from_state(
+                terminal_state.clone(),
+            );
+        wrong_recipient.terminal_proofs[0].recipient = DeviceIdentity::new(
+            PrincipalId::new(b"did:plc:abcdefghijklmnopqrstuvwx".to_vec()).unwrap(),
+            *Uuid::new_v4().as_bytes(),
+        )
+        .unwrap();
+        assert!(hydrate_conversation_state(&authority, wrong_recipient).is_err());
+
+        let mut open_interval =
+            crate::chat_protocol::state_machine::ConversationStateHydration::for_test_from_state(
+                terminal_state.clone(),
+            );
+        open_interval.intervals[0].end = None;
+        assert!(hydrate_conversation_state(&authority, open_interval).is_err());
+
+        let mut inconsistent_close =
+            crate::chat_protocol::state_machine::ConversationStateHydration::for_test_from_state(
+                terminal_state.clone(),
+            );
+        inconsistent_close.intervals[0]
+            .end
+            .as_mut()
+            .expect("closed interval")
+            .evidence = inconsistent_close.intervals[0].opening.clone();
+        assert!(hydrate_conversation_state(&authority, inconsistent_close).is_err());
+
+        let terminal_rows =
+            crate::chat_protocol::state_machine::ConversationStateHydration::for_test_from_state(
+                terminal_state,
+            );
+        let active_cid = Uuid::new_v4();
+        let active_template = crate::frozen_public_state::restore_genesis();
+        let active_coordinate = crate::chat_protocol::snapshot::PublicGroupSnapshotCoordinate::new(
+            *active_cid.as_bytes(),
+            active_template.coordinate().generation(),
+            active_template.coordinate().state_version(),
+            *active_template.coordinate().group_id(),
+            active_template.coordinate().epoch(),
+            *active_template.coordinate().group_context_hash(),
+            *active_template.coordinate().confirmation_tag(),
+            active_template.coordinate().lifecycle(),
+        );
+        let active_public = ActivePublicState::for_test(&active_template, active_coordinate);
+        let active_entry = build_real_corpus_creation_entry(*active_cid.as_bytes());
+        seed_real_creation_graph_with_public_state(&pool, &active_entry, &active_public).await;
+        let active_locked_at: DateTime<Utc> =
+            sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
+                .fetch_one(&pool)
+                .await
+                .expect("active negative lock instant");
+        let mut active_tx = pool.begin().await.expect("begin active negative read");
+        let active_locked =
+            hydrate_locked_conversation_state(&mut active_tx, active_cid, active_locked_at)
+                .await
+                .expect("active negative base hydrates");
+        let mut active_with_terminal =
+            crate::chat_protocol::state_machine::ConversationStateHydration::for_test_from_state(
+                active_locked.state().clone(),
+            );
+        active_with_terminal
+            .terminal_proofs
+            .push(terminal_rows.terminal_proofs[0].clone());
+        active_tx
+            .rollback()
+            .await
+            .expect("rollback active negative read");
+        let active_authority =
+            HydrationAuthority::new(*active_cid.as_bytes()).expect("active authority");
+        assert!(hydrate_conversation_state(&active_authority, active_with_terminal).is_err());
     }
 
     #[tokio::test]

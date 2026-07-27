@@ -38,7 +38,8 @@ use super::super::{
         RecoveryRequestHydrationRow, RecoveryRequestStatus, RecoveryReservationHydrationRow,
         RecoverySource, RequestEntryKind, RequestEvidence, ReservationStatus,
         ResetRequestHydrationRow, ResetRequestStatus, ServerTimestamp, StateMachineError,
-        TransitionEvidence, WelcomeHydrationRow, WelcomeStatus, WorkTerminalHydrationRow,
+        TerminalProofHydrationRow, TransitionEvidence, WelcomeHydrationRow, WelcomeStatus,
+        WorkTerminalHydrationRow,
     },
     validation::{BareDid, KeyThumbprint},
 };
@@ -6336,58 +6337,259 @@ pub(crate) fn require_terminal_timestamp(
 }
 
 // ===========================================================================
-// T4-H2-pre G1 — active locked conversation aggregate.
+// T4-H2-pre terminal-family sub-seal E — immutable scheduleTerminal proofs.
+//
+// A proof row is only a locator. Its authority comes from reloading the exact
+// referenced historical control entry through the sealed verifier and then
+// matching every duplicated durable field byte-for-byte. No current-head or
+// timestamp search may substitute another close transition.
+// ===========================================================================
+
+#[allow(dead_code)]
+#[derive(Debug, Error)]
+pub(crate) enum TerminalProofHydrationError {
+    #[error("clean-chat schedule terminal proof column is out of domain")]
+    OutOfDomain,
+    #[error("clean-chat schedule terminal proof transition is absent")]
+    EvidenceMissing,
+    #[error("clean-chat schedule terminal proof transition failed re-verification")]
+    InvalidEvidence,
+    #[error("clean-chat schedule terminal proof does not match its verified transition")]
+    BindingMismatch,
+    #[error("clean-chat schedule terminal proof hydration database error: {0}")]
+    Database(#[from] sqlx::Error),
+}
+
+impl From<ControlEvidenceLoadError> for TerminalProofHydrationError {
+    fn from(error: ControlEvidenceLoadError) -> Self {
+        match error {
+            ControlEvidenceLoadError::EntryMissing => TerminalProofHydrationError::EvidenceMissing,
+            ControlEvidenceLoadError::InvalidEvidence => {
+                TerminalProofHydrationError::InvalidEvidence
+            }
+            ControlEvidenceLoadError::Database(error) => {
+                TerminalProofHydrationError::Database(error)
+            }
+        }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct DurableTerminalProofHydrationRow {
+    conversation_id: Uuid,
+    recipient_did: String,
+    recipient_device_id: Uuid,
+    terminal_seq: i64,
+    transition_id: Uuid,
+    outer_entry_fingerprint: Vec<u8>,
+    received_at: DateTime<Utc>,
+}
+
+pub(crate) fn terminal_proof_timestamp(
+    value: DateTime<Utc>,
+) -> Result<ServerTimestamp, TerminalProofHydrationError> {
+    if value.timestamp_millis() < 0 || !value.timestamp_subsec_nanos().is_multiple_of(1_000_000) {
+        return Err(TerminalProofHydrationError::OutOfDomain);
+    }
+    ServerTimestamp::from_canonical_stored(&canonical_millis(value))
+        .map_err(|_| TerminalProofHydrationError::OutOfDomain)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn match_terminal_proof_evidence(
+    expected_conversation_id: [u8; 16],
+    proof_conversation_id: [u8; 16],
+    terminal_seq: u64,
+    transition_id: [u8; 16],
+    outer_entry_fingerprint: [u8; 32],
+    received_at: ServerTimestamp,
+    authority: PersistedControlAuthority,
+) -> Result<TransitionEvidence, TerminalProofHydrationError> {
+    if !uuid_is_canonical_v4(Uuid::from_bytes(expected_conversation_id))
+        || !uuid_is_canonical_v4(Uuid::from_bytes(proof_conversation_id))
+        || !uuid_is_canonical_v4(Uuid::from_bytes(transition_id))
+        || terminal_seq == 0
+        || terminal_seq > MAX_PROTOCOL_INTEGER
+        || outer_entry_fingerprint == [0; 32]
+    {
+        return Err(TerminalProofHydrationError::OutOfDomain);
+    }
+    let evidence = authority
+        .into_transition()
+        .map_err(|_| TerminalProofHydrationError::InvalidEvidence)?;
+    let signed = evidence
+        .signed_authority()
+        .ok_or(TerminalProofHydrationError::InvalidEvidence)?;
+    if signed.kind() != SignedMutationKind::ConversationClose
+        || signed.control_conversation_id() != Some(&expected_conversation_id)
+    {
+        return Err(TerminalProofHydrationError::InvalidEvidence);
+    }
+    if proof_conversation_id != expected_conversation_id
+        || evidence.seq() != terminal_seq
+        || evidence.transition_id() != &transition_id
+        || evidence.outer_entry_fingerprint() != &outer_entry_fingerprint
+        || evidence.received_at() != received_at
+    {
+        return Err(TerminalProofHydrationError::BindingMismatch);
+    }
+    Ok(evidence)
+}
+
+async fn hydrate_terminal_proof_row(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &HistoricalRehydrationAuthority,
+    expected_conversation_id: Uuid,
+    row: DurableTerminalProofHydrationRow,
+) -> Result<TerminalProofHydrationRow, TerminalProofHydrationError> {
+    if row.conversation_id != expected_conversation_id
+        || !uuid_is_canonical_v4(row.conversation_id)
+        || !uuid_is_canonical_v4(row.transition_id)
+    {
+        return Err(TerminalProofHydrationError::OutOfDomain);
+    }
+    let terminal_seq = u64::try_from(row.terminal_seq)
+        .ok()
+        .filter(|value| (1..=MAX_PROTOCOL_INTEGER).contains(value))
+        .ok_or(TerminalProofHydrationError::OutOfDomain)?;
+    let outer_entry_fingerprint: [u8; 32] = row
+        .outer_entry_fingerprint
+        .as_slice()
+        .try_into()
+        .map_err(|_| TerminalProofHydrationError::OutOfDomain)?;
+    let received_at = terminal_proof_timestamp(row.received_at)?;
+    let recipient = DeviceIdentity::new(
+        PrincipalId::new(row.recipient_did.into_bytes())
+            .map_err(|_| TerminalProofHydrationError::OutOfDomain)?,
+        *row.recipient_device_id.as_bytes(),
+    )
+    .map_err(|_| TerminalProofHydrationError::OutOfDomain)?;
+
+    let authority = load_historical_control_evidence(
+        transaction,
+        authority,
+        expected_conversation_id,
+        row.transition_id,
+    )
+    .await?;
+    let evidence = match_terminal_proof_evidence(
+        *expected_conversation_id.as_bytes(),
+        *row.conversation_id.as_bytes(),
+        terminal_seq,
+        *row.transition_id.as_bytes(),
+        outer_entry_fingerprint,
+        received_at,
+        authority,
+    )?;
+
+    Ok(TerminalProofHydrationRow {
+        recipient,
+        conversation_id: *expected_conversation_id.as_bytes(),
+        evidence,
+    })
+}
+
+/// Rehydrate all immutable scheduleTerminal rows for a locked conversation.
+///
+/// Every row reloads only its directly referenced transition. The returned
+/// collection is sorted by protocol `DeviceIdentity` bytes, not PostgreSQL text
+/// collation, and duplicate device identities fail closed.
+pub(crate) fn canonicalize_terminal_proof_hydration_rows(
+    mut rows: Vec<TerminalProofHydrationRow>,
+) -> Result<Vec<TerminalProofHydrationRow>, TerminalProofHydrationError> {
+    rows.sort_by(|left, right| left.recipient.cmp(&right.recipient));
+    if rows
+        .windows(2)
+        .any(|pair| pair[0].recipient == pair[1].recipient)
+    {
+        return Err(TerminalProofHydrationError::BindingMismatch);
+    }
+    Ok(rows)
+}
+
+#[allow(dead_code)]
+pub(crate) async fn load_terminal_proof_hydration_rows(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &HistoricalRehydrationAuthority,
+    conversation_id: Uuid,
+) -> Result<Vec<TerminalProofHydrationRow>, TerminalProofHydrationError> {
+    let durable_rows: Vec<DurableTerminalProofHydrationRow> = sqlx::query_as(
+        r#"
+        SELECT conversation_id, recipient_did, recipient_device_id, terminal_seq,
+               transition_id, outer_entry_fingerprint, received_at
+          FROM chat.application_schedule_terminal_proofs
+         WHERE conversation_id = $1
+        "#,
+    )
+    .bind(conversation_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+
+    let mut rows = Vec::with_capacity(durable_rows.len());
+    for row in durable_rows {
+        rows.push(hydrate_terminal_proof_row(transaction, authority, conversation_id, row).await?);
+    }
+    canonicalize_terminal_proof_hydration_rows(rows)
+}
+
+// ===========================================================================
+// T4-H2-pre G1 — locked active or terminal conversation aggregate.
 //
 // Every leg below is read while the caller owns the conversation-row lock
 // acquired by `hydrate_locked_conversation_head`. Historical evidence is
 // reverified from durable entry bytes; no cached state or test authority enters
 // the production path. Closed/superseded state is deliberately unsupported
-// until terminal-proof hydration exists.
+// Terminal heads deliberately skip active public-state material and instead
+// require the exact immutable scheduleTerminal proof set below.
 // ===========================================================================
 
 #[derive(Debug, Error)]
 pub(crate) enum ConversationStateHydrationError {
-    #[error("clean-chat active aggregate head hydration failed: {0}")]
+    #[error("clean-chat aggregate head hydration failed: {0}")]
     Head(ConversationHeadHydrationError),
-    #[error("clean-chat active aggregate public-state hydration failed: {0}")]
+    #[error("clean-chat aggregate public-state hydration failed: {0}")]
     PublicState(PublicStateHydrationError),
-    #[error("clean-chat active aggregate producer hydration failed: {0}")]
+    #[error("clean-chat aggregate producer hydration failed: {0}")]
     Producer(ProducerHydrationError),
-    #[error("clean-chat active aggregate metadata hydration failed: {0}")]
+    #[error("clean-chat aggregate metadata hydration failed: {0}")]
     Metadata(MetadataHydrationError),
-    #[error("clean-chat active aggregate participant hydration failed: {0}")]
+    #[error("clean-chat aggregate participant hydration failed: {0}")]
     Participants(ParticipantHydrationError),
-    #[error("clean-chat active aggregate leaf hydration failed: {0}")]
+    #[error("clean-chat aggregate leaf hydration failed: {0}")]
     Leaves(LeafHydrationError),
-    #[error("clean-chat active aggregate interval hydration failed: {0}")]
+    #[error("clean-chat aggregate interval hydration failed: {0}")]
     Intervals(IntervalHydrationError),
-    #[error("clean-chat active aggregate recovery-work hydration failed: {0}")]
+    #[error("clean-chat aggregate recovery-work hydration failed: {0}")]
     RecoveryWork(RecoveryHydrationError),
-    #[error("clean-chat active aggregate reset-work hydration failed: {0}")]
+    #[error("clean-chat aggregate reset-work hydration failed: {0}")]
     ResetWork(ResetLeaveHydrationError),
-    #[error("clean-chat active aggregate leave-work hydration failed: {0}")]
+    #[error("clean-chat aggregate leave-work hydration failed: {0}")]
     LeaveWork(ResetLeaveHydrationError),
-    #[error("clean-chat active aggregate Welcome hydration failed: {0}")]
+    #[error("clean-chat aggregate Welcome hydration failed: {0}")]
     Welcomes(WelcomeHydrationError),
-    #[error("clean-chat active aggregate authority construction failed: {0}")]
+    #[error("clean-chat aggregate terminal-proof hydration failed: {0}")]
+    TerminalProofs(TerminalProofHydrationError),
+    #[error("clean-chat aggregate authority construction failed: {0}")]
     Authority(StateMachineError),
-    #[error("clean-chat active aggregate state validation failed: {0}")]
+    #[error("clean-chat aggregate state validation failed: {0}")]
     State(StateMachineError),
-    #[error("clean-chat active aggregate snapshot decode failed: {0}")]
+    #[error("clean-chat aggregate snapshot decode failed: {0}")]
     Snapshot(super::super::public_state::PublicStateError),
-    #[error("clean-chat active aggregate read-set does not match the locked head")]
+    #[error("clean-chat aggregate read-set does not match the locked head")]
     ReadSetMismatch,
-    #[error("clean-chat terminal or superseded lifecycle is not yet supported")]
+    #[error("clean-chat catalog and head lifecycle disagree")]
     TerminalLifecycleUnsupported,
     #[error("clean-chat conversation kind or lifecycle is out of domain")]
     ConversationDomain,
     #[error("clean-chat active aggregate unexpectedly contains schedule terminal proofs")]
     UnexpectedTerminalProof,
-    #[error("clean-chat active aggregate graph digest is invalid")]
+    #[error("clean-chat terminal aggregate retains an active leaf")]
+    TerminalLeafPresent,
+    #[error("clean-chat aggregate graph digest is invalid")]
     GraphDigest,
-    #[error("clean-chat active aggregate could not be sealed")]
+    #[error("clean-chat aggregate could not be sealed")]
     Seal,
-    #[error("clean-chat active aggregate database error: {0}")]
+    #[error("clean-chat aggregate database error: {0}")]
     Database(#[from] sqlx::Error),
 }
 
@@ -6748,13 +6950,22 @@ fn graph_digest_welcome(digest: &mut Sha256, value: &WelcomeHydrationRow) {
     graph_digest_option(digest, value.terminal.as_ref(), graph_digest_terminal);
 }
 
-fn active_conversation_graph_digest(
+fn graph_digest_terminal_proof(digest: &mut Sha256, value: &TerminalProofHydrationRow) {
+    graph_digest_device(digest, &value.recipient);
+    digest.update(value.conversation_id);
+    graph_digest_transition(digest, &value.evidence);
+}
+
+fn conversation_graph_digest(
     head: &LockedConversationHeadGuard,
-    snapshot_digest: &[u8; 32],
+    snapshot_digest: Option<&[u8; 32]>,
     rows: &ConversationStateHydration,
 ) -> [u8; 32] {
     let mut digest = Sha256::new();
-    digest.update(b"CATBIRD-CHAT-ACTIVE-CONVERSATION-GRAPH\0");
+    digest.update(match snapshot_digest {
+        Some(_) => b"CATBIRD-CHAT-ACTIVE-CONVERSATION-GRAPH\0".as_slice(),
+        None => b"CATBIRD-CHAT-TERMINAL-CONVERSATION-GRAPH\0".as_slice(),
+    });
     digest.update(head.conversation_id().as_bytes());
     graph_digest_option(
         &mut digest,
@@ -6762,7 +6973,9 @@ fn active_conversation_graph_digest(
         graph_digest_coordinate,
     );
     digest.update(head.next_entry_seq().to_be_bytes());
-    digest.update(snapshot_digest);
+    graph_digest_option(&mut digest, snapshot_digest, |digest, value| {
+        digest.update(value)
+    });
     digest.update([match rows.kind {
         ConversationKind::Direct => 1,
         ConversationKind::Group => 2,
@@ -6794,6 +7007,9 @@ fn active_conversation_graph_digest(
         graph_digest_interval(&mut digest, value);
     }
     digest.update((rows.terminal_proofs.len() as u64).to_be_bytes());
+    for value in &rows.terminal_proofs {
+        graph_digest_terminal_proof(&mut digest, value);
+    }
     digest.update((rows.recovery_requests.len() as u64).to_be_bytes());
     for value in &rows.recovery_requests {
         graph_digest_recovery_request(&mut digest, value);
@@ -6823,22 +7039,33 @@ pub(crate) fn active_conversation_graph_digest_for_test(
     snapshot_digest: &[u8; 32],
     rows: &ConversationStateHydration,
 ) -> [u8; 32] {
-    active_conversation_graph_digest(head, snapshot_digest, rows)
+    conversation_graph_digest(head, Some(snapshot_digest), rows)
 }
 
-pub(crate) fn resolve_active_conversation_kind(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConversationHydrationLifecycle {
+    Active,
+    Terminal,
+}
+
+pub(crate) fn resolve_conversation_hydration_kind(
     head_lifecycle: PublicGroupSnapshotLifecycle,
     stored_kind: &str,
     stored_lifecycle: &str,
-) -> Result<ConversationKind, ConversationStateHydrationError> {
-    if head_lifecycle != PublicGroupSnapshotLifecycle::Active || stored_lifecycle != "active" {
-        return Err(ConversationStateHydrationError::TerminalLifecycleUnsupported);
-    }
-    match stored_kind {
-        "direct" => Ok(ConversationKind::Direct),
-        "group" => Ok(ConversationKind::Group),
-        _ => Err(ConversationStateHydrationError::ConversationDomain),
-    }
+) -> Result<(ConversationKind, ConversationHydrationLifecycle), ConversationStateHydrationError> {
+    let lifecycle = match (head_lifecycle, stored_lifecycle) {
+        (PublicGroupSnapshotLifecycle::Active, "active") => ConversationHydrationLifecycle::Active,
+        (PublicGroupSnapshotLifecycle::Superseded, "superseded") => {
+            ConversationHydrationLifecycle::Terminal
+        }
+        _ => return Err(ConversationStateHydrationError::TerminalLifecycleUnsupported),
+    };
+    let kind = match stored_kind {
+        "direct" => ConversationKind::Direct,
+        "group" => ConversationKind::Group,
+        _ => return Err(ConversationStateHydrationError::ConversationDomain),
+    };
+    Ok((kind, lifecycle))
 }
 
 pub(crate) fn certify_no_terminal_proofs(
@@ -6853,8 +7080,8 @@ pub(crate) fn certify_no_terminal_proofs(
     Ok(Vec::new())
 }
 
-/// Hydrate, validate, and seal one active conversation graph under the caller's
-/// transaction-local conversation-row lock.
+/// Hydrate, validate, and seal one active or terminal conversation graph under
+/// the caller's transaction-local conversation-row lock.
 ///
 /// The returned guard remains valid only while `transaction` remains open. This
 /// function never begins, commits, or rolls back a transaction.
@@ -6878,46 +7105,51 @@ pub(crate) async fn hydrate_locked_conversation_state(
             .await?;
     let (kind, lifecycle) =
         kind_and_lifecycle.ok_or(ConversationStateHydrationError::ReadSetMismatch)?;
-    let kind = resolve_active_conversation_kind(head_coordinate.lifecycle(), &kind, &lifecycle)?;
+    let (kind, aggregate_lifecycle) =
+        resolve_conversation_hydration_kind(head_coordinate.lifecycle(), &kind, &lifecycle)?;
 
-    let public_guard = hydrate_public_state_under_locked_head(transaction, &head)
-        .await
-        .map_err(ConversationStateHydrationError::PublicState)?;
-    let (
-        public_transaction_id,
-        public_conversation_id,
-        coordinate,
-        snapshot,
-        binding,
-        encoded_tree_summary,
-        expected_tree_summary_sha256,
-        public_locked_at,
-        generation_row_digest,
-    ) = public_guard.into_parts();
-    if public_transaction_id != head.transaction_id()
-        || public_conversation_id != head.conversation_id()
-        || &coordinate != head_coordinate
-        || public_locked_at != head.locked_at()
-    {
-        return Err(ConversationStateHydrationError::ReadSetMismatch);
-    }
-    let snapshot_digest = *binding.snapshot_sha256();
-
-    let public_state = {
-        let public_guard = seal_locked_public_state_hydration(
-            public_transaction_id,
-            public_conversation_id,
-            coordinate,
-            snapshot,
-            binding,
-            encoded_tree_summary,
-            expected_tree_summary_sha256,
-            public_locked_at,
-            generation_row_digest,
-        )
-        .ok_or(ConversationStateHydrationError::ReadSetMismatch)?;
-        super::super::public_state::load_persisted_active_snapshot(public_guard)
-            .map_err(ConversationStateHydrationError::Snapshot)?
+    let (public_state, snapshot_digest) = match aggregate_lifecycle {
+        ConversationHydrationLifecycle::Active => {
+            let public_guard = hydrate_public_state_under_locked_head(transaction, &head)
+                .await
+                .map_err(ConversationStateHydrationError::PublicState)?;
+            let (
+                public_transaction_id,
+                public_conversation_id,
+                coordinate,
+                snapshot,
+                binding,
+                encoded_tree_summary,
+                expected_tree_summary_sha256,
+                public_locked_at,
+                generation_row_digest,
+            ) = public_guard.into_parts();
+            if public_transaction_id != head.transaction_id()
+                || public_conversation_id != head.conversation_id()
+                || &coordinate != head_coordinate
+                || public_locked_at != head.locked_at()
+            {
+                return Err(ConversationStateHydrationError::ReadSetMismatch);
+            }
+            let snapshot_digest = *binding.snapshot_sha256();
+            let public_guard = seal_locked_public_state_hydration(
+                public_transaction_id,
+                public_conversation_id,
+                coordinate,
+                snapshot,
+                binding,
+                encoded_tree_summary,
+                expected_tree_summary_sha256,
+                public_locked_at,
+                generation_row_digest,
+            )
+            .ok_or(ConversationStateHydrationError::ReadSetMismatch)?;
+            let public_state =
+                super::super::public_state::load_persisted_active_snapshot(public_guard)
+                    .map_err(ConversationStateHydrationError::Snapshot)?;
+            (Some(public_state), Some(snapshot_digest))
+        }
+        ConversationHydrationLifecycle::Terminal => (None, None),
     };
 
     let historical = historical_authority_for_locked_head(&head)
@@ -6934,9 +7166,26 @@ pub(crate) async fn hydrate_locked_conversation_state(
     let participants = load_participant_hydration_rows(transaction, &historical, conversation_id)
         .await
         .map_err(ConversationStateHydrationError::Participants)?;
-    let leaves = load_leaf_hydration_rows(transaction, conversation_id, public_state.binding())
-        .await
-        .map_err(ConversationStateHydrationError::Leaves)?;
+    let leaves = match public_state.as_ref() {
+        Some(public_state) => {
+            load_leaf_hydration_rows(transaction, conversation_id, public_state.binding())
+                .await
+                .map_err(ConversationStateHydrationError::Leaves)?
+        }
+        None => {
+            let active_leaf_count: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM chat.member_devices \
+                 WHERE conversation_id=$1 AND active",
+            )
+            .bind(conversation_id)
+            .fetch_one(&mut **transaction)
+            .await?;
+            if active_leaf_count != 0 {
+                return Err(ConversationStateHydrationError::TerminalLeafPresent);
+            }
+            Vec::new()
+        }
+    };
     let intervals = load_interval_hydration_rows(transaction, &historical, conversation_id)
         .await
         .map_err(ConversationStateHydrationError::Intervals)?;
@@ -6956,20 +7205,29 @@ pub(crate) async fn hydrate_locked_conversation_state(
         .await
         .map_err(ConversationStateHydrationError::Welcomes)?;
 
-    let terminal_proof_count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM chat.application_schedule_terminal_proofs \
-         WHERE conversation_id=$1",
-    )
-    .bind(conversation_id)
-    .fetch_one(&mut **transaction)
-    .await?;
-    let terminal_proofs = certify_no_terminal_proofs(terminal_proof_count)?;
+    let terminal_proofs = match aggregate_lifecycle {
+        ConversationHydrationLifecycle::Active => {
+            let terminal_proof_count: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM chat.application_schedule_terminal_proofs \
+                 WHERE conversation_id=$1",
+            )
+            .bind(conversation_id)
+            .fetch_one(&mut **transaction)
+            .await?;
+            certify_no_terminal_proofs(terminal_proof_count)?
+        }
+        ConversationHydrationLifecycle::Terminal => {
+            load_terminal_proof_hydration_rows(transaction, &historical, conversation_id)
+                .await
+                .map_err(ConversationStateHydrationError::TerminalProofs)?
+        }
+    };
 
     let rows = ConversationStateHydration {
         kind,
-        coordinate: *public_state.coordinate(),
+        coordinate: *head_coordinate,
         producer,
-        public_state: Some(public_state),
+        public_state,
         metadata,
         metadata_producer,
         participants,
@@ -6982,12 +7240,12 @@ pub(crate) async fn hydrate_locked_conversation_state(
         leave_requests,
         welcomes,
     };
-    let graph_digest = active_conversation_graph_digest(&head, &snapshot_digest, &rows);
+    let graph_digest = conversation_graph_digest(&head, snapshot_digest.as_ref(), &rows);
     if graph_digest == [0; 32] {
         return Err(ConversationStateHydrationError::GraphDigest);
     }
     let state = hydrate_conversation_state(&hydration, rows)
         .map_err(ConversationStateHydrationError::State)?;
-    seal_locked_conversation(state, head, graph_digest, Some(snapshot_digest))
+    seal_locked_conversation(state, head, graph_digest, snapshot_digest)
         .ok_or(ConversationStateHydrationError::Seal)
 }
