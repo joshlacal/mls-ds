@@ -1148,14 +1148,11 @@ pub(crate) async fn hydrate_execution_context(
         .effects()
         .head_cas()
         .ok_or(ExecutionContextHydrationError::MissingAuthority)?;
-    #[cfg(not(test))]
-    {
-        let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
-            .fetch_one(&mut **transaction)
-            .await?;
-        if transaction_id != head.transaction_id() {
-            return Err(ExecutionContextHydrationError::AuthorityMismatch);
-        }
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+    if transaction_id != head.transaction_id() {
+        return Err(ExecutionContextHydrationError::AuthorityMismatch);
     }
     if plan.effects().kind() != PlanKind::WelcomeExpiry
         && server_instant(head.locked_at())? != facts.applied_at
@@ -1485,14 +1482,11 @@ async fn preflight_device_revocation_execution_authority(
         .effects()
         .head_cas()
         .ok_or(ExecutionContextHydrationError::MissingAuthority)?;
-    #[cfg(not(test))]
-    {
-        let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
-            .fetch_one(&mut **transaction)
-            .await?;
-        if transaction_id != head.transaction_id() {
-            return Err(ExecutionContextHydrationError::AuthorityMismatch);
-        }
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+    if transaction_id != head.transaction_id() {
+        return Err(ExecutionContextHydrationError::AuthorityMismatch);
     }
     if server_instant(head.locked_at())? != facts.applied_at {
         return Err(ExecutionContextHydrationError::AuthorityMismatch);

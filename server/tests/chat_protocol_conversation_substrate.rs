@@ -3581,9 +3581,23 @@ mod historical_control_loader {
         .expect("genuine one-participant close plans");
         let close_timestamp =
             ServerTimestamp::from_canonical_stored(&close.received_at).expect("close timestamp");
+        let mut tx = pool.begin().await.expect("begin genuine close");
+        // This harness builds the plan through the test-only pure seam, so take
+        // the same conversation row lock the production planner already holds
+        // before invoking the production G6 derivation facade.
+        sqlx::query("SELECT 1 FROM chat.conversations WHERE conversation_id=$1 FOR UPDATE")
+            .bind(cid)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("lock genuine close head");
+        let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+            .fetch_one(&mut *tx)
+            .await
+            .expect("read genuine close transaction ID");
         let plan = persistence_plan_for_test(
             planned,
-            ConversationHeadCasBinding::for_test_edge(
+            ConversationHeadCasBinding::for_test_edge_with_transaction_id(
+                transaction_id,
                 entry.cid,
                 *close.entry_id.as_bytes(),
                 *prior.coordinate(),
@@ -3595,15 +3609,6 @@ mod historical_control_loader {
             crate::chat_protocol::state_machine::PlanAuthority::Transition(transition),
         );
 
-        let mut tx = pool.begin().await.expect("begin genuine close");
-        // This harness builds the plan through the test-only pure seam, so take
-        // the same conversation row lock the production planner already holds
-        // before invoking the production G6 derivation facade.
-        sqlx::query("SELECT 1 FROM chat.conversations WHERE conversation_id=$1 FOR UPDATE")
-            .bind(cid)
-            .fetch_one(&mut *tx)
-            .await
-            .expect("lock genuine close head");
         let rejected = hydrate_execution_context(
             &mut tx,
             &plan,
@@ -5582,6 +5587,31 @@ mod historical_control_loader {
         }
 
         impl G6RevocationPreflightFixture {
+            fn conversation_plan_for_transaction(
+                &self,
+                transaction_id: &str,
+            ) -> ConversationPersistencePlan {
+                let planned =
+                    plan_device_revocation(&self.conversation_state, self.evidence.clone())
+                        .expect("genuine revocation replans for exact transaction packaging");
+                let template_head = self
+                    .conversation_plan
+                    .effects()
+                    .head_cas()
+                    .expect("fixture retains its synthesized head CAS");
+                device_revocation_plan_for_test(
+                    planned,
+                    ConversationHeadCasBinding::for_test_internal_with_transaction_id(
+                        transaction_id.to_owned(),
+                        *template_head.conversation_id(),
+                        *self.conversation_state.coordinate(),
+                        template_head.expected_next_entry_seq(),
+                        template_head.locked_at(),
+                    ),
+                    self.evidence.clone(),
+                )
+            }
+
             fn batch(
                 &self,
                 revoked_packages: Vec<RevocationPackageCasBinding>,
@@ -6161,26 +6191,12 @@ mod historical_control_loader {
                 .expect("rollback second aggregate read");
             let second_planned = plan_device_revocation(&second_state, fixture.evidence.clone())
                 .expect("second genuine conversation plans same device revocation");
-            let second_plan = device_revocation_plan_for_test(
-                second_planned,
-                ConversationHeadCasBinding::for_test_internal(
-                    *second_cid.as_bytes(),
-                    *second_state.coordinate(),
-                    5,
-                    accepted,
-                ),
-                fixture.evidence.clone(),
-            );
             let first_cid = Uuid::from_bytes(
                 *fixture
                     .conversation_plan
                     .state()
                     .coordinate
                     .conversation_id(),
-            );
-            let batch = fixture.batch(
-                Vec::new(),
-                vec![fixture.conversation_plan.clone(), second_plan],
             );
             let pre_batch_tail =
                 device_event_predecessor(&pool, &fixture.target_did, fixture.target_device_id)
@@ -6216,6 +6232,23 @@ mod historical_control_loader {
                 .begin()
                 .await
                 .expect("begin sequential revocation proof");
+            let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+                .fetch_one(&mut *tx)
+                .await
+                .expect("read sequential revocation transaction ID");
+            let first_plan = fixture.conversation_plan_for_transaction(&transaction_id);
+            let second_plan = device_revocation_plan_for_test(
+                second_planned,
+                ConversationHeadCasBinding::for_test_internal_with_transaction_id(
+                    transaction_id,
+                    *second_cid.as_bytes(),
+                    *second_state.coordinate(),
+                    5,
+                    accepted,
+                ),
+                fixture.evidence.clone(),
+            );
+            let batch = fixture.batch(Vec::new(), vec![first_plan, second_plan]);
             seed_g6_revoke_receipt(&mut tx, &fixture).await;
             let applied = apply_device_revocation_batch_sequential(&mut tx, &batch, artifacts)
                 .await
@@ -6348,16 +6381,6 @@ mod historical_control_loader {
             );
             let second_planned = plan_device_revocation(&second_state, invalid_evidence.clone())
                 .expect("shape-valid later revocation plan retains invalid signed wrapper");
-            let second_plan = device_revocation_plan_for_test(
-                second_planned,
-                ConversationHeadCasBinding::for_test_internal(
-                    *second_cid.as_bytes(),
-                    *second_state.coordinate(),
-                    5,
-                    accepted,
-                ),
-                invalid_evidence,
-            );
             let first_cid = Uuid::from_bytes(
                 *fixture
                     .conversation_plan
@@ -6366,10 +6389,6 @@ mod historical_control_loader {
                     .conversation_id(),
             );
             let (available_ref, binding) = append_g6_available_package(&pool, &fixture).await;
-            let batch = fixture.batch(
-                vec![binding],
-                vec![fixture.conversation_plan.clone(), second_plan],
-            );
             let artifacts = vec![
                 ConversationExecutionArtifacts::new(
                     first_cid,
@@ -6417,6 +6436,23 @@ mod historical_control_loader {
                 .begin()
                 .await
                 .expect("begin invalid later-authority proof");
+            let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+                .fetch_one(&mut *tx)
+                .await
+                .expect("read invalid-authority transaction ID");
+            let first_plan = fixture.conversation_plan_for_transaction(&transaction_id);
+            let second_plan = device_revocation_plan_for_test(
+                second_planned,
+                ConversationHeadCasBinding::for_test_internal_with_transaction_id(
+                    transaction_id,
+                    *second_cid.as_bytes(),
+                    *second_state.coordinate(),
+                    5,
+                    accepted,
+                ),
+                invalid_evidence,
+            );
+            let batch = fixture.batch(vec![binding], vec![first_plan, second_plan]);
             let error = apply_device_revocation_batch_sequential(&mut tx, &batch, artifacts)
                 .await
                 .expect_err("invalid later authority must reject the complete batch");
@@ -6589,49 +6625,48 @@ mod historical_control_loader {
             );
         }
 
-        #[tokio::test]
-        #[ignore = "requires the dedicated append-only gate database"]
-        async fn g6_welcome_expiry_facade_emits_exact_entryless_authority() {
-            const FIXED_GATE_DB: &str = "postgres://localhost/catbird_chat_protocol_test_20260722";
-            let database_url = std::env::var("TEST_DATABASE_URL")
-                .expect("TEST_DATABASE_URL must name the existing gate database");
-            assert_eq!(
-                database_url, FIXED_GATE_DB,
-                "G6 Welcome-expiry proof may write only its dedicated append-only database"
-            );
-            common::chat_protocol::validate_chat_protocol_database_url(Some(&database_url))
-                .expect("unsafe TEST_DATABASE_URL for G6 Welcome-expiry proof");
-            let pool = PgPool::connect(&database_url)
-                .await
-                .expect("connect to existing G6 gate database");
-
-            let graph = commit_genuine_policy_acceptance_fulfillment_at(
-                &pool,
-                Uuid::new_v4(),
-                Uuid::new_v4(),
-            )
-            .await;
+        async fn begin_g6_welcome_expiry_plan<'a>(
+            pool: &'a PgPool,
+            graph: &GenuinePolicyRoleGraph,
+        ) -> (Transaction<'a, Postgres>, ConversationPersistencePlan) {
             let cid = Uuid::from_bytes(graph.entry.cid);
             let observed_at = instant(KP_NOT_AFTER) + chrono::Duration::milliseconds(1);
-            let mut tx = pool
+            let mut read = pool
                 .begin()
                 .await
-                .expect("begin locked Welcome-expiry proof");
-            let locked = hydrate_locked_conversation_state(&mut tx, cid, observed_at)
+                .expect("begin Welcome-expiry aggregate read");
+            let locked = hydrate_locked_conversation_state(&mut read, cid, observed_at)
                 .await
                 .expect("lock genuine pending-Welcome aggregate");
+            let state = locked.state().clone();
+            let next_entry_seq = locked.head().next_entry_seq();
             let welcome = locked
                 .state()
                 .welcome(graph.fulfillment.welcome_id.as_bytes())
                 .expect("genuine pending Welcome retained")
                 .clone();
             assert_eq!(welcome.status(), WelcomeStatus::Pending);
+            read.rollback()
+                .await
+                .expect("rollback Welcome-expiry aggregate read");
 
-            let planned = plan_welcome_expiry_for_test(
-                locked.state(),
-                *graph.fulfillment.welcome_id.as_bytes(),
-            )
-            .expect("genuine pending Welcome plans expiry");
+            let mut transaction = pool
+                .begin()
+                .await
+                .expect("begin transaction-bound Welcome-expiry proof");
+            sqlx::query("SELECT 1 FROM chat.conversations WHERE conversation_id=$1 FOR UPDATE")
+                .bind(cid)
+                .fetch_one(&mut *transaction)
+                .await
+                .expect("lock Welcome-expiry conversation head");
+            let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+                .fetch_one(&mut *transaction)
+                .await
+                .expect("read caller-owned transaction ID");
+
+            let planned =
+                plan_welcome_expiry_for_test(&state, *graph.fulfillment.welcome_id.as_bytes())
+                    .expect("genuine pending Welcome plans expiry");
             let observed =
                 ServerTimestamp::from_unix_millis_for_test(observed_at.timestamp_millis())
                     .expect("canonical observed instant");
@@ -6645,37 +6680,156 @@ mod historical_control_loader {
             );
             let plan = persistence_plan_for_test(
                 planned,
-                ConversationHeadCasBinding::for_test_internal(
+                ConversationHeadCasBinding::for_test_internal_with_transaction_id(
+                    transaction_id,
                     *cid.as_bytes(),
-                    *locked.state().coordinate(),
-                    locked.head().next_entry_seq(),
+                    *state.coordinate(),
+                    next_entry_seq,
                     observed,
                 ),
             )
             .with_execution_context_authority_for_test(PlanAuthority::WelcomeExpiry(
                 expiry_authority,
             ));
-            let context = hydrate_execution_context(
-                &mut tx,
-                &plan,
-                ExecutionContextArtifacts {
-                    accepted_control_entry_bytes: None,
-                    genesis_group_info_bytes: None,
-                    primary_event_payload: Some(b"welcome-expired-g6".to_vec()),
-                    welcome_disposition_event_payloads: Vec::new(),
-                },
+            (transaction, plan)
+        }
+
+        fn g6_welcome_expiry_artifacts() -> ExecutionContextArtifacts {
+            ExecutionContextArtifacts {
+                accepted_control_entry_bytes: None,
+                genesis_group_info_bytes: None,
+                primary_event_payload: Some(b"welcome-expired-g6".to_vec()),
+                welcome_disposition_event_payloads: Vec::new(),
+            }
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated append-only gate database"]
+        async fn g6_welcome_expiry_facade_requires_same_transaction() {
+            let pool = g6_gate_pool("Welcome-expiry same-transaction proof").await;
+            let graph = commit_genuine_policy_acceptance_fulfillment_at(
+                &pool,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
             )
-            .await
-            .expect("production facade hydrates genuine Welcome expiry");
+            .await;
+            let (mut transaction, plan) = begin_g6_welcome_expiry_plan(&pool, &graph).await;
+            let context =
+                hydrate_execution_context(&mut transaction, &plan, g6_welcome_expiry_artifacts())
+                    .await
+                    .expect("production facade hydrates genuine Welcome expiry");
 
             assert!(context.authority.control_entry().is_none());
             assert_eq!(
                 context.authority.operation_id(),
                 graph.fulfillment.welcome_id
             );
-            tx.rollback()
+            transaction
+                .rollback()
                 .await
-                .expect("rollback read-only facade proof");
+                .expect("rollback matching transaction proof");
+
+            let mut different_transaction = pool
+                .begin()
+                .await
+                .expect("begin mismatched transaction proof");
+            let error = hydrate_execution_context(
+                &mut different_transaction,
+                &plan,
+                g6_welcome_expiry_artifacts(),
+            )
+            .await
+            .expect_err("sealed plan must reject a different PostgreSQL transaction");
+            assert!(matches!(
+                error,
+                ExecutionContextHydrationError::AuthorityMismatch
+            ));
+            different_transaction
+                .rollback()
+                .await
+                .expect("rollback mismatched transaction proof");
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated append-only gate database"]
+        async fn g6_facade_retains_canonical_device_lock_until_transaction_ends() {
+            let pool = g6_gate_pool("facade device-lock retention proof").await;
+            let graph = commit_genuine_policy_acceptance_fulfillment_at(
+                &pool,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+            )
+            .await;
+            let locked_device_did = graph.entry.actor_did.clone();
+            let locked_device_id = graph.entry.actor_device_id;
+            let (mut locking_transaction, plan) = begin_g6_welcome_expiry_plan(&pool, &graph).await;
+            hydrate_execution_context(
+                &mut locking_transaction,
+                &plan,
+                g6_welcome_expiry_artifacts(),
+            )
+            .await
+            .expect("production facade hydrates while retaining device locks");
+
+            let mut blocked_transaction =
+                pool.begin().await.expect("begin conflicting device lock");
+            sqlx::query("SET LOCAL lock_timeout = '250ms'")
+                .execute(&mut *blocked_transaction)
+                .await
+                .expect("bound conflicting device lock wait");
+            let lock_result = sqlx::query(
+                "SELECT 1 FROM chat.devices \
+                 WHERE user_did=$1 AND device_id=$2 FOR UPDATE",
+            )
+            .bind(&locked_device_did)
+            .bind(locked_device_id)
+            .fetch_one(&mut *blocked_transaction)
+            .await;
+            let lock_error = match lock_result {
+                Err(error) => error,
+                Ok(_) => panic!("facade must retain the audience device-row lock"),
+            };
+            let database_error = lock_error
+                .as_database_error()
+                .expect("lock timeout must be a PostgreSQL database error");
+            assert_eq!(
+                database_error.code().as_deref(),
+                Some("55P03"),
+                "conflicting mutation must fail specifically on the held row lock"
+            );
+            println!(
+                "G6_LOCK sqlstate={} message={}",
+                database_error.code().as_deref().unwrap_or("<none>"),
+                database_error.message()
+            );
+            blocked_transaction
+                .rollback()
+                .await
+                .expect("rollback blocked transaction");
+
+            locking_transaction
+                .rollback()
+                .await
+                .expect("release facade device locks");
+
+            let mut after_release = pool.begin().await.expect("begin post-release device lock");
+            sqlx::query("SET LOCAL lock_timeout = '250ms'")
+                .execute(&mut *after_release)
+                .await
+                .expect("bound post-release device lock wait");
+            sqlx::query(
+                "SELECT 1 FROM chat.devices \
+                 WHERE user_did=$1 AND device_id=$2 FOR UPDATE",
+            )
+            .bind(&locked_device_did)
+            .bind(locked_device_id)
+            .fetch_one(&mut *after_release)
+            .await
+            .expect("device row is lockable after facade transaction ends");
+            after_release
+                .rollback()
+                .await
+                .expect("rollback post-release lock proof");
         }
 
         #[tokio::test]
@@ -12559,20 +12713,6 @@ mod historical_control_loader {
             .expect("genuine signed ChangeRole plans");
             let resulting_state = planned.resulting_state().clone();
 
-            // Test-only head packaging supplies no semantic authority: the policy
-            // evidence above came from production canonical decode + Ed25519
-            // verification, and the production executor still performs every
-            // plan-shape validation and durable CAS. The final aggregate reload
-            // independently re-verifies the committed seq-5/seq-6 bytes.
-            let head = ConversationHeadCasBinding::for_test_edge(
-                *cid.as_bytes(),
-                *control.entry.entry_id.as_bytes(),
-                *prior.coordinate(),
-                seq,
-                control.received_at,
-            );
-            let plan = persistence_plan_for_test(planned, head)
-                .with_execution_context_authority_for_test(PlanAuthority::Transition(transition));
             let expected_alice_predecessor =
                 device_event_predecessor(pool, &graph.entry.actor_did, graph.entry.actor_device_id)
                     .await;
@@ -12589,6 +12729,25 @@ mod historical_control_loader {
                 .fetch_one(&mut *tx)
                 .await
                 .expect("lock genuine role-change head");
+            let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+                .fetch_one(&mut *tx)
+                .await
+                .expect("read genuine role-change transaction ID");
+            // Test-only head packaging supplies no semantic authority: the policy
+            // evidence above came from production canonical decode + Ed25519
+            // verification, and the production executor still performs every
+            // plan-shape validation and durable CAS. The final aggregate reload
+            // independently re-verifies the committed seq-5/seq-6 bytes.
+            let head = ConversationHeadCasBinding::for_test_edge_with_transaction_id(
+                transaction_id,
+                *cid.as_bytes(),
+                *control.entry.entry_id.as_bytes(),
+                *prior.coordinate(),
+                seq,
+                control.received_at,
+            );
+            let plan = persistence_plan_for_test(planned, head)
+                .with_execution_context_authority_for_test(PlanAuthority::Transition(transition));
             let ctx = hydrate_execution_context(
                 &mut tx,
                 &plan,

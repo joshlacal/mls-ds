@@ -12160,8 +12160,27 @@ impl ConversationHeadCasBinding {
         next_entry_seq: u64,
         locked_at: ServerTimestamp,
     ) -> Self {
+        Self::for_test_internal_with_transaction_id(
+            "e2b6-executor-test".to_owned(),
+            conversation_id,
+            prior,
+            next_entry_seq,
+            locked_at,
+        )
+    }
+
+    /// Exact-transaction variant used only by integration proofs that exercise
+    /// production facade transaction binding. The value must come from
+    /// `txid_current()` on the caller-owned PostgreSQL transaction.
+    pub(crate) fn for_test_internal_with_transaction_id(
+        transaction_id: String,
+        conversation_id: [u8; 16],
+        prior: PublicGroupSnapshotCoordinate,
+        next_entry_seq: u64,
+        locked_at: ServerTimestamp,
+    ) -> Self {
         Self {
-            transaction_id: "e2b6-executor-test".to_owned(),
+            transaction_id,
             conversation_id,
             expected_prior: Some(prior),
             expected_next_entry_seq: next_entry_seq,
@@ -12182,8 +12201,29 @@ impl ConversationHeadCasBinding {
         allocated_seq: u64,
         locked_at: ServerTimestamp,
     ) -> Self {
+        Self::for_test_edge_with_transaction_id(
+            "e2b3-executor-test".to_owned(),
+            conversation_id,
+            entry_id,
+            prior,
+            allocated_seq,
+            locked_at,
+        )
+    }
+
+    /// Exact-transaction variant used only by integration proofs that exercise
+    /// production facade transaction binding. The value must come from
+    /// `txid_current()` on the caller-owned PostgreSQL transaction.
+    pub(crate) fn for_test_edge_with_transaction_id(
+        transaction_id: String,
+        conversation_id: [u8; 16],
+        entry_id: [u8; 16],
+        prior: PublicGroupSnapshotCoordinate,
+        allocated_seq: u64,
+        locked_at: ServerTimestamp,
+    ) -> Self {
         Self {
-            transaction_id: "e2b3-executor-test".to_owned(),
+            transaction_id,
             conversation_id,
             expected_prior: Some(prior),
             expected_next_entry_seq: allocated_seq,
