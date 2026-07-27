@@ -40,7 +40,7 @@ PROTOCOL_PATH = STACK_ROOT / "docs/CHAT_PROTOCOL.md"
 APPLICATION_PROTOCOL_PATH = STACK_ROOT / "docs/CHAT_APPLICATION_PROTOCOL.md"
 APPLICATION_MANIFEST_PATH = STACK_ROOT / "docs/generated-artifacts/chat-application-v1/manifest.json"
 APPLICATION_MANIFEST_INPUT_ENV = "CATBIRD_CHAT_APPLICATION_FIXTURE_INPUT"
-FROZEN_APPLICATION_MANIFEST_SHA256 = "4ecfa4193eaf0eac1ca50a8a5ed023178469f59f0fa634c645d7c84a4b0fb4fa"
+FROZEN_APPLICATION_MANIFEST_SHA256 = "d7a856c2473579c06af7ddad67a17ea3b633064d0856093b009766f1d849df24"
 TASK1_DOC_PATHS = (
     STACK_ROOT / ".superpowers/sdd/mls-chat-task-1-semantic-repair-brief.md",
     STACK_ROOT / ".superpowers/sdd/mls-chat-task-1-report.md",
@@ -4754,6 +4754,9 @@ def validate_crypto_wire_corpus() -> None:
     assert set(manifest["identifiers"]) == {
         "conversationId", "conversationIdHex", "messageId", "messageIdHex",
         "transitionId", "transitionIdHex",
+        "genericTransitionId", "genericTransitionIdHex",
+        "leaveFulfillmentTransitionId", "leaveFulfillmentTransitionIdHex",
+        "rejoinTransitionId", "rejoinTransitionIdHex",
     }
     assert "reservationIntentDigest" not in json.dumps(manifest)
     assert isinstance(manifest["evaluationUnixSeconds"], int) and manifest["evaluationUnixSeconds"] > 0
@@ -4858,16 +4861,37 @@ def validate_crypto_wire_corpus() -> None:
 
     chain = manifest["chain"]
     assert chain["genesisEpoch"] == 0 and chain["committedEpoch"] == 1
-    assert chain["genesisStateVersion"] == 0 and chain["committedStateVersion"] == 1
-    assert chain["rejoinEpoch"] == 4 and chain["rejoinStateVersion"] == 4
+    assert chain["genesisStateVersion"] == 0 and chain["addPriorStateVersion"] == 2
+    assert chain["committedStateVersion"] == 3
+    assert chain["genericPriorStateVersion"] == 3
+    assert chain["genericCommittedStateVersion"] == 4
+    assert chain["removePriorStateVersion"] == 4
+    assert chain["removeCommittedStateVersion"] == 5
+    assert chain["rejoinPriorStateVersion"] == 7
+    assert chain["rejoinEpoch"] == 4 and chain["rejoinStateVersion"] == 8
     assert chain["rejoinMemberCredentials"] == chain["committedMemberCredentials"]
     for field in (
         "groupIdHex", "genesisGroupContextHashHex", "genesisConfirmationTagHex",
         "committedGroupContextHashHex", "committedConfirmationTagHex",
-        "innerKeyPackageRefHex", "rejoinGroupContextHashHex",
+        "innerKeyPackageRefHex", "genericCommittedGroupContextHashHex",
+        "genericCommittedConfirmationTagHex", "removeCommittedGroupContextHashHex",
+        "removeCommittedConfirmationTagHex", "rejoinGroupContextHashHex",
         "rejoinConfirmationTagHex", "rejoinInnerKeyPackageRefHex",
+        "commitAadSha256Hex", "genericCommitAadSha256Hex",
+        "removeCommitAadSha256Hex", "rejoinCommitAadSha256Hex",
     ):
         assert len(bytes.fromhex(chain[field])) == 32
+    transition_ids = [
+        manifest["identifiers"][field]
+        for field in (
+            "transitionIdHex",
+            "genericTransitionIdHex",
+            "leaveFulfillmentTransitionIdHex",
+            "rejoinTransitionIdHex",
+        )
+    ]
+    assert len(set(transition_ids)) == 4
+    assert all(len(bytes.fromhex(value)) == 16 for value in transition_ids)
     assert bytes.fromhex(chain["innerKeyPackageRefHex"]) == payloads["key-package-ref.bin"]
     assert bytes.fromhex(chain["rejoinInnerKeyPackageRefHex"]) == payloads["rejoin-key-package-ref.bin"]
     assert chain["rejoinInnerKeyPackageRefHex"] != chain["innerKeyPackageRefHex"]

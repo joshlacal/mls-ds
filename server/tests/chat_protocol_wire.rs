@@ -966,6 +966,8 @@ struct GenesisGroupInfoFixture {
 #[derive(Clone, Copy)]
 enum StatefulCommitVariant {
     EmptySelfUpdate,
+    EmptyWithDefaultPathCapabilities,
+    EmptyWithChangedPathCredential,
     AddWithDefaultPathCapabilities,
     AddWithChangedPathCredential,
 }
@@ -975,6 +977,8 @@ struct StatefulCommitFixture {
     commit: Vec<u8>,
     signature_key: Vec<u8>,
     now_unix_seconds: u64,
+    next_group_context_hash: [u8; 32],
+    next_confirmation_tag: [u8; 32],
 }
 
 fn stateful_commit_fixture(variant: StatefulCommitVariant) -> StatefulCommitFixture {
@@ -1021,6 +1025,34 @@ fn stateful_commit_fixture(variant: StatefulCommitVariant) -> StatefulCommitFixt
             .commit()
             .tls_serialize_detached()
             .expect("serialize empty self-update"),
+        StatefulCommitVariant::EmptyWithDefaultPathCapabilities => group
+            .self_update(
+                &provider,
+                &signer,
+                LeafNodeParameters::builder()
+                    .with_capabilities(Capabilities::default())
+                    .build(),
+            )
+            .expect("create default-capabilities self-update")
+            .commit()
+            .tls_serialize_detached()
+            .expect("serialize default-capabilities self-update"),
+        StatefulCommitVariant::EmptyWithChangedPathCredential => group
+            .self_update(
+                &provider,
+                &signer,
+                LeafNodeParameters::builder()
+                    .with_credential_with_key(CredentialWithKey {
+                        credential: BasicCredential::new(b"did:plc:mallory#same-key".to_vec())
+                            .into(),
+                        signature_key: signature_key.clone().into(),
+                    })
+                    .build(),
+            )
+            .expect("create changed-credential self-update")
+            .commit()
+            .tls_serialize_detached()
+            .expect("serialize changed-credential self-update"),
         StatefulCommitVariant::AddWithDefaultPathCapabilities
         | StatefulCommitVariant::AddWithChangedPathCredential => {
             let bob_signer =
@@ -1061,7 +1093,9 @@ fn stateful_commit_fixture(variant: StatefulCommitVariant) -> StatefulCommitFixt
                         })
                         .build()
                 }
-                StatefulCommitVariant::EmptySelfUpdate => unreachable!(),
+                StatefulCommitVariant::EmptySelfUpdate
+                | StatefulCommitVariant::EmptyWithDefaultPathCapabilities
+                | StatefulCommitVariant::EmptyWithChangedPathCredential => unreachable!(),
             };
             group
                 .commit_builder()
@@ -1078,12 +1112,19 @@ fn stateful_commit_fixture(variant: StatefulCommitVariant) -> StatefulCommitFixt
                 .expect("serialize variant Commit")
         }
     };
+    group
+        .merge_pending_commit(&provider)
+        .expect("merge variant Commit for exact successor coordinate");
+    let (next_group_context_hash, next_confirmation_tag) =
+        exported_group_coordinate(&group, &provider, &signer);
 
     StatefulCommitFixture {
         group_info,
         commit,
         signature_key,
         now_unix_seconds,
+        next_group_context_hash,
+        next_confirmation_tag,
     }
 }
 
@@ -2407,31 +2448,48 @@ fn public_commit_rejects_noncanonical_xwing_path_keys_and_kem_outputs() {
 }
 
 #[test]
-fn stateful_commit_requires_membership_effects_and_an_immutable_clean_sender_path() {
+fn stateful_commit_accepts_a_clean_sender_refresh_and_rejects_sender_path_mutation() {
     let empty = stateful_commit_fixture(StatefulCommitVariant::EmptySelfUpdate);
     let prior = stateful_fixture_group_info(&empty);
     let prior_binding = binding_for_validated_group(&prior, 0, 0);
-    let expected_next_coordinate = successor_coordinate(&prior_binding, [0x33; 32], [0x44; 32]);
+    let expected_next_coordinate = successor_coordinate(
+        &prior_binding,
+        empty.next_group_context_hash,
+        empty.next_confirmation_tag,
+    );
     let commit = validate_public_commit(&empty.commit, MAX_PUBLIC_MESSAGE_WIRE_BYTES)
         .expect("structural self-update Commit");
-    assert_eq!(
-        process_public_commit(
-            prior.public_state(),
-            commit,
-            commit_policy(
-                b"variant-aad",
-                &prior_binding,
-                &expected_next_coordinate,
-                empty.now_unix_seconds,
-                100,
-            ),
-        )
-        .expect_err("effect-free epoch churn"),
-        WireValidationError::EmptyCommitEffects
+    let refreshed = process_public_commit(
+        prior.public_state(),
+        commit,
+        commit_policy(
+            b"variant-aad",
+            &prior_binding,
+            &expected_next_coordinate,
+            empty.now_unix_seconds,
+            100,
+        ),
+    )
+    .expect("proposal-free member refresh is a sender-key effect");
+    assert!(refreshed.adds().is_empty());
+    assert!(refreshed.removes().is_empty());
+    assert_ne!(
+        refreshed.sender_update().prior_encryption_key(),
+        refreshed.sender_update().next_encryption_key(),
+        "the authenticated update path must rotate the sender encryption key"
     );
+    assert_eq!(refreshed.next_binding().epoch(), 1);
     assert_eq!(prior.epoch(), 0);
 
     for (variant, reason) in [
+        (
+            StatefulCommitVariant::EmptyWithDefaultPathCapabilities,
+            "proposal-free refresh path capabilities outside the exact singleton profile",
+        ),
+        (
+            StatefulCommitVariant::EmptyWithChangedPathCredential,
+            "proposal-free refresh path changes the sender identity",
+        ),
         (
             StatefulCommitVariant::AddWithDefaultPathCapabilities,
             "path capabilities outside the exact singleton profile",

@@ -954,11 +954,10 @@ impl VerifiedCommitPublicState {
 
     /// Synthetic ZERO-PROPOSAL commit (`sv+1`, `epoch+1`, fresh hash/tag; no
     /// adds/removes, sender self-update only). Mirrors `for_test_remove`'s pure
-    /// public-state seam — the executor generic-commit arm is verified against this
-    /// (the real `commit-generic-public-mls` parses via `validate_public_commit`,
-    /// but `process_commit` reconstructing a NON-authoritative prior from an earlier
-    /// public commit diverges cryptographically, which is exactly why the
-    /// state-machine suite drives generic/remove commits synthetically too).
+    /// public-state seam for isolated planner/executor unit tests whose arbitrary
+    /// coordinates cannot consume the fixed corpus identity. Separate corpus
+    /// coverage processes the real proposal-free Commit and its exact predecessor
+    /// through production `process_commit`.
     #[cfg(test)]
     pub(crate) fn for_test_generic(
         prior: &ActivePublicState,

@@ -5702,11 +5702,11 @@ async fn build_generic_commit(pool: &PgPool, scenario: &FulfillmentScenario) -> 
     let conversation_id = scenario.conversation_id;
     let prior = &scenario.fulfillment_state; // sv 2, epoch 1, alice + bob.
 
-    // The frozen ZERO-PROPOSAL commit (epoch 1 -> 2) parses as a valid public
-    // commit; the executor arm is driven by a SYNTHETIC zero-proposal commit — the
-    // same pure public-state seam the state-machine suite uses for generic/remove
-    // commits (a `process_commit` reconstruction of a NON-authoritative prior from
-    // an earlier public commit diverges cryptographically; see the report).
+    // This isolated executor scenario uses an arbitrary conversation coordinate,
+    // so it cannot consume the fixed-identity corpus Commit. Drive only the
+    // already-verified public-state effect through the synthetic seam here; the
+    // substrate corpus gate separately processes the real proposal-free Commit
+    // and exact predecessor through production `process_commit`.
     let commit_bytes = corpus_file("commit-generic-public.mls");
     validate_public_commit(&commit_bytes, MAX_PUBLIC_MESSAGE_WIRE_BYTES)
         .expect("frozen generic Commit parses as a valid public commit");

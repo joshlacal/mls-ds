@@ -601,8 +601,6 @@ pub enum WireValidationError {
     CommitAadMismatch,
     #[error("public Commit failed OpenMLS signature or semantic processing")]
     InvalidPublicCommit,
-    #[error("public Commit must contain one or more membership effects")]
-    EmptyCommitEffects,
     #[error("public Commit contains too many proposals")]
     TooManyCommitProposals,
     #[error("public Commit contains a proposal by reference")]
@@ -1285,9 +1283,6 @@ pub fn process_public_commit(
         // the retained exact wire cardinality prevents duplicate proposals
         // from collapsing into a smaller, apparently valid effect set.
         return Err(WireValidationError::DuplicateCommitProposal);
-    }
-    if proposal_count == 0 {
-        return Err(WireValidationError::EmptyCommitEffects);
     }
     if proposal_count > MAX_WELCOME_RECIPIENTS {
         return Err(WireValidationError::TooManyCommitProposals);

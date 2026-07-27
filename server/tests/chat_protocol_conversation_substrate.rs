@@ -2356,6 +2356,7 @@ mod historical_control_path {
             wrapper["body"]["next"]["groupContextHash"].clone();
         wrapper["body"]["metadataSnapshot"]["coordinate"]["confirmationTag"] =
             wrapper["body"]["next"]["confirmationTag"].clone();
+        wrapper["body"]["signedAt"] = manifest["creation"]["signedAt"].clone();
         repair_body_digests(&mut wrapper["body"]);
         wrapper["signature"] = Value::String(STANDARD.encode([0_u8; 64]));
         let canonical =
@@ -2366,6 +2367,7 @@ mod historical_control_path {
         entry.raw_wrapper = serde_json::to_vec(&wrapper).unwrap();
         let mut row: Value = serde_json::from_slice(&entry.public_row_json).unwrap();
         row["signedRequest"] = wrapper;
+        row["receivedAt"] = manifest["creation"]["receivedAt"].clone();
         entry.public_row_json = serde_json::to_vec(&row).unwrap();
         entry.outer_entry_fingerprint =
             *decode_and_verify_control_entry(&entry.public_row_json, &public_key)
@@ -2387,6 +2389,36 @@ mod historical_control_path {
             .into_transition()
             .expect("corpus-bound creation is a transition");
         entry
+    }
+
+    #[test]
+    fn corpus_creation_entry_preserves_manifest_chronology() {
+        let manifest_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/generated-artifacts/mls-chat-v1/crypto-wire/manifest.json");
+        let manifest: Value = serde_json::from_slice(
+            &std::fs::read(manifest_path).expect("read frozen corpus manifest"),
+        )
+        .expect("parse frozen corpus manifest");
+        let cid = Uuid::parse_str(
+            manifest["identifiers"]["conversationId"]
+                .as_str()
+                .expect("corpus conversation id"),
+        )
+        .expect("corpus conversation UUID");
+        let entry = build_real_corpus_creation_entry(*cid.as_bytes());
+        let wrapper: Value =
+            serde_json::from_slice(&entry.raw_wrapper).expect("parse corpus creation wrapper");
+        let row: Value =
+            serde_json::from_slice(&entry.public_row_json).expect("parse corpus creation row");
+
+        assert_eq!(
+            wrapper["body"]["signedAt"], manifest["creation"]["signedAt"],
+            "signed creation chronology is corpus-authoritative"
+        );
+        assert_eq!(
+            row["receivedAt"], manifest["creation"]["receivedAt"],
+            "durable outer chronology is corpus-authoritative"
+        );
     }
 
     pub(super) fn build_real_close_entry(entry: &RealCreationEntry) -> RealCloseEntry {
@@ -3590,7 +3622,11 @@ mod historical_control_loader {
         let entry_payload = entry.public_row_json.clone();
         let entry_payload_sha = Sha256::digest(&entry_payload).to_vec();
         let entry_outer_fingerprint = entry.outer_entry_fingerprint.to_vec();
-        let at = clock_now(pool).await;
+        // The accepted outer timestamp is part of the production-verified
+        // control entry. Persist that exact instant across every creation
+        // provenance row so durable chronology cannot diverge from the bytes
+        // that historical hydration later re-verifies.
+        let at = verified_entry.received_at().datetime();
 
         let mut tx = pool.begin().await.expect("begin real creation");
         sqlx::query(
@@ -3774,6 +3810,17 @@ mod historical_control_loader {
         .execute(&mut *tx)
         .await
         .expect("insert creation entry");
+        sqlx::query(
+            r#"INSERT INTO chat.entry_recipients(
+                conversation_id,seq,user_did,device_id,entitlement_kind
+            ) VALUES($1,1,$2,$3,'control')"#,
+        )
+        .bind(conversation_id)
+        .bind(actor_did)
+        .bind(actor_device_id)
+        .execute(&mut *tx)
+        .await
+        .expect("route creation entry to its active creator");
         sqlx::query(
             r#"INSERT INTO chat.application_intervals(
                 membership_interval_id,conversation_id,generation,recipient_did,
@@ -4632,8 +4679,8 @@ mod historical_control_loader {
         };
         use super::seed_real_creation_graph;
         use crate::chat_protocol::public_state::{
-            encode_public_tree_summary, load_persisted_active_snapshot, verify_recovery_welcome,
-            ActivePublicState,
+            encode_public_tree_summary, load_persisted_active_snapshot, process_commit,
+            rebind_active_snapshot, verify_recovery_welcome, ActivePublicState,
         };
         use crate::chat_protocol::repository::core::{
             active_conversation_graph_digest_for_test, hydrate_locked_conversation_head,
@@ -4662,10 +4709,10 @@ mod historical_control_loader {
             ControlEntryContent, ConversationHeadCasBinding, ConversationKind, ConversationState,
             ConversationStateHydration, DeviceIdentity, EventFanout, ExecutionActor,
             ExecutionContext, HistoricalRehydrationAuthority, HydrationAuthority, LeafRecoveryKind,
-            ParticipantRole, ParticipantStatus, PrincipalId, RecoveryOriginHydrationRow,
-            RecoveryRequestStatus, RecoverySource, ReservationStatus, ServerTimestamp,
-            SpineArtifacts, TransitionEvidence, WelcomeDispositionInput, WelcomeStatus,
-            WorkTerminalHydrationRow,
+            LeaveRequestStatus, ParticipantRole, ParticipantStatus, PrincipalId,
+            RecoveryOriginHydrationRow, RecoveryRequestStatus, RecoverySource, ReservationStatus,
+            ServerTimestamp, SpineArtifacts, TransitionEvidence, WelcomeDispositionInput,
+            WelcomeStatus, WorkTerminalHydrationRow,
         };
         use crate::chat_protocol::transcript::{
             decode_and_verify_control_entry, decode_canonical_signed_mutation,
@@ -4673,8 +4720,8 @@ mod historical_control_loader {
         };
         use crate::chat_protocol::validation::ed25519_key_id;
         use crate::chat_protocol::wire::{
-            validate_key_package, KeyPackageValidationPolicy, MAX_KEY_PACKAGE_WIRE_BYTES,
-            MAX_WELCOME_WIRE_BYTES,
+            validate_key_package, validate_public_commit, KeyPackageValidationPolicy,
+            MAX_KEY_PACKAGE_WIRE_BYTES, MAX_PUBLIC_MESSAGE_WIRE_BYTES, MAX_WELCOME_WIRE_BYTES,
         };
         use crate::common;
 
@@ -4683,21 +4730,33 @@ mod historical_control_loader {
         // losslessly through Postgres microsecond storage). `EXPIRES_AT` is
         // exactly `LEAST(REQUESTED_AT + 5min, KP.not_after)`, the expiry the
         // deferred `assert_recovery_fulfillment_mapping` constraint requires.
-        const REQUESTED_AT: &str = "2030-01-01T00:00:00.000Z";
-        const EXPIRES_AT: &str = "2030-01-01T00:05:00.000Z";
-        const KP_NOT_BEFORE: &str = "2029-12-31T23:59:00.000Z";
-        const KP_NOT_AFTER: &str = "2030-01-01T00:11:00.000Z";
-        const SIGNED_AT: &str = "2029-12-31T23:59:59.000Z";
-        const FULFILLMENT_SIGNED_AT: &str = "2030-01-01T00:00:59.000Z";
-        const FULFILLED_AT: &str = "2030-01-01T00:01:00.000Z";
-        const POLICY_ADD_AT: &str = "2029-12-31T23:59:30.000Z";
-        const ROLE_ADMIN_AT: &str = "2030-01-01T00:02:00.000Z";
-        const ROLE_MEMBER_AT: &str = "2030-01-01T00:03:00.000Z";
+        const KP_NOT_BEFORE: &str = "2026-07-27T03:05:08.000Z";
+        const KP_NOT_AFTER: &str = "2026-07-28T03:06:08.000Z";
+        const POLICY_ADD_AT: &str = "2026-07-27T04:06:08.000Z";
+        const SIGNED_AT: &str = "2026-07-27T04:06:08.500Z";
+        const REQUESTED_AT: &str = "2026-07-27T04:06:09.000Z";
+        const EXPIRES_AT: &str = "2026-07-27T04:11:09.000Z";
+        const FULFILLMENT_SIGNED_AT: &str = "2026-07-27T04:06:09.500Z";
+        const FULFILLED_AT: &str = "2026-07-27T04:06:10.000Z";
+        const GENERIC_SIGNED_AT: &str = "2026-07-27T04:06:10.500Z";
+        const GENERIC_AT: &str = "2026-07-27T04:06:11.000Z";
+        const LEAVE_SIGNED_AT: &str = "2026-07-27T04:06:11.500Z";
+        const LEAVE_AT: &str = "2026-07-27T04:06:12.000Z";
+        const LEAVE_FULFILLMENT_SIGNED_AT: &str = "2026-07-27T04:06:12.500Z";
+        const LEAVE_FULFILLED_AT: &str = "2026-07-27T04:06:13.000Z";
+        const REINVITE_AT: &str = "2026-07-27T04:06:14.000Z";
+        const REACCEPT_SIGNED_AT: &str = "2026-07-27T04:06:14.500Z";
+        const REACCEPT_AT: &str = "2026-07-27T04:06:15.000Z";
+        const REACCEPT_EXPIRES_AT: &str = "2026-07-27T04:11:15.000Z";
+        const REJOIN_SIGNED_AT: &str = "2026-07-27T04:06:15.500Z";
+        const REJOIN_AT: &str = "2026-07-27T04:06:16.000Z";
+        const ROLE_ADMIN_AT: &str = "2026-07-27T04:06:11.000Z";
+        const ROLE_MEMBER_AT: &str = "2026-07-27T04:06:12.000Z";
 
         const BOB_SIGNING_SEED: [u8; 32] = [
-            0xa9, 0x6b, 0x42, 0xd3, 0x5f, 0x80, 0xe9, 0x18, 0x4c, 0xef, 0x61, 0x44, 0x4a, 0xbc,
-            0xc2, 0x81, 0xf6, 0x54, 0x13, 0x22, 0x93, 0x40, 0xb8, 0xc0, 0x6f, 0x34, 0xe6, 0xa0,
-            0xba, 0x74, 0xb4, 0x09,
+            0xd4, 0xa1, 0xc4, 0x8e, 0x33, 0x92, 0x40, 0x8e, 0x24, 0x40, 0x90, 0x3f, 0xc5, 0x67,
+            0x8d, 0xa5, 0x69, 0x98, 0xeb, 0x66, 0xeb, 0xb8, 0xa9, 0x64, 0xa7, 0xe4, 0xe4, 0xc2,
+            0xad, 0x82, 0xe9, 0xb5,
         ];
 
         #[tokio::test]
@@ -4916,6 +4975,1622 @@ mod historical_control_loader {
                 .expect("rollback fresh aggregate read");
         }
 
+        #[tokio::test]
+        #[ignore = "requires the dedicated append-only gate database"]
+        async fn terminal_family_b_fulfilled_leave_and_later_rejoin() {
+            const FIXED_GATE_DB: &str = "postgres://localhost/catbird_chat_protocol_test_20260722";
+            let database_url = std::env::var("TEST_DATABASE_URL")
+                .expect("TEST_DATABASE_URL must name the existing gate database");
+            assert_eq!(
+                database_url, FIXED_GATE_DB,
+                "terminal-family B may write only its dedicated append-only database"
+            );
+            common::chat_protocol::validate_chat_protocol_database_url(Some(&database_url))
+                .expect("unsafe TEST_DATABASE_URL for terminal-family B");
+            let pool = PgPool::connect(&database_url)
+                .await
+                .expect("connect to existing terminal-family B database");
+            let manifest = corpus_manifest();
+            let cid = Uuid::parse_str(manifest["identifiers"]["conversationId"].as_str().unwrap())
+                .unwrap();
+
+            let existing_head = sqlx::query_as::<_, (i64, i64)>(
+                "SELECT current_state_version,next_entry_seq FROM chat.conversations \
+                 WHERE conversation_id=$1",
+            )
+            .bind(cid)
+            .fetch_optional(&pool)
+            .await
+            .expect("read terminal-family B fixed head");
+            if let Some((state_version, next_entry_seq)) = existing_head {
+                if (state_version, next_entry_seq) == (8, 11) {
+                    assert_terminal_family_b_final_graph(&pool, cid).await;
+                    return;
+                }
+                assert_eq!(
+                    (state_version, next_entry_seq),
+                    (4, 7),
+                    "an incomplete fixed CID must be the exact durable seq1-6 resume prefix"
+                );
+            }
+
+            let fixed_transition_ids: Vec<Uuid> = [
+                "transitionId",
+                "genericTransitionId",
+                "leaveFulfillmentTransitionId",
+                "rejoinTransitionId",
+            ]
+            .into_iter()
+            .map(|field| Uuid::parse_str(manifest["identifiers"][field].as_str().unwrap()).unwrap())
+            .collect();
+            let states = fixed_corpus_commit_states();
+            let (actors, creation_transition_id, leave) = if existing_head.is_none() {
+                assert_terminal_family_b_identity_precondition(&pool, &manifest).await;
+                let occupied_transition_count: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM chat.transitions WHERE transition_id = ANY($1)",
+                )
+                .bind(&fixed_transition_ids)
+                .fetch_one(&pool)
+                .await
+                .expect("check fixed transition occupancy");
+                assert_eq!(occupied_transition_count, 0);
+                let package_refs = vec![
+                    corpus_hex::<32>(&manifest["chain"]["innerKeyPackageRefHex"]).to_vec(),
+                    corpus_hex::<32>(&manifest["chain"]["rejoinInnerKeyPackageRefHex"]).to_vec(),
+                ];
+                let occupied_package_count: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM chat.key_packages WHERE key_package_ref = ANY($1)",
+                )
+                .bind(&package_refs)
+                .fetch_one(&pool)
+                .await
+                .expect("check fixed package occupancy");
+                assert_eq!(occupied_package_count, 0);
+
+                let graph = commit_genuine_policy_acceptance_fulfillment(&pool).await;
+                assert_eq!(Uuid::from_bytes(graph.entry.cid), cid);
+                assert_eq!(graph.fulfillment.transition_id, fixed_transition_ids[0]);
+                let creation_wrapper: Value =
+                    serde_json::from_slice(&graph.entry.raw_wrapper).unwrap();
+                let creation_transition_id =
+                    Uuid::parse_str(creation_wrapper["body"]["transitionId"].as_str().unwrap())
+                        .unwrap();
+                commit_fixed_generic_edge(&pool, &graph, creation_transition_id, &states.generic)
+                    .await;
+                let leave = commit_fixed_leave_request(&pool, &graph, &states.generic).await;
+                (
+                    TerminalFamilyBActors {
+                        entry: graph.entry,
+                        invitee: graph.invitee,
+                    },
+                    creation_transition_id,
+                    leave,
+                )
+            } else {
+                load_terminal_family_b_seq6_prefix(&pool, cid, &states).await
+            };
+            commit_fixed_remove_fulfillment(
+                &pool,
+                &actors,
+                creation_transition_id,
+                &states.generic,
+                &states.removed,
+                &leave,
+            )
+            .await;
+            let (reinvitee, invitation_state, invitation) =
+                commit_fixed_reinvitation(&pool, &actors, &states.removed).await;
+            let reacceptance = commit_fixed_reacceptance(
+                &pool,
+                &actors,
+                &reinvitee,
+                invitation.transition_id,
+                &invitation_state,
+                &states.rejoin_prior,
+            )
+            .await;
+            let rejoin = commit_fixed_rejoin_fulfillment(
+                &pool,
+                &actors,
+                &reinvitee,
+                &reacceptance,
+                creation_transition_id,
+                &states.rejoin_prior,
+                &states.rejoined,
+            )
+            .await;
+            assert_eq!(rejoin.transition_id, fixed_transition_ids[3]);
+            assert_terminal_family_b_final_graph(&pool, cid).await;
+        }
+
+        async fn assert_terminal_family_b_identity_precondition(pool: &PgPool, manifest: &Value) {
+            let bob = &manifest["identity"]["bob"];
+            let did = bob["actorDid"].as_str().unwrap();
+            let device_id = Uuid::parse_str(bob["deviceId"].as_str().unwrap()).unwrap();
+            let key_id = bob["keyId"].as_str().unwrap();
+            let expected_public_key = corpus_hex::<32>(&bob["signaturePublicKeyHex"]);
+            let existing: Option<(
+                String,
+                i64,
+                DateTime<Utc>,
+                Option<DateTime<Utc>>,
+                Vec<u8>,
+                i64,
+                DateTime<Utc>,
+                Option<DateTime<Utc>>,
+            )> = sqlx::query_as(
+                r#"SELECT device.status,
+                          device.auth_generation,
+                          device.created_at,
+                          device.revoked_at,
+                          device_key.signing_public_key,
+                          device_key.enrollment_auth_generation,
+                          device_key.created_at,
+                          device_key.revoked_at
+                     FROM chat.devices device
+                     JOIN chat.device_keys device_key
+                       ON device_key.user_did=device.user_did
+                      AND device_key.device_id=device.device_id
+                      AND device_key.key_id=$3
+                    WHERE device.user_did=$1
+                      AND device.device_id=$2"#,
+            )
+            .bind(did)
+            .bind(device_id)
+            .bind(key_id)
+            .fetch_optional(pool)
+            .await
+            .expect("read fixed-corpus Bob identity precondition");
+            if let Some((
+                status,
+                auth_generation,
+                device_created_at,
+                device_revoked_at,
+                public_key,
+                key_auth_generation,
+                key_created_at,
+                key_revoked_at,
+            )) = existing
+            {
+                let requested_at = instant(REQUESTED_AT);
+                assert_eq!(status, "active");
+                assert_eq!(auth_generation, 1);
+                assert!(device_created_at <= requested_at);
+                assert!(device_revoked_at.is_none_or(|at| at >= requested_at));
+                assert_eq!(public_key, expected_public_key);
+                assert_eq!(key_auth_generation, 1);
+                assert!(key_created_at <= requested_at);
+                assert!(key_revoked_at.is_none_or(|at| at >= requested_at));
+            }
+        }
+
+        async fn assert_terminal_family_b_seq6_prefix_complete(
+            pool: &PgPool,
+            cid: Uuid,
+            states: &FixedCorpusCommitStates,
+        ) {
+            let manifest = corpus_manifest();
+            let alice_did = manifest["identity"]["alice"]["actorDid"].as_str().unwrap();
+            let alice_device =
+                Uuid::parse_str(manifest["identity"]["alice"]["deviceId"].as_str().unwrap())
+                    .unwrap();
+            let bob_did = manifest["identity"]["bob"]["actorDid"].as_str().unwrap();
+            let bob_device =
+                Uuid::parse_str(manifest["identity"]["bob"]["deviceId"].as_str().unwrap()).unwrap();
+            let locked_at = instant(LEAVE_AT) + chrono::Duration::milliseconds(1);
+            let mut read = pool
+                .begin()
+                .await
+                .expect("begin seq1-6 resume-prefix aggregate read");
+            let aggregate = hydrate_locked_conversation_state(&mut read, cid, locked_at)
+                .await
+                .expect("seq1-6 resume prefix independently hydrates");
+            assert_eq!(aggregate.state().coordinate().state_version(), 4);
+            assert_eq!(aggregate.head().next_entry_seq(), 7);
+            assert_eq!(
+                aggregate.state().public_state().snapshot(),
+                states.generic.snapshot()
+            );
+            assert_eq!(aggregate.state().participants().len(), 2);
+            assert_eq!(aggregate.state().leaves().len(), 2);
+            assert_ne!(aggregate.locked_graph_digest(), &[0; 32]);
+            read.rollback()
+                .await
+                .expect("rollback seq1-6 resume-prefix aggregate read");
+
+            let prefix_counts: (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) =
+                sqlx::query_as(
+                    r#"SELECT
+                    (SELECT count(*) FROM chat.participants
+                      WHERE conversation_id=$1 AND current_membership AND status='active'),
+                    (SELECT count(*) FROM chat.member_devices
+                      WHERE conversation_id=$1 AND active),
+                    (SELECT count(*) FROM chat.application_intervals
+                      WHERE conversation_id=$1 AND terminal_seq IS NULL),
+                    (SELECT count(*) FROM chat.leaf_recovery_requests
+                      WHERE conversation_id=$1 AND status='fulfilled'),
+                    (SELECT count(*) FROM chat.key_package_reservations
+                      WHERE conversation_id=$1 AND status='consumed'),
+                    (SELECT count(*) FROM chat.welcome_bundles
+                      WHERE conversation_id=$1),
+                    (SELECT count(*) FROM chat.welcome_deliveries delivery
+                      JOIN chat.welcome_bundles bundle USING(welcome_id)
+                      WHERE bundle.conversation_id=$1 AND delivery.status='superseded'),
+                    (SELECT count(*) FROM chat.welcome_dispositions disposition
+                      JOIN chat.welcome_bundles bundle USING(welcome_id)
+                      WHERE bundle.conversation_id=$1
+                        AND disposition.winner_kind='superseded'),
+                    (SELECT count(*) FROM chat.events event
+                      JOIN chat.welcome_dispositions disposition
+                        ON disposition.event_position=event.event_position
+                      JOIN chat.welcome_bundles bundle USING(welcome_id)
+                      WHERE bundle.conversation_id=$1),
+                    (SELECT count(*) FROM chat.outbox outbox
+                      JOIN chat.welcome_dispositions disposition
+                        ON disposition.event_position=outbox.event_position
+                      JOIN chat.welcome_bundles bundle USING(welcome_id)
+                      WHERE bundle.conversation_id=$1),
+                    (SELECT count(*) FROM chat.metadata_snapshots
+                      WHERE conversation_id=$1)"#,
+                )
+                .bind(cid)
+                .fetch_one(pool)
+                .await
+                .expect("inspect complete seq1-6 ancillary prefix");
+            assert_eq!(
+                prefix_counts,
+                (2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 3),
+                "resume prefix retains every ancillary ownership/provenance row"
+            );
+            let consumed_package_count: i64 = sqlx::query_scalar(
+                r#"SELECT count(*) FROM chat.key_packages package
+                    JOIN chat.key_package_reservations reservation
+                      ON reservation.key_package_ref=package.key_package_ref
+                   WHERE reservation.conversation_id=$1
+                     AND reservation.status='consumed'
+                     AND package.status='consumed'"#,
+            )
+            .bind(cid)
+            .fetch_one(pool)
+            .await
+            .expect("inspect consumed prefix package");
+            assert_eq!(consumed_package_count, 1);
+            let welcome_event_recipient_count: i64 = sqlx::query_scalar(
+                r#"SELECT count(*) FROM chat.event_recipients recipient
+                    JOIN chat.welcome_dispositions disposition
+                      ON disposition.event_position=recipient.event_position
+                    JOIN chat.welcome_bundles bundle USING(welcome_id)
+                   WHERE bundle.conversation_id=$1
+                     AND recipient.user_did=$2
+                     AND recipient.device_id=$3
+                     AND recipient.entitlement_kind='welcome'"#,
+            )
+            .bind(cid)
+            .bind(bob_did)
+            .bind(bob_device)
+            .fetch_one(pool)
+            .await
+            .expect("inspect prefix Welcome event audience");
+            assert_eq!(welcome_event_recipient_count, 1);
+
+            let routing: Vec<(i64, String, Uuid, String)> = sqlx::query_as(
+                "SELECT seq,user_did,device_id,entitlement_kind \
+                 FROM chat.entry_recipients WHERE conversation_id=$1 \
+                 ORDER BY seq,user_did,device_id",
+            )
+            .bind(cid)
+            .fetch_all(pool)
+            .await
+            .expect("load seq1-6 routing");
+            let mut expected = vec![
+                (1, alice_did.to_owned(), alice_device, "control".to_owned()),
+                (2, alice_did.to_owned(), alice_device, "control".to_owned()),
+                (3, alice_did.to_owned(), alice_device, "control".to_owned()),
+                (4, alice_did.to_owned(), alice_device, "control".to_owned()),
+                (5, alice_did.to_owned(), alice_device, "control".to_owned()),
+                (5, bob_did.to_owned(), bob_device, "control".to_owned()),
+                (6, alice_did.to_owned(), alice_device, "control".to_owned()),
+                (6, bob_did.to_owned(), bob_device, "control".to_owned()),
+            ];
+            expected.sort_by(|left, right| {
+                (&left.0, &left.1, &left.2).cmp(&(&right.0, &right.1, &right.2))
+            });
+            assert_eq!(routing, expected, "resume prefix routing is exact");
+        }
+
+        async fn load_terminal_family_b_seq6_prefix(
+            pool: &PgPool,
+            cid: Uuid,
+            states: &FixedCorpusCommitStates,
+        ) -> (TerminalFamilyBActors, Uuid, GenuineLeaveRequest) {
+            assert_terminal_family_b_seq6_prefix_complete(pool, cid, states).await;
+            let manifest = corpus_manifest();
+            let add_transition_id =
+                Uuid::parse_str(manifest["identifiers"]["transitionId"].as_str().unwrap()).unwrap();
+            let generic_transition_id = Uuid::parse_str(
+                manifest["identifiers"]["genericTransitionId"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            let transitions: Vec<(i64, String, Uuid)> = sqlx::query_as(
+                "SELECT entry_seq,kind,transition_id FROM chat.transitions \
+                 WHERE conversation_id=$1 ORDER BY entry_seq",
+            )
+            .bind(cid)
+            .fetch_all(pool)
+            .await
+            .expect("load terminal-family B durable prefix transitions");
+            assert_eq!(transitions.len(), 5);
+            assert_eq!(
+                transitions
+                    .iter()
+                    .map(|(seq, kind, _)| (*seq, kind.as_str()))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (1, "creation"),
+                    (2, "policy"),
+                    (3, "acceptConversation"),
+                    (4, "leafRecovery"),
+                    (5, "commit"),
+                ]
+            );
+            assert_eq!(transitions[3].2, add_transition_id);
+            assert_eq!(transitions[4].2, generic_transition_id);
+            let creation_transition_id = transitions[0].2;
+
+            let entries: Vec<(i64, String, Option<Uuid>)> = sqlx::query_as(
+                "SELECT seq,entry_kind,transition_id FROM chat.entries \
+                 WHERE conversation_id=$1 ORDER BY seq",
+            )
+            .bind(cid)
+            .fetch_all(pool)
+            .await
+            .expect("load terminal-family B durable prefix entries");
+            assert_eq!(entries.len(), 6);
+            assert_eq!(
+                entries.iter().map(|(seq, _, _)| *seq).collect::<Vec<_>>(),
+                vec![1, 2, 3, 4, 5, 6]
+            );
+            for index in 0..5 {
+                assert_eq!(entries[index].2, Some(transitions[index].2));
+            }
+            assert_eq!(entries[5].1, "blue.catbird.chat.defs#leaveRequestEntry");
+            assert_eq!(entries[5].2, None);
+
+            let durable_states: Vec<(i64, String, Uuid, Vec<u8>)> = sqlx::query_as(
+                "SELECT state_version,state_kind,producing_transition_id,public_snapshot_bytes \
+                 FROM chat.generation_states WHERE conversation_id=$1 AND generation=0 \
+                 ORDER BY state_version",
+            )
+            .bind(cid)
+            .fetch_all(pool)
+            .await
+            .expect("load terminal-family B durable prefix states");
+            assert_eq!(durable_states.len(), 5);
+            let expected_snapshots = [
+                states.genesis.snapshot(),
+                states.genesis.snapshot(),
+                states.genesis.snapshot(),
+                states.added.snapshot(),
+                states.generic.snapshot(),
+            ];
+            let expected_state_kinds = [
+                "creation",
+                "policy",
+                "acceptConversation",
+                "commit",
+                "commit",
+            ];
+            for (index, (version, kind, producer, snapshot)) in durable_states.iter().enumerate() {
+                assert_eq!(*version, i64::try_from(index).unwrap());
+                assert_eq!(kind, expected_state_kinds[index]);
+                assert_eq!(*producer, transitions[index].2);
+                assert_eq!(snapshot, expected_snapshots[index]);
+            }
+
+            let creation: (
+                Uuid,
+                Vec<u8>,
+                Vec<u8>,
+                Vec<u8>,
+                String,
+                Uuid,
+                String,
+                Vec<u8>,
+            ) = sqlx::query_as(
+                r#"SELECT entry.entry_id,
+                          entry.accepted_payload_bytes,
+                          entry.signed_request_bytes,
+                          entry.outer_entry_fingerprint,
+                          entry.actor_did,
+                          entry.actor_device_id,
+                          entry.actor_key_id,
+                          device_key.signing_public_key
+                     FROM chat.entries entry
+                     JOIN chat.device_keys device_key
+                       ON device_key.user_did=entry.actor_did
+                      AND device_key.device_id=entry.actor_device_id
+                      AND device_key.key_id=entry.actor_key_id
+                    WHERE entry.conversation_id=$1 AND entry.seq=1"#,
+            )
+            .bind(cid)
+            .fetch_one(pool)
+            .await
+            .expect("load genuine durable creation entry");
+            let mut entry = build_real_corpus_creation_entry(*cid.as_bytes());
+            assert_eq!(entry.public_key, creation.7);
+            entry.entry_id = creation.0;
+            entry.public_row_json = creation.1;
+            entry.raw_wrapper = creation.2;
+            entry.outer_entry_fingerprint = creation.3.try_into().unwrap();
+            entry.actor_did = creation.4;
+            entry.actor_device_id = creation.5;
+            entry.actor_key_id = creation.6;
+            entry.head_next_entry_seq = 7;
+            let verified_creation =
+                decode_and_verify_control_entry(&entry.public_row_json, &entry.public_key)
+                    .expect("durable creation entry still verifies");
+            assert_eq!(
+                verified_creation.outer_control_fingerprint(),
+                &entry.outer_entry_fingerprint
+            );
+            let creation_wrapper: Value = serde_json::from_slice(&entry.raw_wrapper).unwrap();
+            assert_eq!(
+                Uuid::parse_str(creation_wrapper["body"]["transitionId"].as_str().unwrap())
+                    .unwrap(),
+                creation_transition_id
+            );
+
+            let mut invitee = corpus_invitee();
+            let participant_period_id: Uuid = sqlx::query_scalar(
+                "SELECT participant_period_id FROM chat.participants \
+                 WHERE conversation_id=$1 AND user_did=$2 AND status='active' \
+                   AND current_membership",
+            )
+            .bind(cid)
+            .bind(&invitee.did)
+            .fetch_one(pool)
+            .await
+            .expect("load durable active Bob participant period");
+            invitee.participant_period_id = participant_period_id;
+            let durable_bob_key: Vec<u8> = sqlx::query_scalar(
+                "SELECT signing_public_key FROM chat.device_keys \
+                 WHERE user_did=$1 AND device_id=$2 AND key_id=$3",
+            )
+            .bind(&invitee.did)
+            .bind(invitee.device_id)
+            .bind(&invitee.key_id)
+            .fetch_one(pool)
+            .await
+            .expect("load durable Bob signing key");
+            assert_eq!(
+                durable_bob_key,
+                invitee.signing_key.verifying_key().to_bytes()
+            );
+
+            let generic = states.generic.coordinate();
+            let leave_entry: (
+                Uuid,
+                Vec<u8>,
+                Vec<u8>,
+                Vec<u8>,
+                Vec<u8>,
+                Vec<u8>,
+                Vec<u8>,
+                Vec<u8>,
+            ) = sqlx::query_as(
+                r#"SELECT entry.entry_id,
+                          entry.accepted_payload_bytes,
+                          entry.signed_request_bytes,
+                          request.signing_transcript_bytes,
+                          request.request_digest,
+                          request.signature,
+                          entry.server_fields_bytes,
+                          entry.outer_entry_fingerprint
+                     FROM chat.leave_requests request
+                     JOIN chat.entries entry
+                       ON entry.conversation_id=request.conversation_id
+                      AND entry.seq=6
+                      AND entry.actor_did=request.requester_did
+                      AND entry.actor_device_id=request.requester_device_id
+                    WHERE request.conversation_id=$1
+                      AND request.requester_did=$2
+                      AND request.requester_device_id=$3"#,
+            )
+            .bind(cid)
+            .bind(&invitee.did)
+            .bind(invitee.device_id)
+            .fetch_one(pool)
+            .await
+            .expect("load genuine durable leave entry");
+            let leave_request: (
+                Uuid,
+                i64,
+                Vec<u8>,
+                i64,
+                Vec<u8>,
+                Vec<u8>,
+                String,
+                Option<Uuid>,
+                Option<DateTime<Utc>>,
+            ) = sqlx::query_as(
+                r#"SELECT leave_request_id,
+                          prior_state_version,
+                          prior_group_id,
+                          prior_epoch,
+                          prior_group_context_hash,
+                          prior_confirmation_tag,
+                          status,
+                          terminal_transition_id,
+                          terminal_at
+                     FROM chat.leave_requests
+                    WHERE conversation_id=$1
+                      AND requester_did=$2
+                      AND requester_device_id=$3"#,
+            )
+            .bind(cid)
+            .bind(&invitee.did)
+            .bind(invitee.device_id)
+            .fetch_one(pool)
+            .await
+            .expect("load genuine durable pending leave request");
+            assert_eq!(leave_request.1, 4);
+            assert_eq!(leave_request.2, generic.group_id());
+            assert_eq!(leave_request.3, i64::try_from(generic.epoch()).unwrap());
+            assert_eq!(leave_request.4, generic.group_context_hash());
+            assert_eq!(leave_request.5, generic.confirmation_tag());
+            assert_eq!(leave_request.6, "pending");
+            assert_eq!(leave_request.7, None);
+            assert_eq!(leave_request.8, None);
+            let verified_leave = decode_and_verify_control_entry(
+                &leave_entry.1,
+                invitee.signing_key.verifying_key().as_bytes(),
+            )
+            .expect("durable Bob leave request still verifies");
+            let outer_fingerprint: [u8; 32] = leave_entry.7.try_into().unwrap();
+            assert_eq!(
+                verified_leave.outer_control_fingerprint(),
+                &outer_fingerprint
+            );
+            let canonical_leave = decode_canonical_signed_mutation(&leave_entry.2)
+                .expect("durable Bob leave mutation remains canonical");
+            assert_eq!(canonical_leave.transcript_bytes(), leave_entry.3);
+            assert_eq!(leave_entry.4, canonical_leave.request_digest());
+            assert_eq!(leave_entry.5, canonical_leave.signature());
+            let leave = GenuineLeaveRequest {
+                request_id: leave_request.0,
+                entry_id: leave_entry.0,
+                public_row_json: leave_entry.1,
+                raw_wrapper: leave_entry.2,
+                signing_transcript: leave_entry.3,
+                request_digest: leave_entry.4,
+                signature: leave_entry.5,
+                server_fields: leave_entry.6,
+                outer_fingerprint,
+            };
+            (
+                TerminalFamilyBActors { entry, invitee },
+                creation_transition_id,
+                leave,
+            )
+        }
+
+        async fn assert_terminal_family_b_final_graph(pool: &PgPool, cid: Uuid) {
+            let manifest = corpus_manifest();
+            let bob_did = manifest["identity"]["bob"]["actorDid"].as_str().unwrap();
+            let alice_did = manifest["identity"]["alice"]["actorDid"].as_str().unwrap();
+            let bob_device_id =
+                Uuid::parse_str(manifest["identity"]["bob"]["deviceId"].as_str().unwrap()).unwrap();
+            let leave_transition_id = Uuid::parse_str(
+                manifest["identifiers"]["leaveFulfillmentTransitionId"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            let rejoin_transition_id = Uuid::parse_str(
+                manifest["identifiers"]["rejoinTransitionId"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            let locked_at = instant(REJOIN_AT) + chrono::Duration::milliseconds(1);
+            let mut tx = pool
+                .begin()
+                .await
+                .expect("begin terminal-family B final read");
+            let aggregate = hydrate_locked_conversation_state(&mut tx, cid, locked_at)
+                .await
+                .expect("terminal-family B final aggregate independently hydrates");
+            assert_eq!(aggregate.state().coordinate().state_version(), 8);
+            assert_eq!(aggregate.head().next_entry_seq(), 11);
+            assert_eq!(
+                aggregate.state().public_state().snapshot(),
+                corpus_file("committed-rejoin-public-state.bin")
+            );
+            let bob = PrincipalId::new(bob_did.as_bytes().to_vec()).unwrap();
+            let alice = PrincipalId::new(alice_did.as_bytes().to_vec()).unwrap();
+            assert_eq!(
+                aggregate.state().participant(&alice).unwrap().status(),
+                ParticipantStatus::Active
+            );
+            assert_eq!(
+                aggregate.state().participant(&bob).unwrap().status(),
+                ParticipantStatus::Active
+            );
+            assert_eq!(aggregate.state().leaves().len(), 2);
+            let fulfilled_leave_id: Uuid = sqlx::query_scalar(
+                "SELECT leave_request_id FROM chat.leave_requests \
+                 WHERE conversation_id=$1 AND requester_did=$2 AND status='fulfilled'",
+            )
+            .bind(cid)
+            .bind(bob_did)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("fulfilled leave row remains durable");
+            assert_eq!(
+                aggregate
+                    .state()
+                    .leave_request(fulfilled_leave_id.as_bytes())
+                    .expect("fulfilled leave remains in hydrated history")
+                    .status(),
+                LeaveRequestStatus::Fulfilled
+            );
+            assert_ne!(aggregate.locked_graph_digest(), &[0; 32]);
+
+            let participant_periods: Vec<(Uuid, bool, Option<Uuid>, Option<i64>)> = sqlx::query_as(
+                r#"SELECT participant_period_id,current_membership,
+                              removing_transition_id,removing_seq
+                         FROM chat.participants
+                        WHERE conversation_id=$1 AND user_did=$2
+                        ORDER BY created_at,participant_period_id"#,
+            )
+            .bind(cid)
+            .bind(bob_did)
+            .fetch_all(&mut *tx)
+            .await
+            .expect("load old and new Bob participant periods");
+            assert_eq!(participant_periods.len(), 2);
+            assert_ne!(participant_periods[0].0, participant_periods[1].0);
+            assert_eq!(
+                (
+                    participant_periods[0].1,
+                    participant_periods[0].2,
+                    participant_periods[0].3
+                ),
+                (false, Some(leave_transition_id), Some(7))
+            );
+            assert!(participant_periods[1].1);
+            assert_eq!(participant_periods[1].2, None);
+
+            let leaf_periods: Vec<(Uuid, bool, i64, Option<i64>, Uuid)> = sqlx::query_as(
+                r#"SELECT leaf_period_id,active,joined_seq,removed_seq,joined_transition_id
+                     FROM chat.member_devices
+                    WHERE conversation_id=$1 AND user_did=$2 AND device_id=$3
+                    ORDER BY created_at,leaf_period_id"#,
+            )
+            .bind(cid)
+            .bind(bob_did)
+            .bind(bob_device_id)
+            .fetch_all(&mut *tx)
+            .await
+            .expect("load old and new Bob leaf periods");
+            assert_eq!(leaf_periods.len(), 2);
+            assert_ne!(leaf_periods[0].0, leaf_periods[1].0);
+            assert_eq!(
+                (leaf_periods[0].1, leaf_periods[0].2, leaf_periods[0].3),
+                (false, 4, Some(7))
+            );
+            assert_eq!(
+                (leaf_periods[1].1, leaf_periods[1].2, leaf_periods[1].3),
+                (true, 10, None)
+            );
+            assert_eq!(leaf_periods[1].4, rejoin_transition_id);
+
+            let intervals: Vec<(i64, Option<i64>, Uuid)> = sqlx::query_as(
+                r#"SELECT start_seq,terminal_seq,opening_transition_id
+                     FROM chat.application_intervals
+                    WHERE conversation_id=$1 AND recipient_did=$2 AND recipient_device_id=$3
+                    ORDER BY start_seq"#,
+            )
+            .bind(cid)
+            .bind(bob_did)
+            .bind(bob_device_id)
+            .fetch_all(&mut *tx)
+            .await
+            .expect("load old and new Bob access intervals");
+            assert_eq!(intervals.len(), 2);
+            assert_eq!((intervals[0].0, intervals[0].1), (4, Some(7)));
+            assert_eq!((intervals[1].0, intervals[1].1), (10, None));
+            assert_eq!(intervals[1].2, rejoin_transition_id);
+
+            let alice_device_id =
+                Uuid::parse_str(manifest["identity"]["alice"]["deviceId"].as_str().unwrap())
+                    .unwrap();
+            let creation_received_at =
+                instant(manifest["creation"]["receivedAt"].as_str().unwrap());
+            let creation_provenance: (
+                DateTime<Utc>,
+                DateTime<Utc>,
+                DateTime<Utc>,
+                DateTime<Utc>,
+                DateTime<Utc>,
+                DateTime<Utc>,
+                DateTime<Utc>,
+                DateTime<Utc>,
+                DateTime<Utc>,
+            ) = sqlx::query_as(
+                r#"SELECT conversation.created_at,
+                          generation.activated_at,
+                          transition.accepted_at,
+                          state.created_at,
+                          participant.created_at,
+                          member.created_at,
+                          interval.created_at,
+                          metadata.created_at,
+                          entry.received_at
+                     FROM chat.conversations conversation
+                     JOIN chat.generations generation
+                       ON generation.conversation_id=conversation.conversation_id
+                      AND generation.generation=0
+                     JOIN chat.entries entry
+                       ON entry.conversation_id=conversation.conversation_id
+                      AND entry.seq=1
+                     JOIN chat.transitions transition
+                       ON transition.transition_id=entry.transition_id
+                     JOIN chat.generation_states state
+                       ON state.conversation_id=conversation.conversation_id
+                      AND state.generation=0 AND state.state_version=0
+                     JOIN chat.participants participant
+                       ON participant.conversation_id=conversation.conversation_id
+                      AND participant.user_did=$2
+                     JOIN chat.member_devices member
+                       ON member.conversation_id=conversation.conversation_id
+                      AND member.user_did=$2 AND member.device_id=$3
+                      AND member.joined_seq=1
+                     JOIN chat.application_intervals interval
+                       ON interval.conversation_id=conversation.conversation_id
+                      AND interval.recipient_did=$2 AND interval.recipient_device_id=$3
+                      AND interval.start_seq=1
+                     JOIN chat.metadata_snapshots metadata
+                       ON metadata.conversation_id=conversation.conversation_id
+                      AND metadata.generation=0 AND metadata.state_version=0
+                    WHERE conversation.conversation_id=$1"#,
+            )
+            .bind(cid)
+            .bind(alice_did)
+            .bind(alice_device_id)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("load exact creation chronology provenance");
+            for persisted in [
+                creation_provenance.0,
+                creation_provenance.1,
+                creation_provenance.2,
+                creation_provenance.3,
+                creation_provenance.4,
+                creation_provenance.5,
+                creation_provenance.6,
+                creation_provenance.7,
+                creation_provenance.8,
+            ] {
+                assert_eq!(
+                    persisted, creation_received_at,
+                    "every creation provenance row uses the verified outer receivedAt"
+                );
+            }
+
+            let entries: Vec<(i64, DateTime<Utc>)> = sqlx::query_as(
+                "SELECT seq,received_at FROM chat.entries \
+                 WHERE conversation_id=$1 ORDER BY seq",
+            )
+            .bind(cid)
+            .fetch_all(&mut *tx)
+            .await
+            .expect("load final entry chronology");
+            let expected_entry_times = [
+                creation_received_at,
+                instant(POLICY_ADD_AT),
+                instant(REQUESTED_AT),
+                instant(FULFILLED_AT),
+                instant(GENERIC_AT),
+                instant(LEAVE_AT),
+                instant(LEAVE_FULFILLED_AT),
+                instant(REINVITE_AT),
+                instant(REACCEPT_AT),
+                instant(REJOIN_AT),
+            ];
+            assert_eq!(entries.len(), expected_entry_times.len());
+            for (index, ((seq, received_at), expected)) in
+                entries.iter().zip(expected_entry_times).enumerate()
+            {
+                assert_eq!(*seq, i64::try_from(index + 1).unwrap());
+                assert_eq!(*received_at, expected);
+            }
+            assert!(
+                entries.windows(2).all(|pair| pair[0].1 < pair[1].1),
+                "entry chronology is strictly monotone"
+            );
+
+            let transitions: Vec<(i64, DateTime<Utc>)> = sqlx::query_as(
+                "SELECT entry_seq,accepted_at FROM chat.transitions \
+                 WHERE conversation_id=$1 ORDER BY entry_seq",
+            )
+            .bind(cid)
+            .fetch_all(&mut *tx)
+            .await
+            .expect("load final transition chronology");
+            let expected_transition_times = [
+                (1, creation_received_at),
+                (2, instant(POLICY_ADD_AT)),
+                (3, instant(REQUESTED_AT)),
+                (4, instant(FULFILLED_AT)),
+                (5, instant(GENERIC_AT)),
+                (7, instant(LEAVE_FULFILLED_AT)),
+                (8, instant(REINVITE_AT)),
+                (9, instant(REACCEPT_AT)),
+                (10, instant(REJOIN_AT)),
+            ];
+            assert_eq!(transitions, expected_transition_times);
+            assert!(
+                transitions.windows(2).all(|pair| pair[0].1 < pair[1].1),
+                "transition chronology is strictly monotone"
+            );
+
+            let states: Vec<(i64, DateTime<Utc>)> = sqlx::query_as(
+                "SELECT state_version,created_at FROM chat.generation_states \
+                 WHERE conversation_id=$1 AND generation=0 ORDER BY state_version",
+            )
+            .bind(cid)
+            .fetch_all(&mut *tx)
+            .await
+            .expect("load final state chronology");
+            assert_eq!(
+                states,
+                vec![
+                    (0, creation_received_at),
+                    (1, instant(POLICY_ADD_AT)),
+                    (2, instant(REQUESTED_AT)),
+                    (3, instant(FULFILLED_AT)),
+                    (4, instant(GENERIC_AT)),
+                    (5, instant(LEAVE_FULFILLED_AT)),
+                    (6, instant(REINVITE_AT)),
+                    (7, instant(REACCEPT_AT)),
+                    (8, instant(REJOIN_AT)),
+                ]
+            );
+            assert!(
+                states.windows(2).all(|pair| pair[0].1 < pair[1].1),
+                "state chronology is strictly monotone"
+            );
+            assert!(locked_at > entries.last().unwrap().1);
+
+            let routing: Vec<(i64, String, Uuid, String)> = sqlx::query_as(
+                "SELECT seq,user_did,device_id,entitlement_kind \
+                 FROM chat.entry_recipients WHERE conversation_id=$1 \
+                 ORDER BY seq,user_did,device_id",
+            )
+            .bind(cid)
+            .fetch_all(&mut *tx)
+            .await
+            .expect("load final exact routing");
+            let mut expected_routing = vec![
+                (
+                    1,
+                    alice_did.to_owned(),
+                    alice_device_id,
+                    "control".to_owned(),
+                ),
+                (
+                    2,
+                    alice_did.to_owned(),
+                    alice_device_id,
+                    "control".to_owned(),
+                ),
+                (
+                    3,
+                    alice_did.to_owned(),
+                    alice_device_id,
+                    "control".to_owned(),
+                ),
+                (
+                    4,
+                    alice_did.to_owned(),
+                    alice_device_id,
+                    "control".to_owned(),
+                ),
+                (
+                    5,
+                    alice_did.to_owned(),
+                    alice_device_id,
+                    "control".to_owned(),
+                ),
+                (5, bob_did.to_owned(), bob_device_id, "control".to_owned()),
+                (
+                    6,
+                    alice_did.to_owned(),
+                    alice_device_id,
+                    "control".to_owned(),
+                ),
+                (6, bob_did.to_owned(), bob_device_id, "control".to_owned()),
+                (
+                    7,
+                    alice_did.to_owned(),
+                    alice_device_id,
+                    "control".to_owned(),
+                ),
+                (
+                    7,
+                    bob_did.to_owned(),
+                    bob_device_id,
+                    "intervalClose".to_owned(),
+                ),
+                (
+                    8,
+                    alice_did.to_owned(),
+                    alice_device_id,
+                    "control".to_owned(),
+                ),
+                (
+                    9,
+                    alice_did.to_owned(),
+                    alice_device_id,
+                    "control".to_owned(),
+                ),
+                (
+                    10,
+                    alice_did.to_owned(),
+                    alice_device_id,
+                    "control".to_owned(),
+                ),
+            ];
+            expected_routing.sort_by(|left, right| {
+                (&left.0, &left.1, &left.2).cmp(&(&right.0, &right.1, &right.2))
+            });
+            assert_eq!(routing, expected_routing, "final routing is exact");
+
+            let final_ancillary_counts: (i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+                r#"SELECT
+                        (SELECT count(*) FROM chat.leaf_recovery_requests
+                          WHERE conversation_id=$1 AND status='fulfilled'),
+                        (SELECT count(*) FROM chat.key_package_reservations
+                          WHERE conversation_id=$1 AND status='consumed'),
+                        (SELECT count(*) FROM chat.welcome_bundles
+                          WHERE conversation_id=$1),
+                        (SELECT count(*) FROM chat.welcome_deliveries delivery
+                          JOIN chat.welcome_bundles bundle USING(welcome_id)
+                          WHERE bundle.conversation_id=$1
+                            AND delivery.status='superseded'),
+                        (SELECT count(*) FROM chat.welcome_deliveries delivery
+                          JOIN chat.welcome_bundles bundle USING(welcome_id)
+                          WHERE bundle.conversation_id=$1
+                            AND delivery.status='pending'),
+                        (SELECT count(*) FROM chat.metadata_snapshots
+                          WHERE conversation_id=$1),
+                        (SELECT count(*) FROM chat.application_intervals
+                          WHERE conversation_id=$1)"#,
+            )
+            .bind(cid)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("inspect final ancillary graph");
+            assert_eq!(
+                final_ancillary_counts,
+                (2, 2, 2, 1, 1, 5, 3),
+                "final graph retains both recovery lineages and exact metadata/access history"
+            );
+            tx.rollback()
+                .await
+                .expect("rollback terminal-family B final read");
+        }
+
+        struct FixedCorpusCommitStates {
+            genesis: ActivePublicState,
+            add_prior: ActivePublicState,
+            added: ActivePublicState,
+            generic: ActivePublicState,
+            removed: ActivePublicState,
+            rejoin_prior: ActivePublicState,
+            rejoined: ActivePublicState,
+        }
+
+        fn fixed_corpus_commit_states() -> FixedCorpusCommitStates {
+            let manifest = corpus_manifest();
+            let chain = &manifest["chain"];
+            let cid = corpus_hex::<16>(&manifest["identifiers"]["conversationIdHex"]);
+            let group_id = corpus_hex::<32>(&chain["groupIdHex"]);
+            let evaluation = manifest["evaluationUnixSeconds"].as_u64().unwrap();
+            let coordinate =
+                |state_version: u64, epoch: &str, context: &str, confirmation: &str| {
+                    PublicGroupSnapshotCoordinate::new(
+                        cid,
+                        0,
+                        state_version,
+                        group_id,
+                        chain[epoch].as_u64().unwrap(),
+                        corpus_hex::<32>(&chain[context]),
+                        corpus_hex::<32>(&chain[confirmation]),
+                        PublicGroupSnapshotLifecycle::Active,
+                    )
+                };
+            let process = |prior: &ActivePublicState,
+                           name: &str,
+                           aad_hash: &str,
+                           next: PublicGroupSnapshotCoordinate| {
+                let bytes = corpus_file(name);
+                let parsed = validate_public_commit(&bytes, MAX_PUBLIC_MESSAGE_WIRE_BYTES)
+                    .expect("canonical corpus Commit parses");
+                let aad = parsed.aad().to_vec();
+                assert_eq!(
+                    <[u8; 32]>::from(Sha256::digest(&aad)),
+                    corpus_hex::<32>(&chain[aad_hash])
+                );
+                process_commit(prior, &bytes, &aad, next, evaluation, 100)
+                    .unwrap_or_else(|error| panic!("{name} processes: {error:?}"))
+            };
+
+            let genesis = crate::frozen_public_state::restore_genesis();
+            let invited = rebind_active_snapshot(
+                &genesis,
+                PublicGroupSnapshotCoordinate::new(
+                    cid,
+                    0,
+                    1,
+                    group_id,
+                    genesis.coordinate().epoch(),
+                    *genesis.coordinate().group_context_hash(),
+                    *genesis.coordinate().confirmation_tag(),
+                    PublicGroupSnapshotLifecycle::Active,
+                ),
+            )
+            .expect("invitation coordinate-only edge");
+            let add_prior = rebind_active_snapshot(
+                &invited,
+                PublicGroupSnapshotCoordinate::new(
+                    cid,
+                    0,
+                    chain["addPriorStateVersion"].as_u64().unwrap(),
+                    group_id,
+                    invited.coordinate().epoch(),
+                    *invited.coordinate().group_context_hash(),
+                    *invited.coordinate().confirmation_tag(),
+                    PublicGroupSnapshotLifecycle::Active,
+                ),
+            )
+            .expect("acceptance coordinate-only edge");
+            let add = process(
+                &add_prior,
+                "commit-public.mls",
+                "commitAadSha256Hex",
+                coordinate(
+                    chain["committedStateVersion"].as_u64().unwrap(),
+                    "committedEpoch",
+                    "committedGroupContextHashHex",
+                    "committedConfirmationTagHex",
+                ),
+            );
+            assert_eq!(add.adds().len(), 1);
+            assert_eq!(
+                add.adds()[0].key_package_ref(),
+                &corpus_hex::<32>(&chain["innerKeyPackageRefHex"])
+            );
+            assert_eq!(
+                add.next().snapshot(),
+                corpus_file("committed-public-state.bin"),
+                "processed Add snapshot is byte-exact with the committed corpus artifact"
+            );
+            let added = add.into_next();
+            let generic_commit = process(
+                &added,
+                "commit-generic-public.mls",
+                "genericCommitAadSha256Hex",
+                coordinate(
+                    chain["genericCommittedStateVersion"].as_u64().unwrap(),
+                    "genericCommittedEpoch",
+                    "genericCommittedGroupContextHashHex",
+                    "genericCommittedConfirmationTagHex",
+                ),
+            );
+            assert!(generic_commit.adds().is_empty());
+            assert!(generic_commit.removes().is_empty());
+            assert_ne!(
+                generic_commit.sender_update().prior_encryption_key(),
+                generic_commit.sender_update().next_encryption_key(),
+                "generic Commit must rotate the authenticated sender encryption key"
+            );
+            assert_eq!(
+                generic_commit.next().snapshot(),
+                corpus_file("committed-generic-public-state.bin"),
+                "processed generic snapshot is byte-exact with the committed corpus artifact"
+            );
+            let generic = generic_commit.into_next();
+            let remove = process(
+                &generic,
+                "commit-remove-public.mls",
+                "removeCommitAadSha256Hex",
+                coordinate(
+                    chain["removeCommittedStateVersion"].as_u64().unwrap(),
+                    "removeCommittedEpoch",
+                    "removeCommittedGroupContextHashHex",
+                    "removeCommittedConfirmationTagHex",
+                ),
+            );
+            assert_eq!(remove.removes().len(), 1);
+            assert_eq!(
+                remove.removes()[0].basic_credential(),
+                manifest["identity"]["bob"]["credentialIdentity"]
+                    .as_str()
+                    .expect("Bob credential identity")
+                    .as_bytes(),
+                "Remove targets Bob's exact corpus basic credential"
+            );
+            assert_eq!(
+                remove.next().snapshot(),
+                corpus_file("committed-remove-public-state.bin"),
+                "processed Remove snapshot is byte-exact with the committed corpus artifact"
+            );
+            let removed = remove.into_next();
+            let reinvited = rebind_active_snapshot(
+                &removed,
+                PublicGroupSnapshotCoordinate::new(
+                    cid,
+                    0,
+                    6,
+                    group_id,
+                    removed.coordinate().epoch(),
+                    *removed.coordinate().group_context_hash(),
+                    *removed.coordinate().confirmation_tag(),
+                    PublicGroupSnapshotLifecycle::Active,
+                ),
+            )
+            .expect("reinvitation coordinate-only edge");
+            let rejoin_prior = rebind_active_snapshot(
+                &reinvited,
+                PublicGroupSnapshotCoordinate::new(
+                    cid,
+                    0,
+                    chain["rejoinPriorStateVersion"].as_u64().unwrap(),
+                    group_id,
+                    reinvited.coordinate().epoch(),
+                    *reinvited.coordinate().group_context_hash(),
+                    *reinvited.coordinate().confirmation_tag(),
+                    PublicGroupSnapshotLifecycle::Active,
+                ),
+            )
+            .expect("reacceptance coordinate-only edge");
+            let rejoin = process(
+                &rejoin_prior,
+                "commit-rejoin-public.mls",
+                "rejoinCommitAadSha256Hex",
+                coordinate(
+                    chain["rejoinStateVersion"].as_u64().unwrap(),
+                    "rejoinEpoch",
+                    "rejoinGroupContextHashHex",
+                    "rejoinConfirmationTagHex",
+                ),
+            );
+            assert_eq!(rejoin.adds().len(), 1);
+            assert_eq!(
+                rejoin.adds()[0].key_package_ref(),
+                &corpus_hex::<32>(&chain["rejoinInnerKeyPackageRefHex"])
+            );
+            assert_eq!(
+                rejoin.next().snapshot(),
+                corpus_file("committed-rejoin-public-state.bin"),
+                "processed rejoin snapshot is byte-exact with the committed corpus artifact"
+            );
+            let rejoined = rejoin.into_next();
+            FixedCorpusCommitStates {
+                genesis,
+                add_prior,
+                added,
+                generic,
+                removed,
+                rejoin_prior,
+                rejoined,
+            }
+        }
+
+        #[test]
+        fn fixed_corpus_add_generic_remove_rejoin_processes_exactly() {
+            let states = fixed_corpus_commit_states();
+            assert_eq!(states.genesis.coordinate().state_version(), 0);
+            assert_eq!(states.add_prior.coordinate().state_version(), 2);
+            assert_eq!(states.added.coordinate().state_version(), 3);
+            assert_eq!(states.generic.coordinate().state_version(), 4);
+            assert_eq!(states.removed.coordinate().state_version(), 5);
+            assert_eq!(states.removed.binding().tree_summary().leaves().len(), 1);
+            assert_eq!(states.rejoin_prior.coordinate().state_version(), 7);
+            assert_eq!(states.rejoined.coordinate().state_version(), 8);
+            assert_eq!(states.rejoined.binding().tree_summary().leaves().len(), 2);
+        }
+
+        struct GenuineCommitControl {
+            entry_id: Uuid,
+            transition_id: Uuid,
+            public_row_json: Vec<u8>,
+            raw_wrapper: Vec<u8>,
+            canonical_projection: Vec<u8>,
+            signing_transcript: Vec<u8>,
+            request_digest: Vec<u8>,
+            signature: Vec<u8>,
+            server_fields: Vec<u8>,
+            outer_fingerprint: [u8; 32],
+            metadata_nonce: Vec<u8>,
+            metadata_ciphertext: Vec<u8>,
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn build_genuine_commit_control(
+            entry: &RealCreationEntry,
+            creation_transition_id: Uuid,
+            kind: SignedMutationKind,
+            entry_kind: &str,
+            transition_id: Uuid,
+            prior: &PublicGroupSnapshotCoordinate,
+            next: &PublicGroupSnapshotCoordinate,
+            seq: u64,
+            signed_at: &str,
+            received_at: &str,
+            commit_file: &str,
+            participant_changes: Vec<Value>,
+            leaf_changes: Vec<Value>,
+            leave_request_id: Option<Uuid>,
+            nonce_byte: u8,
+            ciphertext_byte: u8,
+        ) -> GenuineCommitControl {
+            let signing_key = entry.signing_key();
+            let entry_id = Uuid::new_v4();
+            let commit_bytes = corpus_file(commit_file);
+            let metadata_nonce = vec![nonce_byte; 12];
+            let metadata_ciphertext = vec![ciphertext_byte; 16];
+            let mut body = json!({
+                "$type": kind.type_id(),
+                "signatureDomain": String::from_utf8(kind.domain().to_vec()).unwrap(),
+                "transitionId": transition_id,
+                "actorDid": &entry.actor_did,
+                "actorDeviceId": entry.actor_device_id,
+                "keyId": &entry.actor_key_id,
+                "authGeneration": 1,
+                "prior": coordinate_json(prior),
+                "next": coordinate_json(next),
+                "aad": {
+                    "protocolVersion": "1",
+                    "conversationId": STANDARD.encode(entry.cid),
+                    "generation": prior.generation(),
+                    "transitionId": STANDARD.encode(transition_id.as_bytes()),
+                    "prior": {
+                        "conversationId": STANDARD.encode(entry.cid),
+                        "generation": prior.generation(),
+                        "stateVersion": prior.state_version(),
+                        "groupId": STANDARD.encode(prior.group_id()),
+                        "epoch": prior.epoch(),
+                        "groupContextHash": STANDARD.encode(prior.group_context_hash()),
+                        "confirmationTag": STANDARD.encode(prior.confirmation_tag()),
+                        "lifecycle": "active",
+                    },
+                },
+                "manifest": {
+                    "participantChanges": participant_changes,
+                    "leafChanges": leaf_changes,
+                },
+                "commit": {
+                    "framing": "mlsMessage",
+                    "contentType": "publicMessageCommit",
+                    "bytes": STANDARD.encode(&commit_bytes),
+                    "sha256": STANDARD.encode(Sha256::digest(&commit_bytes)),
+                },
+                "metadataSnapshot": {
+                    "coordinate": {
+                        "conversationId": STANDARD.encode(entry.cid),
+                        "generation": next.generation(),
+                        "groupId": STANDARD.encode(next.group_id()),
+                        "epoch": next.epoch(),
+                        "groupContextHash": STANDARD.encode(next.group_context_hash()),
+                        "confirmationTag": STANDARD.encode(next.confirmation_tag()),
+                    },
+                    "originTransitionId": creation_transition_id,
+                    "metadataVersion": 1,
+                    "nonce": STANDARD.encode(&metadata_nonce),
+                    "ciphertext": STANDARD.encode(&metadata_ciphertext),
+                    "ciphertextSha256": STANDARD.encode(Sha256::digest(&metadata_ciphertext)),
+                    "ciphertextSize": metadata_ciphertext.len(),
+                    "authorProof": {
+                        "authorDid": &entry.actor_did,
+                        "authorDeviceId": entry.actor_device_id,
+                        "authorKeyId": &entry.actor_key_id,
+                        "signaturePublicKey": STANDARD.encode(&entry.public_key),
+                        "authGenerationAtOrigin": 1,
+                        "originTransitionId": creation_transition_id,
+                        "originSeq": 1,
+                        "roleAtOrigin": "admin",
+                        "deviceStatusAtOrigin": "active",
+                    },
+                },
+                "idempotencyKey": Uuid::new_v4(),
+                "signedAt": signed_at,
+            });
+            if let Some(leave_request_id) = leave_request_id {
+                body["leaveRequestId"] = json!(leave_request_id);
+            }
+            let mut wrapper = json!({"body": body, "signature": STANDARD.encode([0_u8; 64])});
+            let unsigned = serde_json::to_vec(&wrapper).unwrap();
+            let unsigned = decode_canonical_signed_mutation(&unsigned)
+                .expect("fixed-corpus Commit canonicalizes");
+            wrapper["signature"] = Value::String(
+                STANDARD.encode(signing_key.sign(unsigned.transcript_bytes()).to_bytes()),
+            );
+            let raw_wrapper = serde_json::to_vec(&wrapper).unwrap();
+            let canonical = decode_canonical_signed_mutation(&raw_wrapper)
+                .expect("signed fixed-corpus Commit canonicalizes");
+            let public_row_json = serde_json::to_vec(&json!({
+                "$type": entry_kind,
+                "entryId": entry_id,
+                "conversationId": Uuid::from_bytes(entry.cid),
+                "seq": seq,
+                "signedRequest": wrapper,
+                "receivedAt": received_at,
+            }))
+            .unwrap();
+            let decoded = decode_and_verify_control_entry(&public_row_json, &entry.public_key)
+                .expect("fixed-corpus Commit control verifies");
+            GenuineCommitControl {
+                entry_id,
+                transition_id,
+                public_row_json,
+                raw_wrapper,
+                canonical_projection: canonical.canonical_projection().to_vec(),
+                signing_transcript: canonical.transcript_bytes().to_vec(),
+                request_digest: canonical.request_digest().to_vec(),
+                signature: canonical.signature().to_vec(),
+                server_fields: decoded
+                    .server_fields_dag_cbor()
+                    .expect("fixed-corpus Commit server fields"),
+                outer_fingerprint: *decoded.outer_control_fingerprint(),
+                metadata_nonce,
+                metadata_ciphertext,
+            }
+        }
+
+        struct GenuineLeaveRequest {
+            request_id: Uuid,
+            entry_id: Uuid,
+            public_row_json: Vec<u8>,
+            raw_wrapper: Vec<u8>,
+            signing_transcript: Vec<u8>,
+            request_digest: Vec<u8>,
+            signature: Vec<u8>,
+            server_fields: Vec<u8>,
+            outer_fingerprint: [u8; 32],
+        }
+
+        fn build_genuine_leave_request(
+            entry: &RealCreationEntry,
+            prior: &PublicGroupSnapshotCoordinate,
+        ) -> GenuineLeaveRequest {
+            let request_id = Uuid::new_v4();
+            let entry_id = Uuid::new_v4();
+            let kind = SignedMutationKind::LeaveRequest;
+            let manifest = corpus_manifest();
+            let bob = &manifest["identity"]["bob"];
+            let mut wrapper = json!({
+                "body": {
+                    "$type": kind.type_id(),
+                    "signatureDomain": String::from_utf8(kind.domain().to_vec()).unwrap(),
+                    "leaveRequestId": request_id,
+                    "actorDid": bob["actorDid"],
+                    "actorDeviceId": bob["deviceId"],
+                    "keyId": bob["keyId"],
+                    "authGeneration": 1,
+                    "prior": coordinate_json(prior),
+                    "idempotencyKey": Uuid::new_v4(),
+                    "signedAt": LEAVE_SIGNED_AT,
+                },
+                "signature": STANDARD.encode([0_u8; 64]),
+            });
+            let unsigned = decode_canonical_signed_mutation(&serde_json::to_vec(&wrapper).unwrap())
+                .expect("leave request canonicalizes");
+            let bob_key = SigningKey::from_bytes(&BOB_SIGNING_SEED);
+            wrapper["signature"] = Value::String(
+                STANDARD.encode(bob_key.sign(unsigned.transcript_bytes()).to_bytes()),
+            );
+            let raw_wrapper = serde_json::to_vec(&wrapper).unwrap();
+            let canonical = decode_canonical_signed_mutation(&raw_wrapper)
+                .expect("signed leave request canonicalizes");
+            let public_row_json = serde_json::to_vec(&json!({
+                "$type": "blue.catbird.chat.defs#leaveRequestEntry",
+                "entryId": entry_id,
+                "conversationId": Uuid::from_bytes(entry.cid),
+                "seq": 6,
+                "signedRequest": wrapper,
+                "receivedAt": LEAVE_AT,
+            }))
+            .unwrap();
+            let decoded = decode_and_verify_control_entry(
+                &public_row_json,
+                bob_key.verifying_key().as_bytes(),
+            )
+            .expect("genuine Bob leave request verifies");
+            GenuineLeaveRequest {
+                request_id,
+                entry_id,
+                public_row_json,
+                raw_wrapper,
+                signing_transcript: canonical.transcript_bytes().to_vec(),
+                request_digest: canonical.request_digest().to_vec(),
+                signature: canonical.signature().to_vec(),
+                server_fields: decoded
+                    .server_fields_dag_cbor()
+                    .expect("leave request server fields"),
+                outer_fingerprint: *decoded.outer_control_fingerprint(),
+            }
+        }
+
+        #[test]
+        fn fixed_corpus_generic_remove_and_leave_controls_are_genuinely_signed() {
+            let states = fixed_corpus_commit_states();
+            let entry =
+                build_real_corpus_creation_entry(*states.genesis.coordinate().conversation_id());
+            let creation_wrapper: Value = serde_json::from_slice(&entry.raw_wrapper).unwrap();
+            let creation_transition_id =
+                Uuid::parse_str(creation_wrapper["body"]["transitionId"].as_str().unwrap())
+                    .unwrap();
+            let manifest = corpus_manifest();
+            let generic_transition_id = Uuid::parse_str(
+                manifest["identifiers"]["genericTransitionId"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            let generic = build_genuine_commit_control(
+                &entry,
+                creation_transition_id,
+                SignedMutationKind::CommitTransition,
+                "blue.catbird.chat.defs#commitEntry",
+                generic_transition_id,
+                states.added.coordinate(),
+                states.generic.coordinate(),
+                5,
+                GENERIC_SIGNED_AT,
+                GENERIC_AT,
+                "commit-generic-public.mls",
+                vec![],
+                vec![],
+                None,
+                0x41,
+                0x42,
+            );
+            assert_eq!(generic.transition_id, generic_transition_id);
+
+            let leave = build_genuine_leave_request(&entry, states.generic.coordinate());
+            let bob = &manifest["identity"]["bob"];
+            let remove_transition_id = Uuid::parse_str(
+                manifest["identifiers"]["leaveFulfillmentTransitionId"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            let remove = build_genuine_commit_control(
+                &entry,
+                creation_transition_id,
+                SignedMutationKind::LeaveCommitFulfillment,
+                "blue.catbird.chat.defs#leaveCommitFulfillmentEntry",
+                remove_transition_id,
+                states.generic.coordinate(),
+                states.removed.coordinate(),
+                7,
+                LEAVE_FULFILLMENT_SIGNED_AT,
+                LEAVE_FULFILLED_AT,
+                "commit-remove-public.mls",
+                vec![json!({
+                    "$type": "blue.catbird.chat.defs#removeParticipant",
+                    "userDid": bob["actorDid"],
+                })],
+                vec![json!({
+                    "$type": "blue.catbird.chat.defs#removeLeaf",
+                    "userDid": bob["actorDid"],
+                    "deviceId": bob["deviceId"],
+                })],
+                Some(leave.request_id),
+                0x43,
+                0x44,
+            );
+            assert_eq!(remove.transition_id, remove_transition_id);
+
+            let reinvitee = corpus_invitee();
+            let reinvited = rebound_state(&states.removed, 6);
+            let rejoin_package_ref = validate_corpus_recovery_artifacts(
+                "rejoin-key-package.mls",
+                "rejoin-welcome.mls",
+                "rejoinInnerKeyPackageRefHex",
+            );
+            let reacceptance = build_real_acceptance_entry_at(
+                &entry,
+                &reinvitee,
+                Uuid::new_v4(),
+                coordinate_json(reinvited.coordinate()),
+                9,
+                REACCEPT_SIGNED_AT,
+                REACCEPT_AT,
+                REACCEPT_EXPIRES_AT,
+                Some((rejoin_package_ref, corpus_file("rejoin-key-package.mls"))),
+            );
+            let rejoin_transition_id = Uuid::parse_str(
+                manifest["identifiers"]["rejoinTransitionId"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            let rejoin = build_genuine_add_fulfillment_entry_at(
+                &entry,
+                &reinvitee,
+                &reacceptance,
+                creation_transition_id,
+                states.rejoin_prior.coordinate(),
+                states.rejoined.coordinate(),
+                rejoin_transition_id,
+                10,
+                REJOIN_SIGNED_AT,
+                REJOIN_AT,
+                "commit-rejoin-public.mls",
+                "rejoin-welcome.mls",
+                0x45,
+                0x46,
+            );
+            assert_eq!(rejoin.transition_id, rejoin_transition_id);
+        }
+
+        #[test]
+        fn fixed_corpus_control_times_are_manifest_lifetime_bound() {
+            let manifest = corpus_manifest();
+            let evaluation = manifest["evaluationUnixSeconds"].as_i64().unwrap();
+            let lifetime = &manifest["mlsProfile"]["keyPackageLifetime"];
+            let not_before = lifetime["notBeforeUnixSeconds"].as_i64().unwrap();
+            let not_after = lifetime["notAfterUnixSeconds"].as_i64().unwrap();
+            let canonical = |seconds: i64, millis: i64| {
+                (DateTime::<Utc>::from_timestamp(seconds, 0).unwrap()
+                    + chrono::Duration::milliseconds(millis))
+                .to_rfc3339_opts(SecondsFormat::Millis, true)
+            };
+            assert_eq!(KP_NOT_BEFORE, canonical(not_before, 0));
+            assert_eq!(KP_NOT_AFTER, canonical(not_after, 0));
+            assert_eq!(
+                manifest["creation"]["signedAt"].as_str().unwrap(),
+                canonical(evaluation, 0)
+            );
+            assert_eq!(
+                manifest["creation"]["receivedAt"].as_str().unwrap(),
+                canonical(evaluation + 1, 0)
+            );
+            for (actual, seconds, millis) in [
+                (POLICY_ADD_AT, 3_600, 0),
+                (SIGNED_AT, 3_600, 500),
+                (REQUESTED_AT, 3_601, 0),
+                (FULFILLMENT_SIGNED_AT, 3_601, 500),
+                (FULFILLED_AT, 3_602, 0),
+                (GENERIC_SIGNED_AT, 3_602, 500),
+                (GENERIC_AT, 3_603, 0),
+                (LEAVE_SIGNED_AT, 3_603, 500),
+                (LEAVE_AT, 3_604, 0),
+                (LEAVE_FULFILLMENT_SIGNED_AT, 3_604, 500),
+                (LEAVE_FULFILLED_AT, 3_605, 0),
+                (REINVITE_AT, 3_606, 0),
+                (REACCEPT_SIGNED_AT, 3_606, 500),
+                (REACCEPT_AT, 3_607, 0),
+                (REJOIN_SIGNED_AT, 3_607, 500),
+                (REJOIN_AT, 3_608, 0),
+            ] {
+                assert_eq!(actual, canonical(evaluation + seconds, millis));
+                let at = instant(actual);
+                assert!(at >= instant(KP_NOT_BEFORE) && at < instant(KP_NOT_AFTER));
+                assert!(at > instant(manifest["creation"]["receivedAt"].as_str().unwrap()));
+            }
+            assert_eq!(EXPIRES_AT, canonical(evaluation + 3_901, 0));
+            assert_eq!(REACCEPT_EXPIRES_AT, canonical(evaluation + 3_907, 0));
+            assert!(instant(EXPIRES_AT) < instant(KP_NOT_AFTER));
+            assert!(instant(REACCEPT_EXPIRES_AT) < instant(KP_NOT_AFTER));
+        }
+
         fn instant(text: &str) -> DateTime<Utc> {
             DateTime::parse_from_rfc3339(text)
                 .expect("canonical instant")
@@ -4965,7 +6640,8 @@ mod historical_control_loader {
 
         fn rebound_state(template: &ActivePublicState, state_version: u64) -> ActivePublicState {
             let prior = template.coordinate();
-            ActivePublicState::for_test(
+            assert_eq!(state_version, prior.state_version() + 1);
+            rebind_active_snapshot(
                 template,
                 PublicGroupSnapshotCoordinate::new(
                     *prior.conversation_id(),
@@ -4978,6 +6654,7 @@ mod historical_control_loader {
                     PublicGroupSnapshotLifecycle::Active,
                 ),
             )
+            .expect("coordinate-only edge rebinds through production validation")
         }
 
         fn corpus_invitee() -> AcceptanceInvitee {
@@ -5554,7 +7231,9 @@ mod historical_control_loader {
                 creation_transition_id,
                 prior,
                 2,
+                SIGNED_AT,
                 REQUESTED_AT,
+                EXPIRES_AT,
                 None,
             )
         }
@@ -5566,7 +7245,9 @@ mod historical_control_loader {
             invitation_transition_id: Uuid,
             prior: Value,
             seq: u64,
+            signed_at: &str,
             received_at: &str,
+            expires_at: &str,
             corpus_package: Option<([u8; 32], Vec<u8>)>,
         ) -> RealAcceptanceEntry {
             let entry_id = Uuid::new_v4();
@@ -5591,7 +7272,7 @@ mod historical_control_loader {
                 "keyId": &invitee.key_id,
                 "authGeneration": 1,
                 "idempotencyKey": Uuid::new_v4().hyphenated().to_string(),
-                "signedAt": SIGNED_AT,
+                "signedAt": signed_at,
                 "transitionId": transition_id.hyphenated().to_string(),
                 "prior": prior,
                 "next": next.clone(),
@@ -5628,7 +7309,7 @@ mod historical_control_loader {
                     "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
                     "purpose": "leafRecovery",
                     "status": "active",
-                    "expiresAt": EXPIRES_AT,
+                    "expiresAt": expires_at,
                     "keyPackage": {
                         "framing": "mlsMessage",
                         "contentType": "keyPackage",
@@ -5638,8 +7319,8 @@ mod historical_control_loader {
                     }
                 },
                 "status": "open",
-                "requestedAt": REQUESTED_AT,
-                "expiresAt": EXPIRES_AT,
+                "requestedAt": received_at,
+                "expiresAt": expires_at,
             });
             let row = json!({
                 "$type": "blue.catbird.chat.defs#participantAcceptanceEntry",
@@ -6136,6 +7817,11 @@ mod historical_control_loader {
             fulfillment: RealLeafRecoveryFulfillmentEntry,
         }
 
+        struct TerminalFamilyBActors {
+            entry: RealCreationEntry,
+            invitee: AcceptanceInvitee,
+        }
+
         async fn insert_real_generation_state(
             tx: &mut Transaction<'_, Postgres>,
             cid: Uuid,
@@ -6175,26 +7861,1223 @@ mod historical_control_loader {
             .expect("insert real generation state");
         }
 
+        #[allow(clippy::too_many_arguments)]
+        async fn insert_genuine_commit_edge(
+            tx: &mut Transaction<'_, Postgres>,
+            entry: &RealCreationEntry,
+            creation_transition_id: Uuid,
+            control: &GenuineCommitControl,
+            transition_kind: &str,
+            entry_kind: &str,
+            prior_state_version: u64,
+            next_state: &ActivePublicState,
+            seq: u64,
+            accepted_at: DateTime<Utc>,
+            recipient_devices: &[(&str, Uuid, &str)],
+        ) {
+            let cid = Uuid::from_bytes(entry.cid);
+            let next_state_version = next_state.coordinate().state_version();
+            assert_eq!(next_state_version, prior_state_version + 1);
+            let updated = sqlx::query(
+                "UPDATE chat.conversations SET current_state_version=$2,next_entry_seq=$3 \
+                 WHERE conversation_id=$1 AND current_generation=0 \
+                   AND current_state_version=$4 AND next_entry_seq=$5",
+            )
+            .bind(cid)
+            .bind(i64::try_from(next_state_version).unwrap())
+            .bind(i64::try_from(seq + 1).unwrap())
+            .bind(i64::try_from(prior_state_version).unwrap())
+            .bind(i64::try_from(seq).unwrap())
+            .execute(&mut **tx)
+            .await
+            .expect("advance fixed-corpus conversation Commit edge");
+            assert_eq!(updated.rows_affected(), 1, "exact conversation-head CAS");
+            let updated = sqlx::query(
+                "UPDATE chat.generations SET current_state_version=$2 \
+                 WHERE conversation_id=$1 AND generation=0 AND current_state_version=$3",
+            )
+            .bind(cid)
+            .bind(i64::try_from(next_state_version).unwrap())
+            .bind(i64::try_from(prior_state_version).unwrap())
+            .execute(&mut **tx)
+            .await
+            .expect("advance fixed-corpus generation Commit edge");
+            assert_eq!(updated.rows_affected(), 1, "exact generation-head CAS");
+
+            let metadata_snapshot_id = Uuid::new_v4();
+            sqlx::query(
+                r#"INSERT INTO chat.transitions(
+                    transition_id,conversation_id,kind,actor_did,actor_device_id,actor_key_id,
+                    actor_auth_generation,actor_role,actor_device_status,signed_request_bytes,
+                    unsigned_projection_bytes,signing_transcript_bytes,request_digest,signature,
+                    prior_generation,prior_state_version,next_generation,next_state_version,
+                    metadata_snapshot_id,entry_seq,accepted_at
+                ) VALUES($1,$2,$3,$4,$5,$6,1,'admin','active',$7,$8,$9,$10,$11,
+                    0,$12,0,$13,$14,$15,$16)"#,
+            )
+            .bind(control.transition_id)
+            .bind(cid)
+            .bind(transition_kind)
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .bind(&entry.actor_key_id)
+            .bind(&control.raw_wrapper)
+            .bind(&control.canonical_projection)
+            .bind(&control.signing_transcript)
+            .bind(&control.request_digest)
+            .bind(&control.signature)
+            .bind(i64::try_from(prior_state_version).unwrap())
+            .bind(i64::try_from(next_state_version).unwrap())
+            .bind(metadata_snapshot_id)
+            .bind(i64::try_from(seq).unwrap())
+            .bind(accepted_at)
+            .execute(&mut **tx)
+            .await
+            .expect("insert fixed-corpus Commit transition");
+
+            insert_real_generation_state(
+                tx,
+                cid,
+                next_state,
+                "commit",
+                control.transition_id,
+                accepted_at,
+            )
+            .await;
+            let coordinate = next_state.coordinate();
+            sqlx::query(
+                r#"INSERT INTO chat.metadata_snapshots(
+                    metadata_snapshot_id,conversation_id,generation,state_version,group_id,epoch,
+                    group_context_hash,confirmation_tag,producing_transition_id,
+                    origin_transition_id,metadata_version,nonce,ciphertext,ciphertext_sha256,
+                    ciphertext_size,author_did,author_device_id,author_key_id,author_public_key,
+                    author_auth_generation,author_origin_seq,author_role,author_device_status,created_at
+                ) VALUES($1,$2,0,$3,$4,$5,$6,$7,$8,$9,1,$10,$11,$12,16,$13,$14,$15,$16,
+                    1,1,'admin','active',$17)"#,
+            )
+            .bind(metadata_snapshot_id)
+            .bind(cid)
+            .bind(i64::try_from(next_state_version).unwrap())
+            .bind(coordinate.group_id().to_vec())
+            .bind(i64::try_from(coordinate.epoch()).unwrap())
+            .bind(coordinate.group_context_hash().to_vec())
+            .bind(coordinate.confirmation_tag().to_vec())
+            .bind(control.transition_id)
+            .bind(creation_transition_id)
+            .bind(&control.metadata_nonce)
+            .bind(&control.metadata_ciphertext)
+            .bind(Sha256::digest(&control.metadata_ciphertext).to_vec())
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .bind(&entry.actor_key_id)
+            .bind(&entry.public_key)
+            .bind(accepted_at)
+            .execute(&mut **tx)
+            .await
+            .expect("insert fixed-corpus Commit metadata");
+
+            sqlx::query(
+                r#"INSERT INTO chat.entries(
+                    conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,
+                    accepted_payload_sha256,signed_request_bytes,request_digest,signature,
+                    server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,
+                    actor_key_id,actor_auth_generation,generation,state_version,transition_id,
+                    received_at
+                ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,1,0,$15,$16,$17)"#,
+            )
+            .bind(cid)
+            .bind(i64::try_from(seq).unwrap())
+            .bind(control.entry_id)
+            .bind(entry_kind)
+            .bind(&control.public_row_json)
+            .bind(Sha256::digest(&control.public_row_json).to_vec())
+            .bind(&control.raw_wrapper)
+            .bind(&control.request_digest)
+            .bind(&control.signature)
+            .bind(&control.server_fields)
+            .bind(control.outer_fingerprint.to_vec())
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .bind(&entry.actor_key_id)
+            .bind(i64::try_from(next_state_version).unwrap())
+            .bind(control.transition_id)
+            .bind(accepted_at)
+            .execute(&mut **tx)
+            .await
+            .expect("insert fixed-corpus Commit entry");
+            for (did, device_id, entitlement_kind) in recipient_devices {
+                sqlx::query(
+                    r#"INSERT INTO chat.entry_recipients(
+                        conversation_id,seq,user_did,device_id,entitlement_kind
+                    ) VALUES($1,$2,$3,$4,$5)"#,
+                )
+                .bind(cid)
+                .bind(i64::try_from(seq).unwrap())
+                .bind(*did)
+                .bind(*device_id)
+                .bind(*entitlement_kind)
+                .execute(&mut **tx)
+                .await
+                .expect("route fixed-corpus Commit entry");
+            }
+        }
+
+        async fn supersede_welcome_for_transition(
+            tx: &mut Transaction<'_, Postgres>,
+            entry: &RealCreationEntry,
+            invitee: &AcceptanceInvitee,
+            welcome_id: Uuid,
+            transition_id: Uuid,
+            at: DateTime<Utc>,
+        ) {
+            sqlx::query(
+                r#"INSERT INTO chat.protocol_instances(
+                    singleton,protocol_instance_id,cursor_key_id,created_at
+                ) VALUES(TRUE,$1,$2,$3) ON CONFLICT (singleton) DO NOTHING"#,
+            )
+            .bind(Uuid::new_v4())
+            .bind(&entry.actor_key_id)
+            .bind(at)
+            .execute(&mut **tx)
+            .await
+            .expect("ensure fixed-corpus protocol instance");
+            let protocol_instance_id: Uuid =
+                sqlx::query_scalar("SELECT protocol_instance_id FROM chat.protocol_instances")
+                    .fetch_one(&mut **tx)
+                    .await
+                    .expect("fixed-corpus protocol instance");
+            let payload = b"fixed-corpus-welcome-superseded".to_vec();
+            let event_position: i64 = sqlx::query_scalar(
+                r#"INSERT INTO chat.events(
+                    event_id,event_kind,payload_bytes,payload_sha256,created_at,protocol_instance_id
+                ) VALUES($1,'welcomeDisposition',$2,$3,$4,$5) RETURNING event_position"#,
+            )
+            .bind(Uuid::new_v4())
+            .bind(&payload)
+            .bind(Sha256::digest(&payload).to_vec())
+            .bind(at)
+            .bind(protocol_instance_id)
+            .fetch_one(&mut **tx)
+            .await
+            .expect("insert fixed-corpus Welcome disposition event");
+            let updated = sqlx::query(
+                "UPDATE chat.welcome_deliveries SET status='superseded',terminal_at=$2 \
+                 WHERE welcome_id=$1 AND status='pending'",
+            )
+            .bind(welcome_id)
+            .bind(at)
+            .execute(&mut **tx)
+            .await
+            .expect("supersede fixed-corpus Welcome");
+            assert_eq!(updated.rows_affected(), 1, "one pending Welcome superseded");
+            sqlx::query(
+                r#"INSERT INTO chat.welcome_dispositions(
+                    welcome_id,winner_kind,signed_request_bytes,signing_transcript_bytes,
+                    request_digest,signature,rejection_reason,terminal_at,event_position,
+                    terminal_transition_id,terminal_revocation_id
+                ) VALUES($1,'superseded',NULL,NULL,NULL,NULL,NULL,$2,$3,$4,NULL)"#,
+            )
+            .bind(welcome_id)
+            .bind(at)
+            .bind(event_position)
+            .bind(transition_id)
+            .execute(&mut **tx)
+            .await
+            .expect("insert fixed-corpus Welcome disposition");
+            let predecessor: Option<i64> = sqlx::query_scalar(
+                "SELECT max(event_position) FROM chat.event_recipients \
+                 WHERE user_did=$1 AND device_id=$2",
+            )
+            .bind(&invitee.did)
+            .bind(invitee.device_id)
+            .fetch_one(&mut **tx)
+            .await
+            .expect("fixed-corpus Welcome audience predecessor");
+            sqlx::query(
+                r#"INSERT INTO chat.event_recipients(
+                    event_position,user_did,device_id,entitlement_kind,
+                    audience_predecessor_position
+                ) VALUES($1,$2,$3,'welcome',$4)"#,
+            )
+            .bind(event_position)
+            .bind(&invitee.did)
+            .bind(invitee.device_id)
+            .bind(predecessor)
+            .execute(&mut **tx)
+            .await
+            .expect("insert fixed-corpus Welcome event recipient");
+            sqlx::query(
+                r#"INSERT INTO chat.outbox(
+                    outbox_id,event_position,work_kind,status,next_attempt_at,created_at
+                ) VALUES($1,$2,'stream','pending',$3,$3)"#,
+            )
+            .bind(Uuid::new_v4())
+            .bind(event_position)
+            .bind(at)
+            .execute(&mut **tx)
+            .await
+            .expect("insert fixed-corpus Welcome outbox");
+        }
+
+        async fn commit_fixed_generic_edge(
+            pool: &PgPool,
+            graph: &GenuinePolicyRoleGraph,
+            creation_transition_id: Uuid,
+            generic: &ActivePublicState,
+        ) {
+            let manifest = corpus_manifest();
+            let transition_id = Uuid::parse_str(
+                manifest["identifiers"]["genericTransitionId"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            let control = build_genuine_commit_control(
+                &graph.entry,
+                creation_transition_id,
+                SignedMutationKind::CommitTransition,
+                "blue.catbird.chat.defs#commitEntry",
+                transition_id,
+                fixed_corpus_commit_states().added.coordinate(),
+                generic.coordinate(),
+                5,
+                GENERIC_SIGNED_AT,
+                GENERIC_AT,
+                "commit-generic-public.mls",
+                vec![],
+                vec![],
+                None,
+                0x41,
+                0x42,
+            );
+            let recipients = [
+                (
+                    graph.entry.actor_did.as_str(),
+                    graph.entry.actor_device_id,
+                    "control",
+                ),
+                (
+                    graph.invitee.did.as_str(),
+                    graph.invitee.device_id,
+                    "control",
+                ),
+            ];
+            let mut tx = pool.begin().await.expect("begin fixed generic Commit");
+            insert_genuine_commit_edge(
+                &mut tx,
+                &graph.entry,
+                creation_transition_id,
+                &control,
+                "commit",
+                "blue.catbird.chat.defs#commitEntry",
+                3,
+                generic,
+                5,
+                instant(GENERIC_AT),
+                &recipients,
+            )
+            .await;
+            supersede_welcome_for_transition(
+                &mut tx,
+                &graph.entry,
+                &graph.invitee,
+                graph.fulfillment.welcome_id,
+                transition_id,
+                instant(GENERIC_AT),
+            )
+            .await;
+            tx.commit()
+                .await
+                .expect("fixed generic Commit crosses deferred constraints");
+        }
+
+        async fn commit_fixed_leave_request(
+            pool: &PgPool,
+            graph: &GenuinePolicyRoleGraph,
+            generic: &ActivePublicState,
+        ) -> GenuineLeaveRequest {
+            let request = build_genuine_leave_request(&graph.entry, generic.coordinate());
+            let cid = Uuid::from_bytes(graph.entry.cid);
+            let at = instant(LEAVE_AT);
+            let expires_at = at + chrono::Duration::hours(24);
+            let mut tx = pool
+                .begin()
+                .await
+                .expect("begin fixed-corpus leave request");
+            let updated = sqlx::query(
+                "UPDATE chat.conversations SET next_entry_seq=7 \
+                 WHERE conversation_id=$1 AND current_generation=0 \
+                   AND current_state_version=4 AND next_entry_seq=6",
+            )
+            .bind(cid)
+            .execute(&mut *tx)
+            .await
+            .expect("advance fixed-corpus head through leave request");
+            assert_eq!(updated.rows_affected(), 1, "exact leave-request head CAS");
+
+            sqlx::query(
+                r#"INSERT INTO chat.entries(
+                    conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,
+                    accepted_payload_sha256,signed_request_bytes,request_digest,signature,
+                    server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,
+                    actor_key_id,actor_auth_generation,generation,state_version,transition_id,
+                    received_at
+                ) VALUES($1,6,$2,'blue.catbird.chat.defs#leaveRequestEntry',$3,$4,$5,$6,$7,
+                    $8,$9,$10,$11,$12,1,NULL,NULL,NULL,$13)"#,
+            )
+            .bind(cid)
+            .bind(request.entry_id)
+            .bind(&request.public_row_json)
+            .bind(Sha256::digest(&request.public_row_json).to_vec())
+            .bind(&request.raw_wrapper)
+            .bind(&request.request_digest)
+            .bind(&request.signature)
+            .bind(&request.server_fields)
+            .bind(request.outer_fingerprint.to_vec())
+            .bind(&graph.invitee.did)
+            .bind(graph.invitee.device_id)
+            .bind(&graph.invitee.key_id)
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert genuine Bob leave request entry");
+            sqlx::query(
+                r#"INSERT INTO chat.leave_requests(
+                    leave_request_id,conversation_id,requester_did,requester_device_id,
+                    requester_key_id,requester_auth_generation,prior_generation,prior_state_version,
+                    prior_group_id,prior_epoch,prior_group_context_hash,prior_confirmation_tag,
+                    status,signed_request_bytes,signing_transcript_bytes,request_digest,signature,
+                    received_at,expires_at
+                ) VALUES($1,$2,$3,$4,$5,1,0,4,$6,$7,$8,$9,'pending',$10,$11,$12,$13,$14,$15)"#,
+            )
+            .bind(request.request_id)
+            .bind(cid)
+            .bind(&graph.invitee.did)
+            .bind(graph.invitee.device_id)
+            .bind(&graph.invitee.key_id)
+            .bind(generic.coordinate().group_id().to_vec())
+            .bind(i64::try_from(generic.coordinate().epoch()).unwrap())
+            .bind(generic.coordinate().group_context_hash().to_vec())
+            .bind(generic.coordinate().confirmation_tag().to_vec())
+            .bind(&request.raw_wrapper)
+            .bind(&request.signing_transcript)
+            .bind(&request.request_digest)
+            .bind(&request.signature)
+            .bind(at)
+            .bind(expires_at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert genuine Bob pending leave request");
+            for (did, device_id) in [
+                (graph.entry.actor_did.as_str(), graph.entry.actor_device_id),
+                (graph.invitee.did.as_str(), graph.invitee.device_id),
+            ] {
+                sqlx::query(
+                    r#"INSERT INTO chat.entry_recipients(
+                        conversation_id,seq,user_did,device_id,entitlement_kind
+                    ) VALUES($1,6,$2,$3,'control')"#,
+                )
+                .bind(cid)
+                .bind(did)
+                .bind(device_id)
+                .execute(&mut *tx)
+                .await
+                .expect("route genuine Bob leave request");
+            }
+            tx.commit()
+                .await
+                .expect("genuine Bob leave request crosses deferred mapping");
+            request
+        }
+
+        async fn commit_fixed_remove_fulfillment(
+            pool: &PgPool,
+            graph: &TerminalFamilyBActors,
+            creation_transition_id: Uuid,
+            generic: &ActivePublicState,
+            removed: &ActivePublicState,
+            leave: &GenuineLeaveRequest,
+        ) {
+            let manifest = corpus_manifest();
+            let bob = &manifest["identity"]["bob"];
+            let transition_id = Uuid::parse_str(
+                manifest["identifiers"]["leaveFulfillmentTransitionId"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            let control = build_genuine_commit_control(
+                &graph.entry,
+                creation_transition_id,
+                SignedMutationKind::LeaveCommitFulfillment,
+                "blue.catbird.chat.defs#leaveCommitFulfillmentEntry",
+                transition_id,
+                generic.coordinate(),
+                removed.coordinate(),
+                7,
+                LEAVE_FULFILLMENT_SIGNED_AT,
+                LEAVE_FULFILLED_AT,
+                "commit-remove-public.mls",
+                vec![json!({
+                    "$type": "blue.catbird.chat.defs#removeParticipant",
+                    "userDid": bob["actorDid"],
+                })],
+                vec![json!({
+                    "$type": "blue.catbird.chat.defs#removeLeaf",
+                    "userDid": bob["actorDid"],
+                    "deviceId": bob["deviceId"],
+                })],
+                Some(leave.request_id),
+                0x43,
+                0x44,
+            );
+            let recipients = [
+                (
+                    graph.entry.actor_did.as_str(),
+                    graph.entry.actor_device_id,
+                    "control",
+                ),
+                (
+                    graph.invitee.did.as_str(),
+                    graph.invitee.device_id,
+                    "intervalClose",
+                ),
+            ];
+            let at = instant(LEAVE_FULFILLED_AT);
+            let cid = Uuid::from_bytes(graph.entry.cid);
+            let mut tx = pool
+                .begin()
+                .await
+                .expect("begin fixed-corpus Remove fulfillment");
+            let (leaf_period_id, participant_period_id): (Uuid, Uuid) = sqlx::query_as(
+                r#"SELECT leaf_period_id,participant_period_id
+                     FROM chat.member_devices
+                    WHERE conversation_id=$1 AND user_did=$2 AND device_id=$3 AND active
+                    FOR UPDATE"#,
+            )
+            .bind(cid)
+            .bind(&graph.invitee.did)
+            .bind(graph.invitee.device_id)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("lock old Bob leaf period");
+            insert_genuine_commit_edge(
+                &mut tx,
+                &graph.entry,
+                creation_transition_id,
+                &control,
+                "leaveCommit",
+                "blue.catbird.chat.defs#leaveCommitFulfillmentEntry",
+                4,
+                removed,
+                7,
+                at,
+                &recipients,
+            )
+            .await;
+            let updated = sqlx::query(
+                r#"UPDATE chat.member_devices
+                      SET removed_state_version=5,removed_transition_id=$2,removed_seq=7,
+                          removed_at=$3,active=FALSE
+                    WHERE leaf_period_id=$1 AND active"#,
+            )
+            .bind(leaf_period_id)
+            .bind(transition_id)
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("close old Bob leaf period");
+            assert_eq!(updated.rows_affected(), 1);
+            let updated = sqlx::query(
+                r#"UPDATE chat.application_intervals
+                      SET terminal_seq=7,closing_state_version=5,closing_transition_id=$2,
+                          closing_outer_entry_fingerprint=$3,closing_kind='remove',
+                          closing_leaf_period_id=$1,removed_at=$4
+                    WHERE opening_leaf_period_id=$1 AND terminal_seq IS NULL"#,
+            )
+            .bind(leaf_period_id)
+            .bind(transition_id)
+            .bind(control.outer_fingerprint.to_vec())
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("close old Bob application interval");
+            assert_eq!(updated.rows_affected(), 1);
+            let updated = sqlx::query(
+                r#"UPDATE chat.participants
+                      SET removing_transition_id=$2,removing_seq=7,removed_at=$3,
+                          current_membership=FALSE
+                    WHERE participant_period_id=$1 AND current_membership"#,
+            )
+            .bind(participant_period_id)
+            .bind(transition_id)
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("close old Bob participant period");
+            assert_eq!(updated.rows_affected(), 1);
+            let updated = sqlx::query(
+                r#"UPDATE chat.leave_requests
+                      SET status='fulfilled',terminal_request_digest=$2,
+                          terminal_transition_id=$3,terminal_at=$4
+                    WHERE leave_request_id=$1 AND status='pending'"#,
+            )
+            .bind(leave.request_id)
+            .bind(&control.request_digest)
+            .bind(transition_id)
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("fulfill genuine Bob leave request");
+            assert_eq!(updated.rows_affected(), 1);
+            tx.commit()
+                .await
+                .expect("fixed-corpus Remove fulfillment crosses deferred constraints");
+        }
+
+        async fn commit_fixed_reinvitation(
+            pool: &PgPool,
+            graph: &TerminalFamilyBActors,
+            removed: &ActivePublicState,
+        ) -> (AcceptanceInvitee, ActivePublicState, GenuinePolicyControl) {
+            let invitee = corpus_invitee();
+            let state = rebound_state(removed, 6);
+            let control = genuine_policy_control(
+                &graph.entry,
+                removed.coordinate(),
+                8,
+                REINVITE_AT,
+                vec![GenuinePolicyChange::Add(&invitee.did)],
+            );
+            let cid = Uuid::from_bytes(graph.entry.cid);
+            let at = instant(REINVITE_AT);
+            let mut tx = pool.begin().await.expect("begin fixed-corpus reinvitation");
+            let updated = sqlx::query(
+                "UPDATE chat.conversations SET current_state_version=6,next_entry_seq=9 \
+                 WHERE conversation_id=$1 AND current_generation=0 \
+                   AND current_state_version=5 AND next_entry_seq=8",
+            )
+            .bind(cid)
+            .execute(&mut *tx)
+            .await
+            .expect("advance fixed-corpus reinvitation head");
+            assert_eq!(updated.rows_affected(), 1);
+            let updated = sqlx::query(
+                "UPDATE chat.generations SET current_state_version=6 \
+                 WHERE conversation_id=$1 AND generation=0 AND current_state_version=5",
+            )
+            .bind(cid)
+            .execute(&mut *tx)
+            .await
+            .expect("advance fixed-corpus reinvitation generation");
+            assert_eq!(updated.rows_affected(), 1);
+            sqlx::query(
+                r#"INSERT INTO chat.transitions(
+                    transition_id,conversation_id,kind,actor_did,actor_device_id,actor_key_id,
+                    actor_auth_generation,actor_role,actor_device_status,signed_request_bytes,
+                    unsigned_projection_bytes,signing_transcript_bytes,request_digest,signature,
+                    prior_generation,prior_state_version,next_generation,next_state_version,
+                    entry_seq,accepted_at
+                ) VALUES($1,$2,'policy',$3,$4,$5,1,'admin','active',$6,$7,$8,$9,$10,
+                    0,5,0,6,8,$11)"#,
+            )
+            .bind(control.transition_id)
+            .bind(cid)
+            .bind(&graph.entry.actor_did)
+            .bind(graph.entry.actor_device_id)
+            .bind(&graph.entry.actor_key_id)
+            .bind(&control.entry.signed_request_bytes)
+            .bind(&control.entry.unsigned_projection_bytes)
+            .bind(&control.entry.signing_transcript_bytes)
+            .bind(&control.entry.request_digest)
+            .bind(&control.entry.signature)
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert fixed-corpus reinvitation transition");
+            insert_real_generation_state(&mut tx, cid, &state, "policy", control.transition_id, at)
+                .await;
+            sqlx::query(
+                r#"INSERT INTO chat.entries(
+                    conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,
+                    accepted_payload_sha256,signed_request_bytes,request_digest,signature,
+                    server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,
+                    actor_key_id,actor_auth_generation,generation,state_version,transition_id,
+                    received_at
+                ) VALUES($1,8,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,1,0,6,$14,$15)"#,
+            )
+            .bind(cid)
+            .bind(control.entry.entry_id)
+            .bind(&control.entry.entry_kind)
+            .bind(&control.entry.accepted_payload_bytes)
+            .bind(&control.entry.accepted_payload_sha256)
+            .bind(&control.entry.signed_request_bytes)
+            .bind(&control.entry.request_digest)
+            .bind(&control.entry.signature)
+            .bind(&control.entry.server_fields_bytes)
+            .bind(&control.entry.outer_entry_fingerprint)
+            .bind(&graph.entry.actor_did)
+            .bind(graph.entry.actor_device_id)
+            .bind(&graph.entry.actor_key_id)
+            .bind(control.transition_id)
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert fixed-corpus reinvitation entry");
+            sqlx::query(
+                r#"INSERT INTO chat.entry_recipients(
+                    conversation_id,seq,user_did,device_id,entitlement_kind
+                ) VALUES($1,8,$2,$3,'control')"#,
+            )
+            .bind(cid)
+            .bind(&graph.entry.actor_did)
+            .bind(graph.entry.actor_device_id)
+            .execute(&mut *tx)
+            .await
+            .expect("route fixed-corpus reinvitation");
+            sqlx::query(
+                r#"INSERT INTO chat.participants(
+                    participant_period_id,conversation_id,user_did,status,role,role_transition_id,
+                    role_changed_at,created_by_did,created_by_device_id,invitation_transition_id,
+                    invitation_entry_id,invited_at,current_membership,created_at
+                ) VALUES($1,$2,$3,'pending','member',$4,$5,$6,$7,$4,$8,$5,true,$5)"#,
+            )
+            .bind(invitee.participant_period_id)
+            .bind(cid)
+            .bind(&invitee.did)
+            .bind(control.transition_id)
+            .bind(at)
+            .bind(&graph.entry.actor_did)
+            .bind(graph.entry.actor_device_id)
+            .bind(control.entry.entry_id)
+            .execute(&mut *tx)
+            .await
+            .expect("open new Bob participant period");
+            tx.commit()
+                .await
+                .expect("fixed-corpus reinvitation crosses deferred constraints");
+            (invitee, state, control)
+        }
+
+        async fn commit_fixed_reacceptance(
+            pool: &PgPool,
+            graph: &TerminalFamilyBActors,
+            invitee: &AcceptanceInvitee,
+            invitation_transition_id: Uuid,
+            invitation_state: &ActivePublicState,
+            accepted_state: &ActivePublicState,
+        ) -> RealAcceptanceEntry {
+            let key_package_ref = validate_corpus_recovery_artifacts(
+                "rejoin-key-package.mls",
+                "rejoin-welcome.mls",
+                "rejoinInnerKeyPackageRefHex",
+            );
+            let acceptance = build_real_acceptance_entry_at(
+                &graph.entry,
+                invitee,
+                invitation_transition_id,
+                coordinate_json(invitation_state.coordinate()),
+                9,
+                REACCEPT_SIGNED_AT,
+                REACCEPT_AT,
+                REACCEPT_EXPIRES_AT,
+                Some((key_package_ref, corpus_file("rejoin-key-package.mls"))),
+            );
+            assert_eq!(accepted_state.coordinate().state_version(), 7);
+            let cid = Uuid::from_bytes(graph.entry.cid);
+            let at = instant(REACCEPT_AT);
+            let coordinate = accepted_state.coordinate();
+            let mut tx = pool.begin().await.expect("begin fixed-corpus reacceptance");
+            let updated = sqlx::query(
+                "UPDATE chat.conversations SET current_state_version=7,next_entry_seq=10 \
+                 WHERE conversation_id=$1 AND current_generation=0 \
+                   AND current_state_version=6 AND next_entry_seq=9",
+            )
+            .bind(cid)
+            .execute(&mut *tx)
+            .await
+            .expect("advance fixed-corpus reacceptance head");
+            assert_eq!(updated.rows_affected(), 1);
+            let updated = sqlx::query(
+                "UPDATE chat.generations SET current_state_version=7 \
+                 WHERE conversation_id=$1 AND generation=0 AND current_state_version=6",
+            )
+            .bind(cid)
+            .execute(&mut *tx)
+            .await
+            .expect("advance fixed-corpus reacceptance generation");
+            assert_eq!(updated.rows_affected(), 1);
+            sqlx::query(
+                r#"INSERT INTO chat.transitions(
+                    transition_id,conversation_id,kind,actor_did,actor_device_id,actor_key_id,
+                    actor_auth_generation,actor_role,actor_device_status,signed_request_bytes,
+                    unsigned_projection_bytes,signing_transcript_bytes,request_digest,signature,
+                    prior_generation,prior_state_version,next_generation,next_state_version,
+                    entry_seq,accepted_at
+                ) VALUES($1,$2,'acceptConversation',$3,$4,$5,1,'member','active',$6,$7,$8,$9,$10,
+                    0,6,0,7,9,$11)"#,
+            )
+            .bind(acceptance.transition_id)
+            .bind(cid)
+            .bind(&invitee.did)
+            .bind(invitee.device_id)
+            .bind(&invitee.key_id)
+            .bind(&acceptance.raw_wrapper)
+            .bind(&acceptance.unsigned_projection)
+            .bind(&acceptance.signing_transcript)
+            .bind(&acceptance.request_digest)
+            .bind(&acceptance.signature)
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert fixed-corpus reacceptance transition");
+            insert_real_generation_state(
+                &mut tx,
+                cid,
+                accepted_state,
+                "acceptConversation",
+                acceptance.transition_id,
+                at,
+            )
+            .await;
+            sqlx::query(
+                r#"INSERT INTO chat.entries(
+                    conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,
+                    accepted_payload_sha256,signed_request_bytes,request_digest,signature,
+                    server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,
+                    actor_key_id,actor_auth_generation,generation,state_version,transition_id,
+                    received_at
+                ) VALUES($1,9,$2,'blue.catbird.chat.defs#participantAcceptanceEntry',
+                    $3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1,0,7,$13,$14)"#,
+            )
+            .bind(cid)
+            .bind(acceptance.entry_id)
+            .bind(&acceptance.public_row_json)
+            .bind(Sha256::digest(&acceptance.public_row_json).to_vec())
+            .bind(&acceptance.raw_wrapper)
+            .bind(&acceptance.request_digest)
+            .bind(&acceptance.signature)
+            .bind(&acceptance.server_fields)
+            .bind(acceptance.outer_fingerprint.to_vec())
+            .bind(&invitee.did)
+            .bind(invitee.device_id)
+            .bind(&invitee.key_id)
+            .bind(acceptance.transition_id)
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert fixed-corpus reacceptance entry");
+            sqlx::query(
+                r#"INSERT INTO chat.entry_recipients(
+                    conversation_id,seq,user_did,device_id,entitlement_kind
+                ) VALUES($1,9,$2,$3,'control')"#,
+            )
+            .bind(cid)
+            .bind(&graph.entry.actor_did)
+            .bind(graph.entry.actor_device_id)
+            .execute(&mut *tx)
+            .await
+            .expect("route fixed-corpus reacceptance");
+            let updated = sqlx::query(
+                "UPDATE chat.participants SET status='active',acceptance_transition_id=$2,\
+                    acceptance_entry_id=$3,accepted_at=$4 \
+                 WHERE participant_period_id=$1 AND status='pending' AND current_membership",
+            )
+            .bind(invitee.participant_period_id)
+            .bind(acceptance.transition_id)
+            .bind(acceptance.entry_id)
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("activate new Bob participant period");
+            assert_eq!(updated.rows_affected(), 1);
+            let init_key =
+                Sha256::digest([b"fixed-rejoin-init".as_ref(), &acceptance.request_id].concat())
+                    .to_vec();
+            sqlx::query(
+                r#"INSERT INTO chat.key_packages(
+                    key_package_ref,wrapper_bytes,wrapper_sha256,init_key,owner_did,
+                    owner_device_id,owner_key_id,owner_auth_generation,not_before,not_after,
+                    status,created_at
+                ) VALUES($1,$2,$3,$4,$5,$6,$7,1,$8,$9,'reserved',$10)"#,
+            )
+            .bind(acceptance.key_package_ref.to_vec())
+            .bind(&acceptance.key_package_wrapper)
+            .bind(Sha256::digest(&acceptance.key_package_wrapper).to_vec())
+            .bind(init_key)
+            .bind(&invitee.did)
+            .bind(invitee.device_id)
+            .bind(&invitee.key_id)
+            .bind(instant(KP_NOT_BEFORE))
+            .bind(instant(KP_NOT_AFTER))
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert fixed-corpus rejoin package");
+            let request_id = Uuid::from_bytes(acceptance.request_id);
+            sqlx::query(
+                r#"INSERT INTO chat.key_package_reservations(
+                    recovery_request_id,key_package_ref,conversation_id,generation,requester_did,
+                    requester_device_id,requester_key_id,requester_auth_generation,recipient_did,
+                    recipient_device_id,bound_state_version,bound_group_id,bound_epoch,
+                    bound_group_context_hash,bound_confirmation_tag,purpose,expires_at,status,created_at
+                ) VALUES($1,$2,$3,0,$4,$5,$6,1,$4,$5,7,$7,$8,$9,$10,
+                    'leafRecovery',$11,'active',$12)"#,
+            )
+            .bind(request_id)
+            .bind(acceptance.key_package_ref.to_vec())
+            .bind(cid)
+            .bind(&invitee.did)
+            .bind(invitee.device_id)
+            .bind(&invitee.key_id)
+            .bind(coordinate.group_id().to_vec())
+            .bind(i64::try_from(coordinate.epoch()).unwrap())
+            .bind(coordinate.group_context_hash().to_vec())
+            .bind(coordinate.confirmation_tag().to_vec())
+            .bind(instant(REACCEPT_EXPIRES_AT))
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert fixed-corpus rejoin reservation");
+            sqlx::query(
+                r#"INSERT INTO chat.leaf_recovery_requests(
+                    recovery_request_id,conversation_id,generation,requester_did,requester_device_id,
+                    requester_key_id,requester_auth_generation,recovery_kind,source,bound_state_version,
+                    bound_group_id,bound_epoch,bound_group_context_hash,bound_confirmation_tag,
+                    reservation_request_id,status,signed_request_bytes,signing_transcript_bytes,
+                    request_digest,signature,requested_at,expires_at
+                ) VALUES($1,$2,0,$3,$4,$5,1,'add','acceptConversation',7,$6,$7,$8,$9,$1,
+                    'open',$10,$11,$12,$13,$14,$15)"#,
+            )
+            .bind(request_id)
+            .bind(cid)
+            .bind(&invitee.did)
+            .bind(invitee.device_id)
+            .bind(&invitee.key_id)
+            .bind(coordinate.group_id().to_vec())
+            .bind(i64::try_from(coordinate.epoch()).unwrap())
+            .bind(coordinate.group_context_hash().to_vec())
+            .bind(coordinate.confirmation_tag().to_vec())
+            .bind(&acceptance.raw_wrapper)
+            .bind(&acceptance.signing_transcript)
+            .bind(&acceptance.request_digest)
+            .bind(&acceptance.signature)
+            .bind(at)
+            .bind(instant(REACCEPT_EXPIRES_AT))
+            .execute(&mut *tx)
+            .await
+            .expect("insert fixed-corpus rejoin recovery request");
+            tx.commit()
+                .await
+                .expect("fixed-corpus reacceptance crosses deferred constraints");
+            acceptance
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        async fn commit_fixed_rejoin_fulfillment(
+            pool: &PgPool,
+            graph: &TerminalFamilyBActors,
+            invitee: &AcceptanceInvitee,
+            acceptance: &RealAcceptanceEntry,
+            creation_transition_id: Uuid,
+            prior: &ActivePublicState,
+            rejoined: &ActivePublicState,
+        ) -> RealLeafRecoveryFulfillmentEntry {
+            let transition_id = Uuid::parse_str(
+                corpus_manifest()["identifiers"]["rejoinTransitionId"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            let fulfillment = build_genuine_add_fulfillment_entry_at(
+                &graph.entry,
+                invitee,
+                acceptance,
+                creation_transition_id,
+                prior.coordinate(),
+                rejoined.coordinate(),
+                transition_id,
+                10,
+                REJOIN_SIGNED_AT,
+                REJOIN_AT,
+                "commit-rejoin-public.mls",
+                "rejoin-welcome.mls",
+                0x45,
+                0x46,
+            );
+            let cid = Uuid::from_bytes(graph.entry.cid);
+            let at = instant(REJOIN_AT);
+            let coordinate = rejoined.coordinate();
+            let metadata_snapshot_id = Uuid::new_v4();
+            let leaf_period_id = Uuid::new_v4();
+            let bob_leaf = rejoined
+                .binding()
+                .tree_summary()
+                .leaves()
+                .iter()
+                .find(|leaf| {
+                    leaf.basic_credential()
+                        == format!("{}#{}", invitee.did, invitee.device_id).as_bytes()
+                })
+                .expect("rejoined snapshot contains Bob");
+            assert_eq!(
+                bob_leaf.signature_key(),
+                invitee.signing_key.verifying_key().as_bytes()
+            );
+            let mut tx = pool
+                .begin()
+                .await
+                .expect("begin fixed-corpus rejoin fulfillment");
+            let updated = sqlx::query(
+                "UPDATE chat.conversations SET current_state_version=8,next_entry_seq=11 \
+                 WHERE conversation_id=$1 AND current_generation=0 \
+                   AND current_state_version=7 AND next_entry_seq=10",
+            )
+            .bind(cid)
+            .execute(&mut *tx)
+            .await
+            .expect("advance fixed-corpus rejoin head");
+            assert_eq!(updated.rows_affected(), 1);
+            let updated = sqlx::query(
+                "UPDATE chat.generations SET current_state_version=8 \
+                 WHERE conversation_id=$1 AND generation=0 AND current_state_version=7",
+            )
+            .bind(cid)
+            .execute(&mut *tx)
+            .await
+            .expect("advance fixed-corpus rejoin generation");
+            assert_eq!(updated.rows_affected(), 1);
+            sqlx::query(
+                r#"INSERT INTO chat.transitions(
+                    transition_id,conversation_id,kind,actor_did,actor_device_id,actor_key_id,
+                    actor_auth_generation,actor_role,actor_device_status,signed_request_bytes,
+                    unsigned_projection_bytes,signing_transcript_bytes,request_digest,signature,
+                    prior_generation,prior_state_version,next_generation,next_state_version,
+                    metadata_snapshot_id,entry_seq,accepted_at
+                ) VALUES($1,$2,'leafRecovery',$3,$4,$5,1,'admin','active',$6,$7,$8,$9,$10,
+                    0,7,0,8,$11,10,$12)"#,
+            )
+            .bind(transition_id)
+            .bind(cid)
+            .bind(&graph.entry.actor_did)
+            .bind(graph.entry.actor_device_id)
+            .bind(&graph.entry.actor_key_id)
+            .bind(&fulfillment.raw_wrapper)
+            .bind(&fulfillment.canonical_projection)
+            .bind(&fulfillment.signing_transcript)
+            .bind(&fulfillment.request_digest)
+            .bind(&fulfillment.signature)
+            .bind(metadata_snapshot_id)
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert fixed-corpus rejoin transition");
+            insert_real_generation_state(&mut tx, cid, rejoined, "commit", transition_id, at).await;
+            let metadata_ciphertext = vec![0x46_u8; 16];
+            sqlx::query(
+                r#"INSERT INTO chat.metadata_snapshots(
+                    metadata_snapshot_id,conversation_id,generation,state_version,group_id,epoch,
+                    group_context_hash,confirmation_tag,producing_transition_id,
+                    origin_transition_id,metadata_version,nonce,ciphertext,ciphertext_sha256,
+                    ciphertext_size,author_did,author_device_id,author_key_id,author_public_key,
+                    author_auth_generation,author_origin_seq,author_role,author_device_status,created_at
+                ) VALUES($1,$2,0,8,$3,$4,$5,$6,$7,$8,1,$9,$10,$11,16,$12,$13,$14,$15,
+                    1,1,'admin','active',$16)"#,
+            )
+            .bind(metadata_snapshot_id)
+            .bind(cid)
+            .bind(coordinate.group_id().to_vec())
+            .bind(i64::try_from(coordinate.epoch()).unwrap())
+            .bind(coordinate.group_context_hash().to_vec())
+            .bind(coordinate.confirmation_tag().to_vec())
+            .bind(transition_id)
+            .bind(creation_transition_id)
+            .bind(vec![0x45_u8; 12])
+            .bind(&metadata_ciphertext)
+            .bind(Sha256::digest(&metadata_ciphertext).to_vec())
+            .bind(&graph.entry.actor_did)
+            .bind(graph.entry.actor_device_id)
+            .bind(&graph.entry.actor_key_id)
+            .bind(&graph.entry.public_key)
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert fixed-corpus rejoin metadata");
+            sqlx::query(
+                r#"INSERT INTO chat.entries(
+                    conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,
+                    accepted_payload_sha256,signed_request_bytes,request_digest,signature,
+                    server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,
+                    actor_key_id,actor_auth_generation,generation,state_version,transition_id,
+                    received_at
+                ) VALUES($1,10,$2,'blue.catbird.chat.defs#leafRecoveryFulfillmentEntry',
+                    $3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1,0,8,$13,$14)"#,
+            )
+            .bind(cid)
+            .bind(fulfillment.entry_id)
+            .bind(&fulfillment.public_row_json)
+            .bind(Sha256::digest(&fulfillment.public_row_json).to_vec())
+            .bind(&fulfillment.raw_wrapper)
+            .bind(&fulfillment.request_digest)
+            .bind(&fulfillment.signature)
+            .bind(&fulfillment.server_fields_dag_cbor)
+            .bind(fulfillment.outer_entry_fingerprint.to_vec())
+            .bind(&graph.entry.actor_did)
+            .bind(graph.entry.actor_device_id)
+            .bind(&graph.entry.actor_key_id)
+            .bind(transition_id)
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert fixed-corpus rejoin entry");
+            sqlx::query(
+                r#"INSERT INTO chat.entry_recipients(
+                    conversation_id,seq,user_did,device_id,entitlement_kind
+                ) VALUES($1,10,$2,$3,'control')"#,
+            )
+            .bind(cid)
+            .bind(&graph.entry.actor_did)
+            .bind(graph.entry.actor_device_id)
+            .execute(&mut *tx)
+            .await
+            .expect("route fixed-corpus rejoin entry");
+            sqlx::query(
+                r#"INSERT INTO chat.member_devices(
+                    leaf_period_id,participant_period_id,conversation_id,generation,user_did,
+                    device_id,leaf_index,basic_credential,leaf_signature_key,leaf_key_id,
+                    leaf_auth_generation,origin,join_key_package_ref,joined_state_version,
+                    joined_transition_id,joined_seq,active,created_at
+                ) VALUES($1,$2,$3,0,$4,$5,$6,$7,$8,$9,1,'keyPackage',$10,8,$11,10,true,$12)"#,
+            )
+            .bind(leaf_period_id)
+            .bind(invitee.participant_period_id)
+            .bind(cid)
+            .bind(&invitee.did)
+            .bind(invitee.device_id)
+            .bind(i64::from(bob_leaf.leaf_index()))
+            .bind(bob_leaf.basic_credential())
+            .bind(bob_leaf.signature_key())
+            .bind(&invitee.key_id)
+            .bind(acceptance.key_package_ref.to_vec())
+            .bind(transition_id)
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("open new Bob leaf period");
+            sqlx::query(
+                r#"INSERT INTO chat.application_intervals(
+                    membership_interval_id,conversation_id,generation,recipient_did,
+                    recipient_device_id,start_seq,opening_kind,opening_transition_id,
+                    opening_outer_entry_fingerprint,opening_state_version,opening_group_id,
+                    opening_epoch,opening_group_context_hash,opening_confirmation_tag,
+                    opening_leaf_period_id,created_at
+                ) VALUES($1,$2,0,$3,$4,10,'add',$1,$5,8,$6,$7,$8,$9,$10,$11)"#,
+            )
+            .bind(transition_id)
+            .bind(cid)
+            .bind(&invitee.did)
+            .bind(invitee.device_id)
+            .bind(fulfillment.outer_entry_fingerprint.to_vec())
+            .bind(coordinate.group_id().to_vec())
+            .bind(i64::try_from(coordinate.epoch()).unwrap())
+            .bind(coordinate.group_context_hash().to_vec())
+            .bind(coordinate.confirmation_tag().to_vec())
+            .bind(leaf_period_id)
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("open new Bob application interval");
+            let request_id = Uuid::from_bytes(acceptance.request_id);
+            let updated = sqlx::query(
+                "UPDATE chat.leaf_recovery_requests SET status='fulfilled',\
+                    fulfilling_transition_id=$1,terminal_at=$2 \
+                 WHERE recovery_request_id=$3 AND status='open'",
+            )
+            .bind(transition_id)
+            .bind(at)
+            .bind(request_id)
+            .execute(&mut *tx)
+            .await
+            .expect("fulfill fixed-corpus rejoin recovery");
+            assert_eq!(updated.rows_affected(), 1);
+            let updated = sqlx::query(
+                "UPDATE chat.key_package_reservations SET status='consumed',\
+                    consumed_transition_id=$1,terminal_at=$2 \
+                 WHERE recovery_request_id=$3 AND status='active'",
+            )
+            .bind(transition_id)
+            .bind(at)
+            .bind(request_id)
+            .execute(&mut *tx)
+            .await
+            .expect("consume fixed-corpus rejoin reservation");
+            assert_eq!(updated.rows_affected(), 1);
+            let updated = sqlx::query(
+                "UPDATE chat.key_packages SET status='consumed',terminal_transition_id=$1,\
+                    terminal_at=$2 WHERE key_package_ref=$3 AND status='reserved'",
+            )
+            .bind(transition_id)
+            .bind(at)
+            .bind(acceptance.key_package_ref.to_vec())
+            .execute(&mut *tx)
+            .await
+            .expect("consume fixed-corpus rejoin package");
+            assert_eq!(updated.rows_affected(), 1);
+            sqlx::query(
+                r#"INSERT INTO chat.welcome_bundles(
+                    welcome_id,conversation_id,transition_id,entry_seq,generation,state_version,
+                    group_id,epoch,group_context_hash,confirmation_tag,wrapper_bytes,
+                    wrapper_sha256,created_at
+                ) VALUES($1,$2,$3,10,0,8,$4,$5,$6,$7,$8,$9,$10)"#,
+            )
+            .bind(fulfillment.welcome_id)
+            .bind(cid)
+            .bind(transition_id)
+            .bind(coordinate.group_id().to_vec())
+            .bind(i64::try_from(coordinate.epoch()).unwrap())
+            .bind(coordinate.group_context_hash().to_vec())
+            .bind(coordinate.confirmation_tag().to_vec())
+            .bind(&fulfillment.opaque_welcome)
+            .bind(Sha256::digest(&fulfillment.opaque_welcome).to_vec())
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert fixed-corpus rejoin Welcome");
+            sqlx::query(
+                r#"INSERT INTO chat.welcome_deliveries(
+                    welcome_id,recipient_did,recipient_device_id,recovery_request_id,
+                    key_package_ref,expires_at,status
+                ) VALUES($1,$2,$3,$4,$5,$6,'pending')"#,
+            )
+            .bind(fulfillment.welcome_id)
+            .bind(&invitee.did)
+            .bind(invitee.device_id)
+            .bind(request_id)
+            .bind(acceptance.key_package_ref.to_vec())
+            .bind(instant(KP_NOT_AFTER))
+            .execute(&mut *tx)
+            .await
+            .expect("insert fixed-corpus rejoin Welcome delivery");
+            tx.commit()
+                .await
+                .expect("fixed-corpus rejoin fulfillment crosses deferred constraints");
+            fulfillment
+        }
+
         async fn commit_genuine_policy_acceptance_fulfillment(
             pool: &PgPool,
         ) -> GenuinePolicyRoleGraph {
-            let cid = Uuid::new_v4();
+            let cid = Uuid::parse_str(
+                corpus_manifest()["identifiers"]["conversationId"]
+                    .as_str()
+                    .expect("fixed corpus conversationId"),
+            )
+            .expect("fixed corpus conversation UUID");
             let mut entry = build_real_corpus_creation_entry(*cid.as_bytes());
             entry.head_next_entry_seq = 2;
-            let corpus_genesis = crate::frozen_public_state::restore_genesis();
-            let genesis = ActivePublicState::for_test(
-                &corpus_genesis,
-                PublicGroupSnapshotCoordinate::new(
-                    *cid.as_bytes(),
-                    corpus_genesis.coordinate().generation(),
-                    0,
-                    *corpus_genesis.coordinate().group_id(),
-                    corpus_genesis.coordinate().epoch(),
-                    *corpus_genesis.coordinate().group_context_hash(),
-                    *corpus_genesis.coordinate().confirmation_tag(),
-                    PublicGroupSnapshotLifecycle::Active,
-                ),
-            );
+            let states = fixed_corpus_commit_states();
+            let genesis = states.genesis;
+            assert_eq!(genesis.coordinate().conversation_id(), cid.as_bytes());
             let creation_transition_id =
                 super::seed_real_creation_graph_with_public_state(pool, &entry, &genesis).await;
             let invitee = corpus_invitee();
@@ -6321,6 +9204,17 @@ mod historical_control_loader {
             .await
             .expect("insert genuine Policy Add entry");
             sqlx::query(
+                r#"INSERT INTO chat.entry_recipients(
+                    conversation_id,seq,user_did,device_id,entitlement_kind
+                ) VALUES($1,2,$2,$3,'control')"#,
+            )
+            .bind(cid)
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .execute(&mut *tx)
+            .await
+            .expect("route genuine Policy Add to Alice");
+            sqlx::query(
                 r#"INSERT INTO chat.participants(
                     participant_period_id,conversation_id,user_did,status,role,role_transition_id,
                     role_changed_at,created_by_did,created_by_device_id,invitation_transition_id,
@@ -6349,7 +9243,9 @@ mod historical_control_loader {
                 policy.transition_id,
                 coordinate_json(policy_state.coordinate()),
                 3,
+                SIGNED_AT,
                 REQUESTED_AT,
+                EXPIRES_AT,
                 Some((corpus_key_package_ref, corpus_file("key-package.mls"))),
             );
             assert_eq!(
@@ -6359,8 +9255,11 @@ mod historical_control_loader {
             let acceptance_state = rebound_state(&policy_state, 2);
             commit_genuine_acceptance(pool, &entry, &invitee, &acceptance, &acceptance_state).await;
 
-            let committed =
-                crate::frozen_public_state::restore_add_commit(&acceptance_state, 0).into_next();
+            let committed = states.added;
+            assert_eq!(
+                committed.snapshot(),
+                corpus_file("committed-public-state.bin")
+            );
             assert_eq!(committed.coordinate().state_version(), 3);
             let fulfillment = build_genuine_add_fulfillment_entry(
                 &entry,
@@ -6478,6 +9377,17 @@ mod historical_control_loader {
             .await
             .expect("insert genuine acceptance entry");
             sqlx::query(
+                r#"INSERT INTO chat.entry_recipients(
+                    conversation_id,seq,user_did,device_id,entitlement_kind
+                ) VALUES($1,3,$2,$3,'control')"#,
+            )
+            .bind(cid)
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .execute(&mut *tx)
+            .await
+            .expect("route genuine acceptance to Alice");
+            sqlx::query(
                 "UPDATE chat.participants SET status='active',acceptance_transition_id=$2,\
                  acceptance_entry_id=$3,accepted_at=$4 \
                  WHERE participant_period_id=$1 AND status='pending'",
@@ -6566,6 +9476,82 @@ mod historical_control_loader {
             .execute(&mut *tx)
             .await
             .expect("insert genuine acceptance recovery");
+            let mapping: (bool, bool, bool, bool, bool, bool, bool, bool) = sqlx::query_as(
+                r#"SELECT
+                    package.key_package_ref IS NOT NULL,
+                    reservation.conversation_id=request.conversation_id
+                      AND reservation.generation=request.generation
+                      AND reservation.requester_did=request.requester_did
+                      AND reservation.requester_device_id=request.requester_device_id
+                      AND reservation.requester_key_id=request.requester_key_id
+                      AND reservation.requester_auth_generation=request.requester_auth_generation
+                      AND reservation.recipient_did=request.requester_did
+                      AND reservation.recipient_device_id=request.requester_device_id,
+                    reservation.bound_state_version=request.bound_state_version
+                      AND reservation.bound_group_id=request.bound_group_id
+                      AND reservation.bound_epoch=request.bound_epoch
+                      AND reservation.bound_group_context_hash=request.bound_group_context_hash
+                      AND reservation.bound_confirmation_tag=request.bound_confirmation_tag,
+                    reservation.created_at=request.requested_at
+                      AND reservation.expires_at=request.expires_at
+                      AND reservation.expires_at=
+                          LEAST(reservation.created_at + INTERVAL '5 minutes',package.not_after),
+                    EXISTS(
+                        SELECT 1 FROM chat.participants participant
+                         WHERE participant.conversation_id=request.conversation_id
+                           AND participant.user_did=request.requester_did
+                           AND participant.status='active'
+                           AND participant.created_at <= request.requested_at
+                           AND (participant.accepted_at IS NULL
+                                OR participant.accepted_at <= request.requested_at)
+                           AND (participant.removed_at IS NULL
+                                OR participant.removed_at >= request.requested_at)),
+                    EXISTS(
+                        SELECT 1 FROM chat.devices device
+                        JOIN chat.device_keys device_key
+                          ON device_key.user_did=device.user_did
+                         AND device_key.device_id=device.device_id
+                         AND device_key.key_id=request.requester_key_id
+                        WHERE device.user_did=request.requester_did
+                          AND device.device_id=request.requester_device_id
+                          AND device.created_at <= request.requested_at
+                          AND (device.revoked_at IS NULL OR device.revoked_at >= request.requested_at)
+                          AND device_key.created_at <= request.requested_at
+                          AND (device_key.revoked_at IS NULL
+                               OR device_key.revoked_at >= request.requested_at)),
+                    EXISTS(
+                        SELECT 1 FROM chat.generation_states state
+                         WHERE state.conversation_id=request.conversation_id
+                           AND state.generation=request.generation
+                           AND state.state_version=request.bound_state_version
+                           AND state.created_at <= request.requested_at),
+                    NOT EXISTS(
+                        SELECT 1 FROM chat.member_devices member
+                         WHERE member.conversation_id=request.conversation_id
+                           AND member.generation=request.generation
+                           AND member.user_did=request.requester_did
+                           AND member.device_id=request.requester_device_id
+                           AND member.joined_state_version <= request.bound_state_version
+                           AND (member.removed_state_version IS NULL
+                                OR member.removed_state_version > request.bound_state_version))
+                 FROM chat.leaf_recovery_requests request
+                 JOIN chat.key_package_reservations reservation
+                   ON reservation.recovery_request_id=request.recovery_request_id
+                 LEFT JOIN chat.key_packages package
+                   ON package.key_package_ref=reservation.key_package_ref
+                  AND package.owner_did=reservation.recipient_did
+                  AND package.owner_device_id=reservation.recipient_device_id
+                WHERE request.recovery_request_id=$1"#,
+            )
+            .bind(request_id)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("inspect genuine acceptance deferred mapping");
+            assert_eq!(
+                mapping,
+                (true, true, true, true, true, true, true, true),
+                "genuine acceptance mapping inputs are exact before deferred validation"
+            );
             tx.commit()
                 .await
                 .expect("genuine acceptance crosses schema constraints");
@@ -6709,6 +9695,17 @@ mod historical_control_loader {
             .execute(&mut *tx)
             .await
             .expect("insert genuine Add fulfillment entry");
+            sqlx::query(
+                r#"INSERT INTO chat.entry_recipients(
+                    conversation_id,seq,user_did,device_id,entitlement_kind
+                ) VALUES($1,4,$2,$3,'control')"#,
+            )
+            .bind(cid)
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .execute(&mut *tx)
+            .await
+            .expect("route genuine Add fulfillment to Alice");
             sqlx::query(
                 r#"INSERT INTO chat.member_devices(
                     leaf_period_id,participant_period_id,conversation_id,generation,user_did,
@@ -7231,13 +10228,53 @@ mod historical_control_loader {
             prior: &PublicGroupSnapshotCoordinate,
             next: &PublicGroupSnapshotCoordinate,
         ) -> RealLeafRecoveryFulfillmentEntry {
+            let transition_id = Uuid::parse_str(
+                corpus_manifest()["identifiers"]["transitionId"]
+                    .as_str()
+                    .expect("fixed Add transitionId"),
+            )
+            .expect("fixed Add transition UUID");
+            build_genuine_add_fulfillment_entry_at(
+                entry,
+                invitee,
+                acceptance,
+                creation_transition_id,
+                prior,
+                next,
+                transition_id,
+                4,
+                FULFILLMENT_SIGNED_AT,
+                FULFILLED_AT,
+                "commit-public.mls",
+                "welcome.mls",
+                0x26,
+                0x32,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn build_genuine_add_fulfillment_entry_at(
+            entry: &RealCreationEntry,
+            invitee: &AcceptanceInvitee,
+            acceptance: &RealAcceptanceEntry,
+            creation_transition_id: Uuid,
+            prior: &PublicGroupSnapshotCoordinate,
+            next: &PublicGroupSnapshotCoordinate,
+            transition_id: Uuid,
+            seq: u64,
+            signed_at: &str,
+            received_at: &str,
+            commit_file: &str,
+            welcome_file: &str,
+            metadata_nonce_byte: u8,
+            metadata_ciphertext_byte: u8,
+        ) -> RealLeafRecoveryFulfillmentEntry {
             let signing_key = entry.signing_key();
-            let transition_id = Uuid::new_v4();
             let entry_id = Uuid::new_v4();
             let welcome_id = Uuid::new_v4();
-            let commit_bytes = corpus_file("commit-public.mls");
-            let opaque_welcome = corpus_file("welcome.mls");
-            let metadata_ciphertext = vec![0x32_u8; 16];
+            let commit_bytes = corpus_file(commit_file);
+            let opaque_welcome = corpus_file(welcome_file);
+            let metadata_ciphertext = vec![metadata_ciphertext_byte; 16];
             let request_id = Uuid::from_bytes(acceptance.request_id);
             let body = json!({
                 "$type": SignedMutationKind::LeafRecoveryFulfillment.type_id(),
@@ -7310,7 +10347,7 @@ mod historical_control_loader {
                     },
                     "originTransitionId": creation_transition_id,
                     "metadataVersion": 1,
-                    "nonce": STANDARD.encode([0x26_u8; 12]),
+                    "nonce": STANDARD.encode([metadata_nonce_byte; 12]),
                     "ciphertext": STANDARD.encode(&metadata_ciphertext),
                     "ciphertextSha256": STANDARD.encode(Sha256::digest(&metadata_ciphertext)),
                     "ciphertextSize": metadata_ciphertext.len(),
@@ -7328,7 +10365,7 @@ mod historical_control_loader {
                 },
                 "recoveryRequestId": request_id,
                 "idempotencyKey": Uuid::new_v4(),
-                "signedAt": FULFILLMENT_SIGNED_AT,
+                "signedAt": signed_at,
             });
             let mut wrapper = json!({"body": body, "signature": STANDARD.encode([0_u8; 64])});
             let unsigned = serde_json::to_vec(&wrapper).unwrap();
@@ -7345,9 +10382,9 @@ mod historical_control_loader {
                 "$type": "blue.catbird.chat.defs#leafRecoveryFulfillmentEntry",
                 "entryId": entry_id,
                 "conversationId": Uuid::from_bytes(entry.cid),
-                "seq": 4,
+                "seq": seq,
                 "signedRequest": wrapper,
-                "receivedAt": FULFILLED_AT,
+                "receivedAt": received_at,
             }))
             .unwrap();
             let decoded = decode_and_verify_control_entry(&public_row_json, &entry.public_key)
@@ -9437,7 +12474,7 @@ mod historical_control_loader {
             fn welcome_terminal_selector_requires_exact_status_and_direct_cause() {
                 let terminal_at = instant("2030-01-01T00:10:00.000Z");
                 let other_at = instant("2030-01-01T00:10:01.000Z");
-                let expires_at = instant(KP_NOT_AFTER);
+                let expires_at = instant("2030-01-01T01:00:00.000Z");
                 let transition_id = Uuid::new_v4();
                 let revocation_id = Uuid::new_v4();
                 let signed = [0x31_u8; 8];
