@@ -117,8 +117,8 @@ use chat_protocol::state_machine::{
     CommitCommand, ControlEntryContent, ConversationHeadCasBinding, ConversationKind,
     ConversationState, CreationCommand, CreationDecision, DeviceIdentity,
     DeviceRevocationBatchPersistencePlan, DeviceRevocationEvidence, EventFanout, ExecutionActor,
-    ExecutionContext, ExecutorError, HydrationAuthority, LeafPersistenceColumns,
-    LeafRecoveryCancellation, LeafRecoveryFulfillment, LeafRecoveryKind,
+    ExecutionAuthority, ExecutionContext, ExecutorError, HydrationAuthority,
+    LeafPersistenceColumns, LeafRecoveryCancellation, LeafRecoveryFulfillment, LeafRecoveryKind,
     LeafRecoveryRequestCommand, LeaveCancellation, LeaveFulfillment, LeaveRequestCommand,
     LockedRegistrationProjection, MetadataAuthorColumns, MetadataSnapshotBinding,
     PolicyPlanMutation, PrincipalId, RecoveryOpenContext, RequestEntryKind, RequestEvidence,
@@ -964,7 +964,7 @@ async fn group_policy_add_participant_commits_state_version_plus_one() {
             role: TransitionActorRole::Admin,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id,
             entry_kind: "blue.catbird.chat.defs#policyEntry".to_owned(),
             accepted_payload_bytes: payload.clone(),
@@ -976,7 +976,7 @@ async fn group_policy_add_participant_commits_state_version_plus_one() {
             signature: vec![0x54_u8; 64],
             server_fields_bytes: vec![0x55_u8; 8],
             outer_entry_fingerprint: vec![0x12_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![0x61_u8; 16],
             public_snapshot_sha256: Sha256::digest([0x61_u8; 16]).to_vec(),
@@ -1556,7 +1556,7 @@ async fn build_signed_policy_apply(
             role: TransitionActorRole::Admin,
             device_status: "active".to_owned(),
         },
-        entry: signed.entry,
+        authority: ExecutionAuthority::ControlEntry(signed.entry),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![marker; 16],
             public_snapshot_sha256: Sha256::digest([marker; 16]).to_vec(),
@@ -1997,7 +1997,7 @@ fn close_ctx(
             role: chat_protocol::repository::transition::TransitionActorRole::Admin,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id,
             entry_kind: "blue.catbird.chat.defs#conversationCloseEntry".to_owned(),
             accepted_payload_bytes: payload.clone(),
@@ -2009,7 +2009,7 @@ fn close_ctx(
             signature: vec![0x34_u8; 64],
             server_fields_bytes: vec![0x35_u8; 8],
             outer_entry_fingerprint: vec![0x13_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![0x41_u8; 16],
             public_snapshot_sha256: Sha256::digest([0x41_u8; 16]).to_vec(),
@@ -2242,7 +2242,7 @@ async fn reset_request_commits_without_changing_the_coordinate() {
             role: chat_protocol::repository::transition::TransitionActorRole::Admin,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id,
             entry_kind: "blue.catbird.chat.defs#resetRequestEntry".to_owned(),
             accepted_payload_bytes: vec![0x64_u8; 8],
@@ -2254,7 +2254,7 @@ async fn reset_request_commits_without_changing_the_coordinate() {
             signature: signature.clone(),
             server_fields_bytes: vec![0x66_u8; 8],
             outer_entry_fingerprint: vec![0x14_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![],
             public_snapshot_sha256: vec![],
@@ -2397,7 +2397,7 @@ async fn commit_reset_request(
             role: chat_protocol::repository::transition::TransitionActorRole::Admin,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id,
             entry_kind: "blue.catbird.chat.defs#resetRequestEntry".to_owned(),
             accepted_payload_bytes: vec![0x64_u8; 8],
@@ -2409,7 +2409,7 @@ async fn commit_reset_request(
             signature: signature.clone(),
             server_fields_bytes: vec![0x66_u8; 8],
             outer_entry_fingerprint: vec![0x14_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![],
             public_snapshot_sha256: vec![],
@@ -2595,7 +2595,7 @@ async fn reset_activation_commits_two_generation_graph_and_conflicts_on_replay()
             role: chat_protocol::repository::transition::TransitionActorRole::Admin,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id,
             entry_kind: "blue.catbird.chat.defs#resetActivationEntry".to_owned(),
             accepted_payload_bytes: payload.clone(),
@@ -2607,7 +2607,7 @@ async fn reset_activation_commits_two_generation_graph_and_conflicts_on_replay()
             signature: vec![0x84_u8; 64],
             server_fields_bytes: vec![0x85_u8; 8],
             outer_entry_fingerprint: vec![0x15_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![0x91_u8; 16],
             public_snapshot_sha256: Sha256::digest([0x91_u8; 16]).to_vec(),
@@ -2867,7 +2867,7 @@ async fn reset_activation_supersedes_prior_pending_welcome() {
             role: TransitionActorRole::Admin,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id: req_entry,
             entry_kind: "blue.catbird.chat.defs#resetRequestEntry".to_owned(),
             accepted_payload_bytes: vec![0x94_u8; 8],
@@ -2879,7 +2879,7 @@ async fn reset_activation_supersedes_prior_pending_welcome() {
             signature: req_signature.clone(),
             server_fields_bytes: vec![0x96_u8; 8],
             outer_entry_fingerprint: vec![0x1A_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![],
             public_snapshot_sha256: vec![],
@@ -3037,7 +3037,7 @@ async fn reset_activation_supersedes_prior_pending_welcome() {
             role: TransitionActorRole::Admin,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id: act_entry,
             entry_kind: "blue.catbird.chat.defs#resetActivationEntry".to_owned(),
             accepted_payload_bytes: payload.clone(),
@@ -3049,7 +3049,7 @@ async fn reset_activation_supersedes_prior_pending_welcome() {
             signature: vec![0xAD_u8; 64],
             server_fields_bytes: vec![0xAE_u8; 8],
             outer_entry_fingerprint: vec![0x1B_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![0xB1_u8; 16],
             public_snapshot_sha256: Sha256::digest([0xB1_u8; 16]).to_vec(),
@@ -3372,7 +3372,7 @@ async fn reset_activation_supersedes_prior_open_recovery_request() {
             role: TransitionActorRole::Admin,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id: Uuid::new_v4(),
             entry_kind: "blue.catbird.chat.defs#applicationEntry".to_owned(),
             accepted_payload_bytes: vec![0xC3_u8; 8],
@@ -3384,7 +3384,7 @@ async fn reset_activation_supersedes_prior_open_recovery_request() {
             signature: vec![0xC5_u8; 64],
             server_fields_bytes: vec![0xC6_u8; 8],
             outer_entry_fingerprint: vec![0x17_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![],
             public_snapshot_sha256: vec![],
@@ -3493,7 +3493,7 @@ async fn reset_activation_supersedes_prior_open_recovery_request() {
             role: TransitionActorRole::Admin,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id: req_entry,
             entry_kind: "blue.catbird.chat.defs#resetRequestEntry".to_owned(),
             accepted_payload_bytes: vec![0x94_u8; 8],
@@ -3505,7 +3505,7 @@ async fn reset_activation_supersedes_prior_open_recovery_request() {
             signature: req_signature.clone(),
             server_fields_bytes: vec![0x96_u8; 8],
             outer_entry_fingerprint: vec![0x1A_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![],
             public_snapshot_sha256: vec![],
@@ -3662,7 +3662,7 @@ async fn reset_activation_supersedes_prior_open_recovery_request() {
             role: TransitionActorRole::Admin,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id: act_entry,
             entry_kind: "blue.catbird.chat.defs#resetActivationEntry".to_owned(),
             accepted_payload_bytes: payload.clone(),
@@ -3674,7 +3674,7 @@ async fn reset_activation_supersedes_prior_open_recovery_request() {
             signature: vec![0xAD_u8; 64],
             server_fields_bytes: vec![0xAE_u8; 8],
             outer_entry_fingerprint: vec![0x1B_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![0xB1_u8; 16],
             public_snapshot_sha256: Sha256::digest([0xB1_u8; 16]).to_vec(),
@@ -3988,7 +3988,7 @@ async fn acceptance_commits_recovery_open_and_promotes_participant() {
             role: TransitionActorRole::Member,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id,
             entry_kind: "blue.catbird.chat.defs#participantAcceptanceEntry".to_owned(),
             accepted_payload_bytes: payload.clone(),
@@ -4000,7 +4000,7 @@ async fn acceptance_commits_recovery_open_and_promotes_participant() {
             signature: vec![0xA4_u8; 64],
             server_fields_bytes: vec![0xA5_u8; 8],
             outer_entry_fingerprint: vec![0x16_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![0xB1_u8; 16],
             public_snapshot_sha256: Sha256::digest([0xB1_u8; 16]).to_vec(),
@@ -4247,7 +4247,7 @@ async fn acceptance_supersedes_prior_open_recovery_request() {
             role: TransitionActorRole::Member,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id,
             entry_kind: "blue.catbird.chat.defs#participantAcceptanceEntry".to_owned(),
             accepted_payload_bytes: payload.clone(),
@@ -4259,7 +4259,7 @@ async fn acceptance_supersedes_prior_open_recovery_request() {
             signature: vec![0xA4_u8; 64],
             server_fields_bytes: vec![0xA5_u8; 8],
             outer_entry_fingerprint: vec![0x16_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![0xB1_u8; 16],
             public_snapshot_sha256: Sha256::digest([0xB1_u8; 16]).to_vec(),
@@ -4453,7 +4453,7 @@ async fn acceptance_stales_prior_pending_reset_request() {
             role: TransitionActorRole::Member,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id,
             entry_kind: "blue.catbird.chat.defs#participantAcceptanceEntry".to_owned(),
             accepted_payload_bytes: payload.clone(),
@@ -4465,7 +4465,7 @@ async fn acceptance_stales_prior_pending_reset_request() {
             signature: vec![0xA4_u8; 64],
             server_fields_bytes: vec![0xA5_u8; 8],
             outer_entry_fingerprint: vec![0x16_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![0xB1_u8; 16],
             public_snapshot_sha256: Sha256::digest([0xB1_u8; 16]).to_vec(),
@@ -4625,7 +4625,7 @@ async fn leaf_recovery_replace_request_commits_without_advancing_coordinate() {
         },
         // Internal op: the executor appends no control entry, but write_recovery_open
         // sources the leaf_recovery_requests signed material from ctx.entry.
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id: Uuid::new_v4(),
             entry_kind: "blue.catbird.chat.defs#applicationEntry".to_owned(),
             accepted_payload_bytes: vec![0x73_u8; 8],
@@ -4637,7 +4637,7 @@ async fn leaf_recovery_replace_request_commits_without_advancing_coordinate() {
             signature: vec![0x75_u8; 64],
             server_fields_bytes: vec![0x76_u8; 8],
             outer_entry_fingerprint: vec![0x17_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![],
             public_snapshot_sha256: vec![],
@@ -4837,7 +4837,7 @@ async fn build_replace_recovery_request(
             role: TransitionActorRole::Admin,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id: Uuid::new_v4(),
             entry_kind: "blue.catbird.chat.defs#applicationEntry".to_owned(),
             accepted_payload_bytes: vec![request_byte; 8],
@@ -4849,7 +4849,7 @@ async fn build_replace_recovery_request(
             signature: vec![request_byte; 64],
             server_fields_bytes: vec![request_byte; 8],
             outer_entry_fingerprint: vec![request_byte; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![],
             public_snapshot_sha256: vec![],
@@ -4983,7 +4983,7 @@ async fn leaf_recovery_cancellation_releases_reservation_and_reactivates_package
             role: TransitionActorRole::Admin,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id: Uuid::new_v4(),
             entry_kind: "blue.catbird.chat.defs#applicationEntry".to_owned(),
             accepted_payload_bytes: vec![0x83_u8; 8],
@@ -4995,7 +4995,7 @@ async fn leaf_recovery_cancellation_releases_reservation_and_reactivates_package
             signature: vec![0x85_u8; 64],
             server_fields_bytes: vec![0x86_u8; 8],
             outer_entry_fingerprint: vec![0x18_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![],
             public_snapshot_sha256: vec![],
@@ -5156,19 +5156,8 @@ async fn welcome_expiry_terminalizes_delivery_and_materializes_recovery_work() {
             role: TransitionActorRole::Admin,
             device_status: "active".to_owned(),
         },
-        // No control entry (internal op); only the entry_id is echoed back.
-        entry: ControlEntryContent {
-            entry_id: Uuid::new_v4(),
-            entry_kind: "blue.catbird.chat.defs#applicationEntry".to_owned(),
-            accepted_payload_bytes: vec![0x7A_u8; 8],
-            accepted_payload_sha256: Sha256::digest([0x7A_u8; 8]).to_vec(),
-            signed_request_bytes: vec![0x7B_u8; 16],
-            unsigned_projection_bytes: vec![0x7C_u8; 8],
-            signing_transcript_bytes: vec![0x7B_u8; 16],
-            request_digest: Sha256::digest([0x7B_u8; 16]).to_vec(),
-            signature: vec![0x7D_u8; 64],
-            server_fields_bytes: vec![0x7E_u8; 8],
-            outer_entry_fingerprint: vec![0x18_u8; 32],
+        authority: ExecutionAuthority::Entryless {
+            operation_id: welcome_id,
         },
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![],
@@ -5397,7 +5386,7 @@ async fn build_welcome_response(
             role: TransitionActorRole::Member,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id: Uuid::new_v4(),
             entry_kind: "blue.catbird.chat.defs#applicationEntry".to_owned(),
             accepted_payload_bytes: vec![byte.wrapping_add(1); 8],
@@ -5409,7 +5398,7 @@ async fn build_welcome_response(
             signature: vec![byte.wrapping_add(3); 64],
             server_fields_bytes: vec![byte.wrapping_add(4); 8],
             outer_entry_fingerprint: vec![byte.wrapping_add(5); 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![],
             public_snapshot_sha256: vec![],
@@ -5799,7 +5788,7 @@ async fn build_generic_commit(pool: &PgPool, scenario: &FulfillmentScenario) -> 
             role: TransitionActorRole::Admin,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id: commit_entry,
             entry_kind: "blue.catbird.chat.defs#commitEntry".to_owned(),
             accepted_payload_bytes: payload.clone(),
@@ -5811,7 +5800,7 @@ async fn build_generic_commit(pool: &PgPool, scenario: &FulfillmentScenario) -> 
             signature: vec![0xE6_u8; 64],
             server_fields_bytes: vec![0xE7_u8; 8],
             outer_entry_fingerprint: vec![0x1A_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![0xF1_u8; 16],
             public_snapshot_sha256: Sha256::digest([0xF1_u8; 16]).to_vec(),
@@ -6182,7 +6171,12 @@ async fn build_signed_generic_remove_commit(
     let mut exact_aad = b"CATBIRD-CHAT-MLS-AAD-COMMIT\0".to_vec();
     exact_aad.extend_from_slice(&projection.aad().canonical_dag_cbor());
     let aad_sha256: [u8; 32] = Sha256::digest(exact_aad).into();
-    let entry_id = built.ctx.entry.entry_id;
+    let entry_id = built
+        .ctx
+        .authority
+        .control_entry()
+        .expect("generic commit carries control-entry authority")
+        .entry_id;
     let row = json!({
         "$type": "blue.catbird.chat.defs#commitEntry",
         "entryId": entry_id,
@@ -6236,7 +6230,7 @@ async fn build_signed_generic_remove_commit(
         received,
     );
     built.plan = persistence_plan_for_test(planned, head_cas);
-    built.ctx.entry = ControlEntryContent {
+    built.ctx.authority = ExecutionAuthority::ControlEntry(ControlEntryContent {
         entry_id,
         entry_kind: "blue.catbird.chat.defs#commitEntry".to_owned(),
         accepted_payload_bytes: row_bytes.clone(),
@@ -6248,7 +6242,7 @@ async fn build_signed_generic_remove_commit(
         signature: signature.to_vec(),
         server_fields_bytes: server_fields,
         outer_entry_fingerprint: outer_fingerprint.to_vec(),
-    };
+    });
     built.ctx.spine.leaf_count = 1;
     built.ctx.entry_recipients = vec![
         (fixture.alice_id.clone(), EntryEntitlementKind::Control),
@@ -6274,7 +6268,13 @@ async fn signed_generic_remove_commit_closes_only_removed_leaf_and_interval() {
     let scenario = run_fulfillment_scenario(&pool).await;
     let (built, bob_leaf_period) = build_signed_generic_remove_commit(&pool, &scenario).await;
     let applied_at = built.ctx.applied_at;
-    let outer_fingerprint = built.ctx.entry.outer_entry_fingerprint.clone();
+    let outer_fingerprint = built
+        .ctx
+        .authority
+        .control_entry()
+        .expect("generic commit carries control-entry authority")
+        .outer_entry_fingerprint
+        .clone();
 
     let mut tx = pool.begin().await.expect("begin signed generic Remove");
     let applied = apply_conversation_persistence_plan(&mut tx, &built.plan, &built.ctx)
@@ -6811,7 +6811,7 @@ async fn commit_leave_request(
             role: TransitionActorRole::Member,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id,
             entry_kind: "blue.catbird.chat.defs#leaveRequestEntry".to_owned(),
             accepted_payload_bytes: vec![0x74_u8; 8],
@@ -6823,7 +6823,7 @@ async fn commit_leave_request(
             signature: vec![0x76_u8; 64],
             server_fields_bytes: vec![0x77_u8; 8],
             outer_entry_fingerprint: vec![0x1A_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![],
             public_snapshot_sha256: vec![],
@@ -7000,7 +7000,7 @@ async fn leave_cancellation_terminalizes_pending_request_and_conflicts_on_replay
             role: TransitionActorRole::Member,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id,
             entry_kind: "blue.catbird.chat.defs#leaveCancellationEntry".to_owned(),
             accepted_payload_bytes: vec![0x84_u8; 8],
@@ -7012,7 +7012,7 @@ async fn leave_cancellation_terminalizes_pending_request_and_conflicts_on_replay
             signature: vec![0x86_u8; 64],
             server_fields_bytes: vec![0x87_u8; 8],
             outer_entry_fingerprint: vec![0x1B_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![],
             public_snapshot_sha256: vec![],
@@ -7172,7 +7172,7 @@ async fn zero_leaf_leave_commits_immediate_self_removal() {
             role: TransitionActorRole::Member,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id,
             entry_kind: "blue.catbird.chat.defs#zeroLeafLeaveEntry".to_owned(),
             accepted_payload_bytes: vec![0x94_u8; 8],
@@ -7184,7 +7184,7 @@ async fn zero_leaf_leave_commits_immediate_self_removal() {
             signature: vec![0x96_u8; 64],
             server_fields_bytes: vec![0x97_u8; 8],
             outer_entry_fingerprint: vec![0x1C_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![0xE1_u8; 16],
             public_snapshot_sha256: Sha256::digest([0xE1_u8; 16]).to_vec(),
@@ -7376,7 +7376,7 @@ async fn zero_leaf_leave_supersedes_prior_open_recovery_request() {
             role: TransitionActorRole::Member,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id,
             entry_kind: "blue.catbird.chat.defs#zeroLeafLeaveEntry".to_owned(),
             accepted_payload_bytes: vec![0x94_u8; 8],
@@ -7388,7 +7388,7 @@ async fn zero_leaf_leave_supersedes_prior_open_recovery_request() {
             signature: vec![0x96_u8; 64],
             server_fields_bytes: vec![0x97_u8; 8],
             outer_entry_fingerprint: vec![0x1C_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![0xE1_u8; 16],
             public_snapshot_sha256: Sha256::digest([0xE1_u8; 16]).to_vec(),
@@ -7606,7 +7606,7 @@ async fn leave_fulfillment_commits_remove_and_supersedes_pending_welcome() {
             role: TransitionActorRole::Admin,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id: fulfill_entry,
             entry_kind: "blue.catbird.chat.defs#leaveCommitFulfillmentEntry".to_owned(),
             accepted_payload_bytes: payload.clone(),
@@ -7618,7 +7618,7 @@ async fn leave_fulfillment_commits_remove_and_supersedes_pending_welcome() {
             signature: vec![0xFD_u8; 64],
             server_fields_bytes: vec![0xFE_u8; 8],
             outer_entry_fingerprint: vec![0x1D_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![0xC1_u8; 16],
             public_snapshot_sha256: Sha256::digest([0xC1_u8; 16]).to_vec(),
@@ -7887,7 +7887,7 @@ async fn build_replace_fulfillment(pool: &PgPool) -> BuiltReplaceFulfillment {
             role: TransitionActorRole::Member,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id: Uuid::new_v4(),
             entry_kind: "blue.catbird.chat.defs#applicationEntry".to_owned(),
             accepted_payload_bytes: vec![0x83_u8; 8],
@@ -7899,7 +7899,7 @@ async fn build_replace_fulfillment(pool: &PgPool) -> BuiltReplaceFulfillment {
             signature: vec![0x85_u8; 64],
             server_fields_bytes: vec![0x86_u8; 8],
             outer_entry_fingerprint: vec![0x18_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![],
             public_snapshot_sha256: vec![],
@@ -8073,7 +8073,7 @@ async fn build_replace_fulfillment(pool: &PgPool) -> BuiltReplaceFulfillment {
             role: TransitionActorRole::Admin,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id: replace_entry,
             entry_kind: "blue.catbird.chat.defs#leafRecoveryFulfillmentEntry".to_owned(),
             accepted_payload_bytes: payload.clone(),
@@ -8085,7 +8085,7 @@ async fn build_replace_fulfillment(pool: &PgPool) -> BuiltReplaceFulfillment {
             signature: vec![0xBD_u8; 64],
             server_fields_bytes: vec![0xBE_u8; 8],
             outer_entry_fingerprint: vec![0x1E_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![0xC1_u8; 16],
             public_snapshot_sha256: Sha256::digest([0xC1_u8; 16]).to_vec(),
@@ -8552,7 +8552,7 @@ async fn build_bob_leave_fulfillment(
             role: TransitionActorRole::Admin,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id: fulfill_entry,
             entry_kind: "blue.catbird.chat.defs#leaveCommitFulfillmentEntry".to_owned(),
             accepted_payload_bytes: payload.clone(),
@@ -8564,7 +8564,7 @@ async fn build_bob_leave_fulfillment(
             signature: vec![0xFD_u8; 64],
             server_fields_bytes: vec![0xFE_u8; 8],
             outer_entry_fingerprint: vec![0x1D_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![0xC1_u8; 16],
             public_snapshot_sha256: Sha256::digest([0xC1_u8; 16]).to_vec(),
@@ -8767,7 +8767,7 @@ async fn close_after_leave_emits_proof_only_for_removed_device() {
             role: TransitionActorRole::Admin,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id: close_entry,
             entry_kind: "blue.catbird.chat.defs#conversationCloseEntry".to_owned(),
             accepted_payload_bytes: payload.clone(),
@@ -8779,7 +8779,7 @@ async fn close_after_leave_emits_proof_only_for_removed_device() {
             signature: vec![0xE4_u8; 64],
             server_fields_bytes: vec![0xE5_u8; 8],
             outer_entry_fingerprint: vec![0x1F_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![0xE6_u8; 16],
             public_snapshot_sha256: Sha256::digest([0xE6_u8; 16]).to_vec(),
@@ -8988,7 +8988,7 @@ async fn generic_commit_supersedes_prior_open_recovery_request() {
             role: TransitionActorRole::Admin,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id: Uuid::new_v4(),
             entry_kind: "blue.catbird.chat.defs#applicationEntry".to_owned(),
             accepted_payload_bytes: vec![0xC1_u8; 8],
@@ -9000,7 +9000,7 @@ async fn generic_commit_supersedes_prior_open_recovery_request() {
             signature: vec![0xC1_u8; 64],
             server_fields_bytes: vec![0xC1_u8; 8],
             outer_entry_fingerprint: vec![0xC1_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![],
             public_snapshot_sha256: vec![],
@@ -9147,7 +9147,7 @@ async fn generic_commit_supersedes_prior_open_recovery_request() {
             role: TransitionActorRole::Admin,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id: commit_entry,
             entry_kind: "blue.catbird.chat.defs#commitEntry".to_owned(),
             accepted_payload_bytes: vec![0xB6_u8; 12],
@@ -9159,7 +9159,7 @@ async fn generic_commit_supersedes_prior_open_recovery_request() {
             signature: vec![0xB8_u8; 64],
             server_fields_bytes: vec![0xB9_u8; 8],
             outer_entry_fingerprint: vec![0x1B_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![0xBA_u8; 16],
             public_snapshot_sha256: Sha256::digest([0xBA_u8; 16]).to_vec(),
@@ -9337,7 +9337,7 @@ async fn seed_reset_leave_then_build_commit(
             role: TransitionActorRole::Admin,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id: reset_entry,
             entry_kind: "blue.catbird.chat.defs#resetRequestEntry".to_owned(),
             accepted_payload_bytes: vec![0x94_u8; 8],
@@ -9349,7 +9349,7 @@ async fn seed_reset_leave_then_build_commit(
             signature: reset_signature.clone(),
             server_fields_bytes: vec![0x96_u8; 8],
             outer_entry_fingerprint: vec![0x1A_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![],
             public_snapshot_sha256: vec![],
@@ -9451,7 +9451,7 @@ async fn seed_reset_leave_then_build_commit(
             role: TransitionActorRole::Member,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id: leave_entry,
             entry_kind: "blue.catbird.chat.defs#leaveRequestEntry".to_owned(),
             accepted_payload_bytes: vec![0x74_u8; 8],
@@ -9463,7 +9463,7 @@ async fn seed_reset_leave_then_build_commit(
             signature: vec![0x76_u8; 64],
             server_fields_bytes: vec![0x77_u8; 8],
             outer_entry_fingerprint: vec![0x1A_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![],
             public_snapshot_sha256: vec![],
@@ -9604,7 +9604,7 @@ async fn seed_reset_leave_then_build_commit(
             role: TransitionActorRole::Admin,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id: commit_entry,
             entry_kind: "blue.catbird.chat.defs#commitEntry".to_owned(),
             accepted_payload_bytes: vec![0xB6_u8; 12],
@@ -9616,7 +9616,7 @@ async fn seed_reset_leave_then_build_commit(
             signature: vec![0xB8_u8; 64],
             server_fields_bytes: vec![0xB9_u8; 8],
             outer_entry_fingerprint: vec![0x1B_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![0xBA_u8; 16],
             public_snapshot_sha256: Sha256::digest([0xBA_u8; 16]).to_vec(),
@@ -9690,7 +9690,12 @@ async fn generic_commit_stales_prior_pending_reset_and_leave_requests() {
     let scenario = run_fulfillment_scenario(&pool).await;
     let (plan, ctx, reset_request_id, leave_request_id, commit_transition) =
         seed_reset_leave_then_build_commit(pool.clone(), &scenario).await;
-    let commit_request_digest = ctx.entry.request_digest.clone();
+    let commit_request_digest = ctx
+        .authority
+        .control_entry()
+        .expect("commit carries control-entry authority")
+        .request_digest
+        .clone();
 
     let mut tx = pool.begin().await.expect("begin generic commit");
     apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
@@ -9909,7 +9914,7 @@ async fn seed_three_member_bob_pending_leave(
             role: TransitionActorRole::Admin,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id: policy_entry,
             entry_kind: "blue.catbird.chat.defs#policyEntry".to_owned(),
             accepted_payload_bytes: vec![0x51_u8; 12],
@@ -9921,7 +9926,7 @@ async fn seed_three_member_bob_pending_leave(
             signature: vec![0x54_u8; 64],
             server_fields_bytes: vec![0x55_u8; 8],
             outer_entry_fingerprint: vec![0x12_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![0x61_u8; 16],
             public_snapshot_sha256: Sha256::digest([0x61_u8; 16]).to_vec(),
@@ -10029,7 +10034,7 @@ async fn seed_three_member_bob_pending_leave(
             role: TransitionActorRole::Member,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id: leave_entry,
             entry_kind: "blue.catbird.chat.defs#leaveRequestEntry".to_owned(),
             accepted_payload_bytes: vec![0x74_u8; 8],
@@ -10041,7 +10046,7 @@ async fn seed_three_member_bob_pending_leave(
             signature: vec![0x76_u8; 64],
             server_fields_bytes: vec![0x77_u8; 8],
             outer_entry_fingerprint: vec![0x1A_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![],
             public_snapshot_sha256: vec![],
@@ -10155,7 +10160,7 @@ async fn build_carol_zero_leaf_leave(
             role: TransitionActorRole::Member,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id,
             entry_kind: "blue.catbird.chat.defs#zeroLeafLeaveEntry".to_owned(),
             accepted_payload_bytes: vec![0x94_u8; 8],
@@ -10167,7 +10172,7 @@ async fn build_carol_zero_leaf_leave(
             signature: vec![0x96_u8; 64],
             server_fields_bytes: vec![0x97_u8; 8],
             outer_entry_fingerprint: vec![0x1C_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![0xE1_u8; 16],
             public_snapshot_sha256: Sha256::digest([0xE1_u8; 16]).to_vec(),
@@ -10226,7 +10231,12 @@ async fn zero_leaf_leave_stales_other_members_pending_leave_request() {
     let carol_did = setup_data.carol_did.clone();
     let bob_leave_request_id = setup_data.bob_leave_request_id;
     let (plan, ctx, zll_transition) = build_carol_zero_leaf_leave(&pool, &setup_data).await;
-    let zll_request_digest = ctx.entry.request_digest.clone();
+    let zll_request_digest = ctx
+        .authority
+        .control_entry()
+        .expect("zero-leaf leave carries control-entry authority")
+        .request_digest
+        .clone();
 
     let mut tx = pool.begin().await.expect("begin carol zero-leaf leave");
     apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
@@ -10469,7 +10479,7 @@ async fn setup_revoked_target(pool: &PgPool) -> RevocationSetup {
             role: TransitionActorRole::Admin,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id: Uuid::new_v4(),
             entry_kind: "blue.catbird.chat.defs#applicationEntry".to_owned(),
             accepted_payload_bytes: vec![0x73_u8; 8],
@@ -10481,7 +10491,7 @@ async fn setup_revoked_target(pool: &PgPool) -> RevocationSetup {
             signature: vec![0x75_u8; 64],
             server_fields_bytes: vec![0x76_u8; 8],
             outer_entry_fingerprint: vec![0x17_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![],
             public_snapshot_sha256: vec![],
@@ -10583,19 +10593,8 @@ async fn setup_revoked_target(pool: &PgPool) -> RevocationSetup {
             role: TransitionActorRole::Admin,
             device_status: "active".to_owned(),
         },
-        // Entry-less: the arm reads only `entry.entry_id`, but the field is required.
-        entry: ControlEntryContent {
-            entry_id: Uuid::new_v4(),
-            entry_kind: "blue.catbird.chat.defs#applicationEntry".to_owned(),
-            accepted_payload_bytes: vec![0x7d_u8; 8],
-            accepted_payload_sha256: Sha256::digest([0x7d_u8; 8]).to_vec(),
-            signed_request_bytes: signed_request.clone(),
-            unsigned_projection_bytes: vec![0x7e_u8; 8],
-            signing_transcript_bytes: signing_transcript.clone(),
-            request_digest: request_digest.to_vec(),
-            signature: signature.to_vec(),
-            server_fields_bytes: vec![0x7f_u8; 8],
-            outer_entry_fingerprint: vec![0x1a_u8; 32],
+        authority: ExecutionAuthority::Entryless {
+            operation_id: revocation_id,
         },
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![],
@@ -10855,18 +10854,8 @@ async fn commit_bob_welcome_revocation(
             role: TransitionActorRole::Member,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
-            entry_id: Uuid::new_v4(),
-            entry_kind: "blue.catbird.chat.defs#applicationEntry".to_owned(),
-            accepted_payload_bytes: vec![0x8D_u8; 8],
-            accepted_payload_sha256: Sha256::digest([0x8D_u8; 8]).to_vec(),
-            signed_request_bytes: signed_request.clone(),
-            unsigned_projection_bytes: vec![0x8E_u8; 8],
-            signing_transcript_bytes: signing_transcript.clone(),
-            request_digest: request_digest.to_vec(),
-            signature: signature.to_vec(),
-            server_fields_bytes: vec![0x8F_u8; 8],
-            outer_entry_fingerprint: vec![0x20_u8; 32],
+        authority: ExecutionAuthority::Entryless {
+            operation_id: revocation_id,
         },
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![],
@@ -12250,7 +12239,7 @@ async fn build_policy_edge(
             role: TransitionActorRole::Admin,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id,
             entry_kind: "blue.catbird.chat.defs#policyEntry".to_owned(),
             accepted_payload_bytes: payload.clone(),
@@ -12262,7 +12251,7 @@ async fn build_policy_edge(
             signature: vec![0x54_u8; 64],
             server_fields_bytes: vec![0x55_u8; 8],
             outer_entry_fingerprint: vec![0x12_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![0x61_u8; 16],
             public_snapshot_sha256: Sha256::digest([0x61_u8; 16]).to_vec(),
@@ -12507,7 +12496,7 @@ async fn seed_alice_open_recovery(
             role: TransitionActorRole::Admin,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id: Uuid::new_v4(),
             entry_kind: "blue.catbird.chat.defs#applicationEntry".to_owned(),
             accepted_payload_bytes: vec![0x73_u8; 8],
@@ -12519,7 +12508,7 @@ async fn seed_alice_open_recovery(
             signature: vec![0x75_u8; 64],
             server_fields_bytes: vec![0x76_u8; 8],
             outer_entry_fingerprint: vec![0x17_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![],
             public_snapshot_sha256: vec![],
@@ -12933,7 +12922,7 @@ async fn build_reset_activation_edge(
             role: TransitionActorRole::Admin,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id,
             entry_kind: "blue.catbird.chat.defs#resetActivationEntry".to_owned(),
             accepted_payload_bytes: payload.clone(),
@@ -12945,7 +12934,7 @@ async fn build_reset_activation_edge(
             signature: vec![0x84_u8; 64],
             server_fields_bytes: vec![0x85_u8; 8],
             outer_entry_fingerprint: vec![0x15_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![0x91_u8; 16],
             public_snapshot_sha256: Sha256::digest([0x91_u8; 16]).to_vec(),

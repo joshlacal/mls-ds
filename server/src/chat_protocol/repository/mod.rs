@@ -10,6 +10,9 @@ pub(crate) mod auth;
 pub(crate) mod blobs;
 #[cfg(not(test))]
 pub(crate) mod core;
+#[cfg(not(test))]
+#[allow(dead_code)]
+pub(crate) mod execution_context;
 // `delivery` and `transition` are the dumb-SQL writers the E2b-2 transition
 // executor composes. They are unconditionally compiled (not `#[cfg(not(test))]`)
 // so the executor — which is likewise now unconditional — resolves

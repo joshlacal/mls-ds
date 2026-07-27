@@ -7864,6 +7864,29 @@ impl WelcomeExpiryAuthority {
     }
 }
 
+#[cfg(test)]
+impl WelcomeExpiryAuthority {
+    pub(crate) fn for_test(
+        welcome_id: [u8; 16],
+        recipient: DeviceIdentity,
+        coordinate: PublicGroupSnapshotCoordinate,
+        transition_seq: u64,
+        terminal_at: ServerTimestamp,
+        observed_at: ServerTimestamp,
+    ) -> Self {
+        assert!(observed_at >= terminal_at);
+        Self {
+            welcome_id,
+            recipient,
+            coordinate,
+            transition_seq,
+            terminal_at,
+            observed_at,
+            locked_row_digest: [1; 32],
+        }
+    }
+}
+
 impl RevocationTargetCasBinding {
     pub(crate) fn transaction_id(&self) -> &str {
         &self.transaction_id
@@ -11803,6 +11826,19 @@ pub(crate) enum PolicyPlanMutation {
 
 #[cfg(test)]
 impl ConversationPersistencePlan {
+    /// G6 test-only bridge: integration harnesses compile the pure planners,
+    /// while production binds `effects.authority` by consuming repository lock
+    /// guards. This additive seam lets genuine, cryptographically reverified
+    /// authority exercise the production ExecutionContext facade without
+    /// widening or changing any production constructor.
+    pub(crate) fn with_execution_context_authority_for_test(
+        mut self,
+        authority: PlanAuthority,
+    ) -> Self {
+        self.effects.authority = Some(authority);
+        self
+    }
+
     pub(crate) fn with_policy_mutation_for_test(mut self, mutation: PolicyPlanMutation) -> Self {
         if matches!(&mutation, PolicyPlanMutation::DuplicateDelta) {
             self.effects
@@ -15049,10 +15085,10 @@ fn would_remove_last_active_admin(state: &ConversationState, principal: &Princip
 
 pub(crate) use executor::{
     apply_conversation_persistence_plan, apply_device_revocation_batch, AppliedTransition,
-    ControlEntryContent, EventFanout, ExecutionActor, ExecutionContext, ExecutorError,
-    LeafPersistenceColumns, MetadataAuthorColumns, RecoveryOpenContext, ResetRequestRow,
-    SpineArtifacts, WelcomeDispositionInput, WelcomeExpiryContext, WelcomeRejectionWork,
-    WelcomeResponseContext,
+    ControlEntryContent, EventFanout, ExecutionActor, ExecutionAuthority, ExecutionContext,
+    ExecutorError, LeafPersistenceColumns, MetadataAuthorColumns, RecoveryOpenContext,
+    ResetRequestRow, SpineArtifacts, WelcomeDispositionInput, WelcomeExpiryContext,
+    WelcomeRejectionWork, WelcomeResponseContext,
 };
 
 mod executor {
@@ -15170,6 +15206,37 @@ mod executor {
         pub(crate) outer_entry_fingerprint: Vec<u8>,
     }
 
+    /// Closed execution authority consumed by the persistence executor.
+    ///
+    /// `WelcomeExpiry` and `DeviceRevocation` are the only entryless plan
+    /// families. Their exact durable operation identifier is retained directly,
+    /// so neither the hydration facade nor a caller can invent control-entry
+    /// bytes, digests, fingerprints, or signatures for them.
+    // Keep the authority shape explicit and allocation-free at this executor
+    // boundary; the larger control-entry arm is the common case.
+    #[allow(clippy::large_enum_variant)]
+    #[derive(Clone, Debug)]
+    pub(crate) enum ExecutionAuthority {
+        ControlEntry(ControlEntryContent),
+        Entryless { operation_id: Uuid },
+    }
+
+    impl ExecutionAuthority {
+        pub(crate) fn control_entry(&self) -> Option<&ControlEntryContent> {
+            match self {
+                Self::ControlEntry(entry) => Some(entry),
+                Self::Entryless { .. } => None,
+            }
+        }
+
+        pub(crate) fn operation_id(&self) -> Uuid {
+            match self {
+                Self::ControlEntry(entry) => entry.entry_id,
+                Self::Entryless { operation_id } => *operation_id,
+            }
+        }
+    }
+
     /// The public-state serialization artifacts the coordinate spine stores. The
     /// facade produces these from the validated merged public state; they are
     /// input, never re-serialized by the executor.
@@ -15265,7 +15332,7 @@ mod executor {
         /// The trusted request instant `T` — every `*_at` the executor writes.
         pub(crate) applied_at: DateTime<Utc>,
         pub(crate) actor: ExecutionActor,
-        pub(crate) entry: ControlEntryContent,
+        pub(crate) authority: ExecutionAuthority,
         pub(crate) spine: SpineArtifacts,
         pub(crate) opened_leaves: Vec<LeafPersistenceColumns>,
         pub(crate) metadata_author: Option<MetadataAuthorColumns>,
@@ -15311,6 +15378,18 @@ mod executor {
         /// binds the disposition row to (one per superseded welcome). Empty for
         /// edges that supersede no welcome.
         pub(crate) welcome_dispositions: Vec<WelcomeDispositionInput>,
+    }
+
+    impl ExecutionContext {
+        fn entry(&self) -> &ControlEntryContent {
+            self.authority
+                .control_entry()
+                .expect("execution authority validated before executor dispatch")
+        }
+
+        fn operation_id(&self) -> Uuid {
+            self.authority.operation_id()
+        }
     }
 
     /// The `welcomeDisposition` event + outbox the executor appends when a
@@ -15380,6 +15459,28 @@ mod executor {
         i64::try_from(value).map_err(|_| ExecutorError::ValueOutOfRange)
     }
 
+    fn require_execution_authority(
+        kind: PlanKind,
+        authority: &ExecutionAuthority,
+    ) -> Result<Uuid, ExecutorError> {
+        match (kind, authority) {
+            (
+                PlanKind::WelcomeExpiry | PlanKind::DeviceRevocation,
+                ExecutionAuthority::Entryless { operation_id },
+            ) => Ok(*operation_id),
+            (
+                PlanKind::WelcomeExpiry | PlanKind::DeviceRevocation,
+                ExecutionAuthority::ControlEntry(_),
+            ) => Err(ExecutorError::MissingContext(
+                "entryless operation authority",
+            )),
+            (_, ExecutionAuthority::ControlEntry(entry)) => Ok(entry.entry_id),
+            (_, ExecutionAuthority::Entryless { .. }) => {
+                Err(ExecutorError::MissingContext("control-entry authority"))
+            }
+        }
+    }
+
     fn server_instant(value: ServerTimestamp) -> Result<DateTime<Utc>, ExecutorError> {
         DateTime::<Utc>::from_timestamp_millis(value.unix_millis())
             .ok_or(ExecutorError::ValueOutOfRange)
@@ -15445,7 +15546,7 @@ mod executor {
         let current = &hydration.producer;
         if !validate_transition_evidence(current)
             || current.transition_id() != transition_id.as_bytes()
-            || current.outer_entry_fingerprint() != ctx.entry.outer_entry_fingerprint.as_slice()
+            || current.outer_entry_fingerprint() != ctx.entry().outer_entry_fingerprint.as_slice()
         {
             return Err(ExecutorError::InconsistentPlan(
                 "policy producer does not bind the current transition",
@@ -15472,14 +15573,14 @@ mod executor {
         let signed_authority = current.authority.as_ref();
         if let Some(authority) = signed_authority {
             if authority.kind != SignedMutationKind::PolicyTransition
-                || authority.control_entry_id != Some(*ctx.entry.entry_id.as_bytes())
+                || authority.control_entry_id != Some(*ctx.entry().entry_id.as_bytes())
                 || authority.control_conversation_id
                     != Some(*hydration.coordinate.conversation_id())
                 || authority.actor.principal().as_bytes() != ctx.actor.user_did.as_bytes()
                 || Uuid::from_bytes(*authority.actor.device_id()) != ctx.actor.device_id
-                || authority.signed_request_bytes != ctx.entry.signed_request_bytes
-                || authority.request_digest.as_slice() != ctx.entry.request_digest
-                || authority.signature.as_slice() != ctx.entry.signature
+                || authority.signed_request_bytes != ctx.entry().signed_request_bytes
+                || authority.request_digest.as_slice() != ctx.entry().request_digest
+                || authority.signature.as_slice() != ctx.entry().signature
             {
                 return Err(ExecutorError::InconsistentPlan(
                     "policy signed authority does not bind execution context",
@@ -15670,6 +15771,7 @@ mod executor {
         ctx: &ExecutionContext,
     ) -> Result<AppliedTransition, ExecutorError> {
         let effects = plan.effects();
+        require_execution_authority(effects.kind(), &ctx.authority)?;
         let head = effects
             .head_cas()
             .ok_or(ExecutorError::InconsistentPlan("missing head CAS binding"))?;
@@ -16138,7 +16240,7 @@ mod executor {
         Ok(AppliedTransition {
             // No control entry / seq was allocated; echo the unchanged counter.
             allocated_seq: u64::try_from(successor_next_entry_seq).unwrap(),
-            entry_id: ctx.entry.entry_id,
+            entry_id: ctx.entry().entry_id,
             event_positions,
             successor_coordinate: plan.successor_coordinate().copied(),
         })
@@ -16246,6 +16348,11 @@ mod executor {
                 "welcome expiry must expire a pending welcome",
             ))?;
         let welcome_id = Uuid::from_bytes(*expired.welcome_id());
+        if ctx.operation_id() != welcome_id {
+            return Err(ExecutorError::MissingContext(
+                "exact Welcome expiry operation id",
+            ));
+        }
         let terminal_at = server_instant(expired.expires_at())?;
         let recipient = expired.recipient().clone();
         let welcome_coordinate = expired.coordinate();
@@ -16350,7 +16457,7 @@ mod executor {
         Ok(AppliedTransition {
             // No control entry / seq was allocated; echo the unchanged counter.
             allocated_seq: u64::try_from(successor_next_entry_seq).unwrap(),
-            entry_id: ctx.entry.entry_id,
+            entry_id: ctx.operation_id(),
             event_positions: vec![position],
             successor_coordinate: plan.successor_coordinate().copied(),
         })
@@ -16401,6 +16508,11 @@ mod executor {
             }
         };
         let revocation_id = Uuid::from_bytes(*evidence.revocation_id());
+        if ctx.operation_id() != revocation_id {
+            return Err(ExecutorError::MissingContext(
+                "exact device revocation operation id",
+            ));
+        }
         let accepted_at = server_instant(evidence.accepted_at())?;
 
         // Only the target's own work is terminalized; every other family empty.
@@ -16490,7 +16602,7 @@ mod executor {
         Ok(AppliedTransition {
             // No control entry / seq was allocated; echo the unchanged counter.
             allocated_seq: u64::try_from(successor_next_entry_seq).unwrap(),
-            entry_id: ctx.entry.entry_id,
+            entry_id: ctx.operation_id(),
             event_positions,
             successor_coordinate: plan.successor_coordinate().copied(),
         })
@@ -16580,46 +16692,75 @@ mod executor {
         plan: &DeviceRevocationBatchPersistencePlan,
         conversation_ctxs: &[ExecutionContext],
     ) -> Result<Vec<AppliedTransition>, ExecutorError> {
+        // The complete batch shape is a pure preflight. No global revocation,
+        // registration, package, or conversation writer may run until every
+        // conversation/context pair has proven the exact entryless authority.
+        if plan.conversations().len() != conversation_ctxs.len() {
+            return Err(ExecutorError::InconsistentPlan(
+                "device revocation batch needs one execution context per conversation",
+            ));
+        }
+        let revocation_id = Uuid::from_bytes(*plan.authority().revocation_id());
+        for (conversation, ctx) in plan.conversations().iter().zip(conversation_ctxs) {
+            if conversation.effects().kind() != PlanKind::DeviceRevocation {
+                return Err(ExecutorError::InconsistentPlan(
+                    "device revocation batch contains a non-revocation conversation plan",
+                ));
+            }
+            let conversation_evidence = match conversation.effects().authority() {
+                Some(PlanAuthority::DeviceRevocation(evidence)) => evidence,
+                _ => {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "device revocation batch conversation lacks revocation authority",
+                    ))
+                }
+            };
+            if Uuid::from_bytes(*conversation_evidence.revocation_id()) != revocation_id {
+                return Err(ExecutorError::InconsistentPlan(
+                    "device revocation batch conversation authority disagrees",
+                ));
+            }
+            let operation_id =
+                require_execution_authority(PlanKind::DeviceRevocation, &ctx.authority)?;
+            if operation_id != revocation_id {
+                return Err(ExecutorError::MissingContext(
+                    "exact device revocation operation id",
+                ));
+            }
+        }
         let evidence = plan.authority();
-        let revocation_id = Uuid::from_bytes(*evidence.revocation_id());
         let accepted_at = server_instant(evidence.accepted_at())?;
+        let revocation_row = NewDeviceRevocation {
+            revocation_id,
+            actor_did: device_did(evidence.actor())?,
+            actor_device_id: device_uuid(evidence.actor()),
+            actor_key_id: URL_SAFE_NO_PAD.encode(evidence.actor_key_id()),
+            actor_auth_generation: checked_i64(evidence.actor_auth_generation())?,
+            target_did: device_did(evidence.target())?,
+            target_device_id: device_uuid(evidence.target()),
+            target_auth_generation: checked_i64(evidence.expected_target_auth_generation())?,
+            accepted_request_bytes: evidence.signed_request_bytes().to_vec(),
+            signing_transcript_bytes: evidence.signing_transcript_bytes().to_vec(),
+            request_digest: evidence.request_digest().to_vec(),
+            signature: evidence.signature().to_vec(),
+            signed_at: server_instant(evidence.signed_at())?,
+            accepted_at,
+        };
+        let target_cas = plan.target_cas();
+        let registration_revoke = RegistrationRevoke {
+            target_did: device_did(target_cas.target())?,
+            target_device_id: device_uuid(target_cas.target()),
+            expected_auth_generation: checked_i64(target_cas.expected_auth_generation())?,
+            revocation_id,
+            revoked_at: accepted_at,
+        };
 
         // 1. The immutable device_revocations row (the terminal_revocation_id FK
         //    target for every work-row terminalization below).
-        insert_device_revocation(
-            transaction,
-            &NewDeviceRevocation {
-                revocation_id,
-                actor_did: device_did(evidence.actor())?,
-                actor_device_id: device_uuid(evidence.actor()),
-                actor_key_id: URL_SAFE_NO_PAD.encode(evidence.actor_key_id()),
-                actor_auth_generation: checked_i64(evidence.actor_auth_generation())?,
-                target_did: device_did(evidence.target())?,
-                target_device_id: device_uuid(evidence.target()),
-                target_auth_generation: checked_i64(evidence.expected_target_auth_generation())?,
-                accepted_request_bytes: evidence.signed_request_bytes().to_vec(),
-                signing_transcript_bytes: evidence.signing_transcript_bytes().to_vec(),
-                request_digest: evidence.request_digest().to_vec(),
-                signature: evidence.signature().to_vec(),
-                signed_at: server_instant(evidence.signed_at())?,
-                accepted_at,
-            },
-        )
-        .await?;
+        insert_device_revocation(transaction, &revocation_row).await?;
 
         // 2. The target registration revoke (devices active -> revoked + its key).
-        let target_cas = plan.target_cas();
-        cas_registration_revoke(
-            transaction,
-            &RegistrationRevoke {
-                target_did: device_did(target_cas.target())?,
-                target_device_id: device_uuid(target_cas.target()),
-                expected_auth_generation: checked_i64(target_cas.expected_auth_generation())?,
-                revocation_id,
-                revoked_at: accepted_at,
-            },
-        )
-        .await?;
+        cas_registration_revoke(transaction, &registration_revoke).await?;
 
         // 3. Revoke the AVAILABLE target packages (conversation_id == None); the
         //    Reserved ones (conversation_id == Some) are revoked by the
@@ -16640,11 +16781,6 @@ mod executor {
         }
 
         // 4. Drive each conversation's entry-less revocation plan.
-        if plan.conversations().len() != conversation_ctxs.len() {
-            return Err(ExecutorError::InconsistentPlan(
-                "device revocation batch needs one execution context per conversation",
-            ));
-        }
         let mut applied = Vec::with_capacity(plan.conversations().len());
         for (conversation, ctx) in plan.conversations().iter().zip(conversation_ctxs) {
             applied
@@ -16778,10 +16914,10 @@ mod executor {
         // signed request's bytes/digest/signature (the signature-shape trigger
         // requires them non-NULL for acknowledged/rejected).
         let authorization = WelcomeClientAuthorization {
-            signed_request_bytes: ctx.entry.signed_request_bytes.clone(),
-            signing_transcript_bytes: ctx.entry.signing_transcript_bytes.clone(),
-            request_digest: ctx.entry.request_digest.clone(),
-            signature: ctx.entry.signature.clone(),
+            signed_request_bytes: ctx.entry().signed_request_bytes.clone(),
+            signing_transcript_bytes: ctx.entry().signing_transcript_bytes.clone(),
+            request_digest: ctx.entry().request_digest.clone(),
+            signature: ctx.entry().signature.clone(),
         };
         // The disposition shape must match the successor status; a rejection carries
         // the recovery work, an acknowledgement must not.
@@ -16871,7 +17007,7 @@ mod executor {
 
         Ok(AppliedTransition {
             allocated_seq: u64::try_from(successor_next_entry_seq).unwrap(),
-            entry_id: ctx.entry.entry_id,
+            entry_id: ctx.entry().entry_id,
             event_positions: vec![position],
             successor_coordinate: plan.successor_coordinate().copied(),
         })
@@ -16982,7 +17118,7 @@ mod executor {
         let key_package_ref = recovery.key_package_ref().to_vec();
         // The signed cancellation request's digest — the SAME value the released
         // reservation records, per the cancelled-status mapping cross-check.
-        let terminal_request_digest = ctx.entry.request_digest.clone();
+        let terminal_request_digest = ctx.entry().request_digest.clone();
 
         // 1. Head CAS VERIFY (coordinate + seq counter unchanged).
         transition::cas_conversation_head(
@@ -17005,10 +17141,10 @@ mod executor {
             transaction,
             recovery_request_id,
             &LeafRecoveryTermination::Cancelled {
-                terminal_signed_request_bytes: ctx.entry.signed_request_bytes.clone(),
-                terminal_signing_transcript_bytes: ctx.entry.signing_transcript_bytes.clone(),
+                terminal_signed_request_bytes: ctx.entry().signed_request_bytes.clone(),
+                terminal_signing_transcript_bytes: ctx.entry().signing_transcript_bytes.clone(),
                 terminal_request_digest: terminal_request_digest.clone(),
-                terminal_signature: ctx.entry.signature.clone(),
+                terminal_signature: ctx.entry().signature.clone(),
                 terminal_at: applied_at,
             },
         )
@@ -17039,7 +17175,7 @@ mod executor {
 
         Ok(AppliedTransition {
             allocated_seq: u64::try_from(successor_next_entry_seq).unwrap(),
-            entry_id: ctx.entry.entry_id,
+            entry_id: ctx.entry().entry_id,
             event_positions,
             successor_coordinate: plan.successor_coordinate().copied(),
         })
@@ -17270,11 +17406,11 @@ mod executor {
                 actor_auth_generation: ctx.actor.auth_generation,
                 actor_role: ctx.actor.role,
                 actor_device_status: ctx.actor.device_status.clone(),
-                signed_request_bytes: ctx.entry.signed_request_bytes.clone(),
-                unsigned_projection_bytes: ctx.entry.unsigned_projection_bytes.clone(),
-                signing_transcript_bytes: ctx.entry.signing_transcript_bytes.clone(),
-                request_digest: ctx.entry.request_digest.clone(),
-                signature: ctx.entry.signature.clone(),
+                signed_request_bytes: ctx.entry().signed_request_bytes.clone(),
+                unsigned_projection_bytes: ctx.entry().unsigned_projection_bytes.clone(),
+                signing_transcript_bytes: ctx.entry().signing_transcript_bytes.clone(),
+                request_digest: ctx.entry().request_digest.clone(),
+                signature: ctx.entry().signature.clone(),
                 coordinates: TransitionCoordinates {
                     prior: Some((expected_generation, expected_state_version)),
                     next: Some((generation, state_version)),
@@ -17593,7 +17729,7 @@ mod executor {
             transaction,
             effects,
             transition_id,
-            &ctx.entry.request_digest,
+            &ctx.entry().request_digest,
             applied_at,
         )
         .await?;
@@ -17618,7 +17754,7 @@ mod executor {
 
         Ok(AppliedTransition {
             allocated_seq: u64::try_from(seq_i64).unwrap(),
-            entry_id: ctx.entry.entry_id,
+            entry_id: ctx.entry().entry_id,
             event_positions,
             successor_coordinate: plan.successor_coordinate().copied(),
         })
@@ -17919,11 +18055,11 @@ mod executor {
                 actor_auth_generation: ctx.actor.auth_generation,
                 actor_role: ctx.actor.role,
                 actor_device_status: ctx.actor.device_status.clone(),
-                signed_request_bytes: ctx.entry.signed_request_bytes.clone(),
-                unsigned_projection_bytes: ctx.entry.unsigned_projection_bytes.clone(),
-                signing_transcript_bytes: ctx.entry.signing_transcript_bytes.clone(),
-                request_digest: ctx.entry.request_digest.clone(),
-                signature: ctx.entry.signature.clone(),
+                signed_request_bytes: ctx.entry().signed_request_bytes.clone(),
+                unsigned_projection_bytes: ctx.entry().unsigned_projection_bytes.clone(),
+                signing_transcript_bytes: ctx.entry().signing_transcript_bytes.clone(),
+                request_digest: ctx.entry().request_digest.clone(),
+                signature: ctx.entry().signature.clone(),
                 coordinates: TransitionCoordinates {
                     prior: Some((expected_generation, expected_state_version)),
                     next: Some((generation, state_version)),
@@ -18025,7 +18161,7 @@ mod executor {
             transaction,
             effects,
             transition_id,
-            &ctx.entry.request_digest,
+            &ctx.entry().request_digest,
             applied_at,
         )
         .await?;
@@ -18041,7 +18177,7 @@ mod executor {
 
         Ok(AppliedTransition {
             allocated_seq: u64::try_from(seq_i64).unwrap(),
-            entry_id: ctx.entry.entry_id,
+            entry_id: ctx.entry().entry_id,
             event_positions,
             successor_coordinate: plan.successor_coordinate().copied(),
         })
@@ -18287,11 +18423,11 @@ mod executor {
                 actor_auth_generation: ctx.actor.auth_generation,
                 actor_role: ctx.actor.role,
                 actor_device_status: ctx.actor.device_status.clone(),
-                signed_request_bytes: ctx.entry.signed_request_bytes.clone(),
-                unsigned_projection_bytes: ctx.entry.unsigned_projection_bytes.clone(),
-                signing_transcript_bytes: ctx.entry.signing_transcript_bytes.clone(),
-                request_digest: ctx.entry.request_digest.clone(),
-                signature: ctx.entry.signature.clone(),
+                signed_request_bytes: ctx.entry().signed_request_bytes.clone(),
+                unsigned_projection_bytes: ctx.entry().unsigned_projection_bytes.clone(),
+                signing_transcript_bytes: ctx.entry().signing_transcript_bytes.clone(),
+                request_digest: ctx.entry().request_digest.clone(),
+                signature: ctx.entry().signature.clone(),
                 coordinates: TransitionCoordinates {
                     prior: Some((expected_generation, expected_state_version)),
                     next: Some((generation, state_version)),
@@ -18413,7 +18549,7 @@ mod executor {
             transaction,
             leave_request_id,
             &LeaveRequestTermination::Fulfilled {
-                terminal_request_digest: ctx.entry.request_digest.clone(),
+                terminal_request_digest: ctx.entry().request_digest.clone(),
                 terminal_transition_id: transition_id,
                 terminal_at: applied_at,
             },
@@ -18456,7 +18592,7 @@ mod executor {
             transaction,
             effects,
             transition_id,
-            &ctx.entry.request_digest,
+            &ctx.entry().request_digest,
             applied_at,
         )
         .await?;
@@ -18473,7 +18609,7 @@ mod executor {
 
         Ok(AppliedTransition {
             allocated_seq: u64::try_from(seq_i64).unwrap(),
-            entry_id: ctx.entry.entry_id,
+            entry_id: ctx.entry().entry_id,
             event_positions,
             successor_coordinate: plan.successor_coordinate().copied(),
         })
@@ -18660,11 +18796,11 @@ mod executor {
                 actor_auth_generation: ctx.actor.auth_generation,
                 actor_role: ctx.actor.role,
                 actor_device_status: ctx.actor.device_status.clone(),
-                signed_request_bytes: ctx.entry.signed_request_bytes.clone(),
-                unsigned_projection_bytes: ctx.entry.unsigned_projection_bytes.clone(),
-                signing_transcript_bytes: ctx.entry.signing_transcript_bytes.clone(),
-                request_digest: ctx.entry.request_digest.clone(),
-                signature: ctx.entry.signature.clone(),
+                signed_request_bytes: ctx.entry().signed_request_bytes.clone(),
+                unsigned_projection_bytes: ctx.entry().unsigned_projection_bytes.clone(),
+                signing_transcript_bytes: ctx.entry().signing_transcript_bytes.clone(),
+                request_digest: ctx.entry().request_digest.clone(),
+                signature: ctx.entry().signature.clone(),
                 coordinates: TransitionCoordinates {
                     prior: None,
                     next: Some((generation, state_version)),
@@ -18723,7 +18859,7 @@ mod executor {
 
         Ok(AppliedTransition {
             allocated_seq: u64::try_from(seq_i64).unwrap(),
-            entry_id: ctx.entry.entry_id,
+            entry_id: ctx.entry().entry_id,
             event_positions,
             successor_coordinate: plan.successor_coordinate().copied(),
         })
@@ -18903,11 +19039,11 @@ mod executor {
                 actor_auth_generation: ctx.actor.auth_generation,
                 actor_role: ctx.actor.role,
                 actor_device_status: ctx.actor.device_status.clone(),
-                signed_request_bytes: ctx.entry.signed_request_bytes.clone(),
-                unsigned_projection_bytes: ctx.entry.unsigned_projection_bytes.clone(),
-                signing_transcript_bytes: ctx.entry.signing_transcript_bytes.clone(),
-                request_digest: ctx.entry.request_digest.clone(),
-                signature: ctx.entry.signature.clone(),
+                signed_request_bytes: ctx.entry().signed_request_bytes.clone(),
+                unsigned_projection_bytes: ctx.entry().unsigned_projection_bytes.clone(),
+                signing_transcript_bytes: ctx.entry().signing_transcript_bytes.clone(),
+                request_digest: ctx.entry().request_digest.clone(),
+                signature: ctx.entry().signature.clone(),
                 coordinates: TransitionCoordinates {
                     prior: Some((expected_generation, expected_state_version)),
                     next: Some((generation, state_version)),
@@ -18969,7 +19105,7 @@ mod executor {
             transaction,
             effects,
             transition_id,
-            &ctx.entry.request_digest,
+            &ctx.entry().request_digest,
             applied_at,
         )
         .await?;
@@ -18979,7 +19115,7 @@ mod executor {
 
         Ok(AppliedTransition {
             allocated_seq: u64::try_from(seq_i64).unwrap(),
-            entry_id: ctx.entry.entry_id,
+            entry_id: ctx.entry().entry_id,
             event_positions,
             successor_coordinate: plan.successor_coordinate().copied(),
         })
@@ -19228,11 +19364,11 @@ mod executor {
                 actor_auth_generation: ctx.actor.auth_generation,
                 actor_role: ctx.actor.role,
                 actor_device_status: ctx.actor.device_status.clone(),
-                signed_request_bytes: ctx.entry.signed_request_bytes.clone(),
-                unsigned_projection_bytes: ctx.entry.unsigned_projection_bytes.clone(),
-                signing_transcript_bytes: ctx.entry.signing_transcript_bytes.clone(),
-                request_digest: ctx.entry.request_digest.clone(),
-                signature: ctx.entry.signature.clone(),
+                signed_request_bytes: ctx.entry().signed_request_bytes.clone(),
+                unsigned_projection_bytes: ctx.entry().unsigned_projection_bytes.clone(),
+                signing_transcript_bytes: ctx.entry().signing_transcript_bytes.clone(),
+                request_digest: ctx.entry().request_digest.clone(),
+                signature: ctx.entry().signature.clone(),
                 coordinates: TransitionCoordinates {
                     prior: Some((expected_generation, expected_state_version)),
                     next: Some((generation, state_version)),
@@ -19294,7 +19430,7 @@ mod executor {
             transaction,
             effects,
             transition_id,
-            &ctx.entry.request_digest,
+            &ctx.entry().request_digest,
             applied_at,
         )
         .await?;
@@ -19303,7 +19439,7 @@ mod executor {
 
         Ok(AppliedTransition {
             allocated_seq: u64::try_from(seq_i64).unwrap(),
-            entry_id: ctx.entry.entry_id,
+            entry_id: ctx.entry().entry_id,
             event_positions,
             successor_coordinate: plan.successor_coordinate().copied(),
         })
@@ -19487,11 +19623,11 @@ mod executor {
                 actor_auth_generation: ctx.actor.auth_generation,
                 actor_role: ctx.actor.role,
                 actor_device_status: ctx.actor.device_status.clone(),
-                signed_request_bytes: ctx.entry.signed_request_bytes.clone(),
-                unsigned_projection_bytes: ctx.entry.unsigned_projection_bytes.clone(),
-                signing_transcript_bytes: ctx.entry.signing_transcript_bytes.clone(),
-                request_digest: ctx.entry.request_digest.clone(),
-                signature: ctx.entry.signature.clone(),
+                signed_request_bytes: ctx.entry().signed_request_bytes.clone(),
+                unsigned_projection_bytes: ctx.entry().unsigned_projection_bytes.clone(),
+                signing_transcript_bytes: ctx.entry().signing_transcript_bytes.clone(),
+                request_digest: ctx.entry().request_digest.clone(),
+                signature: ctx.entry().signature.clone(),
                 coordinates: TransitionCoordinates {
                     prior: Some((expected_generation, expected_state_version)),
                     next: Some((generation, state_version)),
@@ -19579,7 +19715,7 @@ mod executor {
                     recipient_device_id: device_uuid(proof.recipient()),
                     terminal_seq: seq_i64,
                     transition_id,
-                    outer_entry_fingerprint: ctx.entry.outer_entry_fingerprint.clone(),
+                    outer_entry_fingerprint: ctx.entry().outer_entry_fingerprint.clone(),
                     received_at: applied_at,
                 },
             )
@@ -19620,7 +19756,7 @@ mod executor {
             transaction,
             effects,
             transition_id,
-            &ctx.entry.request_digest,
+            &ctx.entry().request_digest,
             applied_at,
         )
         .await?;
@@ -19630,7 +19766,7 @@ mod executor {
 
         Ok(AppliedTransition {
             allocated_seq: u64::try_from(seq_i64).unwrap(),
-            entry_id: ctx.entry.entry_id,
+            entry_id: ctx.entry().entry_id,
             event_positions,
             successor_coordinate: plan.successor_coordinate().copied(),
         })
@@ -19777,7 +19913,7 @@ mod executor {
 
         Ok(AppliedTransition {
             allocated_seq: u64::try_from(seq_i64).unwrap(),
-            entry_id: ctx.entry.entry_id,
+            entry_id: ctx.entry().entry_id,
             event_positions,
             successor_coordinate: plan.successor_coordinate().copied(),
         })
@@ -19911,10 +20047,10 @@ mod executor {
                 prior_epoch: epoch,
                 prior_group_context_hash: coordinate.group_context_hash().to_vec(),
                 prior_confirmation_tag: coordinate.confirmation_tag().to_vec(),
-                signed_request_bytes: ctx.entry.signed_request_bytes.clone(),
-                signing_transcript_bytes: ctx.entry.signing_transcript_bytes.clone(),
-                request_digest: ctx.entry.request_digest.clone(),
-                signature: ctx.entry.signature.clone(),
+                signed_request_bytes: ctx.entry().signed_request_bytes.clone(),
+                signing_transcript_bytes: ctx.entry().signing_transcript_bytes.clone(),
+                request_digest: ctx.entry().request_digest.clone(),
+                signature: ctx.entry().signature.clone(),
                 received_at: applied_at,
                 expires_at: applied_at + chrono::Duration::hours(24),
             },
@@ -19934,7 +20070,7 @@ mod executor {
 
         Ok(AppliedTransition {
             allocated_seq: u64::try_from(seq_i64).unwrap(),
-            entry_id: ctx.entry.entry_id,
+            entry_id: ctx.entry().entry_id,
             event_positions,
             successor_coordinate: plan.successor_coordinate().copied(),
         })
@@ -20057,7 +20193,7 @@ mod executor {
             transaction,
             leave_request_id,
             &LeaveRequestTermination::Cancelled {
-                terminal_request_digest: ctx.entry.request_digest.clone(),
+                terminal_request_digest: ctx.entry().request_digest.clone(),
                 terminal_at: applied_at,
             },
         )
@@ -20076,7 +20212,7 @@ mod executor {
 
         Ok(AppliedTransition {
             allocated_seq: u64::try_from(seq_i64).unwrap(),
-            entry_id: ctx.entry.entry_id,
+            entry_id: ctx.entry().entry_id,
             event_positions,
             successor_coordinate: plan.successor_coordinate().copied(),
         })
@@ -20332,11 +20468,11 @@ mod executor {
                 actor_auth_generation: ctx.actor.auth_generation,
                 actor_role: ctx.actor.role,
                 actor_device_status: ctx.actor.device_status.clone(),
-                signed_request_bytes: ctx.entry.signed_request_bytes.clone(),
-                unsigned_projection_bytes: ctx.entry.unsigned_projection_bytes.clone(),
-                signing_transcript_bytes: ctx.entry.signing_transcript_bytes.clone(),
-                request_digest: ctx.entry.request_digest.clone(),
-                signature: ctx.entry.signature.clone(),
+                signed_request_bytes: ctx.entry().signed_request_bytes.clone(),
+                unsigned_projection_bytes: ctx.entry().unsigned_projection_bytes.clone(),
+                signing_transcript_bytes: ctx.entry().signing_transcript_bytes.clone(),
+                request_digest: ctx.entry().request_digest.clone(),
+                signature: ctx.entry().signature.clone(),
                 coordinates: TransitionCoordinates {
                     // resetActivation: next == successor (both point at the fresh
                     // generation), retired == (prior_gen, prior_sv + 1).
@@ -20531,7 +20667,7 @@ mod executor {
             transaction,
             effects,
             transition_id,
-            &ctx.entry.request_digest,
+            &ctx.entry().request_digest,
             applied_at,
         )
         .await?;
@@ -20548,7 +20684,7 @@ mod executor {
 
         Ok(AppliedTransition {
             allocated_seq: u64::try_from(seq_i64).unwrap(),
-            entry_id: ctx.entry.entry_id,
+            entry_id: ctx.entry().entry_id,
             event_positions,
             successor_coordinate: plan.successor_coordinate().copied(),
         })
@@ -20771,11 +20907,11 @@ mod executor {
                 actor_auth_generation: ctx.actor.auth_generation,
                 actor_role: ctx.actor.role,
                 actor_device_status: ctx.actor.device_status.clone(),
-                signed_request_bytes: ctx.entry.signed_request_bytes.clone(),
-                unsigned_projection_bytes: ctx.entry.unsigned_projection_bytes.clone(),
-                signing_transcript_bytes: ctx.entry.signing_transcript_bytes.clone(),
-                request_digest: ctx.entry.request_digest.clone(),
-                signature: ctx.entry.signature.clone(),
+                signed_request_bytes: ctx.entry().signed_request_bytes.clone(),
+                unsigned_projection_bytes: ctx.entry().unsigned_projection_bytes.clone(),
+                signing_transcript_bytes: ctx.entry().signing_transcript_bytes.clone(),
+                request_digest: ctx.entry().request_digest.clone(),
+                signature: ctx.entry().signature.clone(),
                 coordinates: TransitionCoordinates {
                     prior: Some((expected_generation, expected_state_version)),
                     next: Some((generation, state_version)),
@@ -20809,7 +20945,7 @@ mod executor {
                 user_did: principal_did(participant_change.principal())?,
                 acceptance: ParticipantAcceptance {
                     acceptance_transition_id: transition_id,
-                    acceptance_entry_id: ctx.entry.entry_id,
+                    acceptance_entry_id: ctx.entry().entry_id,
                     accepted_at: applied_at,
                 },
             },
@@ -20858,7 +20994,7 @@ mod executor {
             transaction,
             effects,
             transition_id,
-            &ctx.entry.request_digest,
+            &ctx.entry().request_digest,
             applied_at,
         )
         .await?;
@@ -20879,7 +21015,7 @@ mod executor {
 
         Ok(AppliedTransition {
             allocated_seq: u64::try_from(seq_i64).unwrap(),
-            entry_id: ctx.entry.entry_id,
+            entry_id: ctx.entry().entry_id,
             event_positions,
             successor_coordinate: plan.successor_coordinate().copied(),
         })
@@ -20944,10 +21080,10 @@ mod executor {
                 bound_group_context_hash: bound.group_context_hash().to_vec(),
                 bound_confirmation_tag: bound.confirmation_tag().to_vec(),
                 reservation_request_id: recovery_request_id,
-                signed_request_bytes: ctx.entry.signed_request_bytes.clone(),
-                signing_transcript_bytes: ctx.entry.signing_transcript_bytes.clone(),
-                request_digest: ctx.entry.request_digest.clone(),
-                signature: ctx.entry.signature.clone(),
+                signed_request_bytes: ctx.entry().signed_request_bytes.clone(),
+                signing_transcript_bytes: ctx.entry().signing_transcript_bytes.clone(),
+                request_digest: ctx.entry().request_digest.clone(),
+                signature: ctx.entry().signature.clone(),
                 requested_at,
                 expires_at,
             },
@@ -21076,15 +21212,15 @@ mod executor {
     ) -> AppendEntry {
         AppendEntry {
             conversation_id,
-            entry_id: ctx.entry.entry_id,
-            entry_kind: ctx.entry.entry_kind.clone(),
-            accepted_payload_bytes: ctx.entry.accepted_payload_bytes.clone(),
-            accepted_payload_sha256: ctx.entry.accepted_payload_sha256.clone(),
-            signed_request_bytes: ctx.entry.signed_request_bytes.clone(),
-            request_digest: ctx.entry.request_digest.clone(),
-            signature: ctx.entry.signature.clone(),
-            server_fields_bytes: ctx.entry.server_fields_bytes.clone(),
-            outer_entry_fingerprint: ctx.entry.outer_entry_fingerprint.clone(),
+            entry_id: ctx.entry().entry_id,
+            entry_kind: ctx.entry().entry_kind.clone(),
+            accepted_payload_bytes: ctx.entry().accepted_payload_bytes.clone(),
+            accepted_payload_sha256: ctx.entry().accepted_payload_sha256.clone(),
+            signed_request_bytes: ctx.entry().signed_request_bytes.clone(),
+            request_digest: ctx.entry().request_digest.clone(),
+            signature: ctx.entry().signature.clone(),
+            server_fields_bytes: ctx.entry().server_fields_bytes.clone(),
+            outer_entry_fingerprint: ctx.entry().outer_entry_fingerprint.clone(),
             actor_did: ctx.actor.user_did.clone(),
             actor_device_id: ctx.actor.device_id,
             actor_key_id: ctx.actor.key_id.clone(),
@@ -21278,7 +21414,7 @@ mod executor {
             let invitation = match &row.invitation {
                 Some(_) => Some(ParticipantInvitation {
                     invitation_transition_id: transition_id,
-                    invitation_entry_id: ctx.entry.entry_id,
+                    invitation_entry_id: ctx.entry().entry_id,
                     invited_at: applied_at,
                 }),
                 None => None,
@@ -21833,5 +21969,66 @@ mod executor {
             positions.push(position);
         }
         Ok(positions)
+    }
+
+    #[cfg(test)]
+    mod authority_shape_tests {
+        use super::*;
+
+        #[test]
+        fn welcome_expiry_authority_is_entryless_and_retains_exact_welcome_id() {
+            let welcome_id = Uuid::parse_str("6d5b4f71-5ff3-4ac2-89a9-8bcfd1675e61")
+                .expect("fixed Welcome UUID");
+            let authority = ExecutionAuthority::Entryless {
+                operation_id: welcome_id,
+            };
+
+            let operation_id = require_execution_authority(PlanKind::WelcomeExpiry, &authority)
+                .expect("Welcome expiry accepts exact entryless authority");
+
+            assert_eq!(operation_id, welcome_id);
+            assert!(
+                authority.control_entry().is_none(),
+                "server-authored expiry must carry no control content"
+            );
+        }
+
+        #[test]
+        fn entry_bearing_plan_rejects_entryless_authority() {
+            let authority = ExecutionAuthority::Entryless {
+                operation_id: Uuid::parse_str("78b7734f-7423-46a5-85f8-ac86a2527ee0")
+                    .expect("fixed operation UUID"),
+            };
+
+            assert!(matches!(
+                require_execution_authority(PlanKind::Policy, &authority),
+                Err(ExecutorError::MissingContext("control-entry authority"))
+            ));
+        }
+
+        #[test]
+        fn entryless_plan_rejects_control_entry_authority() {
+            let authority = ExecutionAuthority::ControlEntry(ControlEntryContent {
+                entry_id: Uuid::parse_str("3afcbca2-89c9-4454-ae41-2450dac4f845")
+                    .expect("fixed entry UUID"),
+                entry_kind: "blue.catbird.chat.defs#policyEntry".to_owned(),
+                accepted_payload_bytes: vec![1],
+                accepted_payload_sha256: vec![2; 32],
+                signed_request_bytes: vec![3],
+                unsigned_projection_bytes: vec![4],
+                signing_transcript_bytes: vec![5],
+                request_digest: vec![6; 32],
+                signature: vec![7; 64],
+                server_fields_bytes: vec![8],
+                outer_entry_fingerprint: vec![9; 32],
+            });
+
+            assert!(matches!(
+                require_execution_authority(PlanKind::DeviceRevocation, &authority),
+                Err(ExecutorError::MissingContext(
+                    "entryless operation authority"
+                ))
+            ));
+        }
     }
 }

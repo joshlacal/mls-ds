@@ -46,14 +46,14 @@ use crate::chat_protocol::state_machine::{
     CommitCommand, ControlEntryContent, ConversationHeadCasBinding, ConversationKind,
     ConversationState, CreationCommand, CreationDecision, DeviceIdentity,
     DeviceRevocationBatchPersistencePlan, DeviceRevocationEvidence, EventFanout, ExecutionActor,
-    ExecutionContext, ExecutorError, LeafPersistenceColumns, LeafRecoveryCancellation,
-    LeafRecoveryFulfillment, LeafRecoveryKind, LeafRecoveryRequestCommand, LeaveCancellation,
-    LeaveFulfillment, LeaveRequestCommand, LockedRegistrationProjection, MetadataAuthorColumns,
-    MetadataSnapshotBinding, PrincipalId, RecoveryOpenContext, RequestEntryKind, RequestEvidence,
-    ResetActivation, ResetRequestCommand, ResetRequestRow, RevocationPackageCasBinding,
-    RevocationTargetCasBinding, ServerTimestamp, SpineArtifacts, TransitionEvidence,
-    WelcomeDispositionInput, WelcomeExpiryContext, WelcomeRejectionWork, WelcomeResponseContext,
-    WelcomeStatus, ZeroLeafLeave,
+    ExecutionAuthority, ExecutionContext, ExecutorError, LeafPersistenceColumns,
+    LeafRecoveryCancellation, LeafRecoveryFulfillment, LeafRecoveryKind,
+    LeafRecoveryRequestCommand, LeaveCancellation, LeaveFulfillment, LeaveRequestCommand,
+    LockedRegistrationProjection, MetadataAuthorColumns, MetadataSnapshotBinding, PrincipalId,
+    RecoveryOpenContext, RequestEntryKind, RequestEvidence, ResetActivation, ResetRequestCommand,
+    ResetRequestRow, RevocationPackageCasBinding, RevocationTargetCasBinding, ServerTimestamp,
+    SpineArtifacts, TransitionEvidence, WelcomeDispositionInput, WelcomeExpiryContext,
+    WelcomeRejectionWork, WelcomeResponseContext, WelcomeStatus, ZeroLeafLeave,
 };
 use crate::chat_protocol::validation::ed25519_key_id;
 #[path = "frozen_public_state.rs"]
@@ -479,7 +479,7 @@ pub async fn build_creation_with_invitee(
             role: TransitionActorRole::Admin,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id,
             entry_kind: "blue.catbird.chat.defs#creationEntry".to_owned(),
             accepted_payload_bytes: accepted_payload.clone(),
@@ -491,7 +491,7 @@ pub async fn build_creation_with_invitee(
             signature: vec![0x24_u8; 64],
             server_fields_bytes: vec![0x25_u8; 8],
             outer_entry_fingerprint: vec![0x11_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![0x31_u8; 16],
             public_snapshot_sha256: Sha256::digest([0x31_u8; 16]).to_vec(),
@@ -675,7 +675,7 @@ pub async fn acceptance_ctx(
             role: TransitionActorRole::Member,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id,
             entry_kind: "blue.catbird.chat.defs#participantAcceptanceEntry".to_owned(),
             accepted_payload_bytes: payload.clone(),
@@ -687,7 +687,7 @@ pub async fn acceptance_ctx(
             signature: vec![0xA4_u8; 64],
             server_fields_bytes: vec![0xA5_u8; 8],
             outer_entry_fingerprint: vec![0x16_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![0xB1_u8; 16],
             public_snapshot_sha256: Sha256::digest([0xB1_u8; 16]).to_vec(),
@@ -1027,7 +1027,7 @@ pub async fn build_fulfillment(pool: &PgPool) -> BuiltFulfillment {
             role: TransitionActorRole::Admin,
             device_status: "active".to_owned(),
         },
-        entry: ControlEntryContent {
+        authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
             entry_id: fulfill_entry,
             entry_kind: "blue.catbird.chat.defs#leafRecoveryFulfillmentEntry".to_owned(),
             accepted_payload_bytes: payload.clone(),
@@ -1039,7 +1039,7 @@ pub async fn build_fulfillment(pool: &PgPool) -> BuiltFulfillment {
             signature: vec![0xC5_u8; 64],
             server_fields_bytes: vec![0xC6_u8; 8],
             outer_entry_fingerprint: vec![0x19_u8; 32],
-        },
+        }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![0xD1_u8; 16],
             public_snapshot_sha256: Sha256::digest([0xD1_u8; 16]).to_vec(),

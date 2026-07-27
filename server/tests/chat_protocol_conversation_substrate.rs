@@ -72,6 +72,13 @@ mod chat_protocol {
                 "/src/chat_protocol/repository/delivery.rs"
             ));
         }
+        pub mod execution_context {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/execution_context.rs"
+            ));
+        }
     }
     pub mod state_machine {
         #![allow(dead_code)]
@@ -80,6 +87,17 @@ mod chat_protocol {
             "/src/chat_protocol/state_machine.rs"
         ));
     }
+}
+
+#[test]
+fn g6_execution_context_facade_is_production_reachable() {
+    use chat_protocol::repository::execution_context::{
+        hydrate_execution_context, ExecutionContextArtifacts,
+    };
+
+    fn reachable<T>(_value: T) {}
+    reachable(hydrate_execution_context);
+    reachable(ExecutionContextArtifacts::default());
 }
 
 use std::time::Duration;
@@ -2801,21 +2819,20 @@ mod historical_control_loader {
         PublicStateHydrationError, RetainedMetadataCandidate, RetainedMetadataCatalogHead,
         RetainedMetadataHead, TerminalProofHydrationError,
     };
-    use crate::chat_protocol::repository::delivery::{
-        EntryEntitlementKind, EventEntitlementKind, EventKind, OutboxWorkKind,
+    use crate::chat_protocol::repository::delivery::{EntryEntitlementKind, EventKind};
+    use crate::chat_protocol::repository::execution_context::{
+        hydrate_execution_context, ExecutionContextArtifacts, ExecutionContextHydrationError,
     };
-    use crate::chat_protocol::repository::transition::TransitionActorRole;
     use crate::chat_protocol::snapshot::{
         PublicGroupSnapshotLeaf, PublicGroupSnapshotLifecycle, PublicGroupSnapshotTreeSummary,
     };
     use crate::chat_protocol::state_machine::{
         apply_conversation_persistence_plan, hydrate_conversation_state,
         metadata_binding_of_transition, persistence_plan_for_test, plan_close, CloseConversation,
-        ControlEntryContent, ConversationHeadCasBinding, ConversationKind, DeviceIdentity,
-        EventFanout, ExecutionActor, ExecutionContext, HistoricalRehydrationAuthority,
-        HydrationAuthority, MetadataSnapshotBinding, OpeningKind, ParticipantRole,
-        ParticipantStatus, PersistedControlAuthority, PrincipalId, RequestEntryKind,
-        RequestEvidence, ServerTimestamp, SpineArtifacts, TerminalProofHydrationRow,
+        ConversationHeadCasBinding, ConversationKind, DeviceIdentity,
+        HistoricalRehydrationAuthority, HydrationAuthority, MetadataSnapshotBinding, OpeningKind,
+        ParticipantRole, ParticipantStatus, PersistedControlAuthority, PrincipalId,
+        RequestEntryKind, RequestEvidence, ServerTimestamp, TerminalProofHydrationRow,
         TransitionEvidence,
     };
     use crate::chat_protocol::transcript::{
@@ -3558,7 +3575,7 @@ mod historical_control_loader {
             &prior,
             CloseConversation {
                 actor: actor.clone(),
-                transition,
+                transition: transition.clone(),
             },
         )
         .expect("genuine one-participant close plans");
@@ -3573,97 +3590,63 @@ mod historical_control_loader {
                 2,
                 close_timestamp,
             ),
+        )
+        .with_execution_context_authority_for_test(
+            crate::chat_protocol::state_machine::PlanAuthority::Transition(transition),
         );
 
-        let prior_public = prior.public_state();
-        let tree = encode_public_tree_summary(prior_public.binding().tree_summary())
-            .expect("close predecessor tree is canonical");
-        let protocol_instance_id: Uuid =
-            sqlx::query_scalar("SELECT protocol_instance_id FROM chat.protocol_instances")
-                .fetch_one(pool)
-                .await
-                .expect("protocol instance");
-        let leaf_period_id: Uuid = sqlx::query_scalar(
-            r#"SELECT leaf_period_id FROM chat.member_devices
-               WHERE conversation_id=$1 AND user_did=$2 AND device_id=$3 AND active"#,
-        )
-        .bind(cid)
-        .bind(&entry.actor_did)
-        .bind(entry.actor_device_id)
-        .fetch_one(pool)
-        .await
-        .expect("active creator leaf period");
-        let event_predecessor: Option<i64> = sqlx::query_scalar(
-            "SELECT max(event_position) FROM chat.event_recipients \
-             WHERE user_did=$1 AND device_id=$2",
-        )
-        .bind(&entry.actor_did)
-        .bind(entry.actor_device_id)
-        .fetch_one(pool)
-        .await
-        .expect("historical schedule event predecessor");
-        let applied_at = DateTime::parse_from_rfc3339(&close.received_at)
-            .unwrap()
-            .with_timezone(&Utc);
-        let context = ExecutionContext {
-            protocol_instance_id,
-            applied_at,
-            actor: ExecutionActor {
-                user_did: entry.actor_did.clone(),
-                device_id: entry.actor_device_id,
-                key_id: entry.actor_key_id.clone(),
-                auth_generation: 1,
-                role: TransitionActorRole::Admin,
-                device_status: "active".to_owned(),
-            },
-            entry: ControlEntryContent {
-                entry_id: close.entry_id,
-                entry_kind: "blue.catbird.chat.defs#conversationCloseEntry".to_owned(),
-                accepted_payload_bytes: close.public_row_json.clone(),
-                accepted_payload_sha256: Sha256::digest(&close.public_row_json).to_vec(),
-                signed_request_bytes: close.raw_wrapper.clone(),
-                unsigned_projection_bytes: close.canonical_projection.clone(),
-                signing_transcript_bytes: close.signing_transcript.clone(),
-                request_digest: close.request_digest.clone(),
-                signature: close.signature.clone(),
-                server_fields_bytes: close.server_fields_dag_cbor.clone(),
-                outer_entry_fingerprint: close.outer_entry_fingerprint.to_vec(),
-            },
-            spine: SpineArtifacts {
-                public_snapshot_bytes: prior_public.snapshot().to_vec(),
-                public_snapshot_sha256: prior_public.snapshot_sha256().to_vec(),
-                tree_summary_bytes: tree.bytes().to_vec(),
-                tree_summary_sha256: tree.sha256().to_vec(),
-                leaf_count: i64::try_from(prior_public.binding().tree_summary().leaves().len())
-                    .unwrap(),
-                genesis_group_info_bytes: vec![],
-                genesis_group_info_sha256: vec![],
-            },
-            opened_leaves: vec![],
-            metadata_author: None,
-            participant_period_ids: vec![],
-            leaf_period_ids: vec![],
-            entry_recipients: vec![(actor.clone(), EntryEntitlementKind::ScheduleTerminal)],
-            events: vec![EventFanout {
-                event_id: Uuid::new_v4(),
-                event_kind: EventKind::ConversationClosed,
-                payload_bytes: format!("conversation-closed-{cid}").into_bytes(),
-                recipients: vec![(
-                    actor.clone(),
-                    EventEntitlementKind::HistoricalSchedule,
-                    event_predecessor,
-                )],
-                outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
-            }],
-            closing_leaf_periods: vec![(actor, leaf_period_id)],
-            closing_participant_periods: vec![],
-            reset_request_row: None,
-            recovery_open: None,
-            welcome_expiry: None,
-            welcome_response: None,
-            welcome_dispositions: vec![],
-        };
         let mut tx = pool.begin().await.expect("begin genuine close");
+        // This harness builds the plan through the test-only pure seam, so take
+        // the same conversation row lock the production planner already holds
+        // before invoking the production G6 derivation facade.
+        sqlx::query("SELECT 1 FROM chat.conversations WHERE conversation_id=$1 FOR UPDATE")
+            .bind(cid)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("lock genuine close head");
+        let rejected = hydrate_execution_context(
+            &mut tx,
+            &plan,
+            ExecutionContextArtifacts {
+                accepted_control_entry_bytes: Some(vec![0xff, 0x00]),
+                genesis_group_info_bytes: None,
+                primary_event_payload: Some(format!("conversation-closed-{cid}").into_bytes()),
+                welcome_disposition_event_payloads: Vec::new(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            rejected,
+            Err(ExecutionContextHydrationError::ControlEntryMismatch)
+        ));
+        let context = hydrate_execution_context(
+            &mut tx,
+            &plan,
+            ExecutionContextArtifacts {
+                accepted_control_entry_bytes: Some(close.public_row_json.clone()),
+                genesis_group_info_bytes: None,
+                primary_event_payload: Some(format!("conversation-closed-{cid}").into_bytes()),
+                welcome_disposition_event_payloads: Vec::new(),
+            },
+        )
+        .await
+        .expect("production facade hydrates genuine close context");
+        assert_eq!(context.actor.user_did, entry.actor_did);
+        assert_eq!(
+            context
+                .authority
+                .control_entry()
+                .expect("close carries control-entry authority")
+                .entry_id,
+            close.entry_id
+        );
+        assert_eq!(
+            context.entry_recipients,
+            vec![(actor, EntryEntitlementKind::ScheduleTerminal)]
+        );
+        assert_eq!(context.closing_leaf_periods.len(), 1);
+        assert_eq!(context.events.len(), 1);
+        assert_eq!(context.events[0].event_kind, EventKind::ConversationClosed);
         let applied = apply_conversation_persistence_plan(&mut tx, &plan, &context)
             .await
             .expect("production executor applies genuine close");
@@ -5262,7 +5245,10 @@ mod historical_control_loader {
             RecoveryPackageHydrationError, WelcomeTerminalColumns, WelcomeTerminalSelection,
         };
         use crate::chat_protocol::repository::delivery::{
-            EntryEntitlementKind, EventEntitlementKind, EventKind, OutboxWorkKind,
+            EntryEntitlementKind, EventEntitlementKind, EventKind,
+        };
+        use crate::chat_protocol::repository::execution_context::{
+            hydrate_execution_context, ExecutionContextArtifacts,
         };
         use crate::chat_protocol::repository::transition::TransitionActorRole;
         use crate::chat_protocol::snapshot::{
@@ -5271,14 +5257,19 @@ mod historical_control_loader {
         };
         use crate::chat_protocol::state_machine::{
             acceptance_recovery_package_artifact_matches, apply_conversation_persistence_plan,
-            persistence_plan_for_test, plan_policy, recovery_fulfillment_terminal_matches,
-            ControlEntryContent, ConversationHeadCasBinding, ConversationKind, ConversationState,
-            ConversationStateHydration, DeviceIdentity, EventFanout, ExecutionActor,
-            ExecutionContext, HistoricalRehydrationAuthority, HydrationAuthority, LeafRecoveryKind,
-            LeaveRequestStatus, ParticipantRole, ParticipantStatus, PrincipalId,
+            apply_device_revocation_batch, device_revocation_plan_for_test,
+            persistence_plan_for_test, plan_device_revocation, plan_policy,
+            plan_welcome_expiry_for_test, recovery_fulfillment_terminal_matches,
+            ControlEntryContent, ConversationHeadCasBinding, ConversationKind,
+            ConversationPersistencePlan, ConversationState, ConversationStateHydration,
+            DeviceIdentity, DeviceRevocationBatchPersistencePlan, DeviceRevocationEvidence,
+            ExecutionActor, ExecutionAuthority, ExecutionContext, ExecutorError,
+            HistoricalRehydrationAuthority, HydrationAuthority, LeafRecoveryKind,
+            LeaveRequestStatus, ParticipantRole, ParticipantStatus, PlanAuthority, PrincipalId,
             RecoveryOriginHydrationRow, RecoveryRequestStatus, RecoverySource, ReservationStatus,
-            ServerTimestamp, SpineArtifacts, TransitionEvidence, WelcomeDispositionInput,
-            WelcomeStatus, WorkTerminalHydrationRow,
+            RevocationPackageCasBinding, RevocationTargetCasBinding, ServerTimestamp,
+            SpineArtifacts, TransitionEvidence, WelcomeExpiryAuthority, WelcomeStatus,
+            WorkTerminalHydrationRow,
         };
         use crate::chat_protocol::transcript::{
             decode_and_verify_control_entry, decode_canonical_signed_mutation,
@@ -5322,6 +5313,21 @@ mod historical_control_loader {
         const REJOIN_AT: &str = "2026-07-27T04:06:16.000Z";
         const ROLE_ADMIN_AT: &str = "2026-07-27T04:06:11.000Z";
         const ROLE_MEMBER_AT: &str = "2026-07-27T04:06:12.000Z";
+
+        async fn g6_gate_pool(label: &str) -> PgPool {
+            const FIXED_GATE_DB: &str = "postgres://localhost/catbird_chat_protocol_test_20260722";
+            let database_url = std::env::var("TEST_DATABASE_URL")
+                .expect("TEST_DATABASE_URL must name the existing gate database");
+            assert_eq!(
+                database_url, FIXED_GATE_DB,
+                "G6 {label} may write only its dedicated append-only database"
+            );
+            common::chat_protocol::validate_chat_protocol_database_url(Some(&database_url))
+                .unwrap_or_else(|_| panic!("unsafe TEST_DATABASE_URL for G6 {label}"));
+            PgPool::connect(&database_url)
+                .await
+                .unwrap_or_else(|error| panic!("connect to G6 gate database for {label}: {error}"))
+        }
 
         const BOB_SIGNING_SEED: [u8; 32] = [
             0xd4, 0xa1, 0xc4, 0x8e, 0x33, 0x92, 0x40, 0x8e, 0x24, 0x40, 0x90, 0x3f, 0xc5, 0x67,
@@ -5375,20 +5381,24 @@ mod historical_control_loader {
             let first = execute_genuine_role_change(
                 &pool,
                 &graph,
+                &graph.invitee.did,
                 ParticipantRole::Admin,
                 5,
                 ROLE_ADMIN_AT,
                 Some(graph.fulfillment.welcome_id),
+                true,
             )
             .await;
             assert_eq!(first.coordinate().state_version(), 4);
             let second = execute_genuine_role_change(
                 &pool,
                 &graph,
+                &graph.invitee.did,
                 ParticipantRole::Member,
                 6,
                 ROLE_MEMBER_AT,
                 None,
+                true,
             )
             .await;
             assert_eq!(second.coordinate().state_version(), 5);
@@ -5554,6 +5564,626 @@ mod historical_control_loader {
                 .rollback()
                 .await
                 .expect("rollback fresh aggregate read");
+        }
+
+        struct G6RevocationPreflightFixture {
+            evidence: DeviceRevocationEvidence,
+            target_cas: RevocationTargetCasBinding,
+            conversation_plan: ConversationPersistencePlan,
+            conversation_state: ConversationState,
+            context: ExecutionContext,
+            target_did: String,
+            target_device_id: Uuid,
+            target_key_id: String,
+            revocation_id: Uuid,
+            accepted_at: DateTime<Utc>,
+        }
+
+        impl G6RevocationPreflightFixture {
+            fn batch(
+                &self,
+                revoked_packages: Vec<RevocationPackageCasBinding>,
+                conversations: Vec<ConversationPersistencePlan>,
+            ) -> DeviceRevocationBatchPersistencePlan {
+                DeviceRevocationBatchPersistencePlan::for_test(
+                    self.evidence.clone(),
+                    self.target_cas.clone(),
+                    revoked_packages,
+                    conversations,
+                )
+            }
+        }
+
+        async fn g6_revocation_preflight_fixture(
+            pool: &PgPool,
+        ) -> (GenuinePolicyRoleGraph, G6RevocationPreflightFixture) {
+            let graph = commit_genuine_policy_acceptance_fulfillment_at(
+                pool,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+            )
+            .await;
+            let target = DeviceIdentity::new(
+                PrincipalId::new(graph.invitee.did.as_bytes().to_vec())
+                    .expect("canonical target DID"),
+                *graph.invitee.device_id.as_bytes(),
+            )
+            .expect("canonical target device");
+            let actor_key_id: [u8; 32] = URL_SAFE_NO_PAD
+                .decode(&graph.invitee.key_id)
+                .expect("decode target key id")
+                .try_into()
+                .expect("Ed25519 key id");
+            let accepted_at: DateTime<Utc> =
+                sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
+                    .fetch_one(pool)
+                    .await
+                    .expect("sample revocation instant");
+            let accepted =
+                ServerTimestamp::from_unix_millis_for_test(accepted_at.timestamp_millis())
+                    .expect("canonical revocation instant");
+            let cid = Uuid::from_bytes(graph.entry.cid);
+            let mut read = pool.begin().await.expect("begin revocation aggregate read");
+            let locked = hydrate_locked_conversation_state(&mut read, cid, accepted_at)
+                .await
+                .expect("hydrate genuine revocation aggregate");
+            let conversation_state = locked.state().clone();
+            read.rollback()
+                .await
+                .expect("rollback revocation aggregate read");
+            let revocation_id = Uuid::new_v4();
+            let signing_transcript = Uuid::new_v4().as_bytes().to_vec();
+            let request_digest: [u8; 32] = Sha256::digest(&signing_transcript).into();
+            let evidence = DeviceRevocationEvidence::for_test(
+                *revocation_id.as_bytes(),
+                target.clone(),
+                target.clone(),
+                actor_key_id,
+                1,
+                1,
+                accepted,
+                accepted,
+                request_digest,
+                [0xC1; 64],
+                Uuid::new_v4().as_bytes().to_vec(),
+                signing_transcript,
+            );
+            let planned = plan_device_revocation(&conversation_state, evidence.clone())
+                .expect("genuine active target plans revocation");
+            let conversation_plan = device_revocation_plan_for_test(
+                planned,
+                ConversationHeadCasBinding::for_test_internal(
+                    *cid.as_bytes(),
+                    *conversation_state.coordinate(),
+                    5,
+                    accepted,
+                ),
+                evidence.clone(),
+            );
+            let protocol_instance_id: Uuid =
+                sqlx::query_scalar("SELECT protocol_instance_id FROM chat.protocol_instances")
+                    .fetch_one(pool)
+                    .await
+                    .expect("read protocol instance");
+            let context = ExecutionContext {
+                protocol_instance_id,
+                applied_at: accepted_at,
+                actor: ExecutionActor {
+                    user_did: graph.invitee.did.clone(),
+                    device_id: graph.invitee.device_id,
+                    key_id: graph.invitee.key_id.clone(),
+                    auth_generation: 1,
+                    role: TransitionActorRole::Member,
+                    device_status: "active".to_owned(),
+                },
+                authority: ExecutionAuthority::Entryless {
+                    operation_id: revocation_id,
+                },
+                spine: SpineArtifacts {
+                    public_snapshot_bytes: Vec::new(),
+                    public_snapshot_sha256: Vec::new(),
+                    tree_summary_bytes: Vec::new(),
+                    tree_summary_sha256: Vec::new(),
+                    leaf_count: 2,
+                    genesis_group_info_bytes: Vec::new(),
+                    genesis_group_info_sha256: Vec::new(),
+                },
+                opened_leaves: Vec::new(),
+                metadata_author: None,
+                participant_period_ids: Vec::new(),
+                leaf_period_ids: Vec::new(),
+                entry_recipients: Vec::new(),
+                events: Vec::new(),
+                closing_leaf_periods: Vec::new(),
+                closing_participant_periods: Vec::new(),
+                reset_request_row: None,
+                recovery_open: None,
+                welcome_expiry: None,
+                welcome_response: None,
+                welcome_dispositions: Vec::new(),
+            };
+            let target_cas = RevocationTargetCasBinding::for_test(target.clone(), 1, accepted);
+            let target_did = graph.invitee.did.clone();
+            let target_key_id = graph.invitee.key_id.clone();
+            (
+                graph,
+                G6RevocationPreflightFixture {
+                    evidence,
+                    target_cas,
+                    conversation_plan,
+                    conversation_state,
+                    context,
+                    target_did,
+                    target_device_id: Uuid::from_bytes(*target.device_id()),
+                    target_key_id,
+                    revocation_id,
+                    accepted_at,
+                },
+            )
+        }
+
+        fn g6_control_authority(operation_id: Uuid) -> ExecutionAuthority {
+            ExecutionAuthority::ControlEntry(ControlEntryContent {
+                entry_id: operation_id,
+                entry_kind: "blue.catbird.chat.defs#policyEntry".to_owned(),
+                accepted_payload_bytes: vec![0xD1],
+                accepted_payload_sha256: vec![0xD2; 32],
+                signed_request_bytes: vec![0xD3],
+                unsigned_projection_bytes: vec![0xD4],
+                signing_transcript_bytes: vec![0xD5],
+                request_digest: vec![0xD6; 32],
+                signature: vec![0xD7; 64],
+                server_fields_bytes: vec![0xD8],
+                outer_entry_fingerprint: vec![0xD9; 32],
+            })
+        }
+
+        async fn assert_g6_batch_preflight_left_no_writes(
+            transaction: &mut Transaction<'_, Postgres>,
+            fixture: &G6RevocationPreflightFixture,
+            available_ref: Option<[u8; 32]>,
+        ) {
+            let revocations: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM chat.device_revocations WHERE revocation_id=$1",
+            )
+            .bind(fixture.revocation_id)
+            .fetch_one(&mut **transaction)
+            .await
+            .expect("count revocation residue");
+            assert_eq!(
+                revocations, 0,
+                "invalid batch inserted its immutable revocation row"
+            );
+            let registration: (String, Option<Uuid>) = sqlx::query_as(
+                "SELECT status,revocation_id FROM chat.devices \
+                 WHERE user_did=$1 AND device_id=$2",
+            )
+            .bind(&fixture.target_did)
+            .bind(fixture.target_device_id)
+            .fetch_one(&mut **transaction)
+            .await
+            .expect("read target registration");
+            assert_eq!(
+                registration,
+                ("active".to_owned(), None),
+                "invalid batch changed the target registration"
+            );
+            if let Some(key_package_ref) = available_ref {
+                let package: (String, Option<Uuid>) = sqlx::query_as(
+                    "SELECT status,terminal_revocation_id FROM chat.key_packages \
+                     WHERE key_package_ref=$1",
+                )
+                .bind(key_package_ref.to_vec())
+                .fetch_one(&mut **transaction)
+                .await
+                .expect("read available package");
+                assert_eq!(
+                    package,
+                    ("available".to_owned(), None),
+                    "invalid batch revoked an available package"
+                );
+            }
+        }
+
+        async fn append_g6_available_package(
+            pool: &PgPool,
+            fixture: &G6RevocationPreflightFixture,
+        ) -> ([u8; 32], RevocationPackageCasBinding) {
+            let key_package_ref: [u8; 32] = Sha256::digest(Uuid::new_v4().as_bytes()).into();
+            let created_at = fixture.accepted_at - chrono::Duration::hours(1);
+            let wrapper = Uuid::new_v4().as_bytes().to_vec();
+            let mut init_key = Uuid::new_v4().as_bytes().to_vec();
+            init_key.extend_from_slice(Uuid::new_v4().as_bytes());
+            sqlx::query(
+                "INSERT INTO chat.key_packages(\
+                    key_package_ref,wrapper_bytes,wrapper_sha256,init_key,owner_did,\
+                    owner_device_id,owner_key_id,owner_auth_generation,not_before,not_after,\
+                    status,created_at\
+                 ) VALUES($1,$2,$3,$4,$5,$6,$7,1,$8,$9,'available',$10)",
+            )
+            .bind(key_package_ref.to_vec())
+            .bind(&wrapper)
+            .bind(Sha256::digest(&wrapper).to_vec())
+            .bind(&init_key)
+            .bind(&fixture.target_did)
+            .bind(fixture.target_device_id)
+            .bind(&fixture.target_key_id)
+            .bind(created_at - chrono::Duration::hours(1))
+            .bind(created_at + chrono::Duration::hours(24))
+            .bind(created_at)
+            .execute(pool)
+            .await
+            .expect("append unique available package");
+            let accepted =
+                ServerTimestamp::from_unix_millis_for_test(fixture.accepted_at.timestamp_millis())
+                    .expect("canonical package revocation instant");
+            (
+                key_package_ref,
+                RevocationPackageCasBinding::for_test_available(
+                    fixture.evidence.target().clone(),
+                    key_package_ref,
+                    *fixture.revocation_id.as_bytes(),
+                    accepted,
+                ),
+            )
+        }
+
+        fn g6_policy_plan(
+            graph: &GenuinePolicyRoleGraph,
+            prior: &ConversationState,
+        ) -> (ConversationPersistencePlan, ExecutionContext) {
+            let cid = Uuid::from_bytes(graph.entry.cid);
+            let control = genuine_policy_control(
+                &graph.entry,
+                prior.coordinate(),
+                5,
+                ROLE_ADMIN_AT,
+                vec![GenuinePolicyChange::ChangeRole(
+                    &graph.invitee.did,
+                    ParticipantRole::Admin,
+                )],
+            );
+            let actor = DeviceIdentity::new(
+                PrincipalId::new(graph.entry.actor_did.as_bytes().to_vec())
+                    .expect("canonical policy actor DID"),
+                *graph.entry.actor_device_id.as_bytes(),
+            )
+            .expect("canonical policy actor");
+            let planned = plan_policy(
+                prior,
+                actor,
+                control.transition,
+                Sha256::digest(control.transition_id.as_bytes()).into(),
+            )
+            .expect("genuine entry-bearing policy plans");
+            let plan = persistence_plan_for_test(
+                planned,
+                ConversationHeadCasBinding::for_test_edge(
+                    *cid.as_bytes(),
+                    *control.entry.entry_id.as_bytes(),
+                    *prior.coordinate(),
+                    5,
+                    control.received_at,
+                ),
+            );
+            let context = ExecutionContext {
+                protocol_instance_id: Uuid::nil(),
+                applied_at: control.received_at_db,
+                actor: ExecutionActor {
+                    user_did: graph.entry.actor_did.clone(),
+                    device_id: graph.entry.actor_device_id,
+                    key_id: graph.entry.actor_key_id.clone(),
+                    auth_generation: 1,
+                    role: TransitionActorRole::Admin,
+                    device_status: "active".to_owned(),
+                },
+                authority: ExecutionAuthority::Entryless {
+                    operation_id: Uuid::new_v4(),
+                },
+                spine: SpineArtifacts {
+                    public_snapshot_bytes: Vec::new(),
+                    public_snapshot_sha256: Vec::new(),
+                    tree_summary_bytes: Vec::new(),
+                    tree_summary_sha256: Vec::new(),
+                    leaf_count: 2,
+                    genesis_group_info_bytes: Vec::new(),
+                    genesis_group_info_sha256: Vec::new(),
+                },
+                opened_leaves: Vec::new(),
+                metadata_author: None,
+                participant_period_ids: Vec::new(),
+                leaf_period_ids: Vec::new(),
+                entry_recipients: Vec::new(),
+                events: Vec::new(),
+                closing_leaf_periods: Vec::new(),
+                closing_participant_periods: Vec::new(),
+                reset_request_row: None,
+                recovery_open: None,
+                welcome_expiry: None,
+                welcome_response: None,
+                welcome_dispositions: Vec::new(),
+            };
+            (plan, context)
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated append-only gate database"]
+        async fn g6_entry_bearing_executor_rejects_entryless_authority_before_writes() {
+            let pool = g6_gate_pool("entry-bearing authority proof").await;
+            let (graph, fixture) = g6_revocation_preflight_fixture(&pool).await;
+            let (plan, context) = g6_policy_plan(&graph, &fixture.conversation_state);
+            let cid = Uuid::from_bytes(graph.entry.cid);
+
+            let mut tx = pool.begin().await.expect("begin policy authority probe");
+            let error = apply_conversation_persistence_plan(&mut tx, &plan, &context)
+                .await
+                .expect_err("entry-bearing policy must reject Entryless authority");
+            assert!(matches!(
+                error,
+                ExecutorError::MissingContext("control-entry authority")
+            ));
+            let head: (i64, i64) = sqlx::query_as(
+                "SELECT current_state_version,next_entry_seq FROM chat.conversations \
+                 WHERE conversation_id=$1",
+            )
+            .bind(cid)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("read policy head");
+            assert_eq!(head, (3, 5), "rejected policy changed the head");
+            let seq_five: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM chat.transitions \
+                 WHERE conversation_id=$1 AND entry_seq=5",
+            )
+            .bind(cid)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("count policy residue");
+            assert_eq!(seq_five, 0, "rejected policy appended a transition");
+            tx.rollback()
+                .await
+                .expect("rollback policy authority probe");
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated append-only gate database"]
+        async fn g6_revocation_batch_preflight_rejects_control_authority_before_writes() {
+            let pool = g6_gate_pool("batch authority proof").await;
+            let (_, fixture) = g6_revocation_preflight_fixture(&pool).await;
+            let batch = fixture.batch(Vec::new(), vec![fixture.conversation_plan.clone()]);
+            let mut context = fixture.context.clone();
+            context.authority = g6_control_authority(fixture.revocation_id);
+
+            let mut tx = pool.begin().await.expect("begin batch authority probe");
+            let error =
+                apply_device_revocation_batch(&mut tx, &batch, std::slice::from_ref(&context))
+                    .await
+                    .expect_err("revocation batch must reject ControlEntry authority");
+            assert!(matches!(
+                error,
+                ExecutorError::MissingContext("entryless operation authority")
+            ));
+            assert_g6_batch_preflight_left_no_writes(&mut tx, &fixture, None).await;
+            tx.rollback().await.expect("rollback batch authority probe");
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated append-only gate database"]
+        async fn g6_revocation_batch_preflight_rejects_wrong_count_before_writes() {
+            let pool = g6_gate_pool("batch count proof").await;
+            let (_, fixture) = g6_revocation_preflight_fixture(&pool).await;
+            let (available_ref, binding) = append_g6_available_package(&pool, &fixture).await;
+            let batch = fixture.batch(vec![binding], vec![fixture.conversation_plan.clone()]);
+
+            let mut tx = pool.begin().await.expect("begin batch count probe");
+            let error = apply_device_revocation_batch(&mut tx, &batch, &[])
+                .await
+                .expect_err("revocation batch must reject a missing context");
+            assert!(matches!(
+                error,
+                ExecutorError::InconsistentPlan(
+                    "device revocation batch needs one execution context per conversation"
+                )
+            ));
+            assert_g6_batch_preflight_left_no_writes(&mut tx, &fixture, Some(available_ref)).await;
+            tx.rollback().await.expect("rollback batch count probe");
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated append-only gate database"]
+        async fn g6_revocation_batch_preflight_rejects_wrong_id_before_writes() {
+            let pool = g6_gate_pool("batch identity proof").await;
+            let (_, fixture) = g6_revocation_preflight_fixture(&pool).await;
+            let batch = fixture.batch(Vec::new(), vec![fixture.conversation_plan.clone()]);
+            let mut context = fixture.context.clone();
+            context.authority = ExecutionAuthority::Entryless {
+                operation_id: Uuid::new_v4(),
+            };
+
+            let mut tx = pool.begin().await.expect("begin batch identity probe");
+            let error =
+                apply_device_revocation_batch(&mut tx, &batch, std::slice::from_ref(&context))
+                    .await
+                    .expect_err("revocation batch must reject the wrong operation ID");
+            assert!(matches!(
+                error,
+                ExecutorError::MissingContext("exact device revocation operation id")
+            ));
+            assert_g6_batch_preflight_left_no_writes(&mut tx, &fixture, None).await;
+            tx.rollback().await.expect("rollback batch identity probe");
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated append-only gate database"]
+        async fn g6_revocation_batch_preflight_rejects_wrong_kind_before_writes() {
+            let pool = g6_gate_pool("batch plan-kind proof").await;
+            let (graph, fixture) = g6_revocation_preflight_fixture(&pool).await;
+            let (policy_plan, mut context) = g6_policy_plan(&graph, &fixture.conversation_state);
+            context.authority = ExecutionAuthority::Entryless {
+                operation_id: fixture.revocation_id,
+            };
+            let batch = fixture.batch(Vec::new(), vec![policy_plan]);
+
+            let mut tx = pool.begin().await.expect("begin batch plan-kind probe");
+            let error =
+                apply_device_revocation_batch(&mut tx, &batch, std::slice::from_ref(&context))
+                    .await
+                    .expect_err("revocation batch must reject a non-revocation plan");
+            assert!(matches!(
+                error,
+                ExecutorError::InconsistentPlan(
+                    "device revocation batch contains a non-revocation conversation plan"
+                )
+            ));
+            assert_g6_batch_preflight_left_no_writes(&mut tx, &fixture, None).await;
+            tx.rollback().await.expect("rollback batch plan-kind probe");
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated append-only gate database"]
+        async fn g6_actor_role_is_locked_predecessor_role_during_self_demotion() {
+            const FIXED_GATE_DB: &str = "postgres://localhost/catbird_chat_protocol_test_20260722";
+            let database_url = std::env::var("TEST_DATABASE_URL")
+                .expect("TEST_DATABASE_URL must name the existing gate database");
+            assert_eq!(
+                database_url, FIXED_GATE_DB,
+                "G6 actor-role proof may write only its dedicated append-only database"
+            );
+            common::chat_protocol::validate_chat_protocol_database_url(Some(&database_url))
+                .expect("unsafe TEST_DATABASE_URL for G6 actor-role proof");
+            let pool = PgPool::connect(&database_url)
+                .await
+                .expect("connect to existing G6 gate database");
+
+            let graph = commit_genuine_policy_acceptance_fulfillment_at(
+                &pool,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+            )
+            .await;
+            let promoted = execute_genuine_role_change(
+                &pool,
+                &graph,
+                &graph.invitee.did,
+                ParticipantRole::Admin,
+                5,
+                ROLE_ADMIN_AT,
+                Some(graph.fulfillment.welcome_id),
+                true,
+            )
+            .await;
+            assert_eq!(promoted.coordinate().state_version(), 4);
+
+            let self_demoted = execute_genuine_role_change(
+                &pool,
+                &graph,
+                &graph.entry.actor_did,
+                ParticipantRole::Member,
+                6,
+                ROLE_MEMBER_AT,
+                None,
+                false,
+            )
+            .await;
+            assert_eq!(self_demoted.coordinate().state_version(), 5);
+            assert_eq!(
+                self_demoted
+                    .participant(
+                        &PrincipalId::new(graph.entry.actor_did.as_bytes().to_vec()).unwrap()
+                    )
+                    .expect("Alice remains an active participant")
+                    .role(),
+                ParticipantRole::Member
+            );
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated append-only gate database"]
+        async fn g6_welcome_expiry_facade_emits_exact_entryless_authority() {
+            const FIXED_GATE_DB: &str = "postgres://localhost/catbird_chat_protocol_test_20260722";
+            let database_url = std::env::var("TEST_DATABASE_URL")
+                .expect("TEST_DATABASE_URL must name the existing gate database");
+            assert_eq!(
+                database_url, FIXED_GATE_DB,
+                "G6 Welcome-expiry proof may write only its dedicated append-only database"
+            );
+            common::chat_protocol::validate_chat_protocol_database_url(Some(&database_url))
+                .expect("unsafe TEST_DATABASE_URL for G6 Welcome-expiry proof");
+            let pool = PgPool::connect(&database_url)
+                .await
+                .expect("connect to existing G6 gate database");
+
+            let graph = commit_genuine_policy_acceptance_fulfillment_at(
+                &pool,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+            )
+            .await;
+            let cid = Uuid::from_bytes(graph.entry.cid);
+            let observed_at = instant(KP_NOT_AFTER) + chrono::Duration::milliseconds(1);
+            let mut tx = pool
+                .begin()
+                .await
+                .expect("begin locked Welcome-expiry proof");
+            let locked = hydrate_locked_conversation_state(&mut tx, cid, observed_at)
+                .await
+                .expect("lock genuine pending-Welcome aggregate");
+            let welcome = locked
+                .state()
+                .welcome(graph.fulfillment.welcome_id.as_bytes())
+                .expect("genuine pending Welcome retained")
+                .clone();
+            assert_eq!(welcome.status(), WelcomeStatus::Pending);
+
+            let planned = plan_welcome_expiry_for_test(
+                locked.state(),
+                *graph.fulfillment.welcome_id.as_bytes(),
+            )
+            .expect("genuine pending Welcome plans expiry");
+            let observed =
+                ServerTimestamp::from_unix_millis_for_test(observed_at.timestamp_millis())
+                    .expect("canonical observed instant");
+            let expiry_authority = WelcomeExpiryAuthority::for_test(
+                *welcome.welcome_id(),
+                welcome.recipient().clone(),
+                *welcome.coordinate(),
+                welcome.transition_seq(),
+                welcome.expires_at(),
+                observed,
+            );
+            let plan = persistence_plan_for_test(
+                planned,
+                ConversationHeadCasBinding::for_test_internal(
+                    *cid.as_bytes(),
+                    *locked.state().coordinate(),
+                    locked.head().next_entry_seq(),
+                    observed,
+                ),
+            )
+            .with_execution_context_authority_for_test(PlanAuthority::WelcomeExpiry(
+                expiry_authority,
+            ));
+            let context = hydrate_execution_context(
+                &mut tx,
+                &plan,
+                ExecutionContextArtifacts {
+                    accepted_control_entry_bytes: None,
+                    genesis_group_info_bytes: None,
+                    primary_event_payload: Some(b"welcome-expired-g6".to_vec()),
+                    welcome_disposition_event_payloads: Vec::new(),
+                },
+            )
+            .await
+            .expect("production facade hydrates genuine Welcome expiry");
+
+            assert!(context.authority.control_entry().is_none());
+            assert_eq!(
+                context.authority.operation_id(),
+                graph.fulfillment.welcome_id
+            );
+            tx.rollback()
+                .await
+                .expect("rollback read-only facade proof");
         }
 
         #[tokio::test]
@@ -11312,10 +11942,12 @@ mod historical_control_loader {
         async fn execute_genuine_role_change(
             pool: &PgPool,
             graph: &GenuinePolicyRoleGraph,
+            target_did: &str,
             role: ParticipantRole,
             seq: u64,
             at: &str,
             superseded_welcome: Option<Uuid>,
+            apply: bool,
         ) -> ConversationState {
             let cid = Uuid::from_bytes(graph.entry.cid);
             let locked_at: DateTime<Utc> =
@@ -11335,7 +11967,7 @@ mod historical_control_loader {
                 prior.coordinate(),
                 seq,
                 at,
-                vec![GenuinePolicyChange::ChangeRole(&graph.invitee.did, role)],
+                vec![GenuinePolicyChange::ChangeRole(target_did, role)],
             );
             assert_eq!(
                 control
@@ -11345,6 +11977,8 @@ mod historical_control_loader {
                 Some(SignedMutationKind::PolicyTransition),
                 "planner receives genuine signed policy authority"
             );
+            let transition = control.transition.clone();
+            let accepted_control_entry_bytes = control.entry.accepted_payload_bytes.clone();
             let alice = DeviceIdentity::new(
                 PrincipalId::new(graph.entry.actor_did.as_bytes().to_vec()).unwrap(),
                 *graph.entry.actor_device_id.as_bytes(),
@@ -11376,117 +12010,99 @@ mod historical_control_loader {
                 seq,
                 control.received_at,
             );
-            let plan = persistence_plan_for_test(planned, head);
-            let protocol_instance_id: Uuid =
-                sqlx::query_scalar("SELECT protocol_instance_id FROM chat.protocol_instances")
-                    .fetch_one(pool)
-                    .await
-                    .expect("protocol instance");
-            let successor_public_state = resulting_state.public_state();
-            let tree = encode_public_tree_summary(successor_public_state.binding().tree_summary())
-                .expect("role successor tree encodes");
-
-            let mut audience = vec![
-                (alice.clone(), graph.entry.actor_did.clone()),
-                (bob.clone(), graph.invitee.did.clone()),
-            ];
-            audience.sort_by(|left, right| {
-                (left.1.as_bytes(), left.0.device_id())
-                    .cmp(&(right.1.as_bytes(), right.0.device_id()))
-            });
-            let entry_recipients = audience
-                .iter()
-                .map(|(device, _)| (device.clone(), EntryEntitlementKind::Control))
-                .collect();
-            let changed_targets: Vec<_> = if superseded_welcome.is_some() {
-                vec![(alice.clone(), graph.entry.actor_did.clone())]
-            } else {
-                audience.clone()
-            };
-            let mut changed_recipients = Vec::new();
-            for (device, did) in changed_targets {
-                changed_recipients.push((
-                    device.clone(),
-                    EventEntitlementKind::Participant,
-                    device_event_predecessor(pool, &did, Uuid::from_bytes(*device.device_id()))
-                        .await,
-                ));
-            }
-            let welcome_dispositions = if let Some(welcome_id) = superseded_welcome {
-                vec![WelcomeDispositionInput {
-                    welcome_id,
-                    event: EventFanout {
-                        event_id: Uuid::new_v4(),
-                        event_kind: EventKind::WelcomeDisposition,
-                        payload_bytes: format!("welcome-superseded-{seq}").into_bytes(),
-                        recipients: vec![(
-                            bob.clone(),
-                            EventEntitlementKind::Welcome,
-                            device_event_predecessor(
-                                pool,
-                                &graph.invitee.did,
-                                graph.invitee.device_id,
-                            )
-                            .await,
-                        )],
-                        outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
-                    },
-                }]
-            } else {
-                vec![]
-            };
-            let ctx = ExecutionContext {
-                protocol_instance_id,
-                applied_at: control.received_at_db,
-                actor: ExecutionActor {
-                    user_did: graph.entry.actor_did.clone(),
-                    device_id: graph.entry.actor_device_id,
-                    key_id: graph.entry.actor_key_id.clone(),
-                    auth_generation: 1,
-                    role: TransitionActorRole::Admin,
-                    device_status: "active".to_owned(),
-                },
-                entry: control.entry,
-                spine: SpineArtifacts {
-                    public_snapshot_bytes: successor_public_state.snapshot().to_vec(),
-                    public_snapshot_sha256: successor_public_state.snapshot_sha256().to_vec(),
-                    tree_summary_bytes: tree.bytes().to_vec(),
-                    tree_summary_sha256: tree.sha256().to_vec(),
-                    leaf_count: i64::try_from(
-                        successor_public_state
-                            .binding()
-                            .tree_summary()
-                            .leaves()
-                            .len(),
-                    )
-                    .unwrap(),
-                    genesis_group_info_bytes: vec![],
-                    genesis_group_info_sha256: vec![],
-                },
-                opened_leaves: vec![],
-                metadata_author: None,
-                participant_period_ids: vec![],
-                leaf_period_ids: vec![],
-                entry_recipients,
-                events: vec![EventFanout {
-                    event_id: Uuid::new_v4(),
-                    event_kind: EventKind::ConversationChanged,
-                    payload_bytes: format!("role-change-{seq}").into_bytes(),
-                    recipients: changed_recipients,
-                    outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
-                }],
-                closing_leaf_periods: vec![],
-                closing_participant_periods: vec![],
-                reset_request_row: None,
-                recovery_open: None,
-                welcome_expiry: None,
-                welcome_response: None,
-                welcome_dispositions,
-            };
+            let plan = persistence_plan_for_test(planned, head)
+                .with_execution_context_authority_for_test(PlanAuthority::Transition(transition));
+            let expected_alice_predecessor =
+                device_event_predecessor(pool, &graph.entry.actor_did, graph.entry.actor_device_id)
+                    .await;
+            let expected_bob_predecessor =
+                device_event_predecessor(pool, &graph.invitee.did, graph.invitee.device_id).await;
             let mut tx = pool
                 .begin()
                 .await
                 .expect("begin production ChangeRole executor");
+            // The pure planner test seam does not acquire repository locks.
+            // Production callers already hold this exact conversation lock.
+            sqlx::query("SELECT 1 FROM chat.conversations WHERE conversation_id=$1 FOR UPDATE")
+                .bind(cid)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("lock genuine role-change head");
+            let ctx = hydrate_execution_context(
+                &mut tx,
+                &plan,
+                ExecutionContextArtifacts {
+                    accepted_control_entry_bytes: Some(accepted_control_entry_bytes),
+                    genesis_group_info_bytes: None,
+                    primary_event_payload: Some(format!("role-change-{seq}").into_bytes()),
+                    welcome_disposition_event_payloads: superseded_welcome
+                        .map(|welcome_id| {
+                            vec![(welcome_id, format!("welcome-superseded-{seq}").into_bytes())]
+                        })
+                        .unwrap_or_default(),
+                },
+            )
+            .await
+            .expect("production facade hydrates genuine role-change context");
+            assert_eq!(ctx.actor.user_did, graph.entry.actor_did);
+            assert_eq!(ctx.actor.device_id, graph.entry.actor_device_id);
+            assert_eq!(ctx.actor.role, TransitionActorRole::Admin);
+            assert_eq!(ctx.entry_recipients.len(), 2);
+            assert!(ctx
+                .entry_recipients
+                .iter()
+                .all(|(_, kind)| *kind == EntryEntitlementKind::Control));
+            assert!(ctx.participant_period_ids.is_empty());
+            assert!(ctx.leaf_period_ids.is_empty());
+            assert!(ctx.opened_leaves.is_empty());
+            assert_eq!(ctx.events.len(), 1);
+            assert_eq!(ctx.events[0].event_kind, EventKind::ConversationChanged);
+            assert_eq!(
+                ctx.events[0].recipients.len(),
+                if superseded_welcome.is_some() { 1 } else { 2 }
+            );
+            assert_eq!(
+                ctx.events[0]
+                    .recipients
+                    .iter()
+                    .find(|(device, _, _)| *device == alice)
+                    .map(|(_, _, predecessor)| *predecessor),
+                Some(expected_alice_predecessor)
+            );
+            if superseded_welcome.is_none() {
+                assert_eq!(
+                    ctx.events[0]
+                        .recipients
+                        .iter()
+                        .find(|(device, _, _)| *device == bob)
+                        .map(|(_, _, predecessor)| *predecessor),
+                    Some(expected_bob_predecessor)
+                );
+            } else {
+                assert!(!ctx.events[0]
+                    .recipients
+                    .iter()
+                    .any(|(device, _, _)| *device == bob));
+            }
+            assert_eq!(
+                ctx.welcome_dispositions.len(),
+                usize::from(superseded_welcome.is_some())
+            );
+            if let Some(disposition) = ctx.welcome_dispositions.first() {
+                assert_eq!(disposition.event.recipients.len(), 1);
+                assert_eq!(disposition.event.recipients[0].0, bob);
+                assert_eq!(
+                    disposition.event.recipients[0].1,
+                    EventEntitlementKind::Welcome
+                );
+                assert_eq!(disposition.event.recipients[0].2, expected_bob_predecessor);
+            }
+            if !apply {
+                tx.rollback()
+                    .await
+                    .expect("rollback facade-only genuine role change");
+                return resulting_state;
+            }
             let applied = apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
                 .await
                 .expect("production ChangeRole executor applies");
@@ -15251,7 +15867,7 @@ mod historical_control_loader {
             apply_conversation_persistence_plan, hydrate_conversation_state,
             persistence_plan_for_test, plan_reset_activation, ControlEntryContent,
             ConversationHeadCasBinding, ConversationKind, ConversationStateHydration,
-            DeviceIdentity, EventFanout, ExecutionActor, ExecutionContext,
+            DeviceIdentity, EventFanout, ExecutionActor, ExecutionAuthority, ExecutionContext,
             HistoricalRehydrationAuthority, HydrationAuthority, LeafPersistenceColumns,
             LeaveRequestStatus, MetadataAuthorColumns, ParticipantRemovalEvidence, PrincipalId,
             ResetActivation, ResetRequestStatus, ServerTimestamp, SpineArtifacts,
@@ -17028,7 +17644,7 @@ mod historical_control_loader {
                     role: TransitionActorRole::Admin,
                     device_status: "active".to_owned(),
                 },
-                entry: ControlEntryContent {
+                authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
                     entry_id: activation.entry_id,
                     entry_kind: "blue.catbird.chat.defs#resetActivationEntry".to_owned(),
                     accepted_payload_bytes: activation.public_row_json.clone(),
@@ -17040,7 +17656,7 @@ mod historical_control_loader {
                     signature: activation.signature.clone(),
                     server_fields_bytes: activation.server_fields_dag_cbor.clone(),
                     outer_entry_fingerprint: activation.outer_entry_fingerprint.clone(),
-                },
+                }),
                 spine: SpineArtifacts {
                     public_snapshot_bytes: activation.successor_public_state.snapshot().to_vec(),
                     public_snapshot_sha256: activation
